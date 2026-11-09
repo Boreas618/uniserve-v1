@@ -91,52 +91,31 @@ impl Linear {
         self.weight.view()
     }
 
-    /// `out = input · weight + bias`.
-    ///
-    /// `input` is `[m, k]` and `out` is `[m, n]`, both row-major on their last axis.
     /// The descriptor [`Self::forward`] launches with, for an input and an output of these
     /// element types.
     ///
-    /// The row count is not in it: rows are a launch value and not a key field, so one request space
-    /// enumerates a descriptor per pair of element types and the operator is compiled once for
-    /// every row count that reaches it. This is the same arithmetic `forward` runs — `forward` calls
-    /// this — so an enumeration built on it cannot drift from what the model launches.
-    pub fn descriptor(&self, input: DType, output: DType) -> Descriptor {
-        Self::descriptor_of(
-            self.k,
-            input,
-            self.weight.dtype(),
-            self.order,
-            self.bias.is_some(),
-            output,
-        )
-    }
-
-    /// The descriptor a dense product over `k` columns launches with, from the numbers alone.
-    ///
-    /// A deployment answers "what must be compiled?" before it opens a device, and this key reads the
-    /// contraction length, the weight's element type, the order, whether an epilogue adds a bias, and
-    /// the two element types — never the weight's values or its row count. [`Self::descriptor`] calls
-    /// it with a loaded layer's numbers, so an enumeration built on it cannot drift from the launch.
-    pub fn descriptor_of(
-        k: u32,
-        input: DType,
-        weight: DType,
-        order: WeightOrder,
-        bias: bool,
-        output: DType,
-    ) -> Descriptor {
+    /// The row count is not in it: rows are a launch value and not a key field, so the operator is
+    /// compiled once for every row count that reaches it. The key reads the contraction length, the
+    /// weight's element type, the order, whether an epilogue adds a bias, and the two element types.
+    fn descriptor(&self, input: DType, output: DType) -> Descriptor {
         Descriptor {
             input,
-            weight,
+            weight: self.weight.dtype(),
             accumulate: ACCUMULATE,
             output,
-            order,
-            epilogue: if bias { Epilogue::Bias } else { Epilogue::None },
-            k,
+            order: self.order,
+            epilogue: if self.bias.is_some() {
+                Epilogue::Bias
+            } else {
+                Epilogue::None
+            },
+            k: self.k,
         }
     }
 
+    /// `out = input · weight + bias`.
+    ///
+    /// `input` is `[m, k]` and `out` is `[m, n]`, both row-major on their last axis.
     pub fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
         let k = u64::from(self.k);
         let n = u64::from(self.n);
@@ -396,7 +375,7 @@ impl Nvfp4Linear {
         block
     }
 
-    pub fn encode_descriptor(&self) -> QuantizeDescriptor {
+    fn encode_descriptor(&self) -> QuantizeDescriptor {
         QuantizeDescriptor {
             input: self.input,
             columns: self.k,
@@ -406,40 +385,8 @@ impl Nvfp4Linear {
         }
     }
 
-    /// The packed product's descriptor, from the geometry alone, for `rows` activation rows.
-    ///
-    /// `rows` is the request's row count and **not** the descriptor's `m`: the key states the row
-    /// class that holds `rows` ([`packed_rows`]), because the module is compiled per class and its
-    /// entry refuses any other row count. The product's grid is the row count, which is why a
-    /// deployment enumerates the classes its worker builds rather than an unbounded row count.
-    #[allow(clippy::too_many_arguments)]
-    pub fn descriptor_of(
-        rows: u32,
-        n: u32,
-        k: u32,
-        layout: ScaleLayout,
-        bias: bool,
-        output: DType,
-    ) -> Result<GemmDescriptor> {
-        let descriptor = GemmDescriptor {
-            packed: DType::U8,
-            scale: DType::F8E4M3,
-            accumulate: ACCUMULATE,
-            output,
-            layout,
-            epilogue: if bias { Epilogue::Bias } else { Epilogue::None },
-            m: packed_rows(rows)?,
-            n,
-            k,
-        };
-        // The walk's own statement of the pair, refused here if it ever stops being one: this is the
-        // descriptor the key file and the fixture are built from.
-        ops::fp4::check_gemm(&descriptor)?;
-        Ok(descriptor)
-    }
-
     /// This projection's descriptor for `rows` activation rows, keyed by their class.
-    pub fn descriptor(&self, rows: u32, output: DType) -> Result<GemmDescriptor> {
+    fn descriptor(&self, rows: u32, output: DType) -> Result<GemmDescriptor> {
         let descriptor = GemmDescriptor {
             packed: DType::U8,
             scale: self.scales.dtype(),
@@ -459,34 +406,6 @@ impl Nvfp4Linear {
         // E4M3 makes a key no store built - refused here, where the layer can say which plane.
         ops::fp4::check_gemm(&descriptor)?;
         Ok(descriptor)
-    }
-
-    /// The arena one launch of this projection carves for a request of `rows` activation rows.
-    ///
-    /// Three regions, each aligned up like the arena's own grants: the packed activation, the block
-    /// scales in this layout's shape, and one FP32 row factor per activation row.
-    ///
-    /// **The regions are the class's, not the request's** ([`packed_rows`]): the launch states the
-    /// class, so a region reserved for fifteen rows is a region a 128-row launch writes past — and
-    /// every other check would still agree, because the store has the cell, the descriptor matches
-    /// it and the launch runs. Only the arena would know, and it does not speak. A row count above
-    /// the largest class reserves its own rows; the launch refuses that launch by name.
-    pub fn scratch_bytes(&self, rows: u64) -> u64 {
-        let class = PACKED_M_CLASSES
-            .iter()
-            .copied()
-            .map(u64::from)
-            .find(|class| *class >= rows)
-            .unwrap_or(rows);
-        let align =
-            |bytes: u64| bytes.div_ceil(crate::forward::ALIGNMENT) * crate::forward::ALIGNMENT;
-        let values = align(class * u64::from(self.k) / 2);
-        let scales = {
-            let shape = self.layout.shape(class, u64::from(self.k));
-            align(shape.numel())
-        };
-        let token_scale = align(class * 4);
-        values + scales + token_scale
     }
 
     /// `out = projection(input)`, with the product launched at the row *class* of `input`'s rows.
@@ -656,12 +575,44 @@ mod tests {
         assert_eq!(projection.weight().shape.dims(), &[8, 32]);
     }
 
+    /// One forward of `projection` over `rows` BF16 activation rows on a recording forward: its
+    /// answer, the programs it launched, and the arena it reserved beyond its operands.
+    fn recorded_forward(
+        projection: &Nvfp4Linear,
+        rows: u64,
+    ) -> (Result<()>, Vec<(String, String)>, u64) {
+        let arena = crate::Arena::counting();
+        let f = Forward::recording(&arena);
+        let class = u64::from(packed_rows(rows as u32).expect("a row class"));
+        let input = arena
+            .tensor(DType::BF16, Shape::new(&[rows, u64::from(projection.k())]))
+            .expect("a counting arena");
+        let alpha = arena
+            .tensor(DType::F32, Shape::new(&[1]))
+            .expect("a counting arena");
+        let out = arena
+            .tensor(DType::BF16, Shape::new(&[class, u64::from(projection.n())]))
+            .expect("a counting arena");
+        let operands = arena.used();
+        let (answer, launches) =
+            crate::forward::recorded(|| projection.forward(&f, input, alpha, out));
+        (answer, launches, arena.peak() - operands)
+    }
+
+    /// The keys a recorded forward launched for `operator`.
+    fn keys_of<'a>(launches: &'a [(String, String)], operator: &str) -> Vec<&'a str> {
+        launches
+            .iter()
+            .filter(|(name, _)| name == operator)
+            .map(|(_, key)| key.as_str())
+            .collect()
+    }
+
     /// A scales plane declared as bytes is refused where the key is built, not at the launch.
     ///
     /// The block scales of an NVFP4 weight are E4M3 and the packed pairs are bytes; a checkpoint
     /// whose scales plane says otherwise would key `scale_u8`, which no store built, and the launch
-    /// would report a missing program rather than the declared type. The refusal is one line in the
-    /// product's own check, called here as the descriptor is built.
+    /// would report a missing program rather than the declared type.
     #[test]
     fn a_scales_plane_declared_as_bytes_is_refused_where_the_key_is_built() {
         let layout = ScaleLayout::Swizzled128X4;
@@ -669,45 +620,14 @@ mod tests {
         scales.scales = weight(DType::U8, layout.shape(8, 64).dims());
         let projection =
             Nvfp4Linear::new(&scales, None, ScaleLayout::Swizzled128X4, DType::BF16, 128).unwrap();
-        let error = projection
-            .descriptor(16, DType::BF16)
-            .expect_err("a byte scales plane is not an NVFP4 operand");
-        let text = error.to_string();
+        let (answer, ..) = recorded_forward(&projection, 16);
+        let text = answer
+            .expect_err("a byte scales plane is not an NVFP4 operand")
+            .to_string();
         assert!(
             text.contains("f8e4m3 block scale"),
             "the refusal names the pair: {text}"
         );
-    }
-
-    /// The walk's descriptor and a loaded projection's are one key.
-    ///
-    /// `descriptor_of` states the operand types from the geometry alone, which is what the key walk
-    /// and the fixture use; `descriptor` states the scales' type from the checkpoint's own plane. A
-    /// checkpoint whose scales plane is declared as anything but E4M3 makes the two keys differ, and
-    /// the launch then asks the store for a program the walk never named - with every number in the
-    /// key looking plausible. This pins the pair this deployment's checkpoint states.
-    #[test]
-    fn the_walk_and_a_loaded_projection_state_one_key() {
-        let (n, k, rows) = (8_u64, 64_u64, 16_u32);
-        let layout = ScaleLayout::Swizzled128X4;
-        let mut scales = packed(n, k, layout);
-        scales.scales = weight(DType::F8E4M3, layout.shape(n, k).dims());
-        let projection = Nvfp4Linear::new(&scales, None, layout, DType::BF16, 128).unwrap();
-
-        let loaded = projection.descriptor(rows, DType::BF16).expect("a key");
-        let walked =
-            Nvfp4Linear::descriptor_of(rows, n as u32, k as u32, layout, false, DType::BF16)
-                .expect("the walk's key");
-
-        assert_eq!(loaded.packed, walked.packed, "the packed bytes");
-        assert_eq!(
-            loaded.scale, walked.scale,
-            "the block scale: the checkpoint's plane and the walk's literal must be one type"
-        );
-        assert_eq!(loaded.m, walked.m, "the row class");
-        assert_eq!(loaded.n, walked.n);
-        assert_eq!(loaded.k, walked.k);
-        assert_eq!(loaded.layout, walked.layout);
     }
 
     #[test]
@@ -743,9 +663,8 @@ mod tests {
     fn a_packed_product_is_keyed_per_row_class_and_a_dense_one_is_not() {
         // The two products differ in what their module depends on: the dense one's grid and tile
         // are its geometry's, so every row count reaches one compiled module, while the packed
-        // product's `m` is a compile-time constant of its module — so a deployment enumerates the
-        // row *classes* it builds, and two requests inside one class are one program. This is what
-        // a key enumeration reads off the layers.
+        // product's `m` is a compile-time constant of its module — so two requests inside one row
+        // class are one program.
         let packed = Nvfp4Linear::new(
             &packed(8, 64, ScaleLayout::Swizzled128X4),
             None,
@@ -754,29 +673,42 @@ mod tests {
             128,
         )
         .unwrap();
+        let launched = |rows: u64| {
+            let (answer, launches, _) = recorded_forward(&packed, rows);
+            answer.expect("the recorded forward");
+            launches
+        };
+        let (one, eight) = (launched(1), launched(8));
         // One and eight rows are the 128-row class: the same program, not two.
-        assert_eq!(
-            packed.descriptor(1, DType::BF16).unwrap().to_string(),
-            packed.descriptor(8, DType::BF16).unwrap().to_string()
-        );
+        assert_eq!(keys_of(&one, "nvfp4_gemm"), keys_of(&eight, "nvfp4_gemm"));
         // A class boundary is a different module, and that is the only thing `m` distinguishes.
         assert_ne!(
-            packed.descriptor(128, DType::BF16).unwrap().to_string(),
-            packed.descriptor(129, DType::BF16).unwrap().to_string()
+            keys_of(&launched(128), "nvfp4_gemm"),
+            keys_of(&launched(129), "nvfp4_gemm")
         );
         // The activation encoding is one module whatever the row count: its key names the column
         // count, the layout and the block, and the rows travel in the launch.
         assert_eq!(
-            packed.encode_descriptor().to_string(),
-            packed.encode_descriptor().to_string()
+            keys_of(&one, "nvfp4_quantize"),
+            keys_of(&launched(129), "nvfp4_quantize")
         );
-        // A dense projection's descriptor does not take a row count at all, which is the same
-        // statement made by the signature.
+
+        // A dense projection's key takes no row count at all.
         let dense = Linear::new(weight(DType::BF16, &[8, 64]), None, WeightOrder::NxK).unwrap();
-        assert_eq!(
-            dense.descriptor(DType::BF16, DType::BF16).to_string(),
-            dense.descriptor(DType::BF16, DType::BF16).to_string()
-        );
+        let dense_keys = |rows: u64| {
+            let arena = crate::Arena::counting();
+            let f = Forward::recording(&arena);
+            let input = arena
+                .tensor(DType::BF16, Shape::new(&[rows, 64]))
+                .expect("a counting arena");
+            let out = arena
+                .tensor(DType::BF16, Shape::new(&[rows, 8]))
+                .expect("a counting arena");
+            let (answer, launches) = crate::forward::recorded(|| dense.forward(&f, input, out));
+            answer.expect("the recorded forward");
+            launches
+        };
+        assert_eq!(dense_keys(1), dense_keys(129));
     }
 
     #[test]
@@ -820,11 +752,16 @@ mod tests {
             128,
         )
         .unwrap();
-        assert_eq!(packed.scratch_bytes(15), packed.scratch_bytes(128));
-        assert_eq!(packed.scratch_bytes(129), packed.scratch_bytes(256));
-        // And it is larger than the request's own regions would be, which is the defect stated as
-        // a number rather than as an inequality: 15 rows of a 64-wide contraction.
-        assert!(packed.scratch_bytes(15) > 15 * 32 + 15 * 4);
+        let reserved = |rows: u64| {
+            let (answer, _, reserved) = recorded_forward(&packed, rows);
+            answer.expect("the recorded forward");
+            reserved
+        };
+        assert_eq!(reserved(15), reserved(128));
+        assert_eq!(reserved(129), reserved(256));
+        // And it is larger than the request's own regions would be: 15 rows of a 64-wide
+        // contraction.
+        assert!(reserved(15) > 15 * 32 + 15 * 4);
     }
 
     #[test]

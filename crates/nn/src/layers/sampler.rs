@@ -357,13 +357,12 @@ impl Sampler {
     /// The descriptors this layer launches with, each built in exactly one place.
     ///
     /// Every field is layer geometry or a fixed element type — the vocabulary, the candidate width,
-    /// the row block, the token width — so a request space enumerates them without a stream, an
-    /// arena or a batch, and both sampling paths launch these. The row count of a draw is a launch
-    /// value and appears in none of them.
+    /// the row block, the token width — and both sampling paths launch these. The row count of a
+    /// draw is a launch value and appears in none of them.
     ///
     /// Penalties and temperature over the whole vocabulary: `logits`' element type is the one thing
     /// a deployment chooses.
-    pub fn shape_descriptor(&self, logits: DType) -> ShapeDescriptor {
+    fn shape_descriptor(&self, logits: DType) -> ShapeDescriptor {
         ShapeDescriptor {
             dtype: logits,
             vocabulary: self.vocabulary,
@@ -383,7 +382,7 @@ impl Sampler {
     /// `filter_candidates` reads the largest at lane 0 and the request's own `top_k` at index
     /// `top_k - 1`, and `candidate_order` then sorts by id — so an emission that is a set and not an
     /// order silently changes what a request draws.
-    pub fn top_descriptor(&self) -> TopKDescriptor {
+    fn top_descriptor(&self) -> TopKDescriptor {
         TopKDescriptor {
             dtype: DType::F32,
             vocabulary: self.vocabulary,
@@ -395,7 +394,7 @@ impl Sampler {
     }
 
     /// The row's own thresholds applied to its candidates.
-    pub fn filter_descriptor(&self) -> FilterDescriptor {
+    fn filter_descriptor(&self) -> FilterDescriptor {
         FilterDescriptor {
             width: self.width,
             tile: CANDIDATE_TILE,
@@ -406,7 +405,7 @@ impl Sampler {
 
     /// The candidates reordered by token id, so a draw does not depend on the order the top-k
     /// program kept.
-    pub fn order_descriptor(&self) -> OrderDescriptor {
+    fn order_descriptor(&self) -> OrderDescriptor {
         OrderDescriptor {
             values: DType::F32,
             ids: DType::I32,
@@ -420,7 +419,7 @@ impl Sampler {
     /// `CANDIDATE_TILE` lanes and keeps only a running maximum and a running denominator, so the
     /// candidate width may be the whole vocabulary. A tile derived from the width would ask for one
     /// register per candidate.
-    pub fn softmax_descriptor(&self) -> SoftmaxDescriptor {
+    fn softmax_descriptor(&self) -> SoftmaxDescriptor {
         SoftmaxDescriptor {
             dtype: DType::F32,
             columns: self.width,
@@ -433,7 +432,7 @@ impl Sampler {
     ///
     /// The tile is a chunk of the row, as the distribution's is: the draw walks the candidates in
     /// tiles and keeps a running cumulative, so the width may be the whole vocabulary.
-    pub fn draw_descriptor(&self) -> InverseCdfDescriptor {
+    fn draw_descriptor(&self) -> InverseCdfDescriptor {
         InverseCdfDescriptor {
             width: self.width,
             tile: CANDIDATE_TILE,
@@ -444,7 +443,7 @@ impl Sampler {
     }
 
     /// The greedy path's argmax over the shaped row.
-    pub fn argmax_descriptor(&self) -> ArgMaxDescriptor {
+    fn argmax_descriptor(&self) -> ArgMaxDescriptor {
         ArgMaxDescriptor {
             dtype: DType::F32,
             width: self.vocabulary,
@@ -454,7 +453,7 @@ impl Sampler {
     }
 
     /// The reported log-probabilities over the shaped distribution of the whole vocabulary.
-    pub fn log_softmax_descriptor(&self) -> LogSoftmaxDescriptor {
+    fn log_softmax_descriptor(&self) -> LogSoftmaxDescriptor {
         LogSoftmaxDescriptor {
             dtype: DType::F32,
             columns: self.vocabulary,
@@ -464,7 +463,7 @@ impl Sampler {
     }
 
     /// The reported log-probability of the token each row drew.
-    pub fn logprob_descriptor(&self) -> LogprobDescriptor {
+    fn logprob_descriptor(&self) -> LogprobDescriptor {
         LogprobDescriptor {
             columns: self.vocabulary,
             ids: self.tokens,

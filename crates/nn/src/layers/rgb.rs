@@ -31,11 +31,11 @@ pub struct RgbBytes {
 }
 
 impl RgbBytes {
-    /// The descriptor a byte packing of `channels` channels launches, stated without its weights.
+    /// The descriptor a byte packing of `channels` channels launches.
     ///
     /// The de-normalization constants are weights and the raster's extents are launch values, so the
     /// key is the element type and the channel count.
-    pub fn descriptor_of(dtype: DType, channels: u32) -> rgb::Descriptor {
+    fn descriptor(dtype: DType, channels: u32) -> rgb::Descriptor {
         rgb::Descriptor {
             dtype,
             channels,
@@ -129,9 +129,7 @@ impl RgbBytes {
                 format!("the packed image is u8, not {}", out.dtype),
             ));
         }
-        // One construction with `RgbBytes::descriptor_of`: a walk and a launch cannot state
-        // different programs for the same packing.
-        let descriptor = Self::descriptor_of(self.dtype, self.channels);
+        let descriptor = Self::descriptor(self.dtype, self.channels);
         f.operate::<RgbBytesOp>(
             &descriptor,
             rgb::Args {

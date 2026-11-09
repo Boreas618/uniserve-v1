@@ -39,43 +39,30 @@ impl RmsNorm {
         self.weight.view()
     }
 
-    /// `out = x · rsqrt(mean(x²) + eps) · weight`.
     /// The descriptor [`Self::forward`] launches with, for an input of `input`.
     ///
     /// The row count is not in it: rows are a launch value, and a normalization is compiled per
-    /// column count and element type.
-    pub fn descriptor(&self, input: ops::DType) -> RmsNormDescriptor {
-        Self::descriptor_of(self.columns, input)
+    /// column count and element type; the tile follows the width.
+    fn descriptor(&self, input: ops::DType) -> RmsNormDescriptor {
+        RmsNormDescriptor {
+            dtype: input,
+            columns: self.columns,
+            tile: row_tile(self.columns),
+            pdl: PDL,
+        }
     }
 
     /// The descriptor [`Self::forward_with_residual`] launches with, for an input of `input`.
-    pub fn add_descriptor(&self, input: ops::DType) -> AddRmsNormDescriptor {
-        Self::add_descriptor_of(self.columns, input)
-    }
-
-    /// The descriptor the fused residual-add and normalization launches with, from the width alone.
-    pub fn add_descriptor_of(columns: u32, input: ops::DType) -> AddRmsNormDescriptor {
+    fn add_descriptor(&self, input: ops::DType) -> AddRmsNormDescriptor {
         AddRmsNormDescriptor {
             dtype: input,
-            columns,
-            tile: row_tile(columns),
+            columns: self.columns,
+            tile: row_tile(self.columns),
             pdl: PDL,
         }
     }
 
-    /// The descriptor a normalization over `columns` channels launches with, from the width alone.
-    ///
-    /// The row count is a launch value, and the tile follows the width, so a deployment that has only
-    /// a configuration states this program exactly.
-    pub fn descriptor_of(columns: u32, input: ops::DType) -> RmsNormDescriptor {
-        RmsNormDescriptor {
-            dtype: input,
-            columns,
-            tile: row_tile(columns),
-            pdl: PDL,
-        }
-    }
-
+    /// `out = x · rsqrt(mean(x²) + eps) · weight`.
     pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
         let columns = u64::from(self.columns);
         x.require_row("RmsNorm", x.dtype, columns)
@@ -178,21 +165,12 @@ impl LayerNorm {
     ///
     /// The bias is in it, so a layer with and one without are two modules: the epilogue loads a
     /// second vector or it does not.
-    pub fn descriptor(&self, input: ops::DType) -> LayerNormDescriptor {
-        Self::descriptor_of(input, self.columns, self.bias.is_some())
-    }
-
-    /// The descriptor a layer normalization over `columns` channels launches, stated without its
-    /// weights.
-    ///
-    /// The bias's presence is a descriptor field (the epilogue loads a second vector or it does not),
-    /// so a walk reads it from the checkpoint's mapping rather than from a loaded layer.
-    pub fn descriptor_of(input: ops::DType, columns: u32, bias: bool) -> LayerNormDescriptor {
+    fn descriptor(&self, input: ops::DType) -> LayerNormDescriptor {
         LayerNormDescriptor {
             dtype: input,
-            columns,
-            tile: row_tile(columns),
-            bias,
+            columns: self.columns,
+            tile: row_tile(self.columns),
+            bias: self.bias.is_some(),
             pdl: PDL,
         }
     }

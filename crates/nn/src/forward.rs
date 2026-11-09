@@ -733,6 +733,26 @@ impl<'a> Forward<'a> {
     }
 }
 
+/// Runs `walk` with a capture sink installed and answers what it reported, as `(operator, key)`
+/// pairs in launch order: the observation a layer's test makes of its forward on a recording
+/// [`Forward`].
+#[cfg(test)]
+pub(crate) fn recorded<T>(walk: impl FnOnce() -> T) -> (T, Vec<(String, String)>) {
+    struct Launches(Vec<(String, String)>);
+
+    impl ops::capture::Sink for Launches {
+        fn launched(&mut self, operator: &'static str, key: &str) {
+            self.0.push((operator.to_owned(), key.to_owned()));
+        }
+    }
+
+    let mut launches = Launches(Vec::new());
+    ops::capture::set_sink(Some(&mut launches));
+    let answer = walk();
+    ops::capture::set_sink(None);
+    (answer, launches.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,36 +762,20 @@ mod tests {
     /// its programs — a traversal that cannot miss a launch, on a machine that has no GPU and no shards.
     #[test]
     fn a_recording_forward_reports_the_program_it_would_launch() {
-        struct Rows(Vec<(String, String)>);
-
-        impl ops::capture::Sink for Rows {
-            fn launched(&mut self, operator: &'static str, key: &str) {
-                self.0.push((operator.to_owned(), key.to_owned()));
-            }
-        }
-
         let arena = Arena::new(DevicePtr::new(0), 1 << 20);
         let forward = Forward::recording(&arena);
         assert!(forward.is_recording());
 
-        let descriptor = crate::layers::Silu::descriptor_of(DType::BF16, 1024);
         let extent = Shape::new(&[4, 1024]);
-        let args = ops::activation::SiluArgs {
-            x: arena.tensor(DType::BF16, extent).unwrap(),
-            out: arena.tensor(DType::BF16, extent).unwrap(),
-        };
+        let x = arena.tensor(DType::BF16, extent).unwrap();
+        let out = arena.tensor(DType::BF16, extent).unwrap();
+        let (walked, launches) = recorded(|| crate::layers::Silu.forward(&forward, x, out));
+        walked.expect("a recording forward launches nothing");
 
-        let mut rows = Rows(Vec::new());
-        ops::capture::set_sink(Some(&mut rows));
-        forward
-            .operate::<ops::activation::Silu>(&descriptor, args)
-            .expect("a recording forward launches nothing");
-        ops::capture::set_sink(None);
-
-        assert_eq!(
-            rows.0,
-            vec![("silu".to_owned(), ops::descriptor::key(&descriptor))]
-        );
+        assert_eq!(launches.len(), 1, "{launches:?}");
+        let (operator, key) = &launches[0];
+        assert_eq!(operator, "silu");
+        assert!(key.starts_with("dtype_bf16_columns_1024_"), "{key}");
     }
 
     #[test]

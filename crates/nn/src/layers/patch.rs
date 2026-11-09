@@ -83,7 +83,7 @@ impl Patch {
     ///
     /// The raster's extents and the frame count travel with the call — the program reads them as
     /// words — so every canvas of an element type is one compiled module.
-    pub fn descriptor_of(dtype: ops::DType) -> patch::Descriptor {
+    fn descriptor(dtype: ops::DType) -> patch::Descriptor {
         patch::Descriptor {
             dtype,
             block: BLOCK,
@@ -99,7 +99,7 @@ impl Patch {
         frames: u64,
     ) -> Result<()> {
         let frames = self.check_frames(latent, frames)?;
-        let descriptor = Self::descriptor_of(latent.dtype);
+        let descriptor = Self::descriptor(latent.dtype);
         // The layer's raster travels with the call: the program reads it as words, so every canvas
         // of an element type is one compiled module, and the layer's geometry never reaches a key.
         f.operate::<PatchOp>(

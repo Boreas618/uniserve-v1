@@ -60,14 +60,10 @@ pub use cross_fade::CrossFade;
 pub use embedding::Embedding;
 pub use exchange::UlyssesExchange;
 pub use frame::{FrameMoments, FrameNormPad, FramePad};
-pub use head::{ParallelLMHead, gather_rows, gather_rows_descriptor};
+pub use head::{ParallelLMHead, gather_rows};
 pub use linear::{Linear, Nvfp4Linear, PACKED_M_CLASSES, packed_rows};
 pub use modulation::{GatedResidual, ModulatedRmsNorm};
-pub use moe::{
-    Buffer, ENCODE_CHUNK, EncodedStep, FusedTables, Group, Launch, Moe, MoeGeometry, TILE_ROWS,
-    dense_bytes, encoded_bytes, exchanged_bytes, exchanged_rows, router_bytes, routing_bytes,
-    sort_bytes, step_bytes,
-};
+pub use moe::{ENCODE_CHUNK, FusedTables, Moe};
 pub use noise::{Key as NoiseKey, Noise};
 pub use norm::{LayerNorm, RmsNorm};
 pub use ops::activation::Activation;
@@ -118,24 +114,6 @@ pub mod launch {
     pub(crate) fn kv_tile(head_dim: u32) -> u32 {
         head_dim.clamp(1, 128).next_power_of_two().min(128)
     }
-}
-
-/// The tiling constants a stored program's descriptor key carries.
-///
-/// A key names the block a program was compiled for, so the number has one owner: the layer that
-/// launches it. Re-exported here for a fixture generator that sits above this crate - it must read
-/// what the layers launch rather than restate it, or `generator == fixture` proves only that two
-/// statements agree with each other.
-pub mod tiles {
-    pub use super::activation::BLOCK as ELEMENTWISE_BLOCK;
-    pub use super::bias::BLOCK as BIAS_BLOCK;
-    pub use super::head::BLOCK as LOGITS_BLOCK;
-    pub use super::launch::{EMBEDDING_TOKENS, PDL, QK_NORM_ROWS, ROTARY_BLOCK, row_tile};
-    pub use super::pool::BLOCK as POOL_BLOCK;
-    pub use super::position::BLOCK as POSITION_BLOCK;
-    pub use super::rotate::{BLOCK as ROTATE_BLOCK, ROWS as ROTATE_ROWS};
-    pub use super::rows::BLOCK as ROWS_BLOCK;
-    pub use super::unpatchify::BLOCK as UNPATCHIFY_BLOCK;
 }
 
 /// The accumulation element type of every floating-point operator here.

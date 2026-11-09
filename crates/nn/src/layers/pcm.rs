@@ -42,11 +42,10 @@ impl PcmInterleave {
         Ok(Self { dtype })
     }
 
-    /// The descriptor a two-channel interleave of `dtype` launches, stated without a layer.
+    /// The descriptor a two-channel interleave of `dtype` launches.
     ///
-    /// A deployment answers "which programs must be compiled for me?" before any weight is read; the
-    /// sample count is a launch value and is not part of the key.
-    pub fn descriptor_of(dtype: DType) -> Result<pcm::Descriptor> {
+    /// The sample count is a launch value and is not part of the key.
+    fn descriptor(dtype: DType) -> Result<pcm::Descriptor> {
         if dtype != DType::F32 {
             return Err(Error::shape(
                 "PcmInterleave",
@@ -110,9 +109,7 @@ impl PcmInterleave {
             Shape::new(&[samples]),
         );
         let first = TensorView::new(planes.ptr, self.dtype, Shape::new(&[samples]));
-        // One construction with `PcmInterleave::descriptor_of`: a walk and a launch cannot state
-        // different programs for the same interleave.
-        let descriptor = Self::descriptor_of(self.dtype)?;
+        let descriptor = Self::descriptor(self.dtype)?;
         f.operate::<PcmInterleaveOp>(
             &descriptor,
             pcm::Args {

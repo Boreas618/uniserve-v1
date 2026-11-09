@@ -28,7 +28,7 @@ use crate::weights::Weight;
 ///
 /// The programs vary the tile with the row width, so the descriptor states the element count one
 /// statement handles; a power of two keeps every vector load aligned.
-pub const BLOCK: u32 = 1024;
+const BLOCK: u32 = 1024;
 
 /// The elements one program of the packed gated activation walks: wide enough that each lane moves a
 /// whole vector of a half-precision row, which is what this memory-bound step runs at.
@@ -56,14 +56,14 @@ impl GatedActivation {
         self
     }
 
-    /// The descriptor one gated activation of `width` channels launches, stated without a device.
+    /// The descriptor one gated activation of `width` channels launches.
     ///
-    /// The two row strides are launch values a walk reads from the scratch layout, and `elements` is
+    /// The two row strides are the inputs' own, and `elements` is
     /// the output's element count — the descriptor's `wide` form is a second program, so it is part of
     /// the key and not a heuristic. The form follows the widest span a launch addresses, the strided
     /// inputs included: a packed projection's last row sits twice as far in as the output's, so an
     /// output well inside 32 bits can still read past them.
-    pub fn descriptor_of(
+    fn descriptor(
         dtype: DType,
         width: u64,
         activation: Activation,
@@ -89,32 +89,6 @@ impl GatedActivation {
         })
     }
 
-    /// The descriptor of a gated activation over the two halves of **one packed projection**.
-    ///
-    /// A walk states the keys a launch will make but cannot see the views a launch will build, and the
-    /// packed form is where stating a stride by hand goes wrong: the halves of a `[rows, 2 · width]`
-    /// projection keep the packed row stride, so each one's stride between rows is **twice its width**.
-    /// `descriptor_of(.., width, .., 2 · width, 2 · width, ..)` is what `forward` derives from those
-    /// views; this is that arithmetic, stated once, next to the contract and proved against a packed
-    /// view in the tests below.
-    pub fn packed_descriptor_of(
-        dtype: DType,
-        width: u64,
-        activation: Activation,
-        elements: u64,
-        stepwise: bool,
-    ) -> Result<activation::ActAndMulDescriptor> {
-        Self::descriptor_of(
-            dtype,
-            width,
-            activation,
-            2 * width,
-            2 * width,
-            elements,
-            stepwise,
-        )
-    }
-
     /// `out = act(gate) · value`.
     ///
     /// `gate` and `value` have `out`'s extents; their rows may be strided (the halves of one packed
@@ -128,7 +102,7 @@ impl GatedActivation {
         out: TensorView,
     ) -> Result<()> {
         let width = out.shape.last();
-        let descriptor = Self::descriptor_of(
+        let descriptor = Self::descriptor(
             out.dtype,
             width,
             self.activation,
@@ -287,13 +261,11 @@ pub struct PackedSwiGlu {
 }
 
 impl PackedSwiGlu {
-    /// The descriptor one packed gated activation of `width` channels launches, stated without a
-    /// device or a projection.
+    /// The descriptor one packed gated activation of `width` channels launches.
     ///
-    /// `input_stride` is the row stride of the projection's output, which a walk reads from the
-    /// scratch tensor the layer carves; the bias's presence and the absolute-max mode are the
-    /// layer's.
-    pub fn descriptor_of(
+    /// `input_stride` is the row stride of the projection's output; the bias's presence and the
+    /// absolute-max mode are the layer's.
+    fn descriptor(
         dtype: DType,
         width: u64,
         input_stride: u64,
@@ -358,7 +330,7 @@ impl PackedSwiGlu {
                 ),
             ));
         }
-        let descriptor = Self::descriptor_of(
+        let descriptor = Self::descriptor(
             out.dtype,
             width,
             projection.strides.get(0),
@@ -399,11 +371,11 @@ impl Gelu {
         }
     }
 
-    /// The descriptor one GELU over rows of `columns` channels launches, stated without a device.
+    /// The descriptor one GELU over rows of `columns` channels launches.
     ///
     /// The approximation is part of the key: the checkpoint's blocks and its merger use two different
     /// ones, which are two programs.
-    pub fn descriptor_of(
+    fn descriptor(
         dtype: DType,
         columns: u32,
         approximate: ops::gelu::Approximation,
@@ -427,7 +399,7 @@ impl Gelu {
         }
         let columns = u32::try_from(x.shape.last())
             .map_err(|_| Error::shape("Gelu", "more columns than a descriptor holds".to_owned()))?;
-        let descriptor = Self::descriptor_of(x.dtype, columns, self.approximation);
+        let descriptor = Self::descriptor(x.dtype, columns, self.approximation);
         f.operate::<ops::gelu::Gelu>(&descriptor, ops::gelu::Args { x, out })
     }
 }
@@ -454,7 +426,7 @@ impl Snake {
 
     /// The descriptor one Snake launch takes: the element type and the channel count, which is the
     /// length of every frequency. The samples per channel travel with the call.
-    pub fn descriptor_of(dtype: ops::DType, channels: u64) -> ops::snake::Descriptor {
+    fn descriptor(dtype: ops::DType, channels: u64) -> ops::snake::Descriptor {
         ops::snake::Descriptor {
             dtype,
             channels: u32::try_from(channels).unwrap_or(u32::MAX),
@@ -493,7 +465,7 @@ impl Snake {
                 ),
             ));
         }
-        let descriptor = Self::descriptor_of(x.dtype, self.channels);
+        let descriptor = Self::descriptor(x.dtype, self.channels);
         f.operate::<ops::snake::Snake>(&descriptor, ops::snake::Args { x, alpha, out })
     }
 }
@@ -508,7 +480,7 @@ pub struct Silu;
 impl Silu {
     /// The descriptor one SiLU launch takes: the element type and the row's column count, which is the
     /// width the timestep embedding activates.
-    pub fn descriptor_of(dtype: ops::DType, columns: u32) -> ops::activation::SiluDescriptor {
+    fn descriptor(dtype: ops::DType, columns: u32) -> ops::activation::SiluDescriptor {
         ops::activation::SiluDescriptor {
             dtype,
             columns,
@@ -527,7 +499,7 @@ impl Silu {
         }
         let columns = u32::try_from(x.shape.last())
             .map_err(|_| Error::shape("Silu", "more columns than a descriptor holds".to_owned()))?;
-        let descriptor = Self::descriptor_of(x.dtype, columns);
+        let descriptor = Self::descriptor(x.dtype, columns);
         f.operate::<ops::activation::Silu>(&descriptor, ops::activation::SiluArgs { x, out })
     }
 }
@@ -540,67 +512,36 @@ mod tests {
     /// The 64-bit form follows the packed input's span, which runs twice as far as the output's: with
     /// 14336 channels the last row of 74899 is past `2**31` elements of input while the output is at
     /// half of that. A 32-bit launch there wraps a row's offset and reads another row's memory.
+    ///
+    /// The halves of one packed `[rows, 2 · width]` projection keep the packed row stride, which is
+    /// what the forward reads from the views it is handed.
     #[test]
     fn a_packed_projection_goes_wide_on_its_input_span() {
         let width = 14_336u64;
         let wide = |rows: u64| {
-            GatedActivation::packed_descriptor_of(
-                DType::BF16,
-                width,
-                Activation::Silu,
-                rows * width,
-                true,
-            )
-            .expect("the descriptor")
-            .wide
+            let arena = crate::Arena::counting();
+            let f = Forward::recording(&arena);
+            let packed = arena
+                .tensor(DType::BF16, Shape::new(&[rows, 2 * width]))
+                .expect("a counting arena");
+            let half = Shape::new(&[rows, width]);
+            let gate = TensorView::with_strides(packed.ptr, packed.dtype, half, packed.strides);
+            let value = TensorView::with_strides(
+                packed.ptr.offset(width * 2),
+                packed.dtype,
+                half,
+                packed.strides,
+            );
+            let out = arena.tensor(DType::BF16, half).expect("a counting arena");
+            let activation = GatedActivation::new(Activation::Silu).with_stepwise();
+            let (walked, launches) =
+                crate::forward::recorded(|| activation.forward(&f, gate, value, out));
+            walked.expect("the recorded forward");
+            let (operator, key) = &launches[0];
+            assert_eq!(operator, "act_and_mul");
+            key.contains("_wide_true_")
         };
         assert!(!wide(74_898), "74898 rows stay inside 32 bits");
         assert!(wide(74_899), "74899 rows do not");
-    }
-
-    /// The packed descriptor is the one a launch derives from the two halves of one packed projection:
-    /// the halves keep the packed row stride, so each one's stride between rows is twice its width.
-    ///
-    /// This is stated as a test because getting it wrong is silent: a walk that writes the half's width
-    /// instead names a program no launch makes, and a store built from that key holds a cell nothing
-    /// reads while the launch's own key is missing — the failure surfaces at a run, not at a build.
-    #[test]
-    fn a_packed_projection_states_the_stride_its_halves_carry() {
-        let width = 14_336u64;
-        let rows = 3u64;
-        let packed = TensorView::new(
-            ops::DevicePtr::new(0),
-            DType::BF16,
-            Shape::new(&[rows, 2 * width]),
-        );
-        let half = Shape::new(&[rows, width]);
-        let value = TensorView::with_strides(packed.ptr, packed.dtype, half, packed.strides);
-        let gate = TensorView::with_strides(packed.ptr, packed.dtype, half, packed.strides);
-
-        assert_eq!(
-            gate.strides.get(0),
-            2 * width,
-            "the half keeps the packed stride"
-        );
-
-        let derived = GatedActivation::descriptor_of(
-            DType::BF16,
-            width,
-            Activation::Silu,
-            gate.strides.get(0),
-            value.strides.get(0),
-            rows * width,
-            true,
-        )
-        .expect("the halves' descriptor");
-        let stated = GatedActivation::packed_descriptor_of(
-            DType::BF16,
-            width,
-            Activation::Silu,
-            rows * width,
-            true,
-        )
-        .expect("the packed descriptor");
-        assert_eq!(derived, stated);
     }
 }

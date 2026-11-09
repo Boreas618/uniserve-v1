@@ -42,12 +42,11 @@ impl Transpose {
     /// axis folds it into the rows — `[1, channels, frames]` is the `[channels, frames]` matrix this
     /// takes, because the batch is the caller's and not the transpose's. A rank that is not two is
     /// refused with the shape in the message rather than reinterpreted.
-    /// The descriptor this layer's launch takes, for a walk that asks a model which programs it
-    /// launches with no device.
+    /// The descriptor this layer's launch takes.
     ///
     /// No caller's element type: a transpose is typed by the matrix it was built for, and both
     /// operands are that type.
-    pub fn descriptor(&self) -> transpose::Descriptor {
+    fn descriptor(&self) -> transpose::Descriptor {
         transpose::Descriptor {
             dtype: self.dtype,
             block: BLOCK,

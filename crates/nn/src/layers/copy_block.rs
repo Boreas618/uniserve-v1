@@ -41,7 +41,7 @@ impl CopyBlock {
     /// each element lands. Both views must be four-axis and hold the same extents.
     /// The descriptor one strided-to-packed copy takes: the element type alone. The extents and the
     /// strides travel with the call.
-    pub fn descriptor_of(dtype: ops::DType) -> copy_block::Descriptor {
+    fn descriptor(dtype: ops::DType) -> copy_block::Descriptor {
         copy_block::Descriptor {
             source: dtype,
             out: dtype,
@@ -50,10 +50,10 @@ impl CopyBlock {
     }
 
     /// The descriptor of a copy whose rows are unit-stride and aligned on both sides.
-    pub fn wide_descriptor_of(dtype: ops::DType) -> copy_block::Descriptor {
+    fn wide_descriptor(dtype: ops::DType) -> copy_block::Descriptor {
         copy_block::Descriptor {
             wide: true,
-            ..Self::descriptor_of(dtype)
+            ..Self::descriptor(dtype)
         }
     }
 
@@ -66,7 +66,7 @@ impl CopyBlock {
         destination_strides: &[i64; RANK],
     ) -> Result<()> {
         f.operate::<CopyBlockOp>(
-            &Self::wide_descriptor_of(self.dtype),
+            &Self::wide_descriptor(self.dtype),
             copy_block::Args {
                 source,
                 out: destination,
@@ -94,7 +94,7 @@ impl CopyBlock {
                 ));
             }
         }
-        let descriptor = Self::descriptor_of(self.dtype);
+        let descriptor = Self::descriptor(self.dtype);
         f.operate::<CopyBlockOp>(
             &descriptor,
             copy_block::Args {

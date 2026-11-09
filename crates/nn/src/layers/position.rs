@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 use crate::forward::Forward;
 
 /// Elements one thread block handles.
-pub const BLOCK: u32 = 1024;
+const BLOCK: u32 = 1024;
 
 /// Bilinear resample of a learned position table, one launch per grid.
 #[derive(Clone, Copy)]
@@ -62,7 +62,7 @@ impl PositionInterpolate {
     /// The descriptor one resample of this tower's learned table launches: the element type, the
     /// channels and the learned side. The source points come from the request's tables and only their
     /// count reaches the kernel.
-    pub fn descriptor(&self) -> Descriptor {
+    fn descriptor(&self) -> Descriptor {
         Descriptor {
             dtype: self.datatype,
             channels: self.channels,

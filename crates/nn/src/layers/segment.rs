@@ -115,14 +115,9 @@ impl SegmentAttention {
         self.head_dim
     }
 
-    /// Attend `query` against the tiles `tables` name, writing zeroed padding rows for the rest.
-    ///
-    /// `query`, `key` and `value` are `[tiles · block, heads, head_dim]`; `out` has the query's
-    /// shape. The softmax scale is `1/sqrt(head_dim)`, applied once to `q · k`: the sparse path has
-    /// no learned softmax scale.
-    /// The descriptor one fine-attention launch takes, from the block geometry and the query's element
-    /// type. A walk states it from the same fields the launch reads.
-    pub fn descriptor_of(&self, dtype: DType) -> SparseDescriptor {
+    /// The descriptor one fine-attention launch takes, from the block geometry and the query's
+    /// element type.
+    fn descriptor(&self, dtype: DType) -> SparseDescriptor {
         SparseDescriptor {
             block: self.block,
             dtype,
@@ -134,7 +129,7 @@ impl SegmentAttention {
     }
 
     /// The descriptor the padding-row zeroing takes: the output's element type and the tile geometry.
-    pub fn zero_descriptor(&self) -> segments::ZeroPaddingDescriptor {
+    fn zero_descriptor(&self) -> segments::ZeroPaddingDescriptor {
         segments::ZeroPaddingDescriptor {
             dtype: self.output,
             heads: self.heads,
@@ -144,6 +139,11 @@ impl SegmentAttention {
         }
     }
 
+    /// Attend `query` against the tiles `tables` name, writing zeroed padding rows for the rest.
+    ///
+    /// `query`, `key` and `value` are `[tiles · block, heads, head_dim]`; `out` has the query's
+    /// shape. The softmax scale is `1/sqrt(head_dim)`, applied once to `q · k`: the sparse path has
+    /// no learned softmax scale.
     pub fn forward(
         &self,
         f: &Forward,
@@ -154,7 +154,7 @@ impl SegmentAttention {
         out: TensorView,
     ) -> Result<()> {
         let head_dim = f64::from(self.head_dim);
-        let descriptor = self.descriptor_of(query.dtype);
+        let descriptor = self.descriptor(query.dtype);
         f.operate::<SparseAttention>(
             &descriptor,
             SparseArgs {

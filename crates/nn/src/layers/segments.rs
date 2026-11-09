@@ -138,38 +138,6 @@ impl VsaTiles {
         self.width
     }
 
-    /// The descriptor one `vsa_add_gated_tiles` launch takes.
-    pub fn add_gated_tiles_descriptor(&self, dtype: DType) -> segments::AddGatedTilesDescriptor {
-        segments::AddGatedTilesDescriptor {
-            dtype,
-            tile_rows: self.tile_rows,
-            width: self.width,
-            block_rows: self.block_rows,
-        }
-    }
-
-    /// The descriptor one `vsa_compose_gated_rows` launch takes.
-    ///
-    /// The gate's member table is a descriptor field — a contiguous `[members]` array the program
-    /// reads as it starts — so it enters the key with the count beside it.
-    pub fn compose_descriptor(
-        &self,
-        dtype: DType,
-        slots: &[u32],
-    ) -> segments::ComposeGatedRowsDescriptor {
-        let mut table = [0_u32; MAX_MEMBERS];
-        table[..slots.len()].copy_from_slice(slots);
-        segments::ComposeGatedRowsDescriptor {
-            dtype,
-            heads: self.heads,
-            tile_rows: self.tile_rows,
-            width: self.width,
-            block_rows: self.block_rows,
-            slots: table,
-            members: slots.len() as u32,
-        }
-    }
-
     /// The descriptor one `vsa_select_tiles` launch takes, for a key-tile **bound**.
     ///
     /// `block` is the lane width the compiled program ranks in, and the package's own signature
@@ -178,7 +146,7 @@ impl VsaTiles {
     /// program compiled for the deployment's bound serves **every** request up to it. A descriptor
     /// built from a request's tile count instead compiles a fresh module per distinct count whose
     /// extra lanes are all masked off - the same arithmetic at the cost of a class per request.
-    pub fn select_descriptor(&self, tiles: u64) -> Result<segments::SelectTilesDescriptor> {
+    fn select_descriptor(&self, tiles: u64) -> Result<segments::SelectTilesDescriptor> {
         Ok(segments::SelectTilesDescriptor {
             block: u32::try_from(tiles.max(1).next_power_of_two()).map_err(|_| {
                 Error::shape("VsaTiles", format!("{tiles} key tiles in one query tile"))
@@ -228,9 +196,9 @@ impl VsaTiles {
     /// The descriptor one `vsa_prepare_tiles` launch takes, from the geometry and the strides.
     ///
     /// The strides are **compiled in** (`crates/ops/kernels/vsa_prepare_tiles/triton/src/build.py`
-    /// hands them to the build as constants), so they are in the key, and a walk states them from the
-    /// layout the model's own buffers have rather than from a caller's choice.
-    pub fn prepare_descriptor(
+    /// hands them to the build as constants), so they are in the key, taken from the layout the
+    /// model's own buffers have rather than from a caller's choice.
+    fn prepare_descriptor(
         dtype: DType,
         geometry: [u32; 5],
         norm: bool,
@@ -264,30 +232,6 @@ impl VsaTiles {
             value_head_stride: value_head,
             factor_stride: factor,
         }
-    }
-
-    /// The descriptor the launch takes for a `[rows, heads, width]` row-major view and a factor table
-    /// whose rows are `factor_row` long — the layout the model's arena buffers have.
-    pub fn contiguous_prepare_descriptor(
-        &self,
-        dtype: DType,
-        factor_row: u64,
-    ) -> segments::PrepareTilesDescriptor {
-        let row = u64::from(self.heads) * u64::from(self.width);
-        let head = u64::from(self.width);
-        Self::prepare_descriptor(
-            dtype,
-            [
-                self.heads,
-                self.width,
-                self.rotated,
-                self.tile_rows,
-                self.block_rows,
-            ],
-            self.norm,
-            [row, head, row, head, row, head, factor_row],
-            Float::from(self.eps),
-        )
     }
 
     /// Normalize, rotate, zero and pool whole tiles of projected Q/K/V rows.
@@ -438,7 +382,7 @@ impl VsaTiles {
     /// selection only compares and the attention scales its own products.
     /// The descriptor one score launch takes: the head count, the features per head and the bound on
     /// the dot product's length. A walk states it from the layer's own geometry.
-    pub fn scores_descriptor(&self) -> segments::ScoresDescriptor {
+    fn scores_descriptor(&self) -> segments::ScoresDescriptor {
         segments::ScoresDescriptor::new(
             self.heads,
             self.width,
@@ -449,7 +393,7 @@ impl VsaTiles {
 
     /// The descriptor one compression launch takes: the element type, the head count, the features
     /// per head, and the bound on the key tiles one reduction covers.
-    pub fn compress_descriptor(&self, dtype: DType) -> segments::CompressPooledDescriptor {
+    fn compress_descriptor(&self, dtype: DType) -> segments::CompressPooledDescriptor {
         segments::CompressPooledDescriptor::new(
             dtype,
             self.heads,
@@ -676,22 +620,46 @@ impl VsaTiles {
 mod tests {
     use super::*;
 
-    /// The selection's block is the deployment's bound rounded up to a power of two, not the request's
-    /// count: the package's `tiles` is a runtime argument and the kernel masks the lanes past it, so
-    /// one compiled class serves every request up to the bound.
+    /// The selection's block is the layout's own key-tile count rounded up to a power of two: the
+    /// package's `tiles` is a runtime argument and the kernel masks the lanes past it, so one
+    /// compiled class serves every layout of a class, up to the deployment's bound.
     #[test]
-    fn the_select_block_is_the_deployments_bound_rounded_up() {
+    fn the_select_block_is_the_layouts_tiles_rounded_up() {
         let layer = VsaTiles::with_default_tile(4, 128, 1e-6)
             .unwrap()
             .with_tile_bound(5_400)
             .unwrap();
-        // 5 400 rounds up to 8 192: the bound's class, whatever a request asks for.
-        assert_eq!(layer.select_descriptor(5_400).unwrap().block, 8_192);
-        assert_eq!(layer.select_descriptor(1).unwrap().block, 1);
-        // The member table is the layer's own statement of the gate's slots.
-        let compose = layer.compose_descriptor(DType::BF16, &[2, 5]);
-        assert_eq!(compose.members, 2);
-        assert_eq!(&compose.slots[..2], &[2, 5]);
+        let block = |tiles: u64| {
+            let arena = crate::Arena::counting();
+            let f = Forward::recording(&arena);
+            let table = |shape: &[u64]| arena.tensor(DType::I32, Shape::new(shape)).unwrap();
+            let scores = arena
+                .tensor(DType::F32, Shape::new(&[4, 1, tiles]))
+                .unwrap();
+            let (segments, sizes, keep) = (table(&[tiles]), table(&[tiles]), table(&[tiles]));
+            let (indices, counts) = (table(&[4, 1, tiles]), table(&[4, 1]));
+            let (walked, launches) = crate::forward::recorded(|| {
+                layer.select(&f, scores, segments, sizes, keep, indices, counts, 0)
+            });
+            walked.unwrap();
+            assert_eq!(launches.len(), 1, "{launches:?}");
+            launches[0].1.clone()
+        };
+        // 5 400 rounds up to 8 192, and a layout below the floor is compiled at the floor.
+        assert_eq!(block(5_400), "block_8192");
+        assert_eq!(block(1), block(u64::from(SELECT_FLOOR)));
+        // Past the deployment's bound there is no scratch, so the layout is refused.
+        let arena = crate::Arena::counting();
+        let f = Forward::recording(&arena);
+        let past = arena
+            .tensor(DType::F32, Shape::new(&[4, 1, 5_401]))
+            .unwrap();
+        let table = arena.tensor(DType::I32, Shape::new(&[5_401])).unwrap();
+        assert!(
+            layer
+                .select(&f, past, table, table, table, table, table, 0)
+                .is_err()
+        );
     }
     use ops::{DType, DevicePtr, Shape};
 

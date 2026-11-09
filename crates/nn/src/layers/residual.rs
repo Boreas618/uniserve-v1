@@ -55,13 +55,10 @@ impl WeightedRmsNorm {
         self.weight.shape().numel() as u32
     }
 
-    /// The descriptor one launch without a magnitude takes, for a walk without a device: rows of
-    /// `dtype`, normalized into `activation`.
-    pub fn descriptor_of(
-        columns: u32,
-        dtype: DType,
-        activation: DType,
-    ) -> residual::WeightedRmsNormDescriptor {
+    /// The descriptor one launch without a magnitude takes: rows of `dtype`, normalized into
+    /// `activation`.
+    fn descriptor(&self, dtype: DType, activation: DType) -> residual::WeightedRmsNormDescriptor {
+        let columns = self.columns();
         residual::WeightedRmsNormDescriptor {
             dtype,
             columns,
@@ -83,7 +80,7 @@ impl WeightedRmsNorm {
         out: TensorView,
         partials: Option<TensorView>,
     ) -> Result<()> {
-        let mut descriptor = Self::descriptor_of(self.columns(), x.dtype, out.dtype);
+        let mut descriptor = self.descriptor(x.dtype, out.dtype);
         descriptor.absmax = partials.is_some();
         let args = residual::WeightedRmsNormArgs {
             x,
@@ -118,33 +115,21 @@ impl ScaledResidual {
         Ok(Self { scale, bias })
     }
 
-    /// The descriptor one launch takes, for a walk that asks a model which programs it launches with
-    /// no device.
+    /// The descriptor one launch takes.
     ///
     /// `dtype` is the caller's: the hidden states' element type is the deployment's, while the
     /// layer's width and its bias's presence are its own.
-    pub fn descriptor(&self, dtype: DType) -> Result<residual::ScaledResidualDescriptor> {
-        Self::descriptor_of(dtype, self.scale.shape().numel(), self.bias.is_some())
-    }
-
-    /// The descriptor a residual over `columns`-wide rows launches, stated without its weights.
-    ///
-    /// A walk has the config's width and the checkpoint's bias presence and neither weight.
-    pub fn descriptor_of(
-        dtype: DType,
-        columns: u64,
-        update_bias: bool,
-    ) -> Result<residual::ScaledResidualDescriptor> {
+    fn descriptor(&self, dtype: DType) -> Result<residual::ScaledResidualDescriptor> {
         Ok(residual::ScaledResidualDescriptor {
             dtype,
-            columns: u32::try_from(columns).map_err(|_| {
+            columns: u32::try_from(self.scale.shape().numel()).map_err(|_| {
                 Error::shape(
                     "ScaledResidual",
                     "a row wider than a descriptor holds".to_owned(),
                 )
             })?,
             block: BLOCK,
-            update_bias,
+            update_bias: self.bias.is_some(),
         })
     }
 
@@ -203,40 +188,27 @@ impl ScaledResidualRmsNorm {
         self.weight.shape().numel() as u32
     }
 
-    /// Fold `update` into `hidden` and normalize it into `out`.
-    ///
-    /// `hidden`, `update` and `out` are `[rows, columns]` in the activation element type; `partials`
-    /// is `[rows]` FP32 and is required exactly when the layer records the magnitude.
-    /// The descriptor one launch takes, for a walk without a device; see
-    /// [`ScaledResidual::descriptor`].
-    pub fn descriptor(
+    /// The descriptor one launch takes: a residual of `dtype` folding updates of `activation`.
+    fn descriptor(
         &self,
         dtype: DType,
         activation: DType,
     ) -> residual::ScaledResidualRmsNormDescriptor {
-        let mut descriptor =
-            Self::descriptor_of(self.columns(), dtype, activation, self.bias.is_some());
-        descriptor.absmax = self.absmax;
-        descriptor
-    }
-
-    /// The descriptor from the numbers alone: a residual of `dtype` folding updates of `activation`.
-    pub fn descriptor_of(
-        columns: u32,
-        dtype: DType,
-        activation: DType,
-        update_bias: bool,
-    ) -> residual::ScaledResidualRmsNormDescriptor {
+        let columns = self.columns();
         residual::ScaledResidualRmsNormDescriptor {
             dtype,
             columns,
             tile: row_tile(columns),
-            update_bias,
-            absmax: false,
+            update_bias: self.bias.is_some(),
+            absmax: self.absmax,
             activation,
         }
     }
 
+    /// Fold `update` into `hidden` and normalize it into `out`.
+    ///
+    /// `hidden`, `update` and `out` are `[rows, columns]` in the activation element type; `partials`
+    /// is `[rows]` FP32 and is required exactly when the layer records the magnitude.
     pub fn forward(
         &self,
         f: &Forward,
@@ -316,41 +288,24 @@ impl ScaledResidualLayerNorm {
         self.weight.shape().numel() as u32
     }
 
-    /// Fold `update` into `hidden` and normalize it into `out`.
-    /// The descriptor one launch takes, for a walk without a device; see
-    /// [`ScaledResidual::descriptor`].
-    pub fn descriptor(
+    /// The descriptor one launch takes: a residual of `dtype` folding updates of `activation`.
+    fn descriptor(
         &self,
         dtype: DType,
         activation: DType,
     ) -> residual::ScaledResidualLayerNormDescriptor {
-        let mut descriptor = Self::descriptor_of(
-            self.columns(),
-            dtype,
-            activation,
-            self.update_bias.is_some(),
-        );
-        descriptor.absmax = self.absmax;
-        descriptor
-    }
-
-    /// The descriptor from the numbers alone: a residual of `dtype` folding updates of `activation`.
-    pub fn descriptor_of(
-        columns: u32,
-        dtype: DType,
-        activation: DType,
-        update_bias: bool,
-    ) -> residual::ScaledResidualLayerNormDescriptor {
+        let columns = self.columns();
         residual::ScaledResidualLayerNormDescriptor {
             dtype,
             columns,
             tile: row_tile(columns),
-            update_bias,
-            absmax: false,
+            update_bias: self.update_bias.is_some(),
+            absmax: self.absmax,
             activation,
         }
     }
 
+    /// Fold `update` into `hidden` and normalize it into `out`.
     pub fn forward(
         &self,
         f: &Forward,
@@ -391,11 +346,11 @@ impl ScaledResidualLayerNorm {
 pub struct ScaledAdd;
 
 impl ScaledAdd {
-    /// The descriptor one launch takes, for a walk without a device.
+    /// The descriptor one launch takes.
     ///
     /// The two operands' element types are the caller's — a BF16 trajectory stepped by an FP32
     /// velocity is the intended pairing — and the width is the operands', so both are arguments.
-    pub fn descriptor(&self, target: DType, source: DType) -> residual::ScaledAddDescriptor {
+    fn descriptor(&self, target: DType, source: DType) -> residual::ScaledAddDescriptor {
         residual::ScaledAddDescriptor {
             target,
             source,

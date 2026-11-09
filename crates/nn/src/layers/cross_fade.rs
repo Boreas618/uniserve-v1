@@ -71,9 +71,8 @@ impl CrossFade {
     /// optional.
     /// The descriptor one blend launches: the element type, the extent along the axis and the axis.
     ///
-    /// One module serves every seam of one width, so a walk that knows the grid's seam widths states
-    /// every blend the decoder compiles.
-    pub fn descriptor(&self) -> cross_fade::Descriptor {
+    /// One module serves every seam of one width.
+    fn descriptor(&self) -> cross_fade::Descriptor {
         cross_fade::Descriptor {
             dtype: self.dtype,
             extent: self.extent,

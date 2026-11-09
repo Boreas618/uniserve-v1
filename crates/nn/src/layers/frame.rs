@@ -26,27 +26,15 @@ impl FramePad {
         Self { reflect }
     }
 
-    /// The descriptor one pad launch takes, for a walk that asks a model which programs it launches
-    /// with no device.
+    /// The descriptor one pad launch takes.
     ///
     /// The block tiles are the operator's own split of the values' and the output's extents, so they
     /// are stated from the views rather than from an element type alone.
-    pub fn pad_descriptor(&self, values: TensorView, out: TensorView) -> frame::FramePadDescriptor {
+    fn descriptor(&self, values: TensorView, out: TensorView) -> frame::FramePadDescriptor {
         let (block_pixels, block_channels) = frame::FramePadDescriptor::tiles(&values, &out);
-        Self::descriptor_of(values.dtype, self.reflect, block_pixels, block_channels)
-    }
-
-    /// The descriptor one pad launch takes from the numbers alone: a walk has the extents, not the
-    /// views, and the block split turns on two of their facts (`FramePadDescriptor::tiles_of`).
-    pub fn descriptor_of(
-        dtype: ops::DType,
-        reflect: bool,
-        block_pixels: u32,
-        block_channels: u32,
-    ) -> frame::FramePadDescriptor {
         frame::FramePadDescriptor {
-            dtype,
-            reflect,
+            dtype: values.dtype,
+            reflect: self.reflect,
             block_pixels,
             block_channels,
         }
@@ -68,7 +56,7 @@ impl FramePad {
         left: u64,
         front: u64,
     ) -> Result<()> {
-        let descriptor = self.pad_descriptor(values, out);
+        let descriptor = self.descriptor(values, out);
         let args = frame::FramePadArgs {
             values,
             out,
@@ -93,34 +81,18 @@ impl FrameMoments {
         Self { groups, eps }
     }
 
-    /// The descriptor one moments launch takes, for a walk without a device.
+    /// The descriptor one moments launch takes.
     ///
     /// The reduction class is derived from the frame's own shape, so a launch can never name a class
     /// narrower than the reduction it asks for: `channels_per_group · pixels`, padded to a power of
     /// two because that is what the compiled program's bound is.
-    pub fn moments_descriptor(&self, values: TensorView) -> frame::FrameMomentsDescriptor {
-        Self::descriptor_of(
-            values.dtype,
-            values.shape.dim(1),
-            values.shape.dim(3) * values.shape.dim(4),
-            self.groups,
-            self.eps,
-        )
-    }
-
-    /// The descriptor one moments launch takes from the frame's own numbers: the channels, the pixels
-    /// per frame, and the groups the reduction is classed by.
-    pub fn descriptor_of(
-        dtype: ops::DType,
-        channels: u64,
-        pixels: u64,
-        groups: u64,
-        eps: f32,
-    ) -> frame::FrameMomentsDescriptor {
+    fn descriptor(&self, values: TensorView) -> frame::FrameMomentsDescriptor {
+        let channels = values.shape.dim(1);
+        let pixels = values.shape.dim(3) * values.shape.dim(4);
         frame::FrameMomentsDescriptor {
-            dtype,
-            reduction: frame::frame_reduction_class(channels / groups.max(1), pixels),
-            epsilon: Float::from(eps),
+            dtype: values.dtype,
+            reduction: frame::frame_reduction_class(channels / self.groups.max(1), pixels),
+            epsilon: Float::from(self.eps),
         }
     }
 
@@ -136,7 +108,7 @@ impl FrameMoments {
         mean: TensorView,
         rstd: TensorView,
     ) -> Result<()> {
-        let descriptor = self.moments_descriptor(values);
+        let descriptor = self.descriptor(values);
         let args = frame::FrameMomentsArgs {
             values,
             mean,
@@ -179,13 +151,11 @@ impl FrameNormPad {
         })
     }
 
-    /// The descriptor one normalize-pad launch takes from numbers: the frame's channels and pixels,
-    /// the groups its statistics are taken over, the storage order it writes, whether the affine
-    /// parameters are present, and the padded frame's pixel count (one pixel is a class of its own).
-    ///
-    /// A walk has the extents and not the views, so it states the order; a launch reads it off
-    /// `out`'s strides, which is where the order of a frame actually lives.
-    pub fn descriptor_of(
+    /// The descriptor one normalize-pad launch takes: the frame's channels and pixels, the groups
+    /// its statistics are taken over, the storage order it writes (read off `out`'s strides, which
+    /// is where the order of a frame lives), whether the affine parameters are present, and the
+    /// padded frame's pixel count (one pixel is a class of its own).
+    fn descriptor(
         dtype: ops::DType,
         channels: u64,
         pixels: u64,
@@ -252,7 +222,7 @@ impl FrameNormPad {
             ));
         }
         let padded_pixels = out.shape.dim(3) * out.shape.dim(4);
-        let descriptor = Self::descriptor_of(
+        let descriptor = Self::descriptor(
             values.dtype,
             values.shape.dim(1),
             values.shape.dim(3) * values.shape.dim(4),

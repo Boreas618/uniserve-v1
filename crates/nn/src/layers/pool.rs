@@ -15,7 +15,7 @@ use crate::forward::Forward;
 use crate::layers::launch::PDL;
 
 /// The elements one pool program produces.
-pub const BLOCK: u32 = 1024;
+const BLOCK: u32 = 1024;
 
 /// The head average and the adaptive width pool of an attention projection.
 pub struct AdaptivePool {
@@ -53,9 +53,9 @@ impl AdaptivePool {
         })
     }
 
-    /// The descriptor one pool launch takes: the head geometry and the element type. The head and
-    /// width counts are the module's, so a walk states them from the config.
-    pub fn descriptor(&self, dtype: ops::DType) -> adaptive_pool::Descriptor {
+    /// The descriptor one pool launch takes: the head geometry, which is the module's, and the
+    /// element type.
+    fn descriptor(&self, dtype: ops::DType) -> adaptive_pool::Descriptor {
         adaptive_pool::Descriptor {
             dtype,
             heads: self.heads,

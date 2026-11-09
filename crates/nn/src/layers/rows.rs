@@ -33,7 +33,7 @@ use crate::error::{Error, Result};
 use crate::forward::Forward;
 
 /// Elements one thread block places.
-pub const BLOCK: u32 = 1024;
+const BLOCK: u32 = 1024;
 
 /// Row writes over a `[rows, columns]` sequence.
 #[derive(Clone, Copy)]
@@ -68,10 +68,10 @@ impl Rows {
         self.forward(f, Mode::Replace, destination, source, indices)
     }
 
-    /// The descriptor one gather or scatter of `columns`-wide rows launches, stated without a device.
+    /// The descriptor one gather or scatter of `columns`-wide rows launches.
     ///
     /// The mode is part of the key: a replace and a tap are two programs over the same table.
-    pub fn descriptor_of(dtype: DType, mode: Mode, columns: u32) -> rows::Descriptor {
+    fn descriptor(dtype: DType, mode: Mode, columns: u32) -> rows::Descriptor {
         rows::Descriptor {
             dtype,
             mode,
@@ -100,7 +100,7 @@ impl Rows {
         source: TensorView,
         indices: TensorView,
     ) -> Result<()> {
-        let descriptor = Self::descriptor_of(self.datatype, mode, self.columns);
+        let descriptor = Self::descriptor(self.datatype, mode, self.columns);
         f.operate::<RowsOp>(
             &descriptor,
             rows::Args {

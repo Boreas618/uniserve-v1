@@ -103,14 +103,14 @@ impl ModulatedRmsNorm {
     /// parameter row of each activation row; `out` is `[rows, width]` in the output element type
     /// (the activation's, or E4M3 with `output_scale` present); `retained`, when present, is
     /// `[rows, width]` and receives the normalized source.
-    /// The descriptor one modulated normalization launches, stated without a device.
+    /// The descriptor one modulated normalization launches.
     ///
     /// Which of the shapes it takes is the call's: `update`, `retain` and the gate's presence are
     /// descriptor fields, so a block's attention norm (no update, no gate) and its feed-forward norm
     /// (both) are two programs over one width. The three strides are the modulation tensor's row
-    /// width, which a walk reads from the layout the cache is gathered into.
+    /// width, read from the layout the cache is gathered into.
     #[allow(clippy::too_many_arguments)]
-    pub fn descriptor_of(
+    fn descriptor(
         dtype: ops::DType,
         output: ops::DType,
         indices: ops::DType,
@@ -172,7 +172,7 @@ impl ModulatedRmsNorm {
             .map_err(|_| Error::shape("ModulatedRmsNorm", "a row wider than a u32".to_owned()))?;
         let shift = self.shift.view();
         let scale = self.scale.view();
-        let descriptor = Self::descriptor_of(
+        let descriptor = Self::descriptor(
             value.dtype,
             out.dtype,
             row_indices.dtype,
@@ -215,8 +215,8 @@ pub struct GatedResidual {
 }
 
 impl GatedResidual {
-    /// The descriptor one gated residual over `width`-wide rows launches, stated without a device.
-    pub fn descriptor_of(
+    /// The descriptor one gated residual over `width`-wide rows launches.
+    fn descriptor(
         dtype: ops::DType,
         indices: ops::DType,
         width: u64,
@@ -288,7 +288,7 @@ impl GatedResidual {
                 format!("{} row indices for {rows} rows", row_indices.shape.numel()),
             ));
         }
-        let descriptor = Self::descriptor_of(
+        let descriptor = Self::descriptor(
             hidden.dtype,
             row_indices.dtype,
             width,

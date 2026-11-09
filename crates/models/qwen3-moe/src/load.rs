@@ -238,16 +238,15 @@ fn refuse_dense_parameters(root: &Path, representation: &Representation) -> Resu
     let config = Config::read(root)?;
     for (parameter, role) in representation::parameters(&config) {
         let parameter = parameter.as_str();
-        // A *quantized projection* is the one shape this entry point cannot serve yet: its packed
-        // product is keyed by the row count, which `keys()` has no input for. The refusal says so
-        // rather than reading the parameter as dense.
         // A packed *projection* is served: the loader builds it as an encoder and a product, so only
         // a role this tree has no encoded form for is refused here.
         match (representation.adopts(parameter, role)?, role) {
             (Adopted::Source, _) | (Adopted::Quantized, Role::Projection) => {}
             (Adopted::Quantized, _) => {
                 return Err(Error::Config(format!(
-                    "the checkpoint's calibration quantizes `{parameter}`, and this model builds it                      as a dense projection: the encoded projection path needs its packed product                      compiled per row count, which the key walk does not enumerate yet. Load a                      checkpoint whose calibration excludes the attention and dense-MLP projections,                      or wait for that half; reading it as dense would read packed E2M1 as a matrix"
+                    "the checkpoint's calibration quantizes `{parameter}`, a parameter this model \
+                     has no encoded form for: reading it as dense would read packed E2M1 as a \
+                     matrix. Load a checkpoint whose calibration excludes it"
                 )));
             }
         }

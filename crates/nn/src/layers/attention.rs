@@ -240,13 +240,12 @@ impl Attention {
     ///
     /// Serves both the `Dense` and the `Fp32` backend; the element types the views carry decide the
     /// descriptor, and the package behind it decides the tile and split heuristics.
-    /// The descriptor one dense attention launch takes, for a walk that asks a model which programs
-    /// it launches with no device.
+    /// The descriptor one dense attention launch takes.
     ///
     /// Everything the key carries is here: the geometry is the module's, the element types and the key
     /// bound are the call's, and `cu_seq_lens` says which of the two programs the call selects — not
     /// what this launch reads.
-    pub fn dense_descriptor(
+    fn dense_descriptor(
         &self,
         query: DType,
         key_value: DType,
@@ -625,7 +624,7 @@ impl Attention {
     /// is compiled for the combination. The window and the deployment's bound are the layer's: a
     /// windowed attention and a full one are different programs, and `max_kv_len` is the reduction
     /// length the 7.3 tolerance is written against.
-    pub fn descriptor(
+    fn descriptor(
         &self,
         phase: Phase,
         query: DType,
@@ -651,7 +650,7 @@ impl Attention {
     ///
     /// Both are key fields and they differ in an E4M3 deployment, which is why the projection's own
     /// dtype cannot stand in for the cache's.
-    pub fn write_descriptor(&self, projection: DType, cache: DType) -> KvDescriptor {
+    fn write_descriptor(&self, projection: DType, cache: DType) -> KvDescriptor {
         KvDescriptor {
             dtype: projection,
             kv: cache,
@@ -665,7 +664,7 @@ impl Attention {
 
     /// The descriptor the quantizing cache write launches with: the projection's type, one plane's
     /// page scales and the geometry both share.
-    pub fn scaled_write_descriptor(&self, projection: DType) -> kv::ScaledWriteDescriptor {
+    fn scaled_write_descriptor(&self, projection: DType) -> kv::ScaledWriteDescriptor {
         kv::ScaledWriteDescriptor {
             dtype: projection,
             scale: DType::F32,
@@ -906,28 +905,100 @@ mod tests {
         );
     }
 
+    /// The programs one paged forward of `tokens` tokens in one sequence launches on a recording
+    /// forward, over a cache whose planes are `cache`.
+    fn launched(attention: &Attention, phase: PhaseKind, tokens: u64, cache: DType) -> Vec<String> {
+        let arena = crate::Arena::counting();
+        let f = Forward::recording(&arena);
+        let tensor = |dtype: DType, dims: &[u64]| arena.tensor(dtype, Shape::new(dims)).unwrap();
+        let batch = TokenBatch {
+            positions: tensor(DType::I32, &[tokens]),
+            slot_mapping: tensor(DType::I32, &[tokens]),
+            seq_lens: tensor(DType::I32, &[1]),
+            query_offsets: tensor(DType::I32, &[2]),
+            logits_rows: tensor(DType::I32, &[1]),
+            phase,
+            page_size: 64,
+            num_tokens: tokens as u32,
+            max_kv_len: 64,
+            draft_lens: None,
+        };
+        let pages = [1, 64, 4, 128];
+        let scale = (cache == DType::F8E4M3).then(|| tensor(DType::F32, &[1, 1, 1, 1]));
+        let planes = [KvPlanes {
+            key: tensor(cache, &pages),
+            value: tensor(cache, &pages),
+            key_initialized: tensor(DType::U8, &[1, 1, 1, 1]),
+            value_initialized: tensor(DType::U8, &[1, 1, 1, 1]),
+            key_scale: scale,
+            value_scale: scale,
+        }];
+        let groups = [KvGroup {
+            block_tables: tensor(DType::I32, &[1, 1]),
+            page_size: 64,
+            dtype: cache,
+            layers: &planes,
+        }];
+        let query = tensor(DType::BF16, &[tokens, 32, 128]);
+        let key = tensor(DType::BF16, &[tokens, 4, 128]);
+        let value = tensor(DType::BF16, &[tokens, 4, 128]);
+        let out = tensor(DType::BF16, &[tokens, 32, 128]);
+        let workspace = tensor(DType::U8, &[TRTLLM_WORKSPACE_BYTES]);
+        let (walked, launches) = crate::forward::recorded(|| {
+            attention.forward(
+                &f,
+                &batch,
+                &KvView { groups: &groups },
+                0,
+                0,
+                query,
+                key,
+                value,
+                out,
+                workspace,
+            )
+        });
+        walked.unwrap();
+        launches
+            .into_iter()
+            .map(|(operator, key)| format!("{operator}/{key}"))
+            .collect()
+    }
+
     #[test]
     fn the_cache_writes_key_the_plane_type_and_the_reads_key_the_phase() {
         let attention = Attention::paged(128, 32, 4, 64, 40_960, None, 0.088).unwrap();
+        let writes = |launches: &[String]| -> Vec<String> {
+            launches
+                .iter()
+                .filter(|launch| launch.starts_with("kv_write"))
+                .cloned()
+                .collect()
+        };
+        let reads = |launches: &[String]| -> Vec<String> {
+            launches
+                .iter()
+                .filter(|launch| launch.starts_with("paged_attention/"))
+                .cloned()
+                .collect()
+        };
         // A cache of the projection's own type and an E4M3 cache are two programs, because the
         // quantizing write applies a page scale the scatter never sees.
-        assert_ne!(
-            attention
-                .write_descriptor(DType::BF16, DType::BF16)
-                .to_string(),
-            attention
-                .write_descriptor(DType::BF16, DType::F8E4M3)
-                .to_string()
+        let plain = launched(&attention, PhaseKind::Prefill, 8, DType::BF16);
+        let quantized = launched(&attention, PhaseKind::Prefill, 8, DType::F8E4M3);
+        assert_eq!(writes(&plain).len(), 1, "{plain:?}");
+        assert!(!writes(&quantized).is_empty(), "{quantized:?}");
+        assert!(
+            writes(&quantized)
+                .iter()
+                .all(|write| !writes(&plain).contains(write)),
+            "{plain:?} {quantized:?}"
         );
         // A prefill reads a whole sequence and a decode one token: one attention program each.
-        assert_ne!(
-            attention
-                .descriptor(Phase::Prefill, DType::BF16, DType::BF16, DType::BF16)
-                .to_string(),
-            attention
-                .descriptor(Phase::Decode, DType::BF16, DType::BF16, DType::BF16)
-                .to_string()
-        );
+        let decode = launched(&attention, PhaseKind::Decode, 1, DType::BF16);
+        assert_eq!(reads(&plain).len(), 1, "{plain:?}");
+        assert_eq!(reads(&decode).len(), 1, "{decode:?}");
+        assert_ne!(reads(&plain), reads(&decode));
     }
 
     #[test]

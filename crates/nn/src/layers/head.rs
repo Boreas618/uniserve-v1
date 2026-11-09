@@ -22,7 +22,7 @@ pub struct ParallelLMHead {
 }
 
 /// Elements one `logits_gather` / `logits_unpad` program handles.
-pub const BLOCK: u32 = 1024;
+const BLOCK: u32 = 1024;
 
 impl ParallelLMHead {
     /// The head whose rank holds `local` vocabulary rows starting at id `first`, padded to `padded`.
@@ -164,16 +164,15 @@ impl ParallelLMHead {
     }
 
     /// The descriptor the vocabulary unpad launches with, for a gathered matrix of `gathered_width`
-    /// columns.
+    /// columns: the gathered logits' element type, the type the sampler's candidate buffer carries,
+    /// the vocabulary, the gathered width, the block and PDL.
     ///
     /// The gathered width is `padded × ranks`, so it is a launch value that follows the deployment's
     /// rank count rather than a property of the head; the vocabulary and the block are the head's.
-    /// The descriptor the unpadding launch uses: the gathered logits' element type, the type the
-    /// sampler's candidate buffer carries, the vocabulary, the gathered width, the block and PDL.
     ///
     /// The two element types are separate because the head's product is in the model's dtype and the
     /// sampler reads FP32; [`ops::logits::VocabUnpad`] widens here, once.
-    pub fn unpad_descriptor(
+    fn unpad_descriptor(
         &self,
         dtype: DType,
         output: DType,
@@ -185,27 +184,6 @@ impl ParallelLMHead {
             vocabulary: self.vocabulary,
             padded: gathered_width,
             block: BLOCK,
-            pdl: crate::layers::launch::PDL,
-        }
-    }
-
-    /// The unpad's descriptor, from the vocabulary's size alone.
-    ///
-    /// The gathered width is `padded × ranks` — a launch value that follows the deployment's rank
-    /// count — so it is an argument; the vocabulary and the block are the checkpoint's and the
-    /// program's.
-    pub fn unpad_descriptor_of(
-        vocabulary: u32,
-        dtype: DType,
-        output: DType,
-        gathered_width: u32,
-    ) -> UnpadDescriptor {
-        UnpadDescriptor {
-            dtype,
-            output,
-            vocabulary,
-            padded: gathered_width,
-            block: 1024,
             pdl: crate::layers::launch::PDL,
         }
     }
@@ -255,18 +233,4 @@ pub fn gather_rows(
     let args = logits::GatherArgs { hidden, rows, out };
 
     f.operate::<LogitsGather>(&descriptor, args)
-}
-
-/// The descriptor one row gather launches: the element type and the width of the rows it moves.
-///
-/// A diffusion block's modulation is a host table gathered per layer, so a walk states one program per
-/// table width it gathers rather than one per schedule row.
-pub fn gather_rows_descriptor(dtype: ops::DType, columns: u64) -> Result<GatherDescriptor> {
-    Ok(GatherDescriptor {
-        dtype,
-        columns: u32::try_from(columns)
-            .map_err(|_| Error::shape("gather_rows", "a hidden width above u32::MAX".to_owned()))?,
-        block: 1024,
-        pdl: crate::layers::launch::PDL,
-    })
 }

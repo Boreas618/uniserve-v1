@@ -60,11 +60,13 @@ fn a_split_recording_answers_the_gathered_width_of_its_rank() {
 
     let (answer, launches) = recorded(|| head.forward(&f, hidden, projected, Some(gathered), out));
     answer.expect("two shards of 16 gather into 32 columns");
-    let unpad = ops::descriptor::key(&head.unpad_descriptor(DType::BF16, DType::F32, 32));
+    // The unpad reads the gathered BF16 logits two shards wide and writes the 30-entry vocabulary
+    // in FP32.
     assert!(
         launches
             .iter()
-            .any(|(operator, key)| operator == <VocabUnpad as Op>::NAME && *key == unpad),
+            .any(|(operator, key)| operator == <VocabUnpad as Op>::NAME
+                && key.starts_with("dtype_bf16_output_f32_vocabulary_30_padded_32_")),
         "{launches:?}"
     );
 
@@ -164,7 +166,12 @@ fn a_collective_needs_a_split() {
 fn a_recording_forward_refuses_a_call_the_device_would_refuse() {
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
-    let descriptor = nn::layers::Silu::descriptor_of(DType::BF16, 1024);
+    let descriptor = ops::activation::SiluDescriptor {
+        dtype: DType::BF16,
+        columns: 1024,
+        block: 1024,
+        pdl: false,
+    };
     let x = arena.tensor(DType::BF16, Shape::new(&[4, 1024])).unwrap();
     let short = arena.tensor(DType::BF16, Shape::new(&[3, 1024])).unwrap();
 

@@ -55,11 +55,6 @@ impl TileStitch {
         })
     }
 
-    /// The descriptor one stitch launches, for a walk without a device.
-    pub const fn descriptor(&self) -> Descriptor {
-        self.descriptor
-    }
-
     /// Stitch `tokens` into `out`, `[channels, frames, height, width]`, through the two axis tables.
     pub fn forward(
         &self,

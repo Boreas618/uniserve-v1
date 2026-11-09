@@ -202,49 +202,6 @@ impl Conv3d {
             self.channels_last,
         )
     }
-
-    /// The descriptor this layer's launch takes, for a walk that asks a model which programs it
-    /// launches with no device.
-    pub fn descriptor(&self, input: DType, output: DType) -> Descriptor {
-        descriptor_of(
-            input,
-            &self.weight,
-            self.bias.as_ref(),
-            output,
-            self.geometry,
-            3,
-            false,
-            self.tf32,
-            self.channels_last,
-        )
-    }
-
-    /// The descriptor a three-dimensional convolution's launch, stated from its geometry and element types alone.
-    ///
-    /// A deployment answers "which programs must be compiled for me?" before any weight exists, so
-    /// the construction stays beside the launch it describes rather than being restated by the walk.
-    #[allow(clippy::too_many_arguments)]
-    pub fn descriptor_of(
-        input: DType,
-        weight: DType,
-        bias: bool,
-        output: DType,
-        geometry: ConvGeometry,
-        tf32: bool,
-        channels_last: bool,
-    ) -> Descriptor {
-        Descriptor {
-            input,
-            weight,
-            output,
-            geometry: geometry.descriptor(),
-            bias,
-            tf32,
-            channels_last,
-            rank: 3,
-            transposed: false,
-        }
-    }
 }
 
 /// A one-dimensional convolution (the audio decoder's convolutions).
@@ -292,47 +249,6 @@ impl Conv1d {
             self.tf32,
             false,
         )
-    }
-
-    /// The descriptor this layer's launch takes; see [`Conv3d::descriptor`].
-    pub fn descriptor(&self, input: DType, output: DType) -> Descriptor {
-        descriptor_of(
-            input,
-            &self.weight,
-            self.bias.as_ref(),
-            output,
-            self.geometry,
-            1,
-            false,
-            self.tf32,
-            false,
-        )
-    }
-
-    /// The descriptor a one-dimensional convolution's launch, stated from its geometry and element types alone.
-    ///
-    /// A deployment answers "which programs must be compiled for me?" before any weight exists, so
-    /// the construction stays beside the launch it describes rather than being restated by the walk.
-    #[allow(clippy::too_many_arguments)]
-    pub fn descriptor_of(
-        input: DType,
-        weight: DType,
-        bias: bool,
-        output: DType,
-        geometry: ConvGeometry,
-        tf32: bool,
-    ) -> Descriptor {
-        Descriptor {
-            input,
-            weight,
-            output,
-            geometry: geometry.descriptor(),
-            bias,
-            tf32,
-            channels_last: false,
-            rank: 1,
-            transposed: false,
-        }
     }
 }
 
@@ -382,59 +298,16 @@ impl ConvTranspose1d {
             false,
         )
     }
-
-    /// The descriptor this layer's launch takes; see [`Conv3d::descriptor`].
-    pub fn descriptor(&self, input: DType, output: DType) -> Descriptor {
-        descriptor_of(
-            input,
-            &self.weight,
-            self.bias.as_ref(),
-            output,
-            self.geometry,
-            1,
-            true,
-            self.tf32,
-            false,
-        )
-    }
-
-    /// The descriptor a transposed one-dimensional convolution's launch, stated from its geometry and element types alone.
-    ///
-    /// A deployment answers "which programs must be compiled for me?" before any weight exists, so
-    /// the construction stays beside the launch it describes rather than being restated by the walk.
-    #[allow(clippy::too_many_arguments)]
-    pub fn descriptor_of(
-        input: DType,
-        weight: DType,
-        bias: bool,
-        output: DType,
-        geometry: ConvGeometry,
-        tf32: bool,
-    ) -> Descriptor {
-        Descriptor {
-            input,
-            weight,
-            output,
-            geometry: geometry.descriptor(),
-            bias,
-            tf32,
-            channels_last: false,
-            rank: 1,
-            transposed: true,
-        }
-    }
 }
 
 /// The descriptor one convolution launch takes.
 ///
-/// The three layers share one launch, so they share the construction of its descriptor: an accessor
-/// per layer that built it separately would be three chances for one to drift from the operator it
-/// names, and the walk that asks a model for its programs reads exactly this.
+/// The three layers share one launch, so they share the construction of its descriptor.
 #[allow(
     clippy::too_many_arguments,
     reason = "every argument is a geometry or an element type the descriptor states separately"
 )]
-fn descriptor_of(
+fn descriptor(
     input: DType,
     weight: &Weight,
     bias: Option<&Weight>,
@@ -483,7 +356,7 @@ fn launch(
             "the bias and the output have different element types".to_owned(),
         ));
     }
-    let descriptor = descriptor_of(
+    let descriptor = descriptor(
         input.dtype,
         weight,
         bias,

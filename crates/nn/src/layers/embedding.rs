@@ -71,24 +71,15 @@ impl Embedding {
 
     /// The descriptor [`Self::forward`] launches with, for an output of `out` and ids of `ids`.
     ///
-    /// The token count is not in it — the ids' length is a launch value — so a request space
-    /// enumerates one descriptor per pair of element types, and the row count of the table comes
-    /// from the layer's shard.
-    pub fn descriptor(&self, out: DType, ids: DType) -> Descriptor {
-        Self::descriptor_of(self.rows, self.hidden, self.first, out, ids)
-    }
-
-    /// The descriptor the gather launches with, from the table's shape alone.
-    ///
-    /// `rows` is this rank's shard, `hidden` its width and `first` the vocabulary id the shard
-    /// opens at; the token count is a launch value and not a key field.
-    pub fn descriptor_of(rows: u32, hidden: u32, first: u32, out: DType, ids: DType) -> Descriptor {
+    /// The token count is not in it — the ids' length is a launch value; `rows` is this rank's
+    /// shard, `hidden` its width and `first` the vocabulary id the shard opens at.
+    fn descriptor(&self, out: DType, ids: DType) -> Descriptor {
         Descriptor {
             dtype: out,
             ids,
-            hidden,
-            first,
-            rows,
+            hidden: self.hidden,
+            first: self.first,
+            rows: self.rows,
             block: EMBEDDING_TOKENS,
             pdl: PDL,
         }

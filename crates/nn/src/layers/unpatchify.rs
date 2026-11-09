@@ -18,7 +18,7 @@ use crate::forward::Forward;
 use crate::layers::launch::PDL;
 
 /// The elements one program writes.
-pub const BLOCK: u32 = 1024;
+const BLOCK: u32 = 1024;
 
 /// The packed-token to planar-raster mapping of a video decoder.
 #[derive(Clone, Copy)]
@@ -61,8 +61,8 @@ impl UnpatchifyVideo {
     /// from `out`, which the caller already sized: `out.dim(1) / temporal` frames, and likewise for
     /// the rows and columns. Spare token rows past the grid are never read.
     /// The descriptor one unpatchify launches: the element type, stated once for every tile of a
-    /// canvas. The extents are launch values, so a walk with a configuration states this program.
-    pub fn descriptor(&self) -> unpatchify::Descriptor {
+    /// canvas. The extents are launch values.
+    fn descriptor(&self) -> unpatchify::Descriptor {
         unpatchify::Descriptor {
             dtype: self.dtype,
             affine: false,

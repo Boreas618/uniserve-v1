@@ -118,39 +118,17 @@ impl AudioActivation {
         Ok(self)
     }
 
-    /// The descriptor a block of this geometry launches, stated without its weights.
-    ///
-    /// A deployment answers "which programs must be compiled for me?" before any weight is read, and
-    /// the geometry is what the key names — the signal's length is a launch value and not part of it.
-    pub fn descriptor_of(
-        dtype: DType,
-        channels: u32,
-        kernel: u32,
-        ratio: u32,
-        block: u32,
-    ) -> audio_activation::Descriptor {
+    /// The descriptor a block of this geometry launches, which also states the expected output
+    /// length; the signal's length is a launch value and not part of the key.
+    fn descriptor(&self) -> audio_activation::Descriptor {
         audio_activation::Descriptor {
-            dtype,
-            channels,
-            kernel,
-            ratio,
-            block,
+            dtype: self.dtype,
+            channels: self.channels,
+            kernel: self.kernel,
+            ratio: self.ratio,
+            block: self.block,
             pdl: PDL,
         }
-    }
-
-    /// The descriptor's view of the geometry, which states the expected output length.
-    ///
-    /// One construction with [`AudioActivation::descriptor_of`], so the walk and the launch cannot
-    /// state different descriptors for the same block.
-    fn descriptor(&self) -> audio_activation::Descriptor {
-        Self::descriptor_of(
-            self.dtype,
-            self.channels,
-            self.kernel,
-            self.ratio,
-            self.block,
-        )
     }
 
     /// The samples one channel has after the block, for an input of `length` samples.
@@ -295,17 +273,13 @@ mod tests {
         assert!(AudioActivation::new(DType::F32, 8, 12, 0, 4).is_err());
     }
 
-    /// The output length is the operator's own arithmetic, not a second copy of it in the layer: the
-    /// chain preserves the length through the ratio, so asking the descriptor and asking the layer
-    /// is the same question.
+    /// The chain upsamples by the ratio and downsamples by it again, so it preserves the signal's
+    /// length.
     #[test]
-    fn the_output_length_is_the_descriptor_s() {
+    fn the_output_length_is_the_input_length() {
         let block = AudioActivation::new(DType::F32, 8, 12, 2, 4).unwrap();
         for length in [16_u64, 64, 480] {
-            assert_eq!(
-                block.output_length(length).unwrap(),
-                block.descriptor().output(length).unwrap()
-            );
+            assert_eq!(block.output_length(length).unwrap(), length);
         }
     }
 }

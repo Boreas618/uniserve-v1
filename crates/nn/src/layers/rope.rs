@@ -196,36 +196,18 @@ impl Rotary {
         Ok(self)
     }
 
-    /// The factor table's descriptor at an element type of the caller's.
+    /// The factor table's descriptor, for positions of `positions` and a table of `factors`.
     ///
     /// FP32 is every trained transformer's table; a model whose reference rounds the factors to its
-    /// activation type states that type here, and the table's type is the only thing that moves.
-    pub fn factors_descriptor_at(
-        rotated: u32,
-        scale: f32,
-        sections: Option<Sections>,
-        positions: ops::DType,
-        factors: ops::DType,
-    ) -> FactorsDescriptor {
+    /// activation type states that type, and the table's type is the only thing that moves.
+    fn factors_descriptor(&self, positions: ops::DType, factors: ops::DType) -> FactorsDescriptor {
+        let sections = self.sections;
         FactorsDescriptor {
             dtype: factors,
-            ..Self::factors_descriptor_of(rotated, scale, sections, positions)
-        }
-    }
-
-    /// The factor table's descriptor, from the rotation's numbers alone.
-    pub fn factors_descriptor_of(
-        rotated: u32,
-        scale: f32,
-        sections: Option<Sections>,
-        positions: ops::DType,
-    ) -> FactorsDescriptor {
-        FactorsDescriptor {
-            dtype: ops::DType::F32,
             positions,
-            columns: rotated / 2,
+            columns: self.rotated / 2,
             block: ROTARY_BLOCK,
-            scale: scale.into(),
+            scale: self.scale.into(),
             pdl: PDL,
             axes: sections.map_or(1, |sections| sections.axes()),
             interleaved: sections.is_some_and(|sections| sections.is_interleaved()),
@@ -238,50 +220,22 @@ impl Rotary {
     ///
     /// `affine` states whether the per-head normalization has a learned weight, which is a different
     /// program: with one it loads the weight, without one it has no weight ports.
-    pub fn apply_descriptor(
+    fn apply_descriptor(
         &self,
         input: ops::DType,
         output: ops::DType,
         affine: bool,
     ) -> QkNormRopeDescriptor {
-        Self::apply_descriptor_of(
-            self.head_dim,
-            self.q_heads,
-            self.k_heads,
-            self.rotation,
-            self.epsilon,
-            self.rotated,
-            input,
-            output,
-            affine,
-        )
-    }
-
-    /// The rotation-and-per-head-normalization descriptor, from the head geometry alone.
-    ///
-    /// `affine` states whether the normalization has a learned weigh, which is a different program.
-    #[allow(clippy::too_many_arguments)]
-    pub fn apply_descriptor_of(
-        head_dim: u32,
-        q_heads: u32,
-        k_heads: u32,
-        rotation: Rotation,
-        epsilon: f32,
-        rotated: u32,
-        input: ops::DType,
-        output: ops::DType,
-        affine: bool,
-    ) -> QkNormRopeDescriptor {
-        let head = u64::from(head_dim);
+        let head = u64::from(self.head_dim);
         QkNormRopeDescriptor {
             dtype: input,
             output,
-            head_dim,
-            q_heads,
-            k_heads,
-            rotation,
-            epsilon: epsilon.into(),
-            rotated,
+            head_dim: self.head_dim,
+            q_heads: self.q_heads,
+            k_heads: self.k_heads,
+            rotation: self.rotation,
+            epsilon: self.epsilon.into(),
+            rotated: self.rotated,
             rows: QK_NORM_ROWS,
             block: head.next_power_of_two().min(1024) as u32,
             affine,
@@ -292,23 +246,15 @@ impl Rotary {
     }
 
     /// The strided form's descriptor (`ops::rope::QkNormRopeDescriptor::strided`): queries and keys
-    /// of `dtype`, factors of `factors`, no learned scale, turned in place.
-    pub fn strided_descriptor_of(
-        head_dim: u32,
-        heads: u32,
-        rotation: Rotation,
-        epsilon: f32,
-        rotated: u32,
-        dtype: ops::DType,
-        factors: ops::DType,
-    ) -> QkNormRopeDescriptor {
+    /// of `dtype` with the queries' head count, factors of `factors`, no learned scale, turned in
+    /// place.
+    fn strided_descriptor(&self, dtype: ops::DType, factors: ops::DType) -> QkNormRopeDescriptor {
         QkNormRopeDescriptor {
+            k_heads: self.q_heads,
             rows: STRIDED_TOKENS,
             factors,
             strided: true,
-            ..Self::apply_descriptor_of(
-                head_dim, heads, heads, rotation, epsilon, rotated, dtype, dtype, false,
-            )
+            ..self.apply_descriptor(dtype, dtype, false)
         }
     }
 
@@ -326,15 +272,7 @@ impl Rotary {
         cosine: TensorView,
         sine: TensorView,
     ) -> Result<()> {
-        let descriptor = Self::strided_descriptor_of(
-            self.head_dim,
-            self.q_heads,
-            self.rotation,
-            self.epsilon,
-            self.rotated,
-            query.dtype,
-            cosine.dtype,
-        );
+        let descriptor = self.strided_descriptor(query.dtype, cosine.dtype);
         let args = QkNormRopeArgs {
             query,
             key,
@@ -396,13 +334,7 @@ impl Rotary {
                 ),
             ));
         }
-        let descriptor = Self::factors_descriptor_at(
-            self.rotated,
-            self.scale,
-            self.sections,
-            positions.dtype,
-            cosine.dtype,
-        );
+        let descriptor = self.factors_descriptor(positions.dtype, cosine.dtype);
         let args = FactorsArgs {
             positions,
             frequencies: self.frequencies.view(),

@@ -21,10 +21,10 @@ use crate::layers::Rotation;
 use crate::layers::launch::PDL;
 
 /// Tokens one rotation program handles.
-pub const ROWS: u32 = 8;
+const ROWS: u32 = 8;
 
 /// Head elements one program loads at a time.
-pub const BLOCK: u32 = 128;
+const BLOCK: u32 = 128;
 
 /// The rotation of a vision tower's queries or keys.
 #[derive(Clone, Copy)]
@@ -67,9 +67,9 @@ impl Rotate {
         })
     }
 
-    /// The descriptor one rotation launch takes, for a walk that asks a model which programs it
-    /// launches with no device: the geometry is the module's and the element types are the call's.
-    pub fn descriptor(&self, input: ops::DType, output: ops::DType) -> RopeApplyDescriptor {
+    /// The descriptor one rotation launch takes: the geometry is the module's and the element types
+    /// are the call's.
+    fn descriptor(&self, input: ops::DType, output: ops::DType) -> RopeApplyDescriptor {
         RopeApplyDescriptor {
             dtype: input,
             output,
