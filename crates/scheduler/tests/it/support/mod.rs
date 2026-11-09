@@ -129,8 +129,9 @@ pub(crate) fn scheduler_with_stating(
 /// admission, no batch — so an epoch that submits a request must be given one.
 /// The module is the `fcfs` program this tree builds for
 /// `wasm32-unknown-unknown`, the one that reproduces the rules the tests were
-/// written against: `scheduler::packaged_module` builds it on first use, and a
-/// module named by `SCHED_POLICY_WASM` is read instead.
+/// written against: `scheduler::packaged_module` builds it on first use, or
+/// reads the module `SCHED_POLICY_WASM` names, and precompiles it for this host
+/// as a Program Server does.
 pub(crate) fn policy_module() -> Vec<u8> {
     scheduler::packaged_module()
 }
