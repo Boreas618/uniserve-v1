@@ -681,10 +681,31 @@ impl ProcessorConfig {
     /// Returns [`ProcessorConfigError`] when a text is not a processor config,
     /// or when the two configs disagree on the patch geometry.
     pub fn parse(image: &str, video: &str) -> Result<Self, ProcessorConfigError> {
-        let image: ProcessorFile =
-            serde_json::from_str(image).map_err(ProcessorConfigError::Image)?;
-        let video: ProcessorFile =
-            serde_json::from_str(video).map_err(ProcessorConfigError::Video)?;
+        Self::of_files(
+            serde_json::from_str(image).map_err(ProcessorConfigError::Image)?,
+            serde_json::from_str(video).map_err(ProcessorConfigError::Video)?,
+        )
+    }
+
+    /// [`Self::parse`] over the two configs already read as JSON values, as
+    /// the model's loading boundary holds its sidecars.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::parse`].
+    pub fn from_values(
+        image: &serde_json::Value,
+        video: &serde_json::Value,
+    ) -> Result<Self, ProcessorConfigError> {
+        Self::of_files(
+            ProcessorFile::deserialize(image).map_err(ProcessorConfigError::Image)?,
+            ProcessorFile::deserialize(video).map_err(ProcessorConfigError::Video)?,
+        )
+    }
+
+    /// The geometry the image and video processor files state, which must
+    /// patch alike.
+    fn of_files(image: ProcessorFile, video: ProcessorFile) -> Result<Self, ProcessorConfigError> {
         let geometry =
             |file: &ProcessorFile| (file.patch_size, file.temporal_patch_size, file.merge_size);
         if geometry(&image) != geometry(&video) {

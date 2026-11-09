@@ -48,6 +48,7 @@ pub use video_vae::{SpatialPadding, VideoVaeConfig};
 
 use crate::checkpoint::{ContractSchedule, Dit, Layout, Sidecars};
 use crate::encoding::Clip;
+use crate::processing::plan::ProcessorConfig;
 use crate::{Error, Result};
 
 /// Frames per second of a generated video.
@@ -103,6 +104,10 @@ pub struct Config {
     pub video_vae: VideoVaeConfig,
     /// The audio VAE: the BigVGAN decoder every task uses and the encoder `ref2va` uses.
     pub audio_vae: AudioVaeConfig,
+    /// The conditioner's Qwen3-VL processor geometry: how a condition image is resized to the
+    /// vision grid the text encoder reads. Read from the two processor files the request processing
+    /// reads it from, and `None` when the checkpoint states no video processor file.
+    pub processor: Option<ProcessorConfig>,
 }
 
 impl Config {
@@ -125,6 +130,12 @@ impl Config {
     /// below sees a value it cannot use.
     pub fn normalize(layout: &Layout, sidecars: &Sidecars) -> Result<Self> {
         let text_encoder = TextEncoderConfig::parse(&sidecars.text_encoder, &sidecars.processor)?;
+        let processor = sidecars
+            .video_processor
+            .as_ref()
+            .map(|video| ProcessorConfig::from_values(&sidecars.processor, video))
+            .transpose()
+            .map_err(|error| Error::config(format!("the checkpoint's processor: {error}")))?;
         let video_vae = VideoVaeConfig::parse(&sidecars.video_vae)?;
         let audio_vae = AudioVaeConfig::parse(&sidecars.audio_vae)?;
         let shifts = Shifts {
@@ -197,6 +208,7 @@ impl Config {
             denoisers,
             video_vae,
             audio_vae,
+            processor,
         };
         config.validate()?;
         Ok(config)

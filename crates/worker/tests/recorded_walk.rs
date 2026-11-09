@@ -20,17 +20,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use nn::capability::{
-    Clip, Conditioning, DecodedMedia, Decoder, Denoiser, LatentShape, Latents, Layout, Seed,
-    StateTable, Step, VideoRequest, WarmRequest,
+    Clip, Conditioning, DecodedMedia, Decoder, Denoiser, Encoder, EncoderInputs, EncoderLayout,
+    EncoderOutputs, EncoderPrompt, ImageShape, LatentShape, Latents, Layout, MediaFormat, Seed,
+    StateTable, Step, TokenBatch, VideoRequest, WarmPrompt, WarmRequest,
 };
 use nn::{Forward, Result};
 use ops::logits::{GatherArgs, GatherDescriptor, LogitsGather};
 use ops::{DType, Op, Shape, TensorView};
 use platform::{Allocator, Budget, Device, DeviceId, PoolKind, Stream};
 use worker::arena::Pools;
-use worker::plan::{Bucket, Buckets};
+use worker::plan::{Bucket, Buckets, Variant};
 use worker::runner::{Binding, Runner, RunnerId};
 use worker::runners::denoiser::{DenoiserRunner, DenoiserShape};
+use worker::runners::encoder::{EncoderRunner, EncoderShape, WarmVision};
 use worker::runners::{DecoderRunner, recording::Footprint};
 
 const DEVICE: DeviceId = DeviceId(0);
@@ -303,4 +305,138 @@ fn a_decoder_records_its_gather_and_its_decode() {
     assert_eq!(footprint.keys, keys(&[6, 8]));
     assert_eq!(footprint.peak, 16384);
     assert_eq!(footprint.widest, Some(bucket));
+}
+
+/// The row width of the fake media format's patch rows.
+const PATCH_WIDTH: u32 = 24;
+
+/// A media format whose patch rows are `PATCH_WIDTH` BF16 elements: what an encoder's recorded
+/// walk lays a vision prompt's placeholder rows out by. It converts nothing.
+struct Patches;
+
+impl MediaFormat for Patches {
+    fn condition_pixels(&self, _: &[u8], _: u32, _: u32, _: u32, _: &mut [f32]) -> Result<()> {
+        Err(nn::Error::Unsupported("a walk converts no pixels".into()))
+    }
+
+    fn patch_dtype(&self) -> DType {
+        DType::BF16
+    }
+
+    fn patch_width(&self) -> u32 {
+        PATCH_WIDTH
+    }
+
+    fn patch_side(&self) -> u32 {
+        16
+    }
+
+    fn patches(&self, _: &[u8], _: u32, _: [u32; 3], _: &mut [u8]) -> Result<()> {
+        Err(nn::Error::Unsupported("a walk converts no patches".into()))
+    }
+
+    fn track_samples(&self, samples: u64) -> Result<u64> {
+        Ok(samples)
+    }
+
+    fn track(&self, _: &[f32], _: u64, _: &mut [f32]) -> Result<()> {
+        Err(nn::Error::Unsupported("a walk converts no track".into()))
+    }
+}
+
+/// An encoder whose text encode reserves 1 KiB and whose vision encode reserves 4 KiB per image,
+/// launching a gather whose width names the image count (`2` for text, `4 · images` with them).
+///
+/// Its vision encode refuses patch rows that are not the media format's width or that do not hold
+/// each image's grid, so a walk that laid them out otherwise fails instead of reporting.
+struct Prompting;
+
+impl Encoder for Prompting {
+    fn layout(&self, batch: &TokenBatch, images: &[ImageShape]) -> EncoderLayout {
+        EncoderLayout {
+            rows: batch.num_tokens,
+            tokens: batch.num_tokens,
+            images: images.to_vec(),
+        }
+    }
+
+    fn state_tables(&self, layout: &EncoderLayout) -> Vec<StateTable> {
+        vec![StateTable {
+            name: "positions",
+            dtype: DType::I32,
+            shape: Shape::new(&[u64::from(layout.tokens)]),
+        }]
+    }
+
+    fn prepare_state(
+        &self,
+        _: &EncoderPrompt<'_>,
+        _: &EncoderLayout,
+        _: &mut [Vec<u8>],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn encode(&self, f: &Forward, inputs: EncoderInputs<'_>, _: EncoderOutputs) -> Result<()> {
+        let images = inputs.images.len() as u64;
+        if images == 0 {
+            return launch(f, 1024, 2);
+        }
+        for (image, shape) in inputs.images.iter().zip(&inputs.layout.images) {
+            let rows: u64 = shape.grid.iter().map(|extent| u64::from(*extent)).product();
+            if image.pixels.shape.dims() != [rows, u64::from(PATCH_WIDTH)] {
+                return Err(nn::Error::Unsupported(format!(
+                    "patch rows {:?} for a grid {:?}",
+                    image.pixels.shape.dims(),
+                    shape.grid
+                )));
+            }
+        }
+        launch(f, 4096 * images, 4 * images as u32)
+    }
+}
+
+/// An encoder runner's footprint holds the eager encode of every admitted vision prompt beside the
+/// captured text encode of each bucket that prompt rides: a one-row bucket of at least its vision
+/// tokens. The vision encode reserves more than the text encode, so a walk of the captured encode
+/// alone would claim a region the eager one overruns.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn an_encoder_records_its_vision_prompts() {
+    let one = Bucket::prefill(1, 8, Variant::Encode);
+    let two = Bucket::prefill(2, 8, Variant::Encode);
+    let image = ImageShape { grid: [1, 2, 4] };
+    let mut runner = EncoderRunner::new(
+        binding(),
+        Arc::new(Prompting),
+        Buckets::new([one, two]),
+        WarmVision {
+            prompts: vec![
+                // Two image tokens: the one-row bucket of eight serves it.
+                WarmPrompt {
+                    images: vec![image],
+                    tokens: 2,
+                },
+                // Sixteen tokens: no bucket serves it, so it is never walked.
+                WarmPrompt {
+                    images: vec![image, image],
+                    tokens: 16,
+                },
+            ],
+            format: Arc::new(Patches),
+        },
+        EncoderShape {
+            hidden: 16,
+            dtype: DType::BF16,
+        },
+        Arc::new(ops::Generation::new(0, [])),
+    )
+    .expect("a runner of two buckets");
+    runner.attach_pools(pools());
+
+    let footprint = runner.record_walk().expect("a recorded walk");
+
+    assert_eq!(footprint.keys, keys(&[2, 4]));
+    assert_eq!(footprint.peak, 4096);
+    assert_eq!(footprint.widest, Some(one));
 }

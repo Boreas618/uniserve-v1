@@ -120,6 +120,15 @@ impl ModelRunner {
         };
         let encode_set = Buckets::new(encode_buckets);
         let decode_set = Buckets::new(decode_buckets);
+        // How the model reads condition media: the media stage writes a prompt's patch rows by it,
+        // and the encoder's recorded walk lays out the admitted vision prompts' rows by it.
+        let format = pipeline.format()?;
+        // The prompts with vision blocks this deployment admits, which the encoder encodes eagerly
+        // over its stream's region: its recorded walk encodes them so the region holds them.
+        let vision = media_encoder::WarmVision {
+            prompts: pipeline.warm_prompts(&serving)?,
+            format: Arc::clone(&format),
+        };
         let encoder = media_encoder::EncoderRunner::new(
             Binding {
                 id: RunnerId(0),
@@ -129,6 +138,7 @@ impl ModelRunner {
             },
             text,
             encode_set,
+            vision,
             media_encoder::EncoderShape { hidden, dtype },
             Arc::clone(generation),
         )?
@@ -338,7 +348,7 @@ impl ModelRunner {
                     })
                 })
             },
-            pipeline.format()?,
+            format,
         );
         runners.push(NamedRunner::new(RunnerId(4), Box::new(media)));
         Ok(runners)

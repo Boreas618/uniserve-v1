@@ -61,7 +61,7 @@ pub use capability::{
     BatchRow, BatchRows, CausalLm, ConditionPiece, ConditionRole, ConditionShape, Conditioning,
     DecodedMedia, Decoder, Denoiser, Encoder, EncoderInputs, EncoderLayout, EncoderOutputs,
     EncoderPrompt, ImageInput, ImageShape, KvGroup, KvPlanes, KvView, Latents, Layout, MediaFormat,
-    RowKind, Seed, StateTable, Step, TokenBatch, VideoRequest, WarmRequest,
+    RowKind, Seed, StateTable, Step, TokenBatch, VideoRequest, WarmPrompt, WarmRequest,
 };
 pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, Reading, TensorLocation};
 pub use error::{Error, Result};

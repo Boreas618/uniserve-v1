@@ -13,7 +13,10 @@
 //! prompt's vision grids are the request's: a captured graph per grid would be one per image size a
 //! client can send, and the tower's tables differ with every one. So such a prompt is walked once,
 //! operator by operator, over its own layout and tables ([`EncoderRunner::encode_vision`]): only a
-//! prompt without vision tokens is captured.
+//! prompt without vision tokens is captured. That eager encode runs over the same stream region the
+//! captured ones address, so the recorded walk encodes, beside each bucket's captured encode, every
+//! vision prompt the deployment admits that fits the bucket ([`WarmVision`]), through the same
+//! function the serving path calls ([`EncoderRunner::encode_images`]).
 //!
 //! **It keeps no cache and therefore no state group.** The state group of §8 is what a recurrent
 //! model must checkpoint at a boundary it declares, and an encoder computes its hidden states from
@@ -28,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use ipc::TimingCounters;
 use nn::capability::{
     Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageInput, ImageShape,
-    TokenBatch,
+    MediaFormat, StateTable, TokenBatch, WarmPrompt,
 };
 use ops::{DType, PhaseKind, TensorView};
 use platform::DeviceId;
@@ -52,6 +55,16 @@ pub struct EncoderShape {
     pub hidden: u32,
     /// The element type of those states.
     pub dtype: DType,
+}
+
+/// The prompts with vision blocks a deployment admits, which the recorded walk encodes beside the
+/// captured buckets, and the patch rows their blocks read.
+pub struct WarmVision {
+    /// Each admitted prompt's vision blocks ([`nn::family::VideoModel::warm_prompts`]).
+    pub prompts: Vec<WarmPrompt>,
+    /// How the media stage writes the patch rows a vision encode reads
+    /// ([`Product::VisionPixels`]): their element type and row width.
+    pub format: Arc<dyn MediaFormat>,
 }
 
 /// The columns an encoder stages a batch into, sized for the largest bucket it was bound with.
@@ -159,6 +172,8 @@ pub struct EncoderRunner<M: Encoder + Send + Sync + ?Sized> {
     /// The vision blocks of the prompt staged last, when it carries any: the replay of that batch
     /// walks the encode instead of launching a graph.
     vision: Option<VisionPrompt>,
+    /// The vision prompts the recorded walk encodes beside the captured buckets.
+    warm: WarmVision,
     /// The block-by-block diagnosis, off unless `UNISERVE_DIAG_DIR` names a directory.
     diag: crate::runners::diag::Diag,
     /// The tensor group this runner's rank reduces over, absent when one rank holds the encoder.
@@ -179,14 +194,14 @@ struct VisionPrompt {
     /// The request the patch rows were read for.
     request: ipc::RequestKey,
     /// Each block's `[time, rows, columns]` patch grid, in presentation order.
-    grids: Vec<[u32; 3]>,
+    images: Vec<ImageShape>,
 }
 
 /// The vision blocks a request's conditioning presents, in presentation order.
 ///
 /// Every condition with a conditioner's view is one block, and they are presented in request order
 /// (its model's request processing). An audio reference and a `ref2va` keyframe present none.
-fn vision_grids(conditioning: &[u8]) -> Result<Vec<[u32; 3]>> {
+fn vision_images(conditioning: &[u8]) -> Result<Vec<ImageShape>> {
     let decoded = proto::video::Conditions::decode(conditioning).map_err(|error| {
         Error::Invalid(format!(
             "a media request's conditioning does not decode: {error}"
@@ -196,7 +211,9 @@ fn vision_grids(conditioning: &[u8]) -> Result<Vec<[u32; 3]>> {
         .conditions
         .iter()
         .filter_map(|condition| condition.vision.as_ref())
-        .map(|vision| [vision.grid.t, vision.grid.h, vision.grid.w])
+        .map(|vision| ImageShape {
+            grid: [vision.grid.t, vision.grid.h, vision.grid.w],
+        })
         .collect())
 }
 
@@ -205,11 +222,14 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
     ///
     /// The buckets are the ones the plan states for this runner (`Runner::media_plan`), and the
     /// columns are sized for the largest of them: an encoder captures per bucket and stages into
-    /// one set of columns, because the buckets differ only in how many tokens they carry.
+    /// one set of columns, because the buckets differ only in how many tokens they carry. `vision`
+    /// is what the deployment admits of prompts with vision blocks, which the recorded walk encodes
+    /// beside the buckets so the stream's region holds their eager encodes.
     pub fn new(
         binding: Binding,
         model: Arc<M>,
         buckets: Buckets,
+        vision: WarmVision,
         shape: EncoderShape,
         generation: Arc<ops::Generation>,
     ) -> Result<Self> {
@@ -245,6 +265,7 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
             products: None,
             pending: Vec::new(),
             vision: None,
+            warm: vision,
             diag: crate::runners::diag::Diag::from_env(),
             group: None,
             host_pool: None,
@@ -489,8 +510,8 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
                 self.pending.push((staged.request, first, rows));
                 self.diag
                     .write_bytes("encoder", "conditioning.json", &staged.conditioning);
-                let grids = vision_grids(&staged.conditioning)?;
-                if grids.is_empty() {
+                let images = vision_images(&staged.conditioning)?;
+                if images.is_empty() {
                     continue;
                 }
                 // One walk serves one prompt: its tables are that prompt's, and a batch of two
@@ -504,7 +525,7 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
                 }
                 self.vision = Some(VisionPrompt {
                     request: staged.request,
-                    grids,
+                    images,
                 });
             }
         }
@@ -609,57 +630,13 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
     /// The layout is the prompt's own - its presented tokens and its blocks' grids - so its tables
     /// are written for this prompt alone, into pinned storage the device reads in place, and the
     /// walk reads them there. The arena is the stream's, whose bucket extents a graph of this runner
-    /// addresses: nothing of a graph is live between its replays, so this walk may reuse it.
-    fn encode_vision(
-        &mut self,
-        bucket: Bucket,
-        generation: u64,
-        prompt: VisionPrompt,
-    ) -> Result<()> {
+    /// addresses: nothing of a graph is live between its replays, so this walk may reuse it, and the
+    /// recorded walk encodes the vision prompts the deployment admits so the region holds it.
+    fn encode_vision(&self, bucket: Bucket, generation: u64, prompt: VisionPrompt) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
         let tokens = u32::try_from(self.ids.len())
             .map_err(|_| Error::Invalid("a prompt of more tokens than a u32 counts".into()))?;
-        let layout = EncoderLayout {
-            rows: tokens,
-            tokens,
-            images: prompt
-                .grids
-                .iter()
-                .map(|grid| ImageShape { grid: *grid })
-                .collect(),
-        };
-        let tables = self.model.state_tables(&layout);
-        let mut host = Vec::with_capacity(tables.len());
-        for table in &tables {
-            host.push(vec![
-                0_u8;
-                usize::try_from(Tables::plan_bytes(
-                    std::slice::from_ref(table)
-                )?)
-                .map_err(|_| Error::Invalid(
-                    "a table is larger than memory".into()
-                ))?
-            ]);
-        }
-        self.model
-            .prepare_state(&EncoderPrompt { ids: &self.ids }, &layout, &mut host)
-            .map_err(Error::from)?;
-        let mut held = Vec::with_capacity(tables.len());
-        let mut state = Vec::with_capacity(tables.len());
-        for (table, bytes) in tables.iter().zip(&host) {
-            let mut buffer = platform::PinnedBuffer::new(self.device, bytes.len().max(1))?;
-            // SAFETY: the buffer was allocated above and no device work reads it yet.
-            unsafe {
-                buffer.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
-            }
-            state.push(TensorView::new(
-                ops::DevicePtr::new(buffer.address()),
-                table.dtype,
-                table.shape,
-            ));
-            held.push(buffer);
-        }
 
         let products = self
             .products
@@ -668,18 +645,6 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
         let patches = products
             .ordered(prompt.request, Product::VisionPixels, &stream)?
             .ok_or_else(|| products::absent(prompt.request, Product::VisionPixels))?;
-        let width = patches.shape.dim(1);
-        let mut images = Vec::with_capacity(prompt.grids.len());
-        let mut first = 0_u64;
-        for grid in &prompt.grids {
-            let rows = u64::from(grid[0]) * u64::from(grid[1]) * u64::from(grid[2]);
-            images.push(ImageInput {
-                pixels: patches
-                    .at(patches.offset_elements(first * width))
-                    .reshape(ops::Shape::new(&[rows, width])),
-            });
-            first += rows;
-        }
 
         let base = self.pool()?.base(self.stream_id())?;
         let reserved = self.pool()?.reserved_on(self.stream_id());
@@ -689,42 +654,23 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
             nn::Forward::new(&stream, &kernels, &arena),
             group.as_deref(),
         );
-        let rows = u64::from(tokens);
-        let hidden_width = u64::from(self.shape.hidden.max(1));
-        let batch = TokenBatch {
-            positions: self.columns.positions.extent(0..rows),
-            slot_mapping: self.columns.logits_rows.extent(0..rows.max(1)),
-            seq_lens: self.columns.seq_lens.extent(0..1),
-            query_offsets: self.columns.query_offsets.extent(0..2),
-            logits_rows: self.columns.logits_rows.extent(0..1),
-            phase: PhaseKind::Prefill,
-            page_size: 0,
-            num_tokens: tokens,
-            max_kv_len: bucket.tokens,
-            draft_lens: None,
-        };
-        let hidden = self
-            .columns
-            .hidden
-            .extent(0..rows * hidden_width)
-            .reshape(ops::Shape::new(&[rows, hidden_width]));
         self.upload()?;
-        self.model
-            .encode(
-                &forward,
-                EncoderInputs {
-                    ids: self.columns.ids.extent(0..rows),
-                    batch,
-                    images: &images,
-                    layout: &layout,
-                    state: &state,
-                },
-                EncoderOutputs { hidden },
-            )
-            .map_err(Error::from)?;
+        // The pinned tables stay alive until the encode that reads them in place has completed.
+        let mut held = Vec::new();
+        let (tables, state) = self.encode_images(
+            &forward,
+            bucket,
+            tokens,
+            &prompt.images,
+            patches,
+            |layout, tables| self.pinned_tables(layout, tables, &mut held),
+        )?;
         // The tables are this prompt's alone and the walk just queued reads them.
         stream.synchronize()?;
+
         if self.diag.enabled() {
+            let rows = u64::from(tokens);
+            let hidden_width = u64::from(self.shape.hidden.max(1));
             let _ = self.diag.write(
                 self.device,
                 &stream,
@@ -753,6 +699,120 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
         }
         drop(held);
         Ok(())
+    }
+
+    /// Writes the staged prompt's `tables` of `layout` into pinned host buffers the device reads in
+    /// place, pushing each buffer onto `held`, and answers their views in the tables' order.
+    ///
+    /// The caller keeps `held` until the device work that reads the views has completed.
+    fn pinned_tables(
+        &self,
+        layout: &EncoderLayout,
+        tables: &[StateTable],
+        held: &mut Vec<platform::PinnedBuffer>,
+    ) -> Result<Vec<TensorView>> {
+        let mut host = Vec::with_capacity(tables.len());
+        for table in tables {
+            let bytes = usize::try_from(Tables::plan_bytes(std::slice::from_ref(table))?)
+                .map_err(|_| Error::Invalid("a table is larger than memory".into()))?;
+            host.push(vec![0_u8; bytes]);
+        }
+        self.model
+            .prepare_state(&EncoderPrompt { ids: &self.ids }, layout, &mut host)
+            .map_err(Error::from)?;
+
+        let mut state = Vec::with_capacity(tables.len());
+        for (table, bytes) in tables.iter().zip(&host) {
+            let mut buffer = platform::PinnedBuffer::new(self.device, bytes.len().max(1))?;
+            // SAFETY: the buffer was allocated above and no device work reads it yet.
+            unsafe {
+                buffer.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+            }
+            state.push(TensorView::new(
+                ops::DevicePtr::new(buffer.address()),
+                table.dtype,
+                table.shape,
+            ));
+            held.push(buffer);
+        }
+        Ok(state)
+    }
+
+    /// Encodes one prompt of `tokens` tokens whose vision blocks are `images` on `forward`: the
+    /// layout, its tables and the model call, which the eager serving path
+    /// ([`Self::encode_vision`]) and the recorded walk both run.
+    ///
+    /// `patches` is the `[rows, width]` patch rows of every block, one block's rows after
+    /// another's, in the media stage's element type. `state` answers the views of the layout's
+    /// tables: pinned host tables when serving, placeholders in the recorded walk, which issues no
+    /// device work. The prompt's columns are the staged ones, and its states land in the hidden
+    /// column's first rows. Answers the tables and the views the encode read.
+    fn encode_images(
+        &self,
+        forward: &nn::Forward<'_>,
+        bucket: Bucket,
+        tokens: u32,
+        images: &[ImageShape],
+        patches: TensorView,
+        state: impl FnOnce(&EncoderLayout, &[StateTable]) -> Result<Vec<TensorView>>,
+    ) -> Result<(Vec<StateTable>, Vec<TensorView>)> {
+        let layout = EncoderLayout {
+            rows: tokens,
+            tokens,
+            images: images.to_vec(),
+        };
+        let tables = self.model.state_tables(&layout);
+        let state = state(&layout, &tables)?;
+
+        // Each block reads its own run of the patch rows: `time × rows × columns` of them.
+        let width = patches.shape.dim(1);
+        let mut pixels = Vec::with_capacity(images.len());
+        let mut first = 0_u64;
+        for image in images {
+            let [time, height, columns] = image.grid;
+            let rows = u64::from(time) * u64::from(height) * u64::from(columns);
+            pixels.push(ImageInput {
+                pixels: patches
+                    .at(patches.offset_elements(first * width))
+                    .reshape(ops::Shape::new(&[rows, width])),
+            });
+            first += rows;
+        }
+
+        // One prompt alone: one row of `tokens` keys, whose bound is the bucket's.
+        let rows = u64::from(tokens);
+        let hidden_width = u64::from(self.shape.hidden.max(1));
+        let batch = TokenBatch {
+            positions: self.columns.positions.extent(0..rows),
+            slot_mapping: self.columns.logits_rows.extent(0..rows.max(1)),
+            seq_lens: self.columns.seq_lens.extent(0..1),
+            query_offsets: self.columns.query_offsets.extent(0..2),
+            logits_rows: self.columns.logits_rows.extent(0..1),
+            phase: PhaseKind::Prefill,
+            page_size: 0,
+            num_tokens: tokens,
+            max_kv_len: bucket.tokens,
+            draft_lens: None,
+        };
+        let hidden = self
+            .columns
+            .hidden
+            .extent(0..rows * hidden_width)
+            .reshape(ops::Shape::new(&[rows, hidden_width]));
+        self.model
+            .encode(
+                forward,
+                EncoderInputs {
+                    ids: self.columns.ids.extent(0..rows),
+                    batch,
+                    images: &pixels,
+                    layout: &layout,
+                    state: &state,
+                },
+                EncoderOutputs { hidden },
+            )
+            .map_err(Error::from)?;
+        Ok((tables, state))
     }
 
     /// Walks the encode once for `bucket`, recording every operator launch's nodes into the
@@ -942,15 +1002,57 @@ impl<M: Encoder + Send + Sync + ?Sized> Runner for EncoderRunner<M> {
         self.counters = Some(counters);
     }
 
-    /// The encode every bucket's graph captures, over placeholders of its layout's tables.
+    /// The encode every bucket's graph captures, over placeholders of its layout's tables, and the
+    /// eager encode of every admitted vision prompt the bucket serves.
+    ///
+    /// A prompt with vision blocks is encoded alone (`stage`), so it rides a bucket of one row,
+    /// and only one of at least its vision tokens. It is walked at the bucket's whole token count,
+    /// the longest prompt that bucket serves, over placeholder patch rows of the media stage's
+    /// element type and width; its eager encode starts at the region's first address, as a walk
+    /// of its own does.
     fn record_walk(&mut self) -> Result<Footprint> {
         let mut footprint = Footprint::default();
         let group = self.group.clone();
+        let patch_dtype = self.warm.format.patch_dtype();
+        let patch_width = u64::from(self.warm.format.patch_width());
         for bucket in self.capture_order() {
             footprint.walk(Some(bucket), |walk| {
                 let state = walk.tables(&self.model.state_tables(&self.layout(bucket)))?;
                 self.encode(&walk.forward(group.as_deref())?, bucket, &state)
             })?;
+
+            if bucket.rows != 1 {
+                continue;
+            }
+            for prompt in &self.warm.prompts {
+                if prompt.tokens > bucket.tokens {
+                    continue;
+                }
+                let rows: u64 = prompt
+                    .images
+                    .iter()
+                    .map(|image| {
+                        image
+                            .grid
+                            .iter()
+                            .map(|extent| u64::from(*extent))
+                            .product::<u64>()
+                    })
+                    .sum();
+                footprint.walk(Some(bucket), |walk| {
+                    let patches =
+                        walk.placeholder(patch_dtype, ops::Shape::new(&[rows, patch_width]))?;
+                    self.encode_images(
+                        &walk.forward(group.as_deref())?,
+                        bucket,
+                        bucket.tokens,
+                        &prompt.images,
+                        patches,
+                        |_, tables| walk.tables(tables),
+                    )
+                    .map(drop)
+                })?;
+            }
         }
         Ok(footprint)
     }

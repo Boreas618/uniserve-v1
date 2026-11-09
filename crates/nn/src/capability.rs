@@ -421,6 +421,23 @@ impl WarmRequest {
     }
 }
 
+/// A prompt with vision blocks that a deployment admits, as an encoder's recorded walk encodes it.
+///
+/// A prompt that presents vision blocks is encoded eagerly over its own layout rather than by a
+/// captured graph, on the same stream region the captured encodes address, so the extent that
+/// region must hold is the widest of those encodes too. Its grids are a request's, but a
+/// deployment fixes the ones its rules derive from what it serves (a keyframe is resized to the
+/// canvas it is generated on), and a model states those here
+/// ([`crate::family::VideoModel::warm_prompts`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WarmPrompt {
+    /// The prompt's vision blocks, in presentation order.
+    pub images: Vec<ImageShape>,
+    /// The vision placeholder tokens those blocks present: a prompt carrying them is at least this
+    /// long, so it rides only an encode bucket of at least this many tokens.
+    pub tokens: u32,
+}
+
 /// A video request's numerical layout input: what the denoiser must lay out.
 ///
 /// Every field is a request fact the worker already holds — it decoded the media, encoded the

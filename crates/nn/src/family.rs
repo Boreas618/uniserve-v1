@@ -20,7 +20,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::capability::{CausalLm, Decoder, Denoiser, Encoder, MediaFormat, WarmRequest};
+use crate::capability::{
+    CausalLm, Decoder, Denoiser, Encoder, MediaFormat, WarmPrompt, WarmRequest,
+};
 use crate::{Checkpoint, DType, Result, WeightLoader};
 
 /// One model family a build serves.
@@ -333,6 +335,19 @@ pub trait VideoModel: Send + Sync {
     ///
     /// Fails when `serving` states a size, duration or capacity the pipeline does not serve.
     fn candidates(&self, serving: &VideoServing) -> Result<Vec<WarmRequest>>;
+
+    /// The prompts with vision blocks a deployment serving `serving` admits whose grids the
+    /// deployment fixes: one per distinct set of grids, each as a request of a served canvas
+    /// presents it. The text encoder's recorded walk encodes each beside the captured encodes, so
+    /// the stream region it claims holds the eager vision encode as well.
+    ///
+    /// Empty for a deployment whose tasks present no vision block.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `serving` states a size the pipeline does not serve, or when a task presents
+    /// vision blocks and the checkpoint states no rule to size them.
+    fn warm_prompts(&self, serving: &VideoServing) -> Result<Vec<WarmPrompt>>;
 
     /// What the placed denoiser serves under `serving`, as the deployment's request processing
     /// plans requests against it.

@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use nn::capability::{Decoder, Encoder, MediaFormat, WarmRequest};
+use nn::capability::{Decoder, Encoder, ImageShape, MediaFormat, WarmPrompt, WarmRequest};
 use nn::family::{
     ConditionBounds, Description, Family, VideoCheckpoint, VideoFamily, VideoModel, VideoPlacement,
     VideoServing,
@@ -22,6 +22,7 @@ use crate::config::{AttentionKind, Canvas, NAMED_CANVASES};
 use crate::load::MinimaxH3;
 use crate::output::VideoPostprocessor;
 use crate::partition::Ulysses;
+use crate::processing::plan::ProcessorConfig;
 use crate::{
     AUDIO_CHANNELS, AUDIO_HOP, AUDIO_SAMPLE_RATE, CANVAS_MULTIPLE, CLIP_FRAMES, CLIP_LATENTS,
     Component, Config, FPS, Partition, VideoTask,
@@ -310,6 +311,10 @@ impl VideoModel for H3Pipeline {
         candidates(&self.tasks, serving, &ladder)
     }
 
+    fn warm_prompts(&self, serving: &VideoServing) -> nn::Result<Vec<WarmPrompt>> {
+        warm_prompts(&self.tasks, serving, self.config.processor.as_ref())
+    }
+
     fn description(&self, serving: &VideoServing) -> nn::Result<Description> {
         describe(self, serving)
     }
@@ -479,6 +484,60 @@ fn candidates(
         }
     }
     Ok(candidates)
+}
+
+/// The prompts with vision blocks a deployment admits whose grids the deployment fixes.
+///
+/// An `fl2va` keyframe is fitted to the generated canvas and enters the conditioner at the canvas's
+/// own size, which the processor resizes to its grid ([`ProcessorConfig::image_grid`], as the
+/// request processing's keyframe plan calls it), so a request of each served canvas presents one
+/// such grid per keyframe: one keyframe, or every anchor the task takes. A `t2va` prompt presents
+/// no vision block, and a `ref2va` reference presents a grid that follows the client's media rather
+/// than anything the deployment serves, so neither states a prompt here.
+fn warm_prompts(
+    tasks: &[VideoTask],
+    serving: &VideoServing,
+    processor: Option<&ProcessorConfig>,
+) -> nn::Result<Vec<WarmPrompt>> {
+    if !tasks.contains(&VideoTask::FirstLastToVideoAudio) {
+        return Ok(Vec::new());
+    }
+    let processor = processor.ok_or_else(|| {
+        nn::Error::Unsupported(
+            "the deployment serves fl2va and the checkpoint states no \
+             processor/video_preprocessor_config.json, so the vision grid a keyframe presents \
+             cannot be sized"
+                .to_owned(),
+        )
+    })?;
+
+    let (first_frames, last_frames, _) = task_conditions(VideoTask::FirstLastToVideoAudio);
+    let mut prompts: Vec<WarmPrompt> = Vec::new();
+    for canvas in deployment_canvases(&serving.sizes)? {
+        let grid = processor
+            .image_grid(canvas.height, canvas.width)
+            .map_err(|error| {
+                nn::Error::Unsupported(format!(
+                    "a keyframe of the {}x{} canvas: {error}",
+                    canvas.width, canvas.height
+                ))
+            })?;
+        let image = ImageShape {
+            grid: [grid.t, grid.h, grid.w],
+        };
+        // Each temporal step of a block presents one run of merged tokens.
+        let tokens = grid.t * processor.block_tokens(grid);
+        for keyframes in 1..=first_frames + last_frames {
+            let prompt = WarmPrompt {
+                images: vec![image; keyframes as usize],
+                tokens: tokens * keyframes,
+            };
+            if !prompts.contains(&prompt) {
+                prompts.push(prompt);
+            }
+        }
+    }
+    Ok(prompts)
 }
 
 /// `seconds` at the model's frame rate, rounded.
@@ -678,6 +737,56 @@ mod tests {
         assert!(
             message.contains("1000x1000") && message.contains("1344x768"),
             "{message}"
+        );
+    }
+
+    /// An `fl2va` deployment admits, per served canvas, a prompt of one keyframe and one of both
+    /// anchors, each keyframe at the processor's grid of the canvas; a `t2va` one admits none.
+    #[test]
+    fn a_keyframe_presents_the_grid_of_its_canvas() {
+        // The released processor: 16-pixel patches merged 2x2, an image budget of 64Ki to 16Mi
+        // pixels.
+        let processor = ProcessorConfig::parse(
+            r#"{"patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
+                "size": {"shortest_edge": 65536, "longest_edge": 16777216}}"#,
+            r#"{"patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
+                "size": {"shortest_edge": 4096, "longest_edge": 25165824}}"#,
+        )
+        .expect("the released processor");
+        let serving = VideoServing {
+            sizes: vec![(1344, 768)],
+            max_seconds: 4.0,
+            text_capacities: vec![2048],
+            condition_rows: None,
+        };
+
+        // 768x1344 pixels are 48x84 patches of one temporal step, which merge to 1008 tokens.
+        let keyframe = ImageShape { grid: [1, 48, 84] };
+        assert_eq!(
+            warm_prompts(
+                &[VideoTask::FirstLastToVideoAudio],
+                &serving,
+                Some(&processor)
+            )
+            .expect("an fl2va deployment's prompts"),
+            vec![
+                WarmPrompt {
+                    images: vec![keyframe],
+                    tokens: 1008,
+                },
+                WarmPrompt {
+                    images: vec![keyframe, keyframe],
+                    tokens: 2016,
+                },
+            ]
+        );
+        assert_eq!(
+            warm_prompts(&[VideoTask::TextToVideoAudio], &serving, None).expect("no vision"),
+            Vec::new()
+        );
+        assert!(
+            warm_prompts(&[VideoTask::FirstLastToVideoAudio], &serving, None).is_err(),
+            "an fl2va deployment cannot size a keyframe without the processor"
         );
     }
 }
