@@ -1097,6 +1097,9 @@ impl Recorder {
     /// which is what makes this the set to compare against the mechanism's
     /// queues. (The `announced_*` sets below are cumulative: they answer "was
     /// this ever shown", which is the victim rules' question, not this one.)
+    ///
+    /// Its one reader is the debug builds' synchronization check.
+    #[cfg(debug_assertions)]
     pub(crate) fn known(&self) -> impl Iterator<Item = RequestId> + '_ {
         self.told.keys().copied()
     }
