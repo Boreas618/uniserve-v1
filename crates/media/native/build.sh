@@ -9,7 +9,7 @@
 #
 # PREFIX is the directory the runtime is installed into, which a build then
 # names with UNISERVE_FFMPEG_DIR. The build is idempotent: an existing PREFIX
-# with both libraries is left alone.
+# with both libraries is not rebuilt, only made relocatable, and needs no source.
 #
 # Requirements: gcc, make, pkg-config, zlib and the FFmpeg 8.1.2 source tree
 # FFMPEG_SOURCE names. The x264 tarball is pinned by its SHA-256; if upstream's master archive has
@@ -19,7 +19,8 @@ set -euo pipefail
 
 PREFIX=${1:?usage: build.sh <PREFIX>, the directory the runtime is installed into}
 JOBS=${JOBS:-$(nproc)}
-FFMPEG_SOURCE=${FFMPEG_SOURCE:?names the FFmpeg 8.1.2 source tree}
+# Only a prefix without FFmpeg needs the source; an existing one is made relocatable below.
+FFMPEG_SOURCE=${FFMPEG_SOURCE:-}
 
 # The x264 master archive the provisioned runtime was built from, x264 build
 # 165 (point version 0.165.x).
@@ -46,8 +47,8 @@ if [ ! -f "$PREFIX/lib/libavcodec.so" ] || [ ! -f "$PREFIX/lib/libx264.so" ]; th
 
   if [ ! -f "$PREFIX/lib/libavcodec.so" ]; then
     echo "building FFmpeg 8.1.2 with libx264 into $PREFIX"
-    if [ ! -d "$FFMPEG_SOURCE" ]; then
-      echo "FFmpeg 8.1.2 source not found at $FFMPEG_SOURCE" >&2
+    if [ -z "$FFMPEG_SOURCE" ] || [ ! -d "$FFMPEG_SOURCE" ]; then
+      echo "FFMPEG_SOURCE names the FFmpeg 8.1.2 source tree; none is at \"$FFMPEG_SOURCE\"" >&2
       exit 1
     fi
     cp -a "$FFMPEG_SOURCE" "$build/ffmpeg"

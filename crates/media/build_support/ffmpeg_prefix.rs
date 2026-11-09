@@ -4,8 +4,8 @@
 // `crates/media` compiles the C shim over FFmpeg's headers and links the `libav*` shared
 // libraries; the package that produces an executable must also record where those libraries live,
 // because Cargo passes a dependency's `rustc-link-search` and `rustc-link-lib` on to dependents
-// but not its `rustc-link-arg`. Both build scripts therefore `include!` this file, so the rule has
-// one statement rather than two copies.
+// but not its `rustc-link-arg` (`run_path.rs`). Every such build script therefore `include!`s this
+// file, so the rule has one statement rather than copies.
 //
 // `UNISERVE_FFMPEG_DIR` names the installation's prefix; a build without it stops and says so.
 
