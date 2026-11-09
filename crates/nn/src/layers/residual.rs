@@ -238,16 +238,16 @@ impl Default for Residual {
     }
 }
 
-/// The two-coefficient update `y ← β · y + α · x`, in place on `y`.
+/// The two-coefficient update `inout ← β · inout + α · x`, in place on `inout`.
 ///
 /// A diffusion solver's arithmetic: an Euler step is `α = σ_next − σ`, `β = 1`; a rescale is
 /// `α = 0`. Both coefficients are host values, so a captured graph stays valid, and the two
 /// operands' element types may differ on purpose — a BF16 trajectory stepped by an FP32 velocity.
-/// The products and the sum are FP32 and round once into `y`'s element type.
+/// The products and the sum are FP32 and round once into `inout`'s element type.
 pub struct Axpby;
 
 impl Axpby {
-    /// `y ← β · y + α · x` over two `[rows, columns]` views of one shape.
+    /// `inout ← β · inout + α · x` over two `[rows, columns]` views of one shape.
     ///
     /// # Errors
     ///
@@ -255,24 +255,24 @@ impl Axpby {
     pub fn forward(
         &self,
         f: &Forward,
-        y: TensorView,
+        inout: TensorView,
         x: TensorView,
         alpha: f32,
         beta: f32,
     ) -> Result<()> {
-        if y.shape.rank() != 2 || y.shape != x.shape {
+        if inout.shape.rank() != 2 || inout.shape != x.shape {
             return Err(Error::shape(
                 "Axpby",
-                format!("{:?} with {:?}", y.shape.dims(), x.shape.dims()),
+                format!("{:?} with {:?}", inout.shape.dims(), x.shape.dims()),
             ));
         }
         let descriptor = residual::ScaledAddDescriptor {
-            target: y.dtype,
+            target: inout.dtype,
             source: x.dtype,
             block: BLOCK,
         };
         let args = residual::ScaledAddArgs {
-            target: y,
+            target: inout,
             source: x,
             alpha,
             beta,

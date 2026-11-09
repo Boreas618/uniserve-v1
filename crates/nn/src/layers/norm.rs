@@ -223,8 +223,12 @@ impl RmsNorm {
     /// # Errors
     ///
     /// When the checkpoint lacks the weight or holds another width.
-    pub fn load(scope: &mut Scope<'_, '_>, width: u64, eps: f32) -> Result<Self> {
-        Self::new(scope.tensor("weight", &[width])?, eps, Epilogue::None)
+    pub fn load(scope: &mut Scope<'_, '_>, width: u32, eps: f32) -> Result<Self> {
+        Self::new(
+            scope.tensor("weight", &[u64::from(width)])?,
+            eps,
+            Epilogue::None,
+        )
     }
 
     /// The per-channel scale.
@@ -446,7 +450,8 @@ impl LayerNorm {
     /// # Errors
     ///
     /// When the checkpoint lacks either tensor or holds another width.
-    pub fn load(scope: &mut Scope<'_, '_>, width: u64, eps: f32) -> Result<Self> {
+    pub fn load(scope: &mut Scope<'_, '_>, width: u32, eps: f32) -> Result<Self> {
+        let width = u64::from(width);
         let weight = scope.tensor("weight", &[width])?;
         let bias = scope.tensor("bias", &[width])?;
         Self::new(weight, Some(bias), eps, Epilogue::None)
@@ -605,7 +610,7 @@ pub struct CausalPad {
 /// read the frame twice instead of three times: the statistics, then one pass that normalizes,
 /// activates and pads.
 pub struct GroupNorm {
-    groups: u64,
+    groups: u32,
     eps: f32,
     weight: Option<Weight>,
     bias: Option<Weight>,
@@ -620,7 +625,7 @@ impl GroupNorm {
     ///
     /// A weight without a bias or a bias without a weight, or no groups.
     pub fn new(
-        groups: u64,
+        groups: u32,
         eps: f32,
         weight: Option<Weight>,
         bias: Option<Weight>,
@@ -699,7 +704,7 @@ impl GroupNorm {
         // Both launches take the same reduction: `channels_per_group · pixels`, padded to the power
         // of two the compiled program is bounded by.
         let pixels = values.shape.dim(3) * values.shape.dim(4);
-        let reduction = frame::frame_reduction_class(channels / self.groups, pixels);
+        let reduction = frame::frame_reduction_class(channels / u64::from(self.groups), pixels);
 
         f.operate::<FrameMoments>(
             &frame::FrameMomentsDescriptor {
@@ -711,7 +716,7 @@ impl GroupNorm {
                 values,
                 mean,
                 rstd,
-                groups: self.groups,
+                groups: u64::from(self.groups),
             },
         )?;
         f.operate::<FrameNormPad>(
@@ -731,7 +736,7 @@ impl GroupNorm {
                 weight: self.weight.as_ref().map(Weight::view),
                 bias: self.bias.as_ref().map(Weight::view),
                 out,
-                groups: self.groups,
+                groups: u64::from(self.groups),
                 top: self.pad.top,
                 left: self.pad.left,
                 front: self.pad.front,

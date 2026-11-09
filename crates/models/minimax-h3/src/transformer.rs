@@ -804,7 +804,11 @@ impl Transformer {
                 Parallel::None,
             )?),
             layers,
-            norm_out: RmsNorm::load(&mut loader.scope("norm_out.norm"), hidden, config.norm_eps)?,
+            norm_out: RmsNorm::load(
+                &mut loader.scope("norm_out.norm"),
+                config.hidden_size,
+                config.norm_eps,
+            )?,
             // A student's checkpoint holds the stacked interval heads, so the plain projection is
             // read only when the partition has one head.
             video_out: match heads {

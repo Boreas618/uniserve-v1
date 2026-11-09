@@ -93,7 +93,6 @@ pub fn load(
         rank: partition.expert_rank,
     };
 
-    let hidden = u64::from(config.hidden_size);
     let head_dim = u64::from(config.head_dim);
     let q_heads = partition.local_attention_heads(&config);
     let kv_heads = partition.local_key_value_heads(&config);
@@ -118,7 +117,11 @@ pub fn load(
         )?
     };
 
-    let norm = RmsNorm::load(&mut loader.scope("model.norm"), hidden, config.rms_norm_eps)?;
+    let norm = RmsNorm::load(
+        &mut loader.scope("model.norm"),
+        config.hidden_size,
+        config.rms_norm_eps,
+    )?;
 
     // The rotary recipe: one frequency table and the score multiplier the recipe adds.
     let (frequencies, score_scale) = rotary_recipe(&config)?;
@@ -132,9 +135,13 @@ pub fn load(
     for layer in 0..config.num_hidden_layers {
         let mut scope = loader.scope(format!("model.layers.{layer}"));
         let eps = config.rms_norm_eps;
-        let input_norm = RmsNorm::load(&mut scope.scope("input_layernorm"), hidden, eps)?;
-        let post_attention_norm =
-            RmsNorm::load(&mut scope.scope("post_attention_layernorm"), hidden, eps)?;
+        let input_norm =
+            RmsNorm::load(&mut scope.scope("input_layernorm"), config.hidden_size, eps)?;
+        let post_attention_norm = RmsNorm::load(
+            &mut scope.scope("post_attention_layernorm"),
+            config.hidden_size,
+            eps,
+        )?;
 
         let mut attention = scope.scope("self_attn");
         let bias = if config.attention_bias {

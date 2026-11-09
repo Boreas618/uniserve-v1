@@ -456,18 +456,10 @@ impl Block {
             Parallel::None,
         )?;
         Ok(Self {
-            input_norm: LayerNorm::load(
-                &mut scope.scope("norm1"),
-                u64::from(hidden),
-                LAYER_NORM_EPS,
-            )?,
+            input_norm: LayerNorm::load(&mut scope.scope("norm1"), hidden, LAYER_NORM_EPS)?,
             qkv,
             output,
-            output_norm: LayerNorm::load(
-                &mut scope.scope("norm2"),
-                u64::from(hidden),
-                LAYER_NORM_EPS,
-            )?,
+            output_norm: LayerNorm::load(&mut scope.scope("norm2"), hidden, LAYER_NORM_EPS)?,
             first,
             second,
         })
@@ -582,11 +574,7 @@ impl Merger {
             config.hidden_size
         };
         Ok(Self {
-            norm: LayerNorm::load(
-                &mut scope.scope("norm"),
-                u64::from(norm_width),
-                LAYER_NORM_EPS,
-            )?,
+            norm: LayerNorm::load(&mut scope.scope("norm"), norm_width, LAYER_NORM_EPS)?,
             first: Linear::load(
                 &mut scope.scope("linear_fc1"),
                 width,

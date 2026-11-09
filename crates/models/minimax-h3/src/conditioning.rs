@@ -79,7 +79,6 @@ impl RefinerBlock {
         loader: &mut WeightLoader<'_>,
     ) -> Result<Self> {
         let prefix = format!("token_refiner.refiner_blocks.{index}");
-        let hidden = u64::from(config.hidden_size);
         let inner = config.num_attention_heads * config.head_dim;
         let ffn = config.intermediate_size;
 
@@ -125,22 +124,22 @@ impl RefinerBlock {
             intermediate_size: config.intermediate_size,
             norm1: RmsNorm::load(
                 &mut loader.scope(format!("{prefix}.norm1")),
-                hidden,
+                config.hidden_size,
                 config.norm_eps,
             )?,
             norm2: RmsNorm::load(
                 &mut loader.scope(format!("{prefix}.norm2")),
-                hidden,
+                config.hidden_size,
                 config.norm_eps,
             )?,
             query_norm: RmsNorm::load(
                 &mut loader.scope(format!("{prefix}.attn.norm_q")),
-                u64::from(config.head_dim),
+                config.head_dim,
                 config.qk_norm_eps,
             )?,
             key_norm: RmsNorm::load(
                 &mut loader.scope(format!("{prefix}.attn.norm_k")),
-                u64::from(config.head_dim),
+                config.head_dim,
                 config.qk_norm_eps,
             )?,
             qkv,
@@ -246,7 +245,6 @@ impl TokenRefiner {
                 "an H3 denoiser's token refiner has at least one layer".to_owned(),
             ));
         }
-        let hidden = u64::from(config.hidden_size);
         let input = Linear::load(
             &mut loader.scope("context_embedder"),
             config.text_dim,
@@ -262,7 +260,7 @@ impl TokenRefiner {
             blocks,
             norm: RmsNorm::load(
                 &mut loader.scope("token_refiner.final_norm"),
-                hidden,
+                config.hidden_size,
                 config.norm_eps,
             )?,
             hidden_size: config.hidden_size,

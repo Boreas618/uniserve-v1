@@ -1003,7 +1003,7 @@ impl VideoEncoder {
             Ok(Normalized {
                 // One pixel on each spatial side and two zero frames in front.
                 norm: GroupNorm::new(
-                    u64::from(groups),
+                    groups,
                     epsilon,
                     Some(weight),
                     Some(bias),
@@ -2174,8 +2174,10 @@ impl Projection {
                 "{wide} latent channels over {heads} attention heads"
             )));
         }
-        let shortcut_norm = LayerNorm::load(&mut scope.scope("norm3"), wide, NORM_EPS)?;
-        let attention_norm = LayerNorm::load(&mut scope.scope("norm1"), wide, NORM_EPS)?;
+        let shortcut_norm =
+            LayerNorm::load(&mut scope.scope("norm3"), config.latent_dim, NORM_EPS)?;
+        let attention_norm =
+            LayerNorm::load(&mut scope.scope("norm1"), config.latent_dim, NORM_EPS)?;
         let mut shortcut = scope.scope("proj");
         let shortcut = Linear::new(
             shortcut.tensor("weight", &[channels, wide])?,
@@ -2219,7 +2221,8 @@ impl Projection {
             WeightOrder::NxK,
         )?;
         let pool = AdaptivePool::new(heads, wide / heads, channels)?;
-        let mlp_norm = LayerNorm::load(&mut scope.scope("norm2"), channels, NORM_EPS)?;
+        let mlp_norm =
+            LayerNorm::load(&mut scope.scope("norm2"), config.latent_channels, NORM_EPS)?;
         let mlp = GeGlu::load(config, &mut scope.scope("mlp"))?;
         Ok(Self {
             shortcut_norm,
@@ -2297,7 +2300,7 @@ impl GeGlu {
     fn load(config: &crate::AudioVaeConfig, scope: &mut Scope<'_, '_>) -> Result<Self> {
         let channels = u64::from(config.latent_channels);
         let hidden = 2 * channels;
-        let norm = LayerNorm::load(&mut scope.scope("norm"), channels, NORM_EPS)?;
+        let norm = LayerNorm::load(&mut scope.scope("norm"), config.latent_channels, NORM_EPS)?;
         let mut linear = |module: &str, out: u64, input: u64| -> Result<Linear> {
             let mut module = scope.scope(module);
             Ok(Linear::new(

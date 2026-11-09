@@ -375,7 +375,6 @@ impl Layer {
         split: Split,
         frequencies: Weight,
     ) -> Result<Self> {
-        let hidden = u64::from(config.hidden_size);
         let head_dim = u64::from(config.head_dim);
         let sections = sections_of(config)?;
         let mut attention = scope.scope("self_attn");
@@ -422,7 +421,7 @@ impl Layer {
         Ok(Self {
             input_norm: RmsNorm::load(
                 &mut scope.scope("input_layernorm"),
-                hidden,
+                config.hidden_size,
                 config.rms_norm_eps,
             )?,
             qkv,
@@ -443,7 +442,7 @@ impl Layer {
             .map_err(Error::from)?,
             post_norm: RmsNorm::load(
                 &mut scope.scope("post_attention_layernorm"),
-                hidden,
+                config.hidden_size,
                 config.rms_norm_eps,
             )?,
             gate,
