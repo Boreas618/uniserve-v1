@@ -33,7 +33,7 @@ use crate::batch::{Batch, BatchOutput, CallId, CallOutput, Job, Jobs, RowState};
 use crate::host::{HostAction, Lane, Outcome};
 use crate::plan::Variant;
 use crate::runner::{Binding, Runner, RunnerId};
-use crate::runners::products::{Product, Products};
+use crate::runners::products::{CONDITION_MEDIA, Product, Products};
 
 /// One request's conditions, as its media reading leaves them for the calls that read them.
 ///
@@ -937,7 +937,7 @@ impl MediaStage {
             * self.format.patch_dtype().bytes().ok_or_else(|| {
                 crate::Error::Invalid("a patch row has no whole-byte size".into())
             })?;
-        let float = ops::DType::F32
+        let float = CONDITION_MEDIA
             .bytes()
             .ok_or_else(|| crate::Error::Invalid("an FP32 has no whole-byte size".into()))?;
         Ok(ConditionRead {
@@ -966,11 +966,14 @@ impl MediaStage {
         let stream_id = crate::arena::StreamId(self.stream.raw());
         {
             let held = crate::lock(&regions);
+            let element = CONDITION_MEDIA.bytes().ok_or_else(|| {
+                crate::Error::Invalid("a condition element has no whole-byte size".into())
+            })?;
             let float = |buffer: &platform::PinnedBuffer| {
                 ops::TensorView::new(
                     ops::DevicePtr::new(buffer.address()),
-                    ops::DType::F32,
-                    ops::Shape::new(&[buffer.len() as u64 / 4]),
+                    CONDITION_MEDIA,
+                    ops::Shape::new(&[buffer.len() as u64 / element]),
                 )
             };
             let patch = |buffer: &platform::PinnedBuffer| -> Result<ops::TensorView> {

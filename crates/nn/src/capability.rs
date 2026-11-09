@@ -827,30 +827,6 @@ pub trait Denoiser {
     /// The latent layout this request needs.
     fn layout(&self, request: &VideoRequest<'_>) -> Layout;
 
-    /// The bytes this request's forward needs, as the model's own plan computes them.
-    ///
-    /// This is the one number a caller cannot derive and must not transcribe: it is the total of
-    /// the model's plan for the layout this request names, so a caller allocating from a literal
-    /// beside the plan holds a second statement of a value only the model owns. The plan is derived
-    /// here from `request` in the order the worker already uses - [`layout`](Self::layout) and
-    /// then the model's own plan - so a caller never has two ways to name the same plan.
-    ///
-    /// It is a pure function of the request: two requests with one layout answer the same bytes,
-    /// because the worker caches a capture by bucket and a plan that varied inside a layout would
-    /// be an allocation that fits one request and not the next. It allocates nothing and touches no
-    /// device: the model states what its forward needs and the runtime owner allocates to it.
-    ///
-    /// A request outside the deployment's bound - a canvas it does not serve, a row count past the
-    /// packed ladder - is refused by name, never answered with a number for a layout the forward
-    /// cannot run. A denoiser that states no plan refuses, as it does for a schedule it does not
-    /// have: a zero would be the same value as an arena of no bytes.
-    fn arena_bytes(&self, request: &VideoRequest<'_>) -> Result<u64> {
-        Err(Error::Unsupported(format!(
-            "a denoiser that states no arena plan for a layout of {:?}",
-            self.layout(request)
-        )))
-    }
-
     /// The denoising steps `request` runs, in order.
     ///
     /// The runner executes one step per call and cannot derive the schedule: it belongs to the
@@ -1126,33 +1102,6 @@ pub trait Decoder {
         ))
     }
 
-    /// The bytes one decode of `layout` needs, as the model's own plan computes them.
-    ///
-    /// The same contract as [`Denoiser::arena_bytes`], for the subject a decoder already has: it is
-    /// the total of the model's plan for the layout, a pure function of it - two clips of one layout
-    /// answer the same bytes, because the worker keys a capture and its arena by layout - and it
-    /// allocates nothing and touches no device.
-    ///
-    /// It takes a layout rather than a request because a decoder is handed a layout:
-    /// [`layout_of`](Self::layout_of) is how its runner got one, and
-    /// [`layout_tables`](Self::layout_tables) and [`prepare_layout`](Self::prepare_layout) take the
-    /// same subject in the same form.
-    ///
-    /// A layout this block cannot serve - a raster it does not decode to - is refused by name, never
-    /// answered with a number the decode would run past. A decoder that states no plan refuses, as it
-    /// does for a layout it cannot map: a zero would be the same value as an arena of no bytes.
-    fn arena_bytes(&self, layout: &Layout) -> Result<u64> {
-        // `Unsupported`, as [`Denoiser::arena_bytes`] answers, and not a shape error: a caller must
-        // be able to tell a block that states no plan from one that refuses the layout it was
-        // given. The first is a block the seam does not cover yet; the second is a deployment whose
-        // layout and block disagree, and a runner that swallowed both would report the second as the
-        // first.
-        Err(Error::Unsupported(format!(
-            "this decoder states no arena plan for a layout of {:?}",
-            layout.video
-        )))
-    }
-
     /// The interleaved PCM window one decode of `audio` writes: sample frames and channels.
     ///
     /// **A track's window is the model's to state, and the runner sizes a column from it.** The
@@ -1270,56 +1219,6 @@ mod tests {
             height,
             width,
         }
-    }
-
-    /// "This block states no plan" is `Unsupported`, and a refusal about a layout is not.
-    ///
-    /// A runner passes over `Unsupported` - the pool is then the only figure there is - and fails on
-    /// anything else, because a block that states a plan and refuses the layout it was handed is a
-    /// deployment whose block and layout disagree. Both being one variant would make the second
-    /// report as the first, which is the silent failure the arena plan exists to remove.
-    #[test]
-    fn a_block_that_states_no_arena_plan_says_unsupported() {
-        struct Silent;
-
-        impl Decoder for Silent {
-            fn layout_tables(&self, _layout: &Layout) -> Result<Vec<StateTable>> {
-                Ok(Vec::new())
-            }
-
-            fn prepare_layout(&self, _layout: &Layout, _out: &mut [Vec<u8>]) -> Result<()> {
-                Ok(())
-            }
-
-            fn element_type(&self) -> DType {
-                DType::F32
-            }
-
-            fn decode(
-                &self,
-                _f: &Forward,
-                _latents: TensorView,
-                _state: &[TensorView],
-                _out: DecodedMedia,
-            ) -> Result<()> {
-                Ok(())
-            }
-        }
-
-        let layout = Layout {
-            video: latent(16, 2, 3, 4),
-            audio: None,
-            text_rows: 0,
-            condition_rows: 0,
-            condition_elements: 0,
-        };
-        let error = Silent
-            .arena_bytes(&layout)
-            .expect_err("a block with no plan states nothing");
-        assert!(
-            matches!(error, Error::Unsupported(_)),
-            "a block with no plan is Unsupported, not a shape error: {error:?}"
-        );
     }
 
     /// The conditions' draw elements are the sum of their own unpacked latent shapes, which is

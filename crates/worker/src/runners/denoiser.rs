@@ -58,9 +58,9 @@ use crate::plan::{Bucket, Extent, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
 use crate::runners::diag::Diag;
-use crate::runners::floor;
 use crate::runners::lifecycle::{Lifecycle, walk_capture, warmed_capture};
 use crate::runners::products::{self, Product, Products};
+use crate::runners::recording::{Footprint, Walk};
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
 
@@ -78,8 +78,7 @@ pub struct DenoiserShape {
     ///
     /// **Two types, therefore two sizes.** A latent column sized at the stack's type is half the
     /// bytes the model reads, so a runner that held one type here would refuse every step with
-    /// "the video latents are bf16 and a trajectory is f32" and the arena floor would be short by the
-    /// trajectory's own size.
+    /// "the video latents are bf16 and a trajectory is f32".
     pub sample: DType,
     /// The width of the encoded conditioning rows: the text encoder's hidden width, which a layout
     /// counts rows of and states no width for.
@@ -401,6 +400,34 @@ struct Pending {
     stated: Arc<WarmRequest>,
 }
 
+/// What opening one request on this runner reads: its row of the columns, its seed, its stated
+/// request, its condition pieces and the regions their raw media lie in.
+///
+/// A replay builds it from a staged row and the product store; the recorded walk builds it from a
+/// bucket's warm request and placeholder regions of the same extents.
+struct Opening<'a> {
+    /// The row of the bucket's columns the request occupies.
+    index: u32,
+    /// The request's noise seed.
+    seed: nn::capability::Seed,
+    /// The request as its first step reads it.
+    stated: &'a WarmRequest,
+    /// The model's condition pieces of `stated`, in the order it packs them.
+    pieces: &'a [nn::capability::ConditionPiece],
+    /// `[elements]` the pixels of every condition, conditions in request order.
+    pixels: Option<TensorView>,
+    /// `[elements]` the soundtrack samples of every condition, conditions in request order.
+    samples: Option<TensorView>,
+    /// Whether a latent preparation restored the request's trajectory: it then draws no noise and
+    /// starts no schedule.
+    restored: bool,
+}
+
+/// The elements of a piece's extents.
+fn elements(extents: &[u64]) -> u64 {
+    extents.iter().product::<u64>()
+}
+
 /// The request a staged row states, within the bucket `warm` plans.
 ///
 /// A graph is captured for a bucket's capacity, and a request's state tables say how much of that
@@ -685,27 +712,6 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
     pub fn schedule(&self, bucket: Bucket) -> Result<Vec<Step>> {
         let plan = self.plan_of(bucket)?;
         self.model.schedule(&plan.warm.view()).map_err(Error::from)
-    }
-
-    /// Claims the arena the largest bucket's evaluation plans.
-    fn claim(&mut self) -> Result<()> {
-        let plans = self.buckets.clone();
-        let mut needed = 0;
-        for plan in &plans {
-            needed = needed.max(
-                floor::checked(
-                    plan.bucket,
-                    self.model.arena_bytes(&plan.warm.view()),
-                    u64::MAX,
-                )?
-                .unwrap_or(0),
-            );
-        }
-        if needed > 0 {
-            let stream = self.stream_id();
-            self.pool()?.claim(stream, needed)?;
-        }
-        Ok(())
     }
 
     fn stream_id(&self) -> StreamId {
@@ -1048,50 +1054,21 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             .tables
             .views(self.lifecycle.generation.number(), &key, &tables)?;
         for row in &self.pending {
-            let latents = self.latents(bucket, row.index)?;
-            // The raw media a conditioner encodes, each visual piece with its anchoring draw: the
-            // request's first step is the one forward that reads them.
-            let media = self.media_of(row, &forward)?;
-            let cond = self.conditioning(bucket, row.index, &state, &media)?;
-            // The stream's first elements are the conditions' draws, so the trajectory's offsets
-            // are the request's own and not the warm request's the bucket was captured from.
-            let drawn = Layout {
-                condition_elements: self.model.layout(&row.stated.view()).condition_elements,
-                ..layout
+            let pieces = self
+                .model
+                .condition_pieces(&row.stated.view())
+                .map_err(Error::from)?;
+            let (pixels, samples) = self.regions(row, &pieces)?;
+            let opening = Opening {
+                index: row.index,
+                seed: row.seed,
+                stated: &row.stated,
+                pieces: &pieces,
+                pixels,
+                samples,
+                restored: restored.is_some(),
             };
-            if restored.is_none() {
-                self.model.draw_noise(&forward, row.seed, drawn, latents)?;
-            }
-            // **The conditioner, eager and once per request, outside the graph.** `text` holds the
-            // encoder's rows as `seed` copied them; this folds `source` into it in place, so every
-            // replay of the bucket reads rows refined for its own request. It is not a graph node
-            // because a graph replays once per *step* while this runs once per *request* - a
-            // refinement inside the captured graph would compound over the schedule, and `text` is
-            // written in place.
-            if let Some(source) = cond.source {
-                self.dump("conditioner", "source", source);
-            }
-            self.model.prepare_conditioning(&forward, cond)?;
-            self.dump("conditioner", "text", cond.text);
-            for (index, piece) in media.iter().enumerate() {
-                if let Some(pixels) = piece.pixels {
-                    self.dump("media", &format!("pixels_{index}"), pixels);
-                }
-                if let Some(audio) = piece.audio {
-                    self.dump("media", &format!("samples_{index}"), audio);
-                }
-                if let Some(noise) = piece.noise {
-                    self.dump("media", &format!("draw_{index}"), noise);
-                }
-            }
-            if self.diag.enabled() {
-                for (table, view) in tables.iter().zip(state.iter()) {
-                    self.dump("state", table.name, *view);
-                }
-            }
-            if restored.is_none() {
-                self.model.prepare_latents(&forward, cond, latents)?;
-            }
+            self.open(&forward, bucket, &opening, &state)?;
         }
         self.opened = Some((request, bucket));
         self.restored = None;
@@ -1295,23 +1272,15 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         Ok(())
     }
 
-    /// The raw media of `row`'s conditions, in the order the model packs them.
-    ///
-    /// The media reader left each kind in one region, conditions in request order, so a piece's
-    /// place in its region is the sum of the extents of the conditions before it. Those extents are
-    /// the model's statement ([`nn::capability::ConditionPiece`]), and the two regions are read in
-    /// place: a condition is read once, by this forward.
-    fn media_of(
+    /// The condition media regions `row`'s pieces read, as the media reader published them: the
+    /// pixels and the soundtrack samples of every condition, each kind in one region.
+    fn regions(
         &self,
         row: &Pending,
-        forward: &nn::Forward<'_>,
-    ) -> Result<Vec<nn::capability::MediaInput>> {
-        let pieces = self
-            .model
-            .condition_pieces(&row.stated.view())
-            .map_err(Error::from)?;
+        pieces: &[nn::capability::ConditionPiece],
+    ) -> Result<(Option<TensorView>, Option<TensorView>)> {
         if pieces.is_empty() {
-            return Ok(Vec::new());
+            return Ok((None, None));
         }
         let products = self
             .products
@@ -1334,8 +1303,26 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             Product::ConditionSamples,
             pieces.iter().any(|piece| piece.track.is_some()),
         )?;
-        let mut offsets = vec![(0_u64, 0_u64); row.stated.conditions.len()];
-        let elements = |extents: &[u64]| extents.iter().product::<u64>();
+        Ok((pixels, samples))
+    }
+
+    /// The raw media of a request's conditions, in the order the model packs them, with each
+    /// visual piece's anchoring draw reserved in `forward`'s arena and drawn there.
+    ///
+    /// The media reader left each kind in one region, conditions in request order, so a piece's
+    /// place in its region is the sum of the extents of the conditions before it. Those extents are
+    /// the model's statement ([`nn::capability::ConditionPiece`]), and the two regions are read in
+    /// place: a condition is read once, by this forward.
+    fn media(
+        &self,
+        forward: &nn::Forward<'_>,
+        opening: &Opening<'_>,
+    ) -> Result<Vec<nn::capability::MediaInput>> {
+        let pieces = opening.pieces;
+        if pieces.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut offsets = vec![(0_u64, 0_u64); opening.stated.conditions.len()];
         let mut ordered: Vec<&nn::capability::ConditionPiece> = pieces.iter().collect();
         ordered.sort_by_key(|piece| piece.condition);
         let (mut pixel_at, mut sample_at) = (0_u64, 0_u64);
@@ -1346,17 +1333,16 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         }
         let view = |source: Option<TensorView>, at: u64, shape: &[u64]| -> Result<TensorView> {
             let source = source.ok_or_else(|| {
-                Error::Invalid(format!(
-                    "request {} states a piece the media reader left no region for",
-                    row.request.request_id.0
-                ))
+                Error::Invalid(
+                    "a request states a condition piece the media reader left no region for".into(),
+                )
             })?;
             Ok(source
                 .at(source.offset_elements(at))
                 .reshape(Shape::new(shape)))
         };
         let mut media = Vec::with_capacity(pieces.len());
-        for piece in &pieces {
+        for piece in pieces {
             let (pixel_at, sample_at) = offsets[piece.condition as usize];
             let noise = match piece.draw {
                 Some(draw) => {
@@ -1364,7 +1350,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
                         .arena()
                         .tensor(self.shape.sample, latent_shape(&draw))?;
                     self.model
-                        .draw_condition_noise(forward, row.seed, piece, view)
+                        .draw_condition_noise(forward, opening.seed, piece, view)
                         .map_err(Error::from)?;
                     Some(view)
                 }
@@ -1377,17 +1363,143 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
                 pixels: piece
                     .pixels
                     .as_ref()
-                    .map(|shape| view(pixels, pixel_at, shape))
+                    .map(|shape| view(opening.pixels, pixel_at, shape))
                     .transpose()?,
                 audio: piece
                     .track
                     .as_ref()
-                    .map(|shape| view(samples, sample_at, shape))
+                    .map(|shape| view(opening.samples, sample_at, shape))
                     .transpose()?,
                 noise,
             });
         }
         Ok(media)
+    }
+
+    /// Opens one request on this runner, eagerly on `forward`: its condition draws, its noise, its
+    /// conditioner (the conditioning encode of its condition media included) and its schedule's
+    /// start, in that order (see [`Self::first_step`]).
+    ///
+    /// The replay that opens a request and the recorded walk both run this, so the forwards a
+    /// request's opening launches are the ones the walk records. The diagnosis dumps read the
+    /// device and are skipped on a recording forward.
+    fn open(
+        &self,
+        forward: &nn::Forward<'_>,
+        bucket: Bucket,
+        opening: &Opening<'_>,
+        state: &[TensorView],
+    ) -> Result<()> {
+        let dump = |block: &str, name: &str, view: TensorView| {
+            if !forward.is_recording() {
+                self.dump(block, name, view);
+            }
+        };
+        let layout = layout_of(bucket)?;
+        let latents = self.latents(bucket, opening.index)?;
+        // The raw media a conditioner encodes, each visual piece with its anchoring draw: the
+        // request's first step is the one forward that reads them.
+        let media = self.media(forward, opening)?;
+        let cond = self.conditioning(bucket, opening.index, state, &media)?;
+        // The stream's first elements are the conditions' draws, so the trajectory's offsets
+        // are the request's own and not the warm request's the bucket was captured from.
+        let drawn = Layout {
+            condition_elements: self.model.layout(&opening.stated.view()).condition_elements,
+            ..layout
+        };
+        if !opening.restored {
+            self.model
+                .draw_noise(forward, opening.seed, drawn, latents)?;
+        }
+        // **The conditioner, eager and once per request, outside the graph.** `text` holds the
+        // encoder's rows as `seed` copied them; this folds `source` into it in place, so every
+        // replay of the bucket reads rows refined for its own request. It is not a graph node
+        // because a graph replays once per *step* while this runs once per *request* - a
+        // refinement inside the captured graph would compound over the schedule, and `text` is
+        // written in place.
+        if let Some(source) = cond.source {
+            dump("conditioner", "source", source);
+        }
+        self.model.prepare_conditioning(forward, cond)?;
+        dump("conditioner", "text", cond.text);
+        for (index, piece) in media.iter().enumerate() {
+            if let Some(pixels) = piece.pixels {
+                dump("media", &format!("pixels_{index}"), pixels);
+            }
+            if let Some(audio) = piece.audio {
+                dump("media", &format!("samples_{index}"), audio);
+            }
+            if let Some(noise) = piece.noise {
+                dump("media", &format!("draw_{index}"), noise);
+            }
+        }
+        if self.diag.enabled() && !forward.is_recording() {
+            let tables = self.model.state_tables(&layout);
+            for (table, view) in tables.iter().zip(state.iter()) {
+                self.dump("state", table.name, *view);
+            }
+        }
+        if !opening.restored {
+            self.model.prepare_latents(forward, cond, latents)?;
+        }
+        Ok(())
+    }
+
+    /// Opens `bucket`'s warm request and walks the step its graph captures, on recording forwards
+    /// of `walk` ([`Runner::record_walk`]).
+    ///
+    /// The opening and the step each start at the stream region's first address, as the replay's
+    /// eager opening and the captured graph do. The state tables and the condition media regions
+    /// are placeholders of the extents the request's own would have; the warm request states the
+    /// bucket's conditions, so the conditioning encode a request of the bucket runs is walked too.
+    fn walk_recorded(&self, walk: &Walk, bucket: Bucket) -> Result<()> {
+        let warm = &self.plan_of(bucket)?.warm;
+        let layout = layout_of(bucket)?;
+        let state = walk.tables(&self.model.state_tables(&layout))?;
+        let group = self.group.as_deref();
+        let pieces = self
+            .model
+            .condition_pieces(&warm.view())
+            .map_err(Error::from)?;
+        // The media reader's regions hold every condition's pixels, then every condition's samples,
+        // in its own element type.
+        let region = |extents: Vec<u64>| -> Result<Option<TensorView>> {
+            match extents.iter().sum::<u64>() {
+                0 => Ok(None),
+                total => walk
+                    .placeholder(products::CONDITION_MEDIA, Shape::new(&[total]))
+                    .map(Some),
+            }
+        };
+        let pixels = region(
+            pieces
+                .iter()
+                .filter_map(|piece| piece.pixels.as_ref().map(|shape| elements(shape)))
+                .collect(),
+        )?;
+        let samples = region(
+            pieces
+                .iter()
+                .filter_map(|piece| piece.track.as_ref().map(|shape| elements(shape)))
+                .collect(),
+        )?;
+        let opening = Opening {
+            index: 0,
+            seed: nn::capability::Seed(0),
+            stated: warm,
+            pieces: &pieces,
+            pixels,
+            samples,
+            restored: false,
+        };
+        self.open(&walk.forward(group)?, bucket, &opening, &state)?;
+        walk.arena().reset();
+        let step = self
+            .schedule(bucket)?
+            .first()
+            .copied()
+            .ok_or_else(|| self.no_step(bucket))?;
+        self.step(&walk.forward(group)?, bucket, step, &state)
     }
 
     /// Writes the pending request's own state tables over the ones the capture read.
@@ -1639,22 +1751,27 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         if self.constants_filled {
             return Ok(());
         }
+        let stream = self.stream.clone();
+        let base = self.pool()?.base(self.stream_id())?;
+        let reserved = self.pool()?.reserved_on(self.stream_id());
+        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
+        self.constants(&nn::Forward::new(&stream, kernels, &arena))?;
+        self.constants_filled = true;
+        Ok(())
+    }
+
+    /// Runs the model's constant fold on `forward`, at the stream region's first address: what
+    /// [`Self::fill_constants`] launches once per load and the recorded walk records.
+    fn constants(&self, forward: &nn::Forward<'_>) -> Result<()> {
         if !self.model.constant_tables().is_empty() {
             return Err(Error::Invalid(
                 "this model declares constant tables, and this runner holds no storage for them"
                     .into(),
             ));
         }
-        let stream = self.stream.clone();
-        let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved_on(self.stream_id());
-        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
-        let forward = nn::Forward::new(&stream, kernels, &arena);
         self.model
-            .prepare_constants(&forward, &[])
-            .map_err(Error::from)?;
-        self.constants_filled = true;
-        Ok(())
+            .prepare_constants(forward, &[])
+            .map_err(Error::from)
     }
 
     /// Writes the staged step's index into the `step` state table a replay reads.
@@ -1714,11 +1831,24 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             .get(index as usize)
             .copied()
             .ok_or_else(|| self.no_step(bucket))?;
+        self.step(&forward, bucket, step, &state)
+    }
+
+    /// One step of request zero of `bucket` on `forward`, over the layout's state tables `state`:
+    /// the model call a capture walk records, the diagnosis' eager step runs, and the recorded walk
+    /// records.
+    fn step(
+        &self,
+        forward: &nn::Forward<'_>,
+        bucket: Bucket,
+        step: Step,
+        state: &[TensorView],
+    ) -> Result<()> {
         let media: [nn::capability::MediaInput; 0] = [];
         let latents = self.latents(bucket, 0)?;
-        let cond = self.conditioning(bucket, 0, &state, &media)?;
+        let cond = self.conditioning(bucket, 0, state, &media)?;
         self.model
-            .denoise(&forward, step, latents, cond)
+            .denoise(forward, step, latents, cond)
             .map_err(Error::from)
     }
 
@@ -1755,12 +1885,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             .first()
             .copied()
             .ok_or_else(|| self.no_step(bucket))?;
-        let media: [nn::capability::MediaInput; 0] = [];
-        let latents = self.latents(bucket, 0)?;
-        let cond = self.conditioning(bucket, 0, &state, &media)?;
-        self.model
-            .denoise(&forward, step, latents, cond)
-            .map_err(Error::from)?;
+        self.step(&forward, bucket, step, &state)?;
         if first {
             self.pool()?
                 .record(self.stream_id(), bucket, arena.peak())?;
@@ -1976,8 +2101,15 @@ impl<M: Denoiser + Send + Sync + ?Sized> Runner for DenoiserRunner<M> {
         self.pools = Some(pools);
     }
 
-    fn claim_arena(&mut self) -> Result<()> {
-        self.claim()
+    /// The model's constants once, then for every bucket the opening of its warm request and the
+    /// step its graph captures.
+    fn record_walk(&mut self) -> Result<Footprint> {
+        let mut footprint = Footprint::default();
+        footprint.walk(None, |walk| self.constants(&walk.forward(None)?))?;
+        for bucket in self.capture_order() {
+            footprint.walk(Some(bucket), |walk| self.walk_recorded(walk, bucket))?;
+        }
+        Ok(footprint)
     }
 
     fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {

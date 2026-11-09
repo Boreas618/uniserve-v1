@@ -86,11 +86,19 @@ impl ModelRunner {
         // whole clip asked one decode call for a raster no decoder produces.
         let window = pipeline.decode_window();
         let mut decode_buckets: Vec<worker::plan::Bucket> = Vec::new();
+        // The timelines a request of each canvas may ask for: a clip's splice follows its timeline's
+        // schedule, so the decoder's recorded walk splices every clip of each of them.
+        let mut timelines: BTreeMap<worker::plan::Bucket, std::collections::BTreeSet<u32>> =
+            BTreeMap::new();
         for candidate in &candidates {
             let bucket = worker::plan::Bucket::clip(window, candidate.height, candidate.width);
             if !decode_buckets.contains(&bucket) {
                 decode_buckets.push(bucket);
             }
+            timelines
+                .entry(bucket)
+                .or_default()
+                .insert(candidate.frames);
         }
         let hidden = pipeline.text_width();
         let text = pipeline.text_encoder().context(
@@ -248,7 +256,8 @@ impl ModelRunner {
             // The video decoder's second entry point. A pipeline that holds none serves a clip
             // rather than a timeline, and the runner then publishes the clip.
             pipeline.splicer(),
-        )?;
+        )?
+        .serving(timelines);
         let mut runners = vec![
             NamedRunner::new(RunnerId(0), Box::new(encoder)),
             NamedRunner::new(RunnerId(1), Box::new(denoise)),

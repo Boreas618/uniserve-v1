@@ -31,6 +31,7 @@
 //! this runner's stream, which also works when the denoiser ran on another device - and reads a
 //! batch buffer as the clip only when the store holds none.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use nn::capability::{Clip, DecodedMedia, Decoder, Layout};
@@ -44,6 +45,7 @@ use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
 use crate::runners::lifecycle::{Lifecycle, walk_capture, warmed_capture};
 use crate::runners::products::{Product, Products};
+use crate::runners::recording::{Footprint, Walk};
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
 
@@ -192,6 +194,9 @@ pub struct DecoderRunner<M: Decoder + Send + Sync + ?Sized> {
     staged_unit: u32,
     /// The units of `published_for`'s timeline this runner has published.
     published_units: u32,
+    /// The timelines, in frames, a request of each decode bucket's canvas may ask for: the splice
+    /// schedules the recorded walk splices. Empty without a postprocessor.
+    timelines: BTreeMap<Bucket, BTreeSet<u32>>,
 }
 
 /// Whether a decode of `request` may start while a clip published under `published` is still held.
@@ -301,7 +306,17 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
             staged_first: 0,
             staged_unit: 0,
             published_units: 0,
+            timelines: BTreeMap::new(),
         })
+    }
+
+    /// This runner with the timelines, in frames, a request of each decode bucket's canvas may ask
+    /// for: what a clip's splice depends on beyond its bucket, so the recorded walk splices every
+    /// clip of every timeline the deployment serves.
+    #[must_use]
+    pub fn serving(mut self, timelines: BTreeMap<Bucket, BTreeSet<u32>>) -> Self {
+        self.timelines = timelines;
+        self
     }
 
     /// One decode bucket's latent layout, from the model's map.
@@ -358,26 +373,6 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
     /// another's.
     fn key(bucket: Bucket) -> String {
         format!("decode-{:?}-{}", bucket.extent, bucket.rows)
-    }
-
-    /// Claims the arena the largest bucket's decode plans.
-    fn claim(&mut self) -> Result<()> {
-        let mut needed = 0;
-        for bucket in self.capture_order() {
-            let layout = Self::layout_of(&self.model, bucket)?;
-            // One rule for both media runners, so the two cannot read an absent plan and a refused
-            // one differently: `floor::checked` passes over a decoder that states no plan and refuses
-            // any other answer by name.
-            needed = needed.max(
-                super::floor::checked(bucket, self.model.arena_bytes(&layout), u64::MAX)?
-                    .unwrap_or(0),
-            );
-        }
-        if needed > 0 {
-            let stream = self.stream_id();
-            self.pool()?.claim(stream, needed)?;
-        }
-        Ok(())
     }
 
     /// The bytes `bucket`'s tables need, as the plan books them before admission (4.3).
@@ -676,7 +671,6 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
         let reserved = self.pool()?.reserved();
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let forward = nn::Forward::new(&stream, &kernels, &arena);
-        let layout = self.layout(bucket)?;
         let column = self
             .trajectory
             .as_ref()
@@ -686,9 +680,22 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
             self.latent,
             Shape::new(&[self.trajectory_elements]),
         );
+        self.gather(&forward, bucket, trajectory, first)
+    }
+
+    /// Gathers the clip starting at latent frame `first` of `trajectory` into the latents column:
+    /// the model call a replay makes before its graph launches, and the recorded walk records.
+    fn gather(
+        &self,
+        forward: &nn::Forward<'_>,
+        bucket: Bucket,
+        trajectory: TensorView,
+        first: u32,
+    ) -> Result<()> {
+        let layout = self.layout(bucket)?;
         let block = self.latents(&layout)?;
         self.model
-            .gather_latents(&forward, &layout, trajectory, first, block)
+            .gather_latents(forward, &layout, trajectory, first, block)
             .map_err(Error::from)
     }
 
@@ -719,6 +726,15 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
 
     /// The raster this runner's replay writes, `[channels, frames, rows, columns]`.
     fn raster(&self, bucket: Bucket) -> Result<TensorView> {
+        Ok(TensorView::new(
+            self.columns.raster.device.ptr,
+            self.dtype,
+            self.raster_shape(bucket)?,
+        ))
+    }
+
+    /// `[channels, frames, rows, columns]` of `bucket`'s raster.
+    fn raster_shape(&self, bucket: Bucket) -> Result<Shape> {
         let Extent::Clip {
             frames,
             height,
@@ -729,16 +745,12 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
                 "bucket {bucket} is not a decode bucket"
             )));
         };
-        Ok(TensorView::new(
-            self.columns.raster.device.ptr,
-            self.dtype,
-            Shape::new(&[
-                u64::from(RASTER_CHANNELS),
-                u64::from(frames),
-                u64::from(height),
-                u64::from(width),
-            ]),
-        ))
+        Ok(Shape::new(&[
+            u64::from(RASTER_CHANNELS),
+            u64::from(frames),
+            u64::from(height),
+            u64::from(width),
+        ]))
     }
 
     /// Publishes the clip a replay just wrote, so the transport can read it by the request's name.
@@ -811,13 +823,30 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
         let state = self
             .tables
             .views(self.lifecycle.generation.number(), &key, &tables)?;
-        let latents = self.latents(&layout)?;
         let raster = self.raster(bucket)?;
+        self.decode(&forward, &layout, &state, raster)?;
+        if first {
+            self.pool()?
+                .record(self.stream_id(), bucket, arena.peak())?;
+        }
+        Ok(())
+    }
+
+    /// Decodes the staged clip of `layout` into `raster` on `forward`, over the layout's tables
+    /// `state`: the model call a capture walk records and the recorded walk records.
+    fn decode(
+        &self,
+        forward: &nn::Forward<'_>,
+        layout: &Layout,
+        state: &[TensorView],
+        raster: TensorView,
+    ) -> Result<()> {
+        let latents = self.latents(layout)?;
         self.model
             .decode(
-                &forward,
+                forward,
                 latents,
-                &state,
+                state,
                 DecodedMedia {
                     video: Some(raster),
                     // A video decoder writes frames; a bucket that states a clip states no audio, so
@@ -825,10 +854,80 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
                     audio: None,
                 },
             )
-            .map_err(Error::from)?;
-        if first {
-            self.pool()?
-                .record(self.stream_id(), bucket, arena.peak())?;
+            .map_err(Error::from)
+    }
+
+    /// Walks every forward a decode of `bucket` launches, on recording forwards of `walk`
+    /// ([`Runner::record_walk`]): the gather of a clip from its trajectory, the decode its graph
+    /// captures, and the splice of every clip of every timeline the bucket's canvas serves. Each
+    /// starts at the stream region's first address, as a replay's do.
+    ///
+    /// The gathered trajectory is one clip long: the gather's programs follow the clip and the
+    /// element type, not the trajectory's length. The columns a replay writes are placeholders of
+    /// their extents.
+    fn walk_recorded(&self, walk: &Walk, bucket: Bucket) -> Result<()> {
+        let layout = self.layout(bucket)?;
+        let block = self.latents(&layout)?;
+        let trajectory = walk.placeholder(self.latent, Shape::new(&[block.numel()]))?;
+        self.gather(
+            &walk.forward(None)?,
+            bucket,
+            trajectory,
+            self.model.clip_start(0),
+        )?;
+        walk.arena().reset();
+        let state = walk.tables(&self.model.layout_tables(&layout).map_err(Error::from)?)?;
+        let raster = self.raster_shape(bucket)?;
+        let raster = walk.placeholder(self.dtype, raster)?;
+        self.decode(&walk.forward(None)?, &layout, &state, raster)?;
+        let Some(postprocessor) = self.postprocessor.as_deref() else {
+            return Ok(());
+        };
+        let Extent::Clip { height, width, .. } = bucket.extent else {
+            return Err(Error::Invariant(format!(
+                "bucket {bucket} is not a decode bucket"
+            )));
+        };
+        for frames in self.timelines.get(&bucket).into_iter().flatten() {
+            let schedule = postprocessor.splices(*frames).map_err(Error::from)?;
+            let clips = u32::try_from(schedule.len())
+                .map_err(|_| Error::Invalid("a timeline of more clips than a u32 counts".into()))?;
+            for (index, splice) in (0..clips).zip(schedule.iter().copied()) {
+                walk.arena().reset();
+                let successor = tail_for_successor(&schedule, index);
+                let previous = (splice.overlap > 0)
+                    .then(|| {
+                        walk.placeholder(
+                            self.dtype,
+                            tail_shape(RASTER_CHANNELS, splice.overlap, height, width),
+                        )
+                    })
+                    .transpose()?;
+                let video =
+                    walk.placeholder(DType::U8, splice_shape(splice.keep, height, width))?;
+                // The tail column a replay sizes for the timeline's fades, when it fades at all.
+                let overlap = successor.max(splice.overlap);
+                let tail = (overlap > 0)
+                    .then(|| -> Result<TensorView> {
+                        let elements =
+                            tail_elements(RASTER_CHANNELS, height, width, overlap, clips)?;
+                        walk.placeholder(self.dtype, Shape::new(&[elements]))
+                    })
+                    .transpose()?;
+                self.splice(
+                    &walk.forward(None)?,
+                    postprocessor,
+                    Splicing {
+                        previous,
+                        clip: raster,
+                        splice,
+                        video,
+                        tail,
+                        index,
+                        successor,
+                    },
+                )?;
+            }
         }
         Ok(())
     }
@@ -945,31 +1044,56 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
         let video = TensorView::new(
             timeline_frame(column, splice.first, height, width),
             DType::U8,
-            Shape::new(&[
-                u64::from(splice.keep),
-                u64::from(height),
-                u64::from(width),
-                3_u64,
-            ]),
+            splice_shape(splice.keep, height, width),
         );
+        let kept = self.splice(
+            forward,
+            postprocessor.as_ref(),
+            Splicing {
+                previous,
+                clip,
+                splice,
+                video,
+                tail: self.tail.as_ref().map(|tail| tail.device),
+                index,
+                successor,
+            },
+        )?;
+        if let Some(kept) = kept {
+            self.publish_tail(request, index, kept)?;
+        }
+        self.staged_keep = Some(splice.keep);
+        self.staged_first = splice.first;
+        Ok(())
+    }
+
+    /// Writes one clip into its timeline's frames and keeps the frames its successor fades
+    /// against: the model calls a replay's splice makes and the recorded walk records.
+    ///
+    /// Answers the tail kept for the successor, `[channels, overlap, rows, columns]`, or `None` when
+    /// the clip owes no successor a tail.
+    fn splice(
+        &self,
+        forward: &nn::Forward<'_>,
+        postprocessor: &(dyn Decoder + Send + Sync),
+        splicing: Splicing,
+    ) -> Result<Option<TensorView>> {
         postprocessor
             .splice(
                 forward,
-                previous,
-                clip,
-                nn::capability::Splice { first: 0, ..splice },
+                splicing.previous,
+                splicing.clip,
+                nn::capability::Splice {
+                    first: 0,
+                    ..splicing.splice
+                },
                 DecodedMedia {
-                    video: Some(video),
+                    video: Some(splicing.video),
                     audio: None,
                 },
             )
             .map_err(Error::from)?;
-        self.keep_tail(
-            forward, request, index, &clip, channels, height, width, successor,
-        )?;
-        self.staged_keep = Some(splice.keep);
-        self.staged_first = splice.first;
-        Ok(())
+        self.keep_tail(forward, &splicing)
     }
 
     /// Sizes the tail columns for an overlap of `overlap` frames and a timeline of `clips` clips, the
@@ -990,14 +1114,7 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
         if overlap == 0 {
             return Ok(());
         }
-        let elements = u64::from(channels)
-            .checked_mul(u64::from(overlap))
-            .and_then(|elements| elements.checked_mul(u64::from(height)))
-            .and_then(|elements| elements.checked_mul(u64::from(width)))
-            .ok_or_else(|| Error::Invalid("a clip's tail extent overflows".into()))?;
-        let slots = elements
-            .checked_mul(u64::from(clips))
-            .ok_or_else(|| Error::Invalid("a timeline's tails overflow".into()))?;
+        let slots = tail_elements(channels, height, width, overlap, clips)?;
         if self
             .tail
             .as_ref()
@@ -1039,76 +1156,71 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
             .ok_or_else(|| crate::runners::products::absent(request, kind))
     }
 
-    /// Keeps the clip's last `overlap` frames for the next clip's fade, and publishes them.
+    /// Keeps the clip's last `successor` frames in its slot of the tail column, for the next clip's
+    /// fade, and answers the slot; `None` when the clip owes no successor a tail.
     ///
     /// The tail is one contiguous run per channel of the clip's own raster (`[channels, frames, rows,
     /// columns]`), so this is one block copy on the runner's stream and no arithmetic. It has to
     /// happen before the next decode, which writes over the clip's column. Both columns are pinned
     /// host memory, which the driver's `cuMemcpyAsync` copies on the host once the stream drains, so
     /// the copy is a kernel: a memcpy here held the device thread for the whole decode.
-    #[allow(clippy::too_many_arguments)]
     fn keep_tail(
         &self,
-        forward: &nn::Forward,
-        request: ipc::RequestKey,
-        index: u32,
-        clip: &TensorView,
-        channels: u32,
-        height: u32,
-        width: u32,
-        overlap: u32,
-    ) -> Result<()> {
-        let Some(tail) = self.tail.as_ref() else {
-            return Ok(());
+        forward: &nn::Forward<'_>,
+        splicing: &Splicing,
+    ) -> Result<Option<TensorView>> {
+        let overlap = splicing.successor;
+        let Some(tail) = splicing.tail else {
+            return Ok(None);
         };
         if overlap == 0 {
-            return Ok(());
+            return Ok(None);
         }
+        let clip = splicing.clip;
+        let channels = clip.shape.dim(0);
         let frames = clip.shape.dim(1);
+        let (height, width) = (clip.shape.dim(2), clip.shape.dim(3));
         let start = frames
             .checked_sub(u64::from(overlap))
             .ok_or_else(|| Error::Invalid("a clip is shorter than its own tail".into()))?;
         let stride = u64::from(overlap)
-            .saturating_mul(u64::from(height))
-            .saturating_mul(u64::from(width));
-        let slot = u64::from(index) * u64::from(channels) * stride;
-        let plane = frames
-            .saturating_mul(u64::from(height))
-            .saturating_mul(u64::from(width));
-        let block = Shape::new(&[u64::from(channels), 1, 1, stride]);
+            .saturating_mul(height)
+            .saturating_mul(width);
+        let slot = u64::from(splicing.index) * channels * stride;
+        let plane = frames.saturating_mul(height).saturating_mul(width);
+        let block = Shape::new(&[channels, 1, 1, stride]);
         let source = TensorView::with_strides(
             clip.element(&[0, start, 0, 0]),
             self.dtype,
             block,
             nn::Strides::new(&[plane, stride, stride, 1]),
         );
-        let destination = TensorView::new(tail.device.element(&[slot]), self.dtype, block);
+        let destination = TensorView::new(tail.element(&[slot]), self.dtype, block);
         let strides = [stride as i64, stride as i64, stride as i64, 1];
         nn::layers::CopyBlock::new(self.dtype)
             .map_err(Error::from)?
             .forward_wide(forward, source, destination, &strides)
             .map_err(Error::from)?;
+        Ok(Some(TensorView::new(
+            tail.element(&[slot]),
+            self.dtype,
+            Shape::new(&[channels, u64::from(overlap), height, width]),
+        )))
+    }
+
+    /// Publishes the tail clip `index` kept, for its successor's rank to fade against.
+    fn publish_tail(&self, request: ipc::RequestKey, index: u32, tail: TensorView) -> Result<()> {
         let store = self
             .products
             .as_ref()
             .ok_or_else(|| crate::runners::products::no_store(request))?;
-        let published = TensorView::new(
-            tail.device.element(&[slot]),
-            self.dtype,
-            Shape::new(&[
-                u64::from(channels),
-                u64::from(overlap),
-                u64::from(height),
-                u64::from(width),
-            ]),
-        );
         store.publish(
             request,
             Product::Tail(index),
             self.device,
             self.stream_id(),
             Some(crate::runners::products::written_on(&self.stream)?),
-            &published,
+            &tail,
         )
     }
 
@@ -1131,6 +1243,53 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
             Shape::new(&[u64::from(keep), u64::from(height), u64::from(width), 3_u64]),
         ))
     }
+}
+
+/// What one clip's splice reads and writes.
+struct Splicing {
+    /// `[channels, overlap, rows, columns]` the predecessor's tail the clip fades against, absent
+    /// for the timeline's first clip.
+    previous: Option<TensorView>,
+    /// `[channels, frames, rows, columns]` the clip's decoded raster.
+    clip: TensorView,
+    /// The clip's place in its timeline.
+    splice: nn::capability::Splice,
+    /// `[keep, rows, columns, 3]` bytes: the timeline frames the clip writes.
+    video: TensorView,
+    /// The tail column, one slot per clip of the timeline; absent when no clip of the timeline
+    /// owes a successor a tail.
+    tail: Option<TensorView>,
+    /// The clip's index in its timeline, which names its tail slot.
+    index: u32,
+    /// The frames the clip leaves its successor; zero when it owes none.
+    successor: u32,
+}
+
+/// `[keep, rows, columns, 3]`: the timeline frames one splice writes.
+fn splice_shape(keep: u32, height: u32, width: u32) -> Shape {
+    Shape::new(&[u64::from(keep), u64::from(height), u64::from(width), 3_u64])
+}
+
+/// `[channels, overlap, rows, columns]`: one clip's tail.
+fn tail_shape(channels: u32, overlap: u32, height: u32, width: u32) -> Shape {
+    Shape::new(&[
+        u64::from(channels),
+        u64::from(overlap),
+        u64::from(height),
+        u64::from(width),
+    ])
+}
+
+/// The elements of a tail column holding `clips` tails of `overlap` frames.
+fn tail_elements(channels: u32, height: u32, width: u32, overlap: u32, clips: u32) -> Result<u64> {
+    let elements = u64::from(channels)
+        .checked_mul(u64::from(overlap))
+        .and_then(|elements| elements.checked_mul(u64::from(height)))
+        .and_then(|elements| elements.checked_mul(u64::from(width)))
+        .ok_or_else(|| Error::Invalid("a clip's tail extent overflows".into()))?;
+    elements
+        .checked_mul(u64::from(clips))
+        .ok_or_else(|| Error::Invalid("a timeline's tails overflow".into()))
 }
 
 /// The frames clip `index` must leave behind: what its successor fades against, none for the last.
@@ -1257,8 +1416,14 @@ impl<M: Decoder + Send + Sync + ?Sized> Runner for DecoderRunner<M> {
         self.products = Some(products);
     }
 
-    fn claim_arena(&mut self) -> Result<()> {
-        self.claim()
+    /// For every decode bucket: the gather, the decode and every splice a request of its canvas
+    /// launches.
+    fn record_walk(&mut self) -> Result<Footprint> {
+        let mut footprint = Footprint::default();
+        for bucket in self.capture_order() {
+            footprint.walk(Some(bucket), |walk| self.walk_recorded(walk, bucket))?;
+        }
+        Ok(footprint)
     }
 
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {

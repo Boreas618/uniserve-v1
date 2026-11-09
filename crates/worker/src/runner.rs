@@ -191,12 +191,18 @@ pub trait Runner: Send {
     /// by name: discarding it would take away the graphs that answer batches.
     fn discard(&mut self, generation: u64) -> Result<()>;
 
-    /// States what this runner's stream needs of the device's graph range, from the model's plan.
+    /// Walks every bucket this runner captures, and every forward it launches eagerly while it warms
+    /// and serves, on a recording forward over a counting arena
+    /// ([`crate::runners::recording`]): the programs those forwards launch and the extent they
+    /// reserve in this runner's stream region.
     ///
-    /// Called once the pools are attached and before any capture maps a range. A runner whose model
-    /// states no plan keeps the even share.
-    fn claim_arena(&mut self) -> crate::Result<()> {
-        Ok(())
+    /// The device worker calls it once the pools are attached and before any capture maps a range,
+    /// claims the stream's region from the recorded peak, and answers the recorded keys to the
+    /// engine, which installs exactly those in the epoch's first generation. The walk issues no
+    /// device work. A runner that launches nothing on the device answers an empty recording, and its
+    /// stream keeps the even share.
+    fn record_walk(&mut self) -> crate::Result<crate::runners::recording::Footprint> {
+        Ok(crate::runners::recording::Footprint::default())
     }
 
     /// Gives the runner the device's graph pools, before its first capture.

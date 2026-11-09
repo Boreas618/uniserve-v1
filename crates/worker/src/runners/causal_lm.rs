@@ -53,6 +53,7 @@ use crate::plan::Variant;
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::{Column, encode_f32, encode_i32};
 use crate::runners::lifecycle::{Lifecycle, walk_capture};
+use crate::runners::recording::{Footprint, Walk};
 
 /// The capture sink, at the path the device tests of the rebind mechanism import it from.
 pub use crate::runners::lifecycle::Recording;
@@ -2245,6 +2246,16 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         self.counters = Some(counters);
     }
 
+    /// Every bucket of the capture plan, in capture order: the step its graph captures, with the
+    /// sampler and the commit of a bucket that samples, or the expert step a join takes part in.
+    fn record_walk(&mut self) -> Result<Footprint> {
+        let mut footprint = Footprint::default();
+        for bucket in self.capture_plan() {
+            footprint.walk(Some(bucket), |walk| self.walk_recorded(walk, bucket))?;
+        }
+        Ok(footprint)
+    }
+
     fn attach_uncompared(&mut self, sink: Arc<std::sync::Mutex<Vec<String>>>) {
         self.uncompared = Some(sink);
     }
@@ -3051,7 +3062,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
         }
         self.upload_scratch_slots(bucket, pages)?;
         let base = self.pool()?.base(self.stream_id())?;
-        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), self.pool()?.reserved());
+        let reserved = self.pool()?.reserved_on(self.stream_id());
+        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let batch = self.token_batch_with(
             bucket,
             self.columns
@@ -3074,7 +3086,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         )?;
         let slots: Vec<i32> = self.staging.slots(rows).to_vec();
         let ids = self.input_ids(bucket);
-        self.with_kv(&slots, Some((pages, &lengths)), |cache| {
+        self.with_kv(&slots, Some((pages, &lengths)), false, |cache| {
             self.model
                 .embed_input_ids(&forward, ids, hidden)
                 .map_err(Error::from)?;
@@ -4873,11 +4885,13 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// Runs `operation` with the batch's `KvView` over `slots`, resident or scratch.
     ///
     /// The view lives as long as the closure: `KvGroup` borrows its layer planes, so the planes,
-    /// tables and groups are locals of one scope and the model reads them borrowed.
+    /// tables and groups are locals of one scope and the model reads them borrowed. A `quiet` walk
+    /// reads the resident block tables where they stand rather than gathering them on the stream.
     fn with_kv<R>(
         &self,
         slots: &[i32],
         scratch_pages: Option<(u32, &[i32])>,
+        quiet: bool,
         operation: impl FnOnce(&KvView<'_>) -> Result<R>,
     ) -> Result<R> {
         let groups = self.kv.groups();
@@ -4887,7 +4901,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             match scratch_pages {
                 None => {
                     layers.push(self.kv.planes(group)?);
-                    tables.push(if self.capturing {
+                    tables.push(if quiet {
                         self.kv.block_table_view(group, slots)?
                     } else {
                         self.kv.block_table(group, slots, &self.stream)?
@@ -4940,8 +4954,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let first = self.pool()?.begin(self.stream_id(), bucket)?;
         self.upload(bucket)?;
         let base = self.pool()?.base(self.stream_id())?;
-        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), self.pool()?.reserved());
-        let batch = self.token_batch(bucket)?;
+        let reserved = self.pool()?.reserved_on(self.stream_id());
+        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         // Under the dump, every layer's attended output is read at its own launch: the buffer is
         // reused by the next layer, so any later reading is the last layer's whichever name it has.
         let probe = AttentionOutputs::default();
@@ -4967,25 +4981,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         if let Some(views) = shaped.as_ref() {
             forward = forward.with_exchange(views);
         }
-        let hidden = arena.tensor(
-            self.geometry.hidden_dtype,
-            ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.geometry.hidden)]),
-        )?;
-        let slots: Vec<i32> = self.staging.slots(bucket.rows as usize).to_vec();
-        let ids = self.input_ids(bucket);
-        self.gather_step(&forward, bucket)?;
-        self.with_kv(&slots, None, |cache| {
-            self.model
-                .embed_input_ids(&forward, ids, hidden)
-                .map_err(Error::from)?;
-            self.model
-                .forward(&forward, &batch, cache, hidden)
-                .map_err(Error::from)?;
-            if bucket.variant.samples() {
-                self.sample(&forward, bucket, &arena, hidden)?;
-            }
-            Ok(())
-        })?;
+        self.step(&forward, bucket)?;
         if runner_dump() {
             tracing::info!(
                 bucket = %bucket,
@@ -4998,6 +4994,77 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 .record(self.stream_id(), bucket, arena.peak())?;
         }
         Ok(())
+    }
+
+    /// One step of the staged `bucket` on `forward`: the slots' gathers, the embedding, the stack
+    /// and, for a bucket that samples, the sampler and the token-state commit. The model calls a
+    /// capture walk records, a warm walk launches, and the recorded walk records.
+    ///
+    /// Every buffer the step works in is reserved from `forward`'s arena in this order, so a
+    /// recording forward over a counting arena reaches the extent the launching one does.
+    fn step(&self, forward: &Forward<'_>, bucket: Bucket) -> Result<()> {
+        let batch = self.token_batch(bucket)?;
+        let hidden = forward.arena().tensor(
+            self.geometry.hidden_dtype,
+            ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.geometry.hidden)]),
+        )?;
+        let slots: Vec<i32> = self.staging.slots(bucket.rows as usize).to_vec();
+        let ids = self.input_ids(bucket);
+        self.gather_step(forward, bucket)?;
+        // A recording or a capture issues no table copy of its own: the tables are read where they
+        // stand, which is what a replay addresses.
+        let quiet = self.capturing || forward.is_recording();
+        self.with_kv(&slots, None, quiet, |cache| {
+            self.model
+                .embed_input_ids(forward, ids, hidden)
+                .map_err(Error::from)?;
+            self.model
+                .forward(forward, &batch, cache, hidden)
+                .map_err(Error::from)?;
+            if bucket.variant.samples() {
+                self.sample(forward, bucket, hidden)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Walks `bucket` on recording forwards of `walk` ([`Runner::record_walk`]): the step its
+    /// graph captures, or this rank's part in an expert step it only joins.
+    ///
+    /// The bucket's warm pose is staged on the host and nothing is uploaded: a recording reads no
+    /// value, and the columns' addresses are what the forward is handed. The expert exchange's
+    /// views are placeholders of the extents the transport lays out.
+    fn walk_recorded(&mut self, walk: &Walk, bucket: Bucket) -> Result<()> {
+        let views = match self.experts.as_ref() {
+            Some(member) => {
+                // The exchange's own program is resolved when the transport is created, before any
+                // forward runs, so the walk states it beside the forward's.
+                member.record_program();
+                Some(member.recorded_views(|dtype, shape| walk.placeholder(dtype, shape))?)
+            }
+            None => None,
+        };
+        let shaped = views.as_ref().map(|views| views.at_rows(bucket.capacity));
+        if self.joins_only(bucket) {
+            let views = shaped
+                .as_ref()
+                .ok_or_else(|| Error::Invariant("a join walked with no expert transport".into()))?;
+            let forward = walk.forward(None)?.with_exchange(views);
+            return self.model.join_expert_step(&forward).map_err(Error::from);
+        }
+        match self.staging.staged() {
+            Some(staged) if staged == bucket => {}
+            _ => {
+                self.stage_warm(bucket)?;
+            }
+        }
+        let mut forward = walk
+            .forward(self.tensor.as_deref())?
+            .with_live_tokens(self.columns.live_tokens.device);
+        if let Some(views) = shaped.as_ref() {
+            forward = forward.with_exchange(views);
+        }
+        self.step(&forward, bucket)
     }
 
     /// What a step reads through its slots, gathered on the device.
@@ -5065,7 +5132,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let stream = self.stream.clone();
         let first = self.pool()?.begin(self.stream_id(), bucket)?;
         let base = self.pool()?.base(self.stream_id())?;
-        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), self.pool()?.reserved());
+        let reserved = self.pool()?.reserved_on(self.stream_id());
+        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let views = self
             .experts
             .as_ref()
@@ -5086,13 +5154,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// The step gathers the rows whose logits are wanted, projects them, and samples one token per
     /// row through the model's sampler; its working set comes from the bucket's arena, so a replay
     /// samples without a host round trip.
-    fn sample(
-        &self,
-        forward: &Forward<'_>,
-        bucket: Bucket,
-        arena: &nn::Arena,
-        hidden: TensorView,
-    ) -> Result<()> {
+    fn sample(&self, forward: &Forward<'_>, bucket: Bucket, hidden: TensorView) -> Result<()> {
+        let arena = forward.arena();
         let Some(sampling) = &self.sampling else {
             return Err(Error::State(
                 "the runner has no sampler but the bucket samples",
@@ -5166,13 +5229,17 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // is kept (the arena's buffer is live until the next `begin`, and `read_sampled` runs before
         // that); a greedy bucket's own launch already states every token it keeps.
         let logits = (bucket.variant == crate::plan::Variant::PrefillOutput).then_some(logits);
-        self.bucket_samples.borrow_mut().insert(
-            bucket,
-            Sampled {
-                tokens: samples.tokens,
-                logits,
-            },
-        );
+        // A recording's views address no memory, so only a launching walk names where a replay's
+        // tokens land.
+        if !forward.is_recording() {
+            self.bucket_samples.borrow_mut().insert(
+                bucket,
+                Sampled {
+                    tokens: samples.tokens,
+                    logits,
+                },
+            );
+        }
         self.commit_step(forward, bucket, &samples)?;
         Ok(())
     }

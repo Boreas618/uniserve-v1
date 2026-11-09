@@ -33,6 +33,7 @@ use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
 use crate::runners::lifecycle::{Lifecycle, walk_capture, warmed_capture};
 use crate::runners::products::{Product, Products};
+use crate::runners::recording::Footprint;
 use crate::{Error, Result};
 
 /// The two columns one track's decode is staged into, sized for the largest track this runner serves.
@@ -230,23 +231,6 @@ impl<M: Decoder + Send + Sync + ?Sized> AudioDecoderRunner<M> {
             .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
-    /// Claims the arena the largest bucket's decode plans.
-    fn claim(&mut self) -> Result<()> {
-        let mut needed = 0;
-        for bucket in self.capture_order() {
-            let layout = self.layout(bucket)?;
-            needed = needed.max(
-                super::floor::checked(bucket, self.model.arena_bytes(&layout), u64::MAX)?
-                    .unwrap_or(0),
-            );
-        }
-        if needed > 0 {
-            let stream = self.stream_id();
-            self.pool()?.claim(stream, needed)?;
-        }
-        Ok(())
-    }
-
     /// The track's latents, `[frames, channels]`, as the model reads them.
     fn latents(&self, audio: LatentShape) -> TensorView {
         TensorView::new(
@@ -366,12 +350,25 @@ impl<M: Decoder + Send + Sync + ?Sized> AudioDecoderRunner<M> {
         let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let forward = nn::Forward::new(&stream, generation, &arena);
+        self.decode(&forward, bucket)?;
+        if first {
+            self.pool()?
+                .record(self.stream_id(), bucket, arena.peak())?;
+        }
+        Ok(())
+    }
+}
+
+impl<M: Decoder + Send + Sync + ?Sized> AudioDecoderRunner<M> {
+    /// Decodes `bucket`'s staged track on `forward`: the model call a capture walk records and the
+    /// recorded walk records.
+    fn decode(&self, forward: &nn::Forward<'_>, bucket: Bucket) -> Result<()> {
         let audio = self.audio(bucket)?;
         let latents = self.latents(audio);
         let pcm = self.pcm(audio)?;
         self.model
             .decode(
-                &forward,
+                forward,
                 latents,
                 // Every table this decoder reads is a weight, bound at load: the capability states
                 // that an audio decode is given none, so the runner passes none.
@@ -381,12 +378,7 @@ impl<M: Decoder + Send + Sync + ?Sized> AudioDecoderRunner<M> {
                     audio: Some(pcm),
                 },
             )
-            .map_err(Error::from)?;
-        if first {
-            self.pool()?
-                .record(self.stream_id(), bucket, arena.peak())?;
-        }
-        Ok(())
+            .map_err(Error::from)
     }
 }
 
@@ -483,8 +475,15 @@ impl<M: Decoder + Send + Sync + ?Sized> Runner for AudioDecoderRunner<M> {
         self.products = Some(products);
     }
 
-    fn claim_arena(&mut self) -> Result<()> {
-        self.claim()
+    /// The decode every audio bucket's graph captures.
+    fn record_walk(&mut self) -> Result<Footprint> {
+        let mut footprint = Footprint::default();
+        for bucket in self.capture_order() {
+            footprint.walk(Some(bucket), |walk| {
+                self.decode(&walk.forward(None)?, bucket)
+            })?;
+        }
+        Ok(footprint)
     }
 
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {

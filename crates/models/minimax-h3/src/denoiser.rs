@@ -1512,39 +1512,6 @@ impl nn::capability::Denoiser for Denoiser {
         self.rules.cover(request)
     }
 
-    /// The bytes one evaluation of `request` reserves, from this deployment's own plan.
-    ///
-    /// The layout is the trait's own and the plan is [`Denoiser::denoise_arena`], so a caller sizes
-    /// storage from the number the forward fills rather than from a literal beside it. Nothing here
-    /// allocates or touches a device: the model states what its forward needs and the runtime owner
-    /// allocates to it.
-    /// The stage's floor: **the larger of one evaluation and the prompt's fold**, because the two
-    /// reuse one region rather than following one another in it.
-    ///
-    /// The captured graph's nodes carry the offsets the planning walk recorded, and that walk starts
-    /// its arena at the region's base and runs the evaluation alone. The fold runs only on the live
-    /// path (`first_step`, before the first replay) and writes its result into the conditioning
-    /// column, so its scratch and the graph's buffers occupy the same offsets by construction: the
-    /// graph clobbers the fold's scratch, which is dead, and never the fold's output, which is a
-    /// column. Adding the two would refuse a deployment that serves - and the plan's entries are
-    /// storage the worker allocates by name, so an added entry is memory rather than a bound.
-    ///
-    /// The larger, then, and not the sum: at every deployment here the evaluation is the larger (the
-    /// fold is 532 MiB against the evaluation's 6.1 GiB at a 1024-row capacity), and the `max` is
-    /// stated rather than assumed because a deployment whose evaluation were smaller would need it.
-    fn arena_bytes(&self, request: &VideoRequest<'_>) -> nn::Result<u64> {
-        let layout = self.layout(request);
-        let plan = self.denoise_arena(&layout).map_err(flattened)?;
-        let evaluation = crate::decoding::arena_reservation(&plan);
-        let rows = layout.text_rows.saturating_add(layout.condition_rows);
-        let fold = crate::conditioning::fold_bytes(
-            &self.config.transformer,
-            rows,
-            self.transformer.dtype(),
-        );
-        Ok(evaluation.max(fold))
-    }
-
     /// The denoising steps this checkpoint runs for `request`'s task ([`crate::VideoTask::of`]).
     ///
     /// Both modalities advance on one step counter - [`Schedule::num_steps`] refuses a grid whose two
@@ -2361,42 +2328,6 @@ impl Denoiser {
         self.places_encoders
     }
 
-    /// Every buffer one evaluation at `layout` reserves, in the forward's own reservation order.
-    ///
-    /// The worker sizes the denoiser's arena by the sum of this plan and keys its storage by the
-    /// names, as it does for the decoder's two plans and the splice's. It is [`denoise_arena`] with
-    /// this deployment's own numbers - the checkpoint's element type and the schedule's group count -
-    /// so the plan and the forward read one configuration.
-    pub fn denoise_arena(&self, layout: &Layout) -> Result<Vec<crate::decoding::Buffer>> {
-        let rows = self.bound(layout)?;
-        let _ = rows;
-        denoise_arena(
-            &self.config,
-            &self.rules.arrangement,
-            self.cache.groups().count(),
-            self.transformer.dtype(),
-            layout,
-        )
-    }
-
-    /// Refuse a layout whose packed rows exceed the bound this deployment was loaded for.
-    ///
-    /// The stack's dense attention is compiled with that bound as `nn`'s `DenseDescriptor.max_kv_len`
-    /// and refuses a longer key run at its own launch, so a wider layout has no module at all: the
-    /// refusal belongs where a layout first meets the deployment, not at the first layer of a
-    /// capture that then has to be thrown away.
-    fn bound(&self, layout: &Layout) -> Result<u32> {
-        let tokens = packed_rows(&self.config, &self.rules.arrangement, layout)?;
-        if tokens > self.rows {
-            return Err(Error::config(format!(
-                "this denoiser was loaded for {} packed rows and {} is a layout beyond it; the \
-                 attention is compiled for the bound, so no module would launch",
-                self.rows, tokens
-            )));
-        }
-        Ok(tokens)
-    }
-
     /// Encode the request's raw media and write its condition rows into the prefix source.
     ///
     /// The rows are the layout's - `MediaInput::rows` and `audio_rows` carry the counts the packing
@@ -2806,8 +2737,9 @@ impl Denoiser {
         let height = video.shape.dim(2);
         let width = video.shape.dim(3);
         let tokens = u64::from(tables.get("groups")?.shape.dim(0) as u32);
-        // The same bound `denoise_arena` checks, at the one other place a request reaches this block:
-        // a request wider than the deployment was loaded for has no attention module to run.
+        // The bound this deployment was loaded for: the stack's dense attention is compiled with it
+        // as `DenseDescriptor.max_kv_len`, so a request wider than it has no attention module to
+        // run, and the runner's recorded walk of a layout past it refuses here at load.
         if tokens > u64::from(self.rows) {
             return Err(Error::config(format!(
                 "this denoiser was loaded for {} packed rows and the request has {tokens}; the \

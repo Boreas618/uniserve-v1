@@ -48,6 +48,10 @@ use platform::{DeviceId, Event};
 use crate::Result;
 use crate::arena::StreamId;
 
+/// The element type of [`Product::ConditionPixels`] and [`Product::ConditionSamples`]: the media
+/// stage converts decoded frames and tracks to FP32, which is what the conditioning encoders read.
+pub const CONDITION_MEDIA: ops::DType = ops::DType::F32;
+
 /// One kind of media product a request has.
 ///
 /// The kinds are the model's own: `nn::capability::Layout` states the rows, elements and shapes of

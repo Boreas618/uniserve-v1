@@ -41,6 +41,7 @@ use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::{Column, Region, encode_i32};
 use crate::runners::lifecycle::{Lifecycle, walk_capture, warmed_capture};
 use crate::runners::products::{self, Product, Products};
+use crate::runners::recording::Footprint;
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
 
@@ -766,7 +767,6 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
         let base = self.pool()?.base(self.stream_id())?;
         let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
-        let batch = self.token_batch(bucket)?;
         let group = self.group.clone();
         let probes = crate::profiling::fences::capturing(&stream);
         let forward = crate::runners::denoiser::grouped(
@@ -783,12 +783,32 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
         let state = self
             .tables
             .views(self.lifecycle.generation.number(), &key, &tables)?;
+        self.encode(&forward, bucket, &state)?;
+        if first {
+            self.pool()?
+                .record(self.stream_id(), bucket, arena.peak())?;
+        }
+        Ok(())
+    }
+}
+
+impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
+    /// Encodes `bucket`'s staged prompts on `forward`, over the layout's tables `state`: the model
+    /// call a capture walk records and the recorded walk records.
+    fn encode(
+        &self,
+        forward: &nn::Forward<'_>,
+        bucket: Bucket,
+        state: &[TensorView],
+    ) -> Result<()> {
+        let layout = self.layout(bucket);
+        let batch = self.token_batch(bucket)?;
         let tokens = u64::from(bucket.tokens);
         let width = u64::from(self.shape.hidden.max(1));
         // The states are the column's first `tokens × width` elements: a warm capture writes them
         // and so does every replay, at the offset a request's rows begin, which is why the region
         // is the runner's rather than the walk's.
-        let hidden_view = self
+        let hidden = self
             .columns
             .hidden
             .extent(0..tokens * width)
@@ -798,22 +818,11 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
             batch,
             images: &[],
             layout: &layout,
-            state: &state,
+            state,
         };
         self.model
-            .encode(
-                &forward,
-                inputs,
-                EncoderOutputs {
-                    hidden: hidden_view,
-                },
-            )
-            .map_err(Error::from)?;
-        if first {
-            self.pool()?
-                .record(self.stream_id(), bucket, arena.peak())?;
-        }
-        Ok(())
+            .encode(forward, inputs, EncoderOutputs { hidden })
+            .map_err(Error::from)
     }
 }
 
@@ -931,6 +940,19 @@ impl<M: Encoder + Send + Sync + ?Sized> Runner for EncoderRunner<M> {
 
     fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {
         self.counters = Some(counters);
+    }
+
+    /// The encode every bucket's graph captures, over placeholders of its layout's tables.
+    fn record_walk(&mut self) -> Result<Footprint> {
+        let mut footprint = Footprint::default();
+        let group = self.group.clone();
+        for bucket in self.capture_order() {
+            footprint.walk(Some(bucket), |walk| {
+                let state = walk.tables(&self.model.state_tables(&self.layout(bucket)))?;
+                self.encode(&walk.forward(group.as_deref())?, bucket, &state)
+            })?;
+        }
+        Ok(footprint)
     }
 
     fn serve(&mut self, job: &Job) -> Result<BatchOutput> {

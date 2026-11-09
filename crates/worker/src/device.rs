@@ -11,6 +11,7 @@
 //! device's context for a sticky error (2.4); the program-layer update sends `precopy`,
 //! `switchover` and `purge`, which take effect at batch boundaries (7.3).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -19,7 +20,7 @@ use std::time::{Duration, Instant};
 use ops::Generation;
 use platform::DeviceId;
 
-use crate::arena::Pools;
+use crate::arena::{Pools, StreamId};
 use crate::batch::{Batch, BatchOutput, Job, JobKind, Submission, SubmissionId};
 use crate::job::{Command, JobQueue, jobs_of, phase_of};
 use crate::plan::Bucket;
@@ -39,6 +40,9 @@ pub struct Worker {
     /// reason: the mechanism asks whether a media computation is served before it forms the batch,
     /// and that answer cannot be a round trip to the device thread (2.4).
     media: crate::plan::Buckets,
+    /// The programs this device's runners launch, from their recorded walks: stated once at spawn,
+    /// before any capture, so the engine can install them without asking the device thread.
+    recorded: BTreeMap<String, BTreeSet<String>>,
     queue: Arc<JobQueue>,
     thread: Option<JoinHandle<()>>,
     /// The device's graph pools, shared by every runner that issues here (4.1).
@@ -106,6 +110,54 @@ impl SharedCounters {
             device_ns: self.device_ns.load(Ordering::Relaxed),
         }
     }
+}
+
+/// Walks every runner of a device on a recording forward ([`crate::runners::recording`]), claims
+/// each stream's arena region from the largest peak recorded on it, and answers the union of the
+/// keys the runners launch.
+///
+/// A stream's claim replaces its even share of the graph range: the walk records what the stream's
+/// forwards reserve, captured and eager alike, so the claim is the region the stream addresses. A
+/// stream whose runners reserved nothing keeps the even share. The peak is logged once per runner
+/// with the bucket whose walk reached it.
+fn recorded_walks(
+    device: DeviceId,
+    runners: &mut [NamedRunner],
+    pools: &std::sync::Mutex<Pools>,
+) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let mut keys = crate::runners::recording::Footprint::default();
+    let mut claims: BTreeMap<StreamId, u64> = BTreeMap::new();
+    for named in runners.iter_mut() {
+        let footprint = named.runner.record_walk()?;
+        keys.union(&footprint);
+        let Some(stream) = named.runner.stream().map(|stream| StreamId(stream.raw())) else {
+            continue;
+        };
+        tracing::info!(
+            device = device.0,
+            runner = named.id.0,
+            stream = stream.0,
+            peak = footprint.peak,
+            bucket = footprint.widest.map_or_else(
+                || "per-load forwards".to_owned(),
+                |bucket| bucket.to_string()
+            ),
+            operators = footprint.keys.len(),
+            keys = footprint.keys.values().map(BTreeSet::len).sum::<usize>(),
+            "a runner's recorded walk: the arena its forwards reach and the programs they launch"
+        );
+        if footprint.peak > 0 {
+            let claim = claims.entry(stream).or_default();
+            *claim = (*claim).max(footprint.peak);
+        }
+    }
+    let mut pools = pools
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (stream, bytes) in claims {
+        pools.claim(stream, bytes)?;
+    }
+    Ok(keys.keys)
 }
 
 /// The device's graph storage, as the engine sizes it before the worker starts.
@@ -220,11 +272,11 @@ impl Worker {
         );
         for named in &mut runners {
             named.runner.attach_pools(Arc::clone(&pools));
-            named.runner.claim_arena()?;
             named.runner.attach_counters(Arc::clone(&counters));
             named.runner.attach_uncompared(Arc::clone(&uncompared));
             named.runner.attach_products(Arc::clone(&products));
         }
+        let recorded = recorded_walks(device, &mut runners, &pools)?;
         // What the next generation captures and what it is planned in, stated before the first
         // capture rather than discovered by paying for it: the first generation of an epoch has no
         // serving generation to compare against, so every bucket is captured and every operator of
@@ -295,6 +347,7 @@ impl Worker {
             device,
             phases,
             media,
+            recorded,
             activity,
             queue,
             thread: Some(thread),
@@ -305,6 +358,13 @@ impl Worker {
             streams,
             copy_stream,
         })
+    }
+
+    /// Every program this device's runners launch, by operator name and descriptor key: the union
+    /// of their recorded walks ([`crate::runners::recording`]), which the engine installs in the
+    /// epoch's first generation.
+    pub fn recorded(&self) -> &BTreeMap<String, BTreeSet<String>> {
+        &self.recorded
     }
 
     /// The streams this device's runners compute on.

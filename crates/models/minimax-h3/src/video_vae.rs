@@ -1765,39 +1765,6 @@ impl Decoder for VideoDecoder {
         })
     }
 
-    /// The bytes one decode of `layout` needs, from this block's own plan.
-    ///
-    /// The layout states the canvas's latent extents, and the block decodes one canvas, so a layout
-    /// naming another raster is refused by name - the same mismatch `layout_of` refuses from its side,
-    /// reached here by a caller that built the layout itself. The plan is `video_arena`'s for that
-    /// canvas at this decoder's element type, so the number and the plan a runner allocates from are
-    /// one statement rather than two.
-    fn arena_bytes(&self, layout: &nn::capability::Layout) -> nn::Result<u64> {
-        let canvas = Canvas::clip(&self.config, layout.video.height, layout.video.width);
-        if !self.canvases.contains(&canvas) {
-            return Err(nn::Error::Shape {
-                owner: "VideoDecoder",
-                problem: format!(
-                    "this decoder serves {} and the layout states {}x{} latent cells",
-                    self.canvases
-                        .iter()
-                        .map(|canvas| format!("{}x{}", canvas.width, canvas.height))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    layout.video.width,
-                    layout.video.height,
-                ),
-            });
-        }
-        let plan = crate::decoding::video_arena(&self.config, &canvas).map_err(|error| {
-            nn::Error::Shape {
-                owner: "VideoDecoder",
-                problem: format!("this decoder's plan for its canvas: {error}"),
-            }
-        })?;
-        Ok(crate::decoding::arena_reservation(&plan))
-    }
-
     /// Decode one clip: every tile of its canvas, stitched into `out.video`.
     ///
     /// `latents` is the clip's `[voxels, latent_channels]` FP32 rows in tile order — the runner gathers
@@ -2261,36 +2228,6 @@ pub(crate) mod tests {
                 .to_string()
                 .contains(&format!("{} frame(s)", clip.frames)),
             "the refusal names the frame count it decodes: {error}"
-        );
-
-        // The arena is the canvas's own plan: a wider raster needs more bytes, and this decoder
-        // refuses the other's layout by name rather than answering with a number for its own raster.
-        let bytes = decoder
-            .arena_bytes(&layout)
-            .expect("the plan of its own canvas");
-        let wider_canvas = Canvas::clip(&config, 2 * ratio, 3 * ratio);
-        let wider_decoder = stated_decoder(&config, wider_canvas);
-        let wider_layout = wider_decoder
-            .layout_of(clip_of(&config, wider_canvas))
-            .expect("the wider decoder's own canvas");
-        let wider_bytes = wider_decoder
-            .arena_bytes(&wider_layout)
-            .expect("the wider canvas's plan");
-        assert!(
-            bytes > 0 && wider_bytes > bytes,
-            "the wider canvas states {wider_bytes} B, not more than the {bytes} B of the narrower one"
-        );
-        let error = decoder
-            .arena_bytes(&wider_layout)
-            .expect_err("the layout of another canvas");
-        assert!(
-            error.to_string().contains("latent cells"),
-            "the refusal names the canvas mismatch: {error}"
-        );
-        assert!(
-            matches!(error, nn::Error::Shape { .. }),
-            "a layout this decoder cannot serve is a shape refusal and not the `Unsupported` a \
-             block with no plan at all states: {error:?}"
         );
     }
 

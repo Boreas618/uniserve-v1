@@ -17,9 +17,9 @@ pub mod denoiser;
 pub(crate) mod diag;
 pub mod encoder;
 pub mod experts;
-pub(crate) mod floor;
 pub mod lifecycle;
 pub mod media;
+pub mod recording;
 pub(crate) mod tables;
 
 pub use audio::AudioDecoderRunner;

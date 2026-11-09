@@ -30,49 +30,6 @@ use ops::gemm::WeightOrder;
 use crate::config::TransformerConfig;
 use crate::{Error, Result};
 
-/// The fold's whole reservation from the configuration alone, in reservation order.
-///
-/// The prompt's refinement runs once per request, inside the denoiser's arena and before the first
-/// evaluation (`Denoiser::prepare_conditioning`), so its scratch is part of a stage's floor. The
-/// plan that sizes the arena (`crate::denoiser::denoise_arena`) prices it from this function, which
-/// is why the extents live here beside the fold that reserves them rather than in the plan.
-///
-/// The working buffer is the whole refined document (`[rows, hidden]`, the input projection's
-/// output); every block then reserves its own [`Scratch`].
-pub fn fold_plan(config: &TransformerConfig, rows: u32) -> Vec<(String, Shape)> {
-    let mut plan = vec![(
-        "refiner.working".to_owned(),
-        Shape::new(&[u64::from(rows), u64::from(config.hidden_size)]),
-    )];
-    for index in 0..config.num_refiner_layers {
-        let scratch = Scratch::new(
-            config.hidden_size,
-            config.head_dim,
-            config.num_attention_heads,
-            config.intermediate_size,
-            rows,
-        );
-        for (name, shape) in scratch.entries() {
-            plan.push((format!("refiner.{index}.{name}"), shape));
-        }
-    }
-    plan
-}
-
-/// The bytes the fold's whole reservation needs, from the configuration alone.
-///
-/// The denoiser's stage floor takes the larger of this and one evaluation's plan, because the two
-/// occupy the same offsets: the fold runs only on the live path, before the first replay, and the
-/// captured graph's nodes carry the planning walk's offsets from the region's base.
-pub fn fold_bytes(config: &TransformerConfig, rows: u32, dtype: nn::DType) -> u64 {
-    let width = dtype.bytes().unwrap_or(4);
-    fold_plan(config, rows)
-        .iter()
-        .map(|(_, shape)| shape.dims().iter().product::<u64>())
-        .sum::<u64>()
-        * width
-}
-
 /// The per-request device tables the refiner's attention reads.
 ///
 /// Both are int32 cumulative counts over the packed rows, `[documents + 1]` long: the queries cover

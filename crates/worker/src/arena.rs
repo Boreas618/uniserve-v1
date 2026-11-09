@@ -135,7 +135,7 @@ struct Ledger {
     /// The device bytes every mapping is booked against (4.1).
     budget: u64,
     streams: BTreeMap<StreamId, StreamBooks>,
-    /// What a runner stated its stream needs, from the model's own plan.
+    /// What a runner's recorded walk reached on its stream (`runners::recording`).
     ///
     /// The streams of one device differ by an order of magnitude: a denoiser's activations at a
     /// served canvas are several times an audio decoder's, so an even division of the range starves
@@ -400,7 +400,7 @@ impl Pools {
     /// `bytes` is the device's whole graph storage (`capacity::graph_storage_budget_bytes`) and
     /// a stream that states nothing gets `bytes / streams` of it: a captured graph addresses fixed
     /// buffers, so a stream's range must not move while its graphs live, and two streams' work runs
-    /// at once. A stream that claims what its model's plan needs holds that instead (`claim`), and
+    /// at once. A stream claimed at the peak its runners' recorded walk reached holds that instead (`claim`), and
     /// the claims of one device may sum past `bytes`, so the addresses reach the whole allowance:
     /// they cost nothing, and the mappings are what the allowance books and refuses.
     /// `budget` is the device budget the pool is booked against, kept apart from the reservation so
@@ -466,7 +466,8 @@ impl Pools {
         self.ledger.reservation_of(stream)
     }
 
-    /// States what `stream` needs, from the model's own plan, before its range is mapped.
+    /// States what `stream` needs, the peak its runners' recorded walk reached, before its range
+    /// is mapped.
     pub fn claim(&mut self, stream: StreamId, bytes: u64) -> Result<()> {
         self.ledger.claim(stream, bytes)
     }

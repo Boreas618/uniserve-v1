@@ -1103,28 +1103,6 @@ impl Decoder for BigVgan {
         nn::DType::F32
     }
 
-    /// The bytes one decode of `layout` needs, from the audio VAE's own plan.
-    ///
-    /// `layout.audio` is the subject: the plan is keyed by the track's latent frames, so a layout
-    /// that states no audio track is refused by name rather than answered with the plan for zero
-    /// frames - an arena of no bytes for a decode that would run past it.
-    fn arena_bytes(&self, layout: &nn::capability::Layout) -> nn::Result<u64> {
-        let refuse = |problem: String| nn::Error::Shape {
-            owner: "BigVgan",
-            problem,
-        };
-        let audio = layout
-            .audio
-            .ok_or_else(|| refuse("this layout states no audio track to decode".to_owned()))?;
-        let plan = crate::audio_vae::audio_arena(&self.config, audio.frames).map_err(|error| {
-            refuse(format!(
-                "this decoder's plan for a track of {} latent step(s): {error}",
-                audio.frames
-            ))
-        })?;
-        Ok(crate::decoding::arena_reservation(&plan))
-    }
-
     fn layout_tables(&self, _layout: &nn::capability::Layout) -> nn::Result<Vec<StateTable>> {
         // Every table this decoder reads is a weight, bound at load: nothing follows from the
         // layout, so the runner uploads nothing for it. `Ok` of nothing for every layout is the

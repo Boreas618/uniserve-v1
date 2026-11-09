@@ -401,19 +401,8 @@ impl Member {
             return Ok(());
         }
         let shape = self.shape;
-        let descriptor = ops::moe::exchange::Descriptor {
-            mode: self.mode,
-            hidden: shape.hidden,
-            intermediate: shape.intermediate,
-            top: shape.top,
-            experts: shape.experts,
-            max_tokens: shape.max_tokens,
-            ranks: shape.ranks,
-            attention: shape.attention_ranks,
-            dtype: shape.dtype,
-        };
         let kernel = generation
-            .op::<ops::moe::ExpertExchange>(&descriptor)
+            .op::<ops::moe::ExpertExchange>(&self.descriptor())
             .map_err(|error| Error::Invalid(format!("the expert exchange's program: {error}")))?;
         let device = platform::DeviceId(shape.device);
         let before = device.memory_info().map_err(Error::Cuda)?.free;
@@ -447,7 +436,39 @@ impl Member {
         let views = transport
             .views()
             .map_err(|error| Error::Invalid(format!("reading the expert transport: {error}")))?;
-        self.backend.views = Some(ExchangeViews {
+        self.backend.views = Some(self.exchange_views(views));
+        self.backend.transport = Some(transport);
+        tracing::info!(
+            rank = self.rank,
+            ranks = shape.ranks,
+            max_tokens = shape.max_tokens,
+            fused = views.fused,
+            "the expert transport is mapped"
+        );
+        Ok(())
+    }
+
+    /// The exchange program's descriptor: what [`Self::ensure`] resolves the transport's program
+    /// by.
+    fn descriptor(&self) -> ops::moe::exchange::Descriptor {
+        let shape = self.shape;
+        ops::moe::exchange::Descriptor {
+            mode: self.mode,
+            hidden: shape.hidden,
+            intermediate: shape.intermediate,
+            top: shape.top,
+            experts: shape.experts,
+            max_tokens: shape.max_tokens,
+            ranks: shape.ranks,
+            attention: shape.attention_ranks,
+            dtype: shape.dtype,
+        }
+    }
+
+    /// The layer's views of a transport's regions, with this member's group and its warm meeting.
+    fn exchange_views(&self, views: ops::moe::exchange::TransportViews) -> ExchangeViews {
+        let shape = self.shape;
+        ExchangeViews {
             transport: views.transport,
             ranks: shape.ranks,
             attention: shape.attention_ranks,
@@ -473,16 +494,48 @@ impl Member {
                     Ok(())
                 })
             },
-        });
-        self.backend.transport = Some(transport);
-        tracing::info!(
-            rank = self.rank,
-            ranks = shape.ranks,
-            max_tokens = shape.max_tokens,
-            fused = views.fused,
-            "the expert transport is mapped"
-        );
-        Ok(())
+        }
+    }
+
+    /// Reports the exchange program [`Self::ensure`] resolves to the capture sink installed on
+    /// this thread: a recorded walk states it beside the programs its forwards launch.
+    pub fn record_program(&self) {
+        if ops::capture::installed() {
+            ops::capture::launched(
+                <ops::moe::ExpertExchange as ops::Op>::NAME,
+                &ops::descriptor::key(&self.descriptor()),
+            );
+        }
+    }
+
+    /// The views a transport of this member's shape lays out, over regions `placeholder` answers
+    /// for each `(dtype, shape)`: what a recorded walk hands its forwards in place of
+    /// [`Self::views`], before any transport exists.
+    ///
+    /// The transport handle is null, which no recording forward reads. Whether one launch runs the
+    /// whole expert layer is the package's answer on a live transport; a recording takes it from
+    /// the member's mode, which is the backend the package is created for.
+    pub fn recorded_views(
+        &self,
+        mut placeholder: impl FnMut(ops::DType, ops::Shape) -> Result<ops::TensorView>,
+    ) -> Result<ExchangeViews> {
+        let [states, ids, weights, combined, live, packed, packed_scales] = self.shape.regions();
+        let mut view = |(dtype, shape)| placeholder(dtype, shape);
+        let views = ops::moe::exchange::TransportViews {
+            // SAFETY: a recording forward hands the handle to no launch.
+            transport: unsafe {
+                ops::moe::exchange::ExchangeTransport::from_handle(std::ptr::null_mut())
+            },
+            states: view(states)?,
+            ids: view(ids)?,
+            weights: view(weights)?,
+            combined: view(combined)?,
+            live: view(live)?,
+            packed: view(packed)?,
+            packed_scales: view(packed_scales)?,
+            fused: self.mode == ops::moe::exchange::Mode::Fused,
+        };
+        Ok(self.exchange_views(views))
     }
 
     /// Enters the union's next step and writes its capacity on `stream`.

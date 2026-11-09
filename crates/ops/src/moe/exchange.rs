@@ -430,6 +430,27 @@ const _: () = assert!(std::mem::offset_of!(Info, error) == INFO_LAYOUT.error);
 type LifecycleEntry = unsafe extern "C" fn(*mut Lifecycle, *mut c_void) -> i32;
 type InfoEntry = unsafe extern "C" fn(*mut Info, *mut c_void) -> i32;
 
+impl TransportShape {
+    /// The element type and extents of each region a transport of this shape lays out, in the
+    /// order [`TransportViews`] names them: `states`, `ids`, `weights`, `combined`, `live`, `packed`
+    /// and `packed_scales`.
+    pub fn regions(&self) -> [(DType, Shape); 7] {
+        let max_tokens = u64::from(self.max_tokens);
+        let rows = u64::from(self.ranks) * max_tokens;
+        let hidden = u64::from(self.hidden);
+        let top = u64::from(self.top);
+        [
+            (self.dtype, Shape::new(&[rows, hidden])),
+            (DType::I32, Shape::new(&[rows, top])),
+            (DType::F32, Shape::new(&[rows, top])),
+            (self.dtype, Shape::new(&[rows, hidden])),
+            (DType::I32, Shape::new(&[1])),
+            (DType::U8, Shape::new(&[max_tokens, hidden / 2])),
+            (DType::F8E4M3, Shape::new(&[max_tokens, hidden / 16])),
+        ]
+    }
+}
+
 /// The views of a transport, as the layer reads them.
 #[derive(Clone, Copy, Debug)]
 pub struct TransportViews {
@@ -546,27 +567,19 @@ impl Transport {
         // SAFETY: `info` has the layout the header declares; this entry issues no device work.
         let status = unsafe { (self.info)(&mut info, std::ptr::null_mut()) };
         check(status, "info", &info.error)?;
-        let shape = self.shape;
-        let max_tokens = u64::from(shape.max_tokens);
-        let rows = u64::from(shape.ranks) * max_tokens;
-        let hidden = u64::from(shape.hidden);
-        let top = u64::from(shape.top);
-        let view = |pointer: *mut c_void, dtype: DType, dims: &[u64]| {
-            TensorView::new(DevicePtr::new(pointer as u64), dtype, Shape::new(dims))
+        let [states, ids, weights, combined, live, packed, packed_scales] = self.shape.regions();
+        let view = |pointer: *mut c_void, (dtype, shape): (DType, Shape)| {
+            TensorView::new(DevicePtr::new(pointer as u64), dtype, shape)
         };
         Ok(TransportViews {
             transport: self.handle(),
-            states: view(info.states, shape.dtype, &[rows, hidden]),
-            ids: view(info.ids, DType::I32, &[rows, top]),
-            weights: view(info.weights, DType::F32, &[rows, top]),
-            combined: view(info.combined, shape.dtype, &[rows, hidden]),
-            live: view(info.live, DType::I32, &[1]),
-            packed: view(info.packed, DType::U8, &[max_tokens, hidden / 2]),
-            packed_scales: view(
-                info.packed_scales,
-                DType::F8E4M3,
-                &[max_tokens, hidden / 16],
-            ),
+            states: view(info.states, states),
+            ids: view(info.ids, ids),
+            weights: view(info.weights, weights),
+            combined: view(info.combined, combined),
+            live: view(info.live, live),
+            packed: view(info.packed, packed),
+            packed_scales: view(info.packed_scales, packed_scales),
             fused: info.fused != 0,
         })
     }
