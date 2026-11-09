@@ -709,8 +709,9 @@ impl VisionTower {
             &[u64::from(config.num_position_embeddings), hidden],
         )?;
         let merger = Merger::load(&mut tower.scope("merger"), config, false)?;
-        let rotary = Rotary::load(
-            &mut tower.scope("rotary_pos_emb"),
+        // The factor tables are the runner's host tables (`positions::VisionRotary`), so the
+        // rotation publishes no spectrum.
+        let rotary = Rotary::new(
             spectrum(config)?,
             RotarySpec {
                 head_dim,

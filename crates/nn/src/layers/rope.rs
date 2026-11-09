@@ -590,21 +590,36 @@ pub struct Gains {
 
 /// One stack's rotary embedding: the published spectrum, the factors of a batch and the rotation.
 pub struct Rotary {
-    table: Weight,
+    /// The published spectrum [`Self::factors`] reads; absent for a rotation whose factor tables
+    /// the runner computes on the host ([`Self::new`]), which publishes nothing it never reads.
+    table: Option<Weight>,
     spectrum: Spectrum,
     spec: RotarySpec,
 }
 
 impl Rotary {
     /// The rotary of `spectrum` for heads of `spec`, publishing the spectrum under `scope` as the
-    /// constant `inv_freq`.
+    /// constant `inv_freq` its device factors read.
     ///
     /// # Errors
     ///
-    /// A spectrum [`Spectrum::inverse_frequencies`] refuses, no head, a head narrower than the
-    /// rotated width, or query heads that do not group the key heads.
+    /// As [`Self::new`], or a spectrum [`Spectrum::inverse_frequencies`] refuses.
     pub fn load(scope: &mut Scope<'_, '_>, spectrum: Spectrum, spec: RotarySpec) -> Result<Self> {
         let frequencies = spectrum.inverse_frequencies()?;
+        let mut rotary = Self::new(spectrum, spec)?;
+        rotary.table =
+            Some(scope.constant_f32("inv_freq", &[frequencies.len() as u64], &frequencies)?);
+        Ok(rotary)
+    }
+
+    /// The rotation of `spectrum` for heads of `spec` alone: its factor tables come from the
+    /// caller, so it publishes no spectrum and [`Self::factors`] refuses.
+    ///
+    /// # Errors
+    ///
+    /// No head, a head narrower than the rotated width, or query heads that do not group the key
+    /// heads.
+    pub fn new(spectrum: Spectrum, spec: RotarySpec) -> Result<Self> {
         let rotated = spectrum.rotated();
         if spec.heads == 0 || spec.kv_heads == 0 || !spec.heads.is_multiple_of(spec.kv_heads) {
             return Err(Error::shape(
@@ -624,9 +639,8 @@ impl Rotary {
                 ),
             ));
         }
-        let table = scope.constant_f32("inv_freq", &[frequencies.len() as u64], &frequencies)?;
         Ok(Self {
-            table,
+            table: None,
             spectrum,
             spec,
         })
@@ -711,7 +725,8 @@ impl Rotary {
     ///
     /// # Errors
     ///
-    /// Positions that are not one coordinate per axis and token, tables of another extent, or the
+    /// A rotation built without its spectrum ([`Self::new`]), positions that are not one coordinate
+    /// per axis and token, tables of another extent, or the
     /// operator's refusal.
     pub fn factors(
         &self,
@@ -755,10 +770,16 @@ impl Rotary {
                 ),
             ));
         }
+        let table = self.table.as_ref().ok_or_else(|| {
+            Error::shape(
+                "Rotary::factors",
+                "this rotation published no spectrum: its factors are the caller's".to_owned(),
+            )
+        })?;
         let descriptor = self.factors_descriptor(positions.dtype, cosine.dtype);
         let args = FactorsArgs {
             positions,
-            frequencies: self.table.view(),
+            frequencies: table.view(),
             cosine,
             sine,
         };
@@ -1010,6 +1031,40 @@ mod tests {
             grid_positions(&[3], Normalization::CellCentre, std::f32::consts::TAU).unwrap();
         assert_eq!(turned[0], std::f32::consts::TAU * third);
         assert!(grid_positions(&[2, 0], Normalization::CellCentre, 1.0).is_err());
+    }
+
+    /// A rotation built without its spectrum turns heads by the caller's factors and refuses to
+    /// compute factors of its own.
+    #[test]
+    fn a_rotation_without_its_spectrum_computes_no_factors() {
+        use crate::forward::{Arena, Forward};
+        use ops::{DType, Shape};
+
+        let rotary = Rotary::new(
+            Spectrum::Default {
+                theta: 10_000.0,
+                dim: 16,
+                precision: Precision::F32,
+            },
+            RotarySpec {
+                head_dim: 16,
+                heads: 2,
+                kv_heads: 2,
+                qk_norm: QkNorm::None,
+            },
+        )
+        .unwrap();
+        let arena = Arena::counting();
+        let f = Forward::recording(&arena);
+        let tensor = |dtype, dims: &[u64]| arena.tensor(dtype, Shape::new(dims)).unwrap();
+        let (cosine, sine) = (tensor(DType::F32, &[3, 8]), tensor(DType::F32, &[3, 8]));
+        let positions = tensor(DType::I32, &[3]);
+        assert!(rotary.factors(&f, positions, cosine, sine).is_err());
+        let heads = || tensor(DType::BF16, &[3, 2, 16]);
+        let (query, key) = (heads(), heads());
+        rotary
+            .apply(&f, query, key, None, cosine, sine, heads(), heads())
+            .unwrap();
     }
 
     /// A plain spectrum is the f64 power series, its first pair unity and the rest falling.
