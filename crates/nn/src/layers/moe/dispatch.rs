@@ -22,8 +22,8 @@ use ops::moe::exchange::ExchangeTransport;
 ///
 /// The views are the transport's own device buffers: the layer reads them to sort and compute its
 /// experts and writes its sums back, and never allocates or frees them. `hidden` and `top` describe
-/// one row of the received layout. `ranks x capacity` rows exist, and `live` states how many of them
-/// the running step holds, which the agreed capacity decides on the device.
+/// one row of the received layout. `ranks x rank_rows` rows exist, and `live` states how many of them
+/// the running step holds, which the ranks agree on the device.
 pub struct DispatchViews {
     /// The package's transport for this device and group.
     ///
@@ -34,25 +34,26 @@ pub struct DispatchViews {
     pub ranks: u32,
     /// Leading ranks of the group that hold no experts.
     pub attention: u32,
-    /// Rows one rank may exchange: the MoE plan's capacity, so the rows fit without a host read.
-    pub capacity: u32,
+    /// Rows of one rank's block of the received views: the most one rank may exchange in a step,
+    /// which the worker sizes the transport for, so the rows fit without a host read.
+    pub rank_rows: u32,
     /// Rows per rank the expert work of this walk is shaped for: the step's graph holds at most
-    /// this many, so the received views are read to `ranks * step_rows` rows. At most `capacity`.
+    /// this many, so the received views are read to `ranks * step_rows` rows. At most `rank_rows`.
     pub step_rows: u32,
-    /// `[ranks * capacity, hidden]` in the activation element type: the dispatched activations.
+    /// `[ranks * rank_rows, hidden]` in the activation element type: the dispatched activations.
     pub states: TensorView,
-    /// `[ranks * capacity, top]` i32: the experts each received row is routed to.
+    /// `[ranks * rank_rows, top]` i32: the experts each received row is routed to.
     pub ids: TensorView,
-    /// `[ranks * capacity, top]` f32: the router weights of each received row.
+    /// `[ranks * rank_rows, top]` f32: the router weights of each received row.
     pub weights: TensorView,
-    /// `[ranks * capacity, hidden]` in the activation element type: where this rank's experts leave
+    /// `[ranks * rank_rows, hidden]` in the activation element type: where this rank's experts leave
     /// each received row's sum, for the combine to return.
     pub combined: TensorView,
     /// `[1]` i32: the leading rows of these views the running step holds.
     pub live: TensorView,
-    /// `[capacity, hidden / 2]` u8: where a fused launch reads this rank's encoded rows.
+    /// `[rank_rows, hidden / 2]` u8: where a fused launch reads this rank's encoded rows.
     pub packed: TensorView,
-    /// `[capacity, hidden / 16]` block scales of those rows.
+    /// `[rank_rows, hidden / 16]` block scales of those rows.
     pub packed_scales: TensorView,
     /// One launch runs the whole expert layer, so the layer sorts and multiplies nothing itself.
     pub fused: bool,
@@ -68,20 +69,20 @@ pub struct DispatchViews {
 }
 
 impl DispatchViews {
-    /// These views for a walk whose expert work holds `rows` rows per rank; zero keeps the whole
-    /// capacity.
+    /// These views for a walk whose expert work holds `rows` rows per rank; zero keeps every row
+    /// of a rank's block.
     #[must_use]
     pub fn at_rows(&self, rows: u32) -> Self {
         let step_rows = if rows == 0 {
-            self.capacity
+            self.rank_rows
         } else {
-            rows.min(self.capacity)
+            rows.min(self.rank_rows)
         };
         Self {
             transport: self.transport,
             ranks: self.ranks,
             attention: self.attention,
-            capacity: self.capacity,
+            rank_rows: self.rank_rows,
             step_rows,
             states: self.states,
             ids: self.ids,
@@ -130,7 +131,7 @@ impl DispatchViews {
     /// The worker builds this value, so a wrong extent is a wiring error; checking it here keeps
     /// it out of a launch that would read unrelated memory.
     pub fn require_extents(&self, name: &'static str) -> crate::Result<()> {
-        let rows = u64::from(self.ranks) * u64::from(self.capacity);
+        let rows = u64::from(self.ranks) * u64::from(self.rank_rows);
         let hidden = self.hidden();
         let top = self.top();
         if top == 0 || hidden == 0 {
@@ -165,8 +166,8 @@ mod tests {
     use super::*;
     use crate::{DType, DevicePtr, Shape};
 
-    fn exchange(ranks: u32, capacity: u32, hidden: u64, top: u64) -> DispatchViews {
-        let rows = u64::from(ranks) * u64::from(capacity);
+    fn exchange(ranks: u32, rank_rows: u32, hidden: u64, top: u64) -> DispatchViews {
+        let rows = u64::from(ranks) * u64::from(rank_rows);
         let base = DevicePtr::new(0x1_0000);
         DispatchViews {
             transport: {
@@ -176,8 +177,8 @@ mod tests {
             },
             ranks,
             attention: 0,
-            capacity,
-            step_rows: capacity,
+            rank_rows,
+            step_rows: rank_rows,
             states: TensorView::new(base, DType::BF16, Shape::new(&[rows, hidden])),
             ids: TensorView::new(base, DType::I32, Shape::new(&[rows, top])),
             weights: TensorView::new(base, DType::F32, Shape::new(&[rows, top])),
@@ -186,12 +187,12 @@ mod tests {
             packed: TensorView::new(
                 base,
                 DType::U8,
-                Shape::new(&[u64::from(capacity), hidden / 2]),
+                Shape::new(&[u64::from(rank_rows), hidden / 2]),
             ),
             packed_scales: TensorView::new(
                 base,
                 DType::F8E4M3,
-                Shape::new(&[u64::from(capacity), hidden / 16]),
+                Shape::new(&[u64::from(rank_rows), hidden / 16]),
             ),
             fused: false,
             source_only: false,

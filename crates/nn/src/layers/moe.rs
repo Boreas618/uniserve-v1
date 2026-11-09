@@ -1525,9 +1525,9 @@ impl Moe {
     ///
     /// `exchange` is the worker's bundle for this group: the package's transport and the views of
     /// its workspace — the rows this rank received at dispatch, with their ids and weights, in the
-    /// package's capacity-sized layout. The layer never allocates or owns any of it.
+    /// package's layout, sized by the worker. The layer never allocates or owns any of it.
     ///
-    /// Every buffer is the worst case for the group's capacity, so a captured graph replays over
+    /// Every buffer holds the most rows a rank may exchange, so a captured graph replays over
     /// the same addresses however the router routes a later batch.
     pub fn forward_expert_parallel(
         &self,
@@ -1547,8 +1547,8 @@ impl Moe {
         let hidden_width = u64::from(self.hidden);
         let top = u64::from(self.top);
         let ranks = u64::from(exchange.ranks);
-        let capacity = u64::from(exchange.capacity);
-        let received = u64::from(exchange.ranks) * capacity;
+        let rank_rows = u64::from(exchange.rank_rows);
+        let received = u64::from(exchange.ranks) * rank_rows;
         let tokens = hidden.rows();
 
         hidden
@@ -1574,16 +1574,16 @@ impl Moe {
                 ),
             ));
         }
-        if capacity == 0 || received == 0 {
+        if rank_rows == 0 || received == 0 {
             return Err(Error::shape(
                 "Moe",
-                "the exchange's capacity is empty: a rank sends at least one row".to_owned(),
+                "the exchange holds no row: a rank sends at least one".to_owned(),
             ));
         }
-        if tokens > capacity {
+        if tokens > rank_rows {
             return Err(Error::shape(
                 "Moe",
-                format!("the batch has {tokens} tokens, the exchange carries {capacity} per rank"),
+                format!("the batch has {tokens} tokens, the exchange carries {rank_rows} per rank"),
             ));
         }
         for (name, view, dtype) in [
@@ -1697,7 +1697,7 @@ impl Moe {
             intermediate: self.intermediate,
             top: self.top,
             experts: self.experts,
-            max_tokens: exchange.capacity,
+            max_tokens: exchange.rank_rows,
             ranks: exchange.ranks,
             attention: exchange.attention,
             dtype: exchange.states.dtype,
@@ -1746,7 +1746,7 @@ impl Moe {
             permuted_to_token,
             total_padded_tokens,
             num_non_exiting_tiles,
-            // The rows the step holds, which the agreed capacity decides on the device: the views'
+            // The rows the step holds, which the ranks agree on the device: the views'
             // extents are the transport's largest step, and the rows past the count are left over
             // from an earlier one.
             live_tokens: Some(exchange.live),
@@ -1904,7 +1904,7 @@ impl Moe {
             intermediate: self.intermediate,
             top: self.top,
             experts: self.experts,
-            max_tokens: exchange.capacity,
+            max_tokens: exchange.rank_rows,
             ranks: exchange.ranks,
             attention: exchange.attention,
             dtype: out.dtype,
@@ -1940,7 +1940,7 @@ impl Moe {
             intermediate: self.intermediate,
             top: self.top,
             experts: self.experts,
-            max_tokens: exchange.capacity,
+            max_tokens: exchange.rank_rows,
             ranks: exchange.ranks,
             attention: exchange.attention,
             dtype: exchange.states.dtype,
