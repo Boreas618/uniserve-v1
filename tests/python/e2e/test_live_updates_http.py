@@ -937,7 +937,7 @@ def test_a_switch_after_a_hot_restart_finds_the_storage_of_the_epoch_before(
     The epoch that serves took its storage from the one before it, under that
     epoch's name. The daemon that switched it is gone, and the next target still
     maps that storage.
-    """
+    """  # noqa: E501
     name = "qwen3-live-restart-switch"
     log = tmp_path / "server.log"
     executables = []
@@ -1260,8 +1260,8 @@ def _restart_while_streaming(
     assert moved["change"] == "daemon", moved
     successors.append(moved["pid"])
     moved_url = f"http://127.0.0.1:{port}"
-    # The answer comes from the daemon on the previous address, and the successor binds a new
-    # address once it holds the deployment.
+    # The answer comes from the daemon on the previous address, and the
+    # successor binds a new address once it holds the deployment.
     _wait_until(lambda: _listens(port), 60, "the new address did not open")
     reply = _chat(moved_url, name, "Say hello.")
     assert reply["choices"][0]["message"]["content"]
@@ -1306,7 +1306,8 @@ def _restart_while_streaming(
         return tomllib.loads(status["config"])
 
     # A commit may be asked while the target is still being promoted, and it is
-    # applied when the trial starts: the configuration moves once the target serves.
+    # applied when the trial starts: the configuration moves once the target
+    # serves.
     _wait_until(
         lambda: (
             served_config()["cuda_graph_config"]["decode_batch_sizes"]
@@ -1485,8 +1486,9 @@ def test_a_storage_server_restart_keeps_the_deployment_serving(
         _change_epoch(base_url, CHANGE)
         reply = _chat(base_url, name, "Say hello.")
         assert reply["choices"][0]["message"]["content"]
-        # The ledger books a storage once however many epochs map it, so a successor that read the
-        # checkpoint again would book its weights beside these.
+        # The ledger books a storage once however many epochs map it, so a
+        # successor that read the checkpoint again would book its weights beside
+        # these.
         assert _weight_bytes(base_url) == weights
 
 
@@ -1541,7 +1543,7 @@ def test_a_target_that_finds_no_storage_leaves_the_serving_epoch_serving(
     and its graphs are its own to find. With two GiB left on the GPU it finds no
     room for them, so the update ends on its exit, and the stream goes on with
     the cache as it was.
-    """
+    """  # noqa: E501
     name = "qwen3-live-pressure"
     log = tmp_path / "server.log"
     device = os.environ.get("UNISERVE_LIVE_DEVICE", "0")
@@ -1657,7 +1659,8 @@ RECOVERY_BOUND_S = 120.0
 #: A count to 60 is about 230 tokens, which a single request on one GB200 now
 #: streams in under a second, so a kill made after the eighth number landed
 #: after the response had ended and no request was left to migrate. A count to
-#: 300 streams for several seconds, which the kill and a switch both land inside.
+#: 300 streams for several seconds, which the kill and a switch both land
+#: inside.
 RECOVERY_PROMPT = (
     "Count from 1 to 300, separated by commas and spaces. "
     "Write only the numbers."
@@ -2055,7 +2058,7 @@ def test_an_epoch_switch_to_a_new_executable_fails_no_request(
 
 
 def _update(base_url: str) -> dict:
-    """The update in flight or the last one, as ``GET /admin/config`` reports it."""
+    """The update in flight or the last one, as ``GET /admin/config`` reports it."""  # noqa: E501
     status = httpx.get(f"{base_url}/admin/config", timeout=60).json()
     return status.get("update") or {}
 
@@ -2133,7 +2136,7 @@ def _assert_whole(streaming: threading.Thread, streamed: dict) -> int:
         pytest.fail(
             f"the response lost or repeated a count at {wrong}: "
             f"{text[max(at - 60, 0) : at + 80]!r}, deltas "
-            f"{[piece for piece in pieces[3 * wrong - 12 : 3 * wrong + 12]]}"
+            f"{list(pieces[3 * wrong - 12 : 3 * wrong + 12])}"
         )
     assert len(streamed["reasons"]) == 1, (
         f"the count ended {streamed['reasons']}"
@@ -2222,7 +2225,8 @@ def test_an_operator_rollback_returns_to_the_previous_epoch_under_a_request(
                 )
         else:
             assert all(_runs(pid) for pid in before)
-        # A node that cannot move the weights keeps them on its GPUs, and says why.
+        # A node that cannot move the weights keeps them on its GPUs, and says
+        # why.
         _wait_until(
             lambda: (
                 previous_epoch == "parked"
@@ -2267,8 +2271,8 @@ def test_a_regression_of_the_epoch_on_trial_reverts_it(
     """
     name = "qwen3-live-regression"
     log = tmp_path / "server.log"
-    # The walk costs a step about a fifth more than a replay, so a threshold of a
-    # fifth would read the machine and not the regression.
+    # The walk costs a step about a fifth more than a replay, so a threshold of
+    # a fifth would read the machine and not the regression.
     thresholds = (
         "update_config.rollback.step_time_regression=0.05",
         f'update_config.rollback.window="{TRIAL_WINDOW_S}s"',
@@ -2426,10 +2430,11 @@ def test_warming_waits_for_the_stated_tail_and_limits_the_prefill(
 ):
     """The two warming options change what a switch does.
 
-    A tail of two tokens is reached only at a page boundary, so it takes rounds a
-    page's tail does not. Prompts in their prefill run past a tail of one token, so
-    a round limits the source's prefill, and the wait still ends: a tail that stays
-    past the limit costs the requests a recomputation and no failure.
+    A tail of two tokens is reached only at a page boundary, so it takes rounds
+    a page's tail does not. Prompts in their prefill run past a tail of one
+    token, so a round limits the source's prefill, and the wait still ends: a
+    tail that stays past the limit costs the requests a recomputation and no
+    failure.
     """
     name = "qwen3-live-warming-options"
     log = tmp_path / "server.log"
@@ -2466,9 +2471,10 @@ def test_warming_waits_for_the_stated_tail_and_limits_the_prefill(
             "the update did not end",
         )
 
-        # Prompts that never repeat keep a prefill running under the switch, and what
-        # they generate leaves a tail past a page. A round that happens on no tail ends
-        # the wait as it should and limits nothing, so the switch is tried again.
+        # Prompts that never repeat keep a prefill running under the switch, and
+        # what they generate leaves a tail past a page. A round that happens on
+        # no tail ends the wait as it should and limits nothing, so the switch
+        # is tried again.
         prompts = threading.Event()
 
         def prefills() -> None:
@@ -2688,7 +2694,10 @@ def test_requests_that_outgrow_the_cache_in_decode_all_finish(
     # About 3400 tokens each (a number of three digits, its comma and its
     # space are five tokens), so eight of them need more than three caches of
     # 8192 tokens by their ends, and the cache fills while every one decodes.
-    prompt = "Count from 1 to 700, separated by commas and spaces. Write only the numbers."
+    prompt = (
+        "Count from 1 to 700, separated by commas and spaces. "
+        "Write only the numbers."
+    )
     with _serve(runtime, log, name, options=options) as base_url:
         streams = []
         for _ in range(8):
@@ -2752,10 +2761,11 @@ def test_a_weight_update_leaves_the_pages_of_the_old_weights_in_the_host_cache(
     """A page in the host KV cache belongs to the weights that computed it.
 
     A prompt finds its pages in the host cache once the device's prefix cache is
-    flushed. After an update to other weights the same prompt finds none of them,
-    although the new weights name the same model: it computes its own, which the
-    next flush makes it find. The other checkpoint is another copy of the files,
-    so the two weights answer alike and a stale page would go unseen in the text.
+    flushed. After an update to other weights the same prompt finds none of
+    them, although the new weights name the same model: it computes its own,
+    which the next flush makes it find. The other checkpoint is another copy of
+    the files, so the two weights answer alike and a stale page would go unseen
+    in the text.
     """
     other = os.environ.get("UNISERVE_QWEN3_UPDATED_MODEL")
     if not other:
@@ -2812,18 +2822,18 @@ def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
 ):
     """``previous_epoch = "host"`` moves bytes, and a revert brings them back.
 
-    A target of other model files maps none of the serving epoch's weights, so the
-    weights that epoch alone retains leave its GPU for host storage while the
-    target serves. The revert returns them and starts the epoch on them, under a
-    stream that crosses both moves whole, and it answers as it did.
+    A target of other model files maps none of the serving epoch's weights, so
+    the weights that epoch alone retains leave its GPU for host storage while
+    the target serves. The revert returns them and starts the epoch on them,
+    under a stream that crosses both moves whole, and it answers as it did.
     """
     other = os.environ.get("UNISERVE_QWEN3_UPDATED_MODEL")
     if not other:
         pytest.skip("UNISERVE_QWEN3_UPDATED_MODEL names no other checkpoint")
     name = "qwen3-live-host-weights"
     log = tmp_path / "server.log"
-    # The target loads its checkpoint beside the serving one, and the deployment's
-    # quota of the GPU holds both only past the default share.
+    # The target loads its checkpoint beside the serving one, and the
+    # deployment's quota of the GPU holds both only past the default share.
     options = (*OPTIONS, "mem_fraction_static=0.9")
     with _serve(runtime, log, name, options=options) as base_url:
         answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
