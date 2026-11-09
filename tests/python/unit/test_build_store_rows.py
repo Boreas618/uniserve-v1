@@ -1,10 +1,12 @@
 """How a key fixture's rows are read, and what a row may state.
 
-A fixture row is `op<TAB>descriptor`, and it may state a third field: the backend the deployment
-launches that key on. The field exists because the backend is not a property of the key - 
-`paged_attention` declares `bf16`/`f16` on `trtllm` and `f8e4m3` on `triton`, so a store built from a
-two-column fixture chooses a backend by coverage, which is not necessarily the one the deployment
-names. A row that states it is held to: the store builds that package or refuses.
+A fixture row is `op<TAB>descriptor`, and it may state a third field: the
+backend the deployment launches that key on. The field exists because the
+backend is not a property of the key - `paged_attention` declares `bf16`/`f16`
+on `trtllm` and `f8e4m3` on `triton`, so a store built from a two-column fixture
+chooses a backend by coverage, which is not necessarily the one the deployment
+names. A row that states it is held to: the store builds that package or
+refuses.
 """
 
 import importlib.util
@@ -19,7 +21,10 @@ REPOSITORY = pathlib.Path(__file__).resolve().parents[3]
 
 @pytest.fixture(scope="module")
 def store():
-    """`tools/build_store.py` imported by path: it is a program under `tools/`, not a package."""
+    """`tools/build_store.py`, imported by path.
+
+    It is a program under `tools/`, not a package.
+    """
     path = REPOSITORY / "tools" / "build_store.py"
     spec = importlib.util.spec_from_file_location("build_store", path)
     module = importlib.util.module_from_spec(spec)

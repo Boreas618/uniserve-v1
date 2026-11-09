@@ -16,10 +16,10 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.python.e2e.profiling_helpers import Load, ended, serve, start
 from tests.python.e2e.program_server import (
     program_server as running_program_server,
 )
-from tests.python.e2e.profiling_helpers import Load, ended, serve, start
 from uniserve_eval.profile import ProfileFile
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
