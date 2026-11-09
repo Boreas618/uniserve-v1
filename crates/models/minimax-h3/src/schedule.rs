@@ -11,8 +11,9 @@
 //!
 //! ## The arithmetic
 //!
-//! The formulas are the released ones, evaluated in the same
-//! precision so the host-side sequences agree with them:
+//! The formulas are the released ones, evaluated in the same precision so the host-side sequences
+//! agree with them. The uniform grid and the DMD ladder are the shared flow-matching grids
+//! ([`nn::diffusion::Grid`]); the block grid and its fixed-point shift are this family's own:
 //!
 //! ```text
 //! uniform grid   u_i = linspace(1, 0, points) in FP32;  sigma_i = shift(u_i), deduplicated in FP32
@@ -37,6 +38,7 @@
 //! (`TO exec`).
 
 use nn::Step;
+use nn::diffusion::{Grid, linspace};
 
 use crate::config::{ScheduleGrid, ScheduleSpec};
 use crate::{Error, Result};
@@ -109,18 +111,22 @@ impl Schedule {
     /// its length must equal the fused per-step head tables' count, so collapsing two rungs would
     /// silently misalign every step's heads.
     pub fn sigmas(&self, modality: Modality) -> Vec<f32> {
-        let shift = f64::from(self.shift(modality));
+        let shift = self.shift(modality);
         match &self.spec.grid {
-            ScheduleGrid::Uniform { points } => uniform_sigmas(*points, shift),
+            ScheduleGrid::Uniform { points } => Grid::Uniform { points: *points }.sigmas(shift),
             ScheduleGrid::Dmd {
                 rungs,
                 num_train_timesteps,
-            } => ladder_sigmas(rungs, f64::from(*num_train_timesteps), shift),
+            } => Grid::Ladder {
+                rungs: rungs.clone(),
+                train_steps: f64::from(*num_train_timesteps),
+            }
+            .sigmas(shift),
             ScheduleGrid::Blocks {
                 intervals,
                 nodes,
                 max_t,
-            } => block_sigmas(*intervals, nodes, f64::from(*max_t), shift),
+            } => block_sigmas(*intervals, nodes, f64::from(*max_t), f64::from(shift)),
         }
     }
 
@@ -246,67 +252,6 @@ impl Schedule {
                 .collect(),
         ))
     }
-}
-
-/// The rectified-flow time shift in FP64.
-fn shifted(value: f64, shift: f64) -> f64 {
-    shift * value / (1.0 + (shift - 1.0) * value)
-}
-
-/// The rectified-flow time shift in FP32, the arithmetic the released grid evaluates.
-fn shifted32(value: f32, shift: f32) -> f32 {
-    shift * value / (1.0 + (shift - 1.0) * value)
-}
-
-/// Drop consecutive equal FP32 values, as `torch.unique_consecutive` does.
-fn deduplicate(values: Vec<f32>) -> Vec<f32> {
-    let mut points: Vec<f32> = Vec::with_capacity(values.len());
-    for value in values {
-        if points
-            .last()
-            .is_none_or(|previous| previous.to_bits() != value.to_bits())
-        {
-            points.push(value);
-        }
-    }
-    points
-}
-
-/// `linspace(start, end, count)` in FP64: `start + i · (end - start) / (count - 1)`.
-fn linspace(start: f64, end: f64, count: usize) -> Vec<f64> {
-    let step = (end - start) / (count - 1) as f64;
-    (0..count)
-        // Both endpoints are exact: the clean end of a schedule must be zero and not the residue
-        // that `start + n * step` leaves, which would scale the final sample by it.
-        .map(|index| match index {
-            0 => start,
-            last if last == count - 1 => end,
-            _ => start + index as f64 * step,
-        })
-        .collect()
-}
-
-/// The released uniform grid's sigma points for one modality.
-fn uniform_sigmas(points: u32, shift: f64) -> Vec<f32> {
-    let shift32 = shift as f32;
-    let values = linspace(1.0, 0.0, points as usize)
-        .into_iter()
-        .map(|value| shifted32(value as f32, shift32))
-        .collect();
-    deduplicate(values)
-}
-
-/// A DMD ladder's sigma points for one modality: the shifted rungs, then the clean endpoint.
-fn ladder_sigmas(rungs: &[u32], num_train_timesteps: f64, shift: f64) -> Vec<f32> {
-    let mut sigmas: Vec<f32> = rungs
-        .iter()
-        .map(|rung| shifted(f64::from(*rung) / num_train_timesteps, shift) as f32)
-        .collect();
-    sigmas.push(0.0);
-    // Not deduplicated: the reference keeps one sigma per trained rung, and
-    // a collapsed rung would leave the schedule with fewer evaluations than the checkpoint has head
-    // tables. Only the uniform grid collapses equal points.
-    sigmas
 }
 
 /// A parallel-decoding student's node sigmas for one modality.
@@ -473,7 +418,10 @@ mod tests {
         assert_eq!(video.len(), 9);
         assert_eq!(*video.last().expect("the clean endpoint"), 0.0);
         // A rung is unshifted on the training schedule and shifted once here.
-        assert_eq!(video[0], shifted(999.0 / 1000.0, 10.0) as f32);
+        assert_eq!(
+            video[0],
+            nn::diffusion::time_shift(999.0_f64 / 1000.0, 10.0) as f32
+        );
     }
 
     #[test]
@@ -508,6 +456,25 @@ mod tests {
             .expect("a parallel-decoding grid scales its draw");
         assert!((video - 0.999).abs() < 1e-6);
         assert!((audio - 0.999).abs() < 1e-6);
+    }
+
+    /// The grid's kind decides whether a draw is scaled, not its first number: a distilled ladder's
+    /// first sigma is below one too, and the reference scales a parallel-decoding draw alone.
+    #[test]
+    fn only_a_block_grid_scales_its_draw() {
+        let distilled = dmd();
+        assert!(distilled.sigmas(Modality::Video)[0] < 1.0);
+        assert_eq!(
+            distilled.start_sigma(Modality::Video).expect("a level"),
+            None
+        );
+        assert_eq!(base().start_sigma(Modality::Video).expect("a level"), None);
+        assert!(
+            blocks()
+                .start_sigma(Modality::Video)
+                .expect("a level")
+                .is_some()
+        );
     }
 
     #[test]

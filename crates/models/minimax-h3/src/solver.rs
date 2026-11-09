@@ -1,31 +1,9 @@
-//! The denoiser's solver: one Euler step of a diffusion trajectory per evaluation.
+//! The denoiser's solver: one Euler step of each modality's trajectory per evaluation.
 //!
 //! A network evaluates a velocity at a noise level; the solver advances the sample from that level
-//! to the next. MiniMax-H3 uses the released clean-sample Euler solver,
-//! whose two statements
-//!
-//! ```text
-//! clean = 1 - timestep                  # = sigma, rounded to the sample's dtype
-//! v     = v * clean + x                 # the clean estimate, one rounding
-//! ratio = sigma_next / sigma            # FP32
-//! x     = x * ratio + v * (1 - ratio)
-//! ```
-//!
-//! close algebraically to one Euler step in the sigma domain,
-//!
-//! ```text
-//! x += v * (sigma - sigma_next)
-//! ```
-//!
-//! because `sigma * (1 - ratio) = sigma - sigma_next`. The operator that computes it is
-//! `scaled_residual` (`hidden += update * scale`), whose scale is a device view. A step's
-//! coefficient is a host value of the checkpoint's fixed schedule, so this module publishes the
-//! coefficients as one FP32 `[steps, 1]` constant per modality at load and gathers the evaluated
-//! step's word **on the device**, indexed by the worker's `step` table, into one staged word per
-//! forward. The launch therefore addresses one buffer whose *contents* change per evaluation
-//! instead of one buffer per evaluation: every evaluation of a layout runs the same graph, so one
-//! capture serves the whole trajectory and the solver may sit inside the captured stack. Only the
-//! step table's four bytes are the worker's per-replay write.
+//! to the next. MiniMax-H3 uses the released clean-sample Euler solver, which closes algebraically
+//! to the shared flow-matching step [`nn::diffusion::Euler`], `x += v · (sigma - sigma_next)`.
+//! This module binds one such step per modality to the checkpoint's evaluated [`Schedule`].
 //!
 //! ## What the solver writes
 //!
@@ -38,85 +16,59 @@
 //! `scaled_residual` reads its residual and its update in one element type. The released denoiser
 //! predicts in FP32 over a trajectory it keeps in the sample's own type, so that the Euler
 //! arithmetic stays FP32 and only the store rounds. This model instead declares the output heads'
-//! precision as the latents' type (each layer declares its precision rather than inheriting an
-//! autocast region), so the trajectory and the velocity agree in type, the arithmetic inside the
-//! operator is FP32, and the store rounds once per step. The difference from the released pipeline
-//! is one rounding per step of the velocity; it is inside the operator's tolerance and is the
-//! `quality` preset's own representation.
+//! precision as the latents' type, so the trajectory and the velocity agree in type, the arithmetic
+//! inside the operator is FP32, and the store rounds once per step.
 
-use nn::layers::{Residual, Scale};
-use nn::weights::{Weight, WeightLoader};
-use nn::{Forward, Shape, TensorView};
+use nn::diffusion::Euler;
+use nn::weights::WeightLoader;
+use nn::{Forward, TensorView};
 
 use crate::schedule::{Modality, Schedule};
 use crate::{Error, Result};
 
-/// The elements of a latent tensor as the operator's row matrix sees them.
-///
-/// The Euler update is elementwise, so any contiguous view is one element per row; the latents keep
-/// their mathematical shape (`[channels, frames, height, width]`) and the operator sees
-/// `[elements, 1]`, which is the shape a `[1]` scale broadcasts over.
-pub fn elements(sample: TensorView) -> Result<TensorView> {
-    if sample.strides != nn::Strides::row_major(sample.shape) {
-        return Err(Error::checkpoint(
-            "H3 latents must be contiguous for the solver's elementwise update".to_owned(),
-        ));
-    }
-    let count = sample.shape.numel();
-    Ok(TensorView::new(
-        sample.ptr,
-        sample.dtype,
-        Shape::new(&[count, 1]),
-    ))
-}
-
 /// The Euler solver of a checkpoint's schedule.
 ///
-/// One value per modality: the video and audio timelines advance together but carry their own
-/// shifts and so their own coefficients.
+/// One [`Euler`] step per modality: the video and audio timelines advance together but carry their
+/// own shifts and so their own coefficients.
 pub struct Solver {
-    video: Track,
-    audio: Track,
-}
-
-/// One modality's steps: the coefficient table a step gathers its scale from, and the level a draw
-/// starts from.
-struct Track {
-    /// `[steps, 1]` FP32: evaluation `i` advances the sample by `coefficients[i]`, gathered on the
-    /// device from the worker's `step` table so one capture serves every evaluation.
-    coefficients: Weight,
-    /// Scales a fresh draw to the schedule's first level: `sample += sample * (sigma_0 - 1)`.
-    ///
-    /// A parallel-decoding student's first node is not unit noise; the released and distilled
-    /// grids start at `sigma_0 = 1`, where the layer is omitted because the draw is already right.
-    start: Option<Residual>,
+    video: Euler,
+    audio: Euler,
 }
 
 impl Solver {
     /// Publish the schedule's coefficients and build the steps.
     ///
-    /// `loader` is the loading boundary's weight loader: the two coefficient tables become
-    /// constants of the retained store, so every deployment of this checkpoint reads the same
-    /// numbers and a graph addresses them by address.
+    /// Each modality's coefficient table becomes a constant of the retained store under
+    /// `denoiser.<modality>`, so every deployment of this checkpoint reads the same numbers and a
+    /// graph addresses them by address.
     pub fn load(schedule: &Schedule, loader: &mut WeightLoader<'_>) -> Result<Self> {
+        let mut euler = |modality: Modality| -> Result<Euler> {
+            let mut scope = loader.scope(format!("denoiser.{}", modality.as_str()));
+            // Only the grid that scales its draw states a start level (`Schedule::start_sigma`): a
+            // released or distilled grid starts from unit noise and needs no launch at all.
+            Ok(Euler::load(
+                &mut scope,
+                &schedule.sigmas(modality),
+                schedule.start_sigma(modality)?,
+            )?)
+        };
         Ok(Self {
-            video: Track::load(schedule, Modality::Video, loader)?,
-            audio: Track::load(schedule, Modality::Audio, loader)?,
+            video: euler(Modality::Video)?,
+            audio: euler(Modality::Audio)?,
         })
     }
 
     /// How many evaluations one modality has.
     pub fn steps(&self, modality: Modality) -> u32 {
-        match modality {
-            Modality::Video => self.video.coefficients.shape().dims()[0] as u32,
-            Modality::Audio => self.audio.coefficients.shape().dims()[0] as u32,
-        }
+        self.euler(modality).steps()
     }
 
     /// Advance `sample` in place to the next noise level: `sample += velocity * Δsigma`.
     ///
     /// `evaluation` is the step's index in the schedule; the runner gets it from
-    /// [`Schedule::steps`] and passes it back in [`nn::Step::index`](nn::Step).
+    /// [`Schedule::steps`] and passes it back in [`nn::Step::index`](nn::Step). `index` is the
+    /// worker's `step` table the coefficient is gathered by on the device, and `gathered` the one
+    /// FP32 word it lands in.
     #[allow(clippy::too_many_arguments)]
     pub fn step(
         &self,
@@ -128,7 +80,6 @@ impl Solver {
         index: TensorView,
         gathered: TensorView,
     ) -> Result<()> {
-        let track = self.track(modality);
         let steps = self.steps(modality);
         if evaluation >= steps {
             return Err(Error::checkpoint(format!(
@@ -136,19 +87,9 @@ impl Solver {
                 modality.as_str()
             )));
         }
-        let (sample, velocity) = self.check(sample, velocity, modality)?;
-        // The coefficient is read on the device from the worker's `step` table, so the launch that
-        // follows addresses one buffer whose contents change per evaluation rather than one buffer
-        // per evaluation: one capture serves them all.
-        nn::layers::IndexRows.gather(f, track.coefficients.view(), index, gathered)?;
-        let scale = Weight {
-            backing: nn::Backing::new(gathered.ptr, 4),
-            view: gathered.reshape(Shape::new(&[1])),
-        };
-        // A one-channel scale: every element of the sample's single column reads it.
-        Residual::new(Scale::Channel(scale), None)
-            .and_then(|scaled| scaled.forward(f, sample, velocity, None, sample))
-            .map_err(Error::from)
+        Ok(self
+            .euler(modality)
+            .forward(f, sample, velocity, index, gathered)?)
     }
 
     /// Scale a fresh draw to the level the schedule starts from.
@@ -156,229 +97,13 @@ impl Solver {
     /// The released and distilled grids start from unit noise, where this does nothing; a
     /// parallel-decoding student scales by its first node's sigma.
     pub fn start(&self, f: &Forward, modality: Modality, sample: TensorView) -> Result<()> {
-        let Some(start) = self.track(modality).start.as_ref() else {
-            return Ok(());
-        };
-        let sample = elements(sample)?;
-        start
-            .forward(f, sample, sample, None, sample)
-            .map_err(Error::from)
+        Ok(self.euler(modality).prepare_latents(f, sample)?)
     }
 
-    /// The coefficients of one step, as the published table holds them: `sigma - sigma_next`.
-    ///
-    /// **The direction is the solver's, not a rumour of it.** The released network predicts a
-    /// velocity pointing from the sample towards its clean end, and the released step advances the
-    /// sample along the *time* the network reads, `x += v · (t_next - t)` with `t = 1 - sigma`
-    /// (the clean-sample Euler step: `clean = 1 - timestep = sigma`,
-    /// `x' = x·r + (v·sigma + x)·(1 - r) = x + (sigma - sigma_next)·v`, `r = sigma_next / sigma`).
-    /// The interval is therefore positive on a descending trajectory, and the last one is the
-    /// schedule's own final sigma: the last step lands the sample on its clean estimate.
-    ///
-    /// This is the schedule's arithmetic without a launch, for the loading boundary's tests and for
-    /// the worker's own diagnostics.
-    pub fn coefficients(schedule: &Schedule, modality: Modality) -> Result<Vec<f32>> {
-        let steps = schedule.steps(modality)?;
-        Ok(steps
-            .into_iter()
-            .map(|step| step.sigma - step.sigma_next)
-            .collect())
-    }
-
-    fn track(&self, modality: Modality) -> &Track {
+    fn euler(&self, modality: Modality) -> &Euler {
         match modality {
             Modality::Video => &self.video,
             Modality::Audio => &self.audio,
         }
-    }
-
-    /// Check that a step's two views are the same contiguous element count in one type.
-    fn check(
-        &self,
-        sample: TensorView,
-        velocity: TensorView,
-        modality: Modality,
-    ) -> Result<(TensorView, TensorView)> {
-        let (sample, velocity) = (elements(sample)?, elements(velocity)?);
-        if sample.shape != velocity.shape {
-            return Err(Error::checkpoint(format!(
-                "H3 {} velocity {:?} does not cover the sample's {:?}",
-                modality.as_str(),
-                velocity.shape.dims(),
-                sample.shape.dims()
-            )));
-        }
-        if sample.dtype != velocity.dtype {
-            return Err(Error::checkpoint(format!(
-                "H3 {} velocity is {} while the trajectory is {}; the step's operator reads one \
-                 type",
-                modality.as_str(),
-                velocity.dtype,
-                sample.dtype
-            )));
-        }
-        Ok((sample, velocity))
-    }
-}
-
-impl Track {
-    fn load(
-        schedule: &Schedule,
-        modality: Modality,
-        loader: &mut WeightLoader<'_>,
-    ) -> Result<Self> {
-        let coefficients = Solver::coefficients(schedule, modality)?;
-        let mut track = loader.scope(format!("denoiser.{}", modality.as_str()));
-        let table = track.constant_f32(
-            "step_coefficients",
-            &[coefficients.len() as u64, 1],
-            &coefficients,
-        )?;
-
-        // The start coefficient is `sigma_0 - 1`, and only the grid that scales its draw has one
-        // (`Schedule::start_sigma`): a released or distilled grid starts from unit noise and needs
-        // no launch at all.
-        let start = match schedule.start_sigma(modality)? {
-            None => None,
-            Some(sigma) => {
-                let table = track.constant_f32("start_coefficient", &[1], &[sigma - 1.0])?;
-                Some(Residual::new(Scale::Channel(table), None).map_err(Error::from)?)
-            }
-        };
-        Ok(Self {
-            coefficients: table,
-            start,
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::ScheduleSpec;
-    use crate::config::Shifts;
-
-    fn base() -> Schedule {
-        let spec = ScheduleSpec::uniform(
-            50,
-            Shifts {
-                video: 12.0,
-                audio: 3.0,
-            },
-        )
-        .expect("the base checkpoint's schedule");
-        Schedule::new(&spec).expect("an aligned base schedule")
-    }
-
-    fn dmd() -> Schedule {
-        // A distilled ladder: its first sigma is below one too, which is why the *kind* decides
-        // whether a draw is scaled and the number does not.
-        let spec = ScheduleSpec::dmd(
-            vec![999, 874, 749, 624, 500, 375, 250, 125],
-            1000.0,
-            Shifts {
-                video: 10.0,
-                audio: 3.0,
-            },
-        )
-        .expect("a DMD ladder");
-        Schedule::new(&spec).expect("an aligned DMD schedule")
-    }
-
-    fn blocks() -> Schedule {
-        let spec = ScheduleSpec::blocks(
-            32,
-            vec![0, 4, 8, 12, 16, 20, 24, 28, 32],
-            0.999,
-            Shifts {
-                video: 12.0,
-                audio: 3.0,
-            },
-        )
-        .expect("a block grid");
-        Schedule::new(&spec).expect("an aligned block schedule")
-    }
-
-    #[test]
-    fn a_coefficient_is_the_interval_the_time_advances() {
-        let schedule = base();
-        let coefficients = Solver::coefficients(&schedule, Modality::Video).expect("coefficients");
-        let steps = schedule.steps(Modality::Video).expect("steps");
-        assert_eq!(coefficients.len(), steps.len());
-        for (coefficient, step) in coefficients.iter().zip(&steps) {
-            // The trajectory descends in sigma and ascends in the network's time, so the interval
-            // the clean-ward velocity is scaled by is positive: `t_next - t = sigma - sigma_next`.
-            assert!(*coefficient > 0.0);
-            assert!((coefficient - (step.sigma - step.sigma_next)).abs() < 1e-6);
-        }
-        // The last step lands exactly on the clean endpoint: the whole final level is added.
-        assert!((coefficients[48] - steps[48].sigma).abs() < 1e-6);
-    }
-
-    #[test]
-    fn the_released_clean_sample_form_closes_to_the_same_step() {
-        // The released network's velocity points from the sample towards its clean end,
-        // `v = (x0 - x) / sigma`: the solver recovers the clean estimate as `x0 = x + v sigma` and
-        // then blends it in, `x' = x r + x0 (1 - r)` with `r = sigma_next / sigma`. That is the
-        // reference's own sign, and it closes to `x + v (sigma - sigma_next)`.
-        let (sigma, sigma_next) = (0.75f32, 0.25f32);
-        let ratio = sigma_next / sigma;
-        for (x, v) in [(0.5f32, 1.25f32), (-2.0, 0.125), (0.0, -3.0)] {
-            let clean = x + v * sigma;
-            let released = x * ratio + clean * (1.0 - ratio);
-            let euler = x + v * (sigma - sigma_next);
-            assert!(
-                (released - euler).abs() < 1e-6,
-                "released {released} and euler {euler} disagree"
-            );
-        }
-    }
-
-    #[test]
-    fn the_base_schedule_takes_forty_nine_steps() {
-        let schedule = base();
-        let coefficients = Solver::coefficients(&schedule, Modality::Audio).expect("coefficients");
-        assert_eq!(coefficients.len(), 49);
-    }
-
-    #[test]
-    fn a_parallel_decoding_student_starts_below_unit_noise() {
-        let schedule = blocks();
-        let sigma = schedule
-            .start_sigma(Modality::Video)
-            .expect("a start level")
-            .expect("a parallel-decoding grid scales its draw");
-        assert!((sigma - 0.999).abs() < 1e-6);
-        // Its draw is scaled by `sigma`, which the start coefficient expresses as `sigma - 1`.
-        assert!((sigma - 1.0 - -0.001).abs() < 1e-6);
-        // The released grid starts at unit noise and needs no launch.
-        assert_eq!(base().start_sigma(Modality::Video).expect("a level"), None);
-        // And a distilled grid's first sigma is also below one, so the kind decides and not the
-        // number: the reference scales a `PddGrid`'s draw alone.
-        let distilled = dmd();
-        assert!(distilled.sigmas(Modality::Video)[0] < 1.0);
-        assert_eq!(
-            distilled.start_sigma(Modality::Video).expect("a level"),
-            None
-        );
-    }
-
-    #[test]
-    fn a_latent_view_is_one_element_per_row() {
-        let view = TensorView::new(
-            nn::DevicePtr::new(0),
-            nn::DType::BF16,
-            Shape::new(&[24, 5, 8, 8]),
-        );
-        let elements = elements(view).expect("a contiguous latent tensor");
-        assert_eq!(elements.shape.dims(), &[24 * 5 * 8 * 8, 1]);
-    }
-
-    #[test]
-    fn a_strided_latent_tensor_is_refused() {
-        let mut view =
-            TensorView::new(nn::DevicePtr::new(0), nn::DType::BF16, Shape::new(&[24, 5]));
-        view.strides = nn::Strides::new(&[2, 1]);
-        assert!(elements(view).is_err());
     }
 }
