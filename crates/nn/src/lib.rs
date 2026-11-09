@@ -59,6 +59,7 @@ pub mod group;
 pub mod layers;
 pub mod quantization;
 pub mod tensor;
+pub mod timestep;
 pub mod weights;
 
 pub use capability::{

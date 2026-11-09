@@ -451,3 +451,44 @@ fn a_paged_block_writes_its_layers_planes_then_reads_them() {
             .is_err()
     );
 }
+
+// ---- Timestep embedding -------------------------------------------------------------------------
+
+/// The timestep embedding projects, activates and projects, and leaves the arena as it found it.
+#[test]
+fn a_timestep_embedding_projects_activates_and_projects() {
+    use nn::timestep::{TimestepEmbedding, TimestepSpec};
+
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = checkpoint(
+        directory.path(),
+        &[
+            ("time.linear_1.weight", &[HIDDEN, 16]),
+            ("time.linear_1.bias", &[HIDDEN]),
+            ("time.linear_2.weight", &[INTERMEDIATE, HIDDEN]),
+            ("time.linear_2.bias", &[INTERMEDIATE]),
+        ],
+    );
+    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let embedding = TimestepEmbedding::load(
+        &mut loader.scope("time"),
+        TimestepSpec {
+            frequency_dim: 16,
+            hidden: HIDDEN as u32,
+            out: INTERMEDIATE as u32,
+        },
+    )
+    .unwrap();
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let (x, out) = (view(&arena, &[2, 16]), view(&arena, &[2, INTERMEDIATE]));
+    let used = arena.used();
+    let (result, launches) = launched(|| embedding.forward(&f, x, out));
+    result.unwrap();
+    assert_eq!(launches.len(), 3, "{launches:?}");
+    assert_eq!(
+        (launches[0].as_str(), launches[2].as_str()),
+        ("gemm", "gemm")
+    );
+    assert_eq!(arena.used(), used);
+}

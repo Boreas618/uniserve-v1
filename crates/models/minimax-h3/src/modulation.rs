@@ -32,6 +32,7 @@
 
 use nn::Shape;
 use nn::layers::{Bias, IndexRows, Linear, Parallel};
+use nn::timestep::{TimestepEmbedding, TimestepSpec};
 use nn::weights::{Weight, WeightLoader};
 use nn::{DType, Forward, TensorView};
 
@@ -254,16 +255,14 @@ pub fn entries(video: &[f32], audio: &[f32], groups: Groups) -> Result<(Vec<f32>
 /// timestep embedding and one projection per layer, then releases them. Nothing runs them per
 /// evaluation, so they are held only until `Projections::fill` has produced the tables once.
 pub struct Projections {
-    /// `time_embedder.linear_1`: `[time_hidden, frequency]`, FP32, with its bias.
-    first: Linear,
-    /// `time_embedder.linear_2`: `[time_dim, time_hidden]`, FP32, with its bias.
-    second: Linear,
+    /// `time_embedder`: `linear_1` `[time_hidden, frequency]` and `linear_2` `[time_dim,
+    /// time_hidden]`, FP32, with their biases.
+    time: TimestepEmbedding,
     /// One `adaln_proj.linear` per layer: `[18 * hidden, time_dim]`, with its bias.
     layers: Vec<Linear>,
     /// `norm_out.linear`: `[2 * hidden, time_dim]`, with its bias.
     output: Linear,
     frequency_dim: u32,
-    time_hidden_dim: u32,
     time_dim: u32,
 }
 
@@ -321,24 +320,17 @@ impl Projections {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            first: projection(
-                loader,
-                "time_embedder.linear_1",
-                config.frequency_dim,
-                config.time_hidden_dim,
-                Some(DType::F32),
-            )?,
-            second: projection(
-                loader,
-                "time_embedder.linear_2",
-                config.time_hidden_dim,
-                config.time_dim,
-                Some(DType::F32),
+            time: TimestepEmbedding::load(
+                &mut loader.scope("time_embedder").pinned(DType::F32),
+                TimestepSpec {
+                    frequency_dim: config.frequency_dim,
+                    hidden: config.time_hidden_dim,
+                    out: config.time_dim,
+                },
             )?,
             layers,
             output: projection(loader, "norm_out.linear", config.time_dim, 2 * hidden, None)?,
             frequency_dim: config.frequency_dim,
-            time_hidden_dim: config.time_hidden_dim,
             time_dim: config.time_dim,
         })
     }
@@ -389,7 +381,7 @@ impl Projections {
         // projections read the deployment's type - **one narrowing between them**, which is the
         // reference's `.to(weight.dtype)` and the only crossing in this cache. At an FP32
         // deployment the two types coincide and the narrowing is skipped.
-        let time_type = self.first.weight().dtype;
+        let time_type = self.time.dtype();
         let dtype = self.layers[0].weight().dtype;
         if time_type != DType::F32 {
             return Err(Error::config(format!(
@@ -419,18 +411,8 @@ impl Projections {
                 embedding.dtype
             )));
         }
-        let hidden = arena.tensor(
-            time_type,
-            Shape::new(&[groups, u64::from(self.time_hidden_dim)]),
-        )?;
-        let activated = arena.tensor(
-            time_type,
-            Shape::new(&[groups, u64::from(self.time_hidden_dim)]),
-        )?;
         let time = arena.tensor(time_type, Shape::new(&[groups, u64::from(self.time_dim)]))?;
-        self.first.forward(f, embedding, hidden)?;
-        nn::layers::Silu.forward(f, hidden, activated)?;
-        self.second.forward(f, activated, time)?;
+        self.time.forward(f, embedding, time)?;
         // The projections read `silu(embedding)`: the
         // pair's output is activated once more before any modulation reads it.
         let activated_time = arena.tensor(time_type, time.shape)?;
@@ -458,50 +440,13 @@ impl Projections {
     /// ones, at the frequencies `theta_high^(-2i / frequency_dim)`: the released recipe, written
     /// here because it is the only part of the cache that is arithmetic on a host value.
     pub fn frequencies(&self, times: &[f32]) -> Result<Vec<f32>> {
-        embedding(times, self.frequency_dim)
+        Ok(nn::timestep::sinusoidal(times, self.frequency_dim)?)
     }
 
     /// The element type the modulation projections read: the tables' type, and the cache's.
     pub fn dtype(&self) -> DType {
         self.layers[0].weight().dtype
     }
-}
-
-/// The sinusoidal embedding of each entry time, `[entries, frequency_dim]` FP32.
-///
-/// The GLIDE/DiT order: the first half
-/// of a row is a cosine per frequency and the second half is the sine of the same angle, so row
-/// `r`, element `i` is `cos(t_r · 10000^(-i/half))` for `i < half` and the sine for `i >= half`.
-///
-/// **The order is not cosmetic.** The shared FP32 projection reads this vector as 256 unrelated
-/// inputs, so a row that interleaved sine and cosine would be a different modulation under the same
-/// schedule - and nothing downstream can see it: the products are finite, the widths match, and the
-/// shape of the failure is a slightly different picture. The angle is computed in f64 and stored
-/// once as f32, which is the reference's own rounding of `exp`/`cos` in float32 to within an ulp.
-fn embedding(times: &[f32], frequency_dim: u32) -> Result<Vec<f32>> {
-    if times.is_empty() {
-        return Err(Error::checkpoint(
-            "a timestep embedding needs at least one time".to_owned(),
-        ));
-    }
-    if frequency_dim == 0 || !frequency_dim.is_multiple_of(2) {
-        return Err(Error::checkpoint(format!(
-            "a {frequency_dim}-wide timestep embedding has no cosine half"
-        )));
-    }
-    let half = (frequency_dim / 2) as usize;
-    let mut values = Vec::with_capacity(times.len() * frequency_dim as usize);
-    for time in times {
-        let angles: Vec<f64> = (0..half)
-            .map(|index| {
-                let exponent = 2.0 * index as f64 / f64::from(frequency_dim);
-                f64::from(*time) * 10_000_f64.powf(-exponent)
-            })
-            .collect();
-        values.extend(angles.iter().map(|angle| angle.cos() as f32));
-        values.extend(angles.iter().map(|angle| angle.sin() as f32));
-    }
-    Ok(values)
 }
 
 #[cfg(test)]
@@ -545,31 +490,6 @@ mod tests {
         let (times, table) = entries(&[1.0, 0.5], &[1.0, 0.5], Groups::Conditioned).unwrap();
         assert_eq!(times, vec![1.0, 0.5, 0.999]);
         assert_eq!(table, vec![0, 0, 0, 0, 1, 1, 2, 0]);
-    }
-
-    #[test]
-    fn the_timestep_embedding_is_every_cosine_then_every_sine() {
-        // The reference's feature vector is `cat((cos, sin))` over the frequency ladder, not an
-        // interleaving of the two: the shared projection reads 256 unrelated inputs, so a permuted
-        // row is a different modulation for the same schedule and every downstream number is
-        // finite, well-shaped and wrong.
-        let dim = 8;
-        let time = 0.25f32;
-        let values = embedding(&[time], dim).expect("an embedding");
-        assert_eq!(values.len(), dim as usize);
-        let half = dim as usize / 2;
-        for index in 0..half {
-            let angle = f64::from(time) * 10_000_f64.powf(-(index as f64) / half as f64);
-            assert!(
-                (values[index] - angle.cos() as f32).abs() < 1e-6,
-                "element {index} is a cosine"
-            );
-            assert!(
-                (values[half + index] - angle.sin() as f32).abs() < 1e-6,
-                "element {} is the sine of the same angle",
-                half + index
-            );
-        }
     }
 
     #[test]
