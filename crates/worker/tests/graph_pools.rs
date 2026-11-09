@@ -221,9 +221,13 @@ fn two_generations_share_one_graph_pool() {
         mapped_before_free,
         "freeing a buffer changed the storage the pool maps"
     );
+    // The reservation is what the pool was asked for rounded up to the device's allocation
+    // granularity, so it can exceed what was asked for: the bound is the pool's own figure.
+    let reserved = allocator.reserved_bytes(PoolKind::Graph);
     assert!(
-        mapped_before_free <= RESERVATION,
-        "the pool mapped {mapped_before_free} bytes of a {RESERVATION}-byte reservation"
+        mapped_before_free <= reserved,
+        "the pool mapped {mapped_before_free} bytes of a {reserved}-byte reservation \
+         ({RESERVATION} bytes asked for)"
     );
 }
 
