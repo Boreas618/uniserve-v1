@@ -703,8 +703,9 @@ fn the_final_adaln_norm_modulates_by_shift_and_scale() {
     assert!(norm.forward(&f, &block_table, rows, hidden, out).is_err());
 }
 
-/// The table holds one row per distinct level, the entry of each step's groups, and a writable
-/// table per block; a step gathers its entries, then each block's rows at them.
+/// The table holds one row per distinct level and the entry of each step's groups, and states the
+/// modulation tables the runtime allocates; bound to them, a step gathers its entries, then each
+/// block's rows at them.
 #[test]
 fn a_timestep_table_holds_each_distinct_level_once() {
     let directory = tempfile::tempdir().unwrap();
@@ -727,23 +728,30 @@ fn a_timestep_table_holds_each_distinct_level_once() {
     .unwrap();
     assert_eq!((table.groups(), table.steps()), (2, 3));
     assert_eq!(table.frequencies().shape.dims(), &[4, 16]);
-    let layers = table.layer_tables();
-    assert_eq!(layers.len(), 2);
-    assert_eq!(layers[0].shape.dims(), &[4, 6 * HIDDEN]);
-    assert_eq!(table.output_table().shape.dims(), &[4, 2 * HIDDEN]);
+    let tables = table.tables();
+    assert_eq!(tables.len(), 2);
+    assert_eq!(tables[0].shape.dims(), &[2, 4, 6 * HIDDEN]);
+    assert_eq!(tables[1].shape.dims(), &[4, 2 * HIDDEN]);
 
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
+    let views: Vec<_> = tables
+        .iter()
+        .map(|stated| arena.tensor(stated.dtype, stated.shape).unwrap())
+        .collect();
+    let bound = table.bind(&views).unwrap();
+    assert_eq!(bound.layer_table(1).unwrap().shape.dims(), &[4, 6 * HIDDEN]);
+    assert!(table.bind(&views[..1]).is_err(), "both tables are bound");
     let step = arena.tensor(DType::I32, Shape::new(&[1])).unwrap();
     let entries = arena.tensor(DType::I32, Shape::new(&[1, 2])).unwrap();
     let rows = modulation(&arena, 2, 6);
     let (result, launches) = launched(|| {
         table.entries_of(&f, step, entries)?;
-        table.layer(&f, 1, entries, rows)
+        bound.layer(&f, 1, entries, rows)
     });
     result.unwrap();
     assert_eq!(launches.len(), 2);
-    assert!(table.layer(&f, 2, entries, rows).is_err(), "two blocks");
+    assert!(bound.layer(&f, 2, entries, rows).is_err(), "two blocks");
 
     let (times, indices) = TimestepTable::entries(&levels, 2).unwrap();
     assert_eq!(times, [1.0, 0.75, 0.5, 0.25]);

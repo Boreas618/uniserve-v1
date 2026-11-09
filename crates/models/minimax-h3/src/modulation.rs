@@ -22,7 +22,7 @@
 //! [`crate::transformer`] index with it.
 
 use nn::Shape;
-use nn::diffusion::TimestepTable;
+use nn::diffusion::TimestepRows;
 use nn::layers::{Bias, Linear, Parallel};
 use nn::timestep::{TimestepEmbedding, TimestepSpec};
 use nn::weights::WeightLoader;
@@ -183,10 +183,12 @@ impl Projections {
     /// schedule's, which do not change per request.
     ///
     /// The weights are the checkpoint's `[out, in]` matrices, so the geometry is `NxK`.
-    pub fn compute(&self, f: &Forward, table: &TimestepTable) -> Result<()> {
-        let embedding = table.frequencies();
-        let layers_out: &[TensorView] = &table.layer_tables();
-        let output_out = table.output_table();
+    pub fn compute(&self, f: &Forward, rows: &TimestepRows<'_>) -> Result<()> {
+        let embedding = rows.table().frequencies();
+        let layers_out: Vec<TensorView> = (0..self.layers.len())
+            .map(|layer| rows.layer_table(layer))
+            .collect::<nn::Result<_>>()?;
+        let output_out = rows.output_table();
         if layers_out.len() != self.layers.len() {
             return Err(Error::checkpoint(format!(
                 "{} AdaLN layer views for {} layers",
@@ -234,7 +236,7 @@ impl Projections {
                 output_out.dtype
             )));
         }
-        for table in layers_out {
+        for table in &layers_out {
             if table.dtype != dtype {
                 return Err(Error::config(format!(
                     "an AdaLN layer table is {} and the projections' weights are {dtype}",
@@ -265,7 +267,7 @@ impl Projections {
             nn::layers::Cast.forward(f, time, out)?;
             out
         };
-        for (layer, out) in self.layers.iter().zip(layers_out) {
+        for (layer, out) in self.layers.iter().zip(&layers_out) {
             layer.forward(f, narrow, *out)?;
         }
         Ok(self.output.forward(f, narrow, output_out)?)
@@ -299,7 +301,8 @@ mod tests {
     fn a_generated_step_reads_the_video_and_audio_levels() {
         let levels = levels(&[0.9, 0.5], &[0.8, 0.4], Groups::Generated).unwrap();
         assert_eq!(levels, vec![0.9, 0.8, 0.5, 0.4]);
-        let (times, table) = TimestepTable::entries(&levels, Groups::Generated.count()).unwrap();
+        let (times, table) =
+            nn::diffusion::TimestepTable::entries(&levels, Groups::Generated.count()).unwrap();
         assert_eq!(times, vec![0.9, 0.8, 0.5, 0.4]);
         assert_eq!(table, vec![0, 1, 2, 3]);
     }
@@ -309,7 +312,8 @@ mod tests {
         // The visual condition is the video's level floored at the clean anchor, and the audio
         // reference is clean: at the first step both are 1.0, at the second they separate.
         let levels = levels(&[1.0, 0.5], &[1.0, 0.5], Groups::Conditioned).unwrap();
-        let (times, table) = TimestepTable::entries(&levels, Groups::Conditioned.count()).unwrap();
+        let (times, table) =
+            nn::diffusion::TimestepTable::entries(&levels, Groups::Conditioned.count()).unwrap();
         assert_eq!(times, vec![1.0, 0.5, 0.999]);
         assert_eq!(table, vec![0, 0, 0, 0, 1, 1, 2, 0]);
     }

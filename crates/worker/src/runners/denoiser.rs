@@ -544,6 +544,8 @@ pub struct DenoiserRunner<M: Denoiser + Send + Sync + ?Sized> {
     /// A batch is one step, so this is filled by `submit` and consumed by the replay that follows;
     /// a second `submit` before a replay would be a second batch, which the worker does not do.
     pending: Vec<Pending>,
+    /// The model's constant tables, allocated once per load ([`Constants`]).
+    constants: Constants,
     /// Whether this load's constants are written.
     constants_filled: bool,
     /// The sequence group this runner's rank exchanges over, absent at one rank.
@@ -647,6 +649,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             products: None,
             staged_step: None,
             pending: Vec::new(),
+            constants: Constants::default(),
             constants_filled: false,
             group: None,
             calls: Vec::new(),
@@ -826,6 +829,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         bucket: Bucket,
         index: u32,
         state: &'a [TensorView],
+        constants: &'a [TensorView],
         media: &'a [nn::capability::MediaInput],
     ) -> Result<Conditioning<'a>> {
         let layout = layout_of(bucket)?;
@@ -845,6 +849,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             images: None,
             audio: None,
             state,
+            constants,
             step: Some(self.columns.step.shaped(&[1])),
         })
     }
@@ -1066,7 +1071,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
                 samples,
                 restored: restored.is_some(),
             };
-            self.open(&forward, bucket, &opening, &state)?;
+            self.open(&forward, bucket, &opening, &state, &self.constants.views)?;
         }
         self.opened = Some((request, bucket));
         self.restored = None;
@@ -1386,13 +1391,14 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         bucket: Bucket,
         opening: &Opening<'_>,
         state: &[TensorView],
+        constants: &[TensorView],
     ) -> Result<()> {
         let layout = layout_of(bucket)?;
         let latents = self.latents(bucket, opening.index)?;
         // The raw media a conditioner encodes, each visual piece with its anchoring draw: the
         // request's first step is the one forward that reads them.
         let media = self.media(forward, opening)?;
-        let cond = self.conditioning(bucket, opening.index, state, &media)?;
+        let cond = self.conditioning(bucket, opening.index, state, constants, &media)?;
         // The stream's first elements are the conditions' draws, so the trajectory's offsets
         // are the request's own and not the warm request's the bucket was captured from.
         let drawn = Layout {
@@ -1430,12 +1436,13 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         let warm = &self.plan_of(bucket)?.warm;
         let layout = layout_of(bucket)?;
         let state = walk.tables(&self.model.state_tables(&layout).map_err(Error::from)?)?;
+        let constants = walk.tables(&self.model.constant_tables())?;
         let group = self.group.as_deref();
-        self.walk_opening(walk, bucket, warm, &state)?;
+        self.walk_opening(walk, bucket, warm, &state, &constants)?;
         for conditions in &warm.openings {
             walk.arena().reset();
             let stated = opened(warm, conditions.clone(), warm.text_tokens, Vec::new());
-            self.walk_opening(walk, bucket, &stated, &state)?;
+            self.walk_opening(walk, bucket, &stated, &state, &constants)?;
         }
         walk.arena().reset();
         let step = self
@@ -1443,7 +1450,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             .first()
             .copied()
             .ok_or_else(|| self.no_step(bucket))?;
-        self.step(&walk.forward(group)?, bucket, step, &state)
+        self.step(&walk.forward(group)?, bucket, step, &state, &constants)
     }
 
     /// Opens `stated` in `bucket` on a recording forward of `walk`, through the opening a replay
@@ -1455,6 +1462,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         bucket: Bucket,
         stated: &WarmRequest,
         state: &[TensorView],
+        constants: &[TensorView],
     ) -> Result<()> {
         let pieces = self
             .model
@@ -1496,6 +1504,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             bucket,
             &opening,
             state,
+            constants,
         )
     }
 
@@ -1695,24 +1704,27 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         if self.constants_filled {
             return Ok(());
         }
+        if self.constants.views.is_empty() {
+            let tables = self.model.constant_tables();
+            let allocated =
+                Constants::allocate(&mut *self.lifecycle.pool()?, &tables, &self.stream)?;
+            self.constants = allocated;
+        }
         let stream = self.stream.clone();
         let arena = self.lifecycle.arena()?;
-        self.constants(&nn::Forward::new(&stream, kernels, &arena))?;
+        self.constants(
+            &nn::Forward::new(&stream, kernels, &arena),
+            &self.constants.views,
+        )?;
         self.constants_filled = true;
         Ok(())
     }
 
-    /// Runs the model's constant fold on `forward`, at the stream region's first address: what
-    /// [`Self::fill_constants`] launches once per load and the recorded walk records.
-    fn constants(&self, forward: &nn::Forward<'_>) -> Result<()> {
-        if !self.model.constant_tables().is_empty() {
-            return Err(Error::Invalid(
-                "this model declares constant tables, and this runner holds no storage for them"
-                    .into(),
-            ));
-        }
+    /// Runs the model's constant fold on `forward` into `tables`, at the stream region's first
+    /// address: what [`Self::fill_constants`] launches once per load and the recorded walk records.
+    fn constants(&self, forward: &nn::Forward<'_>, tables: &[TensorView]) -> Result<()> {
         self.model
-            .prepare_constants(forward, &[])
+            .prepare_constants(forward, tables)
             .map_err(Error::from)
     }
 
@@ -1754,10 +1766,11 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         bucket: Bucket,
         step: Step,
         state: &[TensorView],
+        constants: &[TensorView],
     ) -> Result<()> {
         let media: [nn::capability::MediaInput; 0] = [];
         let latents = self.latents(bucket, 0)?;
-        let cond = self.conditioning(bucket, 0, state, &media)?;
+        let cond = self.conditioning(bucket, 0, state, constants, &media)?;
         self.model
             .denoise(forward, step, latents, cond)
             .map_err(Error::from)
@@ -1973,7 +1986,10 @@ impl<M: Denoiser + Send + Sync + ?Sized> Runner for DenoiserRunner<M> {
     /// step its graph captures.
     fn record_walk(&mut self) -> Result<Footprint> {
         let mut footprint = Footprint::default();
-        footprint.walk(None, |walk| self.constants(&walk.forward(None)?))?;
+        footprint.walk(None, |walk| {
+            let tables = walk.tables(&self.model.constant_tables())?;
+            self.constants(&walk.forward(None)?, &tables)
+        })?;
         for bucket in self.capture_order() {
             footprint.walk(Some(bucket), |walk| self.walk_recorded(walk, bucket))?;
         }
@@ -2285,13 +2301,58 @@ impl<M: Denoiser + Send + Sync + ?Sized> RunnerLifecycle for DenoiserRunner<M> {
             .first()
             .copied()
             .ok_or_else(|| self.no_step(bucket))?;
-        self.step(&forward, bucket, step, &state)?;
+        self.step(&forward, bucket, step, &state, &self.constants.views)?;
         if first {
             self.lifecycle
                 .pool()?
                 .record(self.lifecycle.stream_id(), bucket, arena.peak())?;
         }
         Ok(())
+    }
+}
+
+/// The model's constant tables ([`Denoiser::constant_tables`]) as this runner holds them.
+///
+/// Allocated once per load from the device's resident pool, before the first capture, so every
+/// captured step addresses them where they stand; the model fills them once
+/// ([`Denoiser::prepare_constants`]) and every step reads them.
+#[derive(Default)]
+struct Constants {
+    /// The allocations, kept for the addresses the graphs hold.
+    _storage: Vec<platform::Buffer>,
+    /// One view per table, in the model's order.
+    views: Vec<TensorView>,
+}
+
+impl Constants {
+    /// One resident allocation per table of `tables`, zeroed on `stream`.
+    fn allocate(
+        pools: &mut Pools,
+        tables: &[nn::StateTable],
+        stream: &platform::Stream,
+    ) -> Result<Self> {
+        let mut storage = Vec::with_capacity(tables.len());
+        let mut views = Vec::with_capacity(tables.len());
+        for table in tables {
+            let bytes = table
+                .dtype
+                .bytes()
+                .and_then(|width| width.checked_mul(table.shape.numel()))
+                .ok_or_else(|| {
+                    Error::Invalid(format!("constant table {} has no byte extent", table.name))
+                })?;
+            let buffer = pools.allocate(platform::PoolKind::Resident, bytes)?;
+            let ptr = ops::DevicePtr::new(buffer.address());
+            // SAFETY: the buffer is `bytes` of device storage just allocated for this table, and
+            // the fill that writes it is issued after this on the same stream.
+            unsafe { ops::zero_bytes(ptr, bytes, stream)? };
+            views.push(TensorView::new(ptr, table.dtype, table.shape));
+            storage.push(buffer);
+        }
+        Ok(Self {
+            _storage: storage,
+            views,
+        })
     }
 }
 

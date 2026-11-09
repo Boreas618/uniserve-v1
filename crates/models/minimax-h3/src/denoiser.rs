@@ -1333,20 +1333,15 @@ fn place(
 /// One checkpoint's denoiser: the DiT, the schedule it is evaluated on, its solver and the AdaLN
 /// cache the runner fills once after loading.
 ///
-/// ## The AdaLN cache is model memory
+/// ## The AdaLN cache is a constant table
 ///
 /// The reference derives the modulation tables at load (`weights._prepare_adaln_cache`), so they are
-/// weights rather than per-request execution state: 50 tables of `[entries, 18 * hidden]` plus
+/// constants rather than per-request execution state: 50 tables of `[entries, 18 * hidden]` plus
 /// `[entries, 2 * hidden]`, about 1.9 GiB at FP32 for a 50-step checkpoint and 0.33 GiB for the DMD
-/// ladder. The cache is allocated through the weight loader, at the schedule's own entry count, and
-/// filled by one post-load launch.
-///
-/// That is a declared deviation from the capability's constant-table mechanism: [`Denoiser::constant_tables`]
-/// is empty and [`Denoiser::prepare_constants`] writes the model's own region, so the worker
-/// allocates nothing and no table is duplicated. It is one model's load-time fold, sized by that
-/// model from its config alone and read only by it; a capability field carrying those views would
-/// make every worker size a table it never reads. The launch stays capture-safe, writing a region
-/// allocated once.
+/// ladder. Their extents follow from the schedule's entry count and the stack's widths, which the
+/// model states as its constant tables ([`Denoiser::constant_tables`]); the runtime allocates them
+/// once per load, [`Denoiser::prepare_constants`] fills them with one post-load launch, and every
+/// step reads them ([`nn::capability::Conditioning::constants`]).
 pub struct Denoiser {
     config: DenoiserConfig,
     rules: Layouts,
@@ -1686,7 +1681,7 @@ impl nn::capability::Denoiser for Denoiser {
             ))));
         }
         // An evaluation has no host bytes of its own: every coefficient a step reads is a constant
-        // the loader wrote once (`constant_tables` is empty), and the step index is device data the
+        // the loader wrote or the constant tables hold, and the step index is device data the
         // worker writes before each replay. A buffer offered here means the caller and
         // `constant_tables` disagree about what an evaluation owns.
         if !out.is_empty() {
@@ -2379,9 +2374,10 @@ impl Denoiser {
 
         // The stack, conditioned by the step's gathered modulation.
         let step_index = tables.get("step")?;
+        let adaln = self.cache.bind(cond.constants)?;
         self.transformer.forward(
             f,
-            &self.cache,
+            &adaln,
             step_index,
             hidden,
             own(tables.get("modulation_indices")?),
@@ -2403,7 +2399,7 @@ impl Denoiser {
         // its table, so a cache whose projections drifted away from the stack's type is a named
         // refusal and not a mixed gather.
         let modulation = arena.tensor(hidden.dtype, Shape::new(&[groups, 2 * hidden_size]))?;
-        self.cache.output(f, entries, modulation)?;
+        adaln.output(f, entries, modulation)?;
         let modulation = ModulationTable::output(modulation, hidden_size)?;
 
         // The solver's scale: one FP32 word the `step` table indexes into the coefficient table.
@@ -2691,22 +2687,14 @@ impl Denoiser {
         &self.schedule
     }
 
-    /// The tables the runner fills after loading.
-    ///
-    /// Empty by construction: the AdaLN cache is model memory (see [`Denoiser`]).
+    /// The tables the runner allocates after loading: the AdaLN cache's modulation tables.
     pub fn constant_tables(&self) -> Vec<StateTable> {
-        Vec::new()
+        self.cache.tables()
     }
 
-    /// Fill the AdaLN cache from the schedule's times: the one post-load launch.
+    /// Fill the AdaLN cache `out` from the schedule's times: the one post-load launch.
     pub fn prepare_constants(&self, f: &Forward, out: &[TensorView]) -> Result<()> {
-        if !out.is_empty() {
-            return Err(Error::config(format!(
-                "the H3 AdaLN cache is model memory; {} worker views were offered",
-                out.len()
-            )));
-        }
-        self.projections.compute(f, &self.cache)
+        self.projections.compute(f, &self.cache.bind(out)?)
     }
 }
 

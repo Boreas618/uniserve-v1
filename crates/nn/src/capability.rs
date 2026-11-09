@@ -797,6 +797,9 @@ pub struct Conditioning<'a> {
     pub audio: Option<TensorView>,
     /// The tables [`Denoiser::state_tables`] named for this layout, in that order.
     pub state: &'a [TensorView],
+    /// The model's constant tables ([`Denoiser::constant_tables`]), in that order, as the runtime
+    /// allocated them and [`Denoiser::prepare_constants`] filled them.
+    pub constants: &'a [TensorView],
     /// `[1]` i64: the step the schedule evaluates, when the model selects coefficients on the
     /// device. Absent when the model's coefficients arrive as launch scalars.
     pub step: Option<TensorView>,
@@ -1028,7 +1031,9 @@ pub trait Denoiser {
     fn evaluations(&self) -> u32;
 
     /// The tables that never change for this model, in the order [`Self::prepare_constants`] fills
-    /// them.
+    /// them: values the model computes from its weights once, such as a fixed schedule's timestep
+    /// modulation. Their extents follow from the configuration; the runtime allocates them once per
+    /// load and hands them to every step ([`Conditioning::constants`]).
     fn constant_tables(&self) -> Vec<StateTable>;
 
     /// Fill `out` with the constants, in [`Self::constant_tables`]' order.

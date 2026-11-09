@@ -5,7 +5,7 @@
 //! each modality's velocity. A layer is an [`AdaLnBlock`] over H3's attention, conditioned by the
 //! step's AdaLN rows, and the final normalization is an [`AdaLnOut`].
 //!
-//! The step's AdaLN rows are device data gathered from the [`TimestepTable`] in H3's row layout
+//! The step's AdaLN rows are device data gathered from the [`nn::diffusion::TimestepTable`] in H3's row layout
 //! ([`crate::modulation`]), so one captured stack serves every step of the schedule.
 
 use crate::attention::{self, Factors};
@@ -17,7 +17,7 @@ use crate::schedule::{Modality, Schedule};
 use crate::{Error, Result};
 
 use nn::blocks::{AdaLnBlock, AdaLnOut, AdaLnSpec, GateUp, GatedMlpSpec, ModulationTable};
-use nn::diffusion::TimestepTable;
+use nn::diffusion::TimestepRows;
 use nn::family::Split;
 use nn::layers::{
     Bias, Linear, Parallel, PatchEmbed, PatchEmbedSpec, Precision, QkNorm, Rotary, RotarySpec,
@@ -692,13 +692,13 @@ impl Transformer {
 
     /// The stack over `hidden` `[tokens, hidden_size]`, in place, at one step.
     ///
-    /// `adaln` is the cache the worker bound for this request, `step` the `[1]` i32 step index
+    /// `adaln` is the AdaLN cache over the tables the runtime allocated, `step` the `[1]` i32 step index
     /// the worker wrote before the replay, and `rows` the `[tokens]` AdaLN row of each token.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         f: &Forward,
-        adaln: &TimestepTable,
+        adaln: &TimestepRows<'_>,
         step: TensorView,
         hidden: TensorView,
         rows: TensorView,
@@ -719,7 +719,7 @@ impl Transformer {
     fn stack(
         &self,
         f: &Forward,
-        adaln: &TimestepTable,
+        adaln: &TimestepRows<'_>,
         step: TensorView,
         hidden: TensorView,
         rows: TensorView,
@@ -728,12 +728,12 @@ impl Transformer {
         segments: Option<&Segments>,
         total_rows: u32,
     ) -> Result<()> {
-        let groups = adaln.groups();
+        let groups = adaln.table().groups();
         let width = hidden.shape.last();
         let tokens = hidden.shape.dim(0);
         let arena = f.arena();
         let entries = arena.tensor(nn::DType::I32, Shape::new(&[1, groups]))?;
-        adaln.entries_of(f, step, entries)?;
+        adaln.table().entries_of(f, step, entries)?;
         // **The gather's own arrangement: one row per entry, the whole 18-vector table across the
         // columns** (`IndexRows::gather` derives its output from the table's columns and the index count,
         // so a buffer of the same bytes in another shape is refused by name:

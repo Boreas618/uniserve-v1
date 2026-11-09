@@ -32,6 +32,7 @@
 
 use ops::{DType, Shape, Strides, TensorView};
 
+use crate::capability::StateTable;
 use crate::error::{Error, Result};
 use crate::forward::Forward;
 use crate::layers::{Axpby, IndexRows, Residual, Scale};
@@ -289,19 +290,21 @@ pub struct TimestepTableSpec {
 /// groups' rows by entry index:
 ///
 /// ```text
-/// frequencies  [entries, frequency_dim]   FP32   the sinusoidal embedding of each distinct level
-/// entries      [steps, groups]            i32    the entry each (step, group) reads
-/// layers.<i>   [entries, layer_columns]          block i's modulation at each entry
-/// output       [entries, output_columns]         the final norm's modulation at each entry
+/// frequencies  [entries, frequency_dim]           FP32   the sinusoidal embedding of each level
+/// entries      [steps, groups]                    i32    the entry each (step, group) reads
+/// layers       [layers, entries, layer_columns]          each block's modulation at each entry
+/// output       [entries, output_columns]                 the final norm's modulation at each entry
 /// ```
 ///
-/// The model fills the block and output tables from `frequencies` once after loading, through its
-/// own projections. A step's index is a device value, so one captured graph serves every step.
+/// `frequencies` and `entries` are constants of the schedule, published at load. The two
+/// modulation tables are model-computed constants the runtime allocates: the table states them
+/// ([`Self::tables`]), the model fills them once after loading from `frequencies` through its own
+/// projections, and every step reads them ([`Self::bind`]). A step's index is a device value, so
+/// one captured graph serves every step.
 pub struct TimestepTable {
     frequencies: Weight,
     entries: Weight,
-    layers: Vec<Weight>,
-    output: Weight,
+    spec: TimestepTableSpec,
 }
 
 impl TimestepTable {
@@ -349,8 +352,8 @@ impl TimestepTable {
 
     /// The table of `levels` (step-major, `groups` per step) under `scope`.
     ///
-    /// Publishes `frequencies` and `entries` as constants and reserves `layers.<i>` and `output` as
-    /// writable tables, zero until the model fills them.
+    /// Publishes `frequencies` and `entries` as constants; the modulation tables are the runtime's
+    /// ([`Self::tables`]).
     ///
     /// # Errors
     ///
@@ -372,21 +375,77 @@ impl TimestepTable {
         // One row per step of the levels, which may be more rows than distinct entries.
         let steps = (table.len() / groups as usize) as u64;
         let entry_table = scope.constant_i32("entries", &[steps, u64::from(groups)], &table)?;
-        let layers = (0..spec.layers)
-            .map(|index| {
-                scope.writable_zeros(
-                    &format!("layers.{index}"),
-                    spec.dtype,
-                    &[entries, spec.layer_columns],
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let output = scope.writable_zeros("output", spec.dtype, &[entries, spec.output_columns])?;
         Ok(Self {
             frequencies,
             entries: entry_table,
-            layers,
-            output,
+            spec,
+        })
+    }
+
+    /// The distinct levels the table holds a row of.
+    fn rows(&self) -> u64 {
+        self.frequencies.shape().dim(0)
+    }
+
+    /// The modulation tables the runtime allocates for this table, in [`Self::bind`]'s order:
+    /// `[layers, entries, layer_columns]` and `[entries, output_columns]`, of the spec's element
+    /// type. Their extents follow from the schedule and the stack's widths alone.
+    pub fn tables(&self) -> Vec<StateTable> {
+        let entries = self.rows();
+        vec![
+            StateTable {
+                name: "timestep_layers",
+                dtype: self.spec.dtype,
+                shape: Shape::new(&[
+                    u64::from(self.spec.layers),
+                    entries,
+                    self.spec.layer_columns,
+                ]),
+            },
+            StateTable {
+                name: "timestep_output",
+                dtype: self.spec.dtype,
+                shape: Shape::new(&[entries, self.spec.output_columns]),
+            },
+        ]
+    }
+
+    /// This table over the runtime's `tables`, the views of [`Self::tables`] in its order.
+    ///
+    /// # Errors
+    ///
+    /// Views of another count, element type or extent than the tables state.
+    pub fn bind<'t>(&'t self, tables: &[TensorView]) -> Result<TimestepRows<'t>> {
+        let stated = self.tables();
+        if tables.len() != stated.len() {
+            return Err(Error::shape(
+                "TimestepTable",
+                format!(
+                    "{} tables were bound, {} are stated",
+                    tables.len(),
+                    stated.len()
+                ),
+            ));
+        }
+        for (view, table) in tables.iter().zip(&stated) {
+            if view.dtype != table.dtype || view.shape != table.shape {
+                return Err(Error::shape(
+                    "TimestepTable",
+                    format!(
+                        "{} is {} {:?}, {} {:?} is stated",
+                        table.name,
+                        view.dtype,
+                        view.shape.dims(),
+                        table.dtype,
+                        table.shape.dims()
+                    ),
+                ));
+            }
+        }
+        Ok(TimestepRows {
+            table: self,
+            layers: tables[0],
+            output: tables[1],
         })
     }
 
@@ -405,16 +464,6 @@ impl TimestepTable {
         self.frequencies.view()
     }
 
-    /// The writable block tables, one per block, for the model's projections to fill.
-    pub fn layer_tables(&self) -> Vec<TensorView> {
-        self.layers.iter().map(Weight::view).collect()
-    }
-
-    /// The writable final-norm table.
-    pub fn output_table(&self) -> TensorView {
-        self.output.view()
-    }
-
     /// The entries step `step` reads: `step` is `[1]` i32 on the device and `out` `[1, groups]`
     /// i32.
     ///
@@ -424,9 +473,49 @@ impl TimestepTable {
     pub fn entries_of(&self, f: &Forward, step: TensorView, out: TensorView) -> Result<()> {
         IndexRows.gather(f, self.entries.view(), step, out)
     }
+}
+
+/// A [`TimestepTable`] bound to the runtime's modulation tables: what the model fills once and
+/// every step gathers from.
+#[derive(Clone, Copy)]
+pub struct TimestepRows<'t> {
+    table: &'t TimestepTable,
+    /// `[layers, entries, layer_columns]`.
+    layers: TensorView,
+    /// `[entries, output_columns]`.
+    output: TensorView,
+}
+
+impl TimestepRows<'_> {
+    /// The table these rows belong to.
+    pub fn table(&self) -> &TimestepTable {
+        self.table
+    }
+
+    /// Block `layer`'s `[entries, layer_columns]` table.
+    ///
+    /// # Errors
+    ///
+    /// A block the table does not hold.
+    pub fn layer_table(&self, layer: usize) -> Result<TensorView> {
+        let layers = self.layers.shape.dim(0);
+        if layer as u64 >= layers {
+            return Err(Error::shape(
+                "TimestepTable",
+                format!("{layers} block tables, not block {layer}"),
+            ));
+        }
+        let shape = Shape::new(&[self.layers.shape.dim(1), self.layers.shape.dim(2)]);
+        Ok(self.layers.narrow(0, layer as u64, 1)?.reshape(shape))
+    }
+
+    /// The final norm's `[entries, output_columns]` table.
+    pub fn output_table(&self) -> TensorView {
+        self.output
+    }
 
     /// Block `layer`'s modulation rows at `entries` (the `[1, groups]` view
-    /// [`Self::entries_of`] wrote), into `out` `[groups, layer_columns]`.
+    /// [`TimestepTable::entries_of`] wrote), into `out` `[groups, layer_columns]`.
     ///
     /// # Errors
     ///
@@ -438,13 +527,7 @@ impl TimestepTable {
         entries: TensorView,
         out: TensorView,
     ) -> Result<()> {
-        let table = self.layers.get(layer).ok_or_else(|| {
-            Error::shape(
-                "TimestepTable",
-                format!("{} block tables, not block {layer}", self.layers.len()),
-            )
-        })?;
-        IndexRows.gather(f, table.view(), flat(entries), out)
+        IndexRows.gather(f, self.layer_table(layer)?, flat(entries), out)
     }
 
     /// The final norm's modulation rows at `entries`, into `out` `[groups, output_columns]`.
@@ -453,7 +536,7 @@ impl TimestepTable {
     ///
     /// The gather's refusal.
     pub fn output(&self, f: &Forward, entries: TensorView, out: TensorView) -> Result<()> {
-        IndexRows.gather(f, self.output.view(), flat(entries), out)
+        IndexRows.gather(f, self.output, flat(entries), out)
     }
 }
 
