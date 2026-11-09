@@ -49,11 +49,13 @@ fn arguments() -> Result<Args, String> {
         (None, None, None, None, None, None, None);
     let mut arguments = std::env::args().skip(1);
     while let Some(flag) = arguments.next() {
+        // Each build runs in its packages own directory, so every path is the callers, made
+        // absolute before a build reads it.
         let mut value = || {
-            arguments
+            let path = arguments
                 .next()
-                .map(PathBuf::from)
-                .ok_or_else(|| format!("{flag} takes a value"))
+                .ok_or_else(|| format!("{flag} takes a value"))?;
+            std::path::absolute(&path).map_err(|error| format!("{flag} {path}: {error}"))
         };
         match flag.as_str() {
             "--kernels" => kernels = Some(value()?),
