@@ -57,7 +57,6 @@ use crate::memory::latent::restore;
 use crate::plan::{Bucket, Extent, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
-use crate::runners::diag::Diag;
 use crate::runners::lifecycle::{Lifecycle, walk_capture, warmed_capture};
 use crate::runners::products::{self, Product, Products};
 use crate::runners::recording::{Footprint, Walk};
@@ -538,9 +537,7 @@ pub struct DenoiserRunner<M: Denoiser + Send + Sync + ?Sized> {
     /// `None` until the worker attaches it, and a step that needs a product without one refuses by
     /// name rather than staging zeros.
     products: Option<Arc<dyn Products>>,
-    /// The block-by-block diagnosis, off unless `UNISERVE_DIAG_DIR` names a directory.
-    diag: Diag,
-    /// The step of the schedule the staged batch is, which names the diagnosis dumps.
+    /// The step of the schedule the staged batch is: the index its step column holds.
     staged_step: Option<u32>,
     /// The rows of the batch being served: what a replay seeds from the store, what it publishes
     /// its trajectory back to, and the seed its first step's draw is addressed by.
@@ -650,7 +647,6 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             tables: Tables::new(),
             columns,
             products: None,
-            diag: Diag::from_env(),
             staged_step: None,
             pending: Vec::new(),
             constants_filled: false,
@@ -666,10 +662,9 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         })
     }
 
-    /// This runner as rank `rank` of the sequence `group`: every forward it runs carries the group.
+    /// This runner as a rank of the sequence `group`: every forward it runs carries the group.
     #[must_use]
-    pub fn in_group(mut self, rank: u32, group: Option<Arc<nn::Group>>) -> Self {
-        self.diag = std::mem::replace(&mut self.diag, Diag::from_env()).for_rank(rank);
+    pub fn in_group(mut self, group: Option<Arc<nn::Group>>) -> Self {
         self.group = group;
         self
     }
@@ -1403,8 +1398,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
     /// start, in that order (see [`Self::first_step`]).
     ///
     /// The replay that opens a request and the recorded walk both run this, so the forwards a
-    /// request's opening launches are the ones the walk records. The diagnosis dumps read the
-    /// device and are skipped on a recording forward.
+    /// request's opening launches are the ones the walk records.
     fn open(
         &self,
         forward: &nn::Forward<'_>,
@@ -1412,11 +1406,6 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         opening: &Opening<'_>,
         state: &[TensorView],
     ) -> Result<()> {
-        let dump = |block: &str, name: &str, view: TensorView| {
-            if !forward.is_recording() {
-                self.dump(block, name, view);
-            }
-        };
         let layout = layout_of(bucket)?;
         let latents = self.latents(bucket, opening.index)?;
         // The raw media a conditioner encodes, each visual piece with its anchoring draw: the
@@ -1442,28 +1431,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         // because a graph replays once per *step* while this runs once per *request* - a
         // refinement inside the captured graph would compound over the schedule, and `text` is
         // written in place.
-        if let Some(source) = cond.source {
-            dump("conditioner", "source", source);
-        }
         self.model.prepare_conditioning(forward, cond)?;
-        dump("conditioner", "text", cond.text);
-        for (index, piece) in media.iter().enumerate() {
-            if let Some(pixels) = piece.pixels {
-                dump("media", &format!("pixels_{index}"), pixels);
-            }
-            if let Some(audio) = piece.audio {
-                dump("media", &format!("samples_{index}"), audio);
-            }
-            if let Some(noise) = piece.noise {
-                dump("media", &format!("draw_{index}"), noise);
-            }
-        }
-        if self.diag.enabled() && !forward.is_recording() {
-            let tables = self.model.state_tables(&layout).map_err(Error::from)?;
-            for (table, view) in tables.iter().zip(state.iter()) {
-                self.dump("state", table.name, *view);
-            }
-        }
         if !opening.restored {
             self.model.prepare_latents(forward, cond, latents)?;
         }
@@ -1580,15 +1548,6 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         )
     }
 
-    /// Writes one named tensor of the block-by-block diagnosis, when a directory is named.
-    fn dump(&self, block: &str, name: &str, view: TensorView) {
-        if self.diag.enabled() {
-            let _ = self
-                .diag
-                .write(self.device, &self.stream, block, name, view);
-        }
-    }
-
     /// Publishes each pending row's trajectory as this runner's columns hold it.
     ///
     /// **No copy**: the captured graph updates the latents in place, so the column *is* the
@@ -1648,8 +1607,8 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         }
     }
 
-    /// Writes the coefficient index the step reads, before a walk or a replay, and records it for
-    /// the diagnosis.
+    /// Writes the coefficient index the step reads, before a walk or a replay, and records it as
+    /// the staged step.
     ///
     /// Little-endian is the **device's** convention for the `[1]` `i64` table a kernel reads, not the
     /// host's: the column is device memory a launch addresses, so the bytes are the device's byte
@@ -1685,50 +1644,6 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             "the schedule of bucket {bucket} states no step to capture; the bucket asked for the \
              schedule of a request of {request}"
         ))
-    }
-
-    /// Writes the latents of the staged step under the block-by-block diagnosis' own names.
-    ///
-    /// The protocol's names are per evaluation: the state on entry to evaluation `e` is what both
-    /// implementations dump, so a replay writes `denoiser/latents_video_e` before it launches and
-    /// `latents_video_{e+1}` after it - the runner's step updates the latents in place, so the exit
-    /// state of one evaluation is the entry state of the next and the two trees hold the same names.
-    /// Evaluation zero's entry state is the request's noise, so it is written under that name too.
-    ///
-    /// A dump never fails a request (design 10): `Diag::write` reports and the step goes on.
-    fn dump_latents(&self, bucket: Bucket, index: u32) {
-        if !self.diag.enabled() {
-            return;
-        }
-        let Ok(video) = self.video_latents(bucket, 0) else {
-            return;
-        };
-        self.write_latent("video", video, index);
-        if let Ok(Some(audio)) = self.audio_latents(bucket, 0) {
-            self.write_latent("audio", audio, index);
-        }
-    }
-
-    /// One modality's latents, at the step's own names.
-    fn write_latent(&self, modality: &str, view: TensorView, index: u32) {
-        let _ = self.diag.write(
-            self.device,
-            &self.stream,
-            "denoiser",
-            &format!("latents_{modality}_{index}"),
-            view,
-        );
-        if index == 0 {
-            // Evaluation zero's entry state is the request's noise, and the reference dumps it under
-            // that name; the two names hold one tensor rather than two computations.
-            let _ = self.diag.write(
-                self.device,
-                &self.stream,
-                "denoiser",
-                &format!("noise_{modality}"),
-                view,
-            );
-        }
     }
 
     /// Stages a bucket with no batch behind it, so a first capture has defined columns to read.
@@ -1852,39 +1767,8 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         Ok(())
     }
 
-    /// Runs the staged step operator by operator instead of replaying its graph.
-    ///
-    /// This is the diagnosis' own control: a step that is right here and wrong in a replay says the
-    /// capture is what differs.
-    fn eager_step(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
-        let kernels = self.lifecycle.generation_named(generation)?;
-        let stream = self.stream.clone();
-        let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved_on(self.stream_id());
-        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
-        let group = self.group.clone();
-        let forward = grouped(
-            nn::Forward::new(&stream, &kernels, &arena),
-            group.as_deref(),
-        );
-        let layout = layout_of(bucket)?;
-        let tables = self.model.state_tables(&layout).map_err(Error::from)?;
-        let key = Self::key(bucket);
-        let state = self
-            .tables
-            .views(self.lifecycle.generation.number(), &key, &tables)?;
-        let index = self.staged_step.unwrap_or(0);
-        let step = self
-            .schedule(bucket)?
-            .get(index as usize)
-            .copied()
-            .ok_or_else(|| self.no_step(bucket))?;
-        self.step(&forward, bucket, step, &state)
-    }
-
     /// One step of request zero of `bucket` on `forward`, over the layout's state tables `state`:
-    /// the model call a capture walk records, the diagnosis' eager step runs, and the recorded walk
-    /// records.
+    /// the model call a capture walk and the recorded walk record.
     fn step(
         &self,
         forward: &nn::Forward<'_>,
@@ -1960,10 +1844,9 @@ impl<M: Denoiser + Send + Sync + ?Sized> Runner for DenoiserRunner<M> {
     }
 
     /// A step's graph reads the step's index from a state table the stream writes in order, so the
-    /// next step can be launched behind it. The diagnosis reads the columns between steps, so it
-    /// waits for each.
+    /// next step can be launched behind it.
     fn overlaps_replays(&self) -> bool {
-        !self.diag.enabled()
+        true
     }
 
     fn stream(&self) -> Option<&platform::Stream> {
@@ -2203,15 +2086,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> Runner for DenoiserRunner<M> {
                         "the bucket was prepared for an earlier generation; its programs did not change"
                     );
                 }
-                let step = self.staged_step;
-                if let Some(step) = step {
-                    self.dump_latents(*bucket, step);
-                }
                 let launched = std::time::Instant::now();
-                let eager = self.diag.eager();
-                if eager {
-                    self.eager_step(*bucket, *generation)?;
-                }
                 let (_, captured) = self
                     .lifecycle
                     .graphs
@@ -2221,18 +2096,11 @@ impl<M: Denoiser + Send + Sync + ?Sized> Runner for DenoiserRunner<M> {
                             "no graph of bucket {bucket} at generation {generation}"
                         ))
                     })?;
-                if !eager {
-                    captured.launch(&stream)?;
-                }
+                captured.launch(&stream)?;
                 // The graph advanced the trajectory in place; what a decode reads next is this
                 // column, and the store records that view rather than a copy of it.
                 self.publish(*bucket)?;
                 self.pending.clear();
-                if let Some(step) = step {
-                    // The step updates the latents in place, so the exit state of this evaluation is
-                    // the entry state of the next one, which is the name both trees dump.
-                    self.dump_latents(*bucket, step + 1);
-                }
                 if let Some(counters) = &self.counters {
                     counters.launches(captured.kernel_nodes());
                 }

@@ -187,8 +187,6 @@ pub struct DecoderRunner<M: Decoder + Send + Sync + ?Sized> {
     /// The frames the splice staged last wrote for the staged request's clip: the extent the product
     /// states, taken from the schedule rather than recomputed here.
     staged_keep: Option<u32>,
-    /// The block-by-block diagnosis, off unless `UNISERVE_DIAG_DIR` names a directory.
-    diag: crate::runners::diag::Diag,
     /// The timeline frame the clip staged last starts at, and the unit it is.
     staged_first: u32,
     staged_unit: u32,
@@ -302,7 +300,6 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
             tail: None,
             staged_frames: None,
             staged_keep: None,
-            diag: crate::runners::diag::Diag::from_env(),
             staged_first: 0,
             staged_unit: 0,
             published_units: 0,
@@ -1016,26 +1013,6 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
             None
         };
         let clip = self.raster(bucket)?;
-        if self.diag.enabled() {
-            let _ = self.diag.write(
-                self.device,
-                &self.stream,
-                "decoder",
-                &format!("raster_{index}"),
-                clip,
-            );
-            let _ = self.diag.write(
-                self.device,
-                &self.stream,
-                "decoder",
-                &format!("latents_{index}"),
-                TensorView::new(
-                    self.columns.latents.device.ptr,
-                    self.latent,
-                    Shape::new(&[self.columns.latents.device.numel()]),
-                ),
-            );
-        }
         let column = self.frames.as_ref().ok_or_else(|| {
             Error::Invariant(
                 "a postprocessor is bound and no frames column was sized for the bucket".into(),
@@ -1315,9 +1292,9 @@ impl<M: Decoder + Send + Sync + ?Sized> Runner for DecoderRunner<M> {
 
     /// A clip's replay reads and writes on the stream, in order, and each clip keeps its own frames
     /// in the timeline, so the next clip can be launched behind it and a finished clip's encode runs
-    /// beside it. The diagnosis reads the columns between clips, so it waits for each.
+    /// beside it.
     fn overlaps_replays(&self) -> bool {
-        !self.diag.enabled()
+        true
     }
 
     fn stream(&self) -> Option<&platform::Stream> {

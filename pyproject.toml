@@ -24,7 +24,7 @@ test = [
     "httpx",
     "pytest>=8.1",
     "pytest-timeout>=2.3",
-    # The HTTP tests and the numeric diagnosis compare served tensors, and
+    # The HTTP tests compare served tensors, and
     # tokenize with the checkpoint's own tokenizer.
     "numpy",
     "safetensors",

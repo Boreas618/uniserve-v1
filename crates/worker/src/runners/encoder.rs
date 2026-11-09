@@ -174,8 +174,6 @@ pub struct EncoderRunner<M: Encoder + Send + Sync + ?Sized> {
     vision: Option<VisionPrompt>,
     /// The vision prompts the recorded walk encodes beside the captured buckets.
     warm: WarmVision,
-    /// The block-by-block diagnosis, off unless `UNISERVE_DIAG_DIR` names a directory.
-    diag: crate::runners::diag::Diag,
     /// The tensor group this runner's rank reduces over, absent when one rank holds the encoder.
     group: Option<Arc<nn::Group>>,
     /// The host encoder pool of this runner's device, which a request's encoded states are read
@@ -266,7 +264,6 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
             pending: Vec::new(),
             vision: None,
             warm: vision,
-            diag: crate::runners::diag::Diag::from_env(),
             group: None,
             host_pool: None,
             writes_outputs: false,
@@ -508,8 +505,6 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
             for (index, (first, rows)) in spans(&threads.query_offsets)?.into_iter().enumerate() {
                 let staged = media.request(index)?;
                 self.pending.push((staged.request, first, rows));
-                self.diag
-                    .write_bytes("encoder", "conditioning.json", &staged.conditioning);
                 let images = vision_images(&staged.conditioning)?;
                 if images.is_empty() {
                     continue;
@@ -657,7 +652,7 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
         self.upload()?;
         // The pinned tables stay alive until the encode that reads them in place has completed.
         let mut held = Vec::new();
-        let (tables, state) = self.encode_images(
+        self.encode_images(
             &forward,
             bucket,
             tokens,
@@ -668,35 +663,6 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
         // The tables are this prompt's alone and the walk just queued reads them.
         stream.synchronize()?;
 
-        if self.diag.enabled() {
-            let rows = u64::from(tokens);
-            let hidden_width = u64::from(self.shape.hidden.max(1));
-            let _ = self.diag.write(
-                self.device,
-                &stream,
-                "encoder",
-                "prompt_ids",
-                self.columns.ids.extent(0..rows),
-            );
-            let _ = self
-                .diag
-                .write(self.device, &stream, "encoder", "patches", patches);
-            let _ = self.diag.write(
-                self.device,
-                &stream,
-                "encoder",
-                "hidden",
-                self.columns
-                    .hidden
-                    .extent(0..rows * hidden_width)
-                    .reshape(ops::Shape::new(&[rows, hidden_width])),
-            );
-            for (table, view) in tables.iter().zip(&state) {
-                let _ = self
-                    .diag
-                    .write(self.device, &stream, "encoder", table.name, *view);
-            }
-        }
         drop(held);
         Ok(())
     }
@@ -745,7 +711,7 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
     /// another's, in the media stage's element type. `state` answers the views of the layout's
     /// tables: pinned host tables when serving, placeholders in the recorded walk, which issues no
     /// device work. The prompt's columns are the staged ones, and its states land in the hidden
-    /// column's first rows. Answers the tables and the views the encode read.
+    /// column's first rows.
     fn encode_images(
         &self,
         forward: &nn::Forward<'_>,
@@ -754,7 +720,7 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
         images: &[ImageShape],
         patches: TensorView,
         state: impl FnOnce(&EncoderLayout, &[StateTable]) -> Result<Vec<TensorView>>,
-    ) -> Result<(Vec<StateTable>, Vec<TensorView>)> {
+    ) -> Result<()> {
         let layout = EncoderLayout {
             rows: tokens,
             tokens,
@@ -810,8 +776,7 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
                 },
                 EncoderOutputs { hidden },
             )
-            .map_err(Error::from)?;
-        Ok((tables, state))
+            .map_err(Error::from)
     }
 
     /// Walks the encode once for `bucket`, recording every operator launch's nodes into the
@@ -1054,7 +1019,6 @@ impl<M: Encoder + Send + Sync + ?Sized> Runner for EncoderRunner<M> {
                         patches,
                         |_, tables| walk.tables(tables),
                     )
-                    .map(drop)
                 })?;
             }
         }

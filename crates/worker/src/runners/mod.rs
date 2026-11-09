@@ -14,7 +14,6 @@ pub mod causal_lm;
 pub(crate) mod columns;
 pub mod decoder;
 pub mod denoiser;
-pub(crate) mod diag;
 pub mod encoder;
 pub mod experts;
 pub mod lifecycle;

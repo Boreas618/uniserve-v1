@@ -236,7 +236,7 @@ impl ModelRunner {
             },
             Arc::clone(generation),
         )?
-        .in_group(self.rank, groups.sequence.clone());
+        .in_group(groups.sequence.clone());
         // The host latent pool a preempted request's trajectory is written to and a resumed one's
         // read from, at this rank's Storage Server, its pages sized for the denoiser's
         // largest trajectory. The engine counts this process's ranks as one rank of the worker
