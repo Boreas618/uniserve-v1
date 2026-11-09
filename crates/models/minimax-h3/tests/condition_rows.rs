@@ -7,38 +7,21 @@
 // below as test code, where a failed unwrap is the test's failure report.
 #![cfg(test)]
 
+use minimax_h3::FRAMES as CLIPS;
 use minimax_h3::packing::{self, Condition, Frame, Role};
+use minimax_h3::processing::ConditionPacking;
 use minimax_h3::processing::plan::{
     AudioClip, ConditionInput, FramePosition, KeyframeFit, Prepared, VideoClip,
 };
-use minimax_h3::processing::{ConditionPacking, FrameClips};
 use proto::video::Canvas;
-
-const CLIPS: FrameClips = FrameClips {
-    min_frames: 22,
-    clip_frames: 17,
-    clip_latent_frames: 5,
-    tail_latent_frames: 2,
-};
-
-const CLIP: minimax_h3::encoding::Clip = minimax_h3::encoding::Clip {
-    frames: 17,
-    latents: 5,
-    token_drop: 3,
-};
 
 const TARGET: Canvas = Canvas {
     width: 1344,
     height: 768,
 };
 
-fn canvas(width: u32, height: u32) -> minimax_h3::config::Canvas {
-    minimax_h3::config::Canvas {
-        short_edge: width.min(height),
-        aspect: (width, height),
-        width,
-        height,
-    }
+fn canvas(width: u32, height: u32) -> Canvas {
+    Canvas { width, height }
 }
 
 fn rule_rows(plan: &ConditionInput, tile: u32) -> u32 {
@@ -55,7 +38,7 @@ fn rule_rows(plan: &ConditionInput, tile: u32) -> u32 {
 
 fn packed_rows(condition: Condition, tile: u32) -> u32 {
     let target = canvas(TARGET.width, TARGET.height);
-    packing::condition_segments(&[condition], &target, CLIP)
+    packing::condition_segments(&[condition], &target)
         .unwrap()
         .iter()
         .map(|segment| packing::segment_tiles(segment, tile).unwrap() * tile)

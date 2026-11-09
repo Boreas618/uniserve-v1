@@ -17,13 +17,13 @@ use qwen3::processor::ProcessorConfig;
 use serde_json::{Value, json};
 
 use super::plan::{
-    self, CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, CANVAS_SHORT_EDGE, ConditionSpec, ConditionType,
-    MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, PlanLimits, ReferenceConfig, RequestField, Role, Target,
+    self, ConditionSpec, ConditionType, PlanLimits, ReferenceConfig, RequestField, Role, Target,
     VideoInputError,
 };
 use super::presentation::{self, VIDEO_TAG};
 use super::{ConditionPacking, DenoiserInfo};
 use crate::VideoTask;
+use crate::config::{MAX_SECONDS, MIN_SECONDS};
 
 /// The seed a request without one uses, as the reference does.
 pub const DEFAULT_SEED: u64 = 42;
@@ -59,10 +59,10 @@ impl H3Processor {
     /// Fails when the description is not a MiniMax-H3 denoiser's, names a task this model does not
     /// have, the processor options are refused, or the processor files are not the conditioner's.
     pub fn bind(binding: VideoBinding<'_>) -> Result<Self, String> {
-        if !(MIN_VIDEO_SECONDS..=MAX_VIDEO_SECONDS).contains(&binding.max_seconds) {
+        if !(MIN_SECONDS..=MAX_SECONDS).contains(&binding.max_seconds) {
             return Err(format!(
-                "`video_config.max_seconds` must lie in [{MIN_VIDEO_SECONDS}, \
-                 {MAX_VIDEO_SECONDS}] for MiniMax-H3, got {}",
+                "`video_config.max_seconds` must lie in [{MIN_SECONDS}, {MAX_SECONDS}] for \
+                 MiniMax-H3, got {}",
                 binding.max_seconds
             ));
         }
@@ -83,9 +83,12 @@ impl H3Processor {
             .collect::<Result<Vec<_>, _>>()?;
 
         // The processor's options are its reference sizing, within what the denoiser declares.
-        let references =
-            ReferenceConfig::from_kwargs(binding.processor_options, &denoiser.references)
-                .map_err(|message| format!("invalid mm_processor_kwargs: {message}"))?;
+        let references = ReferenceConfig::from_kwargs(
+            binding.processor_options,
+            &denoiser.references,
+            &denoiser.canvas_rule,
+        )
+        .map_err(|message| format!("invalid mm_processor_kwargs: {message}"))?;
 
         let [image, video] = binding.files else {
             return Err(format!(
@@ -100,6 +103,9 @@ impl H3Processor {
             tasks,
             max_video_seconds: binding.max_seconds,
             frame_rate: denoiser.frame_rate,
+            audio_sample_rate: denoiser.audio_sample_rate,
+            audio_hop: denoiser.audio_hop,
+            canvas_rule: denoiser.canvas_rule,
             frames: denoiser.frames,
             canvases: denoiser.canvases.clone(),
             reference_limits: denoiser.references,
@@ -208,7 +214,9 @@ impl H3Processor {
                 self.denoiser
                     .canvases
                     .first()
-                    .map_or(CANVAS_SHORT_EDGE, |served| served.short_edge),
+                    .map_or(self.denoiser.canvas_rule.short_edge, |served| {
+                        served.short_edge
+                    }),
                 "auto".to_owned(),
             ),
         };
@@ -218,7 +226,7 @@ impl H3Processor {
             Some(Length::Seconds(seconds)) => Some(seconds),
             Some(Length::Frames(frames)) => {
                 let rule = self.denoiser.frames;
-                if frames < rule.min_frames || rule.align_up(frames) != frames {
+                if !rule.is_legal(frames) {
                     return Err(InputError::invalid(
                         "num_frames",
                         format!(
@@ -342,16 +350,16 @@ impl VideoProcessor for H3Processor {
             "task_references": task_references,
             "sizes": self.sizes(),
             "canvas_rule": {
-                "short_edge": CANVAS_SHORT_EDGE,
-                "multiple": CANVAS_MULTIPLE,
-                "max_pixels": CANVAS_MAX_PIXELS,
+                "short_edge": self.denoiser.canvas_rule.short_edge,
+                "multiple": self.denoiser.canvas_rule.multiple,
+                "max_pixels": self.denoiser.canvas_rule.max_pixels,
             },
             "fps": self.denoiser.frame_rate,
             "audio_sample_rate": self.denoiser.audio_sample_rate,
             "frames": self.denoiser.frames,
-            "min_seconds": MIN_VIDEO_SECONDS,
+            "min_seconds": MIN_SECONDS,
             "max_seconds": limits.max_video_seconds,
-            "model_max_seconds": MAX_VIDEO_SECONDS,
+            "model_max_seconds": MAX_SECONDS,
             "num_inference_steps": self.denoise_steps(),
             "schedule": {
                 "flow_shift": self.denoiser.video_shift,
@@ -438,7 +446,8 @@ mod tests {
     use serde_json::Map;
 
     use super::*;
-    use crate::processing::plan::tests::{FRAMES, fixture};
+    use crate::config::{AUDIO_HOP, AUDIO_SAMPLE_RATE, CANVAS_RULE, FPS, FRAMES};
+    use crate::processing::plan::tests::fixture;
     use crate::processing::presentation::tests::CharacterTokenizer;
     use crate::processing::{ReferenceLimits, ServedCanvas};
 
@@ -449,9 +458,11 @@ mod tests {
             schedule_points: 9,
             video_shift: 12.0,
             audio_shift: 3.0,
-            frame_rate: 24,
-            audio_sample_rate: 32_000,
+            frame_rate: FPS,
+            audio_sample_rate: AUDIO_SAMPLE_RATE,
+            audio_hop: AUDIO_HOP,
             frames: FRAMES,
+            canvas_rule: CANVAS_RULE,
             canvases: vec![
                 ServedCanvas {
                     short_edge: 768,
@@ -582,8 +593,8 @@ mod tests {
     /// A deployment's longest output must lie within the model's own bounds.
     #[test]
     fn a_deployment_beyond_the_models_duration_is_refused() {
-        assert!(processor(&["t2va"], MAX_VIDEO_SECONDS + 1.0).is_err());
-        assert!(processor(&["t2va"], MIN_VIDEO_SECONDS - 1.0).is_err());
+        assert!(processor(&["t2va"], MAX_SECONDS + 1.0).is_err());
+        assert!(processor(&["t2va"], MIN_SECONDS - 1.0).is_err());
     }
 
     /// A vision block is a run of vision tags, wherever in the prompt it lies.

@@ -21,10 +21,9 @@
 
 use std::ops::Range;
 
-use crate::config::{
-    AUDIO_CHANNELS, AUDIO_HOP, AttentionKind, CANVAS_MULTIPLE, CLIP_FRAMES, CLIP_LATENTS, Canvas,
-    FPS, SPARSE_TILE_ROWS,
-};
+use proto::video::Canvas;
+
+use crate::config::{AUDIO_CHANNELS, AUDIO_HOP, CANVAS_RULE, FPS, FRAMES, SPARSE_TILE_ROWS};
 use crate::{Error, Result};
 
 /// The `(time, height, width)` token grid of one video tile of each tile size.
@@ -75,6 +74,16 @@ pub struct LatentRaster {
 }
 
 impl LatentRaster {
+    /// The latent raster of `canvas`: its sides over the VAE's spatial compression. A canvas off
+    /// the canvas grid is refused by [`latent_raster`], which callers that do not hold a planned
+    /// canvas go through.
+    pub const fn of(canvas: &Canvas) -> Self {
+        Self {
+            height: canvas.height / LATENT_COMPRESSION,
+            width: canvas.width / LATENT_COMPRESSION,
+        }
+    }
+
     /// Patch rows of one latent frame: one row per [`PATCH_SIDE`]-square patch.
     pub fn patch_rows(&self) -> u32 {
         (self.height / PATCH_SIDE) * (self.width / PATCH_SIDE)
@@ -90,82 +99,28 @@ pub fn video_grid(frames: u32, raster: LatentRaster) -> (u32, u32, u32) {
     )
 }
 
-/// The latent raster of a canvas whose sides are multiples of the VAE's patch grid.
+/// The latent raster of a canvas whose sides lie on the canvas rule's grid: whole patches of the
+/// VAE's latent cells.
 pub fn latent_raster(canvas: &Canvas) -> Result<LatentRaster> {
-    if !canvas.width.is_multiple_of(CANVAS_MULTIPLE)
-        || !canvas.height.is_multiple_of(CANVAS_MULTIPLE)
-    {
+    let multiple = CANVAS_RULE.multiple;
+    if !canvas.width.is_multiple_of(multiple) || !canvas.height.is_multiple_of(multiple) {
         return Err(Error::config(format!(
-            "an H3 canvas side must be a multiple of {CANVAS_MULTIPLE} pixels, got {}x{}",
+            "an H3 canvas side must be a multiple of {multiple} pixels, got {}x{}",
             canvas.width, canvas.height
         )));
     }
-    Ok(LatentRaster {
-        height: canvas.height / LATENT_COMPRESSION,
-        width: canvas.width / LATENT_COMPRESSION,
-    })
+    Ok(LatentRaster::of(canvas))
 }
 
-/// Round a requested frame count up to the next one H3 generates: the next `17n + 5`, at least 22.
-pub fn align_num_frames(requested: u32) -> u32 {
-    (requested + (CLIP_FRAMES + CLIP_LATENTS - requested % CLIP_FRAMES) % CLIP_FRAMES)
-        .max(CLIP_FRAMES + CLIP_LATENTS)
-}
-
-/// The latent frames one clip decodes: its own [`CLIP_LATENTS`] and the two the next clip repeats.
-///
-/// Consecutive clips advance by [`CLIP_LATENTS`], so a timeline of `n` clips holds
-/// `n * CLIP_LATENTS + (CLIP_LATENT_WINDOW - CLIP_LATENTS)` latent frames - the "`5n + 2`" that the
-/// frame rule and its inverse both depend on. The two appear once, here.
-pub const CLIP_LATENT_WINDOW: u32 = CLIP_LATENTS + 2;
-
-/// Latent frames a generated frame count encodes to: `n * CLIP_LATENTS + 2` for `n` clips.
-pub fn video_latent_frames(num_frames: u32) -> Result<u32> {
-    if num_frames < CLIP_FRAMES + CLIP_LATENTS || num_frames % CLIP_FRAMES != CLIP_LATENTS {
+/// The latent frames of a generated video of `num_frames` frames, refusing a count the frame rule
+/// does not generate ([`FRAMES`]).
+pub fn timeline_latents(num_frames: u32) -> Result<u32> {
+    if !FRAMES.is_legal(num_frames) {
         return Err(Error::config(format!(
-            "an H3 frame count has the form {CLIP_FRAMES}n + {CLIP_LATENTS}, got {num_frames}"
+            "an H3 frame count is one of the frame rule {FRAMES:?}, got {num_frames}"
         )));
     }
-    let clips = (num_frames - CLIP_LATENTS) / CLIP_FRAMES;
-    Ok(clips * CLIP_LATENTS + (CLIP_LATENT_WINDOW - CLIP_LATENTS))
-}
-
-/// The clips of a latent timeline: how many [`CLIP_LATENTS`]-frame windows it holds.
-///
-/// The inverse of [`video_latent_frames`]' clip count, and the one place a latent timeline is read
-/// back: a count that is off by a clip is an empty table or one that stops short of the last window,
-/// and neither shows as an error at the call site. Refuses a timeline no clip sequence produces,
-/// including the zero-clip one (two latent frames), rather than returning the truncated division.
-pub fn clip_count(latent_frames: u32) -> Result<u32> {
-    let extra = CLIP_LATENT_WINDOW - CLIP_LATENTS;
-    let aligned = latent_frames.checked_sub(extra).ok_or_else(|| {
-        Error::config(format!(
-            "an H3 latent timeline holds at least {CLIP_LATENT_WINDOW} latent frames, got \
-             {latent_frames}"
-        ))
-    })?;
-    if aligned == 0 || !aligned.is_multiple_of(CLIP_LATENTS) {
-        return Err(Error::config(format!(
-            "an H3 latent frame count has the form {CLIP_LATENTS}n + {extra} with n positive, got \
-             {latent_frames}"
-        )));
-    }
-    Ok(aligned / CLIP_LATENTS)
-}
-
-/// The generated frame count of a latent frame count: the inverse of [`video_latent_frames`].
-///
-/// A decode of `n * CLIP_LATENTS + 2` latent frames produces the `n * CLIP_FRAMES + CLIP_LATENTS`
-/// frames those latents were encoded from, so the decoder's tables can be derived from a layout's
-/// latent extents without knowing the request's frame rule. Refuses a latent count no clip timeline
-/// produces.
-pub fn video_output_frames(latent_frames: u32) -> Result<u32> {
-    let clips = clip_count(latent_frames)?;
-    let frames = clips
-        .checked_mul(CLIP_FRAMES)
-        .and_then(|frames| frames.checked_add(CLIP_LATENTS))
-        .ok_or_else(|| Error::config("the H3 frame count overflows".to_owned()))?;
-    Ok(frames)
+    Ok(FRAMES.latent_frames(num_frames))
 }
 
 /// Audio latent steps of a generated frame count: the duration in 40 Hz latents, rounded to the
@@ -385,58 +340,6 @@ pub fn tiled_rows(grid: (u32, u32, u32), shape: (u32, u32, u32), tiles: u32) -> 
     rows
 }
 
-/// The packed row of each latent voxel a clip's decoder reads, in clip-then-raster order.
-///
-/// The video VAE decodes one 25-frame clip at a time from `CLIP_DECODE_LATENTS` latent frames:
-/// clip `k` reads latent frames `[5k, 5k + 7)`, five that advance the timeline and two the next
-/// clip reads again, so a video's clips partition its latent frames and the last clip's input ends
-/// exactly at the last latent frame. Under dense attention the raster and packed orders agree; a
-/// sparse layout orders the rows tile-major, so each clip's rows are the packed position of every
-/// raster row it reads (the inverse of [`video_order`]).
-pub fn clip_rows(attention: AttentionKind, num_frames: u32, canvas: &Canvas) -> Result<Vec<u32>> {
-    let raster = latent_raster(canvas)?;
-    let order = video_order(attention, num_frames, canvas)?;
-    let mut packed_of_raster = vec![0_u32; order.len()];
-    for (packed, raster_row) in order.iter().enumerate() {
-        packed_of_raster[*raster_row as usize] = packed as u32;
-    }
-    let tokens = raster.patch_rows();
-    let clips = (num_frames - CLIP_LATENTS) / CLIP_FRAMES;
-    let mut rows = Vec::with_capacity((clips * CLIP_DECODE_LATENTS * tokens) as usize);
-    for clip in 0..clips {
-        let start = clip * CLIP_LATENTS * tokens;
-        let stop = start + CLIP_DECODE_LATENTS * tokens;
-        rows.extend_from_slice(&packed_of_raster[start as usize..stop as usize]);
-    }
-    Ok(rows)
-}
-
-/// The raster row of each generated video row, in packed order.
-///
-/// Dense packing keeps the raster order; a sparse layout orders the rows tile-major, which depends
-/// on neither the prompt nor the conditions.
-pub fn video_order(attention: AttentionKind, num_frames: u32, canvas: &Canvas) -> Result<Vec<u32>> {
-    video_order_of(
-        attention,
-        video_latent_frames(num_frames)?,
-        latent_raster(canvas)?,
-    )
-}
-
-/// The same order, from the latent extents a layout states rather than a pixel canvas.
-pub fn video_order_of(
-    attention: AttentionKind,
-    frames: u32,
-    raster: LatentRaster,
-) -> Result<Vec<u32>> {
-    match attention {
-        AttentionKind::Dense => Ok((0..frames * raster.patch_rows()).collect()),
-        AttentionKind::Sparse { tile, .. } => {
-            Ok(tile_order(video_grid(frames, raster), tile_shape(tile)?).raster)
-        }
-    }
-}
-
 /// Rotary time of one latent frame's gap: the output frames it covers, rescaled.
 const ROPE_FRAME_RESCALE: f64 = 5.0 / 3.0;
 
@@ -445,10 +348,6 @@ const ROPE_FRAMES_PER_LATENT: [u32; 5] = [1, 4, 4, 4, 4];
 
 /// Scale of the spatial rotary axes.
 const ROPE_SPATIAL_SCALE: f64 = 32.0;
-
-/// Latent frames one clip's decoder input covers: its five advancing frames and the two the next
-/// clip also reads.
-const CLIP_DECODE_LATENTS: u32 = 7;
 
 /// The rotary coordinates of the patches along one spatial axis.
 ///
@@ -621,7 +520,7 @@ pub fn dense_packing(
         ));
     }
     let raster = latent_raster(canvas)?;
-    let frames = video_latent_frames(num_frames)?;
+    let frames = timeline_latents(num_frames)?;
     let video_rows = frames * raster.patch_rows();
     let audio_rows = audio_rows(num_frames);
     let rows = video_rows + audio_rows + text_rows + condition_rows;
@@ -699,7 +598,7 @@ pub fn dense_tables(
     }
     let raster = latent_raster(canvas)?;
     let rows = packing.padded_tokens;
-    let frames = video_latent_frames(num_frames)?;
+    let frames = timeline_latents(num_frames)?;
     let audio_frames = audio_latent_frames(num_frames);
     let (spatial, width_grid) = frame_grid(raster);
 
@@ -860,11 +759,7 @@ pub struct Condition {
 /// request's keyframes lead its references as the SGLang layout holds them.
 /// A one-frame reference is an image; a longer one is a video, with its
 /// soundtrack when it carries audio; a reference without pixels is audio.
-pub fn condition_segments(
-    conditions: &[Condition],
-    canvas: &Canvas,
-    clip: crate::encoding::Clip,
-) -> Result<Vec<Segment>> {
+pub fn condition_segments(conditions: &[Condition], canvas: &Canvas) -> Result<Vec<Segment>> {
     let mut keyframes = Vec::new();
     let mut references = Vec::new();
     for (index, condition) in conditions.iter().enumerate() {
@@ -872,16 +767,23 @@ pub fn condition_segments(
             None => None,
             Some(frame) => {
                 let raster = latent_raster(&frame.canvas)?;
-                // The condition's latent count is the **encoder's** clip rule, one statement of
-                // it: `ceil(frames / 17) * latents - token_drop`, a still being one frame and one
-                // latent frame with no repeat. It is not the generated timeline's rule
-                // ([`video_latent_frames`]), which agrees with it only on an aligned count: a
-                // 30-frame reference is 7 latent frames and 12 by the generated rule.
-                let frames = clip.latent_frames(frame.num_frames)?;
+                // A condition is cut into clips, so its latent count is the frame rule's for any
+                // count ([`processing::FrameClips::latent_frames`]): a still is one frame and one
+                // latent frame, and a 30-frame reference is 7 latent frames, where rounding it up
+                // to the next generated count (39) would give 12.
+                if frame.num_frames == 0 {
+                    return Err(Error::config(
+                        "a video condition of no frame encodes nothing".to_owned(),
+                    ));
+                }
+                let frames = FRAMES.latent_frames(frame.num_frames);
                 Some(Visual { frames, raster })
             }
         };
-        let audio_frames = condition.audio_samples.div_ceil(AUDIO_HOP);
+        let audio_frames = crate::encoding::audio_latent_frames(
+            u64::from(condition.audio_samples),
+            u64::from(AUDIO_HOP),
+        ) as u32;
         let (kind, anchor) = match (condition.role, &visual) {
             (Role::Reference, None) => (SegmentKind::Audio, None),
             (Role::Reference, Some(visual)) if visual.frames == 1 => (SegmentKind::Image, None),
@@ -1048,7 +950,7 @@ pub fn segment_extent(
         )));
     }
     let raster = latent_raster(canvas)?;
-    let grid = video_grid(video_latent_frames(num_frames)?, raster);
+    let grid = video_grid(timeline_latents(num_frames)?, raster);
     let shape = tile_shape(tile)?;
     let video_tiles =
         grid.0.div_ceil(shape.0) * grid.1.div_ceil(shape.1) * grid.2.div_ceil(shape.2);
@@ -1254,7 +1156,7 @@ pub fn segment_tables(
     let rows = extent.padded_tokens as usize;
     let tiles = extent.padded_tokens / tile;
     let raster = latent_raster(canvas)?;
-    let frames = video_latent_frames(num_frames)?;
+    let frames = timeline_latents(num_frames)?;
     let (spatial, width_grid) = frame_grid(raster);
     let shape = tile_shape(tile)?;
 
@@ -1452,69 +1354,8 @@ mod tests {
     /// The 768p 16:9 canvas: 1344x768, 84x48 latent columns and rows.
     fn canvas() -> Canvas {
         Canvas {
-            short_edge: 768,
-            aspect: (16, 9),
             width: 1344,
             height: 768,
-        }
-    }
-
-    #[test]
-    fn the_frame_rule_extends_a_duration_to_the_next_whole_clip() {
-        for (seconds, frames) in [(4, 107), (5, 124), (8, 192), (15, 362)] {
-            assert_eq!(align_num_frames(seconds * FPS), frames, "{seconds} s");
-            // A count that already has the form is its own answer.
-            assert_eq!(align_num_frames(frames), frames);
-        }
-        // Shorter than one clip is one clip: `CLIP_FRAMES` of body plus the `CLIP_LATENTS` carried
-        // over is the shortest count the pipeline generates.
-        let shortest = CLIP_FRAMES + CLIP_LATENTS;
-        assert_eq!(align_num_frames(1), shortest);
-        assert_eq!(align_num_frames(shortest), shortest);
-    }
-
-    #[test]
-    fn a_frame_count_encodes_to_five_latents_per_clip_and_the_trailing_overlap() {
-        for (frames, latents) in [(107, 32), (124, 37), (192, 57), (362, 107)] {
-            assert_eq!(
-                video_latent_frames(frames).expect("a legal frame count"),
-                latents
-            );
-            // Each whole clip contributes `CLIP_LATENTS`, and the pipeline carries two more.
-            assert_eq!(
-                latents,
-                (frames - CLIP_LATENTS) / CLIP_FRAMES * CLIP_LATENTS + 2
-            );
-        }
-        for illegal in [21_u32, 100, 0] {
-            assert!(video_latent_frames(illegal).is_err(), "{illegal}");
-        }
-    }
-
-    #[test]
-    fn a_frame_count_survives_its_encode_and_decode() {
-        // The inverse must return the count it was given for every legal count, which is the one
-        // property the constant in its return expression cannot get away with being wrong.
-        for frames in (22..=400).filter(|frames| frames % CLIP_FRAMES == CLIP_LATENTS) {
-            let latents = video_latent_frames(frames).expect("a legal frame count");
-            assert_eq!(
-                video_output_frames(latents).expect("the inverse of a legal count"),
-                frames,
-                "{frames} frames"
-            );
-            assert_eq!(
-                clip_count(latents).expect("a legal timeline"),
-                (frames - CLIP_LATENTS) / CLIP_FRAMES,
-                "{frames} frames"
-            );
-        }
-        // No clip timeline produces fewer than one clip's window, and neither does a truncated one.
-        for refused in [0_u32, 2, CLIP_LATENT_WINDOW - 1, CLIP_LATENT_WINDOW + 1] {
-            assert!(clip_count(refused).is_err(), "{refused} latent frames");
-            assert!(
-                video_output_frames(refused).is_err(),
-                "{refused} latent frames"
-            );
         }
     }
 
@@ -1692,38 +1533,6 @@ mod tests {
             segment_tiles(&image, 128).expect("a tile"),
             (45 * 80_u32).div_ceil(128)
         );
-    }
-
-    #[test]
-    fn a_dense_network_reads_the_generated_rows_in_raster_order() {
-        let order = video_order(AttentionKind::Dense, 124, &canvas()).expect("a plan");
-        assert_eq!(order.len(), 37 * 1008);
-        assert_eq!(order[..3], [0, 1, 2]);
-        assert_eq!(order[order.len() - 1], 37 * 1008 - 1);
-    }
-
-    #[test]
-    fn a_sparse_network_reads_them_tile_major() {
-        let order = video_order(
-            AttentionKind::sparse(64, 0.8, None).expect("sparse"),
-            124,
-            &canvas(),
-        )
-        .expect("a plan");
-        let tile = tile_order(
-            video_grid(
-                37,
-                LatentRaster {
-                    height: 48,
-                    width: 84,
-                },
-            ),
-            (4, 4, 4),
-        );
-        assert_eq!(order, tile.raster);
-        // A 37x24x42 grid holds 10x6x11 tiles of 4x4x4.
-        assert_eq!(tile.sizes.len(), 10 * 6 * 11);
-        assert_eq!(order.len(), 37 * 1008);
     }
 
     /// The spatial rotary grid of one axis, as the released plan defines it: evenly spaced over an
@@ -2266,8 +2075,6 @@ mod tests {
                 role: Role::Reference,
                 frame: Some(Frame {
                     canvas: Canvas {
-                        short_edge: 512,
-                        aspect: (1, 1),
                         width: 512,
                         height: 512,
                     },
@@ -2284,7 +2091,7 @@ mod tests {
                 audio_samples: 0,
             },
         ];
-        let segments = condition_segments(&conditions, &target, clip()).expect("four conditions");
+        let segments = condition_segments(&conditions, &target).expect("four conditions");
         // Keyframes first in request order, then the references in request order: the audio track
         // is condition 0 and the reference video condition 2.
         let kinds: Vec<_> = segments.iter().map(|segment| segment.kind).collect();
@@ -2313,8 +2120,6 @@ mod tests {
             role: Role::Reference,
             frame: Some(Frame {
                 canvas: Canvas {
-                    short_edge: 512,
-                    aspect: (1, 1),
                     width: 512,
                     height: 512,
                 },
@@ -2322,7 +2127,7 @@ mod tests {
             }),
             audio_samples: 0,
         };
-        let segments = condition_segments(&[image], &target, clip()).expect("an image");
+        let segments = condition_segments(&[image], &target).expect("an image");
         assert_eq!(segments[0].kind, SegmentKind::Image);
         assert_eq!(segments[0].visual.expect("pixels").frames, 1);
 
@@ -2330,14 +2135,12 @@ mod tests {
             audio_samples: 800,
             ..image
         };
-        assert!(condition_segments(&[with_audio], &target, clip()).is_err());
+        assert!(condition_segments(&[with_audio], &target).is_err());
 
         let off_canvas = Condition {
             role: Role::FirstFrame,
             frame: Some(Frame {
                 canvas: Canvas {
-                    short_edge: 512,
-                    aspect: (1, 1),
                     width: 512,
                     height: 512,
                 },
@@ -2345,16 +2148,7 @@ mod tests {
             }),
             audio_samples: 0,
         };
-        assert!(condition_segments(&[off_canvas], &target, clip()).is_err());
-    }
-
-    /// The shipped checkpoint's clip: 17 frames a clip, five latent frames each, three dropped.
-    fn clip() -> crate::encoding::Clip {
-        crate::encoding::Clip {
-            frames: CLIP_FRAMES,
-            latents: CLIP_LATENTS,
-            token_drop: 3,
-        }
+        assert!(condition_segments(&[off_canvas], &target).is_err());
     }
 
     #[test]
@@ -2372,7 +2166,7 @@ mod tests {
                 }),
                 audio_samples: 0,
             };
-            condition_segments(&[condition], &target, clip())
+            condition_segments(&[condition], &target)
                 .expect("a referenced clip")
                 .remove(0)
                 .visual
@@ -2380,121 +2174,11 @@ mod tests {
                 .frames
         };
         assert_eq!(count(30), 7);
-        assert_eq!(count(39), video_latent_frames(39).expect("aligned"));
+        assert_eq!(count(39), timeline_latents(39).expect("aligned"));
         // On an aligned count the two rules agree, which is the property that keeps them from
         // drifting: 17n + 5 frames are 5n + 2 latent frames either way.
-        assert_eq!(count(124), video_latent_frames(124).expect("aligned"));
+        assert_eq!(count(124), timeline_latents(124).expect("aligned"));
         // A still is one frame and one latent frame, with no repeat to the clip count.
         assert_eq!(count(1), 1);
-    }
-
-    #[test]
-    fn a_clips_rows_are_the_packed_position_of_every_latent_voxel_it_decodes() {
-        let canvas = canvas();
-        let tokens = latent_raster(&canvas).expect("raster").patch_rows();
-        // 124 frames give 37 latent frames and seven clips of seven latent frames.
-        let clips = 7;
-        assert_eq!(clips * CLIP_LATENTS * tokens + 2 * tokens, 37 * tokens);
-
-        // Dense packing keeps the raster order, so each clip's rows are its own contiguous range
-        // and consecutive clips share the two latent frames the later one re-reads.
-        let dense = clip_rows(AttentionKind::Dense, 124, &canvas).expect("a plan");
-        assert_eq!(dense.len() as u32, clips * CLIP_DECODE_LATENTS * tokens);
-        for clip in 0..clips {
-            let begin = (clip * CLIP_DECODE_LATENTS * tokens) as usize;
-            let span = (CLIP_DECODE_LATENTS * tokens) as usize;
-            let first = (clip * CLIP_LATENTS * tokens) as usize;
-            assert_eq!(dense[begin], first as u32);
-            assert!(
-                dense[begin..begin + span]
-                    .windows(2)
-                    .all(|pair| pair[1] == pair[0] + 1)
-            );
-        }
-
-        // A sparse layout permutes the rows, and the clips still cover every row once.
-        let attention = AttentionKind::sparse(64, 0.8, None).expect("sparse");
-        let order = video_order(attention, 124, &canvas).expect("a plan");
-        let sparse = clip_rows(attention, 124, &canvas).expect("a plan");
-        assert_eq!(sparse.len() as u32, clips * CLIP_DECODE_LATENTS * tokens);
-        // Every row a clip decodes reads one of that clip's own latent frames, and the clips
-        // together cover the sequence once per latent frame plus the overlaps.
-        let mut every = sparse.clone();
-        every.sort_unstable();
-        let mut covered = every.clone();
-        covered.dedup();
-        assert_eq!(covered, (0..37 * tokens).collect::<Vec<_>>());
-        assert_eq!(every.len() as u32, clips * CLIP_DECODE_LATENTS * tokens);
-        for (index, packed) in sparse.iter().enumerate() {
-            let clip = index as u32 / (CLIP_DECODE_LATENTS * tokens);
-            let raster_row = order[*packed as usize];
-            assert!(
-                raster_row >= clip * CLIP_LATENTS * tokens
-                    && raster_row < (clip * CLIP_LATENTS + CLIP_DECODE_LATENTS) * tokens,
-                "clip {clip} reads raster row {raster_row}"
-            );
-        }
-
-        // A frame count off the clip rule is refused by the latent arithmetic.
-        assert!(clip_rows(AttentionKind::Dense, 100, &canvas).is_err());
-    }
-
-    #[test]
-    fn the_clip_rows_invert_the_packing_over_each_clips_seven_frames() {
-        let canvas = crate::config::Canvas {
-            short_edge: 768,
-            aspect: (7, 4),
-            width: 1344,
-            height: 768,
-        };
-        let patch_rows = u64::from(
-            crate::packing::latent_raster(&canvas)
-                .expect("raster")
-                .patch_rows(),
-        );
-        // Dense packing keeps raster order, so the clip rows are the raster rows in sequence.
-        let rows = crate::packing::clip_rows(crate::config::AttentionKind::Dense, 107, &canvas)
-            .expect("rows");
-        assert_eq!(rows.len() as u64, 6 * 7 * patch_rows);
-        // Clips start five latent frames after the previous one and read seven, so clip `k`'s rows are
-        // the raster's rows from frame `5k` — not from `7k`, which is what a clip without overlap
-        // would give.
-        for (index, row) in rows.iter().enumerate() {
-            let clip = index as u64 / (7 * patch_rows);
-            let within = index as u64 % (7 * patch_rows);
-            assert_eq!(u64::from(*row), clip * 5 * patch_rows + within);
-        }
-        // A sparse packing permutes them within the generated video. Consecutive clips share their
-        // last two latent frames, so a row is named once per clip that reads it — the union covers the
-        // generated rows, and no row is named twice inside one clip.
-        let sparse = crate::config::AttentionKind::Sparse {
-            tile: 128,
-            sparsity: 0.8,
-            reference_keep: None,
-        };
-        let rows = crate::packing::clip_rows(sparse, 107, &canvas).expect("rows");
-        assert_eq!(rows.len() as u64, 6 * 7 * patch_rows);
-        let per_frame = patch_rows as usize;
-        let clip_rows = 7 * per_frame;
-        let mut generated = vec![false; (5 * 6 + 2) as usize * per_frame];
-        for (clip, block) in rows.chunks(clip_rows).enumerate() {
-            let mut in_clip = vec![false; generated.len()];
-            for row in block {
-                let index = *row as usize;
-                assert!(
-                    index < generated.len(),
-                    "clip {clip} reads row {index} outside the video"
-                );
-                assert!(!in_clip[index], "clip {clip} names row {index} twice");
-                in_clip[index] = true;
-                generated[index] = true;
-            }
-        }
-        assert!(
-            generated.iter().all(|row| *row),
-            "a generated row is read by no clip"
-        );
-        // Clips overlap by two latent frames: the second clip starts five frames after the first.
-        assert_eq!(rows[7 * per_frame], rows[5 * per_frame]);
     }
 }

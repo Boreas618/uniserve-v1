@@ -529,7 +529,8 @@ impl Blend {
 /// The temporal clips a long video is decoded in: each clip decodes a window of latent frames, keeps
 /// a body, and hands an overlap tail to its successor, which fades its first frames against it.
 ///
-/// A timeline of `n` clips is `body · n + overlap` frames. Clip `k` reads `window()` latent frames
+/// A timeline of `n` clips is `body · n + overlap` frames; which frame counts are timelines is the
+/// family's frame rule, which states the clips a count holds. Clip `k` reads `window()` latent frames
 /// from `k · advance`, decodes them to `window() · temporal` frames of which the leading surplus
 /// over `native()` is cropped, keeps its first `body` frames, skips `padding`, and its last
 /// `overlap` frames are the tail; the last clip keeps its tail.
@@ -568,22 +569,21 @@ impl TemporalClips {
         (self.body + self.padding, self.native())
     }
 
-    /// The splices a timeline of `frames` frames is written in: clip `i` writes from frame
+    /// The splices a timeline of `count` clips is written in: clip `i` writes from frame
     /// `body · i`, every clip but the first fades `overlap` frames against its predecessor, and the
     /// last keeps its tail.
     ///
     /// # Errors
     ///
-    /// A timeline that is not `body · n + overlap` frames for a positive `n`.
-    pub fn splices(&self, frames: u32) -> Result<Vec<Splice>> {
+    /// A timeline of no clip.
+    pub fn splices(&self, count: u32) -> Result<Vec<Splice>> {
         let (body, tail) = (self.body, self.overlap);
-        if body == 0 || frames < body + tail || !(frames - tail).is_multiple_of(body) {
+        if count == 0 {
             return Err(Error::shape(
                 "TemporalClips",
-                format!("a timeline is {body} · n + {tail} frames, and {frames} is not"),
+                "a timeline holds at least one clip".to_owned(),
             ));
         }
-        let count = (frames - tail) / body;
         Ok((0..count)
             .map(|index| Splice {
                 keep: body + if index + 1 == count { tail } else { 0 },
@@ -1106,7 +1106,7 @@ mod tests {
         assert_eq!(clips.window(), 7);
         assert_eq!(clips.start(2), 10);
         assert_eq!(clips.tail(), (20, 25));
-        let splices = clips.splices(17 * 3 + 5).unwrap();
+        let splices = clips.splices(3).unwrap();
         assert_eq!(splices.len(), 3);
         assert_eq!(
             (splices[0].keep, splices[0].overlap, splices[0].first),
@@ -1120,7 +1120,6 @@ mod tests {
             (splices[2].keep, splices[2].overlap, splices[2].first),
             (22, 5, 34)
         );
-        assert!(clips.splices(21).is_err());
-        assert!(clips.splices(17 * 2 + 6).is_err());
+        assert!(clips.splices(0).is_err());
     }
 }

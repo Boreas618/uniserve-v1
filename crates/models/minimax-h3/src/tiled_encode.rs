@@ -6,10 +6,11 @@
 //! the tiles among the forward's ranks, gathers them and stitches the moments: vertical seams, then
 //! horizontal ones, each tile's neighbours read as encoded. What stays here is the checkpoint's
 //! geometry (its [`TILE_PIXELS`] tiles with at least [`MINIMUM_OVERLAP`] shared, compressed
-//! [`SPATIAL_RATIO`]-fold), the encoder's buffers, and the copy that packs a tile cut from a wider
+//! [`LATENT_COMPRESSION`]-fold), the encoder's buffers, and the copy that packs a tile cut from a wider
 //! raster before the encoder reads it.
 
-use crate::encoding::{EncoderScratch, Extent, SPATIAL_RATIO, VideoEncoder};
+use crate::encoding::{EncoderScratch, Extent, VideoEncoder};
+use crate::packing::LATENT_COMPRESSION;
 use crate::video_vae::{MINIMUM_OVERLAP, TILE_PIXELS};
 use crate::{Error, Result};
 use nn::tiling::{Tile, TileBlocks, TiledEncode};
@@ -102,7 +103,7 @@ impl ClipEncoder {
                 width,
                 TILE_PIXELS,
                 MINIMUM_OVERLAP,
-                SPATIAL_RATIO,
+                LATENT_COMPRESSION,
                 DType::F32,
             )?,
         })
@@ -136,8 +137,8 @@ impl ClipEncoder {
             .flat_map(|frames| {
                 self.tiles().iter().map(move |tile| Extent {
                     frames: *frames,
-                    height: tile.rows.1 * SPATIAL_RATIO,
-                    width: tile.columns.1 * SPATIAL_RATIO,
+                    height: tile.rows.1 * LATENT_COMPRESSION,
+                    width: tile.columns.1 * LATENT_COMPRESSION,
                 })
             })
             .collect();
@@ -203,7 +204,7 @@ mod tests {
     fn a_raster_within_one_tile_is_one_tile_with_no_seam() {
         let small = ClipEncoder::new(256, 256).expect("one tile");
         let latent = small.latent_extent();
-        assert_eq!(latent, (256 / SPATIAL_RATIO, 256 / SPATIAL_RATIO));
+        assert_eq!(latent, (256 / LATENT_COMPRESSION, 256 / LATENT_COMPRESSION));
         let tiles = small.tiles();
         assert_eq!(tiles.len(), 1);
         assert_eq!(tiles[0].rows, (0, latent.0));
@@ -217,8 +218,8 @@ mod tests {
 
     #[test]
     fn a_raster_that_is_not_whole_patches_is_refused_rather_than_truncated() {
-        assert!(ClipEncoder::new(256 + SPATIAL_RATIO / 2, 256).is_err());
-        assert!(ClipEncoder::new(256, 256 + SPATIAL_RATIO / 2).is_err());
+        assert!(ClipEncoder::new(256 + LATENT_COMPRESSION / 2, 256).is_err());
+        assert!(ClipEncoder::new(256, 256 + LATENT_COMPRESSION / 2).is_err());
         assert!(ClipEncoder::new(768, 1344).is_ok());
         assert!(ClipEncoder::new(480, 832).is_ok());
     }

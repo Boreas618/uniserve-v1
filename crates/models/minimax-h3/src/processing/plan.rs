@@ -11,10 +11,13 @@
 //! media are fetched; [`plan_request`] then plans from the probed media.
 //!
 //! These are the only implementation of the rules: the deployment's processor
-//! (`super::processor`) plans every request with them. The model's own facts,
-//! such as its output frame rate, are the rules' parameters ([`PlanLimits`]),
-//! as the denoiser declares them. The rules are tested against
-//! [`PLAN_VECTORS`], vectors generated from the reference pipeline.
+//! (`super::processor`) plans every request with them. The family-neutral
+//! rules they are built from - the frame rule, the canvas rule, the cover crop
+//! and the resampled length - are `crates/processing`'s, and the model's own
+//! facts, such as its output frame rate and the values those rules are
+//! parameterized by, are the rules' parameters ([`PlanLimits`]), as the
+//! denoiser declares them. The rules are tested against [`PLAN_VECTORS`],
+//! vectors generated from the reference pipeline.
 //!
 //! The arithmetic reproduces the diffusers MiniMax-H3 pipeline and the
 //! checkpoint's Qwen3-VL processor operation for operation, in `f64` where
@@ -39,31 +42,21 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use processing::{AudioMetadata, ConditionPlan, ImageMetadata, MediaMetadata, VideoMetadata};
+use processing::{
+    AudioMetadata, CanvasError, CanvasRule, ConditionPlan, CoverCrop, FrameClips, ImageMetadata,
+    MediaMetadata, VideoMetadata, cover_crop, requested_frames, resampled_len,
+};
 use proto::video::{Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, VisionGrid};
 
-use super::{ConditionPacking, FrameClips, ReferenceLimits, ServedCanvas};
+use super::{ConditionPacking, ReferenceLimits, ServedCanvas};
 use crate::VideoTask;
+use crate::config::{AUDIO_CHANNELS, MIN_SECONDS};
+use crate::encoding::audio_latent_frames;
+use crate::packing::{LatentRaster, PATCH_SIDE};
 use qwen3::processor::{ProcessorConfig, VisionError, sample_frames};
 
-/// Short edge of the adapt_shape_v1 canvas rule, in pixels.
-pub const CANVAS_SHORT_EDGE: u32 = 768;
-/// Area cap of the canvas rule, in pixels.
-pub const CANVAS_MAX_PIXELS: u32 = 768 * 1344;
-/// What every canvas side is a multiple of: the VAE's 16x spatial
-/// compression times the 2x2 denoiser patch.
-pub const CANVAS_MULTIPLE: u32 = 32;
-/// Narrowest accepted width-to-height ratio, 1:4.
-pub const MIN_ASPECT_RATIO: f64 = 0.25;
-/// Widest accepted width-to-height ratio, 4:1.
-pub const MAX_ASPECT_RATIO: f64 = 4.0;
 /// The ratio `auto` means for `t2va` and `ref2va`.
 const DEFAULT_ASPECT_RATIO: (u32, u32) = (16, 9);
-
-/// The shortest output a request may ask for, in seconds.
-pub const MIN_VIDEO_SECONDS: f64 = crate::family::MIN_VIDEO_SECONDS;
-/// The longest output a request may ask for, in seconds.
-pub const MAX_VIDEO_SECONDS: f64 = 15.0;
 
 /// The planning vectors the rules are tested against, generated from the
 /// reference pipeline: a file of this crate's, which the daemon's request tests
@@ -72,13 +65,6 @@ pub const PLAN_VECTORS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/data/minimax_h3_plan.json"
 );
-
-/// The audio VAE's sample rate and hop: 40 latents per second.
-pub const AUDIO_SAMPLE_RATE: u32 = 32_000;
-/// Samples per audio latent.
-pub const AUDIO_HOP: u32 = 800;
-/// Stereo channels, packed channel-major.
-const AUDIO_CHANNELS: u32 = 2;
 
 /// The request field a rejection names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,27 +110,6 @@ impl fmt::Display for RequestField {
     }
 }
 
-/// An aspect the canvas rule cannot resolve ([`canvas`]).
-#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
-pub enum CanvasError {
-    /// A side is zero, negative or not a number.
-    #[error("aspect must be positive, got {width}:{height}")]
-    NonPositive {
-        /// The aspect's width.
-        width: f64,
-        /// The aspect's height.
-        height: f64,
-    },
-    /// The width-to-height ratio lies outside 1:4 to 4:1.
-    #[error("aspect {width}:{height} lies outside 1:4 to 4:1")]
-    OutOfRange {
-        /// The aspect's width.
-        width: f64,
-        /// The aspect's height.
-        height: f64,
-    },
-}
-
 /// A duration or media fact the rules cannot size.
 ///
 /// The messages name what is wrong in request terms; [`plan_request`] and
@@ -152,10 +117,8 @@ pub enum CanvasError {
 /// ([`VideoInputError::Invalid`]).
 #[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
 pub enum RuleError {
-    /// A duration outside `[MIN_VIDEO_SECONDS, max_seconds]`, or not finite.
-    #[error(
-        "video duration must be a finite number of seconds in [{MIN_VIDEO_SECONDS}, {max_seconds}]"
-    )]
+    /// A duration outside `[MIN_SECONDS, max_seconds]`, or not finite.
+    #[error("video duration must be a finite number of seconds in [{MIN_SECONDS}, {max_seconds}]")]
     Duration {
         /// The longest duration served.
         max_seconds: f64,
@@ -163,13 +126,20 @@ pub enum RuleError {
     /// An image or video the conditioner's processor cannot size or sample.
     #[error(transparent)]
     Vision(#[from] VisionError),
-    /// An image reference outside 1:4 to 4:1.
-    #[error("a reference image must lie within 1:4 and 4:1, got {width}x{height}")]
+    /// An image reference outside the canvas rule's aspects.
+    #[error(
+        "a reference image must lie within {}:{} and {}:{}, got {width}x{height}",
+        narrowest.0, narrowest.1, widest.0, widest.1
+    )]
     ReferenceAspect {
         /// Width in pixels.
         width: u32,
         /// Height in pixels.
         height: u32,
+        /// The narrowest aspect the canvas rule resolves.
+        narrowest: (u32, u32),
+        /// The widest aspect the canvas rule resolves.
+        widest: (u32, u32),
     },
     /// A start offset at or past the end of a soundtrack.
     #[error("start_time_seconds lies past the end of the audio track")]
@@ -281,124 +251,6 @@ pub enum FramePosition {
     Last,
 }
 
-/// Denoiser rows of one latent frame of `canvas`: one per 32x32 pixel block.
-pub const fn rows_per_frame(canvas: Canvas) -> u32 {
-    (canvas.width / CANVAS_MULTIPLE) * (canvas.height / CANVAS_MULTIPLE)
-}
-
-/// Resolves a display aspect into a canvas with the adapt_shape_v1 rule.
-///
-/// Only the ratio of the arguments matters. The short edge starts at 768
-/// pixels, an area above `768 * 1344` scales both sides down, and each side
-/// rounds half to even to a multiple of 32, so the final area may end up
-/// slightly above the cap.
-///
-/// # Errors
-///
-/// Returns [`CanvasError`] when the ratio is not finite and positive or lies
-/// outside 1:4 to 4:1.
-pub fn canvas(aspect_width: f64, aspect_height: f64) -> Result<Canvas, CanvasError> {
-    if !(aspect_width > 0.0 && aspect_height > 0.0) {
-        return Err(CanvasError::NonPositive {
-            width: aspect_width,
-            height: aspect_height,
-        });
-    }
-    let ratio = aspect_width / aspect_height;
-    if !(MIN_ASPECT_RATIO..=MAX_ASPECT_RATIO).contains(&ratio) {
-        return Err(CanvasError::OutOfRange {
-            width: aspect_width,
-            height: aspect_height,
-        });
-    }
-    let short_edge = f64::from(CANVAS_SHORT_EDGE);
-    let (mut width, mut height) = if ratio >= 1.0 {
-        (short_edge * ratio, short_edge)
-    } else {
-        (short_edge, short_edge / ratio)
-    };
-    let area = width * height;
-    let max_pixels = f64::from(CANVAS_MAX_PIXELS);
-    if area > max_pixels {
-        // `powf(0.5)` rather than `sqrt` reproduces the reference's `** 0.5`.
-        let scale = (max_pixels / area).powf(0.5);
-        width *= scale;
-        height *= scale;
-    }
-    Ok(Canvas {
-        width: nearest_multiple(width),
-        height: nearest_multiple(height),
-    })
-}
-
-/// Rounds a side half to even to the nearest multiple of 32, at least 32.
-fn nearest_multiple(value: f64) -> u32 {
-    let multiple = f64::from(CANVAS_MULTIPLE);
-    // Sides stay far below `u32::MAX`, so the conversion is exact.
-    ((value / multiple).round_ties_even() * multiple).max(multiple) as u32
-}
-
-/// Every canvas the canvas rule resolves a display aspect to, each once,
-/// from the narrowest aspect to the widest.
-///
-/// [`canvas`] is piecewise constant in the ratio: a side changes only where
-/// its unrounded length crosses an odd multiple of half
-/// [`CANVAS_MULTIPLE`]. Below the area cap the long side is the short edge
-/// times the ratio (its reciprocal for a portrait aspect); above it the long
-/// side is `sqrt(cap * ratio)` and the short side `sqrt(cap / ratio)`.
-/// Those crossings, the ends of the range and the ratio the cap starts at
-/// cut 1:4 to 4:1 into intervals of one canvas each, so the canvases at the
-/// cuts and at the midpoints between them are all of them.
-pub fn rule_canvases() -> Vec<Canvas> {
-    let short_edge = f64::from(CANVAS_SHORT_EDGE);
-    let max_pixels = f64::from(CANVAS_MAX_PIXELS);
-    let multiple = f64::from(CANVAS_MULTIPLE);
-    let cap = max_pixels / (short_edge * short_edge);
-    let mut cuts = vec![MIN_ASPECT_RATIO, MAX_ASPECT_RATIO, 1.0, cap, 1.0 / cap];
-    // No side of the range is longer than the long side at 4:1 under the cap.
-    let longest = (max_pixels * MAX_ASPECT_RATIO).sqrt();
-    let mut crossing = multiple / 2.0;
-    while crossing <= longest + multiple {
-        for ratio in [
-            crossing / short_edge,
-            crossing * crossing / max_pixels,
-            max_pixels / (crossing * crossing),
-        ] {
-            cuts.extend([ratio, 1.0 / ratio]);
-        }
-        crossing += multiple;
-    }
-    cuts.retain(|ratio| (MIN_ASPECT_RATIO..=MAX_ASPECT_RATIO).contains(ratio));
-    cuts.sort_by(f64::total_cmp);
-    cuts.dedup();
-
-    let midpoints: Vec<f64> = cuts
-        .windows(2)
-        .map(|pair| f64::midpoint(pair[0], pair[1]))
-        .collect();
-    let mut probes = cuts;
-    probes.extend(midpoints);
-    probes.sort_by(f64::total_cmp);
-    let mut canvases = Vec::new();
-    // Every probe lies within 1:4 to 4:1, which the rule accepts.
-    for size in probes
-        .into_iter()
-        .filter_map(|ratio| canvas(ratio, 1.0).ok())
-    {
-        if !canvases.contains(&size) {
-            canvases.push(size);
-        }
-    }
-    canvases
-}
-
-/// Frames of `seconds` of video at `fps`: the product rounded half to even,
-/// as the reference implementations round with Python's `round`.
-pub fn requested_frames(seconds: f64, fps: u32) -> u32 {
-    // Callers pass validated durations, whose products stay far below 2^32.
-    (seconds * f64::from(fps)).round_ties_even() as u32
-}
-
 /// Converts an explicit duration into its output frame count at
 /// `frame_rate` frames per second, the rate the denoiser declares.
 ///
@@ -412,14 +264,14 @@ pub fn requested_frames(seconds: f64, fps: u32) -> u32 {
 /// # Errors
 ///
 /// Returns [`RuleError::Duration`] when `seconds` is not finite or lies
-/// outside `[MIN_VIDEO_SECONDS, max_video_seconds]`.
+/// outside `[MIN_SECONDS, max_video_seconds]`.
 pub fn video_frame_count(
     seconds: f64,
     max_video_seconds: f64,
     frame_rate: u32,
     frames: &FrameClips,
 ) -> Result<u32, RuleError> {
-    if !seconds.is_finite() || !(MIN_VIDEO_SECONDS..=max_video_seconds).contains(&seconds) {
+    if !seconds.is_finite() || !(MIN_SECONDS..=max_video_seconds).contains(&seconds) {
         return Err(RuleError::Duration {
             max_seconds: max_video_seconds,
         });
@@ -431,7 +283,7 @@ pub fn video_frame_count(
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Target<'a> {
     /// `target.short_edge`: the resolution class, in pixels, of a canvas the
-    /// deployment serves; 768 is the canvas rule's.
+    /// deployment serves; the canvas rule's short edge is one.
     pub short_edge: u32,
     /// `target.aspect_ratio`: `auto` or `W:H`.
     pub aspect_ratio: &'a str,
@@ -459,13 +311,13 @@ pub struct ConditionSpec {
 /// A reference is only ever reduced by default: an image whose short edge
 /// exceeds `image_short_edge` scales down to it, and a video with more
 /// pixels than the canvas of its aspect scales down to that canvas, while
-/// smaller references keep their own size on the 32-pixel grid. The released
+/// smaller references keep their own size on the canvas grid. The released
 /// pipeline also enlarges smaller ones to those sizes, which `enlarge`
 /// selects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReferenceConfig {
     /// Short edge, in pixels, an image reference is encoded at, at most: a
-    /// multiple of 32 up to the edge the denoiser declares.
+    /// multiple of the canvas grid up to the edge the denoiser declares.
     pub image_short_edge: u32,
     /// Whether a reference smaller than its encoding size is enlarged to it:
     /// an image to `image_short_edge` and a video to the canvas of its
@@ -511,10 +363,11 @@ impl ReferenceConfig {
     ///
     /// Returns a message for an option this processor does not take, a value
     /// of the wrong type, or a short edge [`ReferenceConfig::validate`]
-    /// refuses.
+    /// refuses on the canvas grid of `rule`.
     pub fn from_kwargs(
         kwargs: &serde_json::Map<String, serde_json::Value>,
         limits: &ReferenceLimits,
+        rule: &CanvasRule,
     ) -> Result<Self, String> {
         let options = ReferenceOptions::deserialize(serde_json::Value::Object(kwargs.clone()))
             .map_err(|error| error.to_string())?;
@@ -524,27 +377,28 @@ impl ReferenceConfig {
                 .unwrap_or(limits.image_short_edge),
             enlarge: options.enlarge_references,
         };
-        config.validate(limits)?;
+        config.validate(limits, rule)?;
         Ok(config)
     }
 
-    /// Checks that the short edge is a multiple of 32 from 32 pixels to the
-    /// edge the denoiser declares; a denoiser that takes no image reference
-    /// sizes none.
+    /// Checks that the short edge is a multiple of the canvas grid of `rule`
+    /// from one multiple to the edge the denoiser declares; a denoiser that
+    /// takes no image reference sizes none.
     ///
     /// # Errors
     ///
     /// Returns a message naming the short edge.
-    pub fn validate(&self, limits: &ReferenceLimits) -> Result<(), String> {
+    pub fn validate(&self, limits: &ReferenceLimits, rule: &CanvasRule) -> Result<(), String> {
         if limits.images == 0 {
             return Ok(());
         }
         let edge = self.image_short_edge;
         let largest = limits.image_short_edge;
-        if !edge.is_multiple_of(CANVAS_MULTIPLE) || !(CANVAS_MULTIPLE..=largest).contains(&edge) {
+        let multiple = rule.multiple;
+        if !edge.is_multiple_of(multiple) || !(multiple..=largest).contains(&edge) {
             return Err(format!(
-                "a reference image short edge must be a multiple of {CANVAS_MULTIPLE} from \
-                 {CANVAS_MULTIPLE} to {largest} pixels, got {edge}"
+                "a reference image short edge must be a multiple of {multiple} from {multiple} to \
+                 {largest} pixels, got {edge}"
             ));
         }
         Ok(())
@@ -562,6 +416,14 @@ pub struct PlanLimits {
     /// denoiser declares it: durations and reference videos are counted on
     /// it.
     pub frame_rate: u32,
+    /// Sample rate, in Hz, every soundtrack is resampled to, as the denoiser
+    /// declares it.
+    pub audio_sample_rate: u32,
+    /// Samples of one audio latent frame, as the denoiser declares it.
+    pub audio_hop: u32,
+    /// How a display aspect resolves to a canvas, as the denoiser declares
+    /// it.
+    pub canvas_rule: CanvasRule,
     /// How the denoiser's VAE divides a video's frames into clips, as it
     /// declares it: the frame counts it generates and a reference video's
     /// encoded frames and latent units follow from it.
@@ -591,42 +453,6 @@ impl PlanLimits {
         edges
     }
 }
-/// An aspect-preserving resize followed by a centred crop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct CoverCrop {
-    /// Width the image is resized to before cropping.
-    pub width: u32,
-    /// Height the image is resized to before cropping.
-    pub height: u32,
-    /// Left edge of the crop in the resized image.
-    pub left: u32,
-    /// Top edge of the crop in the resized image.
-    pub top: u32,
-}
-
-/// Returns the LANCZOS resize and centred crop of a `width` x `height` image
-/// that cover `canvas`.
-///
-/// The scale is the larger of the two side ratios; each resized side rounds
-/// half to even and never falls below the canvas, and the crop is centred
-/// with floor division.
-pub fn cover_crop(width: u32, height: u32, canvas: Canvas) -> CoverCrop {
-    let scale = (f64::from(canvas.width) / f64::from(width))
-        .max(f64::from(canvas.height) / f64::from(height));
-    let resized_width = canvas
-        .width
-        .max((f64::from(width) * scale).round_ties_even() as u32);
-    let resized_height = canvas
-        .height
-        .max((f64::from(height) * scale).round_ties_even() as u32);
-    CoverCrop {
-        width: resized_width,
-        height: resized_height,
-        left: (resized_width - canvas.width) / 2,
-        top: (resized_height - canvas.height) / 2,
-    }
-}
-
 /// How a keyframe is put on the target canvas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct KeyframeFit {
@@ -647,7 +473,7 @@ pub struct AudioClip {
     pub start_sample: u64,
     /// Native samples kept after the start offset.
     pub source_samples: u64,
-    /// Samples after resampling to 32 kHz.
+    /// Samples after resampling to the model's sample rate.
     pub samples: u64,
     /// Audio latents per channel; the clip packs `2 * latents` channel-major
     /// rows.
@@ -844,7 +670,7 @@ impl ConditionInput {
     ///
     /// A keyframe is one unit, one latent frame of the canvas it is fitted
     /// to. A reference image is `image_bands` units: bands of its rows of
-    /// 32x32-pixel patches dealt as evenly as possible in order, so with `g`
+    /// denoiser patches (32x32 pixels) dealt as evenly as possible in order, so with `g`
     /// patch rows band `b` holds rows `b * g / bands` to
     /// `(b + 1) * g / bands`, rounded down, `image_bands` clamped to one
     /// through `g`. Each band is encoded on its own and the bands assemble
@@ -857,10 +683,11 @@ impl ConditionInput {
     /// none.
     pub fn latent_units(&self, canvas: Canvas, image_bands: u32) -> Vec<u32> {
         match &self.prepared {
-            Prepared::Keyframe(_) => vec![rows_per_frame(canvas)],
+            Prepared::Keyframe(_) => vec![LatentRaster::of(&canvas).patch_rows()],
             Prepared::Image(size) => {
-                let patch_rows = size.height / CANVAS_MULTIPLE;
-                let patches_per_row = size.width / CANVAS_MULTIPLE;
+                let raster = LatentRaster::of(size);
+                let patch_rows = raster.height / PATCH_SIDE;
+                let patches_per_row = raster.width / PATCH_SIDE;
                 let bands = image_bands.clamp(1, patch_rows.max(1));
                 (0..bands)
                     .map(|band| {
@@ -871,7 +698,7 @@ impl ConditionInput {
                     .collect()
             }
             Prepared::Video(clip) => {
-                let rows_per_frame = rows_per_frame(clip.canvas);
+                let rows_per_frame = LatentRaster::of(&clip.canvas).patch_rows();
                 let clips = clip.vae_clips;
                 let mut units = vec![
                     clips.clip_latent_frames * rows_per_frame;
@@ -891,12 +718,12 @@ impl ConditionInput {
     pub fn packed_rows(&self, canvas: Canvas, packing: &ConditionPacking) -> u32 {
         let tile = packing.tile_rows.max(1);
         let visual = match &self.prepared {
-            Prepared::Keyframe(_) => rows_per_frame(canvas).div_ceil(tile),
-            Prepared::Image(size) => rows_per_frame(*size).div_ceil(tile),
+            Prepared::Keyframe(_) => LatentRaster::of(&canvas).patch_rows().div_ceil(tile),
+            Prepared::Image(size) => LatentRaster::of(size).patch_rows().div_ceil(tile),
             Prepared::Video(clip) => [
                 clip.vae_clips.latent_frames(clip.vae_frames),
-                clip.canvas.height / CANVAS_MULTIPLE,
-                clip.canvas.width / CANVAS_MULTIPLE,
+                LatentRaster::of(&clip.canvas).height / PATCH_SIDE,
+                LatentRaster::of(&clip.canvas).width / PATCH_SIDE,
             ]
             .into_iter()
             .zip(packing.video_tile)
@@ -1009,28 +836,35 @@ impl VideoParams {
 ///
 /// An image whose short edge exceeds `config.image_short_edge` scales down
 /// to it; a smaller one keeps its size, or scales up to that edge under
-/// `config.enlarge`. Each side then rounds half to even to a multiple of 32.
-/// Unlike the canvas rule there is no area cap.
+/// `config.enlarge`. Each side then rounds half to even to the canvas grid
+/// of `rule` ([`CanvasRule::nearest_multiple`]). Unlike the canvas rule there
+/// is no area cap.
 ///
 /// # Errors
 ///
-/// Returns [`RuleError::ReferenceAspect`] when the image lies outside 1:4
-/// to 4:1.
+/// Returns [`RuleError::ReferenceAspect`] when the image lies outside the
+/// rule's aspects.
 pub fn reference_image_size(
     width: u32,
     height: u32,
     config: &ReferenceConfig,
+    rule: &CanvasRule,
 ) -> Result<Canvas, RuleError> {
-    if u64::from(width) > 4 * u64::from(height) || u64::from(height) > 4 * u64::from(width) {
-        return Err(RuleError::ReferenceAspect { width, height });
+    if !rule.admits(width, height) {
+        return Err(RuleError::ReferenceAspect {
+            width,
+            height,
+            narrowest: rule.narrowest,
+            widest: rule.widest,
+        });
     }
     let mut scale = f64::from(config.image_short_edge) / f64::from(width.min(height));
     if !config.enlarge {
         scale = scale.min(1.0);
     }
     Ok(Canvas {
-        width: nearest_multiple(f64::from(width) * scale),
-        height: nearest_multiple(f64::from(height) * scale),
+        width: rule.nearest_multiple(f64::from(width) * scale),
+        height: rule.nearest_multiple(f64::from(height) * scale),
     })
 }
 
@@ -1040,11 +874,14 @@ fn start_offset(seconds: f64, rate: f64) -> u64 {
     (seconds * rate + 0.5).floor() as u64
 }
 
-/// Sizes a soundtrack: start offset, truncation, 32 kHz resampling, latents.
+/// Sizes a soundtrack: start offset, truncation, resampling to the model's
+/// rate, latents.
 ///
 /// The first `floor(s * rate + 0.5)` samples are skipped and the rest is
 /// truncated at the native rate to the generated duration, `frames` at
-/// `frame_rate`, as the reference does before it resamples to 32 kHz.
+/// the limits' frame rate, as the reference does before it resamples to the
+/// limits' sample rate ([`resampled_len`]); the track encodes to one latent
+/// frame per audio hop, the last one padded ([`audio_latent_frames`]).
 ///
 /// # Errors
 ///
@@ -1055,8 +892,9 @@ pub fn audio_clip(
     media: &AudioMetadata,
     start_seconds: f64,
     frames: u32,
-    frame_rate: u32,
+    limits: &PlanLimits,
 ) -> Result<AudioClip, RuleError> {
+    let frame_rate = limits.frame_rate;
     let rate = media.sample_rate;
     let start_sample = start_offset(start_seconds, f64::from(rate));
     if start_sample >= media.samples {
@@ -1066,34 +904,15 @@ pub fn audio_clip(
     // The reference truncates to `int(frames / fps * rate)` samples.
     let limit = (f64::from(frames) / f64::from(frame_rate) * f64::from(rate)).trunc() as u64;
     let source = available.min(limit);
-    let samples = if rate == AUDIO_SAMPLE_RATE {
-        source
-    } else {
-        // torchaudio's resampler returns ceil(new * length / orig) samples
-        // for the gcd-reduced rates.
-        let divisor = gcd(u64::from(rate), u64::from(AUDIO_SAMPLE_RATE));
-        let new = u64::from(AUDIO_SAMPLE_RATE) / divisor;
-        let orig = u64::from(rate) / divisor;
-        (source * new).div_ceil(orig)
-    };
+    let samples = resampled_len(source, rate, limits.audio_sample_rate);
     Ok(AudioClip {
         sample_rate: rate,
         start_sample,
         source_samples: source,
         samples,
-        // The audio VAE pads the waveform to a whole hop.
-        latents: u32::try_from(samples.div_ceil(u64::from(AUDIO_HOP)))
+        latents: u32::try_from(audio_latent_frames(samples, u64::from(limits.audio_hop)))
             .map_err(|_| RuleError::AudioLength)?,
     })
-}
-
-const fn gcd(mut a: u64, mut b: u64) -> u64 {
-    while b != 0 {
-        let remainder = a % b;
-        a = b;
-        b = remainder;
-    }
-    a
 }
 
 /// Sizes a reference video and the conditioner's view of it.
@@ -1109,27 +928,29 @@ const fn gcd(mut a: u64, mut b: u64) -> u64 {
 /// # Errors
 ///
 /// Returns [`RuleError::VideoCanvas`] when the display aspect lies outside
-/// 1:4 to 4:1, [`RuleError::ReferenceFrames`] when fewer than the frame
-/// rule's fewest frames (22 for the released checkpoint) remain after the
-/// offset, and the errors of [`audio_clip`],
-/// [`sample_frames`] and [`ProcessorConfig::video_grid`].
+/// the canvas rule's aspects, [`RuleError::ReferenceFrames`] when fewer than
+/// the frame rule's fewest frames (22 for the released checkpoint) remain
+/// after the offset, and the errors of [`audio_clip`], [`sample_frames`] and
+/// [`ProcessorConfig::video_grid`].
 pub fn video_reference(
     media: &VideoMetadata,
     start_seconds: f64,
     frames: u32,
-    frame_rate: u32,
-    clips: &FrameClips,
+    limits: &PlanLimits,
     vision: &ProcessorConfig,
-    config: &ReferenceConfig,
 ) -> Result<(VideoClip, VideoVision), RuleError> {
+    let (frame_rate, clips, rule) = (limits.frame_rate, &limits.frames, &limits.canvas_rule);
     // Display sizes stay far below 2^53, so the conversions are exact.
-    let mut size = canvas(media.display_width as f64, media.display_height as f64)
+    let mut size = rule
+        .canvas(media.display_width as f64, media.display_height as f64)
         .map_err(RuleError::VideoCanvas)?;
     let pixels = |width: u32, height: u32| u64::from(width) * u64::from(height);
-    if !config.enlarge && pixels(media.width, media.height) < pixels(size.width, size.height) {
+    if !limits.references.enlarge
+        && pixels(media.width, media.height) < pixels(size.width, size.height)
+    {
         size = Canvas {
-            width: nearest_multiple(f64::from(media.width)),
-            height: nearest_multiple(f64::from(media.height)),
+            width: rule.nearest_multiple(f64::from(media.width)),
+            height: rule.nearest_multiple(f64::from(media.height)),
         };
     }
     let source_rate =
@@ -1158,7 +979,7 @@ pub fn video_reference(
     let soundtrack = media
         .soundtrack
         .as_ref()
-        .map(|track| audio_clip(track, start_seconds, frames, frame_rate))
+        .map(|track| audio_clip(track, start_seconds, frames, limits))
         .transpose()?;
 
     let (frame_indices, block_timestamps) =
@@ -1183,67 +1004,6 @@ pub fn video_reference(
     Ok((clip, seen))
 }
 
-/// The largest references a request generating a given frame count may
-/// bring, as [`reference_bounds`] states them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReferenceBounds {
-    /// The two largest rasters an image reference is encoded at: the
-    /// encoding short edge at the widest (4:1) and the tallest (1:4)
-    /// accepted aspect.
-    pub images: [Canvas; 2],
-    /// Encoded frames of the longest reference video.
-    pub video_frames: u32,
-    /// The largest rasters a reference video is encoded at: the canvas
-    /// rule's canvases ([`rule_canvases`]); a smaller video keeps its own
-    /// size, within its canvas.
-    pub video_canvases: Vec<Canvas>,
-    /// The most model-rate samples of a soundtrack or audio reference.
-    pub audio_samples: u64,
-}
-
-/// Bounds every reference of a request that generates `frames` frames.
-///
-/// However a deployment sizes references ([`ReferenceConfig`]),
-/// [`reference_image_size`] encodes an image's short edge at most at
-/// `image_short_edge`, the edge the denoiser declares, so its sides, and the
-/// rows any packing gives it, are at most those of that edge at the widest or
-/// the tallest accepted aspect. [`video_reference`] keeps at most `frames` frames of a
-/// video, whose leading frames forming a count of the frame rule `clips` it
-/// encodes on the canvas of the video's aspect or, for a video with fewer
-/// pixels than that canvas, at its own size, whose sides on the 32-pixel
-/// grid are at most the canvas's.
-/// [`audio_clip`] truncates a track to the generated duration and resamples
-/// it to 32 kHz, so it returns at most `ceil(frames * 32000 / frame_rate)`
-/// samples whatever the source rate, `frame_rate` being the output frame
-/// rate the frames are counted at. A model sizes these shapes with its own
-/// packing to provision the largest condition set it admits.
-pub fn reference_bounds(
-    frames: u32,
-    frame_rate: u32,
-    clips: &FrameClips,
-    image_short_edge: u32,
-) -> ReferenceBounds {
-    let edge = image_short_edge;
-    ReferenceBounds {
-        images: [
-            Canvas {
-                width: 4 * edge,
-                height: edge,
-            },
-            Canvas {
-                width: edge,
-                height: 4 * edge,
-            },
-        ],
-        // No reference video fits a request shorter than the rule's fewest
-        // frames.
-        video_frames: clips.align_down(frames).unwrap_or(0),
-        video_canvases: rule_canvases(),
-        audio_samples: (u64::from(frames) * u64::from(AUDIO_SAMPLE_RATE))
-            .div_ceil(u64::from(frame_rate)),
-    }
-}
-
 /// Parses `W:H` into positive integers written in canonical decimal form;
 /// `None` when malformed.
 fn parse_aspect_ratio(value: &str) -> Option<(u32, u32)> {
@@ -1258,12 +1018,12 @@ fn parse_aspect_ratio(value: &str) -> Option<(u32, u32)> {
 /// The canvas a target names without consulting media; `None` for `fl2va`
 /// with `auto`, whose canvas follows the first keyframe.
 ///
-/// `canvases` are the canvases a deployment serves, each with the
+/// `limits.canvases` are the canvases a deployment serves, each with the
 /// `(short_edge, aspect_ratio)` that selects it. `auto` is 16:9 for `t2va`
 /// and `ref2va`. A `W:H` ratio named at the target's short edge selects that
-/// canvas. `fl2va` also takes any ratio from 1:4 to 4:1, which the canvas
-/// rule ([`canvas`]) resolves at its 768-pixel short edge; a deployment
-/// serves such a canvas only when it is one of `canvases`.
+/// canvas. `fl2va` also takes any ratio within the canvas rule's aspects,
+/// which the rule ([`CanvasRule::canvas`]) resolves at its short edge; a
+/// deployment serves such a canvas only when it is one of the canvases.
 ///
 /// # Errors
 ///
@@ -1273,8 +1033,9 @@ fn parse_aspect_ratio(value: &str) -> Option<(u32, u32)> {
 pub fn named_canvas(
     task: VideoTask,
     target: &Target<'_>,
-    canvases: &[ServedCanvas],
+    limits: &PlanLimits,
 ) -> Result<Option<Canvas>, VideoInputError> {
+    let (canvases, rule) = (&limits.canvases, &limits.canvas_rule);
     let name = if target.aspect_ratio != "auto" {
         target.aspect_ratio.to_owned()
     } else if task == VideoTask::FirstLastToVideoAudio {
@@ -1291,10 +1052,10 @@ pub fn named_canvas(
         return Ok(Some(served.canvas));
     }
 
-    let by_rule =
-        task == VideoTask::FirstLastToVideoAudio && target.short_edge == CANVAS_SHORT_EDGE;
+    let by_rule = task == VideoTask::FirstLastToVideoAudio && target.short_edge == rule.short_edge;
     if by_rule && let Some((width, height)) = parse_aspect_ratio(&name) {
-        return canvas(f64::from(width), f64::from(height))
+        return rule
+            .canvas(f64::from(width), f64::from(height))
             .map(Some)
             .map_err(|error| {
                 VideoInputError::invalid(RequestField::TargetAspectRatio, error.to_string())
@@ -1314,7 +1075,10 @@ pub fn named_canvas(
         ));
     }
     let allowed = match (task, by_rule) {
-        (VideoTask::FirstLastToVideoAudio, true) => "auto or W:H within 1:4 to 4:1".to_owned(),
+        (VideoTask::FirstLastToVideoAudio, true) => format!(
+            "auto or W:H within {}:{} to {}:{}",
+            rule.narrowest.0, rule.narrowest.1, rule.widest.0, rule.widest.1
+        ),
         (VideoTask::FirstLastToVideoAudio, false) => format!("one of {}", served.join(", ")),
         _ => format!("auto or one of {}", served.join(", ")),
     };
@@ -1377,7 +1141,7 @@ pub fn check_request(
         ));
     }
 
-    if let Some(size) = named_canvas(task, target, &limits.canvases)? {
+    if let Some(size) = named_canvas(task, target, limits)? {
         check_served(size, limits)?;
     }
 
@@ -1623,17 +1387,18 @@ fn target_canvas(
     media: &[MediaMetadata],
     limits: &PlanLimits,
 ) -> Result<Canvas, VideoInputError> {
-    if let Some(size) = named_canvas(task, target, &limits.canvases)? {
+    if let Some(size) = named_canvas(task, target, limits)? {
         return Ok(size);
     }
     // fl2va with `auto`: the conditions are keyframes and the first one sets
-    // the canvas through the canvas rule, at its 768-pixel short edge.
-    if target.short_edge != CANVAS_SHORT_EDGE {
+    // the canvas through the canvas rule, at its short edge.
+    let rule = &limits.canvas_rule;
+    if target.short_edge != rule.short_edge {
         return Err(VideoInputError::invalid(
             RequestField::TargetShortEdge,
             format!(
-                "must be {CANVAS_SHORT_EDGE} for an auto aspect ratio, got {}",
-                target.short_edge
+                "must be {} for an auto aspect ratio, got {}",
+                rule.short_edge, target.short_edge
             ),
         ));
     }
@@ -1643,12 +1408,13 @@ fn target_canvas(
             "the first keyframe is not an image",
         ));
     };
-    canvas(f64::from(first.width), f64::from(first.height)).map_err(|error| {
-        VideoInputError::condition(
-            0,
-            format!("the first keyframe sets the canvas, but its {error}"),
-        )
-    })
+    rule.canvas(f64::from(first.width), f64::from(first.height))
+        .map_err(|error| {
+            VideoInputError::condition(
+                0,
+                format!("the first keyframe sets the canvas, but its {error}"),
+            )
+        })
 }
 
 pub(crate) fn plan_keyframe(
@@ -1707,8 +1473,13 @@ fn plan_reference(
     };
     match media {
         MediaMetadata::Image(image) => {
-            let size = reference_image_size(image.width, image.height, &limits.references)
-                .map_err(reject)?;
+            let size = reference_image_size(
+                image.width,
+                image.height,
+                &limits.references,
+                &limits.canvas_rule,
+            )
+            .map_err(reject)?;
             let grid = vision
                 .image_grid(size.height, size.width)
                 .map_err(|error| reject(error.into()))?;
@@ -1719,21 +1490,13 @@ fn plan_reference(
             Ok(plan(Prepared::Image(size), Some(seen), 0))
         }
         MediaMetadata::Audio(audio) => {
-            let clip = audio_clip(audio, 0.0, frames, limits.frame_rate).map_err(reject)?;
+            let clip = audio_clip(audio, 0.0, frames, limits).map_err(reject)?;
             Ok(plan(Prepared::Audio(clip), None, clip.rows()))
         }
         MediaMetadata::Video(video) => {
             let start = condition.start_seconds.unwrap_or(0.0);
-            let (clip, seen) = video_reference(
-                video,
-                start,
-                frames,
-                limits.frame_rate,
-                &limits.frames,
-                vision,
-                &limits.references,
-            )
-            .map_err(reject)?;
+            let (clip, seen) =
+                video_reference(video, start, frames, limits, vision).map_err(reject)?;
             let audio_rows = clip.soundtrack.map_or(0, |track| track.rows());
             Ok(plan(
                 Prepared::Video(clip),
@@ -1814,7 +1577,6 @@ pub fn plan_request(
 
 #[cfg(test)]
 pub(super) mod tests {
-    use std::collections::HashSet;
 
     use serde::Deserialize;
     use serde_json::{Value, json};
@@ -1822,14 +1584,13 @@ pub(super) mod tests {
     use super::super::presentation::present;
     use super::super::presentation::tests::CharacterTokenizer;
     use super::{
-        AudioClip, AudioMetadata, Canvas, ConditionInput, ConditionSpec, ConditionType, FrameClips,
-        FramePosition, ImageMetadata, KeyframeFit, MAX_ASPECT_RATIO, MIN_ASPECT_RATIO,
-        MediaMetadata, PlanLimits, Prepared, ReferenceConfig, RequestField, Role, Target,
-        VideoClip, VideoInputError, VideoMetadata, VideoParams, VideoTask, Vision, audio_clip,
-        canvas, check_request, cover_crop, gcd, plan_request, reference_bounds,
-        reference_image_size, requested_frames, rows_per_frame, rule_canvases, video_frame_count,
-        video_reference,
+        AudioClip, AudioMetadata, Canvas, ConditionInput, ConditionSpec, ConditionType,
+        FramePosition, ImageMetadata, KeyframeFit, LatentRaster, MediaMetadata, PlanLimits,
+        Prepared, ReferenceConfig, RequestField, Role, Target, VideoClip, VideoInputError,
+        VideoMetadata, VideoParams, VideoTask, Vision, audio_clip, check_request, cover_crop,
+        plan_request, reference_image_size, video_frame_count, video_reference,
     };
+    use crate::config::{AUDIO_HOP, AUDIO_SAMPLE_RATE, CANVAS_RULE, FPS, FRAMES};
     use crate::processing::{ReferenceLimits, ServedCanvas};
     use processing::FrameRate;
     use qwen3::processor::ProcessorConfig;
@@ -1846,19 +1607,6 @@ pub(super) mod tests {
     pub(in crate::processing) fn vision(fixture: &Value) -> ProcessorConfig {
         ProcessorConfig::deserialize(&fixture["vision"]).unwrap()
     }
-
-    /// The released checkpoint's output frame rate, which the vectors were
-    /// generated at.
-    pub(in crate::processing) const FRAME_RATE: u32 = 24;
-
-    /// The released checkpoint's frame rule: `17n + 5` frames, five latent
-    /// frames per clip and two for the tail.
-    pub(in crate::processing) const FRAMES: FrameClips = FrameClips {
-        min_frames: 22,
-        clip_frames: 17,
-        clip_latent_frames: 5,
-        tail_latent_frames: 2,
-    };
 
     /// The released checkpoint's documented references: nine images, three
     /// videos, three audio tracks and twelve in all, images encoded at a
@@ -1914,7 +1662,8 @@ pub(super) mod tests {
     }
 
     /// Limits that serve every task and duration the model does, at the
-    /// canvases of the vectors.
+    /// canvases of the vectors, by the released checkpoint's rules, which the
+    /// vectors were generated with.
     pub(in crate::processing) fn limits() -> PlanLimits {
         PlanLimits {
             tasks: vec![
@@ -1923,7 +1672,10 @@ pub(super) mod tests {
                 VideoTask::ReferenceToVideoAudio,
             ],
             max_video_seconds: 15.0,
-            frame_rate: FRAME_RATE,
+            frame_rate: FPS,
+            audio_sample_rate: AUDIO_SAMPLE_RATE,
+            audio_hop: AUDIO_HOP,
+            canvas_rule: CANVAS_RULE,
             frames: FRAMES,
             canvases: vector_canvases(),
             reference_limits: REFERENCE_LIMITS,
@@ -2113,41 +1865,13 @@ pub(super) mod tests {
         let fixture = fixture();
         for case in fixture["canvas_cases"].as_array().unwrap() {
             let (width, height) = pair(&case["aspect"]);
-            let resolved = canvas(f64::from(width), f64::from(height));
+            let resolved = CANVAS_RULE.canvas(f64::from(width), f64::from(height));
             if case.get("error").is_some() {
                 assert!(resolved.is_err(), "{case}");
             } else {
                 assert_eq!(resolved.unwrap(), size(&case["canvas"]), "{case}");
             }
         }
-    }
-
-    /// The rule's canvases are exactly those a dense sweep of 1:4 to 4:1
-    /// resolves to, each listed once.
-    #[test]
-    fn rule_canvases_are_every_canvas_of_the_range() {
-        let listed = rule_canvases();
-        let unique: HashSet<Canvas> = listed.iter().copied().collect();
-        assert_eq!(unique.len(), listed.len());
-
-        let steps = 1_000_000;
-        let swept: HashSet<Canvas> = (0..=steps)
-            .map(|step| {
-                let ratio = MIN_ASPECT_RATIO
-                    + (MAX_ASPECT_RATIO - MIN_ASPECT_RATIO) * f64::from(step) / f64::from(steps);
-                canvas(ratio, 1.0).unwrap()
-            })
-            .collect();
-        assert_eq!(swept, unique);
-    }
-
-    /// A duration's frames round half to even, as Python's `round` does:
-    /// 1.5 frames are 2 and 4.5 frames are 4.
-    #[test]
-    fn requested_frames_round_half_to_even() {
-        assert_eq!(requested_frames(5.0, 24), 120);
-        assert_eq!(requested_frames(0.0625, 24), 2);
-        assert_eq!(requested_frames(0.1875, 24), 4);
     }
 
     /// Durations align up to `17n + 5` frames within the served range, with
@@ -2175,7 +1899,7 @@ pub(super) mod tests {
                 let field = plan.unwrap_err().field();
                 assert_eq!(field, Some(RequestField::TargetDuration), "{case}");
                 assert!(
-                    video_frame_count(seconds, 15.0, FRAME_RATE, &FRAMES).is_err(),
+                    video_frame_count(seconds, 15.0, FPS, &FRAMES).is_err(),
                     "{case}"
                 );
                 continue;
@@ -2183,7 +1907,7 @@ pub(super) mod tests {
             let plan = plan.unwrap();
             assert_eq!(u64::from(plan.num_frames), case["num_frames"], "{case}");
             assert_eq!(
-                u64::from(video_frame_count(seconds, 15.0, FRAME_RATE, &FRAMES).unwrap()),
+                u64::from(video_frame_count(seconds, 15.0, FPS, &FRAMES).unwrap()),
                 case["num_frames"],
                 "{case}"
             );
@@ -2203,8 +1927,12 @@ pub(super) mod tests {
         let vision = vision(&fixture);
         for case in fixture["reference_image_cases"].as_array().unwrap() {
             let (width, height) = pair(&case["size"]);
-            let resized =
-                reference_image_size(width, height, &ReferenceConfig::released(&REFERENCE_LIMITS));
+            let resized = reference_image_size(
+                width,
+                height,
+                &ReferenceConfig::released(&REFERENCE_LIMITS),
+                &CANVAS_RULE,
+            );
             if case.get("error").is_some() {
                 assert!(resized.is_err(), "{case}");
                 continue;
@@ -2222,7 +1950,11 @@ pub(super) mod tests {
                 case["vision_tokens"],
                 "{case}"
             );
-            assert_eq!(u64::from(rows_per_frame(resized)), case["rows"], "{case}");
+            assert_eq!(
+                u64::from(LatentRaster::of(&resized).patch_rows()),
+                case["rows"],
+                "{case}"
+            );
         }
     }
 
@@ -2316,7 +2048,10 @@ pub(super) mod tests {
             }),
             ..image.clone()
         };
-        assert_eq!(keyframe.latent_units(size, 4), [rows_per_frame(size)]);
+        assert_eq!(
+            keyframe.latent_units(size, 4),
+            [LatentRaster::of(&size).patch_rows()]
+        );
     }
 
     /// A latent encoding round's units are divided evenly among a request's
@@ -2419,15 +2154,7 @@ pub(super) mod tests {
             let facts = video_facts(case);
             let start = case["start_seconds"].as_f64().unwrap();
             let frames = case["num_frames"].as_u64().unwrap() as u32;
-            let planned = video_reference(
-                &facts,
-                start,
-                frames,
-                FRAME_RATE,
-                &FRAMES,
-                &vision,
-                &ReferenceConfig::released(&REFERENCE_LIMITS),
-            );
+            let planned = video_reference(&facts, start, frames, &limits(), &vision);
             if case.get("error").is_some() {
                 assert!(planned.is_err(), "{case}");
                 continue;
@@ -2450,97 +2177,21 @@ pub(super) mod tests {
                 case["vision_grid"]
             );
             assert_eq!(u64::from(seen.block_tokens), case["block_tokens"], "{case}");
-            let rows = latents * rows_per_frame(clip.canvas);
+            let rows = latents * LatentRaster::of(&clip.canvas).patch_rows();
             assert_eq!(u64::from(rows), case["rows"], "{case}");
-        }
-    }
-
-    /// Every reference the planner prepares for a five-second request fits
-    /// the bounds of its 124 frames, enlarged or not: an image of any
-    /// accepted aspect and size, and a video of any aspect, size and frame
-    /// rate with a soundtrack of any rate.
-    #[test]
-    fn prepared_references_fit_their_bounds() {
-        let fixture = fixture();
-        let vision = vision(&fixture);
-        let frames = video_frame_count(5.0, 15.0, FRAME_RATE, &FRAMES).unwrap();
-        let edge = REFERENCE_LIMITS.image_short_edge;
-        let bounds = reference_bounds(frames, FRAME_RATE, &FRAMES, edge);
-        assert_eq!(
-            bounds.images,
-            [
-                Canvas {
-                    width: 4 * edge,
-                    height: edge
-                },
-                Canvas {
-                    width: edge,
-                    height: 4 * edge
-                },
-            ]
-        );
-        assert_eq!((bounds.video_frames, bounds.audio_samples), (124, 165_334));
-        assert_eq!(bounds.video_canvases, rule_canvases());
-        let within = |size: Canvas, bounds: &[Canvas]| {
-            bounds
-                .iter()
-                .any(|bound| size.width <= bound.width && size.height <= bound.height)
-        };
-
-        for config in [
-            ReferenceConfig::new(&REFERENCE_LIMITS),
-            ReferenceConfig::released(&REFERENCE_LIMITS),
-        ] {
-            for scale in [1, 3] {
-                for width in (250..=4000).step_by(7) {
-                    let size = reference_image_size(scale * width, scale * 1000, &config).unwrap();
-                    assert!(within(size, &bounds.images), "{width} {config:?}");
-                }
-            }
-            for ((width, height), (numerator, denominator), sample_rate) in [
-                ((1920, 1080), (24, 1), 32_000),
-                ((480, 854), (30_000, 1001), 44_100),
-                ((2048, 512), (60, 1), 48_000),
-                ((300, 1200), (25, 1), 22_050),
-                ((3840, 1646), (24_000, 1001), 16_000),
-            ] {
-                let divisor = gcd(u64::from(width), u64::from(height));
-                let facts = VideoMetadata {
-                    display_width: u64::from(width) / divisor,
-                    display_height: u64::from(height) / divisor,
-                    width,
-                    height,
-                    frame_rate: FrameRate {
-                        numerator,
-                        denominator,
-                    },
-                    frames: 10_000,
-                    soundtrack: Some(AudioMetadata {
-                        sample_rate,
-                        samples: 10_000_000,
-                    }),
-                };
-                let (clip, _) =
-                    video_reference(&facts, 0.0, frames, FRAME_RATE, &FRAMES, &vision, &config)
-                        .unwrap();
-                assert!(clip.vae_frames <= bounds.video_frames, "{facts:?}");
-                assert!(within(clip.canvas, &bounds.video_canvases), "{facts:?}");
-                let track = clip.soundtrack.unwrap();
-                assert!(track.samples <= bounds.audio_samples, "{facts:?}");
-            }
         }
     }
 
     /// A reference is only ever reduced unless the deployment enlarges: an
     /// image above the short edge and a video above the canvas of its aspect
     /// scale down as the released pipeline scales them, and smaller ones
-    /// keep their own size on the 32-pixel grid.
+    /// keep their own size on the canvas grid.
     #[test]
     fn references_are_enlarged_only_on_request() {
         let sized = |width, height| Canvas { width, height };
         let unenlarged = ReferenceConfig::new(&REFERENCE_LIMITS);
         let image = |width, height, config: &ReferenceConfig| {
-            reference_image_size(width, height, config).unwrap()
+            reference_image_size(width, height, config, &CANVAS_RULE).unwrap()
         };
         // 1080 rounds to 34 patches; 768 is already on the grid.
         assert_eq!(image(1920, 1080, &unenlarged), sized(1920, 1088));
@@ -2561,15 +2212,15 @@ pub(super) mod tests {
         assert_eq!(image(2560, 1440, &half), sized(1824, 1024));
         assert_eq!(image(768, 768, &half), sized(768, 768));
         // The 1:4 to 4:1 bound holds at any size.
-        assert!(reference_image_size(4100, 1000, &unenlarged).is_err());
+        assert!(reference_image_size(4100, 1000, &unenlarged, &CANVAS_RULE).is_err());
 
         let fixture = fixture();
         let vision = vision(&fixture);
         let video = |width: u32, height: u32, config: &ReferenceConfig| {
-            let divisor = gcd(u64::from(width), u64::from(height));
+            // Only the display aspect's ratio matters to the canvas rule.
             let facts = VideoMetadata {
-                display_width: u64::from(width) / divisor,
-                display_height: u64::from(height) / divisor,
+                display_width: u64::from(width),
+                display_height: u64::from(height),
                 width,
                 height,
                 frame_rate: FrameRate {
@@ -2579,7 +2230,11 @@ pub(super) mod tests {
                 frames: 48,
                 soundtrack: None,
             };
-            video_reference(&facts, 0.0, 124, FRAME_RATE, &FRAMES, &vision, config)
+            let limits = PlanLimits {
+                references: *config,
+                ..limits()
+            };
+            video_reference(&facts, 0.0, 124, &limits, &vision)
                 .unwrap()
                 .0
                 .canvas
@@ -2597,11 +2252,15 @@ pub(super) mod tests {
     /// A reference config reads the processor options a deployment states,
     /// absent ones keeping their defaults (the image edge the denoiser
     /// declares), and refuses an option the processor does not take; its
-    /// short edge lies on the 32-pixel grid up to the declared edge.
+    /// short edge lies on the canvas grid up to the declared edge.
     #[test]
     fn a_reference_config_reads_processor_options() {
         let read = |options: Value| {
-            ReferenceConfig::from_kwargs(options.as_object().unwrap(), &REFERENCE_LIMITS)
+            ReferenceConfig::from_kwargs(
+                options.as_object().unwrap(),
+                &REFERENCE_LIMITS,
+                &CANVAS_RULE,
+            )
         };
         assert_eq!(read(json!({})), Ok(ReferenceConfig::new(&REFERENCE_LIMITS)));
         assert_eq!(
@@ -2630,7 +2289,11 @@ pub(super) mod tests {
                 image_short_edge: edge,
                 enlarge: false,
             };
-            assert_eq!(config.validate(&REFERENCE_LIMITS).is_ok(), valid, "{edge}");
+            assert_eq!(
+                config.validate(&REFERENCE_LIMITS, &CANVAS_RULE).is_ok(),
+                valid,
+                "{edge}"
+            );
         }
 
         // A denoiser that declares a smaller edge bounds the deployment's.
@@ -2638,8 +2301,9 @@ pub(super) mod tests {
             image_short_edge: 1024,
             ..REFERENCE_LIMITS
         };
-        let read =
-            |options: Value| ReferenceConfig::from_kwargs(options.as_object().unwrap(), &smaller);
+        let read = |options: Value| {
+            ReferenceConfig::from_kwargs(options.as_object().unwrap(), &smaller, &CANVAS_RULE)
+        };
         assert_eq!(
             read(json!({})).map(|config| config.image_short_edge),
             Ok(1024)
@@ -2647,7 +2311,7 @@ pub(super) mod tests {
         assert!(read(json!({"reference_image_short_edge": 2048})).is_err());
         // A denoiser that takes no image reference sizes none.
         let none = ReferenceLimits::default();
-        assert!(ReferenceConfig::from_kwargs(&serde_json::Map::new(), &none).is_ok());
+        assert!(ReferenceConfig::from_kwargs(&serde_json::Map::new(), &none, &CANVAS_RULE).is_ok());
     }
 
     /// Soundtracks truncate at their native rate, resample to 32 kHz and pad
@@ -2660,7 +2324,7 @@ pub(super) mod tests {
                 &audio_facts(case),
                 case["start_seconds"].as_f64().unwrap(),
                 case["num_frames"].as_u64().unwrap() as u32,
-                FRAME_RATE,
+                &limits(),
             )
             .unwrap();
             assert_eq!(audio_json(&clip), case["clip"], "{case}");
@@ -2880,8 +2544,7 @@ pub(super) mod tests {
             short_edge: 480,
             ..target("16:9")
         };
-        let error = super::named_canvas(VideoTask::TextToVideoAudio, &narrow, &limits.canvases)
-            .unwrap_err();
+        let error = super::named_canvas(VideoTask::TextToVideoAudio, &narrow, &limits).unwrap_err();
         assert_eq!(error.field(), Some(RequestField::TargetAspectRatio));
         assert!(
             error

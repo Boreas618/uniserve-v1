@@ -18,21 +18,16 @@ use nn::family::{
 };
 use nn::{Checkpoint, DType, WeightLoader};
 
-use crate::config::{AttentionKind, Canvas, NAMED_CANVASES};
+use crate::config::{AttentionKind, CANVAS_RULE, FRAMES, MIN_SECONDS, named_canvases};
 use crate::denoiser::Capacity;
 use crate::load::MinimaxH3;
 use crate::processing::ConditionPacking;
-use crate::{
-    AUDIO_CHANNELS, AUDIO_HOP, AUDIO_SAMPLE_RATE, CANVAS_MULTIPLE, CLIP_FRAMES, CLIP_LATENTS,
-    Config, FPS, Partition, VideoTask,
-};
+use crate::{AUDIO_CHANNELS, AUDIO_HOP, AUDIO_SAMPLE_RATE, Config, FPS, Partition, VideoTask};
+use proto::video::Canvas;
 use qwen3::processor::ProcessorConfig;
 
 /// The MiniMax-H3 family.
 pub const FAMILY: Family = Family::Video(&MinimaxH3Family);
-
-/// The shortest output a request may ask for, in seconds.
-pub const MIN_VIDEO_SECONDS: f64 = 4.0;
 
 /// The family's one value, which [`FAMILY`] refers to.
 struct MinimaxH3Family;
@@ -139,7 +134,7 @@ impl VideoCheckpoint for H3Checkpoint {
 
         let canvases = deployment_canvases(&serving.sizes)?
             .into_iter()
-            .map(|canvas| (canvas.width, canvas.height))
+            .map(|(_, canvas)| (canvas.width, canvas.height))
             .collect::<Vec<_>>();
         let model = crate::load(
             config,
@@ -259,26 +254,21 @@ impl VideoModel for H3Pipeline {
     }
 
     fn format(&self) -> nn::Result<MediaFormat> {
-        Ok(crate::encoding::media_format(&self.config, self.dtype)?)
+        Ok(crate::encoding::media_format(&self.config, self.dtype))
     }
 
     fn timeline(&self, seconds: f64) -> nn::Result<u32> {
-        let frames = (seconds * f64::from(FPS)).round();
-        if !(frames.is_finite() && frames >= 1.0) {
-            return Err(nn::Error::Unsupported(format!(
-                "{seconds} seconds is not a positive number of frames at {FPS} frames per second"
-            )));
-        }
-        snap_frames(frames as u32)
+        timeline(seconds)
     }
 
     fn video_units(&self, frames: u32) -> nn::Result<Vec<u32>> {
         // The decoder's temporal clips are the one home of the clip schedule.
-        Ok(crate::video_vae::clips(&self.config.video_vae)
-            .splices(frames)?
-            .into_iter()
-            .map(|splice| splice.keep)
-            .collect())
+        Ok(
+            crate::video_vae::splices(&crate::video_vae::clips(&self.config.video_vae), frames)?
+                .into_iter()
+                .map(|splice| splice.keep)
+                .collect(),
+        )
     }
 
     fn condition_bounds(&self) -> ConditionBounds {
@@ -288,14 +278,15 @@ impl VideoModel for H3Pipeline {
             .filter(|denoiser| denoiser.places_encoders())
             .map_or(0, |denoiser| denoiser.rules().capacity().condition_rows);
 
-        // A condition row is one latent patch, `CANVAS_MULTIPLE` pixels square, of one latent
-        // frame, which covers up to `CLIP_FRAMES / CLIP_LATENTS` output frames rounded up; a
-        // track's latent frame is two rows.
-        let frames = CLIP_FRAMES.div_ceil(CLIP_LATENTS);
+        // A condition row is one latent patch, a cell of the canvas grid square, of one latent
+        // frame, which covers up to a clip's frames over its latent frames, rounded up; a track's
+        // latent frame is two rows.
+        let frames = FRAMES.clip_frames.div_ceil(FRAMES.clip_latent_frames);
+        let cell = CANVAS_RULE.multiple;
         let merge = self.config.text_encoder.vision.spatial_merge_size;
         ConditionBounds {
             rows,
-            pixels: rows.saturating_mul(CANVAS_MULTIPLE * CANVAS_MULTIPLE * frames),
+            pixels: rows.saturating_mul(cell * cell * frames),
             samples: (rows / AUDIO_CHANNELS).saturating_mul(AUDIO_HOP),
             patches_per_token: merge * merge,
         }
@@ -377,47 +368,45 @@ fn served_tasks(
     Ok(served)
 }
 
-/// The least legal timeline of at least `frames` frames (`17 * n + 5`).
-///
-/// A timeline is one 17-frame body per clip plus a 5-frame tail (`video_vae::clips`),
-/// so the legal counts are 22, 39, 56, … : 4 s is 96 frames and snaps to 107, 15 s is 360 and snaps
-/// to 362.
-fn snap_frames(frames: u32) -> nn::Result<u32> {
-    let tail = crate::video_vae::OVERLAP_FRAMES;
-    if frames < CLIP_FRAMES + tail {
+/// The frames of the least timeline of the frame rule that lasts at least `seconds`: the duration's
+/// frames as the request rules count them ([`processing::requested_frames`]), aligned up to the
+/// frame rule ([`FRAMES`]), so 4 s is 96 frames and aligns to 107, 15 s is 360 and aligns to 362.
+fn timeline(seconds: f64) -> nn::Result<u32> {
+    let frames = processing::requested_frames(seconds, FPS);
+    if !seconds.is_finite() || frames == 0 || frames > u32::MAX - FRAMES.clip_frames {
         return Err(nn::Error::Unsupported(format!(
-            "{frames} frame(s) is shorter than a timeline, which is at least {} ({CLIP_FRAMES} \
-             body frames and a {tail}-frame tail)",
-            CLIP_FRAMES + tail
+            "{seconds} seconds is not a positive number of frames at {FPS} frames per second"
         )));
     }
-    let beyond = frames - tail;
-    Ok(tail + beyond.div_ceil(CLIP_FRAMES) * CLIP_FRAMES)
+    Ok(FRAMES.align_up(frames))
 }
 
-/// The named canvases of the sizes a deployment serves, in its order.
+/// The canvases of the sizes a deployment serves, each with the aspect ratio that names it, in the
+/// deployment's order.
 ///
 /// **One decoder serves the whole set**: the constants a decode reads are a tile's or a width's,
 /// the same for every canvas, so a size of the set is a lookup and costs no device storage.
-fn deployment_canvases(sizes: &[(u32, u32)]) -> nn::Result<Vec<&'static Canvas>> {
+fn deployment_canvases(sizes: &[(u32, u32)]) -> nn::Result<Vec<((u32, u32), Canvas)>> {
     if sizes.is_empty() {
         return Err(nn::Error::Unsupported(
             "this deployment serves no size, so no raster could be decoded".to_owned(),
         ));
     }
+    let generated = named_canvases()?;
     sizes
         .iter()
         .map(|&(width, height)| {
-            NAMED_CANVASES
+            generated
                 .iter()
-                .find(|canvas| canvas.width == width && canvas.height == height)
+                .find(|(_, canvas)| canvas.width == width && canvas.height == height)
+                .copied()
                 .ok_or_else(|| {
                     nn::Error::Unsupported(format!(
                         "this deployment serves {width}x{height}, which the checkpoint does not \
                          generate: it generates {}",
-                        NAMED_CANVASES
+                        generated
                             .iter()
-                            .map(|canvas| format!("{}x{}", canvas.width, canvas.height))
+                            .map(|(_, canvas)| format!("{}x{}", canvas.width, canvas.height))
                             .collect::<Vec<_>>()
                             .join(", ")
                     ))
@@ -456,12 +445,14 @@ fn candidates(
     packing: &ConditionPacking,
     processor: Option<&ProcessorConfig>,
 ) -> nn::Result<Vec<WarmRequest>> {
-    let longest = snap_frames(seconds_to_frames(serving.max_seconds)?)?;
-    let shortest = snap_frames(seconds_to_frames(MIN_VIDEO_SECONDS)?)?;
-    let timelines: Vec<u32> = (shortest..=longest).step_by(CLIP_FRAMES as usize).collect();
+    let longest = timeline(serving.max_seconds)?;
+    let shortest = timeline(MIN_SECONDS)?;
+    let timelines: Vec<u32> = (shortest..=longest)
+        .step_by(FRAMES.clip_frames as usize)
+        .collect();
 
     let mut candidates = Vec::new();
-    for canvas in deployment_canvases(&serving.sizes)? {
+    for (_, canvas) in deployment_canvases(&serving.sizes)? {
         for task in tasks.iter().copied() {
             let (first_frames, last_frames, references) = task_conditions(task);
 
@@ -474,7 +465,7 @@ fn candidates(
                 ladder.iter().copied().map(Some).collect()
             };
             let openings = if task == VideoTask::FirstLastToVideoAudio {
-                keyframe_openings(canvas, ladder, packing, processor)?
+                keyframe_openings(&canvas, ladder, packing, processor)?
             } else {
                 Vec::new()
             };
@@ -531,10 +522,7 @@ fn keyframe_openings(
                 .to_owned(),
         )
     })?;
-    let size = proto::video::Canvas {
-        width: canvas.width,
-        height: canvas.height,
-    };
+    let size = *canvas;
     // An image of the canvas's own size: the keyframe plan fits every image onto the canvas, so
     // the image's size reaches only the media reader's crop and not the condition's shape.
     let image = processing::ImageMetadata {
@@ -640,7 +628,7 @@ fn warm_prompts(
 
     let (first_frames, last_frames, _) = task_conditions(VideoTask::FirstLastToVideoAudio);
     let mut prompts: Vec<WarmPrompt> = Vec::new();
-    for canvas in deployment_canvases(&serving.sizes)? {
+    for (_, canvas) in deployment_canvases(&serving.sizes)? {
         let grid = processor
             .image_grid(canvas.height, canvas.width)
             .map_err(|error| {
@@ -667,17 +655,6 @@ fn warm_prompts(
     Ok(prompts)
 }
 
-/// `seconds` at the model's frame rate, rounded.
-fn seconds_to_frames(seconds: f64) -> nn::Result<u32> {
-    let frames = (seconds * f64::from(FPS)).round();
-    if !(frames.is_finite() && frames >= 1.0 && frames <= f64::from(u32::MAX)) {
-        return Err(nn::Error::Unsupported(format!(
-            "{seconds} seconds is not a positive number of frames at {FPS} frames per second"
-        )));
-    }
-    Ok(frames as u32)
-}
-
 /// What the placed denoiser serves under `serving`, as the request processing plans requests
 /// against it.
 ///
@@ -685,8 +662,7 @@ fn seconds_to_frames(seconds: f64) -> nn::Result<u32> {
 /// what its network could run; the schedule and the shifts are its too. The frame rule is the clip
 /// rule, the rates are the model's output clock, and the canvases are the deployment's sizes.
 fn describe(pipeline: &H3Pipeline, serving: &VideoServing) -> nn::Result<Description> {
-    use crate::processing::{DenoiserInfo, FrameClips, ReferenceLimits, ServedCanvas};
-    use proto::video::Canvas as Size;
+    use crate::processing::{DenoiserInfo, ReferenceLimits, ServedCanvas};
 
     let denoiser = pipeline.network().ok_or_else(|| {
         nn::Error::Unsupported(
@@ -702,17 +678,6 @@ fn describe(pipeline: &H3Pipeline, serving: &VideoServing) -> nn::Result<Descrip
     let steps = denoiser.schedule().num_steps()?;
     let shifts = &denoiser.config().schedule.shifts;
 
-    // The timeline rule: the fewest frames are one whole clip and the tail, and the tail's latent
-    // frames are what the timeline holds past the clip's.
-    let min_frames = CLIP_FRAMES + CLIP_LATENTS;
-    let latent_frames = crate::packing::video_latent_frames(min_frames)?;
-    let frames = FrameClips {
-        min_frames,
-        clip_frames: CLIP_FRAMES,
-        clip_latent_frames: CLIP_LATENTS,
-        tail_latent_frames: latent_frames - CLIP_LATENTS,
-    };
-
     let condition_packing = condition_packing(denoiser);
 
     let report = DenoiserInfo {
@@ -722,16 +687,16 @@ fn describe(pipeline: &H3Pipeline, serving: &VideoServing) -> nn::Result<Descrip
         audio_shift: f64::from(shifts.audio),
         frame_rate: FPS,
         audio_sample_rate: AUDIO_SAMPLE_RATE,
-        frames,
+        audio_hop: AUDIO_HOP,
+        frames: FRAMES,
+        canvas_rule: CANVAS_RULE,
         canvases: deployment_canvases(&serving.sizes)?
             .into_iter()
-            .map(|canvas| ServedCanvas {
-                short_edge: canvas.short_edge,
-                aspect_ratio: canvas.name(),
-                canvas: Size {
-                    width: canvas.width,
-                    height: canvas.height,
-                },
+            .map(|((width, height), canvas)| ServedCanvas {
+                // Every canvas is generated at the rule's resolution class.
+                short_edge: CANVAS_RULE.short_edge,
+                aspect_ratio: format!("{width}:{height}"),
+                canvas,
             })
             .collect(),
         references: if tasks.contains(&VideoTask::ReferenceToVideoAudio) {
@@ -821,14 +786,15 @@ mod tests {
     }
 
     /// A timeline is `17 * n + 5` frames, and a duration is served by the least timeline covering
-    /// it.
+    /// it; a duration of no frame is refused.
     #[test]
-    fn a_duration_snaps_to_the_least_timeline_covering_it() {
-        assert_eq!(snap_frames(96).unwrap(), 107, "4 s");
-        assert_eq!(snap_frames(120).unwrap(), 124, "5 s");
-        assert_eq!(snap_frames(360).unwrap(), 362, "15 s");
-        assert_eq!(snap_frames(22).unwrap(), 22, "one clip and its tail");
-        assert!(snap_frames(21).is_err(), "shorter than one clip");
+    fn a_duration_aligns_to_the_least_timeline_covering_it() {
+        assert_eq!(timeline(4.0).unwrap(), 107);
+        assert_eq!(timeline(5.0).unwrap(), 124);
+        assert_eq!(timeline(15.0).unwrap(), 362);
+        assert_eq!(timeline(0.5).unwrap(), 22, "one clip and its tail");
+        assert!(timeline(0.0).is_err());
+        assert!(timeline(f64::NAN).is_err());
     }
 
     /// A size the checkpoint does not generate is refused by name, with the sizes it does.

@@ -2,8 +2,10 @@
 //! prepared and presented, and the processor a deployment binds ([`processor`]).
 //!
 //! [`plan`] holds the request rules: the canvas, the frame counts, how every condition is prepared,
-//! what the conditioner reads of it and the denoiser rows it adds. [`presentation`] lists and
-//! tokenizes what the conditioner reads. The model's workers describe their placed denoiser to
+//! what the conditioner reads of it and the denoiser rows it adds, over the family-neutral rules of
+//! `crates/processing` (the frame rule, the canvas rule, the cover crop and the resampled length),
+//! parameterized by the values the denoiser declares. [`presentation`] lists and tokenizes what the
+//! conditioner reads. The model's workers describe their placed denoiser to
 //! request processing as a [`DenoiserInfo`] (`crate::family`), which [`processor`] binds the
 //! deployment's processor from; each planned condition reaches the workers in the pipeline's
 //! shared vocabulary (`proto::video`).
@@ -12,6 +14,7 @@ pub mod plan;
 pub mod presentation;
 pub mod processor;
 
+use ::processing::{CanvasRule, FrameClips};
 use proto::video::Canvas;
 use serde::{Deserialize, Serialize};
 
@@ -42,60 +45,6 @@ impl ::processing::VideoFamily for H3Family {
         binding: ::processing::VideoBinding<'_>,
     ) -> Result<Box<dyn ::processing::VideoProcessor>, String> {
         Ok(Box::new(processor::H3Processor::bind(binding)?))
-    }
-}
-
-/// How a model's video VAE divides a video's frames into clips.
-///
-/// A video has `min_frames + n * clip_frames` frames: one decode unit per
-/// clip, so `n + 1` units. The VAE encodes each clip to `clip_latent_frames`
-/// latent frames and the tail past the whole clips to `tail_latent_frames`.
-/// The model states the rule and the worker declares it in its handshake;
-/// every count a request derives from it, the generated frames, the decode
-/// units and a reference video's encoded frames and latent units, follows
-/// from these four values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct FrameClips {
-    /// Fewest frames of a video: one clip and the tail.
-    pub min_frames: u32,
-    /// Frames each further clip adds.
-    pub clip_frames: u32,
-    /// Latent frames one clip encodes to.
-    pub clip_latent_frames: u32,
-    /// Latent frames of the tail past the clips.
-    pub tail_latent_frames: u32,
-}
-
-impl FrameClips {
-    /// The decode units of a video of `frames` legal frames: one per clip.
-    pub fn units(&self, frames: u32) -> u32 {
-        frames.saturating_sub(self.min_frames) / self.clip_frames + 1
-    }
-
-    /// The fewest legal frame count that is at least `requested`.
-    pub fn align_up(&self, requested: u32) -> u32 {
-        let beyond = requested.saturating_sub(self.min_frames);
-        self.min_frames + beyond.div_ceil(self.clip_frames) * self.clip_frames
-    }
-
-    /// The most legal frames of at most `available`, or `None` below the
-    /// fewest.
-    pub fn align_down(&self, available: u32) -> Option<u32> {
-        let beyond = available.checked_sub(self.min_frames)?;
-        Some(self.min_frames + beyond / self.clip_frames * self.clip_frames)
-    }
-
-    /// The latent frames the VAE encodes `frames` legal frames to.
-    pub fn latent_frames(&self, frames: u32) -> u32 {
-        self.units(frames) * self.clip_latent_frames + self.tail_latent_frames
-    }
-
-    /// Whether the rule is positive and leaves a tail past the first clip.
-    pub fn is_valid(&self) -> bool {
-        self.clip_frames > 0
-            && self.min_frames > self.clip_frames
-            && self.clip_latent_frames > 0
-            && self.tail_latent_frames > 0
     }
 }
 
@@ -183,9 +132,14 @@ pub struct DenoiserInfo {
     pub frame_rate: u32,
     /// Sample rate, in Hz, of the audio track generated with each video.
     pub audio_sample_rate: u32,
+    /// Samples of one audio latent frame: a condition's track encodes to one
+    /// latent frame per hop, the last one padded.
+    pub audio_hop: u32,
     /// How the VAE divides a video's frames into clips, which counts the
     /// frames the deployment generates and their decode units.
     pub frames: FrameClips,
+    /// How a display aspect resolves to the canvas the model generates for it.
+    pub canvas_rule: CanvasRule,
     /// The only canvases the deployment serves: those it prepares, each
     /// with the `(short_edge, aspect_ratio)` its model names it by, in the
     /// order the deployment names them.
@@ -224,8 +178,9 @@ impl DenoiserInfo {
     }
 
     /// Checks that tasks are named once each, the schedule has an endpoint
-    /// and positive finite shifts, the frame and audio sample rates and the
-    /// frame rule are declared, at least one canvas is prepared and each is a
+    /// and positive finite shifts, the frame and audio sample rates, the audio
+    /// hop, the frame rule and the canvas rule are declared, at least one canvas
+    /// is prepared and each is a
     /// positive raster named by its own `(short_edge, aspect_ratio)` pair,
     /// and the reference limits bound each kind within the total, with an
     /// image edge where images are taken.
@@ -249,8 +204,8 @@ impl DenoiserInfo {
         if self.frame_rate == 0 {
             return Err("a video denoiser declares no frame rate");
         }
-        if self.audio_sample_rate == 0 {
-            return Err("a video denoiser declares no audio sample rate");
+        if self.audio_sample_rate == 0 || self.audio_hop == 0 {
+            return Err("a video denoiser declares no audio sample rate or no audio hop");
         }
         let packing = self.condition_packing;
         if packing.capacity > 0 && (packing.tile_rows == 0 || packing.video_tile.contains(&0)) {
@@ -258,6 +213,9 @@ impl DenoiserInfo {
         }
         if !self.frames.is_valid() {
             return Err("a video denoiser declares an empty frame rule");
+        }
+        if !self.canvas_rule.is_valid() {
+            return Err("a video denoiser declares an empty canvas rule");
         }
         let references = &self.references;
         if references

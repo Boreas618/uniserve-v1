@@ -27,9 +27,9 @@
 //!
 //! A reference video reaches the encoder as `[frames, height, width, 3]` **uint8** pixels — the
 //! same raster the decoder writes (`crate::output`) — and is normalized per channel by
-//! `(pixel / 255 − mean) / std` with the ImageNet constants before the input convolution. A clip
-//! shorter than the checkpoint's [`crate::config::CLIP_FRAMES`] repeats its last frame; a single
-//! frame stays alone.
+//! `(pixel / 255 − mean) / std` with the ImageNet constants before the input convolution. A
+//! condition is cut into the frame rule's clips ([`crate::config::FRAMES`]), each encoded alone; a
+//! single frame stays alone.
 //!
 //! ## Causal extents
 //!
@@ -47,11 +47,9 @@
 
 /// `nn.LayerNorm`'s default epsilon, which the reference's audio projection does not override.
 const NORM_EPS: f32 = 1e-5;
-use crate::config::VideoVaeConfig;
+use crate::config::{FRAMES, VideoVaeConfig};
+use crate::packing::LATENT_COMPRESSION;
 use crate::{Error, Result};
-
-/// The spatial compression of the video encoder: input pixels per latent position.
-pub const SPATIAL_RATIO: u32 = 16;
 
 /// The channels of a condition's raster: RGB.
 pub const PIXEL_CHANNELS: u32 = 3;
@@ -59,13 +57,13 @@ pub const PIXEL_CHANNELS: u32 = 3;
 /// How H3's encoders read a request's decoded media, with the vision tower at `dtype`: the video
 /// encoder's planar pixels normalized by the ImageNet constants ([`crate::output::PIXEL_NORM`]), the
 /// vision tower's patch rows by the processor's statistics, and the audio encoder's channel rows
-/// padded to whole latent hops.
-pub fn media_format(config: &crate::Config, dtype: DType) -> Result<nn::capability::MediaFormat> {
-    Ok(nn::capability::MediaFormat {
+/// padded to whole latent hops ([`crate::config::AUDIO_HOP`]).
+pub fn media_format(config: &crate::Config, dtype: DType) -> nn::capability::MediaFormat {
+    nn::capability::MediaFormat {
         pixels: crate::output::PIXEL_NORM,
         patches: qwen3::processor::patch_format(&config.text_encoder.vision, config.pixels, dtype),
-        hop: u64::from(AudioStack::of(&config.audio_vae)?.samples_per_latent),
-    })
+        hop: u64::from(crate::config::AUDIO_HOP),
+    }
 }
 
 /// The extents of one tensor of the encoder's stack, in frames, rows and columns.
@@ -120,90 +118,6 @@ pub struct Stack {
     pub blocks: u32,
     /// Latent channels.
     pub latent_channels: u32,
-    /// The clip the network reads: its frames and what one clip yields.
-    pub clip: Clip,
-}
-
-/// The clip a causal encoder cuts a raster into, and what its frames are worth.
-///
-/// Three numbers of one geometry, stated together because every use needs all three: the frames the
-/// network reads at once, the latent frames one complete clip yields, and the latent frames a
-/// condition drops from its last clip because a later clip of a generated video would overlap them.
-/// A condition's own latent count follows from them ([`Clip::latent_frames`]), and packing takes this
-/// value rather than three loose numbers so that the count has one statement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Clip {
-    /// Frames one clip of the encoder's raster is.
-    pub frames: u32,
-    /// Latent frames one complete clip yields.
-    pub latents: u32,
-    /// Latent frames a condition drops from its last clip.
-    pub token_drop: u32,
-}
-
-impl Clip {
-    /// The clip a checkpoint's video VAE config states.
-    pub fn of(config: &VideoVaeConfig) -> Result<Self> {
-        let clip = Self {
-            frames: config.clip_length,
-            latents: config.clip_latents(),
-            token_drop: config.token_drop,
-        };
-        if clip.frames == 0 || clip.latents <= clip.token_drop {
-            return Err(Error::config(format!(
-                "a clip of {} frames yields {} latent frames and drops {}; the drop must leave some",
-                clip.frames, clip.latents, clip.token_drop
-            )));
-        }
-        Ok(clip)
-    }
-
-    /// The latent frames a **condition** of `frames` frames encodes to.
-    ///
-    /// A condition is cut into clips of [`Self::frames`] frames, each yielding [`Self::latents`] latent
-    /// frames, and the last clip's trailing [`Self::token_drop`] latent frames are dropped - so 17
-    /// frames are 2 and 22 are 7. A single frame is a still and yields one: the network's causal front
-    /// padding makes one frame one latent frame, and the reference encodes
-    /// an image or a keyframe through the same network alone.
-    ///
-    /// This is a **different statement** from a generated timeline's (`packing::video_latent_frames`:
-    /// `17n + 5` frames to `5n + 2` latents). The two agree on the counts a generation uses, and only
-    /// this one accepts the counts a condition may be - a condition is cut and padded, not generated.
-    pub fn latent_frames(&self, frames: u32) -> Result<u32> {
-        if frames == 0 {
-            return Err(Error::config(
-                "a video condition of no frame encodes nothing".to_owned(),
-            ));
-        }
-        if frames == 1 {
-            return Ok(1);
-        }
-        Ok(frames.div_ceil(self.frames) * self.latents - self.token_drop)
-    }
-
-    /// The clips a condition of `frames` frames is cut into, in order.
-    ///
-    /// Each clip is encoded alone, as the reference's `clips` and `latent_slices` cut it:
-    /// the frames it reads and the latent frames it writes, the last clip
-    /// holding what is left of both. A still is one clip of one frame.
-    pub fn spans(&self, frames: u32) -> Result<Vec<ClipSpan>> {
-        let total = self.latent_frames(frames)?;
-        let mut spans = Vec::with_capacity(frames.div_ceil(self.frames) as usize);
-        let (mut first, mut latent) = (0, 0);
-        while first < frames {
-            let length = self.frames.min(frames - first);
-            let latents = self.latents.min(total - latent);
-            spans.push(ClipSpan {
-                first,
-                frames: length,
-                latent,
-                latents,
-            });
-            first += length;
-            latent += latents;
-        }
-        Ok(spans)
-    }
 }
 
 impl Stack {
@@ -253,9 +167,9 @@ impl Stack {
             .iter()
             .try_fold(1u32, |product, stride| product.checked_mul(*stride))
             .ok_or_else(|| Error::config("the video encoder's strides overflow".to_owned()))?;
-        if compression != SPATIAL_RATIO {
+        if compression != LATENT_COMPRESSION {
             return Err(Error::config(format!(
-                "the video encoder compresses space {compression}-fold, not {SPATIAL_RATIO}"
+                "the video encoder compresses space {compression}-fold, not {LATENT_COMPRESSION}"
             )));
         }
         Ok(Self {
@@ -265,7 +179,6 @@ impl Stack {
             spatial_strides: config.spatial_downsample_factors.clone(),
             blocks: config.layers_per_block,
             latent_channels: config.latent_channels,
-            clip: Clip::of(config)?,
         })
     }
 
@@ -297,8 +210,9 @@ impl Stack {
 /// The audio encoder's stack: DAC's strided widening network and the latent projection.
 ///
 /// The decoder's rates are the encoder's reversed only in effect: the encoder's five strided stages
-/// multiply to the 800 samples of one latent frame, so a whole number of latent frames in gives whole
-/// latent frames out. `encoder_rates` are [2, 4, 4, 5, 5] and each stage doubles the width, starting
+/// multiply to the 800 samples of one latent frame ([`crate::config::AUDIO_HOP`], which the
+/// configuration holds the rates to), so a whole number of latent frames in gives whole latent
+/// frames out. `encoder_rates` are [2, 4, 4, 5, 5] and each stage doubles the width, starting
 /// from `encoder_dim` after the input convolution.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AudioStack {
@@ -314,8 +228,6 @@ pub struct AudioStack {
     pub latent_channels: u32,
     /// Attention heads of the latent projection.
     pub heads: u32,
-    /// Samples per latent frame: the product of the rates.
-    pub samples_per_latent: u32,
 }
 
 impl AudioStack {
@@ -337,11 +249,6 @@ impl AudioStack {
                 config.num_attention_heads, config.latent_dim
             )));
         }
-        let samples_per_latent = config
-            .encoder_rates
-            .iter()
-            .try_fold(1u32, |product, rate| product.checked_mul(*rate))
-            .ok_or_else(|| Error::config("the audio encoder's rates overflow".to_owned()))?;
         let mut width = config.encoder_dim;
         let widths = config
             .encoder_rates
@@ -358,7 +265,6 @@ impl AudioStack {
             latent_dim: config.latent_dim,
             latent_channels: config.latent_channels,
             heads: config.num_attention_heads,
-            samples_per_latent,
         })
     }
 
@@ -382,41 +288,40 @@ impl AudioStack {
         }
         lengths
     }
-
-    /// The latent frames a track of `samples` encodes to, and the length the stack must be given.
-    pub fn latent_frames(&self, samples: u32) -> Result<u32> {
-        let frames = audio_latent_frames(u64::from(samples), u64::from(self.samples_per_latent))?;
-        u32::try_from(frames)
-            .map_err(|_| Error::config(format!("{samples} samples exceed a latent frame count")))
-    }
 }
 
-/// The latent frames a track of `samples` encodes to: `ceil(samples / hop)`.
+/// The latent frames a track of `samples` encodes to at `hop` samples a latent frame:
+/// `ceil(samples / hop)`, none for no sample.
 ///
-/// One statement of the rule, because two callers need it: the stack's geometry and the encoder's
-/// own output extent. **This is the encode's direction:** a requested duration is covered, so the
-/// track is `+0..hop-1` samples longer than the request and never short.
-/// [`crate::packing::audio_latent_frames`] is the other direction - a request's video frame count
-/// to its latents, rounded to nearest - and the two are deliberately named alike and documented
-/// against each other, because a reader who takes one for the other gets a figure that looks right.
-/// The ceiling is the reference's, and it is a ceiling because its `unpack_samples` right-pads the
-/// track with zeros to [`padded_samples`] first, so every strided convolution divides exactly and
-/// the last latent frame reads those zeros.
-pub fn audio_latent_frames(samples: u64, hop: u64) -> Result<u64> {
-    if samples == 0 || hop == 0 {
-        return Err(Error::config(
-            "an audio track of no samples encodes to no latent frames".to_owned(),
-        ));
-    }
-    Ok(samples.div_ceil(hop))
+/// The one statement of the rule: the request processing counts a condition's audio rows with it,
+/// the packing lays them out by it, and the encoder sizes its output by it. **This is the encode's
+/// direction:** a requested duration is covered, so the track is `+0..hop-1` samples longer than
+/// the request and never short. [`crate::packing::audio_latent_frames`] is the other direction - a
+/// request's video frame count to its latents, rounded to nearest - and the two are deliberately
+/// named alike and documented against each other, because a reader who takes one for the other gets
+/// a figure that looks right. The ceiling is the reference's, and it is a ceiling because its
+/// `unpack_samples` right-pads the track with zeros to [`padded_samples`] first, so every strided
+/// convolution divides exactly and the last latent frame reads those zeros.
+pub const fn audio_latent_frames(samples: u64, hop: u64) -> u64 {
+    samples.div_ceil(hop)
 }
 
 /// The length the encoder must be given for a track of `samples`: the ceiling's own multiple.
 ///
-/// The padding is [`audio_latent_frames`]' multiple less the track, so a whole-frame track is unchanged
-/// and any other is right-padded with zeros exactly as the reference's `unpack_samples` does.
+/// The padding is [`audio_latent_frames`]' multiple less the track, so a whole-frame track is
+/// unchanged and any other is right-padded with zeros exactly as the reference's `unpack_samples`
+/// does.
+///
+/// # Errors
+///
+/// A track of no sample, which encodes to nothing.
 pub fn padded_samples(samples: u64, hop: u64) -> Result<u64> {
-    Ok(audio_latent_frames(samples, hop)? * hop)
+    if samples == 0 {
+        return Err(Error::config(
+            "an audio track of no samples encodes to no latent frames".to_owned(),
+        ));
+    }
+    Ok(audio_latent_frames(samples, hop) * hop)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -751,19 +656,6 @@ fn distinct(extents: &[Extent]) -> Vec<Extent> {
     seen
 }
 
-/// One clip of a condition: the frames it reads and the latent frames it writes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ClipSpan {
-    /// The clip's first frame.
-    pub first: u32,
-    /// Its frames.
-    pub frames: u32,
-    /// The first latent frame it writes.
-    pub latent: u32,
-    /// The latent frames it writes.
-    pub latents: u32,
-}
-
 /// The buffers one tile extent's encode works in, reserved once for a whole run of tiles.
 ///
 /// A run's tiles are not uniform - the right and bottom edges of a grid are shorter - so a scratch holds
@@ -945,10 +837,10 @@ impl VideoEncoder {
                 self.stack.input_channels
             )));
         }
-        if frames == 0 || frames > u64::from(self.stack.clip.frames) {
+        if frames == 0 || frames > u64::from(FRAMES.clip_frames) {
             return Err(Error::config(format!(
                 "a video encoder reads one still or one clip of at most {} frames, not {frames}",
-                self.stack.clip.frames
+                FRAMES.clip_frames
             )));
         }
         let raster = Extent {
@@ -1015,26 +907,6 @@ impl VideoEncoder {
             set.output_rstd,
             out,
         )
-    }
-
-    /// The latent frames a **condition** of `frames` frames encodes to.
-    ///
-    /// A condition is cut into clips of `Stack::clip_frames` frames, each yielding
-    /// `Stack::clip_latents` latent frames, and the last clip's trailing `Stack::token_drop` latent
-    /// frames are dropped - so 17 frames are 2 latent frames and 22 are 7. A single frame is a still and
-    /// yields one (the network's causal front padding makes one frame one latent frame).
-    ///
-    /// This is a **different statement** from the generated timeline's `packing::video_latent_frames`
-    /// (`17n + 5` frames to `5n + 2` latents). The two agree on the counts a generation uses and this
-    /// one alone accepts the counts a condition may be - 17, 30, any length - because a condition is
-    /// cut and padded, not generated.
-    pub fn latent_frames(&self, frames: u32) -> Result<u32> {
-        self.stack.clip.latent_frames(frames)
-    }
-
-    /// The clips a **condition** of `frames` frames is cut into, in order ([`Clip::spans`]).
-    pub fn clips(&self, frames: u32) -> Result<Vec<ClipSpan>> {
-        self.stack.clip.spans(frames)
     }
 
     /// Project the stitched moments to the posterior's two fields: one call, after the stitch.
@@ -1197,7 +1069,12 @@ impl AudioEncoder {
     /// divides exactly and the last latent frame reads those zeros. A track of any positive length
     /// therefore encodes, and [`Self::encode`] states what it needs to do the same.
     pub fn frames(&self, samples: u64) -> Result<u64> {
-        let frames = audio_latent_frames(samples, self.hop())?;
+        if samples == 0 {
+            return Err(Error::config(
+                "an audio track of no samples encodes to no latent frames".to_owned(),
+            ));
+        }
+        let frames = audio_latent_frames(samples, self.hop());
         if frames > u64::from(LONGEST_TRACK) {
             return Err(Error::config(format!(
                 "{frames} latent frames exceed the {LONGEST_TRACK}-frame track the encoder's \
@@ -1558,80 +1435,6 @@ mod tests {
 
     use crate::video_vae::tests::video_config;
 
-    /// A video encoder over the fixture's config: the stack is all `latent_frames` needs, so no
-    /// weights are loaded.
-    fn encoder_stack() -> Stack {
-        Stack::of(&video_config()).expect("the fixture's stack")
-    }
-
-    /// A condition's clips cover its frames and its latent frames, whole clips and then what is
-    /// left, the reference's `clips` and `latent_slices`.
-    #[test]
-    fn a_condition_is_cut_into_its_clips() {
-        let clip = encoder_stack().clip;
-        assert_eq!(
-            clip.spans(1).unwrap(),
-            [ClipSpan {
-                first: 0,
-                frames: 1,
-                latent: 0,
-                latents: 1
-            }]
-        );
-        let video = clip.spans(39).unwrap();
-        assert_eq!(video.len(), 3);
-        assert_eq!(
-            video[2],
-            ClipSpan {
-                first: 34,
-                frames: 5,
-                latent: 10,
-                latents: 2
-            }
-        );
-        for frames in [22, 39, 56, 124, 362] {
-            let spans = clip.spans(frames).unwrap();
-            let last = spans.last().unwrap();
-            assert_eq!(last.first + last.frames, frames);
-            assert_eq!(
-                last.latent + last.latents,
-                clip.latent_frames(frames).unwrap()
-            );
-        }
-    }
-
-    #[test]
-    fn a_condition_is_counted_by_its_own_rule() {
-        // The reference counts a condition in clips: every clip of `clip_length` frames yields
-        // `clip_latents` latent frames and the last clip's trailing `token_drop` are dropped, so the
-        // canonical 22 frames (`clip_length + 5`) are two clips less three.
-        let clip = encoder_stack().clip;
-        assert_eq!(clip.latent_frames(1).expect("a still"), 1);
-        assert_eq!(
-            clip.latent_frames(clip.frames).expect("one clip"),
-            clip.latents - clip.token_drop
-        );
-        let tail = clip.frames + crate::config::CLIP_LATENTS;
-        assert_eq!(
-            clip.latent_frames(tail).expect("a clip and a tail"),
-            2 * clip.latents - clip.token_drop
-        );
-        // A length no generation produces is a condition all the same: two clips and a short tail.
-        assert_eq!(
-            clip.latent_frames(2 * clip.frames - 4)
-                .expect("a short last clip"),
-            2 * clip.latents - clip.token_drop
-        );
-        assert!(clip.latent_frames(0).is_err());
-
-        // The generated timeline's rule agrees on the canonical count, which is why the two must be
-        // stated separately rather than one standing in for the other.
-        assert_eq!(
-            clip.latent_frames(tail).expect("a clip and a tail"),
-            crate::packing::video_latent_frames(tail).expect("the generated rule")
-        );
-    }
-
     #[test]
     fn a_run_reserves_one_set_per_distinct_tile_extent() {
         let tile = |height: u32, width: u32| Extent {
@@ -1771,14 +1574,15 @@ mod tests {
     #[test]
     fn the_audio_encoder_stages_land_on_whole_latent_frames() {
         let stack = AudioStack::of(&crate::audio_vae::tests::audio_config()).expect("the stack");
-        assert_eq!(stack.samples_per_latent, 800);
         assert_eq!(stack.lengths(800), vec![800, 400, 100, 25, 5, 1]);
         assert_eq!(stack.lengths(1600), vec![1600, 800, 200, 50, 10, 2]);
-        assert_eq!(stack.latent_frames(800).expect("one frame"), 1);
-        assert_eq!(stack.latent_frames(24000).expect("thirty frames"), 30);
+        assert_eq!(audio_latent_frames(800, 800), 1);
+        assert_eq!(audio_latent_frames(24000, 800), 30);
         // A partial frame rounds up, and the length the network is given is the ceiling's own multiple:
         // the reference right-pads the track with zeros, so nothing is dropped.
-        assert_eq!(stack.latent_frames(801).expect("rounds up"), 2);
+        assert_eq!(audio_latent_frames(801, 800), 2);
+        assert_eq!(audio_latent_frames(0, 800), 0);
+        assert!(padded_samples(0, 800).is_err());
         assert_eq!(padded_samples(801, 800).expect("padded"), 1600);
         assert_eq!(padded_samples(1600, 800).expect("whole"), 1600);
         // Each stage doubles the width from the input convolution's.

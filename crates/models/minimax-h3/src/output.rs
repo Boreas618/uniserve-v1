@@ -170,9 +170,9 @@ impl nn::capability::Decoder for VideoPostprocessor {
         Ok(PIXEL_NORM)
     }
 
-    /// The splices a timeline of `frames` frames is written in ([`TemporalClips::splices`]).
+    /// The splices a timeline of `frames` frames is written in ([`crate::video_vae::splices`]).
     fn splices(&self, frames: u32) -> nn::Result<Vec<nn::capability::Splice>> {
-        self.clips.splices(frames)
+        Ok(crate::video_vae::splices(&self.clips, frames)?)
     }
 }
 
@@ -348,9 +348,7 @@ mod tests {
     #[test]
     fn the_only_clip_of_a_timeline_keeps_its_own_tail() {
         let clips = clips();
-        let schedule = clips
-            .splices(clips.body + clips.overlap)
-            .expect("a one-clip timeline");
+        let schedule = clips.splices(1).expect("a one-clip timeline");
         let (spliced, launches, peak) = recorded_splice(false, schedule[0]);
         let placed = spliced.expect("the only clip");
         assert_eq!(peak, 0, "a clip with no predecessor reserves nothing");

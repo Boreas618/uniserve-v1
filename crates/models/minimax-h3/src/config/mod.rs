@@ -9,22 +9,21 @@
 //!
 //! ## What is a fact of the checkpoint and what is a fact of the request
 //!
-//! The dimensions, the schedule, the attention kind, the canvases a DMD student generates and the
-//! latent statistics are the checkpoint's and are stated here. How a request selects a canvas, how
-//! many frames a duration gives and how condition media are planned are the request rules'
-//! (`crates/models/rules`), and are not duplicated here - except the twelve canvases a DMD student
-//! was trained on, which are a fact of *that* checkpoint rather than of the rule.
+//! The dimensions, the schedule, the attention kind and the latent statistics are the checkpoint's
+//! and are read here. The values the family-neutral request rules of `crates/processing` are
+//! parameterized by - the frame rule ([`FRAMES`]), the canvas rule ([`CANVAS_RULE`]) and the
+//! durations a request may ask for - are stated here once, and every component of the crate and
+//! its request processing reads them from here.
 //!
 //! ## Timeline
 //!
-//! H3 counts video in frames at [`FPS`], in clips of [`CLIP_FRAMES`] frames that the video VAE
-//! encodes to [`CLIP_LATENTS`] latent frames, and audio in latent steps of [`AUDIO_HOP`] samples
-//! at [`AUDIO_SAMPLE_RATE`]. The checkpoint's own VAE configuration must agree with these, which
-//! [`Config::normalize`] checks: a checkpoint whose compression differs is one this crate's
-//! packing and reconstruction cannot serve.
+//! H3 counts video in frames at [`FPS`], by the frame rule [`FRAMES`] (`17n + 5` frames, clips of 17
+//! frames that the video VAE encodes to 5 latent frames, the final clip keeping 2), and audio in
+//! latent steps of [`AUDIO_HOP`] samples at [`AUDIO_SAMPLE_RATE`]. The checkpoint's own VAE
+//! configuration must agree with these, which [`Config::normalize`] checks: a checkpoint whose
+//! compression differs is one this crate's packing and reconstruction cannot serve.
 
 mod audio_vae;
-mod canvas;
 mod denoiser;
 mod text;
 mod video_vae;
@@ -32,13 +31,12 @@ mod video_vae;
 use std::collections::BTreeMap;
 
 use nn::config::Fields;
+use processing::{CanvasRule, FrameClips};
+use proto::video::Canvas;
 
 use crate::VideoTask;
 
 pub use audio_vae::AudioVaeConfig;
-pub use canvas::{
-    CANVAS_SHORT_EDGE, Canvas, NAMED_ASPECT_RATIOS, NAMED_CANVASES, offered_canvases,
-};
 pub use denoiser::{
     AttentionKind, DenoiserConfig, SPARSE_TILE_ROWS, ScheduleGrid, ScheduleSpec, Shifts,
     TransformerConfig,
@@ -47,22 +45,35 @@ pub use text::RETAINED_LAYERS;
 pub use video_vae::VideoVaeConfig;
 
 use crate::checkpoint::{ContractSchedule, Dit, Layout, Sidecars};
-use crate::encoding::Clip;
+use crate::packing::{LATENT_COMPRESSION, PATCH_SIDE};
 use crate::{Error, Result};
 use qwen3::processor::ProcessorConfig;
 
 /// Frames per second of a generated video.
 pub const FPS: u32 = 24;
 
-/// Frames of one video VAE clip: the temporal footprint of one encoding step.
-pub const CLIP_FRAMES: u32 = 17;
+/// The frame rule of every video H3 generates and every condition it encodes.
+///
+/// A generated video is `17n + 5` frames: the video VAE encodes each 17-frame clip to 5 latent frames
+/// and the 5-frame tail past the whole clips to 2, the final clip dropping 3 latent frames that the
+/// next clip's overlap repeats. The packing, the rotary coordinates and the decoder's clip splice are
+/// written for this timeline, so a checkpoint whose video VAE states another is refused
+/// ([`Config::normalize`]).
+pub const FRAMES: FrameClips = FrameClips {
+    min_frames: 22,
+    clip_frames: 17,
+    clip_latent_frames: 5,
+    tail_latent_frames: 2,
+};
 
-/// Latent frames one [`CLIP_FRAMES`]-frame clip encodes to.
-pub const CLIP_LATENTS: u32 = 5;
+/// The video VAE's temporal compression: one latent frame covers this many video frames.
+pub const TEMPORAL_COMPRESSION: u32 = 4;
 
-/// Latent frames the final clip drops from a generated length; the next clip's overlap repeats
-/// them.
-pub const DROPPED_LATENTS: u32 = 3;
+/// The shortest output a request may ask for, in seconds.
+pub const MIN_SECONDS: f64 = 4.0;
+
+/// The longest output a request may ask for, in seconds: the most a deployment may serve.
+pub const MAX_SECONDS: f64 = 15.0;
 
 /// The longest generated clip a deployment's bounds are taken over, in frames.
 ///
@@ -83,9 +94,41 @@ pub const AUDIO_HOP: u32 = AUDIO_SAMPLE_RATE / AUDIO_LATENTS_PER_SECOND;
 /// Channels of the generated audio: interleaved stereo.
 pub const AUDIO_CHANNELS: u32 = 2;
 
-/// A canvas side is a multiple of this many pixels, so it survives the video VAE's 16x spatial
-/// compression on a whole number of 2x2 transformer patches.
-pub const CANVAS_MULTIPLE: u32 = 32;
+/// The canvas rule H3 generates by (diffusers' `adapt_shape_v1`): a 768-pixel short edge, an area
+/// cap of `768 * 1344` pixels, aspects from 1:4 to 4:1, and sides on a 32-pixel grid, so a side
+/// survives the video VAE's 16x spatial compression on a whole number of 2x2 transformer patches.
+pub const CANVAS_RULE: CanvasRule = CanvasRule {
+    short_edge: 768,
+    max_pixels: 768 * 1344,
+    multiple: LATENT_COMPRESSION * PATCH_SIDE,
+    narrowest: (1, 4),
+    widest: (4, 1),
+};
+
+/// The aspect ratios a request names a canvas by besides `auto`, landscape first. Every H3
+/// checkpoint generates the canvas rule's canvas of each at its short edge, and a deployment
+/// serves a subset of them (`docs/minimax_h3/minimax_h3.md`).
+pub const NAMED_ASPECT_RATIOS: [(u32, u32); 6] =
+    [(21, 9), (16, 9), (4, 3), (1, 1), (3, 4), (9, 16)];
+
+/// The canvases every H3 checkpoint generates: the canvas rule's canvas of each named aspect ratio,
+/// with the ratio, in [`NAMED_ASPECT_RATIOS`]' order (1536x672 for 21:9 to 768x1344 for 9:16).
+///
+/// # Errors
+///
+/// Fails when the rule refuses a named ratio, which a rule that states the named ratios' range does
+/// not.
+pub fn named_canvases() -> Result<Vec<((u32, u32), Canvas)>> {
+    NAMED_ASPECT_RATIOS
+        .iter()
+        .map(|&(width, height)| {
+            CANVAS_RULE
+                .canvas(f64::from(width), f64::from(height))
+                .map(|canvas| ((width, height), canvas))
+                .map_err(|error| Error::config(format!("the canvas rule: {error}")))
+        })
+        .collect()
+}
 
 /// Steps of the training schedule a DMD student's rungs are stated on.
 pub const NUM_TRAIN_TIMESTEPS: f32 = 1000.0;
@@ -203,9 +246,7 @@ impl Config {
                     },
                 ),
             };
-            let clip = Clip::of(&video_vae)?;
-            let denoiser =
-                DenoiserConfig::new(transformer, schedule, attention, tasks.clone(), clip)?;
+            let denoiser = DenoiserConfig::new(transformer, schedule, attention, tasks.clone())?;
             denoisers.insert(*dit, denoiser);
         }
 
@@ -242,9 +283,8 @@ impl Config {
 
     /// Check the components against each other and against the timeline.
     fn validate(&self) -> Result<()> {
-        // H3's packing and reconstruction hard-code one clip timeline: 17 frames encode to 5
-        // latent frames, of which the final clip drops 3, at 16x spatial and 4x temporal
-        // compression.
+        // H3's packing and reconstruction hard-code one clip timeline, the frame rule's, at 16x
+        // spatial and 4x temporal compression.
         let video = &self.video_vae;
         if (
             video.clip_length,
@@ -253,17 +293,20 @@ impl Config {
             video.spatial_compression(),
             video.temporal_compression(),
         ) != (
-            CLIP_FRAMES,
-            CLIP_LATENTS,
-            CLIP_LATENTS - DROPPED_LATENTS,
-            16,
-            4,
+            FRAMES.clip_frames,
+            FRAMES.clip_latent_frames,
+            FRAMES.tail_latent_frames,
+            LATENT_COMPRESSION,
+            TEMPORAL_COMPRESSION,
         ) {
             return Err(Error::config(format!(
-                "MiniMax-H3 video_vae must encode {CLIP_FRAMES}-frame clips to {CLIP_LATENTS} \
-                 latent frames, dropping {DROPPED_LATENTS} of them from the final clip, at 16x \
-                 spatial and 4x temporal compression; this checkpoint states {} frames to {} \
-                 latents, keeping {}, at {}x spatial and {}x temporal",
+                "MiniMax-H3 video_vae must encode {}-frame clips to {} latent frames, keeping {} of \
+                 them in the final clip, at {LATENT_COMPRESSION}x spatial and \
+                 {TEMPORAL_COMPRESSION}x temporal compression; this checkpoint states {} frames to \
+                 {} latents, keeping {}, at {}x spatial and {}x temporal",
+                FRAMES.clip_frames,
+                FRAMES.clip_latent_frames,
+                FRAMES.tail_latent_frames,
                 video.clip_length,
                 video.clip_latents(),
                 video.final_clip_latents(),

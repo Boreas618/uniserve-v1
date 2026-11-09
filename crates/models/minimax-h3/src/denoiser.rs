@@ -9,7 +9,7 @@
 //!
 //! A graph is captured per **layout** - the frame count, canvas, text capacity and condition
 //! capacity - and replayed for every request that fits it. So the layout snaps: frames to `17n + 5`
-//! ([`crate::packing::align_num_frames`]), sides to the checkpoint's 32-pixel grid, and both prefix
+//! ([`crate::config::FRAMES`]), sides to the checkpoint's 32-pixel grid, and both prefix
 //! capacities up to whole capacity units (64 rows under dense attention, the sparse tile
 //! otherwise). Two requests of one layout share one set of tables, and the worker keys its
 //! storage by `(layout, name)`.
@@ -47,13 +47,14 @@ use nn::family::Split;
 use nn::{DType, Forward, Shape, TensorView, WeightLoader};
 
 use crate::attention::Factors;
-use crate::config::{Canvas, DenoiserConfig, MAX_FRAMES};
+use crate::config::{CANVAS_RULE, DenoiserConfig, FRAMES, MAX_FRAMES};
 use crate::modulation::{Groups, Projections};
 use crate::packing::{self, DensePacking};
 use crate::schedule::{Modality, Schedule};
 use crate::solver::Solver;
 use crate::transformer::Transformer;
 use crate::{Error, Result};
+use proto::video::Canvas;
 
 /// The modulation columns one AdaLN row holds: six affine vectors of three tags each.
 const ADALN_COLUMNS: u64 = 18;
@@ -200,16 +201,11 @@ impl Layouts {
             .iter()
             .map(|condition| {
                 condition.frame.map_or(0, |frame| {
-                    // A condition is cut into clips, so its latent count is the encoder's rule
-                    // ([`crate::encoding::Clip::latent_frames`]), not the generated timeline's:
-                    // a 30-frame reference is 7 latent frames, and counting 0 - which the
-                    // generated rule does, since 30 is not `17n + 5` - would shift every later
-                    // draw of the request by the condition's whole volume.
-                    let frames = self
-                        .config
-                        .clip
-                        .latent_frames(frame.num_frames)
-                        .unwrap_or(0);
+                    // A condition is cut into clips, so its latent count is the frame rule's for
+                    // any count ([`processing::FrameClips::latent_frames`]): a 30-frame reference is
+                    // 7 latent frames, and counting none because 30 is not a generated count would
+                    // shift every later draw of the request by the condition's whole volume.
+                    let frames = FRAMES.latent_frames(frame.num_frames);
                     match packing::latent_raster(&frame.canvas) {
                         Ok(raster) => {
                             u64::from(frames)
@@ -234,44 +230,29 @@ impl Layouts {
     /// differ because the sparse packing pads to whole tiles (46848 against 38080 at the released
     /// canvases).
     pub fn rows_bound(&self) -> Result<u32> {
-        let mut bound = 0;
-        let sparse = matches!(
-            self.config.attention,
-            crate::config::AttentionKind::Sparse { .. }
-        );
-        for canvas in crate::config::offered_canvases() {
-            let mut frames = crate::CLIP_FRAMES + crate::CLIP_LATENTS;
-            while frames <= MAX_FRAMES {
-                if sparse {
-                    let tile = self.config.attention.capacity_rows();
-                    if let Ok(segment) = packing::segment_packing(
-                        frames,
-                        canvas,
-                        self.capacity.text_rows,
-                        self.capacity.condition_rows,
-                        tile,
-                        tile,
-                    ) {
-                        bound = bound.max(segment.extent.padded_tokens);
-                    }
-                } else if let Ok(dense) = packing::dense_packing(
+        match self.config.attention {
+            crate::config::AttentionKind::Sparse { tile, .. } => self.bound(|frames, canvas| {
+                packing::segment_extent(
+                    frames,
+                    canvas,
+                    self.capacity.text_rows,
+                    self.capacity.condition_rows,
+                    tile,
+                    tile,
+                )
+                .map(|extent| extent.padded_tokens)
+            }),
+            crate::config::AttentionKind::Dense => self.bound(|frames, canvas| {
+                packing::dense_packing(
                     frames,
                     canvas,
                     self.capacity.text_rows,
                     self.capacity.condition_rows,
                     self.sequence.size,
-                ) {
-                    bound = bound.max(dense.padded_tokens);
-                }
-                frames += crate::CLIP_FRAMES;
-            }
+                )
+                .map(|dense| dense.padded_tokens)
+            }),
         }
-        if bound == 0 {
-            return Err(Error::config(
-                "a deployment offers no canvas a layout can be built for".to_owned(),
-            ));
-        }
-        Ok(bound)
     }
 
     /// The largest number of video tiles any layout of this deployment reaches.
@@ -291,21 +272,36 @@ impl Layouts {
             ));
         };
         let tile = self.config.attention.capacity_rows();
+        self.bound(|frames, canvas| {
+            packing::segment_extent(
+                frames,
+                canvas,
+                self.capacity.text_rows,
+                self.capacity.condition_rows,
+                tile,
+                tile,
+            )
+            .map(|extent| extent.video_tiles)
+        })
+    }
+
+    /// The largest `measure` of any layout this deployment's bounds are taken over: every canvas the
+    /// checkpoint generates ([`crate::config::named_canvases`]) at every frame count of the frame
+    /// rule up to [`MAX_FRAMES`], at the deployment's capacities. A layout the packing refuses is
+    /// not one the deployment serves and measures nothing.
+    ///
+    /// The bounds are taken over the checkpoint's canvases and frame counts rather than the
+    /// deployment's sizes and longest output, so that a deployment's attention scratch and the
+    /// programs keyed by its bounds are one set for every deployment of a checkpoint and capacity.
+    fn bound(&self, measure: impl Fn(u32, &Canvas) -> Result<u32>) -> Result<u32> {
         let mut bound = 0;
-        for canvas in crate::config::offered_canvases() {
-            let mut frames = crate::CLIP_FRAMES + crate::CLIP_LATENTS;
+        for (_, canvas) in crate::config::named_canvases()? {
+            let mut frames = FRAMES.min_frames;
             while frames <= MAX_FRAMES {
-                if let Ok(segment) = packing::segment_packing(
-                    frames,
-                    canvas,
-                    self.capacity.text_rows,
-                    self.capacity.condition_rows,
-                    tile,
-                    tile,
-                ) {
-                    bound = bound.max(segment.extent.video_tiles);
+                if let Ok(measured) = measure(frames, &canvas) {
+                    bound = bound.max(measured);
                 }
-                frames += crate::CLIP_FRAMES;
+                frames += FRAMES.clip_frames;
             }
         }
         if bound == 0 {
@@ -366,7 +362,7 @@ impl Layouts {
         Ok(Layout {
             video: LatentShape {
                 channels: self.config.transformer.video_channels,
-                frames: packing::video_latent_frames(frames)?,
+                frames: FRAMES.latent_frames(frames),
                 height: raster.height,
                 width: raster.width,
             },
@@ -428,7 +424,7 @@ impl Layouts {
     /// the deployment's, because a layout holds every prompt that fits it, and the condition rows
     /// are the rung the request states.
     pub fn layout(&self, request: &VideoRequest) -> Result<(Layout, DensePacking)> {
-        let frames = packing::align_num_frames(request.frames);
+        let frames = frames_of(request);
         let canvas = canvas_of(request)?;
         let packing = packing::dense_packing(
             frames,
@@ -776,7 +772,7 @@ impl Layouts {
             )));
         }
         let conditions = conditions_of(request);
-        let segments = packing::condition_segments(&conditions, &canvas, self.config.clip)?;
+        let segments = packing::condition_segments(&conditions, &canvas)?;
         let tables = packing::segment_tables(
             &packing,
             frames,
@@ -873,7 +869,7 @@ impl Layouts {
         let frames = frame_count(layout.video.frames)?;
         let canvas = canvas_of_latents(layout)?;
         let conditions = conditions_of(request);
-        let segments = packing::condition_segments(&conditions, &canvas, self.config.clip)?;
+        let segments = packing::condition_segments(&conditions, &canvas)?;
         let tables = packing::dense_tables(
             &packing,
             frames,
@@ -995,9 +991,10 @@ fn vision_spans(request: &VideoRequest<'_>) -> Vec<(u32, u32)> {
         .collect()
 }
 
-/// The frame count a request is snapped to.
+/// The frame count a request is snapped to: the fewest the frame rule generates of at least its
+/// own.
 pub fn frames_of(request: &VideoRequest) -> u32 {
-    packing::align_num_frames(request.frames)
+    FRAMES.align_up(request.frames)
 }
 
 /// The steps a packing's audio rows hold: one row per channel plane per step.
@@ -1044,38 +1041,29 @@ pub fn canvas_of(request: &VideoRequest) -> Result<Canvas> {
             request.width, request.height
         )));
     }
-    let width = round_up(request.width, crate::CANVAS_MULTIPLE);
-    let height = round_up(request.height, crate::CANVAS_MULTIPLE);
-    let divisor = gcd(width, height);
-    Ok(Canvas {
-        short_edge: width.min(height),
-        aspect: (width / divisor, height / divisor),
-        width,
-        height,
-    })
+    let width = round_up(request.width, CANVAS_RULE.multiple);
+    let height = round_up(request.height, CANVAS_RULE.multiple);
+    Ok(Canvas { width, height })
 }
 
 /// The canvas a layout's latent raster came from.
 fn canvas_of_latents(layout: &Layout) -> Result<Canvas> {
     let canvas = Canvas {
-        short_edge: (layout.video.height * 16).min(layout.video.width * 16),
-        aspect: (layout.video.width, layout.video.height),
-        width: layout.video.width * 16,
-        height: layout.video.height * 16,
+        width: layout.video.width * packing::LATENT_COMPRESSION,
+        height: layout.video.height * packing::LATENT_COMPRESSION,
     };
     packing::latent_raster(&canvas)?;
     Ok(canvas)
 }
 
 /// The generated frame count a latent frame count came from: `5n + 2` latent frames are `17n + 5`
-/// generated frames ([`crate::packing::video_latent_frames`], inverted).
+/// generated frames ([`processing::FrameClips::frames_of_latents`]).
 fn frame_count(latent_frames: u32) -> Result<u32> {
-    if latent_frames < 2 || !(latent_frames - 2).is_multiple_of(crate::CLIP_LATENTS) {
-        return Err(Error::config(format!(
-            "{latent_frames} latent frames are not 5n + 2"
-        )));
-    }
-    Ok((latent_frames - 2) / crate::CLIP_LATENTS * crate::CLIP_FRAMES + crate::CLIP_LATENTS)
+    FRAMES.frames_of_latents(latent_frames).ok_or_else(|| {
+        Error::config(format!(
+            "{latent_frames} latent frames are no timeline of the frame rule {FRAMES:?}"
+        ))
+    })
 }
 
 /// The request's conditions in the geometry the packing places them by.
@@ -1103,19 +1091,12 @@ fn conditions_of(request: &VideoRequest) -> Vec<packing::Condition> {
 
 /// The canvas a raster of `width` × `height` pixels is, or `None` without pixels.
 ///
-/// The reduction is `canvas_of`'s: the short edge and the aspect, both exact. A raster no canvas
-/// can hold is refused by the packing that reads it, not here.
+/// A raster no canvas can hold is refused by the packing that reads it, not here.
 fn canvas_of_raster(width: u32, height: u32) -> Option<Canvas> {
     if width == 0 || height == 0 {
         return None;
     }
-    let divisor = gcd(width, height);
-    Some(Canvas {
-        short_edge: width.min(height),
-        aspect: (width / divisor, height / divisor),
-        width,
-        height,
-    })
+    Some(Canvas { width, height })
 }
 
 /// The pieces of `request`'s conditions, in the order the packing holds them.
@@ -1130,7 +1111,7 @@ fn pieces_of(
     request: &VideoRequest,
 ) -> Result<Vec<nn::capability::ConditionPiece>> {
     let canvas = canvas_of(request)?;
-    let segments = packing::condition_segments(&conditions_of(request), &canvas, config.clip)?;
+    let segments = packing::condition_segments(&conditions_of(request), &canvas)?;
     let channels = config.transformer.video_channels;
     let mut cursor = 0_u64;
     let mut pieces = Vec::with_capacity(segments.len());
@@ -1272,15 +1253,6 @@ fn condition_ranges(
 /// Round `value` up to the next multiple of `unit`.
 fn round_up(value: u32, unit: u32) -> u32 {
     value.div_ceil(unit) * unit
-}
-
-/// The greatest common divisor, for the aspect ratio a raster states.
-fn gcd(left: u32, right: u32) -> u32 {
-    if right == 0 {
-        left
-    } else {
-        gcd(right, left % right)
-    }
 }
 
 /// Coordinates as FP32, axis-major: every row's first axis, then every row's second.
@@ -1936,7 +1908,7 @@ impl Denoiser {
                 piece.role
             ))
         })?;
-        let compression = u64::from(crate::encoding::SPATIAL_RATIO);
+        let compression = u64::from(packing::LATENT_COMPRESSION);
         if pixels.shape.rank() != 5 || pixels.shape.dim(0) != 1 {
             return Err(Error::config(format!(
                 "condition {:?} reads [1, channels, frames, height, width] pixels, not {:?}",
@@ -1979,7 +1951,12 @@ impl Denoiser {
         // frame, and a reference video its whole clips and a shorter last one.
         let frame_count = u32::try_from(frames)
             .map_err(|_| Error::config("a condition of more frames than u32 holds".to_owned()))?;
-        let clips = encoders.video.clips(frame_count)?;
+        if frame_count == 0 {
+            return Err(Error::config(
+                "a video condition of no frame encodes nothing".to_owned(),
+            ));
+        }
+        let clips = FRAMES.clips(frame_count);
         let longest = clips.iter().map(|clip| clip.frames).max().unwrap_or(1);
         // A run's tiles are uniform (the seam split keeps every tile at the tile size), so one
         // buffer holds any tile of this run and its extents are the plan's largest.
@@ -1991,8 +1968,8 @@ impl Denoiser {
         // (`crate::encoding::VideoEncoder::moments`).
         let video_channels = u64::from(self.config.transformer.video_channels);
         let run_rows = u64::from(clip.latent_extent().0);
-        let run_columns = u64::from(wider / crate::encoding::SPATIAL_RATIO);
-        let latent_frames = u64::from(encoders.video.latent_frames(frame_count)?);
+        let run_columns = u64::from(wider / packing::LATENT_COMPRESSION);
+        let latent_frames = u64::from(FRAMES.latent_frames(frame_count));
         let (tile_height, tile_width) = clip.tiles().iter().fold((0_u64, 0_u64), |held, tile| {
             (
                 held.0.max(u64::from(tile.rows.1) * compression),
@@ -2739,11 +2716,6 @@ mod tests {
             .expect("the base checkpoint's schedule"),
             attention: AttentionKind::DENSE,
             tasks: vec![crate::VideoTask::TextToVideoAudio],
-            clip: crate::encoding::Clip {
-                frames: 17,
-                latents: 5,
-                token_drop: 3,
-            },
         };
         Layouts::new(
             config,
@@ -2770,11 +2742,6 @@ mod tests {
             .expect("a uniform grid"),
             attention: AttentionKind::DENSE,
             tasks: vec![crate::VideoTask::TextToVideoAudio],
-            clip: crate::encoding::Clip {
-                frames: 17,
-                latents: 5,
-                token_drop: 3,
-            },
         };
         let schedule = Schedule::new(&config.schedule).expect("the checkpoint's schedule");
         let count = schedule.num_steps().expect("an aligned grid");
@@ -2965,10 +2932,8 @@ mod tests {
                     nn::capability::ConditionRole::LastFrame => packing::Role::LastFrame,
                     nn::capability::ConditionRole::Reference => packing::Role::Reference,
                 },
-                frame: (shape.width > 0).then(|| packing::Frame {
+                frame: (shape.width > 0).then_some(packing::Frame {
                     canvas: Canvas {
-                        short_edge: shape.width.min(shape.height),
-                        aspect: (1, 1),
                         width: shape.width,
                         height: shape.height,
                     },
@@ -3099,42 +3064,30 @@ mod tests {
     }
 
     #[test]
-    fn the_tile_bound_covers_every_layout_the_deployment_serves() {
+    fn the_tile_bound_covers_the_longest_layout_of_every_canvas() {
         // The compression's score matrix has one column per video tile, so the bound has to cover
-        // every layout the deployment can be asked for - not only the longest frame count, because a
-        // canvas with a taller grid can hold more tiles at a shorter one.
+        // the longest layout of every canvas the checkpoint generates, and is reached by one of
+        // them: a number larger than any layout's spends memory on nothing, and one smaller refuses
+        // on the device instead of counting.
         let rules = sparse_layouts();
         let bound = rules
             .tiles_bound()
             .expect("a sparse deployment bounds its tiles");
-        let tile = rules.config.attention.capacity_rows();
-        let mut largest = 0;
-        for canvas in crate::config::offered_canvases() {
-            let mut frames = crate::CLIP_FRAMES + crate::CLIP_LATENTS;
-            while frames <= MAX_FRAMES {
-                if let Ok(segment) = packing::segment_packing(
-                    frames,
-                    canvas,
-                    rules.capacity.text_rows,
-                    rules.capacity.condition_rows,
-                    tile,
-                    tile,
-                ) {
-                    let tiles = segment.extent.video_tiles;
-                    assert!(
-                        tiles <= bound,
-                        "{tiles} tiles at {}x{} and {frames} frames exceed the bound {bound}",
-                        canvas.width,
-                        canvas.height
-                    );
-                    largest = largest.max(tiles);
-                }
-                frames += crate::CLIP_FRAMES;
-            }
-        }
-        // And the bound is reached rather than merely safe: a number larger than any layout's spends
-        // memory on nothing, and one smaller refuses on the device instead of counting.
-        assert_eq!(largest, bound);
+        let longest = FRAMES.align_down(MAX_FRAMES).expect("a timeline");
+        let tiles: Vec<u32> = crate::config::named_canvases()
+            .expect("the named canvases")
+            .into_iter()
+            .map(|(_, canvas)| {
+                let request = request(longest, canvas.width, canvas.height);
+                rules
+                    .segment_of(&rules.cover(&request).expect("a layout"))
+                    .expect("a segment packing")
+                    .extent
+                    .video_tiles
+            })
+            .collect();
+        assert!(tiles.iter().all(|tiles| *tiles <= bound), "{tiles:?}");
+        assert_eq!(tiles.iter().max(), Some(&bound));
     }
 
     #[test]
@@ -3200,9 +3153,7 @@ mod tests {
         let conditions = [packing::Condition {
             role: packing::Role::FirstFrame,
             frame: Some(packing::Frame {
-                canvas: crate::config::Canvas {
-                    short_edge: 768,
-                    aspect: (16, 9),
+                canvas: Canvas {
                     width: 1344,
                     height: 768,
                 },
@@ -3210,9 +3161,7 @@ mod tests {
             }),
             audio_samples: 0,
         }];
-        let canvas = crate::config::Canvas {
-            short_edge: 768,
-            aspect: (16, 9),
+        let canvas = proto::video::Canvas {
             width: 1344,
             height: 768,
         };
@@ -3229,9 +3178,7 @@ mod tests {
         // condition: the encoder cuts it into 17-frame clips and drops the last one's tail, so 30
         // frames are 7 latent frames. Counting it with the generated rule would give 0 - 30 is not
         // `17n + 5` - and every later draw of the request would move by the whole condition.
-        let canvas = crate::config::Canvas {
-            short_edge: 768,
-            aspect: (16, 9),
+        let canvas = proto::video::Canvas {
             width: 1344,
             height: 768,
         };
@@ -3245,11 +3192,7 @@ mod tests {
         }];
         let rule = layouts();
         let raster = packing::latent_raster(&canvas).expect("the canvas' raster");
-        let latents = rule
-            .config
-            .clip
-            .latent_frames(30)
-            .expect("a clip of 30 frames");
+        let latents = FRAMES.latent_frames(30);
         assert!(latents > 1, "the condition is more than a still");
         assert_eq!(
             rule.condition_elements(&conditions, &canvas),
@@ -3487,9 +3430,6 @@ mod tests {
         assert_eq!(conditions[0].role, packing::Role::FirstFrame);
         let frame = conditions[0].frame.expect("a keyframe carries its pixels");
         assert_eq!((frame.canvas.width, frame.canvas.height), (832, 480));
-        // A canvas is the short edge and the exact aspect, as `canvas_of` reduces one.
-        assert_eq!(frame.canvas.short_edge, 480);
-        assert_eq!(frame.canvas.aspect, (26, 15));
         assert_eq!(frame.num_frames, 1);
         assert_eq!(conditions[1].role, packing::Role::Reference);
         // A reference clip's frame count is a *generated* count, `17n + 5`: the fixture asks for 22,
@@ -3497,7 +3437,7 @@ mod tests {
         // count H3 generates, and a fixture stating one would test a stream the model cannot serve.
         let clip = conditions[1].frame.expect("a clip has pixels").num_frames;
         assert_eq!(clip, 22);
-        assert_eq!(clip, packing::align_num_frames(clip));
+        assert!(FRAMES.is_legal(clip));
         assert_eq!(conditions[1].audio_samples, 24_000);
         assert!(
             conditions[2].frame.is_none(),
@@ -3522,7 +3462,7 @@ mod tests {
                 let frames = if frame.num_frames <= 1 {
                     1
                 } else {
-                    packing::video_latent_frames(frame.num_frames).unwrap()
+                    FRAMES.latent_frames(frame.num_frames)
                 };
                 u64::from(frames) * u64::from(raster.height) * u64::from(raster.width) * channels
             })
@@ -3558,8 +3498,7 @@ mod tests {
         };
         let conditions = conditions_of(&request);
         let canvas = canvas_of_raster(832, 480).unwrap();
-        let segments =
-            packing::condition_segments(&conditions, &canvas, layouts().config.clip).unwrap();
+        let segments = packing::condition_segments(&conditions, &canvas).unwrap();
         let audio: Vec<_> = segments
             .iter()
             .filter(|segment| segment.audio_rows() > 0)
@@ -3734,8 +3673,6 @@ mod tests {
         let segment = packing::segment_packing(
             124,
             &Canvas {
-                short_edge: 768,
-                aspect: (7, 4),
                 width: 1344,
                 height: 768,
             },
@@ -3759,7 +3696,7 @@ mod tests {
         let conditions = conditions_of(&request);
         let declared = rule.condition_elements(&conditions, &canvas);
         assert_eq!(layout.condition_elements, declared);
-        let segments = packing::condition_segments(&conditions, &canvas, rule.config.clip).unwrap();
+        let segments = packing::condition_segments(&conditions, &canvas).unwrap();
         assert_eq!(segments.len(), conditions.len());
         assert!(packing.padded_tokens > packing.video_rows + packing.audio_rows);
         // With no conditions the video's stream starts at zero.

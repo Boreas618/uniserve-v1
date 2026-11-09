@@ -53,29 +53,37 @@
 //! over as many packed sequences as there are tiles. A tile is a sequence of its own, so nothing
 //! crosses between tiles until the stitch.
 
+use crate::config::FRAMES;
 use crate::{Error, Result, VideoVaeConfig};
 use nn::layers::{Normalization, grid_positions};
 use nn::tiling::{Grid, TemporalClips, TiledDecode};
 
-/// Frames of a decoded clip's tail, which the next clip fades its first body frames against.
+/// The temporal clips the checkpoint's decoder decodes a timeline in, by the frame rule
+/// ([`FRAMES`]).
 ///
-/// The checkpoint's decode constant (the reference's `frame_overlap`); its config does not state it.
-pub const OVERLAP_FRAMES: u32 = 5;
-
-/// The temporal clips the checkpoint's decoder decodes a timeline in.
-///
-/// A clip keeps `clip_length` frames, skips the `token_drop` padding frames the final clip drops,
-/// and ends in an [`OVERLAP_FRAMES`] tail: 25 native frames, so a clip reads `ceil(25 / 4) = 7`
-/// latent frames from `5k` ([`crate::CLIP_LATENTS`] per clip) and its decode's leading surplus is
-/// cropped.
+/// A clip keeps the rule's 17 clip frames, skips the 3 padding frames the final clip drops, and ends
+/// in the rule's 5-frame tail, which the next clip fades its first body frames against (the
+/// reference's `frame_overlap`): 25 native frames, so a clip reads `ceil(25 / 4) = 7` latent frames
+/// from `5k` (the rule's clip latent frames per clip) and its decode's leading surplus is cropped.
 pub fn clips(config: &VideoVaeConfig) -> TemporalClips {
     TemporalClips {
-        body: config.clip_length,
-        padding: config.token_drop,
-        overlap: OVERLAP_FRAMES,
+        body: FRAMES.clip_frames,
+        padding: FRAMES.token_drop(),
+        overlap: FRAMES.tail_frames(),
         temporal: config.temporal_compression(),
-        advance: crate::CLIP_LATENTS,
+        advance: FRAMES.clip_latent_frames,
     }
+}
+
+/// The splices a timeline of `frames` frames is decoded and written in: one per clip of the frame
+/// rule, which refuses a count it does not generate.
+pub fn splices(clips: &TemporalClips, frames: u32) -> Result<Vec<nn::capability::Splice>> {
+    if !FRAMES.is_legal(frames) {
+        return Err(Error::config(format!(
+            "a timeline is a frame count of the frame rule {FRAMES:?}, and {frames} is not"
+        )));
+    }
+    Ok(clips.splices(FRAMES.units(frames))?)
 }
 
 /// The latent raster of one decode call, and the token count it produces.
@@ -968,7 +976,7 @@ impl Decoder for VideoDecoder {
     /// The checkpoint's clip schedule for a timeline of `frames` frames ([`clips`]), which a runner
     /// that bound only a decoder reads as well as the postprocessor does.
     fn splices(&self, frames: u32) -> nn::Result<Vec<nn::capability::Splice>> {
-        clips(&self.config).splices(frames)
+        Ok(splices(&clips(&self.config), frames)?)
     }
 
     /// Clip `k` decodes latent frames `[5k, 5k + 7)`: five that advance the timeline, and two the
@@ -1536,9 +1544,7 @@ pub(crate) mod tests {
     #[test]
     fn the_decoder_table_names_one_position_per_row() {
         let config = video_config();
-        let canvas = crate::config::Canvas {
-            short_edge: 768,
-            aspect: (7, 4),
+        let canvas = proto::video::Canvas {
             width: 1344,
             height: 768,
         };

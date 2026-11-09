@@ -13,14 +13,25 @@
 //!
 //! The executable registers the families it serves ([`Catalogue`]); nothing in the daemon names a
 //! model.
+//!
+//! The family-neutral rules a video request is planned with are stated here once, each
+//! parameterized by values the family states: the frame rule ([`FrameClips`]), the canvas rule
+//! ([`CanvasRule`]), the cover crop ([`cover_crop`]) and the resampled length of a track
+//! ([`resampled_len`]).
 
+mod canvas;
 mod catalogue;
+mod frames;
 mod media;
 mod video;
 mod vocabulary;
 
+pub use canvas::{CanvasError, CanvasRule, CoverCrop, cover_crop};
 pub use catalogue::{Catalogue, ChatProfile, Family, ReasoningFormat, Serving, ToolCallFormat};
-pub use media::{AudioMetadata, FrameRate, ImageMetadata, MediaMetadata, VideoMetadata};
+pub use frames::{ClipSpan, FrameClips, requested_frames};
+pub use media::{
+    AudioMetadata, FrameRate, ImageMetadata, MediaMetadata, VideoMetadata, resampled_len,
+};
 pub use video::{
     ConditionPlan, InputError, Length, Reference, ReferenceKind, VideoBinding, VideoFamily,
     VideoPlan, VideoProcessor, VideoSpec,

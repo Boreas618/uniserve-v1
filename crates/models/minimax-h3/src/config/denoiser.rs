@@ -14,7 +14,6 @@
 use crate::VideoTask;
 use nn::config::Fields;
 
-use crate::encoding::Clip;
 use crate::{Error, Result};
 
 /// The video noise level shift and the audio one, as a schedule states them.
@@ -373,14 +372,6 @@ pub struct DenoiserConfig {
     pub attention: AttentionKind,
     /// The tasks it serves, in canonical order.
     pub tasks: Vec<VideoTask>,
-    /// The clip rule the checkpoint's video VAE states, which every layout needs.
-    ///
-    /// A request's conditions are cut into clips of the encoder's raster, so the rows they occupy -
-    /// and the noise their draws are offset by - follow the VAE's three numbers, not the generated
-    /// timeline's rule. They are read from the same `video_vae` section once, at the loading
-    /// boundary, so the conditioner that encodes a condition and the layout that counts its rows
-    /// cannot disagree about how many latent frames it is.
-    pub clip: Clip,
 }
 
 impl DenoiserConfig {
@@ -390,7 +381,6 @@ impl DenoiserConfig {
         schedule: ScheduleSpec,
         attention: AttentionKind,
         tasks: Vec<VideoTask>,
-        clip: Clip,
     ) -> Result<Self> {
         if tasks.is_empty() {
             return Err(Error::config(
@@ -424,7 +414,6 @@ impl DenoiserConfig {
             schedule,
             attention,
             tasks,
-            clip,
         })
     }
 }
@@ -565,15 +554,6 @@ mod tests {
         assert!(ScheduleSpec::uniform(1, shifts()).is_err());
     }
 
-    /// The released checkpoint's clip rule: 17 frames a clip, 5 latent frames each, 3 dropped.
-    fn clip() -> Clip {
-        Clip {
-            frames: 17,
-            latents: 5,
-            token_drop: 3,
-        }
-    }
-
     #[test]
     fn a_denoiser_refuses_tasks_that_repeat_and_heads_that_disagree_with_its_grid() {
         let transformer = parse(&transformer()).expect("parsed");
@@ -582,7 +562,6 @@ mod tests {
             ScheduleSpec::uniform(50, shifts()).expect("grid"),
             AttentionKind::DENSE,
             vec![VideoTask::TextToVideoAudio, VideoTask::TextToVideoAudio],
-            clip(),
         )
         .expect_err("a repeated task is refused");
         assert!(matches!(error, Error::Config(ref problem) if problem.contains("distinct")));
@@ -594,7 +573,6 @@ mod tests {
             ScheduleSpec::blocks(32, vec![0, 32], 0.999, shifts()).expect("grid"),
             AttentionKind::DENSE,
             vec![VideoTask::ReferenceToVideoAudio],
-            clip(),
         )
         .expect_err("an ordinary DiT has one head");
         assert!(matches!(error, Error::Config(ref problem) if problem.contains("output heads")));

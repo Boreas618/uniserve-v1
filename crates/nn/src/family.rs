@@ -429,11 +429,12 @@ pub trait VideoModel: Send + Sync {
     /// Fails when the configuration states no format for the deployment's element type.
     fn format(&self) -> Result<MediaFormat>;
 
-    /// The frames of the least legal timeline that lasts at least `seconds`.
+    /// The frames of the least legal timeline that lasts at least `seconds`; a duration shorter
+    /// than the shortest timeline lasts the shortest.
     ///
     /// # Errors
     ///
-    /// Fails when `seconds` is no positive duration or shorter than the shortest timeline.
+    /// Fails when `seconds` is no positive duration.
     fn timeline(&self, seconds: f64) -> Result<u32>;
 
     /// The frames of each decode unit of a `frames`-frame timeline, in order.

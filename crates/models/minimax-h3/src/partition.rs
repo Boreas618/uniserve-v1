@@ -40,9 +40,9 @@ pub fn condition_rows(config: &Config, task: VideoTask) -> Result<u32> {
     }
     // The frame's rows at the largest canvas the deployment offers: a keyframe is fitted to the
     // generated canvas, so this is its size whatever the request asks for.
-    let frame_rows = crate::config::offered_canvases()
+    let frame_rows = crate::config::named_canvases()?
         .iter()
-        .map(|canvas| crate::packing::latent_raster(canvas).map(|raster| raster.patch_rows()))
+        .map(|(_, canvas)| crate::packing::latent_raster(canvas).map(|raster| raster.patch_rows()))
         .collect::<Result<Vec<u32>>>()?
         .into_iter()
         .max()
@@ -52,13 +52,13 @@ pub fn condition_rows(config: &Config, task: VideoTask) -> Result<u32> {
         VideoTask::FirstLastToVideoAudio => 2 * frame_rows,
         VideoTask::ReferenceToVideoAudio => {
             // A reference **with a soundtrack is a clip** (`an H3 image reference carries no audio`),
-            // so it is `CLIP_FRAMES` pixel frames and the packing's own rule reduces them to latent
-            // frames - not one frame with a track beside it. One latent frame fewer is a capacity
-            // that refuses the request it was derived for.
-            let clip = crate::encoding::Clip::of(&config.video_vae)?;
-            let latents = clip.latent_frames(crate::CLIP_FRAMES)?;
+            // so it is one clip of the frame rule's pixel frames and the packing's own rule reduces
+            // them to latent frames - not one frame with a track beside it. One latent frame fewer
+            // is a capacity that refuses the request it was derived for.
+            let frames = crate::FRAMES.clip_frames;
+            let latents = crate::FRAMES.latent_frames(frames);
             // The track is one clip long, and the packing counts it in latent steps of stereo rows.
-            let samples = crate::CLIP_FRAMES * crate::AUDIO_SAMPLE_RATE / crate::FPS;
+            let samples = frames * crate::AUDIO_SAMPLE_RATE / crate::FPS;
             latents * frame_rows + crate::AUDIO_CHANNELS * samples.div_ceil(crate::AUDIO_HOP)
         }
     };
