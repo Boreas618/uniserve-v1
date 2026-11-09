@@ -40,9 +40,9 @@ use nn::capability::{
 };
 use nn::family::Split;
 use nn::layers::{
-    Attention, Bias, GateBias, GatedActivation, Halves, IndexRows, Linear, Parallel, QkvBias,
-    QkvLinear, QkvNames, QkvSpec, Residual, ResidualStream, RmsNorm, Rotary, Rounding, Sections,
-    VocabParallelEmbedding,
+    Attention, Bias, Gains, GateBias, GatedActivation, Halves, IndexRows, Linear, Parallel,
+    Precision, QkNorm, QkvBias, QkvLinear, QkvNames, QkvSpec, Residual, ResidualStream, RmsNorm,
+    Rotary, RotarySpec, Rounding, Sections, Spectrum, VocabParallelEmbedding,
 };
 use nn::weights::{Scope, WeightLoader};
 use nn::{Arena, Forward, Shape, TensorView, Weight};
@@ -50,8 +50,8 @@ use ops::activation::Activation;
 
 use crate::config::TextEncoderConfig;
 use crate::partition::Partition;
-use crate::positions::{self, Mrope};
-use crate::vision::{BlockRows, ImageTables, Outputs, ROPE_THETA, VisionTower};
+use crate::positions;
+use crate::vision::{self, BlockRows, ImageTables, Outputs, VisionTower};
 use crate::{Error, Result};
 
 /// The component a deployment's fence probes name (`profiling_config.fence_components`): one layer
@@ -168,15 +168,19 @@ impl Plan {
 
 /// The M-RoPE cut of one head: the checkpoint's widths, in rotated elements, interleaved.
 ///
+/// The language layers' rotary spectrum: Qwen3-VL's interleaved M-RoPE over the whole head.
+///
 /// The checkpoint states `mrope_section: [24, 20, 20]` and `mrope_interleaved: true`
-/// (`text_encoder/config.json`, `rope_scaling`). The widths count *frequencies*, and the rotary
-/// operator counts *rotated elements*, so each is doubled; the interleaved cut assigns every
-/// compact frequency the axis `ops::rope::interleaved_axes` gives it (`j % 3` while
-/// `j < widths[a] * 3`), and the contiguous cut is a different coordinate assignment.
-fn sections_of(config: &TextEncoderConfig) -> Result<Sections> {
-    let mrope = Mrope::new(config.mrope_sections, config.head_dim)?;
-    let widths = mrope.widths().map(|width| width * 2);
-    Ok(Sections::new(&widths)?.interleaved())
+/// (`text_encoder/config.json`, `rope_scaling`): the widths count frequencies, and every compact
+/// frequency takes the axis `ops::rope::interleaved_axes` gives it (`j % 3` while
+/// `j < widths[a] * 3`). The reference computes the spectrum in FP32, and so does this one.
+fn spectrum(config: &TextEncoderConfig) -> Result<Spectrum> {
+    Ok(Spectrum::Sectioned {
+        theta: config.rope_theta,
+        dim: config.head_dim,
+        sections: Sections::new(&config.mrope_sections)?,
+        precision: Precision::F32,
+    })
 }
 
 /// The widths one tensor-parallel rank of the text stack holds.
@@ -356,7 +360,6 @@ struct Layer {
     query_norm: Weight,
     /// The keys' per-head normalization.
     key_norm: Weight,
-    rotary: Rotary,
     post_norm: RmsNorm,
     gate: Linear,
     up: Linear,
@@ -366,17 +369,8 @@ struct Layer {
 
 impl Layer {
     /// The layer the module at `scope` states, at `split`'s rank of the tensor-parallel group.
-    ///
-    /// `frequencies` is the stack's one rotary frequency table, which every layer rotates by.
-    fn load(
-        scope: &mut Scope<'_, '_>,
-        config: &TextEncoderConfig,
-        rank: &Rank,
-        split: Split,
-        frequencies: Weight,
-    ) -> Result<Self> {
+    fn load(scope: &mut Scope<'_, '_>, config: &TextEncoderConfig, split: Split) -> Result<Self> {
         let head_dim = u64::from(config.head_dim);
-        let sections = sections_of(config)?;
         let mut attention = scope.scope("self_attn");
         let qkv = QkvLinear::load(
             &mut attention,
@@ -428,18 +422,6 @@ impl Layer {
             output,
             query_norm,
             key_norm,
-            rotary: Rotary::new(
-                frequencies,
-                config.head_dim,
-                rank.query_heads,
-                rank.key_value_heads,
-                config.rms_norm_eps,
-                crate::SPLIT_HALF,
-                1.0,
-            )
-            .map_err(Error::from)?
-            .sectioned(sections)
-            .map_err(Error::from)?,
             post_norm: RmsNorm::load(
                 &mut scope.scope("post_attention_layernorm"),
                 config.hidden_size,
@@ -502,13 +484,16 @@ impl Layer {
             buffers.key,
             buffers.value,
         )?;
-        self.rotary
+        encoder
+            .rotary
             .apply(
                 f,
                 buffers.as_heads(buffers.query, heads.0, encoder.config.head_dim)?,
                 buffers.as_heads(buffers.key, heads.1, encoder.config.head_dim)?,
-                Some(self.query_norm.view()),
-                Some(self.key_norm.view()),
+                Some(Gains {
+                    query: self.query_norm.view(),
+                    key: self.key_norm.view(),
+                }),
                 cosine,
                 sine,
                 buffers.as_heads(buffers.rotated_query, heads.0, encoder.config.head_dim)?,
@@ -565,7 +550,7 @@ pub struct TextEncoder {
     dtype: nn::DType,
     rank: Rank,
     embedding: VocabParallelEmbedding,
-    /// The prompt's M-RoPE factor tables; the layers apply the same factors.
+    /// The stack's one M-RoPE rotary: the prompt's factor tables, and every layer's rotation.
     rotary: Rotary,
     layers: Vec<Layer>,
     tower: VisionTower,
@@ -605,16 +590,26 @@ impl TextEncoder {
             config.hidden_size,
             split,
         )?;
-        // One frequency table rotates the prompt's factors and every layer's.
-        let frequencies = frequencies(loader, config)?;
+        // One rotary turns the prompt's factors and every layer's queries and keys, each head
+        // normalized by its layer's gains in the same launch.
+        let rotary = Rotary::load(
+            &mut loader.scope(format!("{PREFIX}.rotary_emb")),
+            spectrum(config)?,
+            RotarySpec {
+                head_dim: config.head_dim,
+                heads: rank.query_heads,
+                kv_heads: rank.key_value_heads,
+                qk_norm: QkNorm::Fused {
+                    epsilon: config.rms_norm_eps,
+                },
+            },
+        )?;
         let layers = (0..retained)
             .map(|index| {
                 Layer::load(
                     &mut loader.scope(format!("{PREFIX}.layers.{index}")),
                     config,
-                    &rank,
                     split,
-                    frequencies,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -627,24 +622,12 @@ impl TextEncoder {
             )));
         }
         let deepstack_layers = (0..features).collect::<Vec<_>>();
-        let sections = sections_of(config)?;
         Ok(Self {
             config: config.clone(),
             partition: *partition,
             dtype,
             embedding,
-            rotary: Rotary::new(
-                frequencies,
-                config.head_dim,
-                rank.query_heads,
-                rank.key_value_heads,
-                config.rms_norm_eps,
-                crate::SPLIT_HALF,
-                1.0,
-            )
-            .map_err(Error::from)?
-            .sectioned(sections)
-            .map_err(Error::from)?,
+            rotary,
             layers,
             tower: VisionTower::load(loader, &config.vision, dtype)?,
             activation: GatedActivation::new(ACTIVATION, Rounding::Fused, GateBias::None)
@@ -854,7 +837,7 @@ impl TextEncoder {
             inputs.batch.max_kv_len,
             true,
             None,
-            (self.config.head_dim as f32).sqrt().recip(),
+            self.rotary.spectrum().score_scale(self.config.head_dim)?,
         )
         .map_err(Error::from)?;
 
@@ -1050,7 +1033,7 @@ fn write_state(
     let side = BlockRows::position_grid(vision)?;
     let head_dim = BlockRows::head_dim(vision)?;
     let rotary = positions::VisionRotary::new(head_dim)?;
-    let frequencies = positions::inverse_frequencies(head_dim / 2, ROPE_THETA)?;
+    let frequencies = vision::spectrum(vision)?.inverse_frequencies()?;
     let mut index = Vec::new();
     let mut weight = Vec::new();
     let mut cosine = Vec::new();
@@ -1263,20 +1246,6 @@ fn invalid_input(problem: String) -> Error {
     ))))
 }
 
-/// The rotary frequency table: `theta^(-2j/head_dim)` for every rotated frequency, in FP32.
-///
-/// It is computed once here from the configuration (the frequency table is a loading-boundary
-/// value) and published as a retained constant, so the factors op reads it as a
-/// device weight like any other.
-fn frequencies(loader: &mut WeightLoader<'_>, config: &TextEncoderConfig) -> Result<Weight> {
-    let frequencies = positions::inverse_frequencies(config.head_dim, config.rope_theta)?;
-    Ok(loader.scope(format!("{PREFIX}.rotary_emb")).constant_f32(
-        "inv_freq",
-        &[frequencies.len() as u64],
-        &frequencies,
-    )?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1293,15 +1262,13 @@ mod tests {
     #[test]
     fn the_mrope_cut_is_interleaved_and_agrees_with_the_host_rule() {
         let config = config();
-        let sections = sections_of(&config).expect("the checkpoint's sections");
-        assert!(sections.is_interleaved());
+        let Spectrum::Sectioned { sections, .. } = spectrum(&config).expect("the spectrum") else {
+            panic!("the text encoder's spectrum is sectioned");
+        };
         assert_eq!(sections.axes(), 3);
+        assert_eq!(sections.widths(), config.mrope_sections);
         // The checkpoint's widths count frequencies; the operator's count rotated elements.
-        let widths = Mrope::new(config.mrope_sections, config.head_dim)
-            .expect("sections")
-            .widths()
-            .map(|width| width * 2);
-        assert_eq!(sections.widths(), widths);
+        let widths = config.mrope_sections.map(|width| width * 2);
         assert_eq!(
             u64::from(widths.iter().sum::<u32>()),
             u64::from(config.head_dim)
@@ -1450,7 +1417,8 @@ mod tests {
         }
         // The rotary factors are the 2-D rotation of each patch's own coordinates.
         let coordinates = positions::rotary_coordinates(4, 6, merge).expect("coordinates");
-        let frequencies = positions::inverse_frequencies(head_dim / 2, crate::vision::ROPE_THETA)
+        let frequencies = vision::spectrum(&config.vision)
+            .and_then(|spectrum| Ok(spectrum.inverse_frequencies()?))
             .expect("frequencies");
         let rotary = positions::VisionRotary::new(head_dim).expect("a rotary head");
         let columns = (head_dim / 2) as usize;
@@ -1725,7 +1693,8 @@ mod tests {
     #[test]
     fn the_frequency_table_is_the_checkpoints_rotary_recipe() {
         let config = config();
-        let frequencies = crate::positions::inverse_frequencies(config.head_dim, config.rope_theta)
+        let frequencies = spectrum(&config)
+            .and_then(|spectrum| Ok(spectrum.inverse_frequencies()?))
             .expect("the released recipe");
         assert_eq!(frequencies.len(), config.head_dim as usize / 2);
         assert_eq!(frequencies[0], 1.0);

@@ -76,9 +76,8 @@ pub use layers::{
     Cast, CausalPad, Conv1d, Conv3d, ConvGeometry, ConvTranspose1d, CrossFade, Epilogue, FramePad,
     GateBias, GatedActivation, Gelu, GroupNorm, Halves, IndexRows, LayerNorm, Linear, Modulation,
     Moe, Noise, NoiseKey, ParallelLMHead, PcmInterleave, Residual, ResidualStream, RgbBytes,
-    RmsNorm, Rotary, Rotate, Rotation, Rounding, Sampler, SamplerState, Samples, Scale, Sections,
-    SegmentAttention, SegmentTables, Silu, Snake, TRTLLM_WORKSPACE_BYTES, UlyssesExchange,
-    VsaTiles,
+    RmsNorm, Rotary, Rounding, Sampler, SamplerState, Samples, Scale, SegmentAttention,
+    SegmentTables, Silu, Snake, TRTLLM_WORKSPACE_BYTES, UlyssesExchange, VsaTiles,
 };
 pub use ops::PhaseKind;
 pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};

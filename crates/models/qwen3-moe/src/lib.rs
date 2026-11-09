@@ -24,7 +24,7 @@ pub mod model;
 pub mod partition;
 pub mod processing;
 
-pub use config::{Config, RopeScaling, YaRn};
+pub use config::Config;
 pub use model::{LoadOptions, Qwen3Moe};
 pub use partition::Partition;
 

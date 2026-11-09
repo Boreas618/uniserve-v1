@@ -9,7 +9,7 @@
 //! Four kinds of table are derived:
 //!
 //! - the language layers' interleaved M-RoPE coordinates ([`rope_index`]), whose factors the device
-//!   computes from the uploaded positions under the [`Mrope`] cut;
+//!   computes from the uploaded positions under the text encoder's sectioned spectrum;
 //! - the vision tower's 2-D rotary coordinates of a patch grid in merge-block order
 //!   ([`rotary_coordinates`]) and their factors ([`VisionRotary::factors`]);
 //! - the learned position table's bilinear sample of each merged patch ([`position_samples`]), the
@@ -18,7 +18,7 @@
 //!   temporal patch of every grid) and the prompt row each merged vision row takes
 //!   ([`vision_destinations`]).
 //!
-//! The arithmetic is Qwen3-VL's, in its order and precision: frequencies and factors in FP32,
+//! The arithmetic is Qwen3-VL's, in its order and precision: factors in FP32 over the FP32 spectrum,
 //! positions as integers, and the position table's sample coordinates on an FP32 `linspace` whose
 //! step is computed in FP32 (`torch.linspace` over a float32 scalar type).
 
@@ -29,57 +29,6 @@ pub const POSITION_TAPS: u64 = 4;
 
 /// One merged row's bilinear sample: the four learned-table rows it blends, and their weights.
 pub type PositionSamples = (Vec<[i32; 4]>, Vec<[f32; 4]>);
-
-/// The M-RoPE cut of a head's rotation: one width per axis, interleaved.
-///
-/// The checkpoint states `mrope_section: [24, 20, 20]` and `mrope_interleaved: true`: the head's
-/// compact frequency `j` rotates by the coordinate of axis `j % 3` while `j < 24 * 3`, and axis 0
-/// takes every remaining frequency (`ops::rope::interleaved_axes`). Each axis therefore receives
-/// exactly its section width and keeps frequencies from the whole spectrum.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Mrope {
-    widths: [u32; 3],
-    head_dim: u32,
-}
-
-impl Mrope {
-    /// The sections `widths` (frequencies per axis) of a `head_dim`-element head.
-    ///
-    /// The widths must be positive and split half the head, and the axes must be interleaved: H3's
-    /// checkpoint states `mrope_interleaved: true`, and the contiguous cut
-    /// (`ops::rope::FactorsDescriptor::sections`) is a different coordinate assignment.
-    pub fn new(widths: [u32; 3], head_dim: u32) -> Result<Self> {
-        if widths.contains(&0) {
-            return Err(invalid(
-                "Mrope",
-                format!("the M-RoPE sections {widths:?} must be positive"),
-            ));
-        }
-        if !head_dim.is_multiple_of(2) {
-            return Err(invalid(
-                "Mrope",
-                format!("a {head_dim}-element head has no rotation pair"),
-            ));
-        }
-        let covered: u32 = widths.iter().sum();
-        if covered != head_dim / 2 {
-            return Err(invalid(
-                "Mrope",
-                format!(
-                    "the M-RoPE sections {widths:?} cover {covered} frequencies of the {} a \
-                     {head_dim}-element head rotates",
-                    head_dim / 2
-                ),
-            ));
-        }
-        Ok(Self { widths, head_dim })
-    }
-
-    /// The section widths, in frequency order.
-    pub const fn widths(self) -> [u32; 3] {
-        self.widths
-    }
-}
 
 /// The vision tower's 2-D rotary embedding: half of each head by the patch row, half by its column.
 ///
@@ -117,9 +66,9 @@ impl VisionRotary {
 
     /// The FP32 factors of `coordinates`, written into `cosine` and `sine`.
     ///
-    /// `coordinates` holds each patch's `(row, column)` in merge-block order, `frequencies` one
-    /// angle per compact frequency (`inverse_frequencies` of `head_dim / 2`, 18 for a 72-element
-    /// head), and both tables are `[patches, head_dim / 2]`.
+    /// `coordinates` holds each patch's `(row, column)` in merge-block order, `frequencies` the
+    /// tower's repeated spectrum (`nn::layers::Spectrum::Repeated`, one block of `head_dim / 4`
+    /// frequencies per axis, `head_dim / 2` in all), and both tables are `[patches, head_dim / 2]`.
     pub fn factors(
         self,
         coordinates: &[[i64; 2]],
@@ -129,11 +78,11 @@ impl VisionRotary {
     ) -> Result<()> {
         let columns = (self.head_dim / 2) as usize;
         let per_axis = columns / 2;
-        if frequencies.len() != per_axis {
+        if frequencies.len() != columns {
             return Err(invalid(
                 "VisionRotary::factors",
                 format!(
-                    "{} frequencies for the {per_axis} each rotary half of a {}-element head",
+                    "{} frequencies for the {columns} rotated pairs of a {}-element head",
                     frequencies.len(),
                     self.head_dim
                 ),
@@ -149,7 +98,7 @@ impl VisionRotary {
         for (patch, coordinate) in coordinates.iter().enumerate() {
             for frequency in 0..columns {
                 let axis = if frequency < per_axis { 0 } else { 1 };
-                let angle = coordinate[axis] as f32 * frequencies[frequency % per_axis];
+                let angle = coordinate[axis] as f32 * frequencies[frequency];
                 cosine[patch * columns + frequency] = angle.cos();
                 sine[patch * columns + frequency] = angle.sin();
             }
@@ -158,31 +107,9 @@ impl VisionRotary {
     }
 }
 
-/// The checkpoint's rotary frequencies: `theta^(-2j/dim)` for `j` in `0..dim/2`, in FP32.
-///
-/// The reference's `torch.arange(0, dim, 2, dtype=float32) / dim` and `theta ** ...`; the same
-/// values keyed into retained storage as a device weight (`Rotary::frequencies`).
-pub fn inverse_frequencies(dim: u32, theta: f32) -> Result<Vec<f32>> {
-    if !dim.is_multiple_of(2) {
-        return Err(invalid(
-            "inverse_frequencies",
-            format!("a rotary width of {dim} elements has no pair"),
-        ));
-    }
-    if !theta.is_finite() || theta <= 0.0 {
-        return Err(invalid(
-            "inverse_frequencies",
-            format!("the rotary base {theta} is not positive"),
-        ));
-    }
-    Ok((0..dim / 2)
-        .map(|index| 1.0 / theta.powf((2 * index) as f32 / dim as f32))
-        .collect())
-}
-
 /// The `[temporal, height, width]` M-RoPE coordinates of one prompt's tokens.
 ///
-/// Every maximal run of [`Mrope`] placeholders is one vision block and consumes the next grid of
+/// Every maximal run of vision placeholders is one vision block and consumes the next grid of
 /// its kind: `image_grids` for a run of `image_token_id`, `video_grids` for a run of
 /// `video_token_id`. A video grid
 /// `(time, height, width)` covers `time` runs of one time step each, because Qwen3-VL presents
@@ -501,33 +428,13 @@ fn check_len(
 mod tests {
     use super::*;
 
-    const HEAD_DIM: u32 = 128;
-    const THETA: f32 = 5_000_000.0;
     const IMAGE_TOKEN: u32 = 151_655;
     const VIDEO_TOKEN: u32 = 151_656;
-
-    fn mrope() -> Mrope {
-        Mrope::new([24, 20, 20], HEAD_DIM).expect("H3's sections")
-    }
-
-    #[test]
-    fn frequencies_are_the_checkpoints_rotary_base() {
-        let frequencies = inverse_frequencies(HEAD_DIM, THETA).expect("frequencies");
-        assert_eq!(frequencies.len(), 64);
-        // `theta ** 0` is one, and the table decreases geometrically.
-        assert_eq!(frequencies[0], 1.0);
-        for pair in frequencies.windows(2) {
-            assert!(pair[0] > pair[1]);
-        }
-        assert!(inverse_frequencies(HEAD_DIM + 1, THETA).is_err());
-        assert!(inverse_frequencies(HEAD_DIM, 0.0).is_err());
-    }
 
     #[test]
     fn interleaved_sections_cycle_their_axes() {
         // The device's rule takes the section widths in rotated elements, two per frequency.
-        let sections = mrope();
-        let widths = sections.widths();
+        let widths: [u32; 3] = [24, 20, 20];
         let axes = ops::rope::interleaved_axes(&widths.map(|width| width * 2));
         assert_eq!(axes.len(), 64);
         // Each axis owns exactly its section's width of frequencies, counted from the whole
@@ -552,20 +459,12 @@ mod tests {
         }
         // A narrower first section pushes the frequencies it cannot hold onto axis 0: with
         // `[16, 24, 24]` the bound of axis 0 is 48, so 48 itself falls back while 49 and 50 do not.
-        let narrow = Mrope::new([16, 24, 24], HEAD_DIM).expect("sections");
-        let axes = ops::rope::interleaved_axes(&narrow.widths().map(|width| width * 2));
+        let narrow: [u32; 3] = [16, 24, 24];
+        let axes = ops::rope::interleaved_axes(&narrow.map(|width| width * 2));
         assert_eq!(axes[48], 0);
         assert_eq!(axes[49], 1);
         assert_eq!(axes[50], 2);
         assert_eq!(axes[51], 0);
-    }
-
-    #[test]
-    fn sections_must_split_half_the_head() {
-        assert!(Mrope::new([24, 20, 20], HEAD_DIM).is_ok());
-        assert!(Mrope::new([24, 20, 19], HEAD_DIM).is_err());
-        assert!(Mrope::new([0, 32, 32], HEAD_DIM).is_err());
-        assert!(Mrope::new([24, 20, 20], HEAD_DIM + 1).is_err());
     }
 
     #[test]
@@ -710,7 +609,15 @@ mod tests {
     fn vision_rotary_pairs_rows_then_columns() {
         let rotary = VisionRotary::new(72).expect("head width");
         assert_eq!(rotary.per_axis(), 18);
-        let frequencies = inverse_frequencies(36, 10_000.0).expect("frequencies");
+        // The tower's spectrum: 18 frequencies of a 36-channel embedding, once per axis.
+        let frequencies = nn::layers::Spectrum::Repeated {
+            theta: 10_000.0,
+            pairs: 18,
+            axes: 2,
+            precision: nn::layers::Precision::F32,
+        }
+        .inverse_frequencies()
+        .expect("frequencies");
         // One patch at (0, 0) and one at (0, 2).
         let coordinates = [[0, 0], [0, 2]];
         let mut cosine = vec![0.0; 72];

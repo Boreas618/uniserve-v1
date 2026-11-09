@@ -2401,7 +2401,7 @@ impl Denoiser {
         // the operator's `rotated` counts channels (three axes of `2 * rope_freq_dim` = 96) and a
         // factor table is half that (48), so this product is the table's width and not the
         // operator's field. The two numbers differ by two and are named alike.
-        let pairs = u64::from(self.config.transformer.rope_frequency_dim) * 3;
+        let pairs = u64::from(self.transformer.rotary().columns());
         let cosine = arena.tensor(DType::F32, Shape::new(&[tokens, pairs]))?;
         let sine = arena.tensor(DType::F32, Shape::new(&[tokens, pairs]))?;
         self.transformer
@@ -2443,7 +2443,11 @@ impl Denoiser {
             step_index,
             hidden,
             own(tables.get("modulation_indices")?),
-            Factors { cosine, sine },
+            Factors {
+                rotary: self.transformer.rotary(),
+                cosine,
+                sine,
+            },
             visible.as_ref(),
             segments.as_ref(),
             tokens as u32,

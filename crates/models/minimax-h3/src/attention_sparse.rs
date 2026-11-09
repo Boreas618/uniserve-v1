@@ -1,6 +1,5 @@
 use nn::layers::{
-    Bias, Linear, Parallel, Rotary, Sections, SegmentAttention, SegmentTables, UlyssesExchange,
-    VsaTiles,
+    Bias, Linear, Parallel, Rotary, SegmentAttention, SegmentTables, UlyssesExchange, VsaTiles,
 };
 use nn::weights::{Weight, WeightLoader};
 use nn::{Forward, Shape, TensorView};
@@ -25,8 +24,6 @@ pub struct Sparse {
     /// Per-head normalization gains of the query and the key.
     pub query_gain: Weight,
     pub key_gain: Weight,
-    /// The partial rotation of the head.
-    pub rotary: Rotary,
     /// The tile preparation: normalization, rotation, padding and pooling.
     pub tiles: VsaTiles,
     /// The fine attention over the selected tiles of the rows, in the checkpoint's dtype.
@@ -54,7 +51,7 @@ impl Sparse {
         index: u32,
         config: &TransformerConfig,
         rows: u32,
-        rotated_axes: &[u32],
+        rotary: &Rotary,
         tile_rows: u32,
         tile_bound: u32,
         partition: &Partition,
@@ -64,35 +61,13 @@ impl Sparse {
         let hidden = u64::from(config.hidden_size);
         let head = u64::from(config.head_dim);
         let inner = u64::from(config.num_attention_heads) * head;
-        let rotated: u32 = rotated_axes.iter().sum();
-        if rotated == 0 || rotated > config.head_dim || !rotated.is_multiple_of(2) {
-            return Err(Error::config(format!(
-                "{rotated} rotated channels of a {} element head",
-                config.head_dim
-            )));
-        }
+        // The tile preparation turns the leading channels the stack's rotary turns, by the same
+        // factor tables, fused with its own per-head norm.
+        let rotated = rotary.spectrum().rotated();
         let mut attention = loader.scope(&prefix);
         let query_gain = attention.scope("norm_q").tensor("weight", &[head])?;
         let key_gain = attention.scope("norm_k").tensor("weight", &[head])?;
-        let frequencies =
-            crate::attention::frequencies(loader, config, rotated, rotated_axes.len() as u32)?;
-        // The rotation reads *this rank's* heads: under Ulysses the sequence is split across ranks
-        // and each holds `heads / degree` of them (`Partition::denoiser_heads`), so a descriptor that
-        // named the global count would refuse its own query view at any degree above one.
         let local_heads = partition.denoiser_heads(config.num_attention_heads);
-        let rotary = Rotary::new(
-            frequencies,
-            config.head_dim,
-            local_heads,
-            local_heads,
-            config.qk_norm_eps,
-            crate::SPLIT_HALF,
-            1.0,
-        )?
-        .partial(rotated)?
-        // Contiguous sections, not the interleaved cycle: the reference's factors are one block
-        // per coordinate axis (axis 0 first), and the cycle belongs to the text encoder's M-RoPE.
-        .sectioned(Sections::new(rotated_axes)?)?;
         let exchange = match partition.ulysses_degree {
             1 => None,
             degree => Some(UlyssesExchange::new(degree as u64)?),
@@ -141,7 +116,6 @@ impl Sparse {
             )?,
             query_gain,
             key_gain,
-            rotary,
             tiles,
             fine,
             heads: config.num_attention_heads,
@@ -152,19 +126,6 @@ impl Sparse {
             projection: partition.projection,
             rank: partition.sequence_rank as u64,
         })
-    }
-
-    /// The rotary factor tables of `positions` `[3, rows]`, written into the two views.
-    pub fn factors(
-        &self,
-        f: &Forward,
-        positions: TensorView,
-        cosine: TensorView,
-        sine: TensorView,
-    ) -> Result<()> {
-        self.rotary
-            .factors(f, positions, cosine, sine)
-            .map_err(Error::from)
     }
 
     /// Attend `normalized`, this rank's `[rows, hidden]`, and write this rank's `[rows, hidden]`.
@@ -179,7 +140,7 @@ impl Sparse {
         &self,
         f: &Forward,
         normalized: TensorView,
-        factors: Factors,
+        factors: Factors<'_>,
         sizes: TensorView,
         segments: TensorView,
         keep: TensorView,
@@ -261,7 +222,7 @@ impl Sparse {
         &self,
         f: &Forward,
         normalized: TensorView,
-        factors: Factors,
+        factors: Factors<'_>,
         sizes: TensorView,
         segments: TensorView,
         keep: TensorView,

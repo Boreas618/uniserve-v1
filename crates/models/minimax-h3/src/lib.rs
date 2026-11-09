@@ -69,13 +69,6 @@ pub use config::{
     SpatialPadding, TextEncoderConfig, TransformerConfig, UNIFORM_GRID_POINTS, VideoVaeConfig,
     VisionConfig,
 };
-/// The rotation convention every fused normalization-and-rotation in this model uses.
-///
-/// The model rotates **split-half**: coordinate `i` of a rotated span pairs with `i + span / 2`,
-/// and the DiT's rotated span is each head's leading 96 channels. The neox pairing - adjacent
-/// coordinates - is a different arithmetic from the same factor table, so the convention is stated
-/// once here and read by every call site.
-pub const SPLIT_HALF: ops::rope::Rotation = ops::rope::Rotation::Half;
 
 pub use load::load;
 pub use partition::{Component, Partition};

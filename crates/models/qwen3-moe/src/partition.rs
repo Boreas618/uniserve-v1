@@ -151,8 +151,11 @@ mod tests {
                 head_dim: 2,
                 hidden_act: ops::activation::Activation::Silu,
                 rms_norm_eps: 1e-6,
-                rope_theta: 10_000.0,
-                rope_scaling: None,
+                rope: nn::layers::Spectrum::Default {
+                    theta: 10_000.0,
+                    dim: 128,
+                    precision: nn::layers::Precision::F64,
+                },
                 max_position_embeddings: 1,
                 attention_bias: false,
                 tie_word_embeddings: false,

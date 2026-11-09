@@ -27,8 +27,8 @@ use crate::schedule::{Modality, Schedule};
 use crate::{Error, Result};
 
 use nn::layers::{
-    Bias, Epilogue, GateBias, GatedActivation, Halves, Linear, Modulation, Parallel, Residual,
-    ResidualStream, RmsNorm, Rounding, Scale,
+    Bias, Epilogue, GateBias, GatedActivation, Halves, Linear, Modulation, Parallel, Precision,
+    QkNorm, Residual, ResidualStream, RmsNorm, Rotary, RotarySpec, Rounding, Scale, Spectrum,
 };
 use nn::tensor::Backing;
 use nn::weights::{Weight, WeightLoader};
@@ -40,15 +40,22 @@ use ops::gemm::WeightOrder;
 const TRANSFORMER: &str = "models.minimax_h3.denoiser.Transformer";
 const TRANSFORMER_LAYER: &str = "models.minimax_h3.denoiser.TransformerLayer";
 
-/// The rotary width of one head's three axes: `2 * rope_frequency_dim` channels each.
+/// The coordinate axes of a packed row's rotary position: time, height and width.
+const ROTARY_AXES: u32 = 3;
+
+/// The DiT's rotary spectrum: `rope_frequency_dim` frequencies repeated over the three axes.
 ///
-/// The width is the checkpoint's `rope_freq_dim`, not a constant of this module: the reference
-/// builds its rotary embedding as `RotaryEmbedding(2 * rope_frequency_dim)`
-/// and applies that one spectrum to each of the
-/// three coordinates. Three is the model's own count: `position_ids` is
-/// `[3, rows]`, one coordinate for time, height and width.
-pub fn rotated_axes(config: &TransformerConfig) -> [u32; 3] {
-    [2 * config.rope_frequency_dim; 3]
+/// The reference builds its rotary embedding as `RotaryEmbedding(2 * rope_frequency_dim)` and hands
+/// it one axis spanning the whole head, so the same spectrum is evaluated at each of the three
+/// coordinates and the axes' factors are three contiguous blocks of one table; the trailing
+/// channels of a head pass through. The table is evaluated in f64.
+pub fn spectrum(config: &TransformerConfig) -> Spectrum {
+    Spectrum::Repeated {
+        theta: config.rope_theta,
+        pairs: config.rope_frequency_dim,
+        axes: ROTARY_AXES,
+        precision: Precision::F64,
+    }
 }
 
 /// One dilated layer of the stack.
@@ -65,12 +72,18 @@ pub struct Layer {
 }
 
 impl Layer {
-    /// Read layer `index` of a partition.
+    /// Read layer `index` of a partition, turning by the stack's `rotary`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a layer is its index, the stack's configuration, rotary and bounds, the partition \
+                  and the loader"
+    )]
     fn load(
         kind: AttentionKind,
         index: u32,
         config: &TransformerConfig,
         rows: u32,
+        rotary: &Rotary,
         tile_bound: u32,
         partition: &Partition,
         loader: &mut WeightLoader<'_>,
@@ -86,14 +99,7 @@ impl Layer {
                 .scope(format!("{prefix}.norm2"))
                 .tensor("weight", &[hidden])?,
             attention: attention::Layer::load(
-                kind,
-                index,
-                config,
-                rows,
-                &rotated_axes(config),
-                tile_bound,
-                partition,
-                loader,
+                kind, index, config, rows, rotary, tile_bound, partition, loader,
             )?,
             // The checkpoint fuses the feed-forward's value half first and its gate half second.
             gate_up: Linear::load(
@@ -132,7 +138,7 @@ impl Layer {
         out: TensorView,
         modulation: TensorView,
         rows: TensorView,
-        factors: Factors,
+        factors: Factors<'_>,
         visible: Option<&Visible>,
         segments: Option<&Segments>,
         scratch: &Scratch,
@@ -576,9 +582,12 @@ impl Transformer {
         Ok(audio.forward(f, rows, out)?)
     }
 
-    /// The rotary factor tables of the packed rows, from their axis-major positions.
-    ///
-    /// Every layer rotates with the same table, so the first layer's rotary computes them.
+    /// The stack's rotary: its spectrum, and the factor tables every layer turns by.
+    pub const fn rotary(&self) -> &Rotary {
+        &self.rotary
+    }
+
+    /// The rotary factor tables of the packed rows, from their `[3, rows]` axis-major positions.
     pub fn factors(
         &self,
         f: &Forward,
@@ -586,10 +595,7 @@ impl Transformer {
         cosine: TensorView,
         sine: TensorView,
     ) -> Result<()> {
-        let layer = self.layers.first().ok_or_else(|| {
-            Error::Unsupported("an H3 partition with no layers has no rotary".to_owned())
-        })?;
-        layer.attention.factors(f, positions, cosine, sine)
+        Ok(self.rotary.factors(f, positions, cosine, sine)?)
     }
 
     /// The final normalization and one modality's output projection: `hidden` in, velocity out.
@@ -700,6 +706,8 @@ fn borrowed(view: TensorView) -> Result<Weight> {
 pub struct Transformer {
     proj_in: Linear,
     audio_proj_in: Option<Linear>,
+    /// The stack's one rotary embedding, published once and applied by every layer.
+    rotary: Rotary,
     layers: Vec<Layer>,
     norm_out: RmsNorm,
     /// The base form's one output head per modality. A student fuses its heads instead.
@@ -780,8 +788,28 @@ impl Transformer {
         let hidden = u64::from(config.hidden_size);
         let video_in = u64::from(config.video_channels) * 4;
         let audio_in = u64::from(config.audio_channels);
+        // The rotation reads *this rank's* heads: under Ulysses each rank attends `heads / degree`
+        // of them over the whole sequence (`Partition::denoiser_heads`), and every head's query and
+        // key are normalized by the layer's gains before they turn.
+        let local_heads = partition.denoiser_heads(config.num_attention_heads);
+        let rotary = Rotary::load(
+            &mut loader.scope("transformer.rotary_emb"),
+            spectrum(config),
+            RotarySpec {
+                head_dim: config.head_dim,
+                heads: local_heads,
+                kv_heads: local_heads,
+                qk_norm: QkNorm::Fused {
+                    epsilon: config.qk_norm_eps,
+                },
+            },
+        )?;
         let layers = (0..config.num_hidden_layers)
-            .map(|index| Layer::load(kind, index, config, rows, tile_bound, partition, loader))
+            .map(|index| {
+                Layer::load(
+                    kind, index, config, rows, &rotary, tile_bound, partition, loader,
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             // **The four end projections are FP32 parameters at every preset**, because they are
@@ -803,6 +831,7 @@ impl Transformer {
                 Bias::Present,
                 Parallel::None,
             )?),
+            rotary,
             layers,
             norm_out: RmsNorm::load(
                 &mut loader.scope("norm_out.norm"),
@@ -912,7 +941,7 @@ impl Transformer {
         step: TensorView,
         hidden: TensorView,
         rows: TensorView,
-        factors: Factors,
+        factors: Factors<'_>,
         visible: Option<&Visible>,
         segments: Option<&Segments>,
         total_rows: u32,
@@ -933,7 +962,7 @@ impl Transformer {
         step: TensorView,
         hidden: TensorView,
         rows: TensorView,
-        factors: Factors,
+        factors: Factors<'_>,
         visible: Option<&Visible>,
         segments: Option<&Segments>,
         total_rows: u32,

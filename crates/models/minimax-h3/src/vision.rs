@@ -25,7 +25,8 @@
 //! over a `[patches, 2]` position. That is
 //! neither the contiguous nor the interleaved M-RoPE cut, both of which give each axis its own band
 //! of frequencies, so the factors are the runner's tables and
-//! [`crate::positions::VisionRotary::factors`] computes them in the reference's FP32 formulas.
+//! [`crate::positions::VisionRotary::factors`] computes them in the reference's FP32 formulas over the
+//! tower's [`spectrum`].
 //!
 //! ## Precision
 //!
@@ -52,8 +53,8 @@
 use nn::capability::ImageInput;
 use nn::family::Split;
 use nn::layers::{
-    Attention, Bias, Gelu, LayerNorm, Linear, Parallel, PositionInterpolate, QkvBias, QkvLinear,
-    QkvNames, QkvSpec, Residual, Rotate,
+    Attention, Bias, Gelu, LayerNorm, Linear, Parallel, PositionInterpolate, Precision, QkNorm,
+    QkvBias, QkvLinear, QkvNames, QkvSpec, Residual, Rotary, RotarySpec, Spectrum,
 };
 use nn::weights::{Scope, WeightLoader};
 use nn::{Arena, Forward, Shape, TensorView, Weight};
@@ -66,7 +67,31 @@ use crate::{Error, Result};
 const LAYER_NORM_EPS: f32 = 1e-6;
 
 /// The 2-D rotary frequency base (`ROPE_THETA` in the reference).
-pub const ROPE_THETA: f32 = 10_000.0;
+const ROPE_THETA: f32 = 10_000.0;
+
+/// The two coordinate axes of a patch's rotary position: its row and its column.
+const ROTARY_AXES: u32 = 2;
+
+/// The tower's rotary spectrum: `head_dim / 4` frequencies, repeated for the row and the column.
+///
+/// The reference builds one `RotaryEmbedding(head_dim / 2)` and evaluates its whole spectrum at
+/// each of the two coordinates, so each axis repeats the same band in its own block of the table.
+/// It computes the spectrum in FP32, and so does this one.
+pub fn spectrum(config: &VisionConfig) -> Result<Spectrum> {
+    let head_dim = BlockRows::head_dim(config)?;
+    if !head_dim.is_multiple_of(4) {
+        return Err(invalid(
+            "VisionTower",
+            format!("a {head_dim}-element head does not split into two even rotary halves"),
+        ));
+    }
+    Ok(Spectrum::Repeated {
+        theta: ROPE_THETA,
+        pairs: head_dim / 4,
+        axes: ROTARY_AXES,
+        precision: Precision::F32,
+    })
+}
 
 /// The checkpoint's tensor names under the text encoder's component.
 const PREFIX: &str = "model.visual";
@@ -491,18 +516,16 @@ impl Block {
         )?;
 
         // Both projections rotate by the patch's own 2-D factors; nothing normalizes them.
-        for (unrotated, rotated) in [
-            (buffers.query, buffers.rotated_query),
-            (buffers.key, buffers.rotated_key),
-        ] {
-            tower.rotate.apply(
-                f,
-                buffers.as_heads(unrotated, heads, head_dim)?,
-                image.cosine,
-                image.sine,
-                buffers.as_heads(rotated, heads, head_dim)?,
-            )?;
-        }
+        tower.rotary.apply(
+            f,
+            buffers.as_heads(buffers.query, heads, head_dim)?,
+            buffers.as_heads(buffers.key, heads, head_dim)?,
+            None,
+            image.cosine,
+            image.sine,
+            buffers.as_heads(buffers.rotated_query, heads, head_dim)?,
+            buffers.as_heads(buffers.rotated_key, heads, head_dim)?,
+        )?;
 
         // One sequence per time step, packed in one launch: the key bound is every step together
         // and the longest row is one step, so a video block of several steps launches as an image.
@@ -672,7 +695,8 @@ pub struct VisionTower {
     /// The query/key row counts of one dense bidirectional call; its key bound is the grid's.
     heads: u32,
     head_dim: u32,
-    rotate: Rotate,
+    /// The 2-D rotation of every block's queries and keys, by the factor tables the host prepared.
+    rotary: Rotary,
     layers: Vec<Block>,
     /// The layers whose hidden state a DeepStack merger reads, in checkpoint order.
     deepstack_layers: Vec<usize>,
@@ -736,6 +760,16 @@ impl VisionTower {
             &[u64::from(config.num_position_embeddings), hidden],
         )?;
         let merger = Merger::load(&mut tower.scope("merger"), config, false)?;
+        let rotary = Rotary::load(
+            &mut tower.scope("rotary_pos_emb"),
+            spectrum(config)?,
+            RotarySpec {
+                head_dim,
+                heads,
+                kv_heads: heads,
+                qk_norm: QkNorm::None,
+            },
+        )?;
         Ok(Self {
             deepstack_layers: deepstack_layers(config)?,
             patch,
@@ -743,8 +777,7 @@ impl VisionTower {
             position_grid,
             heads,
             head_dim,
-            rotate: Rotate::new(u64::from(head_dim), u64::from(heads), crate::SPLIT_HALF)
-                .map_err(Error::from)?,
+            rotary,
             layers,
             merger,
             deepstack,
@@ -831,7 +864,7 @@ impl VisionTower {
             rows.patches,
             false,
             None,
-            (self.head_dim as f32).sqrt().recip(),
+            self.rotary.spectrum().score_scale(self.head_dim)?,
         )
         .map_err(Error::from)?;
 

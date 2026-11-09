@@ -9,39 +9,10 @@
 //! architecture this crate serves, together with its rotary recipe (plain or YaRN).
 
 use nn::config::Fields;
+use nn::layers::Spectrum;
 use ops::activation::Activation;
 
 use crate::{Error, Result};
-
-/// A YaRN rotary recipe, the only scaled recipe a Qwen3 checkpoint may use.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct YaRn {
-    /// The context extension factor the checkpoint declares.
-    ///
-    /// Recorded, not applied: the table is built from `max_position_embeddings /
-    /// original_max_position_embeddings`, which is transformers' rule; vLLM uses this factor. The
-    /// two agree for a checkpoint that states consistent numbers, and the choice is a recorded
-    /// divergence from one reference (`specs/model-library.md`, D10).
-    pub factor: f32,
-    /// The context length the recipe was fitted to.
-    pub original_max_position_embeddings: u32,
-    /// The attention scaling, when the checkpoint declares one.
-    pub attention_factor: Option<f32>,
-    /// The high-frequency correction boundary.
-    pub beta_fast: f32,
-    /// The low-frequency correction boundary.
-    pub beta_slow: f32,
-    /// The YaRN magnitude scale, when declared.
-    pub mscale: Option<f32>,
-    /// The all-dimension magnitude scale, when declared.
-    pub mscale_all_dim: Option<f32>,
-    /// Whether the recipe truncates the correction at the boundaries; read and, like `factor`,
-    /// recorded rather than applied (D10).
-    pub truncate: bool,
-}
-
-/// The rotary recipe of the checkpoint: plain positions when `None`.
-pub type RopeScaling = Option<YaRn>;
 
 /// Immutable numerical parameters of one Qwen3-MoE checkpoint.
 ///
@@ -69,10 +40,8 @@ pub struct Config {
     pub hidden_act: Activation,
     /// RMSNorm epsilon of both pre-norms, the Q/K norms and the final norm.
     pub rms_norm_eps: f32,
-    /// Rotary base frequency.
-    pub rope_theta: f32,
-    /// The scaled rotary recipe, `None` for plain rotary positions.
-    pub rope_scaling: RopeScaling,
+    /// The rotary spectrum: plain or YaRN, over every channel of a head, in f64.
+    pub rope: Spectrum,
     /// The context length the checkpoint was trained for.
     pub max_position_embeddings: u32,
     /// Whether the Q/K/V and output projections carry a bias.
@@ -167,7 +136,7 @@ impl Config {
         let max_position_embeddings = fields
             .optional_count("max_position_embeddings")?
             .unwrap_or(32768);
-        let rotary = Rotary::read(fields, max_position_embeddings)?;
+        let rope = Spectrum::from_hf(fields, head_dim, max_position_embeddings)?;
 
         // Transformers serializes the expert count as `num_local_experts` in newer releases; a
         // checkpoint carrying both must agree.
@@ -228,8 +197,7 @@ impl Config {
             rms_norm_eps: fields
                 .optional_positive("rms_norm_eps")?
                 .map_or(1e-6, |value| value as f32),
-            rope_theta: rotary.theta,
-            rope_scaling: rotary.scaling,
+            rope,
             max_position_embeddings,
             attention_bias: fields.optional_flag("attention_bias")?.unwrap_or(false),
             tie_word_embeddings: fields
@@ -264,136 +232,6 @@ impl Config {
             && !self.mlp_only_layers.contains(&layer)
             && (layer + 1).is_multiple_of(self.decoder_sparse_step)
     }
-}
-
-/// The rotary recipe resolved from the checkpoint's metadata.
-struct Rotary {
-    theta: f32,
-    scaling: RopeScaling,
-}
-
-impl Rotary {
-    /// Resolve `rope_theta`, `rope_scaling`/`rope_parameters` and the partial factor, rejecting the
-    /// recipes this model does not serve.
-    ///
-    /// `rope_parameters` is the newer transformers spelling of the recipe and takes precedence over
-    /// `rope_scaling`; a value either states is read through both in that order.
-    fn read(fields: &Fields<'_>, max_position_embeddings: u32) -> Result<Self> {
-        let scaling = fields.optional_object("rope_scaling")?;
-        let parameters = fields.optional_object("rope_parameters")?;
-        let maps = [parameters.as_ref(), scaling.as_ref()];
-
-        let stated_type = match &scaling {
-            Some(scaling) => scaling.optional_text("type")?,
-            None => None,
-        };
-        let kind = match &parameters {
-            Some(parameters) => parameters.optional_text("rope_type")?,
-            None => None,
-        }
-        .or(stated_type)
-        .unwrap_or("default");
-        if let Some(other) = stated_type
-            && other != kind
-        {
-            return Err(Error::Config(
-                "conflicting rotary type aliases rope_scaling/rope_parameters".to_owned(),
-            ));
-        }
-
-        let theta = match fields.optional_number("rope_theta")? {
-            Some(theta) => Some(theta),
-            None => first(&maps, |map| map.optional_number("rope_theta"))?,
-        }
-        .unwrap_or(10_000.0);
-        if !(theta.is_finite() && theta > 0.0) {
-            return Err(Error::Config(
-                "rope_theta must be finite and positive".to_owned(),
-            ));
-        }
-        let partial = match fields.optional_number("partial_rotary_factor")? {
-            Some(partial) => Some(partial),
-            None => first(&maps, |map| map.optional_number("partial_rotary_factor"))?,
-        }
-        .unwrap_or(1.0);
-        if partial != 1.0 {
-            return Err(Error::Config(
-                "partial rotary positions are not supported".to_owned(),
-            ));
-        }
-
-        let scaling = match kind {
-            "default" => None,
-            "yarn" => Some(yarn(&maps, max_position_embeddings)?),
-            other => {
-                return Err(Error::Config(format!(
-                    "unsupported rotary recipe {other:?}; Qwen3-MoE serves default and yarn"
-                )));
-            }
-        };
-        Ok(Self {
-            theta: theta as f32,
-            scaling,
-        })
-    }
-}
-
-/// The first of `maps` that states a value through `read`.
-fn first<T>(
-    maps: &[Option<&Fields<'_>>],
-    read: impl Fn(&Fields<'_>) -> nn::Result<Option<T>>,
-) -> Result<Option<T>> {
-    for map in maps.iter().flatten() {
-        if let Some(value) = read(map)? {
-            return Ok(Some(value));
-        }
-    }
-    Ok(None)
-}
-
-/// Resolve the YaRN recipe's fields from `maps`, the recipe's objects in precedence order.
-fn yarn(maps: &[Option<&Fields<'_>>], default_original: u32) -> Result<YaRn> {
-    let number = |key: &str| first(maps, |map| map.optional_number(key));
-    let factor = number("factor")?
-        .ok_or_else(|| Error::Config("a yarn rotary recipe requires factor".to_owned()))?
-        as f32;
-    let original = first(maps, |map| {
-        map.optional_index("original_max_position_embeddings")
-    })?
-    .unwrap_or(default_original);
-    let attention_factor = number("attention_factor")?.map(|value| value as f32);
-    let beta_fast = number("beta_fast")?.map_or(32.0, |value| value as f32);
-    let beta_slow = number("beta_slow")?.map_or(1.0, |value| value as f32);
-    let mscale = number("mscale")?.map(|value| value as f32);
-    let mscale_all_dim = number("mscale_all_dim")?.map(|value| value as f32);
-    let truncate = first(maps, |map| map.optional_flag("truncate"))?.unwrap_or(true);
-
-    for (name, value) in [
-        ("factor", factor),
-        ("beta_fast", beta_fast),
-        ("beta_slow", beta_slow),
-    ] {
-        if !(value.is_finite() && value > 0.0) {
-            return Err(Error::Config(format!(
-                "yarn {name} must be finite and positive"
-            )));
-        }
-    }
-    if original == 0 {
-        return Err(Error::Config(
-            "yarn original_max_position_embeddings must be positive".to_owned(),
-        ));
-    }
-    Ok(YaRn {
-        factor,
-        original_max_position_embeddings: original,
-        attention_factor,
-        beta_fast,
-        beta_slow,
-        mscale,
-        mscale_all_dim,
-        truncate,
-    })
 }
 
 #[cfg(test)]
@@ -465,7 +303,7 @@ mod tests {
         assert_eq!(config.num_experts, 128);
         assert!(config.sparse(0) && config.sparse(3));
         assert_eq!(config.hidden_act, Activation::Silu);
-        assert!(config.rope_scaling.is_none());
+        assert!(matches!(config.rope, Spectrum::Default { theta, dim: 128, .. } if theta == 1e6));
     }
 
     #[test]
@@ -498,9 +336,12 @@ mod tests {
         let mut value = complete();
         value["rope_scaling"] = serde_json::json!({"type": "yarn", "factor": 4.0, "original_max_position_embeddings": 4096});
         let config = parse(&value).expect("a supported checkpoint");
-        let yarn = config.rope_scaling.expect("a yarn recipe");
+        let Spectrum::Yarn { yarn, .. } = config.rope else {
+            panic!("a yarn recipe, not {:?}", config.rope);
+        };
         assert_eq!(yarn.factor, 4.0);
         assert_eq!(yarn.original_max_position_embeddings, 4096);
+        assert_eq!(yarn.max_position_embeddings, 40960);
         assert!(yarn.truncate);
     }
 

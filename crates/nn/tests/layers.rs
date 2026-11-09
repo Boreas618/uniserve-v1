@@ -9,8 +9,8 @@
 use nn::{
     Activation, AdaptivePool, Arena, CausalPad, Conv3d, ConvGeometry, DType, DevicePtr, Epilogue,
     Forward, GateBias, GatedActivation, GroupNorm, Halves, KvGroup, KvPlanes, KvView, LayerNorm,
-    Linear, Modulation, Residual, ResidualStream, RmsNorm, Rotary, Rotate, Rotation, Rounding,
-    Scale, Shape, Snake, TensorView, VsaTiles, Weight,
+    Linear, Modulation, Residual, ResidualStream, RmsNorm, Rounding, Scale, Shape, Snake,
+    TensorView, VsaTiles, Weight,
 };
 use ops::gemm::WeightOrder;
 
@@ -292,16 +292,6 @@ fn a_gated_product_reads_halves_and_biases_of_its_output_width() {
 }
 
 #[test]
-fn a_rotary_needs_a_pair_per_head() {
-    let frequencies = weight(&[32]);
-    assert!(Rotary::new(frequencies, 64, 8, 8, 1e-6, Rotation::Half, 0.125).is_ok());
-    assert!(
-        Rotary::new(frequencies, 63, 8, 8, 1e-6, Rotation::Half, 0.125).is_err(),
-        "an odd head dimension has no rotation pair"
-    );
-}
-
-#[test]
 fn a_group_normalization_states_its_groups_and_its_affine_pair() {
     let pad = CausalPad {
         top: 1,
@@ -435,17 +425,6 @@ fn the_audio_layers_hold_their_channels() {
     assert!(AdaptivePool::new(8, 256, 0).is_err());
     // Wider than the descriptor's fields hold.
     assert!(AdaptivePool::new(u64::from(u32::MAX) + 1, 256, 32).is_err());
-}
-
-/// The vision tower's rotation is built from its head geometry alone: the tables are the caller's
-/// and the whole head turns, so a narrower cut or an odd head has no program.
-#[test]
-fn a_vision_rotation_holds_a_head_and_its_heads() {
-    let rotate = Rotate::new(64, 12, Rotation::Half).unwrap();
-    assert_eq!((rotate.head_dim(), rotate.heads()), (64, 12));
-    assert!(Rotate::new(63, 12, Rotation::Half).is_err());
-    assert!(Rotate::new(0, 12, Rotation::Half).is_err());
-    assert!(Rotate::new(64, 0, Rotation::Half).is_err());
 }
 
 /// A layer's planes are the ones its own index names, and the refusal for an index the cache has not

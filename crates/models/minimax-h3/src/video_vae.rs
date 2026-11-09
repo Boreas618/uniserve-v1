@@ -352,7 +352,7 @@ pub fn rotary(config: &VideoVaeConfig) -> Result<(u32, [u32; 3])> {
 /// token, whose coordinates are all zero because they are not placed in space.
 ///
 /// The table is `[3, rows]` F32, axis-major, because the rotation reads one leading coordinate per
-/// axis (`Sections::new(&[16, 16, 16])`): a row-major `[rows, 3]` table would be read transposed and
+/// axis (the decoder's repeated spectrum): a row-major `[rows, 3]` table would be read transposed and
 /// silently rotate every row by another row's angles. Coordinates are in radians — the reference's
 /// cell-centre grid times `2π` — so the raw inverse frequencies give the reference's angle.
 ///
@@ -411,8 +411,8 @@ pub const MINIMUM_OVERLAP: u32 = 64;
 use nn::Forward;
 use nn::layers::{
     Attention, Bias, Cast, ChannelAffine, Epilogue, GateBias, GatedActivation, Halves, IndexRows,
-    LayerNorm, Linear, MergedColumnLinear, Parallel, ResidualStream, RmsNorm, Rotary, Rounding,
-    Sections,
+    LayerNorm, Linear, MergedColumnLinear, Parallel, Precision, QkNorm, ResidualStream, RmsNorm,
+    Rotary, RotarySpec, Rounding, Spectrum,
 };
 use nn::weights::{Weight, WeightLoader};
 use nn::{DType, DecodedMedia, Decoder, Shape, StateTable, TableValues, TensorView};
@@ -656,7 +656,6 @@ impl VideoDecoder {
         let head = config.decoder_attention_head_dim;
         let heads = config.decoder_num_attention_heads;
         let ffn = width * config.decoder_ffn_mult;
-        let (rotated, sections) = rotary(config)?;
         let stitch = crate::decoding::ClipDecoder::new(config)?;
         let out_channels = config.out_channels
             * config.temporal_compression()
@@ -827,22 +826,17 @@ impl VideoDecoder {
             Bias::Present,
             Parallel::None,
         )?;
-        let frequencies = loader.scope("video_vae.rotary_emb").constant_f32(
-            "inv_freq",
-            &[u64::from(rotated / 2)],
-            &inverse_frequencies(config)?,
+        // The checkpoint stores no per-head gain, so the fused norm before the rotation has none.
+        let rotary = Rotary::load(
+            &mut loader.scope("video_vae.rotary_emb"),
+            spectrum(config)?,
+            RotarySpec {
+                head_dim: head,
+                heads,
+                kv_heads: heads,
+                qk_norm: QkNorm::Fused { epsilon },
+            },
         )?;
-        let rotary = Rotary::new(
-            frequencies,
-            head,
-            heads,
-            heads,
-            epsilon,
-            crate::SPLIT_HALF,
-            1.0,
-        )?
-        .partial(rotated)?
-        .sectioned(Sections::new(&sections)?)?;
         let rows = tile.rows();
         // `[0, rows, ...]`, one offset per tile of the widest canvas and the end.
         let offsets = (0..=most_tiles)
@@ -908,32 +902,19 @@ fn restore_tables(config: &VideoVaeConfig) -> Result<(Vec<f32>, Vec<f32>)> {
     Ok((config.latents_std.clone(), config.latents_mean.clone()))
 }
 
-/// The decoder's inverse frequencies, in the order its factors are laid out.
+/// The decoder's rotary spectrum: one axis's frequencies repeated over the three axes, in f64.
 ///
-/// One block per axis, each over that axis's own width: the reference builds its embedding with
-/// `head_dim · ratio / 3` and reuses those frequencies on all three axes, so axis `a` takes
-/// `theta^(-2k / sections[a])` rather than a slice of one wider spectrum.
-///
-/// This is the table the decoder publishes as `video_vae.rotary_emb.inv_freq` and the one a
-/// factors comparison reads: a wrong spectrum or a wrong axis order is a phase drift that no shape,
-/// element type or key check can see, so the numbers have to be comparable without a device.
-pub fn inverse_frequencies(config: &VideoVaeConfig) -> Result<Vec<f32>> {
-    let (rotated, sections) = rotary(config)?;
-    let mut table = Vec::new();
-    for width in &sections {
-        for pair in 0..width / 2 {
-            let exponent = 2.0 * f64::from(pair) / f64::from(*width);
-            table.push(f64::from(config.decoder_rope_theta).powf(-exponent) as f32);
-        }
-    }
-    if table.len() as u32 != rotated / 2 {
-        return Err(Error::config(format!(
-            "the rotary table of {rotated} channels holds {} frequencies, {} expected",
-            table.len(),
-            rotated / 2
-        )));
-    }
-    Ok(table)
+/// The reference builds its embedding with `head_dim · ratio / 3` and reuses those frequencies on
+/// all three axes, so axis `a` takes `theta^(-2k / sections[a])` rather than a slice of one wider
+/// spectrum; the decoder publishes it as `video_vae.rotary_emb.inv_freq`.
+pub fn spectrum(config: &VideoVaeConfig) -> Result<Spectrum> {
+    let (_, sections) = rotary(config)?;
+    Ok(Spectrum::Repeated {
+        theta: config.decoder_rope_theta,
+        pairs: sections[0] / 2,
+        axes: sections.len() as u32,
+        precision: Precision::F64,
+    })
 }
 
 impl VideoDecoder {

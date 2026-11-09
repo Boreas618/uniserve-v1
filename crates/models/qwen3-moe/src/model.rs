@@ -38,8 +38,8 @@
 
 use nn::capability::{CausalLm, KvView, TokenBatch};
 use nn::layers::{
-    Attention, GatedActivation, Halves, Linear, Moe, ParallelLMHead, QkvLinear, ResidualStream,
-    RmsNorm, Rotary, TRTLLM_WORKSPACE_BYTES, VocabParallelEmbedding,
+    Attention, Gains, GatedActivation, Halves, Linear, Moe, ParallelLMHead, QkvLinear,
+    ResidualStream, RmsNorm, Rotary, TRTLLM_WORKSPACE_BYTES, VocabParallelEmbedding,
 };
 use nn::weights::Weight;
 use nn::{Arena, DType, Forward, Shape, Strides, TensorView};
@@ -87,6 +87,8 @@ pub struct Qwen3Moe {
     partition: Partition,
     dtype: DType,
     embedding: VocabParallelEmbedding,
+    /// The stack's one rotary embedding: every layer turns by the factors it computes once.
+    rotary: Rotary,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     head: ParallelLMHead,
@@ -102,7 +104,8 @@ pub(crate) struct DecoderLayer {
 }
 
 /// The attention sublayer: the query, key and value projections, the row-parallel output
-/// projection, the fused Q/K normalization and rotation, and the paged attention layer.
+/// projection, the per-head gains of the stack's fused Q/K normalization and rotation, and the
+/// paged attention layer.
 ///
 /// Each projection is held in the representation its checkpoint stores, which the loader decided;
 /// the forward calls the same methods either way.
@@ -111,7 +114,6 @@ pub(crate) struct AttentionLayer {
     pub(crate) o_proj: Linear,
     pub(crate) q_norm: Weight,
     pub(crate) k_norm: Weight,
-    pub(crate) rotary: Rotary,
     pub(crate) attention: Attention,
 }
 
@@ -301,6 +303,7 @@ impl Qwen3Moe {
         partition: Partition,
         dtype: DType,
         embedding: VocabParallelEmbedding,
+        rotary: Rotary,
         layers: Vec<DecoderLayer>,
         norm: RmsNorm,
         head: ParallelLMHead,
@@ -323,6 +326,7 @@ impl Qwen3Moe {
             partition,
             dtype,
             embedding,
+            rotary,
             layers,
             norm,
             head,
@@ -389,7 +393,7 @@ impl Qwen3Moe {
         let sine = f
             .arena
             .tensor(DType::F32, Shape::new(&[tokens, extents.factors]))?;
-        self.factors(f, batch.positions, cosine, sine)?;
+        self.rotary.factors(f, batch.positions, cosine, sine)?;
         let buffers = Buffers::reserve(f.arena, extents, self.dtype)?;
         // The decode kernel splits a row's keys over CTAs and counts their arrivals in the head of
         // this workspace, and it needs that count at zero on entry and resets it itself. The arena
@@ -414,6 +418,7 @@ impl Qwen3Moe {
                     batch,
                     cache,
                     index,
+                    &self.rotary,
                     &buffers,
                     residual,
                     buffers.residual,
@@ -441,21 +446,6 @@ impl Qwen3Moe {
     pub const fn page_tokens(&self) -> u32 {
         self.options.page_tokens
     }
-
-    /// The rotary factor tables of `positions`, written into `cosine` and `sine`.
-    fn factors(
-        &self,
-        f: &Forward,
-        positions: TensorView,
-        cosine: TensorView,
-        sine: TensorView,
-    ) -> Result<()> {
-        self.layers[0]
-            .attention
-            .rotary
-            .factors(f, positions, cosine, sine)
-            .map_err(Error::from)
-    }
 }
 
 impl DecoderLayer {
@@ -478,6 +468,7 @@ impl DecoderLayer {
         batch: &TokenBatch,
         cache: &KvView<'_>,
         layer: usize,
+        rotary: &Rotary,
         buffers: &Buffers,
         residual: TensorView,
         residual_out: TensorView,
@@ -505,7 +496,7 @@ impl DecoderLayer {
 
         f.fenced(ATTENTION, format_args!("layers.{layer}.self_attn"), || {
             self.attention.forward(
-                f, batch, cache, layer, buffers, normalized, cosine, sine, update,
+                f, batch, cache, layer, rotary, buffers, normalized, cosine, sine, update,
             )
         })?;
 
@@ -542,6 +533,7 @@ impl AttentionLayer {
         batch: &TokenBatch,
         cache: &KvView<'_>,
         layer: usize,
+        rotary: &Rotary,
         buffers: &Buffers,
         normalized: TensorView,
         cosine: TensorView,
@@ -558,13 +550,15 @@ impl AttentionLayer {
         let key_rotated = buffers.key_rotated.reshape(key.shape);
         let attended = buffers.attended.reshape(query.shape);
 
-        self.rotary
+        rotary
             .apply(
                 f,
                 query,
                 key,
-                Some(self.q_norm.view()),
-                Some(self.k_norm.view()),
+                Some(Gains {
+                    query: self.q_norm.view(),
+                    key: self.k_norm.view(),
+                }),
                 cosine,
                 sine,
                 query_rotated,

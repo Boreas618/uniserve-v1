@@ -40,7 +40,7 @@
 //! the prepared rows stays in the checkpoint's dtype like the dense one.
 
 use nn::family::Split;
-use nn::layers::{Attention as Flash, Bias, Linear, Parallel, Rotary, Sections, UlyssesExchange};
+use nn::layers::{Attention as Flash, Bias, Gains, Linear, Parallel, Rotary, UlyssesExchange};
 use nn::weights::{Weight, WeightLoader};
 use nn::{Forward, Shape, TensorView};
 
@@ -241,46 +241,20 @@ impl Layer {
         index: u32,
         config: &TransformerConfig,
         rows: u32,
-        rotated_axes: &[u32],
+        rotary: &Rotary,
         tile_bound: u32,
         partition: &Partition,
         loader: &mut WeightLoader<'_>,
     ) -> Result<Self> {
         match kind {
             crate::config::AttentionKind::Dense => Ok(Self::Dense(Box::new(Dense::load(
-                index,
-                config,
-                rows,
-                rotated_axes,
-                partition,
-                loader,
+                index, config, rows, rotary, partition, loader,
             )?))),
             crate::config::AttentionKind::Sparse { tile, .. } => Ok(Self::Sparse(Box::new(
                 crate::attention_sparse::Sparse::load(
-                    index,
-                    config,
-                    rows,
-                    rotated_axes,
-                    tile,
-                    tile_bound,
-                    partition,
-                    loader,
+                    index, config, rows, rotary, tile, tile_bound, partition, loader,
                 )?,
             ))),
-        }
-    }
-
-    /// The rotary factor tables of `positions`: one table serves either kind.
-    pub fn factors(
-        &self,
-        f: &Forward,
-        positions: TensorView,
-        cosine: TensorView,
-        sine: TensorView,
-    ) -> Result<()> {
-        match self {
-            Self::Dense(dense) => dense.factors(f, positions, cosine, sine),
-            Self::Sparse(sparse) => sparse.factors(f, positions, cosine, sine),
         }
     }
 
@@ -307,7 +281,7 @@ impl Layer {
         &self,
         f: &Forward,
         normalized: TensorView,
-        factors: Factors,
+        factors: Factors<'_>,
         visible: Option<&Visible>,
         segments: Option<&crate::attention_sparse::Segments>,
         scratch: &LayerScratch,
@@ -374,9 +348,11 @@ pub struct Visible {
     pub key_rows: u32,
 }
 
-/// The rotary factor tables of one forward, `[tokens, rotated / 2]` FP32 each.
+/// The stack's rotary and its factor tables of one forward, `[tokens, rotated / 2]` FP32 each.
 #[derive(Clone, Copy)]
-pub struct Factors {
+pub struct Factors<'a> {
+    /// The stack's one rotary: every layer turns by it, with its own per-head gains.
+    pub rotary: &'a Rotary,
     /// The cosine table of the packed rows.
     pub cosine: TensorView,
     /// The sine table of the packed rows.
@@ -389,7 +365,6 @@ pub struct Dense {
     key: HeadProjection,
     value: HeadProjection,
     output: Linear,
-    rotary: Rotary,
     query_gain: Weight,
     key_gain: Weight,
     attention: Flash,
@@ -403,13 +378,13 @@ pub struct Dense {
 impl Dense {
     /// Read layer `index`'s dense attention of a DiT partition.
     ///
-    /// `rows` is the layout's packed row capacity, which bounds the keys of one call; `rotated` is
-    /// the rotated width of a head and `sections` its axes, in that order.
+    /// `rows` is the layout's packed row capacity, which bounds the keys of one call; `rotary` is
+    /// the stack's, whose spectrum states the softmax scale.
     pub fn load(
         index: u32,
         config: &TransformerConfig,
         rows: u32,
-        rotated_axes: &[u32],
+        rotary: &Rotary,
         partition: &Partition,
         loader: &mut WeightLoader<'_>,
     ) -> Result<Self> {
@@ -417,36 +392,11 @@ impl Dense {
         let hidden = u64::from(config.hidden_size);
         let head = u64::from(config.head_dim);
         let inner = u64::from(config.num_attention_heads) * head;
-        let rotated: u32 = rotated_axes.iter().sum();
-        if rotated == 0 || rotated > config.head_dim || !rotated.is_multiple_of(2) {
-            return Err(Error::config(format!(
-                "{rotated} rotated channels of a {} element head",
-                config.head_dim
-            )));
-        }
 
         let mut attention = loader.scope(&prefix);
         let query_gain = attention.scope("norm_q").tensor("weight", &[head])?;
         let key_gain = attention.scope("norm_k").tensor("weight", &[head])?;
-        let frequencies =
-            crate::attention::frequencies(loader, config, rotated, rotated_axes.len() as u32)?;
-        // The rotation reads *this rank's* heads: under Ulysses the sequence is split across ranks
-        // and each holds `heads / degree` of them (`Partition::denoiser_heads`), so a descriptor that
-        // named the global count would refuse its own query view at any degree above one.
         let local_heads = partition.denoiser_heads(config.num_attention_heads);
-        let rotary = Rotary::new(
-            frequencies,
-            config.head_dim,
-            local_heads,
-            local_heads,
-            config.qk_norm_eps,
-            crate::SPLIT_HALF,
-            1.0,
-        )?
-        .partial(rotated)?
-        // Contiguous sections, not the interleaved cycle: the reference's factors are one block
-        // per coordinate axis (axis 0 first), and the cycle belongs to the text encoder's M-RoPE.
-        .sectioned(Sections::new(rotated_axes)?)?;
 
         let head_projection = |loader: &mut WeightLoader<'_>, name: &str| {
             HeadProjection::load(
@@ -468,7 +418,6 @@ impl Dense {
                 Bias::Absent,
                 Parallel::None,
             )?,
-            rotary,
             query_gain,
             key_gain,
             attention: Flash::dense(
@@ -478,7 +427,7 @@ impl Dense {
                 rows,
                 false,
                 None,
-                1.0 / (config.head_dim as f32).sqrt(),
+                rotary.spectrum().score_scale(config.head_dim)?,
             )?,
             exchange: exchange(partition),
             projection: partition.projection,
@@ -488,26 +437,13 @@ impl Dense {
         })
     }
 
-    /// The rotary factor tables of `positions` `[3, rows]`, written into the two views.
-    pub fn factors(
-        &self,
-        f: &Forward,
-        positions: TensorView,
-        cosine: TensorView,
-        sine: TensorView,
-    ) -> Result<()> {
-        self.rotary
-            .factors(f, positions, cosine, sine)
-            .map_err(Error::from)
-    }
-
     /// Attend `normalized` `[rows, hidden]` of this rank and write `[rows, hidden]`.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         f: &Forward,
         normalized: TensorView,
-        factors: Factors,
+        factors: Factors<'_>,
         visible: &Visible,
         scratch: &Scratch,
         out: TensorView,
@@ -567,8 +503,8 @@ impl Dense {
     }
 
     /// Normalize and rotate every head of the query and the key.
-    fn rotate(&self, f: &Forward, factors: Factors, scratch: &Scratch) -> Result<()> {
-        Ok(self.rotary.apply(
+    fn rotate(&self, f: &Forward, factors: Factors<'_>, scratch: &Scratch) -> Result<()> {
+        Ok(factors.rotary.apply(
             f,
             scratch
                 .query
@@ -576,8 +512,10 @@ impl Dense {
             scratch
                 .key
                 .reshape(heads(scratch.key, self.local_heads, self.head_dim)),
-            Some(self.query_gain.view()),
-            Some(self.key_gain.view()),
+            Some(Gains {
+                query: self.query_gain.view(),
+                key: self.key_gain.view(),
+            }),
             factors.cosine,
             factors.sine,
             scratch.rotated_query.reshape(heads(
@@ -678,66 +616,6 @@ fn heads(view: TensorView, count: u32, head_dim: u32) -> Shape {
     ])
 }
 
-/// The rotary frequency table of `rotated` channels: one spectrum, repeated once per axis.
-///
-/// The reference builds `RotaryEmbedding(2 * rope_frequency_dim, theta=...)` and hands it **one
-/// axis spanning the whole head**, so the same `rope_frequency_dim` frequencies are evaluated at
-/// each of the three coordinate axes and the factors of the axes are three contiguous blocks of one
-/// table (`[axes, tokens, dim / 2]`, flattened to `[tokens, 3 * rope_frequency_dim]`). A single
-/// spectrum spread over all `rotated` channels instead gives the second and third axes frequencies
-/// that differ from the reference's by a constant factor of `theta^(-1/3)` and `theta^(-2/3)` at
-/// every pair - a slow phase drift with position, and not a mistake any shape or dtype check can
-/// see.
-///
-/// The table is a constant of the checkpoint's rope parameters, published through the loader like
-/// any other weight, so the operator reads it as a device weight.
-pub(crate) fn frequencies(
-    loader: &mut WeightLoader<'_>,
-    config: &TransformerConfig,
-    rotated: u32,
-    axes: u32,
-) -> Result<Weight> {
-    let pairs = config.rope_frequency_dim;
-    if pairs == 0 || axes == 0 || rotated != 2 * pairs * axes {
-        return Err(Error::config(format!(
-            "{rotated} rotated channels are not {axes} axes of {pairs} frequency pairs"
-        )));
-    }
-    // Every layer of both attention paths reads the one table: it is named once for the model,
-    // and the retained key's digest of its values keeps another construction from sharing it.
-    let half = u64::from(rotated / 2);
-    Ok(loader.scope("transformer.rotary_emb").constant_f32(
-        "inv_freq",
-        &[half],
-        &table(pairs, axes, config.rope_theta),
-    )?)
-}
-
-/// The factor table of `axes` coordinate axes: one spectrum of `pairs` frequencies, repeated.
-///
-/// The spectrum is the reference's `RotaryEmbedding(2 * pairs)` inverse frequency (`theta **
-/// (arange(0, dim, 2) / dim)`, `dim = 2 * pairs`, inverted), and the repetition is its flattening
-/// of `[axes, tokens, dim / 2]` factors into `[tokens, axes * dim / 2]`: pair `a * pairs + i` is
-/// the `i`-th frequency of axis `a`, so every axis rotates with the same spectrum and the axes
-/// occupy contiguous blocks.
-///
-/// Public because it is a host statement a comparison can read: the spectrum and the axes' order
-/// are the two facts a rotation can have wrong while every shape, type and count stays right, and
-/// only a table compares them.
-pub fn table(pairs: u32, axes: u32, theta: f32) -> Vec<f32> {
-    let spectrum: Vec<f32> = (0..pairs)
-        .map(|index| {
-            let exponent = 2.0 * f64::from(index) / (2.0 * f64::from(pairs));
-            (f64::from(theta).powf(-exponent)) as f32
-        })
-        .collect();
-    let mut table = Vec::with_capacity((pairs * axes) as usize);
-    for _ in 0..axes {
-        table.extend_from_slice(&spectrum);
-    }
-    table
-}
-
 /// The exchange of a partition's sequence degree, absent when one rank holds the sequence.
 fn exchange(partition: &Partition) -> Option<UlyssesExchange> {
     match partition.ulysses_degree {
@@ -750,33 +628,4 @@ fn exchange(partition: &Partition) -> Option<UlyssesExchange> {
 pub(crate) fn width(channels: u64) -> Result<u32> {
     u32::try_from(channels)
         .map_err(|_| Error::config(format!("{channels} channels exceed a projection's width")))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::table;
-
-    /// Every coordinate axis rotates with the same spectrum, in its own contiguous block.
-    ///
-    /// The reference hands its rotary one axis spanning the whole head and flattens the three
-    /// axes' factors into one table, so a table whose blocks differ
-    /// would rotate the height and width coordinates with the wrong frequencies - which is a phase
-    /// drift with position, not a shape or dtype error.
-    #[test]
-    fn each_coordinate_axis_owns_a_block_of_the_same_spectrum() {
-        let pairs = 16;
-        let axes = 3;
-        let table = table(pairs, axes, 10_000.0);
-        assert_eq!(table.len(), (pairs * axes) as usize);
-        for axis in 1..axes {
-            assert_eq!(
-                &table[(axis * pairs) as usize..((axis + 1) * pairs) as usize],
-                &table[0..pairs as usize],
-                "axis {axis} does not carry axis 0's spectrum"
-            );
-        }
-        // A rotary's first frequency is unity and the rest fall with the pair index.
-        assert_eq!(table[0], 1.0);
-        assert!(table[1] < 1.0 && table[1] > table[15]);
-    }
 }
