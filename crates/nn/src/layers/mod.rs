@@ -71,7 +71,10 @@ pub use position::PositionInterpolate;
 pub use posterior::Posterior;
 pub use residual::{Axpby, Cast, Residual, Scale};
 pub use rgb::RgbBytes;
-pub use rope::{Gains, Precision, QkNorm, Rotary, RotarySpec, Sections, Spectrum, Yarn};
+pub use rope::{
+    Gains, Normalization, Precision, QkNorm, Rotary, RotarySpec, Sections, Spectrum, Yarn,
+    grid_positions,
+};
 pub use rows::IndexRows;
 pub use sampler::{Candidates, Sampler, SamplerState, Samples};
 pub use transpose::Transpose;

@@ -54,6 +54,7 @@
 //! crosses between tiles until the stitch.
 
 use crate::{Error, Result, VideoVaeConfig};
+use nn::layers::{Normalization, grid_positions};
 use nn::tiling::{Grid, TemporalClips, TiledDecode};
 
 /// Frames of a decoded clip's tail, which the next clip fades its first body frames against.
@@ -212,38 +213,22 @@ pub fn positions(canvas: &Canvas) -> Result<Vec<f32>> {
             "a decoder canvas of no frame, row or column has no position".to_owned(),
         ));
     }
+    // The reference builds cell-centre coordinates in `[-1, 1)` and multiplies them by `2π` at its
+    // rotary call, both in float32 (its meshgrid is float32 and its caller multiplies in the same
+    // type); the frequency table is the raw inverse frequencies, so the `2π` is folded in here.
+    let voxels = grid_positions(
+        &[canvas.frames, canvas.height, canvas.width],
+        Normalization::CellCentre,
+        std::f32::consts::TAU,
+    )?;
+    // Each axis's row is the voxels' coordinates, then zeros for the register and zero rows.
     let rows = canvas.rows() as usize;
+    let cells = voxels.len() / 3;
     let mut table = vec![0.0f32; 3 * rows];
-    let mut row = 0;
-    for frame in 0..canvas.frames {
-        for height in 0..canvas.height {
-            for column in 0..canvas.width {
-                let coordinates = [
-                    axis(frame, canvas.frames),
-                    axis(height, canvas.height),
-                    axis(column, canvas.width),
-                ];
-                for (channel, value) in coordinates.iter().enumerate() {
-                    table[channel * rows + row] = *value;
-                }
-                row += 1;
-            }
-        }
+    for (axis, coordinates) in voxels.chunks_exact(cells).enumerate() {
+        table[axis * rows..][..cells].copy_from_slice(coordinates);
     }
     Ok(table)
-}
-
-/// One cell-centre coordinate of an axis of `size`, in radians.
-///
-/// The reference builds cell-centre coordinates in `[-1, 1)` and multiplies them by `2π` at its
-/// rotary call; the frequency table here is the raw inverse frequencies, so the angle comes out as
-/// `2π · position · frequency` with the `2π` folded into the table the runner uploads.
-fn axis(index: u32, size: u32) -> f32 {
-    // The reference's own arithmetic: the cell centre and the `2π` turn are both float32 (its
-    // meshgrid is float32 and its caller multiplies by `2π` in the same type), so one rounding
-    // stands between the reference and this table rather than two.
-    let centre = (index as f32 + 0.5) / size as f32;
-    std::f32::consts::TAU * (2.0 * centre - 1.0)
 }
 
 /// The tile extent of the checkpoint's decoder, in output pixels.

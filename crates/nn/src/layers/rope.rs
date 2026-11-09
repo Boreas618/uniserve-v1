@@ -938,9 +938,79 @@ impl Rotary {
     }
 }
 
+/// How [`grid_positions`] places the cells of one axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Normalization {
+    /// Cell `i` of an axis of `n` cells sits at its centre in `[-1, 1)`: `2 · (i + 0.5) / n − 1`,
+    /// evaluated in f32 as `(i + 0.5) / n` first.
+    CellCentre,
+}
+
+/// The rotary coordinates of every cell of a grid of `extents`, axis-major `[axes, cells]`.
+///
+/// Cells run in raster order (the first axis slowest), and each coordinate is the cell's
+/// normalized position along its axis multiplied by `scale` in f32: a spectrum of raw inverse
+/// frequencies then turns a cell by `scale · position · frequency` (a `2π` scale gives the angle
+/// of a reference that multiplies its grid by `2π` at the rotary call). Axis-major because a
+/// repeated or sectioned rotary reads one leading coordinate per axis.
+///
+/// # Errors
+///
+/// An axis of no cells.
+pub fn grid_positions(
+    extents: &[u32],
+    normalization: Normalization,
+    scale: f32,
+) -> Result<Vec<f32>> {
+    if extents.contains(&0) {
+        return Err(Error::shape(
+            "grid_positions",
+            format!("a grid of {extents:?} cells has an empty axis"),
+        ));
+    }
+    let coordinate = |index: u32, size: u32| match normalization {
+        Normalization::CellCentre => {
+            let centre = (index as f32 + 0.5) / size as f32;
+            scale * (2.0 * centre - 1.0)
+        }
+    };
+    let cells: usize = extents.iter().map(|extent| *extent as usize).product();
+    let mut table = vec![0.0_f32; extents.len() * cells];
+    for cell in 0..cells {
+        // The cell's index along each axis, the last axis fastest.
+        let mut rest = cell;
+        for (axis, extent) in extents.iter().enumerate().rev() {
+            let size = *extent as usize;
+            table[axis * cells + cell] = coordinate((rest % size) as u32, *extent);
+            rest /= size;
+        }
+    }
+    Ok(table)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A grid's coordinates are each cell's centre along its axis, scaled, axis-major and in raster
+    /// order.
+    #[test]
+    fn grid_positions_are_scaled_cell_centres_in_raster_order() {
+        let table = grid_positions(&[2, 3], Normalization::CellCentre, 1.0).unwrap();
+        // Two rows of three columns: the rows' coordinates, then the columns'.
+        assert_eq!(&table[..6], &[-0.5, -0.5, -0.5, 0.5, 0.5, 0.5]);
+        let third = (0.5_f32 / 3.0) * 2.0 - 1.0;
+        assert_eq!(table[6], third);
+        assert_eq!(table[7], 0.0);
+        assert_eq!(table[8], -third);
+        assert_eq!(&table[9..], &table[6..9]);
+
+        // The scale multiplies the f32 coordinate after the centre is formed.
+        let turned =
+            grid_positions(&[3], Normalization::CellCentre, std::f32::consts::TAU).unwrap();
+        assert_eq!(turned[0], std::f32::consts::TAU * third);
+        assert!(grid_positions(&[2, 0], Normalization::CellCentre, 1.0).is_err());
+    }
 
     /// A plain spectrum is the f64 power series, its first pair unity and the rest falling.
     #[test]
