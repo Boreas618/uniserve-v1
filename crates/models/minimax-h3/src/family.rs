@@ -97,7 +97,7 @@ impl VideoCheckpoint for H3Checkpoint {
         // **The partition serves the tasks of the network the deployment places.** One partition
         // carries one network's block set and condition capacity, so a deployment places one of
         // the release's two networks.
-        let tasks = served_tasks(&config.serving(), placement.components.as_ref(), &self.root)?;
+        let tasks = served_tasks(&config.tasks(), placement.components.as_ref(), &self.root)?;
 
         // **The prompt capacity is the deployment's, and the denoiser's packed prefix holds it.**
         // A layout reserves one row per prompt token, so the text capacity the model is built with

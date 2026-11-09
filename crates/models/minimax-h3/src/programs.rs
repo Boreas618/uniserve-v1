@@ -169,7 +169,7 @@ impl Deployment {
     /// checkpoint** - a base checkpoint holding no `transformer_ref` would be reported as serving
     /// `ref2va`, and the deployment that believed it would load no such partition.
     pub fn checkpoint_tasks(root: &std::path::Path) -> Result<Vec<crate::VideoTask>> {
-        Ok(Config::read(root, None)?.serving())
+        Ok(Config::read(root, None)?.tasks())
     }
 
     /// The clip lengths a **generated** timeline may have, computed from the packing's rule rather

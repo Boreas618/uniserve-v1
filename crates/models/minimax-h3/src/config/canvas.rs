@@ -85,20 +85,7 @@ pub const NAMED_CANVASES: [Canvas; 6] = [
     },
 ];
 
-impl Canvas {
-    /// Whether this canvas's raster is the ruled one for its class and ratio.
-    pub fn is_ruled(&self) -> bool {
-        // Both sides on the VAE's 32-pixel grid, and the raster's ratio the one the request names
-        // within the one 32-pixel step the rule rounds: the short edge starts at the class's and
-        // the area is capped, so a wide ratio's short side is shorter than the class's edge.
-        let (aspect_width, aspect_height) = (i64::from(self.aspect.0), i64::from(self.aspect.1));
-        let (width, height) = (i64::from(self.width), i64::from(self.height));
-        self.width.is_multiple_of(super::CANVAS_MULTIPLE)
-            && self.height.is_multiple_of(super::CANVAS_MULTIPLE)
-            && (width * aspect_height - height * aspect_width).abs()
-                <= i64::from(super::CANVAS_MULTIPLE) * aspect_width.max(aspect_height)
-    }
-}
+impl Canvas {}
 
 #[cfg(test)]
 mod tests {
@@ -112,7 +99,6 @@ mod tests {
             // Every canvas survives the video VAE's 16x spatial compression on a whole number of
             // 2x2 transformer patches.
             assert_eq!(canvas.short_edge, CANVAS_SHORT_EDGE);
-            assert!(canvas.is_ruled(), "{}", canvas.name());
         }
     }
 

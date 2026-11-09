@@ -202,28 +202,6 @@ impl Config {
         Ok(config)
     }
 
-    /// The DiT a deployment places, when the checkpoint holds only one.
-    ///
-    /// A base release holds both partitions and a deployment places one, which the deployment
-    /// names; an export holds exactly one.
-    pub fn only_denoiser(&self) -> Option<(Dit, &DenoiserConfig)> {
-        let mut dits = self.denoisers.iter();
-        match (dits.next(), dits.next()) {
-            (Some((dit, config)), None) => Some((*dit, config)),
-            _ => None,
-        }
-    }
-
-    /// The tasks a deployment of this checkpoint can serve: those of the network it holds.
-    ///
-    /// A distilled export serves every task of the partition its student replaces: the student
-    /// serves every task of the partition's network. Which
-    /// partition a deployment runs is the deployment page's statement, so a release that holds both
-    /// serves the tasks of the one the page places.
-    pub fn serving(&self) -> Vec<VideoTask> {
-        self.tasks()
-    }
-
     /// The tasks the checkpoint can serve: each DiT's, in canonical order.
     pub fn tasks(&self) -> Vec<VideoTask> {
         let mut tasks = Vec::new();
@@ -241,13 +219,6 @@ impl Config {
             }
         }
         tasks
-    }
-
-    /// The DiT that serves `task`, when the checkpoint holds one.
-    pub fn denoiser_for(&self, task: VideoTask) -> Option<(Dit, &DenoiserConfig)> {
-        self.denoisers
-            .iter()
-            .find_map(|(dit, config)| config.tasks.contains(&task).then_some((*dit, config)))
     }
 
     /// Check the components against each other and against the timeline.
@@ -560,10 +531,8 @@ mod tests {
                 VideoTask::ReferenceToVideoAudio,
             ]
         );
-        let (dit, denoiser) = config
-            .denoiser_for(VideoTask::ReferenceToVideoAudio)
-            .expect("the reference task");
-        assert_eq!(dit, Dit::Reference);
+        let denoiser = &config.denoisers[&Dit::Reference];
+        assert!(denoiser.tasks.contains(&VideoTask::ReferenceToVideoAudio));
         assert_eq!(denoiser.attention, AttentionKind::Dense);
         assert_eq!(
             denoiser.schedule,
@@ -576,7 +545,7 @@ mod tests {
             )
             .expect("the grid")
         );
-        assert!(config.only_denoiser().is_none());
+        assert_eq!(config.denoisers.len(), 2);
     }
 
     #[test]
@@ -595,8 +564,8 @@ mod tests {
         let mut sidecars = sidecars(&layout);
         sidecars.scheduler = json(r#"{"shift": 10.0}"#);
         let config = Config::normalize(&layout, &sidecars).expect("a DMD export");
-        let (dit, denoiser) = config.only_denoiser().expect("one partition");
-        assert_eq!(dit, Dit::Base);
+        assert_eq!(config.denoisers.keys().collect::<Vec<_>>(), [&Dit::Base]);
+        let denoiser = &config.denoisers[&Dit::Base];
         assert_eq!(denoiser.schedule.steps(), 8);
         assert_eq!(
             denoiser.attention,
@@ -626,8 +595,7 @@ mod tests {
         let mut sidecars = sidecars(&layout);
         sidecars.scheduler = json(r#"{"shift": 10.0}"#);
         let config = Config::normalize(&layout, &sidecars).expect("a dense export");
-        let (_, denoiser) = config.only_denoiser().expect("one partition");
-        assert_eq!(denoiser.attention, AttentionKind::Dense);
+        assert_eq!(config.denoisers[&Dit::Base].attention, AttentionKind::Dense);
     }
 
     #[test]
@@ -698,17 +666,6 @@ mod tests {
         assert!(
             matches!(error, Error::Config(ref problem) if problem.contains("disagree")),
             "{error}"
-        );
-    }
-
-    #[test]
-    fn a_denoiser_is_found_by_the_task_it_serves() {
-        let config = released_config();
-        assert_eq!(
-            config
-                .denoiser_for(VideoTask::FirstLastToVideoAudio)
-                .map(|(dit, _)| dit),
-            Some(Dit::Base)
         );
     }
 }

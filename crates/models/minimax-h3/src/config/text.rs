@@ -335,16 +335,6 @@ impl TextEncoderConfig {
     pub const fn query_width(&self) -> u32 {
         self.num_attention_heads * self.head_dim
     }
-
-    /// The width of the key and value projection of one rank.
-    pub const fn key_value_width(&self) -> u32 {
-        self.num_key_value_heads * self.head_dim
-    }
-
-    /// The width of one M-RoPE axis's rotation: `2 * sections[axis]` channels of each head.
-    pub fn mrope_axis_width(&self, axis: usize) -> u32 {
-        self.mrope_sections[axis] * 2
-    }
 }
 
 #[cfg(test)]
@@ -408,9 +398,8 @@ mod tests {
         assert_eq!(config.num_checkpoint_layers, 64);
         assert_eq!(config.num_retained_layers, RETAINED_LAYERS);
         assert_eq!(config.mrope_sections, [24, 20, 20]);
-        assert_eq!(config.mrope_axis_width(0), 48);
         assert_eq!(config.query_width(), 8192);
-        assert_eq!(config.key_value_width(), 1024);
+        assert_eq!(config.num_key_value_heads * config.head_dim, 1024);
         assert_eq!(config.vision.depth, 27);
         assert_eq!(config.vision.deepstack_visual_indexes, vec![8, 16, 24]);
         assert_eq!(config.pixels.mean, [0.5, 0.5, 0.5]);
