@@ -7,14 +7,16 @@ use std::sync::Arc;
 
 use ipc::UpdateFailure;
 use program_server::program::Programs;
-use program_server::{Descriptors, PrepareRequest, Program, ProgramRequest, Target};
+use program_server::{
+    CoverRequest, Descriptors, PrepareRequest, Program, ProgramRequest, ProgramSlot, Target,
+};
 use worker::host::HostTask;
 
 use super::MainProcess;
 use super::precopy::Precopy;
 use crate::programs::modules::{Install, ModuleWork, Unavailable, UnavailableCell};
 use crate::programs::select::{
-    Candidates, built_keys, declared_program, descriptor_keys, key_fits_phase, merge_request,
+    Candidates, Routes, built_keys, covered_slots, descriptor_keys, key_fits_phase, merge_request,
     resolve_slots, select_programs,
 };
 
@@ -27,7 +29,8 @@ pub(super) enum Advance {
     Retry(Vec<Arc<HostTask<ModuleWork>>>),
     /// Every program this host built for the operator has been tried.
     Exhausted(String),
-    /// The programs are the daemon's, so there is no candidate to move to.
+    /// The operator has no candidate list to move along: the daemon named its programs, or the
+    /// Program Server's coverage chose the package of each of its keys.
     Named,
     /// The store could not be read, so no candidate can be chosen.
     Failed(String),
@@ -112,15 +115,9 @@ impl MainProcess {
     ) -> std::result::Result<(Programs, Candidates), UpdateFailure> {
         let invalid = |reason: String| UpdateFailure::Precopy { reason };
         let listing = self.listing().map_err(invalid)?;
+        // A store that has built nothing yet is not refused here: the recorded operators are routed
+        // to the packages that cover their keys after this resolution (`advance_listing`).
         let chosen = select_programs(&listing.packages, &self.targets);
-        if chosen.is_empty() && named.is_empty() {
-            return Err(invalid(format!(
-                "the precopy named no kernel program and this host has built none: the store's \
-                 listing holds {} package(s) and none has a module for this host's targets, so \
-                 there is nothing to install",
-                listing.packages.len()
-            )));
-        }
         tracing::info!(
             packages = listing.packages.len(),
             operators = chosen.len(),
@@ -176,61 +173,31 @@ impl MainProcess {
         resolve_slots(named, &chosen, &built, &listing.packages).map_err(invalid)
     }
 
-    /// One operator's program from this host's store, for a walk that named an operator the
-    /// deployment left unnamed.
+    /// The slots that fill `operator` with `keys`, as the Program Server routes them: each key to
+    /// the installed package whose manifest covers it for this host's targets.
     ///
-    /// The store's listing is the authority for what this host can launch: its packages are the
-    /// modules built for this host's targets. The first candidate of the operator is taken - the
-    /// deployment expressed no preference, so the store's order decides - and `None` says the store
-    /// describes nothing for the operator, which the caller states as a missing package rather than
-    /// a missing key.
-    pub(super) fn borrow_program(
+    /// The engine reads no manifest, so which package can build a key is the Program Server's
+    /// answer, asked once per operator. A key no installed package covers is a refusal naming the
+    /// operator and the key.
+    pub(super) fn cover_keys(
         &self,
         operator: &str,
-    ) -> std::result::Result<Option<(program_server::program::ProgramSlot, Program)>, String> {
-        let listing = self.listing()?;
-        for (op, ordered) in select_programs(&listing.packages, &self.targets) {
-            if ops::operator_name(&op) != Some(operator) {
-                continue;
-            }
-            let Some((backend, revision)) = ordered.first() else {
-                continue;
-            };
-            return Ok(Some((
-                program_server::program::ProgramSlot {
-                    op,
-                    phase: None,
-                    part: None,
-                },
-                Program {
-                    backend: backend.clone(),
-                    revision: *revision,
-                    arguments: Default::default(),
-                },
-            )));
-        }
-        // A package the store holds and has never built is invisible to `select_programs`, and an
-        // operator no model forward reaches is exactly that: `slot_commit` is launched by the
-        // runner's own step, so no capture it is missing from comes before the walk names it, and
-        // nothing in the deployment can name its package either. The store holds the package and
-        // declares the keys it can build (`[kernel.descriptors]`), so installing it and asking for
-        // the walked key is what builds it - otherwise a generation refuses an operator the store
-        // holds, which reads as a store defect and is not one.
-        match declared_program(&self.listing()?.packages, operator) {
-            Some((op, backend, revision)) => Ok(Some((
-                program_server::program::ProgramSlot {
-                    op,
-                    phase: None,
-                    part: None,
-                },
-                Program {
-                    backend,
-                    revision,
-                    arguments: Default::default(),
-                },
-            ))),
-            None => Ok(None),
-        }
+        keys: Vec<String>,
+    ) -> std::result::Result<(Vec<(ProgramSlot, Program)>, Routes), String> {
+        let request = CoverRequest {
+            op: operator.to_owned(),
+            targets: self.targets.clone(),
+            keys,
+        };
+        let coverage = self
+            .programs
+            .lock()
+            .map_err(|_| "the Program Server client was poisoned".to_owned())?
+            .cover(&request)
+            .map_err(|error| {
+                format!("asking the Program Server which package covers {operator}'s keys: {error}")
+            })?;
+        covered_slots(operator, &coverage)
     }
 
     /// The module-load tasks one generation needs, one per device.
@@ -242,10 +209,15 @@ impl MainProcess {
     /// So `required` carries the keys the devices' recorded walks reported, and every one of them is
     /// asked of the Program Server in this one admission; a key a device's walk still finds missing
     /// joins them and the installs are admitted again.
+    ///
+    /// A slot in `routes` was filled by the Program Server's coverage, and its package is asked for
+    /// exactly the keys routed to it: the keys of its operator are divided between the packages that
+    /// cover them, so no package is asked for another's.
     pub(super) fn admit_installs(
         &mut self,
         programs: &Programs,
         required: &BTreeMap<String, BTreeSet<String>>,
+        routes: &Routes,
     ) -> std::result::Result<Admitted, UpdateFailure> {
         let invalid = |reason: String| UpdateFailure::Precopy { reason };
         // The Program Server's listing, read at most once and only when a program's keys cannot be
@@ -267,6 +239,13 @@ impl MainProcess {
                     slot.op
                 )));
             };
+            if let Some(routed) = routes.get(slot) {
+                let group = groups
+                    .entry((program.backend.clone(), program.revision))
+                    .or_default();
+                merge_request(group, slot, program, routed.clone());
+                continue;
+            }
             // A generation may hold two packages of one operator, one per phase: a key belongs to
             // the phase its own text states, so a phase's slot takes only the keys of its phase and
             // no package is ever asked for a key it cannot build. A key that states no phase fits
@@ -438,14 +417,12 @@ impl MainProcess {
                 (covers, candidate)
             })
             .collect();
-        // The stated order: coverage of the required keys, then the highest revision, then the
-        // backend name. Coverage only orders; it never excludes a candidate.
+        // The stated order: coverage of the required keys, then the store's preference
+        // (`program_server::preference`). Coverage only orders; it never excludes a candidate.
         remaining.sort_by(|left, right| {
-            right
-                .0
-                .cmp(&left.0)
-                .then_with(|| right.1.1.cmp(&left.1.1))
-                .then_with(|| left.1.0.as_str().cmp(right.1.0.as_str()))
+            right.0.cmp(&left.0).then_with(|| {
+                program_server::preference((&left.1.0, left.1.1), (&right.1.0, right.1.1))
+            })
         });
         let Some((covers, next)) = remaining.into_iter().next() else {
             // Every candidate is spent: the refusal names the operator, what it could not serve and
@@ -476,7 +453,7 @@ impl MainProcess {
                 arguments: Default::default(),
             },
         );
-        match self.admit_installs(&precopy.programs, &precopy.required) {
+        match self.admit_installs(&precopy.programs, &precopy.required, &precopy.routes) {
             Ok((tasks, unavailable)) => {
                 precopy.unavailable = unavailable;
                 Advance::Retry(tasks)

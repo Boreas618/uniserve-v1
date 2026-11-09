@@ -1,6 +1,7 @@
 //! Which programs a generation installs: the candidates this host's store built for each
 //! operator, the deployment's named programs resolved against them into slots, the descriptor keys
-//! each package is asked for, and the operators an update changed.
+//! each package is asked for, the slots the Program Server's coverage routes an operator's keys to,
+//! and the operators an update changed.
 
 use std::collections::BTreeMap;
 
@@ -81,37 +82,9 @@ pub(crate) fn changed_operators(prepared: &Programs, serving: &Programs) -> Vec<
     changed
 }
 
-/// The package the store holds for `operator` when none of them is built: the highest revision,
-/// ties broken by the backend's name so the choice is the same on every run.
-///
-/// This is the answer for an operator nothing has captured yet - the package that states its keys
-/// in its manifest but has no module for this host - which is what `select_programs` cannot see,
-/// because its own question is what this host can launch *now*.
-pub(crate) fn declared_program(
-    packages: &[program_server::protocol::ListedPackage],
-    operator: &str,
-) -> Option<(String, String, u32)> {
-    let mut declared: Vec<&program_server::protocol::ListedPackage> = packages
-        .iter()
-        .filter(|package| ops::operator_name(&package.op) == Some(operator))
-        .collect();
-    declared.sort_by(|left, right| {
-        right
-            .revision
-            .cmp(&left.revision)
-            .then_with(|| left.backend.cmp(&right.backend))
-    });
-    let package = declared.first()?;
-    Some((
-        package.op.clone(),
-        package.backend.clone(),
-        package.revision,
-    ))
-}
-
 /// The programs each operator of `packages` may be installed from, in the order the precopy's walk
-/// tries them: the highest installed revision first, and among equal revisions the backend whose
-/// name sorts first, so the order is the same on every run.
+/// tries them: [`program_server::preference`], the highest installed revision first and among equal
+/// revisions the backend whose name sorts first, so the order is the same on every run.
 ///
 /// Nothing here excludes a candidate. An operator built under two backends is one slot with two
 /// programs rather than one choice made before the walk, because whether a program can serve a
@@ -189,12 +162,10 @@ pub(crate) fn select_programs(
         }
         held.push(candidate);
     }
+    // The store's one preference rule, which the Program Server's `cover` applies as well.
     for candidates in chosen.values_mut() {
         candidates.sort_by(|left, right| {
-            right
-                .1
-                .cmp(&left.1)
-                .then_with(|| left.0.as_str().cmp(right.0.as_str()))
+            program_server::preference((&left.0, left.1), (&right.0, right.1))
         });
     }
     chosen
@@ -259,7 +230,8 @@ pub(crate) fn key_fits_phase(key: &str, phase: Option<PhaseKind>) -> bool {
     }
 }
 
-/// The slots one operator's generation holds, from what each candidate package built for this host.
+/// The slots one operator's generation holds, from the keys each package holds for this host: the
+/// keys it built, or the keys the Program Server's coverage chose it for (`covered_slots`).
 ///
 /// An operator may be built by more than one package - `paged_attention` is fa4's prefill module and
 /// trtllm's decode one - and then its generation must hold *both*: the forward launches a prefill
@@ -575,6 +547,63 @@ pub(crate) fn resolve_slots(
         }
     }
     Ok((programs, candidates))
+}
+
+/// The descriptor keys of each slot the Program Server's coverage filled, by slot: the keys its
+/// package was chosen for, and the only keys that package is asked to build for the operator.
+pub(crate) type Routes = BTreeMap<ProgramSlot, Vec<String>>;
+
+/// The slots one operator's keys fill, from the Program Server's answer to `cover`.
+///
+/// The answer names, for every key, the one installed package whose manifest covers it, so the
+/// packages' key sets are disjoint and each package holds the keys it alone is asked for. They go
+/// through [`operator_slots`] as a built store's packages do: one package fills the operator's
+/// single slot; several are split by phase when each claims phases of its own, and otherwise each
+/// holds a part slot of its own descriptors. Every slot's route is its package's keys of the
+/// slot's phase.
+///
+/// A key no installed package covers refuses the operator, naming every such key: the forward
+/// launches it, and no package of this store could build it.
+pub(crate) fn covered_slots(
+    op: &str,
+    coverage: &program_server::Coverage,
+) -> std::result::Result<(Vec<(ProgramSlot, Program)>, Routes), String> {
+    if !coverage.uncovered.is_empty() {
+        return Err(format!(
+            "no installed {op} package covers descriptor {} for this host's targets: the model's \
+             forward launches it, so install a package whose [kernel.descriptors] declares it",
+            coverage.uncovered.join(", ")
+        ));
+    }
+    let holders: Vec<(Program, Vec<String>)> = coverage
+        .covered
+        .iter()
+        .map(|covered| {
+            (
+                Program {
+                    backend: covered.package.backend.clone(),
+                    revision: covered.package.revision,
+                    arguments: Default::default(),
+                },
+                covered.keys.clone(),
+            )
+        })
+        .collect();
+    let slots = operator_slots(op, &holders, None);
+    let mut routes = Routes::new();
+    for (slot, program) in &slots {
+        let keys: Vec<String> = holders
+            .iter()
+            .filter(|(holder, _)| {
+                holder.backend == program.backend && holder.revision == program.revision
+            })
+            .flat_map(|(_, keys)| keys)
+            .filter(|key| key_fits_phase(key, slot.phase))
+            .cloned()
+            .collect();
+        routes.insert(slot.clone(), keys);
+    }
+    Ok((slots, routes))
 }
 
 /// Adds one slot's keys to a package's request, merging with a slot of an operator the package
@@ -1164,33 +1193,122 @@ mod tests {
         );
     }
 
-    /// An operator no model forward reaches - the runner launches `slot_commit` itself - is a
-    /// package the store holds and has never built, so `select_programs` cannot see it. The walk
-    /// names the operator, and the declaration is what lets this host build the key it needs: the
-    /// highest revision of the operator's packages, ties broken by the backend so two runs choose
-    /// alike.
+    /// A `cover` answer naming `entries` - each a package's backend and the keys it was chosen
+    /// for, all at revision 1 - and the keys no package covers.
+    fn coverage(entries: &[(&str, &[&str])], uncovered: &[&str]) -> program_server::Coverage {
+        program_server::Coverage {
+            covered: entries
+                .iter()
+                .map(|(backend, keys)| program_server::Covered {
+                    package: program_server::protocol::Package {
+                        op: "dense_attention".to_owned(),
+                        backend: (*backend).to_owned(),
+                        revision: 1,
+                    },
+                    keys: keys.iter().map(|key| (*key).to_owned()).collect(),
+                })
+                .collect(),
+            uncovered: uncovered.iter().map(|key| (*key).to_owned()).collect(),
+        }
+    }
+
+    /// The keys of one operator two packages cover - fa4's BF16 attention and f32's FP32 one, whose
+    /// keys state no phase - fill two part slots, each package with its own keys alone, so neither
+    /// is asked for a key only the other declares.
     #[test]
-    fn a_declared_package_is_chosen_for_an_operator_nothing_built() {
-        let package = |backend: &str, revision: u32| program_server::protocol::ListedPackage {
-            op: "slot_commit".to_owned(),
-            backend: backend.to_owned(),
-            revision,
-            modules: Vec::new(),
+    fn keys_two_packages_cover_fill_a_part_slot_each() {
+        let bf16 = "dtype_bf16_kv_bf16_out_bf16_head_dim_128_q_heads_56_kv_heads_56_mask_dense_window_false";
+        let f32 =
+            "dtype_f32_kv_f32_out_f32_head_dim_64_q_heads_8_kv_heads_8_mask_dense_window_false";
+        let answer = coverage(&[("f32", &[f32]), ("fa4", &[bf16])], &[]);
+
+        let (slots, routes) =
+            covered_slots("dense_attention", &answer).expect("every key is covered");
+        let part = |backend: &str| ProgramSlot {
+            op: "dense_attention".to_owned(),
+            phase: None,
+            part: Some(backend.to_owned()),
         };
-        let packages = vec![
-            package("triton", 1),
-            package("triton", 3),
-            package("cuda", 3),
-        ];
+        let held: Vec<(ProgramSlot, String)> = slots
+            .iter()
+            .map(|(slot, program)| (slot.clone(), program.backend.clone()))
+            .collect();
         assert_eq!(
-            declared_program(&packages, "slot_commit"),
-            Some(("slot_commit".to_owned(), "cuda".to_owned(), 3)),
-            "the highest revision did not win, or the tie was not broken by the backend's name"
+            held,
+            vec![
+                (part("f32"), "f32".to_owned()),
+                (part("fa4"), "fa4".to_owned())
+            ]
+        );
+        assert_eq!(routes[&part("f32")], vec![f32.to_owned()]);
+        assert_eq!(routes[&part("fa4")], vec![bf16.to_owned()]);
+    }
+
+    /// Keys one package covers fill the operator's single slot, with every key routed to it.
+    #[test]
+    fn keys_one_package_covers_fill_one_slot() {
+        let keys = ["dtype_bf16_head_dim_128", "dtype_bf16_head_dim_64"];
+        let answer = coverage(&[("fa4", &keys)], &[]);
+
+        let (slots, routes) =
+            covered_slots("dense_attention", &answer).expect("every key is covered");
+        let slot = ProgramSlot::all("dense_attention");
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].0, slot);
+        assert_eq!(slots[0].1.backend, "fa4");
+        assert_eq!(routes[&slot], keys.map(str::to_owned).to_vec());
+    }
+
+    /// A key the forward launches and no installed package covers refuses the operator, naming the
+    /// operator and the key, rather than handing it to a package that would refuse it at build.
+    #[test]
+    fn a_key_no_package_covers_refuses_the_operator() {
+        let uncovered = "dtype_f16_head_dim_96";
+        let answer = coverage(&[("fa4", &["dtype_bf16_head_dim_128"])], &[uncovered]);
+
+        let error = covered_slots("dense_attention", &answer).expect_err("a key is uncovered");
+        assert!(error.contains("dense_attention"), "{error}");
+        assert!(error.contains(uncovered), "{error}");
+    }
+
+    /// Phase keys routed to the packages that built them fill the same slots the built store's own
+    /// resolution gives, so a store built ahead and one routed by coverage install alike.
+    #[test]
+    fn routed_phases_fill_the_slots_a_built_store_resolves() {
+        let prefill = "phase_prefill_dtype_bf16_kv_bf16_out_bf16_head_dim_128_page_64_q_heads_32";
+        let decode = "phase_decode_dtype_bf16_kv_bf16_out_bf16_head_dim_128_page_64_q_heads_32";
+        let mut chosen: BTreeMap<String, Vec<(String, u32)>> = BTreeMap::new();
+        chosen.insert(
+            "paged_attention".to_owned(),
+            vec![("fa4".to_owned(), 1), ("trtllm".to_owned(), 1)],
+        );
+        let mut built: BTreeMap<(String, String, u32), Vec<String>> = BTreeMap::new();
+        built.insert(
+            ("paged_attention".to_owned(), "fa4".to_owned(), 1),
+            vec![prefill.to_owned()],
+        );
+        built.insert(
+            ("paged_attention".to_owned(), "trtllm".to_owned(), 1),
+            vec![decode.to_owned()],
+        );
+        let (resolved, _) = resolve_slots(&Programs::new(), &chosen, &built, &[])
+            .expect("the store decides when nothing is named");
+
+        let mut answer = coverage(&[("fa4", &[prefill]), ("trtllm", &[decode])], &[]);
+        for covered in &mut answer.covered {
+            covered.package.op = "paged_attention".to_owned();
+        }
+        let (slots, routes) =
+            covered_slots("paged_attention", &answer).expect("every key is covered");
+        let routed: Programs = slots.into_iter().collect();
+        assert_eq!(routed, resolved);
+        assert_eq!(
+            routes[&ProgramSlot::phase("paged_attention", PhaseKind::Prefill)],
+            vec![prefill.to_owned()]
         );
         assert_eq!(
-            declared_program(&packages, "paged_attention"),
-            None,
-            "an operator the store holds no package of was answered"
+            routes[&ProgramSlot::phase("paged_attention", PhaseKind::Decode)],
+            vec![decode.to_owned()]
         );
     }
 }
