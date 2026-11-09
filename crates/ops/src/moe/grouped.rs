@@ -30,6 +30,7 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use crate::activation::Activation;
 use crate::descriptor::Key;
 use crate::fp4::ScaleLayout;
 use crate::kernel::{Kernel, NativeCall};
@@ -47,37 +48,13 @@ use super::{address, dtype_code, to_i64};
 /// declaration about that data, not something the descriptor can state.
 pub const ACTIVATION_ENVELOPE: f32 = 8.0;
 
-/// The gated activation a FC1 applies.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Activation {
-    /// `silu(gate) · up`.
-    Silu,
-    /// `gelu_tanh(gate) · up`.
-    GeluTanh,
-}
-
-impl fmt::Display for Activation {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Silu => "silu",
-            Self::GeluTanh => "gelu_tanh",
-        })
-    }
-}
-
-impl TryFrom<crate::activation::Activation> for Activation {
-    type Error = Error;
-
-    /// The grouped products' gate for an activation, refusing the exact GELU no FC1 implements.
-    fn try_from(activation: crate::activation::Activation) -> Result<Self> {
-        match activation {
-            crate::activation::Activation::Silu => Ok(Self::Silu),
-            crate::activation::Activation::GeluTanh => Ok(Self::GeluTanh),
-            crate::activation::Activation::Gelu => Err(Error::Shape(
-                "a grouped expert product gates with silu or gelu_tanh, not the exact gelu"
-                    .to_owned(),
-            )),
-        }
+/// Refuses the exact GELU: a FC1 gates with `silu` or `gelu_tanh`, the two its kernels compile.
+fn require_gate(operator: &'static str, activation: Activation) -> Result<()> {
+    match activation {
+        Activation::Silu | Activation::GeluTanh => Ok(()),
+        Activation::Gelu => Err(Error::Shape(format!(
+            "{operator}: a grouped expert product gates with silu or gelu_tanh, not the exact gelu"
+        ))),
     }
 }
 
@@ -274,6 +251,7 @@ impl Op for GatherGemm {
     type Args<'a> = GatherGemmArgs;
 
     fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
+        require_gate(Self::NAME, descriptor.activation)?;
         let hidden = u64::from(descriptor.hidden);
         let intermediate = u64::from(descriptor.intermediate);
         let experts = u64::from(descriptor.experts);
@@ -954,6 +932,7 @@ impl Op for GatherGemmNvfp4 {
 
     /// The launch's shape and geometry rules, and the workspace both encoded products carry.
     fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
+        require_gate(Self::NAME, descriptor.activation)?;
         let hidden = u64::from(descriptor.hidden);
         let intermediate = u64::from(descriptor.intermediate);
         let experts = u64::from(descriptor.experts);

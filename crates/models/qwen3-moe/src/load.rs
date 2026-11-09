@@ -19,7 +19,6 @@ use nn::layers::{
 };
 use nn::quantization::Declaration;
 use nn::weights::{Scope, WeightLoader};
-use ops::moe::grouped::Activation as MoeActivation;
 use ops::rope::Rotation;
 
 use crate::model::{AttentionLayer, DecoderLayer, DenseMlp, LoadOptions, Mlp, Qwen3Moe};
@@ -206,7 +205,7 @@ pub fn load(
                     top: config.num_experts_per_tok,
                     hidden: config.hidden_size,
                     intermediate: config.moe_intermediate_size,
-                    activation: activation(config.hidden_act)?,
+                    activation: config.hidden_act,
                     renormalize: config.norm_topk_prob,
                 },
                 EXPERT_NAMES,
@@ -344,11 +343,6 @@ fn dense_block(scope: &mut Scope<'_, '_>, tensor: Split, config: &Config) -> Res
         down_proj,
         activation,
     })
-}
-
-/// The operator's name for the checkpoint's activation.
-pub(crate) fn activation(activation: ops::activation::Activation) -> Result<MoeActivation> {
-    MoeActivation::try_from(activation).map_err(|error| Error::Nn(error.into()))
 }
 
 /// The rotary frequency table and the multiplier the recipe applies to the attention scores.

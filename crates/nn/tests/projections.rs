@@ -535,7 +535,7 @@ fn a_routed_block_loads_its_window_and_reduces_its_split() {
         top: 1,
         hidden: 8,
         intermediate: 4,
-        activation: ops::moe::grouped::Activation::Silu,
+        activation: ops::activation::Activation::Silu,
         renormalize: true,
     };
     let names = ExpertNames {
