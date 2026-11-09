@@ -49,7 +49,6 @@ generator:
 server:
   host: 127.0.0.1
   port: 18083
-  output_dir: /tmp/fastvideo-minimax-h3/outputs
   served_model_name: MiniMax-H3
 
 # Requests state their canvas, frames, steps and seed; these defaults fix the
