@@ -43,7 +43,7 @@ use nn::family::Split;
 use nn::layers::{
     Attention as Flash, Bias, CopyBlock, Linear, Parallel, Rotary, Sections, UlyssesExchange,
 };
-use nn::weights::{Weight, WeightLoader, WeightRequest};
+use nn::weights::{Weight, WeightLoader};
 use nn::{Forward, Shape, TensorView};
 
 use crate::config::TransformerConfig;
@@ -420,9 +420,11 @@ impl Dense {
             )));
         }
 
-        let query_gain = gain(loader, &format!("{prefix}.norm_q.weight"), head)?;
-        let key_gain = gain(loader, &format!("{prefix}.norm_k.weight"), head)?;
-        let frequencies = frequencies(loader, config, rotated, rotated_axes.len() as u32)?;
+        let mut attention = loader.scope(&prefix);
+        let query_gain = attention.scope("norm_q").tensor("weight", &[head])?;
+        let key_gain = attention.scope("norm_k").tensor("weight", &[head])?;
+        let frequencies =
+            crate::attention::frequencies(loader, config, rotated, rotated_axes.len() as u32)?;
         // The rotation reads *this rank's* heads: under Ulysses the sequence is split across ranks
         // and each holds `heads / degree` of them (`Partition::denoiser_heads`), so a descriptor that
         // named the global count would refuse its own query view at any degree above one.
@@ -454,7 +456,13 @@ impl Dense {
             query: head_projection(loader, "to_q")?,
             key: head_projection(loader, "to_k")?,
             value: head_projection(loader, "to_v")?,
-            output: projection(loader, &format!("{prefix}.to_out.0"), inner, hidden)?,
+            output: Linear::load(
+                &mut loader.scope(format!("{prefix}.to_out.0")),
+                width(inner)?,
+                width(hidden)?,
+                Bias::Absent,
+                Parallel::None,
+            )?,
             rotary,
             query_gain,
             key_gain,
@@ -678,7 +686,7 @@ fn heads(view: TensorView, count: u32, head_dim: u32) -> Shape {
 ///
 /// The table is a constant of the checkpoint's rope parameters, published through the loader like
 /// any other weight, so the operator reads it as a device weight.
-fn frequencies(
+pub(crate) fn frequencies(
     loader: &mut WeightLoader<'_>,
     config: &TransformerConfig,
     rotated: u32,
@@ -690,21 +698,13 @@ fn frequencies(
             "{rotated} rotated channels are not {axes} axes of {pairs} frequency pairs"
         )));
     }
-    let mut bytes = Vec::with_capacity(rotated as usize * 2);
-    for value in table(pairs, axes, config.rope_theta) {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    // The name states the construction as well as the width: the values a name publishes changed
-    // when the spectrum stopped being spread over the whole rotated width, and a retained buffer
-    // served under the older name would be a cache hit on the wrong table.
-    let name = format!("transformer.rotary.{pairs}x{axes}.{}", config.rope_theta);
+    // Every layer of both attention paths reads the one table: it is named once for the model,
+    // and the retained key's digest of its values keeps another construction from sharing it.
     let half = u64::from(rotated / 2);
-    Ok(loader.constant(
-        &name,
-        nn::DType::F32,
-        Shape::new(&[half]),
-        &bytes,
-        "minimax-h3",
+    Ok(loader.scope("transformer.rotary_emb").constant_f32(
+        "inv_freq",
+        &[half],
+        &table(pairs, axes, config.rope_theta),
     )?)
 }
 
@@ -741,31 +741,10 @@ fn exchange(partition: &Partition) -> Option<UlyssesExchange> {
     }
 }
 
-/// A projection of the checkpoint: `[out, in]`, without bias.
-pub(crate) fn projection(
-    loader: &mut WeightLoader<'_>,
-    name: &str,
-    inputs: u64,
-    outputs: u64,
-) -> Result<Linear> {
-    Ok(Linear::load(
-        &mut loader.scope(name),
-        width(inputs)?,
-        width(outputs)?,
-        Bias::Absent,
-        Parallel::None,
-    )?)
-}
-
 /// A channel count as a projection's width.
 pub(crate) fn width(channels: u64) -> Result<u32> {
     u32::try_from(channels)
         .map_err(|_| Error::config(format!("{channels} channels exceed a projection's width")))
-}
-
-/// A normalization's learned gain.
-fn gain(loader: &mut WeightLoader<'_>, name: &str, columns: u64) -> Result<Weight> {
-    Ok(loader.load(&WeightRequest::region(name, 0, Shape::new(&[columns])))?)
 }
 
 #[cfg(test)]

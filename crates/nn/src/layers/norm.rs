@@ -13,7 +13,7 @@ use ops::norm::{
 use crate::error::{Error, Result};
 use crate::forward::Forward;
 use crate::layers::launch::{PDL, row_tile};
-use crate::weights::Weight;
+use crate::weights::{Scope, Weight};
 
 /// RMS normalization with a per-channel scale.
 pub struct RmsNorm {
@@ -32,6 +32,16 @@ impl RmsNorm {
             columns: u32::try_from(columns)
                 .map_err(|_| Error::shape("RmsNorm", format!("a width of {columns} elements")))?,
         })
+    }
+
+    /// The normalization module at `scope`: its `weight` of `width` channels, with variance floor
+    /// `eps`.
+    ///
+    /// # Errors
+    ///
+    /// When the checkpoint lacks the weight or holds another width.
+    pub fn load(scope: &mut Scope<'_, '_>, width: u64, eps: f32) -> Result<Self> {
+        Self::new(scope.tensor("weight", &[width])?, eps)
     }
 
     /// The per-channel scale.
@@ -138,6 +148,18 @@ pub struct LayerNorm {
 }
 
 impl LayerNorm {
+    /// The affine normalization module at `scope`: its `weight` and `bias` of `width` channels,
+    /// with variance floor `eps`.
+    ///
+    /// # Errors
+    ///
+    /// When the checkpoint lacks either tensor or holds another width.
+    pub fn load(scope: &mut Scope<'_, '_>, width: u64, eps: f32) -> Result<Self> {
+        let weight = scope.tensor("weight", &[width])?;
+        let bias = scope.tensor("bias", &[width])?;
+        Self::new(weight, Some(bias), eps)
+    }
+
     /// The normalization of `weight`'s width with variance floor `eps`.
     pub fn new(weight: Weight, bias: Option<Weight>, eps: f32) -> Result<Self> {
         let columns = weight.shape().numel();

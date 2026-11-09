@@ -30,7 +30,7 @@ use nn::layers::{
     Bias, GatedActivation, GatedResidual, Linear, ModulatedRmsNorm, Parallel, RmsNorm,
 };
 use nn::tensor::Backing;
-use nn::weights::{Weight, WeightLoader, WeightRequest};
+use nn::weights::{Weight, WeightLoader};
 use nn::{Forward, Shape, TensorView};
 use ops::gemm::WeightOrder;
 
@@ -104,8 +104,12 @@ impl Layer {
         let hidden = u64::from(config.hidden_size);
         let ffn = u64::from(config.intermediate_size);
         Ok(Self {
-            norm1: gain(loader, &format!("{prefix}.norm1.weight"), hidden)?,
-            norm2: gain(loader, &format!("{prefix}.norm2.weight"), hidden)?,
+            norm1: loader
+                .scope(format!("{prefix}.norm1"))
+                .tensor("weight", &[hidden])?,
+            norm2: loader
+                .scope(format!("{prefix}.norm2"))
+                .tensor("weight", &[hidden])?,
             attention: attention::Layer::load(
                 kind,
                 index,
@@ -117,10 +121,20 @@ impl Layer {
                 loader,
             )?,
             // The checkpoint fuses the feed-forward's value half first and its gate half second.
-            // `projection` appends the `.weight` itself: a name that already ends in it asks the
-            // checkpoint for `…weight.weight`, which is the name the index does not hold.
-            gate_up: projection(loader, &format!("{prefix}.ff.net.0.proj"), 2 * ffn, hidden)?,
-            down: projection(loader, &format!("{prefix}.ff.net.2"), hidden, ffn)?,
+            gate_up: Linear::load(
+                &mut loader.scope(format!("{prefix}.ff.net.0.proj")),
+                attention::width(hidden)?,
+                attention::width(2 * ffn)?,
+                Bias::Absent,
+                Parallel::None,
+            )?,
+            down: Linear::load(
+                &mut loader.scope(format!("{prefix}.ff.net.2")),
+                attention::width(ffn)?,
+                attention::width(hidden)?,
+                Bias::Absent,
+                Parallel::None,
+            )?,
             gated: GatedActivation::new(ops::activation::Activation::Silu).with_stepwise(),
             eps: config.norm_eps,
         })
@@ -506,24 +520,10 @@ impl FusedHeads {
             let target = (u64::from(block) * out) as usize;
             fused_bias[target..][..block_bias.len()].copy_from_slice(&block_bias);
         }
-        let modality_name = modality.as_str();
+        let mut heads = loader.scope(format!("denoiser.{}.student_heads", modality.as_str()));
         Ok(Self {
-            weight: loader.constant(
-                &format!("denoiser.{modality_name}.student_heads.weight"),
-                nn::DType::F32,
-                Shape::new(&[blocks, per_head]),
-                &nn::DType::F32.encode(&fused).map_err(nn::Error::from)?,
-                "minimax-h3",
-            )?,
-            bias: loader.constant(
-                &format!("denoiser.{modality_name}.student_heads.bias"),
-                nn::DType::F32,
-                Shape::new(&[blocks, out]),
-                &nn::DType::F32
-                    .encode(&fused_bias)
-                    .map_err(nn::Error::from)?,
-                "minimax-h3",
-            )?,
+            weight: heads.constant_f32("weight", &[blocks, per_head], &fused)?,
+            bias: heads.constant_f32("bias", &[blocks, out], &fused_bias)?,
             out: u32::try_from(out)
                 .map_err(|_| Error::checkpoint(format!("{name}'s width exceeds u32")))?,
             hidden: u32::try_from(hidden)
@@ -790,39 +790,42 @@ impl Transformer {
             // `audio_output` are pinned at FP32 whatever the attention, MLP and VAE tiers are. So
             // the widening `wide` performs meets an FP32 weight and the product is FP32 on both
             // sides, which is what makes the released BF16 stack run a FP32 sample at all.
-            proj_in: projection_with_bias(loader, "proj_in", hidden, video_in, nn::DType::F32)?,
-            audio_proj_in: Some(projection_with_bias(
-                loader,
-                "audio_proj_in",
-                hidden,
-                audio_in,
-                nn::DType::F32,
+            proj_in: Linear::load(
+                &mut loader.scope("proj_in").pinned(nn::DType::F32),
+                attention::width(video_in)?,
+                attention::width(hidden)?,
+                Bias::Present,
+                Parallel::None,
+            )?,
+            audio_proj_in: Some(Linear::load(
+                &mut loader.scope("audio_proj_in").pinned(nn::DType::F32),
+                attention::width(audio_in)?,
+                attention::width(hidden)?,
+                Bias::Present,
+                Parallel::None,
             )?),
             layers,
-            norm_out: RmsNorm::new(
-                gain(loader, "norm_out.norm.weight", hidden)?,
-                config.norm_eps,
-            )?,
+            norm_out: RmsNorm::load(&mut loader.scope("norm_out.norm"), hidden, config.norm_eps)?,
             // A student's checkpoint holds the stacked interval heads, so the plain projection is
             // read only when the partition has one head.
             video_out: match heads {
                 Some(_) => None,
-                None => Some(projection_with_bias(
-                    loader,
-                    "proj_out",
-                    video_in,
-                    hidden,
-                    nn::DType::F32,
+                None => Some(Linear::load(
+                    &mut loader.scope("proj_out").pinned(nn::DType::F32),
+                    attention::width(hidden)?,
+                    attention::width(video_in)?,
+                    Bias::Present,
+                    Parallel::None,
                 )?),
             },
             audio_out: match heads {
                 Some(_) => None,
-                None => Some(projection_with_bias(
-                    loader,
-                    "audio_proj_out",
-                    audio_in,
-                    hidden,
-                    nn::DType::F32,
+                None => Some(Linear::load(
+                    &mut loader.scope("audio_proj_out").pinned(nn::DType::F32),
+                    attention::width(hidden)?,
+                    attention::width(audio_in)?,
+                    Bias::Present,
+                    Parallel::None,
                 )?),
             },
             heads,
@@ -1024,44 +1027,6 @@ impl Scratch {
             attention: layer.attention.reserve(f, hidden, total_rows)?,
         })
     }
-}
-
-/// A `[out, in]` projection of the checkpoint, without bias.
-fn projection(
-    loader: &mut WeightLoader<'_>,
-    name: &str,
-    rows: u64,
-    columns: u64,
-) -> Result<Linear> {
-    Ok(Linear::load(
-        &mut loader.scope(name),
-        attention::width(columns)?,
-        attention::width(rows)?,
-        Bias::Absent,
-        Parallel::None,
-    )?)
-}
-
-/// A `[out, in]` projection of the checkpoint with its bias, read as `dtype`.
-fn projection_with_bias(
-    loader: &mut WeightLoader<'_>,
-    name: &str,
-    rows: u64,
-    columns: u64,
-    dtype: nn::DType,
-) -> Result<Linear> {
-    Ok(Linear::load(
-        &mut loader.scope(name).pinned(dtype),
-        attention::width(columns)?,
-        attention::width(rows)?,
-        Bias::Present,
-        Parallel::None,
-    )?)
-}
-
-/// A normalization's or projection's learned gain.
-fn gain(loader: &mut WeightLoader<'_>, name: &str, columns: u64) -> Result<Weight> {
-    Ok(loader.load(&WeightRequest::region(name, 0, Shape::new(&[columns])))?)
 }
 
 #[cfg(test)]

@@ -404,69 +404,6 @@ pub const TILE_PIXELS: u32 = 256;
 /// The minimum overlap between two adjacent tiles, in output pixels.
 pub const MINIMUM_OVERLAP: u32 = 64;
 
-/// Every parameter of the decoder, with its checkpoint key.
-///
-/// The decoder is the post-quantization projection, the input projection, the register table, 36
-/// transformer layers of twelve parameters each, and the final LayerNorm and output projection read
-/// from the checkpoint's name-translated keys (`decoder.proj_in`, `decoder.transformer_blocks.<i>`,
-/// `decoder.norm_out`, `decoder.proj_out`, `post_quant_conv`). The feed-forward projection is one
-/// packed tensor, value rows first, which is what the value-first SwiGLU reads: the reference splits
-/// it into two views only for its quantized fused path, and the dense decoder never does.
-///
-/// The vocabulary is [`crate::audio_vae::Source`]'s: a logical parameter named once, and the
-/// checkpoint tensor that fills it.
-pub fn sources(config: &VideoVaeConfig) -> crate::Result<Vec<crate::audio_vae::Source>> {
-    use crate::audio_vae::{Source, Tensor};
-
-    let mut sources = Vec::new();
-    let region = |parameter: &str, tensor: String| Source {
-        parameter: parameter.to_owned(),
-        tensor: Tensor::Region(tensor),
-    };
-
-    for (parameter, tensor) in [
-        ("post_quant.weight", "post_quant_conv.weight".to_owned()),
-        ("post_quant.bias", "post_quant_conv.bias".to_owned()),
-        ("input.weight", "decoder.proj_in.weight".to_owned()),
-        ("input.bias", "decoder.proj_in.bias".to_owned()),
-        ("registers", "decoder.register_tokens".to_owned()),
-    ] {
-        sources.push(region(parameter, tensor));
-    }
-    for index in 0..config.decoder_num_layers {
-        let at = |name: &str| format!("decoder.transformer_blocks.{index}.{name}");
-        for (parameter, tensor) in [
-            ("norm1.weight", at("norm1.weight")),
-            ("norm2.weight", at("norm2.weight")),
-            ("scale1", at("scale1")),
-            ("scale2", at("scale2")),
-            ("query.weight", at("attn.to_q.weight")),
-            ("query.bias", at("attn.to_q.bias")),
-            ("key.weight", at("attn.to_k.weight")),
-            ("key.bias", at("attn.to_k.bias")),
-            ("value.weight", at("attn.to_v.weight")),
-            ("value.bias", at("attn.to_v.bias")),
-            ("output.weight", at("attn.to_out.0.weight")),
-            ("output.bias", at("attn.to_out.0.bias")),
-            ("gate_up.weight", at("ff.net.0.proj.weight")),
-            ("gate_up.bias", at("ff.net.0.proj.bias")),
-            ("down.weight", at("ff.net.2.weight")),
-            ("down.bias", at("ff.net.2.bias")),
-        ] {
-            sources.push(region(&format!("layers.{index}.{parameter}"), tensor));
-        }
-    }
-    for (parameter, tensor) in [
-        ("norm.weight", "decoder.norm_out.weight".to_owned()),
-        ("norm.bias", "decoder.norm_out.bias".to_owned()),
-        ("output.weight", "decoder.proj_out.weight".to_owned()),
-        ("output.bias", "decoder.proj_out.bias".to_owned()),
-    ] {
-        sources.push(region(parameter, tensor));
-    }
-    Ok(sources)
-}
-
 // ---------------------------------------------------------------------------------------------
 // The video decoder's transformer.
 // ---------------------------------------------------------------------------------------------
@@ -476,7 +413,7 @@ use nn::layers::{
     Attention, Bias, Linear, MergedColumnLinear, PackedSwiGlu, Parallel, Rotary, Rows, ScaledAdd,
     ScaledResidualLayerNorm, ScaledResidualRmsNorm, Sections, WeightedRmsNorm,
 };
-use nn::weights::{Weight, WeightLoader, WeightRequest};
+use nn::weights::{Weight, WeightLoader};
 use nn::{DType, DecodedMedia, Decoder, Shape, StateTable, TableValues, TensorView};
 use ops::gemm::WeightOrder;
 
@@ -726,123 +663,120 @@ impl VideoDecoder {
             * config.spatial_compression();
         let epsilon = config.decoder_norm_eps;
         let channels = u64::from(config.latent_channels);
-        // The constants this canvas publishes, declared once: a caller that reserves device storage
-        // before loading sizes its pool by this list, and every publish below is checked against it.
-        let declared_sizes = constants(config, widest, u64::from(width))?;
-
+        // The constants the export does not hold - the latent restore, the identity the
+        // post-quantization bias rides on, the zero row the token layout appends, the two index
+        // tables that address a tile's trailing rows, the rotary frequencies and the sequence
+        // offsets - are the decoder's own, named under `video_vae`.
         let (restore_weight, restore_bias) = restore_tables(config)?;
-        let restore = Linear::new(
-            constant(
-                loader,
-                &declared_sizes,
-                "video_vae.restore.weight",
-                Shape::new(&[channels, channels]),
-                &restore_weight,
-            )?,
-            Some(constant(
-                loader,
-                &declared_sizes,
-                "video_vae.restore.bias",
-                Shape::new(&[channels]),
-                &restore_bias,
-            )?),
-            WeightOrder::NxK,
-        )?;
+        let restore = {
+            let mut constants = loader.scope("video_vae.restore");
+            Linear::new(
+                constants.constant("weight", STREAM, &[channels, channels], &restore_weight)?,
+                Some(constants.constant("bias", STREAM, &[channels], &restore_bias)?),
+                WeightOrder::NxK,
+            )?
+        };
         // The post-quantization convolution is 1x1x1: its `[channels, channels, 1, 1, 1]` weight is
         // the matrix of a projection, whose bias the next product adds (see `post_quant_bias`).
+        let mut post_quant_conv = loader.scope("post_quant_conv");
+        let mut post_quant_conv = post_quant_conv.pinned(ACTIVATION);
         let post_quant = Linear::load(
-            &mut loader.scope("post_quant_conv").pinned(ACTIVATION),
+            &mut post_quant_conv,
             width_of(channels)?,
             width_of(channels)?,
             Bias::Absent,
             Parallel::None,
         )?;
-        let identity: Vec<u8> = (0..channels * channels)
-            .flat_map(|index| {
-                let one = index / channels == index % channels;
-                ops::values::f32_to_f16(if one { 1.0 } else { 0.0 }).to_le_bytes()
+        let post_quant_bias = post_quant_conv.tensor("bias", &[channels])?;
+        let identity: Vec<f32> = (0..channels * channels)
+            .map(|index| {
+                if index / channels == index % channels {
+                    1.0
+                } else {
+                    0.0
+                }
             })
             .collect();
-        declared(&declared_sizes, "video_vae.identity", identity.len())?;
         let post_quant_bias = Linear::new(
-            loader.constant(
-                "video_vae.identity",
+            loader.scope("video_vae").constant(
+                "identity",
                 ACTIVATION,
-                Shape::new(&[channels, channels]),
+                &[channels, channels],
                 &identity,
-                "minimax-h3",
             )?,
-            Some(
-                loader.load(
-                    &WeightRequest::region("post_quant_conv.bias", 0, Shape::new(&[channels]))
-                        .pinned(ACTIVATION),
-                )?,
-            ),
+            Some(post_quant_bias),
             WeightOrder::NxK,
         )?;
-        let input = linear(loader, "decoder.proj_in", channels, u64::from(width))?;
-
-        let registers = read(
-            loader,
-            "decoder.register_tokens",
-            &[u64::from(canvas.registers), u64::from(width)],
+        let input = Linear::load(
+            &mut loader.scope("decoder.proj_in").pinned(ACTIVATION),
+            width_of(channels)?,
+            width,
+            Bias::Present,
+            Parallel::None,
         )?;
-        let zero_row = zeroes(
-            loader,
-            &declared_sizes,
-            "video_vae.zero_row",
-            u64::from(width),
+
+        let registers = loader.scope("decoder").pinned(STREAM).tensor(
+            "register_tokens",
+            &[u64::from(canvas.registers), u64::from(width)],
         )?;
         if canvas.tail == 0 {
             return Err(Error::config(
                 "the decoder canvas has the trailing zero row".to_owned(),
             ));
         }
+        let mut constants = loader.scope("video_vae");
+        let zero_row = constants.zeros("zero_row", STREAM, &[1, u64::from(width)])?;
         // **A tile's rows, not the clip's.** These two tables say where a tile's register tokens and
         // its trailing zero row go, and the row write launches against that tile's own slice of the
         // stream, so one tile's offsets serve every tile and every canvas of a uniform grid.
-        let register_rows = indices(
-            loader,
-            &declared_sizes,
-            "video_vae.register_rows",
-            tile.voxels() as u32,
-            canvas.registers,
+        let first_row = |rows: u64| {
+            i32::try_from(rows).map_err(|_| Error::config(format!("a tile row {rows} above I32")))
+        };
+        let register_rows = constants.indices(
+            "register_rows",
+            first_row(tile.voxels())?,
+            u64::from(canvas.registers),
         )?;
-        let zero_rows = indices(
-            loader,
-            &declared_sizes,
-            "video_vae.zero_rows",
-            (tile.voxels() + u64::from(canvas.registers)) as u32,
-            canvas.tail,
+        let zero_rows = constants.indices(
+            "zero_rows",
+            first_row(tile.voxels() + u64::from(canvas.registers))?,
+            u64::from(canvas.tail),
         )?;
 
-        let vector =
-            |loader: &mut WeightLoader, name: String| read(loader, &name, &[u64::from(width)]);
+        // The normalizations' gains and the residual scales stay at the stream's width.
+        let vector = |loader: &mut WeightLoader, module: String, leaf: &str| -> Result<Weight> {
+            Ok(loader
+                .scope(module)
+                .pinned(STREAM)
+                .tensor(leaf, &[u64::from(width)])?)
+        };
         let first = WeightedRmsNorm::new(
             vector(
                 loader,
-                "decoder.transformer_blocks.0.norm1.weight".to_owned(),
+                "decoder.transformer_blocks.0.norm1".to_owned(),
+                "weight",
             )?,
             epsilon,
         )?;
-        let weight = vector(loader, "decoder.norm_out.weight".to_owned())?;
-        let bias = vector(loader, "decoder.norm_out.bias".to_owned())?;
+        let weight = vector(loader, "decoder.norm_out".to_owned(), "weight")?;
+        let bias = vector(loader, "decoder.norm_out".to_owned(), "bias")?;
         let count = config.decoder_num_layers;
         let last_scale = vector(
             loader,
-            format!("decoder.transformer_blocks.{}.scale2", count - 1),
+            format!("decoder.transformer_blocks.{}", count - 1),
+            "scale2",
         )?;
         let last = ScaledResidualLayerNorm::new(last_scale, None, weight, bias, epsilon)?;
 
         let mut layers = Vec::with_capacity(count as usize);
         for index in 0..count {
             let base = format!("decoder.transformer_blocks.{index}");
-            let scale1 = vector(loader, format!("{base}.scale1"))?;
-            let norm2 = vector(loader, format!("{base}.norm2.weight"))?;
+            let scale1 = vector(loader, base.clone(), "scale1")?;
+            let norm2 = vector(loader, format!("{base}.norm2"), "weight")?;
             let fed = if index + 1 < count {
-                let scale2 = vector(loader, format!("{base}.scale2"))?;
-                let next = format!("decoder.transformer_blocks.{}.norm1.weight", index + 1);
-                let norm1 = vector(loader, next)?;
+                let scale2 = vector(loader, base.clone(), "scale2")?;
+                let next = format!("decoder.transformer_blocks.{}.norm1", index + 1);
+                let norm1 = vector(loader, next, "weight")?;
                 Some(ScaledResidualRmsNorm::new(scale2, None, norm1, epsilon)?)
             } else {
                 None
@@ -855,41 +789,40 @@ impl VideoDecoder {
                 &[width, width, width],
                 Bias::Present,
             )?;
+            let mut projection = |module: &str, from: u32, to: u32| {
+                Linear::load(
+                    &mut loader.scope(format!("{base}.{module}")).pinned(ACTIVATION),
+                    from,
+                    to,
+                    Bias::Present,
+                    Parallel::None,
+                )
+            };
             layers.push(Layer {
                 query_key_value,
-                output: linear(
-                    loader,
-                    &format!("{base}.attn.to_out.0"),
-                    u64::from(width),
-                    u64::from(width),
-                )?,
+                output: projection("attn.to_out.0", width, width)?,
                 attended: ScaledResidualRmsNorm::new(scale1, None, norm2, epsilon)?,
                 // The feed-forward's projection is packed: its rows hold the value half and then the
                 // gate half, so it is twice the feed-forward's width.
-                gate_up: linear(
-                    loader,
-                    &format!("{base}.ff.net.0.proj"),
-                    u64::from(width),
-                    2 * u64::from(ffn),
-                )?,
+                gate_up: projection("ff.net.0.proj", width, 2 * ffn)?,
                 gated: PackedSwiGlu::new(None)?,
-                down: linear(
-                    loader,
-                    &format!("{base}.ff.net.2"),
-                    u64::from(ffn),
-                    u64::from(width),
-                )?,
+                down: projection("ff.net.2", ffn, width)?,
                 fed,
             });
         }
 
-        let output = linear(
-            loader,
-            "decoder.proj_out",
-            u64::from(width),
-            u64::from(out_channels),
+        let output = Linear::load(
+            &mut loader.scope("decoder.proj_out").pinned(ACTIVATION),
+            width,
+            out_channels,
+            Bias::Present,
+            Parallel::None,
         )?;
-        let frequencies = frequencies(loader, &declared_sizes, config)?;
+        let frequencies = loader.scope("video_vae.rotary_emb").constant_f32(
+            "inv_freq",
+            &[u64::from(rotated / 2)],
+            &inverse_frequencies(config)?,
+        )?;
         let rotary = Rotary::new(
             frequencies,
             head,
@@ -902,23 +835,18 @@ impl VideoDecoder {
         .partial(rotated)?
         .sectioned(Sections::new(&sections)?)?;
         let rows = tile.rows();
-        let offsets = {
-            let mut bytes = Vec::with_capacity((most_tiles as usize + 1) * 4);
-            for sequence in 0..=most_tiles {
-                let offset = i32::try_from(sequence * rows).map_err(|_| {
-                    Error::config("a clip's rows exceed a sequence offset".to_owned())
-                })?;
-                bytes.extend_from_slice(&offset.to_le_bytes());
-            }
-            declared(&declared_sizes, "video_vae.sequence_offsets", bytes.len())?;
-            loader.constant(
-                "video_vae.sequence_offsets",
-                DType::I32,
-                Shape::new(&[most_tiles + 1]),
-                &bytes,
-                "minimax-h3",
-            )?
-        };
+        // `[0, rows, ...]`, one offset per tile of the widest canvas and the end.
+        let offsets = (0..=most_tiles)
+            .map(|sequence| {
+                i32::try_from(sequence * rows)
+                    .map_err(|_| Error::config("a clip's rows exceed a sequence offset".to_owned()))
+            })
+            .collect::<Result<Vec<i32>>>()?;
+        let offsets = loader.scope("video_vae").constant_i32(
+            "sequence_offsets",
+            &[most_tiles + 1],
+            &offsets,
+        )?;
         Ok(Self {
             canvases,
             stitch,
@@ -954,17 +882,6 @@ impl VideoDecoder {
     }
 }
 
-/// Read a projection of the checkpoint at [`ACTIVATION`]: `[out, in]` row-major, with its bias.
-fn linear(loader: &mut WeightLoader, name: &str, from: u64, to: u64) -> Result<Linear> {
-    Ok(Linear::load(
-        &mut loader.scope(name).pinned(ACTIVATION),
-        width_of(from)?,
-        width_of(to)?,
-        Bias::Present,
-        Parallel::None,
-    )?)
-}
-
 /// A channel count as a projection's width.
 fn width_of(channels: u64) -> Result<u32> {
     u32::try_from(channels)
@@ -987,130 +904,13 @@ fn restore_tables(config: &VideoVaeConfig) -> Result<(Vec<f32>, Vec<f32>)> {
     Ok((weight, config.latents_mean.clone()))
 }
 
-/// The constants a decoder of this canvas publishes, as `(name, bytes)`.
-///
-/// `load` builds tensors the export does not hold - the latent restore, the zero row the token layout
-/// appends, the two index tables that address the trailing rows, the rotary frequencies and the
-/// sequence offsets - and a caller that reserves device storage before loading has to know what they
-/// cost: the pool charges a block per publish, so a reservation computed from the checkpoint's names
-/// alone is short by every one of these. The list is one statement of them, and `load` checks what it
-/// publishes against it, so the two cannot drift. `canvas` is the served canvas of the most tiles.
-pub fn constants(
-    config: &VideoVaeConfig,
-    canvas: Canvas,
-    width: u64,
-) -> Result<Vec<(String, u64)>> {
-    let (rotated, _) = rotary(config)?;
-    let element = STREAM.bytes().unwrap_or(4);
-    let channels = u64::from(config.latent_channels);
-    Ok(vec![
-        (
-            "video_vae.restore.weight".to_owned(),
-            channels * channels * element,
-        ),
-        ("video_vae.restore.bias".to_owned(), channels * element),
-        (
-            "video_vae.identity".to_owned(),
-            channels * channels * ACTIVATION.bytes().unwrap_or(2),
-        ),
-        ("video_vae.zero_row".to_owned(), width * element),
-        (
-            "video_vae.register_rows".to_owned(),
-            u64::from(canvas.registers) * 4,
-        ),
-        ("video_vae.zero_rows".to_owned(), u64::from(canvas.tail) * 4),
-        (
-            format!("video_vae.rotary.{rotated}.{}", config.decoder_rope_theta),
-            u64::from(rotated / 2) * 4,
-        ),
-        // `[0, rows, ...]`, one offset per tile and the end.
-        (
-            "video_vae.sequence_offsets".to_owned(),
-            (tile_count(config, &canvas)? + 1) * 4,
-        ),
-    ])
-}
-
-/// Read one of the parameters the module's table keeps at the stream's width.
-fn read(loader: &mut WeightLoader, name: &str, shape: &[u64]) -> Result<Weight> {
-    Ok(
-        loader
-            .load(&WeightRequest::region(name.to_owned(), 0, Shape::new(shape)).pinned(STREAM))?,
-    )
-}
-
-/// Check one published constant against [`constants`]' list, so the declaration a caller reserves by
-/// and the tensors the loader publishes are one statement rather than two that can drift.
-fn declared(declared: &[(String, u64)], name: &str, bytes: usize) -> Result<()> {
-    match declared.iter().find(|(entry, _)| entry == name) {
-        Some((_, expected)) if *expected == bytes as u64 => Ok(()),
-        Some((_, expected)) => Err(Error::config(format!(
-            "the constant `{name}` publishes {bytes} bytes where its declared size is {expected}"
-        ))),
-        None => Err(Error::config(format!(
-            "the constant `{name}` is published but not declared"
-        ))),
-    }
-}
-
-/// A constant row of `width` zeros, which the checkpoint's token layout appends to the stream.
-fn zeroes(
-    loader: &mut WeightLoader,
-    declared_sizes: &[(String, u64)],
-    name: &str,
-    width: u64,
-) -> Result<Weight> {
-    let bytes = vec![0u8; (width as usize) * STREAM.bytes().unwrap_or(4) as usize];
-    declared(declared_sizes, name, bytes.len())?;
-    Ok(loader.constant(name, STREAM, Shape::new(&[1, width]), &bytes, "minimax-h3")?)
-}
-
-/// A constant of FP32 `values`.
-fn constant(
-    loader: &mut WeightLoader,
-    declared_sizes: &[(String, u64)],
-    name: &str,
-    shape: Shape,
-    values: &[f32],
-) -> Result<Weight> {
-    let bytes: Vec<u8> = values
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect();
-    declared(declared_sizes, name, bytes.len())?;
-    Ok(loader.constant(name, STREAM, shape, &bytes, "minimax-h3")?)
-}
-
-/// A constant index table: `count` rows starting at `start`.
-fn indices(
-    loader: &mut WeightLoader,
-    declared_sizes: &[(String, u64)],
-    name: &str,
-    start: u32,
-    count: u32,
-) -> Result<Weight> {
-    declared(declared_sizes, name, count as usize * 4)?;
-    let mut bytes = Vec::with_capacity(count as usize * 4);
-    for index in 0..count {
-        bytes.extend_from_slice(&(start + index).to_le_bytes());
-    }
-    Ok(loader.constant(
-        name,
-        DType::I32,
-        Shape::new(&[u64::from(count)]),
-        &bytes,
-        "minimax-h3",
-    )?)
-}
-
-/// The rotary frequency table of the decoder: `theta^(-2i/rotated)` over the rotated width.
 /// The decoder's inverse frequencies, in the order its factors are laid out.
 ///
 /// One block per axis, each over that axis's own width: the reference builds its embedding with
 /// `head_dim · ratio / 3` and reuses those frequencies on all three axes, so axis `a` takes
 /// `theta^(-2k / sections[a])` rather than a slice of one wider spectrum.
 ///
-/// This is the table the decoder publishes as `video_vae.rotary.{rotated}.{theta}` and the one a
+/// This is the table the decoder publishes as `video_vae.rotary_emb.inv_freq` and the one a
 /// factors comparison reads: a wrong spectrum or a wrong axis order is a phase drift that no shape,
 /// element type or key check can see, so the numbers have to be comparable without a device.
 pub fn inverse_frequencies(config: &VideoVaeConfig) -> Result<Vec<f32>> {
@@ -1130,28 +930,6 @@ pub fn inverse_frequencies(config: &VideoVaeConfig) -> Result<Vec<f32>> {
         )));
     }
     Ok(table)
-}
-
-fn frequencies(
-    loader: &mut WeightLoader,
-    declared_sizes: &[(String, u64)],
-    config: &VideoVaeConfig,
-) -> Result<Weight> {
-    let (rotated, _) = rotary(config)?;
-    let table = inverse_frequencies(config)?;
-    let mut bytes = Vec::with_capacity(table.len() * 4);
-    for value in &table {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    let name = format!("video_vae.rotary.{rotated}.{}", config.decoder_rope_theta);
-    declared(declared_sizes, &name, bytes.len())?;
-    Ok(loader.constant(
-        &name,
-        DType::F32,
-        Shape::new(&[table.len() as u64]),
-        &bytes,
-        "minimax-h3",
-    )?)
 }
 
 impl VideoDecoder {
@@ -1880,38 +1658,50 @@ pub(crate) mod tests {
                 * config.spatial_compression()
                 * config.spatial_compression(),
         );
-        let shape = |parameter: &str| -> Vec<u64> {
-            // A layer's parameter is `layers.<index>.<field>`; the head's are named bare.
-            let layer = parameter.starts_with("layers.");
-            let field = if layer {
-                parameter.splitn(3, '.').nth(2).unwrap_or(parameter)
-            } else {
-                parameter
-            };
-            match field {
-                "post_quant.weight" => vec![channels, channels],
-                "post_quant.bias" => vec![channels],
-                "input.weight" => vec![width, channels],
-                "registers" => vec![u64::from(canvas.registers), width],
-                "query.weight" | "key.weight" | "value.weight" => vec![width, width],
-                "gate_up.weight" => vec![2 * ffn, width],
-                "gate_up.bias" => vec![2 * ffn],
-                "down.weight" => vec![width, ffn],
-                "output.weight" if layer => vec![width, width],
-                "output.weight" => vec![out, width],
-                "output.bias" if !layer => vec![out],
-                _ => vec![width],
+        // The checkpoint's tensors, as the export names them.
+        let mut tensors: Vec<(String, Vec<u64>)> = vec![
+            (
+                "post_quant_conv.weight".to_owned(),
+                vec![channels, channels],
+            ),
+            ("post_quant_conv.bias".to_owned(), vec![channels]),
+            ("decoder.proj_in.weight".to_owned(), vec![width, channels]),
+            ("decoder.proj_in.bias".to_owned(), vec![width]),
+            (
+                "decoder.register_tokens".to_owned(),
+                vec![u64::from(canvas.registers), width],
+            ),
+            ("decoder.norm_out.weight".to_owned(), vec![width]),
+            ("decoder.norm_out.bias".to_owned(), vec![width]),
+            ("decoder.proj_out.weight".to_owned(), vec![out, width]),
+            ("decoder.proj_out.bias".to_owned(), vec![out]),
+        ];
+        for index in 0..config.decoder_num_layers {
+            let at = |name: &str| format!("decoder.transformer_blocks.{index}.{name}");
+            for (name, shape) in [
+                ("norm1.weight", vec![width]),
+                ("norm2.weight", vec![width]),
+                ("scale1", vec![width]),
+                ("scale2", vec![width]),
+                ("attn.to_q.weight", vec![width, width]),
+                ("attn.to_q.bias", vec![width]),
+                ("attn.to_k.weight", vec![width, width]),
+                ("attn.to_k.bias", vec![width]),
+                ("attn.to_v.weight", vec![width, width]),
+                ("attn.to_v.bias", vec![width]),
+                ("attn.to_out.0.weight", vec![width, width]),
+                ("attn.to_out.0.bias", vec![width]),
+                ("ff.net.0.proj.weight", vec![2 * ffn, width]),
+                ("ff.net.0.proj.bias", vec![2 * ffn]),
+                ("ff.net.2.weight", vec![width, ffn]),
+                ("ff.net.2.bias", vec![width]),
+            ] {
+                tensors.push((at(name), shape));
             }
-        };
-        let tensors: Vec<(String, DType, Vec<u64>)> = sources(config)
-            .expect("the decoder's sources")
+        }
+        let tensors: Vec<(String, DType, Vec<u64>)> = tensors
             .into_iter()
-            .map(|source| match source.tensor {
-                crate::audio_vae::Tensor::Region(tensor) => {
-                    (tensor, DType::BF16, shape(&source.parameter))
-                }
-                other => panic!("the decoder reads regions, not {other:?}"),
-            })
+            .map(|(name, shape)| (name, DType::BF16, shape))
             .collect();
         let directory = tempfile::tempdir().expect("a temp directory");
         let checkpoint = header_checkpoint(directory.path(), &tensors);
@@ -2336,44 +2126,6 @@ pub(crate) mod tests {
         let table = positions(&clip).expect("positions");
         assert_eq!(clip.rows(), 7 * 256 + 5);
         assert_eq!(table.len() as u64, clip.rows() * 3);
-    }
-
-    #[test]
-    fn the_weight_table_names_every_parameter_of_the_checkpoint() {
-        let table = sources(&video_config()).expect("the decoder's parameters");
-        // 36 layers of sixteen parameters, plus the post-quantization pair, the input pair, the
-        // register table, and the head's four.
-        assert_eq!(table.len(), 36 * 16 + 5 + 4);
-        let names: Vec<&str> = table
-            .iter()
-            .map(|source| source.parameter.as_str())
-            .collect();
-        assert!(names.contains(&"post_quant.weight"));
-        assert!(names.contains(&"registers"));
-        assert!(names.contains(&"layers.0.norm1.weight"));
-        assert!(names.contains(&"layers.35.gate_up.bias"));
-        assert!(names.contains(&"norm.weight"));
-        assert!(names.contains(&"output.weight"));
-        let checkpoint: Vec<String> = table
-            .iter()
-            .map(|source| match &source.tensor {
-                crate::audio_vae::Tensor::Region(tensor) => tensor.clone(),
-                crate::audio_vae::Tensor::Normalized { .. } => {
-                    panic!("the video decoder folds no weight norm")
-                }
-            })
-            .collect();
-        assert!(
-            checkpoint.contains(&"decoder.transformer_blocks.35.ff.net.0.proj.weight".to_owned())
-        );
-        assert!(checkpoint.contains(&"decoder.proj_out.bias".to_owned()));
-        // No parameter and no checkpoint tensor is named twice.
-        for list in [names, checkpoint.iter().map(String::as_str).collect()] {
-            let mut unique = list.clone();
-            unique.sort_unstable();
-            unique.dedup();
-            assert_eq!(unique.len(), list.len());
-        }
     }
 
     /// The dense checkpoint's video VAE config: the sidecar's numbers (`vae/config.json`).

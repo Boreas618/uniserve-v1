@@ -50,7 +50,7 @@ use ops::activation::Activation;
 use crate::config::TextEncoderConfig;
 use crate::partition::Partition;
 use crate::positions::{self, Mrope};
-use crate::vision::{BlockRows, ImageTables, Outputs, ROPE_THETA, VisionTower, ones};
+use crate::vision::{BlockRows, ImageTables, Outputs, ROPE_THETA, VisionTower};
 use crate::{Error, Result};
 
 /// The component a deployment's fence probes name (`profiling_config.fence_components`): one layer
@@ -419,7 +419,11 @@ impl Layer {
             Parallel::Row(split),
         )?;
         Ok(Self {
-            input_norm: normalization(&mut scope.scope("input_layernorm"), hidden, config)?,
+            input_norm: RmsNorm::load(
+                &mut scope.scope("input_layernorm"),
+                hidden,
+                config.rms_norm_eps,
+            )?,
             qkv,
             output,
             query_norm,
@@ -436,7 +440,11 @@ impl Layer {
             .map_err(Error::from)?
             .sectioned(sections)
             .map_err(Error::from)?,
-            post_norm: normalization(&mut scope.scope("post_attention_layernorm"), hidden, config)?,
+            post_norm: RmsNorm::load(
+                &mut scope.scope("post_attention_layernorm"),
+                hidden,
+                config.rms_norm_eps,
+            )?,
             gate,
             up,
             down,
@@ -632,12 +640,14 @@ impl TextEncoder {
             tower: VisionTower::load(loader, &config.vision, dtype)?,
             rows: Rows::new(dtype, hidden).map_err(Error::from)?,
             activation: GatedActivation::new(ACTIVATION),
+            // The fused residual operator reads its coefficient as a weight; every layer adds its
+            // sub-layers' outputs with coefficient one.
             residual: ScaledResidual::new(
-                ones(
-                    loader,
-                    "minimax-h3.text_encoder.residual",
+                loader.scope(PREFIX).constant(
+                    "residual_scale",
                     dtype,
-                    u64::from(config.hidden_size),
+                    &[u64::from(config.hidden_size)],
+                    &vec![1.0; config.hidden_size as usize],
                 )?,
                 None,
             )
@@ -1255,15 +1265,6 @@ fn invalid_input(problem: String) -> Error {
     ))))
 }
 
-/// The normalization module at `scope`: `width` channels with the checkpoint's epsilon.
-fn normalization(
-    scope: &mut Scope<'_, '_>,
-    width: u64,
-    config: &TextEncoderConfig,
-) -> Result<RmsNorm> {
-    RmsNorm::new(scope.tensor("weight", &[width])?, config.rms_norm_eps).map_err(Error::from)
-}
-
 /// The rotary frequency table: `theta^(-2j/head_dim)` for every rotated frequency, in FP32.
 ///
 /// It is computed once here from the configuration (the frequency table is a loading-boundary
@@ -1271,19 +1272,11 @@ fn normalization(
 /// device weight like any other.
 fn frequencies(loader: &mut WeightLoader<'_>, config: &TextEncoderConfig) -> Result<Weight> {
     let frequencies = positions::inverse_frequencies(config.head_dim, config.rope_theta)?;
-    let mut bytes = Vec::with_capacity(frequencies.len() * 4);
-    for value in &frequencies {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    loader
-        .constant(
-            "minimax-h3.text_encoder.rotary.inv_freq",
-            nn::DType::F32,
-            Shape::new(&[frequencies.len() as u64]),
-            &bytes,
-            "minimax-h3",
-        )
-        .map_err(Error::from)
+    Ok(loader.scope(format!("{PREFIX}.rotary_emb")).constant_f32(
+        "inv_freq",
+        &[frequencies.len() as u64],
+        &frequencies,
+    )?)
 }
 
 #[cfg(test)]

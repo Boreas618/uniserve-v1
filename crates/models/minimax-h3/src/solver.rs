@@ -46,7 +46,7 @@
 
 use nn::layers::ScaledResidual;
 use nn::weights::{Weight, WeightLoader};
-use nn::{DType, Forward, Shape, TensorView};
+use nn::{Forward, Shape, TensorView};
 
 use crate::schedule::{Modality, Schedule};
 use crate::{Error, Result};
@@ -225,11 +225,11 @@ impl Track {
         loader: &mut WeightLoader<'_>,
     ) -> Result<Self> {
         let coefficients = Solver::coefficients(schedule, modality)?;
-        let table = publish(
-            loader,
-            &format!("denoiser.{}.step_coefficients", modality.as_str()),
+        let mut track = loader.scope(format!("denoiser.{}", modality.as_str()));
+        let table = track.constant_f32(
+            "step_coefficients",
+            &[coefficients.len() as u64, 1],
             &coefficients,
-            Shape::new(&[coefficients.len() as u64, 1]),
         )?;
 
         // The start coefficient is `sigma_0 - 1`, and only the grid that scales its draw has one
@@ -238,12 +238,7 @@ impl Track {
         let start = match schedule.start_sigma(modality)? {
             None => None,
             Some(sigma) => {
-                let table = publish(
-                    loader,
-                    &format!("denoiser.{}.start_coefficient", modality.as_str()),
-                    &[sigma - 1.0],
-                    Shape::new(&[1]),
-                )?;
+                let table = track.constant_f32("start_coefficient", &[1], &[sigma - 1.0])?;
                 Some(ScaledResidual::new(table, None).map_err(Error::from)?)
             }
         };
@@ -252,22 +247,6 @@ impl Track {
             start,
         })
     }
-}
-
-/// Publish `values` as an FP32 constant of `shape` and answer the weight that views it.
-fn publish(
-    loader: &mut WeightLoader<'_>,
-    name: &str,
-    values: &[f32],
-    shape: Shape,
-) -> Result<Weight> {
-    let mut bytes = Vec::with_capacity(values.len() * 4);
-    for value in values {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    loader
-        .constant(name, DType::F32, shape, &bytes, "minimax-h3")
-        .map_err(Error::from)
 }
 
 #[cfg(test)]
@@ -385,7 +364,7 @@ mod tests {
     fn a_latent_view_is_one_element_per_row() {
         let view = TensorView::new(
             nn::DevicePtr::new(0),
-            DType::BF16,
+            nn::DType::BF16,
             Shape::new(&[24, 5, 8, 8]),
         );
         let elements = elements(view).expect("a contiguous latent tensor");
@@ -394,7 +373,8 @@ mod tests {
 
     #[test]
     fn a_strided_latent_tensor_is_refused() {
-        let mut view = TensorView::new(nn::DevicePtr::new(0), DType::BF16, Shape::new(&[24, 5]));
+        let mut view =
+            TensorView::new(nn::DevicePtr::new(0), nn::DType::BF16, Shape::new(&[24, 5]));
         view.strides = nn::Strides::new(&[2, 1]);
         assert!(elements(view).is_err());
     }

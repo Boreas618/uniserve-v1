@@ -25,7 +25,7 @@ use crate::{AudioVaeConfig, Error, Result};
 use nn::layers::{
     AudioActivation, Conv1d, ConvGeometry, ConvTranspose1d, PcmInterleave, ScaledAdd,
 };
-use nn::weights::WeightRequest;
+use nn::weights::Scope;
 use nn::{
     DType, DecodedMedia, Decoder, Forward, Shape, StateTable, TensorView, Weight, WeightLoader,
 };
@@ -116,140 +116,6 @@ pub fn latent_frames(config: &AudioVaeConfig, samples: u32) -> Result<u32> {
 /// The samples a latent frame count decodes to.
 pub fn track_samples(config: &AudioVaeConfig, latent_frames: u32) -> u64 {
     u64::from(latent_frames) * u64::from(samples_per_latent(config))
-}
-
-/// One logical parameter of the audio decoder and the checkpoint tensor that fills it.
-///
-/// The names are composed from the sidecar's stage table, never transcribed: `parameter` is the
-/// decoder's own path and `tensor` is the checkpoint's key (`audio_vae/diffusion_pytorch_model.
-/// safetensors` after the reference's name translation, `dec_in_proj.*` and `decoder.*`).
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Source {
-    /// The decoder's path for the parameter.
-    pub parameter: String,
-    /// Where the checkpoint stores it.
-    pub tensor: Tensor,
-}
-
-/// How the checkpoint stores one tensor.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Tensor {
-    /// One tensor under one key.
-    Region(String),
-    /// A weight-normalized convolution: `value` holds the weight's extents and `gain` one magnitude
-    /// per output channel. `nn::WeightLoader::weight_norm` folds the pair once at load, so no layer
-    /// below carries it.
-    Normalized {
-        /// The key of the direction tensor (`weight_v`).
-        value: String,
-        /// The key of the magnitude tensor (`weight_g`).
-        gain: String,
-    },
-}
-
-/// Every parameter of the decoder, with its checkpoint key.
-///
-/// The decoder is 135 weight-normalized convolutions (the pre- and post-convolutions, the seven
-/// upsamplers, and 126 anti-aliased multi-periodicity convolutions), 127 alias-free activations —
-/// each with a Kaiser-sinc filter pair and a log-space `alpha`/`beta` — and the input projection with
-/// its bias.
-pub fn sources(config: &AudioVaeConfig) -> Result<Vec<Source>> {
-    let stages = stages(config)?;
-    let mut sources = Vec::new();
-    let region = |parameter: String, tensor: String| Source {
-        parameter,
-        tensor: Tensor::Region(tensor),
-    };
-    let normalized = |parameter: String, base: String| Source {
-        parameter,
-        tensor: Tensor::Normalized {
-            value: format!("{base}.weight_v"),
-            gain: format!("{base}.weight_g"),
-        },
-    };
-    let activation = |sources: &mut Vec<Source>, parameter: String, base: String| {
-        for field in [
-            "act.alpha",
-            "act.beta",
-            "upsample.filter",
-            "downsample.lowpass.filter",
-        ] {
-            sources.push(region(
-                format!("{parameter}.{field}"),
-                format!("{base}.{field}"),
-            ));
-        }
-    };
-
-    // The decoder's input is a plain 1x1 convolution in the reference - `nn.Conv1d(latent_channels,
-    // latent_dim, 1)` outside `_normalized` - and the checkpoint stores it as one weight, so a
-    // normalized pair here asked for two tensors the export does not have and left the one it does
-    // have unread. The body's 136 convolutions *are* weight-normalized and stay so.
-    sources.push(region(
-        "input.weight".to_owned(),
-        "dec_in_proj.weight".to_owned(),
-    ));
-    sources.push(region(
-        "input.bias".to_owned(),
-        "dec_in_proj.bias".to_owned(),
-    ));
-    sources.push(normalized(
-        "pre.weight".to_owned(),
-        "decoder.conv_pre".to_owned(),
-    ));
-    sources.push(region(
-        "pre.bias".to_owned(),
-        "decoder.conv_pre.bias".to_owned(),
-    ));
-
-    for (index, _stage) in stages.iter().enumerate() {
-        let base = format!("decoder.ups.{index}.0");
-        sources.push(normalized(
-            format!("stages.{index}.upsample.weight"),
-            base.clone(),
-        ));
-        sources.push(region(
-            format!("stages.{index}.upsample.bias"),
-            format!("{base}.bias"),
-        ));
-        // Three anti-aliased multi-periodicity blocks per stage, in the reference's order.
-        for block in 0..BLOCKS_PER_STAGE {
-            let base = format!("decoder.resblocks.{}", index * BLOCKS_PER_STAGE + block);
-            let parameter = |name: &str| format!("stages.{index}.blocks.{block}.{name}");
-            for dilation in 0..config.resblock_dilation_sizes.len() {
-                for pair in ["convs1", "convs2"] {
-                    sources.push(normalized(
-                        parameter(&format!("{pair}.{dilation}.weight")),
-                        format!("{base}.{pair}.{dilation}"),
-                    ));
-                    sources.push(region(
-                        parameter(&format!("{pair}.{dilation}.bias")),
-                        format!("{base}.{pair}.{dilation}.bias"),
-                    ));
-                }
-                // A dilation contributes two activations: one before each convolution.
-                for half in 0..2 {
-                    let at = 2 * dilation + half;
-                    activation(
-                        &mut sources,
-                        parameter(&format!("activations.{at}")),
-                        format!("{base}.activations.{at}"),
-                    );
-                }
-            }
-        }
-    }
-
-    activation(
-        &mut sources,
-        "post".to_owned(),
-        "decoder.activation_post".to_owned(),
-    );
-    sources.push(normalized(
-        "output.weight".to_owned(),
-        "decoder.conv_post".to_owned(),
-    ));
-    Ok(sources)
 }
 
 /// The four buffers one anti-aliased block works in, reserved once per stage and reused by its blocks.
@@ -474,90 +340,101 @@ impl BigVgan {
         self.config.sampling_rate
     }
 
-    /// Bind every parameter the checkpoint's audio decoder has, through [`sources`].
+    /// The audio decoder the checkpoint's `dec_in_proj` and `decoder` modules state, read in FP32.
     ///
-    /// The table is consumed exactly: a tensor it names but the load never reads is an error, so a
-    /// checkpoint field cannot be silently dropped, and a parameter read twice is an error too.
+    /// The checkpoint's names are the reference's after its name translation: the input
+    /// projection `dec_in_proj`, then `decoder.conv_pre`, the upsamplers `decoder.ups.<i>.0`, the
+    /// residual blocks `decoder.resblocks.<stage · 3 + block>`, `decoder.activation_post` and
+    /// `decoder.conv_post`. The body's convolutions are weight-normalized and folded once here.
     pub fn load(config: &AudioVaeConfig, loader: &mut WeightLoader) -> Result<Self> {
-        let table = sources(config)?;
         let statistics = Statistics::of(config)?;
         let (scale, shift) = denormalize_tables(&statistics)?;
         let channels = u64::from(config.latent_channels);
-        let denormalize = Conv1d::new(
-            constants(
-                loader,
-                "audio_vae.denormalize.weight",
-                Shape::new(&[channels, channels, 1]),
-                &scale,
-            )?,
-            Some(constants(
-                loader,
-                "audio_vae.denormalize.bias",
-                Shape::new(&[channels]),
-                &shift,
-            )?),
-            geometry(1, 1, 0)?,
-            false,
+        let denormalize = {
+            let mut constants = loader.scope("audio_vae.denormalize");
+            Conv1d::new(
+                constants.constant_f32("weight", &[channels, channels, 1], &scale)?,
+                Some(constants.constant_f32("bias", &[channels], &shift)?),
+                geometry(1, 1, 0)?,
+                false,
+            )?
+        };
+        // The audio decoder computes in FP32 throughout (`DType::F32` below), so every weight is
+        // read in it whatever the checkpoint stores.
+        let mut root = loader.scope("");
+        let mut root = root.pinned(DType::F32);
+        // The decoder's input is a plain 1x1 convolution in the reference - `nn.Conv1d(
+        // latent_channels, latent_dim, 1)` outside `_normalized` - and the export holds its weight
+        // as a **3-d filter** `[latent_dim, latent_channels, 1]`, the rank `Conv1d::new` requires.
+        let input = {
+            let mut input = root.scope("dec_in_proj");
+            Conv1d::new(
+                input.tensor(
+                    "weight",
+                    &[
+                        u64::from(config.latent_dim),
+                        u64::from(config.latent_channels),
+                        1,
+                    ],
+                )?,
+                Some(input.tensor("bias", &[u64::from(config.latent_dim)])?),
+                geometry(1, 1, 0)?,
+                false,
+            )?
+        };
+        let mut decoder = root.scope("decoder");
+        let (weight, bias) = folded(
+            &mut decoder.scope("conv_pre"),
+            Some(u64::from(config.decoder_dim)),
         )?;
-        let mut binder = Binder::new(loader, table);
-        // The input projection is one weight and a bias, and the weight is a **3-d filter**: the
-        // export holds `[latent_dim, latent_channels, 1]` - a kernel of one is the same arithmetic
-        // and not the same rank, and `Conv1d::new` refuses anything that is not 3-d. Asking for two
-        // dimensions would trade a mapping refusal for a rank refusal one line later.
-        let input = Conv1d::new(
-            binder.region(
-                "input.weight",
-                &[
-                    u64::from(config.latent_dim),
-                    u64::from(config.latent_channels),
-                    1,
-                ],
-            )?,
-            Some(binder.region("input.bias", &[u64::from(config.latent_dim)])?),
-            geometry(1, 1, 0)?,
-            false,
-        )?;
-        let pre = Conv1d::new(
-            binder.normalized("pre.weight")?,
-            Some(binder.region("pre.bias", &[u64::from(config.decoder_dim)])?),
-            geometry(7, 1, 3)?,
-            false,
-        )?;
+        let pre = Conv1d::new(weight, bias, geometry(7, 1, 3)?, false)?;
         let stages = stages(config)?;
         let blocks = blocks(config)?;
         let mut built = Vec::with_capacity(stages.len());
         for (index, stage) in stages.iter().enumerate() {
+            let (weight, bias) = folded(
+                &mut decoder.scope(format!("ups.{index}.0")),
+                Some(u64::from(stage.channels_out)),
+            )?;
             let upsample = ConvTranspose1d::new(
-                binder.normalized(&format!("stages.{index}.upsample.weight"))?,
-                Some(binder.region(
-                    &format!("stages.{index}.upsample.bias"),
-                    &[u64::from(stage.channels_out)],
-                )?),
+                weight,
+                bias,
                 geometry(stage.kernel, stage.rate, stage.padding)?,
                 false,
             )?;
             let width = u64::from(stage.channels_out);
             let mut stage_blocks = Vec::with_capacity(BLOCKS_PER_STAGE);
             for block in blocks.iter().filter(|block| block.stage == index) {
-                let at = |name: &str| format!("stages.{index}.blocks.{}.{name}", block.index);
+                let mut module = decoder.scope(format!(
+                    "resblocks.{}",
+                    index * BLOCKS_PER_STAGE + block.index
+                ));
                 let mut steps = Vec::with_capacity(block.steps.len());
                 for (step, dilation) in block.steps.iter().enumerate() {
+                    let (weight, bias) =
+                        folded(&mut module.scope(format!("convs1.{step}")), Some(width))?;
                     let first = Conv1d::new(
-                        binder.normalized(&at(&format!("convs1.{step}.weight")))?,
-                        Some(binder.region(&at(&format!("convs1.{step}.bias")), &[width])?),
+                        weight,
+                        bias,
                         dilated_geometry(block.kernel, 1, dilation.padding, dilation.dilation)?,
                         false,
                     )?;
-                    let first_activation =
-                        binder.activation(&at(&format!("activations.{}", 2 * step)), width)?;
+                    let first_activation = activation(
+                        &mut module.scope(format!("activations.{}", 2 * step)),
+                        width,
+                    )?;
+                    let (weight, bias) =
+                        folded(&mut module.scope(format!("convs2.{step}")), Some(width))?;
                     let second = Conv1d::new(
-                        binder.normalized(&at(&format!("convs2.{step}.weight")))?,
-                        Some(binder.region(&at(&format!("convs2.{step}.bias")), &[width])?),
+                        weight,
+                        bias,
                         geometry(block.kernel, 1, Step::padding_plain(block.kernel))?,
                         false,
                     )?;
-                    let second_activation =
-                        binder.activation(&at(&format!("activations.{}", 2 * step + 1)), width)?;
+                    let second_activation = activation(
+                        &mut module.scope(format!("activations.{}", 2 * step + 1)),
+                        width,
+                    )?;
                     steps.push(DecoderStep {
                         first,
                         first_activation,
@@ -579,14 +456,12 @@ impl BigVgan {
         let last = stages
             .last()
             .ok_or_else(|| Error::config("the audio decoder has no stage".to_owned()))?;
-        let post = binder.activation("post", u64::from(last.channels_out))?;
-        let output = Conv1d::new(
-            binder.normalized("output.weight")?,
-            None,
-            geometry(7, 1, 3)?,
-            false,
+        let post = activation(
+            &mut decoder.scope("activation_post"),
+            u64::from(last.channels_out),
         )?;
-        binder.finish()?;
+        let (weight, _) = folded(&mut decoder.scope("conv_post"), None)?;
+        let output = Conv1d::new(weight, None, geometry(7, 1, 3)?, false)?;
         Ok(Self {
             config: config.clone(),
             denormalize,
@@ -794,20 +669,6 @@ pub fn denormalize_tables(statistics: &Statistics) -> Result<(Vec<f32>, Vec<f32>
     Ok((scale, statistics.mean.clone()))
 }
 
-/// A constant weight of `values` in FP32, published once at load.
-fn constants(
-    loader: &mut nn::WeightLoader<'_>,
-    name: &str,
-    shape: Shape,
-    values: &[f32],
-) -> Result<Weight> {
-    let bytes: Vec<u8> = values
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect();
-    Ok(loader.constant(name, DType::F32, shape, &bytes, "minimax-h3")?)
-}
-
 impl Decoder for BigVgan {
     /// The element type this decoder computes in.
     ///
@@ -933,216 +794,50 @@ fn rows(view: TensorView) -> Result<TensorView> {
     Ok(view.reshape(Shape::new(&[view.shape.numel() / columns, columns])))
 }
 
-/// The parameters of one load, with every table entry tracked so none is skipped.
-pub(crate) struct Binder<'a, 'b> {
-    loader: &'a mut WeightLoader<'b>,
-    table: Vec<Source>,
-    used: Vec<bool>,
+/// The weight-normalized convolution module at `scope`: its `weight`, folded from the stored
+/// `weight_v`/`weight_g` pair, and its `[bias]` of `bias` channels when it has one.
+///
+/// # Errors
+///
+/// When the checkpoint lacks a tensor or holds another extent.
+pub(crate) fn folded(
+    scope: &mut Scope<'_, '_>,
+    bias: Option<u64>,
+) -> Result<(Weight, Option<Weight>)> {
+    let weight = scope.weight_norm("weight")?;
+    let bias = bias
+        .map(|channels| scope.tensor("bias", &[channels]))
+        .transpose()?;
+    Ok((weight, bias))
 }
 
-impl<'a, 'b> Binder<'a, 'b> {
-    pub(crate) fn new(loader: &'a mut WeightLoader<'b>, table: Vec<Source>) -> Self {
-        let used = vec![false; table.len()];
-        Self {
-            loader,
-            table,
-            used,
-        }
-    }
-
-    /// The table entry of `parameter`, marked used.
-    fn entry(&mut self, parameter: &str) -> Result<Tensor> {
-        let index = self
-            .table
-            .iter()
-            .position(|source| source.parameter == parameter)
-            .ok_or_else(|| {
-                Error::checkpoint(format!(
-                    "{}: {}",
-                    parameter.to_owned(),
-                    "the checkpoint's audio decoder has no such parameter".to_owned()
-                ))
-            })?;
-        if self.used[index] {
-            return Err(Error::checkpoint(format!(
-                "{}: {}",
-                parameter.to_owned(),
-                "the parameter is bound twice".to_owned()
-            )));
-        }
-        self.used[index] = true;
-        Ok(self.table[index].tensor.clone())
-    }
-
-    /// A weight-normalized convolution's folded weight.
-    pub(crate) fn normalized(&mut self, parameter: &str) -> Result<Weight> {
-        match self.entry(parameter)? {
-            Tensor::Normalized { value, gain } => {
-                let weight = self.loader.weight_norm(parameter, &value, &gain)?;
-                self.declared(weight, parameter)
-            }
-            other => Err(Error::checkpoint(format!(
-                "{parameter}: the parameter is not weight-normalized: {other:?}"
-            ))),
-        }
-    }
-
-    /// A weight as the audio VAE's declared arithmetic requires it: FP32.
-    ///
-    /// The two audio VAEs compute in FP32 - the alias-free resample's Kaiser-sinc filters, the SnakeBeta
-    /// exponentials and the seven stages' transposed convolutions are all stated in it - and the loader
-    /// converts nothing by default, so a checkpoint whose audio weights are stored in a narrower type
-    /// would reach an operator whose activations are FP32 with weights that are not. That mismatch is
-    /// refused here, at the loading boundary, naming the parameter and the representation it is in.
-    fn declared(&self, weight: Weight, parameter: &str) -> Result<Weight> {
-        if weight.dtype() != DType::F32 {
-            return Err(Error::checkpoint(format!(
-                "{parameter}: the audio VAE computes in FP32 and this weight is {}; the checkpoint's \
-                 audio weights must be converted at load rather than mixed with FP32 activations",
-                weight.dtype()
-            )));
-        }
-        Ok(weight)
-    }
-
-    /// One tensor, read at `shape`.
-    pub(crate) fn region(&mut self, parameter: &str, shape: &[u64]) -> Result<Weight> {
-        match self.entry(parameter)? {
-            Tensor::Region(tensor) => {
-                let weight =
-                    self.loader
-                        .load(&WeightRequest::region(tensor, 0, Shape::new(shape)))?;
-                self.declared(weight, parameter)
-            }
-            other => Err(Error::checkpoint(format!(
-                "{parameter}: the parameter is not one tensor: {other:?}"
-            ))),
-        }
-    }
-
-    /// `shape` elements of one tensor, starting `offset` elements into it.
-    ///
-    /// A row slice of a fused matrix is contiguous, which is what splits the audio encoder's query-key-
-    /// value projection into three matrices: the checkpoint stores them fused by rows, and each one is
-    /// then read on its own by its own linear layer.
-    ///
-    /// **One entry may be sliced any number of times**, which is why this does not go through
-    /// [`Self::entry`]: that guard refuses a parameter bound twice, and a fused matrix is bound once
-    /// and read in three windows. What the guard protects is a parameter read twice *whole* - two
-    /// layers sharing one checkpoint tensor - and [`Self::region`] and [`Self::normalized`] still
-    /// refuse it.
-    pub(crate) fn slice(&mut self, parameter: &str, offset: u64, shape: &[u64]) -> Result<Weight> {
-        let index = self
-            .table
-            .iter()
-            .position(|source| source.parameter == parameter)
-            .ok_or_else(|| {
-                Error::checkpoint(format!(
-                    "{}: {}",
-                    parameter.to_owned(),
-                    "the checkpoint's audio decoder has no such parameter".to_owned()
-                ))
-            })?;
-        self.used[index] = true;
-        match self.table[index].tensor.clone() {
-            Tensor::Region(tensor) => {
-                let weight =
-                    self.loader
-                        .load(&WeightRequest::region(tensor, offset, Shape::new(shape)))?;
-                self.declared(weight, parameter)
-            }
-            other => Err(Error::checkpoint(format!(
-                "{parameter}: the parameter is not one tensor: {other:?}"
-            ))),
-        }
-    }
-
-    /// One alias-free activation: its two frequencies and its two filters.
-    fn activation(&mut self, parameter: &str, channels: u64) -> Result<AudioActivation> {
-        let alpha = self.region(&format!("{parameter}.act.alpha"), &[channels])?;
-        let beta = self.region(&format!("{parameter}.act.beta"), &[channels])?;
-        let up = self.region(
-            &format!("{parameter}.upsample.filter"),
-            &[1, 1, u64::from(ACTIVATION_KERNEL)],
-        )?;
-        let down = self.region(
-            &format!("{parameter}.downsample.lowpass.filter"),
-            &[1, 1, u64::from(ACTIVATION_KERNEL)],
-        )?;
-        Ok(AudioActivation::new(
-            DType::F32,
-            u32::try_from(channels)
-                .map_err(|_| Error::config("an audio width wider than 32 bits".to_owned()))?,
-            ACTIVATION_KERNEL,
-            ACTIVATION_RATIO,
-            ACTIVATION_BLOCK,
-        )?
-        .with_weights(alpha, beta, up, down)?)
-    }
-
-    /// Fail if the table names a parameter the load did not read.
-    pub(crate) fn finish(self) -> Result<()> {
-        match self.table.iter().zip(&self.used).find(|(_, used)| !**used) {
-            Some((source, _)) => Err(Error::checkpoint(format!(
-                "{}: the checkpoint's parameter is never bound",
-                source.parameter
-            ))),
-            None => Ok(()),
-        }
-    }
+/// The alias-free activation module at `scope`: its two log-space frequencies (`act.alpha`,
+/// `act.beta`) of `channels`, and its two Kaiser-sinc filters (`upsample.filter`,
+/// `downsample.lowpass.filter`).
+///
+/// # Errors
+///
+/// When the checkpoint lacks a tensor or holds another extent.
+fn activation(scope: &mut Scope<'_, '_>, channels: u64) -> Result<AudioActivation> {
+    let alpha = scope.tensor("act.alpha", &[channels])?;
+    let beta = scope.tensor("act.beta", &[channels])?;
+    let filter = [1, 1, u64::from(ACTIVATION_KERNEL)];
+    let up = scope.tensor("upsample.filter", &filter)?;
+    let down = scope.tensor("downsample.lowpass.filter", &filter)?;
+    Ok(AudioActivation::new(
+        DType::F32,
+        u32::try_from(channels)
+            .map_err(|_| Error::config("an audio width wider than 32 bits".to_owned()))?,
+        ACTIVATION_KERNEL,
+        ACTIVATION_RATIO,
+        ACTIVATION_BLOCK,
+    )?
+    .with_weights(alpha, beta, up, down)?)
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
 
-    /// A weight the audio VAE cannot compute in is refused at the load, by name.
-    ///
-    /// Both audio halves compute in FP32 - the alias-free resample's Kaiser-sinc filters, the
-    /// SnakeBeta exponentials and the seven stages' transposed convolutions are stated in it - and
-    /// the loader converts nothing by default. A checkpoint whose audio weights are stored narrower
-    /// would therefore reach an FP32 operator with weights that are not, and the refusal at the
-    /// loading boundary is the whole of what stops it: without this, the mismatch appears at the
-    /// kernel that reads one type and is handed another, if the kernel checks at all.
-    ///
-    /// A meta loader answers each request at the type the checkpoint's header states, so a
-    /// checkpoint holding the first weight the load reads, stored as F16, is enough to reach the
-    /// refusal.
-    #[test]
-    fn a_weight_the_audio_vae_cannot_compute_in_is_refused_by_name() {
-        let config = audio_config();
-        let input = sources(&config)
-            .expect("the decoder's sources")
-            .into_iter()
-            .find(|source| source.parameter == "input.weight")
-            .expect("the input projection");
-        let Tensor::Region(tensor) = input.tensor else {
-            panic!("the input projection is one region");
-        };
-        let directory = tempfile::tempdir().expect("a temp directory");
-        let checkpoint = crate::video_vae::tests::header_checkpoint(
-            directory.path(),
-            &[(
-                tensor,
-                DType::F16,
-                vec![
-                    u64::from(config.latent_dim),
-                    u64::from(config.latent_channels),
-                    1,
-                ],
-            )],
-        );
-        let mut loader = WeightLoader::meta(&checkpoint, None, None);
-        // `BigVgan` is not `Debug`, so the outcome is matched rather than unwrapped.
-        let error = match BigVgan::load(&config, &mut loader) {
-            Ok(_) => panic!("an F16 audio weight was accepted"),
-            Err(error) => error,
-        };
-        let message = error.to_string();
-        assert!(
-            message.contains("must be converted at load"),
-            "the refusal names the type the audio VAE cannot compute in: {message}"
-        );
-    }
     use super::*;
 
     pub(crate) fn audio_config() -> AudioVaeConfig {
@@ -1289,52 +984,5 @@ pub(crate) mod tests {
         let mut broken = config.clone();
         broken.resblock_kernel_sizes.pop();
         assert!(blocks(&broken).is_err());
-    }
-
-    #[test]
-    fn the_weight_table_names_every_parameter_of_the_checkpoint() {
-        let config = audio_config();
-        let table = sources(&config).expect("the decoder's parameters");
-        let normalized = table
-            .iter()
-            .filter(|source| matches!(source.tensor, Tensor::Normalized { .. }))
-            .count();
-        // The same count by structure: the pre- and post-convolutions plus every stage's upsampler
-        // and its blocks' convolutions. The input projection is not among them.
-        let stages = config.decoder_rates.len();
-        let kernels = config.resblock_kernel_sizes.len();
-        let normalized_by_structure = 2 + stages * (1 + BLOCKS_PER_STAGE * kernels * 2);
-        assert_eq!(normalized, normalized_by_structure);
-        // The table's total is not asserted here: it would be a restatement of the same structure.
-        // What matters beyond the count is that the table names the checkpoint's parameters in the
-        // right representation - and the pair rule below is that check, stated directly.
-        let names: Vec<&str> = table
-            .iter()
-            .map(|source| source.parameter.as_str())
-            .collect();
-        assert!(names.contains(&"input.weight"));
-        assert!(names.contains(&"pre.weight"));
-        assert!(names.contains(&"stages.6.upsample.weight"));
-        assert!(names.contains(&"stages.0.blocks.2.convs1.2.weight"));
-        assert!(names.contains(&"stages.6.blocks.2.activations.5.act.alpha"));
-        assert!(names.contains(&"post.downsample.lowpass.filter"));
-        assert!(names.contains(&"output.weight"));
-        // No parameter repeats: the stack is named once.
-        let mut unique = names.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(unique.len(), names.len());
-        // A weight-normalized convolution names both directions and one gain.
-        let pre = table
-            .iter()
-            .find(|source| source.parameter == "pre.weight")
-            .expect("the pre-convolution");
-        assert_eq!(
-            pre.tensor,
-            Tensor::Normalized {
-                value: "decoder.conv_pre.weight_v".to_owned(),
-                gain: "decoder.conv_pre.weight_g".to_owned(),
-            }
-        );
     }
 }

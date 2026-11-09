@@ -47,8 +47,6 @@
 //! decoded pixels, the encoder blends latents. A band of latent rows can be encoded on its own: the
 //! tile rows it reads are chosen so that the band's rows equal those rows of the whole encoding.
 
-use crate::audio_vae::Binder;
-
 /// `nn.LayerNorm`'s default epsilon, which the reference's audio projection does not override.
 const NORM_EPS: f32 = 1e-5;
 use crate::config::VideoVaeConfig;
@@ -601,80 +599,6 @@ pub fn normalize(pixel: [u8; 3]) -> [f32; 3] {
     values
 }
 
-/// Every parameter of the video encoder, with the checkpoint key that fills it.
-///
-/// The encoder is the input convolution, six stages of two blocks each, the final normalization and
-/// the moment convolution, plus the one-by-one `quant_conv` after it: 118 tensors in the released
-/// checkpoint. A shortcut convolution exists only where a block changes width, and a downsampling
-/// only where a stage strides.
-pub fn sources(config: &VideoVaeConfig) -> Result<Vec<crate::audio_vae::Source>> {
-    use crate::audio_vae::{Source, Tensor};
-
-    let stack = Stack::of(config)?;
-    let mut sources = Vec::new();
-    let mut push = |parameter: String, tensor: String| {
-        sources.push(Source {
-            parameter,
-            tensor: Tensor::Region(tensor),
-        });
-    };
-
-    for (parameter, tensor) in [
-        ("quant_conv.weight", "quant_conv.weight"),
-        ("quant_conv.bias", "quant_conv.bias"),
-        ("input.weight", "encoder.conv_in.weight"),
-        ("input.bias", "encoder.conv_in.bias"),
-        ("norm.weight", "encoder.norm_out.weight"),
-        ("norm.bias", "encoder.norm_out.bias"),
-        ("output.weight", "encoder.conv_out.weight"),
-        ("output.bias", "encoder.conv_out.bias"),
-    ] {
-        push(parameter.to_owned(), tensor.to_owned());
-    }
-
-    let mut input_width = stack.widths[0];
-    for (index, width) in stack.widths.iter().enumerate() {
-        let stage = format!("encoder.down_blocks.{index}");
-        for block in 0..stack.blocks {
-            let base = format!("{stage}.resnets.{block}");
-            let at = |name: &str| format!("stages.{index}.blocks.{block}.{name}");
-            for half in 0..2u32 {
-                for leaf in ["weight", "bias"] {
-                    push(
-                        at(&format!("norms.{half}.{leaf}")),
-                        format!("{base}.norm{}.{leaf}", half + 1),
-                    );
-                    push(
-                        at(&format!("convolutions.{half}.{leaf}")),
-                        format!("{base}.conv{}.{leaf}", half + 1),
-                    );
-                }
-            }
-            // A block whose width changes projects its residual with a one-by-one convolution.
-            let shortcut_from = if block == 0 { input_width } else { *width };
-            if shortcut_from != *width {
-                for leaf in ["weight", "bias"] {
-                    push(
-                        at(&format!("shortcut.{leaf}")),
-                        format!("{base}.conv_shortcut.{leaf}"),
-                    );
-                }
-            }
-        }
-        // A stage strides through one causal convolution, or not at all.
-        if stack.temporal_strides[index] * stack.spatial_strides[index] > 1 {
-            for leaf in ["weight", "bias"] {
-                push(
-                    format!("stages.{index}.downsample.{leaf}"),
-                    format!("{stage}.downsamplers.0.conv.{leaf}"),
-                );
-            }
-        }
-        input_width = *width;
-    }
-    Ok(sources)
-}
-
 /// The audio encoder's stack: DAC's strided widening network and the latent projection.
 ///
 /// The decoder's rates are the encoder's reversed only in effect: the encoder's five strided stages
@@ -800,162 +724,6 @@ pub fn padded_samples(samples: u64, hop: u64) -> Result<u64> {
     Ok(audio_latent_frames(samples, hop)? * hop)
 }
 
-/// Every parameter of the audio encoder, with the checkpoint keys that fill it.
-///
-/// The encoder is DAC's network — the input convolution, five stages of three dilated residual units
-/// each and a strided widening convolution, then the output convolution — followed by the latent
-/// projection (`pre_block` in the checkpoint) and the mean convolution (`mean_proj`). Every
-/// convolution is weight-normalized. The projection's query, key and value biases are three separate
-/// checkpoint tensors that fill one fused parameter, the key's being a stored zero vector.
-pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_vae::Source>> {
-    use crate::audio_vae::{Source, Tensor};
-
-    fn region(sources: &mut Vec<Source>, parameter: String, tensor: String) {
-        sources.push(Source {
-            parameter,
-            tensor: Tensor::Region(tensor),
-        });
-    }
-    fn normalized(sources: &mut Vec<Source>, parameter: String, base: String) {
-        sources.push(Source {
-            parameter,
-            tensor: Tensor::Normalized {
-                value: format!("{base}.weight_v"),
-                gain: format!("{base}.weight_g"),
-            },
-        });
-    }
-
-    let stack = AudioStack::of(config)?;
-    let mut sources = Vec::new();
-
-    // `network` is the checkpoint's `encoder.block` sequence: the input convolution, one entry per
-    // stage, a Snake, and the output convolution.
-    normalized(
-        &mut sources,
-        "input.weight".to_owned(),
-        "encoder.block.0".to_owned(),
-    );
-    region(
-        &mut sources,
-        "input.bias".to_owned(),
-        "encoder.block.0.bias".to_owned(),
-    );
-    // Three residual units per stage, at dilations 1, 3 and 9; the dilation names the branch in the
-    // plan, not a parameter.
-    let units = 3;
-    for index in 0..stack.rates.len() {
-        let base = format!("encoder.block.{}.block", index + 1);
-        let at = |name: &str| format!("stages.{index}.{name}");
-        for unit in 0..units {
-            normalized(
-                &mut sources,
-                at(&format!("units.{unit}.convs.0.weight")),
-                format!("{base}.{unit}.block.1"),
-            );
-            region(
-                &mut sources,
-                at(&format!("units.{unit}.convs.0.bias")),
-                format!("{base}.{unit}.block.1.bias"),
-            );
-            normalized(
-                &mut sources,
-                at(&format!("units.{unit}.convs.1.weight")),
-                format!("{base}.{unit}.block.3"),
-            );
-            region(
-                &mut sources,
-                at(&format!("units.{unit}.convs.1.bias")),
-                format!("{base}.{unit}.block.3.bias"),
-            );
-            // Each residual unit's two Snakes carry one frequency per channel.
-            for (side, slot) in [("0", 0), ("1", 2)] {
-                region(
-                    &mut sources,
-                    at(&format!("units.{unit}.snakes.{side}.alpha")),
-                    format!("{base}.{unit}.block.{slot}.alpha"),
-                );
-            }
-        }
-        // The reference's `EncoderBlock.block` is five entries - three residual units at 0, 1 and
-        // 2, **the stage's Snake at 3**, and the widening convolution at 4. An extra entry was
-        // assumed before the Snake here, so every name in this block asked for one index too high:
-        // the widen convolution at `.5` and the Snake at `.4`, neither of which the checkpoint has.
-        // That is four names a stage and five stages - the twenty a run reported missing, with
-        // `.block.4.alpha` among them, and a Snake at an index the convolution occupies cannot
-        // exist.
-        normalized(&mut sources, at("widen.weight"), format!("{base}.4"));
-        region(&mut sources, at("widen.bias"), format!("{base}.4.bias"));
-        region(&mut sources, at("snake.alpha"), format!("{base}.3.alpha"));
-    }
-    // The network ends with a Snake and the output convolution.
-    region(
-        &mut sources,
-        "output_snake.alpha".to_owned(),
-        format!("encoder.block.{}.alpha", stack.rates.len() + 1),
-    );
-    let last = stack.rates.len() + 2;
-    normalized(
-        &mut sources,
-        "output.weight".to_owned(),
-        format!("encoder.block.{last}"),
-    );
-    region(
-        &mut sources,
-        "output.bias".to_owned(),
-        format!("encoder.block.{last}.bias"),
-    );
-
-    for (parameter, tensor) in [
-        ("projection.shortcut_norm.weight", "pre_block.norm3.weight"),
-        ("projection.shortcut_norm.bias", "pre_block.norm3.bias"),
-        ("projection.shortcut.weight", "pre_block.proj.weight"),
-        ("projection.shortcut.bias", "pre_block.proj.bias"),
-        ("projection.attention_norm.weight", "pre_block.norm1.weight"),
-        ("projection.attention_norm.bias", "pre_block.norm1.bias"),
-        ("projection.qkv.weight", "pre_block.attn.qkv.weight"),
-        (
-            "projection.attention_output.weight",
-            "pre_block.attn.proj.weight",
-        ),
-        (
-            "projection.attention_output.bias",
-            "pre_block.attn.proj.bias",
-        ),
-        ("projection.mlp_norm.weight", "pre_block.norm2.weight"),
-        ("projection.mlp_norm.bias", "pre_block.norm2.bias"),
-        ("projection.mlp.norm.weight", "pre_block.mlp.norm.weight"),
-        ("projection.mlp.norm.bias", "pre_block.mlp.norm.bias"),
-        ("projection.mlp.gate.weight", "pre_block.mlp.w0.weight"),
-        ("projection.mlp.gate.bias", "pre_block.mlp.w0.bias"),
-        ("projection.mlp.value.weight", "pre_block.mlp.w1.weight"),
-        ("projection.mlp.value.bias", "pre_block.mlp.w1.bias"),
-        ("projection.mlp.output.weight", "pre_block.mlp.w2.weight"),
-        ("projection.mlp.output.bias", "pre_block.mlp.w2.bias"),
-        ("mean_projection.weight", "mean_proj.weight"),
-        ("mean_projection.bias", "mean_proj.bias"),
-    ] {
-        region(&mut sources, parameter.to_owned(), tensor.to_owned());
-    }
-    // The checkpoint fuses query, key and value into one `[3 * wide]` bias parameter and keeps its
-    // three windows as three tensors; the reference fills the windows from them in this order.
-    // This encoder's attention reads the three windows as three layers, so
-    // each window is its own source and its own load: a window is a whole tensor here, while the
-    // fused weight below is one tensor read at three offsets.
-    //
-    // `pre_block.attn.zero_k_bias` is the checkpoint's stored key window - a vector it carries like
-    // the other two - so it is requested and loaded, never substituted by a constant on the strength
-    // of its name: a buffer placed in a learned slot is a silent change to the arithmetic.
-    for (parameter, tensor) in [
-        ("projection.qkv.q_bias", "pre_block.attn.q_bias"),
-        ("projection.qkv.k_bias", "pre_block.attn.zero_k_bias"),
-        ("projection.qkv.v_bias", "pre_block.attn.v_bias"),
-    ] {
-        region(&mut sources, parameter.to_owned(), tensor.to_owned());
-    }
-    Ok(sources)
-}
-
 // ---------------------------------------------------------------------------------------------
 // The video encoder's device path.
 // ---------------------------------------------------------------------------------------------
@@ -965,8 +733,10 @@ use nn::layers::{
     AdaptivePool, Attention, Conv1d, Conv3d, ConvGeometry, FrameMoments, FrameNormPad, FramePad,
     GatedActivation, LayerNorm, Linear, Posterior, ScaledAdd, Snake, Transpose, WeightOrder,
 };
-use nn::weights::{Weight, WeightLoader, WeightRequest};
+use nn::weights::{Scope, Weight, WeightLoader};
 use nn::{DType, Shape, Strides, TensorView};
+
+use crate::audio_vae::folded;
 
 /// One causal convolution of the encoder and the normalization that feeds it.
 ///
@@ -1037,15 +807,6 @@ fn geometry(kernel: u32, stride: [u32; 3]) -> Result<ConvGeometry> {
     )?)
 }
 
-/// Read one weight of `shape`.
-fn read(loader: &mut WeightLoader, name: &str, shape: &[u64]) -> Result<Weight> {
-    Ok(loader.load(&WeightRequest::region(
-        name.to_owned(),
-        0,
-        Shape::new(shape),
-    ))?)
-}
-
 /// The per-channel affine of the latent space, in the encoder's direction: `(sample − mean) / std`.
 ///
 /// Multiplying by `1 / std` and shifting by `−mean / std` is a one-by-one convolution whose weight is
@@ -1078,24 +839,6 @@ pub fn normalize_tables(mean: &[f32], std: &[f32]) -> Result<(Vec<f32>, Vec<f32>
         shift[channel] = -mean[channel] / deviation;
     }
     Ok((scale, shift))
-}
-
-/// A constant weight of `values` in FP32, published once at load.
-///
-/// The checkpoint has no tensor for the latent statistics: they are config fields, and this is where
-/// arithmetic on them becomes a weight the convolution can read. `audio_vae::constants` publishes the
-/// decoder's pair the same way.
-fn constants(
-    loader: &mut WeightLoader<'_>,
-    name: &str,
-    shape: Shape,
-    values: &[f32],
-) -> Result<Weight> {
-    let bytes: Vec<u8> = values
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect();
-    Ok(loader.constant(name, DType::F32, shape, &bytes, "minimax-h3")?)
 }
 
 /// The geometry of one posterior sample: the positions it reads and the channels it writes.
@@ -1200,17 +943,15 @@ impl Sample {
 /// channels-last cuDNN picks another algorithm "whose rounding differs", so the reference keeps
 /// those two out of the speed path itself.
 fn convolution(
-    loader: &mut WeightLoader,
-    name: &str,
+    scope: &mut Scope<'_, '_>,
     from: u32,
     to: u32,
     kernel: u32,
     stride: [u32; 3],
     channels_last: bool,
 ) -> Result<Conv3d> {
-    let weight = read(
-        loader,
-        &format!("{name}.weight"),
+    let weight = scope.tensor(
+        "weight",
         &[
             u64::from(to),
             u64::from(from),
@@ -1219,7 +960,7 @@ fn convolution(
             u64::from(kernel),
         ],
     )?;
-    let bias = read(loader, &format!("{name}.bias"), &[u64::from(to)])?;
+    let bias = scope.tensor("bias", &[u64::from(to)])?;
     Ok(Conv3d::new(
         weight,
         Some(bias),
@@ -1257,15 +998,19 @@ impl VideoEncoder {
                           to: u32,
                           kernel: u32|
          -> Result<Normalized> {
-            let weight = read(
-                loader,
-                &format!("{norm_name}.weight"),
-                &[u64::from(channels)],
-            )?;
-            let bias = read(loader, &format!("{norm_name}.bias"), &[u64::from(channels)])?;
+            let mut norm = loader.scope(norm_name);
+            let weight = norm.tensor("weight", &[u64::from(channels)])?;
+            let bias = norm.tensor("bias", &[u64::from(channels)])?;
             Ok(Normalized {
                 norm: FrameNormPad::new(u64::from(groups), Some(weight), Some(bias), reflect)?,
-                conv: convolution(loader, conv_name, channels, to, kernel, [1; 3], false)?,
+                conv: convolution(
+                    &mut loader.scope(conv_name),
+                    channels,
+                    to,
+                    kernel,
+                    [1; 3],
+                    false,
+                )?,
                 channels,
                 groups,
                 epsilon,
@@ -1273,8 +1018,7 @@ impl VideoEncoder {
         };
 
         let input = convolution(
-            loader,
-            "encoder.conv_in",
+            &mut loader.scope("encoder.conv_in"),
             stack.input_channels,
             stack.widths[0],
             3,
@@ -1309,8 +1053,7 @@ impl VideoEncoder {
                     None
                 } else {
                     Some(convolution(
-                        loader,
-                        &format!("{base}.conv_shortcut"),
+                        &mut loader.scope(format!("{base}.conv_shortcut")),
                         from,
                         *out,
                         1,
@@ -1331,8 +1074,7 @@ impl VideoEncoder {
             ];
             let downsample = if stack.downsamples(index) {
                 Some(convolution(
-                    loader,
-                    &format!("{stage}.downsamplers.0.conv"),
+                    &mut loader.scope(format!("{stage}.downsamplers.0.conv")),
                     *out,
                     *out,
                     3,
@@ -1354,8 +1096,7 @@ impl VideoEncoder {
             3,
         )?;
         let moments = convolution(
-            loader,
-            "quant_conv",
+            &mut loader.scope("quant_conv"),
             2 * stack.latent_channels,
             2 * stack.latent_channels,
             1,
@@ -1365,19 +1106,10 @@ impl VideoEncoder {
         // The latent space's affine: the checkpoint states its statistics, not a tensor for them.
         let latent = u64::from(stack.latent_channels);
         let (scale, shift) = normalize_tables(&config.latents_mean, &config.latents_std)?;
+        let mut constants = loader.scope("video_vae.normalize");
         let normalize = Conv3d::new(
-            constants(
-                loader,
-                "video_vae.normalize.weight",
-                Shape::new(&[latent, latent, 1, 1, 1]),
-                &scale,
-            )?,
-            Some(constants(
-                loader,
-                "video_vae.normalize.bias",
-                Shape::new(&[latent]),
-                &shift,
-            )?),
+            constants.constant_f32("weight", &[latent, latent, 1, 1, 1], &scale)?,
+            Some(constants.constant_f32("bias", &[latent], &shift)?),
             geometry(1, [1; 3])?,
             true,
             false,
@@ -2116,22 +1848,24 @@ impl AudioEncoder {
             .product()
     }
 
-    /// Bind the encoder every checkpoint field it has, through [`audio_sources`].
+    /// The encoder the checkpoint's `encoder`, `pre_block` and `mean_proj` modules state, read in
+    /// FP32.
     ///
-    /// The attention is built for [`LONGEST_TRACK`], the longest track the model supports; a longer
-    /// track is refused by [`Self::frames`] rather than read past the bound. The table is consumed
-    /// exactly, the same discipline the audio decoder's load keeps.
+    /// The encoder is DAC's network - `encoder.block` is the input convolution, one entry per stage
+    /// (three dilated residual units, the stage's Snake and the strided widening convolution), a
+    /// Snake and the output convolution - followed by the latent projection (`pre_block`) and the
+    /// mean convolution (`mean_proj`). Every convolution of the network is weight-normalized and
+    /// folded once here. The attention is built for [`LONGEST_TRACK`], the longest track the model
+    /// supports; a longer track is refused by [`Self::frames`] rather than read past the bound.
     pub fn load(config: &crate::AudioVaeConfig, loader: &mut WeightLoader) -> Result<Self> {
         let frames = LONGEST_TRACK;
-        let table = audio_sources(config)?;
-        let mut binder = Binder::new(loader, table);
+        // The audio encoder computes in FP32 throughout, so every weight is read in it.
+        let mut root = loader.scope("");
+        let mut root = root.pinned(DType::F32);
+        let mut network = root.scope("encoder.block");
         let mut width = config.encoder_dim;
-        let input = Conv1d::new(
-            binder.normalized("input.weight")?,
-            Some(binder.region("input.bias", &[u64::from(width)])?),
-            crate::audio_vae::geometry(7, 1, 3)?,
-            false,
-        )?;
+        let (weight, bias) = folded(&mut network.scope("0"), Some(u64::from(width)))?;
+        let input = Conv1d::new(weight, bias, crate::audio_vae::geometry(7, 1, 3)?, false)?;
 
         let mut stages = Vec::with_capacity(config.encoder_rates.len());
         for (index, rate) in config.encoder_rates.iter().enumerate() {
@@ -2139,39 +1873,42 @@ impl AudioEncoder {
             width = width.checked_mul(2).ok_or_else(|| {
                 Error::config("the encoder's widths overflow a descriptor".to_owned())
             })?;
-            let at = |name: &str| format!("stages.{index}.{name}");
+            // `EncoderBlock.block` is five entries: three residual units at 0, 1 and 2, the stage's
+            // Snake at 3, and the widening convolution at 4.
+            let mut stage = network.scope(format!("{}.block", index + 1));
             let mut units = Vec::with_capacity(3);
             // The three units are the same shape at dilations 1, 3 and 9: the first convolution is
             // seven wide and dilated, its padding keeping the length, and the second is the reference's
             // `Conv1d(channels, channels, 1)`, a pointwise mix.
             for (unit, dilation) in [1u32, 3, 9].into_iter().enumerate() {
-                let name = |slot: &str| at(&format!("units.{unit}.{slot}"));
+                // A residual unit's `block` is its Snake (0), the dilated convolution (1), a second
+                // Snake (2) and the pointwise convolution (3).
+                let mut module = stage.scope(format!("{unit}.block"));
+                let (weight, bias) = folded(&mut module.scope("1"), Some(u64::from(inner)))?;
                 let first = Conv1d::new(
-                    binder.normalized(&name("convs.0.weight"))?,
-                    Some(binder.region(&name("convs.0.bias"), &[u64::from(inner)])?),
+                    weight,
+                    bias,
                     crate::audio_vae::dilated_geometry(7, 1, 3 * dilation, dilation)?,
                     false,
                 )?;
-                let second = Conv1d::new(
-                    binder.normalized(&name("convs.1.weight"))?,
-                    Some(binder.region(&name("convs.1.bias"), &[u64::from(inner)])?),
-                    crate::audio_vae::geometry(1, 1, 0)?,
-                    false,
-                )?;
+                let (weight, bias) = folded(&mut module.scope("3"), Some(u64::from(inner)))?;
+                let second =
+                    Conv1d::new(weight, bias, crate::audio_vae::geometry(1, 1, 0)?, false)?;
                 units.push(EncoderUnit {
                     convs: [first, second],
                     snakes: [Snake::new(u64::from(inner))?, Snake::new(u64::from(inner))?],
                     alphas: [
-                        binder.region(&name("snakes.0.alpha"), &[u64::from(inner)])?,
-                        binder.region(&name("snakes.1.alpha"), &[u64::from(inner)])?,
+                        module.scope("0").tensor("alpha", &[u64::from(inner)])?,
+                        module.scope("2").tensor("alpha", &[u64::from(inner)])?,
                     ],
                 });
             }
             let snake = Snake::new(u64::from(inner))?;
-            let alpha = binder.region(&at("snake.alpha"), &[u64::from(inner)])?;
+            let alpha = stage.scope("3").tensor("alpha", &[u64::from(inner)])?;
+            let (weight, bias) = folded(&mut stage.scope("4"), Some(u64::from(width)))?;
             let widen = Conv1d::new(
-                binder.normalized(&at("widen.weight"))?,
-                Some(binder.region(&at("widen.bias"), &[u64::from(width)])?),
+                weight,
+                bias,
                 crate::audio_vae::geometry(2 * rate, *rate, rate.div_ceil(2))?,
                 false,
             )?;
@@ -2186,44 +1923,38 @@ impl AudioEncoder {
         }
 
         let tail = Snake::new(u64::from(width))?;
-        let tail_alpha = binder.region("output_snake.alpha", &[u64::from(width)])?;
+        // The network ends with a Snake and the output convolution.
+        let stages_end = config.encoder_rates.len();
+        let tail_alpha = network
+            .scope(stages_end + 1)
+            .tensor("alpha", &[u64::from(width)])?;
         // The network's last convolution is three wide, not seven: the reference's `Conv1d(width,
         // latent_dim, 3, padding=1)`.
-        let output = Conv1d::new(
-            binder.normalized("output.weight")?,
-            Some(binder.region("output.bias", &[u64::from(config.latent_dim)])?),
-            crate::audio_vae::geometry(3, 1, 1)?,
-            false,
+        let (weight, bias) = folded(
+            &mut network.scope(stages_end + 2),
+            Some(u64::from(config.latent_dim)),
         )?;
+        let output = Conv1d::new(weight, bias, crate::audio_vae::geometry(3, 1, 1)?, false)?;
 
-        let projection = Projection::load(config, &mut binder, frames)?;
+        let projection = Projection::load(config, &mut root.scope("pre_block"), frames)?;
         let channels = u64::from(config.latent_channels);
         // The reference's mean projection is `nn.Conv1d(latent_channels, latent_channels, 1)`, so the
         // checkpoint stores a three-dimensional filter `[out, in, kernel]` and not a matrix: a kernel
         // of one makes the two the same arithmetic but not the same rank, and `Conv1d::new` refuses a
         // filter that is not 3-d.
+        let mut mean = root.scope("mean_proj");
         let mean = Conv1d::new(
-            binder.region("mean_projection.weight", &[channels, channels, 1])?,
-            Some(binder.region("mean_projection.bias", &[channels])?),
+            mean.tensor("weight", &[channels, channels, 1])?,
+            Some(mean.tensor("bias", &[channels])?),
             crate::audio_vae::geometry(1, 1, 0)?,
             false,
         )?;
-        binder.finish()?;
         // The latent space's affine: the config states its statistics, not a tensor for them.
         let (scale, shift) = normalize_tables(&config.latents_mean, &config.latents_std)?;
+        let mut constants = loader.scope("audio_vae.normalize");
         let normalize = Conv1d::new(
-            constants(
-                loader,
-                "audio_vae.normalize.weight",
-                Shape::new(&[channels, channels, 1]),
-                &scale,
-            )?,
-            Some(constants(
-                loader,
-                "audio_vae.normalize.bias",
-                Shape::new(&[channels]),
-                &shift,
-            )?),
+            constants.constant_f32("weight", &[channels, channels, 1], &scale)?,
+            Some(constants.constant_f32("bias", &[channels], &shift)?),
             crate::audio_vae::geometry(1, 1, 0)?,
             false,
         )?;
@@ -2419,10 +2150,10 @@ fn matrix(view: TensorView) -> Result<TensorView> {
 }
 
 impl Projection {
-    /// Bind the attention projection at the latent width.
+    /// The latent projection module at `scope` (`pre_block`), at the latent width.
     fn load(
         config: &crate::AudioVaeConfig,
-        binder: &mut Binder<'_, '_>,
+        scope: &mut Scope<'_, '_>,
         frames: u32,
     ) -> Result<Self> {
         let wide = u64::from(config.latent_dim);
@@ -2433,36 +2164,31 @@ impl Projection {
                 "{wide} latent channels over {heads} attention heads"
             )));
         }
-        let norm = |binder: &mut Binder<'_, '_>, name: &str| -> Result<LayerNorm> {
-            let weight = binder.region(&format!("projection.{name}.weight"), &[wide])?;
-            let bias = binder.region(&format!("projection.{name}.bias"), &[wide])?;
-            Ok(LayerNorm::new(weight, Some(bias), NORM_EPS)?)
-        };
-        let shortcut_norm = norm(binder, "shortcut_norm")?;
-        let attention_norm = norm(binder, "attention_norm")?;
+        let shortcut_norm = LayerNorm::load(&mut scope.scope("norm3"), wide, NORM_EPS)?;
+        let attention_norm = LayerNorm::load(&mut scope.scope("norm1"), wide, NORM_EPS)?;
+        let mut shortcut = scope.scope("proj");
         let shortcut = Linear::new(
-            binder.region("projection.shortcut.weight", &[channels, wide])?,
-            Some(binder.region("projection.shortcut.bias", &[channels])?),
+            shortcut.tensor("weight", &[channels, wide])?,
+            Some(shortcut.tensor("bias", &[channels])?),
             WeightOrder::NxK,
         )?;
-        // The checkpoint fuses query, key and value into one `[3 · wide, wide]` matrix and one
-        // `[3 · wide]` bias; each third is contiguous, so each head group is its own layer.
+        // The checkpoint fuses query, key and value into one `[3 · wide, wide]` matrix whose thirds
+        // are contiguous rows, and keeps the three bias windows as three tensors: each head group is
+        // its own layer over its rows. `zero_k_bias` is the checkpoint's stored key window - a
+        // vector it carries like the other two - so it is loaded, never substituted by a constant
+        // on the strength of its name: a buffer placed in a learned slot changes the arithmetic.
         let third = wide;
-        let slice = |binder: &mut Binder<'_, '_>,
-                     name: &str,
-                     index: u64,
-                     shape: &[u64]|
-         -> Result<Weight> {
-            binder.slice(name, index * shape.iter().product::<u64>(), shape)
-        };
-        let linear = |binder: &mut Binder<'_, '_>, index: u64, window: &str| -> Result<Linear> {
-            let weight = slice(binder, "projection.qkv.weight", index, &[third, wide])?;
-            let bias = binder.region(&format!("projection.qkv.{window}_bias"), &[third])?;
+        let mut attention = scope.scope("attn");
+        let mut linear = |index: u64, bias: &str| -> Result<Linear> {
+            let weight = attention
+                .scope("qkv")
+                .rows("weight", index * third, &[third, wide])?;
+            let bias = attention.tensor(bias, &[third])?;
             Ok(Linear::new(weight, Some(bias), WeightOrder::NxK)?)
         };
-        let query = linear(binder, 0, "q")?;
-        let key = linear(binder, 1, "k")?;
-        let value = linear(binder, 2, "v")?;
+        let query = linear(0, "q_bias")?;
+        let key = linear(1, "zero_k_bias")?;
+        let value = linear(2, "v_bias")?;
         let head_dim = u32::try_from(wide / heads)
             .map_err(|_| Error::config("a head wider than a launch holds".to_owned()))?;
         let heads_u32 = u32::try_from(heads)
@@ -2476,18 +2202,15 @@ impl Projection {
             None,
             1.0 / (head_dim as f32).sqrt(),
         )?;
+        let mut output = scope.scope("attn.proj");
         let attention_output = Linear::new(
-            binder.region("projection.attention_output.weight", &[channels, channels])?,
-            Some(binder.region("projection.attention_output.bias", &[channels])?),
+            output.tensor("weight", &[channels, channels])?,
+            Some(output.tensor("bias", &[channels])?),
             WeightOrder::NxK,
         )?;
         let pool = AdaptivePool::new(heads, wide / heads, channels)?;
-        let mlp_norm = LayerNorm::new(
-            binder.region("projection.mlp_norm.weight", &[channels])?,
-            Some(binder.region("projection.mlp_norm.bias", &[channels])?),
-            NORM_EPS,
-        )?;
-        let mlp = GeGlu::load(config, binder)?;
+        let mlp_norm = LayerNorm::load(&mut scope.scope("norm2"), channels, NORM_EPS)?;
+        let mlp = GeGlu::load(config, &mut scope.scope("mlp"))?;
         Ok(Self {
             shortcut_norm,
             shortcut,
@@ -2559,29 +2282,23 @@ impl Projection {
 }
 
 impl GeGlu {
-    /// Bind a normalized tanh-GELU gated linear unit over the latent channels.
-    fn load(config: &crate::AudioVaeConfig, binder: &mut Binder<'_, '_>) -> Result<Self> {
+    /// The normalized tanh-GELU gated linear unit at `scope` over the latent channels: its `norm`,
+    /// the gate `w0`, the value `w1` and the output `w2`.
+    fn load(config: &crate::AudioVaeConfig, scope: &mut Scope<'_, '_>) -> Result<Self> {
         let channels = u64::from(config.latent_channels);
         let hidden = 2 * channels;
-        let norm = LayerNorm::new(
-            binder.region("projection.mlp.norm.weight", &[channels])?,
-            Some(binder.region("projection.mlp.norm.bias", &[channels])?),
-            NORM_EPS,
-        )?;
-        let linear = |binder: &mut Binder<'_, '_>, name: &str, out: u64| -> Result<Linear> {
+        let norm = LayerNorm::load(&mut scope.scope("norm"), channels, NORM_EPS)?;
+        let mut linear = |module: &str, out: u64, input: u64| -> Result<Linear> {
+            let mut module = scope.scope(module);
             Ok(Linear::new(
-                binder.region(&format!("projection.mlp.{name}.weight"), &[out, channels])?,
-                Some(binder.region(&format!("projection.mlp.{name}.bias"), &[out])?),
+                module.tensor("weight", &[out, input])?,
+                Some(module.tensor("bias", &[out])?),
                 WeightOrder::NxK,
             )?)
         };
-        let gate = linear(binder, "gate", hidden)?;
-        let value = linear(binder, "value", hidden)?;
-        let output = Linear::new(
-            binder.region("projection.mlp.output.weight", &[channels, hidden])?,
-            Some(binder.region("projection.mlp.output.bias", &[channels])?),
-            WeightOrder::NxK,
-        )?;
+        let gate = linear("w0", hidden, channels)?;
+        let value = linear("w1", hidden, channels)?;
+        let output = linear("w2", channels, hidden)?;
         Ok(Self {
             norm,
             gate,
@@ -3015,38 +2732,6 @@ mod tests {
     }
 
     #[test]
-    fn the_encoder_is_one_hundred_and_eighteen_tensors() {
-        let config = video_config();
-        let table = sources(&config).expect("the encoder's parameters");
-        assert_eq!(table.len(), 118);
-        let names: Vec<&str> = table
-            .iter()
-            .map(|source| source.parameter.as_str())
-            .collect();
-        for expected in [
-            "quant_conv.weight",
-            "input.weight",
-            "norm.bias",
-            "output.weight",
-            "stages.0.blocks.1.norms.0.weight",
-            "stages.5.blocks.0.convolutions.1.bias",
-            "stages.1.blocks.0.shortcut.weight",
-            "stages.3.downsample.weight",
-        ] {
-            assert!(names.contains(&expected), "{expected} is missing");
-        }
-        // The stages whose width is unchanged carry no shortcut, and the last two stride nothing.
-        assert!(!names.contains(&"stages.0.blocks.0.shortcut.weight"));
-        assert!(!names.contains(&"stages.5.blocks.1.shortcut.weight"));
-        assert!(!names.contains(&"stages.4.downsample.weight"));
-        assert!(!names.contains(&"stages.5.downsample.weight"));
-        let mut unique = names.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(unique.len(), names.len());
-    }
-
-    #[test]
     fn the_tile_grid_is_the_decoders_grid_in_input_pixels() {
         let grid = Grid::of(1344, 768).expect("the grid");
         // The decoder's grid at 16 pixels per latent position: seven rows of 256 with overlaps
@@ -3096,71 +2781,6 @@ mod tests {
         // Each stage doubles the width from the input convolution's.
         assert_eq!(stack.widths, vec![128, 256, 512, 1024, 2048]);
         assert_eq!(stack.latent_dim, 2048);
-    }
-
-    #[test]
-    fn the_audio_encoder_table_names_every_parameter() {
-        let config = crate::audio_vae::tests::audio_config();
-        let table = audio_sources(&config).expect("the encoder's parameters");
-        // Stated as the structure it is, because a literal is what went stale: the input pair; each
-        // stage's twenty-one, which is eighteen for the three residual units - two convolutions, two
-        // biases and two Snakes apiece - two for the widening convolution and one for the stage's
-        // Snake; the output Snake and its pair; and the projection block's twenty-one parameters with
-        // the three bias windows the checkpoint keeps as three tensors in place of one fused bias.
-        //
-        // The stage count comes from the configuration, so a checkpoint with a stage fewer keeps this
-        // assertion true instead of turning it red.
-        let stages = config.encoder_rates.len();
-        assert_eq!(table.len(), 2 + stages * 21 + 3 + 21 + 3);
-        let names: Vec<&str> = table
-            .iter()
-            .map(|source| source.parameter.as_str())
-            .collect();
-        for expected in [
-            "input.weight",
-            "stages.0.units.0.convs.0.weight",
-            "stages.4.units.2.convs.1.bias",
-            "stages.4.widen.weight",
-            "stages.4.units.2.snakes.0.alpha",
-            "stages.4.snake.alpha",
-            "output_snake.alpha",
-            "output.weight",
-            "projection.qkv.weight",
-            "projection.qkv.k_bias",
-            "projection.qkv.v_bias",
-            "projection.mlp.gate.weight",
-            "mean_projection.bias",
-        ] {
-            assert!(names.contains(&expected), "{expected} is missing");
-        }
-        let mut unique = names.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(unique.len(), names.len());
-        // Seven weight-normalized convolutions per stage — six in the three residual units and the
-        // widening one — plus the input and the output convolution. The projection block's weights and
-        // the mean convolution are plain, as the checkpoint stores them.
-        let normalized = table
-            .iter()
-            .filter(|source| matches!(source.tensor, crate::audio_vae::Tensor::Normalized { .. }))
-            .count();
-        assert_eq!(normalized, 1 + 5 * 7 + 1);
-        // The fused query-key-value bias names its three checkpoint windows in order: each window is
-        // its own parameter here, and the key's is the checkpoint's `zero_k_bias` tensor.
-        for (parameter, tensor) in [
-            ("projection.qkv.q_bias", "pre_block.attn.q_bias"),
-            ("projection.qkv.k_bias", "pre_block.attn.zero_k_bias"),
-            ("projection.qkv.v_bias", "pre_block.attn.v_bias"),
-        ] {
-            let source = table
-                .iter()
-                .find(|source| source.parameter == parameter)
-                .unwrap_or_else(|| panic!("{parameter} is missing"));
-            match &source.tensor {
-                crate::audio_vae::Tensor::Region(name) => assert_eq!(name, tensor),
-                other => panic!("{parameter} is {other:?}"),
-            }
-        }
     }
 
     #[test]

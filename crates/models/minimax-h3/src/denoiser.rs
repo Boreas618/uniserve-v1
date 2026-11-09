@@ -2651,17 +2651,12 @@ impl Denoiser {
         let frequency = u64::from(config.transformer.frequency_dim);
         let projections = Projections::load(&config.transformer, loader)?;
 
-        let frequencies = loader.constant(
-            "minimax_h3.adaln.frequencies",
-            DType::F32,
-            Shape::new(&[entries, frequency]),
+        let mut adaln = loader.scope("adaln");
+        let frequencies = adaln.constant_f32(
+            "frequencies",
+            &[entries, frequency],
             &projections.frequencies(&times)?,
-            "minimax-h3",
         )?;
-        let mut entry_bytes = Vec::with_capacity(table.len() * 4);
-        for value in &table {
-            entry_bytes.extend_from_slice(&value.to_le_bytes());
-        }
         // One row per timestep of the ladder, and the row count comes from the table itself: the
         // grid holds a level for the clean end as well, so a 49-evaluation schedule states 50 rows
         // (one more than the steps a request takes), while `entries` counts the *distinct* levels
@@ -2675,38 +2670,23 @@ impl Denoiser {
                 "the AdaLN entry table has {entry_rows} rows for {evaluations} evaluations"
             )));
         }
-        let entry_table = loader.constant(
-            "minimax_h3.adaln.entries",
-            DType::I32,
-            Shape::new(&[entry_rows, u64::from(groups.count())]),
-            &entry_bytes,
-            "minimax-h3",
-        )?;
+        let entry_table =
+            adaln.constant_i32("entries", &[entry_rows, u64::from(groups.count())], &table)?;
 
         // The tables are the modulation projections' own type, because the reference allocates them
         // from the product - so at a BF16 stack they are BF16 and at an
         // FP32 deployment FP32. The timestep pair in front of them stays FP32, and the one narrowing
         // between the two halves lives in `Projections::compute`.
         let table_type = projections.dtype();
-        let unit = table_type.bytes().unwrap_or(4);
         let mut adaln_layers = Vec::with_capacity(config.transformer.num_hidden_layers as usize);
-        let zeros = vec![0_u8; (entries * columns * unit) as usize];
         for index in 0..config.transformer.num_hidden_layers {
-            adaln_layers.push(loader.writable_constant(
-                &format!("minimax_h3.adaln.layers.{index}"),
+            adaln_layers.push(adaln.writable_zeros(
+                &format!("layers.{index}"),
                 table_type,
-                Shape::new(&[entries, columns]),
-                &zeros,
-                "minimax-h3",
+                &[entries, columns],
             )?);
         }
-        let adaln_output = loader.writable_constant(
-            "minimax_h3.adaln.output",
-            table_type,
-            Shape::new(&[entries, 2 * hidden]),
-            &vec![0_u8; (entries * 2 * hidden * unit) as usize],
-            "minimax-h3",
-        )?;
+        let adaln_output = adaln.writable_zeros("output", table_type, &[entries, 2 * hidden])?;
         let cache = AdaLnCache::new(
             adaln_layers.clone(),
             adaln_output,

@@ -318,27 +318,9 @@ pub fn load(
                 // writes the video decoder's rasters, so it holds their element type, which the
                 // decoder declares.
                 let dtype = crate::video_vae::ACTIVATION;
-                let bytes = |values: [f32; 3]| -> Vec<u8> {
-                    values
-                        .iter()
-                        .flat_map(|value| value.to_ne_bytes())
-                        .collect()
-                };
-                let shape = nn::Shape::new(&[3]);
-                let mean = loader.constant(
-                    "video_postprocessor.pixel_mean",
-                    nn::DType::F32,
-                    shape,
-                    &bytes(crate::output::PIXEL_MEAN),
-                    "minimax-h3",
-                )?;
-                let std = loader.constant(
-                    "video_postprocessor.pixel_std",
-                    nn::DType::F32,
-                    shape,
-                    &bytes(crate::output::PIXEL_STD),
-                    "minimax-h3",
-                )?;
+                let mut splice = loader.scope("video_postprocessor");
+                let mean = splice.constant_f32("pixel_mean", &[3], &crate::output::PIXEL_MEAN)?;
+                let std = splice.constant_f32("pixel_std", &[3], &crate::output::PIXEL_STD)?;
                 let postprocessor =
                     Arc::new(crate::output::VideoPostprocessor::new(dtype, mean, std)?);
                 video_postprocessor = Some(postprocessor);

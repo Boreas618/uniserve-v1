@@ -46,9 +46,9 @@ struct Qwen3MoeCheckpoint {
 impl TextCheckpoint for Qwen3MoeCheckpoint {
     fn expert_layers(&self) -> std::collections::BTreeMap<String, u32> {
         let experts = self.config.num_experts;
-        crate::weights::expert_sources(&self.config)
+        crate::load::expert_modules(&self.config)
             .into_iter()
-            .map(|source| (source.module, experts))
+            .map(|module| (module, experts))
             .collect()
     }
 

@@ -19,7 +19,6 @@ use nn::layers::{
 };
 use nn::quantization::Declaration;
 use nn::weights::{Scope, WeightLoader};
-use nn::{DType, Shape};
 use ops::moe::grouped::Activation as MoeActivation;
 use ops::rope::Rotation;
 
@@ -36,10 +35,23 @@ const EXPERT_NAMES: ExpertNames<'static> = ExpertNames {
     down: "down_proj",
 };
 
-/// Each routed layer's logical expert ids in physical slot order, by the module path
-/// [`crate::weights::ExpertSource::module`] states. A layer this map does not name keeps the
-/// checkpoint's order.
+/// Each routed layer's logical expert ids in physical slot order, by the layer's
+/// [`expert_module`]. A layer this map does not name keeps the checkpoint's order.
 pub type ExpertOrder = std::collections::BTreeMap<String, Vec<u32>>;
+
+/// The path an [`ExpertOrder`] names the routed experts of decoder layer `layer` by:
+/// `layers.<layer>.mlp.experts`, the model's module path without the checkpoint's `model.` prefix.
+pub fn expert_module(layer: u32) -> String {
+    format!("layers.{layer}.mlp.experts")
+}
+
+/// The [`expert_module`] of every routed layer of `config`, in layer order.
+pub fn expert_modules(config: &Config) -> Vec<String> {
+    (0..config.num_hidden_layers)
+        .filter(|&layer| config.sparse(layer))
+        .map(expert_module)
+        .collect()
+}
 
 /// Load `checkpoint` in the representation `declaration` states about it, with the routed experts
 /// in the slots `order` states (`docs/admin.md`, Expert redistribution).
@@ -106,35 +118,23 @@ pub fn load(
         )?
     };
 
-    let norm = RmsNorm::new(
-        loader.scope("model.norm").tensor("weight", &[hidden])?,
-        config.rms_norm_eps,
-    )?;
+    let norm = RmsNorm::load(&mut loader.scope("model.norm"), hidden, config.rms_norm_eps)?;
 
     // The rotary recipe: one frequency table and the score multiplier the recipe adds.
     let (frequencies, score_scale) = rotary_recipe(&config)?;
-    let table = loader.constant(
-        "qwen3-moe.rotary.inv_freq",
-        DType::F32,
-        Shape::new(&[head_dim / 2]),
-        &frequency_bytes(&frequencies),
-        "qwen3-moe",
-    )?;
+    let table =
+        loader
+            .scope("model.rotary_emb")
+            .constant_f32("inv_freq", &[head_dim / 2], &frequencies)?;
 
     let (slots, slot_table) = expert_slots(&config, order, loader)?;
     let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
     for layer in 0..config.num_hidden_layers {
         let mut scope = loader.scope(format!("model.layers.{layer}"));
-        let input_norm = RmsNorm::new(
-            scope.scope("input_layernorm").tensor("weight", &[hidden])?,
-            config.rms_norm_eps,
-        )?;
-        let post_attention_norm = RmsNorm::new(
-            scope
-                .scope("post_attention_layernorm")
-                .tensor("weight", &[hidden])?,
-            config.rms_norm_eps,
-        )?;
+        let eps = config.rms_norm_eps;
+        let input_norm = RmsNorm::load(&mut scope.scope("input_layernorm"), hidden, eps)?;
+        let post_attention_norm =
+            RmsNorm::load(&mut scope.scope("post_attention_layernorm"), hidden, eps)?;
 
         let mut attention = scope.scope("self_attn");
         let bias = if config.attention_bias {
@@ -278,43 +278,40 @@ fn expert_slots(
     let layers: Vec<u32> = (0..config.num_hidden_layers)
         .filter(|&layer| config.sparse(layer))
         .collect();
+    let modules = expert_modules(config);
     for module in order.keys() {
-        if !crate::weights::expert_sources(config)
-            .iter()
-            .any(|source| &source.module == module)
-        {
+        if !modules.contains(module) {
             return Err(Error::Config(format!(
                 "{module} is not a routed expert layer of this model"
             )));
         }
     }
     let mut slots = HashMap::with_capacity(layers.len());
-    let mut table = Vec::with_capacity(layers.len() * experts as usize * 4);
+    let mut table = Vec::with_capacity(layers.len() * experts as usize);
     for &layer in &layers {
-        let module = format!("layers.{layer}.mlp.experts");
+        let module = expert_module(layer);
         let order: Vec<u32> = match order.get(&module) {
             Some(order) => order.clone(),
             None => (0..experts).collect(),
         };
+        // A slot is below the vocabulary, which `Config` holds in u32 and the router's I32 ids.
         table.extend(
             slot_row(&module, &order, experts as usize)?
                 .iter()
-                .flat_map(|slot| slot.to_le_bytes()),
+                .map(|&slot| slot as i32),
         );
         slots.insert(layer, order);
     }
     if layers.is_empty() {
         return Ok((slots, None));
     }
-    let weight = loader.constant(
-        "qwen3-moe.experts.slots",
-        DType::I32,
-        Shape::new(&[
+    let weight = loader.scope("model").constant_i32(
+        "expert_slots",
+        &[
             as_u64(layers.len(), "the routed layers")?,
             u64::from(experts),
-        ]),
+        ],
         &table,
-        "qwen3-moe",
     )?;
     Ok((slots, Some((weight, layers))))
 }
@@ -474,14 +471,6 @@ fn correction_range(
     let low = dimension(beta_fast).floor().max(0.0);
     let high = dimension(beta_slow).ceil().min(dim - 1.0);
     (low, high)
-}
-
-/// The table's little-endian… device-native FP32 bytes.
-fn frequency_bytes(frequencies: &[f32]) -> Vec<u8> {
-    frequencies
-        .iter()
-        .flat_map(|value| value.to_ne_bytes())
-        .collect()
 }
 
 #[cfg(test)]

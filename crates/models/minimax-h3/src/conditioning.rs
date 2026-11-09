@@ -27,7 +27,7 @@ use nn::layers::{
     Attention, Bias, GatedActivation, Linear, Parallel, QkvBias, QkvLinear, QkvNames, QkvSpec,
     RmsNorm, ScaledResidual,
 };
-use nn::weights::{Weight, WeightLoader, WeightRequest};
+use nn::weights::WeightLoader;
 use nn::{Forward, Shape, TensorView};
 
 use crate::config::TransformerConfig;
@@ -124,27 +124,23 @@ impl RefinerBlock {
         Ok(Self {
             dtype: query_dtype,
             intermediate_size: config.intermediate_size,
-            norm1: norm(
-                loader,
-                &format!("{prefix}.norm1.weight"),
+            norm1: RmsNorm::load(
+                &mut loader.scope(format!("{prefix}.norm1")),
                 hidden,
                 config.norm_eps,
             )?,
-            norm2: norm(
-                loader,
-                &format!("{prefix}.norm2.weight"),
+            norm2: RmsNorm::load(
+                &mut loader.scope(format!("{prefix}.norm2")),
                 hidden,
                 config.norm_eps,
             )?,
-            query_norm: norm(
-                loader,
-                &format!("{prefix}.attn.norm_q.weight"),
+            query_norm: RmsNorm::load(
+                &mut loader.scope(format!("{prefix}.attn.norm_q")),
                 u64::from(config.head_dim),
                 config.qk_norm_eps,
             )?,
-            key_norm: norm(
-                loader,
-                &format!("{prefix}.attn.norm_k.weight"),
+            key_norm: RmsNorm::load(
+                &mut loader.scope(format!("{prefix}.attn.norm_k")),
                 u64::from(config.head_dim),
                 config.qk_norm_eps,
             )?,
@@ -257,9 +253,8 @@ impl TokenRefiner {
         Ok(Self {
             input,
             blocks,
-            norm: norm(
-                loader,
-                "token_refiner.final_norm.weight",
+            norm: RmsNorm::load(
+                &mut loader.scope("token_refiner.final_norm"),
                 hidden,
                 config.norm_eps,
             )?,
@@ -383,33 +378,18 @@ fn identity(
     hidden: u64,
     stream: nn::DType,
 ) -> Result<ScaledResidual> {
-    let one: &[u8] = match stream {
-        nn::DType::F32 => &[0x00, 0x00, 0x80, 0x3f],
-        nn::DType::BF16 => &[0x80, 0x3f],
-        other => {
-            return Err(Error::checkpoint(format!(
-                "a refiner's stream is F32 or BF16, not {other}"
-            )));
-        }
-    };
-    let scale = loader.constant(
-        "refiner.identity_scale",
+    if !matches!(stream, nn::DType::F32 | nn::DType::BF16) {
+        return Err(Error::checkpoint(format!(
+            "a refiner's stream is F32 or BF16, not {stream}"
+        )));
+    }
+    let scale = loader.scope("token_refiner").constant(
+        "identity_scale",
         stream,
-        Shape::new(&[hidden]),
-        &one.repeat(hidden as usize),
-        "minimax-h3",
+        &[hidden],
+        &vec![1.0; hidden as usize],
     )?;
     Ok(ScaledResidual::new(scale, None)?)
-}
-
-/// A `[rows]` weight of the checkpoint.
-fn vector(loader: &mut WeightLoader<'_>, name: &str, rows: u64) -> Result<Weight> {
-    Ok(loader.load(&WeightRequest::region(name, 0, Shape::new(&[rows])))?)
-}
-
-/// A normalization's learned gain.
-fn norm(loader: &mut WeightLoader<'_>, name: &str, columns: u64, eps: f32) -> Result<RmsNorm> {
-    Ok(RmsNorm::new(vector(loader, name, columns)?, eps)?)
 }
 
 #[cfg(test)]

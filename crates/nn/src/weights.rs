@@ -1270,6 +1270,11 @@ impl<'a> WeightLoader<'a> {
     /// `name` is the logical tensor the key records; the key also names both sources, so it cannot
     /// be confused with a plain region of either.
     pub fn weight_norm(&mut self, name: &str, v: &str, g: &str) -> Result<Weight> {
+        self.fold(name, v, g, None)
+    }
+
+    /// [`Self::weight_norm`], written as `pinned` when a scope pins its module's type.
+    fn fold(&mut self, name: &str, v: &str, g: &str, pinned: Option<DType>) -> Result<Weight> {
         let value = self.checkpoint.locate(v)?;
         let gain = self.checkpoint.locate(g)?;
         if value.shape.rank() == 0 {
@@ -1288,7 +1293,7 @@ impl<'a> WeightLoader<'a> {
                 ),
             ));
         }
-        let dtype = self.dtype.unwrap_or(value.dtype);
+        let dtype = pinned.or(self.dtype).unwrap_or(value.dtype);
         if !dtype.is_float() || !value.dtype.is_float() {
             return Err(Error::weight(
                 name,
@@ -2581,7 +2586,7 @@ impl<'s, 'a> Scope<'s, 'a> {
     }
 
     /// Fold this module's weight-normalized `leaf`, stored as `<leaf>_v` and `<leaf>_g`, into one
-    /// weight ([`WeightLoader::weight_norm`]).
+    /// weight ([`WeightLoader::weight_norm`]), written at the scope's pin.
     ///
     /// # Errors
     ///
@@ -2590,7 +2595,114 @@ impl<'s, 'a> Scope<'s, 'a> {
         let name = self.name(leaf);
         self.refuse_packed(std::slice::from_ref(&name))?;
         let (value, gain) = (format!("{name}_v"), format!("{name}_g"));
-        self.loader.weight_norm(&name, &value, &gain)
+        self.loader.fold(&name, &value, &gain, self.pinned)
+    }
+
+    /// A table this module computes rather than reads: `values` encoded as `dtype`
+    /// ([`DType::encode`], which rounds to nearest even), published as `<path>.<leaf>`.
+    ///
+    /// The module path names the constant, and the retained key's provenance digests the bytes
+    /// ([`WeightLoader::constant`]), so two modules' constants never share a name and one module's
+    /// two computations of different numbers never share storage.
+    ///
+    /// # Errors
+    ///
+    /// When `values` is not `shape`'s element count or `dtype` has no host encoding.
+    pub fn constant(
+        &mut self,
+        leaf: &str,
+        dtype: DType,
+        shape: &[u64],
+        values: &[f32],
+    ) -> Result<Weight> {
+        let bytes = dtype.encode(values).map_err(Error::from)?;
+        self.publish(leaf, dtype, shape, &bytes)
+    }
+
+    /// An FP32 table this module computes, as [`Self::constant`] publishes it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::constant`].
+    pub fn constant_f32(&mut self, leaf: &str, shape: &[u64], values: &[f32]) -> Result<Weight> {
+        self.constant(leaf, DType::F32, shape, values)
+    }
+
+    /// An I32 table this module computes, as [`Self::constant`] publishes it.
+    ///
+    /// # Errors
+    ///
+    /// When `values` is not `shape`'s element count.
+    pub fn constant_i32(&mut self, leaf: &str, shape: &[u64], values: &[i32]) -> Result<Weight> {
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect();
+        self.publish(leaf, DType::I32, shape, &bytes)
+    }
+
+    /// The I32 table `[start, start + count)`: a gather's or a scatter's index row.
+    ///
+    /// # Errors
+    ///
+    /// When the range leaves I32.
+    pub fn indices(&mut self, leaf: &str, start: i32, count: u64) -> Result<Weight> {
+        let end = i64::from(start) + i64::try_from(count).unwrap_or(i64::MAX);
+        let end = i32::try_from(end).map_err(|_| {
+            Error::weight(&self.name(leaf), format!("{count} indices from {start}"))
+        })?;
+        let values: Vec<i32> = (start..end).collect();
+        self.constant_i32(leaf, &[count], &values)
+    }
+
+    /// A table of zeros of `dtype`.
+    ///
+    /// # Errors
+    ///
+    /// When `dtype` has no whole-byte element size.
+    pub fn zeros(&mut self, leaf: &str, dtype: DType, shape: &[u64]) -> Result<Weight> {
+        let bytes = self.zero_bytes(leaf, dtype, shape)?;
+        self.publish(leaf, dtype, shape, &bytes)
+    }
+
+    /// A table of zeros of `dtype` this module's launches write once after the load
+    /// ([`WeightLoader::writable_constant`]): it stays writable on the device and is this process's
+    /// own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::zeros`].
+    pub fn writable_zeros(&mut self, leaf: &str, dtype: DType, shape: &[u64]) -> Result<Weight> {
+        let bytes = self.zero_bytes(leaf, dtype, shape)?;
+        self.loader.writable_constant(
+            &self.name(leaf),
+            dtype,
+            Shape::new(shape),
+            &bytes,
+            "nn::weights::Scope",
+        )
+    }
+
+    /// The bytes of `shape` zeros of `dtype`: every supported type's zero is the all-zero pattern.
+    fn zero_bytes(&self, leaf: &str, dtype: DType, shape: &[u64]) -> Result<Vec<u8>> {
+        let element = dtype.bytes().ok_or_else(|| {
+            Error::weight(
+                &self.name(leaf),
+                format!("{dtype} has no whole-byte element"),
+            )
+        })?;
+        Ok(vec![0; (Shape::new(shape).numel() * element) as usize])
+    }
+
+    /// Publish `bytes` as this module's constant `leaf`.
+    fn publish(&mut self, leaf: &str, dtype: DType, shape: &[u64], bytes: &[u8]) -> Result<Weight> {
+        self.loader.constant(
+            &self.name(leaf),
+            dtype,
+            Shape::new(shape),
+            bytes,
+            "nn::weights::Scope",
+        )
     }
 
     /// Load `request` at this scope's pin, refusing a packed source.

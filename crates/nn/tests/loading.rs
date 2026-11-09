@@ -392,6 +392,50 @@ fn a_computed_constant_is_published_once_and_needs_its_own_name() {
     );
     assert_eq!(store.published.len(), 2);
 }
+
+#[test]
+fn a_scope_names_its_constants_by_its_module_path_and_encodes_their_type() {
+    let dir = tempfile::tempdir().unwrap();
+    shard(
+        dir.path(),
+        "model.safetensors",
+        &[("weight", vec![1], bf16(&[1.0]))],
+    );
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let mut store = Recording::default();
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    let mut scope = loader.scope("model.rotary_emb");
+
+    let table = scope
+        .constant("inv_freq", DType::BF16, &[2], &[0.5, 0.25])
+        .unwrap();
+    assert_eq!(table.dtype(), DType::BF16);
+    let rows = scope.indices("rows", 3, 2).unwrap();
+    assert_eq!(rows.dtype(), DType::I32);
+    scope.zeros("pad", DType::F32, &[1, 3]).unwrap();
+    // A value count that is not the shape's is refused, as is a range that leaves I32.
+    assert!(scope.constant_f32("short", &[3], &[1.0]).is_err());
+    assert!(scope.indices("far", i32::MAX, 2).is_err());
+
+    let published: Vec<(&str, &[u8])> = store
+        .published
+        .iter()
+        .map(|(key, bytes, ..)| (key.region.tensors[0].as_str(), bytes.as_slice()))
+        .collect();
+    let indices: Vec<u8> = [3_i32, 4]
+        .iter()
+        .flat_map(|row| row.to_ne_bytes())
+        .collect();
+    assert_eq!(
+        published,
+        [
+            ("model.rotary_emb.inv_freq", bf16(&[0.5, 0.25]).as_slice()),
+            ("model.rotary_emb.rows", indices.as_slice()),
+            ("model.rotary_emb.pad", [0_u8; 12].as_slice()),
+        ]
+    );
+}
+
 /// The `f32` values of BF16 bytes.
 fn from_bf16(bytes: &[u8]) -> Vec<f32> {
     bytes

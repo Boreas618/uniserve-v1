@@ -433,15 +433,41 @@ impl Block {
             QkvBias::Present,
             Split::WHOLE,
         )?;
-        let output = projection(&mut attention.scope("proj"), hidden, hidden)?;
+        let output = Linear::load(
+            &mut attention.scope("proj"),
+            hidden,
+            hidden,
+            Bias::Present,
+            Parallel::None,
+        )?;
         let mut mlp = scope.scope("mlp");
-        let first = projection(&mut mlp.scope("linear_fc1"), hidden, intermediate)?;
-        let second = projection(&mut mlp.scope("linear_fc2"), intermediate, hidden)?;
+        let first = Linear::load(
+            &mut mlp.scope("linear_fc1"),
+            hidden,
+            intermediate,
+            Bias::Present,
+            Parallel::None,
+        )?;
+        let second = Linear::load(
+            &mut mlp.scope("linear_fc2"),
+            intermediate,
+            hidden,
+            Bias::Present,
+            Parallel::None,
+        )?;
         Ok(Self {
-            input_norm: normalization(&mut scope.scope("norm1"), u64::from(hidden))?,
+            input_norm: LayerNorm::load(
+                &mut scope.scope("norm1"),
+                u64::from(hidden),
+                LAYER_NORM_EPS,
+            )?,
             qkv,
             output,
-            output_norm: normalization(&mut scope.scope("norm2"), u64::from(hidden))?,
+            output_norm: LayerNorm::load(
+                &mut scope.scope("norm2"),
+                u64::from(hidden),
+                LAYER_NORM_EPS,
+            )?,
             first,
             second,
         })
@@ -556,9 +582,25 @@ impl Merger {
             config.hidden_size
         };
         Ok(Self {
-            norm: normalization(&mut scope.scope("norm"), u64::from(norm_width))?,
-            first: projection(&mut scope.scope("linear_fc1"), width, width)?,
-            second: projection(&mut scope.scope("linear_fc2"), width, out_hidden)?,
+            norm: LayerNorm::load(
+                &mut scope.scope("norm"),
+                u64::from(norm_width),
+                LAYER_NORM_EPS,
+            )?,
+            first: Linear::load(
+                &mut scope.scope("linear_fc1"),
+                width,
+                width,
+                Bias::Present,
+                Parallel::None,
+            )?,
+            second: Linear::load(
+                &mut scope.scope("linear_fc2"),
+                width,
+                out_hidden,
+                Bias::Present,
+                Parallel::None,
+            )?,
             merge: config.spatial_merge_size,
             width,
             out_hidden,
@@ -692,11 +734,13 @@ impl VisionTower {
             .collect::<Result<Vec<_>>>()?;
         // The patch embedding is a kernel-equals-stride convolution: its `[hidden, C, T, P, P]`
         // weight is read as the `[hidden, tubelet]` matrix of the product it is.
-        let patch = projection(
+        let patch = Linear::load(
             &mut tower.scope("patch_embed.proj"),
             u32::try_from(tubelet)
                 .map_err(|_| invalid("VisionTower", "a tubelet wider than a u32"))?,
             config.hidden_size,
+            Bias::Present,
+            Parallel::None,
         )?;
         let position = tower.scope("pos_embed").tensor(
             "weight",
@@ -717,12 +761,14 @@ impl VisionTower {
             deepstack,
             blocks_gelu,
             merger_gelu: Gelu::exact(),
+            // The fused residual operator reads its coefficient as a weight; these blocks add each
+            // sub-layer's output with coefficient one.
             residual: ScaledResidual::new(
-                ones(
-                    loader,
-                    "minimax-h3.vision.residual",
+                loader.scope(PREFIX).constant(
+                    "residual_scale",
                     dtype,
-                    u64::from(config.hidden_size),
+                    &[hidden],
+                    &vec![1.0; hidden as usize],
                 )?,
                 None,
             )
@@ -927,42 +973,6 @@ impl VisionTower {
         }
         Ok(())
     }
-}
-
-/// The biased projection module at `scope`, `inputs` to `outputs` channels.
-fn projection(scope: &mut Scope<'_, '_>, inputs: u32, outputs: u32) -> Result<Linear> {
-    Ok(Linear::load(
-        scope,
-        inputs,
-        outputs,
-        Bias::Present,
-        Parallel::None,
-    )?)
-}
-
-/// The LayerNorm module at `scope`: `width` channels, with the tower's one variance floor.
-fn normalization(scope: &mut Scope<'_, '_>, width: u64) -> Result<LayerNorm> {
-    let weight = scope.tensor("weight", &[width])?;
-    let bias = scope.tensor("bias", &[width])?;
-    LayerNorm::new(weight, Some(bias), LAYER_NORM_EPS).map_err(Error::from)
-}
-
-/// A retained weight of `columns` ones: the block residual stream's coefficient.
-///
-/// The fused residual operator reads its coefficient as a weight; these blocks add each sub-layer's
-/// output with coefficient one, so the constant is published once per element type and width under
-/// the retained key `name`.
-pub(crate) fn ones(
-    loader: &mut WeightLoader<'_>,
-    name: &str,
-    dtype: nn::DType,
-    columns: u64,
-) -> Result<Weight> {
-    let value = dtype.one().map_err(nn::Error::from)?;
-    let bytes = value.repeat(usize::try_from(columns).unwrap_or(0));
-    loader
-        .constant(name, dtype, Shape::new(&[columns]), &bytes, "minimax-h3")
-        .map_err(Error::from)
 }
 
 #[cfg(test)]

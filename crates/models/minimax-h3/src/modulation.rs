@@ -457,7 +457,7 @@ impl Projections {
     /// Half a pairwise spectrum over the timestep, `sin` on the even columns and `cos` on the odd
     /// ones, at the frequencies `theta_high^(-2i / frequency_dim)`: the released recipe, written
     /// here because it is the only part of the cache that is arithmetic on a host value.
-    pub fn frequencies(&self, times: &[f32]) -> Result<Vec<u8>> {
+    pub fn frequencies(&self, times: &[f32]) -> Result<Vec<f32>> {
         embedding(times, self.frequency_dim)
     }
 
@@ -478,7 +478,7 @@ impl Projections {
 /// schedule - and nothing downstream can see it: the products are finite, the widths match, and the
 /// shape of the failure is a slightly different picture. The angle is computed in f64 and stored
 /// once as f32, which is the reference's own rounding of `exp`/`cos` in float32 to within an ulp.
-fn embedding(times: &[f32], frequency_dim: u32) -> Result<Vec<u8>> {
+fn embedding(times: &[f32], frequency_dim: u32) -> Result<Vec<f32>> {
     if times.is_empty() {
         return Err(Error::checkpoint(
             "a timestep embedding needs at least one time".to_owned(),
@@ -490,7 +490,7 @@ fn embedding(times: &[f32], frequency_dim: u32) -> Result<Vec<u8>> {
         )));
     }
     let half = (frequency_dim / 2) as usize;
-    let mut bytes = Vec::with_capacity(times.len() * frequency_dim as usize * 4);
+    let mut values = Vec::with_capacity(times.len() * frequency_dim as usize);
     for time in times {
         let angles: Vec<f64> = (0..half)
             .map(|index| {
@@ -498,14 +498,10 @@ fn embedding(times: &[f32], frequency_dim: u32) -> Result<Vec<u8>> {
                 f64::from(*time) * 10_000_f64.powf(-exponent)
             })
             .collect();
-        for angle in &angles {
-            bytes.extend_from_slice(&(angle.cos() as f32).to_le_bytes());
-        }
-        for angle in &angles {
-            bytes.extend_from_slice(&(angle.sin() as f32).to_le_bytes());
-        }
+        values.extend(angles.iter().map(|angle| angle.cos() as f32));
+        values.extend(angles.iter().map(|angle| angle.sin() as f32));
     }
-    Ok(bytes)
+    Ok(values)
 }
 
 #[cfg(test)]
@@ -559,13 +555,7 @@ mod tests {
         // finite, well-shaped and wrong.
         let dim = 8;
         let time = 0.25f32;
-        let bytes = embedding(&[time], dim).expect("an embedding");
-        let values: Vec<f32> = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|word| f32::from_le_bytes(*word))
-            .collect();
+        let values = embedding(&[time], dim).expect("an embedding");
         assert_eq!(values.len(), dim as usize);
         let half = dim as usize / 2;
         for index in 0..half {

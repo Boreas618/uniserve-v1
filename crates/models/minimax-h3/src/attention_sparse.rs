@@ -1,10 +1,11 @@
 use nn::layers::{
-    Linear, Rotary, Sections, SegmentAttention, SegmentTables, UlyssesExchange, VsaTiles,
+    Bias, Linear, Parallel, Rotary, Sections, SegmentAttention, SegmentTables, UlyssesExchange,
+    VsaTiles,
 };
-use nn::weights::{Weight, WeightLoader, WeightRequest};
+use nn::weights::{Weight, WeightLoader};
 use nn::{Forward, Shape, TensorView};
 
-use crate::attention::{Factors, HeadProjection, HeadsToRows, projection};
+use crate::attention::{Factors, HeadProjection, HeadsToRows, width};
 use crate::config::TransformerConfig;
 use crate::partition::Partition;
 use crate::{Error, Result};
@@ -70,9 +71,11 @@ impl Sparse {
                 config.head_dim
             )));
         }
-        let query_gain = gain(loader, &format!("{prefix}.norm_q.weight"), head)?;
-        let key_gain = gain(loader, &format!("{prefix}.norm_k.weight"), head)?;
-        let frequencies = frequencies(loader, config, rotated, rotated_axes.len() as u32)?;
+        let mut attention = loader.scope(&prefix);
+        let query_gain = attention.scope("norm_q").tensor("weight", &[head])?;
+        let key_gain = attention.scope("norm_k").tensor("weight", &[head])?;
+        let frequencies =
+            crate::attention::frequencies(loader, config, rotated, rotated_axes.len() as u32)?;
         // The rotation reads *this rank's* heads: under Ulysses the sequence is split across ranks
         // and each holds `heads / degree` of them (`Partition::denoiser_heads`), so a descriptor that
         // named the global count would refuse its own query view at any degree above one.
@@ -129,7 +132,13 @@ impl Sparse {
             key: head_projection(loader, "to_k")?,
             value: head_projection(loader, "to_v")?,
             gate: head_projection(loader, "to_gate_compress")?,
-            output: projection(loader, &format!("{prefix}.to_out.0"), inner, hidden)?,
+            output: Linear::load(
+                &mut loader.scope(format!("{prefix}.to_out.0")),
+                width(inner)?,
+                width(hidden)?,
+                Bias::Absent,
+                Parallel::None,
+            )?,
             query_gain,
             key_gain,
             rotary,
@@ -599,40 +608,4 @@ impl Scratch {
             )?,
         })
     }
-}
-
-/// The rotary frequency table of the sparse path: the dense path's, built the same way.
-///
-/// One `rope_frequency_dim` spectrum repeated once per coordinate axis, because the reference hands
-/// its rotary one axis spanning the whole head and flattens the three axes' factors into three
-/// contiguous blocks (`attention.rs::frequencies` states the evidence).
-fn frequencies(
-    loader: &mut WeightLoader<'_>,
-    config: &TransformerConfig,
-    rotated: u32,
-    axes: u32,
-) -> Result<Weight> {
-    let pairs = config.rope_frequency_dim;
-    if pairs == 0 || axes == 0 || rotated != 2 * pairs * axes {
-        return Err(Error::config(format!(
-            "{rotated} rotated channels are not {axes} axes of {pairs} frequency pairs"
-        )));
-    }
-    let mut bytes = Vec::with_capacity(rotated as usize * 2);
-    for value in crate::attention::table(pairs, axes, config.rope_theta) {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    let name = format!("transformer.rotary.{pairs}x{axes}.{}", config.rope_theta);
-    let half = u64::from(rotated / 2);
-    Ok(loader.constant(
-        &name,
-        nn::DType::F32,
-        Shape::new(&[half]),
-        &bytes,
-        "minimax-h3",
-    )?)
-}
-
-fn gain(loader: &mut WeightLoader<'_>, name: &str, width: u64) -> Result<Weight> {
-    Ok(loader.load(&WeightRequest::region(name, 0, Shape::new(&[width])))?)
 }

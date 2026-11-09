@@ -23,7 +23,6 @@ pub mod load;
 pub mod model;
 pub mod partition;
 pub mod processing;
-pub mod weights;
 
 pub use config::{Config, RopeScaling, YaRn};
 pub use model::{LoadOptions, Qwen3Moe};
