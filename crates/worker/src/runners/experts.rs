@@ -32,7 +32,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use nn::layers::DispatchViews;
-use ops::moe::exchange::{Group, Transport, TransportShape};
+use ops::moe::exchange::{HostGroup, Transport, TransportShape};
 
 use crate::job::JobQueue;
 use crate::runner::RunnerId;
@@ -323,7 +323,7 @@ struct Backing {
     /// Read by the package through the group structure: `group.handle` points into this box, so
     /// it lives as long as the transport.
     _channel: Box<Channel>,
-    group: Box<Group>,
+    group: Box<HostGroup>,
     transport: Option<Transport>,
     views: Option<DispatchViews>,
 }
@@ -340,7 +340,7 @@ impl Member {
             union: Arc::clone(&union),
             rank,
         });
-        let group = Box::new(Group {
+        let group = Box::new(HostGroup {
             handle: std::ptr::from_mut(channel.as_mut()).cast(),
             communicator: std::ptr::null_mut(),
             ranks: i64::from(shape.ranks),

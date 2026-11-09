@@ -1,8 +1,8 @@
-//! `audio_activation`: the BigVGAN decoder's activation block, as one program.
+//! `Activation1d`: BigVGAN's anti-aliased activation, as one program (operator `audio_activation`).
 //!
-//! The decoder's every residual block ends in `Activation1d(SnakeBeta(C))`
-//! (`.venv/lib/python3.12/site-packages/diffusers/models/autoencoders/autoencoder_kl_minimax_h3_audio.py:207`,
-//! `:426`, `:470`). Written out it is five stages:
+//! An anti-aliased residual block of a BigVGAN-style vocoder ends in `Activation1d(SnakeBeta(C))`:
+//! the activation evaluated at `ratio` times the signal's rate, between a Kaiser-windowed sinc
+//! upsampler and a matching low-pass. Written out it is five stages:
 //!
 //! ```text
 //! 1. replicate pad the signal by `kernel/ratio - 1` on each side
@@ -15,24 +15,24 @@
 //! ```
 //!
 //! Four launches and two intermediate buffers if each stage is its own kernel, and the buffers are
-//! `ratio` times the signal: at 44.1 kHz stereo and 1024 channels that is the decoder's largest
-//! allocation by far. One program keeps the upsampled signal inside the block that produced it and
-//! writes only the final `[channels, length]` result, so this operator is the whole chain and it is
-//! the only form of it the catalogue declares.
+//! `ratio` times the signal, which for a wide vocoder stage is its largest allocation by far. One
+//! program keeps the upsampled signal inside the block that produced it and writes only the final
+//! `[channels, length]` result, so this operator is the whole chain and it is the only form of it
+//! the catalogue declares.
 //!
-//! At `ratio = 2` and `kernel = 12` — the decoder's own numbers — the constants read as the envelope
-//! h3 states: replicate pad `5`, crop `15` on each side, low-pass pads `(5, 6)`. They are derived
-//! here rather than written as literals, because a changed rate changes all four.
+//! At `ratio = 2` and `kernel = 12` the constants read as replicate pad `5`, crop `15` on each
+//! side, low-pass pads `(5, 6)`. They are derived here rather than written as literals, because a
+//! changed rate changes all four.
 //!
-//! Both lengths are launch values: an audio length follows the request's duration, so a descriptor
-//! keyed by it would compile a program per duration. The descriptor carries what a program is
-//! compiled from — element type, channels, kernel, ratio, block — and nothing that varies
+//! Both lengths are launch values: a waveform's length follows the request's duration, so a
+//! descriptor keyed by it would compile a program per duration. The descriptor carries what a
+//! program is compiled from — element type, channels, kernel, ratio, block — and nothing that varies
 //! continuously. The `ratio ×` factor of stage 2 is counted once, inside the upsample: a program
 //! that forgets it is short by exactly `ratio`.
 //!
 //! The tolerance is the whole chain's: `2·kernel` taps enter the low-pass, each an FP32 product of
 //! FP32 products, plus the output's own rounding — [`Tolerance::dot`] over `2·kernel + 1` terms in
-//! FP32, which is H3's envelope.
+//! FP32.
 //!
 //! The low-pass's output length is ATen's, not a divisibility rule:
 //! `floor((padded - kernel)/ratio) + 1`, so a padded span the ratio does not divide still yields a
@@ -104,7 +104,7 @@ impl Descriptor {
 
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Geometry only: a shape, a stride or a tap count, so the key names no host float and no
+        // Shape only: a channel count, a stride or a tap count, so the key names no host float and no
         // length that varies with a request.
         Key::new()
             .field("dtype", self.dtype)
@@ -160,9 +160,9 @@ pub struct Args {
 }
 
 /// The decoder's upsampled SnakeBeta and its low-pass, as one program.
-pub struct AudioActivation;
+pub struct Activation1d;
 
-impl Op for AudioActivation {
+impl Op for Activation1d {
     const NAME: &'static str = "audio_activation";
 
     type Descriptor = Descriptor;
@@ -309,8 +309,8 @@ mod tests {
 
     #[test]
     fn the_constants_are_the_envelopes_read_back() {
-        // ratio 2, kernel 12: replicate pad 5, crop 15 a side, low-pass pads (5, 6) — h3's numbers,
-        // derived rather than written.
+        // ratio 2, kernel 12: replicate pad 5, crop 15 a side, low-pass pads (5, 6), derived rather
+        // than written.
         assert_eq!(descriptor().upsample_pad(), 5);
         assert_eq!(descriptor().crop(), 15);
         assert_eq!(descriptor().lowpass_pads(), (5, 6));
@@ -356,9 +356,9 @@ mod tests {
     #[test]
     fn the_bound_is_the_whole_chain() {
         assert_eq!(
-            AudioActivation::tolerance(&descriptor()),
+            Activation1d::tolerance(&descriptor()),
             Tolerance::dot(25, DType::F32, DType::F32)
         );
-        assert!(AudioActivation::tolerance(&descriptor()).rtol > 0.0);
+        assert!(Activation1d::tolerance(&descriptor()).rtol > 0.0);
     }
 }

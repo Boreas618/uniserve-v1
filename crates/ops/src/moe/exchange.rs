@@ -272,7 +272,7 @@ fn message(error: &[u8; 512]) -> Option<&str> {
 /// One instance per rank and group, built by the worker and alive for the transport's whole life.
 /// Mirrored by hand in the same header as `UniserveGroup`.
 #[repr(C)]
-pub struct Group {
+pub struct HostGroup {
     /// What the functions below take as their first argument.
     pub handle: *mut c_void,
     /// The group's `ncclComm_t`, for a package that drives NCCL itself, or null.
@@ -293,13 +293,13 @@ pub struct Group {
 }
 
 /// The size and field offsets the group's header must mirror, in bytes.
-pub const GROUP_LAYOUT: CallLayout = CallLayout {
+pub const HOST_GROUP_LAYOUT: CallLayout = CallLayout {
     size: 568,
     error: 56,
 };
 
-const _: () = assert!(std::mem::size_of::<Group>() == GROUP_LAYOUT.size);
-const _: () = assert!(std::mem::offset_of!(Group, error) == GROUP_LAYOUT.error);
+const _: () = assert!(std::mem::size_of::<HostGroup>() == HOST_GROUP_LAYOUT.size);
+const _: () = assert!(std::mem::offset_of!(HostGroup, error) == HOST_GROUP_LAYOUT.error);
 
 /// What the worker states about a transport it creates.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -372,7 +372,7 @@ impl TransportShape {
 #[repr(C)]
 pub struct Lifecycle {
     pub transport: *mut c_void,
-    pub group: *const Group,
+    pub group: *const HostGroup,
     pub ranks: i64,
     pub rank: i64,
     pub experts: i64,
@@ -496,7 +496,7 @@ impl Transport {
     /// each on its own thread, because `create` blocks until the ranks have met.
     pub fn create(
         kernel: Arc<Kernel>,
-        group: *const Group,
+        group: *const HostGroup,
         shape: TransportShape,
         stream: &Stream,
     ) -> Result<Self> {
@@ -865,7 +865,7 @@ mod tests {
     fn the_headers_declare_these_layouts() {
         for (structure, layout) in [
             ("uniserve_exchange_call", &CALL_LAYOUT),
-            ("UniserveGroup", &GROUP_LAYOUT),
+            ("UniserveGroup", &HOST_GROUP_LAYOUT),
             ("uniserve_exchange_lifecycle", &LIFECYCLE_LAYOUT),
             ("uniserve_exchange_info", &INFO_LAYOUT),
         ] {

@@ -78,9 +78,9 @@
 pub const KERNELS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/kernels");
 
 pub mod activation;
+pub mod activation1d;
 pub mod adaptive_pool;
 pub mod attention;
-pub mod audio_activation;
 pub mod audio_resample;
 pub mod block_copy;
 // Test-only: the package headers' mirrors checked against the layouts this crate passes.
@@ -121,7 +121,6 @@ pub mod rgb;
 pub mod rope;
 pub mod rows;
 pub mod sampler;
-pub mod segments;
 pub mod snake;
 pub mod tensor;
 pub mod tile_stitch;
@@ -130,6 +129,7 @@ pub mod transpose;
 pub mod twins;
 pub mod unpatchify;
 pub mod values;
+pub mod vsa;
 
 pub use descriptor::{Float, Key};
 pub use error::{Error, Result};

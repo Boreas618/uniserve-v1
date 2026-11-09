@@ -31,7 +31,7 @@
 
 use ops::attention::sparse::{SparseArgs, SparseAttention, SparseDescriptor};
 use ops::descriptor::Float;
-use ops::segments::{self, MAX_MEMBERS, VsaZeroPadding};
+use ops::vsa::{self, MAX_MEMBERS, VsaZeroPadding};
 use ops::{DType, Shape, TensorView};
 
 use crate::error::{Error, Result};
@@ -161,13 +161,13 @@ impl VsaAttention {
                 "a tile, a head count and a feature count are each at least one".to_owned(),
             ));
         }
-        if !spec.tile_rows.is_multiple_of(segments::BLOCK_ROWS) {
+        if !spec.tile_rows.is_multiple_of(vsa::BLOCK_ROWS) {
             return Err(Error::shape(
                 OWNER,
                 format!(
                     "a tile of {} rows is not a whole number of {} programmes",
                     spec.tile_rows,
-                    segments::BLOCK_ROWS
+                    vsa::BLOCK_ROWS
                 ),
             ));
         }
@@ -208,7 +208,7 @@ impl VsaAttention {
             eps: spec.epsilon,
             rotated: spec.rotated,
             norm: spec.qk_norm,
-            block_rows: segments::BLOCK_ROWS,
+            block_rows: vsa::BLOCK_ROWS,
             max_tiles: spec.max_tiles,
             keys: spec.max_keys,
             output: spec.output,
@@ -303,13 +303,13 @@ impl VsaAttention {
     }
 
     /// The descriptor the padding-row zeroing takes: the output's element type and the tile geometry.
-    fn zero_descriptor(&self) -> segments::ZeroPaddingDescriptor {
-        segments::ZeroPaddingDescriptor {
+    fn zero_descriptor(&self) -> vsa::ZeroPaddingDescriptor {
+        vsa::ZeroPaddingDescriptor {
             dtype: self.output,
             heads: self.heads,
             tile_rows: self.tile_rows,
             width: self.width,
-            block_rows: segments::BLOCK_ROWS,
+            block_rows: vsa::BLOCK_ROWS,
         }
     }
 
@@ -349,7 +349,7 @@ impl VsaAttention {
         // bound the key tiles bound the query tiles.
         f.operate::<VsaZeroPadding>(
             &self.zero_descriptor(),
-            segments::ZeroPaddingArgs { values: out, sizes },
+            vsa::ZeroPaddingArgs { values: out, sizes },
         )
     }
 
@@ -376,8 +376,8 @@ impl VsaAttention {
     /// program compiled for the deployment's bound serves **every** request up to it. A descriptor
     /// built from a request's tile count instead compiles a fresh module per distinct count whose
     /// extra lanes are all masked off - the same arithmetic at the cost of a class per request.
-    fn select_descriptor(&self, tiles: u64) -> Result<segments::SelectTilesDescriptor> {
-        Ok(segments::SelectTilesDescriptor {
+    fn select_descriptor(&self, tiles: u64) -> Result<vsa::SelectTilesDescriptor> {
+        Ok(vsa::SelectTilesDescriptor {
             block: u32::try_from(tiles.max(1).next_power_of_two()).map_err(|_| {
                 Error::shape(
                     "VsaAttention",
@@ -437,7 +437,7 @@ impl VsaAttention {
         norm: bool,
         strides: [u64; 7],
         epsilon: Float,
-    ) -> segments::PrepareTilesDescriptor {
+    ) -> vsa::PrepareTilesDescriptor {
         let [heads, width, rotated, tile_rows, block_rows] = geometry;
         let [
             query_row,
@@ -448,7 +448,7 @@ impl VsaAttention {
             value_head,
             factor,
         ] = strides;
-        segments::PrepareTilesDescriptor {
+        vsa::PrepareTilesDescriptor {
             dtype,
             heads,
             width,
@@ -511,7 +511,7 @@ impl VsaAttention {
             ],
             Float::from(self.eps),
         );
-        let args = segments::PrepareTilesArgs {
+        let args = vsa::PrepareTilesArgs {
             query,
             key,
             value,
@@ -524,7 +524,7 @@ impl VsaAttention {
             pooled_key,
             pooled_value,
         };
-        f.operate::<segments::VsaPrepareTiles>(&descriptor, args)
+        f.operate::<vsa::VsaPrepareTiles>(&descriptor, args)
     }
 
     /// Fold the compressed branch's gated rows into each tile's rows, in place.
@@ -535,18 +535,18 @@ impl VsaAttention {
         compressed: TensorView,
         gate: TensorView,
     ) -> Result<()> {
-        let descriptor = segments::AddGatedTilesDescriptor {
+        let descriptor = vsa::AddGatedTilesDescriptor {
             dtype: output.dtype,
             tile_rows: self.tile_rows,
             width: self.width,
             block_rows: self.block_rows,
         };
-        let args = segments::AddGatedTilesArgs {
+        let args = vsa::AddGatedTilesArgs {
             output,
             compressed,
             gate,
         };
-        f.operate::<segments::VsaAddGatedTiles>(&descriptor, args)
+        f.operate::<vsa::VsaAddGatedTiles>(&descriptor, args)
     }
 
     /// How many members a composition may name: [`Self::compose`] calls this before it composes a
@@ -585,7 +585,7 @@ impl VsaAttention {
         self.check_members(slots.len())?;
         let mut table = [0_u32; MAX_MEMBERS];
         table[..slots.len()].copy_from_slice(slots);
-        let descriptor = segments::ComposeGatedRowsDescriptor {
+        let descriptor = vsa::ComposeGatedRowsDescriptor {
             dtype: output.dtype,
             heads: self.heads,
             tile_rows: self.tile_rows,
@@ -594,7 +594,7 @@ impl VsaAttention {
             slots: table,
             members: slots.len() as u32,
         };
-        let args = segments::ComposeGatedRowsArgs {
+        let args = vsa::ComposeGatedRowsArgs {
             output,
             fine,
             compressed,
@@ -603,7 +603,7 @@ impl VsaAttention {
             start,
             count,
         };
-        f.operate::<segments::VsaComposeGatedRows>(&descriptor, args)
+        f.operate::<vsa::VsaComposeGatedRows>(&descriptor, args)
     }
 
     /// Contract the pooled query and key tiles into the scores `select` ranks.
@@ -615,8 +615,8 @@ impl VsaAttention {
     /// selection only compares and the attention scales its own products.
     /// The descriptor one score launch takes: the head count, the features per head and the bound on
     /// the dot product's length. A walk states it from the layer's own geometry.
-    fn scores_descriptor(&self) -> segments::ScoresDescriptor {
-        segments::ScoresDescriptor::new(
+    fn scores_descriptor(&self) -> vsa::ScoresDescriptor {
+        vsa::ScoresDescriptor::new(
             self.heads,
             self.width,
             self.width.next_power_of_two(),
@@ -626,8 +626,8 @@ impl VsaAttention {
 
     /// The descriptor one compression launch takes: the element type, the head count, the features
     /// per head, and the bound on the key tiles one reduction covers.
-    fn compress_descriptor(&self, dtype: DType) -> segments::CompressPooledDescriptor {
-        segments::CompressPooledDescriptor::new(
+    fn compress_descriptor(&self, dtype: DType) -> vsa::CompressPooledDescriptor {
+        vsa::CompressPooledDescriptor::new(
             dtype,
             self.heads,
             self.width,
@@ -666,12 +666,12 @@ impl VsaAttention {
             ));
         }
         let descriptor = self.scores_descriptor();
-        let args = segments::ScoresArgs {
+        let args = vsa::ScoresArgs {
             pooled_query,
             pooled_key,
             out: scores,
         };
-        f.operate::<segments::VsaScores>(&descriptor, args)
+        f.operate::<vsa::VsaScores>(&descriptor, args)
     }
 
     /// Each query tile's softmax over the live key tiles weights their pooled values.
@@ -695,13 +695,13 @@ impl VsaAttention {
     ) -> Result<()> {
         self.check_compress(scores, values, sizes, out)?;
         let descriptor = self.compress_descriptor(out.dtype);
-        let args = segments::CompressPooledArgs {
+        let args = vsa::CompressPooledArgs {
             scores,
             values,
             sizes,
             out,
         };
-        f.operate::<segments::VsaCompressPooled>(&descriptor, args)
+        f.operate::<vsa::VsaCompressPooled>(&descriptor, args)
     }
 
     /// The checks [`Self::compress`] makes before it launches, reachable without a device.
@@ -834,7 +834,7 @@ impl VsaAttention {
         // one layout, and a program over the bound's lanes ranks and masks them all for every query
         // tile of every head.
         let descriptor = self.select_descriptor(tiles.max(u64::from(SELECT_FLOOR)))?;
-        let args = segments::SelectTilesArgs {
+        let args = vsa::SelectTilesArgs {
             scores,
             segments,
             sizes,
@@ -843,7 +843,7 @@ impl VsaAttention {
             counts,
             query_offset,
         };
-        f.operate::<segments::VsaSelectTiles>(&descriptor, args)
+        f.operate::<vsa::VsaSelectTiles>(&descriptor, args)
     }
 }
 

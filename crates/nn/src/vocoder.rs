@@ -21,7 +21,7 @@
 //! and the served outputs are this product's, so it is kept (a change is a protocol change). The
 //! final `tanh` or clamp is the caller's: a PCM step clamps as it quantizes.
 
-use ops::audio_activation::{self, AudioActivation as AudioActivationOp};
+use ops::activation1d::{self, Activation1d as Activation1dOp};
 use ops::{DType, Shape, TensorView};
 
 use crate::error::{Error, Result};
@@ -107,8 +107,8 @@ impl Activation1d {
     }
 
     /// The descriptor a block of this geometry launches; the length is a launch value.
-    fn descriptor(&self) -> audio_activation::Descriptor {
-        audio_activation::Descriptor {
+    fn descriptor(&self) -> activation1d::Descriptor {
+        activation1d::Descriptor {
             dtype: self.dtype,
             channels: self.channels,
             kernel: self.kernel,
@@ -195,9 +195,9 @@ impl Activation1d {
             channels * expected * element,
         );
         for row in 0..batch {
-            f.operate::<AudioActivationOp>(
+            f.operate::<Activation1dOp>(
                 &descriptor,
-                audio_activation::Args {
+                activation1d::Args {
                     values: TensorView::new(
                         input.ptr.offset(row * input_row),
                         self.dtype,
