@@ -51,7 +51,8 @@ impl Budget for Allowance {
 /// The device's pools, as a worker attaches them before it walks its runners.
 fn pools() -> Arc<Mutex<Pools>> {
     let device = Device::new(DEVICE).expect("a CUDA device");
-    let totals = Arc::new(Pools::totals_of(u64::MAX / 2));
+    // An allowance the device can reserve address space for; the walks book a few KiB.
+    let totals = Arc::new(Pools::totals_of(1 << 30));
     let allocator = Allocator::new(&device, Arc::new(Allowance::default()) as Arc<dyn Budget>)
         .expect("an allocator over the device");
     Arc::new(Mutex::new(
@@ -88,7 +89,8 @@ fn launch(f: &Forward<'_>, bytes: u64, columns: u32) -> Result<()> {
         &gather(columns),
         GatherArgs {
             hidden: reserved,
-            rows: reserved.reshape(Shape::new(&[rows * u64::from(columns)])),
+            // One row index per gathered row, read from the start of the reserved rows.
+            rows: ops::TensorView::new(reserved.ptr, DType::I32, Shape::new(&[rows])),
             out: reserved,
         },
     )
