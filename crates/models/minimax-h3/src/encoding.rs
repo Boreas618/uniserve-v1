@@ -730,8 +730,8 @@ pub fn padded_samples(samples: u64, hop: u64) -> Result<u64> {
 
 use nn::Forward;
 use nn::layers::{
-    AdaptivePool, Attention, Conv1d, Conv3d, ConvGeometry, FrameMoments, FrameNormPad, FramePad,
-    GateBias, GatedActivation, Halves, LayerNorm, Linear, Posterior, Residual, Rounding, Snake,
+    AdaptivePool, Attention, CausalPad, Conv1d, Conv3d, ConvGeometry, FramePad, GateBias,
+    GatedActivation, GroupNorm, Halves, LayerNorm, Linear, Posterior, Residual, Rounding, Snake,
     Transpose, WeightOrder,
 };
 use nn::weights::{Scope, Weight, WeightLoader};
@@ -747,14 +747,12 @@ use crate::audio_vae::folded;
 /// where the reference adds it in a second pass to keep its rounding equal to `conv(x) + bias` — the
 /// same value, one rounding apart.
 struct Normalized {
-    norm: FrameNormPad,
+    norm: GroupNorm,
     conv: Conv3d,
     /// The source width the normalization reduces.
     channels: u32,
     /// The frame groups its statistics are taken over.
     groups: u32,
-    /// The variance floor of those statistics.
-    epsilon: f32,
 }
 
 /// One residual block: two normalized causal convolutions added to the input's projection.
@@ -1003,7 +1001,19 @@ impl VideoEncoder {
             let weight = norm.tensor("weight", &[u64::from(channels)])?;
             let bias = norm.tensor("bias", &[u64::from(channels)])?;
             Ok(Normalized {
-                norm: FrameNormPad::new(u64::from(groups), Some(weight), Some(bias), reflect)?,
+                // One pixel on each spatial side and two zero frames in front.
+                norm: GroupNorm::new(
+                    u64::from(groups),
+                    epsilon,
+                    Some(weight),
+                    Some(bias),
+                    CausalPad {
+                        top: 1,
+                        left: 1,
+                        front: 2,
+                        reflect,
+                    },
+                )?,
                 conv: convolution(
                     &mut loader.scope(conv_name),
                     channels,
@@ -1014,7 +1024,6 @@ impl VideoEncoder {
                 )?,
                 channels,
                 groups,
-                epsilon,
             })
         };
 
@@ -1168,8 +1177,7 @@ impl Normalized {
                 pad.shape.dims()
             )));
         }
-        FrameMoments::new(u64::from(self.groups), self.epsilon).forward(f, values, mean, rstd)?;
-        self.norm.forward(f, values, mean, rstd, pad, 1, 1, 2)?;
+        self.norm.forward(f, values, mean, rstd, pad)?;
         Ok(self.conv.forward(f, pad, out)?)
     }
 }

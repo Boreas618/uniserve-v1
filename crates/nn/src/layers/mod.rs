@@ -55,7 +55,7 @@ pub use conv::{Conv1d, Conv3d, ConvGeometry, ConvTranspose1d};
 pub use cross_fade::CrossFade;
 pub use embedding::{VocabParallelEmbedding, vocabulary_shard};
 pub use exchange::UlyssesExchange;
-pub use frame::{FrameMoments, FrameNormPad, FramePad};
+pub use frame::FramePad;
 pub use head::ParallelLMHead;
 pub use layout::{Access, Copy, Patchify};
 pub use linear::{
@@ -64,7 +64,7 @@ pub use linear::{
 };
 pub use moe::{ExpertNames, ExpertSlots, Moe, MoeSpec, WEIGHT_SCALE_LAYOUT};
 pub use noise::{Key as NoiseKey, Noise};
-pub use norm::{Epilogue, LayerNorm, Modulation, ResidualStream, RmsNorm};
+pub use norm::{CausalPad, Epilogue, GroupNorm, LayerNorm, Modulation, ResidualStream, RmsNorm};
 pub use ops::activation::Activation;
 pub use ops::gemm::WeightOrder;
 pub use ops::rope::Rotation;

@@ -1,19 +1,15 @@
-//! The video VAE's frame layer: the causal pad, the per-frame group statistics, and the fused
-//! normalize-pad-activate that feeds a convolution.
+//! The causal padding of a video convolution's input (`ops::frame`).
 //!
-//! A video convolution sees a padded, normalized and activated frame. An eager implementation
-//! pads, reduces each frame's channel groups, and normalizes as three passes over the frame; the
-//! operators here fuse them (`ops::frame`), so the layer reads
-//! each frame once. Statistics stay FP32 whatever the activations' element type is; the padding is
-//! replication or reflection, the video VAE's two modes.
+//! A causal video convolution reads its input padded on both sides of height and width and
+//! preceded by zero frames, so no output frame depends on a later input frame. The padding is
+//! replication or reflection; a normalized input is padded by the
+//! [`GroupNorm`](crate::layers::GroupNorm) that writes it.
 
 use ops::TensorView;
-use ops::descriptor::Float;
-use ops::frame::{self, FrameNormPad as NormPadOp};
+use ops::frame;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::forward::Forward;
-use crate::weights::Weight;
 
 /// The causal padding of a video convolution's input.
 pub struct FramePad {
@@ -66,187 +62,5 @@ impl FramePad {
         };
 
         f.operate::<frame::FramePad>(&descriptor, args)
-    }
-}
-
-/// The per-frame group statistics of a video convolution's input.
-pub struct FrameMoments {
-    groups: u64,
-    eps: f32,
-}
-
-impl FrameMoments {
-    /// The statistics of `groups` channel groups, with `eps` added to each variance.
-    pub const fn new(groups: u64, eps: f32) -> Self {
-        Self { groups, eps }
-    }
-
-    /// The descriptor one moments launch takes.
-    ///
-    /// The reduction class is derived from the frame's own shape, so a launch can never name a class
-    /// narrower than the reduction it asks for: `channels_per_group · pixels`, padded to a power of
-    /// two because that is what the compiled program's bound is.
-    fn descriptor(&self, values: TensorView) -> frame::FrameMomentsDescriptor {
-        let channels = values.shape.dim(1);
-        let pixels = values.shape.dim(3) * values.shape.dim(4);
-        frame::FrameMomentsDescriptor {
-            dtype: values.dtype,
-            reduction: frame::frame_reduction_class(channels / self.groups.max(1), pixels),
-            epsilon: Float::from(self.eps),
-        }
-    }
-
-    /// Reduce each frame's group means and reciprocal standard deviations.
-    ///
-    /// `values` is `[batch, channels, frames, height, width]` FP32 in either layout — the operator
-    /// derives a frame's pixel step from the strides; `mean` and `rstd` are the `[batch · frames,
-    /// groups]` FP32.
-    pub fn forward(
-        &self,
-        f: &Forward,
-        values: TensorView,
-        mean: TensorView,
-        rstd: TensorView,
-    ) -> Result<()> {
-        let descriptor = self.descriptor(values);
-        let args = frame::FrameMomentsArgs {
-            values,
-            mean,
-            rstd,
-            groups: self.groups,
-        };
-
-        f.operate::<frame::FrameMoments>(&descriptor, args)
-    }
-}
-
-/// The padded, normalized and activated input of a video convolution.
-pub struct FrameNormPad {
-    groups: u64,
-    weight: Option<Weight>,
-    bias: Option<Weight>,
-    reflect: bool,
-}
-
-impl FrameNormPad {
-    /// The fused normalize-pad-activate of `groups` channel groups, with the learned affine
-    /// parameters when the checkpoint has them.
-    pub fn new(
-        groups: u64,
-        weight: Option<Weight>,
-        bias: Option<Weight>,
-        reflect: bool,
-    ) -> Result<Self> {
-        if weight.is_some() != bias.is_some() {
-            return Err(Error::shape(
-                "FrameNormPad",
-                "the affine parameters come in a weight and a bias, or not at all".to_owned(),
-            ));
-        }
-        Ok(Self {
-            groups,
-            weight,
-            bias,
-            reflect,
-        })
-    }
-
-    /// The descriptor one normalize-pad launch takes: the frame's channels and pixels, the groups
-    /// its statistics are taken over, the storage order it writes (read off `out`'s strides, which
-    /// is where the order of a frame lives), whether the affine parameters are present, and the
-    /// padded frame's pixel count (one pixel is a class of its own).
-    fn descriptor(
-        dtype: ops::DType,
-        channels: u64,
-        pixels: u64,
-        groups: u64,
-        channels_last: bool,
-        affine: bool,
-        padded_pixels: u64,
-    ) -> frame::FrameNormPadDescriptor {
-        frame::FrameNormPadDescriptor {
-            dtype,
-            // The same reduction `frame_moments` takes of the same frame.
-            reduction: frame::frame_reduction_class(channels / groups.max(1), pixels),
-            channels_last,
-            centered: !affine,
-            single_pixel: padded_pixels == 1,
-        }
-    }
-
-    /// Normalize `values` by the frame statistics, pad and activate them into `out`.
-    ///
-    /// `values` is `[batch, channels, frames, height, width]` FP32 with each frame's pixels
-    /// contiguous; `mean` and `rstd` are the `frame_moments` of the same frames; `out` is the padded
-    /// frame in the activation's element type, in either storage order — its strides state which,
-    /// and they select the compiled variant.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward(
-        &self,
-        f: &Forward,
-        values: TensorView,
-        mean: TensorView,
-        rstd: TensorView,
-        out: TensorView,
-        top: u64,
-        left: u64,
-        front: u64,
-    ) -> Result<()> {
-        if out.shape.rank() != 5 {
-            return Err(Error::shape(
-                "FrameNormPad",
-                format!("a padded frame is rank 5, not {:?}", out.shape.dims()),
-            ));
-        }
-        // The axes are logical in either storage order — `[batch, channels, frames, height, width]`
-        // — and the order lives in the strides, so one view of a channels-last buffer serves this
-        // layer exactly as a channels-first one does.
-        let channels = values.shape.dim(1);
-        if out.shape.dim(1) != channels {
-            return Err(Error::shape(
-                "FrameNormPad",
-                format!(
-                    "an output of {} channels for a source of {channels}",
-                    out.shape.dim(1)
-                ),
-            ));
-        }
-        if out.shape.dim(2) < values.shape.dim(2)
-            || out.shape.dim(3) < values.shape.dim(3)
-            || out.shape.dim(4) < values.shape.dim(4)
-        {
-            return Err(Error::shape(
-                "FrameNormPad",
-                "the output's frames, rows and columns cannot be smaller than the source's"
-                    .to_owned(),
-            ));
-        }
-        let padded_pixels = out.shape.dim(3) * out.shape.dim(4);
-        let descriptor = Self::descriptor(
-            values.dtype,
-            values.shape.dim(1),
-            values.shape.dim(3) * values.shape.dim(4),
-            self.groups,
-            // The variant follows the output's storage, which the view states; the operator checks
-            // the two agree before it launches.
-            frame::is_channels_last(&out),
-            self.weight.is_some(),
-            padded_pixels,
-        );
-        let args = frame::FrameNormPadArgs {
-            values,
-            mean,
-            rstd,
-            weight: self.weight.as_ref().map(Weight::view),
-            bias: self.bias.as_ref().map(Weight::view),
-            out,
-            groups: self.groups,
-            top,
-            left,
-            front,
-            reflect: self.reflect,
-        };
-
-        f.operate::<NormPadOp>(&descriptor, args)
     }
 }

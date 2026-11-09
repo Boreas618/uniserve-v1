@@ -7,10 +7,10 @@
 //! region that is never read, because construction only inspects extents and strides.
 
 use nn::{
-    Activation, AdaptivePool, Arena, Conv3d, ConvGeometry, DType, DevicePtr, Epilogue, Forward,
-    FrameNormPad, GateBias, GatedActivation, Halves, KvGroup, KvPlanes, KvView, LayerNorm, Linear,
-    Modulation, Residual, ResidualStream, RmsNorm, Rotary, Rotate, Rotation, Rounding, Scale,
-    Shape, Snake, TensorView, VsaTiles, Weight,
+    Activation, AdaptivePool, Arena, CausalPad, Conv3d, ConvGeometry, DType, DevicePtr, Epilogue,
+    Forward, GateBias, GatedActivation, GroupNorm, Halves, KvGroup, KvPlanes, KvView, LayerNorm,
+    Linear, Modulation, Residual, ResidualStream, RmsNorm, Rotary, Rotate, Rotation, Rounding,
+    Scale, Shape, Snake, TensorView, VsaTiles, Weight,
 };
 use ops::gemm::WeightOrder;
 
@@ -302,13 +302,54 @@ fn a_rotary_needs_a_pair_per_head() {
 }
 
 #[test]
-fn the_frame_normalization_states_its_layout_and_its_affine_pair() {
+fn a_group_normalization_states_its_groups_and_its_affine_pair() {
+    let pad = CausalPad {
+        top: 1,
+        left: 1,
+        front: 2,
+        reflect: false,
+    };
     assert!(
-        FrameNormPad::new(32, Some(weight(&[64])), None, false).is_err(),
+        GroupNorm::new(32, 1e-6, Some(weight(&[64])), None, pad).is_err(),
         "a weight without a bias is not an affine pair"
     );
-    assert!(FrameNormPad::new(32, Some(weight(&[64])), Some(weight(&[64])), false).is_ok());
-    assert!(FrameNormPad::new(32, None, None, true).is_ok());
+    assert!(GroupNorm::new(32, 1e-6, Some(weight(&[64])), Some(weight(&[64])), pad).is_ok());
+    assert!(GroupNorm::new(32, 1e-6, None, None, pad).is_ok());
+    assert!(GroupNorm::new(0, 1e-6, None, None, pad).is_err());
+}
+
+/// The frame a normalization writes holds the source's channels and is at least its extent on
+/// every padded axis.
+#[test]
+fn a_group_normalization_writes_a_frame_no_smaller_than_its_source() {
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let view = |dims: &[u64]| arena.tensor(DType::F32, Shape::new(dims)).unwrap();
+    let pad = CausalPad {
+        top: 1,
+        left: 1,
+        front: 2,
+        reflect: true,
+    };
+    let norm = GroupNorm::new(4, 1e-6, None, None, pad).unwrap();
+    let values = view(&[1, 8, 3, 6, 6]);
+    let (mean, rstd) = (view(&[3, 4]), view(&[3, 4]));
+    assert!(
+        norm.forward(&f, values, mean, rstd, view(&[1, 8, 5, 8, 8]))
+            .is_ok()
+    );
+    assert!(
+        norm.forward(&f, values, mean, rstd, view(&[1, 4, 5, 8, 8]))
+            .is_err()
+    );
+    assert!(
+        norm.forward(&f, values, mean, rstd, view(&[1, 8, 5, 4, 8]))
+            .is_err()
+    );
+    assert!(
+        norm.forward(&f, values, mean, rstd, view(&[8, 5, 8, 8]))
+            .is_err()
+    );
 }
 
 #[test]

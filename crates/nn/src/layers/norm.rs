@@ -1,5 +1,5 @@
-//! Row-wise normalization: RMS and layer normalization, each with the elementwise stages fused
-//! around its row statistics.
+//! Normalization: RMS and layer normalization over rows, each with the elementwise stages fused
+//! around its row statistics, and group normalization over a video frame's channel groups.
 //!
 //! A residual stream is normalized where it is updated, so the add and the normalization are one
 //! launch that reads the row once. The normalization's [`Epilogue`] states what is fused:
@@ -19,9 +19,14 @@
 //! one its epilogue and call name: `rms_norm`, `add_rms_norm`, `weighted_rms_norm` (an RMS
 //! normalization that narrows into a smaller element type), `scaled_residual_rms_norm`,
 //! `modulated_rms_norm`; `layer_norm` and `scaled_residual_layer_norm`.
+//!
+//! [`GroupNorm`] normalizes a frame's channel groups for a causal video convolution, so its fused
+//! stage is that convolution's pre-activation: SiLU and the causal pad (`frame_moments`, then
+//! `frame_norm_pad`).
 
 use ops::TensorView;
 use ops::descriptor::Float;
+use ops::frame::{self, FrameMoments, FrameNormPad};
 use ops::modulation::{self, ModulatedRmsNorm};
 use ops::norm::{self, AddRmsNorm, LayerNorm as LayerNormOp, RmsNorm as RmsNormOp};
 use ops::residual::{self, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm};
@@ -568,5 +573,170 @@ impl LayerNorm {
                     .to_owned(),
             )),
         }
+    }
+}
+
+/// The causal frame a [`GroupNorm`] writes its activated rows into: the padding before the source
+/// on each axis, and whether the spatial border mirrors (`reflect`) or replicates the edge.
+///
+/// The output view's own extents give the padding after the source; the frames in front are zeros,
+/// so no output frame of the convolution that reads the frame depends on a later input frame.
+#[derive(Clone, Copy, Debug)]
+pub struct CausalPad {
+    /// Rows before the source.
+    pub top: u64,
+    /// Columns before the source.
+    pub left: u64,
+    /// Zero frames before the source.
+    pub front: u64,
+    /// Mirror the edge rows and columns rather than replicate them.
+    pub reflect: bool,
+}
+
+/// Group normalization of a video frame's channel groups, with the frame's SiLU activation and its
+/// causal pad fused into the store.
+///
+/// ```text
+/// mean, rstd = group statistics of each frame          frame_moments (FP32, Welford)
+/// out        = pad(silu(norm(values) · weight + bias))  frame_norm_pad
+/// ```
+///
+/// The epilogue is the one a causal video convolution's pre-activation needs, and the two launches
+/// read the frame twice instead of three times: the statistics, then one pass that normalizes,
+/// activates and pads.
+pub struct GroupNorm {
+    groups: u64,
+    eps: f32,
+    weight: Option<Weight>,
+    bias: Option<Weight>,
+    pad: CausalPad,
+}
+
+impl GroupNorm {
+    /// The normalization of `groups` channel groups with variance floor `eps`, the learned affine
+    /// pair when the checkpoint has one, and the causal `pad` of the frame it writes.
+    ///
+    /// # Errors
+    ///
+    /// A weight without a bias or a bias without a weight, or no groups.
+    pub fn new(
+        groups: u64,
+        eps: f32,
+        weight: Option<Weight>,
+        bias: Option<Weight>,
+        pad: CausalPad,
+    ) -> Result<Self> {
+        if weight.is_some() != bias.is_some() {
+            return Err(Error::shape(
+                "GroupNorm",
+                "the affine parameters come in a weight and a bias, or not at all".to_owned(),
+            ));
+        }
+        if groups == 0 {
+            return Err(Error::shape(
+                "GroupNorm",
+                "a normalization of no groups has no statistics".to_owned(),
+            ));
+        }
+        Ok(Self {
+            groups,
+            eps,
+            weight,
+            bias,
+            pad,
+        })
+    }
+
+    /// Normalize `values`, activate them and pad them into `out`.
+    ///
+    /// `values` is `[batch, channels, frames, height, width]` FP32 with each frame's pixels
+    /// contiguous; `mean` and `rstd` are the `[batch · frames, groups]` FP32 statistics buffers the
+    /// call fills; `out` is the padded frame in the activation's element type, in either storage
+    /// order — its strides state which, and they select the compiled variant.
+    ///
+    /// # Errors
+    ///
+    /// An output of another rank or channel count, one smaller than the source, or the operators'
+    /// refusals.
+    pub fn forward(
+        &self,
+        f: &Forward,
+        values: TensorView,
+        mean: TensorView,
+        rstd: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        const OWNER: &str = "GroupNorm";
+        if out.shape.rank() != 5 || values.shape.rank() != 5 {
+            return Err(Error::shape(
+                OWNER,
+                format!(
+                    "a frame is rank 5, not {:?} into {:?}",
+                    values.shape.dims(),
+                    out.shape.dims()
+                ),
+            ));
+        }
+        // The axes are logical in either storage order — `[batch, channels, frames, height, width]`
+        // — and the order lives in the strides.
+        let channels = values.shape.dim(1);
+        if out.shape.dim(1) != channels {
+            return Err(Error::shape(
+                OWNER,
+                format!(
+                    "an output of {} channels for a source of {channels}",
+                    out.shape.dim(1)
+                ),
+            ));
+        }
+        if (2..5).any(|axis| out.shape.dim(axis) < values.shape.dim(axis)) {
+            return Err(Error::shape(
+                OWNER,
+                "the output's frames, rows and columns cannot be smaller than the source's"
+                    .to_owned(),
+            ));
+        }
+        // Both launches take the same reduction: `channels_per_group · pixels`, padded to the power
+        // of two the compiled program is bounded by.
+        let pixels = values.shape.dim(3) * values.shape.dim(4);
+        let reduction = frame::frame_reduction_class(channels / self.groups, pixels);
+
+        f.operate::<FrameMoments>(
+            &frame::FrameMomentsDescriptor {
+                dtype: values.dtype,
+                reduction,
+                epsilon: Float::from(self.eps),
+            },
+            frame::FrameMomentsArgs {
+                values,
+                mean,
+                rstd,
+                groups: self.groups,
+            },
+        )?;
+        f.operate::<FrameNormPad>(
+            &frame::FrameNormPadDescriptor {
+                dtype: values.dtype,
+                reduction,
+                // The variant follows the output's storage, which the view states; the operator
+                // checks the two agree before it launches.
+                channels_last: frame::is_channels_last(&out),
+                centered: self.weight.is_none(),
+                single_pixel: out.shape.dim(3) * out.shape.dim(4) == 1,
+            },
+            frame::FrameNormPadArgs {
+                values,
+                mean,
+                rstd,
+                weight: self.weight.as_ref().map(Weight::view),
+                bias: self.bias.as_ref().map(Weight::view),
+                out,
+                groups: self.groups,
+                top: self.pad.top,
+                left: self.pad.left,
+                front: self.pad.front,
+                reflect: self.pad.reflect,
+            },
+        )
     }
 }
