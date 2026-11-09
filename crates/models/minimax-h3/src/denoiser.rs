@@ -1068,35 +1068,11 @@ fn frame_count(latent_frames: u32) -> Result<u32> {
 
 /// The request's conditions in the geometry the packing places them by.
 fn conditions_of(request: &VideoRequest) -> Vec<packing::Condition> {
-    // The request states each condition's role and the encoded raster it arrives at; the packing
-    // wants that raster as a canvas, which is the same reduction `canvas_of` makes of the request's
-    // own width and height. A condition without pixels is an audio reference and carries none.
     request
         .conditions
         .iter()
-        .map(|shape| packing::Condition {
-            role: match shape.role {
-                ConditionRole::FirstFrame => packing::Role::FirstFrame,
-                ConditionRole::LastFrame => packing::Role::LastFrame,
-                ConditionRole::Reference => packing::Role::Reference,
-            },
-            frame: canvas_of_raster(shape.width, shape.height).map(|canvas| packing::Frame {
-                canvas,
-                num_frames: shape.frames,
-            }),
-            audio_samples: shape.audio_samples,
-        })
+        .map(packing::Condition::of)
         .collect()
-}
-
-/// The canvas a raster of `width` × `height` pixels is, or `None` without pixels.
-///
-/// A raster no canvas can hold is refused by the packing that reads it, not here.
-fn canvas_of_raster(width: u32, height: u32) -> Option<Canvas> {
-    if width == 0 || height == 0 {
-        return None;
-    }
-    Some(Canvas { width, height })
 }
 
 /// The pieces of `request`'s conditions, in the order the packing holds them.
@@ -2924,24 +2900,8 @@ mod tests {
         );
 
         // And the entries' total is the block the runner sizes: the two public answers agree.
-        let conditions: Vec<packing::Condition> = shapes
-            .iter()
-            .map(|shape| packing::Condition {
-                role: match shape.role {
-                    nn::capability::ConditionRole::FirstFrame => packing::Role::FirstFrame,
-                    nn::capability::ConditionRole::LastFrame => packing::Role::LastFrame,
-                    nn::capability::ConditionRole::Reference => packing::Role::Reference,
-                },
-                frame: (shape.width > 0).then_some(packing::Frame {
-                    canvas: Canvas {
-                        width: shape.width,
-                        height: shape.height,
-                    },
-                    num_frames: shape.frames,
-                }),
-                audio_samples: shape.audio_samples,
-            })
-            .collect();
+        let conditions: Vec<packing::Condition> =
+            shapes.iter().map(packing::Condition::of).collect();
         let canvas = rule.canvas(&request).expect("a canvas");
         assert_eq!(
             cursor,
@@ -3468,7 +3428,13 @@ mod tests {
             })
             .sum();
         assert_eq!(
-            u64::from(rule.condition_elements(&conditions, &canvas_of_raster(832, 480).unwrap())),
+            u64::from(rule.condition_elements(
+                &conditions,
+                &Canvas {
+                    width: 832,
+                    height: 480,
+                }
+            )),
             visual
         );
     }
@@ -3497,7 +3463,10 @@ mod tests {
             ..request(121, 832, 480)
         };
         let conditions = conditions_of(&request);
-        let canvas = canvas_of_raster(832, 480).unwrap();
+        let canvas = Canvas {
+            width: 832,
+            height: 480,
+        };
         let segments = packing::condition_segments(&conditions, &canvas).unwrap();
         let audio: Vec<_> = segments
             .iter()

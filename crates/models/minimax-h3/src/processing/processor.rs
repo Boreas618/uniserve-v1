@@ -400,7 +400,9 @@ impl VideoProcessor for H3Processor {
         )
         .map_err(refused)?;
 
-        let condition_rows = planned.condition_rows(&self.condition_packing);
+        let condition_rows = planned
+            .condition_rows(&self.condition_packing)
+            .map_err(refused)?;
         if condition_rows > self.condition_packing.capacity {
             return Err(InputError::invalid(
                 "input_references",

@@ -15,6 +15,7 @@ use crate::VideoTask;
 use nn::family::{Component, Components, Projection, Split};
 
 use crate::checkpoint::TASK_DITS;
+use crate::packing::{Condition, Frame, Role, Tiling};
 use crate::{Error, Result, config::Config};
 
 /// The condition rows a deployment must reserve to serve `task` at the largest canvas it offers.
@@ -26,10 +27,11 @@ use crate::{Error, Result, config::Config};
 /// every conditioned request at the packing's capacity check (`the model packed N condition rows and
 /// the layout reserves 192`).
 ///
-/// So the reservation is derived from what the deployment can be asked for: the largest canvas it
-/// offers, the keyframes the task anchors, and a reference clip's soundtrack. Returning the rows the
-/// task needs is what lets a caller with one fixed case size a stage to that case rather than to the
-/// deployment's worst.
+/// So the reservation is derived from what the deployment can be asked for: the keyframes the task
+/// anchors, or a reference clip and its soundtrack, at whichever canvas the checkpoint generates
+/// they take most rows of, counted row for row by the packing's own count
+/// ([`crate::packing::Tiling::condition_rows`]). Returning the rows the task needs is what lets a
+/// caller with one fixed case size a stage to that case rather than to the deployment's worst.
 pub fn condition_rows(config: &Config, task: VideoTask) -> Result<u32> {
     let dit = dit_of(task)?;
     if !config.denoisers.contains_key(&dit) {
@@ -38,30 +40,40 @@ pub fn condition_rows(config: &Config, task: VideoTask) -> Result<u32> {
             dit.directory()
         )));
     }
-    // The frame's rows at the largest canvas the deployment offers: a keyframe is fitted to the
-    // generated canvas, so this is its size whatever the request asks for.
-    let frame_rows = crate::config::named_canvases()?
-        .iter()
-        .map(|(_, canvas)| crate::packing::latent_raster(canvas).map(|raster| raster.patch_rows()))
-        .collect::<Result<Vec<u32>>>()?
-        .into_iter()
-        .max()
-        .unwrap_or(0);
-    let rows = match task {
-        VideoTask::TextToVideoAudio => 0,
-        VideoTask::FirstLastToVideoAudio => 2 * frame_rows,
-        VideoTask::ReferenceToVideoAudio => {
-            // A reference **with a soundtrack is a clip** (`an H3 image reference carries no audio`),
-            // so it is one clip of the frame rule's pixel frames and the packing's own rule reduces
-            // them to latent frames - not one frame with a track beside it. One latent frame fewer
-            // is a capacity that refuses the request it was derived for.
-            let frames = crate::FRAMES.clip_frames;
-            let latents = crate::FRAMES.latent_frames(frames);
-            // The track is one clip long, and the packing counts it in latent steps of stereo rows.
-            let samples = frames * crate::AUDIO_SAMPLE_RATE / crate::FPS;
-            latents * frame_rows + crate::AUDIO_CHANNELS * samples.div_ceil(crate::AUDIO_HOP)
-        }
-    };
+    let mut rows = 0;
+    for (_, canvas) in crate::config::named_canvases()? {
+        // A keyframe is fitted to the generated canvas, so its raster is the canvas's whatever
+        // the request asks for.
+        let keyframe = |role| Condition {
+            role,
+            frame: Some(Frame {
+                canvas,
+                num_frames: 1,
+            }),
+            audio_samples: 0,
+        };
+        let conditions = match task {
+            VideoTask::TextToVideoAudio => Vec::new(),
+            VideoTask::FirstLastToVideoAudio => {
+                vec![keyframe(Role::FirstFrame), keyframe(Role::LastFrame)]
+            }
+            // A reference **with a soundtrack is a clip** (`an H3 image reference carries no
+            // audio`), so it is one clip of the frame rule's pixel frames, which the packing
+            // reduces to latent frames - not one frame with a track beside it - and its track is one
+            // clip long. One latent frame fewer is a capacity that refuses the request it was
+            // derived for.
+            VideoTask::ReferenceToVideoAudio => vec![Condition {
+                role: Role::Reference,
+                frame: Some(Frame {
+                    canvas,
+                    num_frames: crate::FRAMES.clip_frames,
+                }),
+                audio_samples: crate::FRAMES.clip_frames * crate::AUDIO_SAMPLE_RATE / crate::FPS,
+            }],
+        };
+        let segments = crate::packing::condition_segments(&conditions, &canvas)?;
+        rows = rows.max(Tiling::ROWS.condition_rows(&segments));
+    }
     capacity(config, dit, rows)
 }
 
@@ -424,7 +436,7 @@ mod tests {
             condition_rows(&config, VideoTask::FirstLastToVideoAudio).expect("a capacity"),
             2048
         );
-        // A reference **with a soundtrack is a clip**: `CLIP_FRAMES` pixel frames, which the
+        // A reference **with a soundtrack is a clip**: a clip's pixel frames, which the
         // packing reduces to two latent frames at 1008 patch rows each, plus the soundtrack of one
         // clip (29 latent steps of two channels) - 2 x 1008 + 58 = 2074, in whole units.
         assert_eq!(

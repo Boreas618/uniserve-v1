@@ -50,7 +50,7 @@ use proto::video::{Canvas, ConditionMedia, ConditionRole, ConditionVision, Image
 
 use super::{ConditionPacking, ReferenceLimits, ServedCanvas};
 use crate::VideoTask;
-use crate::config::{AUDIO_CHANNELS, MIN_SECONDS};
+use crate::config::MIN_SECONDS;
 use crate::encoding::audio_latent_frames;
 use crate::packing::{LatentRaster, PATCH_SIDE};
 use qwen3::processor::{ProcessorConfig, VisionError, sample_frames};
@@ -481,9 +481,10 @@ pub struct AudioClip {
 }
 
 impl AudioClip {
-    /// Denoiser rows of the clip: one per latent per stereo channel.
+    /// Denoiser rows of the clip: one per latent per stereo channel
+    /// ([`crate::packing::track_rows`]).
     pub const fn rows(&self) -> u32 {
-        AUDIO_CHANNELS * self.latents
+        crate::packing::track_rows(self.latents)
     }
 
     /// What the media reader decodes.
@@ -711,29 +712,6 @@ impl ConditionInput {
         }
     }
 
-    /// Denoiser rows the condition takes in a layout of `packing`: its audio
-    /// rows in whole tiles, then a keyframe's or an image's rows in whole
-    /// tiles, or the tiles of a video's token grid. `canvas` is the generated
-    /// canvas, which a keyframe is fitted to.
-    pub fn packed_rows(&self, canvas: Canvas, packing: &ConditionPacking) -> u32 {
-        let tile = packing.tile_rows.max(1);
-        let visual = match &self.prepared {
-            Prepared::Keyframe(_) => LatentRaster::of(&canvas).patch_rows().div_ceil(tile),
-            Prepared::Image(size) => LatentRaster::of(size).patch_rows().div_ceil(tile),
-            Prepared::Video(clip) => [
-                clip.vae_clips.latent_frames(clip.vae_frames),
-                LatentRaster::of(&clip.canvas).height / PATCH_SIDE,
-                LatentRaster::of(&clip.canvas).width / PATCH_SIDE,
-            ]
-            .into_iter()
-            .zip(packing.video_tile)
-            .map(|(tokens, extent)| tokens.div_ceil(extent.max(1)))
-            .product(),
-            Prepared::Audio(_) => 0,
-        };
-        (self.audio_rows.div_ceil(tile) + visual).saturating_mul(tile)
-    }
-
     /// Describes the condition for the engine and the workers: its role, the
     /// published media at `source`, what the media reader decodes it into,
     /// what the conditioner reads of it, and the denoiser rows it encodes to,
@@ -763,6 +741,30 @@ impl ConditionInput {
     }
 }
 
+/// Denoiser rows planned `conditions` take in a layout of `packing`, as the
+/// denoiser's packing counts them ([`crate::packing::Tiling::condition_rows`]):
+/// each condition's audio rows in whole tiles, then a keyframe's or an image's
+/// rows in whole tiles, or the tiles of a video's token grid. `canvas` is the
+/// generated canvas, which a keyframe is fitted to.
+///
+/// # Errors
+///
+/// Fails when the packing refuses a planned condition, which the rules plan
+/// none of.
+pub fn condition_rows(
+    conditions: &[ConditionInput],
+    canvas: Canvas,
+    packing: &ConditionPacking,
+) -> Result<u32, VideoInputError> {
+    let shapes: Vec<crate::packing::Condition> = conditions
+        .iter()
+        .map(|condition| crate::packing::Condition::of(&condition.shape(canvas)))
+        .collect();
+    let segments = crate::packing::condition_segments(&shapes, &canvas)
+        .map_err(|error| VideoInputError::internal(format!("packing the conditions: {error}")))?;
+    Ok(packing.tiling().condition_rows(&segments))
+}
+
 /// The resolved size of a request and of every condition.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct VideoParams {
@@ -780,15 +782,17 @@ pub struct VideoParams {
 }
 
 impl VideoParams {
-    /// Denoiser rows the request's conditions take in a layout of `packing`.
-    /// The request's layout holds them: what exceeds `packing.capacity` the
-    /// deployment does not serve, and within it they select the request's
-    /// graph.
-    pub fn condition_rows(&self, packing: &ConditionPacking) -> u32 {
-        self.conditions
-            .iter()
-            .map(|condition| condition.packed_rows(self.canvas, packing))
-            .fold(0, u32::saturating_add)
+    /// Denoiser rows the request's conditions take in a layout of `packing`
+    /// ([`condition_rows`]). The request's layout holds them: what exceeds
+    /// `packing.capacity` the deployment does not serve, and within it they
+    /// select the request's graph.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the packing refuses a planned condition, which the rules
+    /// plan none of.
+    pub fn condition_rows(&self, packing: &ConditionPacking) -> Result<u32, VideoInputError> {
+        condition_rows(&self.conditions, self.canvas, packing)
     }
 
     /// The units each condition's reference image is encoded in when one
@@ -1591,7 +1595,7 @@ pub(super) mod tests {
         plan_request, reference_image_size, video_frame_count, video_reference,
     };
     use crate::config::{AUDIO_HOP, AUDIO_SAMPLE_RATE, CANVAS_RULE, FPS, FRAMES};
-    use crate::processing::{ReferenceLimits, ServedCanvas};
+    use crate::processing::{ConditionPacking, ReferenceLimits, ServedCanvas};
     use processing::FrameRate;
     use qwen3::processor::ProcessorConfig;
 
@@ -2361,6 +2365,19 @@ pub(super) mod tests {
             assert_eq!(
                 u64::from(audio_rows),
                 expected["condition_audio_rows"],
+                "{name}"
+            );
+            // A dense denoiser packs them row for row, so the rows a request's layout holds are
+            // the reference's too.
+            let dense = ConditionPacking {
+                capacity: u32::MAX,
+                tile_rows: 1,
+                video_tile: [1, 1, 1],
+            };
+            assert_eq!(
+                u64::from(plan.condition_rows(&dense).unwrap()),
+                expected["condition_video_rows"].as_u64().unwrap()
+                    + expected["condition_audio_rows"].as_u64().unwrap(),
                 "{name}"
             );
             let conditions: Vec<Value> = plan

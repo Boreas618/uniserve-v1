@@ -23,7 +23,9 @@ use std::ops::Range;
 
 use proto::video::Canvas;
 
-use crate::config::{AUDIO_CHANNELS, AUDIO_HOP, CANVAS_RULE, FPS, FRAMES, SPARSE_TILE_ROWS};
+use crate::config::{
+    AUDIO_CHANNELS, AUDIO_HOP, AttentionKind, CANVAS_RULE, FPS, FRAMES, SPARSE_TILE_ROWS,
+};
 use crate::{Error, Result};
 
 /// The `(time, height, width)` token grid of one video tile of each tile size.
@@ -150,7 +152,13 @@ pub fn audio_latent_frames(num_frames: u32) -> u32 {
 
 /// Audio rows of a generated frame count: one row per channel per latent step.
 pub fn audio_rows(num_frames: u32) -> u32 {
-    AUDIO_CHANNELS * audio_latent_frames(num_frames)
+    track_rows(audio_latent_frames(num_frames))
+}
+
+/// Packed rows of a stereo track of `latent_frames` latent frames: channel-major, one row per
+/// channel per latent frame. A generated track and a condition's alike.
+pub const fn track_rows(latent_frames: u32) -> u32 {
+    AUDIO_CHANNELS * latent_frames
 }
 
 /// Samples of one generated frame count's soundtrack.
@@ -217,9 +225,9 @@ impl Segment {
         self.visual.map_or(0, |visual| visual.rows())
     }
 
-    /// Audio rows: channel-major stereo.
+    /// Audio rows: channel-major stereo ([`track_rows`]).
     pub fn audio_rows(&self) -> u32 {
-        AUDIO_CHANNELS * self.audio_frames
+        track_rows(self.audio_frames)
     }
 }
 
@@ -240,29 +248,70 @@ pub fn tile_shape(tile: u32) -> Result<(u32, u32, u32)> {
         })
 }
 
-/// Tiles one condition occupies in a sparse layout of `tile` rows.
+/// How a layout's condition region holds a request's conditions: in whole tiles of `rows` rows, a
+/// reference video's token grid in tiles of `shape`.
 ///
-/// Its audio rows fill whole tiles, then a keyframe's or an image's rows fill whole tiles and a
-/// video's rows fill the tiles of its token grid.
-pub fn segment_tiles(segment: &Segment, tile: u32) -> Result<u32> {
-    let shape = tile_shape(tile)?;
-    let mut tiles = segment.audio_rows().div_ceil(tile);
-    match segment.kind {
-        SegmentKind::Keyframe | SegmentKind::Image => {
-            tiles += segment.video_rows().div_ceil(tile);
-        }
-        SegmentKind::Video => {
-            let visual = segment.visual.ok_or_else(|| {
-                Error::config("an H3 video segment carries its latent frames".to_owned())
-            })?;
-            let grid = video_grid(visual.frames, visual.raster);
-            tiles += (grid.0.div_ceil(shape.0))
-                * (grid.1.div_ceil(shape.1))
-                * (grid.2.div_ceil(shape.2));
-        }
-        SegmentKind::Audio => {}
+/// A sparse layout's tiling is its attention tile's ([`Tiling::sparse`]); a dense layout packs row
+/// for row ([`Tiling::ROWS`]). [`Tiling::condition_rows`] is the one count of a request's condition
+/// rows: the packing places the conditions in that many rows, the request processing selects the
+/// rung of a request's layout by it, and a deployment's condition capacity is sized by it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Tiling {
+    /// Rows of one tile.
+    pub rows: u32,
+    /// `(time, height, width)` tokens of one video tile.
+    pub shape: (u32, u32, u32),
+}
+
+impl Tiling {
+    /// Row for row: tiles of one row and one token.
+    pub const ROWS: Self = Self {
+        rows: 1,
+        shape: (1, 1, 1),
+    };
+
+    /// The tiles of a sparse layout of `tile` rows.
+    pub fn sparse(tile: u32) -> Result<Self> {
+        Ok(Self {
+            rows: tile,
+            shape: tile_shape(tile)?,
+        })
     }
-    Ok(tiles)
+
+    /// The tiling of a layout of `attention`.
+    pub fn of(attention: AttentionKind) -> Result<Self> {
+        match attention {
+            AttentionKind::Sparse { tile, .. } => Self::sparse(tile),
+            AttentionKind::Dense => Ok(Self::ROWS),
+        }
+    }
+
+    /// Tiles one condition occupies: its audio rows fill whole tiles, then a keyframe's or an
+    /// image's rows fill whole tiles and a video's rows fill the tiles of its token grid.
+    pub fn tiles(&self, segment: &Segment) -> u32 {
+        let tile = self.rows.max(1);
+        let (time, height, width) = self.shape;
+        let visual = match (segment.kind, segment.visual) {
+            (SegmentKind::Keyframe | SegmentKind::Image, _) => segment.video_rows().div_ceil(tile),
+            (SegmentKind::Video, Some(visual)) => {
+                let grid = video_grid(visual.frames, visual.raster);
+                grid.0.div_ceil(time.max(1))
+                    * grid.1.div_ceil(height.max(1))
+                    * grid.2.div_ceil(width.max(1))
+            }
+            // `condition_segments` gives every video its frames; audio has no pixels.
+            (SegmentKind::Video | SegmentKind::Audio, _) => 0,
+        };
+        segment.audio_rows().div_ceil(tile) + visual
+    }
+
+    /// Rows `segments` take in the condition region: their tiles' rows.
+    pub fn condition_rows(&self, segments: &[Segment]) -> u32 {
+        segments
+            .iter()
+            .map(|segment| self.tiles(segment).saturating_mul(self.rows.max(1)))
+            .fold(0, u32::saturating_add)
+    }
 }
 
 /// Tiles of a segment of `tiles` tiles that a query attends, keeping `1 - sparsity` of them.
@@ -567,10 +616,7 @@ pub fn dense_tables(
     segments: &[Segment],
     vision_spans: VisionSpans<'_>,
 ) -> Result<DenseTables> {
-    let condition_rows: u32 = segments
-        .iter()
-        .map(|segment| segment.video_rows() + segment.audio_rows())
-        .sum();
+    let condition_rows = Tiling::ROWS.condition_rows(segments);
     // One refusal per subject, and each names its own count: the two limits are independent - a
     // prompt's rows and a case's condition rows - and a single sentence covering both makes a caller
     // compare two numbers against a message that does not say which of them was too large.
@@ -750,6 +796,29 @@ pub struct Condition {
     pub frame: Option<Frame>,
     /// Samples of its soundtrack.
     pub audio_samples: u32,
+}
+
+impl Condition {
+    /// A condition as a request states it to the denoiser: its role, the raster and frames its
+    /// pixels are encoded at - none for an audio reference, whose raster is empty - and the samples
+    /// of its soundtrack. A raster no canvas can hold is refused by the packing that reads it.
+    pub fn of(shape: &nn::ConditionShape) -> Self {
+        Self {
+            role: match shape.role {
+                nn::ConditionRole::FirstFrame => Role::FirstFrame,
+                nn::ConditionRole::LastFrame => Role::LastFrame,
+                nn::ConditionRole::Reference => Role::Reference,
+            },
+            frame: (shape.width > 0 && shape.height > 0).then_some(Frame {
+                canvas: Canvas {
+                    width: shape.width,
+                    height: shape.height,
+                },
+                num_frames: shape.frames,
+            }),
+            audio_samples: shape.audio_samples,
+        }
+    }
 }
 
 /// Order a request's conditions as the packed sequence holds them.
@@ -1131,15 +1200,10 @@ pub fn segment_tables(
 ) -> Result<SegmentTables> {
     let extent = &packing.extent;
     let tile = extent.tile;
-    let condition_tiles: u32 = segments
-        .iter()
-        .map(|segment| segment_tiles(segment, tile))
-        .collect::<Result<Vec<_>>>()?
-        .iter()
-        .sum();
+    let tiling = Tiling::sparse(tile)?;
     if num_text_tokens < 1
         || num_text_tokens > extent.text_rows
-        || condition_tiles * tile > extent.condition_rows
+        || tiling.condition_rows(segments) > extent.condition_rows
     {
         return Err(Error::config(
             "the prompt and conditions must fit their layout's capacities".to_owned(),
@@ -1479,8 +1543,8 @@ mod tests {
         };
         assert_eq!(keyframe.video_rows(), 1008);
         assert_eq!(keyframe.audio_rows(), 0);
-        assert_eq!(segment_tiles(&keyframe, 64).expect("a tile"), 16);
-        assert_eq!(segment_tiles(&keyframe, 128).expect("a tile"), 8);
+        assert_eq!(Tiling::sparse(64).expect("a tile").tiles(&keyframe), 16);
+        assert_eq!(Tiling::sparse(128).expect("a tile").tiles(&keyframe), 8);
 
         // A reference at a 2048-pixel short edge, with its soundtrack.
         let reference = Visual {
@@ -1500,7 +1564,10 @@ mod tests {
         assert_eq!(video.video_rows(), 37 * 64 * 36);
         assert_eq!(video.audio_rows(), 414);
         // 414 audio rows fill 7 tiles of 64; the video's 37x64x36 grid fills 10x16x9 tiles.
-        assert_eq!(segment_tiles(&video, 64).expect("a tile"), 7 + 10 * 16 * 9);
+        assert_eq!(
+            Tiling::sparse(64).expect("a tile").tiles(&video),
+            7 + 10 * 16 * 9
+        );
 
         let audio = Segment {
             kind: SegmentKind::Audio,
@@ -1510,7 +1577,7 @@ mod tests {
             audio_frames: 207,
         };
         assert_eq!(audio.video_rows(), 0);
-        assert_eq!(segment_tiles(&audio, 128).expect("a tile"), 4);
+        assert_eq!(Tiling::sparse(128).expect("a tile").tiles(&audio), 4);
     }
 
     #[test]
@@ -1530,7 +1597,7 @@ mod tests {
         };
         assert_eq!(image.video_rows(), 45 * 80);
         assert_eq!(
-            segment_tiles(&image, 128).expect("a tile"),
+            Tiling::sparse(128).expect("a tile").tiles(&image),
             (45 * 80_u32).div_ceil(128)
         );
     }
@@ -1954,7 +2021,7 @@ mod tests {
             }),
             audio_frames: 0,
         };
-        assert_eq!(segment_tiles(&reference, 128).expect("tiles"), 80);
+        assert_eq!(Tiling::sparse(128).expect("tiles").tiles(&reference), 80);
         let tables = segment_tables(
             &packing,
             124,

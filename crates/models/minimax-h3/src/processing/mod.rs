@@ -152,6 +152,18 @@ pub struct DenoiserInfo {
     pub condition_packing: ConditionPacking,
 }
 
+impl ConditionPacking {
+    /// The tiles the denoiser's condition region holds conditions in: one-row tiles of one token
+    /// when the denoiser packs row for row.
+    pub fn tiling(&self) -> crate::packing::Tiling {
+        let [time, height, width] = self.video_tile;
+        crate::packing::Tiling {
+            rows: self.tile_rows.max(1),
+            shape: (time.max(1), height.max(1), width.max(1)),
+        }
+    }
+}
+
 impl DenoiserInfo {
     /// The network evaluations of the fixed schedule: one fewer than its
     /// sigma points, and the step count of every request.

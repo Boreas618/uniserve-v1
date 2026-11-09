@@ -18,7 +18,7 @@ use nn::family::{
 };
 use nn::{Checkpoint, DType, WeightLoader};
 
-use crate::config::{AttentionKind, CANVAS_RULE, FRAMES, MIN_SECONDS, named_canvases};
+use crate::config::{CANVAS_RULE, FRAMES, MIN_SECONDS, named_canvases};
 use crate::denoiser::Capacity;
 use crate::load::MinimaxH3;
 use crate::processing::ConditionPacking;
@@ -303,7 +303,7 @@ impl VideoModel for H3Pipeline {
             &self.tasks,
             serving,
             &ladder,
-            &condition_packing(denoiser),
+            &condition_packing(denoiser)?,
             self.config.processor.as_ref(),
         )
     }
@@ -568,10 +568,13 @@ fn keyframe_openings(
             })?;
             plans.push(plan);
         }
-        let rows = plans
-            .iter()
-            .map(|plan| plan.packed_rows(size, packing))
-            .fold(0, u32::saturating_add);
+        let rows =
+            crate::processing::plan::condition_rows(&plans, size, packing).map_err(|error| {
+                nn::Error::Unsupported(format!(
+                    "the keyframes of the {}x{} canvas: {error}",
+                    canvas.width, canvas.height
+                ))
+            })?;
         let Some(rung) = ladder.iter().copied().find(|rung| *rung >= rows) else {
             continue;
         };
@@ -583,22 +586,17 @@ fn keyframe_openings(
 /// How the placed denoiser packs a request's conditions, as the request processing sizes them:
 /// its tiles under sparse attention, row for row under dense attention, and the rows it holds when
 /// this rank places the condition encoders.
-fn condition_packing(denoiser: &crate::denoiser::Denoiser) -> ConditionPacking {
-    let (tile_rows, shape) = match denoiser.config().attention {
-        AttentionKind::Sparse { tile, .. } => {
-            (tile, crate::packing::tile_shape(tile).unwrap_or((1, 1, 1)))
-        }
-        AttentionKind::Dense => (1, (1, 1, 1)),
-    };
-    ConditionPacking {
+fn condition_packing(denoiser: &crate::denoiser::Denoiser) -> nn::Result<ConditionPacking> {
+    let tiling = crate::packing::Tiling::of(denoiser.config().attention)?;
+    Ok(ConditionPacking {
         capacity: if denoiser.places_encoders() {
             denoiser.rules().capacity().condition_rows
         } else {
             0
         },
-        tile_rows,
-        video_tile: [shape.0, shape.1, shape.2],
-    }
+        tile_rows: tiling.rows,
+        video_tile: [tiling.shape.0, tiling.shape.1, tiling.shape.2],
+    })
 }
 
 /// The prompts with vision blocks a deployment admits whose grids the deployment fixes.
@@ -678,7 +676,7 @@ fn describe(pipeline: &H3Pipeline, serving: &VideoServing) -> nn::Result<Descrip
     let steps = denoiser.schedule().num_steps()?;
     let shifts = &denoiser.config().schedule.shifts;
 
-    let condition_packing = condition_packing(denoiser);
+    let condition_packing = condition_packing(denoiser)?;
 
     let report = DenoiserInfo {
         tasks: tasks.iter().map(|task| task.as_str().to_owned()).collect(),
