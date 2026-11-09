@@ -2592,6 +2592,8 @@ version = "2.0.0"
 dependencies = [
  "memmap2",
  "ops",
+ "platform",
+ "program-server",
  "safetensors",
  "serde",
  "serde_json",
