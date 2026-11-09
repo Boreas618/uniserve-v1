@@ -171,7 +171,12 @@ fn pack_tile(f: &Forward, block: TensorView, buffer: TensorView) -> Result<Tenso
         Shape::new(&[channels, frames, height, width]),
         Strides::new(&packed),
     );
-    nn::layers::CopyBlock::new(DType::F32)?.forward(f, block, destination, &destination_strides)?;
+    nn::layers::Copy::new(DType::F32, nn::layers::Access::Element)?.forward(
+        f,
+        block,
+        destination,
+        &destination_strides,
+    )?;
     // The encoder's tile view is the packed copy at the shape it pads from, with the batch axis the
     // scene's contract asks for.
     Ok(TensorView::with_strides(

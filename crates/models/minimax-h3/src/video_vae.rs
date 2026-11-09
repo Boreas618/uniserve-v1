@@ -1292,7 +1292,7 @@ impl Decoder for VideoDecoder {
         let tiles = Tiles::of(&self.config, &clip)
             .map_err(|error| refuse(format!("the clip's tile grid: {error}")))?
             .tiles(&self.config, &clip);
-        let copy = nn::layers::CopyBlock::new(STREAM)?;
+        let copy = nn::layers::Copy::new(STREAM, nn::layers::Access::Element)?;
         let mut row = 0_u64;
         for tile in &tiles {
             let (top, bottom) = tile.latent_rows;

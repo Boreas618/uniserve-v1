@@ -9,8 +9,8 @@
 use nn::{
     Activation, AdaptivePool, Arena, Conv3d, ConvGeometry, DType, DevicePtr, Epilogue, Forward,
     FrameNormPad, GateBias, GatedActivation, Halves, KvGroup, KvPlanes, KvView, LayerNorm, Linear,
-    Modulation, Patch, Residual, ResidualStream, RmsNorm, Rotary, Rotate, Rotation, Rounding,
-    Scale, Shape, Snake, TensorView, VsaTiles, Weight,
+    Modulation, Residual, ResidualStream, RmsNorm, Rotary, Rotate, Rotation, Rounding, Scale,
+    Shape, Snake, TensorView, VsaTiles, Weight,
 };
 use ops::gemm::WeightOrder;
 
@@ -394,22 +394,6 @@ fn the_audio_layers_hold_their_channels() {
     assert!(AdaptivePool::new(8, 256, 0).is_err());
     // Wider than the descriptor's fields hold.
     assert!(AdaptivePool::new(u64::from(u32::MAX) + 1, 256, 32).is_err());
-}
-
-/// The patch mapping is built from a layout's latent geometry: channels and the patch grid are
-/// fixed by the layout, frames are the call's launch value, and an odd extent has no whole patches.
-#[test]
-fn a_patch_mapping_holds_a_layouts_latent_geometry() {
-    let patch = Patch::new(24, 32, 32).unwrap();
-    assert_eq!(patch.channels(), 24);
-    assert!(Patch::new(0, 32, 32).is_err());
-    assert!(Patch::new(24, 0, 32).is_err());
-    assert!(
-        Patch::new(24, 33, 32).is_err(),
-        "an odd height has no whole patch"
-    );
-    assert!(Patch::new(24, 32, 31).is_err());
-    assert!(Patch::new(u64::from(u32::MAX) + 1, 32, 32).is_err());
 }
 
 /// The vision tower's rotation is built from its head geometry alone: the tables are the caller's

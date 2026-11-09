@@ -286,7 +286,7 @@ pub struct BigVgan {
     output: Conv1d,
     pcm: PcmInterleave,
     /// Moves the track from the denoiser's rows into the decoder's channel-major layout.
-    track: nn::layers::CopyBlock,
+    track: nn::layers::Copy,
 }
 
 /// One upsampling stage: a transposed convolution whose output is the sum of three anti-aliased blocks,
@@ -471,7 +471,7 @@ impl BigVgan {
             post,
             output,
             pcm: PcmInterleave::new(DType::F32)?,
-            track: nn::layers::CopyBlock::new(DType::F32)?,
+            track: nn::layers::Copy::new(DType::F32, nn::layers::Access::Element)?,
         })
     }
 

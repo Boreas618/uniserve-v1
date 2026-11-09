@@ -40,9 +40,7 @@
 //! the prepared rows stays in the checkpoint's dtype like the dense one.
 
 use nn::family::Split;
-use nn::layers::{
-    Attention as Flash, Bias, CopyBlock, Linear, Parallel, Rotary, Sections, UlyssesExchange,
-};
+use nn::layers::{Attention as Flash, Bias, Linear, Parallel, Rotary, Sections, UlyssesExchange};
 use nn::weights::{Weight, WeightLoader};
 use nn::{Forward, Shape, TensorView};
 
@@ -216,7 +214,14 @@ impl HeadsToRows {
             nn::Strides::new(&[local, members * local, local, 1]),
         );
         let strides = [local as i64, (members * local) as i64, local as i64, 1];
-        Ok(CopyBlock::new(out.dtype)?.forward_wide(f, source, destination, &strides)?)
+        Ok(
+            nn::layers::Copy::new(out.dtype, nn::layers::Access::Vector)?.forward(
+                f,
+                source,
+                destination,
+                &strides,
+            )?,
+        )
     }
 }
 

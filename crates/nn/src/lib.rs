@@ -24,7 +24,7 @@
 //! [`Conv3d`], [`Conv1d`],
 //! [`ConvTranspose1d`], [`UlyssesExchange`],
 //! [`Sampler`] and [`ParallelLMHead`]; the diffusion and
-//! video models add [`Patch`], [`UnpatchifyVideo`](layers::UnpatchifyVideo),
+//! video models add [`Patchify`](layers::Patchify), [`Copy`](layers::Copy),
 //! [`CrossFade`], [`RgbBytes`],
 //! [`Transpose`](layers::Transpose) and [`SegmentAttention`], and the
 //! audio path adds
@@ -75,7 +75,7 @@ pub use layers::{
     Activation, AdaptivePool, Attention, AttentionBackend, AudioActivation, Axpby, Candidates,
     Cast, Conv1d, Conv3d, ConvGeometry, ConvTranspose1d, CrossFade, Epilogue, FrameMoments,
     FrameNormPad, FramePad, GateBias, GatedActivation, Gelu, Halves, LayerNorm, Linear, Modulation,
-    Moe, Noise, NoiseKey, ParallelLMHead, Patch, PcmInterleave, Residual, ResidualStream, RgbBytes,
+    Moe, Noise, NoiseKey, ParallelLMHead, PcmInterleave, Residual, ResidualStream, RgbBytes,
     RmsNorm, Rotary, Rotate, Rotation, Rounding, Sampler, SamplerState, Samples, Scale, Sections,
     SegmentAttention, SegmentTables, Silu, Snake, TRTLLM_WORKSPACE_BYTES, UlyssesExchange,
     VsaTiles, gather_rows,

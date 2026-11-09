@@ -1197,9 +1197,9 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
         );
         let destination = TensorView::new(tail.element(&[slot]), self.dtype, block);
         let strides = [stride as i64, stride as i64, stride as i64, 1];
-        nn::layers::CopyBlock::new(self.dtype)
+        nn::layers::Copy::new(self.dtype, nn::layers::Access::Vector)
             .map_err(Error::from)?
-            .forward_wide(forward, source, destination, &strides)
+            .forward(forward, source, destination, &strides)
             .map_err(Error::from)?;
         Ok(Some(TensorView::new(
             tail.element(&[slot]),

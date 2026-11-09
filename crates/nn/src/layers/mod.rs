@@ -22,17 +22,16 @@ mod attention;
 mod audio;
 mod bias;
 mod conv;
-mod copy_block;
 mod cross_fade;
 mod embedding;
 mod exchange;
 mod frame;
 mod head;
+mod layout;
 mod linear;
 mod moe;
 mod noise;
 mod norm;
-mod patch;
 mod pcm;
 mod pool;
 mod position;
@@ -47,19 +46,18 @@ mod segment;
 mod segments;
 mod tile_stitch;
 mod transpose;
-mod unpatchify;
 
 pub use activation::{GateBias, GatedActivation, Gelu, Halves, Rounding, Silu, Snake};
 pub use attention::{Attention, AttentionBackend, TRTLLM_WORKSPACE_BYTES};
 pub use audio::AudioActivation;
 pub use bias::BiasAdd;
 pub use conv::{Conv1d, Conv3d, ConvGeometry, ConvTranspose1d};
-pub use copy_block::CopyBlock;
 pub use cross_fade::CrossFade;
 pub use embedding::{VocabParallelEmbedding, vocabulary_shard};
 pub use exchange::UlyssesExchange;
 pub use frame::{FrameMoments, FrameNormPad, FramePad};
 pub use head::{ParallelLMHead, gather_rows};
+pub use layout::{Access, Copy, Patchify};
 pub use linear::{
     Bias, ENCODE_CHUNK, Linear, MergedColumnLinear, PACKED_M_CLASSES, Parallel, QkvBias, QkvLinear,
     QkvNames, QkvSpec, encode_block, packed_rows,
@@ -70,7 +68,6 @@ pub use norm::{Epilogue, LayerNorm, Modulation, ResidualStream, RmsNorm};
 pub use ops::activation::Activation;
 pub use ops::gemm::WeightOrder;
 pub use ops::rope::Rotation;
-pub use patch::Patch;
 pub use pcm::PcmInterleave;
 pub use pool::AdaptivePool;
 pub use position::PositionInterpolate;
@@ -85,7 +82,6 @@ pub use segment::{SegmentAttention, SegmentTables};
 pub use segments::{SELECT_FLOOR, VsaTiles};
 pub use tile_stitch::{TileGrid, TileStitch};
 pub use transpose::Transpose;
-pub use unpatchify::UnpatchifyVideo;
 
 /// The constants a layer's operator descriptor carries and the program package owns.
 ///
