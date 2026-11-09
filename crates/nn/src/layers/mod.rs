@@ -47,7 +47,9 @@ pub use affine::ChannelAffine;
 pub use attention::{
     DenseAttention, DenseSpec, PagedAttention, PagedSpec, TRTLLM_WORKSPACE_BYTES, Varlen,
 };
-pub use conv::{CausalPad, Conv1d, Conv3d, ConvSpec, ConvTranspose1d, Padding};
+pub use conv::{
+    CausalPad, Conv1d, Conv3d, ConvSpec, ConvTranspose1d, Padding, ResnetBlock3d, ResnetSpec,
+};
 pub use embedding::{VocabParallelEmbedding, vocabulary_shard};
 pub use head::ParallelLMHead;
 pub use indexed::StepIndexed;

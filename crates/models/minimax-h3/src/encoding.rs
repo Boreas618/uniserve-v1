@@ -657,21 +657,22 @@ pub fn padded_samples(samples: u64, hop: u64) -> Result<u64> {
 use nn::Forward;
 use nn::layers::{
     AdaptiveAvgPool2d, CausalPad, Conv1d, Conv3d, ConvSpec, DenseAttention, DenseSpec, GateBias,
-    GatedActivation, GroupNorm, Halves, LayerNorm, Linear, Padding, Posterior, Residual, Rounding,
-    Transpose, WeightOrder,
+    GatedActivation, GroupNorm, Halves, LayerNorm, Linear, Padding, Posterior, Residual,
+    ResnetBlock3d, ResnetSpec, Rounding, Transpose, WeightOrder,
 };
 use nn::weights::{Scope, WeightLoader};
 use nn::{DType, Shape, TensorView};
 
 use nn::codec::{DacEncoder, DacSpec};
 
-/// One causal convolution of the encoder and the normalization that feeds it.
+/// The encoder's output convolution and the normalization that feeds it.
 ///
 /// The reference's `CausalConv3d.forward(norm=…)` normalizes each input frame, activates it, pads the
 /// result with a reflection of the edge rows and columns and two zero frames in front, and convolves;
 /// no output frame therefore reads a later input frame. The bias belongs to the convolution here,
 /// where the reference adds it in a second pass to keep its rounding equal to `conv(x) + bias` — the
-/// same value, one rounding apart.
+/// same value, one rounding apart. The residual blocks run the same stage twice
+/// ([`ResnetBlock3d`]).
 struct Normalized {
     norm: GroupNorm,
     conv: Conv3d,
@@ -681,17 +682,10 @@ struct Normalized {
     groups: u32,
 }
 
-/// One residual block: two normalized causal convolutions added to the input's projection.
-struct Block {
-    first: Normalized,
-    second: Normalized,
-    /// The one-by-one projection of the input when the width changes.
-    shortcut: Option<Conv3d>,
-}
-
-/// One encoder level: its blocks, then the convolution that halves space and strides time.
+/// One encoder level: its residual blocks, then the convolution that halves space and strides
+/// time.
 struct Level {
-    blocks: Vec<Block>,
+    blocks: Vec<ResnetBlock3d>,
     downsample: Option<Conv3d>,
 }
 
@@ -800,42 +794,13 @@ impl VideoEncoder {
             )));
         }
         let padding = config.spatial_padding_mode;
-        // A normalized convolution reads its affine parameters from `norm` and its filter from `conv`.
-        let normalized = |loader: &mut WeightLoader,
-                          norm_name: &str,
-                          conv_name: &str,
-                          channels: u32,
-                          to: u32,
-                          kernel: u32|
-         -> Result<Normalized> {
-            let mut norm = loader.scope(norm_name);
-            let weight = norm.tensor("weight", &[u64::from(channels)])?;
-            let bias = norm.tensor("bias", &[u64::from(channels)])?;
-            Ok(Normalized {
-                // One pixel on each spatial side and two zero frames in front.
-                norm: GroupNorm::new(
-                    groups,
-                    epsilon,
-                    Some(weight),
-                    Some(bias),
-                    CausalPad {
-                        top: 1,
-                        left: 1,
-                        front: 2,
-                        padding,
-                    },
-                )?,
-                conv: convolution(
-                    &mut loader.scope(conv_name),
-                    channels,
-                    to,
-                    kernel,
-                    [1; 3],
-                    false,
-                )?,
-                channels,
-                groups,
-            })
+        // One pixel on each spatial side and two zero frames in front, before every normalized
+        // convolution.
+        let pad = CausalPad {
+            top: 1,
+            left: 1,
+            front: 2,
+            padding,
         };
 
         let input = convolution(
@@ -854,39 +819,18 @@ impl VideoEncoder {
             for block in 0..stack.blocks {
                 let base = format!("{stage}.resnets.{block}");
                 let from = if block == 0 { width } else { *out };
-                let first = normalized(
-                    loader,
-                    &format!("{base}.norm1"),
-                    &format!("{base}.conv1"),
-                    from,
-                    *out,
-                    3,
-                )?;
-                let second = normalized(
-                    loader,
-                    &format!("{base}.norm2"),
-                    &format!("{base}.conv2"),
-                    *out,
-                    *out,
-                    3,
-                )?;
-                let shortcut = if from == *out {
-                    None
-                } else {
-                    Some(convolution(
-                        &mut loader.scope(format!("{base}.conv_shortcut")),
-                        from,
-                        *out,
-                        1,
-                        [1; 3],
-                        false,
-                    )?)
-                };
-                blocks.push(Block {
-                    first,
-                    second,
-                    shortcut,
-                });
+                blocks.push(ResnetBlock3d::load(
+                    &mut loader.scope(base),
+                    ResnetSpec {
+                        in_channels: from,
+                        out_channels: *out,
+                        groups,
+                        eps: epsilon,
+                        pad,
+                        kernel: 3,
+                        tf32: true,
+                    },
+                )?);
             }
             let stride = [
                 stack.temporal_strides[index],
@@ -908,14 +852,24 @@ impl VideoEncoder {
             levels.push(Level { blocks, downsample });
             width = *out;
         }
-        let output = normalized(
-            loader,
-            "encoder.norm_out",
-            "encoder.conv_out",
-            width,
-            2 * stack.latent_channels,
-            3,
-        )?;
+        let output = {
+            let mut norm = loader.scope("encoder.norm_out");
+            let weight = norm.tensor("weight", &[u64::from(width)])?;
+            let bias = norm.tensor("bias", &[u64::from(width)])?;
+            Normalized {
+                norm: GroupNorm::new(groups, epsilon, Some(weight), Some(bias), pad)?,
+                conv: convolution(
+                    &mut loader.scope("encoder.conv_out"),
+                    width,
+                    2 * stack.latent_channels,
+                    3,
+                    [1; 3],
+                    false,
+                )?,
+                channels: width,
+                groups,
+            }
+        };
         let moments = convolution(
             &mut loader.scope("quant_conv"),
             2 * stack.latent_channels,
@@ -955,13 +909,7 @@ impl Normalized {
     /// front, so the convolution's own geometry carries none and no output frame reads a later input
     /// frame.
     /// `pad` is `[1, channels, frames + 2, height + 2, width + 2]` and `mean`/`rstd` are
-    /// `[frames, groups]`, all reserved by the encoder's plan.
-    ///
-    /// **Nothing here allocates.** These three buffers were taken from the arena on every call, which
-    /// made the encode ask for roughly another set's worth of bytes per tile that no plan could state:
-    /// the first of them alone measured 647,534,592 B at 17 frames of 256x256 (level 0 at 128
-    /// channels). A reserved buffer is a buffer the plan can count, and the blocks run one after
-    /// another, so one pad per distinct channel count per level is enough.
+    /// `[frames, groups]`, reserved once per tile extent with the encoder's other buffers.
     fn run(
         &self,
         f: &Forward,
@@ -1015,16 +963,6 @@ fn extent(view: TensorView) -> Result<(u64, u64, u64, u64, u64)> {
         view.shape.dim(3),
         view.shape.dim(4),
     ))
-}
-
-/// A five-axis tensor as the two-axis view an elementwise operator reads.
-fn rows(view: TensorView) -> Result<TensorView> {
-    let columns = view.shape.dim(4);
-    if columns == 0 {
-        return Err(Error::config("a tensor of no column".to_owned()));
-    }
-    let rows = view.shape.numel() / columns;
-    Ok(view.reshape(Shape::new(&[rows, columns])))
 }
 
 /// The distinct extents of a run, in the order they are first named.
@@ -1097,9 +1035,8 @@ struct EncoderSet {
     output_rstd: TensorView,
 }
 
-/// One level's buffers: the pair its blocks alternate between, one working buffer the block reads back,
-/// its shortcut projection where the first block widens, and the pad and strided output where the level
-/// downsamples.
+/// One level's buffers: the pair its blocks alternate between, and the pad and strided output where
+/// the level downsamples. A block reserves and releases its own working buffers.
 ///
 /// The pair is the level's **own** width, not the buffer the level was handed. Alternating with the
 /// incoming buffer instead reads a level's second block against its input width whenever the level widens
@@ -1108,18 +1045,8 @@ struct EncoderSet {
 struct LevelSet {
     first: TensorView,
     second: TensorView,
-    working: TensorView,
-    projected: Option<TensorView>,
     pad: Option<TensorView>,
     strided: Option<TensorView>,
-    /// One padded-input buffer per distinct channel count among the level's normalizations, keyed by
-    /// that count. A level's first block widens and its later blocks do not, so a level needs two; the
-    /// blocks run one after another and never hold two pads at once, so one buffer per count is enough.
-    norms: Vec<(u32, TensorView)>,
-    /// The statistics of every normalization at this level, `[frames, groups]` each. Every block of a
-    /// level runs at the level's own frame count, so one pair serves them all.
-    mean: TensorView,
-    rstd: TensorView,
 }
 
 impl VideoEncoder {
@@ -1179,30 +1106,12 @@ impl VideoEncoder {
         let mut levels = Vec::with_capacity(extents.len() - 1);
         for index in 0..extents.len() - 1 {
             let width = u64::from(self.stack.widths[index]);
-            let groups = u64::from(
-                self.levels[index]
-                    .blocks
-                    .first()
-                    .map(|block| block.first.groups)
-                    .unwrap_or(self.output.groups),
-            );
             let extent = &extents[index];
             let next = &extents[index + 1];
             let downsample = self.levels[index].downsample.is_some();
             levels.push(LevelSet {
                 first: buffer(width, extent)?,
                 second: buffer(width, extent)?,
-                working: buffer(width, extent)?,
-                // The first block of a level widens from the previous level's width; later blocks add to
-                // their own width and project nothing.
-                projected: match self.levels[index]
-                    .blocks
-                    .first()
-                    .map(|block| block.shortcut.is_some())
-                {
-                    Some(true) => Some(buffer(width, extent)?),
-                    _ => None,
-                },
                 pad: match downsample {
                     true => Some(f.arena().tensor(
                         DType::F32,
@@ -1220,28 +1129,6 @@ impl VideoEncoder {
                     true => Some(buffer(width, next)?),
                     false => None,
                 },
-                norms: {
-                    let mut norms: Vec<(u32, TensorView)> = Vec::new();
-                    for block in &self.levels[index].blocks {
-                        for normalized in [&block.first, &block.second] {
-                            if norms.iter().any(|(count, _)| *count == normalized.channels) {
-                                continue;
-                            }
-                            // Level zero's first block normalizes raw pixels, so its pad is the pixel
-                            // pad the input convolution has already read: one buffer, not two.
-                            let view = match index == 0
-                                && normalized.channels == self.stack.input_channels
-                            {
-                                true => padded,
-                                false => pad_buffer(u64::from(normalized.channels), extent)?,
-                            };
-                            norms.push((normalized.channels, view));
-                        }
-                    }
-                    norms
-                },
-                mean: moments_buffer(groups, extent)?,
-                rstd: moments_buffer(groups, extent)?,
             });
         }
         let last = extents[extents.len() - 1];
@@ -1250,9 +1137,6 @@ impl VideoEncoder {
         let output_mean = moments_buffer(output_groups, &last)?;
         let output_rstd = moments_buffer(output_groups, &last)?;
 
-        // The normalizations' own padded inputs: one per distinct channel count, because a level's
-        // first block widens and its later blocks do not. Level zero's narrowest is the pixel pad the
-        // input convolution already read, so it is the same buffer rather than a second one.
         Ok(EncoderSet {
             padded,
             stream,
@@ -1325,7 +1209,7 @@ impl VideoEncoder {
                     0 => buffers.first,
                     _ => buffers.second,
                 };
-                self.block(f, block, source, target, buffers)?;
+                block.forward(f, source, target)?;
                 source = target;
             }
             if let Some(downsample) = &level.downsample {
@@ -1437,69 +1321,6 @@ impl VideoEncoder {
         self.normalize
             .forward(f, batched(drawn), batched(out))
             .map_err(Error::from)
-    }
-
-    /// One residual block: two normalized convolutions, added to the input or its projection.
-    ///
-    /// The level's own buffers come in as one argument because they are one thing: `set` holds, for a
-    /// level, the pair of alternating outputs, the scratch its first convolution writes, the projection
-    /// a widening block needs, and the normalization state (`norms`, `mean`, `rstd`) its convolutions
-    /// share. Passing them one by one made a ten-argument call whose argument list was the struct's
-    /// field list - `clippy::too_many_arguments` was reporting a fact about the signature rather than a
-    /// style preference.
-    fn block(
-        &self,
-        f: &Forward,
-        block: &Block,
-        values: TensorView,
-        out: TensorView,
-        set: &LevelSet,
-    ) -> Result<()> {
-        let pad_of = |normalized: &Normalized| -> Result<TensorView> {
-            set.norms
-                .iter()
-                .find(|(count, _)| *count == normalized.channels)
-                .map(|(_, view)| *view)
-                .ok_or_else(|| {
-                    Error::config(format!(
-                        "no reserved pad for a normalization of {} channels",
-                        normalized.channels
-                    ))
-                })
-        };
-        block.first.run(
-            f,
-            values,
-            pad_of(&block.first)?,
-            set.mean,
-            set.rstd,
-            set.working,
-        )?;
-        block.second.run(
-            f,
-            set.working,
-            pad_of(&block.second)?,
-            set.mean,
-            set.rstd,
-            out,
-        )?;
-        let residual = match (&block.shortcut, set.projected) {
-            (Some(shortcut), Some(projected)) => {
-                shortcut.forward(f, values, projected)?;
-                projected
-            }
-            (Some(_), None) => {
-                return Err(Error::config(
-                    "a block that widens its input has no buffer to project it into".to_owned(),
-                ));
-            }
-            (None, _) => values,
-        };
-        // The reference groups the sum as `residual + (values + bias)` and adds the convolution's
-        // bias in a pass of its own; cuDNN adds that bias in a pass of its own too, and IEEE addition
-        // commutes, so `(values + bias) + residual` here is the same rounded value.
-        let sum = rows(out)?;
-        Ok(Residual::default().forward(f, sum, rows(residual)?, None, sum)?)
     }
 }
 

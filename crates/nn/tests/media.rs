@@ -12,7 +12,9 @@ use std::path::Path;
 
 use nn::codec::{DacEncoder, DacSpec};
 use nn::diffusion::{Euler, Grid as Schedule};
-use nn::layers::{CausalPad, Conv1d, ConvSpec, ConvTranspose1d, Padding, Posterior};
+use nn::layers::{
+    CausalPad, Conv1d, ConvSpec, ConvTranspose1d, Padding, Posterior, ResnetBlock3d, ResnetSpec,
+};
 use nn::tiling::{Axis, Blend, Grid, TiledDecode, TiledEncode, gather, voxels};
 use nn::vocoder::{BigVgan, BigVganSpec};
 use nn::{Arena, Checkpoint, DType, Forward, Shape, TensorView, WeightLoader};
@@ -523,4 +525,75 @@ fn a_gather_copies_each_tile_of_the_clip_once() {
     });
     assert_eq!(operators(&launches), ["copy_block", "copy_block"]);
     assert!(gather(&f, &tiles, trajectory, 8, (2, 3), 4, 7, block).is_err());
+}
+
+/// A causal residual block loads diffusers' module names, runs two normalized causal convolutions
+/// and adds the input's projection where the width changes; one of the same width adds the input,
+/// and the block's working buffers are released when it returns.
+#[test]
+fn a_resnet_block_adds_its_input_or_its_projection() {
+    let mut tensors: Vec<(String, Vec<u64>)> = Vec::new();
+    for (block, from) in [("wide", 4_u64), ("same", 8)] {
+        tensors.push((format!("{block}.norm1.weight"), vec![from]));
+        tensors.push((format!("{block}.norm1.bias"), vec![from]));
+        tensors.push((format!("{block}.conv1.weight"), vec![8, from, 3, 3, 3]));
+        tensors.push((format!("{block}.conv1.bias"), vec![8]));
+        tensors.push((format!("{block}.norm2.weight"), vec![8]));
+        tensors.push((format!("{block}.norm2.bias"), vec![8]));
+        tensors.push((format!("{block}.conv2.weight"), vec![8, 8, 3, 3, 3]));
+        tensors.push((format!("{block}.conv2.bias"), vec![8]));
+    }
+    tensors.push(("wide.conv_shortcut.weight".to_owned(), vec![8, 4, 1, 1, 1]));
+    tensors.push(("wide.conv_shortcut.bias".to_owned(), vec![8]));
+    let header: Vec<(&str, &str, &[u64])> = tensors
+        .iter()
+        .map(|(name, shape)| (name.as_str(), "F32", shape.as_slice()))
+        .collect();
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = checkpoint(directory.path(), &header);
+    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let spec = |in_channels| ResnetSpec {
+        in_channels,
+        out_channels: 8,
+        groups: 2,
+        eps: 1e-6,
+        pad: CausalPad {
+            top: 1,
+            left: 1,
+            front: 2,
+            padding: Padding::Reflect,
+        },
+        kernel: 3,
+        tf32: true,
+    };
+    let wide = ResnetBlock3d::load(&mut loader.scope("wide"), spec(4)).unwrap();
+    let same = ResnetBlock3d::load(&mut loader.scope("same"), spec(8)).unwrap();
+
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let view = |dims: &[u64]| arena.tensor(DType::F32, Shape::new(dims)).unwrap();
+    let (narrow, input, out) = (
+        view(&[1, 4, 3, 6, 6]),
+        view(&[1, 8, 3, 6, 6]),
+        view(&[1, 8, 3, 6, 6]),
+    );
+    let used = arena.used();
+    let ((), launches) = recorded(|| wide.forward(&f, narrow, out).unwrap());
+    assert_eq!(
+        operators(&launches),
+        [
+            "frame_moments",
+            "frame_norm_pad",
+            "conv3d",
+            "frame_moments",
+            "frame_norm_pad",
+            "conv3d",
+            "conv3d",
+            "scaled_add"
+        ]
+    );
+    assert_eq!(arena.used(), used, "the working buffers are released");
+    let ((), launches) = recorded(|| same.forward(&f, input, out).unwrap());
+    assert_eq!(launches.len(), 7, "no projection: {launches:?}");
+    assert!(same.forward(&f, narrow, out).is_err());
 }

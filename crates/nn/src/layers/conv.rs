@@ -458,6 +458,170 @@ impl ConvTranspose1d {
     }
 }
 
+/// The arguments of a [`ResnetBlock3d`].
+#[derive(Clone, Copy, Debug)]
+pub struct ResnetSpec {
+    /// Channels the block reads.
+    pub in_channels: u32,
+    /// Channels the block writes.
+    pub out_channels: u32,
+    /// Group-normalization groups.
+    pub groups: u32,
+    /// Group-normalization variance floor.
+    pub eps: f32,
+    /// The causal pad each normalization writes its activated frame into; the spatial padding after
+    /// the source is the padding before it, so a convolution of `2 · top + 1` taps keeps the extent.
+    pub pad: CausalPad,
+    /// The convolutions' taps along each axis.
+    pub kernel: u32,
+    /// Whether cuDNN may use TF32 for the block's FP32 convolutions.
+    pub tf32: bool,
+}
+
+/// A causal video residual block (diffusers' `ResnetBlock3D` with causal convolutions): two stages
+/// of group normalization, SiLU, causal pad and convolution, and the input — or its one-by-one
+/// projection where the width changes — added to the second stage's output.
+///
+/// ```text
+/// h   = conv1(pad(silu(norm1(x))))
+/// out = conv2(pad(silu(norm2(h)))) + shortcut(x)
+/// ```
+///
+/// Each normalization and its pad are one [`GroupNorm`](crate::layers::GroupNorm) pair of launches,
+/// each convolution carries its bias, and the sum rounds once.
+pub struct ResnetBlock3d {
+    spec: ResnetSpec,
+    norm1: crate::layers::GroupNorm,
+    conv1: Conv3d,
+    norm2: crate::layers::GroupNorm,
+    conv2: Conv3d,
+    /// `conv_shortcut`, the projection of the input when the width changes.
+    shortcut: Option<Conv3d>,
+}
+
+impl ResnetBlock3d {
+    /// The block at `scope`: `norm1`, `conv1`, `norm2`, `conv2` and, when the width changes, the
+    /// one-by-one `conv_shortcut`, each with its weight and bias.
+    ///
+    /// # Errors
+    ///
+    /// A spec the layers refuse, or a tensor the checkpoint lacks or holds at another extent.
+    pub fn load(scope: &mut Scope<'_, '_>, spec: ResnetSpec) -> Result<Self> {
+        let norm = |scope: &mut Scope<'_, '_>, channels: u32| -> Result<crate::layers::GroupNorm> {
+            let width = [u64::from(channels)];
+            let weight = scope.tensor("weight", &width)?;
+            let bias = scope.tensor("bias", &width)?;
+            crate::layers::GroupNorm::new(spec.groups, spec.eps, Some(weight), Some(bias), spec.pad)
+        };
+        let conv = |from: u32, to: u32, kernel: u32| ConvSpec {
+            tf32: spec.tf32,
+            ..ConvSpec::new(from, to, [kernel; 3])
+        };
+        let norm1 = norm(&mut scope.scope("norm1"), spec.in_channels)?;
+        let conv1 = Conv3d::load(
+            &mut scope.scope("conv1"),
+            conv(spec.in_channels, spec.out_channels, spec.kernel),
+        )?;
+        let norm2 = norm(&mut scope.scope("norm2"), spec.out_channels)?;
+        let conv2 = Conv3d::load(
+            &mut scope.scope("conv2"),
+            conv(spec.out_channels, spec.out_channels, spec.kernel),
+        )?;
+        let shortcut = match spec.in_channels == spec.out_channels {
+            true => None,
+            false => Some(Conv3d::load(
+                &mut scope.scope("conv_shortcut"),
+                conv(spec.in_channels, spec.out_channels, 1),
+            )?),
+        };
+        Ok(Self {
+            spec,
+            norm1,
+            conv1,
+            norm2,
+            conv2,
+            shortcut,
+        })
+    }
+
+    /// The block's output for `input` `[1, in_channels, frames, height, width]` into `out`
+    /// `[1, out_channels, frames, height, width]`, both FP32 and packed; `input` is never written.
+    ///
+    /// The padded frames, the normalizations' statistics, the first stage's output and the
+    /// projection are reserved for the call and released at its end.
+    ///
+    /// # Errors
+    ///
+    /// Operands of another shape, or an operator's refusal.
+    pub fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
+        let dims = input.shape.dims();
+        let spec = &self.spec;
+        if dims.len() != 5
+            || dims[0] != 1
+            || dims[1] != u64::from(spec.in_channels)
+            || out.shape.dims() != [1, u64::from(spec.out_channels), dims[2], dims[3], dims[4]]
+        {
+            return Err(Error::shape(
+                "ResnetBlock3d",
+                format!(
+                    "{:?} into {:?} for a block of {} to {} channels",
+                    dims,
+                    out.shape.dims(),
+                    spec.in_channels,
+                    spec.out_channels
+                ),
+            ));
+        }
+        let mark = f.arena().mark();
+        let result = self.stages(f, input, out);
+        f.arena().release(mark);
+        result
+    }
+
+    fn stages(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
+        let spec = &self.spec;
+        let dims = input.shape.dims();
+        let (frames, height, width) = (dims[2], dims[3], dims[4]);
+        let pad = |channels: u32| {
+            f.arena().tensor(
+                input.dtype,
+                Shape::new(&[
+                    1,
+                    u64::from(channels),
+                    frames + u64::from(spec.pad.front),
+                    height + 2 * u64::from(spec.pad.top),
+                    width + 2 * u64::from(spec.pad.left),
+                ]),
+            )
+        };
+        let statistics = Shape::new(&[frames, u64::from(spec.groups)]);
+        let (mean, rstd) = (
+            f.arena().tensor(ops::DType::F32, statistics)?,
+            f.arena().tensor(ops::DType::F32, statistics)?,
+        );
+        let first = pad(spec.in_channels)?;
+        let working = f.arena().tensor(out.dtype, out.shape)?;
+        self.norm1.forward(f, input, mean, rstd, first)?;
+        self.conv1.forward(f, first, working)?;
+        let second = pad(spec.out_channels)?;
+        self.norm2.forward(f, working, mean, rstd, second)?;
+        self.conv2.forward(f, second, out)?;
+        let residual = match &self.shortcut {
+            Some(shortcut) => {
+                let projected = f.arena().tensor(out.dtype, out.shape)?;
+                shortcut.forward(f, input, projected)?;
+                projected
+            }
+            None => input,
+        };
+        // `(conv2 + bias) + residual`: the reference adds the convolution's bias in a pass of its
+        // own and then the residual, and IEEE addition commutes, so this is the same rounded sum.
+        let rows =
+            |view: TensorView| view.reshape(Shape::new(&[view.shape.numel() / width, width]));
+        crate::layers::Residual::default().forward(f, rows(out), rows(residual), None, rows(out))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{channels_last_storage, channels_last_strides};
