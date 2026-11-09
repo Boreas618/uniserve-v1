@@ -25,13 +25,16 @@
 //! [`Conv3d`], [`Conv1d`],
 //! [`ConvTranspose1d`], [`UlyssesAttention`](layers::UlyssesAttention),
 //! [`Sampler`] and [`ParallelLMHead`]; the diffusion and
-//! video models add [`Patchify`](layers::Patchify), [`Copy`](layers::Copy),
-//! [`CrossFade`], [`RgbBytes`],
+//! video models add [`Patchify`](layers::Patchify), [`Copy`](layers::Copy), [`RgbBytes`],
 //! [`Transpose`](layers::Transpose) and [`VsaAttention`](layers::VsaAttention), and the
 //! audio path adds
 //! [`Snake`], [`AdaptiveAvgPool2d`] and
 //! [`ChannelAffine`](layers::ChannelAffine). Each holds weight views and geometry, and its forward calls
 //! operators.
+//!
+//! Beside the layers, [`diffusion`] holds the flow-matching schedules and the Euler step, [`tiling`]
+//! the tiled VAE grid, blends and encode and decode drivers, [`vocoder`] the BigVGAN generator and
+//! [`codec`] the DAC encoder.
 //!
 //! ## The capabilities
 //!
@@ -61,6 +64,7 @@ pub mod group;
 pub mod layers;
 pub mod quantization;
 pub mod tensor;
+pub mod tiling;
 pub mod timestep;
 pub mod vocoder;
 pub mod weights;
@@ -79,10 +83,10 @@ pub use forward::{Arena, AttentionProbe, Fence, Forward, Split};
 pub use group::{Group, Transfer};
 pub use layers::{
     Activation, AdaptiveAvgPool2d, Axpby, Candidates, Cast, CausalPad, Conv1d, Conv3d, ConvSpec,
-    ConvTranspose1d, CrossFade, Epilogue, GateBias, GatedActivation, Gelu, GroupNorm, Halves,
-    IndexRows, LayerNorm, Linear, Modulation, Moe, Noise, NoiseKey, Padding, ParallelLMHead,
-    PcmInterleave, Residual, ResidualStream, RgbBytes, RmsNorm, Rotary, Rounding, Sampler,
-    SamplerState, Samples, Scale, Silu, Snake, TRTLLM_WORKSPACE_BYTES,
+    ConvTranspose1d, Epilogue, GateBias, GatedActivation, Gelu, GroupNorm, Halves, IndexRows,
+    LayerNorm, Linear, Modulation, Moe, Noise, NoiseKey, Padding, ParallelLMHead, PcmInterleave,
+    Residual, ResidualStream, RgbBytes, RmsNorm, Rotary, Rounding, Sampler, SamplerState, Samples,
+    Scale, Silu, Snake, TRTLLM_WORKSPACE_BYTES,
 };
 pub use ops::PhaseKind;
 pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};

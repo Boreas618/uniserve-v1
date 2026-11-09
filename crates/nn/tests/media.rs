@@ -11,8 +11,9 @@
 use std::path::Path;
 
 use nn::codec::{DacEncoder, DacSpec};
-use nn::diffusion::{Euler, Grid};
+use nn::diffusion::{Euler, Grid as Schedule};
 use nn::layers::{CausalPad, Conv1d, ConvSpec, ConvTranspose1d, Padding, Posterior};
+use nn::tiling::{Axis, Blend, Grid, TiledDecode, TiledEncode, gather, voxels};
 use nn::vocoder::{BigVgan, BigVganSpec};
 use nn::{Arena, Checkpoint, DType, Forward, Shape, TensorView, WeightLoader};
 
@@ -171,7 +172,7 @@ fn an_euler_step_gathers_its_coefficient_and_adds_the_scaled_velocity() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = empty_checkpoint(directory.path());
     let mut loader = WeightLoader::meta(&checkpoint, None, None);
-    let sigmas = Grid::Uniform { points: 5 }.sigmas(3.0);
+    let sigmas = Schedule::Uniform { points: 5 }.sigmas(3.0);
     let euler = Euler::load(&mut loader.scope("denoiser.video"), &sigmas, None).unwrap();
     let scaled = Euler::load(&mut loader.scope("denoiser.audio"), &sigmas, Some(0.999)).unwrap();
     assert_eq!(euler.steps(), 4);
@@ -391,4 +392,135 @@ fn a_posterior_sample_reads_the_two_halves_of_its_moments() {
         nn::Strides::new(&[60, 60, 10, 1]),
     );
     assert!(Posterior.sample(&f, moments, overlapping, out).is_err());
+}
+
+/// A tiled encode runs the model's forward once per tile, then places the first tile with the
+/// one-position row blend the served encode uses and fades every other tile over its seams; a
+/// tile with neighbours above and to its left blends twice.
+#[test]
+fn a_tiled_encode_runs_each_tile_and_fades_its_seams() {
+    let tiling = TiledEncode::new(32, 48, 32, 16, 16, DType::F32).unwrap();
+    // A 2 x 3 latent raster in one tile row of two tiles that share one column.
+    assert_eq!(tiling.tiles().len(), 2);
+    assert_eq!(tiling.latent(), (2, 3));
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let blocks = tiling.reserve(&f, DType::F32, 4, 3).unwrap();
+    let out = arena.tensor(DType::F32, Shape::new(&[4, 3, 2, 3])).unwrap();
+    let mut encoded = Vec::new();
+    let ((), launches) = recorded(|| {
+        tiling
+            .forward(
+                &f,
+                &blocks,
+                |index, block| {
+                    assert_eq!(block.shape.dims(), [4, 3, 2, 2]);
+                    encoded.push(index);
+                    Ok(())
+                },
+                out,
+            )
+            .unwrap()
+    });
+    assert_eq!(encoded, [0, 1]);
+    assert_eq!(operators(&launches), ["cross_fade", "cross_fade"]);
+    // The first tile's placement and the second tile's one-column seam: two programs.
+    assert!(launches[0].1.contains("extent_1") && launches[0].1.contains("axis_2"));
+    assert!(launches[1].1.contains("extent_1") && launches[1].1.contains("axis_3"));
+
+    // A raster of another element type, or one smaller than the latent raster, is refused.
+    let narrow = arena.tensor(DType::F32, Shape::new(&[4, 3, 2, 2])).unwrap();
+    assert!(tiling.forward(&f, &blocks, |_, _| Ok(()), narrow).is_err());
+    let half = arena.tensor(DType::F16, Shape::new(&[4, 3, 2, 3])).unwrap();
+    assert!(tiling.forward(&f, &blocks, |_, _| Ok(()), half).is_err());
+}
+
+/// A tiled decode reserves every tile's tokens, hands them to the model's forward, and stitches
+/// them into the raster in one launch; a table of another extent is refused.
+#[test]
+fn a_tiled_decode_stitches_every_tiles_tokens_in_one_launch() {
+    let decode = TiledDecode::new(DType::F16, 3, 4, 16).unwrap();
+    assert!(TiledDecode::new(DType::F16, 3, 4, 12).is_err());
+    let grid = Grid::split(32, 48, 32, 16, 16).unwrap();
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let table = arena.tensor(DType::I32, Shape::new(&[32 + 48, 3])).unwrap();
+    let out = arena
+        .tensor(DType::F16, Shape::new(&[3, 8, 32, 48]))
+        .unwrap();
+    let mut decoded = None;
+    let ((), launches) = recorded(|| {
+        decode
+            .forward(
+                &f,
+                &grid,
+                13,
+                |tokens| {
+                    decoded = Some(tokens.shape);
+                    Ok(())
+                },
+                table,
+                out,
+            )
+            .unwrap()
+    });
+    assert_eq!(decoded.unwrap().dims(), [2 * 13, 3 * 4 * 16 * 16]);
+    assert_eq!(operators(&launches), ["tile_stitch"]);
+    let short = arena.tensor(DType::I32, Shape::new(&[32 + 47, 3])).unwrap();
+    assert!(
+        decode
+            .forward(&f, &grid, 13, |_| Ok(()), short, out)
+            .is_err()
+    );
+}
+
+/// The frame blend is three rounded `axpby` launches per channel and frame of the overlap, the
+/// stepwise rule clip fades are served with; operands of another extent are refused.
+#[test]
+fn a_frame_blend_fades_each_frame_in_three_rounded_steps() {
+    let blend = Blend::new(DType::F16, 5, Axis::Frames).unwrap();
+    assert!(Blend::new(DType::F16, 0, Axis::Frames).is_err());
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let view = |dims: &[u64]| arena.tensor(DType::F16, Shape::new(dims)).unwrap();
+    let (previous, clip, out) = (
+        view(&[3, 5, 4, 6]),
+        view(&[3, 25, 4, 6]),
+        view(&[3, 5, 4, 6]),
+    );
+    let ((), launches) = recorded(|| blend.forward(&f, previous, clip, out).unwrap());
+    assert_eq!(launches.len(), 3 * 5 * 3);
+    assert!(launches.iter().all(|(op, _)| op == "scaled_add"));
+    assert!(blend.forward(&f, view(&[3, 4, 4, 6]), clip, out).is_err());
+    assert!(
+        blend
+            .forward(&f, previous, view(&[3, 4, 4, 6]), out)
+            .is_err()
+    );
+
+    let rows = Blend::new(DType::F16, 5, Axis::Rows).unwrap();
+    let tile = view(&[3, 4, 16, 16]);
+    let ((), launches) = recorded(|| rows.forward(&f, tile, tile, tile).unwrap());
+    assert_eq!(operators(&launches), ["cross_fade"]);
+}
+
+/// A gather copies each tile's cells of the clip's frames out of the channel-major trajectory, one
+/// strided copy per tile, and refuses a clip past the trajectory's end.
+#[test]
+fn a_gather_copies_each_tile_of_the_clip_once() {
+    let grid = Grid::split(32, 48, 32, 16, 16).unwrap();
+    let tiles = grid.tiles(16);
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    // Eight channels over ten latent frames of a 2 x 3 raster.
+    let trajectory = arena
+        .tensor(DType::F32, Shape::new(&[8, 10, 2, 3]))
+        .unwrap();
+    let rows = voxels(&tiles, 7, 2, 3).len() as u64;
+    let block = arena.tensor(DType::F32, Shape::new(&[rows, 8])).unwrap();
+    let ((), launches) = recorded(|| {
+        gather(&f, &tiles, trajectory, 8, (2, 3), 3, 7, block).unwrap();
+    });
+    assert_eq!(operators(&launches), ["copy_block", "copy_block"]);
+    assert!(gather(&f, &tiles, trajectory, 8, (2, 3), 4, 7, block).is_err());
 }

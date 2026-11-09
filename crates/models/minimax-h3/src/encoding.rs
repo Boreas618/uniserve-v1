@@ -3,9 +3,8 @@
 //!
 //! Only `ref2va` reads them: a reference video or audio clip is encoded once at
 //! the request boundary and the latents join the packed sequence as clean condition rows. The rest of
-//! this module is the encoders' arithmetic — the stage table, the causal extents, the tile grid and
-//! the band rule a partial encoding follows — and their parameter tables. The numerical bodies follow
-//! the shared layers, as the decoders' do.
+//! this module is the encoders' arithmetic — the stage table and the causal extents — and their
+//! parameter tables. The numerical bodies follow the shared layers, as the decoders' do.
 //!
 //! ## Precision
 //!
@@ -27,7 +26,7 @@
 //! ## The encoder's input
 //!
 //! A reference video reaches the encoder as `[frames, height, width, 3]` **uint8** pixels — the
-//! same raster the decoder writes ([`crate::output::Rgb`]) — and is normalized per channel by
+//! same raster the decoder writes (`crate::output`) — and is normalized per channel by
 //! `(pixel / 255 − mean) / std` with the ImageNet constants before the input convolution. A clip
 //! shorter than the checkpoint's [`crate::config::CLIP_FRAMES`] repeats its last frame; a single
 //! frame stays alone.
@@ -39,18 +38,16 @@
 //! one. A spatial downsampling pads the bottom and the right by one pixel and strides by two, so it
 //! halves an even extent exactly and floors an odd one.
 //!
-//! ## Tiles and bands
+//! ## Tiles
 //!
 //! A tile is 256 input pixels square with at least 64 pixels of overlap, both multiples of the 16-pixel
 //! spatial compression, so every seam spans whole latent positions. Adjacent tiles cross-fade over
 //! `overlap / 16` latent positions in the encoder's output precision — unlike the decoder, which blends
-//! decoded pixels, the encoder blends latents. A band of latent rows can be encoded on its own: the
-//! tile rows it reads are chosen so that the band's rows equal those rows of the whole encoding.
+//! decoded pixels, the encoder blends latents ([`crate::tiled_encode`]).
 
 /// `nn.LayerNorm`'s default epsilon, which the reference's audio projection does not override.
 const NORM_EPS: f32 = 1e-5;
 use crate::config::VideoVaeConfig;
-use crate::video_vae::{MINIMUM_OVERLAP, Seams, TILE_PIXELS};
 use crate::{Error, Result};
 use ops::values::f32_to_bf16;
 
@@ -509,78 +506,6 @@ impl Stack {
             .last()
             .copied()
             .ok_or_else(|| Error::config("the video encoder's stack has no level".to_owned()))
-    }
-}
-
-/// The tile grid of one raster, in input pixels, with the latent positions each seam shares.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Grid {
-    /// The tile rows.
-    pub rows: Seams,
-    /// The tile columns.
-    pub columns: Seams,
-}
-
-impl Grid {
-    /// The grid of a raster whose extents are multiples of the spatial compression.
-    pub fn of(height: u32, width: u32) -> Result<Self> {
-        Ok(Self {
-            rows: Seams::split(height, TILE_PIXELS, MINIMUM_OVERLAP, SPATIAL_RATIO)?,
-            columns: Seams::split(width, TILE_PIXELS, MINIMUM_OVERLAP, SPATIAL_RATIO)?,
-        })
-    }
-
-    /// The latent rows each tile row owns: where it starts in latent rows, then the latent height.
-    ///
-    /// A stitched tile row owns the latent rows from its own start up to the next row's start, so the
-    /// first seams of a run cross-fade and the last row keeps its whole lower overlap.
-    pub fn owned(&self, latent_height: u32) -> Vec<u32> {
-        let mut owned: Vec<u32> = self
-            .rows
-            .starts
-            .iter()
-            .map(|start| start / SPATIAL_RATIO)
-            .collect();
-        owned.push(latent_height);
-        owned
-    }
-
-    /// The tile rows a band of latent rows `[start, stop)` reads, as an inclusive range.
-    ///
-    /// The band's first tile row is the last one starting at or before `start`; it is preceded by one
-    /// more row when `start` falls inside the cross-fade that row shares, because those latent rows
-    /// read the row above. The last row is the last one starting before `stop`.
-    pub fn band(&self, latent_height: u32, start: u32, stop: u32) -> Result<(usize, usize)> {
-        if start >= stop || stop > latent_height {
-            return Err(Error::config(format!(
-                "the latent band [{start}, {stop}) is not a run of the {latent_height} rows"
-            )));
-        }
-        let owned = self.owned(latent_height);
-        let first = (0..self.rows.len())
-            .rev()
-            .find(|index| owned[*index] <= start)
-            .ok_or_else(|| Error::config("the band starts before the first tile".to_owned()))?;
-        let last = (0..self.rows.len())
-            .rev()
-            .find(|index| owned[*index] < stop)
-            .ok_or_else(|| Error::config("the band ends before the first tile".to_owned()))?;
-        let begin = match first.checked_sub(1) {
-            Some(above) if start < owned[first] + self.rows.overlaps[above] / SPATIAL_RATIO => {
-                above
-            }
-            _ => first,
-        };
-        Ok((begin, last))
-    }
-
-    /// The latent positions each seam of an axis cross-fades.
-    pub fn blends(seams: &Seams) -> Vec<u32> {
-        seams
-            .overlaps
-            .iter()
-            .map(|overlap| overlap / SPATIAL_RATIO)
-            .collect()
     }
 }
 
@@ -2396,40 +2321,6 @@ mod tests {
             .expect("moments");
         assert_eq!(single.frames, 1);
         assert_eq!((single.height, single.width), (1, 1));
-    }
-
-    #[test]
-    fn the_tile_grid_is_the_decoders_grid_in_input_pixels() {
-        let grid = Grid::of(1344, 768).expect("the grid");
-        // The decoder's grid at 16 pixels per latent position: seven rows of 256 with overlaps
-        // [80, 80, 80, 80, 64, 64] and four columns with [96, 80, 80].
-        assert_eq!(grid.rows.starts, vec![0, 176, 352, 528, 704, 896, 1088]);
-        assert_eq!(grid.rows.overlaps, vec![80, 80, 80, 80, 64, 64]);
-        assert_eq!(grid.columns.starts, vec![0, 160, 336, 512]);
-        // Every seam spans whole latent positions: 80/16 = 5, 64/16 = 4, 96/16 = 6.
-        assert_eq!(Grid::blends(&grid.rows), vec![5, 5, 5, 5, 4, 4]);
-        assert_eq!(Grid::blends(&grid.columns), vec![6, 5, 5]);
-        // The rows a raster of tiles owns: each start in latent rows, then the height.
-        assert_eq!(grid.owned(84), vec![0, 11, 22, 33, 44, 56, 68, 84]);
-    }
-
-    #[test]
-    fn a_band_reads_the_tile_rows_it_cross_fades_with() {
-        let grid = Grid::of(1344, 768).expect("the grid");
-        let latent_height = 1344 / SPATIAL_RATIO;
-        assert_eq!(latent_height, 84);
-        // The first band starts at the top: no row above it.
-        assert_eq!(grid.band(84, 0, 11).expect("band"), (0, 0));
-        // A band that starts on a row's own first latent row reads only that row and below.
-        assert_eq!(grid.band(84, 16, 33).expect("band"), (1, 2));
-        // A band that starts inside a row's cross-fade reads the row above.
-        let owned = grid.owned(84);
-        assert_eq!(owned[1], 11);
-        assert_eq!(grid.rows.overlaps[0] / SPATIAL_RATIO, 5);
-        assert_eq!(grid.band(84, 13, 20).expect("band"), (0, 1));
-        // Past the end is refused.
-        assert!(grid.band(84, 80, 90).is_err());
-        assert!(grid.band(84, 5, 5).is_err());
     }
 
     #[test]

@@ -20,7 +20,6 @@ use nn::{Checkpoint, DType, WeightLoader};
 
 use crate::config::{AttentionKind, Canvas, NAMED_CANVASES};
 use crate::load::MinimaxH3;
-use crate::output::VideoPostprocessor;
 use crate::partition::Ulysses;
 use crate::processing::ConditionPacking;
 use crate::processing::plan::ProcessorConfig;
@@ -250,7 +249,7 @@ impl VideoModel for H3Pipeline {
     fn decode_window(&self) -> u32 {
         // One decode call decodes the decoder's window of latent frames, each covering the VAE's
         // temporal compression of output frames; a longer timeline is spliced from its units.
-        crate::video_vae::decode_latents(&self.config.video_vae)
+        crate::video_vae::clips(&self.config.video_vae).window()
             * self.config.video_vae.temporal_compression()
     }
 
@@ -270,8 +269,9 @@ impl VideoModel for H3Pipeline {
     }
 
     fn video_units(&self, frames: u32) -> nn::Result<Vec<u32>> {
-        // The postprocessor is the one home of the clip schedule.
-        Ok(VideoPostprocessor::splices_of(frames)?
+        // The decoder's temporal clips are the one home of the clip schedule.
+        Ok(crate::video_vae::clips(&self.config.video_vae)
+            .splices(frames)?
             .into_iter()
             .map(|splice| splice.keep)
             .collect())
@@ -375,11 +375,11 @@ fn served_tasks(
 
 /// The least legal timeline of at least `frames` frames (`17 * n + 5`).
 ///
-/// A timeline is one 17-frame body per clip plus a 5-frame tail (`VideoPostprocessor::splices_of`),
+/// A timeline is one 17-frame body per clip plus a 5-frame tail (`video_vae::clips`),
 /// so the legal counts are 22, 39, 56, … : 4 s is 96 frames and snaps to 107, 15 s is 360 and snaps
 /// to 362.
 fn snap_frames(frames: u32) -> nn::Result<u32> {
-    let tail = crate::output::Rgb::OVERLAP_FRAMES;
+    let tail = crate::video_vae::OVERLAP_FRAMES;
     if frames < CLIP_FRAMES + tail {
         return Err(nn::Error::Unsupported(format!(
             "{frames} frame(s) is shorter than a timeline, which is at least {} ({CLIP_FRAMES} \

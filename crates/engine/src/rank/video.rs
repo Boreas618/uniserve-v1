@@ -81,7 +81,7 @@ impl ModelRunner {
             }
         }
         // **A decode bucket is one decode unit, not the timeline.** The video decoder decodes a clip
-        // of the checkpoint's own window - `decode_latents` latent frames, `frames_out` native ones -
+        // of the checkpoint's own window - `TemporalClips::window` latent frames, `frames_out` native ones -
         // and a timeline longer than one is spliced from its units. A bucket naming the deployment's
         // whole clip asked one decode call for a raster no decoder produces.
         let window = pipeline.decode_window();

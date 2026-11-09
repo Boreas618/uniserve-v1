@@ -18,8 +18,8 @@
 //! | --- | --- | --- |
 //! | `device::ones_scaled_residual` | a channel-scaled `Residual` over an all-ones scale vs `Axpby(1, 1)` and vs one rounding of the sum | `scaled_residual`, `scaled_add` |
 //! | `device::channel_affine` | the diagonal-matrix products vs `x·s+m` and `(x-m)/s` on the host | `gemm`, `conv1d`, `conv3d` |
-//! | `device::frame_blend` | the `Axpby` frame loop vs `CrossFade` | `scaled_add`, `cross_fade` |
-//! | `device::tile_stitch_corners` | `TileStitch` vs `CrossFade` vertical then horizontal, neighbours blended in place | `tile_stitch`, `cross_fade` |
+//! | `device::frame_blend` | the `Axpby` frame loop vs the row `Blend` | `scaled_add`, `cross_fade` |
+//! | `device::tile_stitch_corners` | the fused stitch vs row and column `Blend`s, vertical then horizontal, neighbours blended in place | `tile_stitch`, `cross_fade` |
 //! | `host::refiner_final_norm_eps` | `final_norm_eps` vs `norm_eps` in each shipped H3 transformer config | none |
 //!
 //! Shapes, element types and parameters are the ones the shipped forwards call with
@@ -54,10 +54,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use nn::layers::{
-    Axpby, Conv1d, Conv3d, ConvSpec, CrossFade, Linear, Residual, Scale, TileGrid, TileStitch,
-    WeightOrder,
-};
+use nn::layers::{Axpby, Conv1d, Conv3d, ConvSpec, Linear, Residual, Scale, WeightOrder};
+use nn::tiling::{Axis, Blend, Grid};
 use nn::{Arena, Backing, DType, DevicePtr, Forward, Shape, Strides, TensorView, Weight};
 use ops::values::{f16_to_f32, f32_to_bf16, f32_to_f16};
 
@@ -264,123 +262,14 @@ fn measure(name: &str, dtype: DType, left: &[u8], right: &[u8]) -> Outcome {
     Ok(())
 }
 
-// ---- Checkpoint tensors -------------------------------------------------------------------------
-
-/// The safetensors file of `directory` that holds `name`: the one the index maps it to, or the
-/// directory's single file.
-fn shard(directory: &Path, name: &str) -> Outcome<PathBuf> {
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(directory)? {
-        let path = entry?.path();
-        let file = path
-            .file_name()
-            .and_then(|file| file.to_str())
-            .unwrap_or_default();
-        if file.ends_with(".safetensors.index.json") {
-            let index = config(&path)?;
-            let shard = index
-                .pointer(&format!(
-                    "/weight_map/{}",
-                    name.replace('~', "~0").replace('/', "~1")
-                ))
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| format!("{} maps no {name}", path.display()))?;
-            return Ok(directory.join(shard));
-        }
-        if file.ends_with(".safetensors") {
-            files.push(path);
-        }
-    }
-    match files.as_slice() {
-        [only] => Ok(only.clone()),
-        _ => Err(format!(
-            "{} has no index and {} shards",
-            directory.display(),
-            files.len()
-        )
-        .into()),
-    }
-}
-
-/// The checkpoint tensor `name` of `directory`, widened to `f32`.
-fn tensor(directory: &Path, name: &str) -> Outcome<Vec<f32>> {
-    let path = shard(directory, name)?;
-    let file = std::fs::File::open(&path)?;
-    // SAFETY: the shard is a read-only checkpoint file nothing writes while the harness runs, and
-    // the mapping is dropped before this function returns.
-    let mapped = unsafe { memmap2::Mmap::map(&file)? };
-    let tensors = safetensors::SafeTensors::deserialize(&mapped)?;
-    let view = tensors.tensor(name)?;
-    let dtype = match view.dtype() {
-        safetensors::Dtype::F32 => DType::F32,
-        safetensors::Dtype::F16 => DType::F16,
-        safetensors::Dtype::BF16 => DType::BF16,
-        other => return Err(format!("{name} is stored as {other:?}").into()),
-    };
-    decode(dtype, view.data())
-}
-
 // ---- Video tile grid ----------------------------------------------------------------------------
 
-/// The checkpoint's decode tile and minimum seam, in pixels (`minimax-h3` `video_vae::Tiles::of`),
+/// The checkpoint's decode tile and minimum seam, in pixels (`minimax-h3` `video_vae::grid`),
 /// and the decoder's spatial compression and patch frames (`vae/config.json`'s downsample factors).
 const TILE_PIXELS: u32 = 256;
 const MINIMUM_OVERLAP: u32 = 64;
 const SPATIAL: u32 = 16;
 const PATCH_FRAMES: u32 = 4;
-
-/// One axis of a canvas cut into overlapping tiles: where each starts, and each seam's width.
-struct Seams {
-    starts: Vec<u32>,
-    overlaps: Vec<u32>,
-}
-
-/// The reference's `split_tiles` as `minimax-h3` `video_vae::Seams::split` computes it: the fewest
-/// tiles whose minimum-overlap coverage reaches `length`, the slack spread over the seams in whole
-/// alignment steps.
-fn split(length: u32, tile: u32, overlap: u32, alignment: u32) -> Seams {
-    if tile >= length {
-        return Seams {
-            starts: vec![0],
-            overlaps: Vec::new(),
-        };
-    }
-    let mut count = length.div_ceil(tile);
-    while tile * count - overlap * (count - 1) < length {
-        count += 1;
-    }
-    let mut overlaps = vec![overlap; (count - 1) as usize];
-    let slack = tile * count - overlap * (count - 1) - length;
-    for index in 0..(slack / alignment) as usize {
-        let seam = index % overlaps.len();
-        overlaps[seam] += alignment;
-    }
-    let mut starts = vec![0];
-    for overlap in &overlaps {
-        starts.push(starts[starts.len() - 1] + tile - overlap);
-    }
-    Seams { starts, overlaps }
-}
-
-/// The stitch table of one axis (`minimax-h3` `decoding::stitch_axis`): per position, the tile
-/// that keeps it, the position inside that tile, and the seam it lies in (zero outside one).
-fn stitch_axis(seams: &Seams, length: u32) -> Vec<[i32; 3]> {
-    let mut rows = Vec::with_capacity(length as usize);
-    let mut tile = 0_usize;
-    for position in 0..length {
-        while tile + 1 < seams.starts.len() && seams.starts[tile + 1] <= position {
-            tile += 1;
-        }
-        let inside = position - seams.starts[tile];
-        let seam = tile
-            .checked_sub(1)
-            .and_then(|previous| seams.overlaps.get(previous).copied())
-            .filter(|overlap| inside < *overlap)
-            .unwrap_or(0);
-        rows.push([tile as i32, inside as i32, seam as i32]);
-    }
-    rows
-}
 
 mod host {
     use super::*;
@@ -1033,7 +922,7 @@ mod device {
     /// Case 5, clips: the video postprocessor's fade of a clip's first five frames against its
     /// predecessor's tail (`minimax-h3` `output::VideoPostprocessor::blend`: three `Axpby`
     /// launches a frame, the ramp `i/5` and its complement rounded to FP16 on the host) against
-    /// `CrossFade` over the same frames, read as a band of five rows of one row per frame.
+    /// the row `Blend` over the same frames, read as a band of five rows of one row per frame.
     #[test]
     #[ignore = "requires a CUDA device and a Program Server (UNISERVE_PROGRAM_SERVER_SOCKET)"]
     fn frame_blend() -> Outcome {
@@ -1059,7 +948,7 @@ mod device {
         let term = bench.tensor(dtype, &[1, pixels])?;
         let rounded = |value: f32| f16_to_f32(f32_to_f16(value));
 
-        // `[channels, 1, overlap, pixels]`: the frames as the rows `CrossFade` blends along.
+        // `[channels, 1, overlap, pixels]`: the frames as the rows a row `Blend` blends along.
         let band = |view: TensorView, frames: u64| {
             TensorView::with_strides(
                 view.ptr,
@@ -1068,7 +957,7 @@ mod device {
                 Strides::new(&[frames * pixels, frames * pixels, pixels, 1]),
             )
         };
-        let fade = CrossFade::new(dtype, overlap as u32, 2)?;
+        let fade = Blend::new(dtype, overlap as u32, Axis::Rows)?;
 
         bench.run(&|f| {
             for channel in 0..channels {
@@ -1089,7 +978,7 @@ mod device {
             }
             fade.forward(
                 f,
-                Some(band(previous, overlap)),
+                band(previous, overlap),
                 band(clip, frames),
                 band(faded, overlap),
             )
@@ -1103,9 +992,9 @@ mod device {
         )
     }
 
-    /// Case 5, tiles: `TileStitch` over a 720 x 1280 clip's decode tiles, which fades every pixel
-    /// against its neighbours as they were decoded, against the sequential stitch: tiles in raster
-    /// order, each blended in place with `CrossFade` against the tile above and then the tile to its
+    /// Case 5, tiles: the fused `tile_stitch` over a 720 x 1280 clip's decode tiles, which fades
+    /// every pixel against its neighbours as they were decoded, against the sequential stitch: tiles
+    /// in raster order, each blended in place with a `Blend` against the tile above and then the tile to its
     /// left as those were already blended, then cropped. Corners (in a row and a column seam),
     /// edges (in one) and the interior are reported separately.
     #[test]
@@ -1117,8 +1006,8 @@ mod device {
         let (channels, height, width) = (3_u32, 720_u32, 1280_u32);
         // Two latent frames' tokens: eight frames of every tile.
         let frames = 2 * PATCH_FRAMES;
-        let rows = split(height, TILE_PIXELS, MINIMUM_OVERLAP, SPATIAL);
-        let columns = split(width, TILE_PIXELS, MINIMUM_OVERLAP, SPATIAL);
+        let grid = Grid::split(height, width, TILE_PIXELS, MINIMUM_OVERLAP, SPATIAL)?;
+        let (rows, columns) = (&grid.rows, &grid.columns);
         let (grid_rows, grid_columns) = (rows.starts.len(), columns.starts.len());
         let tiles = grid_rows * grid_columns;
         let side = TILE_PIXELS as usize;
@@ -1156,18 +1045,18 @@ mod device {
             }
         }
         let tokens = bench.values(dtype, &[(tiles * token_rows) as u64, patch as u64], &tokens)?;
-        let row_table = stitch_axis(&rows, height);
-        let column_table = stitch_axis(&columns, width);
+        let table = grid.stitch_table(height, width);
+        let (row_table, column_table) = table.split_at(height as usize);
         let flatten = |table: &[[i32; 3]]| table.iter().flatten().copied().collect::<Vec<i32>>();
         let row_view = bench.upload(
             DType::I32,
             &[u64::from(height), 3],
-            &i32_bytes(&flatten(&row_table)),
+            &i32_bytes(&flatten(row_table)),
         )?;
         let column_view = bench.upload(
             DType::I32,
             &[u64::from(width), 3],
-            &i32_bytes(&flatten(&column_table)),
+            &i32_bytes(&flatten(column_table)),
         )?;
         let raster_dims = [
             u64::from(channels),
@@ -1188,12 +1077,12 @@ mod device {
             &rasters,
         )?;
 
-        let stitch = TileStitch::new(dtype, channels, PATCH_FRAMES, SPATIAL)?;
-        let grid = TileGrid {
-            columns: grid_columns as u32,
-            token_rows: token_rows as u32,
-            height: TILE_PIXELS,
-            width: TILE_PIXELS,
+        let stitch = ops::tile_stitch::Descriptor {
+            dtype,
+            channels,
+            patch_frames: PATCH_FRAMES,
+            patch_side: SPATIAL,
+            block: ops::tile_stitch::BLOCK,
         };
         // A band of one tile: `extent` rows or columns starting at `start` along `axis`.
         let band = |tile: usize, axis: usize, start: u64, extent: u64| {
@@ -1218,12 +1107,25 @@ mod device {
         let mut fades = BTreeMap::new();
         for overlap in rows.overlaps.iter().chain(&columns.overlaps) {
             for axis in [2_u32, 3] {
-                fades.insert((*overlap, axis), CrossFade::new(dtype, *overlap, axis)?);
+                let along = if axis == 2 { Axis::Rows } else { Axis::Columns };
+                fades.insert((*overlap, axis), Blend::new(dtype, *overlap, along)?);
             }
         }
 
         bench.run(&|f| {
-            stitch.forward(f, tokens, row_view, column_view, grid, stitched)?;
+            f.operate::<ops::tile_stitch::TileStitch>(
+                &stitch,
+                ops::tile_stitch::Args {
+                    tokens,
+                    rows: row_view,
+                    columns: column_view,
+                    out: stitched,
+                    tile_columns: grid_columns as u32,
+                    token_rows: token_rows as u32,
+                    tile_height: TILE_PIXELS,
+                    tile_width: TILE_PIXELS,
+                },
+            )?;
             for row in 0..grid_rows {
                 for column in 0..grid_columns {
                     let tile = row * grid_columns + column;
@@ -1237,13 +1139,13 @@ mod device {
                             side - u64::from(extent),
                             u64::from(extent),
                         );
-                        fades[&(extent, 2)].forward(f, Some(above), current, current)?;
+                        fades[&(extent, 2)].forward(f, above, current, current)?;
                     }
                     if column > 0 {
                         let extent = columns.overlaps[column - 1];
                         let current = band(tile, 3, 0, u64::from(extent));
                         let left = band(tile - 1, 3, side - u64::from(extent), u64::from(extent));
-                        fades[&(extent, 3)].forward(f, Some(left), current, current)?;
+                        fades[&(extent, 3)].forward(f, left, current, current)?;
                     }
                 }
             }

@@ -38,7 +38,6 @@ pub mod audio_vae;
 pub mod checkpoint;
 pub mod conditioning;
 pub mod config;
-pub mod decoding;
 pub mod denoiser;
 pub mod encoding;
 pub mod family;

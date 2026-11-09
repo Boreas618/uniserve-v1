@@ -2438,4 +2438,63 @@ mod tests {
         // A frame count off the clip rule is refused by the latent arithmetic.
         assert!(clip_rows(AttentionKind::Dense, 100, &canvas).is_err());
     }
+
+    #[test]
+    fn the_clip_rows_invert_the_packing_over_each_clips_seven_frames() {
+        let canvas = crate::config::Canvas {
+            short_edge: 768,
+            aspect: (7, 4),
+            width: 1344,
+            height: 768,
+        };
+        let patch_rows = u64::from(
+            crate::packing::latent_raster(&canvas)
+                .expect("raster")
+                .patch_rows(),
+        );
+        // Dense packing keeps raster order, so the clip rows are the raster rows in sequence.
+        let rows = crate::packing::clip_rows(crate::config::AttentionKind::Dense, 107, &canvas)
+            .expect("rows");
+        assert_eq!(rows.len() as u64, 6 * 7 * patch_rows);
+        // Clips start five latent frames after the previous one and read seven, so clip `k`'s rows are
+        // the raster's rows from frame `5k` — not from `7k`, which is what a clip without overlap
+        // would give.
+        for (index, row) in rows.iter().enumerate() {
+            let clip = index as u64 / (7 * patch_rows);
+            let within = index as u64 % (7 * patch_rows);
+            assert_eq!(u64::from(*row), clip * 5 * patch_rows + within);
+        }
+        // A sparse packing permutes them within the generated video. Consecutive clips share their
+        // last two latent frames, so a row is named once per clip that reads it — the union covers the
+        // generated rows, and no row is named twice inside one clip.
+        let sparse = crate::config::AttentionKind::Sparse {
+            tile: 128,
+            sparsity: 0.8,
+            reference_keep: None,
+        };
+        let rows = crate::packing::clip_rows(sparse, 107, &canvas).expect("rows");
+        assert_eq!(rows.len() as u64, 6 * 7 * patch_rows);
+        let per_frame = patch_rows as usize;
+        let clip_rows = 7 * per_frame;
+        let mut generated = vec![false; (5 * 6 + 2) as usize * per_frame];
+        for (clip, block) in rows.chunks(clip_rows).enumerate() {
+            let mut in_clip = vec![false; generated.len()];
+            for row in block {
+                let index = *row as usize;
+                assert!(
+                    index < generated.len(),
+                    "clip {clip} reads row {index} outside the video"
+                );
+                assert!(!in_clip[index], "clip {clip} names row {index} twice");
+                in_clip[index] = true;
+                generated[index] = true;
+            }
+        }
+        assert!(
+            generated.iter().all(|row| *row),
+            "a generated row is read by no clip"
+        );
+        // Clips overlap by two latent frames: the second clip starts five frames after the first.
+        assert_eq!(rows[7 * per_frame], rows[5 * per_frame]);
+    }
 }

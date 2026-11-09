@@ -11,8 +11,9 @@
 //! ## What this module owns
 //!
 //! * the arithmetic that turns a raster into token counts ([`Canvas`]) and a canvas into its
-//!   overlapping decode tiles ([`Tiles`], [`Seams`]) — the same `split_tiles` the reference runs, so a
-//!   tile's extent and every seam's overlap are host values a captured bucket can be planned from;
+//!   overlapping decode tiles ([`grid`], over `nn::tiling::Grid`, the reference's `split_tiles`),
+//!   so a tile's extent and every seam's overlap are host values a captured bucket is planned from;
+//!   and the temporal clips a timeline is decoded in ([`clips`]);
 //! * the per-layer composition and the element type each layer declares (`torch.autocast` is
 //!   replaced by a declaration, not by an implicit conversion).
 //!
@@ -52,19 +53,28 @@
 //! over as many packed sequences as there are tiles. A tile is a sequence of its own, so nothing
 //! crosses between tiles until the stitch.
 
-use crate::output::VideoPostprocessor;
 use crate::{Error, Result, VideoVaeConfig};
+use nn::tiling::{Grid, TemporalClips, TiledDecode};
 
-/// The latent frames one clip decodes: seven for the checkpoint.
+/// Frames of a decoded clip's tail, which the next clip fades its first body frames against.
 ///
-/// A clip's native output is the 17-frame body, the three frames the final clip drops and the
-/// five-frame tail — 25 frames — and the decoder emits `temporal_compression` frames per latent frame,
-/// so it reads `ceil(25 / 4) = 7` latent frames and trims the three it does not keep. The reference
-/// states the seven directly; it is derived here so a checkpoint whose
-/// clip, drop or compression differs cannot silently decode the wrong span.
-pub fn decode_latents(config: &VideoVaeConfig) -> u32 {
-    let native = config.clip_length + config.token_drop + crate::decoding::OVERLAP_FRAMES;
-    native.div_ceil(config.temporal_compression())
+/// The checkpoint's decode constant (the reference's `frame_overlap`); its config does not state it.
+pub const OVERLAP_FRAMES: u32 = 5;
+
+/// The temporal clips the checkpoint's decoder decodes a timeline in.
+///
+/// A clip keeps `clip_length` frames, skips the `token_drop` padding frames the final clip drops,
+/// and ends in an [`OVERLAP_FRAMES`] tail: 25 native frames, so a clip reads `ceil(25 / 4) = 7`
+/// latent frames from `5k` ([`crate::CLIP_LATENTS`] per clip) and its decode's leading surplus is
+/// cropped.
+pub fn clips(config: &VideoVaeConfig) -> TemporalClips {
+    TemporalClips {
+        body: config.clip_length,
+        padding: config.token_drop,
+        overlap: OVERLAP_FRAMES,
+        temporal: config.temporal_compression(),
+        advance: crate::CLIP_LATENTS,
+    }
 }
 
 /// The latent raster of one decode call, and the token count it produces.
@@ -86,10 +96,11 @@ pub struct Canvas {
 }
 
 impl Canvas {
-    /// The canvas of one clip of `config`: [`decode_latents`] latent frames at the given latent extents.
+    /// The canvas of one clip of `config`: the [`clips`] window of latent frames at the given latent
+    /// extents.
     pub fn clip(config: &VideoVaeConfig, height: u32, width: u32) -> Self {
         Self {
-            frames: decode_latents(config),
+            frames: clips(config).window(),
             height,
             width,
             registers: config.decoder_num_register_tokens,
@@ -119,199 +130,36 @@ impl Canvas {
     }
 }
 
-/// One axis of a canvas split into overlapping decode tiles.
+/// The decode tile grid of `canvas`, in output pixels: the checkpoint's [`TILE_PIXELS`] tiles with
+/// at least [`MINIMUM_OVERLAP`] shared, aligned to the spatial compression.
 ///
-/// `starts` and `lengths` are output pixels, `overlaps[i]` is the overlap between tile `i` and tile
-/// `i + 1`. Every value is a multiple of the decoder's spatial compression, and a tile's latent slice
-/// is its pixel extent divided by that ratio. The arithmetic is the reference `split_tiles`: the
-/// fewest tiles whose minimum-overlap coverage reaches the extent, with the slack beyond the minimum
-/// spread over the seams in tile order.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Seams {
-    /// Where each tile starts, in output pixels.
-    pub starts: Vec<u32>,
-    /// How long each tile is, in output pixels.
-    pub lengths: Vec<u32>,
-    /// How much tile `i` overlaps tile `i + 1`.
-    pub overlaps: Vec<u32>,
+/// # Errors
+///
+/// A canvas the split refuses.
+pub fn grid(config: &VideoVaeConfig, canvas: &Canvas) -> Result<Grid> {
+    let (height, width) = canvas.pixels(config);
+    Ok(Grid::split(
+        height,
+        width,
+        TILE_PIXELS,
+        MINIMUM_OVERLAP,
+        config.spatial_compression(),
+    )?)
 }
 
-impl Seams {
-    /// Split `length` output pixels into tiles of `tile` with at least `overlap` shared, on a grid of
-    /// `alignment` pixels.
-    ///
-    /// The extent, the tile and the overlap must be multiples of the alignment, which is the
-    /// decoder's spatial compression: a tile reads whole latent columns.
-    pub fn split(length: u32, tile: u32, overlap: u32, alignment: u32) -> Result<Self> {
-        if length == 0 || tile == 0 || alignment == 0 {
-            return Err(Error::config(
-                "a tile split needs a positive extent, tile and alignment".to_owned(),
-            ));
-        }
-        if overlap >= tile {
-            return Err(Error::config(format!(
-                "a {overlap}-pixel overlap does not fit a {tile}-pixel tile"
-            )));
-        }
-        for (name, value) in [("extent", length), ("tile", tile), ("overlap", overlap)] {
-            if !value.is_multiple_of(alignment) {
-                return Err(Error::config(format!(
-                    "the {name} {value} is not a multiple of the {alignment}-pixel alignment"
-                )));
-            }
-        }
-        if tile >= length {
-            return Ok(Self {
-                starts: vec![0],
-                lengths: vec![length],
-                overlaps: Vec::new(),
-            });
-        }
-
-        // The fewest tiles whose minimum-overlap coverage reaches the extent.
-        let mut count = length.div_ceil(tile);
-        while u64::from(tile) * u64::from(count) - u64::from(overlap) * u64::from(count - 1)
-            < u64::from(length)
-        {
-            count += 1;
-        }
-
-        // Spread the slack beyond the minimum overlap over the seams, in tile order, in whole
-        // alignment steps: the first seams of the grid take one step each, cyclically.
-        let seams = count - 1;
-        let mut overlaps = vec![overlap; seams as usize];
-        let covered: u64 =
-            u64::from(tile) * u64::from(count) - u64::from(overlap) * u64::from(seams);
-        let slack = covered - u64::from(length);
-        for index in 0..(slack / u64::from(alignment)) as usize {
-            let seam = index % overlaps.len();
-            overlaps[seam] += alignment;
-        }
-
-        let mut starts = Vec::with_capacity(count as usize);
-        starts.push(0);
-        for overlap in &overlaps {
-            let next = starts[starts.len() - 1] + tile - overlap;
-            starts.push(next);
-        }
-        Ok(Self {
-            starts,
-            lengths: vec![tile; count as usize],
-            overlaps,
-        })
-    }
-
-    /// How many tiles this axis has.
-    pub fn len(&self) -> usize {
-        self.starts.len()
-    }
-
-    /// Whether this axis has no tile.
-    pub fn is_empty(&self) -> bool {
-        self.starts.is_empty()
-    }
-
-    /// The latent span of tile `index`: `(first, end)` in latent cells, end exclusive, over a raster
-    /// whose extent is `raster` **output pixels** (the same unit `split` was given).
-    pub fn latent(&self, index: usize, raster: u32, ratio: u32) -> (u32, u32) {
-        let start = self.starts[index];
-        let end = (start + self.lengths[index]).min(raster);
-        (start / ratio, end.div_ceil(ratio))
-    }
-
-    /// The overlap between tile `index` and tile `index + 1`, in output pixels.
-    pub fn overlap(&self, index: usize) -> Option<u32> {
-        self.overlaps.get(index).copied()
-    }
-}
-
-/// The tile grid of one clip's canvas: the same split applied to the height and to the width.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Tiles {
-    /// Rows of tiles.
-    pub rows: Seams,
-    /// Columns of tiles.
-    pub columns: Seams,
-}
-
-/// One tile of a canvas, in the order the decoder decodes and blends it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Tile {
-    /// Row of the tile grid.
-    pub row: usize,
-    /// Column of the tile grid.
-    pub column: usize,
-    /// The tile's latent rows: `(start, end)`.
-    pub latent_rows: (u32, u32),
-    /// The tile's latent columns: `(start, end)`.
-    pub latent_columns: (u32, u32),
-    /// The overlap this tile shares with the tile above it, in output pixels.
-    pub above: u32,
-    /// The overlap this tile shares with the tile to its left, in output pixels.
-    pub left: u32,
-    /// The overlap the tile below this one shares with it, in output pixels.
-    pub below: u32,
-    /// The overlap the tile to the right shares with it, in output pixels.
-    pub right: u32,
-    /// The tile's own token canvas.
-    pub canvas: Canvas,
-}
-
-impl Tiles {
-    /// The tile grid of `canvas`, with the checkpoint's 256-pixel tiles and 64-pixel minimum overlap.
-    pub fn of(config: &VideoVaeConfig, canvas: &Canvas) -> Result<Self> {
-        let ratio = config.spatial_compression();
-        let (height, width) = canvas.pixels(config);
-        Ok(Self {
-            rows: Seams::split(height, TILE_PIXELS, MINIMUM_OVERLAP, ratio)?,
-            columns: Seams::split(width, TILE_PIXELS, MINIMUM_OVERLAP, ratio)?,
-        })
-    }
-
-    /// Every tile of the grid, row-major: the order in which the reference decodes and blends them.
-    ///
-    /// A tile's canvas is its own latent slice, so no tile reads a neighbour's latents (the reference
-    /// has no halo). The overlaps are stated on the tile that is blended *into* its predecessor: `above`
-    /// and `left` are the ones this tile cross-fades, `below` and `right` are the ones its successor
-    /// will, and a tile trims its trailing rows and columns exactly when those are nonzero.
-    pub fn tiles(&self, config: &VideoVaeConfig, canvas: &Canvas) -> Vec<Tile> {
-        let ratio = config.spatial_compression();
-        // The seams are split on the canvas's output pixels, so the tile's span is clipped there and
-        // then divided into latent cells; using the latent extent here would clip pixel coordinates
-        // to a latent count and give a tile that ends before it starts.
-        let (height, width) = canvas.pixels(config);
-        let mut tiles = Vec::with_capacity(self.rows.len() * self.columns.len());
-        for row in 0..self.rows.len() {
-            for column in 0..self.columns.len() {
-                let (row_start, row_end) = self.rows.latent(row, height, ratio);
-                let (column_start, column_end) = self.columns.latent(column, width, ratio);
-                let above = row
-                    .checked_sub(1)
-                    .map_or(0, |previous| self.rows.overlap(previous).unwrap_or(0));
-                let left = column
-                    .checked_sub(1)
-                    .map_or(0, |previous| self.columns.overlap(previous).unwrap_or(0));
-                tiles.push(Tile {
-                    row,
-                    column,
-                    latent_rows: (row_start, row_end),
-                    latent_columns: (column_start, column_end),
-                    above,
-                    left,
-                    below: self.rows.overlap(row).unwrap_or(0),
-                    right: self.columns.overlap(column).unwrap_or(0),
-                    canvas: Canvas {
-                        frames: canvas.frames,
-                        height: row_end - row_start,
-                        width: column_end - column_start,
-                        registers: canvas.registers,
-                        tail: canvas.tail,
-                    },
-                });
-            }
-        }
-        tiles
-    }
+/// The token canvas of one decode tile of `canvas`: a split keeps every tile one extent, so this is
+/// every tile's, and the position table every tile reads is its.
+///
+/// # Errors
+///
+/// A canvas the split refuses.
+pub fn tile(config: &VideoVaeConfig, canvas: &Canvas) -> Result<Canvas> {
+    let (height, width) = grid(config, canvas)?.tile(config.spatial_compression());
+    Ok(Canvas {
+        height,
+        width,
+        ..*canvas
+    })
 }
 
 /// The width of a decoder head the rotary embedding rotates, and its three shares.
@@ -456,8 +304,8 @@ struct Layer {
 pub struct VideoDecoder {
     /// Every raster this decoder serves: the deployment's canvases, in the order it named them.
     canvases: Vec<Canvas>,
-    /// The tile stitch, built at load so that no layer is built on a request's path.
-    stitch: crate::decoding::ClipDecoder,
+    /// The tiled decode's stitch, built at load so that no layer is built on a request's path.
+    stitch: TiledDecode,
     width: u32,
     /// `value · std + mean` per latent channel, a product then a sum: the
     /// reference restores the latents in FP32 before anything rounds them.
@@ -492,20 +340,6 @@ pub struct VideoDecoder {
     attention: DenseAttention,
 }
 
-/// The canvas of the grid's largest tile, whose position table every tile's is a slice of.
-///
-/// The grid's tiles are uniform where the canvas is at least one tile wide, so this is the checkpoint's
-/// tile; a canvas narrower than one is its own largest tile.
-fn largest_tile(config: &VideoVaeConfig, latent_height: u32, latent_width: u32) -> Result<Canvas> {
-    let clip = Canvas::clip(config, latent_height, latent_width);
-    let tiles = Tiles::of(config, &clip)?.tiles(config, &clip);
-    tiles
-        .iter()
-        .max_by_key(|tile| tile.canvas.rows())
-        .map(|tile| tile.canvas)
-        .ok_or_else(|| Error::config("a canvas with no tile has no position table".to_owned()))
-}
-
 /// The two tables a layout's decode reads, keyed by its latent extents.
 ///
 /// The model's arithmetic, keyed by the **layout**: the rotary positions of the largest tile of the
@@ -517,7 +351,7 @@ pub(crate) fn table_specs(
     latent_height: u32,
     latent_width: u32,
 ) -> Result<Vec<StateTable>> {
-    let positions = u64::from(positions_table(config, latent_height, latent_width)?);
+    let positions = tile(config, &Canvas::clip(config, latent_height, latent_width))?.rows();
     let ratio = u64::from(config.spatial_compression());
     let pixels = (u64::from(latent_height) + u64::from(latent_width)) * ratio;
     Ok(vec![
@@ -549,14 +383,12 @@ pub(crate) fn table_values_into(
             out.len()
         )));
     }
-    let positions = TableValues::F32(positions(&largest_tile(
-        config,
-        latent_height,
-        latent_width,
-    )?)?);
     let clip = Canvas::clip(config, latent_height, latent_width);
+    let positions = TableValues::F32(positions(&tile(config, &clip)?)?);
+    let (height, width) = clip.pixels(config);
     let stitch = TableValues::I32(
-        crate::decoding::stitch_table(config, &clip)?
+        grid(config, &clip)?
+            .stitch_table(height, width)
             .into_iter()
             .flatten()
             .collect(),
@@ -565,12 +397,6 @@ pub(crate) fn table_values_into(
         held.write(table.name, &values)?;
     }
     Ok(())
-}
-
-/// Rows of the largest tile's position table, the extent every tile's positions are a slice of.
-fn positions_table(config: &VideoVaeConfig, latent_height: u32, latent_width: u32) -> Result<u32> {
-    u32::try_from(largest_tile(config, latent_height, latent_width)?.rows())
-        .map_err(|_| Error::config("a tile taller than a table bound".to_owned()))
 }
 
 /// The attention of the decoder's block: FlashAttention 4 over one packed sequence per tile, which is
@@ -586,12 +412,6 @@ fn block_attention(head: u32, heads: u32, rows: u32) -> Result<DenseAttention> {
         window: None,
         scale,
     })?)
-}
-
-/// The tiles of the grid `canvas` splits into: how many sequences a clip of it decodes in one launch.
-fn tile_count(config: &VideoVaeConfig, canvas: &Canvas) -> Result<u64> {
-    let tiles = Tiles::of(config, canvas)?;
-    Ok(tiles.rows.len() as u64 * tiles.columns.len() as u64)
 }
 
 impl VideoDecoder {
@@ -639,9 +459,9 @@ impl VideoDecoder {
         // The tables a decode reads are a **tile's**, not a canvas's: one table serves every tile of
         // every canvas only where every canvas is the same tiles. A deployment whose rasters tile
         // differently would need a table per raster, and is refused by both named.
-        let tile = largest_tile(config, canvas.height, canvas.width)?;
+        let tile = tile(config, &canvas)?;
         for other in &canvases[1..] {
-            if largest_tile(config, other.height, other.width)? != tile {
+            if self::tile(config, other)? != tile {
                 return Err(Error::config(format!(
                     "the deployment serves a {}x{} raster and a {}x{} one whose largest tiles \
                      differ: the tables a decode reads are one tile's, so every canvas must be a \
@@ -650,19 +470,22 @@ impl VideoDecoder {
                 )));
             }
         }
-        // The canvas of the most tiles, which the sequence offsets and the attention's bound answer to.
-        let mut widest = canvas;
+        // The most tiles any served canvas splits into, which the sequence offsets and the
+        // attention's bound answer to.
+        let mut most_tiles = 0_u64;
         for other in &canvases {
-            if tile_count(config, other)? > tile_count(config, &widest)? {
-                widest = *other;
-            }
+            most_tiles = most_tiles.max(grid(config, other)?.len() as u64);
         }
-        let most_tiles = tile_count(config, &widest)?;
         let width = config.decoder_num_attention_heads * config.decoder_attention_head_dim;
         let head = config.decoder_attention_head_dim;
         let heads = config.decoder_num_attention_heads;
         let ffn = width * config.decoder_ffn_mult;
-        let stitch = crate::decoding::ClipDecoder::new(config)?;
+        let stitch = TiledDecode::new(
+            ACTIVATION,
+            config.out_channels,
+            config.temporal_compression(),
+            config.spatial_compression(),
+        )?;
         let out_channels = config.out_channels
             * config.temporal_compression()
             * config.spatial_compression()
@@ -948,25 +771,11 @@ impl VideoDecoder {
         &self.canvases
     }
 
-    /// The largest of this clip's decode tiles: every tile of a served grid has its rows.
-    pub fn largest_tile(&self, canvas: &Canvas) -> Result<Canvas> {
-        let grid = Tiles::of(&self.config, canvas)?.tiles(&self.config, canvas);
-        grid.into_iter()
-            .map(|tile| tile.canvas)
-            .max_by_key(|tile| (tile.voxels(), tile.height, tile.width))
-            .ok_or_else(|| {
-                Error::config(format!(
-                    "a canvas of {} x {} latent cells has no tile to decode",
-                    canvas.height, canvas.width
-                ))
-            })
-    }
-
     /// The transformer's scratch for one clip: every tile's rows at once, because every tile runs in
     /// the same launches.
     pub fn scratch(&self, f: &Forward, canvas: &Canvas) -> Result<ClipScratch> {
-        let tile = self.largest_tile(canvas)?;
-        let tiles = tile_count(&self.config, canvas)?;
+        let tile = tile(&self.config, canvas)?;
+        let tiles = grid(&self.config, canvas)?.len() as u64;
         let rows = tiles * tile.rows();
         let voxels = tiles * tile.voxels();
         let width = u64::from(self.width);
@@ -1008,8 +817,8 @@ impl VideoDecoder {
         out: TensorView,
         scratch: &ClipScratch,
     ) -> Result<()> {
-        let tile = self.largest_tile(canvas)?;
-        let tiles = tile_count(&self.config, canvas)?;
+        let tile = tile(&self.config, canvas)?;
+        let tiles = grid(&self.config, canvas)?.len() as u64;
         let (tile_rows, tile_voxels) = (tile.rows(), tile.voxels());
         let (rows, voxels) = (tiles * tile_rows, tiles * tile_voxels);
         let width = u64::from(self.width);
@@ -1166,37 +975,21 @@ impl Decoder for VideoDecoder {
     /// The voxels of every tile, in the order `decode_clip` reads them: each tile's own latent slice,
     /// frame by frame, so a voxel in an overlap has one row per tile that holds it.
     fn latent_rows(&self, layout: &nn::capability::Layout) -> nn::Result<Option<Vec<u32>>> {
-        let refuse = |problem: String| nn::Error::Shape {
-            owner: "VideoDecoder",
-            problem,
-        };
         let clip = Canvas::clip(&self.config, layout.video.height, layout.video.width);
-        let tiles = Tiles::of(&self.config, &clip)
-            .map_err(|error| refuse(format!("the clip's tile grid: {error}")))?
-            .tiles(&self.config, &clip);
-        let (height, width) = (layout.video.height, layout.video.width);
-        let mut rows = Vec::new();
-        for tile in &tiles {
-            for frame in 0..layout.video.frames {
-                for row in tile.latent_rows.0..tile.latent_rows.1 {
-                    for column in tile.latent_columns.0..tile.latent_columns.1 {
-                        rows.push((frame * height + row) * width + column);
-                    }
-                }
-            }
-        }
-        Ok(Some(rows))
+        let tiles = grid(&self.config, &clip)?.tiles(self.config.spatial_compression());
+        Ok(Some(nn::tiling::voxels(
+            &tiles,
+            layout.video.frames,
+            layout.video.height,
+            layout.video.width,
+        )))
     }
 
     fn layout_tables(&self, layout: &nn::capability::Layout) -> nn::Result<Vec<StateTable>> {
         // A layout whose extents contradict the checkpoint is a named error and not an empty list: a
         // runner that made a mistake hears which one, where an empty answer would have reached the
         // decode as a block with no tables and read nothing.
-        self.tables(layout.video.height, layout.video.width)
-            .map_err(|error| nn::Error::Shape {
-                owner: "VideoDecoder",
-                problem: error.to_string(),
-            })
+        Ok(self.tables(layout.video.height, layout.video.width)?)
     }
 
     fn prepare_layout(
@@ -1204,28 +997,19 @@ impl Decoder for VideoDecoder {
         layout: &nn::capability::Layout,
         out: &mut [TableValues],
     ) -> nn::Result<()> {
-        self.table_values(layout.video.height, layout.video.width, out)
-            .map_err(|error| nn::Error::Shape {
-                owner: "VideoDecoder",
-                problem: error.to_string(),
-            })
+        Ok(self.table_values(layout.video.height, layout.video.width, out)?)
     }
 
-    /// The checkpoint's clip schedule for a timeline of `frames` frames.
-    ///
-    /// The schedule is `17 * n + 5` whatever block is asked: it depends on the checkpoint's clip body
-    /// and overlap frame counts, which the decoder holds as well as the postprocessor does. So both
-    /// answer through [`VideoPostprocessor::splices_of`], and a runner that bound only a decoder - a
-    /// checkpoint with no postprocessor publishes the clip's own raster - still gets the timeline's
-    /// unit list rather than the trait's refusal.
+    /// The checkpoint's clip schedule for a timeline of `frames` frames ([`clips`]), which a runner
+    /// that bound only a decoder reads as well as the postprocessor does.
     fn splices(&self, frames: u32) -> nn::Result<Vec<nn::capability::Splice>> {
-        VideoPostprocessor::splices_of(frames)
+        clips(&self.config).splices(frames)
     }
 
     /// Clip `k` decodes latent frames `[5k, 5k + 7)`: five that advance the timeline, and two the
     /// next clip's window also reads.
     fn clip_start(&self, clip: u32) -> u32 {
-        clip * crate::CLIP_LATENTS
+        clips(&self.config).start(clip)
     }
 
     /// The raster's element type, which the module's table declares: the reference casts its decoded
@@ -1249,59 +1033,26 @@ impl Decoder for VideoDecoder {
         first: u32,
         block: TensorView,
     ) -> nn::Result<()> {
-        let refuse = |problem: String| nn::Error::Shape {
-            owner: "VideoDecoder",
-            problem,
-        };
-        let channels = u64::from(self.config.latent_channels);
-        let (height, width) = (
-            u64::from(layout.video.height),
-            u64::from(layout.video.width),
-        );
-        let plane = height * width;
-        let voxels = trajectory.numel() / channels;
+        // The trajectory a denoiser publishes is FP32 and this decoder restores it in FP32.
+        if trajectory.dtype != STREAM || block.dtype != STREAM {
+            return Err(Error::config(format!(
+                "the decoder gathers {STREAM:?} latents, and the trajectory is {:?} and the block {:?}",
+                trajectory.dtype, block.dtype
+            ))
+            .into());
+        }
         let clip = Canvas::clip(&self.config, layout.video.height, layout.video.width);
-        let frames = u64::from(clip.frames);
-        if !trajectory.numel().is_multiple_of(channels)
-            || (u64::from(first) + frames) * plane > voxels
-            || trajectory.dtype != STREAM
-            || block.dtype != STREAM
-        {
-            return Err(refuse(format!(
-                "a clip of {frames} latent frames from frame {first} of a {plane}-voxel raster is \
-                 past a trajectory of {} {} elements in {channels} channels",
-                trajectory.numel(),
-                trajectory.dtype
-            )));
-        }
-        let tiles = Tiles::of(&self.config, &clip)
-            .map_err(|error| refuse(format!("the clip's tile grid: {error}")))?
-            .tiles(&self.config, &clip);
-        let copy = nn::layers::Copy::new(STREAM, nn::layers::Access::Element)?;
-        let mut row = 0_u64;
-        for tile in &tiles {
-            let (top, bottom) = tile.latent_rows;
-            let (left, right) = tile.latent_columns;
-            let (rows, columns) = (u64::from(bottom - top), u64::from(right - left));
-            let shape = Shape::new(&[channels, frames, rows, columns]);
-            let start = u64::from(first) * plane + u64::from(top) * width + u64::from(left);
-            let source = TensorView::with_strides(
-                trajectory.offset_elements(start),
-                STREAM,
-                shape,
-                nn::Strides::new(&[voxels, plane, width, 1]),
-            );
-            let strides = [1, rows * columns * channels, columns * channels, channels];
-            let destination = TensorView::with_strides(
-                block.offset_elements(row * channels),
-                STREAM,
-                shape,
-                nn::Strides::new(&strides),
-            );
-            copy.forward(f, source, destination, &strides.map(|stride| stride as i64))?;
-            row += frames * rows * columns;
-        }
-        Ok(())
+        let tiles = grid(&self.config, &clip)?.tiles(self.config.spatial_compression());
+        nn::tiling::gather(
+            f,
+            &tiles,
+            trajectory,
+            self.config.latent_channels,
+            (layout.video.height, layout.video.width),
+            first,
+            clip.frames,
+            block,
+        )
     }
 
     /// The latent layout one clip's raster decodes from.
@@ -1319,10 +1070,7 @@ impl Decoder for VideoDecoder {
     /// a runner that handed it another canvas would capture a graph whose constants belong to a
     /// different raster.
     fn layout_of(&self, clip: nn::capability::Clip) -> nn::Result<nn::capability::Layout> {
-        let refuse = |problem: String| nn::Error::Shape {
-            owner: "VideoDecoder",
-            problem,
-        };
+        let refuse = |problem: String| -> nn::Error { Error::config(problem).into() };
         // `pixels` answers `(height, width)` in that order, and this destructures it in the same
         // order: the two were once written the other way round, which a square canvas cannot show.
         // The pair below is compared in one order and the refusal names both rasters in one order,
@@ -1395,10 +1143,7 @@ impl Decoder for VideoDecoder {
         state: &[TensorView],
         out: DecodedMedia,
     ) -> nn::Result<()> {
-        let refuse = |problem: String| nn::Error::Shape {
-            owner: "VideoDecoder",
-            problem,
-        };
+        let refuse = |problem: String| -> nn::Error { Error::config(problem).into() };
         let [positions, stitch] = state else {
             return Err(refuse(format!(
                 "the video decoder reads two tables, video_positions and video_stitch, and {} were \
@@ -1414,7 +1159,7 @@ impl Decoder for VideoDecoder {
         }
         let spatial = self.config.spatial_compression();
         let temporal = self.config.temporal_compression();
-        let channels = u64::from(crate::output::Rgb::CHANNELS);
+        let channels = u64::from(crate::output::RGB_CHANNELS);
         if video.shape.rank() != 4 || video.shape.dim(0) != channels {
             return Err(refuse(format!(
                 "the clip's raster is [{channels}, frames, rows, columns], not {:?}",
@@ -1453,12 +1198,28 @@ impl Decoder for VideoDecoder {
                 latents.dtype
             )));
         }
-        let tiles = Tiles::of(&self.config, &clip)
-            .map_err(|error| refuse(format!("the clip's tile grid: {error}")))?
-            .tiles(&self.config, &clip);
-        self.stitch
-            .decode_clip(f, self, &tiles, latents, *positions, *stitch, video)
-            .map_err(|error| refuse(format!("{error}")))
+        // **One canvas set per decoder object**: the constants a decode reads are the served
+        // canvases' tile's, so a canvas outside the set is refused by name.
+        if !self.canvases.contains(&clip) {
+            return Err(refuse(format!(
+                "a {}x{} latent clip of {} frame(s) is not a canvas this decoder serves",
+                clip.height, clip.width, clip.frames
+            )));
+        }
+        let tile = tile(&self.config, &clip)?;
+        // The transformer runs over every tile at once into the tokens the stitch reads; its scratch
+        // is reserved after the tokens, inside the decode.
+        self.stitch.forward(
+            f,
+            &grid(&self.config, &clip)?,
+            tile.rows(),
+            |tokens| {
+                let scratch = self.scratch(f, &clip)?;
+                Ok(self.decode(f, &clip, latents, *positions, tokens, &scratch)?)
+            },
+            *stitch,
+            video,
+        )
     }
 }
 
@@ -1485,7 +1246,7 @@ pub(crate) mod tests {
         // Two tiles across and one down: the written rows repeat per tile.
         let canvas = Canvas::clip(&config, 16, 28);
         let tiles = 2_u64;
-        let tile = largest_tile(&config, canvas.height, canvas.width).expect("a tile");
+        let tile = tile(&config, &canvas).expect("a tile");
         let decoder = stated_decoder(&config, canvas);
         let arena = nn::Arena::new(nn::DevicePtr::new(0), 1 << 40);
         let forward = nn::Forward::recording(&arena);
@@ -1581,9 +1342,8 @@ pub(crate) mod tests {
             // (`f16`, `f32`): the assertion compares against that spelling rather than a
             // capitalized one the message never has, which fails for a reason that is not the
             // refusal's subject.
-            matches!(&error, nn::Error::Shape { problem, .. }
-                if problem.contains(&format!("{:?}", DType::F16))
-                    && problem.contains(&format!("{:?}", DType::F32))),
+            error.to_string().contains(&format!("{:?}", DType::F16))
+                && error.to_string().contains(&format!("{:?}", DType::F32)),
             "the refusal names both types: {error}"
         );
     }
@@ -1808,24 +1568,6 @@ pub(crate) mod tests {
         );
     }
 
-    fn seams(starts: &[u32], overlaps: &[u32], length: u32) -> Seams {
-        Seams {
-            starts: starts.to_vec(),
-            lengths: vec![TILE_PIXELS; starts.len()],
-            overlaps: overlaps.to_vec(),
-        }
-        .with_length(length)
-    }
-
-    impl Seams {
-        fn with_length(mut self, length: u32) -> Self {
-            if self.starts.len() == 1 {
-                self.lengths = vec![length];
-            }
-            self
-        }
-    }
-
     #[test]
     fn the_decoder_table_names_one_position_per_row() {
         let config = video_config();
@@ -1840,7 +1582,7 @@ pub(crate) mod tests {
         let clip = Canvas::clip(&config, raster.height, raster.width);
         // The position table is axis-major over the largest tile's rows, and the register rows and the
         // trailing zero row carry no coordinate.
-        let tile = largest_tile(&config, raster.height, raster.width).expect("a tile");
+        let tile = tile(&config, &clip).expect("a tile");
         let table = positions(&tile).expect("positions");
         assert_eq!(table.len() as u64, 3 * tile.rows());
         for channel in 0..3u64 {
@@ -1923,103 +1665,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_raster_that_fits_one_tile_is_not_split() {
-        let split = Seams::split(256, TILE_PIXELS, MINIMUM_OVERLAP, 16).expect("one tile");
-        assert_eq!(split.starts, vec![0]);
-        assert_eq!(split.lengths, vec![256]);
-        assert!(split.overlaps.is_empty());
-    }
-
-    #[test]
-    fn the_768p_16_by_9_canvas_splits_as_the_reference_does() {
-        // 1344 × 768 pixels: seven columns and four rows, the slack spread over the first seams.
-        let width = Seams::split(1344, TILE_PIXELS, MINIMUM_OVERLAP, 16).expect("columns");
-        assert_eq!(
-            width,
-            seams(
-                &[0, 176, 352, 528, 704, 896, 1088],
-                &[80, 80, 80, 80, 64, 64],
-                1344
-            )
-        );
-        let height = Seams::split(768, TILE_PIXELS, MINIMUM_OVERLAP, 16).expect("rows");
-        assert_eq!(height, seams(&[0, 160, 336, 512], &[96, 80, 80], 768));
-    }
-
-    #[test]
-    fn the_last_tile_ends_on_the_raster() {
-        for canvas in [480u32, 640, 672, 768, 832, 1024, 1344, 1536] {
-            let split = Seams::split(canvas, TILE_PIXELS, MINIMUM_OVERLAP, 16).expect("split");
-            let last = split.starts[split.len() - 1];
-            assert!(
-                last < canvas && last + split.lengths[split.len() - 1] >= canvas,
-                "the last of {canvas} starts at {last}"
-            );
-            // The whole raster is covered: each start is the previous end less its overlap.
-            for index in 1..split.len() {
-                let previous_end = split.starts[index - 1] + split.lengths[index - 1];
-                assert_eq!(
-                    split.starts[index] + split.overlaps[index - 1],
-                    previous_end
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn an_unaligned_raster_is_refused() {
-        assert!(Seams::split(1000, TILE_PIXELS, MINIMUM_OVERLAP, 16).is_err());
-        assert!(Seams::split(1024, TILE_PIXELS, TILE_PIXELS, 16).is_err());
-        assert!(Seams::split(0, TILE_PIXELS, MINIMUM_OVERLAP, 16).is_err());
-    }
-
-    #[test]
-    fn a_tiles_latent_span_is_its_pixels_over_the_compression() {
+    fn a_canvas_tile_is_its_grids_uniform_tile_with_the_token_suffix() {
         let config = video_config();
         let canvas = Canvas::clip(&config, 48, 84);
         assert_eq!(canvas.frames, 7);
-        assert_eq!(canvas.voxels(), 7 * 48 * 84);
         assert_eq!(canvas.rows(), 7 * 48 * 84 + 4 + 1);
-        let tiles = Tiles::of(&config, &canvas).expect("tiles");
-        let planned = tiles.tiles(&config, &canvas);
-        assert_eq!(planned.len(), 4 * 7);
-        let first = planned[0];
-        assert_eq!(first.latent_rows, (0, 16));
-        assert_eq!(first.latent_columns, (0, 16));
-        assert_eq!((first.above, first.left), (0, 0));
-        assert_eq!((first.below, first.right), (96, 80));
-        // The second column of the first row cross-fades 80 pixels of its predecessor: the width's
-        // slack of 64 pixels is four alignment steps over six seams, so the first four seams carry
-        // 80 pixels and the last two the minimum 64, and the second tile starts 176 pixels in.
-        assert_eq!(planned[1].left, 80);
-        assert_eq!(planned[1].latent_columns, (176 / 16, (176 + 256) / 16));
-        assert_eq!(planned[5].left, 64);
-        // A tile that has a successor below trims its trailing rows; the last row does not.
-        let below = planned[7];
-        assert_eq!(below.row, 1);
-        assert_eq!(below.above, 96);
-        assert_eq!(planned[planned.len() - 1].below, 0);
-    }
-
-    #[test]
-    fn every_tile_of_a_canvas_has_a_canvas_of_its_own() {
-        let config = video_config();
-        let canvas = Canvas::clip(&config, 48, 52);
-        let tiles = Tiles::of(&config, &canvas).expect("tiles");
-        for tile in tiles.tiles(&config, &canvas) {
-            assert!(tile.latent_rows.1 <= canvas.height);
-            assert!(tile.latent_columns.1 <= canvas.width);
-            assert!(tile.latent_rows.0 < tile.latent_rows.1);
-            assert!(tile.latent_columns.0 < tile.latent_columns.1);
-            assert_eq!(
-                tile.canvas.rows(),
-                u64::from(tile.canvas.frames)
-                    * u64::from(tile.latent_rows.1 - tile.latent_rows.0)
-                    * u64::from(tile.latent_columns.1 - tile.latent_columns.0)
-                    + u64::from(tile.canvas.registers)
-                    + u64::from(tile.canvas.tail)
-            );
-        }
+        assert_eq!(grid(&config, &canvas).expect("a grid").len(), 4 * 7);
+        let one = tile(&config, &canvas).expect("a tile");
+        assert_eq!((one.height, one.width), (16, 16));
+        assert_eq!(one.rows(), 7 * 16 * 16 + 4 + 1);
+        // A canvas inside one tile is its own tile.
+        let small = Canvas::clip(&config, 8, 12);
+        assert_eq!(tile(&config, &small).expect("a tile"), small);
     }
 
     #[test]
@@ -2048,15 +1705,16 @@ pub(crate) mod tests {
     #[test]
     fn a_clip_decodes_seven_latent_frames_into_twenty_five() {
         let config = video_config();
-        assert_eq!(decode_latents(&config), 7);
+        let clips = clips(&config);
+        assert_eq!(clips.window(), 7);
         assert_eq!(config.temporal_compression(), 4);
         // The decode emits 28 frames and the splice keeps 25 of them: 25 = 17 + 3 + 5.
-        let native = config.clip_length + config.token_drop + crate::decoding::OVERLAP_FRAMES;
-        assert_eq!(native, 25);
+        assert_eq!(clips.native(), 25);
         assert_eq!(
-            decode_latents(&config) * config.temporal_compression() - native,
+            clips.window() * config.temporal_compression() - clips.native(),
             3
         );
+        assert_eq!(clips.start(2), 10);
         let canvas = Canvas::clip(&config, 16, 16);
         assert_eq!(canvas.frames, 7);
         assert_eq!(canvas.frames_out(&config), 28);

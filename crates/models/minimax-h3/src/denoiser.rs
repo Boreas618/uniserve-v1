@@ -1982,7 +1982,6 @@ impl Denoiser {
             u32::try_from(width).unwrap_or(0),
         );
         let clip = crate::tiled_encode::ClipEncoder::new(taller, wider)?;
-        let plan = clip.plan();
         // One packed copy per tile, taken from the piece's own raster. `CausalPad` - which pads a
         // tile's edges - reads each frame's rows in place, so it wants the *tile's* row stride and a
         // tile cut from a wider raster has the raster's: the kernel refuses it by name ("a frame's
@@ -2012,11 +2011,10 @@ impl Denoiser {
         // and the posterior's first operand share one width
         // (`crate::encoding::VideoEncoder::moments`).
         let video_channels = u64::from(self.config.transformer.video_channels);
-        let (origin, end) = plan.extent();
-        let run_rows = u64::from(end - origin);
+        let run_rows = u64::from(clip.latent_extent().0);
         let run_columns = u64::from(wider / crate::encoding::SPATIAL_RATIO);
         let latent_frames = u64::from(encoders.video.latent_frames(frame_count)?);
-        let (tile_height, tile_width) = plan.tiles.iter().fold((0_u64, 0_u64), |held, tile| {
+        let (tile_height, tile_width) = clip.tiles().iter().fold((0_u64, 0_u64), |held, tile| {
             (
                 held.0.max(u64::from(tile.rows.1) * compression),
                 held.1.max(u64::from(tile.columns.1) * compression),
@@ -2031,7 +2029,7 @@ impl Denoiser {
         // before the next is copied, and copying them all first would encode the last tile's pixels
         // every time.
         let tiles_of = |first: u32, length: u32| {
-            plan.tiles
+            clip.tiles()
                 .iter()
                 .map(|tile| {
                     TensorView::with_strides(
@@ -2068,7 +2066,7 @@ impl Denoiser {
             Shape::new(&[moment_channels, u64::from(widest), run_rows, run_columns]),
             run.strides,
         );
-        let reserved = clip.reserve(f, &encoders.video, &plan, &lengths, widest)?;
+        let reserved = clip.reserve(f, &encoders.video, &lengths, widest)?;
         for span in &clips {
             let blended = TensorView::with_strides(
                 run.element(&[0, u64::from(span.latent), 0, 0]),
@@ -2081,10 +2079,9 @@ impl Denoiser {
                 ]),
                 run.strides,
             );
-            clip.encode_in(
+            clip.encode(
                 f,
                 &encoders.video,
-                &plan,
                 crate::tiled_encode::Scene {
                     pixels: &tiles_of(span.first, span.frames),
                     packed: Some(buffer),
