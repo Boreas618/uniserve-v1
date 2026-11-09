@@ -1,7 +1,7 @@
 //! The programs this deployment compiles, one `operator<TAB>key` line each.
 //!
 //! ```text
-//! cargo run -p minimax-h3 --example programs -- $UNISERVE_H3_MODEL [samples ...]
+//! cargo run -p minimax-h3 --example programs -- MiniMaxAI/MiniMax-H3 [samples ...]
 //! ```
 //!
 //! The rows are a deployment's key file: what a kernel package must provide for

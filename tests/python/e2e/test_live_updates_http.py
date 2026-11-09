@@ -45,8 +45,10 @@ import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    QWEN3_MOE,
     find_free_port,
     log_tail,
+    model_dir,
     require_uniserve_binary,
     server_process,
     start_server,
@@ -127,9 +129,7 @@ def program_server_option() -> list[str]:
 
 
 def _checkpoint() -> str:
-    checkpoint = os.environ.get("UNISERVE_QWEN3_MODEL", "")
-    if not checkpoint or not Path(checkpoint).is_dir():
-        pytest.fail("UNISERVE_QWEN3_MODEL must name the model checkpoint")
+    checkpoint = str(model_dir(QWEN3_MOE))
     return checkpoint
 
 
@@ -2756,7 +2756,7 @@ def test_requests_that_outgrow_the_cache_in_decode_all_finish(
 
 
 def test_a_weight_update_leaves_the_pages_of_the_old_weights_in_the_host_cache(
-    tmp_path: Path, runtime: Path
+    other_weights: str, tmp_path: Path, runtime: Path
 ):
     """A page in the host KV cache belongs to the weights that computed it.
 
@@ -2767,9 +2767,7 @@ def test_a_weight_update_leaves_the_pages_of_the_old_weights_in_the_host_cache(
     the files, so the two weights answer alike and a stale page would go unseen
     in the text.
     """
-    other = os.environ.get("UNISERVE_QWEN3_UPDATED_MODEL")
-    if not other:
-        pytest.skip("UNISERVE_QWEN3_UPDATED_MODEL names no other checkpoint")
+    other = other_weights
     name = "qwen3-live-weights-pages"
     log = tmp_path / "server.log"
     prompt = " ".join(f"item {index} of the list" for index in range(800))
@@ -2818,7 +2816,7 @@ def test_a_weight_update_leaves_the_pages_of_the_old_weights_in_the_host_cache(
 
 
 def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
-    tmp_path: Path, runtime: Path
+    other_weights: str, tmp_path: Path, runtime: Path
 ):
     """``previous_epoch = "host"`` moves bytes, and a revert brings them back.
 
@@ -2827,9 +2825,7 @@ def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
     the target serves. The revert returns them and starts the epoch on them,
     under a stream that crosses both moves whole, and it answers as it did.
     """
-    other = os.environ.get("UNISERVE_QWEN3_UPDATED_MODEL")
-    if not other:
-        pytest.skip("UNISERVE_QWEN3_UPDATED_MODEL names no other checkpoint")
+    other = other_weights
     name = "qwen3-live-host-weights"
     log = tmp_path / "server.log"
     # The target loads its checkpoint beside the serving one, and the

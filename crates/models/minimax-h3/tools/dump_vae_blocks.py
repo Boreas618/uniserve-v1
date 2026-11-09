@@ -24,7 +24,7 @@ One probe per invocation, so a failure costs one tensor and not the batch:
 
     python crates/models/minimax-h3/tools/dump_vae_blocks.py --list
     python crates/models/minimax-h3/tools/dump_vae_blocks.py \\
-        --checkpoint $UNISERVE_H3_MODEL --probe video_decoder:decoder.decoder.layers.0.qkv \\
+        --checkpoint <checkpoint directory> --probe video_decoder:decoder.decoder.layers.0.qkv \\
         --out artifacts/diagnosis/vae-blocks/ref
 
 The plan is printed before anything is loaded, so a wrong module path or a missing weight shard is
@@ -33,7 +33,7 @@ fixed input, and runs the reference's module on the input a candidate's stage wr
 comparison is about the reference's arithmetic and not about who drew the clip's latents.
 
     python crates/models/minimax-h3/tools/dump_vae_blocks.py --probe decode_out \\
-        --stack artifacts/h3-stage2/video_decoder --checkpoint $UNISERVE_H3_MODEL \\
+        --stack artifacts/h3-stage2/video_decoder --checkpoint <checkpoint directory> \\
         --out artifacts/h3-stage2-ref --device cuda A probe is a module path, relative to the component's root module, and the
 value written is that module's output for a fixed input the options below make reproducible.
 

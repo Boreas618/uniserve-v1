@@ -1,5 +1,5 @@
 //!
-//!     cargo run -p qwen3-moe --example audit_checkpoint -- [--root $UNISERVE_QWEN3_MODEL]
+//!     cargo run -p qwen3-moe --example audit_checkpoint -- [--root Qwen/Qwen3-30B-A3B]
 //!
 //! The slice loads this checkpoint against these rules, so a single renamed tensor in one of 48
 //! layers surfaces as a missing-tensor refusal deep in a GPU run. This reads only what the checkout
@@ -189,13 +189,12 @@ fn root_argument() -> Result<PathBuf, String> {
         }
     }
     if root.as_os_str().is_empty() {
-        root = std::env::var_os("UNISERVE_QWEN3_MODEL")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                eprintln!("name the checkpoint with --root or UNISERVE_QWEN3_MODEL");
-                std::process::exit(2)
-            });
+        root = PathBuf::from(qwen3_moe::REPO_ID);
     }
+    root = nn::hub::model_dir(&root.to_string_lossy()).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2)
+    });
     Ok(root)
 }
 

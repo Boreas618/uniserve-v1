@@ -61,6 +61,10 @@ pub mod transformer;
 pub mod video_vae;
 pub mod vision;
 
+/// The Hugging Face repository this crate's examples and tests read when none is named, as vLLM's
+/// model registry names one example checkpoint per architecture.
+pub const REPO_ID: &str = "MiniMaxAI/MiniMax-H3";
+
 pub use checkpoint::{
     AttentionBackend, Contract, ContractSchedule, Dit, Layout, Sidecars, SparseContract,
 };

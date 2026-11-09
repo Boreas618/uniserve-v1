@@ -7,7 +7,7 @@
 //! implementations disagree about, and nothing about a build.
 //!
 //! ```text
-//! cargo run -q -p minimax-h3 --example schedule_dump -- --root $UNISERVE_H3_MODEL \
+//! cargo run -q -p minimax-h3 --example schedule_dump -- --root MiniMaxAI/MiniMax-H3 \
 //!     --out artifacts/diagnosis/minimax-h3/schedule --commit <sha>
 //! ```
 //!
@@ -62,13 +62,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if root.as_os_str().is_empty() {
-        root = std::env::var_os("UNISERVE_H3_MODEL")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                eprintln!("name the checkpoint with --root or UNISERVE_H3_MODEL");
-                std::process::exit(2)
-            });
+        root = PathBuf::from(minimax_h3::REPO_ID);
     }
+    root = nn::hub::model_dir(&root.to_string_lossy()).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2)
+    });
 
     let layout = Layout::detect(&root)?;
     let sidecars = Sidecars::read(&root, None, &layout)?;

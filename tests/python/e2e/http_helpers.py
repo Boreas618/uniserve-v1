@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 from PIL import Image
 
 from uniserve_eval.transport.sse import iter_sse_events
@@ -97,6 +98,33 @@ def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+#: The Hugging Face repositories the end-to-end tests serve. The reference
+#: engines name their test models this way, and the weights resolve through the
+#: local Hub cache that ``HF_HOME`` locates.
+QWEN3_MOE = "Qwen/Qwen3-30B-A3B"
+MINIMAX_H3 = "MiniMaxAI/MiniMax-H3"
+FAST_H3 = "FastVideo/FastVideo-FastH3-8-Step-V2"
+FAST_H3_OMNI = "FastVideo/FastVideo-FastH3-Omni-8-Step-V1"
+
+
+def model_dir(repo_id: str) -> Path:
+    """The local Hub cache's snapshot of `repo_id`.
+
+    Nothing is downloaded: the test fails, naming the command that fetches the
+    repository, when the cache holds none.
+    """
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    try:
+        return Path(snapshot_download(repo_id, local_files_only=True))
+    except LocalEntryNotFoundError:
+        pytest.fail(
+            f"the Hugging Face cache holds no snapshot of {repo_id}: "
+            f"`huggingface-cli download {repo_id}` fetches it"
+        )
 
 
 def require_uniserve_binary() -> Path:

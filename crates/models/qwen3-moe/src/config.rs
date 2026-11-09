@@ -523,11 +523,11 @@ mod tests {
     /// values the design's slice depends on.
     #[test]
     fn the_local_checkpoint_metadata_parses() {
-        // The local checkpoint's metadata, when `UNISERVE_QWEN3_MODEL` names one.
-        let Some(root) = std::env::var_os("UNISERVE_QWEN3_MODEL") else {
+        // The checkpoint's metadata, when the Hub cache holds it.
+        let Ok(root) = nn::hub::model_dir(crate::REPO_ID) else {
             return;
         };
-        let path = std::path::Path::new(&root).join("config.json");
+        let path = root.join("config.json");
         let path = path.as_path();
         if !path.is_file() {
             return;

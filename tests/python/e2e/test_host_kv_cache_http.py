@@ -31,8 +31,10 @@ import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    QWEN3_MOE,
     find_free_port,
     gpu_device,
+    model_dir,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -152,9 +154,7 @@ def _runtime() -> Path:
 
 
 def _checkpoint() -> str:
-    checkpoint = os.environ.get("UNISERVE_QWEN3_MODEL", "")
-    if not checkpoint or not Path(checkpoint).is_dir():
-        pytest.fail("UNISERVE_QWEN3_MODEL must name the model checkpoint")
+    checkpoint = str(model_dir(QWEN3_MOE))
     return checkpoint
 
 

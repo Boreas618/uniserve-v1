@@ -9,7 +9,6 @@ that position.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -18,7 +17,9 @@ import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    QWEN3_MOE,
     find_free_port,
+    model_dir,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -161,24 +162,20 @@ def one_device(
 
 
 @pytest.mark.parametrize(
-    ("description", "model_env"),
+    ("description", "repo_id"),
     [
-        pytest.param(
-            "qwen3", "UNISERVE_QWEN3_MODEL", marks=pytest.mark.model("qwen3")
-        ),
+        pytest.param("qwen3", QWEN3_MOE, marks=pytest.mark.model("qwen3")),
     ],
 )
 @pytest.mark.parametrize("parallel_axis", ["tensor", "pipeline", "sequence"])
 def test_ordered_bindings_generate_outputs(
     tmp_path: Path,
     description: str,
-    model_env: str,
+    repo_id: str,
     parallel_axis: str,
     one_device: Callable[[str, str], dict[str, list[Any]]],
 ):
-    checkpoint = os.environ.get(model_env, "")
-    if not checkpoint or not Path(checkpoint).is_dir():
-        pytest.fail(f"{model_env} must name the model checkpoint directory")
+    checkpoint = str(model_dir(repo_id))
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     parallel = (

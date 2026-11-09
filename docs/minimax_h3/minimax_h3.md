@@ -44,11 +44,8 @@ The NVFP4 repositories are ModelOpt PTQ checkpoints and need Blackwell. A FastH3
 An OmniRef export holds only its DiT partition and schedulers. Its `fastvideo_inference.json` pins the base revision (`base_model_revision`) whose text encoder, tokenizer, processor and VAEs it uses, and the server and workers read every directory the export omits from the Hugging Face cache at that revision, downloading what the cache lacks.
 
 ```bash
-export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
-hf download FastVideo/FastVideo-FastH3-8-Step-V2 --local-dir "$H3_MODEL"
-
-export H3_ROOT=/workspace/models/MiniMax-H3
-hf download MiniMaxAI/MiniMax-H3 --local-dir "$H3_ROOT"
+hf download FastVideo/FastVideo-FastH3-8-Step-V2
+hf download MiniMaxAI/MiniMax-H3
 
 # The base components an OmniRef export pins, into the Hugging Face cache.
 hf download MiniMaxAI/MiniMax-H3 --revision <base_model_revision> \
@@ -61,7 +58,7 @@ hf download MiniMaxAI/MiniMax-H3 --revision <base_model_revision> \
 FastH3 text-to-video and keyframe requests:
 
 ```bash
-uniserve serve "$H3_MODEL" \
+uniserve serve FastVideo/FastVideo-FastH3-8-Step-V2 \
   --worker-groups configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
@@ -71,7 +68,7 @@ uniserve serve "$H3_MODEL" \
 Base text-to-video and keyframe requests:
 
 ```bash
-uniserve serve "$H3_ROOT" \
+uniserve serve MiniMaxAI/MiniMax-H3 \
   --worker-groups configs/minimax_h3/ulysses4.toml --served-model-name MiniMax-H3 \
   --host 0.0.0.0 --set video_config.max_seconds=8 --max-model-len 2048 \
   --set video_config.text_capacities=2048
@@ -80,7 +77,7 @@ uniserve serve "$H3_ROOT" \
 Reference requests, with the base reference denoiser or an OmniRef export:
 
 ```bash
-uniserve serve "$H3_ROOT" \
+uniserve serve MiniMaxAI/MiniMax-H3 \
   --worker-groups configs/minimax_h3/ulysses4-reference.toml \
   --served-model-name MiniMax-H3 --host 0.0.0.0 \
   --set video_config.max_seconds=5 --max-model-len 8192 \
@@ -192,8 +189,8 @@ The latent encoder's ranks (`temporal_units`) encode a request's condition units
 docker build -f docs/minimax_h3/Dockerfile -t uniserve-h3 .
 
 docker run --rm --gpus all --shm-size=4g --ulimit memlock=-1 -p 8000:8000 \
-  -v "$H3_MODEL:/models/h3:ro" \
-  uniserve-h3 serve /models/h3 \
+  -v "${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface" \
+  uniserve-h3 serve FastVideo/FastVideo-FastH3-8-Step-V2 \
     --worker-groups configs/minimax_h3/ulysses4.toml \
     --served-model-name FastH3 \
     --host 0.0.0.0 \

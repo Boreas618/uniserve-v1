@@ -20,7 +20,7 @@ tensor that changes shape changes in one place.
 
     python crates/models/minimax-h3/tools/dump_denoiser.py --list
     python crates/models/minimax-h3/tools/dump_denoiser.py \\
-        --checkpoint $UNISERVE_H3_MODEL --case <case.json> --probe noise \\
+        --checkpoint <checkpoint directory> --case <case.json> --probe noise \\
         --out artifacts/diagnosis/denoiser/ref
 
 One probe per invocation, so a failure costs one tensor set and not the batch. The plan is printed

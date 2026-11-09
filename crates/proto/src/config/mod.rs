@@ -864,7 +864,8 @@ impl Default for VideoJobConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
-    /// Local model directory or Hugging Face repository.
+    /// The checkpoint: a local model directory or Hugging Face repository in the options, and
+    /// the local directory the engine loads once the leader prepares the engine configuration.
     pub model: String,
     /// The local snapshot of the base release the checkpoint continues, whose directories it
     /// omits; `None` for a checkpoint that holds every directory. The leader resolves it when it

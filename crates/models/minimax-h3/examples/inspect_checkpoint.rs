@@ -19,10 +19,10 @@ use minimax_h3::config::Config;
 use minimax_h3::partition::Component;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let root: PathBuf = std::env::args()
+    let model = std::env::args()
         .nth(1)
-        .ok_or("usage: inspect_checkpoint <pipeline root>")?
-        .into();
+        .unwrap_or_else(|| minimax_h3::REPO_ID.to_owned());
+    let root: PathBuf = nn::hub::model_dir(&model)?;
 
     let layout = Layout::detect(&root)?;
     println!("root: {}", root.display());

@@ -14,7 +14,7 @@ The protocol lives in `uniserve_eval/qwen3_moe.toml` (suite `qwen3-moe-gsm8k`); 
 
 All three cells also record `checkpoint = "Qwen3-30B-A3B"`; the column shows the fields that differ.
 
-The BF16 and FP8 KV cells serve the Qwen3-MoE checkpoint at `/workspace/models/Qwen3-30B-A3B`, named by `UNISERVE_QWEN3_MOE_MODEL`; the profile defaults the path. The NVFP4 cell serves a local copy of `nvidia/Qwen3-30B-A3B-NVFP4`, a ModelOpt unified export whose own `config.json` declares its quantization; `UNISERVE_QWEN3_MOE_NVFP4_MODEL` names that directory and has no default, so a host without the export cannot run the NVFP4 cell. The other two cells' server commands do not name the variable. The cells differ in the checkpoint path and the KV cache dtype, and the FP8 KV cell also names an attention provider (see [FP8 KV pages](#fp8-kv-pages)). Each cell's `provenance` is its identity in the comparison.
+The BF16 and FP8 KV cells serve `Qwen/Qwen3-30B-A3B`, and the NVFP4 cell serves `nvidia/Qwen3-30B-A3B-NVFP4`, a ModelOpt unified export whose own `config.json` declares its quantization. The servers read both from the local Hugging Face cache that `HF_HOME` locates, so a host whose cache lacks the export cannot run the NVFP4 cell. The cells differ in the checkpoint and the KV cache dtype, and the FP8 KV cell also names an attention provider (see [FP8 KV pages](#fp8-kv-pages)). Each cell's `provenance` is its identity in the comparison.
 
 No cell states `dtype` or `quantization`: the checkpoint's own representation is used, and `quantization_config` and its precision presets are retired in favour of the checkpoint representation and the `quantization` field. The serving capacity is build configuration: `--mem-fraction-static` defaults to 0.80 and `kv_cache_config.max_tokens` to 65536, and a host may lower either through `UNISERVE_QWEN3_MOE_MEM_FRACTION` or `UNISERVE_QWEN3_MOE_KV_MAX_TOKENS` without making a cell's two runs incomparable.
 
@@ -68,8 +68,6 @@ The BF16 and NVFP4 cells name no attention backend, so each implementation selec
 The profile reads these environment variables:
 
 ```bash
-export UNISERVE_QWEN3_MOE_MODEL=/workspace/models/Qwen3-30B-A3B
-export UNISERVE_QWEN3_MOE_NVFP4_MODEL=<local directory of the NVFP4 export>
 export UNISERVE_QWEN3_MOE_CUDA_VISIBLE_DEVICES=0
 # Optional: UNISERVE_GSM8K_DATASET names a local copy of the test split;
 # UNISERVE_QWEN3_MOE_MEM_FRACTION, UNISERVE_QWEN3_MOE_KV_MAX_TOKENS and

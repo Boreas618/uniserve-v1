@@ -1,7 +1,7 @@
 //! A model's programs, recorded from the model's own `forward`.
 //!
 //! ```text
-//! cargo run -p minimax-h3 --example record -- --root $UNISERVE_H3_MODEL --component all \
+//! cargo run -p minimax-h3 --example record -- --root MiniMaxAI/MiniMax-H3 --component all \
 //!     --clip 260 --raster 672x1536 --extents h3-audio-extents.json \
 //!     --against <key file>
 //! ```
@@ -267,13 +267,12 @@ fn run() -> Result<(), String> {
         }
     }
     if root.as_os_str().is_empty() {
-        root = std::env::var_os("UNISERVE_H3_MODEL")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                eprintln!("name the checkpoint with --root or UNISERVE_H3_MODEL");
-                std::process::exit(2)
-            });
+        root = PathBuf::from(minimax_h3::REPO_ID);
     }
+    root = nn::hub::model_dir(&root.to_string_lossy()).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2)
+    });
     if let Some(table) = check {
         return check_extents(&root, &table);
     }

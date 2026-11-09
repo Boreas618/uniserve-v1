@@ -28,6 +28,8 @@ from pathlib import Path
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    QWEN3_MOE,
+    model_dir,
     require_uniserve_binary,
     start_server,
     stop_server,
@@ -275,8 +277,8 @@ def program_server(
 
     * the kernels — a module for every descriptor key the deployment launches,
       built into the store by ``build_fixtures`` from :func:`deployment_keys`
-      over `checkpoint`, which defaults to the one ``UNISERVE_QWEN3_MODEL``
-      names. The epoch is
+      over `checkpoint`, which defaults to the local Hub cache's snapshot of
+      ``Qwen/Qwen3-30B-A3B``. The epoch is
       refused by the first slot no installed program fills, and a main process
       serves nothing until it can install the kernels the model launches;
     * the policy — ``POLICY_PACKAGE``, installed below, because a policy is a
@@ -302,12 +304,7 @@ def program_server(
     built = Path(named) if named else work / "programs"
     if not named:
         if checkpoint is None:
-            stated = os.environ.get("UNISERVE_QWEN3_MODEL")
-            if not stated:
-                pytest.fail(
-                    "UNISERVE_QWEN3_MODEL must name the model checkpoint"
-                )
-            checkpoint = Path(stated)
+            checkpoint = model_dir(QWEN3_MOE)
         build_store(built, target, interpreter, checkpoint)
     # The builder's two directories are the two the server is given: installed
     # sources for a rebuild, prepared modules for what it serves.

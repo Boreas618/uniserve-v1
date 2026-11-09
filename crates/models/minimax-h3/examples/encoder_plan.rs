@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run -p minimax-h3 --example encoder_plan -- \
-//!     --root $UNISERVE_H3_MODEL --frames 17 --height 768 --width 768
+//!     --root MiniMaxAI/MiniMax-H3 --frames 17 --height 768 --width 768
 //! ```
 //!
 //! ## Why this exists
@@ -33,7 +33,7 @@ const USAGE: &str = "\
 usage: encoder_plan [--root <checkpoint>] [--frames <n>] [--height <n>] [--width <n>]
                     [--extents <json>] [--arena <bytes>] [--check]
 
-  --root     the checkpoint's small files (default $UNISERVE_H3_MODEL)
+  --root     the checkpoint's small files (default MiniMaxAI/MiniMax-H3)
   --frames   the clip's raster frames (default 17, the decoder's clip body)
   --height   the raster's pixel height (default 768)
   --width    the raster's pixel width (default 768)
@@ -87,13 +87,12 @@ fn run() -> Result<(), String> {
         }
     }
     if root.as_os_str().is_empty() {
-        root = std::env::var_os("UNISERVE_H3_MODEL")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                eprintln!("name the checkpoint with --root or UNISERVE_H3_MODEL");
-                std::process::exit(2)
-            });
+        root = PathBuf::from(minimax_h3::REPO_ID);
     }
+    root = nn::hub::model_dir(&root.to_string_lossy()).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2)
+    });
 
     let config = video_config(&root)?;
 

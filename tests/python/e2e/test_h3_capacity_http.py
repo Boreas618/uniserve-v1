@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 import time
 from pathlib import Path
@@ -12,7 +11,9 @@ import pytest
 from transformers import AutoTokenizer
 
 from tests.python.e2e.http_helpers import (
+    FAST_H3,
     find_free_port,
+    model_dir,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -105,12 +106,7 @@ def test_every_admitted_duration_and_prompt_length_replays(
     of different layouts then run concurrently on the two request slots, and
     each matches its own isolated execution.
     """
-    model = os.environ.get("UNISERVE_H3_MODEL")
-    if not model or not Path(model).is_dir():
-        pytest.fail(
-            "UNISERVE_H3_MODEL must name a supported FastH3 checkpoint "
-            "directory; docs/minimax_h3/minimax_h3.md lists them"
-        )
+    model = str(model_dir(FAST_H3))
     deployment = (
         Path(__file__).resolve().parents[3]
         / "configs"

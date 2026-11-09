@@ -9,10 +9,10 @@
 //! which is why neither of those comparators can stand in for this one.
 //!
 //! ```text
-//! cargo run -q -p minimax-h3 --example vision_rope -- --root $UNISERVE_H3_MODEL \
+//! cargo run -q -p minimax-h3 --example vision_rope -- --root MiniMaxAI/MiniMax-H3 \
 //!     --height 4 --width 4 --merge 2 --out artifacts/h3-vision-rope
 //! python crates/models/minimax-h3/tools/compare_rope_factors.py --vision \
-//!     artifacts/h3-vision-rope --checkpoint $UNISERVE_H3_MODEL
+//!     artifacts/h3-vision-rope --checkpoint MiniMaxAI/MiniMax-H3
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
-            "--root" => root = Some(PathBuf::from(value()?)),
+            "--root" => root = Some(nn::hub::model_dir(&value()?)?),
             "--out" => out = PathBuf::from(value()?),
             "--height" => height = value()?.parse()?,
             "--width" => width = value()?.parse()?,

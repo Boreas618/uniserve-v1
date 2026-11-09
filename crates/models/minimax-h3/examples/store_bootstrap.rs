@@ -26,7 +26,7 @@
 //! ```text
 //! cargo build -p minimax-h3 --example programs
 //! cargo run -p minimax-h3 --example store_bootstrap -- \
-//!     --programs target/release/examples/programs --root $UNISERVE_H3_MODEL \
+//!     --programs target/release/examples/programs --root MiniMaxAI/MiniMax-H3 \
 //!     --dtypes bf16,f16 --ulysses 1,2 --conditioned true --samples 256 \
 //!     --rasters 480x832 --tokens 4096 --rows 32000 --elements 123456 --track 44100 --tp 1 \
 //!     > <bootstrap list>

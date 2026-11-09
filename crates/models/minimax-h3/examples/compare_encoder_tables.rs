@@ -215,9 +215,7 @@ fn arguments() -> Result<(PathBuf, PathBuf, PathBuf), String> {
         }
     }
     if checkpoint.as_os_str().is_empty() {
-        checkpoint = std::env::var_os("UNISERVE_H3_MODEL")
-            .map(|root| PathBuf::from(root).join("text_encoder"))
-            .ok_or("name the text encoder with --text-encoder or UNISERVE_H3_MODEL")?;
+        checkpoint = nn::hub::model_dir(minimax_h3::REPO_ID)?.join("text_encoder");
     }
     let case = case.ok_or("--case <case.json> is required")?;
     let out = out.ok_or("--out <dir> is required")?;
@@ -296,10 +294,10 @@ mod tests {
         assert!(header.contains("'descr': '<f4'"));
     }
 
-    /// The released checkpoint's own configuration, when `UNISERVE_H3_MODEL` names it.
+    /// The released checkpoint's own configuration, when the Hub cache holds it.
     fn released() -> Option<TextEncoderConfig> {
-        let root = std::env::var_os("UNISERVE_H3_MODEL")?;
-        read_config(&Path::new(&root).join("text_encoder")).ok()
+        let root = nn::hub::model_dir(minimax_h3::REPO_ID).ok()?;
+        read_config(&root.join("text_encoder")).ok()
     }
 
     #[test]

@@ -3,7 +3,7 @@
 The successor serves on trial until the operator commits it or a fault
 rolls it back.
 
-Qwen3-MoE (``UNISERVE_QWEN3_MODEL``) streams a long greedy count. While it
+Qwen3-MoE (``Qwen/Qwen3-30B-A3B``) streams a long greedy count. While it
 streams, ``PUT /admin/config`` changes the decode batch sizes the CUDA graphs
 capture, which only a new epoch executes: a successor epoch starts beside
 the serving one on the same GPUs and maps its weights and KV cache segments
@@ -56,8 +56,10 @@ import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    QWEN3_MOE,
     dedicated_experts,
     find_free_port,
+    model_dir,
     require_uniserve_binary,
     scaled,
     server_process,
@@ -93,9 +95,7 @@ CHANGE = "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8, 16]"
 
 
 def _checkpoint() -> str:
-    checkpoint = os.environ.get("UNISERVE_QWEN3_MODEL", "")
-    if not checkpoint or not Path(checkpoint).is_dir():
-        pytest.fail("UNISERVE_QWEN3_MODEL must name the model checkpoint")
+    checkpoint = str(model_dir(QWEN3_MOE))
     return checkpoint
 
 
@@ -1072,19 +1072,6 @@ def _hits_of(base_url: str, name: str, prompt: str) -> tuple[str, float]:
     return answer, _prefix_hits(base_url) - hits
 
 
-def _updated_checkpoint() -> str:
-    """Another checkpoint of the model, of the same files but for other
-    weights (``UNISERVE_QWEN3_UPDATED_MODEL``).
-    """  # noqa: D205
-    checkpoint = os.environ.get("UNISERVE_QWEN3_UPDATED_MODEL", "")
-    if not checkpoint or not Path(checkpoint).is_dir():
-        pytest.fail(
-            "UNISERVE_QWEN3_UPDATED_MODEL must name another checkpoint of "
-            "the model, with other weights"
-        )
-    return checkpoint
-
-
 # The share of the GPU a deployment whose successor loads every weight
 # again serves with: both epochs' weights, the successor's graph share and
 # both KV caches fit in it.
@@ -1108,7 +1095,7 @@ def _weights_of(base_url: str) -> set[tuple[int, ...]]:
     ],
 )
 def test_a_change_of_model_files_loads_the_successors_weights(
-    tmp_path: Path, previous_epoch: str, end: str
+    other_weights: str, tmp_path: Path, previous_epoch: str, end: str
 ):
     """An epoch change to other model files of the same model loads the
     successor's changed weights from them beside the serving epoch's and
@@ -1120,7 +1107,7 @@ def test_a_change_of_model_files_loads_the_successors_weights(
     which return to the GPU first.
     """  # noqa: D205
     name = "qwen3-epoch-weights"
-    updated = _updated_checkpoint()
+    updated = other_weights
     change = (
         f"model={updated}",
         f"update_config.previous_epoch={previous_epoch}",
@@ -1292,7 +1279,7 @@ def _segments_of(base_url: str, epoch: int) -> int:
     ],
 )
 def test_a_parked_epoch_evicts_the_cache_its_successor_does_not_map(
-    tmp_path: Path, host_cache: str
+    other_weights: str, tmp_path: Path, host_cache: str
 ):
     """A change to other model files whose requests in flight compute their
     state again maps none of the serving epoch's KV cache. The previous
@@ -1312,7 +1299,7 @@ def test_a_parked_epoch_evicts_the_cache_its_successor_does_not_map(
     """  # noqa: D205
     name = "qwen3-epoch-evict"
     change = [
-        f"model={_updated_checkpoint()}",
+        f"model={other_weights}",
         "update_config.previous_epoch=parked",
     ]
     options, storage, cached = WEIGHTS_SHARE, None, CACHED_PROMPT

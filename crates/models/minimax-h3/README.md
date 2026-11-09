@@ -33,7 +33,7 @@ the export.
 ## Reading a checkpoint without a device
 
 ```sh
-cargo run -p minimax-h3 --example inspect_checkpoint -- $UNISERVE_H3_MODEL
+cargo run -p minimax-h3 --example inspect_checkpoint -- MiniMaxAI/MiniMax-H3
 ```
 
 It prints the contract, the DiT partitions and the tasks each serves, the text encoder's retained and

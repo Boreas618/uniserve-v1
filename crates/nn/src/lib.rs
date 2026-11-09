@@ -52,6 +52,7 @@ pub mod exchange;
 pub mod family;
 pub mod forward;
 pub mod group;
+pub mod hub;
 pub mod layers;
 pub mod tensor;
 pub mod weights;

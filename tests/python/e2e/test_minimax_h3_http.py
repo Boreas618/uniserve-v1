@@ -11,14 +11,15 @@ refused.
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    MINIMAX_H3,
     find_free_port,
+    model_dir,
     require_uniserve_binary,
     server_process,
     t2va_request,
@@ -30,11 +31,7 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("minimax_h3")]
 
 
 def test_base_text_to_video_at_every_768p_size(tmp_path: Path) -> None:
-    model = os.environ.get("UNISERVE_MINIMAX_H3_MODEL")
-    if not model or not Path(model).is_dir():
-        pytest.fail(
-            "UNISERVE_MINIMAX_H3_MODEL must name a MiniMax-H3 diffusers root"
-        )
+    model = str(model_dir(MINIMAX_H3))
     # The 768p canvas of each aspect ratio MiniMax-H3 names: 21:9, 16:9, 4:3,
     # 1:1, 3:4 and 9:16.
     sizes = [

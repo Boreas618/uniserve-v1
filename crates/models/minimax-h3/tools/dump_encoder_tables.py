@@ -31,14 +31,13 @@ Usage::
         --case case.json --out artifacts/diagnosis/<run>/ref \\
         [--text-encoder <checkpoint>/text_encoder]
 
-``--text-encoder`` defaults to the ``text_encoder`` of the checkpoint ``UNISERVE_H3_MODEL`` names.
+``--text-encoder`` defaults to the ``text_encoder`` of the local Hub cache's ``MiniMaxAI/MiniMax-H3``.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import pathlib
 import sys
 
@@ -308,9 +307,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--text-encoder", type=pathlib.Path)
     arguments = parser.parse_args(argv)
     if arguments.text_encoder is None:
-        if not os.environ.get("UNISERVE_H3_MODEL"):
-            parser.error("name the text encoder with --text-encoder or UNISERVE_H3_MODEL")
-        arguments.text_encoder = pathlib.Path(os.environ["UNISERVE_H3_MODEL"]) / "text_encoder"
+        from huggingface_hub import snapshot_download
+
+        root = snapshot_download("MiniMaxAI/MiniMax-H3", local_files_only=True)
+        arguments.text_encoder = pathlib.Path(root) / "text_encoder"
 
     case = json.loads(arguments.case.read_text())
     config = config_of(arguments.text_encoder)
