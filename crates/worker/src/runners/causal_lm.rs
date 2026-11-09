@@ -855,6 +855,33 @@ impl CommitColumns {
 /// Elements one program of a step's gather copies.
 const GATHER_BLOCK: u32 = 1024;
 
+/// The `logits_gather` descriptor of a step's gather of `columns` i32 columns a row.
+fn gather_descriptor(columns: u32) -> ops::logits::GatherDescriptor {
+    ops::logits::GatherDescriptor {
+        dtype: DType::I32,
+        columns,
+        block: GATHER_BLOCK,
+        pdl: nn::layers::launch::PDL,
+    }
+}
+
+/// Every `logits_gather` descriptor a runner of `buckets` launches over block tables `width`
+/// pages wide ([`crate::capacity::block_table_width`]).
+///
+/// The gather is a runner-owned operator: no model calls it, so the model's key enumeration cannot
+/// name it. Each step gathers its rows' block tables, `width` columns a row, and a decode step also
+/// gathers each row's input token, one column. Neither depends on a bucket's rows, so a deployment
+/// needs one key, or two when it decodes.
+pub fn gather_descriptors(buckets: &Buckets, width: u32) -> Vec<ops::logits::GatherDescriptor> {
+    let mut columns = vec![width];
+    if buckets.iter().any(|bucket| bucket.variant.is_decode()) {
+        columns.push(1);
+    }
+    columns.sort_unstable();
+    columns.dedup();
+    columns.into_iter().map(gather_descriptor).collect()
+}
+
 /// A replay on its way: what its answer reads once its copies land.
 struct Flight {
     bucket: Bucket,
@@ -5011,12 +5038,6 @@ impl<M: CausalLm> CausalLmRunner<M> {
     fn gather_step(&self, forward: &Forward<'_>, bucket: Bucket) -> Result<()> {
         let rows = u64::from(bucket.rows);
         let slots = self.columns.slots.shaped(&[rows]);
-        let gather = |columns: u32| ops::logits::GatherDescriptor {
-            dtype: DType::I32,
-            columns,
-            block: GATHER_BLOCK,
-            pdl: nn::layers::launch::PDL,
-        };
         for group in 0..self.kv.groups() {
             let Some((pooled, gathered)) = self.kv.table_source(group, bucket.rows)? else {
                 continue;
@@ -5025,7 +5046,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 .map_err(|_| Error::Invalid("a block table wider than a launch states".into()))?;
             forward
                 .operate::<ops::logits::LogitsGather>(
-                    &gather(width),
+                    &gather_descriptor(width),
                     ops::logits::GatherArgs {
                         hidden: pooled,
                         rows: slots,
@@ -5038,7 +5059,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             let future = u64::from(self.commit.slots);
             forward
                 .operate::<ops::logits::LogitsGather>(
-                    &gather(1),
+                    &gather_descriptor(1),
                     ops::logits::GatherArgs {
                         hidden: self.commit.future.shaped(&[future, 1]),
                         rows: slots,
