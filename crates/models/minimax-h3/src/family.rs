@@ -13,32 +13,23 @@ use std::sync::Arc;
 
 use nn::capability::{Decoder, Encoder, ImageShape, MediaFormat, WarmPrompt, WarmRequest};
 use nn::family::{
-    ConditionBounds, Description, Family, VideoCheckpoint, VideoFamily, VideoModel, VideoPlacement,
-    VideoServing,
+    Component, ConditionBounds, Description, Family, VideoCheckpoint, VideoFamily, VideoModel,
+    VideoPlacement, VideoServing,
 };
 use nn::{Checkpoint, DType, WeightLoader};
 
 use crate::config::{AttentionKind, Canvas, NAMED_CANVASES};
+use crate::denoiser::Capacity;
 use crate::load::MinimaxH3;
-use crate::partition::Ulysses;
 use crate::processing::ConditionPacking;
 use crate::{
     AUDIO_CHANNELS, AUDIO_HOP, AUDIO_SAMPLE_RATE, CANVAS_MULTIPLE, CLIP_FRAMES, CLIP_LATENTS,
-    Component, Config, FPS, Partition, VideoTask,
+    Config, FPS, Partition, VideoTask,
 };
 use qwen3::processor::ProcessorConfig;
 
 /// The MiniMax-H3 family.
 pub const FAMILY: Family = Family::Video(&MinimaxH3Family);
-
-/// The deployment component of the base network, which serves `t2va` and `fl2va`.
-const DENOISER_COMPONENT: &str = "transformer";
-
-/// The deployment component of the reference network, which serves `ref2va`.
-const REFERENCE_COMPONENT: &str = "transformer_ref";
-
-/// The deployment component of the text encoder.
-const TEXT_COMPONENT: &str = "text_encoder";
 
 /// The shortest output a request may ask for, in seconds.
 pub const MIN_VIDEO_SECONDS: f64 = 4.0;
@@ -72,11 +63,16 @@ struct H3Checkpoint {
 
 impl VideoCheckpoint for H3Checkpoint {
     fn denoisers(&self) -> &'static [&'static str] {
-        &[DENOISER_COMPONENT, REFERENCE_COMPONENT]
+        // The two networks a release holds, of which a deployment places one.
+        const NETWORKS: [&str; 2] = [
+            Component::Transformer.name(),
+            Component::TransformerRef.name(),
+        ];
+        &NETWORKS
     }
 
     fn text_encoder(&self) -> &'static str {
-        TEXT_COMPONENT
+        Component::TextEncoder.name()
     }
 
     fn load(
@@ -108,31 +104,38 @@ impl VideoCheckpoint for H3Checkpoint {
             )
         })?;
 
+        // **The rank's place, its blocks and its capacity travel apart.** The partition is the
+        // split alone; the network the tasks run on, the condition encoders a conditioned task
+        // reads and the postprocessor - the video decoder's second entry point, the clip splice,
+        // which holds no weights - are the placed blocks.
         let sequence = placement.sequence;
-        let ulysses = Ulysses::of(sequence.split.size as usize, sequence.projection);
-        let mut partition = Partition::serving(
+        let partition = Partition::new(
             config,
-            tasks[0],
-            ulysses,
+            sequence.split.size as usize,
             placement.tensor.size as usize,
             placement.tensor.rank as usize,
             sequence.split.rank as usize,
-        )?;
-        for task in &tasks[1..] {
-            partition = partition.also_serving(config, *task)?;
-        }
+        )?
+        .projecting(sequence.projection);
+        let blocks = crate::partition::blocks(config, &tasks)?;
 
         // The condition capacity is the deployment's when it states one: the rows a request's
-        // references take follow their rasters, which the task's own default cannot know.
-        let partition = partition.sized(
-            text_capacity,
-            serving.condition_rows.unwrap_or(partition.condition_rows),
-        );
-
-        // **The postprocessor is placed though it holds no weights.** It is the video decoder's
-        // second entry point, the clip splice, and a rank that held the decoder without it would
-        // publish a timeline's first clip and say nothing.
-        let partition = partition.placing(partition.blocks.with(Component::VideoPostprocessor));
+        // references take follow their rasters, which a task's own default cannot know. Without
+        // one it is the widest the tasks ask for.
+        let condition_rows = match serving.condition_rows {
+            Some(rows) => rows,
+            None => tasks
+                .iter()
+                .map(|task| crate::partition::condition_rows(config, *task))
+                .collect::<crate::Result<Vec<u32>>>()?
+                .into_iter()
+                .max()
+                .unwrap_or(0),
+        };
+        let capacity = Capacity {
+            text_rows: text_capacity,
+            condition_rows,
+        };
 
         let canvases = deployment_canvases(&serving.sizes)?
             .into_iter()
@@ -142,6 +145,8 @@ impl VideoCheckpoint for H3Checkpoint {
             config,
             checkpoint,
             partition,
+            blocks,
+            capacity,
             Some(placement.dtype),
             &canvases,
             loader,
@@ -151,7 +156,7 @@ impl VideoCheckpoint for H3Checkpoint {
         // the deployment's longest prompt would refuse every longer prompt at the packed prefix,
         // minutes into a load and in a component that never saw the deployment's number.
         if let Some(denoiser) = model.transformer().or(model.transformer_ref()) {
-            let held = denoiser.rules().arrangement().text_rows;
+            let held = denoiser.rules().capacity().text_rows;
             if serving
                 .text_capacities
                 .iter()
@@ -208,9 +213,9 @@ impl VideoModel for H3Pipeline {
 
     fn denoiser_component(&self) -> &'static str {
         if self.model.transformer_ref().is_some() {
-            REFERENCE_COMPONENT
+            Component::TransformerRef.name()
         } else {
-            DENOISER_COMPONENT
+            Component::Transformer.name()
         }
     }
 
@@ -281,7 +286,7 @@ impl VideoModel for H3Pipeline {
         let rows = self
             .network()
             .filter(|denoiser| denoiser.places_encoders())
-            .map_or(0, |denoiser| denoiser.rules().arrangement().condition_rows);
+            .map_or(0, |denoiser| denoiser.rules().capacity().condition_rows);
 
         // A condition row is one latent patch, `CANVAS_MULTIPLE` pixels square, of one latent
         // frame, which covers up to `CLIP_FRAMES / CLIP_LATENTS` output frames rounded up; a
@@ -357,9 +362,9 @@ fn served_tasks(
         .copied()
         .filter(|task| {
             components.contains(if reference(task) {
-                REFERENCE_COMPONENT
+                Component::TransformerRef.name()
             } else {
-                DENOISER_COMPONENT
+                Component::Transformer.name()
             })
         })
         .collect();
@@ -599,7 +604,7 @@ fn condition_packing(denoiser: &crate::denoiser::Denoiser) -> ConditionPacking {
     };
     ConditionPacking {
         capacity: if denoiser.places_encoders() {
-            denoiser.rules().arrangement().condition_rows
+            denoiser.rules().capacity().condition_rows
         } else {
             0
         },

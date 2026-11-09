@@ -75,6 +75,115 @@ impl Split {
     pub const WHOLE: Self = Self { size: 1, rank: 0 };
 }
 
+/// One block of a video pipeline, by the name a deployment file places it under and execution
+/// reports it by.
+///
+/// The vocabulary is the pipeline components' (`model_index.json`'s names), shared by every video
+/// family; which checkpoint directories a block reads is the family's own mapping.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Component {
+    /// The text encoder and its vision tower.
+    TextEncoder,
+    /// The base denoiser network.
+    Transformer,
+    /// The reference-conditioned denoiser network.
+    TransformerRef,
+    /// The video VAE decoder.
+    VideoDecoder,
+    /// The audio VAE decoder.
+    AudioDecoder,
+    /// The condition encoders a conditioned task reads its media with.
+    LatentEncoder,
+    /// The video postprocessor: the clip splice, which holds no weights.
+    VideoPostprocessor,
+}
+
+impl Component {
+    /// Every component a deployment may place, in deployment order.
+    pub const ALL: [Component; 7] = [
+        Component::TextEncoder,
+        Component::Transformer,
+        Component::TransformerRef,
+        Component::VideoDecoder,
+        Component::AudioDecoder,
+        Component::LatentEncoder,
+        Component::VideoPostprocessor,
+    ];
+
+    /// This component's bit in [`Components`].
+    const fn bit(self) -> u8 {
+        match self {
+            Self::TextEncoder => 0,
+            Self::Transformer => 1,
+            Self::TransformerRef => 2,
+            Self::VideoDecoder => 3,
+            Self::AudioDecoder => 4,
+            Self::LatentEncoder => 5,
+            Self::VideoPostprocessor => 6,
+        }
+    }
+
+    /// The component's name in a deployment file and in what execution reports.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::TextEncoder => "text_encoder",
+            Self::Transformer => "transformer",
+            Self::TransformerRef => "transformer_ref",
+            Self::VideoDecoder => "video_decoder",
+            Self::AudioDecoder => "audio_decoder",
+            Self::LatentEncoder => "latent_encoder",
+            Self::VideoPostprocessor => "video_postprocessor",
+        }
+    }
+}
+
+/// A set of pipeline components: the blocks one rank places.
+///
+/// A deployment places a handful of blocks out of seven, so the set is a bit per block and `Copy`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Components(u8);
+
+impl Components {
+    /// Every block a deployment may place.
+    pub const ALL: Components = Components((1 << Component::ALL.len()) - 1);
+
+    /// No block.
+    pub const NONE: Components = Components(0);
+
+    /// The set of `components`.
+    pub fn of(components: impl IntoIterator<Item = Component>) -> Self {
+        components.into_iter().fold(Self::NONE, Self::with)
+    }
+
+    /// The set with `component` added.
+    pub const fn with(self, component: Component) -> Self {
+        Self(self.0 | 1 << component.bit())
+    }
+
+    /// The set without `component`.
+    pub const fn without(self, component: Component) -> Self {
+        Self(self.0 & !(1 << component.bit()))
+    }
+
+    /// Whether `component` is placed.
+    pub const fn contains(self, component: Component) -> bool {
+        self.0 & (1 << component.bit()) != 0
+    }
+
+    /// The blocks placed, in deployment order.
+    pub fn iter(self) -> impl Iterator<Item = Component> {
+        Component::ALL
+            .into_iter()
+            .filter(move |component| self.contains(*component))
+    }
+}
+
+impl FromIterator<Component> for Components {
+    fn from_iter<I: IntoIterator<Item = Component>>(components: I) -> Self {
+        Self::of(components)
+    }
+}
+
 /// A causal language model family.
 pub trait TextFamily: Send + Sync {
     /// The `architectures` classes this family loads.

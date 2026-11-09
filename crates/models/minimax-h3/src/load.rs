@@ -31,18 +31,17 @@
 
 use std::sync::Arc;
 
+use nn::family::{Component, Components};
+
 use crate::audio_vae::AudioDecoder;
 use crate::checkpoint::Dit;
 use crate::config::Config;
-use crate::denoiser::{ConditionEncoders, Denoiser, Layouts};
+use crate::denoiser::{Capacity, ConditionEncoders, Denoiser, Layouts};
+use crate::partition::directories;
 use crate::schedule::Schedule;
 use crate::text_encoder::TextEncoder;
 use crate::transformer::StudentHeads;
 use crate::{Error, Partition, Result};
-
-/// The block type is the partition's; re-exported here because a block and its loading are read
-/// together, and the layers beside them name their block this way.
-pub use crate::partition::Component;
 
 /// A loaded deployment: the components this rank places, each constructed once.
 pub struct MinimaxH3 {
@@ -102,7 +101,7 @@ impl MinimaxH3 {
 
     /// The reference DiT partition, when this rank places it.
     ///
-    /// A deployment places at most one of the two (`Partition::validate` refuses both), so exactly
+    /// A deployment places at most one of the two (`partition::blocks` refuses both), so exactly
     /// one of this and [`MinimaxH3::transformer`] is `Some` when a denoiser is placed at all.
     pub fn transformer_ref(&self) -> Option<&Arc<Denoiser>> {
         self.transformer_ref.as_ref()
@@ -154,9 +153,9 @@ pub fn refiner_types(text_encoder: nn::DType, dit: nn::DType, dit_directory: &st
 /// Load the deployment this rank places.
 ///
 /// `config` is the configuration the family read from `checkpoint` when it opened it; nothing here
-/// reads a sidecar again. The place and the blocks are the `partition`'s: it names the degrees and
-/// the rank's position in them, the blocks this rank holds, and the row capacities those blocks are
-/// sized for. The checkpoint is one file set per pipeline: an export that continues a base release
+/// reads a sidecar again. `partition` names the degrees and the rank's position in them, `blocks`
+/// the pipeline components this rank places ([`crate::partition::blocks`]), and `capacity` the
+/// prefix rows the denoiser's layouts hold, which the deployment serves. The checkpoint is one file set per pipeline: an export that continues a base release
 /// is opened by the engine as one checkpoint spanning both, so this function never learns about
 /// bases.
 ///
@@ -169,10 +168,17 @@ pub fn refiner_types(text_encoder: nn::DType, dit: nn::DType, dit_directory: &st
 ///
 /// A block this build cannot construct is refused with [`Error::Unsupported`], naming it, rather
 /// than omitted: a deployment that places one must fail at load, not on the device.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the configuration and checkpoint, the partition, the placed blocks, the capacity, \
+              the element type, the rasters and the loader are each the load's own input"
+)]
 pub fn load(
     config: &Config,
     checkpoint: &nn::Checkpoint,
     partition: Partition,
+    blocks: Components,
+    capacity: Capacity,
     dtype: Option<nn::DType>,
     canvases: &[(u32, u32)],
     loader: &mut nn::weights::WeightLoader<'_>,
@@ -184,7 +190,7 @@ pub fn load(
         match dtype {
             Some(stated) => Ok(stated),
             None => Ok(checkpoint
-                .component(component.directories()[0])?
+                .component(directories(component)[0])?
                 .stored_dtype()?),
         }
     };
@@ -195,11 +201,11 @@ pub fn load(
     // request that states no pin, and by the operator's own launch check, which names the cell. Two
     // components, one number: the refiner spans the text encoder and the DiT, so their stored types
     // must agree before a single weight is read.
-    if partition.blocks.contains(Component::TextEncoder) {
+    if blocks.contains(Component::TextEncoder) {
         for dit in [Dit::Base, Dit::Reference] {
             let placed = match dit {
-                Dit::Base => partition.blocks.contains(Component::Transformer),
-                Dit::Reference => partition.blocks.contains(Component::TransformerRef),
+                Dit::Base => blocks.contains(Component::Transformer),
+                Dit::Reference => blocks.contains(Component::TransformerRef),
             };
             if placed {
                 // The probe is the refiner's first attention projection: it is the gemm this
@@ -224,7 +230,7 @@ pub fn load(
     // `latent_encoder`, so by the time the encoders' own component is reached the denoiser is a
     // `Block::Denoiser` and the concrete block that holds them is out of reach. A deployment whose
     // tasks carry no conditions places none.
-    let mut encoders = if partition.blocks.contains(Component::LatentEncoder) {
+    let mut encoders = if blocks.contains(Component::LatentEncoder) {
         Some(ConditionEncoders::load(config, checkpoint, loader)?)
     } else {
         None
@@ -236,7 +242,7 @@ pub fn load(
     let mut video_postprocessor: Option<Arc<crate::output::VideoPostprocessor>> = None;
     let mut video_decoder: Option<Arc<crate::video_vae::VideoDecoder>> = None;
     let mut audio_decoder: Option<Arc<AudioDecoder>> = None;
-    for component in partition.blocks.iter() {
+    for component in blocks.iter() {
         match component {
             Component::TextEncoder => {
                 let source = checkpoint.component("text_encoder")?;
@@ -272,10 +278,10 @@ pub fn load(
                             .join(", ")
                     ))
                 })?;
-                let arrangement = partition.arrangement(denoiser)?;
                 // The attention's scratch is allocated for the largest layout this deployment can
                 // reach, over every canvas the DiT offers and every legal frame count.
-                let rows = Layouts::new(denoiser.clone(), arrangement)?.rows_bound()?;
+                let rows = Layouts::new(denoiser.clone(), capacity, partition.sequence()?)?
+                    .rows_bound()?;
                 let source = checkpoint.component(dit.directory())?;
                 let mut shards = loader.reborrow(source)?;
                 // A parallel-decoding student stacks one head per fine interval; the boundary that
@@ -294,14 +300,15 @@ pub fn load(
                 };
                 let mut denoiser = Denoiser::load(
                     denoiser.clone(),
-                    arrangement,
+                    capacity,
                     rows,
                     &partition,
+                    blocks.contains(Component::LatentEncoder),
                     &mut shards,
                     heads,
                 )?;
                 // The encoders are this block's conditioning half. Only one DiT partition can be
-                // placed on a rank (`Partition::validate` refuses both), so at most one arm takes
+                // placed on a rank (`partition::blocks` refuses both), so at most one arm takes
                 // them; `attach_encoders` refuses a second attach as well.
                 if let Some(encoders) = encoders.take() {
                     denoiser.attach_encoders(encoders)?;
@@ -339,7 +346,7 @@ pub fn load(
                 // The decoder converts the deployment's pixel rasters to its latent canvases and
                 // checks each is whole cells; this file only passes them through.
                 // A VAE directory holds both halves; the decoder reads its own keys from it.
-                let source = checkpoint.component(component.directories()[0])?;
+                let source = checkpoint.component(directories(component)[0])?;
                 let mut shards = loader.reborrow(source)?;
                 let decoder = Arc::new(crate::video_vae::VideoDecoder::load(
                     &config.video_vae,

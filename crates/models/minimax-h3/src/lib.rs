@@ -67,7 +67,7 @@ pub use config::{
 };
 
 pub use load::load;
-pub use partition::{Component, Partition};
+pub use partition::Partition;
 pub use task::VideoTask;
 
 /// What this crate can fail with.

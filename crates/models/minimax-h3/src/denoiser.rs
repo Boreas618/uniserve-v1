@@ -43,6 +43,7 @@
 use nn::blocks::ModulationTable;
 use nn::capability::{ConditionRole, LatentShape, Layout, StateTable, TableValues, VideoRequest};
 use nn::diffusion::{TimestepTable, TimestepTableSpec};
+use nn::family::Split;
 use nn::{DType, Forward, Shape, TensorView, WeightLoader};
 
 use crate::attention::Factors;
@@ -61,53 +62,18 @@ const ADALN_COLUMNS: u64 = 18;
 /// canvases, which is the smallest condition a request brings.
 const LEAST_CONDITION_RUNG: u32 = 1024;
 
-/// The row capacities and the sequence degree a deployment serves.
+/// The packed prefix rows a deployment's layouts hold: its text capacity and its condition
+/// capacity, each a whole number of the attention kind's capacity units.
+///
+/// Both are the deployment's (`nn::family::VideoServing`): the text capacity is its longest prompt,
+/// and the condition capacity the rows its widest conditioned request packs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Arrangement {
-    /// Text rows every layout of this deployment holds, a whole number of capacity units.
+pub struct Capacity {
+    /// Text rows every layout of this deployment holds.
     pub text_rows: u32,
-    /// Condition rows it holds, in capacity units.
+    /// Condition rows it holds at most; a request rides the rung of the condition ladder that
+    /// holds its own.
     pub condition_rows: u32,
-    /// Rows of one sequence shard: the Ulysses degree.
-    pub shard: u32,
-    /// This rank's place in the shard: which interval of the packed rows it owns.
-    pub rank: u32,
-}
-
-impl Arrangement {
-    /// A deployment's arrangement, checked against the attention kind's capacity unit.
-    pub fn new(
-        config: &DenoiserConfig,
-        text_rows: u32,
-        condition_rows: u32,
-        shard: u32,
-    ) -> Result<Self> {
-        let unit = config.attention.capacity_rows();
-        if shard == 0 || !shard.is_power_of_two() {
-            return Err(Error::config(format!(
-                "a sequence shard of {shard} rows is not a power of two"
-            )));
-        }
-        for (name, rows) in [("text", text_rows), ("condition", condition_rows)] {
-            if rows == 0 || !rows.is_multiple_of(unit) {
-                return Err(Error::config(format!(
-                    "a {name} capacity of {rows} rows is not a multiple of the {unit}-row unit"
-                )));
-            }
-        }
-        Ok(Self {
-            text_rows,
-            condition_rows,
-            shard,
-            rank: 0,
-        })
-    }
-
-    /// The same arrangement, for the rank at `rank` of the shard.
-    pub const fn at_rank(mut self, rank: u32) -> Self {
-        self.rank = rank;
-        self
-    }
 }
 
 /// The element type of the sample the trajectory accumulates, and of its noise.
@@ -138,20 +104,47 @@ pub const SAMPLE_DTYPE: DType = DType::F32;
 /// The deployment's layout rule: how a request snaps, and what its tables are.
 pub struct Layouts {
     config: DenoiserConfig,
-    arrangement: Arrangement,
+    capacity: Capacity,
+    /// The denoiser's sequence split: the Ulysses degree its packing aligns to, and this rank's
+    /// interval of the packed rows.
+    sequence: Split,
 }
 
 impl Layouts {
-    /// The rule of a checkpoint and a deployment.
-    pub fn new(config: DenoiserConfig, arrangement: Arrangement) -> Result<Self> {
+    /// The rule of a checkpoint and a deployment of `capacity`, at `sequence`.
+    ///
+    /// # Errors
+    ///
+    /// A transformer without heads, a sequence degree that is not a power of two, or a capacity that
+    /// is not a whole number of the attention kind's units.
+    pub fn new(config: DenoiserConfig, capacity: Capacity, sequence: Split) -> Result<Self> {
         if config.transformer.head_dim == 0 || config.transformer.num_attention_heads == 0 {
             return Err(Error::config(
                 "a denoiser's transformer has attention heads".to_owned(),
             ));
         }
+        if sequence.size == 0 || !sequence.size.is_power_of_two() || sequence.rank >= sequence.size
+        {
+            return Err(Error::config(format!(
+                "rank {} of a sequence split of {} is not a rank of a power-of-two degree",
+                sequence.rank, sequence.size
+            )));
+        }
+        let unit = config.attention.capacity_rows();
+        for (name, rows) in [
+            ("text", capacity.text_rows),
+            ("condition", capacity.condition_rows),
+        ] {
+            if rows == 0 || !rows.is_multiple_of(unit) {
+                return Err(Error::config(format!(
+                    "a {name} capacity of {rows} rows is not a multiple of the {unit}-row unit"
+                )));
+            }
+        }
         Ok(Self {
             config,
-            arrangement,
+            capacity,
+            sequence,
         })
     }
 
@@ -254,8 +247,8 @@ impl Layouts {
                     if let Ok(segment) = packing::segment_packing(
                         frames,
                         canvas,
-                        self.arrangement.text_rows,
-                        self.arrangement.condition_rows,
+                        self.capacity.text_rows,
+                        self.capacity.condition_rows,
                         tile,
                         tile,
                     ) {
@@ -264,9 +257,9 @@ impl Layouts {
                 } else if let Ok(dense) = packing::dense_packing(
                     frames,
                     canvas,
-                    self.arrangement.text_rows,
-                    self.arrangement.condition_rows,
-                    self.arrangement.shard,
+                    self.capacity.text_rows,
+                    self.capacity.condition_rows,
+                    self.sequence.size,
                 ) {
                     bound = bound.max(dense.padded_tokens);
                 }
@@ -305,8 +298,8 @@ impl Layouts {
                 if let Ok(segment) = packing::segment_packing(
                     frames,
                     canvas,
-                    self.arrangement.text_rows,
-                    self.arrangement.condition_rows,
+                    self.capacity.text_rows,
+                    self.capacity.condition_rows,
                     tile,
                     tile,
                 ) {
@@ -378,7 +371,7 @@ impl Layouts {
                 width: raster.width,
             },
             audio: Some(self.audio_latent(packing::audio_latent_frames(frames))),
-            text_rows: self.arrangement.text_rows,
+            text_rows: self.capacity.text_rows,
             condition_rows: self.condition_rows_of(request),
             condition_elements: self.condition_elements(&conditions_of(request), &canvas),
         })
@@ -397,7 +390,7 @@ impl Layouts {
         } else {
             request
                 .condition_rows
-                .unwrap_or(self.arrangement.condition_rows)
+                .unwrap_or(self.capacity.condition_rows)
         }
     }
 
@@ -409,7 +402,7 @@ impl Layouts {
     /// four keyframes up, where a request's empty rows start to cost more than their graphs. Each
     /// is a whole number of capacity units, so a layout of any rung packs.
     pub fn condition_ladder(&self) -> Vec<u32> {
-        let capacity = self.arrangement.condition_rows;
+        let capacity = self.capacity.condition_rows;
         let unit = self.config.attention.capacity_rows();
         let mut rungs = Vec::new();
         let mut doubling = LEAST_CONDITION_RUNG;
@@ -424,9 +417,9 @@ impl Layouts {
         rungs
     }
 
-    /// The arrangement this rule serves.
-    pub const fn arrangement(&self) -> Arrangement {
-        self.arrangement
+    /// The capacity this rule lays requests out in.
+    pub const fn capacity(&self) -> Capacity {
+        self.capacity
     }
 
     /// The layout a request is served in, with the packing of its row extents.
@@ -440,9 +433,9 @@ impl Layouts {
         let packing = packing::dense_packing(
             frames,
             &canvas,
-            self.arrangement.text_rows,
+            self.capacity.text_rows,
             self.condition_rows_of(request),
-            self.arrangement.shard,
+            self.sequence.size,
         )?;
         let elements = self.condition_elements(&conditions_of(request), &canvas);
         let layout = self.layout_of(&packing, &canvas, elements)?;
@@ -515,7 +508,7 @@ impl Layouts {
             &canvas,
             layout.text_rows,
             layout.condition_rows,
-            self.arrangement.shard,
+            self.sequence.size,
         )?;
         let rebuilt = self.layout_of(&packing, &canvas, layout.condition_elements)?;
         if rebuilt.video.frames != layout.video.frames
@@ -641,9 +634,9 @@ impl Layouts {
     /// `sources[i]` is the modality row a rank projects and `slots[i]` the row of its own interval
     /// that row lands in. At one rank every row is owned and the two are the identity and `packed`.
     fn owned_rows(&self, rows: u64, packed: &[i32]) -> (Vec<i32>, Vec<i32>) {
-        let shard = u64::from(self.arrangement.shard.max(1));
+        let shard = u64::from(self.sequence.size.max(1));
         let local = rows / shard;
-        let first = u64::from(self.arrangement.rank) * local;
+        let first = u64::from(self.sequence.rank) * local;
         let mut sources = Vec::new();
         let mut slots = Vec::new();
         for (index, row) in packed.iter().enumerate() {
@@ -1865,7 +1858,7 @@ impl Denoiser {
         // zero row: a rung is the request's, and the source is sized by it, so the writer and the
         // packing's `prefix_index` read one number.
         let total = text.shape.dim(0);
-        let text_rows = u64::from(self.rules.arrangement().text_rows);
+        let text_rows = u64::from(self.rules.capacity().text_rows);
         let reserved = total.checked_sub(text_rows + 1).ok_or_else(|| {
             Error::config(format!(
                 "a {total}-row prefix source cannot hold {text_rows} text rows and the zero row"
@@ -2571,17 +2564,21 @@ impl Denoiser {
 
     /// Read one DiT partition and everything around it.
     ///
-    /// `rows` bounds the packed row count this deployment serves, which sizes the attention's
-    /// scratch. The cache is sized from the checkpoint's schedule alone - the distinct noise levels
-    /// of its grid - so no request grows it and two requests of one shape share it.
+    /// `capacity` is the deployment's prefix rows and `rows` bounds the packed row count it serves,
+    /// which sizes the attention's scratch; `places_encoders` states whether the deployment places
+    /// the condition encoders this block attaches. The cache is sized from the checkpoint's
+    /// schedule alone - the distinct noise levels of its grid - so no request grows it and two
+    /// requests of one shape share it.
     pub fn load(
         config: DenoiserConfig,
-        arrangement: Arrangement,
+        capacity: Capacity,
         rows: u32,
         partition: &crate::Partition,
+        places_encoders: bool,
         loader: &mut WeightLoader<'_>,
         heads: Option<crate::transformer::StudentHeads>,
     ) -> Result<Self> {
+        let sequence = partition.sequence()?;
         let schedule = Schedule::new(&config.schedule)?;
         let evaluations = schedule.num_steps()?;
         let conditioned = config
@@ -2634,7 +2631,7 @@ impl Denoiser {
                 // the bound's next power of two and two bounds inside one class are one module.
                 // The descriptor keeps the live bound, since the tolerance is written against the
                 // reduction length itself.
-                Layouts::new(config.clone(), arrangement)?.tiles_bound()?
+                Layouts::new(config.clone(), capacity, sequence)?.tiles_bound()?
             }
             crate::config::AttentionKind::Dense => 0,
         };
@@ -2655,10 +2652,10 @@ impl Denoiser {
         // every video row of the widest layout.
         let refiner = crate::conditioning::TokenRefiner::load(
             &config.transformer,
-            arrangement.text_rows,
+            capacity.text_rows,
             loader,
         )?;
-        let rules = Layouts::new(config.clone(), arrangement)?;
+        let rules = Layouts::new(config.clone(), capacity, sequence)?;
         Ok(Self {
             config,
             rules,
@@ -2669,15 +2666,13 @@ impl Denoiser {
             cache,
             evaluations,
             refiner,
-            places_encoders: partition
-                .blocks
-                .contains(crate::partition::Component::LatentEncoder),
+            places_encoders,
             encoders: None,
             rows,
             // The denoiser's own rank, not the text encoder's: the two shards are independent, and
             // with one tensor shard every rank's `tensor_rank` is 0 (`partition.rs`).
-            rank: arrangement.rank,
-            shard: arrangement.shard,
+            rank: sequence.rank,
+            shard: sequence.size,
         })
     }
 
@@ -2764,12 +2759,11 @@ mod tests {
         };
         Layouts::new(
             config,
-            Arrangement {
+            Capacity {
                 text_rows: 128,
                 condition_rows: 64,
-                shard: 1,
-                rank: 0,
             },
+            Split::WHOLE,
         )
         .unwrap()
     }
@@ -2845,7 +2839,7 @@ mod tests {
     fn sparse_layouts() -> Layouts {
         let mut config = layouts().config;
         config.attention = AttentionKind::sparse(TILE, 0.8, None).unwrap();
-        Layouts::new(config, layouts().arrangement).unwrap()
+        Layouts::new(config, layouts().capacity, Split::WHOLE).unwrap()
     }
 
     /// The ladder starts at one keyframe, doubles, gains a halfway rung from four keyframes up, and
@@ -2854,7 +2848,7 @@ mod tests {
     fn the_condition_ladder_climbs_to_the_capacity() {
         let ladder = |capacity| {
             let mut rules = sparse_layouts();
-            rules.arrangement.condition_rows = capacity;
+            rules.capacity.condition_rows = capacity;
             rules.condition_ladder()
         };
         assert_eq!(
@@ -2889,7 +2883,7 @@ mod tests {
     #[test]
     fn a_layout_holds_the_rung_of_its_request() {
         let mut rules = sparse_layouts();
-        rules.arrangement.condition_rows = 2048;
+        rules.capacity.condition_rows = 2048;
         let widest = rules.cover(&conditioned()).unwrap();
         assert_eq!(widest.condition_rows, 2048);
         let rung = rules
@@ -3133,8 +3127,8 @@ mod tests {
                 if let Ok(segment) = packing::segment_packing(
                     frames,
                     canvas,
-                    rules.arrangement.text_rows,
-                    rules.arrangement.condition_rows,
+                    rules.capacity.text_rows,
+                    rules.capacity.condition_rows,
                     tile,
                     tile,
                 ) {
@@ -3476,15 +3470,15 @@ mod tests {
         let mut rule = layouts();
         let packed: Vec<i32> = (40..100).collect();
         let rows = 128;
-        rule.arrangement.shard = 1;
-        rule.arrangement.rank = 0;
+        rule.sequence.size = 1;
+        rule.sequence.rank = 0;
         let (sources, slots) = rule.owned_rows(rows, &packed);
         assert_eq!(sources, (0..60).collect::<Vec<i32>>());
         assert_eq!(slots, packed);
-        rule.arrangement.shard = 4;
+        rule.sequence.size = 4;
         let mut seen = Vec::new();
         for rank in 0..4 {
-            rule.arrangement.rank = rank;
+            rule.sequence.rank = rank;
             let (sources, slots) = rule.owned_rows(rows, &packed);
             assert_eq!(sources.len(), slots.len());
             for (source, slot) in sources.iter().zip(&slots) {
@@ -3757,8 +3751,8 @@ mod tests {
                 width: 1344,
                 height: 768,
             },
-            rule.arrangement().text_rows,
-            rule.arrangement().condition_rows,
+            rule.capacity().text_rows,
+            rule.capacity().condition_rows,
             64,
             64,
         )
