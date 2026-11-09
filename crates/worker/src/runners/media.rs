@@ -570,6 +570,23 @@ fn pack_block(
         .map_err(crate::Error::from)
 }
 
+/// The region's bytes as the `f32` rows a condition is written into.
+///
+/// The offsets a request's rows are written at count floats from the region's first byte, so a
+/// region whose base is not four-byte aligned is refused rather than viewed from a shifted start.
+fn float_view(bytes: &mut [u8]) -> crate::Result<&mut [f32]> {
+    // SAFETY: every bit pattern of four initialized bytes is a valid `f32`, so viewing the region's
+    // bytes as floats cannot produce an invalid value; `align_to_mut` splits off any unaligned
+    // prefix and suffix itself.
+    let (prefix, floats, _) = unsafe { bytes.align_to_mut::<f32>() };
+    if !prefix.is_empty() {
+        return Err(crate::Error::Invalid(
+            "a condition region's base is not aligned for f32 rows".into(),
+        ));
+    }
+    Ok(floats)
+}
+
 /// Decodes one request's conditions into `regions`, in request order.
 ///
 /// `crates/media` decodes the bytes into RGB frames and stereo PCM at their planned extents; the
@@ -698,11 +715,7 @@ fn read_conditions(
             // SAFETY: nothing reads the region before this call publishes it, and it was allocated
             // for this request alone.
             let floats = unsafe { region.as_mut_slice() };
-            // SAFETY: every bit pattern of four initialized bytes is a valid `f32`, so viewing the
-            // region's bytes as floats cannot produce an invalid value; `align_to_mut` splits off
-            // any unaligned prefix itself, and a `cuMemHostAlloc` base is page-aligned, so the float
-            // view starts at the region's first byte.
-            let (_, floats, _) = unsafe { floats.align_to_mut::<f32>() };
+            let floats = float_view(floats)?;
             condition_rows(format, source, frames, canvas, &mut floats[pixels_at..])?;
             pixels_at += source.len();
         }
@@ -715,8 +728,7 @@ fn read_conditions(
                 .ok_or_else(|| crate::Error::Invalid("a track has no region".into()))?;
             // SAFETY: as for the pixels above.
             let floats = unsafe { region.as_mut_slice() };
-            // SAFETY: as for the pixels' float view above.
-            let (_, floats, _) = unsafe { floats.align_to_mut::<f32>() };
+            let floats = float_view(floats)?;
             format.track(
                 &pcm[read.samples.start * 2..read.samples.end * 2],
                 track.samples,
