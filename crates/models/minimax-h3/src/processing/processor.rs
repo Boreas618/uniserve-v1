@@ -13,12 +13,13 @@ use processing::{
     VideoSpec, Vocabulary,
 };
 use proto::video::Canvas;
+use qwen3::processor::ProcessorConfig;
 use serde_json::{Value, json};
 
 use super::plan::{
     self, CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, CANVAS_SHORT_EDGE, ConditionSpec, ConditionType,
-    MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, PlanLimits, ProcessorConfig, ReferenceConfig,
-    RequestField, Role, Target, VideoInputError,
+    MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, PlanLimits, ReferenceConfig, RequestField, Role, Target,
+    VideoInputError,
 };
 use super::presentation::{self, VIDEO_TAG};
 use super::{ConditionPacking, DenoiserInfo};

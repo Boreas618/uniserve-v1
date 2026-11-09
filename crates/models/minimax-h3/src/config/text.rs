@@ -1,5 +1,4 @@
-//! The Qwen3-VL text encoder as H3 conditions on it, and the pixel normalization its processor
-//! applies.
+//! The Qwen3-VL text encoder as H3 conditions on it.
 //!
 //! The text encoder's configuration is the Qwen3-VL checkpoint's own ([`qwen3::VlConfig`]); what
 //! H3 adds is how much of it conditions a request. H3 reads the hidden state after the first
@@ -17,34 +16,6 @@ use crate::{Error, Result};
 /// The text encoder checkpoint is a 64-layer Qwen3-VL; H3 reads the state after layer 50. The
 /// checkpoint's configuration does not state how many layers a consumer keeps.
 pub const RETAINED_LAYERS: u32 = 50;
-
-/// How the checkpoint's processor normalizes a pixel before the vision tower patches it.
-///
-/// Each RGB channel maps `x` in `[0, 255]` to `(x / 255 - mean) / std`.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct PixelConfig {
-    /// Per-channel means.
-    pub mean: [f32; 3],
-    /// Per-channel standard deviations.
-    pub std: [f32; 3],
-}
-
-impl PixelConfig {
-    /// Read a processor's `image_mean` and `image_std`.
-    pub fn parse(values: &Fields<'_>) -> Result<Self> {
-        let owner = values.owner();
-        let mean = values.fixed_numbers("image_mean", 3)?;
-        let std = values.fixed_numbers("image_std", 3)?;
-        let mean: [f32; 3] = [mean[0] as f32, mean[1] as f32, mean[2] as f32];
-        let std: [f32; 3] = [std[0] as f32, std[1] as f32, std[2] as f32];
-        if std.iter().any(|value| *value <= 0.0) {
-            return Err(Error::config(format!(
-                "{owner}.image_std must be positive, got {std:?}"
-            )));
-        }
-        Ok(Self { mean, std })
-    }
-}
 
 /// Read `text_encoder/config.json` and check that H3's truncation fits it: the checkpoint holds
 /// the retained layers, and every DeepStack feature has a retained layer to follow.
@@ -80,20 +51,6 @@ mod tests {
         let error = text_encoder(&shallow).expect_err("too few layers");
         assert!(
             matches!(error, Error::Config(ref problem) if problem.contains("keeps")),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn a_processor_states_three_positive_deviations() {
-        let mut negative = crate::config::tests_support::processor();
-        negative["image_std"] = serde_json::json!([0.5, 0.0, 0.5]);
-        let error = PixelConfig::parse(
-            &Fields::of("processor/preprocessor_config.json", &negative).expect("an object"),
-        )
-        .expect_err("a zero deviation is refused");
-        assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("image_std")),
             "{error}"
         );
     }

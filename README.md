@@ -195,7 +195,7 @@ crates/ops/             The interface between Rust and kernel programs: operator
 crates/nn/              The shared computation library: tensor views, numerical layers, capability traits and the model family contract execution loads models through
 crates/processing/      The request-side model contract: a family's chat profile or video processor, which checks and plans model-agnostic video requests
 crates/models/          The concrete models, each a crate that implements both contracts
-  qwen3/                The Qwen3 family: configurations, the decoder layer and stack, `Qwen3MoeForCausalLM`, the Qwen3-VL model and vision tower, and the Qwen3 chat profile
+  qwen3/                The Qwen3 family: configurations, the decoder layer and stack, `Qwen3MoeForCausalLM`, the Qwen3-VL model, vision tower and processor, and the Qwen3 chat profile
   minimax-h3/           MiniMax-H3 and FastH3: checkpoint configuration, mathematical partition, components and request processing (`src/processing/`)
 crates/worker/          The executors: the one thread per device that issues its work, with the runners, graphs and memory owners
 crates/scheduler/       The main process's mechanism: schedulers, KV allocation, executor groups and the request interface's service

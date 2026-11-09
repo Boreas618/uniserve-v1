@@ -43,13 +43,13 @@ pub use denoiser::{
     AttentionKind, DenoiserConfig, SPARSE_TILE_ROWS, ScheduleGrid, ScheduleSpec, Shifts,
     TransformerConfig,
 };
-pub use text::{PixelConfig, RETAINED_LAYERS};
+pub use text::RETAINED_LAYERS;
 pub use video_vae::VideoVaeConfig;
 
 use crate::checkpoint::{ContractSchedule, Dit, Layout, Sidecars};
 use crate::encoding::Clip;
-use crate::processing::plan::ProcessorConfig;
 use crate::{Error, Result};
+use qwen3::processor::ProcessorConfig;
 
 /// Frames per second of a generated video.
 pub const FPS: u32 = 24;
@@ -99,7 +99,7 @@ pub struct Config {
     /// The Qwen3-VL text encoder that conditions a request.
     pub text_encoder: qwen3::VlConfig,
     /// The pixel normalization the text encoder's processor applies.
-    pub pixels: PixelConfig,
+    pub pixels: qwen3::processor::PixelConfig,
     /// Each DiT partition the checkpoint holds, by network.
     pub denoisers: BTreeMap<Dit, DenoiserConfig>,
     /// The video VAE: the decoder every task uses and the encoder `ref2va` uses.
@@ -132,7 +132,7 @@ impl Config {
     /// below sees a value it cannot use.
     pub fn normalize(layout: &Layout, sidecars: &Sidecars) -> Result<Self> {
         let text_encoder = text::text_encoder(&sidecars.text_encoder)?;
-        let pixels = PixelConfig::parse(&Fields::of(
+        let pixels = qwen3::processor::PixelConfig::parse(&Fields::of(
             "processor/preprocessor_config.json",
             &sidecars.processor,
         )?)?;

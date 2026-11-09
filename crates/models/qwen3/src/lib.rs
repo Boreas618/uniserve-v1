@@ -8,6 +8,8 @@
 //! - [`moe`]: `Qwen3MoeForCausalLM`, implementing [`nn::CausalLm`];
 //! - [`vl`]: the Qwen3-VL language model, vision tower, patch mergers and their host position
 //!   tables, which [`VlConfig`] describes;
+//! - [`processor`]: the Qwen-VL processor that sizes media to patch grids and lays pixels out as
+//!   patch rows;
 //! - [`family`] and [`processing`]: the family as execution loads it and as request processing
 //!   serves it.
 //!
@@ -19,6 +21,7 @@ pub mod decoder;
 pub mod family;
 pub mod moe;
 pub mod processing;
+pub mod processor;
 pub mod vl;
 
 pub use config::{MoeConfig, TextConfig, VisionConfig, VlConfig};

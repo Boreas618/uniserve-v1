@@ -49,6 +49,7 @@
 const NORM_EPS: f32 = 1e-5;
 use crate::config::VideoVaeConfig;
 use crate::{Error, Result};
+use qwen3::processor::PatchLayout;
 
 /// The spatial compression of the video encoder: input pixels per latent position.
 pub const SPATIAL_RATIO: u32 = 16;
@@ -62,10 +63,8 @@ pub const PIXEL_CHANNELS: u32 = 3;
 /// patch rows and the audio encoder's zero-padded channel rows.
 #[derive(Clone, Debug)]
 pub struct ConditionFormat {
-    vision: qwen3::VisionConfig,
-    pixels: crate::config::PixelConfig,
-    /// The element type the tower's patch rows are rounded to: its weights' own.
-    dtype: DType,
+    /// The vision tower's patch rows, rounded to its weights' own element type.
+    patches: PatchLayout,
     /// Samples of one audio latent frame.
     hop: u64,
 }
@@ -74,9 +73,7 @@ impl ConditionFormat {
     /// The format of `config`'s encoders, with the tower at `dtype`.
     pub fn new(config: &crate::Config, dtype: DType) -> Result<Self> {
         Ok(Self {
-            vision: config.text_encoder.vision.clone(),
-            pixels: config.pixels,
-            dtype,
+            patches: PatchLayout::new(&config.text_encoder.vision, config.pixels, dtype),
             hop: u64::from(AudioStack::of(&config.audio_vae)?.samples_per_latent),
         })
     }
@@ -160,21 +157,19 @@ impl nn::capability::MediaFormat for ConditionFormat {
     }
 
     fn patch_dtype(&self) -> DType {
-        self.dtype
+        self.patches.dtype
     }
 
     fn patch_width(&self) -> u32 {
-        qwen3::vl::vision::BlockRows::tubelet(&self.vision)
+        self.patches.width()
     }
 
     fn patch_side(&self) -> u32 {
-        self.vision.patch_size
+        self.patches.patch
     }
 
-    /// The processor's patch rows, op for op: `(byte - 255 · mean) / (255 · std)` in FP32, the last
-    /// frame repeated to a whole temporal patch, and rows over each temporal patch in merge-block
-    /// order, each one channel-major tubelet. The tower's projection rounds the pixels to its weights'
-    /// type, so the row is stored rounded (`TubeletEmbed`: `tubelets.to(self.weight.dtype)`).
+    /// The processor's patch rows ([`PatchLayout`]), its bands shared out over the host's threads
+    /// as they lie in `out`.
     fn patches(
         &self,
         planes: &[u8],
@@ -182,80 +177,13 @@ impl nn::capability::MediaFormat for ConditionFormat {
         grid: [u32; 3],
         out: &mut [u8],
     ) -> nn::Result<()> {
-        let [time, rows, columns] = grid;
-        let (patch, merge) = (self.vision.patch_size, self.vision.spatial_merge_size);
-        let temporal = self.vision.temporal_patch_size;
-        let channels = self.vision.in_channels as usize;
-        let (height, width) = ((rows * patch) as usize, (columns * patch) as usize);
-        let area = height * width;
-        // The rows are stored in the tower's own element type, whatever its loader chose.
-        let element = self.dtype.bytes().ok_or_else(|| {
-            Error::Unsupported(format!(
-                "{} patch rows have no whole-byte element",
-                self.dtype
-            ))
-        })? as usize;
-        let width_bytes = self.patch_width() as usize * element;
-        let patches = time as usize * rows as usize * columns as usize;
-        if planes.len() != frames as usize * channels * area
-            || out.len() != patches * width_bytes
-            || frames == 0
-            || frames.div_ceil(temporal) != time
-        {
-            return Err(nn::Error::from(Error::Unsupported(format!(
-                "{} plane bytes and {} row bytes for {frames} frames on a {grid:?} grid",
-                planes.len(),
-                out.len()
-            ))));
-        }
-        let mean = self.pixels.mean.map(|value| value * 255.0);
-        let std = self.pixels.std.map(|value| value * 255.0);
-        let (patch, merge, temporal) = (patch as usize, merge as usize, temporal as usize);
-        // A byte has 256 values, so a channel's normalised element is a table of them, each the
-        // FP32 value rounded once to the tower's type.
-        let mut values = Vec::with_capacity(channels * 256);
-        for channel in 0..channels {
-            for byte in 0..=u8::MAX {
-                values.push((f32::from(byte) - mean[channel]) / std[channel]);
-            }
-        }
-        let table = self.dtype.encode(&values).map_err(nn::Error::from)?;
+        let layout = &self.patches;
+        let band = layout.check(planes.len(), frames, grid, out.len())?;
+        let table = layout.table()?;
         let table = &table;
-        // One band is one temporal patch's row of merge blocks: its bytes follow its predecessor's,
-        // so the bands are shared out as they lie in `out`.
-        let block_rows = rows as usize / merge;
-        let block_columns = columns as usize / merge;
-        let band = patches / (time as usize * block_rows) * width_bytes;
         let mut bands: Vec<(usize, &mut [u8])> = out.chunks_mut(band).enumerate().collect();
         share(&mut bands, workers(), |(index, out)| {
-            let (step, block_row) = (*index / block_rows, *index % block_rows);
-            let mut at = 0_usize;
-            for block_column in 0..block_columns {
-                for merge_row in 0..merge {
-                    for merge_column in 0..merge {
-                        let top = (block_row * merge + merge_row) * patch;
-                        let left = (block_column * merge + merge_column) * patch;
-                        for channel in 0..channels {
-                            for offset in 0..temporal {
-                                // A short temporal patch repeats the last frame: one image is one
-                                // frame repeated.
-                                let frame = (step * temporal + offset).min(frames as usize - 1);
-                                let plane = (frame * channels + channel) * area;
-                                for y in 0..patch {
-                                    let line = plane + (top + y) * width + left;
-                                    for x in 0..patch {
-                                        let entry = (channel * 256 + usize::from(planes[line + x]))
-                                            * element;
-                                        out[at..at + element]
-                                            .copy_from_slice(&table[entry..entry + element]);
-                                        at += element;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            layout.band(table, planes, frames, grid, *index, out);
         });
         Ok(())
     }
@@ -1773,154 +1701,31 @@ impl GeGlu {
 mod tests {
     use super::*;
     use nn::capability::MediaFormat as _;
-    use ops::values::{bf16_to_f32, f32_to_bf16};
 
-    /// The format of a tower of `patch`-pixel patches, two-frame tubelets and `2 x 2` merges.
-    fn format(patch: u32) -> ConditionFormat {
+    /// The format of a tower of 16-pixel patches, two-frame tubelets and `2 x 2` merges, and of
+    /// an audio encoder of 800 samples a latent.
+    fn format() -> ConditionFormat {
         ConditionFormat {
-            vision: qwen3::VisionConfig {
-                depth: 1,
-                hidden_size: 8,
-                intermediate_size: 8,
-                num_heads: 1,
-                hidden_act: ops::activation::Activation::GeluTanh,
-                in_channels: 3,
-                patch_size: patch,
-                temporal_patch_size: 2,
-                spatial_merge_size: 2,
-                out_hidden_size: 8,
-                num_position_embeddings: 16,
-                deepstack_visual_indexes: Vec::new(),
+            patches: PatchLayout {
+                patch: 16,
+                temporal: 2,
+                merge: 2,
+                channels: 3,
+                pixels: qwen3::processor::PixelConfig {
+                    mean: [0.5; 3],
+                    std: [0.5; 3],
+                },
+                dtype: DType::BF16,
             },
-            pixels: crate::config::PixelConfig {
-                mean: [0.5; 3],
-                std: [0.5; 3],
-            },
-            dtype: DType::BF16,
             hop: 800,
         }
-    }
-
-    fn row_value(rows: &[u8], index: usize) -> f32 {
-        let bits = u16::from_le_bytes([rows[2 * index], rows[2 * index + 1]]);
-        bf16_to_f32(bits)
-    }
-
-    /// Patch rows run over merge blocks: the four patches of a `2 x 2` block are consecutive rows,
-    /// and a block's rows come before the next block's. A row-major walk of the patches would give
-    /// every merged token the wrong four, which no shape refuses.
-    #[test]
-    fn patch_rows_run_over_merge_blocks_and_a_row_is_one_channel_major_tubelet() {
-        let format = format(1);
-        // One frame of 2 rows by 4 columns, channel c of pixel (y, x) holding 8 c + 4 y + x.
-        let (height, width) = (2_usize, 4_usize);
-        let mut planes = vec![0_u8; 3 * height * width];
-        for channel in 0..3 {
-            for y in 0..height {
-                for x in 0..width {
-                    planes[(channel * height + y) * width + x] = (8 * channel + 4 * y + x) as u8;
-                }
-            }
-        }
-        let rows = 8;
-        let row = format.patch_width() as usize;
-        assert_eq!(row, 3 * 2);
-        let mut out = vec![0_u8; rows * row * 2];
-        format
-            .patches(&planes, 1, [1, 2, 4], &mut out)
-            .expect("one frame fills one temporal patch");
-        let pixel = |byte: u8| (f32::from(byte) - 127.5) / 127.5;
-        let rounded = |value: f32| bf16_to_f32(f32_to_bf16(value));
-        // The rows of the first block are pixels (0,0), (0,1), (1,0), (1,1); the second block's
-        // first row is pixel (0,2). A row is channel-major with its two frames inside a channel, and
-        // the one frame fills both.
-        let order = [
-            (0, 0),
-            (0, 1),
-            (1, 0),
-            (1, 1),
-            (0, 2),
-            (0, 3),
-            (1, 2),
-            (1, 3),
-        ];
-        for (index, (y, x)) in order.iter().enumerate() {
-            for channel in 0..3 {
-                let expected = rounded(pixel((8 * channel + 4 * y + x) as u8));
-                for frame in 0..2 {
-                    assert_eq!(
-                        row_value(&out, index * row + channel * 2 + frame),
-                        expected,
-                        "row {index} channel {channel} frame {frame}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// An image's temporal patch repeats its one frame, and a video's short last patch repeats its
-    /// last frame: a zero there would hand the tower a frame nobody decoded.
-    #[test]
-    fn a_short_temporal_patch_repeats_the_last_frame() {
-        let format = format(2);
-        let frame = 3 * 4 * 4;
-        // Three frames of 4 x 4, each one value: two temporal patches, the second one frame short.
-        let mut planes = vec![0_u8; 3 * frame];
-        for (index, value) in [10_u8, 20, 30].iter().enumerate() {
-            planes[index * frame..(index + 1) * frame].fill(*value);
-        }
-        let row = format.patch_width() as usize;
-        let rows = 2 * 2 * 2;
-        let mut out = vec![0_u8; rows * row * 2];
-        format
-            .patches(&planes, 3, [2, 2, 2], &mut out)
-            .expect("three frames fill two temporal patches");
-        let pixel = |byte: u8| bf16_to_f32(f32_to_bf16((f32::from(byte) - 127.5) / 127.5));
-        // Inside a channel the tubelet holds its frames in order, four pixels each.
-        assert_eq!(row_value(&out, 0), pixel(10));
-        assert_eq!(row_value(&out, 4), pixel(20));
-        let second = 4 * row;
-        assert_eq!(row_value(&out, second), pixel(30));
-        assert_eq!(row_value(&out, second + 4), pixel(30));
-    }
-
-    /// The patch rows are stored in the tower's own element type: a tower loaded in FP32 reads
-    /// four-byte rows of the unrounded values, and a refusal of every type but BF16 left such a
-    /// tower with no rows at all.
-    #[test]
-    fn patch_rows_are_stored_in_the_towers_element_type() {
-        let format = ConditionFormat {
-            dtype: DType::F32,
-            ..format(1)
-        };
-        // One frame of 2 rows by 2 columns: one merge block, four patch rows.
-        let planes: Vec<u8> = (0..3 * 4).map(|value| (10 * value) as u8).collect();
-        let row = format.patch_width() as usize;
-        let mut out = vec![0_u8; 4 * row * 4];
-        format
-            .patches(&planes, 1, [1, 2, 2], &mut out)
-            .expect("FP32 rows");
-        let value = |index: usize| {
-            f32::from_le_bytes([
-                out[4 * index],
-                out[4 * index + 1],
-                out[4 * index + 2],
-                out[4 * index + 3],
-            ])
-        };
-        // Row 0 is pixel (0, 0): channel 0 holds byte 0, channel 1 byte 40, each frame twice.
-        assert_eq!(value(0), (0.0 - 127.5) / 127.5);
-        assert_eq!(value(2), (40.0 - 127.5) / 127.5);
-        // A buffer of BF16 width is two bytes per element short.
-        let mut short = vec![0_u8; 4 * row * 2];
-        assert!(format.patches(&planes, 1, [1, 2, 2], &mut short).is_err());
     }
 
     /// A condition's pixels are planar and normalised as the encoder reads them, and the track is
     /// two channel rows padded to whole latent frames.
     #[test]
     fn a_conditions_pixels_are_planar_and_a_track_is_padded_channel_rows() {
-        let format = format(16);
+        let format = format();
         let rgb = [255_u8, 0, 128, 0, 255, 128];
         let mut out = [0.0_f32; 6];
         format

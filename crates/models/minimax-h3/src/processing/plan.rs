@@ -44,6 +44,7 @@ use proto::video::{Canvas, ConditionMedia, ConditionRole, ConditionVision, Image
 
 use super::{ConditionPacking, FrameClips, ReferenceLimits, ServedCanvas};
 use crate::VideoTask;
+use qwen3::processor::{ProcessorConfig, VisionError, sample_frames};
 
 /// Short edge of the adapt_shape_v1 canvas rule, in pixels.
 pub const CANVAS_SHORT_EDGE: u32 = 768;
@@ -78,9 +79,6 @@ pub const AUDIO_SAMPLE_RATE: u32 = 32_000;
 pub const AUDIO_HOP: u32 = 800;
 /// Stereo channels, packed channel-major.
 const AUDIO_CHANNELS: u32 = 2;
-
-/// The rate the conditioner samples a reference video at.
-const VIDEO_SAMPLE_FPS: f64 = 2.0;
 
 /// The request field a rejection names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,22 +160,9 @@ pub enum RuleError {
         /// The longest duration served.
         max_seconds: f64,
     },
-    /// An image or video frame whose sides differ by more than 200 times.
-    #[error("an aspect of {width}x{height} exceeds 200:1")]
-    VisionAspect {
-        /// Width in pixels.
-        width: u32,
-        /// Height in pixels.
-        height: u32,
-    },
-    /// Video frames smaller than one merged vision token.
-    #[error("video frames of {width}x{height} are too small")]
-    VisionFrames {
-        /// Width in pixels.
-        width: u32,
-        /// Height in pixels.
-        height: u32,
-    },
+    /// An image or video the conditioner's processor cannot size or sample.
+    #[error(transparent)]
+    Vision(#[from] VisionError),
     /// An image reference outside 1:4 to 4:1.
     #[error("a reference image must lie within 1:4 and 4:1, got {width}x{height}")]
     ReferenceAspect {
@@ -185,16 +170,6 @@ pub enum RuleError {
         width: u32,
         /// Height in pixels.
         height: u32,
-    },
-    /// A reference video too short for one group of conditioner samples.
-    #[error(
-        "a reference video must sample at least {required} frames at {VIDEO_SAMPLE_FPS} fps, got {sampled}"
-    )]
-    SampledFrames {
-        /// Samples one group holds.
-        required: usize,
-        /// Samples the video yields.
-        sampled: usize,
     },
     /// A start offset at or past the end of a soundtrack.
     #[error("start_time_seconds lies past the end of the audio track")]
@@ -218,21 +193,6 @@ pub enum RuleError {
     /// A reference video whose display aspect sets no canvas.
     #[error("the video's {0}")]
     VideoCanvas(CanvasError),
-}
-
-/// A checkpoint's processor configs that [`ProcessorConfig::parse`] cannot
-/// use.
-#[derive(Debug, thiserror::Error)]
-pub enum ProcessorConfigError {
-    /// The image processor config is not a processor config.
-    #[error("parsing the image processor config")]
-    Image(#[source] serde_json::Error),
-    /// The video processor config is not a processor config.
-    #[error("parsing the video processor config")]
-    Video(#[source] serde_json::Error),
-    /// The image and video processors patch differently.
-    #[error("the image and video processors disagree on the patch geometry")]
-    Geometry,
 }
 
 /// A video request the rules reject, or a failure while preparing valid
@@ -631,192 +591,6 @@ impl PlanLimits {
         edges
     }
 }
-
-/// The Qwen3-VL processor geometry: patching and pixel budgets.
-///
-/// It is the image and video processors' configuration, as transformers and
-/// SGLang name it (their `VisionConfig` is the vision tower's model
-/// configuration). Read from the checkpoint's
-/// `processor/preprocessor_config.json` and
-/// `processor/video_preprocessor_config.json` with [`ProcessorConfig::parse`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProcessorConfig {
-    /// Pixels per patch side.
-    pub patch_size: u32,
-    /// Frames merged into one temporal patch.
-    pub temporal_patch_size: u32,
-    /// Patches per merged vision token side.
-    pub merge_size: u32,
-    /// Lower pixel budget of an image.
-    pub image_min_pixels: u64,
-    /// Upper pixel budget of an image.
-    pub image_max_pixels: u64,
-    /// Lower budget of a video: frames times pixels.
-    pub video_min_pixels: u64,
-    /// Upper budget of a video: frames times pixels.
-    pub video_max_pixels: u64,
-}
-
-#[derive(Deserialize)]
-struct ProcessorFile {
-    patch_size: u32,
-    temporal_patch_size: u32,
-    merge_size: u32,
-    size: ProcessorSize,
-}
-
-#[derive(Deserialize)]
-struct ProcessorSize {
-    shortest_edge: u64,
-    longest_edge: u64,
-}
-
-impl ProcessorConfig {
-    /// Parses a checkpoint's image processor config
-    /// (`processor/preprocessor_config.json`) and video processor config
-    /// (`processor/video_preprocessor_config.json`), given as their texts.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProcessorConfigError`] when a text is not a processor config,
-    /// or when the two configs disagree on the patch geometry.
-    pub fn parse(image: &str, video: &str) -> Result<Self, ProcessorConfigError> {
-        Self::of_files(
-            serde_json::from_str(image).map_err(ProcessorConfigError::Image)?,
-            serde_json::from_str(video).map_err(ProcessorConfigError::Video)?,
-        )
-    }
-
-    /// [`Self::parse`] over the two configs already read as JSON values, as
-    /// the model's loading boundary holds its sidecars.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::parse`].
-    pub fn from_values(
-        image: &serde_json::Value,
-        video: &serde_json::Value,
-    ) -> Result<Self, ProcessorConfigError> {
-        Self::of_files(
-            ProcessorFile::deserialize(image).map_err(ProcessorConfigError::Image)?,
-            ProcessorFile::deserialize(video).map_err(ProcessorConfigError::Video)?,
-        )
-    }
-
-    /// The geometry the image and video processor files state, which must
-    /// patch alike.
-    fn of_files(image: ProcessorFile, video: ProcessorFile) -> Result<Self, ProcessorConfigError> {
-        let geometry =
-            |file: &ProcessorFile| (file.patch_size, file.temporal_patch_size, file.merge_size);
-        if geometry(&image) != geometry(&video) {
-            return Err(ProcessorConfigError::Geometry);
-        }
-        Ok(Self {
-            patch_size: image.patch_size,
-            temporal_patch_size: image.temporal_patch_size,
-            merge_size: image.merge_size,
-            image_min_pixels: image.size.shortest_edge,
-            image_max_pixels: image.size.longest_edge,
-            video_min_pixels: video.size.shortest_edge,
-            video_max_pixels: video.size.longest_edge,
-        })
-    }
-
-    /// What a resized side is a multiple of: one merged token.
-    const fn factor(&self) -> u32 {
-        self.patch_size * self.merge_size
-    }
-
-    /// The patch grid the image processor resizes an image to.
-    ///
-    /// This is Qwen2-VL's `smart_resize`: each side rounds half to even to
-    /// the factor, and a size outside the pixel budget is rescaled with floor
-    /// (above) or ceil (below) rounding.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RuleError::VisionAspect`] for an aspect beyond 200:1.
-    pub fn image_grid(&self, height: u32, width: u32) -> Result<VisionGrid, RuleError> {
-        check_vision_aspect(height, width)?;
-        let factor = f64::from(self.factor());
-        let (height, width) = (f64::from(height), f64::from(width));
-        let mut resized_height = (height / factor).round_ties_even() * factor;
-        let mut resized_width = (width / factor).round_ties_even() * factor;
-        if resized_height * resized_width > self.image_max_pixels as f64 {
-            let beta = (height * width / self.image_max_pixels as f64).sqrt();
-            resized_height = factor.max((height / beta / factor).floor() * factor);
-            resized_width = factor.max((width / beta / factor).floor() * factor);
-        } else if resized_height * resized_width < self.image_min_pixels as f64 {
-            let beta = (self.image_min_pixels as f64 / (height * width)).sqrt();
-            resized_height = (height * beta / factor).ceil() * factor;
-            resized_width = (width * beta / factor).ceil() * factor;
-        }
-        Ok(self.grid(1, resized_height, resized_width))
-    }
-
-    /// The patch grid of `frames` sampled video frames.
-    ///
-    /// This is Qwen3-VL's video `smart_resize`: the budget covers all frames,
-    /// which are padded to a whole temporal patch by repeating the last one.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RuleError::VisionFrames`] for frames smaller than one merged
-    /// token and [`RuleError::VisionAspect`] for an aspect beyond 200:1.
-    pub fn video_grid(
-        &self,
-        frames: u32,
-        height: u32,
-        width: u32,
-    ) -> Result<VisionGrid, RuleError> {
-        let factor = self.factor();
-        if height < factor || width < factor {
-            return Err(RuleError::VisionFrames { width, height });
-        }
-        check_vision_aspect(height, width)?;
-        let temporal = self.temporal_patch_size;
-        let padded_frames = frames.div_ceil(temporal) * temporal;
-        let factor = f64::from(factor);
-        let pixels = f64::from(frames) * f64::from(height) * f64::from(width);
-        let (height, width) = (f64::from(height), f64::from(width));
-        let mut resized_height = (height / factor).round_ties_even() * factor;
-        let mut resized_width = (width / factor).round_ties_even() * factor;
-        let budget = f64::from(padded_frames) * resized_height * resized_width;
-        if budget > self.video_max_pixels as f64 {
-            let beta = (pixels / self.video_max_pixels as f64).sqrt();
-            resized_height = factor.max((height / beta / factor).floor() * factor);
-            resized_width = factor.max((width / beta / factor).floor() * factor);
-        } else if budget < self.video_min_pixels as f64 {
-            let beta = (self.video_min_pixels as f64 / pixels).sqrt();
-            resized_height = (height * beta / factor).ceil() * factor;
-            resized_width = (width * beta / factor).ceil() * factor;
-        }
-        Ok(self.grid(padded_frames / temporal, resized_height, resized_width))
-    }
-
-    /// Vision tokens of one temporal block of `grid`.
-    pub const fn block_tokens(&self, grid: VisionGrid) -> u32 {
-        grid.h * grid.w / (self.merge_size * self.merge_size)
-    }
-
-    fn grid(&self, t: u32, resized_height: f64, resized_width: f64) -> VisionGrid {
-        // Resized sides are positive multiples of the factor below 2^32.
-        VisionGrid {
-            t,
-            h: resized_height as u32 / self.patch_size,
-            w: resized_width as u32 / self.patch_size,
-        }
-    }
-}
-
-fn check_vision_aspect(height: u32, width: u32) -> Result<(), RuleError> {
-    let (long, short) = (height.max(width), height.min(width));
-    if f64::from(long) / f64::from(short) > 200.0 {
-        return Err(RuleError::VisionAspect { width, height });
-    }
-    Ok(())
-}
-
 /// An aspect-preserving resize followed by a centred crop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CoverCrop {
@@ -1260,60 +1034,6 @@ pub fn reference_image_size(
     })
 }
 
-/// Samples a clip of `frame_rate` frames per second at 2 fps and labels its
-/// vision blocks.
-///
-/// Every `frame_rate / 2`-th frame is sampled (every twelfth at 24 fps). The
-/// conditioner merges the samples in groups of `temporal_patch`, repeating
-/// the last one to fill a group, and labels a group with the mean of its
-/// timestamps.
-///
-/// # Errors
-///
-/// Returns [`RuleError::SampledFrames`] when fewer frames are sampled than
-/// one group holds.
-pub fn sample_video_frames(
-    frames: u32,
-    temporal_patch: u32,
-    frame_rate: u32,
-) -> Result<(Vec<u32>, Vec<f64>), RuleError> {
-    let stride = f64::from(frame_rate) / VIDEO_SAMPLE_FPS;
-    let mut indices: Vec<u32> = Vec::new();
-    let mut cursor = 0.0_f64;
-    loop {
-        // Python's `round` rounds half to even.
-        let index = cursor.round_ties_even();
-        if index >= f64::from(frames) {
-            break;
-        }
-        let index = index as u32;
-        if indices.last().is_none_or(|&last| index > last) {
-            indices.push(index);
-        }
-        cursor += stride;
-    }
-    let temporal_patch = temporal_patch as usize;
-    if indices.len() < temporal_patch {
-        return Err(RuleError::SampledFrames {
-            required: temporal_patch,
-            sampled: indices.len(),
-        });
-    }
-    let mut timestamps: Vec<f64> = (0..indices.len())
-        .map(|index| index as f64 / VIDEO_SAMPLE_FPS)
-        .collect();
-    let last = timestamps[timestamps.len() - 1];
-    timestamps.resize(
-        indices.len().div_ceil(temporal_patch) * temporal_patch,
-        last,
-    );
-    let blocks = timestamps
-        .chunks(temporal_patch)
-        .map(|group| (group[0] + group[temporal_patch - 1]) / 2.0)
-        .collect();
-    Ok((indices, blocks))
-}
-
 /// Units of a `rate` timeline skipped by a start offset of `seconds`.
 fn start_offset(seconds: f64, rate: f64) -> u64 {
     // Start offsets are validated finite and non-negative.
@@ -1392,7 +1112,7 @@ const fn gcd(mut a: u64, mut b: u64) -> u64 {
 /// 1:4 to 4:1, [`RuleError::ReferenceFrames`] when fewer than the frame
 /// rule's fewest frames (22 for the released checkpoint) remain after the
 /// offset, and the errors of [`audio_clip`],
-/// [`sample_video_frames`] and [`ProcessorConfig::video_grid`].
+/// [`sample_frames`] and [`ProcessorConfig::video_grid`].
 pub fn video_reference(
     media: &VideoMetadata,
     start_seconds: f64,
@@ -1442,7 +1162,7 @@ pub fn video_reference(
         .transpose()?;
 
     let (frame_indices, block_timestamps) =
-        sample_video_frames(kept, vision.temporal_patch_size, frame_rate)?;
+        sample_frames(kept, vision.temporal_patch_size, frame_rate)?;
     let sampled = u32::try_from(frame_indices.len()).unwrap_or(u32::MAX);
     let grid = vision.video_grid(sampled, size.height, size.width)?;
     let clip = VideoClip {
@@ -1989,7 +1709,9 @@ fn plan_reference(
         MediaMetadata::Image(image) => {
             let size = reference_image_size(image.width, image.height, &limits.references)
                 .map_err(reject)?;
-            let grid = vision.image_grid(size.height, size.width).map_err(reject)?;
+            let grid = vision
+                .image_grid(size.height, size.width)
+                .map_err(|error| reject(error.into()))?;
             let seen = Vision::Image(ImageVision {
                 grid,
                 tokens: vision.block_tokens(grid),
@@ -2102,14 +1824,15 @@ pub(super) mod tests {
     use super::{
         AudioClip, AudioMetadata, Canvas, ConditionInput, ConditionSpec, ConditionType, FrameClips,
         FramePosition, ImageMetadata, KeyframeFit, MAX_ASPECT_RATIO, MIN_ASPECT_RATIO,
-        MediaMetadata, PlanLimits, Prepared, ProcessorConfig, ReferenceConfig, RequestField, Role,
-        Target, VideoClip, VideoInputError, VideoMetadata, VideoParams, VideoTask, Vision,
-        audio_clip, canvas, check_request, cover_crop, gcd, plan_request, reference_bounds,
+        MediaMetadata, PlanLimits, Prepared, ReferenceConfig, RequestField, Role, Target,
+        VideoClip, VideoInputError, VideoMetadata, VideoParams, VideoTask, Vision, audio_clip,
+        canvas, check_request, cover_crop, gcd, plan_request, reference_bounds,
         reference_image_size, requested_frames, rows_per_frame, rule_canvases, video_frame_count,
         video_reference,
     };
     use crate::processing::{ReferenceLimits, ServedCanvas};
     use processing::FrameRate;
+    use qwen3::processor::ProcessorConfig;
 
     /// The planning vectors, generated from the diffusers reference.
     pub(in crate::processing) fn fixture() -> Value {

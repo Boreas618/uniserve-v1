@@ -22,11 +22,11 @@ use crate::config::{AttentionKind, Canvas, NAMED_CANVASES};
 use crate::load::MinimaxH3;
 use crate::partition::Ulysses;
 use crate::processing::ConditionPacking;
-use crate::processing::plan::ProcessorConfig;
 use crate::{
     AUDIO_CHANNELS, AUDIO_HOP, AUDIO_SAMPLE_RATE, CANVAS_MULTIPLE, CLIP_FRAMES, CLIP_LATENTS,
     Component, Config, FPS, Partition, VideoTask,
 };
+use qwen3::processor::ProcessorConfig;
 
 /// The MiniMax-H3 family.
 pub const FAMILY: Family = Family::Video(&MinimaxH3Family);
