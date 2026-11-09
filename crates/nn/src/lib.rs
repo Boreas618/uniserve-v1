@@ -61,6 +61,7 @@ pub mod layers;
 pub mod quantization;
 pub mod tensor;
 pub mod timestep;
+pub mod vocoder;
 pub mod weights;
 
 pub use capability::{
@@ -76,11 +77,11 @@ pub use exchange::ExchangeViews;
 pub use forward::{Arena, AttentionProbe, Fence, Forward, Split};
 pub use group::{Group, Transfer};
 pub use layers::{
-    Activation, AdaptiveAvgPool2d, AudioActivation, Axpby, Candidates, Cast, CausalPad, Conv1d,
-    Conv3d, ConvSpec, ConvTranspose1d, CrossFade, Epilogue, GateBias, GatedActivation, Gelu,
-    GroupNorm, Halves, IndexRows, LayerNorm, Linear, Modulation, Moe, Noise, NoiseKey, Padding,
-    ParallelLMHead, PcmInterleave, Residual, ResidualStream, RgbBytes, RmsNorm, Rotary, Rounding,
-    Sampler, SamplerState, Samples, Scale, Silu, Snake, TRTLLM_WORKSPACE_BYTES,
+    Activation, AdaptiveAvgPool2d, Axpby, Candidates, Cast, CausalPad, Conv1d, Conv3d, ConvSpec,
+    ConvTranspose1d, CrossFade, Epilogue, GateBias, GatedActivation, Gelu, GroupNorm, Halves,
+    IndexRows, LayerNorm, Linear, Modulation, Moe, Noise, NoiseKey, Padding, ParallelLMHead,
+    PcmInterleave, Residual, ResidualStream, RgbBytes, RmsNorm, Rotary, Rounding, Sampler,
+    SamplerState, Samples, Scale, Silu, Snake, TRTLLM_WORKSPACE_BYTES,
 };
 pub use ops::PhaseKind;
 pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};

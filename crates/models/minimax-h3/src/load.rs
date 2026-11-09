@@ -31,7 +31,7 @@
 
 use std::sync::Arc;
 
-use crate::audio_vae::BigVgan;
+use crate::audio_vae::AudioDecoder;
 use crate::checkpoint::Dit;
 use crate::config::Config;
 use crate::denoiser::{ConditionEncoders, Denoiser, Layouts};
@@ -51,7 +51,7 @@ pub struct MinimaxH3 {
     transformer_ref: Option<Arc<Denoiser>>,
     video_postprocessor: Option<Arc<crate::output::VideoPostprocessor>>,
     video_decoder: Option<Arc<crate::video_vae::VideoDecoder>>,
-    audio_decoder: Option<Arc<BigVgan>>,
+    audio_decoder: Option<Arc<AudioDecoder>>,
 }
 
 impl std::fmt::Debug for MinimaxH3 {
@@ -83,7 +83,7 @@ impl std::fmt::Debug for MinimaxH3 {
             )
             .field(
                 "audio_decoder",
-                &self.audio_decoder.as_ref().map(|_| "BigVgan"),
+                &self.audio_decoder.as_ref().map(|_| "AudioDecoder"),
             )
             .finish()
     }
@@ -119,7 +119,7 @@ impl MinimaxH3 {
     }
 
     /// The audio decoder, when this rank places it.
-    pub fn audio_decoder(&self) -> Option<&Arc<BigVgan>> {
+    pub fn audio_decoder(&self) -> Option<&Arc<AudioDecoder>> {
         self.audio_decoder.as_ref()
     }
 }
@@ -235,7 +235,7 @@ pub fn load(
     let mut transformer_ref: Option<Arc<Denoiser>> = None;
     let mut video_postprocessor: Option<Arc<crate::output::VideoPostprocessor>> = None;
     let mut video_decoder: Option<Arc<crate::video_vae::VideoDecoder>> = None;
-    let mut audio_decoder: Option<Arc<BigVgan>> = None;
+    let mut audio_decoder: Option<Arc<AudioDecoder>> = None;
     for component in partition.blocks.iter() {
         match component {
             Component::TextEncoder => {
@@ -330,7 +330,7 @@ pub fn load(
                 // at load - so it constructs from its own component and its sidecar alone.
                 let source = checkpoint.component("audio_vae")?;
                 let mut shards = loader.reborrow(source)?;
-                let decoder = Arc::new(BigVgan::load(&config.audio_vae, &mut shards)?);
+                let decoder = Arc::new(AudioDecoder::load(&config.audio_vae, &mut shards)?);
                 audio_decoder = Some(decoder);
             }
             Component::VideoDecoder => {

@@ -737,7 +737,24 @@ use nn::layers::{
 use nn::weights::{Scope, Weight, WeightLoader};
 use nn::{DType, Shape, Strides, TensorView};
 
-use crate::audio_vae::normalized;
+/// A weight-normalized 1-d convolution of `from` to `to` channels with `kernel` taps, `padding`
+/// zeros each side and `dilation`: the DAC encoder's convolution form.
+fn normalized(
+    from: u32,
+    to: u32,
+    kernel: u32,
+    padding: u32,
+    dilation: u32,
+    bias: Bias,
+) -> ConvSpec<1> {
+    ConvSpec {
+        padding: [padding],
+        dilation: [dilation],
+        bias,
+        weight_norm: true,
+        ..ConvSpec::new(from, to, [kernel])
+    }
+}
 
 /// One causal convolution of the encoder and the normalization that feeds it.
 ///
@@ -796,7 +813,7 @@ pub struct VideoEncoder {
 ///
 /// Multiplying by `1 / std` and shifting by `−mean / std` is a one-by-one convolution whose weight is
 /// the diagonal, so the encoder undoes the decoder's `value · std + mean` with one operator of the
-/// same shape as the projection beside it (`audio_vae::denormalize_tables` is that other direction).
+/// same shape as the projection beside it (the audio decoder's `ChannelAffine` restore is that other direction).
 ///
 /// **Declared deviation.** The reference's `(lat - mean) / std` is a subtraction and a division in
 /// f32 - two roundings - while a convolution's multiply-add is one. The values agree to at most 1 ulp

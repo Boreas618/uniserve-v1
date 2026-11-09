@@ -20,7 +20,6 @@
 mod activation;
 mod affine;
 mod attention;
-mod audio;
 mod conv;
 mod cross_fade;
 mod embedding;
@@ -50,7 +49,6 @@ pub use affine::ChannelAffine;
 pub use attention::{
     DenseAttention, DenseSpec, PagedAttention, PagedSpec, TRTLLM_WORKSPACE_BYTES, Varlen,
 };
-pub use audio::AudioActivation;
 pub use conv::{CausalPad, Conv1d, Conv3d, ConvSpec, ConvTranspose1d, Padding};
 pub use cross_fade::CrossFade;
 pub use embedding::{VocabParallelEmbedding, vocabulary_shard};

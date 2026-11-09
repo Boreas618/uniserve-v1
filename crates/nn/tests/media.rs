@@ -12,6 +12,7 @@ use std::path::Path;
 
 use nn::diffusion::{Euler, Grid};
 use nn::layers::{CausalPad, Conv1d, ConvSpec, ConvTranspose1d, Padding};
+use nn::vocoder::{BigVgan, BigVganSpec};
 use nn::{Arena, Checkpoint, DType, Forward, Shape, TensorView, WeightLoader};
 
 /// The programs a walk reported, as `(operator, key)` pairs.
@@ -205,4 +206,94 @@ fn an_euler_step_gathers_its_coefficient_and_adds_the_scaled_velocity() {
         nn::Strides::new(&[48, 16, 4, 2]),
     );
     assert!(scaled.prepare_latents(&f, strided).is_err());
+}
+
+/// The weight-normalized module `name` of a 1-d convolution: its `weight_v`, `weight_g` and,
+/// with `bias`, its bias of the filter's output channels.
+fn normalized_conv(name: &str, filter: [u64; 3], bias: Option<u64>) -> Vec<(String, Vec<u64>)> {
+    let mut tensors = vec![
+        (format!("{name}.weight_v"), filter.to_vec()),
+        (format!("{name}.weight_g"), vec![filter[0], 1, 1]),
+    ];
+    if let Some(channels) = bias {
+        tensors.push((format!("{name}.bias"), vec![channels]));
+    }
+    tensors
+}
+
+/// An alias-free activation module of `channels` and its 12-tap filters.
+fn activation(name: &str, channels: u64) -> Vec<(String, Vec<u64>)> {
+    vec![
+        (format!("{name}.act.alpha"), vec![channels]),
+        (format!("{name}.act.beta"), vec![channels]),
+        (format!("{name}.upsample.filter"), vec![1, 1, 12]),
+        (format!("{name}.downsample.lowpass.filter"), vec![1, 1, 12]),
+    ]
+}
+
+/// A one-stage BigVGAN loads its modules by the generator's names and runs pre-convolution,
+/// upsample, the block's dilation steps, the post activation and the post-convolution; the output
+/// is the input length times the stage rates.
+#[test]
+fn a_bigvgan_generator_upsamples_through_its_stages() {
+    let mut tensors = normalized_conv("decoder.conv_pre", [8, 4, 7], Some(8));
+    tensors.extend(normalized_conv("decoder.ups.0.0", [8, 4, 4], Some(4)));
+    for step in 0..2 {
+        let block = "decoder.resblocks.0";
+        tensors.extend(normalized_conv(
+            &format!("{block}.convs1.{step}"),
+            [4, 4, 3],
+            Some(4),
+        ));
+        tensors.extend(normalized_conv(
+            &format!("{block}.convs2.{step}"),
+            [4, 4, 3],
+            Some(4),
+        ));
+        tensors.extend(activation(&format!("{block}.activations.{}", 2 * step), 4));
+        tensors.extend(activation(
+            &format!("{block}.activations.{}", 2 * step + 1),
+            4,
+        ));
+    }
+    tensors.extend(activation("decoder.activation_post", 4));
+    tensors.extend(normalized_conv("decoder.conv_post", [1, 4, 7], None));
+    let header: Vec<(&str, &str, &[u64])> = tensors
+        .iter()
+        .map(|(name, shape)| (name.as_str(), "F32", shape.as_slice()))
+        .collect();
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = checkpoint(directory.path(), &header);
+    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let spec = BigVganSpec {
+        in_channels: 4,
+        channels: 8,
+        upsample_rates: vec![2],
+        upsample_kernels: vec![4],
+        resblock_kernels: vec![3],
+        resblock_dilations: vec![vec![1, 3]],
+        activation_ratio: 2,
+        final_bias: nn::layers::Bias::Absent,
+    };
+    let generator = BigVgan::load(&mut loader.scope("decoder"), &spec).unwrap();
+    assert_eq!(generator.samples(16), 32);
+    let odd = BigVganSpec {
+        upsample_kernels: vec![4, 4],
+        ..spec.clone()
+    };
+    assert!(BigVgan::load(&mut loader.scope("decoder"), &odd).is_err());
+
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let view = |dims: &[u64]| arena.tensor(DType::F32, Shape::new(dims)).unwrap();
+    let input = view(&[2, 4, 16]);
+    let ((), launches) = recorded(|| generator.forward(&f, input, view(&[2, 1, 32])).unwrap());
+    let count = |name: &str| launches.iter().filter(|(op, _)| op == name).count();
+    // Two dilation steps of two activations each, then the post activation, each once per batch
+    // row; the block's four convolutions between the pre- and post-convolutions.
+    assert_eq!(count("audio_activation"), 2 * (2 * 2 + 1));
+    assert_eq!(count("conv1d"), 1 + 4 + 1);
+    assert_eq!(count("conv_transpose1d"), 1);
+    assert_eq!(launches.first().map(|(op, _)| op.as_str()), Some("conv1d"));
+    assert!(generator.forward(&f, input, view(&[2, 1, 16])).is_err());
 }
