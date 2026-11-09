@@ -817,6 +817,26 @@ pub struct Weight {
 }
 
 impl Weight {
+    /// A weight over memory the caller keeps alive for every launch that reads it: a table gathered
+    /// into the forward's arena, or a request table the runtime holds for the length of a capture
+    /// and its replays. Nothing is retained.
+    ///
+    /// # Errors
+    ///
+    /// A view whose element type has no whole-byte size.
+    pub fn borrowed(view: TensorView) -> Result<Self> {
+        let element = view.dtype.bytes().ok_or_else(|| {
+            Error::weight(
+                "",
+                format!("a borrowed {} view has no whole-byte element", view.dtype),
+            )
+        })?;
+        Ok(Self {
+            backing: Backing::new(view.ptr, view.shape.numel() * element),
+            view,
+        })
+    }
+
     /// The operator-facing view.
     pub fn view(&self) -> TensorView {
         self.view

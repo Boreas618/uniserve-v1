@@ -26,6 +26,7 @@ mod cross_fade;
 mod embedding;
 mod frame;
 mod head;
+mod indexed;
 mod layout;
 mod linear;
 mod moe;
@@ -56,6 +57,7 @@ pub use cross_fade::CrossFade;
 pub use embedding::{VocabParallelEmbedding, vocabulary_shard};
 pub use frame::FramePad;
 pub use head::ParallelLMHead;
+pub use indexed::StepIndexed;
 pub use layout::{Access, Copy, Patchify};
 pub use linear::{
     Bias, ENCODE_CHUNK, Linear, MergedColumnLinear, PACKED_M_CLASSES, Parallel, QkvBias, QkvLinear,

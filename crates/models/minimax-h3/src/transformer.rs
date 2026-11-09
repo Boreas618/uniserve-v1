@@ -30,12 +30,10 @@ use nn::blocks::{GateUp, GatedMlp, GatedMlpSpec};
 use nn::family::Split;
 use nn::layers::{
     Bias, Epilogue, Linear, Modulation, Parallel, Precision, QkNorm, Residual, ResidualStream,
-    RmsNorm, Rotary, RotarySpec, Rounding, Scale, Spectrum, Varlen,
+    RmsNorm, Rotary, RotarySpec, Rounding, Scale, Spectrum, StepIndexed, Varlen,
 };
-use nn::tensor::Backing;
 use nn::weights::{Weight, WeightLoader};
 use nn::{Forward, Shape, TensorView};
-use ops::gemm::WeightOrder;
 
 /// The components a deployment's fence probes name (`profiling_config.fence_components`): the
 /// denoiser's stack and one of its layers.
@@ -318,79 +316,15 @@ pub struct StudentHeads {
     audio: Option<FusedHeads>,
 }
 
-/// One modality's fused heads: the weight and bias rows of every evaluation block.
-struct FusedHeads {
-    /// `[blocks, out * hidden]` FP32: block `b`'s fused weight.
-    ///
-    /// FP32 because the reference builds a student's head FP32: the fused
-    /// row is a sum of the checkpoint's BF16 rows and rounding it back would round a number the
-    /// reference keeps exact. The projection reads the widened FP32 rows (`Transformer::wide`), so
-    /// its two operands are one type and the only rounding is the store into the velocity.
-    weight: Weight,
-    /// `[blocks, out]`: block `b`'s fused bias.
-    bias: Weight,
-    /// The velocity's width for this modality.
-    out: u32,
-    /// The partition's hidden width.
-    hidden: u32,
-    /// The blocks the schedule fused into the table.
-    blocks: u32,
-}
-
-/// One evaluation's head, as the two weights a projection reads.
-struct Selected {
-    weight: Weight,
-    bias: Weight,
-}
-
-impl FusedHeads {
-    /// Pick `block`'s row of each table on the device and answer the two weights over it.
-    fn select(
-        &self,
-        f: &Forward,
-        block: u32,
-        step: TensorView,
-        arena: &nn::Arena,
-    ) -> Result<Selected> {
-        if block >= self.blocks {
-            return Err(Error::checkpoint(format!(
-                "H3 evaluation {block} is outside the {} fused student heads",
-                self.blocks
-            )));
-        }
-        let dtype = self.weight.dtype();
-        let wide = arena.tensor(
-            dtype,
-            Shape::new(&[1, u64::from(self.out) * u64::from(self.hidden)]),
-        )?;
-        nn::layers::IndexRows.gather(f, self.weight.view(), step, wide)?;
-        let narrow = arena.tensor(dtype, Shape::new(&[1, u64::from(self.out)]))?;
-        nn::layers::IndexRows.gather(f, self.bias.view(), step, narrow)?;
-        Ok(Selected {
-            weight: staged(
-                wide.reshape(Shape::new(&[u64::from(self.out), u64::from(self.hidden)])),
-            )?,
-            bias: staged(narrow.reshape(Shape::new(&[u64::from(self.out)])))?,
-        })
-    }
-}
-
-/// A weight over a device buffer the caller of this module owns for the launch's lifetime.
+/// One modality's fused heads: one projection per evaluation block, `[blocks, out * hidden]`
+/// FP32 weights and `[blocks, out]` biases.
 ///
-/// The circled views a step gathers into are arena buffers: they live as long as the forward that
-/// wrote them, which is exactly as long as the projection that reads them, so a weight can address
-/// one without a loader having published it.
-fn staged(view: TensorView) -> Result<Weight> {
-    let element = view.dtype.bytes().ok_or_else(|| {
-        Error::checkpoint(format!(
-            "a staged weight of {} has no whole-byte element size",
-            view.dtype
-        ))
-    })?;
-    Ok(Weight {
-        backing: nn::Backing::new(view.ptr, view.shape.numel() * element),
-        view,
-    })
+/// FP32 because the reference builds a student's head FP32: the fused row is a sum of the
+/// checkpoint's BF16 rows and rounding it back would round a number the reference keeps exact. The
+/// projection reads the widened FP32 rows (`Transformer::wide`), so its two operands are one type
+/// and the only rounding is the store into the velocity.
+struct FusedHeads {
+    heads: StepIndexed,
 }
 
 impl StudentHeads {
@@ -495,14 +429,17 @@ impl FusedHeads {
             fused_bias[target..][..block_bias.len()].copy_from_slice(&block_bias);
         }
         let mut heads = loader.scope(format!("denoiser.{}.student_heads", modality.as_str()));
+        let width = |value: u64, what: &str| {
+            u32::try_from(value)
+                .map_err(|_| Error::checkpoint(format!("{name}'s {what} exceeds u32")))
+        };
         Ok(Self {
-            weight: heads.constant_f32("weight", &[blocks, per_head], &fused)?,
-            bias: heads.constant_f32("bias", &[blocks, out], &fused_bias)?,
-            out: u32::try_from(out)
-                .map_err(|_| Error::checkpoint(format!("{name}'s width exceeds u32")))?,
-            hidden: u32::try_from(hidden)
-                .map_err(|_| Error::checkpoint(format!("{name}'s hidden width exceeds u32")))?,
-            blocks: block_count,
+            heads: StepIndexed::new(
+                heads.constant_f32("weight", &[blocks, per_head], &fused)?,
+                heads.constant_f32("bias", &[blocks, out], &fused_bias)?,
+                width(hidden, "hidden width")?,
+                width(out, "width")?,
+            )?,
         })
     }
 }
@@ -595,7 +532,7 @@ impl Transformer {
             retained: None,
         };
         let norm = RmsNorm::new(
-            borrowed(self.norm_out.weight())?,
+            Weight::borrowed(self.norm_out.weight())?,
             self.config.norm_eps,
             Epilogue::Modulated(modulation),
         )?;
@@ -626,7 +563,7 @@ fn halves(table: TensorView, width: u64) -> Result<(Weight, Weight)> {
             Shape::new(&[rows, width]),
             nn::Strides::new(&[stride, 1]),
         );
-        borrowed(view)
+        Ok(Weight::borrowed(view)?)
     };
     Ok((chunk(0)?, chunk(1)?))
 }
@@ -656,21 +593,9 @@ fn chunks(table: TensorView, width: u64, first: u64) -> Result<(Weight, Weight, 
             Shape::new(&[rows, width]),
             nn::Strides::new(&[stride, 1]),
         );
-        borrowed(view)
+        Ok(Weight::borrowed(view)?)
     };
     Ok((chunk(0)?, chunk(1)?, chunk(2)?))
-}
-
-/// A weight over memory the caller owns: a table gathered for one step.
-///
-/// Nothing is retained: the worker keeps the table alive for the length of the capture and its
-/// replays, which is the same guarantee every other request table has.
-fn borrowed(view: TensorView) -> Result<Weight> {
-    let bytes = view.numel() * view.dtype.bytes().unwrap_or(1);
-    Ok(Weight {
-        backing: Backing::new(view.ptr, bytes),
-        view,
-    })
 }
 
 /// One H3 DiT partition: the projections, the stack and the two output heads.
@@ -871,18 +796,19 @@ impl Transformer {
         out: TensorView,
     ) -> Result<()> {
         if let Some(heads) = &self.heads {
-            let arena = f.arena();
             let fused = match modality {
                 Modality::Video => &heads.video,
                 Modality::Audio => heads.audio.as_ref().ok_or_else(|| {
                     Error::Unsupported("this H3 partition predicts no audio velocity".to_owned())
                 })?,
             };
-            let selected = fused.select(f, block, step, arena)?;
-            return Ok(
-                Linear::new(selected.weight, Some(selected.bias), WeightOrder::NxK)?
-                    .forward(f, hidden, out)?,
-            );
+            if u64::from(block) >= fused.heads.steps() {
+                return Err(Error::checkpoint(format!(
+                    "H3 evaluation {block} is outside the {} fused student heads",
+                    fused.heads.steps()
+                )));
+            }
+            return Ok(fused.heads.forward(f, step, hidden, out)?);
         }
         match modality {
             Modality::Video => {

@@ -492,3 +492,58 @@ fn a_timestep_embedding_projects_activates_and_projects() {
     );
     assert_eq!(arena.used(), used);
 }
+
+// ---- Step-indexed projection --------------------------------------------------------------------
+
+/// A step-indexed projection gathers its step's weight and bias rows, projects with them, and
+/// releases the gathered rows; tables of another extent or type are refused.
+#[test]
+fn a_step_indexed_projection_gathers_its_steps_row_then_projects() {
+    use nn::Weight;
+    use nn::layers::StepIndexed;
+
+    let arena = Arena::counting();
+    let table = |dtype: DType, dims: &[u64]| {
+        Weight::borrowed(arena.tensor(dtype, Shape::new(dims)).unwrap()).unwrap()
+    };
+    let (steps, inputs, outputs) = (4, 32, 8);
+    let projection = StepIndexed::new(
+        table(DType::F32, &[steps, outputs * inputs]),
+        table(DType::F32, &[steps, outputs]),
+        inputs as u32,
+        outputs as u32,
+    )
+    .unwrap();
+    assert_eq!(projection.steps(), steps);
+
+    let f = Forward::recording(&arena);
+    let step = arena.tensor(DType::I32, Shape::new(&[1])).unwrap();
+    let input = arena.tensor(DType::F32, Shape::new(&[3, inputs])).unwrap();
+    let out = arena.tensor(DType::F32, Shape::new(&[3, outputs])).unwrap();
+    let used = arena.used();
+    let (result, launches) = launched(|| projection.forward(&f, step, input, out));
+    result.unwrap();
+    assert_eq!(launches.len(), 3, "{launches:?}");
+    assert_eq!(launches[2], "gemm");
+    assert_eq!(launches[0], launches[1], "one gather per table");
+    assert_eq!(arena.used(), used);
+
+    assert!(
+        StepIndexed::new(
+            table(DType::F32, &[steps, outputs * inputs]),
+            table(DType::BF16, &[steps, outputs]),
+            inputs as u32,
+            outputs as u32,
+        )
+        .is_err()
+    );
+    assert!(
+        StepIndexed::new(
+            table(DType::F32, &[steps, outputs * inputs]),
+            table(DType::F32, &[steps - 1, outputs]),
+            inputs as u32,
+            outputs as u32,
+        )
+        .is_err()
+    );
+}
