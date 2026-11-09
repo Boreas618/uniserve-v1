@@ -37,8 +37,12 @@ def install(root: pathlib.Path, name: str, body: str) -> None:
     (tools / name).write_text(textwrap.dedent(body))
 
 
-def test_a_tool_out_of_the_tree_is_unrunnable_and_names_the_absence(sweep, tmp_path):
-    outcome, detail, _ = sweep.run_tree_check(tmp_path, "kernel_arguments.py", (("--check",),), 60)
+def test_a_tool_out_of_the_tree_is_unrunnable_and_names_the_absence(
+    sweep, tmp_path
+):
+    outcome, detail, _ = sweep.run_tree_check(
+        tmp_path, "kernel_arguments.py", (("--check",),), 60
+    )
 
     assert outcome == "unrunnable"
     assert "tools/kernel_arguments.py is not in this tree" in detail
@@ -55,7 +59,9 @@ def test_a_tool_that_agrees_passes(sweep, tmp_path):
         """,
     )
 
-    outcome, detail, _ = sweep.run_tree_check(tmp_path, "kernel_arguments.py", (("--check",),), 60)
+    outcome, detail, _ = sweep.run_tree_check(
+        tmp_path, "kernel_arguments.py", (("--check",),), 60
+    )
 
     assert outcome == "passed"
     assert "83 operator(s) read" in detail
@@ -74,14 +80,18 @@ def test_a_disagreement_fails_and_names_the_cause(sweep, tmp_path):
         """,
     )
 
-    outcome, detail, _ = sweep.run_tree_check(tmp_path, "kernel_arguments.py", (("--check",),), 60)
+    outcome, detail, _ = sweep.run_tree_check(
+        tmp_path, "kernel_arguments.py", (("--check",),), 60
+    )
 
     assert outcome == "failed"
     assert "rope_apply" in detail
     assert "+1 more cause(s)" in detail
 
 
-def test_a_tool_that_ends_in_an_exception_is_a_gap_in_the_harness(sweep, tmp_path):
+def test_a_tool_that_ends_in_an_exception_is_a_gap_in_the_harness(
+    sweep, tmp_path
+):
     install(
         tmp_path,
         "kernel_arguments.py",
@@ -90,7 +100,9 @@ def test_a_tool_that_ends_in_an_exception_is_a_gap_in_the_harness(sweep, tmp_pat
         """,
     )
 
-    outcome, detail, _ = sweep.run_tree_check(tmp_path, "kernel_arguments.py", (("--check",),), 60)
+    outcome, detail, _ = sweep.run_tree_check(
+        tmp_path, "kernel_arguments.py", (("--check",),), 60
+    )
 
     assert outcome == "unrunnable"
     assert "RuntimeError: no Triton in this interpreter" in detail
@@ -107,7 +119,9 @@ def test_a_usage_refusal_is_unrunnable_and_quotes_the_refusal(sweep, tmp_path):
         """,
     )
 
-    outcome, detail, _ = sweep.run_tree_check(tmp_path, "kernel_arguments.py", (("--check", "x"),), 60)
+    outcome, detail, _ = sweep.run_tree_check(
+        tmp_path, "kernel_arguments.py", (("--check", "x"),), 60
+    )
 
     assert outcome == "unrunnable"
     assert "--fixture needs --store" in detail
@@ -128,7 +142,9 @@ def test_each_invocation_carries_the_store_and_the_fixture_it_compares(sweep):
         assert invocation[invocation.index("--target") + 1] == "sm_100a"
 
 
-def test_source_mode_is_never_run_because_it_reports_an_operators_arms_against_each_other(sweep):
+def test_source_mode_is_never_run_because_it_reports_an_operators_arms_against_each_other(
+    sweep,
+):
     """The check runs against a built artifact or not at all: its source mode over-reports."""
     assert sweep.tree_needs("kernel_arguments.py") == ["--fixture", "--store"]
     assert sweep.tree_needs("kernel_arguments.py", "keys.txt") == ["--store"]
@@ -140,7 +156,9 @@ def test_an_empty_store_is_not_a_green(sweep, tmp_path):
     assert not sweep.store_holds_cells(tmp_path)
     (tmp_path / "op" / "triton" / "1" / "sm_100a" / "key").mkdir(parents=True)
     assert not sweep.store_holds_cells(tmp_path)
-    (tmp_path / "op" / "triton" / "1" / "sm_100a" / "key" / "metadata.json").write_text("{}")
+    (
+        tmp_path / "op" / "triton" / "1" / "sm_100a" / "key" / "metadata.json"
+    ).write_text("{}")
     assert sweep.store_holds_cells(tmp_path)
 
 
@@ -157,13 +175,17 @@ def test_a_comparison_that_compared_nothing_is_not_a_pass(sweep, tmp_path):
         """,
     )
 
-    outcome, detail, _ = sweep.run_tree_check(tmp_path, "kernel_arguments.py", (("--check",),), 60)
+    outcome, detail, _ = sweep.run_tree_check(
+        tmp_path, "kernel_arguments.py", (("--check",),), 60
+    )
 
     assert outcome == "unrunnable"
     assert "compared no cell" in detail
 
 
-def test_two_invocations_are_one_verdict_and_the_louder_mode_wins(sweep, tmp_path):
+def test_two_invocations_are_one_verdict_and_the_louder_mode_wins(
+    sweep, tmp_path
+):
     """A tool whose subject needs two passes is not passed by the one that agreed."""
     install(
         tmp_path,
@@ -181,7 +203,10 @@ def test_two_invocations_are_one_verdict_and_the_louder_mode_wins(sweep, tmp_pat
     )
 
     outcome, detail, _ = sweep.run_tree_check(
-        tmp_path, "kernel_arguments.py", (("--check",), ("--check", "--native")), 60
+        tmp_path,
+        "kernel_arguments.py",
+        (("--check",), ("--check", "--native")),
+        60,
     )
 
     assert outcome == "failed"
@@ -204,7 +229,10 @@ def test_both_invocations_clean_is_a_pass_with_each_detail(sweep, tmp_path):
     )
 
     outcome, detail, _ = sweep.run_tree_check(
-        tmp_path, "kernel_arguments.py", (("--check",), ("--check", "--native")), 60
+        tmp_path,
+        "kernel_arguments.py",
+        (("--check",), ("--check", "--native")),
+        60,
     )
 
     assert outcome == "passed"

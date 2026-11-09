@@ -53,6 +53,7 @@ from tests.python.e2e.http_helpers import (
 # window, head_dim 128, 64-token pages, one rank: trtllm-gen.
 POLICY_PACKAGE = "crates/ops/program-fixtures/policy"
 
+
 def repository() -> Path:
     """The repository root: the workspace the policy package is built in."""
     return Path(__file__).resolve().parents[3]
@@ -364,5 +365,3 @@ def program_server(
         yield socket
     finally:
         stop_server(process)
-
-

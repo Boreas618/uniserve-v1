@@ -60,7 +60,6 @@ from tests.python.e2e.http_helpers import (
     find_free_port,
     require_uniserve_binary,
     server_process,
-    wait_health,
     worker_executable,
 )
 from tests.python.e2e.program_server import (

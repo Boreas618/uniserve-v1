@@ -1,7 +1,7 @@
 """How a key fixture's rows are read, and what a row may state.
 
 A fixture row is `op<TAB>descriptor`, and it may state a third field: the backend the deployment
-launches that key on. The field exists because the backend is not a property of the key - 
+launches that key on. The field exists because the backend is not a property of the key -
 `paged_attention` declares `bf16`/`f16` on `trtllm` and `f8e4m3` on `triton`, so a store built from a
 two-column fixture chooses a backend by coverage, which is not necessarily the one the deployment
 names. A row that states it is held to: the store builds that package or refuses.

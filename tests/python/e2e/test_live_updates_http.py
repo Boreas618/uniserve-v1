@@ -950,7 +950,9 @@ def test_a_switch_after_a_hot_restart_finds_the_storage_of_the_epoch_before(
     try:
         with _serve(runtime, log, name, {"RUST_LOG": "info"}) as base_url:
             answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
-            _change_epoch(base_url, f"worker_config.executable={executables[0]}")
+            _change_epoch(
+                base_url, f"worker_config.executable={executables[0]}"
+            )
             _purged(base_url)
             restarted = _admin(base_url, "restart")
             assert restarted.status_code == 200, (
@@ -958,7 +960,9 @@ def test_a_switch_after_a_hot_restart_finds_the_storage_of_the_epoch_before(
             )
             successors.append(restarted.json()["result"]["pid"])
             _chat(base_url, name, RECOVERY_PROMPT, tokens=8)
-            _change_epoch(base_url, f"worker_config.executable={executables[1]}")
+            _change_epoch(
+                base_url, f"worker_config.executable={executables[1]}"
+            )
             after = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
             assert (
                 after["choices"][0]["message"]["content"]
@@ -1258,9 +1262,7 @@ def _restart_while_streaming(
     moved_url = f"http://127.0.0.1:{port}"
     # The answer comes from the daemon on the previous address, and the successor binds a new
     # address once it holds the deployment.
-    _wait_until(
-        lambda: _listens(port), 60, "the new address did not open"
-    )
+    _wait_until(lambda: _listens(port), 60, "the new address did not open")
     reply = _chat(moved_url, name, "Say hello.")
     assert reply["choices"][0]["message"]["content"]
     _wait_until(
@@ -2116,14 +2118,12 @@ def _assert_whole(streaming: threading.Thread, streamed: dict) -> int:
     """Waits for the count's end; it lost and repeated nothing."""
     streaming.join(timeout=1800)
     assert streamed["done"].is_set(), "the count did not end"
-    assert not streamed["errors"], f"the count failed: {streamed['errors'][0]!r}"
+    assert not streamed["errors"], (
+        f"the count failed: {streamed['errors'][0]!r}"
+    )
     numbers = _numbers(streamed["read"])
     wrong = next(
-        (
-            index
-            for index, number in enumerate(numbers)
-            if number != index + 1
-        ),
+        (index for index, number in enumerate(numbers) if number != index + 1),
         None,
     )
     if wrong is not None:
@@ -2132,10 +2132,12 @@ def _assert_whole(streaming: threading.Thread, streamed: dict) -> int:
         at = text.find(f"{wrong}, ")
         pytest.fail(
             f"the response lost or repeated a count at {wrong}: "
-            f"{text[max(at - 60, 0):at + 80]!r}, deltas "
-            f"{[piece for piece in pieces[3 * wrong - 12:3 * wrong + 12]]}"
+            f"{text[max(at - 60, 0) : at + 80]!r}, deltas "
+            f"{[piece for piece in pieces[3 * wrong - 12 : 3 * wrong + 12]]}"
         )
-    assert len(streamed["reasons"]) == 1, f"the count ended {streamed['reasons']}"
+    assert len(streamed["reasons"]) == 1, (
+        f"the count ended {streamed['reasons']}"
+    )
     return len(numbers)
 
 
@@ -2222,9 +2224,11 @@ def test_an_operator_rollback_returns_to_the_previous_epoch_under_a_request(
             assert all(_runs(pid) for pid in before)
         # A node that cannot move the weights keeps them on its GPUs, and says why.
         _wait_until(
-            lambda: previous_epoch == "parked"
-            or _update(base_url)["moved_to_host_bytes"] > 0
-            or _update(base_url)["previous_epoch_kept"] == previous_epoch,
+            lambda: (
+                previous_epoch == "parked"
+                or _update(base_url)["moved_to_host_bytes"] > 0
+                or _update(base_url)["previous_epoch_kept"] == previous_epoch
+            ),
             120,
             "the previous epoch's storage was not kept",
         )
@@ -2286,7 +2290,9 @@ def test_a_regression_of_the_epoch_on_trial_reverts_it(
         print("reverted:", json.dumps(update))
         (replica,) = update["trial"]["replicas"]
         assert replica["baseline"]["tokens_per_second"] > 0, update
-        assert replica["rates"]["step_us"] > replica["baseline"]["step_us"], update
+        assert replica["rates"]["step_us"] > replica["baseline"]["step_us"], (
+            update
+        )
         count = _assert_whole(streaming, streamed)
         after = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
         assert (
@@ -2501,9 +2507,15 @@ def test_warming_waits_for_the_stated_tail_and_limits_the_prefill(
         assert limited["prefill_limited"], limited
         _admin(base_url, "config/commit")
         answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
-        assert _numbers([answer["choices"][0]["message"]["content"]])[:3] == [1, 2, 3]
+        assert _numbers([answer["choices"][0]["message"]["content"]])[:3] == [
+            1,
+            2,
+            3,
+        ]
         assert not _occurrences(log, "starved"), _log_trouble(log)
-        _artifact("warming-options", {"tight": tight, "under_prefills": limited})
+        _artifact(
+            "warming-options", {"tight": tight, "under_prefills": limited}
+        )
 
 
 def test_a_request_that_ends_at_once_leaves_its_pages_in_the_host_cache(
@@ -2624,7 +2636,8 @@ def test_a_process_of_two_devices_keeps_the_host_kv_cache(
         assert flushed.status_code == 200, flushed.text
         answers = []
         found = _host_tokens_read(
-            base_url, lambda: answers.append(_chat(base_url, name, prompt, tokens=16))
+            base_url,
+            lambda: answers.append(_chat(base_url, name, prompt, tokens=16)),
         )
         print(f"host tokens on {kind} parallel devices:", found)
         assert found > 0, f"{found}{_log_trouble(log)}"
@@ -2632,9 +2645,12 @@ def test_a_process_of_two_devices_keeps_the_host_kv_cache(
         # each, and each keeps a host KV cache of its own; data parallelism is
         # a process per device.
         if kind == "expert":
-            assert _occurrences(log, "schedulers=2 devices=2"), _log_trouble(log)
+            assert _occurrences(log, "schedulers=2 devices=2"), _log_trouble(
+                log
+            )
             assert (
-                _occurrences(log, "the host KV cache serves the worker group") == 2
+                _occurrences(log, "the host KV cache serves the worker group")
+                == 2
             ), _log_trouble(log)
         assert (
             answers[0]["choices"][0]["message"]["content"]
@@ -2706,7 +2722,9 @@ def test_requests_that_outgrow_the_cache_in_decode_all_finish(
             assert numbers == list(range(1, 701)), numbers[-60:]
             assert stream["reasons"] == ["stop"], stream["reasons"]
             counts.append(len(numbers))
-        recomputed = _occurrences(log, "migrates to the engine that serves it now")
+        recomputed = _occurrences(
+            log, "migrates to the engine that serves it now"
+        )
         print("numbers of each count:", counts, "recomputations:", recomputed)
         assert recomputed > 0, "the counts never outgrew the cache"
         # A count longer than the cache holds runs alone until it fills it, and
@@ -2715,7 +2733,9 @@ def test_requests_that_outgrow_the_cache_in_decode_all_finish(
         done = threading.Event()
         reasons: list[str] = []
         errors: list[BaseException] = []
-        _stream_count(base_url, name, read, done, reasons=reasons, errors=errors)
+        _stream_count(
+            base_url, name, read, done, reasons=reasons, errors=errors
+        )
         assert not errors, f"{errors[0]!r}{_log_trouble(log)}"
         *whole, last = _numbers(read)
         print("numbers of a count the cache cannot hold:", len(whole), reasons)
@@ -2814,8 +2834,10 @@ def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
         assert result["change"] == "epoch", result
         _on_trial(base_url)
         _wait_until(
-            lambda: _update(base_url)["moved_to_host_bytes"] > 0
-            or _update(base_url)["host_refused"],
+            lambda: (
+                _update(base_url)["moved_to_host_bytes"] > 0
+                or _update(base_url)["host_refused"]
+            ),
             300,
             "the previous epoch's weights did not move",
         )
