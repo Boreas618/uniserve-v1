@@ -1237,8 +1237,7 @@ pub trait Decoder {
     /// compression would find it in two places.
     ///
     /// A decoder whose decoded raster is not its latent layout scaled by ratios it knows refuses by
-    /// name, the way [`Decoder::splice`] does, rather than answering with a layout that reads as
-    /// one.
+    /// name rather than answering with a layout that reads as one.
     fn layout_of(&self, clip: Clip) -> Result<Layout> {
         let _ = clip;
         Err(Error::shape(
@@ -1272,59 +1271,53 @@ pub trait Decoder {
         state: &[TensorView],
         out: DecodedMedia,
     ) -> Result<()>;
+}
+
+/// The step that writes decoded clips into one timeline.
+///
+/// A decoder decodes one clip of its window and stops; a timeline longer than one window is decoded
+/// clip by clip, each clip overlapping its predecessor, and written by this step: it fades a clip's
+/// leading frames against its predecessor's own decode of the frames the two share and places the
+/// frames the timeline keeps. Which frames each clip writes is the checkpoint's decoding arithmetic,
+/// so the splicer states the schedule ([`Self::splices`]) and the runtime passes each [`Splice`]
+/// back with its clip.
+pub trait Splicer {
+    /// The element type of the rasters it reads and places: the decoder's raster type.
+    fn element_type(&self) -> DType;
+
+    /// How the rasters [`Self::splice`] places are normalized, which the runtime undoes as it writes
+    /// a timeline's bytes.
+    fn pixel_norm(&self) -> PixelNorm;
+
+    /// The splices a timeline of `frames` frames is written in, in the order the frames are decoded.
+    ///
+    /// A splice's `first` is the destination frame in the raster handed to [`Self::splice`], so a
+    /// runtime that gives each clip its own raster states `first: 0`.
+    ///
+    /// # Errors
+    ///
+    /// When `frames` is not a frame count a timeline of this checkpoint holds.
+    fn splices(&self, frames: u32) -> Result<Vec<Splice>>;
 
     /// Place one decoded clip on the timeline, fading it against its predecessor.
     ///
-    /// `clip` is the clip's decoded raster; `previous` is the predecessor's own decode of the frames the
-    /// two share, absent for the timeline's first clip. Answers the normalized runs of the splice's kept
-    /// frames, in order, which the runtime de-normalizes into the timeline's bytes by
-    /// [`Self::pixel_norm`]; a fade's output is reserved from `f`'s arena and read before the arena is
-    /// reset. A decoder that decodes one clip and knows nothing of timelines leaves this default, which
-    /// refuses by the block kind's name so a runner that splices with the wrong block hears which kind
-    /// it called.
+    /// `clip` is the clip's decoded raster; `previous` is the predecessor's own decode of the frames
+    /// the two share, absent for the timeline's first clip. Answers the normalized runs of the
+    /// splice's kept frames, in order, which the runtime de-normalizes into the timeline's bytes by
+    /// [`Self::pixel_norm`]; a fade's output is reserved from `f`'s arena and read before the arena
+    /// is reset.
+    ///
+    /// # Errors
+    ///
+    /// When the views are not a clip and a predecessor of this checkpoint's raster, or `splice`
+    /// fades more frames than the checkpoint overlaps.
     fn splice(
         &self,
         f: &Forward,
         previous: Option<TensorView>,
         clip: TensorView,
         splice: Splice,
-    ) -> Result<Vec<Placed>> {
-        let _ = (f, previous, clip, splice);
-        Err(Error::shape(
-            "Decoder",
-            "this decoder splices no clips".to_owned(),
-        ))
-    }
-
-    /// How the rasters [`Self::splice`] places are normalized, which the runtime undoes as it writes
-    /// a timeline's bytes.
-    fn pixel_norm(&self) -> Result<PixelNorm> {
-        Err(Error::shape(
-            "Decoder",
-            "this decoder places no raster on a timeline".to_owned(),
-        ))
-    }
-
-    /// The splices a timeline of `frames` frames is written in, in the order the frames are decoded.
-    ///
-    /// A timeline is not one clip: the checkpoint decodes it clip by clip, each clip overlapping its
-    /// predecessor by a fade, and the last one keeping its own tail. **Which frames each clip writes is
-    /// the block's arithmetic, not the runner's** - the frame count a timeline may hold, the body each
-    /// clip contributes and the overlap the fade reads all come from the checkpoint's decoding, so a
-    /// runner that spliced a timeline asks this and passes each [`Splice`] to [`splice`](Self::splice).
-    /// A splice's `first` is the destination frame in the raster handed to `splice`, so a runner that
-    /// gives each clip its own raster states `first: 0`.
-    ///
-    /// The default refuses by the block kind's name for the reason `splice` does: a block that cannot
-    /// write a timeline has no schedule to state.
-    fn splices(&self, frames: u32) -> Result<Vec<Splice>> {
-        Err(Error::shape(
-            "Decoder",
-            format!(
-                "this decoder states no splice schedule, and a timeline of {frames} frame(s) asked for one"
-            ),
-        ))
-    }
+    ) -> Result<Vec<Placed>>;
 }
 
 /// An autoregressive token model.

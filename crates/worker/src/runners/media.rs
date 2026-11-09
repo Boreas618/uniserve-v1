@@ -4,7 +4,7 @@
 //! `crates/media` holds the codecs, the muxer and one assembly per request (`MediaRunner`'s
 //! `MuxSession`); this module is what the worker owes it - the request's two published products'
 //! bytes, and the assembly they go into. **The clip this reads is the postprocessor's output,
-//! `[frames, rows, columns, 3]` uint8** - the `video_decoder` component's second entry point, which
+//! `[frames, rows, columns, 3]` uint8** - the splicer's output (`nn::capability::Splicer`), which
 //! drops the VAE's padding frames, cross-fades the clip seams and de-normalises the RGB - so nothing
 //! here converts a raster: an encoder's input and a postprocessor's output are the same bytes.
 //!

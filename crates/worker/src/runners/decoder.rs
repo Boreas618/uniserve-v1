@@ -34,7 +34,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use nn::capability::{Clip, DecodedMedia, Decoder, Layout};
+use nn::capability::{Clip, DecodedMedia, Decoder, Layout, Splicer};
 use ops::{DType, Shape, TensorView};
 use platform::DeviceId;
 
@@ -166,10 +166,10 @@ pub struct DecoderRunner<M: Decoder + Send + Sync + ?Sized> {
     /// The request whose clip the raster column last held, so a decode of another can be refused
     /// while the first is unread ([`clip_is_releasable`]).
     published_for: Option<ipc::RequestKey>,
-    /// The `video_decoder` component's second block, when the deployment serves one: the
-    /// postprocessor that writes a clip's frames into the request's timeline with the seam fade and
-    /// the checkpoint's de-normalization. Without one the runner publishes the clip's own raster.
-    postprocessor: Option<Arc<dyn Decoder + Send + Sync>>,
+    /// The [`Splicer`], when the deployment serves one: the postprocessor that writes a clip's
+    /// frames into the request's timeline with the seam fade and the checkpoint's
+    /// de-normalization. Without one the runner publishes the clip's own raster.
+    postprocessor: Option<Arc<dyn Splicer + Send + Sync>>,
     /// The byte packing of what the postprocessor places, de-normalized by its pixel normalization;
     /// present exactly when the postprocessor is.
     bytes: Option<RgbBytes>,
@@ -245,7 +245,7 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
         model: Arc<M>,
         buckets: Buckets,
         generation: Arc<ops::Generation>,
-        postprocessor: Option<Arc<dyn Decoder + Send + Sync>>,
+        postprocessor: Option<Arc<dyn Splicer + Send + Sync>>,
     ) -> Result<Self> {
         let mut layouts = std::collections::BTreeMap::new();
         let mut largest: Option<(Bucket, Layout)> = None;
@@ -277,7 +277,7 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
         let bytes = postprocessor
             .as_deref()
             .map(|postprocessor| -> Result<RgbBytes> {
-                let norm = postprocessor.pixel_norm().map_err(Error::from)?;
+                let norm = postprocessor.pixel_norm();
                 RgbBytes::new(binding.device, postprocessor.element_type(), norm)
             })
             .transpose()?;
@@ -917,7 +917,7 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
     /// postprocessor there is no timeline - a deployment that serves none publishes the clip's own
     /// raster, which is what the encoder of such a deployment reads.
     ///
-    /// The schedule is the block's (`Decoder::splices`), so the frame count a timeline holds, the
+    /// The schedule is the block's (`Splicer::splices`), so the frame count a timeline holds, the
     /// body each clip keeps and the overlap the fade reads are all the checkpoint's arithmetic. This
     /// runner states only where the clip is: **each clip gets its own raster**, so the splice's
     /// destination starts at frame zero and the product names the frames this clip wrote.
@@ -1014,7 +1014,7 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
     fn splice(
         &self,
         forward: &nn::Forward<'_>,
-        postprocessor: &(dyn Decoder + Send + Sync),
+        postprocessor: &(dyn Splicer + Send + Sync),
         splicing: Splicing,
     ) -> Result<Option<TensorView>> {
         let bytes = self.bytes.as_ref().ok_or_else(|| {

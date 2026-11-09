@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::capability::{
-    CausalLm, Decoder, Denoiser, Encoder, MediaFormat, WarmPrompt, WarmRequest,
+    CausalLm, Decoder, Denoiser, Encoder, MediaFormat, Splicer, WarmPrompt, WarmRequest,
 };
 use crate::{Checkpoint, DType, Result, WeightLoader};
 
@@ -472,9 +472,9 @@ pub trait VideoModel: Send + Sync {
     /// The video decoder: latent frames to a clip of pixels.
     fn video_decoder(&self) -> Option<Arc<dyn Decoder + Send + Sync>>;
 
-    /// The video decoder's second entry point, which splices decoded clips into one timeline;
-    /// `None` publishes each decoded clip as it is.
-    fn splicer(&self) -> Option<Arc<dyn Decoder + Send + Sync>>;
+    /// The step that splices the video decoder's clips into one timeline; `None` publishes each
+    /// decoded clip as it is.
+    fn splicer(&self) -> Option<Arc<dyn Splicer + Send + Sync>>;
 
     /// The audio decoder: latent frames to a soundtrack; `None` for a pipeline without sound.
     fn audio_decoder(&self) -> Option<Arc<dyn Decoder + Send + Sync>>;

@@ -11,7 +11,7 @@
 //! body frames fade against its predecessor's tail with weights `i / overlap` (the frame rule of
 //! [`nn::tiling::Blend`]), so the first blended frame is entirely the predecessor's.
 
-use nn::capability::{PixelNorm, Placed, StateTable};
+use nn::capability::{PixelNorm, Placed};
 use nn::tiling::{Axis, Blend, TemporalClips};
 use nn::{DType, Forward, TensorView};
 
@@ -99,43 +99,10 @@ impl VideoPostprocessor {
     }
 }
 
-impl nn::capability::Decoder for VideoPostprocessor {
+impl nn::capability::Splicer for VideoPostprocessor {
     /// The type the raster it blends is stated in, which is the decoder's own.
     fn element_type(&self) -> nn::DType {
         self.dtype
-    }
-
-    /// No tables: the splice's parameters are its arguments, not state.
-    fn layout_tables(&self, _layout: &nn::capability::Layout) -> nn::Result<Vec<StateTable>> {
-        Ok(Vec::new())
-    }
-
-    /// Nothing to prepare: there are no tables, so `out` must be empty.
-    fn prepare_layout(
-        &self,
-        _layout: &nn::capability::Layout,
-        out: &mut [nn::TableValues],
-    ) -> nn::Result<()> {
-        if out.is_empty() {
-            return Ok(());
-        }
-        Err(Error::config(format!(
-            "a postprocessor has no layout tables, and {} buffers were offered",
-            out.len()
-        ))
-        .into())
-    }
-
-    /// Refuse: the postprocessor has no latents to decode.
-    fn decode(
-        &self,
-        f: &Forward,
-        latents: TensorView,
-        state: &[TensorView],
-        out: nn::capability::DecodedMedia,
-    ) -> nn::Result<()> {
-        let _ = (f, latents, state, out);
-        Err(Error::config("a postprocessor splices; it decodes nothing".to_owned()).into())
     }
 
     /// Place one clip's kept frames on the timeline, fading it against its predecessor.
@@ -166,8 +133,8 @@ impl nn::capability::Decoder for VideoPostprocessor {
     }
 
     /// The ImageNet constants the placed rasters are normalized by.
-    fn pixel_norm(&self) -> nn::Result<PixelNorm> {
-        Ok(PIXEL_NORM)
+    fn pixel_norm(&self) -> PixelNorm {
+        PIXEL_NORM
     }
 
     /// The splices a timeline of `frames` frames is written in ([`crate::video_vae::splices`]).
@@ -282,7 +249,7 @@ mod tests {
         previous: bool,
         splice: nn::capability::Splice,
     ) -> (nn::Result<Vec<Placed>>, Vec<&'static str>, u64) {
-        use nn::capability::Decoder;
+        use nn::capability::Splicer;
         let (height, width) = (16_u64, 16_u64);
         let block = VideoPostprocessor::new(DType::F32, clips()).expect("a postprocessor");
         let arena = nn::Arena::new(nn::DevicePtr::new(0), 1 << 30);

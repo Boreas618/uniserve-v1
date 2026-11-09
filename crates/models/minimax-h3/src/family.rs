@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use nn::capability::{Decoder, Encoder, ImageShape, MediaFormat, WarmPrompt, WarmRequest};
+use nn::capability::{Decoder, Encoder, ImageShape, MediaFormat, Splicer, WarmPrompt, WarmRequest};
 use nn::family::{
     Component, ConditionBounds, Description, Family, Model, VideoCheckpoint, VideoFamily,
     VideoModel, VideoPlacement, VideoServing,
@@ -104,7 +104,7 @@ impl VideoCheckpoint for H3Checkpoint {
 
         // **The rank's place, its blocks and its capacity travel apart.** The partition is the
         // split alone; the network the tasks run on, the condition encoders a conditioned task
-        // reads and the postprocessor - the video decoder's second entry point, the clip splice,
+        // reads and the postprocessor - the clip splicer (`nn::capability::Splicer`),
         // which holds no weights - are the placed blocks.
         let sequence = placement.sequence;
         let partition = Partition::new(
@@ -227,10 +227,10 @@ impl VideoModel for H3Pipeline {
             .map(|decoder| Arc::clone(decoder) as Arc<dyn Decoder + Send + Sync>)
     }
 
-    fn splicer(&self) -> Option<Arc<dyn Decoder + Send + Sync>> {
+    fn splicer(&self) -> Option<Arc<dyn Splicer + Send + Sync>> {
         self.model
             .video_postprocessor()
-            .map(|splicer| Arc::clone(splicer) as Arc<dyn Decoder + Send + Sync>)
+            .map(|splicer| Arc::clone(splicer) as Arc<dyn Splicer + Send + Sync>)
     }
 
     fn audio_decoder(&self) -> Option<Arc<dyn Decoder + Send + Sync>> {

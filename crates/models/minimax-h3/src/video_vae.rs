@@ -973,12 +973,6 @@ impl Decoder for VideoDecoder {
         Ok(self.table_values(layout.video.height, layout.video.width, out)?)
     }
 
-    /// The checkpoint's clip schedule for a timeline of `frames` frames ([`clips`]), which a runner
-    /// that bound only a decoder reads as well as the postprocessor does.
-    fn splices(&self, frames: u32) -> nn::Result<Vec<nn::capability::Splice>> {
-        Ok(splices(&clips(&self.config), frames)?)
-    }
-
     /// Clip `k` decodes latent frames `[5k, 5k + 7)`: five that advance the timeline, and two the
     /// next clip's window also reads.
     fn clip_start(&self, clip: u32) -> u32 {

@@ -285,7 +285,7 @@ impl ModelRunner {
             decoder,
             decode_set,
             Arc::clone(generation),
-            // The video decoder's second entry point. A pipeline that holds none serves a clip
+            // The clip splicer (`nn::capability::Splicer`). A pipeline that holds none serves a clip
             // rather than a timeline, and the runner then publishes the clip.
             pipeline.splicer(),
         )?
