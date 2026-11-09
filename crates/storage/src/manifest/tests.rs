@@ -1289,7 +1289,7 @@ fn listed(key: Key, name: &str, location: Location, epoch: u64) -> crate::protoc
         name: name.into(),
         scopes: vec![scope.clone()],
         retainers: vec![crate::protocol::Retainer { scope, epoch }],
-        location: location,
+        location,
         storage_bytes: 0,
         dtype: "uint8".into(),
         shape: vec![0],

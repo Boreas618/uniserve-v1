@@ -148,6 +148,10 @@ mod tests {
 
     /// A source whose rounds read `reads` in turn, and that records every
     /// prefill budget it was given.
+    #[expect(
+        clippy::type_complexity,
+        reason = "a test reads the operation and the record of the slots it touched, once"
+    )]
     fn source(
         reads: Vec<Vec<Prefix>>,
     ) -> (

@@ -148,7 +148,7 @@ fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
     let reference = SchedulerHandle::over_batches(
         &reference_config,
         reference_limits,
-        reference_pool.clone() as Arc<dyn Batches>,
+        Arc::clone(&reference_pool) as Arc<dyn Batches>,
     )
     .expect("the reference epoch serves");
     install(&reference, &reference_pool);
@@ -178,7 +178,7 @@ fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
                 reason: scheduler::FinishReason::MaxTokens,
                 completion_tokens,
                 ..
-            } if completion_tokens as usize == GENERATED + CONTINUED
+            } if completion_tokens == GENERATED + CONTINUED
         ),
         "the reference ended as {ended:?} after {} tokens",
         expected.len()
@@ -192,7 +192,7 @@ fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
     let running = SchedulerHandle::over_batches(
         &running_config,
         running_limits,
-        running_pool.clone() as Arc<dyn Batches>,
+        Arc::clone(&running_pool) as Arc<dyn Batches>,
     )
     .expect("the running epoch serves");
     install(&running, &running_pool);
@@ -215,7 +215,7 @@ fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
     let successor = SchedulerHandle::over_batches(
         &successor_config,
         successor_limits,
-        successor_pool.clone() as Arc<dyn Batches>,
+        Arc::clone(&successor_pool) as Arc<dyn Batches>,
     )
     .expect("the successor starts beside the running epoch");
     install(&successor, &successor_pool);
@@ -291,7 +291,7 @@ fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
     );
     assert_eq!(
         first.columns.rows.seq_lens.first().copied().unwrap_or(0) as usize,
-        (8 + GENERATED) as usize,
+        (8 + GENERATED),
         "the successor's row starts where the predecessor stopped"
     );
     successor.shutdown();

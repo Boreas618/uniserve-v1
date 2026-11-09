@@ -600,9 +600,7 @@ impl DenoiserInfo {
             return Err("a video denoiser declares no audio sample rate");
         }
         let packing = self.condition_packing;
-        if packing.capacity > 0
-            && (packing.tile_rows == 0 || packing.video_tile.iter().any(|extent| *extent == 0))
-        {
+        if packing.capacity > 0 && (packing.tile_rows == 0 || packing.video_tile.contains(&0)) {
             return Err("a video denoiser takes conditions and declares no tile to pack them in");
         }
         if !self.frames.is_valid() {

@@ -129,7 +129,7 @@ async fn chat_completions(
             processor,
         } = output;
         let request_id = response.request_id.clone();
-        let parser = processor.parser().clone();
+        let parser = *processor.parser();
         let sink = crate::openai::chat_completions::ChatStreamEmitter::new(&response, created);
         let inputs = crate::output::run::ChatOutputInputs {
             tokenizer,
@@ -195,7 +195,7 @@ async fn chat_completions(
             processor,
         } = output;
         let request_id = response.request_id.clone();
-        let parser = processor.parser().clone();
+        let parser = *processor.parser();
         let sink = crate::output::run::ChatBodySink::new(&response, created);
         let inputs = crate::output::run::ChatOutputInputs {
             tokenizer,

@@ -76,7 +76,7 @@ pub(crate) fn slot_mapping(
 /// what `Call.coordinates.logical_position` and its input tokens state.
 #[cfg(test)]
 pub(crate) fn positions(call: &ipc::Call) -> Option<Vec<i32>> {
-    let first = u32::try_from(call.coordinates.logical_position).ok()?;
+    let first = call.coordinates.logical_position;
     let tokens = u32::try_from(call.input_token_ids.len()).ok()?;
     positions_of(first, tokens)
 }
@@ -221,8 +221,8 @@ pub(crate) fn logits_rows_of(
                 logits[last] = i32::try_from(last).ok()?;
             }
             ipc::CallKind::Forward(ipc::ForwardMode::Decode | ipc::ForwardMode::Verify) => {
-                for row in start..end {
-                    logits[row] = i32::try_from(row).ok()?;
+                for (row, slot) in logits.iter_mut().enumerate().take(end).skip(start) {
+                    *slot = i32::try_from(row).ok()?;
                 }
             }
             _ => {}
@@ -351,7 +351,12 @@ mod tests {
     fn mismatched_rows_are_a_fault() {
         let calls = [call(prefill(), true), call(decode(), true)];
         // One span for two calls.
-        assert_eq!(logits_rows(&calls, &[0..1]), None);
+        #[expect(
+            clippy::single_range_in_vec_init,
+            reason = "one span covering two calls is the case under test"
+        )]
+        let one = [0..1];
+        assert_eq!(logits_rows(&calls, &one), None);
         // Spans that are not one contiguous row order.
         assert_eq!(logits_rows(&calls, &[0..2, 3..4]), None);
         assert_eq!(logits_rows(&calls, &[1..2, 2..3]), None);

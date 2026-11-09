@@ -1162,13 +1162,6 @@ pub(crate) fn call(
     (!candidates.is_empty()).then(|| (call_view(request, kind), candidates))
 }
 
-/// One entry per pool the epoch reports, in the order it states them — the
-/// same length and order as the control thread's
-/// `routing.slots`, so an index into this list and an index into that one name
-/// the same rank. The two are built on different threads and carry different
-/// fields (a rank's in-flight count and liveness exist only on the control
-/// thread), so this contract is stated here rather than enforced by a type.
-
 /// Every replica a `place` decision may choose, for `Snapshot::replicas`: one
 /// per worker of the epoch, in the worker's order.
 pub(crate) fn replica_catalog(scheduler: &Scheduler) -> Vec<ReplicaView> {
@@ -1544,11 +1537,13 @@ mod tests {
 
     #[test]
     fn an_epoch_offers_the_phases_its_workers_serve() {
-        let mut info = MainProcessInfo::default();
-        info.components = vec![ipc::ComponentInfo {
-            name: "model".into(),
-            outputs: Vec::new(),
-        }];
+        let mut info = MainProcessInfo {
+            components: vec![ipc::ComponentInfo {
+                name: "model".into(),
+                outputs: Vec::new(),
+            }],
+            ..Default::default()
+        };
         info.supported_calls
             .push(CallKind::Media(MediaCall::Denoising));
         info.media_components
@@ -1602,7 +1597,7 @@ mod tests {
         assert_eq!(unit_of(host_page(9)), None);
         assert_eq!(
             page_target(PageId(u64::MAX)),
-            Some(PageTarget::Host(u64::MAX & !HOST_PAGE))
+            Some(PageTarget::Host(!HOST_PAGE))
         );
         assert_eq!(page_target(PageId(1 << 32)), None);
     }

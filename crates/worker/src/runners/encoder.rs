@@ -288,9 +288,9 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         let Some(pool) = self.host_pool.as_ref() else {
             return Ok(());
         };
-        let element = u64::from(self.shape.dtype.bytes().ok_or_else(|| {
+        let element = self.shape.dtype.bytes().ok_or_else(|| {
             Error::Invalid(format!("{} has no whole-byte size", self.shape.dtype))
-        })?);
+        })?;
         let width = u64::from(self.shape.hidden.max(1));
         let row_bytes = width * element;
         let mut copied = false;

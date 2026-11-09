@@ -789,17 +789,15 @@ impl Epochs {
         })?;
         // §7.2: an update that a revert marked unavailable is refused until
         // it is applied with `force`, whatever it says about itself.
-        if !force {
-            if let Some(failure) = self.unavailable(&update.target) {
-                return Err(Failure {
-                    kind: "unavailable".to_owned(),
-                    reason: format!(
-                        "this update was reverted and is unavailable after a {} failure: {}",
-                        failure.kind, failure.reason
-                    ),
-                    device: failure.device,
-                });
-            }
+        if !force && let Some(failure) = self.unavailable(&update.target) {
+            return Err(Failure {
+                kind: "unavailable".to_owned(),
+                reason: format!(
+                    "this update was reverted and is unavailable after a {} failure: {}",
+                    failure.kind, failure.reason
+                ),
+                device: failure.device,
+            });
         }
         let programs = update.target.programs.clone();
         let mut switch =
@@ -1541,8 +1539,10 @@ mod tests {
     #[test]
     fn a_change_of_the_models_files_is_an_epoch_change() {
         let serving = Epoch::of(ServerArgs::default()).expect("the configuration resolves");
-        let mut other = ServerArgs::default();
-        other.model = Some("/models/other".to_owned());
+        let other = ServerArgs {
+            model: Some("/models/other".to_owned()),
+            ..Default::default()
+        };
         assert_eq!(
             layer(
                 &serving,
@@ -1965,8 +1965,10 @@ mod tests {
     /// load by the option's name, rather than this code clamping it.
     #[test]
     fn the_policys_limits_are_the_launchs_own_token_bound() {
-        let mut config = ServerArgs::default();
-        config.max_num_batched_tokens = NonZeroUsize::new(8192);
+        let mut config = ServerArgs {
+            max_num_batched_tokens: NonZeroUsize::new(8192),
+            ..Default::default()
+        };
         config.scheduler_config.chunked_prefill_size = None;
         let programs = FilledPrograms::of(&config);
         assert_eq!(
@@ -2087,6 +2089,10 @@ mod tests {
         }
 
         // The frontend's own options (§7.7 host layer, frontend row).
+        #[expect(
+            clippy::type_complexity,
+            reason = "each option is its name and the change it makes, listed once"
+        )]
         let host_frontend: Vec<(&str, fn(&mut ServerArgs))> = vec![
             ("server_config.port", |config: &mut ServerArgs| {
                 config.server_config.port = 8001
@@ -2101,6 +2107,10 @@ mod tests {
             }),
         ];
         // The daemon's own options (§7.7 host layer, daemon row).
+        #[expect(
+            clippy::type_complexity,
+            reason = "each option is its name and the change it makes, listed once"
+        )]
         let host_daemon: Vec<(&str, fn(&mut ServerArgs))> = vec![
             ("logging_config.log_requests", |config: &mut ServerArgs| {
                 config.logging_config.log_requests = true
@@ -2110,6 +2120,10 @@ mod tests {
             }),
         ];
         // The values that build a main process (§7.7 build-config row).
+        #[expect(
+            clippy::type_complexity,
+            reason = "each option is its name and the change it makes, listed once"
+        )]
         let epoch: Vec<(&str, fn(&mut ServerArgs))> = vec![
             ("max_running_requests", |config: &mut ServerArgs| {
                 config.max_running_requests = NonZeroUsize::new(4).unwrap()
@@ -2134,6 +2148,10 @@ mod tests {
         ];
         // The program backends (§7.7 backend row) and the program parameters
         // (§7.7 parameter row).
+        #[expect(
+            clippy::type_complexity,
+            reason = "each option is its name and the change it makes, listed once"
+        )]
         let program: Vec<(&str, fn(&mut ServerArgs))> = vec![
             ("scheduler_config.policy", |config: &mut ServerArgs| {
                 config.scheduler_config.policy = proto::request::SchedulingPolicy::Priority
@@ -2323,9 +2341,11 @@ mod tests {
             chunked_prefill_size: NonZeroUsize::new(2048),
             ..SchedulerConfig::default()
         };
-        let mut stated = ServerArgs::default();
-        stated.scheduler_config = scheduler;
-        stated.max_num_batched_tokens = NonZeroUsize::new(4096);
+        let mut stated = ServerArgs {
+            scheduler_config: scheduler,
+            max_num_batched_tokens: NonZeroUsize::new(4096),
+            ..Default::default()
+        };
         stated.speculative_config.expected_speedup = Some(2.5);
         let programs = FilledPrograms::of(&stated);
         assert_eq!(
@@ -2347,9 +2367,11 @@ mod tests {
 
         // Per-phase attention: two entries, each naming its phase, once the
         // fields state different backends.
-        let mut split = ServerArgs::default();
-        split.prefill_attention_backend = Some("fa4".to_owned());
-        split.decode_attention_backend = Some("trtllm".to_owned());
+        let split = ServerArgs {
+            prefill_attention_backend: Some("fa4".to_owned()),
+            decode_attention_backend: Some("trtllm".to_owned()),
+            ..Default::default()
+        };
         let programs = FilledPrograms::of(&split);
         let prefill =
             &programs.kernels[&KernelKey::phase(operators::PAGED_ATTENTION, PhaseKind::Prefill)];
@@ -2370,8 +2392,10 @@ mod tests {
         // operator states it or both phases state the same one; an unstated
         // phase falls back to `attention_backend`, which the split above
         // keeps as a phase of its own.
-        let mut one = ServerArgs::default();
-        one.attention_backend = "fa4".to_owned();
+        let one = ServerArgs {
+            attention_backend: "fa4".to_owned(),
+            ..Default::default()
+        };
         let programs = FilledPrograms::of(&one);
         assert_eq!(
             programs.kernels[&KernelKey::all(operators::PAGED_ATTENTION)].backend,
@@ -2384,9 +2408,11 @@ mod tests {
             )),
             "one backend covers every phase of the operator"
         );
-        let mut agreed = ServerArgs::default();
-        agreed.prefill_attention_backend = Some("fa4".to_owned());
-        agreed.decode_attention_backend = Some("fa4".to_owned());
+        let agreed = ServerArgs {
+            prefill_attention_backend: Some("fa4".to_owned()),
+            decode_attention_backend: Some("fa4".to_owned()),
+            ..Default::default()
+        };
         let programs = FilledPrograms::of(&agreed);
         assert_eq!(
             programs.kernels[&KernelKey::all(operators::PAGED_ATTENTION)].backend,
@@ -2395,8 +2421,10 @@ mod tests {
         );
 
         // A stated grouped expert GEMM program fills both of its operators.
-        let mut moe = ServerArgs::default();
-        moe.moe_runner_backend = Some("cutlass".to_owned());
+        let moe = ServerArgs {
+            moe_runner_backend: Some("cutlass".to_owned()),
+            ..Default::default()
+        };
         let programs = FilledPrograms::of(&moe);
         for operator in [operators::GATHER_GEMM, operators::ROUTE_GEMM] {
             assert_eq!(
@@ -2420,8 +2448,10 @@ mod tests {
             "{refused}"
         );
 
-        let mut stated = ServerArgs::default();
-        stated.attention_backend = "trtllm".to_owned();
+        let mut stated = ServerArgs {
+            attention_backend: "trtllm".to_owned(),
+            ..Default::default()
+        };
         stated.moe_config.expert_parallel = true;
         stated.moe_config.exchange = proto::request::ExpertExchange::AllToAll;
         FilledPrograms::of(&stated)

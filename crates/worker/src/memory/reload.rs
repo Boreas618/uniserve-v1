@@ -211,7 +211,7 @@ fn slots_of(old: &WeightKey, new: &WeightKey) -> Option<Vec<usize>> {
         return None;
     }
     let slots = usize::try_from(old.region.shape.dim(0)).ok()?;
-    if slots == 0 || old.region.tensors.len() % slots != 0 {
+    if slots == 0 || !old.region.tensors.len().is_multiple_of(slots) {
         return None;
     }
     let width = old.region.tensors.len() / slots;

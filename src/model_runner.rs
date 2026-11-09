@@ -152,8 +152,9 @@ impl ModelClass {
 pub(crate) enum Served {
     /// The causal language model, one `Arc` per rank: every device's runner reads the same weights.
     Text(Arc<qwen3_moe::Qwen3Moe>),
-    /// The media pipeline, whose blocks the runners take one `Arc` each.
-    Media(Arc<minimax_h3::load::MinimaxH3>),
+    /// The media pipeline, held by the thread that builds the runners; its blocks the runners take
+    /// one `Arc` each. The pipeline itself is neither `Send` nor `Sync`, so it is counted, not shared.
+    Media(std::rc::Rc<minimax_h3::load::MinimaxH3>),
 }
 
 /// How the data plane loads this rank's model again (§7.6): the rank's model runner, pointed at the
@@ -365,10 +366,10 @@ impl ModelRunner {
         // catalogue is built and long before any weight is mapped; a stated decode tier above the
         // request bound is the clamp in `Scheduler::new`, not a refusal. `tier_refusal` is where
         // that asymmetry is stated and argued.
-        if let Some(sizes) = &tokens {
-            if let Some(refusal) = tier_refusal(rows.as_deref(), rows_bound, sizes, tokens_bound) {
-                bail!("{refusal}");
-            }
+        if let Some(sizes) = &tokens
+            && let Some(refusal) = tier_refusal(rows.as_deref(), rows_bound, sizes, tokens_bound)
+        {
+            bail!("{refusal}");
         }
         let buckets = Buckets::for_batch(
             rows.as_deref(),
@@ -980,7 +981,7 @@ impl ModelRunner {
     fn media_runners(
         &self,
         device: DeviceId,
-        pipeline: &Arc<minimax_h3::load::MinimaxH3>,
+        pipeline: &minimax_h3::load::MinimaxH3,
         generation: &Arc<Generation>,
         blocking: &worker::blocking::ThreadPool,
         groups: &RankGroups,
@@ -1084,11 +1085,9 @@ impl ModelRunner {
         // one, and the first writes the states it computed.
         let reports = report.is_some();
         let longest = u64::from(capacities.iter().copied().max().unwrap_or(0));
-        let element = u64::from(
-            dtype
-                .bytes()
-                .context("the encoder's states have no whole-byte element")?,
-        );
+        let element = dtype
+            .bytes()
+            .context("the encoder's states have no whole-byte element")?;
         let (encoder_pool, encoder_info) = worker::memory::encoders::EncoderHostPool::start(
             client,
             device,
@@ -1590,7 +1589,7 @@ impl ModelRunner {
                         );
                     }
                 }
-                Ok(Served::Media(Arc::new(model)))
+                Ok(Served::Media(std::rc::Rc::new(model)))
             }
         }
     }
@@ -1702,11 +1701,7 @@ impl ModelRunner {
                     prompt_tokens: self.engine_config().model.max_model_len,
                     video_units: clips.units(clips.align_up(frames as u32)),
                     condition_rows,
-                    conditioning_row: (
-                        states,
-                        u32::try_from(self.media_config()?.text_encoder.hidden_size)
-                            .context("the text encoder's width exceeds a u32")?,
-                    ),
+                    conditioning_row: (states, self.media_config()?.text_encoder.hidden_size),
                 };
                 let denoiser = if pipeline.transformer_ref().is_some() {
                     "transformer_ref"
@@ -2064,10 +2059,10 @@ fn checkpoint_tokens(dir: &Path) -> Result<ControlTokens> {
             }
         }
     }
-    if let Some(end_of_text) = end_of_text {
-        if !eos.contains(&end_of_text) {
-            eos.push(end_of_text);
-        }
+    if let Some(end_of_text) = end_of_text
+        && !eos.contains(&end_of_text)
+    {
+        eos.push(end_of_text);
     }
     anyhow::ensure!(
         !eos.is_empty(),
@@ -2965,13 +2960,14 @@ fn video_units(frames: u32) -> worker::Result<Vec<u32>> {
 /// device that did not state these three would refuse the first encode of every request.
 /// The one host call every rank serves: the encode of the units it decoded.
 fn unit_phases() -> Vec<PhaseId> {
-    vec![PhaseId(
-        u16::try_from(scheduler::phase_id(scheduler::PhaseKind::VideoEncode).0)
-            .expect("a phase id fits"),
-    )]
+    vec![phase(scheduler::PhaseKind::VideoEncode)]
 }
 
 /// The phase id `kind` is planned as.
+#[expect(
+    clippy::expect_used,
+    reason = "a phase id is one of a handful of small constants"
+)]
 fn phase(kind: scheduler::PhaseKind) -> PhaseId {
     PhaseId(u16::try_from(scheduler::phase_id(kind).0).expect("a phase id fits"))
 }
@@ -2994,7 +2990,7 @@ fn host_phases() -> Vec<PhaseId> {
         scheduler::PhaseKind::LatentEncoding,
     ]
     .into_iter()
-    .map(|kind| PhaseId(u16::try_from(scheduler::phase_id(kind).0).expect("a phase id fits")))
+    .map(phase)
     .collect()
 }
 
@@ -3041,7 +3037,7 @@ fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
         // The scheduler numbers a phase with the epoch's `u32` and the worker names one with the
         // wire's `u16`: the plan is where the two meet, and a kind that did not fit would be a table
         // this process cannot state rather than a phase to serve quietly.
-        .map(|kind| PhaseId(u16::try_from(scheduler::phase_id(kind).0).expect("a phase id fits")))
+        .map(phase)
         .collect()
 }
 

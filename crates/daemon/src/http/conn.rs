@@ -426,17 +426,16 @@ impl Connection {
         if self.peer_closed {
             return Ok(false);
         }
-        let mut chunk = [0_u8; READ_CHUNK];
+        // Read into the connection's own buffer: a chunk on the stack would be held across the
+        // await, and every future that reads a request would carry it.
+        self.buffer.reserve(READ_CHUNK);
         loop {
-            match self.io.read(&mut chunk).await {
+            match self.io.read_buf(&mut self.buffer).await {
                 Ok(0) => {
                     self.peer_closed = true;
                     return Ok(false);
                 }
-                Ok(read) => {
-                    self.buffer.extend_from_slice(&chunk[..read]);
-                    return Ok(true);
-                }
+                Ok(_) => return Ok(true),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error).context("reading from a connection"),
             }
@@ -2601,11 +2600,10 @@ mod tests {
             "{}",
             response.headers
         );
-        assert_eq!(
+        assert!(
             response
                 .headers
                 .contains(&format!("content-length: {}", document.len())),
-            true,
             "{}",
             response.headers
         );

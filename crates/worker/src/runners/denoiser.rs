@@ -708,9 +708,9 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     /// The bytes of the largest trajectory this runner holds: the video and audio latents of its
     /// largest layout, which a host latent pool's trajectory pages are sized for.
     pub fn trajectory_bytes(&self) -> Result<u64> {
-        let element = u64::from(self.shape.sample.bytes().ok_or_else(|| {
+        let element = self.shape.sample.bytes().ok_or_else(|| {
             Error::Invalid(format!("{} has no whole-byte size", self.shape.sample))
-        })?);
+        })?;
         let mut largest = 0;
         for plan in &self.buckets {
             let layout = layout_of(plan.bucket)?;
@@ -963,9 +963,9 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let stream = self.stream.clone();
         let layout = layout_of(bucket)?;
         let (rows, source_width, text_width) = self.conditioning_row(&layout);
-        let element = u64::from(self.shape.stack.bytes().ok_or_else(|| {
+        let element = self.shape.stack.bytes().ok_or_else(|| {
             Error::Invalid(format!("{} has no whole-byte size", self.shape.stack))
-        })?);
+        })?;
         // One row's size per kind: the two columns are two widths, so a single number would make
         // the shorter kind's copy land inside the wrong column's row (`conditioning_width`).
         let text_bytes = rows * text_width * element;
@@ -1008,7 +1008,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
                 let destination = TensorView::new(
                     ops::DevicePtr::new(column.host.address() + u64::from(index) * stride),
                     self.shape.stack,
-                    Shape::new(&[copied / u64::from(element)]),
+                    Shape::new(&[copied / element]),
                 );
                 if !products.copy_into(request, kind, &destination, &stream)? {
                     return Err(products::absent(request, kind));
@@ -1047,9 +1047,9 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     fn zero_rows(&mut self, bucket: Bucket) -> Result<()> {
         let layout = layout_of(bucket)?;
         let (rows, _, text_width) = self.conditioning_row(&layout);
-        let element = u64::from(self.shape.stack.bytes().ok_or_else(|| {
+        let element = self.shape.stack.bytes().ok_or_else(|| {
             Error::Invalid(format!("{} has no whole-byte size", self.shape.stack))
-        })?);
+        })?;
         let stride = rows * text_width * element;
         let row = text_width * element;
         for pending in &self.pending {
@@ -2241,11 +2241,9 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
 /// gathered to every rank before the solver's update), so two ranks or epochs whose layouts agree
 /// lay out every page alike.
 fn trajectory_layout(layout: &Layout, dtype: DType) -> Result<StorageLayout> {
-    let element = u64::from(
-        dtype
-            .bytes()
-            .ok_or_else(|| Error::Invalid(format!("{dtype} has no whole-byte size")))?,
-    );
+    let element = dtype
+        .bytes()
+        .ok_or_else(|| Error::Invalid(format!("{dtype} has no whole-byte size")))?;
     let field = |tensor: &str, shape: &LatentShape, offset: u64| {
         let dims = [
             u64::from(shape.channels),
@@ -2300,7 +2298,7 @@ fn trajectory_regions(latents: &Latents) -> Result<Vec<(u64, u64)>> {
             .dtype
             .bytes()
             .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", view.dtype)))?;
-        Ok((view.ptr.address(), view.shape.numel() * u64::from(bytes)))
+        Ok((view.ptr.address(), view.shape.numel() * bytes))
     };
     let mut regions = vec![region(&latents.video)?];
     if let Some(audio) = &latents.audio {

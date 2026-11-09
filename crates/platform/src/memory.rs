@@ -185,6 +185,11 @@ impl DeviceAllocation {
         self.bytes
     }
 
+    /// Whether the length is zero.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// The handle type of an exportable allocation; `None` for linear storage.
     pub fn handle_type(&self) -> Option<HandleType> {
         match &self.kind {
@@ -311,6 +316,11 @@ impl PinnedBuffer {
 
     pub fn len(&self) -> usize {
         self.bytes
+    }
+
+    /// Whether the length is zero.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Views the buffer on the host.

@@ -255,7 +255,7 @@ fn reached(handle: &SchedulerHandle, steps: u64) -> Progress {
 #[test]
 fn a_step_asks_the_policy_to_observe_and_dispatch_once_each() {
     let serving = Arc::new(Serving::new(vec![pool()]));
-    let batches: Arc<dyn Batches> = serving.clone();
+    let batches: Arc<dyn Batches> = Arc::clone(&serving) as Arc<dyn Batches>;
     let args = scheduler::sim_args("call-counts");
     let limits = SchedulerConfig {
         max_running_requests: 4,

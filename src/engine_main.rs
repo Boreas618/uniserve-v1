@@ -1680,12 +1680,9 @@ impl MainProcess {
             if front == 0 && self.daemon_closed {
                 continue;
             }
-            loop {
-                // A frame from a closed front ends that front and nothing else: its requests stay
-                // parked for the takeover that claims them (§7.5.1 step 4).
-                let Some(connection) = self.control.front_mut(front) else {
-                    break;
-                };
+            // A frame from a closed front ends that front and nothing else: its requests stay parked
+            // for the takeover that claims them (§7.5.1 step 4).
+            while let Some(connection) = self.control.front_mut(front) {
                 let message = match connection.try_recv() {
                     Ok(Some(message)) => message,
                     Ok(None) => break,
@@ -2024,12 +2021,11 @@ impl MainProcess {
             failure,
             "answering the epoch's program layer"
         );
-        if let Some(rank) = reply {
-            if let Some(channel) = self.control.peer_mut(rank) {
-                if let Err(error) = channel.send(&status) {
-                    tracing::warn!(%error, rank, "answering a peer's program command failed");
-                }
-            }
+        if let Some(rank) = reply
+            && let Some(channel) = self.control.peer_mut(rank)
+            && let Err(error) = channel.send(&status)
+        {
+            tracing::warn!(%error, rank, "answering a peer's program command failed");
         }
         self.report(status);
     }
@@ -2365,6 +2361,10 @@ impl MainProcess {
     /// forward says which ones it launches. So the first generation starts with the keys already
     /// learned and finds the rest by walking - each attempt that finds a kernel missing names the
     /// operator and key it needed, and the install is admitted again with that key added.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the modules to fetch and the cell they leave unavailable are one answer"
+    )]
     fn admit_installs(
         &mut self,
         programs: &Programs,
@@ -2616,25 +2616,25 @@ impl MainProcess {
         // answer is owed to the daemon's switchover wait, so silence here is a timeout with no cause
         // in the log. Failing it by name reverts the update and leaves the process serving what it
         // held.
-        if let (Some(since), true) = (self.warming_since, !self.warming.is_empty()) {
-            if since.elapsed() > self.watchdog.stall_bound() * 2 {
-                let (device, generation) = self
-                    .warming
-                    .first()
-                    .map_or((0, 0), |(device, _, generation)| (*device, *generation));
-                let failure = UpdateFailure::Device {
-                    device,
-                    error: format!(
-                        "warming generation {generation} on device {device} did not finish in {}s",
-                        since.elapsed().as_secs()
-                    ),
-                    batch: None,
-                };
-                self.warming.clear();
-                self.warming_since = None;
-                self.pending_switch = None;
-                return self.failure(failure);
-            }
+        if let (Some(since), true) = (self.warming_since, !self.warming.is_empty())
+            && since.elapsed() > self.watchdog.stall_bound() * 2
+        {
+            let (device, generation) = self
+                .warming
+                .first()
+                .map_or((0, 0), |(device, _, generation)| (*device, *generation));
+            let failure = UpdateFailure::Device {
+                device,
+                error: format!(
+                    "warming generation {generation} on device {device} did not finish in {}s",
+                    since.elapsed().as_secs()
+                ),
+                batch: None,
+            };
+            self.warming.clear();
+            self.warming_since = None;
+            self.pending_switch = None;
+            return self.failure(failure);
         }
         let mut pending = Vec::with_capacity(self.warming.len());
         for (device, submission, generation) in std::mem::take(&mut self.warming) {
@@ -2677,14 +2677,14 @@ impl MainProcess {
         }
         // The switchover's answer is owed to the warmup, and it is sent here - after admission
         // opened - so that `Switched` states the one thing it means: this process can serve.
-        if self.warming.is_empty() {
-            if let Some((generation, reply)) = self.pending_switch.take() {
-                tracing::info!(
-                    generation,
-                    "answering the switchover now that admission is open"
-                );
-                self.answer(reply, ProgramStatus::Switched { generation });
-            }
+        if self.warming.is_empty()
+            && let Some((generation, reply)) = self.pending_switch.take()
+        {
+            tracing::info!(
+                generation,
+                "answering the switchover now that admission is open"
+            );
+            self.answer(reply, ProgramStatus::Switched { generation });
         }
         Ok(None)
     }
@@ -4176,37 +4176,37 @@ impl MainProcess {
                 // stream that skips tokens with nothing saying so. It is refused, naming the two
                 // positions and how far behind the consumer was, so the daemon ends the response
                 // instead of serving a body with a hole in it.
-                if let (Some((oldest, _, _)), true) = (kept.front(), sent > takeover.events) {
-                    if takeover.events + 1 < *oldest {
-                        let oldest = *oldest;
-                        let behind = sent - takeover.events;
-                        tracing::error!(
-                            request = command.request,
-                            front,
-                            from = takeover.events,
-                            oldest,
-                            sent,
-                            behind,
-                            "a takeover names a position this process no longer holds: the \
+                if let (Some((oldest, _, _)), true) = (kept.front(), sent > takeover.events)
+                    && takeover.events + 1 < *oldest
+                {
+                    let oldest = *oldest;
+                    let behind = sent - takeover.events;
+                    tracing::error!(
+                        request = command.request,
+                        front,
+                        from = takeover.events,
+                        oldest,
+                        sent,
+                        behind,
+                        "a takeover names a position this process no longer holds: the \
                              consumer was more events behind than the journal kept"
-                        );
-                        self.reject(
-                            front,
-                            command.request,
-                            proto::request::RejectionKind::Overloaded,
-                            format!(
-                                "the request could not be taken over: its consumer's position \
+                    );
+                    self.reject(
+                        front,
+                        command.request,
+                        proto::request::RejectionKind::Overloaded,
+                        format!(
+                            "the request could not be taken over: its consumer's position \
                                  {} is {} event(s) behind, and this process kept the last {} of \
                                  them from position {} - the handover produced more events of \
                                  this request than a pause may",
-                                takeover.events,
-                                behind,
-                                kept.len(),
-                                oldest,
-                            ),
-                        );
-                        return Ok(());
-                    }
+                            takeover.events,
+                            behind,
+                            kept.len(),
+                            oldest,
+                        ),
+                    );
+                    return Ok(());
                 }
                 let replay = replay_after(&kept, takeover.events);
                 self.streams[index].front = front;
@@ -4618,13 +4618,13 @@ impl MainProcess {
                 Err(error) => failure = Some(error),
             }
         }
-        if delivered == 0 {
-            if let Some(error) = failure {
-                tracing::warn!(
-                    %error,
-                    "reporting the engine's metrics failed: no front of this process is live"
-                );
-            }
+        if delivered == 0
+            && let Some(error) = failure
+        {
+            tracing::warn!(
+                %error,
+                "reporting the engine's metrics failed: no front of this process is live"
+            );
         }
     }
 
@@ -6131,7 +6131,7 @@ impl HostAction for ListStore {
         let mut client = self
             .programs
             .lock()
-            .map_err(|_| worker::Error::State("the Program Server client was poisoned".into()))?;
+            .map_err(|_| worker::Error::State("the Program Server client was poisoned"))?;
         let listing = client.list().map_err(|error| {
             worker::Error::Invalid(format!("reading the Program Server's store: {error}"))
         })?;
@@ -6990,7 +6990,7 @@ impl HostAction for Install {
         let mut client = self
             .programs
             .lock()
-            .map_err(|_| worker::Error::State("the Program Server client was poisoned".into()))?;
+            .map_err(|_| worker::Error::State("the Program Server client was poisoned"))?;
         let mut entries = Vec::new();
         let mut copies = 0_usize;
         let mut prepared: Vec<(String, usize)> = Vec::new();
@@ -7458,35 +7458,6 @@ fn unfinished(submissions: &[Submission], what: &str) -> Option<StageFailure> {
     None
 }
 
-/// The programs each operator of `packages` may be installed from, in the order §7.3 step 2's walk
-/// tries them: the highest installed revision first, and among equal revisions the backend whose
-/// name sorts first, so the order is the same on every run.
-///
-/// Nothing here excludes a candidate. An operator built under two backends is one slot with two
-/// programs rather than one choice made before the walk, because whether a program can serve a
-/// descriptor is only known when the walk names the descriptor (`advance_candidate`).
-///
-/// Two kinds of package are left out, and both would cost more than they buy:
-///
-/// - one with no module built for one of `targets`. Installing it asks `prepare` to *build* it for
-///   this host, so a store built for other targets would spend a startup's whole precopy clock
-///   compiling modules the first token does not need. The operator then stays missing, and the walk
-///   names it - the honest answer for a host the store was not built for.
-/// - one whose operator this binary does not implement: `admit_installs` refuses a precopy for such
-///   an operator, and a program this process could never launch is not worth failing a switchover
-///   over.
-/// The package the store holds for `operator` when none of them is built: the highest revision,
-/// ties broken by the backend's name so the choice is the same on every run.
-///
-/// This is the answer for an operator nothing has captured yet - the package that states its keys
-/// in its manifest but has no module for this host - which is what `select_programs` cannot see,
-/// because its own question is what this host can launch *now*.
-/// The answer to a `Commit`.
-///
-/// A commit whose generation is not on probation names nothing the machine holds: the daemon may be
-/// one message behind the revert that its own rollback threshold caused, so its commit arrives after
-/// the update ended. The state that holds is the one before the update - it serves, nothing was
-/// committed - and that is the answer. A protocol message never ends a process that can still serve.
 /// What a switchover answers: the status now, or nothing until its warmup has run.
 ///
 /// `Switched` states that this process serves, and it cannot serve a batch before the buckets that
@@ -7507,6 +7478,12 @@ fn switchover_answer(warming: usize, generation: u64) -> SwitchoverAnswer {
     }
 }
 
+/// The answer to a `Commit`.
+///
+/// A commit whose generation is not on probation names nothing the machine holds: the daemon may be
+/// one message behind the revert that its own rollback threshold caused, so its commit arrives after
+/// the update ended. The state that holds is the one before the update - it serves, nothing was
+/// committed - and that is the answer. A protocol message never ends a process that can still serve.
 fn answer_commit(update: &mut worker::hot_update::HotUpdate, generation: u64) -> ProgramStatus {
     // An epoch switch commits its target, whose programs were committed when the daemon handed them
     // over: the generation it names already serves with nothing on trial, so the answer is that.
@@ -7687,7 +7664,7 @@ fn key_phase(key: &str) -> Option<PhaseKind> {
 fn key_fits_phase(key: &str, phase: Option<PhaseKind>) -> bool {
     match phase {
         None => true,
-        Some(phase) => key_phase(key).map_or(true, |held| held == phase),
+        Some(phase) => key_phase(key).is_none_or(|held| held == phase),
     }
 }
 
@@ -8061,6 +8038,10 @@ fn device_command(
 /// node's workers through `worker::Batches`: the scheduler forms a batch, the worker issues
 /// it, and the scheduler reads the result - nothing crosses threads except the batch and its
 /// result.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each scheduler is built from the node's whole serving state, each part one argument"
+)]
 fn schedulers(
     model_runner: &ModelRunner,
     launch: &EngineArgs,

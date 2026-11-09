@@ -8,6 +8,7 @@
 //! the normal case after an upgrade, not an accident. These cases state the two
 //! directions of that promise on the encoding itself, which is the only thing
 //! both sides share.
+#![cfg(test)]
 
 use scheduling::guest::wire;
 use scheduling::guest::{

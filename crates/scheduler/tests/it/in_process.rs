@@ -86,7 +86,7 @@ fn config() -> (EngineArgs, SchedulerConfig) {
 #[test]
 fn a_pool_the_process_did_not_launch_serves_the_launched_paths_commands() {
     let batch_sink = Arc::new(Pool::new(vec![crate::support::pool("model")]));
-    let batches: Arc<dyn Batches> = batch_sink.clone();
+    let batches: Arc<dyn Batches> = Arc::clone(&batch_sink) as Arc<dyn Batches>;
     let handle = {
         let (args, limits) = config();
         SchedulerHandle::over_batches(&args, limits, batches)

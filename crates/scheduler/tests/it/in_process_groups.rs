@@ -299,7 +299,7 @@ fn losing_every_worker_stops_request_admission() {
 fn a_prefill_group_hands_its_requests_to_a_decode_group() {
     use scheduler::WorkerGroupRole;
 
-    let prompts = vec![
+    let prompts = [
         vec![7, 8, 9],
         (0..600u32).map(|index| index % 47 + 5).collect(),
     ];

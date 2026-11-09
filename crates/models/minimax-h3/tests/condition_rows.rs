@@ -2,6 +2,7 @@
 //! count selects the graph the rank replays. A count below the packing's would select a layout that
 //! cannot hold the request, and one above it a layout larger than the request needs, so the two
 //! statements are held against each other here over every kind of condition.
+#![cfg(test)]
 
 use minimax_h3::packing::{self, Condition, Frame, Role};
 use models::video::plan::{

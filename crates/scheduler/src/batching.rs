@@ -100,9 +100,7 @@ impl Scheduler {
         }
         let targets = views::replica_targets(self, call.request_key, call.kind);
         let view = views::call_view(call.request_key, call.kind);
-        let Some(mut policy) = self.policy.take() else {
-            return None;
-        };
+        let mut policy = self.policy.take()?;
         let answer = policy
             .place(&view, &replicas)
             .and_then(|index| mechanism::validate_place(&view, &replicas, index).map(|()| index));
@@ -280,7 +278,6 @@ impl Scheduler {
         let mut admissions: Vec<NewRequest> = Vec::new();
         let mut selected = 0usize;
         for (id, phase, wanted) in work.iter().copied() {
-            let id = id;
             if selected >= self.config.max_batch.get() {
                 break;
             }
@@ -413,10 +410,8 @@ impl Scheduler {
             } else {
                 budget
             };
-            if writes_prefix {
-                if let Some(tokens) = wanted {
-                    call_budget = call_budget.min(tokens as usize);
-                }
+            if writes_prefix && let Some(tokens) = wanted {
+                call_budget = call_budget.min(tokens as usize);
             }
             if call_budget == 0 {
                 continue;

@@ -720,9 +720,7 @@ impl Scheduler {
     const EXPERT_REBALANCE_STEPS: u64 = 64;
 
     fn policy_step(&mut self) -> Option<Plan> {
-        let Some(mut policy) = self.policy.take() else {
-            return None;
-        };
+        let mut policy = self.policy.take()?;
         self.step += 1;
         // The kernels this step's batches serve on, read once: a switchover
         // that completes mid-step must not split one step across two epochs

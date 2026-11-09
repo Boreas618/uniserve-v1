@@ -107,7 +107,9 @@ fn replay(stream: &Stream, graph: &GraphExec, data: u64) -> Vec<u32> {
     stream.synchronize().expect("synchronize");
     // SAFETY: the copy completed and the buffer holds `BYTES` readable bytes.
     unsafe { host.as_slice() }
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|word| u32::from_ne_bytes([word[0], word[1], word[2], word[3]]))
         .collect()
 }
@@ -145,9 +147,8 @@ fn a_suspended_pool_restores_at_the_same_addresses_and_its_graph_replays() {
         pools.layout(),
         "the restored pool holds a different layout from the one the graph addresses"
     );
-    assert_eq!(
+    assert!(
         pools.mapped_bytes(PoolKind::Graph) >= BYTES as u64,
-        true,
         "a restored pool maps less than one activation"
     );
 

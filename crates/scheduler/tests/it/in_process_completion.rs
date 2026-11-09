@@ -116,7 +116,7 @@ fn a_request_is_served_through_the_workers_own_batch_path() {
     let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool(
         "model",
     )]));
-    let batches: Arc<dyn Batches> = serving.clone();
+    let batches: Arc<dyn Batches> = Arc::clone(&serving) as Arc<dyn Batches>;
     let handle = SchedulerHandle::over_batches(
         &crate::support::serving::args("in-process-completion"),
         crate::support::serving::limits(&serving),
@@ -207,7 +207,7 @@ fn a_request_that_does_not_fit_a_slot_waits_for_one() {
     let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool(
         "model",
     )]));
-    let batches: Arc<dyn Batches> = serving.clone();
+    let batches: Arc<dyn Batches> = Arc::clone(&serving) as Arc<dyn Batches>;
     let args = crate::support::serving::args("in-process-completion");
     let mut limits = crate::support::serving::limits(&serving);
     limits.max_running_requests = 1;
@@ -258,7 +258,7 @@ fn a_policy_stage_applies_after_a_request_ended() {
     let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool(
         "model",
     )]));
-    let batches: Arc<dyn Batches> = serving.clone();
+    let batches: Arc<dyn Batches> = Arc::clone(&serving) as Arc<dyn Batches>;
     let handle = SchedulerHandle::over_batches(
         &crate::support::serving::args("in-process-completion"),
         crate::support::serving::limits(&serving),
@@ -309,7 +309,7 @@ fn an_admitted_request_is_prefilled_on_the_next_step() {
     let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool(
         "model",
     )]));
-    let batches: Arc<dyn Batches> = serving.clone();
+    let batches: Arc<dyn Batches> = Arc::clone(&serving) as Arc<dyn Batches>;
     let handle = SchedulerHandle::over_batches(
         &crate::support::serving::args("in-process-completion"),
         crate::support::serving::limits(&serving),

@@ -538,9 +538,7 @@ impl DataPlane {
                 )
             };
             let mut walk = Walk::default();
-            model
-                .load(&target, &mut walk)
-                .map_err(|error| Error::Invalid(error))?;
+            model.load(&target, &mut walk).map_err(Error::Invalid)?;
             let log = walk.into_log();
             let pairs = paired(&serving, &log, matching).map_err(|difference| {
                 Error::Invalid(format!(
@@ -575,6 +573,10 @@ impl DataPlane {
     /// on as they did.
     pub fn load(&self, mut planned: Planned) -> Result<Planned> {
         let target = planned.target.clone();
+        #[expect(
+            clippy::type_complexity,
+            reason = "each rank's load, its storage, its device and its weights are gathered once"
+        )]
         let loads: Vec<(
             Arc<dyn ModelLoad>,
             Arc<Retained>,

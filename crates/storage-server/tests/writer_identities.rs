@@ -32,6 +32,7 @@
 //! ```text
 //! cargo test -p storage-server --test writer_identities one_process_holds_two_rank_writer_identities -- --nocapture
 //! ```
+#![cfg(test)]
 
 use std::io::Write as _;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
