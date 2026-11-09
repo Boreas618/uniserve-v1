@@ -48,7 +48,9 @@ mod transpose;
 
 pub use activation::{GateBias, GatedActivation, Gelu, Halves, Rounding, Silu, Snake};
 pub use affine::ChannelAffine;
-pub use attention::{Attention, AttentionBackend, TRTLLM_WORKSPACE_BYTES};
+pub use attention::{
+    DenseAttention, DenseSpec, PagedAttention, PagedSpec, TRTLLM_WORKSPACE_BYTES, Varlen,
+};
 pub use audio::AudioActivation;
 pub use conv::{Conv1d, Conv3d, ConvGeometry, ConvTranspose1d};
 pub use cross_fade::CrossFade;

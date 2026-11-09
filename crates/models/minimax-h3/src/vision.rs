@@ -53,8 +53,9 @@
 use nn::capability::ImageInput;
 use nn::family::Split;
 use nn::layers::{
-    Attention, Bias, Gelu, LayerNorm, Linear, Parallel, PositionInterpolate, Precision, QkNorm,
-    QkvBias, QkvLinear, QkvNames, QkvSpec, Residual, Rotary, RotarySpec, Spectrum,
+    Bias, DenseAttention, DenseSpec, Gelu, LayerNorm, Linear, Parallel, PositionInterpolate,
+    Precision, QkNorm, QkvBias, QkvLinear, QkvNames, QkvSpec, Residual, Rotary, RotarySpec,
+    Spectrum, Varlen,
 };
 use nn::weights::{Scope, WeightLoader};
 use nn::{Arena, Forward, Shape, TensorView, Weight};
@@ -496,7 +497,7 @@ impl Block {
         tower: &VisionTower,
         f: &Forward,
         image: &ImageTables,
-        attention: &Attention,
+        attention: &DenseAttention,
         rows: &BlockRows,
         buffers: &Buffers,
     ) -> Result<()> {
@@ -529,14 +530,17 @@ impl Block {
 
         // One sequence per time step, packed in one launch: the key bound is every step together
         // and the longest row is one step, so a video block of several steps launches as an image.
-        attention.attend_packed(
+        attention.forward(
             f,
             buffers.as_heads(buffers.rotated_query, heads, head_dim)?,
             buffers.as_heads(buffers.rotated_key, heads, head_dim)?,
             buffers.as_heads(buffers.value, heads, head_dim)?,
-            image.lengths,
-            rows.patches,
-            rows.sequence,
+            Some(Varlen {
+                cu_q: image.lengths,
+                cu_k: image.lengths,
+                max_q: Some(rows.sequence),
+                max_k: rows.patches,
+            }),
             buffers.as_heads(buffers.attended, heads, head_dim)?,
         )?;
         self.output
@@ -857,16 +861,15 @@ impl VisionTower {
         // One bidirectional launch over the grid's time steps: the descriptor's key bound is the
         // block's own patches (the reference's attention declares none), and its scale the head's
         // `head_dim^-0.5`.
-        let attention = Attention::dense(
-            self.head_dim,
-            self.heads,
-            self.heads,
-            rows.patches,
-            false,
-            None,
-            self.rotary.spectrum().score_scale(self.head_dim)?,
-        )
-        .map_err(Error::from)?;
+        let attention = DenseAttention::new(DenseSpec {
+            head_dim: self.head_dim,
+            heads: self.heads,
+            kv_heads: self.heads,
+            max_keys: rows.patches,
+            causal: false,
+            window: None,
+            scale: self.rotary.spectrum().score_scale(self.head_dim)?,
+        })?;
 
         let mut next = 0;
         for (index, block) in self.layers.iter().enumerate() {

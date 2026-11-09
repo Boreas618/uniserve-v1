@@ -43,7 +43,7 @@
 use nn::capability::{ConditionRole, LatentShape, Layout, StateTable, TableValues, VideoRequest};
 use nn::{DType, Forward, Shape, TensorView, Weight, WeightLoader};
 
-use crate::attention::{Factors, Visible};
+use crate::attention::Factors;
 use crate::config::{Canvas, DenoiserConfig, MAX_FRAMES};
 use crate::modulation::{AdaLnCache, Groups, Projections};
 use crate::packing::{self, DensePacking};
@@ -2409,10 +2409,11 @@ impl Denoiser {
         // The dense kind reads the whole packed sequence in one go; the sparse kind reads the
         // segment tables instead and has no visibility pair at all.
         let visible = self.config.attention.is_dense().then(|| {
-            Ok::<_, Error>(Visible {
-                cu_seq_lens_q: tables.get("cu_seq_lens_q")?,
-                cu_seq_lens_k: tables.get("cu_seq_lens_k")?,
-                key_rows: tokens as u32,
+            Ok::<_, Error>(nn::layers::Varlen {
+                cu_q: tables.get("cu_seq_lens_q")?,
+                cu_k: tables.get("cu_seq_lens_k")?,
+                max_q: None,
+                max_k: tokens as u32,
             })
         });
         let visible = match visible {

@@ -1,16 +1,19 @@
-//! Attention over the paged cache: write the batch's keys and values, then attend.
+//! Attention: dense over packed sequences, and paged over the prefix cache.
 //!
-//! One call covers both halves because the batch's tokens are written exactly once and read in the
-//! same step: the scheduler's mechanism assigns each token a slot (`-1` for a token it does not
-//! persist), [`ops::kv::KvWrite`] scatters the projections into the pages — or, for an FP8 cache,
-//! [`ops::kv::KvWriteScaled`] derives the page's own scale on the way in, the same tensor the read
-//! side multiplies back — and [`ops::attention::PagedAttention`] reads the pages each row
-//! addresses. Both operators are compiled per geometry, so the descriptor pins the element types,
-//! the head and page geometry and the mask variant, while the batch, the lengths, the scale and
-//! the window travel in the call.
+//! Two layers, one per mathematics a model composes. [`DenseAttention`] attends packed queries to
+//! packed keys in one launch of `ops::attention::dense::DenseAttention`, either as one sequence or
+//! as the variable-length sequences a [`Varlen`] names; the element types of the views decide the
+//! program, so an FP32 attention is the same layer over FP32 operands. [`PagedAttention`] writes a
+//! batch's keys and values into the cache's pages and reads the pages each row addresses: the
+//! scheduler assigns each token a slot (`-1` for a token it does not persist), [`ops::kv::KvWrite`]
+//! scatters the projections into the pages - or, for an FP8 cache, [`ops::kv::KvWriteScaled`]
+//! derives the page's own scale on the way in, the tensor the read side multiplies back - and
+//! [`ops::attention::PagedAttention`] reads them. Both operators are compiled per geometry, so a
+//! descriptor pins the element types, the head and page geometry and the mask, while the batch,
+//! the lengths, the scale and the window travel in the call.
 
-use ops::attention::dense::{DenseArgs, DenseAttention, DenseDescriptor};
-use ops::attention::{Args, Descriptor, Mask, PagedAttention, Phase};
+use ops::attention::dense::{DenseArgs, DenseAttention as DenseOp, DenseDescriptor};
+use ops::attention::{Args, Descriptor, Mask, PagedAttention as PagedOp, Phase};
 use ops::kv::{self, Descriptor as KvDescriptor, KvWrite, KvWriteScaled};
 use ops::{DType, PhaseKind, Shape, TensorView};
 
@@ -19,368 +22,288 @@ use crate::error::{Error, Result};
 use crate::forward::Forward;
 use crate::layers::launch::{PDL, kv_tile};
 
-/// Which implementation reads the keys and values.
+/// The geometry and mask of a [`DenseAttention`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DenseSpec {
+    /// Channels of one head.
+    pub head_dim: u32,
+    /// Query heads one token carries.
+    pub heads: u32,
+    /// Key and value heads one token carries; they group the query heads.
+    pub kv_heads: u32,
+    /// The longest key reduction the deployment serves: the ceiling every call's bound stays under.
+    pub max_keys: u32,
+    /// Whether each query sees only its own past.
+    pub causal: bool,
+    /// An inclusive history window, which only the causal mask reads.
+    pub window: Option<u32>,
+    /// The softmax scale applied to `q · k`.
+    pub scale: f32,
+}
+
+/// The variable-length sequences one dense call packs, as flash attention's varlen call states
+/// them.
 ///
-/// The backend names the program the epoch record fills the operator with (`attention_backend`);
-/// the layer states which attention its model composes so a runner can refuse a block/backend
-/// mismatch before serving, not during a forward.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum AttentionBackend {
-    /// FlashAttention-4's dense kernel through the CuTe DSL program.
-    Dense,
-    /// FP32 attention through a GEMM and a softmax program.
-    Fp32,
-    /// Paged attention over the prefix cache, read and written per token.
-    Paged,
+/// Both tables are `[sequences + 1]` i32 cumulative row counts, of the queries and of the keys; a
+/// call whose sequences attend themselves passes one table as both.
+#[derive(Clone, Copy, Debug)]
+pub struct Varlen {
+    /// The query rows of each sequence, accumulated from zero.
+    pub cu_q: TensorView,
+    /// The key rows of each sequence, accumulated from zero.
+    pub cu_k: TensorView,
+    /// The longest query sequence, when the caller wrote the tables and knows it: the launch sizes
+    /// its schedule by it rather than by the packed row count, which for many equal sequences asks
+    /// for that many times the programs it needs.
+    pub max_q: Option<u32>,
+    /// The longest key reduction this launch makes: a launch value, because a deployment's buckets
+    /// differ by thousands of rows. It covers every key passed and stays within the layer's
+    /// `max_keys`.
+    pub max_k: u32,
 }
 
-/// Paged attention over a cache's planes.
-pub struct Attention {
-    backend: AttentionBackend,
-    head_dim: u32,
-    q_heads: u32,
-    kv_heads: u32,
-    page_size: u32,
-    scale: f32,
-    window: Option<u32>,
-    max_kv_len: u32,
-    causal: bool,
+/// Dense attention from packed queries to packed keys.
+#[derive(Clone, Copy, Debug)]
+pub struct DenseAttention {
+    spec: DenseSpec,
 }
 
-impl Attention {
-    /// Paged attention of `head_dim` elements per head over `page_size`-token pages.
+impl DenseAttention {
+    /// The attention of `spec`.
     ///
-    /// `max_kv_len` is the longest key reduction the deployment serves (40960 for the Qwen3-MoE
-    /// slice): it enters the descriptor and with it the tolerance bound, so a deployment that
-    /// serves longer sequences needs another module, not another launch. `window` is the inclusive history window, when
-    /// the model has one.
-    pub fn paged(
-        head_dim: u32,
-        q_heads: u32,
-        kv_heads: u32,
-        page_size: u32,
-        max_kv_len: u32,
-        window: Option<u32>,
-        scale: f32,
-    ) -> Result<Self> {
-        if head_dim == 0 || q_heads == 0 || kv_heads == 0 || page_size == 0 {
-            return Err(Error::shape(
-                "Attention",
-                "a head, a page and both head counts must be nonzero".to_owned(),
-            ));
-        }
-        if !q_heads.is_multiple_of(kv_heads) {
-            return Err(Error::shape(
-                "Attention",
-                format!("{q_heads} query heads do not group {kv_heads} key heads"),
-            ));
-        }
-        if max_kv_len < page_size {
-            return Err(Error::shape(
-                "Attention",
-                format!("a {max_kv_len}-key bound is shorter than a {page_size}-token page"),
-            ));
-        }
-        Ok(Self {
-            backend: AttentionBackend::Paged,
-            head_dim,
-            q_heads,
-            kv_heads,
-            page_size,
-            scale,
-            window,
-            max_kv_len,
-            causal: true,
-        })
-    }
-
-    /// The backend this layer expects.
-    pub const fn backend(&self) -> AttentionBackend {
-        self.backend
-    }
-
-    /// The elements per head.
-    pub const fn head_dim(&self) -> u32 {
-        self.head_dim
-    }
-
-    /// The longest key reduction the descriptor serves.
-    pub const fn max_kv_len(&self) -> u32 {
-        self.max_kv_len
-    }
-
-    /// Whether this attention masks each query to its own past.
+    /// # Errors
     ///
-    /// The paged backend is always causal; the dense and FP32 backends state it at construction
-    /// and it is part of their descriptor, because a causal mask and a dense one are two programs.
-    pub const fn causal(&self) -> bool {
-        self.causal
-    }
-
-    /// Dense attention over a packed sequence: the language encoder, a cross-attention, the video
-    /// block's attention without the cache.
-    ///
-    /// `max_seq_len` is the longest key sequence the deployment serves and enters the descriptor
-    /// (one value per deployment, like the paged backend's bound). `causal` states the mask the
-    /// model's attention declares; `window` is an inclusive history window, which the causal mask
-    /// requires.
-    pub fn dense(
-        head_dim: u32,
-        q_heads: u32,
-        kv_heads: u32,
-        max_seq_len: u32,
-        causal: bool,
-        window: Option<u32>,
-        scale: f32,
-    ) -> Result<Self> {
-        Self::dense_of(
-            AttentionBackend::Dense,
-            head_dim,
-            q_heads,
-            kv_heads,
-            max_seq_len,
-            causal,
-            window,
-            scale,
-        )
-    }
-
-    /// The FP32 dense attention of the `ref2va` audio encoder and the sparse compression branch:
-    /// the same call, with cuBLASLt SGEMM and a softmax kernel inside the package.
-    ///
-    /// The FP32 paths read a whole sequence at once, so their mask is dense and carries no history
-    /// window; `causal` states the mask the model's attention declares, and the two are different
-    /// programs. The audio encoder's attention is causal.
-    pub fn fp32(
-        head_dim: u32,
-        q_heads: u32,
-        kv_heads: u32,
-        max_seq_len: u32,
-        causal: bool,
-        scale: f32,
-    ) -> Result<Self> {
-        Self::dense_of(
-            AttentionBackend::Fp32,
-            head_dim,
-            q_heads,
-            kv_heads,
-            max_seq_len,
-            causal,
-            None,
-            scale,
-        )
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "a dense attention is named by the mask's, the head geometry and the bound's values"
-    )]
-    fn dense_of(
-        backend: AttentionBackend,
-        head_dim: u32,
-        q_heads: u32,
-        kv_heads: u32,
-        max_seq_len: u32,
-        causal: bool,
-        window: Option<u32>,
-        scale: f32,
-    ) -> Result<Self> {
-        if head_dim == 0 || q_heads == 0 || kv_heads == 0 || max_seq_len == 0 {
+    /// A zero head, bound or head count, query heads that do not group the key heads, a window
+    /// over a dense mask, or a scale that is zero or not finite.
+    pub fn new(spec: DenseSpec) -> Result<Self> {
+        const OWNER: &str = "DenseAttention";
+        if spec.head_dim == 0 || spec.heads == 0 || spec.kv_heads == 0 || spec.max_keys == 0 {
             return Err(Error::shape(
-                "Attention::dense",
-                "a head, a sequence bound and both head counts must be nonzero".to_owned(),
+                OWNER,
+                "a head, a key bound and both head counts must be nonzero".to_owned(),
             ));
         }
-        if !q_heads.is_multiple_of(kv_heads) {
+        if !spec.heads.is_multiple_of(spec.kv_heads) {
             return Err(Error::shape(
-                "Attention::dense",
-                format!("{q_heads} query heads do not group {kv_heads} key heads"),
+                OWNER,
+                format!(
+                    "{} query heads do not group {} key heads",
+                    spec.heads, spec.kv_heads
+                ),
             ));
         }
-        if window.is_some() && !causal {
+        if spec.window.is_some() && !spec.causal {
             return Err(Error::shape(
-                "Attention::dense",
+                OWNER,
                 "a history window reads the causal mask only".to_owned(),
             ));
         }
-        if !scale.is_finite() || scale == 0.0 {
+        if !spec.scale.is_finite() || spec.scale == 0.0 {
             return Err(Error::shape(
-                "Attention::dense",
-                format!("a softmax scale of {scale}"),
+                OWNER,
+                format!("a softmax scale of {}", spec.scale),
             ));
         }
-        Ok(Self {
-            backend,
-            head_dim,
-            q_heads,
-            kv_heads,
-            page_size: 0,
-            scale,
-            window,
-            max_kv_len: max_seq_len,
-            causal,
-        })
+        Ok(Self { spec })
     }
 
-    /// Dense attention from packed queries to packed keys: `query [q_tokens, q_heads, head_dim]`,
-    /// `key`/`value [kv_tokens, kv_heads, head_dim]`, `out [q_tokens, q_heads, head_dim]`.
-    ///
-    /// `cu_seq_lens_q`/`cu_seq_lens_k` are the `[sequences + 1]` i32 row offsets the scheduler
-    /// writes, given together or both absent. Absent means **one sequence**, `[0, q_tokens]` and
-    /// `[0, kv_tokens]`: a decoder that runs one sequence per tile owns no table, and the
-    /// descriptor carries that fact, so the call launches the single-sequence program rather than
-    /// reading a table at a null address. A batch that packs several sequences always passes both,
-    /// and one table without the other is refused by the operator.
-    ///
-    /// `max_kv_len` is the bucket's own key bound: the longest reduction *this* launch makes, which
-    /// is what the tolerance bound is written against, and it is a launch-time value because a
-    /// deployment's buckets differ by tens of thousands of rows. It must cover the keys this call
-    /// passes and stay within the deployment's declared ceiling ([`Self::paged`]'s `max_kv_len`),
-    /// which is the bound the operator was accepted for.
-    ///
-    /// Serves both the `Dense` and the `Fp32` backend; the element types the views carry decide the
-    /// descriptor, and the package behind it decides the tile and split heuristics.
-    /// The descriptor one dense attention launch takes.
-    ///
-    /// Everything the key carries is here: the geometry is the module's, the element types and the key
-    /// bound are the call's, and `cu_seq_lens` says which of the two programs the call selects — not
-    /// what this launch reads.
-    fn dense_descriptor(
+    /// The geometry and mask this attention was built for.
+    pub const fn spec(&self) -> &DenseSpec {
+        &self.spec
+    }
+
+    /// The descriptor one launch takes: the geometry is the layer's, the element types and the key
+    /// bound the call's, and whether offset tables are read selects one of two programs.
+    fn descriptor(
         &self,
         query: DType,
         key_value: DType,
         output: DType,
-        max_kv_len: u32,
-        cu_seq_lens: bool,
+        keys: u32,
+        varlen: bool,
     ) -> DenseDescriptor {
         DenseDescriptor {
             query,
             key_value,
             output,
-            head_dim: self.head_dim,
-            q_heads: self.q_heads,
-            kv_heads: self.kv_heads,
-            mask: if self.causal {
+            head_dim: self.spec.head_dim,
+            q_heads: self.spec.heads,
+            kv_heads: self.spec.kv_heads,
+            mask: if self.spec.causal {
                 Mask::Causal
             } else {
                 Mask::Dense
             },
-            windowed: self.window.is_some(),
-            max_kv_len,
-            cu_seq_lens,
+            windowed: self.spec.window.is_some(),
+            max_kv_len: keys,
+            cu_seq_lens: varlen,
         }
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the call's operands and its two offset tables are the design's argument list"
-    )]
-    pub fn attend_dense(
-        &self,
-        f: &Forward,
-        query: TensorView,
-        key: TensorView,
-        value: TensorView,
-        cu_seq_lens_q: Option<TensorView>,
-        cu_seq_lens_k: Option<TensorView>,
-        max_kv_len: u32,
-        out: TensorView,
-    ) -> Result<()> {
-        self.dense_launch(
-            f,
-            (query, key, value),
-            (cu_seq_lens_q, cu_seq_lens_k),
-            max_kv_len,
-            None,
-            out,
-        )
-    }
-
-    /// One launch over `offsets`' packed sequences, none longer than `longest` rows.
+    /// Attend `query [q_tokens, heads, head_dim]` to `key`/`value [kv_tokens, kv_heads, head_dim]`
+    /// into `out [q_tokens, heads, head_dim]`.
     ///
-    /// The offsets serve both sides, because each sequence attends itself. A caller that wrote the
-    /// offsets knows the longest row, and the module sizes its schedule by it: left to the packed token
-    /// count, a launch of many equal sequences asks for that many times the programs it needs.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the call's operands, its offsets and its two bounds are the design's argument list"
-    )]
-    pub fn attend_packed(
+    /// `varlen` names the packed sequences; absent, the call is **one sequence** of every query and
+    /// every key, its key bound the key count, and the single-sequence program is launched rather
+    /// than one reading a table at a null address.
+    ///
+    /// # Errors
+    ///
+    /// A key bound below the keys passed or above the layer's ceiling, or the operator's refusal.
+    pub fn forward(
         &self,
         f: &Forward,
         query: TensorView,
         key: TensorView,
         value: TensorView,
-        offsets: TensorView,
-        max_kv_len: u32,
-        longest: u32,
+        varlen: Option<Varlen>,
         out: TensorView,
     ) -> Result<()> {
-        self.dense_launch(
-            f,
-            (query, key, value),
-            (Some(offsets), Some(offsets)),
-            max_kv_len,
-            Some(u64::from(longest)),
-            out,
-        )
-    }
-
-    fn dense_launch(
-        &self,
-        f: &Forward,
-        (query, key, value): (TensorView, TensorView, TensorView),
-        (cu_seq_lens_q, cu_seq_lens_k): (Option<TensorView>, Option<TensorView>),
-        max_kv_len: u32,
-        longest: Option<u64>,
-        out: TensorView,
-    ) -> Result<()> {
-        if !matches!(
-            self.backend,
-            AttentionBackend::Dense | AttentionBackend::Fp32
-        ) {
-            return Err(Error::Unsupported(format!(
-                "Attention::attend_dense: the {:?} backend is not a dense attention",
-                self.backend
-            )));
-        }
+        const OWNER: &str = "DenseAttention";
         let kv_tokens = key.shape.dim(0);
-        if u64::from(max_kv_len) < kv_tokens {
+        let keys = match varlen {
+            Some(varlen) => varlen.max_k,
+            None => u32::try_from(kv_tokens).map_err(|_| {
+                Error::shape(OWNER, format!("{kv_tokens} keys exceed a launch's bound"))
+            })?,
+        };
+        if u64::from(keys) < kv_tokens {
             return Err(Error::shape(
-                "Attention::attend_dense",
-                format!("a {max_kv_len}-key bound for a launch of {kv_tokens} keys"),
+                OWNER,
+                format!("a {keys}-key bound for a launch of {kv_tokens} keys"),
             ));
         }
-        if max_kv_len > self.max_kv_len {
+        if keys > self.spec.max_keys {
             return Err(Error::shape(
-                "Attention::attend_dense",
+                OWNER,
                 format!(
-                    "a {max_kv_len}-key bound beyond the {} this module was accepted for",
-                    self.max_kv_len
+                    "a {keys}-key bound beyond the {} this layer was accepted for",
+                    self.spec.max_keys
                 ),
             ));
         }
-        let descriptor = self.dense_descriptor(
-            query.dtype,
-            key.dtype,
-            out.dtype,
-            max_kv_len,
-            cu_seq_lens_q.is_some(),
-        );
+        let descriptor = self.descriptor(query.dtype, key.dtype, out.dtype, keys, varlen.is_some());
         let args = DenseArgs {
             query,
             key,
             value,
-            cu_seq_lens_q,
-            cu_seq_lens_k,
+            cu_seq_lens_q: varlen.map(|varlen| varlen.cu_q),
+            cu_seq_lens_k: varlen.map(|varlen| varlen.cu_k),
             out,
-            scale: self.scale,
-            window_left: self.window.map_or(-1, |window| window as i32),
-            causal: self.causal,
-            longest,
+            scale: self.spec.scale,
+            window_left: self.spec.window.map_or(-1, |window| window as i32),
+            causal: self.spec.causal,
+            longest: varlen.and_then(|varlen| varlen.max_q).map(u64::from),
         };
 
-        f.operate::<DenseAttention>(&descriptor, args)
+        f.operate::<DenseOp>(&descriptor, args)
+    }
+
+    /// [`Self::forward`] into an output of the query's shape and element type, reserved from the
+    /// forward's arena.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::forward`], and an arena that cannot hold the output.
+    pub fn apply(
+        &self,
+        f: &Forward,
+        query: TensorView,
+        key: TensorView,
+        value: TensorView,
+        varlen: Option<Varlen>,
+    ) -> Result<TensorView> {
+        let out = f.arena().tensor(query.dtype, query.shape)?;
+        self.forward(f, query, key, value, varlen, out)?;
+        Ok(out)
+    }
+}
+
+/// The geometry of a [`PagedAttention`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PagedSpec {
+    /// Channels of one head.
+    pub head_dim: u32,
+    /// Query heads one token carries on this rank.
+    pub heads: u32,
+    /// Key and value heads one token carries on this rank.
+    pub kv_heads: u32,
+    /// Tokens one cache page holds.
+    pub page_size: u32,
+    /// The longest key reduction the deployment serves; it enters the descriptor, so a deployment
+    /// that serves longer sequences needs another layer, not another launch.
+    pub max_kv_len: u32,
+    /// An inclusive history window, when the model has one.
+    pub window: Option<u32>,
+    /// The softmax scale applied to `q · k`.
+    pub scale: f32,
+}
+
+/// Bytes at the head of the paged program's workspace that can hold the decode's arrival count:
+/// four bytes per row and query head, at least one per multiprocessor, for any bucket.
+const COUNTER_BYTES: u64 = 1 << 20;
+
+/// Paged attention over a cache's planes: causal, written and read per token.
+pub struct PagedAttention {
+    spec: PagedSpec,
+}
+
+impl PagedAttention {
+    /// The attention of `spec`.
+    ///
+    /// # Errors
+    ///
+    /// A zero head, page or head count, query heads that do not group the key heads, or a key
+    /// bound shorter than one page.
+    pub fn new(spec: PagedSpec) -> Result<Self> {
+        const OWNER: &str = "PagedAttention";
+        if spec.head_dim == 0 || spec.heads == 0 || spec.kv_heads == 0 || spec.page_size == 0 {
+            return Err(Error::shape(
+                OWNER,
+                "a head, a page and both head counts must be nonzero".to_owned(),
+            ));
+        }
+        if !spec.heads.is_multiple_of(spec.kv_heads) {
+            return Err(Error::shape(
+                OWNER,
+                format!(
+                    "{} query heads do not group {} key heads",
+                    spec.heads, spec.kv_heads
+                ),
+            ));
+        }
+        if spec.max_kv_len < spec.page_size {
+            return Err(Error::shape(
+                OWNER,
+                format!(
+                    "a {}-key bound is shorter than a {}-token page",
+                    spec.max_kv_len, spec.page_size
+                ),
+            ));
+        }
+        Ok(Self { spec })
+    }
+
+    /// The geometry this attention was built for.
+    pub const fn spec(&self) -> &PagedSpec {
+        &self.spec
+    }
+
+    /// Zero the decode program's arrival counters at the head of `workspace`, once per forward
+    /// before the first paged call.
+    ///
+    /// The decode program splits a row's keys over CTAs and counts their arrivals in the head of its
+    /// workspace; it needs that count at zero on entry and leaves it at zero itself. A workspace
+    /// carved from an arena holds whatever another bucket's tensors wrote there, and a stale count
+    /// reduces a row before its CTAs are in, so a forward clears it once and every layer of the
+    /// forward then finds it as the one before left it.
+    ///
+    /// # Errors
+    ///
+    /// When the fill cannot be issued.
+    pub fn zero_counters(f: &Forward, workspace: TensorView) -> Result<()> {
+        let bytes = workspace.numel() * workspace.dtype.bytes().unwrap_or(1);
+        f.zero(workspace, bytes.min(COUNTER_BYTES))
     }
 
     /// Write `key` and `value` into `planes`, then attend.
@@ -409,12 +332,6 @@ impl Attention {
         out: TensorView,
         workspace: TensorView,
     ) -> Result<()> {
-        if self.backend != AttentionBackend::Paged {
-            return Err(Error::Unsupported(format!(
-                "Attention: the {:?} backend does not read the paged cache",
-                self.backend
-            )));
-        }
         // One selection for both halves: the layer's index names its planes once, and the read is
         // handed what the write was handed.
         let planes = cache.planes(group, layer)?;
@@ -433,7 +350,7 @@ impl Attention {
     }
 
     /// Write the batch's keys and values into `planes`; slots of `-1` write nothing.
-    pub fn write(
+    fn write(
         &self,
         f: &Forward,
         batch: &TokenBatch,
@@ -441,13 +358,13 @@ impl Attention {
         key: TensorView,
         value: TensorView,
     ) -> Result<()> {
-        let head_dim = u64::from(self.head_dim);
-        let heads = u64::from(self.kv_heads);
+        let head_dim = u64::from(self.spec.head_dim);
+        let heads = u64::from(self.spec.kv_heads);
         for (name, view) in [("key", key), ("value", value)] {
             if view.shape.rank() != 3 || view.shape.dim(1) != heads || view.shape.dim(2) != head_dim
             {
                 return Err(Error::shape(
-                    "Attention::write",
+                    "PagedAttention::write",
                     format!(
                         "{name} is {:?}, [tokens, {heads}, {head_dim}] expected",
                         view.shape.dims()
@@ -465,7 +382,7 @@ impl Attention {
                 && view.strides.last() == 1;
             if !contiguous {
                 return Err(Error::shape(
-                    "Attention::write",
+                    "PagedAttention::write",
                     format!(
                         "{name} is {:?} at strides {}/{}/{}: the cache write addresses a token's \
                          row from its pointer, so the projections must be packed rows of {heads} \
@@ -480,7 +397,7 @@ impl Attention {
         }
         if key.shape.dim(0) != batch.tokens() || value.shape.dim(0) != batch.tokens() {
             return Err(Error::shape(
-                "Attention::write",
+                "PagedAttention::write",
                 format!(
                     "the batch has {} tokens but the projections have {} and {}",
                     batch.tokens(),
@@ -503,7 +420,7 @@ impl Attention {
                 || planes.key.dtype != DType::F8E4M3
             {
                 return Err(Error::shape(
-                    "Attention::write",
+                    "PagedAttention::write",
                     format!(
                         "the cache is {} keys and {} values over {} projections: a cache is the \
                          projections' own type or E4M3 in both planes",
@@ -542,7 +459,7 @@ impl Attention {
         value: TensorView,
     ) -> Result<()> {
         let descriptor = self.scaled_write_descriptor(key.dtype);
-        let rows = u64::from(self.kv_heads) * u64::from(self.head_dim);
+        let rows = u64::from(self.spec.kv_heads) * u64::from(self.spec.head_dim);
         for (name, cache, scale, initialized, source) in [
             (
                 "key",
@@ -563,7 +480,7 @@ impl Attention {
             // cache without one is a cache nobody can read: refused here, before the launch.
             let scale = scale.ok_or_else(|| {
                 Error::shape(
-                    "Attention::write",
+                    "PagedAttention::write",
                     format!(
                         "the {name} cache is {} and carries no page scale",
                         cache.dtype
@@ -597,10 +514,10 @@ impl Attention {
     /// another batch's pages there and the operator could not say so; the batch's arity is known
     /// here, and the refusal names it. This is the check the first decode run needed and did not
     /// have: a table built as a vector surfaced as `paged_attention: expected 2 axes, found 1`.
-    pub fn check_page_table(&self, table: TensorView, sequences: u64) -> Result<()> {
+    fn check_page_table(&self, table: TensorView, sequences: u64) -> Result<()> {
         if table.shape.rank() != 2 || table.shape.dim(0) != sequences {
             return Err(Error::shape(
-                "Attention::attend",
+                "PagedAttention::attend",
                 format!(
                     "the page table is {:?}, [{sequences}, pages] expected: one row per sequence of \
                      this batch",
@@ -610,7 +527,7 @@ impl Attention {
         }
         if table.dtype != DType::I32 {
             return Err(Error::shape(
-                "Attention::attend",
+                "PagedAttention::attend",
                 format!("the page table is {} pages, not i32", table.dtype),
             ));
         }
@@ -636,13 +553,13 @@ impl Attention {
             query,
             key_value,
             output,
-            head_dim: self.head_dim,
-            page_size: self.page_size,
-            q_heads: self.q_heads,
-            kv_heads: self.kv_heads,
+            head_dim: self.spec.head_dim,
+            page_size: self.spec.page_size,
+            q_heads: self.spec.heads,
+            kv_heads: self.spec.kv_heads,
             mask: Mask::Causal,
-            windowed: self.window.is_some(),
-            max_kv_len: self.max_kv_len,
+            windowed: self.spec.window.is_some(),
+            max_kv_len: self.spec.max_kv_len,
         }
     }
 
@@ -654,10 +571,10 @@ impl Attention {
         KvDescriptor {
             dtype: projection,
             kv: cache,
-            page: self.page_size,
-            heads: self.kv_heads,
-            head_dim: self.head_dim,
-            tile: kv_tile(self.head_dim),
+            page: self.spec.page_size,
+            heads: self.spec.kv_heads,
+            head_dim: self.spec.head_dim,
+            tile: kv_tile(self.spec.head_dim),
             pdl: PDL,
         }
     }
@@ -668,10 +585,10 @@ impl Attention {
         kv::ScaledWriteDescriptor {
             dtype: projection,
             scale: DType::F32,
-            page: self.page_size,
-            heads: self.kv_heads,
-            head_dim: self.head_dim,
-            block: kv_tile(self.head_dim),
+            page: self.spec.page_size,
+            heads: self.spec.kv_heads,
+            head_dim: self.spec.head_dim,
+            block: kv_tile(self.spec.head_dim),
             pdl: PDL,
         }
     }
@@ -689,7 +606,7 @@ impl Attention {
         reason = "the design's attention call carries the batch, the group's geometry, the layer's \
                   planes, the query, the output and the program's workspace"
     )]
-    pub fn attend(
+    fn attend(
         &self,
         f: &Forward,
         batch: &TokenBatch,
@@ -702,12 +619,12 @@ impl Attention {
         // The batch's own parts are read by pointer arithmetic inside the programs, so they are
         // checked against each other once here, before any of them is addressed.
         batch.check()?;
-        if group.page_size != self.page_size || batch.page_size != self.page_size {
+        if group.page_size != self.spec.page_size || batch.page_size != self.spec.page_size {
             return Err(Error::shape(
-                "Attention::attend",
+                "PagedAttention::attend",
                 format!(
                     "the layer is built for {} tokens per page, the cache and batch have {} and {}",
-                    self.page_size, group.page_size, batch.page_size
+                    self.spec.page_size, group.page_size, batch.page_size
                 ),
             ));
         }
@@ -716,19 +633,19 @@ impl Attention {
             PhaseKind::Decode => Phase::Decode,
             other => {
                 return Err(Error::Unsupported(format!(
-                    "Attention: phase {other} is not an attention phase"
+                    "PagedAttention: phase {other} is not an attention phase"
                 )));
             }
         };
-        let head_dim = u64::from(self.head_dim);
-        let q_heads = u64::from(self.q_heads);
+        let head_dim = u64::from(self.spec.head_dim);
+        let q_heads = u64::from(self.spec.heads);
         for (name, view) in [("query", query), ("out", out)] {
             if view.shape.rank() != 3
                 || view.shape.dim(1) != q_heads
                 || view.shape.dim(2) != head_dim
             {
                 return Err(Error::shape(
-                    "Attention::attend",
+                    "PagedAttention::attend",
                     format!(
                         "{name} is {:?}, [tokens, {q_heads}, {head_dim}] expected",
                         view.shape.dims()
@@ -759,12 +676,12 @@ impl Attention {
             cum_seq_lens_q: batch.query_offsets,
             out,
             workspace,
-            scale: self.scale,
-            window_left: self.window.map_or(-1, |window| window as i32),
-            causal: self.causal,
+            scale: self.spec.scale,
+            window_left: self.spec.window.map_or(-1, |window| window as i32),
+            causal: true,
         };
 
-        f.operate::<PagedAttention>(&descriptor, args)
+        f.operate::<PagedOp>(&descriptor, args)
     }
 }
 
@@ -782,7 +699,7 @@ fn page_scale(plane: TensorView, scale: Option<TensorView>) -> Result<Option<Ten
             let pages = plane.shape.dim(0);
             if scale.dtype != ops::DType::F32 || scale.shape.numel() != pages {
                 return Err(Error::shape(
-                    "Attention::attend",
+                    "PagedAttention::attend",
                     format!(
                         "an FP8 plane of {pages} pages carries {pages} F32 page scales; the operand \
                          is {} of {} element(s)",
@@ -794,11 +711,11 @@ fn page_scale(plane: TensorView, scale: Option<TensorView>) -> Result<Option<Ten
             Ok(Some(scale))
         }
         (true, None) => Err(Error::shape(
-            "Attention::attend",
+            "PagedAttention::attend",
             "an FP8 cache plane needs its per-page scale".to_owned(),
         )),
         (false, Some(_)) => Err(Error::shape(
-            "Attention::attend",
+            "PagedAttention::attend",
             format!(
                 "a {} cache plane carries no scale; the scale belongs to the page's encoding",
                 plane.dtype
@@ -861,20 +778,31 @@ mod tests {
         assert!(page_scale(plane(DType::BF16), None).is_ok());
     }
 
+    /// The paged geometry of a Qwen3-MoE layer at one rank.
+    fn paged(kv_heads: u32, max_kv_len: u32) -> Result<PagedAttention> {
+        PagedAttention::new(PagedSpec {
+            head_dim: 128,
+            heads: 32,
+            kv_heads,
+            page_size: 64,
+            max_kv_len,
+            window: None,
+            scale: 0.088,
+        })
+    }
+
     #[test]
     fn a_paged_layer_pins_the_page_geometry() {
-        let attention = Attention::paged(128, 32, 4, 64, 40_960, None, 0.088).unwrap();
-        assert_eq!(attention.backend(), AttentionBackend::Paged);
-        assert_eq!(attention.max_kv_len(), 40_960);
+        assert_eq!(paged(4, 40_960).unwrap().spec().max_kv_len, 40_960);
         // 32 query heads do not group 5 key heads.
-        assert!(Attention::paged(128, 32, 5, 64, 40_960, None, 0.088).is_err());
+        assert!(paged(5, 40_960).is_err());
         // A bound shorter than one page cannot address a page.
-        assert!(Attention::paged(128, 32, 4, 64, 32, None, 0.088).is_err());
+        assert!(paged(4, 32).is_err());
     }
 
     #[test]
     fn a_page_table_is_one_i32_row_per_sequence_of_its_batch() {
-        let attention = Attention::paged(128, 32, 4, 64, 40_960, None, 0.088).unwrap();
+        let attention = paged(4, 40_960).unwrap();
         let table = |dtype: DType, shape: &[u64]| {
             TensorView::new(DevicePtr::new(0x2_0000), dtype, Shape::new(shape))
         };
@@ -907,7 +835,12 @@ mod tests {
 
     /// The programs one paged forward of `tokens` tokens in one sequence launches on a recording
     /// forward, over a cache whose planes are `cache`.
-    fn launched(attention: &Attention, phase: PhaseKind, tokens: u64, cache: DType) -> Vec<String> {
+    fn launched(
+        attention: &PagedAttention,
+        phase: PhaseKind,
+        tokens: u64,
+        cache: DType,
+    ) -> Vec<String> {
         let arena = crate::Arena::counting();
         let f = Forward::recording(&arena);
         let tensor = |dtype: DType, dims: &[u64]| arena.tensor(dtype, Shape::new(dims)).unwrap();
@@ -967,7 +900,7 @@ mod tests {
 
     #[test]
     fn the_cache_writes_key_the_plane_type_and_the_reads_key_the_phase() {
-        let attention = Attention::paged(128, 32, 4, 64, 40_960, None, 0.088).unwrap();
+        let attention = paged(4, 40_960).unwrap();
         let writes = |launches: &[String]| -> Vec<String> {
             launches
                 .iter()
@@ -1001,27 +934,68 @@ mod tests {
         assert_ne!(reads(&plain), reads(&decode));
     }
 
+    /// A dense layer of `heads` over `kv_heads`, `causal` or not, with a `window`.
+    fn dense(
+        kv_heads: u32,
+        causal: bool,
+        window: Option<u32>,
+        scale: f32,
+    ) -> Result<DenseAttention> {
+        DenseAttention::new(DenseSpec {
+            head_dim: 128,
+            heads: 32,
+            kv_heads,
+            max_keys: 8_192,
+            causal,
+            window,
+            scale,
+        })
+    }
+
     #[test]
-    fn a_dense_layer_states_its_mask_and_its_bound() {
-        let encoder = Attention::dense(128, 32, 4, 8_192, true, None, 0.088).unwrap();
-        assert_eq!(encoder.backend(), AttentionBackend::Dense);
-        assert_eq!(encoder.max_kv_len(), 8_192);
-        assert!(encoder.causal());
-        // The FP32 paths read a whole sequence at once: dense mask, no window. The audio encoder's
-        // attention is causal and the sparse compression branch's is not, so the flag is the
-        // model's to state, and the two are different descriptors.
-        let audio = Attention::fp32(64, 8, 8, 4_096, true, 0.125).unwrap();
-        assert_eq!(audio.backend(), AttentionBackend::Fp32);
-        assert!(audio.causal());
-        assert!(
-            !Attention::fp32(64, 8, 8, 4_096, false, 0.125)
-                .unwrap()
-                .causal()
-        );
+    fn a_dense_layer_states_its_mask_and_refuses_what_it_cannot_launch() {
+        assert!(dense(4, true, None, 0.088).unwrap().spec().causal);
+        assert!(dense(4, true, Some(1_024), 0.088).is_ok());
         // A history window reads the causal mask only.
-        assert!(Attention::dense(128, 32, 4, 8_192, false, Some(1_024), 0.088).is_err());
-        assert!(Attention::dense(0, 32, 4, 8_192, true, None, 0.088).is_err());
-        assert!(Attention::dense(128, 32, 4, 8_192, true, None, 0.0).is_err());
+        assert!(dense(4, false, Some(1_024), 0.088).is_err());
+        assert!(dense(5, false, None, 0.088).is_err());
+        assert!(dense(4, false, None, 0.0).is_err());
+    }
+
+    /// A call's key bound covers its keys and stays under the layer's ceiling, and a call with
+    /// sequence tables is another program than the single-sequence one.
+    #[test]
+    fn a_dense_call_reads_sequences_under_its_bound() {
+        let attention = dense(4, false, None, 0.088).unwrap();
+        let arena = crate::Arena::counting();
+        let f = Forward::recording(&arena);
+        let tensor = |dtype: DType, dims: &[u64]| arena.tensor(dtype, Shape::new(dims)).unwrap();
+        let query = tensor(DType::BF16, &[16, 32, 128]);
+        let key = tensor(DType::BF16, &[16, 4, 128]);
+        let offsets = tensor(DType::I32, &[3]);
+        let varlen = |max_k| Varlen {
+            cu_q: offsets,
+            cu_k: offsets,
+            max_q: Some(8),
+            max_k,
+        };
+        let call = |varlen: Option<Varlen>| {
+            crate::forward::recorded(|| attention.apply(&f, query, key, key, varlen))
+        };
+        let (single, one) = call(None);
+        single.unwrap();
+        let (packed, two) = call(Some(varlen(16)));
+        packed.unwrap();
+        assert_eq!((one.len(), two.len()), (1, 1));
+        assert_ne!(one[0].1, two[0].1, "sequence tables select another program");
+        assert!(
+            call(Some(varlen(8))).0.is_err(),
+            "a bound below the keys passed"
+        );
+        assert!(
+            call(Some(varlen(16_384))).0.is_err(),
+            "a bound above the layer's ceiling"
+        );
     }
 
     /// A page's scale is its own layer's, so two layers of one group carry different ones and the

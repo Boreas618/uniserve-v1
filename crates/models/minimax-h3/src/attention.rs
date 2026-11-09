@@ -40,7 +40,9 @@
 //! the prepared rows stays in the checkpoint's dtype like the dense one.
 
 use nn::family::Split;
-use nn::layers::{Attention as Flash, Bias, Gains, Linear, Parallel, Rotary, UlyssesExchange};
+use nn::layers::{
+    Bias, DenseAttention, DenseSpec, Gains, Linear, Parallel, Rotary, UlyssesExchange, Varlen,
+};
 use nn::weights::{Weight, WeightLoader};
 use nn::{Forward, Shape, TensorView};
 
@@ -282,7 +284,7 @@ impl Layer {
         f: &Forward,
         normalized: TensorView,
         factors: Factors<'_>,
-        visible: Option<&Visible>,
+        visible: Option<&Varlen>,
         segments: Option<&crate::attention_sparse::Segments>,
         scratch: &LayerScratch,
         out: TensorView,
@@ -331,23 +333,6 @@ pub enum LayerScratch {
     Sparse(Box<crate::attention_sparse::Scratch>),
 }
 
-/// The rows one attention call reads, as device boundary tables.
-///
-/// Both are int32 cumulative counts; a dense call names the whole packed range for its queries and
-/// the request's used rows for its keys.
-#[derive(Clone, Copy)]
-pub struct Visible {
-    /// `[tokens + 1]` int32: this rank's query rows, accumulated from zero.
-    pub cu_seq_lens_q: TensorView,
-    /// `[tokens + 1]` int32: the keys every query sees, accumulated from zero.
-    pub cu_seq_lens_k: TensorView,
-    /// The longest run of key rows any query attends: the last entry of `cu_seq_lens_k`.
-    ///
-    /// The attention descriptor needs it as a launch value, and it is a property of the layout's
-    /// visibility rather than of the rows, so it travels beside the two tables.
-    pub key_rows: u32,
-}
-
 /// The stack's rotary and its factor tables of one forward, `[tokens, rotated / 2]` FP32 each.
 #[derive(Clone, Copy)]
 pub struct Factors<'a> {
@@ -367,7 +352,7 @@ pub struct Dense {
     output: Linear,
     query_gain: Weight,
     key_gain: Weight,
-    attention: Flash,
+    attention: DenseAttention,
     exchange: Option<UlyssesExchange>,
     projection: Projection,
     heads: u32,
@@ -420,15 +405,15 @@ impl Dense {
             )?,
             query_gain,
             key_gain,
-            attention: Flash::dense(
-                config.head_dim,
-                local_heads,
-                local_heads,
-                rows,
-                false,
-                None,
-                rotary.spectrum().score_scale(config.head_dim)?,
-            )?,
+            attention: DenseAttention::new(DenseSpec {
+                head_dim: config.head_dim,
+                heads: local_heads,
+                kv_heads: local_heads,
+                max_keys: rows,
+                causal: false,
+                window: None,
+                scale: rotary.spectrum().score_scale(config.head_dim)?,
+            })?,
             exchange: exchange(partition),
             projection: partition.projection,
             heads: config.num_attention_heads,
@@ -444,7 +429,7 @@ impl Dense {
         f: &Forward,
         normalized: TensorView,
         factors: Factors<'_>,
-        visible: &Visible,
+        visible: &Varlen,
         scratch: &Scratch,
         out: TensorView,
     ) -> Result<()> {
@@ -472,16 +457,12 @@ impl Dense {
         // own element count - the rows differ between the exchanged and the local path, so a token
         // count computed once outside would be right on one of them and wrong on the other.
         let (local_heads, head_dim) = (self.local_heads, self.head_dim);
-        self.attention.attend_dense(
+        self.attention.forward(
             f,
             query.reshape(heads(query, local_heads, head_dim)),
             key.reshape(heads(key, local_heads, head_dim)),
             value.reshape(heads(value, local_heads, head_dim)),
-            Some(visible.cu_seq_lens_q),
-            Some(visible.cu_seq_lens_k),
-            // Every query attends the whole key set in one sequence: the longest key run is the
-            // number of used key rows, which `Visible` states.
-            visible.key_rows,
+            Some(*visible),
             scratch
                 .attended
                 .reshape(heads(scratch.attended, local_heads, head_dim)),

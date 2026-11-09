@@ -18,7 +18,7 @@
 //! every step of the schedule. The tables themselves are the worker's: the model reads the cache
 //! through the borrow it is handed, never through state of its own.
 
-use crate::attention::{self, Factors, Visible};
+use crate::attention::{self, Factors};
 use crate::attention_sparse::Segments;
 use crate::config::{AttentionKind, TransformerConfig};
 use crate::modulation::AdaLnCache;
@@ -29,6 +29,7 @@ use crate::{Error, Result};
 use nn::layers::{
     Bias, Epilogue, GateBias, GatedActivation, Halves, Linear, Modulation, Parallel, Precision,
     QkNorm, Residual, ResidualStream, RmsNorm, Rotary, RotarySpec, Rounding, Scale, Spectrum,
+    Varlen,
 };
 use nn::tensor::Backing;
 use nn::weights::{Weight, WeightLoader};
@@ -139,7 +140,7 @@ impl Layer {
         modulation: TensorView,
         rows: TensorView,
         factors: Factors<'_>,
-        visible: Option<&Visible>,
+        visible: Option<&Varlen>,
         segments: Option<&Segments>,
         scratch: &Scratch,
         next: Option<(&Layer, TensorView)>,
@@ -942,7 +943,7 @@ impl Transformer {
         hidden: TensorView,
         rows: TensorView,
         factors: Factors<'_>,
-        visible: Option<&Visible>,
+        visible: Option<&Varlen>,
         segments: Option<&Segments>,
         total_rows: u32,
     ) -> Result<()> {
@@ -963,7 +964,7 @@ impl Transformer {
         hidden: TensorView,
         rows: TensorView,
         factors: Factors<'_>,
-        visible: Option<&Visible>,
+        visible: Option<&Varlen>,
         segments: Option<&Segments>,
         total_rows: u32,
     ) -> Result<()> {

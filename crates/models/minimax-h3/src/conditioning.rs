@@ -24,8 +24,8 @@
 
 use nn::family::Split;
 use nn::layers::{
-    Attention, Bias, GateBias, GatedActivation, Halves, Linear, Parallel, QkvBias, QkvLinear,
-    QkvNames, QkvSpec, Residual, RmsNorm, Rounding,
+    Bias, DenseAttention, DenseSpec, GateBias, GatedActivation, Halves, Linear, Parallel, QkvBias,
+    QkvLinear, QkvNames, QkvSpec, Residual, RmsNorm, Rounding, Varlen,
 };
 use nn::weights::WeightLoader;
 use nn::{Forward, Shape, TensorView};
@@ -60,7 +60,7 @@ pub struct RefinerBlock {
     /// The stepwise gated activation (`Rounding::Stepwise`): the refiner rounds
     /// `silu(gate)` and the product one step at a time.
     gated: GatedActivation,
-    attention: Attention,
+    attention: DenseAttention,
     /// The plain add of the attention and feed-forward updates into the stream.
     residual: Residual,
     hidden_size: u32,
@@ -109,15 +109,15 @@ impl RefinerBlock {
         let gate_up = projection(loader, "ff.net.0.proj", config.hidden_size, 2 * ffn)?;
         let down = projection(loader, "ff.net.2", ffn, config.hidden_size)?;
 
-        let attention = Attention::dense(
-            config.head_dim,
-            config.num_attention_heads,
-            config.num_attention_heads,
-            rows,
-            false,
-            None,
-            scaling(config.head_dim),
-        )?;
+        let attention = DenseAttention::new(DenseSpec {
+            head_dim: config.head_dim,
+            heads: config.num_attention_heads,
+            kv_heads: config.num_attention_heads,
+            max_keys: rows,
+            causal: false,
+            window: None,
+            scale: scaling(config.head_dim),
+        })?;
 
         Ok(Self {
             dtype: query_dtype,
@@ -192,15 +192,18 @@ impl RefinerBlock {
         let (query, key, value) = (rows.query_normed, rows.key_normed, rows.value);
         // The attention's operands are rank 3 - one axis of tokens, then the heads, then a head's
         // channels (`ops/src/attention/dense.rs`) - while every buffer here is `[rows, inner]`.
-        self.attention.attend_dense(
+        self.attention.forward(
             f,
             query.reshape(with_heads(query, heads, head)),
             key.reshape(with_heads(key, heads, head)),
             value.reshape(with_heads(value, heads, head)),
-            Some(visible.cu_seq_lens_q),
-            Some(visible.cu_seq_lens_k),
             // One document per request over packed rows: every query sees the whole key set.
-            visible.key_rows,
+            Some(Varlen {
+                cu_q: visible.cu_seq_lens_q,
+                cu_k: visible.cu_seq_lens_k,
+                max_q: None,
+                max_k: visible.key_rows,
+            }),
             rows.attended
                 .reshape(with_heads(rows.attended, heads, head)),
         )?;

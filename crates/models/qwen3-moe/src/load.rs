@@ -13,9 +13,9 @@ use std::collections::HashMap;
 
 use nn::family::Split;
 use nn::layers::{
-    Attention, Bias, ExpertNames, ExpertSlots, GateBias, GatedActivation, Linear, Moe, MoeSpec,
-    Parallel, ParallelLMHead, QkNorm, QkvBias, QkvLinear, QkvNames, QkvSpec, RmsNorm, Rotary,
-    RotarySpec, Rounding, VocabParallelEmbedding,
+    Bias, ExpertNames, ExpertSlots, GateBias, GatedActivation, Linear, Moe, MoeSpec,
+    PagedAttention, PagedSpec, Parallel, ParallelLMHead, QkNorm, QkvBias, QkvLinear, QkvNames,
+    QkvSpec, RmsNorm, Rotary, RotarySpec, Rounding, VocabParallelEmbedding,
 };
 use nn::quantization::Declaration;
 use nn::weights::{Scope, WeightLoader};
@@ -178,15 +178,15 @@ pub fn load(
             )?,
             q_norm: attention.scope("q_norm").tensor("weight", &[head_dim])?,
             k_norm: attention.scope("k_norm").tensor("weight", &[head_dim])?,
-            attention: Attention::paged(
-                config.head_dim,
-                q_heads,
+            attention: PagedAttention::new(PagedSpec {
+                head_dim: config.head_dim,
+                heads: q_heads,
                 kv_heads,
-                options.page_tokens,
-                config.max_position_embeddings,
-                None,
-                score_scale,
-            )?,
+                page_size: options.page_tokens,
+                max_kv_len: config.max_position_embeddings,
+                window: None,
+                scale: score_scale,
+            })?,
         };
 
         let mlp = if config.sparse(layer) {

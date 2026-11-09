@@ -21,8 +21,8 @@
 //! opposite of the video VAE decoder's rule (one element type for both parameters and residual,
 //! whatever the deployment's preset - F32 under `dtype = "auto"`, because the checkpoint stores the
 //! VAE in F32 and auto converts nothing; FP16 is a *converted* deployment's element, and every size
-//! halves with it). The layer is [`nn::layers::Attention::fp32`]; no call site may construct the
-//! dense backend for these blocks.
+//! halves with it). The layer is [`nn::layers::DenseAttention`] over FP32 operands; the operands'
+//! element type, not a backend flag, selects the FP32 program.
 //!
 //! ## The encoder's input
 //!
@@ -730,9 +730,9 @@ pub fn padded_samples(samples: u64, hop: u64) -> Result<u64> {
 
 use nn::Forward;
 use nn::layers::{
-    AdaptivePool, Attention, CausalPad, Conv1d, Conv3d, ConvGeometry, FramePad, GateBias,
-    GatedActivation, GroupNorm, Halves, LayerNorm, Linear, Posterior, Residual, Rounding, Snake,
-    Transpose, WeightOrder,
+    AdaptivePool, CausalPad, Conv1d, Conv3d, ConvGeometry, DenseAttention, DenseSpec, FramePad,
+    GateBias, GatedActivation, GroupNorm, Halves, LayerNorm, Linear, Posterior, Residual, Rounding,
+    Snake, Transpose, WeightOrder,
 };
 use nn::weights::{Scope, Weight, WeightLoader};
 use nn::{DType, Shape, Strides, TensorView};
@@ -1752,7 +1752,7 @@ struct Projection {
     query: Linear,
     key: Linear,
     value: Linear,
-    attention: Attention,
+    attention: DenseAttention,
     attention_output: Linear,
     /// The head average and the head width pooled down to the latent channels, in one pass.
     pool: AdaptivePool,
@@ -2205,15 +2205,15 @@ impl Projection {
             .map_err(|_| Error::config("a head wider than a launch holds".to_owned()))?;
         let heads_u32 = u32::try_from(heads)
             .map_err(|_| Error::config("more heads than a launch holds".to_owned()))?;
-        let attention = Attention::dense(
+        let attention = DenseAttention::new(DenseSpec {
             head_dim,
-            heads_u32,
-            heads_u32,
-            frames,
-            true,
-            None,
-            1.0 / (head_dim as f32).sqrt(),
-        )?;
+            heads: heads_u32,
+            kv_heads: heads_u32,
+            max_keys: frames,
+            causal: true,
+            window: None,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+        })?;
         let mut output = scope.scope("attn.proj");
         let attention_output = Linear::new(
             output.tensor("weight", &[channels, channels])?,
@@ -2243,7 +2243,7 @@ impl Projection {
     fn forward(&self, f: &Forward, values: TensorView, frames: u64) -> Result<TensorView> {
         let shape = values.shape;
         let channels = u64::from(self.pool.output());
-        let heads = shape.dim(1) / u64::from(self.attention.head_dim());
+        let heads = shape.dim(1) / u64::from(self.attention.spec().head_dim);
         let shortcut = f
             .arena()
             .tensor(DType::F32, Shape::new(&[frames, channels]))?;
@@ -2252,7 +2252,7 @@ impl Projection {
         self.shortcut.forward(f, normed, shortcut)?;
         self.attention_norm.forward(f, values, None, normed)?;
         // Three contiguous head-group blocks, then causal attention over the frames.
-        let head_shape = Shape::new(&[frames, heads, u64::from(self.attention.head_dim())]);
+        let head_shape = Shape::new(&[frames, heads, u64::from(self.attention.spec().head_dim)]);
         let attended = f.arena().tensor(DType::F32, head_shape)?;
         let mut head_views = Vec::with_capacity(3);
         for linear in [&self.query, &self.key, &self.value] {
@@ -2260,15 +2260,12 @@ impl Projection {
             linear.forward(f, normed, out)?;
             head_views.push(TensorView::new(out.ptr, DType::F32, head_shape));
         }
-        self.attention.attend_dense(
+        self.attention.forward(
             f,
             head_views[0],
             head_views[1],
             head_views[2],
             None,
-            None,
-            u32::try_from(frames)
-                .map_err(|_| Error::config("a track longer than a launch bound".to_owned()))?,
             attended,
         )?;
         let pooled = f

@@ -40,9 +40,9 @@ use nn::capability::{
 };
 use nn::family::Split;
 use nn::layers::{
-    Attention, Bias, Gains, GateBias, GatedActivation, Halves, IndexRows, Linear, Parallel,
-    Precision, QkNorm, QkvBias, QkvLinear, QkvNames, QkvSpec, Residual, ResidualStream, RmsNorm,
-    Rotary, RotarySpec, Rounding, Sections, Spectrum, VocabParallelEmbedding,
+    Bias, DenseAttention, DenseSpec, Gains, GateBias, GatedActivation, Halves, IndexRows, Linear,
+    Parallel, Precision, QkNorm, QkvBias, QkvLinear, QkvNames, QkvSpec, Residual, ResidualStream,
+    RmsNorm, Rotary, RotarySpec, Rounding, Sections, Spectrum, Varlen, VocabParallelEmbedding,
 };
 use nn::weights::{Scope, WeightLoader};
 use nn::{Arena, Forward, Shape, TensorView, Weight};
@@ -452,7 +452,7 @@ impl Layer {
         &self,
         encoder: &TextEncoder,
         f: &Forward,
-        attention: &Attention,
+        attention: &DenseAttention,
         offsets: TensorView,
         buffers: &Buffers,
         carried: Option<TensorView>,
@@ -501,16 +501,19 @@ impl Layer {
             )
             .map_err(Error::from)?;
         attention
-            .attend_dense(
+            .forward(
                 f,
                 buffers.as_heads(buffers.rotated_query, heads.0, encoder.config.head_dim)?,
                 buffers.as_heads(buffers.rotated_key, heads.1, encoder.config.head_dim)?,
                 buffers.as_heads(buffers.value, heads.1, encoder.config.head_dim)?,
-                Some(offsets),
-                Some(offsets),
-                u32::try_from(buffers.value.rows()).map_err(|_| {
-                    invalid_input("a prompt longer than a key bound counts".to_owned())
-                })?,
+                Some(Varlen {
+                    cu_q: offsets,
+                    cu_k: offsets,
+                    max_q: None,
+                    max_k: u32::try_from(buffers.value.rows()).map_err(|_| {
+                        invalid_input("a prompt longer than a key bound counts".to_owned())
+                    })?,
+                }),
                 buffers.as_heads(buffers.attended, heads.0, encoder.config.head_dim)?,
             )
             .map_err(Error::from)?;
@@ -830,16 +833,15 @@ impl TextEncoder {
                 "the batch states no key bound its rows read".to_owned(),
             ));
         }
-        let attention = Attention::dense(
-            self.config.head_dim,
-            self.rank.query_heads,
-            self.rank.key_value_heads,
-            inputs.batch.max_kv_len,
-            true,
-            None,
-            self.rotary.spectrum().score_scale(self.config.head_dim)?,
-        )
-        .map_err(Error::from)?;
+        let attention = DenseAttention::new(DenseSpec {
+            head_dim: self.config.head_dim,
+            heads: self.rank.query_heads,
+            kv_heads: self.rank.key_value_heads,
+            max_keys: inputs.batch.max_kv_len,
+            causal: true,
+            window: None,
+            scale: self.rotary.spectrum().score_scale(self.config.head_dim)?,
+        })?;
 
         self.rotary
             .factors(f, prepared.positions, buffers.cosine, buffers.sine)

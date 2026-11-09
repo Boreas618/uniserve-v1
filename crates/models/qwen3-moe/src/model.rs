@@ -38,7 +38,7 @@
 
 use nn::capability::{CausalLm, KvView, TokenBatch};
 use nn::layers::{
-    Attention, Gains, GatedActivation, Halves, Linear, Moe, ParallelLMHead, QkvLinear,
+    Gains, GatedActivation, Halves, Linear, Moe, PagedAttention, ParallelLMHead, QkvLinear,
     ResidualStream, RmsNorm, Rotary, TRTLLM_WORKSPACE_BYTES, VocabParallelEmbedding,
 };
 use nn::weights::Weight;
@@ -52,10 +52,6 @@ const TRANSFORMER: &str = "models.qwen3.transformer.Transformer";
 const TRANSFORMER_LAYER: &str = "models.qwen3.transformer.TransformerLayer";
 const ATTENTION: &str = "models.qwen3.transformer.Attention";
 const MOE: &str = "models.qwen3.transformer.MoE";
-
-/// Bytes at the head of the attention workspace that can hold the decode's arrival count: four
-/// bytes per row and query head, at least one per multiprocessor, for any bucket this serves.
-const ATTENTION_COUNTER_BYTES: u64 = 1 << 20;
 
 /// What a deployment sets when it loads a Qwen3-MoE model.
 #[derive(Clone, Copy, Debug)]
@@ -114,7 +110,7 @@ pub(crate) struct AttentionLayer {
     pub(crate) o_proj: Linear,
     pub(crate) q_norm: Weight,
     pub(crate) k_norm: Weight,
-    pub(crate) attention: Attention,
+    pub(crate) attention: PagedAttention,
 }
 
 /// The feed-forward sublayer.
@@ -395,15 +391,9 @@ impl Qwen3Moe {
             .tensor(DType::F32, Shape::new(&[tokens, extents.factors]))?;
         self.rotary.factors(f, batch.positions, cosine, sine)?;
         let buffers = Buffers::reserve(f.arena, extents, self.dtype)?;
-        // The decode kernel splits a row's keys over CTAs and counts their arrivals in the head of
-        // this workspace, and it needs that count at zero on entry and resets it itself. The arena
-        // is not zero here: every bucket's extents share one range, so another bucket's tensors
-        // were written over these bytes, and a stale count reduces a row before its CTAs are in.
-        // One fill per forward is enough, because the layers leave the count as they found it.
-        f.zero(
-            buffers.workspace,
-            extents.workspace.min(ATTENTION_COUNTER_BYTES),
-        )?;
+        // The arena is not zero here: every bucket's extents share one range, so the decode
+        // program's arrival counters are cleared once before the first layer reads them.
+        PagedAttention::zero_counters(f, buffers.workspace)?;
 
         let mut residual = hidden;
         let mut input = hidden;

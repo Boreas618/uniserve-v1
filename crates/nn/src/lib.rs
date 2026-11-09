@@ -20,7 +20,8 @@
 //!
 //! [`layers`] holds what a model composes: [`Linear`],
 //! [`RmsNorm`], [`LayerNorm`], [`Rotary`],
-//! [`VocabParallelEmbedding`](layers::VocabParallelEmbedding), [`Attention`], [`Moe`],
+//! [`VocabParallelEmbedding`](layers::VocabParallelEmbedding), [`DenseAttention`](layers::DenseAttention),
+//! [`PagedAttention`](layers::PagedAttention), [`Moe`],
 //! [`Conv3d`], [`Conv1d`],
 //! [`ConvTranspose1d`], [`UlyssesExchange`],
 //! [`Sampler`] and [`ParallelLMHead`]; the diffusion and
@@ -72,12 +73,12 @@ pub use exchange::ExchangeViews;
 pub use forward::{Arena, AttentionProbe, Fence, Forward, Split};
 pub use group::{Group, Transfer};
 pub use layers::{
-    Activation, AdaptivePool, Attention, AttentionBackend, AudioActivation, Axpby, Candidates,
-    Cast, CausalPad, Conv1d, Conv3d, ConvGeometry, ConvTranspose1d, CrossFade, Epilogue, FramePad,
-    GateBias, GatedActivation, Gelu, GroupNorm, Halves, IndexRows, LayerNorm, Linear, Modulation,
-    Moe, Noise, NoiseKey, ParallelLMHead, PcmInterleave, Residual, ResidualStream, RgbBytes,
-    RmsNorm, Rotary, Rounding, Sampler, SamplerState, Samples, Scale, SegmentAttention,
-    SegmentTables, Silu, Snake, TRTLLM_WORKSPACE_BYTES, UlyssesExchange, VsaTiles,
+    Activation, AdaptivePool, AudioActivation, Axpby, Candidates, Cast, CausalPad, Conv1d, Conv3d,
+    ConvGeometry, ConvTranspose1d, CrossFade, Epilogue, FramePad, GateBias, GatedActivation, Gelu,
+    GroupNorm, Halves, IndexRows, LayerNorm, Linear, Modulation, Moe, Noise, NoiseKey,
+    ParallelLMHead, PcmInterleave, Residual, ResidualStream, RgbBytes, RmsNorm, Rotary, Rounding,
+    Sampler, SamplerState, Samples, Scale, SegmentAttention, SegmentTables, Silu, Snake,
+    TRTLLM_WORKSPACE_BYTES, UlyssesExchange, VsaTiles,
 };
 pub use ops::PhaseKind;
 pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};

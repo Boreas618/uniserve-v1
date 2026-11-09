@@ -410,9 +410,9 @@ pub const MINIMUM_OVERLAP: u32 = 64;
 
 use nn::Forward;
 use nn::layers::{
-    Attention, Bias, Cast, ChannelAffine, Epilogue, GateBias, GatedActivation, Halves, IndexRows,
-    LayerNorm, Linear, MergedColumnLinear, Parallel, Precision, QkNorm, ResidualStream, RmsNorm,
-    Rotary, RotarySpec, Rounding, Spectrum,
+    Bias, Cast, ChannelAffine, DenseAttention, DenseSpec, Epilogue, GateBias, GatedActivation,
+    Halves, IndexRows, LayerNorm, Linear, MergedColumnLinear, Parallel, Precision, QkNorm,
+    ResidualStream, RmsNorm, Rotary, RotarySpec, Rounding, Spectrum, Varlen,
 };
 use nn::weights::{Weight, WeightLoader};
 use nn::{DType, DecodedMedia, Decoder, Shape, StateTable, TableValues, TensorView};
@@ -489,7 +489,7 @@ pub struct VideoDecoder {
     head: u64,
     /// Query heads per token.
     heads: u64,
-    attention: Attention,
+    attention: DenseAttention,
 }
 
 /// The canvas of the grid's largest tile, whose position table every tile's is a slice of.
@@ -575,11 +575,17 @@ fn positions_table(config: &VideoVaeConfig, latent_height: u32, latent_width: u3
 
 /// The attention of the decoder's block: FlashAttention 4 over one packed sequence per tile, which is
 /// the kernel the reference runs at this declaration.
-fn block_attention(head: u32, heads: u32, rows: u32) -> Result<Attention> {
+fn block_attention(head: u32, heads: u32, rows: u32) -> Result<DenseAttention> {
     let scale = (head as f32).sqrt().recip();
-    Ok(Attention::dense(
-        head, heads, heads, rows, false, None, scale,
-    )?)
+    Ok(DenseAttention::new(DenseSpec {
+        head_dim: head,
+        heads,
+        kv_heads: heads,
+        max_keys: rows,
+        causal: false,
+        window: None,
+        scale,
+    })?)
 }
 
 /// The tiles of the grid `canvas` splits into: how many sequences a clip of it decodes in one launch.
@@ -1110,14 +1116,17 @@ impl VideoDecoder {
             layer.query_key_value.forward(f, normalized, merged)?;
             self.rotary
                 .apply_strided(f, projection(0), projection(1), cosine, sine)?;
-            self.attention.attend_packed(
+            self.attention.forward(
                 f,
                 projection(0),
                 projection(1),
                 projection(2),
-                offsets,
-                bound,
-                sequence,
+                Some(Varlen {
+                    cu_q: offsets,
+                    cu_k: offsets,
+                    max_q: Some(sequence),
+                    max_k: bound,
+                }),
                 per_head(attended),
             )?;
             layer.output.forward(f, attended, update)?;
