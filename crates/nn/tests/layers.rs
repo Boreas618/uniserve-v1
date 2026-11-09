@@ -7,7 +7,7 @@
 //! region that is never read, because construction only inspects extents and strides.
 
 use nn::{
-    Activation, AdaptivePool, Arena, CausalPad, Conv3d, ConvSpec, DType, DevicePtr, Epilogue,
+    Activation, AdaptiveAvgPool2d, Arena, CausalPad, Conv3d, ConvSpec, DType, DevicePtr, Epilogue,
     Forward, GateBias, GatedActivation, GroupNorm, Halves, KvGroup, KvPlanes, KvView, LayerNorm,
     Linear, Modulation, Residual, ResidualStream, RmsNorm, Rounding, Scale, Shape, Snake,
     TensorView, Weight,
@@ -377,21 +377,41 @@ fn a_group_carries_each_layers_own_page_scales() {
     assert_eq!(second.value_scale.unwrap().ptr, DevicePtr::new(0x2_0500));
 }
 
-/// The audio encoder's activation and head pool are built from the checkpoint's channel counts, so
-/// a mismatched checkpoint fails where it is loaded rather than at the first launch.
+/// The audio encoder's activation is built from the checkpoint's channel count, so a mismatched
+/// checkpoint fails where it is loaded rather than at the first launch.
 #[test]
 fn the_audio_layers_hold_their_channels() {
     assert!(Snake::new(0).is_err());
     assert!(Snake::new(8).is_ok());
+}
 
-    let pool = AdaptivePool::new(8, 256, 32).unwrap();
-    assert_eq!(pool.output(), 32);
-    // A pool of nothing, or into nothing, has no geometry to compile.
-    assert!(AdaptivePool::new(0, 256, 32).is_err());
-    assert!(AdaptivePool::new(8, 0, 32).is_err());
-    assert!(AdaptivePool::new(8, 256, 0).is_err());
-    // Wider than the descriptor's fields hold.
-    assert!(AdaptivePool::new(u64::from(u32::MAX) + 1, 256, 32).is_err());
+/// An adaptive pool reduces every input row to one output row of its columns, the torch output
+/// size `(1, columns)`; an input and output of other extents are refused before a launch.
+#[test]
+fn an_adaptive_pool_reduces_its_rows_to_one_row_of_columns() {
+    assert!(AdaptiveAvgPool2d::new([2, 32]).is_err());
+    assert!(AdaptiveAvgPool2d::new([1, 0]).is_err());
+    let pool = AdaptiveAvgPool2d::new([1, 32]).unwrap();
+
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let view = |dims: &[u64]| arena.tensor(DType::F32, Shape::new(dims)).unwrap();
+    assert!(
+        pool.forward(&f, view(&[5, 8, 256]), view(&[5, 1, 32]))
+            .is_ok()
+    );
+    assert!(
+        pool.forward(&f, view(&[5, 8, 256]), view(&[5, 32]))
+            .is_err()
+    );
+    assert!(
+        pool.forward(&f, view(&[5, 8, 256]), view(&[4, 1, 32]))
+            .is_err()
+    );
+    assert!(
+        pool.forward(&f, view(&[5, 0, 256]), view(&[5, 1, 32]))
+            .is_err()
+    );
 }
 
 /// A layer's planes are the ones its own index names, and the refusal for an index the cache has not

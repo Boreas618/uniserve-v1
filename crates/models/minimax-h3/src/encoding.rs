@@ -730,9 +730,9 @@ pub fn padded_samples(samples: u64, hop: u64) -> Result<u64> {
 
 use nn::Forward;
 use nn::layers::{
-    AdaptivePool, Bias, CausalPad, Conv1d, Conv3d, ConvSpec, DenseAttention, DenseSpec, GateBias,
-    GatedActivation, GroupNorm, Halves, LayerNorm, Linear, Padding, Posterior, Residual, Rounding,
-    Snake, Transpose, WeightOrder,
+    AdaptiveAvgPool2d, Bias, CausalPad, Conv1d, Conv3d, ConvSpec, DenseAttention, DenseSpec,
+    GateBias, GatedActivation, GroupNorm, Halves, LayerNorm, Linear, Padding, Posterior, Residual,
+    Rounding, Snake, Transpose, WeightOrder,
 };
 use nn::weights::{Scope, Weight, WeightLoader};
 use nn::{DType, Shape, Strides, TensorView};
@@ -1741,8 +1741,11 @@ struct Projection {
     value: Linear,
     attention: DenseAttention,
     attention_output: Linear,
-    /// The head average and the head width pooled down to the latent channels, in one pass.
-    pool: AdaptivePool,
+    /// The head average and the head width pooled down to the latent channels, in one pass: the
+    /// heads are the pool's rows.
+    pool: AdaptiveAvgPool2d,
+    /// The latent channels the pool writes.
+    channels: u32,
     mlp_norm: LayerNorm,
     mlp: GeGlu,
 }
@@ -2202,7 +2205,7 @@ impl Projection {
             Some(output.tensor("bias", &[channels])?),
             WeightOrder::NxK,
         )?;
-        let pool = AdaptivePool::new(heads, wide / heads, channels)?;
+        let pool = AdaptiveAvgPool2d::new([1, config.latent_channels])?;
         let mlp_norm =
             LayerNorm::load(&mut scope.scope("norm2"), config.latent_channels, NORM_EPS)?;
         let mlp = GeGlu::load(config, &mut scope.scope("mlp"))?;
@@ -2216,6 +2219,7 @@ impl Projection {
             attention,
             attention_output,
             pool,
+            channels: config.latent_channels,
             mlp_norm,
             mlp,
         })
@@ -2224,7 +2228,7 @@ impl Projection {
     /// Project `values [frames, latent_dim]` to `[frames, latent_channels]`.
     fn forward(&self, f: &Forward, values: TensorView, frames: u64) -> Result<TensorView> {
         let shape = values.shape;
-        let channels = u64::from(self.pool.output());
+        let channels = u64::from(self.channels);
         let heads = shape.dim(1) / u64::from(self.attention.spec().head_dim);
         let shortcut = f
             .arena()
@@ -2253,7 +2257,11 @@ impl Projection {
         let pooled = f
             .arena()
             .tensor(DType::F32, Shape::new(&[frames, channels]))?;
-        self.pool.forward(f, attended, pooled)?;
+        self.pool.forward(
+            f,
+            attended,
+            pooled.reshape(Shape::new(&[frames, 1, channels])),
+        )?;
         let projected = f
             .arena()
             .tensor(DType::F32, Shape::new(&[frames, channels]))?;

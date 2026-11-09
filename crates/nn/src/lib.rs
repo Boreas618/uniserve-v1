@@ -29,7 +29,7 @@
 //! [`CrossFade`], [`RgbBytes`],
 //! [`Transpose`](layers::Transpose) and [`VsaAttention`](layers::VsaAttention), and the
 //! audio path adds
-//! [`Snake`], [`AdaptivePool`] and
+//! [`Snake`], [`AdaptiveAvgPool2d`] and
 //! [`ChannelAffine`](layers::ChannelAffine). Each holds weight views and geometry, and its forward calls
 //! operators.
 //!
@@ -76,9 +76,9 @@ pub use exchange::ExchangeViews;
 pub use forward::{Arena, AttentionProbe, Fence, Forward, Split};
 pub use group::{Group, Transfer};
 pub use layers::{
-    Activation, AdaptivePool, AudioActivation, Axpby, Candidates, Cast, CausalPad, Conv1d, Conv3d,
-    ConvSpec, ConvTranspose1d, CrossFade, Epilogue, GateBias, GatedActivation, Gelu, GroupNorm,
-    Halves, IndexRows, LayerNorm, Linear, Modulation, Moe, Noise, NoiseKey, Padding,
+    Activation, AdaptiveAvgPool2d, AudioActivation, Axpby, Candidates, Cast, CausalPad, Conv1d,
+    Conv3d, ConvSpec, ConvTranspose1d, CrossFade, Epilogue, GateBias, GatedActivation, Gelu,
+    GroupNorm, Halves, IndexRows, LayerNorm, Linear, Modulation, Moe, Noise, NoiseKey, Padding,
     ParallelLMHead, PcmInterleave, Residual, ResidualStream, RgbBytes, RmsNorm, Rotary, Rounding,
     Sampler, SamplerState, Samples, Scale, Silu, Snake, TRTLLM_WORKSPACE_BYTES,
 };

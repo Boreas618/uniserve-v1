@@ -67,7 +67,7 @@ pub use norm::{Epilogue, GroupNorm, LayerNorm, Modulation, ResidualStream, RmsNo
 pub use ops::activation::Activation;
 pub use ops::gemm::WeightOrder;
 pub use pcm::PcmInterleave;
-pub use pool::AdaptivePool;
+pub use pool::AdaptiveAvgPool2d;
 pub use position::PositionInterpolate;
 pub use posterior::Posterior;
 pub use residual::{Axpby, Cast, Residual, Scale};
