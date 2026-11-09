@@ -1,4 +1,4 @@
-//! The scheduler's name for one phase (`specs/worker.md` §4.5).
+//! The scheduler's name for one phase.
 //!
 //! A phase is one block's computation on one kind of call — prefill, decode,
 //! one denoising step. The scheduling mechanism addresses the worker's work by

@@ -3,7 +3,7 @@
 //! An operator never falls back and never ignores a mismatch: a kernel whose module does not match
 //! the descriptor, an argument whose shape contradicts it, a twin region that is too small and a
 //! native entry that reports an error are all failures of the launch, and the caller (the runner)
-//! turns that into a failed precopy or a failed batch (specs/worker.md 7.3).
+//! turns that into a failed precopy or a failed batch.
 
 use crate::platform::PlatformError;
 

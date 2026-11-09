@@ -12,8 +12,8 @@
 //! **A prompt that carries vision blocks runs eagerly.** A graph is captured for a layout, and a
 //! prompt's vision grids are the request's: a captured graph per grid would be one per image size a
 //! client can send, and the tower's tables differ with every one. So such a prompt is walked once,
-//! operator by operator, over its own layout and tables ([`EncoderRunner::encode_vision`]), as the
-//! reference walks it (`uniserve/runner/encoder.py`: only a prompt without vision tokens is captured).
+//! operator by operator, over its own layout and tables ([`EncoderRunner::encode_vision`]): only a
+//! prompt without vision tokens is captured.
 //!
 //! **It keeps no cache and therefore no state group.** The state group of §8 is what a recurrent
 //! model must checkpoint at a boundary it declares, and an encoder computes its hidden states from

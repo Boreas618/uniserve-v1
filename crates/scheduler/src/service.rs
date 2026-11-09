@@ -59,8 +59,7 @@ const READ_INTERVAL: Duration = Duration::from_millis(200);
 
 /// One frame for the daemon, with the media whose descriptor travels beside
 /// it. Cloned when a successor takes over a request and the frames the
-/// response has not taken are sent to it again (`specs/worker.md` §7.5.1
-/// step 4).
+/// response has not taken are sent to it again.
 #[derive(Clone)]
 struct Frame {
     message: wire::FromEngine,
@@ -90,8 +89,7 @@ struct InFlight {
     front: usize,
     consumed: tokio::sync::watch::Sender<u64>,
     /// The connection a successor asked to take this request's event stream
-    /// over from a position, which the forwarding task acts on
-    /// (`specs/worker.md` §7.5.1 step 4).
+    /// over from a position, which the forwarding task acts on.
     takeover: tokio::sync::watch::Sender<Option<Takeover>>,
 }
 
@@ -409,7 +407,7 @@ impl Routing {
     /// Moves `request`'s event stream to the connection at `front`, which
     /// takes it over from the position `consumed`: from now on this request
     /// belongs to that connection, so closing another one does not abandon
-    /// it (`specs/worker.md` §7.5.1 step 4).
+    /// it.
     fn take_over(&self, request: RequestId, front: usize, consumed: u64) {
         if let Some(in_flight) = crate::lock(&self.requests).get_mut(&request) {
             in_flight.front = front;
@@ -1933,8 +1931,7 @@ struct Stream {
 /// Forwards one request's events until its terminal one, never more than
 /// [`EVENT_WINDOW`] beyond those its consumer took, and keeps the events the
 /// consumer has not taken so that a connection taking the request over from a
-/// position receives them again without the request repeating its work
-/// (`specs/worker.md` §7.5.1 step 4).
+/// position receives them again without the request repeating its work.
 async fn forward(stream: Stream, routing: &Routing) {
     let Stream {
         id,

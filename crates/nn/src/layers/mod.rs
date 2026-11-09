@@ -1,7 +1,7 @@
 //! The layers a model composes.
 //!
 //! Each layer holds borrowed weight views and the geometry it was built for, and its forward calls
-//! operators (specs/worker.md 4.3): no layer allocates, synchronizes, captures, looks up a program
+//! operators: no layer allocates, synchronizes, captures, looks up a program
 //! or names a device. Activations a layer needs beyond its arguments come from
 //! [`Forward::arena`](crate::Forward::arena), which the worker sizes per captured bucket.
 //!
@@ -9,14 +9,13 @@
 //!
 //! A few operator descriptors carry a constant that belongs to the kernel program rather than to
 //! the model's geometry: the row tile a normalization loads, the tokens one embedding program
-//! handles, the launch variant. The design gives those constants to the program package (specs/
-//! worker.md 5.2, 5.4: "tile 常数" are package content, and a program's arguments come from the
-//! epoch's program record), while `load_model` here has no program record to read (specs/worker.md
-//! 4.3). Following a uniform rule per operator keeps the descriptor canonical and every launch
-//! path the same until the program arguments are threaded through: a tile is the extent it covers
-//! rounded up to a power of two, and the programs compiled here are the no-PDL variants. The
-//! constants are declared once, in [`launch`], so the step that reads them from a program changes
-//! one module.
+//! handles, the launch variant. The design gives those constants to the program package (tile
+//! constants are package content, and a program's arguments come from the epoch's program record),
+//! while `load_model` here has no program record to read. Following a uniform rule per operator
+//! keeps the descriptor canonical and every launch path the same until the program arguments are
+//! threaded through: a tile is the extent it covers rounded up to a power of two, and the programs
+//! compiled here are the no-PDL variants. The constants are declared once, in [`launch`], so the
+//! step that reads them from a program changes one module.
 
 mod activation;
 mod attention;

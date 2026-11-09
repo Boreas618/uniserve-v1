@@ -1,4 +1,4 @@
-//! The main process's job watchdog (`specs/worker.md` §2.4).
+//! The main process's job watchdog.
 //!
 //! The control thread serves the channels and the commands and never waits for
 //! a job. Each wait for a channel message ends, at the latest, when the worker

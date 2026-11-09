@@ -7,8 +7,7 @@
  * and inspect an encoded file. Rust declares only these functions, so the
  * crate follows FFmpeg's ABI without mirroring its structs.
  *
- * The options are the serving options read from the PyAV implementation the
- * design replaces (`uniserve/media/codec.py`):
+ * The serving options are:
  *
  * | stream | options |
  * | --- | --- |

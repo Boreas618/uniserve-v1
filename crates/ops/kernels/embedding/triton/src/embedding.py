@@ -5,9 +5,7 @@ vocabulary weight, or writes zeros when a token belongs to another shard of a
 tensor-parallel split. The token count, the shard's first id and its row count
 arrive with the launch.
 
-The kernel body is the one UniServe launched before this package existed
-(``uniserve_kernels/src/uniserve_kernels/embedding.py``), unchanged except that
-it imports nothing but Triton.
+The kernel body imports nothing but Triton.
 """
 
 import triton

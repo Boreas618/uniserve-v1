@@ -5,9 +5,7 @@ gate``, with the product and the sum each rounded to the storage dtype as two
 eager element-wise operations round them; the two inline-assembly helpers pin that
 rounding so the compiler cannot contract the multiply with the sum.
 
-The kernel body is the one UniServe launched before this package existed
-(``uniserve_kernels/src/uniserve_kernels/attention/vsa_segments.py``), unchanged
-except that it imports nothing but Triton: the launch-time wrapper, its operand
+The kernel body imports nothing but Triton: the launch-time wrapper, its operand
 checks and its torch types stay with the operator's Rust side.
 """
 

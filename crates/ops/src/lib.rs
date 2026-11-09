@@ -4,7 +4,7 @@
 //!
 //! ## The chain this crate sits in
 //!
-//! `runner → model → layer → operator → kernel` (specs/worker.md 4). Each operator here is one Rust
+//! `runner → model → layer → operator → kernel`. Each operator here is one Rust
 //! type with a name, a descriptor, and an argument struct; a kernel program — a Triton package, a
 //! CuTe DSL package, a CUDA C++ package or a native library — fills that operator, and
 //! `uniserve engine` resolves the programs the epoch record names and hands the modules to
@@ -61,7 +61,7 @@
 //! ## Descriptor keys
 //!
 //! A descriptor's `Display` is its key, and the key is the last segment of the module's path
-//! (`<operator>/<backend>/<revision>/<target>/<key>`, specs/worker.md 5.3). Keys are canonical:
+//! (`<operator>/<backend>/<revision>/<target>/<key>`). Keys are canonical:
 //! fields in declaration order, `<name>_<value>` joined by `_`, and a floating-point value as its
 //! bit pattern ([`descriptor::Float`]). Nothing about a launch may enter a key and nothing a
 //! compilation bakes in may stay out of it.

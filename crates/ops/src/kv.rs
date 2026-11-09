@@ -8,13 +8,12 @@
 //! key.initialized, value.initialized  [pages, 1, 1, 1]   u8, one flag per page
 //! ```
 //!
-//! which is the layout `paged_attention` reads (specs/worker.md 9, KV 写入; the current store's
+//! which is the layout `paged_attention` reads (the store's
 //! `[blocks, block_size, local_kv_heads, head_dim]` with a per-block `initialized` marker). A write
 //! scatters one row per token into the slot the scheduler assigned it; a slot of `-1` writes nothing
 //! and initializes nothing, so a token that is not persisted leaves the page as it was. A flag is
 //! raised when a page receives its first element: the owner of a page zeroes only storage it
-//! created, and a reader must not read a page before it is initialized (specs/worker.md 8, "只清零
-//! 新存储").
+//! created, and a reader must not read a page before it is initialized.
 //!
 //! An **FP8 cache** is filled by a scaled write instead: the same scatter, with each element divided by
 //! the page's own scale and rounded to E4M3 on the way in. That scale is one `[pages, 1, 1, 1]` f32
@@ -272,19 +271,18 @@ type KvWriteArgs = Args;
 /// is about to store, grows the page's scale when it must, and
 /// rewrites the page so that rows written earlier keep their decoded values. That is a different
 /// launch over different operands - the page is read and rewritten, the scale is an output as well as
-/// an input - and its rule is the reference's (`uniserve/prefix_cache/mha.py`'s quantizing write):
+/// an input - and its rule is the prefix cache's quantizing write:
 /// `proposed = max|v| / 448`, `updated = max(scale, proposed)` for an initialized page and `proposed`
 /// otherwise, the page re-encoded from the old scale to the new when it grew, then the new rows stored
 /// at `updated`. It is a separate operator rather than a flag on the write that takes a scale,
 /// because a descriptor must name one program: a field selecting between "apply the scale" and
 /// "derive the scale" would make one key cover two kernels and one tolerance cover two error sources.
 ///
-/// **The scale is derived, never supplied.** The reference derives it from the values it is about to
-/// store (`uniserve/prefix_cache/mha.py`'s quantizing write), and an FP8 cache takes its scales per
-/// block: a checkpoint's per-tensor `k_scale`/`v_scale` floats have no reader here, and a block whose
-/// initialized flag is clear discards whatever its scale buffer held, so such a scalar could not
-/// influence it even as an initial value. A per-tensor scale would be a different layout with a
-/// different reader, not a mode of this operator.
+/// **The scale is derived, never supplied.** It follows from the values about to be stored, and an
+/// FP8 cache takes its scales per block: a checkpoint's per-tensor `k_scale`/`v_scale` floats have
+/// no reader here, and a block whose initialized flag is clear discards whatever its scale buffer
+/// held, so such a scalar could not influence it even as an initial value. A per-tensor scale would
+/// be a different layout with a different reader, not a mode of this operator.
 ///
 /// **A block is a page.** The scale this operator maintains is one number per page, indexed by the
 /// page of each token's slot, and a page holds [`page`](Self::page) tokens - the unit this write

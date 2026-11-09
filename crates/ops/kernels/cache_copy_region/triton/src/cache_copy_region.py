@@ -18,7 +18,7 @@ FP8    (scaled = true)
     initialized[column, unit] = 1                           # last
 ```
 
-The three constants are the reference's (`uniserve/prefix_cache/mha.py:257-304`): `448.0` is the
+Three constants fix the FP8 scale: `448.0` is the
 largest finite E4M3 value, `1e-12` keeps an all-zero span from producing a zero scale, and the growth
 is `max` so a unit that already holds large values is never rescaled downward. The order matters:
 rescale the residents *before* the new scale is stored, and raise the flag last, because a reader that

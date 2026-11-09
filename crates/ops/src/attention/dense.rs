@@ -2,7 +2,7 @@
 //!
 //! The attention of everything H3 does without a prefix cache: the language encoder over packed
 //! text and vision rows, the video transformer's cross-attention onto the encoded conditions, and
-//! the audio encoder, which runs in FP32 (specs/worker.md 9). Each batch's rows are a contiguous run
+//! the audio encoder, which runs in FP32. Each batch's rows are a contiguous run
 //! of the packed tensors, named by the offsets the scheduler writes:
 //!
 //! ```text
@@ -50,7 +50,7 @@
 //!
 //! A native library per backend. `fa4` is FlashAttention-4's CuTe package: tiles, the split-K and
 //! scheduler heuristics, the compiled specializations and their choice, and the output allocation
-//! are its host work (specs/worker.md 9, `flash_attn/cute/interface.py:276-522, 715-730`), so
+//! are its host work (`flash_attn/cute/interface.py:276-522, 715-730`), so
 //! [`Op::launch`] computes no grid. `f32` is the FP32 path — cuBLASLt SGEMM and a softmax kernel
 //! inside the package — for the audio encoder and the sparse compression branch, which hold their
 //! activations in FP32. Both take the same call structure and the same descriptor fields.

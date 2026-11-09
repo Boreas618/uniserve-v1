@@ -15,10 +15,9 @@ side (the operator requires that shape, `rope.rs`'s `q_weight`/`k_weight` check)
 `weight + column`, not `weight + head · head_dim`. A caller that handed it a `[heads, head_dim]` table
 would get the first head's weights for all of them, which looks like a kernel defect and is not.
 
-The numbers are the ones UniServe's kernel computed
-(``uniserve_kernels/src/uniserve_kernels/rope.py``): FP32 sum of squares over
-the head, ``x · rsqrt(mean + eps) · weight``, one product and one sum per
-rotated element, one rounding to the output. A descriptor without a learned
+The arithmetic is an FP32 sum of squares over the head,
+``x · rsqrt(mean + eps) · weight``, one product and one sum per rotated
+element, one rounding to the output. A descriptor without a learned
 scale (the video VAE's per-head normalization) compiles a program with no
 weight ports at all, so the two forms are two kernels rather than one with a
 null pointer.
@@ -252,11 +251,10 @@ def _qk_norm_rope_strided_kernel(
 ):
     """No learned scale, heads turned in place through a row stride, a factor table that repeats.
 
-    One program owns ``ROWS`` tokens of one head, which is the tile the reference's kernel
-    (``uniserve_kernels/src/uniserve_kernels/rope.py``, ``_qk_rms_norm_partial_rope_kernel``)
-    gives a wide row: a loop over heads inside one token would serialize what the machine can run
-    side by side. The program index walks the heads fastest, so neighbouring programs read
-    neighbouring columns of the same rows. The numbers are that kernel's: FP32 statistics over the
+    One program owns ``ROWS`` tokens of one head, which is the tile a wide row needs: a loop over
+    heads inside one token would serialize what the machine can run side by side. The program
+    index walks the heads fastest, so neighbouring programs read neighbouring columns of the
+    same rows. The numbers are ``_qk_norm_rope_kernel``'s: FP32 statistics over the
     head, the pair read back as its normalized value, one rounding at the store. Every value a
     program reads, partners included, belongs to its own tile and is loaded before it stores.
     """

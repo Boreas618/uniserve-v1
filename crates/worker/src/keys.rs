@@ -1,4 +1,4 @@
-//! The keys of derived state at the Storage Server (`specs/worker.md` §8).
+//! The keys of derived state at the Storage Server.
 //!
 //! The server holds storage and never interprets it: every key is computed
 //! here, by the process that derives the state, from the inputs that decide
@@ -12,8 +12,8 @@
 //! | latents | the request's trajectory and its step count, and the model's representation |
 //!
 //! A key carries no program's backend name or revision: replacing a kernel
-//! program keeps the mathematical content, so derived state keeps hitting
-//! (`specs/worker.md` §7.3). A change of mathematics, precision or format is a
+//! program keeps the mathematical content, so derived state keeps hitting.
+//! A change of mathematics, precision or format is a
 //! build-config change, which changes the representation and so the key.
 //!
 //! This replaces the structural digest of the retired loader (the versions of
@@ -167,8 +167,7 @@ fn now_ns() -> i128 {
 }
 
 /// The element type a load's `dtype` and `quantization` produce: the
-/// numerical representation the stored bytes are in (`specs/worker.md` §1,
-/// §8).
+/// numerical representation the stored bytes are in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ElementType<'a> {
     pub dtype: StorageElement,
@@ -190,7 +189,7 @@ impl ElementType<'_> {
 }
 
 /// The model's representation: the part of a key that changes when the same
-/// request's state would hold different bytes (`specs/worker.md` §8, §7.3).
+/// request's state would hold different bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Representation<'a> {
     pub element: ElementType<'a>,

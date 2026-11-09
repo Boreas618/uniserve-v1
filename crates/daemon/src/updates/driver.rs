@@ -1,5 +1,5 @@
 //! The epoch layer's driver: the one object the daemon's update entry and the
-//! process adapter share (`specs/worker.md` §7.4, §2.5).
+//! process adapter share.
 //!
 //! A switch cannot be driven from `apply` alone. Starting it and advancing it
 //! need a [`Roster`] — the daemon's one owner of main processes: claims,

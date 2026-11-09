@@ -4,8 +4,8 @@
 //! These tests drive the crate's public boundary only: media units are
 //! encoded on their own, several units are assembled with a soundtrack into a
 //! request's MP4, and the result is probed and decoded by the external
-//! `ffprobe`/`ffmpeg` binaries. They assert what the media checks of the
-//! design assert (`specs/worker.md` §10): codec, canvas, frame count, frame
+//! `ffprobe`/`ffmpeg` binaries. They assert the media output contract:
+//! codec, canvas, frame count, frame
 //! rate, per-unit content, a stereo AAC track covering the video's duration,
 //! and the refusals of malformed captures and assemblies.
 

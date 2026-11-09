@@ -4,11 +4,10 @@
 //!
 //! - `rotary_factors` turns a position per token into the cosine and sine factors of that position,
 //!   once per forward. The frequency table itself is a device tensor: it is computed once at the
-//!   loading boundary from the checkpoint's rope parameters (`inv_freq`, specs/worker.md 9) and
+//!   loading boundary from the checkpoint's rope parameters (`inv_freq`) and
 //!   never recomputed per step.
 //! - `qk_norm_rope` normalizes each head's row by its RMS, applies the rotation in FP32 and rounds
-//!   once into the output dtype, for queries and keys in one launch (specs/worker.md 9, "Q/K norm
-//!   与 RoPE 融合").
+//!   once into the output dtype, for queries and keys in one launch.
 //!
 //! The rotation this operator expresses is the one the checkpoint's model uses: a rotation of
 //! `rotated` dimensions of each head, in either the half-split pairing (`x[i]` against
@@ -119,7 +118,6 @@ pub fn section_axes(widths: &[u32]) -> Vec<u32> {
 /// Frequency `j` reads axis `j % n` while `j < widths[axis] · n`, and axis 0 otherwise, where `n` is
 /// the number of axes: every axis keeps frequencies from the whole spectrum, each receives exactly
 /// its section width, and the frequencies a narrow section cannot claim fall to the first axis.
-/// `uniserve/nn/rope.py::_interleaved_axes` is the reference this transcribes.
 pub fn interleaved_axes(widths: &[u32]) -> Vec<u32> {
     let count = widths.len() as u32;
     if count == 0 {

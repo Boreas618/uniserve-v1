@@ -1,7 +1,6 @@
 # The workspace's root package is the `uniserve` executable: every UniServe
 # process is one of its commands, each a module under `src/`. The libraries
-# are the members under `crates/`, a crate per process boundary or interface
-# (`specs/worker.md` §3).
+# are the members under `crates/`, a crate per process boundary or interface.
 [workspace]
 resolver = "3"
 members = [

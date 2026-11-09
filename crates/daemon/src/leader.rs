@@ -332,7 +332,7 @@ impl Leader {
         // configuration to the successor, not the update in progress: an
         // epoch switch's children and phases or a program trial's record do
         // not cross it, so the handover waits for the update to end
-        // (`specs/worker.md` §7.5, one update at a time).
+        // (one update at a time).
         if let Some(update) = crate::updates::in_flight(
             self.updates.running(),
             self.epochs().program_update().is_some(),
@@ -1214,8 +1214,7 @@ impl Leader {
     ///
     /// The caller drives the body one engine event at a time
     /// (`output::run::GenerationRun`), so the response can stop at an engine
-    /// event boundary and go on in a successor (design `specs/worker.md`
-    /// §7.5.1).
+    /// event boundary and go on in a successor.
     ///
     /// # Errors
     ///

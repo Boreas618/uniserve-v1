@@ -5,10 +5,8 @@ positions: ``cos/sin(position * frequency) * scale`` with full-range FP32
 trigonometry. Tables are compact, one ``[tokens, rotated / 2]`` row per rotary
 axis, shared by every head of a token.
 
-The kernel body is the one UniServe launched before this package existed
-(``uniserve_kernels/src/uniserve_kernels/rope.py``), unchanged except that it
-imports nothing but Triton: the shape and alias checks, the output allocation
-and the torch types stay with the operator's Rust side.
+The kernel body imports nothing but Triton: the shape and alias checks, the
+output allocation and the torch types stay with the operator's Rust side.
 """
 
 import triton

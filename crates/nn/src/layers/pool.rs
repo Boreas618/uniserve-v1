@@ -3,7 +3,7 @@
 //!
 //! The encoder's attention projection ends with `attended.mean(dim=heads)` followed by
 //! `F.adaptive_avg_pool1d(..., channels)`; both land on the same output element, so one operator
-//! computes them together (specs/worker.md 9, "自适应池化"; `ops::adaptive_pool`). The layer holds
+//! computes them together (`ops::adaptive_pool`). The layer holds
 //! the geometry: how many heads a row has, the width each holds, and how many elements the pool
 //! produces.
 

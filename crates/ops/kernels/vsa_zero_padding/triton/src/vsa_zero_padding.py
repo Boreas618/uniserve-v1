@@ -4,9 +4,7 @@ Programs store zeros to one tile's row block where the tile's valid size ends, s
 a plain per-tile sum of the rows equals the sum of the masked rows. Only padding
 rows are stored, and the launch's shape depends on the tile count alone.
 
-The kernel body is the one UniServe launched before this package existed
-(``uniserve_kernels/src/uniserve_kernels/attention/vsa_segments.py``), unchanged
-except that it imports nothing but Triton: the launch-time wrapper, its operand
+The kernel body imports nothing but Triton: the launch-time wrapper, its operand
 checks and its torch types stay with the operator's Rust side.
 """
 

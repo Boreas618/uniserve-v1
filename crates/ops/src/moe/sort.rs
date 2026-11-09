@@ -8,7 +8,7 @@
 //!
 //! The program is a native library: the sort is a multi-stage histogram/scan/scatter pipeline with
 //! host-side stage selection, and its stages are the package's business (`flashinfer`'s
-//! `moe_utils.moe_sort`, `uniserve/backends/moe/cutedsl.py:167-186`). [`Op::launch`] hands it
+//! `moe_utils.moe_sort`). [`Op::launch`] hands it
 //! [`Call`]; the buffers are the caller's, sized by [`super::max_tiles`] and
 //! [`super::max_permuted_rows`] so they are invariant across a captured graph's replays.
 //!

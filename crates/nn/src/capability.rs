@@ -1,5 +1,5 @@
 //! The capability traits a model implements and the worker calls, and the borrowed inputs and
-//! outputs they exchange (specs/worker.md 4.3).
+//! outputs they exchange.
 //!
 //! The worker dispatches by capability, never by concrete model: a runner owns a
 //! `Box<dyn Encoder>`, `Box<dyn Denoiser>`, `Box<dyn Decoder>` or `Box<dyn CausalLm>` and calls only
@@ -12,8 +12,7 @@
 //! A batch has two halves. [`BatchRows`] is the host half: the scheduler's mechanism assembles the
 //! per-call rows and their column values, the worker uploads them, and they are not visible to a
 //! model. [`TokenBatch`] is the device half: the views a model's layers read, laid out exactly as
-//! the attention and KV-write kernels read them, so a forward does no host conversion (specs/worker.md
-//! 4.3, 4.4, 9).
+//! the attention and KV-write kernels read them, so a forward does no host conversion.
 //!
 //! The paged cache is [`KvView`]: one entry per attention group, each with its block table, its
 //! page geometry and its per-layer key/value planes. A model with one attention type (Qwen3-MoE) has
@@ -227,7 +226,7 @@ impl TokenBatch {
 /// The key/value planes of one attention layer of one group.
 ///
 /// The cache layout is `[pages, page_size, kv_heads, head_dim]` per plane with one `i32`
-/// initialization flag per page (specs/worker.md 9, KV 写入): a reader must not read a page before
+/// initialization flag per page: a reader must not read a page before
 /// its flag is raised, and a page's owner zeroes only storage it created.
 #[derive(Clone, Copy)]
 pub struct KvPlanes {
@@ -428,7 +427,7 @@ impl WarmRequest {
     }
 }
 
-/// A video request's numerical layout input: what the denoiser must lay out (specs/worker.md 4.3).
+/// A video request's numerical layout input: what the denoiser must lay out.
 ///
 /// Every field is a request fact the worker already holds — it decoded the media, encoded the
 /// prompt and knows the canvas — and none is derivable from the others: the packed layout needs the
@@ -450,8 +449,7 @@ pub struct VideoRequest<'a> {
     /// Reference images or clips: they condition the generation as a whole.
     ///
     /// The three roles are counted apart because they enter the layout differently — an anchor is
-    /// one encoded frame at a fixed position, a reference is an encoded clip — and the reference
-    /// implementation enforces it (`uniserve/models/denoiser.py`, `ConditionRole`).
+    /// one encoded frame at a fixed position, a reference is an encoded clip.
     pub references: u32,
     /// Prompt tokens the request presents, vision tokens included.
     ///
@@ -576,7 +574,7 @@ pub struct StateTable {
 /// The seed a noise draw is addressed by.
 ///
 /// A draw is a function of this seed and the element's index, never of a batch position, so
-/// recomputing a request after a migration draws the same noise (specs/worker.md 9, 初始噪声).
+/// recomputing a request after a migration draws the same noise.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Seed(pub u64);
 

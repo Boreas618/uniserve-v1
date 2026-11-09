@@ -1,8 +1,8 @@
 //! NVFP4: the representation a calibrated checkpoint stores a matrix in, and the products over it.
 //!
 //! A ModelOpt NVFP4 checkpoint stores a matrix as packed E2M1 values, two to a byte, with one E4M3
-//! scale per block of sixteen elements and one FP32 tensor scale for the matrix
-//! (specs/worker.md 9, "两个模型的 NVFP4 检查点与 FP8 KV 页"). Activations are encoded into the same
+//! scale per block of sixteen elements and one FP32 tensor scale for the matrix.
+//! Activations are encoded into the same
 //! form at run time and the products read it:
 //!
 //! ```text

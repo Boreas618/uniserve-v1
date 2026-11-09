@@ -67,7 +67,7 @@ constexpr int kReceived = kRanks * kMaxTokens;
 constexpr int kLocalExperts = kExperts / (kRanks - kAttentionRanks);
 constexpr int kWireExperts = kRanks * kLocalExperts;
 
-// The launch shapes `uniserve/backends/experts/deepep.py` chose and DeepEP derives.
+// The launch shapes of the exchange, as DeepEP derives them.
 constexpr int kSMs = 24;
 constexpr int kFullSMs = 148;
 constexpr int kQPs = 129;

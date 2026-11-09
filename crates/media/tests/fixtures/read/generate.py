@@ -3,8 +3,8 @@
 This is a code generator, not a test: it writes small condition media (PNG,
 JPEG with an EXIF orientation, WAV tracks, one tiny H.264 reference video) and
 the reference outputs the readers must produce, computed by the `.venv`
-implementations the readers replace (`uniserve/media/reader.py` and
-`Conditions.read`) and by the environment's FFmpeg for the reference video.
+Python readers the crate's readers replace (transcribed below, call for
+call) and by the environment's FFmpeg for the reference video.
 
 The reference versions are Pillow 12.3.0, PyAV with libavcodec 8.1.2, torch
 2.13.0, torchvision 0.28.0 and torchaudio 2.11.0 (the read-only `.venv` this

@@ -3,8 +3,8 @@
 //!
 //! `lm_head` computes the last position of every request only: `logits_gather` packs those rows of
 //! the final hidden state into one matrix, and after the tensor-parallel head has gathered the
-//! sharded logits, `vocab_unpad` drops the padding the sharded vocabulary carries (specs/worker.md
-//! 9, "`lm_head` 与 logits"). Both operators only move values, so two implementations of either
+//! sharded logits, `vocab_unpad` drops the padding the sharded vocabulary carries.
+//! Both operators only move values, so two implementations of either
 //! agree bit for bit.
 
 use std::fmt;

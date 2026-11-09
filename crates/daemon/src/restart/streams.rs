@@ -1,5 +1,4 @@
-//! The responses in flight across a hot restart (design `specs/worker.md`
-//! §7.5.1).
+//! The responses in flight across a hot restart.
 //!
 //! # Mechanism
 //!

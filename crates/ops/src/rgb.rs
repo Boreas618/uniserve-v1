@@ -11,13 +11,12 @@
 //! quantize(scaled) = round_half_to_even(clamp(scaled, 0, 255))        as u8
 //! ```
 //!
-//! **The arithmetic is FP32 throughout**, whatever the input's element type — the decoders emit
-//! f16 (the video VAE's raster is `float16`, `uniserve/models/minimax_h3/output.py`'s own state
-//! buffer type), so f16 is the element type this operator is declared for, with bf16 and f32
-//! accepted because the arithmetic is the same either way: the reference converts
-//! its normalized pixels to `float32` before the de-normalization and the clamp (`uniserve/media/
-//! pixels.py`, `quantize_image_hwc`), and the same order matters here — a BF16 multiply then a BF16
-//! add would round twice inside a range of 255 worth of bytes.
+//! **The arithmetic is FP32 throughout**, whatever the input's element type — the decoders emit f16
+//! (the video VAE's raster is `float16`, its own state buffer type), so f16 is the element type
+//! this operator is declared for, with bf16 and f32 accepted because the arithmetic is the same
+//! either way: the normalized pixels convert to `float32` before the de-normalization and the
+//! clamp, and the same order matters here — a BF16 multiply then a BF16 add would round twice
+//! inside a range of 255 worth of bytes.
 //!
 //! De-normalization is multiply then add, left to right: the encoder normalized as
 //! `(v / 255 - mean) / std`, so `(x · std + mean) · 255` returns `v`, and no reassociation

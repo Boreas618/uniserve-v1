@@ -1,7 +1,7 @@
 //! How far apart two implementations of one operator may be.
 //!
 //! Shadow execution runs the old and the new kernel of an operator on the same inputs and compares
-//! their outputs (specs/worker.md 7.3). The tolerance is the operator's, not the program's: it says
+//! their outputs. The tolerance is the operator's, not the program's: it says
 //! how much a *correct* implementation may differ from another correct one, so the bound follows
 //! from the operator's mathematics — its reduction length, its accumulation dtype and its output
 //! dtype — and never from a measurement of the pair being compared.

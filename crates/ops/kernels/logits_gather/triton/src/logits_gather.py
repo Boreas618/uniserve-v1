@@ -2,9 +2,8 @@
 
 One program copies a block of elements of the selected rows of the hidden state
 into a dense ``[count, columns]`` matrix, which the vocabulary head's GEMM then
-multiplies. UniServe selected each request's last row with ATen indexing
-(``uniserve/models/logits.py:62-104``); the gather is one launch here, so a
-captured decode step compacts its rows on the device without a host plan.
+multiplies. The gather is one launch, so a captured decode step compacts its
+rows on the device without a host plan.
 """
 
 import triton

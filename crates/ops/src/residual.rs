@@ -17,8 +17,7 @@
 //! The sum and the normalization's statistics stay in FP32 until the store, which is what the eager
 //! expression rounds; `scaled_residual_rms_norm` normalizes the *unrounded* sum while storing the
 //! rounded one, as the reference does. A launch may also record each program's largest normalized
-//! magnitude, an FP32 vector the caller reduces (specs/worker.md 9, the residual and normalization
-//! rows of the MiniMax-H3 table).
+//! magnitude, an FP32 vector the caller reduces.
 //!
 //! The residual and the rows a projection reads may be two element types: the video VAE's decoder
 //! holds its stream in FP32 while its projections read and write FP16, which is what the reference's

@@ -2,8 +2,8 @@
 //!
 //! The sequence is cut into `tile_rows`-row tiles and a query tile attends only to the key tiles its
 //! pooled scores select. **Six programs** do it, none of them allocating, all of them leaving their
-//! indices on the device so a captured graph replays the selection (specs/worker.md 9, "VSA 分块";
-//! `ops::segments`):
+//! indices on the device so a captured graph replays the selection
+//! (`ops::segments`):
 //!
 //! ```text
 //! prepare     normalize and rotate Q and K in place, zero each tile's padding rows, pool the means

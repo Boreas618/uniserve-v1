@@ -1,4 +1,4 @@
-//! The data plane of a serving epoch (`specs/worker.md` §7.6): the updates that change what a
+//! The data plane of a serving epoch: the updates that change what a
 //! rank holds at the Storage Server, inside the epoch and without going through the three update
 //! layers.
 //!

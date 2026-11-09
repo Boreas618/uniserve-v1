@@ -14,7 +14,7 @@
 //! `i` is `row_indices[row]`, and the three modulation vectors are indexed along their leading axis,
 //! whose stride the descriptor carries: one row of the parameters serves many activation rows, and
 //! experts or timestep groups are laid out along that axis. Every intermediate rounds to the
-//! activation dtype, as the eager expression does (specs/worker.md 9, "调制 RMSNorm、门控残差");
+//! activation dtype, as the eager expression does;
 //! only the statistics of the mean square accumulate in FP32.
 //!
 //! One program handles one activation row in `modulated_rms_norm` and loads the whole row before

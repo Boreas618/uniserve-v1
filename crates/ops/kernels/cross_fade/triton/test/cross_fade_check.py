@@ -12,8 +12,8 @@ only for FP8, which a decoded tile is not).
 
 What is checked, for both axes and three element types:
 
-* ``blend_decoded_overlap`` of ``uniserve/nn/video.py`` — the reference's very expression, with its
-  ramp built in the tile's dtype, reproduced here line for line;
+* ``blend_decoded_overlap``, the decoded-overlap blend as an eager torch expression, with its
+  ramp built in the tile's dtype;
 * the aliased destination, ``out`` the same buffer as ``current``, which the operator says is
   allowed because every element is read before the position it is written at;
 * a destination that is a slice of a larger raster, so the three outer strides are not the tile's
@@ -38,7 +38,7 @@ DTYPES = {"f16": torch.float16, "bf16": torch.bfloat16, "f32": torch.float32}
 
 
 def blend_decoded_overlap(previous, current, extent, dim):
-    """``uniserve/nn/video.py``'s reference blend, reproduced expression for expression."""
+    """The decoded-overlap blend as eager torch, every step in the tile's dtype."""
     extent = min(previous.shape[dim], current.shape[dim], extent)
     if extent == 0:
         return current

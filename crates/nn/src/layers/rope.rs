@@ -3,9 +3,9 @@
 //! Two operators, one layer, because the factors depend only on positions and are shared by every
 //! attention layer while the rotation itself is per layer: [`Rotary::factors`] turns the batch's
 //! positions into FP32 cosine and sine tables, and [`Rotary::apply`] normalizes each query and key
-//! head and rotates it (specs/worker.md 9, "RoPE 因子" and "Q/K norm 与 RoPE 融合"). The fused
-//! operator rotates in FP32 and rounds once, which is the recipe the checkpoint's model was trained
-//! with; the frequencies are computed by the loading boundary, not here (specs/worker.md 9).
+//! head and rotates it. The fused operator rotates in FP32 and rounds once, which is the recipe the
+//! checkpoint's model was trained with; the frequencies are computed by the loading boundary, not
+//! here.
 
 use ops::TensorView;
 use ops::rope::{
@@ -25,7 +25,7 @@ use crate::weights::Weight;
 ///
 /// A multimodal transformer's positions are one coordinate per axis (time, height, width) and its
 /// head's rotated width is divided among them in this order, so each column rotates by the
-/// coordinate of the axis its section belongs to (specs/worker.md 9, "RoPE 因子").
+/// coordinate of the axis its section belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sections {
     widths: [u32; MAX_AXES],
@@ -425,8 +425,7 @@ impl Rotary {
     ///
     /// A trained transformer's per-head normalization scales the head by a learned weight; the video
     /// VAE's decoder normalizes each head without one, and that call passes neither weight, which
-    /// compiles a program with no weight ports (specs/worker.md 9, the per-head norm row;
-    /// `ops::rope::QkNormRopeDescriptor::affine`).
+    /// compiles a program with no weight ports (`ops::rope::QkNormRopeDescriptor::affine`).
     #[allow(
         clippy::too_many_arguments,
         reason = "a rotation call carries the two projections, their norms, the two factor tables \

@@ -3,7 +3,7 @@
 //! A diffusion block is conditioned on a timestep embedding: three vectors per conditioning row —
 //! shift, scale and gate — are selected per activation row, the row is normalized, its affine image
 //! is formed from that row's parameters, and a gated update is folded into the residual stream
-//! (specs/worker.md 9, "调制 RMSNorm、门控残差"; `ops::modulation`). The layer owns the three
+//! (`ops::modulation`). The layer owns the three
 //! parameter tables and the epsilon; the activation, the row indices and the residual are the
 //! caller's views.
 
@@ -209,7 +209,7 @@ impl ModulatedRmsNorm {
 /// A diffusion block's second residual is gated not by one channel vector but by the row of a
 /// `[parameters, width]` table that the block's conditioning selects — the same table an indexed
 /// modulation reads, at a different parameter. The layer holds that table; the rows and the update
-/// are the caller's views (specs/worker.md 9, 门控残差; `ops::modulation::GatedResidual`).
+/// are the caller's views (`ops::modulation::GatedResidual`).
 pub struct GatedResidual {
     gate: Weight,
 }
@@ -260,8 +260,8 @@ impl GatedResidual {
     ///
     /// `row_indices` is `[rows]` and selects the gate row each activation row multiplies by. The row
     /// count is the launch's, not the descriptor's: a clip's token count changes with every request,
-    /// so a descriptor carrying it would be a kernel per clip length (specs/worker.md 7.3's extent
-    /// rule), and the operator reads it from `hidden` and packs it as the launch's last scalar.
+    /// so a descriptor carrying it would be a kernel per clip length, and the operator reads it
+    /// from `hidden` and packs it as the launch's last scalar.
     pub fn forward(
         &self,
         f: &Forward,

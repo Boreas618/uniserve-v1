@@ -1,6 +1,6 @@
 //! The captured graphs one runner holds, by bucket and generation.
 //!
-//! A runner serves every batch from a graph captured for a bucket (specs/worker.md 4.5). During a
+//! A runner serves every batch from a graph captured for a bucket. During a
 //! program-layer update it holds the graphs of two generations at once: the ones it is serving
 //! from and the ones precopy is preparing for the next generation (7.3). Both are keyed by
 //! `(bucket, generation)`, which is what lets purge find the graphs that still reference the old

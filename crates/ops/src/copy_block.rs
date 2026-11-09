@@ -231,7 +231,7 @@ impl Op for CopyBlock {
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         // The destination is the twin: a twin of the source would compare the source with itself and
-        // could never fail (specs/worker.md 7.3 — the mistake `ops::rows` had).
+        // could never fail.
         Args {
             out: twins.shadow_of(args.out),
             ..args

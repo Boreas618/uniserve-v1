@@ -1,6 +1,6 @@
 //! Configuration resolved before model loading and physical capacity fitting.
 //!
-//! What the design calls the build config (`specs/worker.md` §7.1) is resolved
+//! What the design calls the build config is resolved
 //! here, before a main process loads a model: the deployment's rank layout of
 //! blocks on devices, the devices themselves, and the values physical capacity
 //! is fitted against. Numerical backend options stay with their program.

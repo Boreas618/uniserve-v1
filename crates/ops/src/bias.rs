@@ -1,7 +1,6 @@
 //! Per-channel bias addition with an optional residual, channel-first.
 //!
-//! The reference adds a convolution's bias in a separate pass rather than inside the convolution
-//! (`uniserve/nn/functional/_bias.py:12-56`):
+//! A convolution's bias is added in a separate pass rather than inside the convolution:
 //!
 //! ```text
 //! out = (residual + residual_bias) + (values + bias)

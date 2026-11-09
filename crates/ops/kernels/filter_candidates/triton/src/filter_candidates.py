@@ -7,9 +7,6 @@ every candidate at or after the first cumulative probability above ``top_p``
 logits plus ``log(min_p)``. A dropped candidate becomes ``-inf``; the program
 also reports whether the row's remaining candidates form a usable distribution.
 
-The numbers and the order are the ones UniServe's tensor composition defined
-(``uniserve/sampling/top_k.py::top_k_candidates`` and ``sample_top_k``).
-
 The row is walked in tiles of ``BLOCK`` lanes and never held whole, so its width is
 unbounded: one block covering the row asks for a register per candidate, which is
 what a vocabulary-sized row cannot give. Four passes, because every stage needs a

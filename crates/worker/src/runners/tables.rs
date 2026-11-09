@@ -1,4 +1,4 @@
-//! The model-declared tables a media runner holds on the device (specs/worker.md 4.3).
+//! The model-declared tables a media runner holds on the device.
 //!
 //! A capability states what it needs and fills it; the worker allocates it. Three kinds reach a
 //! media runner and they differ in when they are made, not in how: a model's **constants** once per

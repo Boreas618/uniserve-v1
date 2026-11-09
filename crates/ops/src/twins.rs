@@ -2,7 +2,7 @@
 //!
 //! During a program-layer update, the new kernel of an operator runs beside the old one on the same
 //! inputs: the old kernel writes the real outputs, the new one writes twins of them, and the two are
-//! compared within the operator's [`Tolerance`] (specs/worker.md 7.3). Because the
+//! compared within the operator's [`Tolerance`]. Because the
 //! new kernel's result is never fed on, the difference of one operator does not accumulate through
 //! the rest of the forward.
 //!
@@ -41,7 +41,7 @@ pub struct Twin {
 
 /// The shadow buffers of one paired execution.
 ///
-/// The region is the worker's scratch pool (specs/worker.md 4.5, 7.3), never the graph pool: a
+/// The region is the worker's scratch pool, never the graph pool: a
 /// paired forward writes resident memory not at all, and `Twins` only carves views of the bytes the
 /// worker gave it.
 pub struct Twins {

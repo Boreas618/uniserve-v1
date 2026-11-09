@@ -765,7 +765,7 @@ impl Products for Held {
         // same width - `f16` and `bf16` are both two bytes - so a byte count that agrees is exactly
         // the case that would copy a reinterpretation silently. A different type is a conversion, not
         // a copy, and the design names the boundary's conversion as one explicit step its handover
-        // performs (specs/worker.md 9 replaced `torch.autocast` with declared per-layer precision);
+        // performs (each layer declares its precision; nothing converts implicitly);
         // this store copies bytes and does not pretend to convert them.
         copyable(placed.view.dtype, destination.dtype, request, kind)?;
         let product = placed.view.byte_len()?;

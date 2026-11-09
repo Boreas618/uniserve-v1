@@ -4,12 +4,11 @@ operator's Triton source.
 One program writes ``BLOCK`` columns of one row of one frame of one channel. A pixel belongs to one
 tile, and its value is that tile's token value, faded against the tile above it and then against the
 tile to its left where it lies in a seam. The two neighbours are read as they were decoded, so a
-corner is computed in the order an edge is, which is the reference's rule
-(``uniserve/nn/vae/tiled.py``, ``stitch_tiles``).
+corner is computed in the order an edge is.
 
-The fade is the reference's arithmetic in the element type at every step
-(``uniserve/nn/video.py``, ``blend_decoded_overlap``): the position and the extent reach the element
-type through FP32, the ratio and its complement round there, each product rounds and the sum rounds.
+The fade's arithmetic is in the element type at every step: the position and the extent reach
+the element type through FP32, the ratio and its complement round there, each product rounds and
+the sum rounds.
 
 The grid's geometry is two tables of ``[tile, position, seam]`` rows, so the program holds no tile
 logic: the row's three words are scalars of the program and the columns' are a load per lane.

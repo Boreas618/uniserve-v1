@@ -3,7 +3,7 @@
 //! A tensor-parallel deployment replicates the router and keeps each rank's experts, so a token
 //! routed to another rank has to travel there. The package owns the transport — its buffers, its
 //! ordering, its state — because the workspace layout is the program's, and dispatches and combines
-//! through it (specs/worker.md 9, "Expert Parallel"; `ops::moe::exchange`).
+//! through it (`ops::moe::exchange`).
 //!
 //! A model layer cannot build that transport: it may not create runtime objects, and the worker
 //! is the one that calls the package's creation entry. What travels through [`Forward`] is

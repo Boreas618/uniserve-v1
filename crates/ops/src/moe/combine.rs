@@ -10,8 +10,7 @@
 //! in FP32 and in route order, rounded once to the output dtype; a route the sort left out of this
 //! rank carries `-1` in the map and contributes nothing, which is how an expert-parallel rank's
 //! partial sum is expressed. The order is fixed, so repeated calls of the same inputs agree bit for
-//! bit — the reason the two-stage form is used instead of an atomic add
-//! (`uniserve/backends/moe/cutedsl.py:32-39`).
+//! bit — the reason the two-stage form is used instead of an atomic add.
 //!
 //! The program is a native library (FlashInfer's `moe_unpermute`, with the host-side launch
 //! configuration of its JIT module), so [`Op::launch`] computes no grid. It is exact in its

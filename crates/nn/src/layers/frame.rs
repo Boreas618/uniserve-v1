@@ -1,9 +1,9 @@
 //! The video VAE's frame layer: the causal pad, the per-frame group statistics, and the fused
 //! normalize-pad-activate that feeds a convolution.
 //!
-//! A video convolution sees a padded, normalized and activated frame. The reference's eager path
+//! A video convolution sees a padded, normalized and activated frame. An eager implementation
 //! pads, reduces each frame's channel groups, and normalizes as three passes over the frame; the
-//! operators here fuse them (specs/worker.md 9, "replicate pad"; `ops::frame`), so the layer reads
+//! operators here fuse them (`ops::frame`), so the layer reads
 //! each frame once. Statistics stay FP32 whatever the activations' element type is; the padding is
 //! replication or reflection, the video VAE's two modes.
 

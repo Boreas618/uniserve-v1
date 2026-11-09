@@ -12,20 +12,18 @@
 //! ```
 //!
 //! Each expert's FC1 weight holds its `I` up rows followed by its `I` gate rows (Hugging Face stores
-//! gate then up; the stacked `up_gate` stores up then gate, `uniserve/nn/moe.py`), and the gated
+//! gate then up; the stacked `up_gate` stores up then gate), and the gated
 //! product is `act(gate) · up` with the activation the descriptor names.
 //!
 //! Both programs are CuTe DSL native libraries — tiles, cluster shapes and the persistent scheduler
 //! are the package's, and its tuning data (which tactic for which token count) is the package's too
-//! (specs/worker.md 5.4) — so [`Op::launch`] computes no grid. The runtime arguments are the ones
-//! the BF16 wrappers pass today
-//! (`uniserve_kernels/src/uniserve_kernels/experts/__init__.py:117-211`).
+//! — so [`Op::launch`] computes no grid.
 //!
 //! # The bound
 //!
 //! A row of FC1 or FC2 is a dot product of length `H` or `I` accumulated in FP32 and rounded once to
 //! BF16. Two correct implementations therefore differ by at most `2γₙ Σ|aᵢbᵢ| + u_out|result|`
-//! (specs/worker.md 7.3, Higham §3.1); with a sum of mixed-sign products the result can cancel, so
+//! (Higham §3.1); with a sum of mixed-sign products the result can cancel, so
 //! [`Tolerance::dot`] states the bound relative to the result and [`ACTIVATION_ENVELOPE`] gives the
 //! absolute term for rows that cancel harder, over the data this operator sees.
 

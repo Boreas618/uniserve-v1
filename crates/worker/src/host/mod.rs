@@ -1,5 +1,5 @@
 //! Bounded host work: the blocking pool the main process runs its non-device
-//! work on (`specs/worker.md` §2.4).
+//! work on.
 //!
 //! Module loading, transfer reads, shared-storage reclamation and the media
 //! codecs run here, each on its own kind of work, so that no device stream and

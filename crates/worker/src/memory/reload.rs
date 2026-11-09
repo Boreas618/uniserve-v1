@@ -1,4 +1,4 @@
-//! A second load of a serving model (`specs/worker.md` §7.6).
+//! A second load of a serving model.
 //!
 //! An in-place weight update and an expert redistribution are the same operation seen from a
 //! rank: the model is loaded again against another target, and each weight whose key moved takes

@@ -1,6 +1,6 @@
 //! Shadow execution: run a changed operator's new kernel beside its old one and compare.
 //!
-//! Precopy checks a program-layer update on real work before switchover (specs/worker.md 7.3): for
+//! Precopy checks a program-layer update on real work before switchover: for
 //! every operator whose kernel program changed, one paired forward runs on the batch's stream
 //! without a graph, where the old kernel writes the real outputs and the new one writes twins
 //! (`Op::shadow`), and the two results are compared element by element within `Op::tolerance`.

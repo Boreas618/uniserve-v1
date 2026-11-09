@@ -6,10 +6,8 @@ overwrites ``update``. The descriptor bakes the element count one launch walks (
 like the kernel's own tile mask), the row width and the tile block; the gate row stride is a launch
 argument, because one parameter table serves many activation rows.
 
-The kernel body is the one UniServe launched before this package existed
-(``uniserve_kernels/src/uniserve_kernels/norm/modulation.py``), unchanged except that it imports
-nothing but Triton: the launch-time wrapper, its operand checks and its torch types stay with the
-operator's Rust side.
+The kernel body imports nothing but Triton: the launch-time wrapper, its operand checks and its
+torch types stay with the operator's Rust side.
 """
 
 import triton

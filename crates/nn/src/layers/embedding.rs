@@ -2,7 +2,7 @@
 //!
 //! The vocabulary is sharded across tensor-parallel ranks. A token outside this rank's shard is
 //! written as zeros by the operator, every rank contributes its own rows, and the layer
-//! all-reduces the result when it has a group (specs/worker.md 9, "词嵌入"): the sum over ranks is
+//! all-reduces the result when it has a group: the sum over ranks is
 //! the token's embedding.
 
 use ops::embedding::{self, Descriptor, Embedding as EmbeddingOp};

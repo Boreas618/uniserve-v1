@@ -1,15 +1,14 @@
 //! One generation of loaded kernels.
 //!
 //! A runner holds the generation it is serving and, during a program-layer update, the one it is
-//! switching to (specs/worker.md 4.2, 4.5, 7.3). A generation is immutable: a switchover builds the
+//! switching to. A generation is immutable: a switchover builds the
 //! next one from the current one plus the kernels of the operators whose program changed, so every
 //! operator whose program did not change keeps its `Arc<Kernel>` — the same loaded module, not a
 //! second copy — and the modules of a replaced generation unload when the last `Arc` to them drops.
 //!
 //! A generation is keyed by (operator name, descriptor key). The operator name is the crate-level
 //! name a kernel program fills, the descriptor key is the canonical text of the values one
-//! compilation covers, and together they are the module's path under the program server's store
-//! (specs/worker.md 5.3).
+//! compilation covers, and together they are the module's path under the program server's store.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,7 +43,7 @@ impl KernelEntry {
 /// The kernels one runner may launch, indexed by (operator, descriptor key).
 ///
 /// Built once and then read-only; a program-layer update builds the successor with [`Self::replace`]
-/// and hands it to the runner at a batch boundary (specs/worker.md 4.5, 7.3).
+/// and hands it to the runner at a batch boundary.
 pub struct Generation {
     number: u64,
     kernels: HashMap<(&'static str, String), Arc<Kernel>>,
@@ -66,7 +65,7 @@ impl Generation {
         }
     }
 
-    /// The generation's number, which graph capture and purge carry (specs/worker.md 4.5, 7.3).
+    /// The generation's number, which graph capture and purge carry.
     pub const fn number(&self) -> u64 {
         self.number
     }
@@ -85,8 +84,7 @@ impl Generation {
     /// The kernel of operator `O` for `descriptor`.
     ///
     /// This is the call every operator's launch makes, and the only way a launch reaches a kernel:
-    /// which program fills the operator is the epoch record's decision, not the launch code's
-    /// (specs/worker.md 4.2).
+    /// which program fills the operator is the epoch record's decision, not the launch code's.
     pub fn op<O: Op>(&self, descriptor: &O::Descriptor) -> Result<&Arc<Kernel>> {
         let key = descriptor::key(descriptor);
         self.kernel(O::NAME, &key)
@@ -113,7 +111,7 @@ impl Generation {
     /// An operator whose program changed is named once and its whole set of descriptors is given:
     /// descriptors it no longer has are gone, so a generation never holds a stale kernel for an
     /// operator that was re-resolved. Every other operator keeps its `Arc<Kernel>`, so its module
-    /// stays loaded across the update (specs/worker.md 4.2).
+    /// stays loaded across the update.
     pub fn replace(
         &self,
         number: u64,

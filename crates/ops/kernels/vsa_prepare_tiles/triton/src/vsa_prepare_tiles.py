@@ -11,12 +11,9 @@ outputs, in the summation order of
 
 The routine that normalizes and rotates a row block travels with this package
 because it is the arithmetic the operator must reproduce: the word-level
-rounding of the stepwise path, not a formula. Both parts are the code UniServe
-launched before this package existed
-(``uniserve_kernels/src/uniserve_kernels/attention/vsa_segments.py`` and
-``uniserve_kernels/src/uniserve_kernels/rope.py``), unchanged except that they
-import nothing but Triton: the launch-time wrappers, their operand checks and
-their torch types stay with the operator's Rust side.
+rounding of the stepwise path, not a formula. Both parts import nothing but
+Triton: the launch-time wrappers, their operand checks and their torch types
+stay with the operator's Rust side.
 """
 
 import triton

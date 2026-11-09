@@ -6,9 +6,7 @@ leading ``segment_keep`` tiles besides every live dense tile, and stores the kep
 tiles first in ascending order followed by the others. A segment's threshold is
 found by bisection over the 32-bit order key rather than by sorting.
 
-The kernel body is the one UniServe launched before this package existed
-(``uniserve_kernels/src/uniserve_kernels/attention/vsa_segments.py``), unchanged
-except that it imports nothing but Triton: the launch-time wrapper, its operand
+The kernel body imports nothing but Triton: the launch-time wrapper, its operand
 checks and its torch types stay with the operator's Rust side.
 """
 

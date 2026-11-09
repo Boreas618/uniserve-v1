@@ -1,4 +1,4 @@
-//! The main process's allocator as the deployment exports it (`specs/worker.md` 4.1 and 8).
+//! The main process's allocator as the deployment exports it.
 //!
 //! Two questions, one family each: how much physical memory a device's budget allows this epoch
 //! (`uniserve:memory_budget`, labelled by device) and how much the device's allocator pools have
@@ -15,7 +15,7 @@
 //! `device = 0` and the later report wins: on a multi-host deployment these two families would
 //! describe no host's allocator, and the reader that compares mapped bytes against a budget would
 //! compare across machines that never shared one. The epoch path is one node and one process today
-//! (`specs/worker.md` 2.4; a replica count is refused by name), so the labels stay `device` alone -
+//! (a replica count is refused by name), so the labels stay `device` alone -
 //! and when several hosts report, the labels gain the host **together with every reader's key**,
 //! because a label added on one side only turns a real comparison into a vacuous one.
 

@@ -4,8 +4,7 @@ One program scores one row in two streaming passes: the row's maximum with the
 log-sum-exp of ``exp(x - max)``, then ``x - logsumexp`` for every element. The
 output is FP32 whatever the input dtype, which is what the sampling path reads.
 
-The numbers are the ones UniServe's tensor composition defined
-(``uniserve/sampling/logprobs.py``): ``log_softmax`` of the logits row.
+The result equals torch's ``log_softmax`` of the logits row.
 """
 
 import triton

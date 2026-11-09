@@ -1,11 +1,9 @@
 //! Host resampling that reproduces the reference implementations' mathematics.
 //!
-//! The three resamplers are what the model conditioning used before the main
-//! process was pure Rust: Pillow's LANCZOS resize, torchaudio's bandlimited
-//! sinc resample, and torchvision's antialiased bicubic resize
-//! (`specs/worker.md` §9, "主机端重采样"). Each reproduces its reference's
-//! arithmetic, not merely a similar filter, so the results agree with the
-//! reference on the §10 check set.
+//! The three resamplers reproduce Pillow's LANCZOS resize, torchaudio's
+//! bandlimited sinc resample, and torchvision's antialiased bicubic resize.
+//! Each reproduces its reference's arithmetic, not merely a similar filter, so
+//! the results agree with the reference on the media check set.
 
 mod bicubic;
 mod lanczos;

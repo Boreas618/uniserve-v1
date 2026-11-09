@@ -1,8 +1,8 @@
 //! Bucket choice: which captured size a forward is padded into.
 //!
 //! A captured graph addresses fixed buffers, so a forward may only be served by a graph captured
-//! for a size that holds it (specs/worker.md 4.5: "each batch planned into the smallest captured
-//! bucket"). This module is the arithmetic of that sentence and nothing else: a [`Shape`] asks for
+//! for a size that holds it, and each batch is planned into the smallest captured bucket that holds
+//! it. This module is the arithmetic of that rule and nothing else: a [`Shape`] asks for
 //! rows and tokens of one kind of work, a [`Bucket`] is a captured size, and [`Buckets`] answers
 //! which captured bucket serves a shape, and in which order the buckets are captured.
 //!

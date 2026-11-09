@@ -4,9 +4,8 @@
 One program draws one row's token from its candidate probabilities with the
 row's uniform draw. The candidates arrive **in ascending vocabulary-id order** -
 the caller's obligation, stated on `InverseCdfArgs`: the layer sorts them by
-token id before this walk (`uniserve/sampling/top_k.py:307-314`), so a fixed draw
-names the same token however the selection kernel ordered equally likely
-candidates, which is the contract UniServe's composition defined.
+token id before this walk, so a fixed draw names the same token however the
+selection kernel ordered equally likely candidates.
 
 The row is walked in tiles of ``BLOCK`` lanes and never held whole, so its width
 is unbounded: the alternative, one block covering the row, asks for a register per

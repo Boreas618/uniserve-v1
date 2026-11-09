@@ -1,5 +1,5 @@
 //! The update entry: one change of the deployment's configuration, decided
-//! by the layer that owns it (`PUT /admin/config`, `specs/worker.md` §7).
+//! by the layer that owns it (`PUT /admin/config`).
 //!
 //! A change is one of three kinds. What the main processes are built from —
 //! their executable, the parallel ranks, the deployment file, the model's
@@ -266,8 +266,8 @@ impl Leader {
     }
 
     /// The epoch layer's arm of [`Leader::apply`]: a change that starts main
-    /// processes which differ in what they build is a switch between epochs
-    /// (`specs/worker.md` §7.4), and the two deployments alone decide it. It
+    /// processes which differ in what they build is a switch between epochs,
+    /// and the two deployments alone decide it. It
     /// answers `Ok(None)` when the change is another layer's — the host path,
     /// the programs, or nothing.
     ///

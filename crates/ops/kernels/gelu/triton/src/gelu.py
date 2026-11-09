@@ -8,11 +8,10 @@ PyTorch's two GELU forms, one program per block of the flattened row-major
   rather than ``0.5·x·(1 + tanh(u))`` because the logistic needs one exponential
   and saturates exactly at both ends.
 
-The formulas are the reference's (``uniserve_kernels/src/uniserve_kernels/
-activation.py``, ``_activate``), which evaluates them in FP32 and rounds once
-into the output: the exact form's error function and the tanh form's exponential
-are each accurate to about one unit in the last place of their own result, and
-the operator's tolerance covers that unit over ``|x| ≤ 8``.
+Both forms evaluate in FP32 and round once into the output: the exact form's
+error function and the tanh form's exponential are each accurate to about one
+unit in the last place of their own result, and the operator's tolerance covers
+that unit over ``|x| ≤ 8``.
 """
 
 import triton

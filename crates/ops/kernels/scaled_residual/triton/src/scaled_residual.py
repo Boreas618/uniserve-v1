@@ -4,10 +4,8 @@ Programs tile the flattened contiguous activation: each element adds one channel
 scale times the update's element into the residual, in place, with the biased
 update rounding before the product and the sum.
 
-The kernel body is the one UniServe launched before this package existed
-(``uniserve_kernels/src/uniserve_kernels/norm/residual.py``), unchanged except that
-it imports nothing but Triton: the launch-time wrapper, its operand checks and its
-torch types stay with the operator's Rust side.
+The kernel body imports nothing but Triton: the launch-time wrapper, its operand
+checks and its torch types stay with the operator's Rust side.
 """
 
 import triton

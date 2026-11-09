@@ -3,7 +3,7 @@
 //!
 //! An epoch is one configuration executed: its main processes on every node,
 //! their communicators, graphs and the storage they create
-//! (`specs/worker.md` §0). The leader's daemon keeps one [`EpochRecord`] per
+//! The leader's daemon keeps one [`EpochRecord`] per
 //! epoch: the [`proto::config::EngineConfig`] it was built from, the programs that fill its
 //! operators and its scheduling interface, the programs a probation keeps as
 //! the previous generation, and its [`Status`].

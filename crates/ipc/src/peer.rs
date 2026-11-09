@@ -1,5 +1,4 @@
-//! A main process's introduction to a peer main process (`specs/worker.md`
-//! §2.3).
+//! A main process's introduction to a peer main process.
 //!
 //! The main processes of one epoch are one build: the daemon starts them from
 //! the same build config, so their peer channel carries Rust messages and no

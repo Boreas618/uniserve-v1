@@ -1,7 +1,7 @@
-//! Probe for design 12's open question: **NCCL with graph capture in one process**.
+//! Probe for an open question of the design: **NCCL with graph capture in one process**.
 //!
-//! The design (specs/worker.md 2.4) gives each device one worker thread and one stream, and 4.5
-//! captures every bucket of that stream into a graph. A tensor-parallel or expert-parallel
+//! The design gives each device one worker thread and one stream, and captures every bucket of
+//! that stream into a graph. A tensor-parallel or expert-parallel
 //! collective inside a captured bucket is then an NCCL call issued from the capturing thread, in a
 //! process that drives more than one GPU - which is exactly the case the design leaves unverified.
 //!

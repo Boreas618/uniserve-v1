@@ -332,7 +332,7 @@ message Event {
 
 // A program: the backend that fills an operator or the scheduling interface,
 // the revision of its package the upstream Program Server numbered, and its
-// parameters (`specs/worker.md` §5.1). The Rust type is `crates/program-server`'s
+// parameters. The Rust type is `crates/program-server`'s
 // `Program`; this is only its wire form, which the daemon records and sends.
 message Program {
   // The backend's name, from the configuration field that selects it.
@@ -370,7 +370,7 @@ message KernelProgram {
 
 // A command for the main process of one epoch, from the daemon that manages
 // it. Commands go only downward: the main process reports on `Upstream`'s
-// `Report` and never commands the daemon (`specs/worker.md` §2.3).
+// `Report` and never commands the daemon.
 message Command {
   oneof kind {
     // Park every request at a step boundary and execute nothing more: a

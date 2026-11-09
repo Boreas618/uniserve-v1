@@ -1,5 +1,4 @@
-//! The deployment's updates: an epoch switch and the trial that decides it
-//! (`specs/worker.md` §7.4, §7.3, §2.5).
+//! The deployment's updates: an epoch switch and the trial that decides it.
 //!
 //! An update that changes what builds a main process re-builds the epoch
 //! ([`crate::epoch::layer`] returns [`crate::epoch::Layer::Epoch`]): each

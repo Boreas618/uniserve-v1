@@ -4,9 +4,7 @@ A request slot's continuation state is what the next call of the request reads
 on the device, without a host round trip: its next input token, its
 continuation predicate, its logical and sampling positions, its verified cache
 length and its penalty counts. This program is that commit, one program for the
-whole step, and it is the reference kernel's
-(``uniserve/sampling/state.py::_commit_kernel``) with the descriptor naming the
-state's element types.
+whole step, with the descriptor naming the state's element types.
 
 Each row names its slot, a mode and, when it sampled, the task whose selection
 it installs:

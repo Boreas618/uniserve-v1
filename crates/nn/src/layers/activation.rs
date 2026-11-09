@@ -1,9 +1,9 @@
 //! The gated activation of a transformer's MLP: the activation of one projection half times the
 //! other.
 //!
-//! Two packings occur, each an operator of its own (specs/worker.md 9, "SwiGLU";
-//! `ops::activation`): [`GatedActivation`] over two arbitrary views, and [`SwiGlu`] over one packed
-//! `[value, gate]` projection with its packed bias. The H3 block's MLP uses the packed form; the
+//! Two packings occur, each an operator of its own (`ops::activation`): [`GatedActivation`] over
+//! two arbitrary views, and [`SwiGlu`] over one packed `[value, gate]` projection with its packed
+//! bias. The H3 block's MLP uses the packed form; the
 //! expert GEMMs use the separate forms.
 //!
 //! **Every gated activation in this module may write in place.** `out` may be the same view as one
@@ -383,8 +383,7 @@ impl PackedSwiGlu {
 ///
 /// H3's audio VAE and its diffusion transformer take PyTorch's tanh form
 /// (`gelu_pytorch_tanh`); a checkpoint whose config says plain `gelu` takes the exact one. They are
-/// separate compilations, so the layer states which it is (specs/worker.md 9, "GELU";
-/// `ops::gelu`).
+/// separate compilations, so the layer states which it is (`ops::gelu`).
 pub struct Gelu {
     approximation: ops::gelu::Approximation,
 }
@@ -441,8 +440,7 @@ impl Gelu {
 /// The audio VAE's periodic activation, `x + sin²(α·x)/(α + 1e-9)`, one frequency per channel.
 ///
 /// The encoder's blocks apply it and the decoder's alias-free activation composes it; `α` is the
-/// checkpoint's raw per-channel parameter, not a log-space pair (specs/worker.md 9, "Snake";
-/// `ops::snake`).
+/// checkpoint's raw per-channel parameter, not a log-space pair (`ops::snake`).
 pub struct Snake {
     channels: u64,
 }
@@ -509,7 +507,7 @@ impl Snake {
 ///
 /// A plain activation, not a gate: the timestep embedding is `Linear → SiLU → Linear` over one
 /// buffer, and folding it into a doubled gate buffer would compute a product nobody asks for
-/// (specs/worker.md 9, 门控残差; `ops::activation::Silu`).
+/// (`ops::activation::Silu`).
 pub struct Silu;
 
 impl Silu {

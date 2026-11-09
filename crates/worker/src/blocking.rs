@@ -1,4 +1,4 @@
-//! The main process's blocking thread pool (`specs/worker.md` §2.4).
+//! The main process's blocking thread pool.
 //!
 //! The main process does four kinds of blocking host work: loading modules,
 //! reading transfers, reclaiming shared storage, and encoding, muxing and

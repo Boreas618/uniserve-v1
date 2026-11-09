@@ -6,10 +6,8 @@ the two-step ``F.pad`` result element for element: every element is a copy of on
 source element or zero. Output frames before ``pad_front`` are zero; every other
 output pixel copies the reflected or replicated source pixel.
 
-The kernel body is the one UniServe launched before this package existed
-(``uniserve_kernels/src/uniserve_kernels/norm/frame.py``), unchanged except that
-it imports nothing but Triton: the launch-time wrapper, its operand checks and
-its torch types stay with the operator's Rust side.
+The kernel body imports nothing but Triton: the launch-time wrapper, its operand
+checks and its torch types stay with the operator's Rust side.
 """
 
 import triton

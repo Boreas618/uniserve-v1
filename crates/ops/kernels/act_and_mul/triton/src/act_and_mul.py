@@ -5,10 +5,8 @@ mostly-masked tail program. ``gate`` and ``value`` are arbitrary views whose
 rows are each one stride apart and unit-strided per channel; the activation
 evaluates in FP32 and the product rounds to the output type.
 
-The kernel body is the one UniServe launched before this package existed
-(``uniserve_kernels/src/uniserve_kernels/activation.py``), unchanged except that
-it imports nothing but Triton: the launch-time wrapper, its operand checks and
-its torch types stay with the operator's Rust side.
+The kernel body imports nothing but Triton: the launch-time wrapper, its operand
+checks and its torch types stay with the operator's Rust side.
 """
 
 import triton

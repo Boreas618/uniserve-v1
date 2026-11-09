@@ -5,8 +5,8 @@
 //! ```
 //!
 //! `α` is `[channels]`, stored as it is used (not in log space), one frequency and reciprocal gain per
-//! channel: `uniserve/models/minimax_h3/audio_vae.py:297-311` defines the decoder's activation with a
-//! single `nn.Parameter(torch.ones(1, channels, 1))` and evaluates exactly the formula above. The
+//! channel: the audio VAE decoder's activation holds a single
+//! `nn.Parameter(torch.ones(1, channels, 1))` and evaluates exactly the formula above. The
 //! epsilon keeps the reciprocal finite for a zero frequency; it is part of the formula and not a
 //! guard a kernel may drop.
 //!
@@ -16,7 +16,7 @@
 //! parameters, so folding them behind a flag would make one operator read a weight the other's
 //! checkpoint does not have.
 //!
-//! The program is a kernel program (specs/worker.md 9, "pad, upsample, SnakeBeta, downsample"): one
+//! The program is a kernel program: one
 //! element of `out` per thread, the channel taken from the linear index so each thread reads one
 //! `α`. `x` and `out` must be row-major, which is what the convolution that feeds the activation
 //! produces.

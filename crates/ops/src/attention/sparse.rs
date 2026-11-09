@@ -3,7 +3,7 @@
 //! H3's video backbone does not attend densely: every query tile keeps a small set of `tile`-row
 //! key blocks, chosen per head and per query tile by a score the caller computes. This operator
 //! evaluates exactly the selected blocks and nothing else, so its cost follows the selection rather
-//! than the sequence length (specs/worker.md 9, "VSA SM100 64 行").
+//! than the sequence length.
 //!
 //! ```text
 //! query   [query_rows, heads, head_dim]          rows are whole tiles

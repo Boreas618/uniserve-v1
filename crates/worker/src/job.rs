@@ -1,6 +1,6 @@
 //! The device worker's queue: what every thread hands the device, in submission order.
 //!
-//! One worker thread per device performs every command (specs/worker.md 2.4). A command is one
+//! One worker thread per device performs every command. A command is one
 //! of:
 //!
 //! - a batch to serve, which the thread stages and replays through the runner that serves its

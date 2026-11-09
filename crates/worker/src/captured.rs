@@ -1,7 +1,7 @@
 //! One captured graph: its executable, the template it came from, the nodes each operator launch
 //! added, and the kernels it references.
 //!
-//! `Captured` is the design's struct (specs/worker.md 4.5) and it exists for two reasons beyond
+//! `Captured` is the design's struct and it exists for two reasons beyond
 //! replay:
 //!
 //! - **Rebind** needs the node of each operator launch. `nodes` records, per launch, the graph

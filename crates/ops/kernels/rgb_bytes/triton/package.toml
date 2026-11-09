@@ -40,9 +40,9 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a", "sm_100f"]
 
 [kernel.descriptors]
-# `f16` is what the video VAE's raster is (`uniserve/models/minimax_h3/output.py`'s
-# state buffer); `bf16` and `f32` are accepted because the arithmetic is the same
-# either way and the reference converts to FP32 before the de-normalization.
+# `f16` is the video VAE's raster dtype; `bf16` and `f32` are accepted because the
+# arithmetic is the same either way: the values convert to FP32 before the
+# de-normalization.
 dimensions = { dtype = ["f16", "bf16", "f32"], channels = ["3"], block = ["1024", "2048"], pdl = ["true", "false"] }
 
 [parameters]

@@ -1,4 +1,4 @@
-//! The vocabulary of a program-layer update (`specs/worker.md` §7.3).
+//! The vocabulary of a program-layer update.
 //!
 //! A program-layer update moves through precopy, switchover, probation and
 //! commit or revert, and ends with a purge. The daemon drives it and every main

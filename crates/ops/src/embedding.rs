@@ -2,7 +2,7 @@
 //!
 //! The vocabulary is sharded across tensor-parallel ranks, and the mathematical embedding of a
 //! token that lies in another rank's shard is zero on this rank: every rank adds its own rows and
-//! the ranks then all-reduce, which the layer performs (specs/worker.md 9, "词嵌入"). The operator
+//! the ranks then all-reduce, which the layer performs. The operator
 //! is therefore a gather with a mask, and two implementations of it agree bit for bit.
 
 use std::fmt;

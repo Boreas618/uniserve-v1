@@ -1,7 +1,7 @@
 //! The residual stream's normalization layer: a channel-scaled update folded into the residual,
 //! and the normalization of the rows that follow.
 //!
-//! Four compositions, each one operator (specs/worker.md 9, the MiniMax-H3 table; `ops::residual`):
+//! Four compositions, each one operator (`ops::residual`):
 //! `scaled_residual`, `scaled_residual_rms_norm`, `scaled_residual_layer_norm`, `weighted_rms_norm`.
 //! A block that uses them reads its residual once instead of running an add, a reduction and a
 //! scale as separate launches.
@@ -393,7 +393,7 @@ impl ScaledResidualLayerNorm {
 /// The Euler step passes `α = σ − σ_next`, `β = 1`; the probability-flow start passes `β = σ₀`,
 /// `α = 0`. Both coefficients are host values, so a captured graph stays valid, and the two
 /// operands' element types differ on purpose — a BF16 trajectory stepped by an FP32 velocity
-/// (specs/worker.md 9, 求解器; `ops::residual::ScaledAdd`).
+/// (`ops::residual::ScaledAdd`).
 pub struct ScaledAdd;
 
 impl ScaledAdd {

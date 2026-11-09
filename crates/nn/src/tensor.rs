@@ -2,7 +2,7 @@
 //!
 //! The view types are not defined here. [`TensorView`], [`Shape`], [`Strides`], [`DType`] and
 //! [`DevicePtr`] are [`ops`] types, because they are the ABI of an operator's arguments and `ops`
-//! depends on `platform` alone (specs/worker.md 4.2, 4.3); `nn` re-exports them so a model writes
+//! depends on `platform` alone; `nn` re-exports them so a model writes
 //! `nn::TensorView`, not two names for one thing.
 //!
 //! What `nn` adds is [`Backing`]: the retained region a weight view borrows. The worker publishes

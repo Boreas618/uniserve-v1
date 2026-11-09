@@ -14,7 +14,7 @@
 #
 # Both halves are here, and both run one program per (column, unit slot) -- grid
 # `(columns, units_per_page, 1)`. An FP8 destination grows the unit's scale to cover the span and
-# rescales the unit's resident values first (`uniserve/prefix_cache/mha.py:257-304`: one amax over the
+# rescales the unit's resident values first (one amax over the
 # whole span, floored at 1e-12, ceiling 448.0, growth only when the cell is initialized). A grid with a
 # token axis could not do that: every token's program would compute its own partial amax and race
 # several scales into one cell, which is a different tensor rather than a different last bit.

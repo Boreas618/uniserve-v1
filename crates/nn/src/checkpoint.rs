@@ -18,9 +18,8 @@
 //!
 //! ## File identity
 //!
-//! Retained weights are keyed by the identity of the files they were read from (specs/worker.md 8),
-//! so a checkpoint edited after it was loaded cannot silently serve the old retained bytes. The rule
-//! is the one `uniserve/loading/retained.py` implements:
+//! Retained weights are keyed by the identity of the files they were read from, so a
+//! checkpoint edited after it was loaded cannot silently serve the old retained bytes. The rule is:
 //!
 //! - a file of a Hugging Face cache is a link to a blob named by a digest of its contents (SHA-256
 //!   for a large file, the git blob SHA-1 otherwise), and the cache writes a blob once, so the blob's

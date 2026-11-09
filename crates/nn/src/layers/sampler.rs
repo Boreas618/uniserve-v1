@@ -1,8 +1,7 @@
 //! Sampling: the request's penalties, its candidate filtering, its draw, and the log-probabilities
 //! it reports.
 //!
-//! One sampling step is a fixed sequence of operator launches over one row per active request
-//! (specs/worker.md 9, "采样"; `uniserve/sampling/top_k.py` today):
+//! One sampling step is a fixed sequence of operator launches over one row per active request:
 //!
 //! ```text
 //! logits [rows, vocabulary]        → logits_shape   → shaped [rows, vocabulary] f32
@@ -39,9 +38,8 @@
 //! shaped logits keep the logits' order and its largest candidate is the temperature-zero token. The
 //! temperature of each row is a request parameter, so the worker knows which rows are greedy and
 //! routes them: `argmax` over the row's logits for those, this path's draw for the rest. No draw can
-//! replace that step, because the draw path's candidates are sorted by token id before the CDF (the
-//! step the reference takes at `uniserve/sampling/top_k.py:307-314`), so a draw of zero selects the
-//! lowest token id rather than the largest logit.
+//! replace that step, because the draw path's candidates are sorted by token id before the CDF, so
+//! a draw of zero selects the lowest token id rather than the largest logit.
 //!
 //! ## Rows that cannot be sampled
 //!
@@ -86,14 +84,10 @@ pub struct SamplerState {
     /// `[rows, PARAMETER_COLUMNS]` f32: temperature, top-k width, top-p, min-p, repetition,
     /// frequency and presence in [`ops::sampler::PARAMETER_COLUMNS`] order.
     ///
-    /// That order is the operators' and the worker writes it. The reference's own table
-    /// (`uniserve/sampling/top_k.py:41-43`) is `temperature, top-p, min-p, typical-p, repetition,
-    /// frequency, presence, top-k`, so it agrees on the four columns this layer's shaper reads
-    /// (0, 4, 5, 6) and differs on the three its cutoffs read: our 1 is the top-k width where the
-    /// reference's 1 is the nucleus threshold, our 2 is that threshold where its 2 is min-p, and our
-    /// 3 is min-p where its 3 is typical-p. Aligning ours to it would therefore turn a top-k width
-    /// into a nucleus threshold and a nucleus threshold into a min-p threshold on every request,
-    /// which no shape check can see. This doc and `Sampler::check` are the only two places in this
+    /// That order is the operators' and the worker writes it. A column's meaning is its position
+    /// alone, so a writer using another order would turn a top-k width into a nucleus threshold
+    /// and a nucleus threshold into a min-p threshold on every request, which no shape check can
+    /// see. This doc and `Sampler::check` are the only two places in this
     /// crate that know the count, and the check uses the constant, so a column added to the
     /// operators needs nothing here.
     pub parameters: TensorView,
@@ -242,8 +236,8 @@ impl Sampler {
     /// The candidates reach [`InverseCdf`] in ascending token id order: [`TopK`] writes them by
     /// descending logit, [`FilterCandidates`] preserves that, and [`CandidateOrder`] permutes both
     /// the values and the ids into token order, which is what makes a fixed draw select the same
-    /// token as the reference's (`uniserve/sampling/top_k.py:307-314`). Greedy rows do not go through
-    /// this method at all — see [`Self::greedy`].
+    /// token whatever order the top-k program kept the candidates in. Greedy rows do not go
+    /// through this method at all — see [`Self::greedy`].
     pub fn forward(
         &self,
         f: &Forward,
@@ -303,9 +297,8 @@ impl Sampler {
         f.operate::<FilterCandidates>(&filter, args)?;
 
         // 3. Token order, because the draw must not depend on the order the top-k program kept the
-        // candidates in: the reference reorders them by token id before its inverse CDF
-        // (`uniserve/sampling/top_k.py:307-314`), and a fixed draw selects the same token only when
-        // the columns mean the same thing on both sides.
+        // candidates in: ordered by token id before the inverse CDF, a fixed draw selects the same
+        // token for the same candidate set.
         let order = self.order_descriptor();
         let args = OrderArgs {
             values: candidates.values,
@@ -595,9 +588,9 @@ impl Sampler {
     /// Take each row's largest shaped logit as its token, and report its log-probability when
     /// `samples` carries one.
     ///
-    /// This is the reference's greedy step (`torch.max` over the shaped row, `uniserve/sampling/
-    /// greedy.py`), for the rows whose temperature is zero. It runs the same shaper as [`Self::forward`]
-    /// and nothing else: no candidate set, no cutoffs, no draw. It is a separate launch sequence
+    /// This is the greedy step (`torch.max` over the shaped row, the lowest index among ties), for
+    /// the rows whose temperature is zero. It runs the same shaper as [`Self::forward`] and nothing
+    /// else: no candidate set, no cutoffs, no draw. It is a separate launch sequence
     /// rather than a branch inside `forward`, because the worker's buckets are homogeneous in the
     /// path their rows take and a bucket's captured plan is one of the two.
     pub fn greedy(

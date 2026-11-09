@@ -1,6 +1,5 @@
 //! The generation bounds a checkpoint's architecture allows, which the
-//! deployment's engine is configured from before its workers report their own
-//! (`specs/worker.md` §4.2).
+//! deployment's engine is configured from before its workers report their own.
 
 use super::ModelConfig;
 

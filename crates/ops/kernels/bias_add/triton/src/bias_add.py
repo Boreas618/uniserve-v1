@@ -17,8 +17,7 @@ merge into one strided axis with unit position stride — contiguous channel-fir
 and channels-last are both that shape read with different strides — and the two
 strides travel as words. ``out`` is written contiguous, channel-first.
 
-The additions are the reference's (``uniserve_kernels/src/uniserve_kernels/
-bias.py``): each is one IEEE round-to-nearest FP32 addition, which the compiler
+Each addition is one IEEE round-to-nearest FP32 addition, which the compiler
 cannot contract or flush, and the store rounds once into the output dtype.
 """
 

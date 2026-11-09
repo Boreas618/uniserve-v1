@@ -1,5 +1,5 @@
 //! One epoch switch: the phases that move a deployment's main processes from
-//! the serving epoch to a target one (`specs/worker.md` §7.4, §7.3, §2.5).
+//! the serving epoch to a target one.
 //!
 //! The switch is driven by events the node roster delivers and by the
 //! operator's commit or rollback; every phase ends on an acknowledgement a

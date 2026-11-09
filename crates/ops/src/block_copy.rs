@@ -11,8 +11,8 @@
 //!
 //! The two launches run in that order: every source block is read into the snapshot before any
 //! target is written, so the vectors may name overlapping blocks. A field that stores an encoded
-//! format one byte wide is copied as bytes, which is why the element type here is the storage's
-//! (specs/worker.md 8, the block copy of the prefix cache). A negative index reads block zero (the
+//! format one byte wide is copied as bytes, which is why the element type here is the storage's.
+//! A negative index reads block zero (the
 //! inactive pair's placeholder) and writes nothing.
 
 use std::fmt;

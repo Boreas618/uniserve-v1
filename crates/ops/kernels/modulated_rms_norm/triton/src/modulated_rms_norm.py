@@ -7,10 +7,8 @@ folds a gated update in, writes an E4M3 output with a per-row scale, and retains
 source; the row count comes from the grid. The three modulation row strides are launch arguments,
 because one parameter table serves many activation rows and its layout is the model's.
 
-The kernel body is the one UniServe launched before this package existed
-(``uniserve_kernels/src/uniserve_kernels/norm/modulation.py``), unchanged except that it imports
-nothing but Triton: the launch-time wrapper, its operand checks and its torch types stay with the
-operator's Rust side.
+The kernel body imports nothing but Triton: the launch-time wrapper, its operand checks and its
+torch types stay with the operator's Rust side.
 """
 
 import triton

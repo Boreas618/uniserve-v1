@@ -1,6 +1,6 @@
 //! The device worker: one thread per device, the only issuer of work to that device's streams.
 //!
-//! The design (specs/worker.md 2.4) gives the worker thread one command at a time, in submission
+//! The design gives the worker thread one command at a time, in submission
 //! order: serve a batch, prepare or switch a generation, release an old one, perform a storage
 //! owner's copies and fences, or wait for the events deferred release hangs on. It blocks only on
 //! the current command's device work, so the command it is performing is exactly what the control

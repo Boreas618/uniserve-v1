@@ -8,7 +8,7 @@ over a row-major ``[rows, channels, width]`` signal with one linear frequency ``
 element of ``out`` per thread; the channel comes from the linear index, so each thread reads one
 ``α``.
 
-The formula is the decoder's own (``uniserve/models/minimax_h3/audio_vae.py``, ``Snake.forward``):
+The formula is the audio decoder's Snake activation:
 ``values + (alpha + 1e-9).reciprocal() * sin(alpha * values).pow(2)``. The epsilon keeps the
 reciprocal finite for a zero frequency and is part of the formula, not a guard. The arithmetic is
 FP32 and the stored value rounds once into the output dtype, which the operator's tolerance covers

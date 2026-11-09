@@ -39,9 +39,8 @@
 //!   call: how the step advances the slot's device state. A decode advances by
 //!   its sampled token; a prefill that samples installs its token at the host
 //!   coordinates; a prefill that samples nothing only states its cache extent;
-//!   a verification installs the base its accepted span advances from. The
-//!   rules are the reference's (`uniserve/worker/text/commit.py`), which is
-//!   where every cell of the table is decided, and nothing here is a default:
+//!   a verification installs the base its accepted span advances from. Every
+//!   cell of the table is decided by these rules, and nothing here is a default:
 //!   a call the table cannot state — a decode or a verification that samples
 //!   nothing, a row writing past its block table — answers `None`.
 //!

@@ -6,9 +6,7 @@ of member ``m``'s interval is row ``m · owner_rows + start + i`` of ``fine`` an
 contiguous ``[members, count, heads, width]`` payload, with the arithmetic of
 ``vsa_add_gated_tiles``.
 
-The kernel body is the one UniServe launched before this package existed
-(``uniserve_kernels/src/uniserve_kernels/attention/vsa_segments.py``), unchanged
-except that it imports nothing but Triton: the launch-time wrapper, its operand
+The kernel body imports nothing but Triton: the launch-time wrapper, its operand
 checks and its torch types stay with the operator's Rust side.
 """
 

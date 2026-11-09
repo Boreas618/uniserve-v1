@@ -1,4 +1,4 @@
-//! The warming of an epoch switch (`specs/worker.md` §7.4 step 1): the
+//! The warming of an epoch switch: the
 //! requests in flight reach the target's cache before the switchover, so that
 //! each computes at most a bounded tail again at the promotion.
 //!

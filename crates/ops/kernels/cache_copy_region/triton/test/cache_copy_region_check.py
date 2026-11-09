@@ -15,8 +15,7 @@ branches of its own:
   ``max(old, proposed)``, every resident byte must be rescaled by ``old/new`` so it decodes to the same
   number it did before, and the span must be encoded with the new scale.
 
-The reference is `uniserve/prefix_cache/mha.py:257-304`, and the numbers below are that code's
-expression, in that order.
+The expected numbers below are the quantizing write's expression, evaluated in the order above.
 
     TRITON_INTERPRET=1 python copy_region_check.py [--package .]
 """

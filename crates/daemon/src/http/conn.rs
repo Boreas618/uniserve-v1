@@ -3,7 +3,7 @@
 //! hyper cannot hand a connection over: its chunked-encoding position, its
 //! write buffer and the request bytes it read ahead all live inside it, and a
 //! daemon that a hot restart replaces must know all three to give a response
-//! in flight to its successor (design `specs/worker.md` §7.5.1). So the daemon
+//! in flight to its successor. So the daemon
 //! serves its own connections: this module accepts, reads one request at a
 //! time, gives the router the same [`Request`] axum's extractors and handlers
 //! already take, and frames the response itself — content-length for a body of

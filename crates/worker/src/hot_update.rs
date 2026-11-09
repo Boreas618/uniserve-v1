@@ -1,5 +1,5 @@
 //! The program-layer update inside one main process: its phases, its
-//! bookkeeping and its decisions (`specs/worker.md` §7.3).
+//! bookkeeping and its decisions.
 //!
 //! The phases are the virtual machine's live-migration phases: precopy prepares
 //! the new generation while serving goes on, switchover cuts over at one batch

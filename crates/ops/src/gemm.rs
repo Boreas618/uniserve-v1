@@ -16,7 +16,7 @@
 //! module and fails here.
 //!
 //! The program is a native library: cuBLASLt's algorithm choice, its workspace and its epilogue are
-//! the package's tuning data (specs/worker.md 5.4) and its host code, so the grid is the library's
+//! the package's tuning data and its host code, so the grid is the library's
 //! and this launch computes none. The library receives [`Call`], whose layout the package's header
 //! mirrors.
 

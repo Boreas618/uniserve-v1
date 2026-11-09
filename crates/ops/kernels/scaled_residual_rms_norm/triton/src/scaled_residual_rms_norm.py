@@ -6,10 +6,8 @@ row, stores the sum rounded to the residual's dtype, and stores the RMS-normaliz
 *unrounded* sum, as the eager expression does. With ``absmax`` the program also
 stores the largest magnitude of its stored normalized row.
 
-The kernel bodies are the ones UniServe launched before this package existed
-(``uniserve_kernels/src/uniserve_kernels/norm/residual.py``), unchanged except that
-they import nothing but Triton: the launch-time wrapper, its operand checks and
-its torch types stay with the operator's Rust side.
+The kernel bodies import nothing but Triton: the launch-time wrapper, its operand
+checks and its torch types stay with the operator's Rust side.
 """
 
 import triton

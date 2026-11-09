@@ -1,5 +1,5 @@
 //! Weights: the layout the reading operator declares, the key retained storage files them under,
-//! and the loader that converts a checkpoint's tensors once (specs/worker.md 4.3, 8).
+//! and the loader that converts a checkpoint's tensors once.
 //!
 //! ## The layout
 //!
@@ -12,12 +12,11 @@
 //!
 //! ## The key
 //!
-//! Retained weights are keyed by exactly the four inputs the design names (specs/worker.md 8): the
-//! identity of every checkpoint file whose bytes produced the weight, the element type the weight
-//! has after conversion, the layout name, and the weight's region in its logical tensor. No program
-//! name or revision enters the key: a program-layer update keeps every retained weight (specs/worker.md
-//! 7.3). A change of dtype, quantization, layout or checkpoint therefore changes the key, and a
-//! change of an operator's program does not.
+//! Retained weights are keyed by exactly four inputs: the identity of every checkpoint file whose
+//! bytes produced the weight, the element type the weight has after conversion, the layout name,
+//! and the weight's region in its logical tensor. No program name or revision enters the key: a
+//! program-layer update keeps every retained weight. A change of dtype, quantization, layout or
+//! checkpoint therefore changes the key, and a change of an operator's program does not.
 //!
 //! ## Publishing
 //!
@@ -37,8 +36,7 @@ use crate::checkpoint::{Checkpoint, FileIdentity};
 use crate::error::{Error, Result};
 use crate::tensor::{Backing, DevicePtr};
 
-/// The suffix one export spells each field of a calibrated NVFP4 projection with (specs/worker.md
-/// 8, 9).
+/// The suffix one export spells each field of a calibrated NVFP4 projection with.
 ///
 /// A calibrated checkpoint states a projection's fields as four tensor names that differ only in
 /// their suffix, and the suffix set is a property of the export, not of the format: two calibration
@@ -71,8 +69,7 @@ pub struct Nvfp4Names {
 impl Nvfp4Names {
     /// The vLLM/ModelOpt spelling: `weight`, `weight_scale`, `weight_scale_2`, `input_scale`.
     ///
-    /// This is what a Qwen3-MoE calibrated checkpoint states, and what
-    /// `uniserve/quantization/quantizer.py` writes.
+    /// This is what a Qwen3-MoE calibrated checkpoint states.
     pub const fn vllm() -> Self {
         Self {
             export: "vLLM ModelOpt",
@@ -160,7 +157,7 @@ impl fmt::Display for WeightLayout {
 
 /// An explicitly requested quantization method.
 ///
-/// The names are SGLang's `quantization` values (specs/worker.md 1, 9): an explicit value converts
+/// The names are SGLang's `quantization` values: an explicit value converts
 /// the checkpoint's weights once, at load; with none, the checkpoint's own representation is kept.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Quantization {
@@ -458,7 +455,7 @@ impl fmt::Display for Provenance {
     }
 }
 
-/// What retained storage files a weight under (specs/worker.md 8).
+/// What retained storage files a weight under.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct WeightKey {
     /// The identity of every checkpoint file the weight was read from, in part order.
@@ -501,7 +498,7 @@ impl fmt::Display for WeightKey {
 ///
 /// The worker implements this over the Storage Server and its read-only device mappings: a
 /// weight already retained under the key is handed back without reading the checkpoint again, and a
-/// converted weight is published once (specs/worker.md 8, "只转换一次").
+/// converted weight is published once.
 pub trait RetainedWeights {
     /// The weight retained under `key`, when the store already holds it.
     fn retained(&mut self, key: &WeightKey) -> Result<Option<Backing>>;
@@ -963,7 +960,7 @@ impl<'a> WeightLoader<'a> {
     /// A loader over `checkpoint` publishing to `store`.
     ///
     /// `dtype` and `quantization` are the launch's explicit precision choices; with neither, a
-    /// weight keeps the checkpoint's representation (specs/worker.md 1).
+    /// weight keeps the checkpoint's representation.
     pub fn new(
         checkpoint: &'a Checkpoint,
         store: &'a mut dyn RetainedWeights,
@@ -1314,7 +1311,7 @@ impl<'a> WeightLoader<'a> {
     /// A pipeline root holds one component per subdirectory (`transformer/`, `vae/`,
     /// `text_encoder/`, …), each with its own index and its own file identities, so a model crate
     /// opens the root once and reads every component through one store: a weight converted once for
-    /// one component is reused for another and never converted twice (specs/worker.md 8).
+    /// one component is reused for another and never converted twice.
     ///
     /// The policy is the loader's, not the component's, so a component that its policy does not
     /// describe is refused here: an FP8-policy loader over a BF16 component, or a float policy over
@@ -1369,10 +1366,9 @@ impl<'a> WeightLoader<'a> {
     /// scale.
     ///
     /// A calibrated checkpoint already holds the encoded fields (`values`, `block_scale`,
-    /// `tensor_scale`, `uniserve/quantization/quantizer.py`), so nothing is quantized here: the
-    /// three are published through retained storage under keys naming the scale layout, and a
-    /// deployment that asks to quantize a BF16 checkpoint at load does it with the
-    /// `nvfp4_quantize` operator on the device, which is where the reference encodes too.
+    /// `tensor_scale`), so nothing is quantized here: the three are published through retained
+    /// storage under keys naming the scale layout, and a deployment that asks to quantize a BF16
+    /// checkpoint at load does it with the `nvfp4_quantize` operator on the device.
     ///
     /// `file` is the arrangement the checkpoint stores its block scales in and `product` the one the
     /// deployment's kernels read; when the two differ the table is permuted here, and
@@ -2139,7 +2135,7 @@ impl<'a> WeightLoader<'a> {
     /// Publish host-computed bytes as a weight, without a checkpoint tensor behind them.
     ///
     /// The rotary frequency table is the first such weight: `inv_freq` is computed once at loading
-    /// from `rope_theta` and `rope_scaling` (specs/worker.md 9), and the `rotary_factors` operator
+    /// from `rope_theta` and `rope_scaling`, and the `rotary_factors` operator
     /// reads it as a device weight, so it takes the same retained-storage path as a checkpoint
     /// weight. There is no file to name it, so the key states the **provenance**: the class that
     /// computed it, `producer`, and a digest of the bytes it produced. Two computations of the same
@@ -2504,7 +2500,7 @@ fn check_layout(tensor: &str, source: &WeightSource, layout: WeightLayout) -> Re
 ///
 /// The checkpoint is stored in one of the three floating-point formats every model here uses, and
 /// a conversion goes through `f32`: the design keeps a checkpoint's own representation unless the
-/// launch states another (specs/worker.md 1), and an explicit statement is one conversion.
+/// launch states another, and an explicit statement is one conversion.
 ///
 /// It is public because a boundary between two computations can need exactly one conversion and no
 /// loader: a model that hands a decoder a tensor its own layers produced states the pair it needs,

@@ -1,9 +1,8 @@
 //! Row-wise normalization: RMS normalization, its fused residual form, and layer normalization.
 //!
-//! Qwen3's decoder keeps a separate residual stream and fuses the residual add into the next norm
-//! (specs/worker.md 9, "RMSNorm 与 add-RMSNorm"; `uniserve/models/qwen3/transformer.py`): the sum is
-//! formed in FP32 and rounded once to the hidden dtype, so [`RmsNorm::forward_with_residual`] is one
-//! operator call and not an add followed by a norm.
+//! Qwen3's decoder keeps a separate residual stream and fuses the residual add into the next norm:
+//! the sum is formed in FP32 and rounded once to the hidden dtype, so
+//! [`RmsNorm::forward_with_residual`] is one operator call and not an add followed by a norm.
 
 use ops::TensorView;
 use ops::norm::{

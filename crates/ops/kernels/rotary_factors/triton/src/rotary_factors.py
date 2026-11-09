@@ -20,10 +20,8 @@ The positions of a sectioned call are ``[axes, tokens]``, contiguous, so axis
 positions are ``[tokens]``, and its key (and so its arguments) are what they
 always were.
 
-The kernel body is the one UniServe launched before this package existed
-(``uniserve_kernels/src/uniserve_kernels/rope.py``), unchanged except that it
-imports nothing but Triton: the shape and alias checks, the output allocation
-and the torch types stay with the operator's Rust side.
+The kernel body imports nothing but Triton: the shape and alias checks, the
+output allocation and the torch types stay with the operator's Rust side.
 """
 
 import triton

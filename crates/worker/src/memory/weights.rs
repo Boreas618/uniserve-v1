@@ -1,4 +1,4 @@
-//! The rank's retained weights (`specs/worker.md` §8).
+//! The rank's retained weights.
 //!
 //! A weight is converted once and kept: the loader reads a checkpoint tensor, converts it to the
 //! deployment's representation, publishes the bytes to the Storage Server under a key, and every

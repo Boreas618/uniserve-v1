@@ -14,9 +14,7 @@
 //! logical ids, so which experts a token picks, and the order of equal scores, do not depend on
 //! where the experts lie (`docs/admin.md`, Expert redistribution). The map is a launch value, a
 //! null pointer without one, so a captured graph reads whatever the table at its address says.
-//! The arithmetic and its order are those of the existing CUDA kernel
-//! (`uniserve_kernels/src/uniserve_kernels/csrc/topk_softmax.cu:52-197`), which in turn reproduces
-//! PyTorch's warp softmax and row-sum composition.
+//! The arithmetic and its order are those of PyTorch's warp softmax and row-sum composition.
 //!
 //! The bound between two implementations: the probabilities are a scale of positive terms, so the
 //! weights carry the `rounding` bound with the reduction length of the softmax, `experts`, and the

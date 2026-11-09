@@ -11,7 +11,7 @@
 //!
 //! One program handles one row and loads its whole row before storing, so the output may alias the
 //! input. `add_rms_norm` adds in FP32 and rounds once on the way to the output dtype, which is the
-//! fused residual normalization every model here uses (specs/worker.md 9, "RMSNorm 与 add-RMSNorm").
+//! fused residual normalization every model here uses.
 
 use std::fmt;
 

@@ -3,8 +3,8 @@
 //!
 //! ## Where this crate sits
 //!
-//! The call chain of one forward is `runner → model → layer → operator → kernel` (specs/worker.md
-//! 4). A model in `crates/models/<model>/` composes the layers here; a layer calls the operators of
+//! The call chain of one forward is `runner → model → layer → operator → kernel`. A
+//! model in `crates/models/<model>/` composes the layers here; a layer calls the operators of
 //! [`ops`] and nothing below them; the operator's launch code reaches the loaded kernel. `nn` owns
 //! no runtime object: it never allocates device memory, creates a stream, captures a graph or
 //! selects a program. Everything a forward needs arrives borrowed in [`Forward`].
@@ -43,7 +43,8 @@
 //!
 //! [`Checkpoint`] is a set of safetensors shards with the identity of every file;
 //! [`WeightLoader`] converts a tensor once into the layout its operator declares and publishes it
-//! to retained storage, keyed by the identity rules of specs/worker.md 8.
+//! to retained storage, keyed by the identity of the files it was read from, its converted element
+//! type, its layout and its region.
 
 pub mod capability;
 pub mod checkpoint;

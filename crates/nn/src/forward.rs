@@ -2,13 +2,13 @@
 //! arena and the communicator.
 //!
 //! A layer receives [`Forward`] and nothing else about the runtime: it cannot create a stream,
-//! allocate device memory, capture a graph, or look up a program (specs/worker.md 4.3, `AGENTS.md`,
+//! allocate device memory, capture a graph, or look up a program (`AGENTS.md`,
 //! Model Library Boundary). Every device address a layer writes is either an argument of the
 //! capability call or a view [`Arena`] handed out.
 //!
 //! ## The arena
 //!
-//! The design puts the concrete `Arena` of specs/worker.md 4.5 with the worker — a region of the
+//! The design puts the concrete activation arena with the worker — a region of the
 //! graph pool plus one static activation plan per captured bucket — but the worker also owns
 //! `Forward`'s borrow of it, and the crate dependency runs `worker → nn`, so the type itself
 //! lives here and the worker fills it. [`Arena`] is the bump region of one forward: the worker
@@ -151,7 +151,7 @@ impl Arena {
     }
 }
 
-/// The one operator a shadow forward runs twice (specs/worker.md 7.3).
+/// The one operator a shadow forward runs twice.
 pub struct Shadow<'a> {
     /// The operator whose programs are being compared, by `Op::NAME`.
     pub operator: &'static str,
@@ -188,7 +188,7 @@ impl<'a> Shadow<'a> {
     }
 }
 
-/// The borrowed execution resources of one forward (specs/worker.md 4.3).
+/// The borrowed execution resources of one forward.
 pub struct Forward<'a> {
     /// The stream this forward's work is issued on and the generation of loaded kernels the
     /// operators resolve their programs from, or `None` for a **recording** forward: one that states
@@ -431,7 +431,7 @@ impl<'a> Forward<'a> {
 
     /// Resolve `O`'s kernel for this descriptor and launch it.
     ///
-    /// When this forward shadows `O` at this descriptor key (specs/worker.md 7.3), the launch is
+    /// When this forward shadows `O` at this descriptor key, the launch is
     /// paired: the new kernel writes the twins and the previous generation's kernel writes the real
     /// outputs last, so the forward continues on the outputs it was going to compute anyway.
     /// Otherwise it is one launch of the current generation's kernel.
@@ -491,7 +491,7 @@ impl<'a> Forward<'a> {
     /// Tell the capture sink, when one is installed, that `O`'s program just launched.
     ///
     /// A capture records the graph nodes each operator launch added, and a program update rebinds
-    /// one operator's parameters at a time through that table (`specs/worker.md` 4.5). The key is
+    /// one operator's parameters at a time through that table. The key is
     /// formatted only when a sink will read it: every launch of a serving step passes through here,
     /// and a capture is the exception, not the rule.
     fn record<O: Op>(descriptor: &O::Descriptor) {

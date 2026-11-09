@@ -2,7 +2,7 @@
 //! pair.
 //!
 //! A convolution's geometry is part of its descriptor, because the program is compiled per shape
-//! family and selects a cuDNN engine for it from its tuning data (specs/worker.md 5.4, 9). The
+//! family and selects a cuDNN engine for it from its tuning data. The
 //! layer holds the geometry the model states and calls the matching operator; the descriptor's
 //! `tf32` flag is the model's numerical declaration for an FP32 convolution (the video VAE keeps it
 //! on, as the `quality` preset does).

@@ -9,10 +9,8 @@
 // [frames, channels, pixels] tensor PyTorch normalizes. The result is therefore bit
 // for bit PyTorch's, which is what the embedding that consumes it relies on.
 //
-// The device code is the reference extension's
-// (`uniserve_kernels/src/uniserve_kernels/norm/csrc/frame.cu`) with the ATen
-// operator, the ATen reduction and the ATen stream replaced by their vendored
-// counterparts and the call's stream.
+// The device code uses vendored counterparts of the ATen operator and the ATen
+// reduction, and launches on the call's stream.
 
 #include <cuda_runtime.h>
 

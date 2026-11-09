@@ -1,4 +1,4 @@
-//! The main process's resident memory (`specs/worker.md` §4 `MainProcess.memory`).
+//! The main process's resident memory.
 //!
 //! Resident memory is device storage the epoch keeps until it retires: the KV
 //! cache planes, the latent pages, the retained weights and the encoder cache. Every one of
@@ -33,7 +33,7 @@ use self::retained::ExclusiveStorage;
 use crate::Result;
 
 /// The main process's resident memory: the owners an epoch keeps until it
-/// retires (`specs/worker.md` §4).
+/// retires.
 ///
 /// Each owner is built by the process that knows its geometry and handed here,
 /// so that the main process holds one value for what a sleep gives back and a

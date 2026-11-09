@@ -3,8 +3,7 @@
 //! An importing rank receives another rank's cache export as raw keys and values. When the source does
 //! not store this rank's representation — a different element type, FP8 with other scale groups, or a
 //! page shape this rank does not store — the span is read into the workspace's scratch and converted,
-//! so imported values round and scale exactly as locally written ones (`uniserve/prefix_cache/
-//! conversion.py`; specs/worker.md 8, the prefix cache's conversion rows).
+//! so imported values round and scale exactly as locally written ones.
 //!
 //! Two programs do it, launched per span in this order, once per field:
 //!
@@ -19,7 +18,7 @@
 //! FP8 scale when the new rows need a larger one, rescales the unit's resident values, and raises the
 //! column's initialized flag. It runs **one program per (column, unit slot)**, and that program owns
 //! the written span of its cell: the scale grows once from one amax over the span
-//! (`max(scale, max(abs(span), 1e-12) / 448)`, `uniserve/prefix_cache/mha.py:257-304`) and the
+//! (`max(scale, max(abs(span), 1e-12) / 448)`) and the
 //! resident values are rescaled by `old/new` before the write. A program per token would compute a
 //! partial amax each and race several scales into one cell.
 //!
@@ -495,9 +494,9 @@ impl Op for CacheCopyRegion {
                 )
             })?);
         // One program per (column, unit slot): it owns the whole written span of that cell, so the
-        // FP8 path's amax is one reduction over the span rather than one per token - the reference
+        // FP8 path's amax is one reduction over the span rather than one per token - the write
         // takes `max(scale, max(abs(span), 1e-12) / 448)` once and rescales the unit's resident
-        // values by `old/new` before writing (`uniserve/prefix_cache/mha.py:257-304`). A program per
+        // values by `old/new` before writing. A program per
         // token would give every token its own partial amax and race several scales into one cell.
         kernel.launch(
             LaunchGrid::new([

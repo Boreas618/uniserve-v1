@@ -11,10 +11,7 @@
 // ActivationSiluKernel.cu. The module compiles without fast math, as PyTorch does,
 // so the composition is bit for bit PyTorch's.
 //
-// The device code is the reference extension's
-// (`uniserve_kernels/src/uniserve_kernels/norm/csrc/frame.cu`), unchanged; the
-// entry around it is this package's, and it launches the kernel from the call's
-// stream.
+// The package's entry launches the kernel from the call's stream.
 
 #include <cuda_runtime.h>
 

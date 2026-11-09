@@ -5,10 +5,8 @@ is unit-strided; each half has its own bias; the output is contiguous. Programs
 tile the output and, on request, each records the largest magnitude of its
 outputs after rounding to the output dtype.
 
-The kernel body is the one UniServe launched before this package existed
-(``uniserve_kernels/src/uniserve_kernels/activation.py``), unchanged except that
-it imports nothing but Triton: the launch-time wrapper, its operand checks and
-its torch types stay with the operator's Rust side.
+The kernel body imports nothing but Triton: the launch-time wrapper, its operand
+checks and its torch types stay with the operator's Rust side.
 """
 
 import triton

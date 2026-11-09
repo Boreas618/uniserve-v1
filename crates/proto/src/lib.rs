@@ -38,7 +38,7 @@ pub mod process {
 }
 
 /// The state a hot restart hands its successor for the responses in flight
-/// (`handoff.proto`, specs/worker.md §7.5.1).
+/// (`handoff.proto`).
 #[allow(clippy::all, reason = "code generated from the schema")]
 pub mod handoff {
     include!(concat!(env!("OUT_DIR"), "/uniserve.handoff.rs"));

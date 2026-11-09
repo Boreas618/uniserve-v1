@@ -1,5 +1,5 @@
 //! The launch file a main process is started with (`uniserve engine --launch
-//! <path>`, `specs/worker.md` §2.3, §7.4).
+//! <path>`).
 //!
 //! The engine takes the file's contents as its whole description: one flag,
 //! no second account of what the process is or which build it serves. The

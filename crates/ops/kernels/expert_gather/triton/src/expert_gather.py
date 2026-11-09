@@ -1,9 +1,8 @@
 """Expert id mapping: the Triton source of the ``expert_gather`` operator.
 
 One program maps a block of a token's top-k logical expert ids to their
-physical experts: ``out[i] = map[ids[i]]``. UniServe evaluated this with two
-ATen ops (``uniserve/nn/moe.py:287-288``); the mapping is one launch here, so a
-captured graph replays it without host work.
+physical experts: ``out[i] = map[ids[i]]``. The mapping is one launch,
+so a captured graph replays it without host work.
 """
 
 import triton

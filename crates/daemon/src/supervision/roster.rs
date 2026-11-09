@@ -1,5 +1,4 @@
-//! The epoch layer's [`Roster`] over the daemon's supervision
-//! (`specs/worker.md` §7.4, §7.3, §2.5).
+//! The epoch layer's [`Roster`] over the daemon's supervision.
 //!
 //! One adapter owns the deployment's main processes for the daemon's life: it
 //! starts and stops them through the leader service, commands the process of

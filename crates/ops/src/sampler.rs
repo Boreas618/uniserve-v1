@@ -2,32 +2,31 @@
 //! selected values.
 //!
 //! The steps are separate operators because each is one kernel program and each is replaced on its
-//! own during a program-layer update; the `Sampler` layer calls them in this order (specs/worker.md
-//! 9, "采样"):
+//! own during a program-layer update; the `Sampler` layer calls them in this order:
 //!
 //! 1. `logits_shape` applies the request's penalties and divides by its temperature. **A row whose
-//!    temperature is zero divides by one**, not by zero: `uniserve/sampling/select.py:443` states
-//!    the rule ("a zero temperature divides by one; callers select those rows by argmax"), and without
-//!    it every greedy request would be shaped into `inf` and `nan` logits. The shaped row is then the
-//!    penalized logits themselves, so the row's largest candidate is its greedy token.
+//!    temperature is zero divides by one**, not by zero: callers select those rows by argmax, and
+//!    without that rule every greedy request would be shaped into `inf` and `nan` logits. The
+//!    shaped row is then the penalized logits themselves, so the row's largest candidate is its
+//!    greedy token.
 //! 2. `top_k` keeps the `width` largest logits of each row, sorted, with the vocabulary id of each.
 //! 3. `filter_candidates` applies the row's top-k width, its nucleus threshold and its min-p
 //!    threshold, and reports whether the row's candidates form a usable distribution.
 //! 4. `softmax` over the candidates (the shared operator in [`crate::norm`]).
 //! 5. `inverse_cdf` draws one token per row from one uniform draw, inverting the row's cumulative
 //!    distribution in the candidate order the layer supplies; the operator has no order of its own
-//!    (`uniserve/sampling/categorical.py` inverts in the order it receives). **That order is the
+//!    and inverts in the order it receives. **That order is the
 //!    candidates sorted by token id**, not the descending logit order `top_k` leaves behind: the
-//!    reference reorders by token id before the draw "so inverse-CDF draws are deterministic for a
-//!    fixed random value independent of top-k kernel ordering, and matches the general path, which
-//!    selects in vocabulary order" (`uniserve/sampling/top_k.py:307-314`). The sort is a step of its
+//!    layer reorders by token id before the draw so that an inverse-CDF draw is deterministic for a
+//!    fixed random value whatever order the top-k kernel produced, and matches the general path,
+//!    which selects in vocabulary order. The sort is a step of its
 //!    own between the filtering and the draw, because the operator that filters does not reorder
 //!    rows. A consequence worth stating: a draw of zero selects the *lowest token id* of each row's
 //!    candidates, not its largest logit — no draw path produces a greedy token.
 //! 6. `argmax` picks the largest candidate, which is a row's greedy token: with the divide-by-one
 //!    rule the shaped row keeps the logits' order, so its largest candidate is the temperature-zero
-//!    token. The reference computes it separately — `torch.max`, with an `all_gather` across the
-//!    tensor-parallel ranks (`uniserve/sampling/greedy.py`) — because no draw can produce it once the
+//!    token. The layer computes it separately — an argmax, gathered across the tensor-parallel
+//!    ranks — because no draw can produce it once the
 //!    candidates are in token order.
 //! 7. `log_softmax` and `logprob_gather` report the log-probability of the tokens the caller asks
 //!    for.
@@ -47,9 +46,9 @@ use crate::{Error, Op, Result, Twins};
 
 /// The columns of one row of sampling parameters, in the order the worker writes them.
 ///
-/// The offsets are fixed by `uniserve/sampling/top_k.py` (`PARAMETER_COLUMNS`, with the temperature
-/// first, the repetition, frequency and presence penalties at 4, 5 and 6, and the top-k width, the
-/// nucleus threshold and the min-p threshold after them); the op reads only the parameters it names.
+/// The offsets are fixed (the temperature first, the repetition, frequency and presence penalties
+/// at 4, 5 and 6, and the top-k width, the nucleus threshold and the min-p threshold after them);
+/// the op reads only the parameters it names.
 pub const PARAMETER_COLUMNS: u32 = 8;
 
 /// The offset of the temperature among a row's parameters.
@@ -491,7 +490,7 @@ impl fmt::Display for InverseCdfDescriptor {
 #[derive(Clone, Copy)]
 pub struct InverseCdfArgs {
     /// `[rows, width]` FP32 candidate probabilities, in the order the caller supplies them; the layer
-    /// sorts by token id first (`uniserve/sampling/top_k.py:307-314`), so the draw does not depend on
+    /// sorts by token id first, so the draw does not depend on
     /// the order the top-k kernel happened to produce.
     pub probabilities: TensorView,
     /// `[rows, width]` the vocabulary ids of the candidates.
@@ -909,12 +908,11 @@ pub struct OrderArgs {
 /// in the order it is given and sorts nothing, while the reference reorders the candidates **by token
 /// id** before the draw "so inverse-CDF draws are deterministic for a fixed random value independent
 /// of top-k kernel ordering, and matches the general path, which selects in vocabulary order"
-/// (`uniserve/sampling/top_k.py:307-314`). Without this step a draw would depend on the order the
-/// top-k program happened to produce, which is exactly what the reference refuses to depend on.
+/// Without this step a draw would depend on the order the top-k program happened to produce.
 ///
 /// It permutes and nothing else: the row's greedy token is not read here. `Sampler::greedy` takes it
 /// from `argmax` over the shaped **full-vocabulary** row, where a column is a token id, so the index
-/// is the token and "lowest index among ties" is `torch.max`'s rule (`uniserve/sampling/greedy.py`);
+/// is the token and "lowest index among ties" is `torch.max`'s rule;
 /// reading a second greedy token from the candidate set here would be a second answer to the same
 /// question, and the two would eventually disagree about a tie.
 pub struct CandidateOrder;

@@ -13,9 +13,9 @@
 //! ```
 //!
 //! `above` and `left` are those tiles as they were decoded, never as they were blended, which is the
-//! reference's rule (`uniserve/nn/vae/tiled.py`, `stitch_tiles`): a neighbour stays unmodified so a
-//! corner is computed in the same order as an edge. `fade` is the reference's arithmetic in the
-//! element type at every step (`uniserve/nn/video.py`, `blend_decoded_overlap`): `position / extent`
+//! stitching rule: a neighbour stays unmodified so a
+//! corner is computed in the same order as an edge. `fade` is the overlap blend's arithmetic in the
+//! element type at every step: `position / extent`
 //! rounds, `1 - that` rounds, each product rounds and their sum rounds.
 //!
 //! The grid's geometry arrives as two tables, one row per pixel of each axis: the tile of that

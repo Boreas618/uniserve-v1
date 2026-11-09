@@ -1,6 +1,5 @@
 //! The trial an update stands while it is on probation: the thresholds of
-//! `update_config.rollback`, read against what the main processes report
-//! (`specs/worker.md` §7.3 step 4, §7.4 step 3).
+//! `update_config.rollback`, read against what the main processes report.
 //!
 //! A fault of the target reverts an update by itself, through the reports the
 //! switch reads. This module adds what no process can report about itself: that

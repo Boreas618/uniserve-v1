@@ -1,7 +1,7 @@
 //! The runner side of media work: what the main process's worker calls.
 //!
 //! The worker runs every method of [`MediaRunner`] on its blocking thread
-//! pool (`specs/worker.md` §2.4, §4.5): media work touches no stream and
+//! pool: media work touches no stream and
 //! schedules no job on a device. The worker owns the copies around it: it
 //! stages device frames and decoded audio in host storage, hands the host
 //! bytes here, and copies what the readers produce to the device products on

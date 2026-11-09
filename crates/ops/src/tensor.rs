@@ -1,7 +1,7 @@
 //! The numerical ABI an operator's launch code is written in: element types, shapes, strides and
 //! borrowed tensor views.
 //!
-//! These are the types a kernel program's parameters are made of (specs/worker.md 4.2, 4.3). They
+//! These are the types a kernel program's parameters are made of. They
 //! live in `ops` because `ops` depends on `platform` alone and both `ops` and `nn` need them; `nn`
 //! re-exports them. Everything here is plain data: no storage is owned, no allocation happens and
 //! nothing synchronizes. A view borrows device memory its owner keeps alive until the stream work
@@ -171,7 +171,7 @@ impl DType {
 
     /// The element type a reduction over this one accumulates in.
     ///
-    /// Every operator here accumulates a floating reduction in FP32 (specs/worker.md 9), so the
+    /// Every operator here accumulates a floating reduction in FP32, so the
     /// bounds are written with `u = 2^-24` whatever the input dtype is.
     pub const fn accumulate(self) -> Self {
         Self::F32

@@ -27,8 +27,8 @@ layout.
 import triton
 import triton.language as tl
 
-#: The reference's clamp of the log-variance (`uniserve/nn/vae/layers.py:134-203`). The lower bound is
-#: why an encoder variance of `1e-40` still conditions.
+#: The lower bound of the log-variance clamp, which is why an encoder variance of `1e-40` still
+#: conditions.
 CLAMP_MIN = tl.constexpr(-30.0)
 
 #: The upper bound of the same clamp.

@@ -2,8 +2,7 @@
 //!
 //! One operator for every attention a model computes over paged keys and values — a prefill of
 //! packed query rows and a decode of one query per row — with the phase in the descriptor, because
-//! the two phases select different kernels, grids and cubins inside the package
-//! (specs/worker.md 5.1, 5.2, 9).
+//! the two phases select different kernels, grids and cubins inside the package.
 //!
 //! ```text
 //! query      [tokens, q_heads, head_dim]      one dtype, row-major
@@ -69,11 +68,10 @@
 //! # The package
 //!
 //! The program is a native library: trtllm-gen's host code selects and loads its cubins, builds its
-//! TMA descriptors, carves its workspace and computes its own grid and cluster (specs/worker.md 9,
-//! `uniserve/backends/attention/trtllm.py:79-91, 163-205`), so [`Op::launch`] computes no grid and
-//! hands the library [`Call`]. FlashAttention-4's CuTe DSL package implements the same operation and
-//! the same call structure, and is chosen by `attention_backend` / `decode_attention_backend` /
-//! `prefill_attention_backend`.
+//! TMA descriptors, carves its workspace and computes its own grid and cluster, so [`Op::launch`]
+//! computes no grid and hands the library [`Call`]. FlashAttention-4's CuTe DSL package implements
+//! the same operation and the same call structure, and is chosen by `attention_backend` /
+//! `decode_attention_backend` / `prefill_attention_backend`.
 //!
 //! The workspace is the program's `workspace_size` argument (512 MiB for trtllm-gen), a transient
 //! region the worker allocates from its scratch pool and zeroes before its first use: trtllm-gen

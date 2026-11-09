@@ -1,6 +1,5 @@
 // The handoff interface: what a daemon hands the process that succeeds it so
-// that the responses it was writing go on without a break (specs/worker.md
-// §7.5.1).
+// that the responses it was writing go on without a break.
 //
 // A successor daemon of the same or another build takes the deployment's
 // listening socket, the connections of the responses in flight and the state

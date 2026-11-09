@@ -1,5 +1,5 @@
 //! Ulysses sequence-parallel exchange: the all-to-all that trades a token split for a head split
-//! and back (specs/worker.md 4.3, `UlyssesExchange`).
+//! and back.
 //!
 //! The exchange is a collective, not a kernel program: every rank sends the same number of bytes, so
 //! there is nothing to compile per geometry and the epoch record fills no program for it.
@@ -10,7 +10,7 @@
 //! received blocks read in member order are the whole sequence in order, for this rank's heads.
 //! Coming back the same collective moves the opposite blocks: block `m` of the send buffer is member
 //! `m`'s rows of this rank's heads, and block `m` of the receive buffer is this rank's rows of member
-//! `m`'s heads. The reference's `HeadExchange` (`uniserve/distributed/tokens.py`) is the same trade.
+//! `m`'s heads.
 
 use ops::TensorView;
 

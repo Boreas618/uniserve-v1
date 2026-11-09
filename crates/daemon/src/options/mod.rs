@@ -163,8 +163,7 @@ pub struct ServerArgs {
     #[arg(skip)]
     pub attention_backend: String,
     /// The attention program that fills prompt processing; unset takes
-    /// `attention_backend` (`prefill_attention_backend`, `specs/worker.md`
-    /// §5.2).
+    /// `attention_backend` (`prefill_attention_backend`).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(skip)]
     pub prefill_attention_backend: Option<String>,

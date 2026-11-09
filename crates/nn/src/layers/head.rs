@@ -2,10 +2,9 @@
 //!
 //! The head is a column-parallel projection across the tensor-parallel ranks: each rank holds a
 //! contiguous slice of the vocabulary rows, projects into its slice, the ranks all-gather the
-//! slices, and the padded tail the sharding added is removed (specs/worker.md 9, "lm_head 与
-//! logits"; the current `VocabParallelHead`). The row selection itself is the worker's: it
-//! gathers the rows whose logits the batch asks for before calling the head, so the head reads a
-//! `[rows, hidden]` view and a graph replays over a fixed row count.
+//! slices, and the padded tail the sharding added is removed. The row selection itself is the
+//! worker's: it gathers the rows whose logits the batch asks for before calling the head, so the
+//! head reads a `[rows, hidden]` view and a graph replays over a fixed row count.
 
 use ops::logits::{self, GatherDescriptor, LogitsGather, UnpadDescriptor, VocabUnpad};
 use ops::{DType, TensorView};

@@ -2,7 +2,7 @@
 //!
 //! A diffusion request starts from standard normal noise. Drawing it on the device means every
 //! element has an address, so a restored request redraws exactly the same values from its seed, and
-//! two requests in one batch draw independent streams (specs/worker.md 9, the initial-noise row).
+//! two requests in one batch draw independent streams.
 //! The address is the one `crates/ipc/src/philox.rs` gives a random draw:
 //!
 //! ```text

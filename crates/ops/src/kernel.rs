@@ -1,16 +1,16 @@
 //! Loaded kernels, their metadata, and the one place a kernel is launched or a native entry called.
 //!
 //! A [`Kernel`] is a module that has been loaded: a cubin loaded into a device's context, or a
-//! native library opened with the C entry it declares (specs/worker.md 4.2, 5.3). A
+//! native library opened with the C entry it declares. A
 //! [`Generation`](crate::Generation) holds one per (operator name, descriptor key) and is immutable
 //! once built, so a kernel stays loaded exactly as long as a generation or a captured graph holds
-//! it (specs/worker.md 7.3, purge).
+//! it.
 //!
 //! ## What a cubin launch takes from here and what from the package
 //!
 //! The grid is the operator's: it follows from the arguments. The thread-block shape, dynamic shared
 //! memory, cluster size, programmatic dependent launch, cooperative launch and global scratch come
-//! from the module's own metadata, which is Triton's JSON field for field (specs/worker.md 5.3), so
+//! from the module's own metadata, which is Triton's JSON field for field, so
 //! a package cannot declare one launch shape and produce a module for another.
 //!
 //! ## The native entry ABI
@@ -52,8 +52,7 @@ pub trait NativeCall {
 /// A module's launch metadata, in Triton's field names.
 ///
 /// Triton writes this JSON beside every cubin it compiles; `ops` reads those fields directly rather
-/// than defining a manifest of its own, so a module's launch shape travels with the module
-/// (specs/worker.md 5.3).
+/// than defining a manifest of its own, so a module's launch shape travels with the module.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CubinMetadata {
     /// The kernel's symbol in the cubin.
@@ -560,7 +559,7 @@ impl Kernel {
     /// Launch this cubin kernel with `grid` and `arguments`.
     ///
     /// A launch on a capturing stream is captured; the operator is written so that it is, and the
-    /// nodes it adds are what a rebind later rewrites (specs/worker.md 4.5).
+    /// nodes it adds are what a rebind later rewrites.
     pub fn launch(
         &self,
         grid: LaunchGrid,

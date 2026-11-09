@@ -219,7 +219,7 @@ impl LoadModel for ModelConfig {
 
 impl InputProcessor {
     /// The model's tokenizer, which a process continuing a response builds
-    /// its incremental decoder from (design `specs/worker.md` §7.5.1).
+    /// its incremental decoder from.
     pub fn tokenizer(&self) -> DynTokenizer {
         Arc::clone(&self.tokenizer)
     }

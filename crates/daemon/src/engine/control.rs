@@ -588,7 +588,7 @@ impl EngineControl {
     /// The arguments of a main process: its program name and the launch file
     /// the daemon wrote for it, and nothing else. Everything the process needs
     /// is in that file, so a flag beside it would be a second account of the
-    /// same thing (`specs/worker.md` §2.3).
+    /// same thing.
     fn arguments(launch: &Path) -> Vec<String> {
         vec![
             "engine".to_owned(),
@@ -669,7 +669,7 @@ impl EngineControl {
 
     /// What the epoch layer starts one epoch's main process with: the
     /// executable the target names, at `generation`, and the arguments every
-    /// engine process of this daemon gets (`specs/worker.md` §7.4).
+    /// engine process of this daemon gets.
     ///
     /// The build is named only when `executable` is this daemon's own binary.
     /// Another executable's children vouch for themselves: the first one's

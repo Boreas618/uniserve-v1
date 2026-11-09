@@ -1,7 +1,6 @@
 //! `adaptive_pool`: the audio encoder's head average and its adaptive width pooling, in one pass.
 //!
-//! The audio encoder's attention projection ends with two reductions
-//! (`uniserve/models/minimax_h3/audio_vae.py:431-440`):
+//! The audio encoder's attention projection ends with two reductions:
 //!
 //! ```text
 //! averaged  = attended.transpose(1, 2).mean(dim=2)          # [batch, frames, head_dim]: mean over heads

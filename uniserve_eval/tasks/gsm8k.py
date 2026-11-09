@@ -1,7 +1,7 @@
 r"""Defines GSM8K's scored text-completion benchmark behavior.
 
 The design confirms Qwen3-MoE quality with GSM8K's strict extracted-answer
-accuracy (``specs/worker.md`` §10). A response is correct only when its final
+accuracy. A response is correct only when its final
 answer value equals the value after the last marker of the row's reference
 answer. A model states its final answer either after a ``#### `` marker or
 inside LaTeX's ``\\boxed{...}``; the form that starts last decides, because

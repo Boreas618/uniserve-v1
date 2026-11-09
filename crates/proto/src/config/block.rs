@@ -1,8 +1,7 @@
 //! The blocks a worker group runs and how each divides over its ranks.
 //!
 //! A block is a named part of the model that implements one capability: the
-//! text encoder, the denoiser, the video decoder, the language model
-//! (`specs/worker.md` §0). A worker group names each block it runs and the
+//! text encoder, the denoiser, the video decoder, the language model. A worker group names each block it runs and the
 //! ordered ranks that run it (the engine's worker group configuration).
 //! A [`BlockConfig`] either forms one model-parallel group over its ranks, of
 //! its tensor, pipeline and sequence degrees, or, with a

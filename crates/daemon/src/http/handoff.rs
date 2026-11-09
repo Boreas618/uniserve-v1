@@ -1,5 +1,4 @@
-//! The responses in flight of one daemon, and how a hot restart freezes them
-//! (design `specs/worker.md` §7.5.1).
+//! The responses in flight of one daemon, and how a hot restart freezes them.
 //!
 //! Every response the daemon produces itself — a chat completion streamed as
 //! server-sent events, one answered as a JSON body, a video artifact streamed

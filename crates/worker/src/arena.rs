@@ -2,7 +2,7 @@
 //!
 //! A captured graph addresses fixed buffers, so a bucket's activations must live at addresses that
 //! do not move while the graph exists, and a serving step must not map or allocate anything
-//! (specs/worker.md 4.5). This module owns the worker side of that:
+//! This module owns the worker side of that:
 //!
 //! - [`Pools`] reserves one virtual range per stream through `platform`'s allocator, which books
 //!   every mapping against the device's budget before it maps (4.1);

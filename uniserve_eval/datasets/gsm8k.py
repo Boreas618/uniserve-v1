@@ -1,7 +1,7 @@
 """Loads GSM8K test questions with their reference answers, in file order.
 
 GSM8K's complete test split is the fixed sample set that confirms
-Qwen3-MoE quality (``specs/worker.md`` §10): 1319 rows read in file order,
+Qwen3-MoE quality: 1319 rows read in file order,
 without shuffling or filtering, so two runs of the same revision resolve the
 same rows and their ``selected_rows`` identity is comparable. Each row
 becomes one example whose prompt is the question verbatim and whose

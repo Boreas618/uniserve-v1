@@ -1,6 +1,6 @@
 //! The runners the device worker holds: one per block a deployment places on the device.
 //!
-//! `specs/worker.md` §4.5 names one runner per capability the model exposes: `EncoderRunner`,
+//! There is one runner per capability the model exposes: `EncoderRunner`,
 //! `DenoiserRunner`, `DecoderRunner` and `CausalLmRunner`, plus the host-side `MediaRunner`. They
 //! share the graph tables, the pools and the staging rules and differ in the capability they call
 //! and in what a bucket of theirs means.

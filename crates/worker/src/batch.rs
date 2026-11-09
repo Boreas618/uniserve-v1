@@ -1,7 +1,7 @@
 //! One step's work across the boundary from the scheduling mechanism to the worker.
 //!
-//! The mechanism decides this step's work (specs/worker.md 4.4) and writes it in the layout the
-//! kernels read; the runner pads it to a bucket and serves it (4.5). This module is that crossing:
+//! The mechanism decides this step's work and writes it in the layout the
+//! kernels read; the runner pads it to a bucket and serves it. This module is that crossing:
 //!
 //! - [`Batch`] is one phase of one step: the host columns the mechanism wrote, the calls whose
 //!   progress the batch advances, the shape the runner pads to, and the generation it serves with;

@@ -8,8 +8,8 @@
 //! rows with [`ForwardBatch::select`] and sets each call's `consumer_slots`),
 //! and sends it as the message of a [`Frame`]. A rank answers with one
 //! [`BatchOutput`] of per-call [`CallOutput`] completions, which it
-//! validates where it builds the response. Both ends are main processes
-//! (`specs/worker.md` 2.4), and each consumes these types directly: a frame
+//! validates where it builds the response. Both ends are main processes,
+//! and each consumes these types directly: a frame
 //! carries a message its sender validated, and its receiver does not check it
 //! again.
 //!

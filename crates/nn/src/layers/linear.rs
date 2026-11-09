@@ -2,9 +2,8 @@
 //!
 //! The layer holds the weight in the order its checkpoint gives (Qwen3 stores `[n, k]` rows of
 //! output channels) and names that order in the `gemm` descriptor, so the product is one operator
-//! call whatever the storage order is. The contraction length is geometry the descriptor bakes in
-//! (specs/worker.md 4.2), so it is checked against the weight at construction and against the input
-//! at every call.
+//! call whatever the storage order is. The contraction length is geometry the descriptor bakes in,
+//! so it is checked against the weight at construction and against the input at every call.
 
 use ops::fp4::{
     BLOCK_ELEMENTS, GemmArgs, GemmDescriptor, Nvfp4Gemm, Nvfp4Quantize, QuantizeArgs,

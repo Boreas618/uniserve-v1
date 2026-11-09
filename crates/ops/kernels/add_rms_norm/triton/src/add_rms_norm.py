@@ -6,10 +6,8 @@ normalizes that sum and rounds once into each output. As in ``rms_norm`` the
 descriptor bakes the row tile and the dependent-launch flag, the row count comes
 from the grid and `columns` from the launch.
 
-The kernel body is the one UniServe launched before this package existed
-(``uniserve_kernels/src/uniserve_kernels/norm/rms.py``), unchanged except that it
-imports nothing but Triton: the operand checks, output allocation and torch types
-stay with the operator's Rust side.
+The kernel body imports nothing but Triton: the operand checks, output allocation
+and torch types stay with the operator's Rust side.
 """
 
 import triton

@@ -11,7 +11,7 @@
 //! frame_norm_pad   out = pad(silu(group_norm(values)))       moments read, one further pass
 //! ```
 //!
-//! `frame_pad` is the "replicate pad" of specs/worker.md 9 and is the whole of the padding a video
+//! `frame_pad` is the "replicate pad" and is the whole of the padding a video
 //! VAE's convolutions need. `frame_moments` and `frame_norm_pad` are `frame.cu`'s two entries: the
 //! first reduces each frame's channel groups with PyTorch's Welford tree, the second writes the
 //! normalized, activated and padded input in one pass, which is the fused operator the design calls

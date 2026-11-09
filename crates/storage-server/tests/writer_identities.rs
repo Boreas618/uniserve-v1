@@ -1,7 +1,7 @@
-//! Probe (a) of `specs/worker.md` §12: can one main process hold several rank
-//! writer identities at the Storage Server?
+//! Probe: can one main process hold several rank writer identities at the
+//! Storage Server?
 //!
-//! §2.5 records this as unverified: the Storage Server identifies a writer by
+//! The design leaves this unverified: the Storage Server identifies a writer by
 //! pidfd, scope and generation (`crates/storage-server/src/lib.rs`, the writer
 //! rules), and the design merges the per-GPU worker processes into one main
 //! process per node. The question the design cannot answer from its text is

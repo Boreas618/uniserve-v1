@@ -11,10 +11,8 @@ A ``block`` that is larger than a program can hold in registers is walked in
 ``STEP`` wide tiles, so one module serves the descriptor's block whatever its
 size.
 
-The kernel body is the one UniServe launched before this package existed
-(``uniserve/sampling/top_k.py``), unchanged except that it imports nothing but
-Triton: the parameter table, the torch types and the allocation stay with the
-operator's Rust side.
+The kernel body imports nothing but Triton: the parameter table, the torch
+types and the allocation stay with the operator's Rust side.
 """
 
 import triton

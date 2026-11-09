@@ -1,4 +1,4 @@
-//! The control thread's channels (`specs/worker.md` §2.3, §2.4).
+//! The control thread's channels.
 //!
 //! The main process's control thread is the only thread that waits on another
 //! process: the daemon's request interface, the daemon's process supervision,

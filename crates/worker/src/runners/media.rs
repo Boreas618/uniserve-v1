@@ -8,7 +8,7 @@
 //! drops the VAE's padding frames, cross-fades the clip seams and de-normalises the RGB - so nothing
 //! here converts a raster: an encoder's input and a postprocessor's output are the same bytes.
 //!
-//! Everything here is host work on blocking threads by design (`specs/worker.md` §4.5): an
+//! Everything here is host work on blocking threads by design: an
 //! encoding, a mux and a reader are not device computations, and the worker's `Media` lane is
 //! where they run. [`MediaWork`] is that lane's action: one stage of one request's artifact, with
 //! the bytes the stage reads already in host memory. It has no graph, no bucket and no device
@@ -540,8 +540,8 @@ fn planes_of(rgb: &[u8], frames: usize, height: usize, width: usize) -> Vec<u8> 
 
 /// One vision block's frames, `[frames, height, width, 3]` RGB at `raster`, as its patch rows.
 ///
-/// The tower reads a grid's own pixels, so each frame is resized to the grid first: the reference's
-/// `pack_pixels` does the same, in the same order (`uniserve/models/qwen3_vl/encoder.py`).
+/// The tower reads a grid's own pixels, so each frame is resized to the grid first and packed
+/// second.
 fn pack_block(
     format: &dyn MediaFormat,
     rgb: &[u8],

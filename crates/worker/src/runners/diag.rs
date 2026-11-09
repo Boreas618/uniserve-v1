@@ -1,4 +1,4 @@
-//! The served run's half of the block-by-block diagnosis (`specs/worker.md` 10).
+//! The served run's half of the block-by-block diagnosis.
 //!
 //! The protocol: both implementations write the named tensors they
 //! computed into their own tree at `<block>/<name>.npy`, and `tools/diagnosis/compare.py` pairs the

@@ -15,7 +15,7 @@
 //! records each program's largest magnitude for the caller's reduction.
 //!
 //! The activation runs in FP32 and the product rounds to the output type, which is what the eager
-//! expression does (specs/worker.md 9, "SwiGLU").
+//! expression does.
 //!
 //! A plain, ungated `silu` is here too, because a model applies it on its own as well: H3's timestep
 //! embedding is `Linear → SiLU → Linear` over one buffer, which is not a gated pair and must not be

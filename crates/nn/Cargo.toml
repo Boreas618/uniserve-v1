@@ -8,7 +8,7 @@ publish = false
 
 # The shared computation library: layers call `ops` operators and nothing below them. The stream,
 # the kernels and the communicator a forward borrows are `ops` names, so the dependency stays
-# `nn → ops → platform` (specs/worker.md 3).
+# `nn → ops → platform`.
 [dependencies]
 ops = { path = "../ops" }
 thiserror.workspace = true

@@ -3,7 +3,7 @@
 //! Once a step's tokens are chosen, one launch folds them into the slots: the next input token, the
 //! continuation and stop predicate, the three lengths a slot tracks, and the penalty counts that bias
 //! later sampling. The state is the worker's — `ops` names it and writes it, allocates nothing and
-//! keeps nothing (`uniserve/sampling/state.py`; specs/worker.md 9, the slot-state row).
+//! keeps nothing.
 //!
 //! ```text
 //! decode    verified += 1                            logical += 1   sampling += 1
@@ -27,10 +27,9 @@
 //! as `slot = task = -1`, and the launch changes nothing — which is how a warmup capture can record
 //! the serving graph without advancing a slot's counts or its positions.
 //!
-//! The masked-by-slot rule is deliberate where it differs from the reference
-//! (`uniserve/sampling/state.py::_commit_kernel` stores the cache length under the row mask, not
-//! under `slot >= 0`, so a padded row there writes `state[-1]`: a host-side bug that a CUDA launch
-//! would turn into a write outside the tensor). The sentinel is honoured here on every store, and the
+//! The masked-by-slot rule is deliberate: a length stored under the row mask rather than under
+//! `slot >= 0` would make a padded row write `state[-1]`, which a CUDA launch turns into a write
+//! outside the tensor. The sentinel is honoured here on every store, and the
 //! catalogue states it.
 
 use std::fmt;

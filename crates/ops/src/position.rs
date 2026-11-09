@@ -3,7 +3,7 @@
 //! A vision tower is trained at one image resolution and runs at several. Its position table is a
 //! learned `[in_side · in_side, channels]` tensor, and the reference resamples it bilinearly to the
 //! grid the image actually has
-//! (`uniserve/models/…`: `F.interpolate(pos_embed.reshape(1, side, side, -1), scale, mode="bilinear",
+//! (`F.interpolate(pos_embed.reshape(1, side, side, -1), scale, mode="bilinear",
 //! align_corners=False)`), per image, inside the forward pass. That cannot be host math: the table
 //! lives on the device (it is a weight), and a host round trip per image would synchronize the
 //! stream in the middle of a captured graph.
@@ -18,7 +18,7 @@
 //! **Which resampling rule this is, the program does not know.** Corner alignment or half-pixel
 //! alignment, edge clamping or edge extension — those are the caller's convention, and each tower has
 //! its own: H3's vision tower resamples with corner alignment and a clamped last sample
-//! (`uniserve/nn/vision/position.py:167-200`, `torch.linspace(0, extent - 1, size)` with
+//! (`torch.linspace(0, extent - 1, size)` with
 //! `upper = (lower + 1).clamp(max = extent - 1)`), which is *not* the `align_corners = false` rule
 //! any one framework defaults to. So the caller computes the four tap indices and four f32 weights
 //! for every output point, once per grid, and the program applies them: no alignment rule, no

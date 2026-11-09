@@ -1,9 +1,8 @@
 """Candidate ordering: the Triton source of the ``candidate_order`` operator.
 
-One program orders one row's candidates into ascending token id, which is the order the reference's
+One program orders one row's candidates into ascending token id, which is the order the
 inverse-CDF draw needs: it draws deterministically for a fixed random value only if the candidate
-order does not depend on the order the top-k program produced
-(``uniserve/sampling/top_k.py:307-314``).
+order does not depend on the order the top-k program produced.
 
 The permutation is by **id**, never by value, and entry ``k`` of a row's output is the input
 candidate with the ``k``-th smallest id. Ties in an id cannot occur within a row (a row holds distinct

@@ -6,7 +6,7 @@
 # One program decodes one (token, layer) of the imported span, up to `head_dim`
 # heads of it: the grid carries the span's extent and the source's page size,
 # scale group and page count are runtime words, so one module serves every span
-# of that geometry (specs/worker.md 8, the prefix cache's conversion rows).
+# of that geometry.
 
 op = "page_conversion"
 backend = "triton"

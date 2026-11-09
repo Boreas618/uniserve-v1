@@ -1,4 +1,4 @@
-//! The peer messages of a program-layer update (`specs/worker.md` §2.3, §7.3).
+//! The peer messages of a program-layer update.
 //!
 //! The daemon receives `PUT /admin/config`, decides that the two configurations
 //! differ only in the programs they fill each operator with (§7.2), and prepares

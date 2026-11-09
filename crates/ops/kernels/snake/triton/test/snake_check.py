@@ -3,8 +3,7 @@
 
     TRITON_INTERPRET=1 crates/program-server/python/.venv/bin/python snake_check.py [--package DIR]
 
-The operator is one line of the H3 audio VAE (`uniserve/models/minimax_h3/audio_vae.py`,
-`Snake.forward`):
+The operator is one line of the H3 audio VAE, its Snake activation:
 
 ```text
 out = x + sin²(α · x) / (α + 1e-9)

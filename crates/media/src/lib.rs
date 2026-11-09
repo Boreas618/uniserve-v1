@@ -3,7 +3,7 @@
 //!
 //! The design places this crate under the worker: media work is blocking
 //! host work, run on the main process's blocking thread pool beside module
-//! loading and transfer reads (`specs/worker.md` §2.4, §4.5). The crate holds
+//! loading and transfer reads. The crate holds
 //! no worker types: the worker copies device results into host buffers,
 //! hands them here, and copies what the readers produce back to the device.
 //!
@@ -35,9 +35,8 @@
 //! Encoding, muxing and the libav* reading calls go through one C shim over
 //! FFmpeg 8.1.2's headers (`src/ffi/shim.c`), built against a shared FFmpeg
 //! runtime with libx264. The shim keeps FFmpeg's ABI out of the Rust side: the
-//! crate declares only its own small C interface in [`ffi`]. The options are
-//! the serving options of the implementation this replaces
-//! (`uniserve/media/codec.py`): libx264 with `preset=ultrafast` and
+//! crate declares only its own small C interface in [`ffi`]. The serving
+//! options are: libx264 with `preset=ultrafast` and
 //! `tune=zerolatency` at 8 threads, yuv420p through swscale's bilinear filter,
 //! AAC with `aac_coder=fast` at 144 kb/s, and the MP4 muxer.
 //!

@@ -9,7 +9,7 @@
 //! (`diffusers/models/autoencoders/autoencoder_kl_minimax_h3_audio.py:133-148`). The epsilon makes
 //! the reciprocal finite at `β = -∞`; it is part of the formula and not a guard the kernel may drop.
 //!
-//! The program is a kernel program (specs/worker.md 9, "pad, upsample, SnakeBeta, downsample"):
+//! The program is a kernel program:
 //! one element of `out` per thread, the channel taken from the linear index so each thread reads one
 //! `α` and one `β`. `x` and `out` must be row-major, which is what the convolution that feeds the
 //! activation produces; the views still carry their own strides, so the same program reads a

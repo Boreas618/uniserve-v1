@@ -4,10 +4,10 @@
 //! same step: the scheduler's mechanism assigns each token a slot (`-1` for a token it does not
 //! persist), [`ops::kv::KvWrite`] scatters the projections into the pages — or, for an FP8 cache,
 //! [`ops::kv::KvWriteScaled`] derives the page's own scale on the way in, the same tensor the read
-//! side multiplies back — and [`ops::attention::PagedAttention`] reads the pages each row addresses
-//! (specs/worker.md 9, "KV 写入" and "注意力"). Both operators are compiled per geometry, so the
-//! descriptor pins the element types, the head and page geometry and the mask variant, while the
-//! batch, the lengths, the scale and the window travel in the call.
+//! side multiplies back — and [`ops::attention::PagedAttention`] reads the pages each row
+//! addresses. Both operators are compiled per geometry, so the descriptor pins the element types,
+//! the head and page geometry and the mask variant, while the batch, the lengths, the scale and
+//! the window travel in the call.
 
 use ops::attention::dense::{DenseArgs, DenseAttention, DenseDescriptor};
 use ops::attention::{Args, Descriptor, Mask, PagedAttention, Phase};
@@ -865,8 +865,8 @@ fn page_scale(plane: TensorView, scale: Option<TensorView>) -> Result<Option<Ten
 
 /// The bytes the trtllm-gen attention program needs as its workspace.
 ///
-/// The program's `workspace_size` argument (specs/worker.md 9); the worker carves it from its
-/// scratch pool and zeroes it once (specs/worker.md 5.4, `D4`).
+/// The program's `workspace_size` argument; the worker carves it from its scratch pool and zeroes
+/// it once.
 pub const TRTLLM_WORKSPACE_BYTES: u64 = 512 << 20;
 
 #[cfg(test)]

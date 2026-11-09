@@ -1,4 +1,4 @@
-//! The epoch arm of a configuration change (`specs/worker.md` §7.3, §7.4):
+//! The epoch arm of a configuration change:
 //! what `apply` calls when `epoch::layer` answers [`Layer::Epoch`].
 //!
 //! The arm decides nothing the other layers own. It answers `Ok(None)` for a

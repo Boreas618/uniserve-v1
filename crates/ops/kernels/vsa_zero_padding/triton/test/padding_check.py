@@ -8,7 +8,7 @@ read as zeros, and the rows inside it are not touched. Both halves are checked, 
 that zeroed the whole tile would pass any check that only looked at the padding, and one that
 zeroed the wrong block would pass any check that only looked at the tile's first rows.
 
-`uniserve/nn/attention/vsa/segments.py::zero_padding` is the reference, copied verbatim: it masks a
+The reference is a CPU transcription of the zero-padding rule: it masks a
 `[tiles, tile, heads, width]` view by the same comparison. The cases are the ones a plausible-but
 -wrong kernel passes:
 
@@ -44,7 +44,7 @@ def load_kernel(package):
 
 
 def reference(rows, sizes, tile):
-    """`uniserve/nn/attention/vsa/segments.py::zero_padding`, on the CPU."""
+    """Zero every row at or past its tile's valid size, on the CPU."""
     live = torch.arange(tile) < sizes[:, None]
     rows.view(sizes.numel(), tile, *rows.shape[1:]).masked_fill_(~live[:, :, None, None], 0)
 

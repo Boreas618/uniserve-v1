@@ -18,7 +18,7 @@ out = n · (1 + scale[i]) + shift[i]
 ```
 
 **The contract's constraint, and what the check is really for.** Every intermediate rounds to
-the activation dtype (`specs/worker.md` 9), so the packages compile with
+the activation dtype, so the packages compile with
 `enable_fp_fusion = False` — without it `value + gate · update` contracts into one fused
 multiply-add and the gated product never rounds. The reference here takes each rounding
 explicitly, in order, through the activation dtype, so a module that fused any of them is a

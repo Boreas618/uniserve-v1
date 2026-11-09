@@ -17,7 +17,7 @@ reading the key — one program reads seven caller strides at once:
   which is the definition of the arithmetic (`prepare_tiles` itself refuses to run without Triton, so
   the check launches the kernel with the same constexpr wiring that function passes). This repository
   no longer holds it: `UNISERVE_REFERENCE_TREE` names a checkout of the last tree that did;
-- that tree's `uniserve/nn/attention/vsa/segments.py`'s `pool` and `zero_padding`, copied verbatim, for the half
+- eager torch transcriptions of the pooling and zero-padding rules (`pool`, `zero_padding`), for the half
   of the operator the kernel need not be trusted about: the padding zeros and the FP32 mean, which
   must equal torch's own reduction bit for bit.
 
@@ -60,7 +60,7 @@ def reference_kernel():
 
 
 def zero_padding(rows, variable_block_sizes, tile):
-    """`uniserve/nn/attention/vsa/segments.py::zero_padding`, for the device as for the host."""
+    """Zero every row at or past its tile's valid size, on the device as on the host."""
     live = torch.arange(tile, device=rows.device) < variable_block_sizes[:, None]
     rows.view(variable_block_sizes.numel(), tile, *rows.shape[1:]).masked_fill_(
         ~live[:, :, None, None], 0
@@ -68,7 +68,7 @@ def zero_padding(rows, variable_block_sizes, tile):
 
 
 def pool(rows, variable_block_sizes, tile):
-    """`uniserve/nn/attention/vsa/segments.py::pool`: the FP32 sum of a tile's rows, then divide."""
+    """The FP32 sum of a tile's rows, divided by its valid size (at least one)."""
     values = rows.view(variable_block_sizes.numel(), tile, *rows.shape[1:])
     total = values.sum(1, dtype=torch.float32)
     return total / variable_block_sizes.clamp_min(1).view(-1, 1, 1)

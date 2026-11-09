@@ -27,8 +27,6 @@
 // two), so the kernel reads its arguments in the operator's packed order and
 // nothing else. Four warps route four tokens, which is the grid the operator
 // computes.
-//
-// |was| `uniserve_kernels/src/uniserve_kernels/csrc/topk_softmax.cu`
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

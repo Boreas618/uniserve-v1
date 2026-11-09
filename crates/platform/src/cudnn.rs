@@ -1,6 +1,6 @@
 //! cuDNN bindings (`libcudnn.so.9`), loaded at run time: the video VAE's
-//! `conv3d` and the audio decoder's `conv1d` (`specs/worker.md` §9), with the
-//! engine choice recorded in the program's tuning data (§5.4).
+//! `conv3d` and the audio decoder's `conv1d`, with the engine choice recorded
+//! in the program's tuning data.
 //!
 //! cuDNN is bound here and nowhere else, through its backend API: a
 //! convolution is described by three tensor descriptors, a convolution

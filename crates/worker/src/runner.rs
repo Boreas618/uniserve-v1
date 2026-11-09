@@ -1,6 +1,6 @@
 //! The runner a block's phase is served by, and the registry the device worker holds.
 //!
-//! A runner serves one block's phases (specs/worker.md 4.5): it owns the captured graphs of those
+//! A runner serves one block's phases: it owns the captured graphs of those
 //! phases, the arena their activations live in, and the slot state a token batch advances. It is
 //! called only on the device worker's thread and only one job at a time, which is why the design
 //! gives it `&mut self` and no synchronization.

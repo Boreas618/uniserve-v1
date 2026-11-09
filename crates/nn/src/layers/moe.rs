@@ -3,8 +3,7 @@
 //!
 //! The block is one layer because its parts only make sense together: routing decides which expert
 //! rows a token's entries go to, the sort turns that decision into the tile layout the grouped
-//! products read, and the combine sums the routes back with the FP32 weights the router produced
-//! (specs/worker.md 9, Qwen3-MoE rows; `uniserve/models/qwen3/transformer.py:111-141`).
+//! products read, and the combine sums the routes back with the FP32 weights the router produced.
 //!
 //! ## Buffers
 //!
@@ -93,7 +92,7 @@ const fn pad_1k(bytes: u64) -> u64 {
 
 /// The tile geometry the grouped products' packages are compiled for.
 ///
-/// Like the row tile of a normalization this is program content (specs/worker.md 5.2, 5.4); the
+/// Like the row tile of a normalization this is program content; the
 /// values here are the packages' default tactic for the Qwen3-MoE shapes, declared once in
 /// [`crate::layers::launch`] rather than at every call.
 const MMA_TILE: (u32, u32) = (128, 128);
@@ -1722,8 +1721,7 @@ impl Moe {
     ///
     /// The rank routes every token over the whole vocabulary, sends each token's payload to the
     /// ranks that hold its experts (`dispatch`), multiplies the routes it was sent with its own
-    /// experts, and sums the ranks' partial results back into its own rows (`combine`,
-    /// specs/worker.md 9's expert rows, `uniserve/backends/experts/alltoall.py` today).
+    /// experts, and sums the ranks' partial results back into its own rows (`combine`).
     ///
     /// `exchange` is the worker's bundle for this group: the package's transport and the views of
     /// its workspace — the rows this rank received at dispatch, with their ids and weights, in the

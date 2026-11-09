@@ -57,7 +57,7 @@ pub(crate) fn stream_handle(stream: &Stream) -> *mut c_void {
 ///
 /// The thread-block shape, dynamic shared memory, cluster size, programmatic dependent launch,
 /// cooperative launch and global scratch all come from the module's Triton metadata; the grid comes
-/// from the operator (specs/worker.md 4.2, 5.3). Only what has no other home travels here.
+/// from the operator. Only what has no other home travels here.
 pub(crate) struct Launch {
     pub blocks: [u32; 3],
     pub threads: u32,

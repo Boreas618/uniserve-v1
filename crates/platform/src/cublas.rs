@@ -1,6 +1,6 @@
 //! cuBLASLt bindings (`libcublasLt.so.13`), loaded at run time: the BF16 and
 //! FP32 matrix multiplications of `nn::Linear` and the language model's
-//! projections (`specs/worker.md` §9).
+//! projections.
 //!
 //! cuBLASLt is bound here and nowhere else. The algorithm of a shape is
 //! chosen once, offline, when the GEMM program's tuning data is made (§5.4):

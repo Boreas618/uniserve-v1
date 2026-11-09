@@ -1,4 +1,4 @@
-# Qwen3-MoE's GSM8K quality confirmation (specs/worker.md §10) on the local
+# Qwen3-MoE's GSM8K quality confirmation on the local
 # Qwen3MoeForCausalLM checkpoint. Three cells confirm the BF16 checkpoint,
 # its ModelOpt NVFP4 export, and the BF16 checkpoint with FP8 KV pages.
 #

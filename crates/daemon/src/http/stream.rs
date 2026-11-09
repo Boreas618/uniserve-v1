@@ -1,5 +1,4 @@
-//! The response bodies a daemon produces itself, and freezes for a successor
-//! (design `specs/worker.md` §7.5.1).
+//! The response bodies a daemon produces itself, and freezes for a successor.
 //!
 //! A streamed response is not hyper's to write: the daemon owns the connection
 //! (see [`crate::http::conn`]), so that a hot restart can stop a response

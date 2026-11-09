@@ -3,7 +3,7 @@
 //! Video sparse attention (VSA) splits the sequence into `tile`-row tiles and attends a query tile
 //! only to the key tiles it selects. Five programs prepare and choose those tiles, and none of them
 //! allocates: the caller owns every buffer, and the indices stay on the device so a captured graph
-//! replays them (specs/worker.md 9, "VSA 分块").
+//! replays them.
 //!
 //! ```text
 //! vsa_prepare_tiles       normalize and rotate Q and K in place, zero the rows past each tile's
@@ -1253,7 +1253,7 @@ pub struct CompressPooledArgs {
 /// The compression branch of VSA: each query tile's softmax over the live key tiles weights their
 /// pooled values.
 ///
-/// The reference (`uniserve/nn/attention/vsa/segments.py:466-479`) is
+/// The compression is
 /// `weights = scores.masked_fill(sizes <= 0, -inf).softmax(-1)` over the key tiles, then
 /// `compressed = weights @ pooled_value` in FP32 and one rounding to the rows' element type. Its
 /// result is per (head, query tile) and is the same for every row of the tile, which is why the

@@ -1,5 +1,5 @@
 //! A streamed chat completion driven one engine event at a time, so that a
-//! hot restart can take it over (design `specs/worker.md` §7.5.1).
+//! hot restart can take it over.
 //!
 //! [`generation_output`](super::assembly::generation_output) pulls the same
 //! pipeline through one `try_stream`; a handed-over response cannot be a

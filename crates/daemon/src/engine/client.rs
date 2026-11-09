@@ -364,8 +364,8 @@ impl EngineClient {
     }
 
     /// Takes one request's event stream over from the connection that
-    /// consumed it, going on after the `consumed` events that response took
-    /// (design `specs/worker.md` §7.5.1 step 4): a hot restart's successor
+    /// consumed it, going on after the `consumed` events that response took:
+    /// a hot restart's successor
     /// attaches to a request the engine kept running, which is neither
     /// cancelled nor submitted again.
     ///

@@ -2,7 +2,7 @@
 //!
 //! The decoder's every residual block ends in `Activation1d(SnakeBeta(C))`
 //! (`.venv/lib/python3.12/site-packages/diffusers/models/autoencoders/autoencoder_kl_minimax_h3_audio.py:207`,
-//! `:426`, `:470`; `uniserve/models/minimax_h3/audio_vae.py:297`). Written out it is five stages:
+//! `:426`, `:470`). Written out it is five stages:
 //!
 //! ```text
 //! 1. replicate pad the signal by `kernel/ratio - 1` on each side

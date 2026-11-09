@@ -2,8 +2,7 @@
 //!
 //! `conv3d`, `conv1d` and `conv_transpose1d` are native programs: cuDNN frontend builds an engine
 //! for one geometry and the package's tuning data names that engine, so the same descriptor always
-//! selects the same engine and the same workspace (specs/worker.md 5.4, "cuBLASLt 和 cuDNN 的算法
-//! 选择也作为调优数据记在对应的 program 包里"). The grid is the library's.
+//! selects the same engine and the same workspace. The grid is the library's.
 //!
 //! The video VAE's FP32 convolutions keep TF32 allowed; that is a descriptor value, because it
 //! changes the numerical contract of the module and therefore its key.

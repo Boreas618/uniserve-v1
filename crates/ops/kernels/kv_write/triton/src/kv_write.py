@@ -4,10 +4,8 @@ One program writes one tile of one token's cache row into the page the scheduler
 assigned it, and raises the page's initialization flag on the tile that starts
 the row. A slot of ``-1`` writes nothing and initializes nothing.
 
-The kernel body is the one UniServe launched before this package existed
-(``uniserve_kernels/src/uniserve_kernels/cache.py``), unchanged except that it
-imports nothing but Triton: the operand checks, the slot computation and the
-torch types stay with the operator's Rust side.
+The kernel body imports nothing but Triton: the operand checks, the slot
+computation and the torch types stay with the operator's Rust side.
 """
 
 import triton

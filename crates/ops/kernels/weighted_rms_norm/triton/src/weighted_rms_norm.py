@@ -5,10 +5,8 @@ FP32, the normalized value rounds once into the output type. With ``absmax`` the
 program also stores the largest magnitude of its stored row, which the caller
 reduces.
 
-The kernel bodies are the ones UniServe launched before this package existed
-(``uniserve_kernels/src/uniserve_kernels/norm/residual.py``), unchanged except that
-they import nothing but Triton: the launch-time wrapper, its operand checks and
-its torch types stay with the operator's Rust side.
+The kernel bodies import nothing but Triton: the launch-time wrapper, its operand
+checks and its torch types stay with the operator's Rust side.
 """
 
 import triton
@@ -71,8 +69,7 @@ def _weighted_rms_norm_absmax_kernel(
     tl.store(output_ptr + row * WIDTH + columns, output, mask=columns < WIDTH)
 
     # ``partials_ptr`` collects one FP32 magnitude per row; the caller reduces
-    # them to one scalar with `uniserve_kernels.reduction.absmax` in a separate
-    # launch.
+    # them to one scalar in a separate launch.
     tl.store(
         partials_ptr + row,
         tl.max(

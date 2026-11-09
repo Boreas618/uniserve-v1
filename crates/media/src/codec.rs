@@ -3,7 +3,7 @@
 //! A media unit is `frames` RGB24 frames of `height` x `width`, encoded by a
 //! fresh libx264 session so that its first frame is a keyframe, then muxed
 //! into a self-contained MP4. The soundtrack is one AAC MP4 over the video's
-//! duration. Both are the serving options of `uniserve/media/codec.py`.
+//! duration. Both use the serving options the crate documentation lists.
 
 /// The video codec every served container uses.
 pub const VIDEO_CODEC: &str = "libx264";

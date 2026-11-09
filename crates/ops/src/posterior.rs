@@ -1,8 +1,7 @@
 //! `posterior`: the VAE encoder's moments to the sample a condition reads, through its FP16 round trip.
 //!
 //! The condition encoder does not condition on the encoder's moments; it conditions on a *sample*
-//! drawn from them and normalised, the same tensor the reference's sampler produces. The chain, in the
-//! reference's order (`uniserve/nn/vae/layers.py:134-203`, `uniserve/nn/vae/encoder.py:88-108`):
+//! drawn from them and normalised. The chain, in order:
 //!
 //! ```text
 //! log_variance = clamp(log_variance, -30, 20)

@@ -18,11 +18,11 @@
 //! same shape in both: the signal, the shared filter, the output, the pad amounts. The two
 //! convolutions differ in the kernel program, and the descriptor names which one was compiled.
 //!
-//! The program is a kernel program (specs/worker.md 9 fuses pad, upsample, SnakeBeta and downsample
-//! into one program where the activation sits between them; each of the four is also its own
-//! operator, which is what this one is). Parameters, in order: `x`, `filter`, `out`, `rows`, `width`,
-//! `out_width`, `pad`, `pad_left`, `pad_right`, the PDL flag. The filter is FP32 and shared by every
-//! channel; the kernel expands it, so the caller never materialises `[channels, 1, kernel]`.
+//! The program is a kernel program (pad, upsample, SnakeBeta and downsample are each an operator of
+//! their own, which is what this one is). Parameters, in order: `x`, `filter`, `out`, `rows`,
+//! `width`, `out_width`, `pad`, `pad_left`, `pad_right`, the PDL flag. The filter is FP32 and
+//! shared by every channel; the kernel expands it, so the caller never materialises
+//! `[channels, 1, kernel]`.
 //!
 //! The tolerance is a `kernel`-term weighted sum in FP32: the taps carry signs, so the bound is
 //! [`Tolerance::dot`] rather than the plain sum bound, and the taps' sum of one keeps the result

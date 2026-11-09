@@ -1,7 +1,7 @@
 # The dense_attention operator's f32 backend: design 5.2's program package, and
 # design 9's "FP32 attention: cuBLASLt SGEMM and a softmax kernel program" — the
 # audio encoder's and the VSA compression branch's path. The slice needs it because
-# those two consumers hold their activations in FP32 (`specs/worker.md` 9), and the
+# those two consumers hold their activations in FP32, and the
 # BF16 projection paths are the `fa4` backend's business, not this program's.
 #
 # One native module per descriptor, and one work item per 64 query rows per head:
