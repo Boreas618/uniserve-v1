@@ -3,9 +3,11 @@
 //! Server, whose pool never held it, finds it in Mooncake and prefetches it
 //! back byte for byte.
 //!
-//! Runs when `UNISERVE_MOONCAKE_MASTER` names a master (`host:port`) and
-//! `MOONCAKE_STORE_LIBRARY` names `libmooncake_store.so`; it returns at once
-//! otherwise. The connectors use Mooncake's P2P handshake for metadata and
+//! Ignored by default: it needs `UNISERVE_MOONCAKE_MASTER` to name a running
+//! master (`host:port`) and `MOONCAKE_STORE_LIBRARY` to name
+//! `libmooncake_store.so`, and fails when requested without them. Run it with
+//! `cargo test -p uniserve --test it mooncake -- --ignored`. The connectors use
+//! Mooncake's P2P handshake for metadata and
 //! TCP for transfers. The first server contributes storage to Mooncake's pool
 //! and the second contributes none, so the second is a client of the
 //! first's segment.
@@ -172,13 +174,13 @@ fn reply(client: &mut Client, request: Request) -> Reply {
 }
 
 #[test]
+#[ignore = "requires a Mooncake master (UNISERVE_MOONCAKE_MASTER) and libmooncake_store.so (MOONCAKE_STORE_LIBRARY)"]
 fn a_page_one_server_commits_is_prefetched_by_another_through_mooncake() {
-    let (Ok(master), Ok(_)) = (
-        std::env::var("UNISERVE_MOONCAKE_MASTER"),
-        std::env::var("MOONCAKE_STORE_LIBRARY"),
-    ) else {
-        return;
-    };
+    let master = std::env::var("UNISERVE_MOONCAKE_MASTER")
+        .expect("UNISERVE_MOONCAKE_MASTER must name a running Mooncake master as host:port");
+    // The Storage Servers this test starts load the library this variable names.
+    std::env::var_os("MOONCAKE_STORE_LIBRARY")
+        .expect("MOONCAKE_STORE_LIBRARY must name libmooncake_store.so");
     // Every run writes pages of its own, which earlier runs' objects in
     // the master cannot answer for.
     let nonce = std::time::SystemTime::now()
