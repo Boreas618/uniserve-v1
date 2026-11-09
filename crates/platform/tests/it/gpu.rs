@@ -2593,10 +2593,10 @@ fn two_rank_half(rank: i32, id: UniqueId) -> Result<(), String> {
 fn two_ranks_exchange_blocks_and_reduce_across_their_group() {
     let _driver = exclusive_driver();
     let devices = Device::count().unwrap();
-    if devices < 2 {
-        eprintln!("two-rank test: {devices} device(s) here, and the exchange needs two");
-        return;
-    }
+    assert!(
+        devices >= 2,
+        "the exchange needs two CUDA devices, and {devices} are visible"
+    );
     let id = UniqueId::new().unwrap();
     let ranks: Vec<_> = (0..2)
         .map(|rank| std::thread::spawn(move || two_rank_half(rank, id)))
