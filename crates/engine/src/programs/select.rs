@@ -429,15 +429,20 @@ pub(crate) fn resolve_slots(
     for op in operators {
         let stated = named_here(&op);
         // A deployment that names a program has chosen an operator's implementation, and the name
-        // is a fact rather than a preference: this host either built that program or it did not.
-        // When it did not, substituting another program is not the smaller failure - the named
-        // program's keys are unknown here, so a substitute may cover no more than the phase it was
-        // not named for, and the walk finds the rest one capture at a time (a generation that holds
-        // one program of a two-phase operator stands at its first warmup). The refusal names what
-        // the store does hold, which is the fact the operator needs to build or to name.
+        // is a fact rather than a preference. A named package the store holds is installed whether
+        // or not this host has built it yet: the devices' recorded walks state the keys it is built
+        // for at install. A named program the store neither built nor holds is refused, naming
+        // what the store does hold, which is the fact the operator needs to install or to name.
+        let held_here = |program: &Program| {
+            packages.iter().any(|package| {
+                package.op == op
+                    && package.backend == program.backend
+                    && package.revision == program.revision
+            })
+        };
         if let Some((_, program)) = stated
             .iter()
-            .find(|(_, program)| keys_of(&op, program).is_empty())
+            .find(|(_, program)| keys_of(&op, program).is_empty() && !held_here(program))
         {
             // What the store has built for the operator, and what it holds without a module: the
             // two are different facts and the message states both, because a package that is
@@ -483,6 +488,25 @@ pub(crate) fn resolve_slots(
                  holds",
             );
             return Err(answer);
+        }
+        // A named program this host has not built yet has no built keys to divide the operator by,
+        // and the deployment chose it: it fills the operator, and the recorded keys are built for
+        // it at install. No other package of the store stands in for it.
+        if let [(None, program)] = stated.as_slice()
+            && keys_of(&op, program).is_empty()
+        {
+            programs.insert(
+                ProgramSlot {
+                    op: op.clone(),
+                    phase: None,
+                    part: None,
+                },
+                program.clone(),
+            );
+            if let Some(ordered) = chosen.get(&op) {
+                candidates.insert(op, ordered.clone());
+            }
+            continue;
         }
         // A deployment that states a backend per phase - a prefill attention backend and a decode
         // one - has already said which keys each of them covers, so nothing here is decided from
@@ -1092,7 +1116,7 @@ mod tests {
     /// walk would find out one capture at a time, each a device preparation that stands until the
     /// watchdog's bound.
     #[test]
-    fn a_named_program_this_host_did_not_build_is_refused_by_name() {
+    fn a_named_program_this_host_has_not_built_fills_its_operator() {
         let prefill = "phase_prefill_dtype_bf16_kv_bf16_out_bf16_head_dim_128_page_64_q_heads_32";
         let mut chosen: BTreeMap<String, Vec<(String, u32)>> = BTreeMap::new();
         chosen.insert("paged_attention".to_owned(), vec![("fa4".to_owned(), 1)]);
@@ -1115,16 +1139,21 @@ mod tests {
             },
         );
 
-        // The store holds the named package and has never built it: that is a store build away
-        // from serving, and the refusal says so rather than naming a substitution.
+        // The store holds the named package and has never built it: the named program fills the
+        // operator, and the store's other built package does not stand in for it.
         let packages = vec![program_server::protocol::ListedPackage {
             op: "paged_attention".to_owned(),
             backend: "trtllm".to_owned(),
             revision: 1,
             modules: Vec::new(),
         }];
-        let error = resolve_slots(&named, &chosen, &built, &packages)
-            .expect_err("nothing of the named package was built here");
+        let (programs, _) = resolve_slots(&named, &chosen, &built, &packages)
+            .expect("an installed named program is accepted before it is built");
+        assert_eq!(programs, named);
+
+        // A named program the store does not hold at all is refused, naming what the store holds.
+        let error = resolve_slots(&named, &chosen, &built, &[])
+            .expect_err("the named package is not in the store");
         assert!(
             error.contains("paged_attention/trtllm revision 1"),
             "the refusal does not name the program the deployment named: {error}"
@@ -1132,10 +1161,6 @@ mod tests {
         assert!(
             error.contains("fa4 revision 1"),
             "the refusal does not name what the store holds instead: {error}"
-        );
-        assert!(
-            error.contains("declares trtllm revision 1 without a module"),
-            "the refusal does not tell a declared-but-unbuilt package from a missing one: {error}"
         );
     }
 
