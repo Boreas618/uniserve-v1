@@ -622,8 +622,8 @@ pub struct TiledEncode {
     latent: (u32, u32),
     /// One compiled blend per seam width and axis.
     blends: Vec<Blend>,
-    /// How the run's first tile reaches the raster; see [`Self::place_first`].
-    first: Blend,
+    /// The copy that places the run's first tile, which has no seam to fade over.
+    first: Copy,
 }
 
 impl TiledEncode {
@@ -660,7 +660,7 @@ impl TiledEncode {
             tiles,
             latent: (height / ratio, width / ratio),
             blends,
-            first: Blend::new(dtype, 1, Axis::Rows)?,
+            first: Copy::new(dtype, Access::Element)?,
         })
     }
 
@@ -833,16 +833,13 @@ impl TiledEncode {
         Ok(())
     }
 
-    /// Place the run's first tile, which has no neighbour to fade against.
-    ///
-    /// The served encode places it with a one-position row blend of the tile with itself, and that
-    /// blend reads the previous source at `rows - extent + i`: at position 0 it writes
-    /// `tile[rows - 1] · 1 + tile[0] · 0`, so the tile's **last** row lands in its first, and every
-    /// later row is copied. The reference copies the tile unchanged. This form is kept because the
-    /// served outputs carry it; correcting it changes every conditioned encode and is a protocol
-    /// change of its own.
+    /// Place the run's first tile, which has no neighbour to fade against: its block is copied
+    /// into the raster unchanged, as the reference's tile assembly copies a tile with no tile above
+    /// or to its left.
     fn place_first(&self, f: &Forward, tile: TensorView, out: TensorView) -> Result<()> {
-        self.first.forward(f, tile, tile, out)
+        // `out` addresses the tile's region of the raster at the raster's strides.
+        let strides: [i64; 4] = std::array::from_fn(|axis| out.strides.get(axis) as i64);
+        self.first.forward(f, tile, out, &strides)
     }
 
     /// The compiled blend of `extent` along `axis`.

@@ -396,9 +396,9 @@ fn a_posterior_sample_reads_the_two_halves_of_its_moments() {
     assert!(Posterior.sample(&f, moments, overlapping, out).is_err());
 }
 
-/// A tiled encode runs the model's forward once per tile, then places the first tile with the
-/// one-position row blend the served encode uses and fades every other tile over its seams; a
-/// tile with neighbours above and to its left blends twice.
+/// A tiled encode runs the model's forward once per tile, then copies the first tile into the
+/// raster unchanged and fades every other tile over its seams; a tile with neighbours above and to
+/// its left blends twice.
 #[test]
 fn a_tiled_encode_runs_each_tile_and_fades_its_seams() {
     let tiling = TiledEncode::new(32, 48, 32, 16, 16, DType::F32).unwrap();
@@ -425,9 +425,9 @@ fn a_tiled_encode_runs_each_tile_and_fades_its_seams() {
             .unwrap()
     });
     assert_eq!(encoded, [0, 1]);
-    assert_eq!(operators(&launches), ["cross_fade", "cross_fade"]);
-    // The first tile's placement and the second tile's one-column seam: two programs.
-    assert!(launches[0].1.contains("extent_1") && launches[0].1.contains("axis_2"));
+    // The first tile has no seam, so its block reaches the raster as a copy; the second fades over
+    // the one column it shares with the first.
+    assert_eq!(operators(&launches), ["copy_block", "cross_fade"]);
     assert!(launches[1].1.contains("extent_1") && launches[1].1.contains("axis_3"));
 
     // A raster of another element type, or one smaller than the latent raster, is refused.
