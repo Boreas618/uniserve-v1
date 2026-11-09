@@ -116,6 +116,23 @@ impl Arrangement {
 /// and audio latents' input and output are pinned there), so the draw, the patch and the unpatchify
 /// all read and write this one type - **not the stack's**, which is the checkpoint's. The forward
 /// refuses a latent of another type by name ([`Denoiser::denoise`]).
+///
+/// ## The two crossings
+///
+/// The reference keeps its trajectory in FP32 and rounds only inside a launch, so the trajectory
+/// crosses to the stack's element type at exactly two points per evaluation, one launch each:
+///
+/// 1. each modality's input projection reads the FP32 patch rows against its FP32-pinned weights
+///    into an FP32 output, which one `Cast` narrows into the packed rows;
+/// 2. each modality's head reads the stack's rows after the final norm, widened by one `Cast`
+///    (`Transformer::wide`) into an FP32 product against its FP32-pinned weights, and the
+///    prediction stays FP32 through the unpatchify and the solver, whose step reads one type for
+///    the sample and the velocity.
+///
+/// The four end projections are FP32 parameters at every preset, so both products are FP32 on both
+/// sides whatever the stack's type is; at an FP32 stack both casts are skipped. Allocating any of
+/// the sample's buffers in the stack's type instead would round the trajectory itself at every
+/// evaluation, which no shape refuses.
 pub const SAMPLE_DTYPE: DType = DType::F32;
 
 /// The deployment's layout rule: how a request snaps, and what its tables are.
@@ -2110,25 +2127,14 @@ impl Denoiser {
 
         // The latent becomes rows, the draw becomes rows - the draw is drawn at latent resolution,
         // so it takes the same mapping - and the anchor mixes them in place over the latent's rows.
-        // `Axpby` is `y ← β · y + α · x`, so the reference's `t · clean + (1 - t) ·
-        // draw` is β = t on the latent's rows and α = 1 - t on the draw's.
         let rows = u64::from(piece.rows);
         let columns = video_channels * 4;
         let clean = f.arena().tensor(DType::F32, Shape::new(&[rows, columns]))?;
         self.transformer.patchify(f, latent, clean)?;
         let anchored = f.arena().tensor(DType::F32, Shape::new(&[rows, columns]))?;
         self.transformer.patchify(f, draw, anchored)?;
-        // `y ← β · y + α · x` with `y` the latent's rows and `x` the
-        // draw's: α weights the draw, β the latent, so the result is `t · clean + (1 - t) · draw`.
-        nn::layers::Axpby
-            .forward(
-                f,
-                clean,
-                anchored,
-                1.0 - VISUAL_CONDITION_TIME,
-                VISUAL_CONDITION_TIME,
-            )
-            .map_err(Error::from)?;
+        // `t · clean + (1 - t) · draw`, in place over the latent's rows.
+        nn::diffusion::add_noise(f, clean, anchored, VISUAL_CONDITION_TIME)?;
         // The projection's output is FP32, and the one rounding is the copy into the rows
         // (`video_input(anchored, output_dtype=torch.float32).to(out.dtype)`).
         let hidden = u64::from(self.config.transformer.hidden_size);
@@ -2264,17 +2270,7 @@ impl Denoiser {
                 video.dtype
             )));
         }
-        // The trajectory is FP32 and the stack is the deployment's, and the two are crossed twice
-        // per evaluation: the input projection reads the FP32 sample, the head reads the stack's own
-        // rows. Both crossings are legal whatever the stack's type is, because **the four end
-        // projections are FP32 parameters at every preset** and the
-        // activation is widened to meet them (`Transformer::wide`) - so the products are FP32 on
-        // both sides and the stack's type never touches a weight of another type.
-        //
-        // What remains the stack's alone is the packed rows in between: `scaled_add` narrows the
-        // projection's FP32 output into them and widens them back at the head, one launch each, and
-        // both cells exist for a BF16 and an FP32 target (`target_bf16_source_f32` and
-        // `target_f32_source_bf16`, 5376 wide).
+        // The sample and the stack meet at the two crossings `SAMPLE_DTYPE` states.
         let arena = f.arena();
 
         // This rank owns one contiguous interval of the packed rows, and the sample and the tables
@@ -2305,22 +2301,12 @@ impl Denoiser {
         let video_sources = tables.get("video_sources")?;
         let video_slots = tables.get("video_slots")?;
         let own_video = video_sources.shape.dim(0);
-        // **The sample is the latent's own type, and the stack is the checkpoint's.** The reference
-        // keeps its trajectory in FP32 (and refuses anything else) and rounds
-        // only inside a launch, so the boundary is crossed twice per evaluation and each crossing is
-        // one launch: the patch and the input projection read the sample's type, the projection's
-        // output is narrowed into the packed rows, and the prediction is widened back before the
-        // solver - whose step reads one type for the sample and the velocity (`solver.rs`).
-        // Allocating these in `cond.text.dtype` instead would round the trajectory itself at every
-        // evaluation, which no shape refuses and no page shows.
         let sample_dtype = SAMPLE_DTYPE;
         // The DiT's `1x2x2` tiles: packed here, and unpacked back into the latent raster after the
         // prediction.
         let patched = arena.tensor(sample_dtype, Shape::new(&[video_rows, channels * 4]))?;
         self.transformer.patchify(f, video, patched)?;
-        // The reference projects with `output_dtype=torch.float32` and narrows afterwards:
-        // the projection's weights are the checkpoint's, its activation
-        // and its output are FP32, and the one rounding into the packed rows is the narrowing.
+        // The first crossing (`SAMPLE_DTYPE`): an FP32 projection, narrowed into the packed rows.
         if own_video > 0 {
             let owned = arena.tensor(sample_dtype, Shape::new(&[own_video, channels * 4]))?;
             nn::layers::IndexRows.gather(f, patched, video_sources, owned)?;
@@ -2372,8 +2358,7 @@ impl Denoiser {
             if own_audio > 0 {
                 let owned = arena.tensor(sample_dtype, Shape::new(&[own_audio, features]))?;
                 nn::layers::IndexRows.gather(f, flat, audio_sources, owned)?;
-                // The audio's own two crossings, for the reason the video's: the latent is the
-                // sample's type and the projection's FP32 output is narrowed into the packed rows.
+                // The audio's first crossing, as the video's.
                 let projected = arena.tensor(DType::F32, Shape::new(&[own_audio, hidden_size]))?;
                 self.transformer.project_audio(f, owned, projected)?;
                 let narrowed = arena.tensor(dtype, Shape::new(&[own_audio, hidden_size]))?;
@@ -2468,9 +2453,7 @@ impl Denoiser {
                 video_slots,
                 one_column(video_groups),
             )?;
-            // The head is FP32 in the reference, so the prediction is
-            // written wide and never narrowed: the solver's sample is the latent's type and the
-            // velocity must be the same one.
+            // The second crossing (`SAMPLE_DTYPE`): the head writes the FP32 prediction.
             let rows = arena.tensor(sample_dtype, Shape::new(&[own_video, channels * 4]))?;
             self.transformer.velocity(
                 f,

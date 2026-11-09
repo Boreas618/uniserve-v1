@@ -449,9 +449,8 @@ impl Transformer {
         out: TensorView,
     ) -> Result<()> {
         let normalized = self.norm_out.apply(f, modulation, rows, hidden)?;
-        // The final modulation is the checkpoint's own type (the BF16 norm times the BF16 table),
-        // and the projection that follows is FP32 - so the widening is
-        // here, between them, and not inside the norm.
+        // The second crossing (`crate::denoiser::SAMPLE_DTYPE`): the modulated rows are the
+        // stack's type and widen here, between the norm and the FP32 head.
         let wide = self.wide(f, normalized)?;
         self.project_head(f, wide, modality, block, step, out)
     }

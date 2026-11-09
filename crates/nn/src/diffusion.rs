@@ -11,6 +11,7 @@
 //! Grid::Ladder       u_i = rung_i / train_steps in FP64;  sigma_i = time_shift(u_i) in FP64,
 //!                    rounded once to FP32, then the clean endpoint 0
 //! Euler              x += v · (sigma_i - sigma_{i+1})
+//! add_noise          x  = t · x + (1 - t) · noise                       a condition's anchor
 //! TimestepTable      the per-block modulation at each distinct level, gathered per step
 //! ```
 //!
@@ -33,7 +34,7 @@ use ops::{DType, Shape, Strides, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
-use crate::layers::{IndexRows, Residual, Scale};
+use crate::layers::{Axpby, IndexRows, Residual, Scale};
 use crate::timestep::sinusoidal;
 use crate::weights::{Scope, Weight};
 
@@ -247,6 +248,21 @@ impl Euler {
         let sample = elements(sample)?;
         start.forward(f, sample, sample, None, sample)
     }
+}
+
+/// Noise a clean `sample` in place to the flow-matching level `t`: `sample ← t · sample + (1 − t) ·
+/// noise`.
+///
+/// `t` is the clean fraction (`1` is the clean sample), the coordinate a condition anchored at a
+/// fixed level is stated in. The coefficients are `t` and the FP32 difference `1 − t`; the products
+/// and the sum are FP32 and round once into `sample`'s element type. `sample` and `noise` are
+/// `[rows, columns]` views of one shape.
+///
+/// # Errors
+///
+/// Views of different shapes, or the operator's refusal.
+pub fn add_noise(f: &Forward, sample: TensorView, noise: TensorView, t: f32) -> Result<()> {
+    Axpby.forward(f, sample, noise, 1.0 - t, t)
 }
 
 /// The geometry of a [`TimestepTable`].

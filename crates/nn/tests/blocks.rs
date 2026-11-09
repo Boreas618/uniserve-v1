@@ -905,3 +905,20 @@ fn a_pre_norm_block_joins_each_update_in_its_residual_form() {
     result.unwrap();
     assert_eq!(launches, ["scaled_add"]);
 }
+
+// ---- Noising -------------------------------------------------------------------------------------
+
+/// A clean sample is noised in place in one launch, from a noise of its own shape only.
+#[test]
+fn add_noise_mixes_a_sample_with_noise_of_its_shape_in_place() {
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let sample = arena.tensor(DType::F32, Shape::new(&[6, HIDDEN])).unwrap();
+    let noise = arena.tensor(DType::F32, Shape::new(&[6, HIDDEN])).unwrap();
+    let (result, launches) = launched(|| nn::diffusion::add_noise(&f, sample, noise, 0.999));
+    result.unwrap();
+    assert_eq!(launches, ["scaled_add"]);
+
+    let short = arena.tensor(DType::F32, Shape::new(&[5, HIDDEN])).unwrap();
+    assert!(nn::diffusion::add_noise(&f, sample, short, 0.999).is_err());
+}
