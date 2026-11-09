@@ -1076,7 +1076,9 @@ impl GenerationRequest {
         self.image
             .validate()
             .map_err(GenerationRequestError::InvalidImage)?;
-        if self.max_images == 0 {
+        // The budget binds a request that can generate an image. One that generates text alone
+        // has no image to count, and the token warmup states its budget as zero.
+        if self.max_images == 0 && self.generates_images() {
             return Err(GenerationRequestError::ZeroMaxImages);
         }
         if self.decodes_text() && self.sampling.min_tokens > self.max_und_tokens {
@@ -1423,7 +1425,7 @@ pub enum GenerationRequestError {
     /// Image-generation parameters are invalid.
     #[error("invalid image parameters: {0}")]
     InvalidImage(#[source] ImageParamsError),
-    /// The request's image budget is zero.
+    /// The image budget of a request that can generate images is zero.
     #[error("max_images must be at least 1")]
     ZeroMaxImages,
     /// Minimum-token floor exceeds the generation budget.
@@ -1828,6 +1830,13 @@ mod tests {
             zero_images.validate(),
             Err(GenerationRequestError::ZeroMaxImages)
         );
+
+        // A request that generates text alone counts no image, so its budget may be zero.
+        let mut text_alone = complete_request();
+        text_alone.constraint = GenerationConstraint::UndOnly;
+        text_alone.max_images = 0;
+        assert!(!text_alone.generates_images());
+        assert_eq!(text_alone.validate(), Ok(()));
 
         let mut invalid_floor = complete_request();
         invalid_floor.sampling.min_tokens = invalid_floor.max_und_tokens + 1;
