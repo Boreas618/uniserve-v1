@@ -22,6 +22,7 @@ use crate::config::{AttentionKind, Canvas, NAMED_CANVASES};
 use crate::load::MinimaxH3;
 use crate::output::VideoPostprocessor;
 use crate::partition::Ulysses;
+use crate::processing::ConditionPacking;
 use crate::processing::plan::ProcessorConfig;
 use crate::{
     AUDIO_CHANNELS, AUDIO_HOP, AUDIO_SAMPLE_RATE, CANVAS_MULTIPLE, CLIP_FRAMES, CLIP_LATENTS,
@@ -308,7 +309,13 @@ impl VideoModel for H3Pipeline {
             )
         })?;
         let ladder = denoiser.rules().condition_ladder();
-        candidates(&self.tasks, serving, &ladder)
+        candidates(
+            &self.tasks,
+            serving,
+            &ladder,
+            &condition_packing(denoiser),
+            self.config.processor.as_ref(),
+        )
     }
 
     fn warm_prompts(&self, serving: &VideoServing) -> nn::Result<Vec<WarmPrompt>> {
@@ -439,10 +446,16 @@ fn task_conditions(task: VideoTask) -> (u32, u32, u32) {
 /// conditions; the runner keeps one candidate per distinct layout. The tasks are the checkpoint's,
 /// on the placed network; the timelines are every legal one from the shortest output to the
 /// deployment's longest.
+///
+/// A conditioned candidate also states the condition sets a request of its layout may open with
+/// ([`WarmRequest::openings`]): an `fl2va` layout those of [`keyframe_openings`] its rung serves.
+/// A `ref2va` reference's raster follows the client's media, so a `ref2va` layout states none.
 fn candidates(
     tasks: &[VideoTask],
     serving: &VideoServing,
     ladder: &[u32],
+    packing: &ConditionPacking,
+    processor: Option<&ProcessorConfig>,
 ) -> nn::Result<Vec<WarmRequest>> {
     let longest = snap_frames(seconds_to_frames(serving.max_seconds)?)?;
     let shortest = snap_frames(seconds_to_frames(MIN_VIDEO_SECONDS)?)?;
@@ -461,6 +474,11 @@ fn candidates(
             } else {
                 ladder.iter().copied().map(Some).collect()
             };
+            let openings = if task == VideoTask::FirstLastToVideoAudio {
+                keyframe_openings(canvas, ladder, packing, processor)?
+            } else {
+                Vec::new()
+            };
 
             for frames in timelines.iter().copied() {
                 for capacity in &serving.text_capacities {
@@ -477,6 +495,11 @@ fn candidates(
                             conditions: Vec::new(),
                             vision_spans: Vec::new(),
                             condition_rows: rung,
+                            openings: openings
+                                .iter()
+                                .filter(|(served, _)| Some(*served) == rung)
+                                .map(|(_, set)| set.clone())
+                                .collect(),
                         });
                     }
                 }
@@ -484,6 +507,111 @@ fn candidates(
         }
     }
     Ok(candidates)
+}
+
+/// The keyframe sets an `fl2va` request of `canvas` may present, each with the rung of `ladder`
+/// that serves it.
+///
+/// A request anchors its first frame, its last, or both (`task_conditions`). Each keyframe is
+/// planned by the request processing's own keyframe plan, which fits it to the canvas whatever
+/// image the client sent, so its shape is the canvas's; a set rides the smallest rung that holds
+/// the rows the processing packs it into under the deployment's `packing`, and a set no rung holds
+/// is one the processing refuses.
+fn keyframe_openings(
+    canvas: &Canvas,
+    ladder: &[u32],
+    packing: &ConditionPacking,
+    processor: Option<&ProcessorConfig>,
+) -> nn::Result<Vec<(u32, Vec<nn::ConditionShape>)>> {
+    use crate::processing::plan::{ConditionSpec, ConditionType, Role, plan_keyframe};
+
+    let processor = processor.ok_or_else(|| {
+        nn::Error::Unsupported(
+            "the deployment serves fl2va and the checkpoint states no \
+             processor/video_preprocessor_config.json, so a keyframe cannot be planned"
+                .to_owned(),
+        )
+    })?;
+    let size = proto::video::Canvas {
+        width: canvas.width,
+        height: canvas.height,
+    };
+    // An image of the canvas's own size: the keyframe plan fits every image onto the canvas, so
+    // the image's size reaches only the media reader's crop and not the condition's shape.
+    let image = processing::ImageMetadata {
+        width: canvas.width,
+        height: canvas.height,
+    };
+    let (first_frames, last_frames, _) = task_conditions(VideoTask::FirstLastToVideoAudio);
+    let anchors: Vec<i64> = std::iter::repeat_n(0, first_frames as usize)
+        .chain(std::iter::repeat_n(-1, last_frames as usize))
+        .collect();
+
+    let mut openings = Vec::new();
+    // Every non-empty subset of the anchors, in anchor order.
+    for mask in 1_u32..(1 << anchors.len()) {
+        let mut plans = Vec::new();
+        for (index, frame_index) in anchors
+            .iter()
+            .enumerate()
+            .filter(|(bit, _)| mask & (1 << bit) != 0)
+            .map(|(_, frame_index)| *frame_index)
+            .enumerate()
+        {
+            let spec = ConditionSpec {
+                condition_type: ConditionType::Image,
+                role: Role::Keyframe,
+                frame_index: Some(frame_index),
+                start_seconds: None,
+            };
+            let plan = plan_keyframe(
+                index,
+                &spec,
+                &image,
+                size,
+                index,
+                VideoTask::FirstLastToVideoAudio,
+                processor,
+            )
+            .map_err(|error| {
+                nn::Error::Unsupported(format!(
+                    "a keyframe of the {}x{} canvas: {error}",
+                    canvas.width, canvas.height
+                ))
+            })?;
+            plans.push(plan);
+        }
+        let rows = plans
+            .iter()
+            .map(|plan| plan.packed_rows(size, packing))
+            .fold(0, u32::saturating_add);
+        let Some(rung) = ladder.iter().copied().find(|rung| *rung >= rows) else {
+            continue;
+        };
+        openings.push((rung, plans.iter().map(|plan| plan.shape(size)).collect()));
+    }
+    Ok(openings)
+}
+
+/// How the placed denoiser packs a request's conditions, as the request processing sizes them:
+/// its tiles under sparse attention, row for row under dense attention, and the rows it holds when
+/// this rank places the condition encoders.
+fn condition_packing(denoiser: &crate::denoiser::Denoiser) -> ConditionPacking {
+    let (tile_rows, shape) = match denoiser.config().attention {
+        AttentionKind::Sparse { tile, .. } => {
+            (tile, crate::packing::tile_shape(tile).unwrap_or((1, 1, 1)))
+        }
+        AttentionKind::Dense => (1, (1, 1, 1)),
+    };
+    ConditionPacking {
+        capacity: if denoiser.places_encoders() {
+            denoiser.rules().arrangement().condition_rows
+        } else {
+            0
+        },
+        tile_rows,
+        video_tile: [shape.0, shape.1, shape.2],
+    }
 }
 
 /// The prompts with vision blocks a deployment admits whose grids the deployment fixes.
@@ -558,9 +686,7 @@ fn seconds_to_frames(seconds: f64) -> nn::Result<u32> {
 /// what its network could run; the schedule and the shifts are its too. The frame rule is the clip
 /// rule, the rates are the model's output clock, and the canvases are the deployment's sizes.
 fn describe(pipeline: &H3Pipeline, serving: &VideoServing) -> nn::Result<Description> {
-    use crate::processing::{
-        ConditionPacking, DenoiserInfo, FrameClips, ReferenceLimits, ServedCanvas,
-    };
+    use crate::processing::{DenoiserInfo, FrameClips, ReferenceLimits, ServedCanvas};
     use proto::video::Canvas as Size;
 
     let denoiser = pipeline.network().ok_or_else(|| {
@@ -588,23 +714,7 @@ fn describe(pipeline: &H3Pipeline, serving: &VideoServing) -> nn::Result<Descrip
         tail_latent_frames: latent_frames - CLIP_LATENTS,
     };
 
-    // How the denoiser packs a request's conditions: its tiles under sparse attention, row for
-    // row under dense attention.
-    let (tile_rows, shape) = match denoiser.config().attention {
-        AttentionKind::Sparse { tile, .. } => {
-            (tile, crate::packing::tile_shape(tile).unwrap_or((1, 1, 1)))
-        }
-        AttentionKind::Dense => (1, (1, 1, 1)),
-    };
-    let condition_packing = ConditionPacking {
-        capacity: if denoiser.places_encoders() {
-            denoiser.rules().arrangement().condition_rows
-        } else {
-            0
-        },
-        tile_rows,
-        video_tile: [shape.0, shape.1, shape.2],
-    };
+    let condition_packing = condition_packing(denoiser);
 
     let report = DenoiserInfo {
         tasks: tasks.iter().map(|task| task.as_str().to_owned()).collect(),
@@ -787,6 +897,74 @@ mod tests {
         assert!(
             warm_prompts(&[VideoTask::FirstLastToVideoAudio], &serving, None).is_err(),
             "an fl2va deployment cannot size a keyframe without the processor"
+        );
+    }
+
+    /// An `fl2va` layout opens with the keyframe sets its rung serves, each keyframe at the
+    /// canvas's raster: one keyframe (either anchor) on the rung that holds one canvas frame, both
+    /// on the rung that holds two, and a `t2va` layout with none.
+    #[test]
+    fn a_rung_opens_with_the_keyframes_it_holds() {
+        let processor = ProcessorConfig::parse(
+            r#"{"patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
+                "size": {"shortest_edge": 65536, "longest_edge": 16777216}}"#,
+            r#"{"patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
+                "size": {"shortest_edge": 4096, "longest_edge": 25165824}}"#,
+        )
+        .expect("the released processor");
+        let serving = VideoServing {
+            sizes: vec![(1344, 768)],
+            max_seconds: 4.0,
+            text_capacities: vec![2048],
+            condition_rows: None,
+        };
+        // Row for row: a 1344x768 keyframe is 42x24 latent patches, 1008 rows.
+        let packing = ConditionPacking {
+            capacity: 2048,
+            tile_rows: 1,
+            video_tile: [1, 1, 1],
+        };
+        let candidates = candidates(
+            &[
+                VideoTask::TextToVideoAudio,
+                VideoTask::FirstLastToVideoAudio,
+            ],
+            &serving,
+            &[1024, 2048],
+            &packing,
+            Some(&processor),
+        )
+        .expect("the deployment's candidates");
+
+        let keyframe = |role| nn::ConditionShape {
+            role,
+            frames: 1,
+            height: 768,
+            width: 1344,
+            audio_samples: 0,
+        };
+        let opened = |rung: Option<u32>| -> Vec<Vec<nn::ConditionShape>> {
+            candidates
+                .iter()
+                .find(|candidate| candidate.condition_rows == rung)
+                .expect("a candidate of the rung")
+                .openings
+                .clone()
+        };
+        assert_eq!(opened(None), Vec::<Vec<nn::ConditionShape>>::new());
+        assert_eq!(
+            opened(Some(1024)),
+            vec![
+                vec![keyframe(nn::ConditionRole::FirstFrame)],
+                vec![keyframe(nn::ConditionRole::LastFrame)],
+            ]
+        );
+        assert_eq!(
+            opened(Some(2048)),
+            vec![vec![
+                keyframe(nn::ConditionRole::FirstFrame),
+                keyframe(nn::ConditionRole::LastFrame),
+            ]]
         );
     }
 }

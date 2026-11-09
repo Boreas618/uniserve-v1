@@ -977,6 +977,35 @@ pub struct ConditionInput {
 }
 
 impl ConditionInput {
+    /// The condition as a denoiser lays it out ([`nn::ConditionShape`]): its role, the frames and
+    /// raster the video encoder encodes and the samples of its soundtrack, as the worker reads them
+    /// from the condition's described media. `canvas` is the generated canvas, which a keyframe is
+    /// fitted to.
+    pub fn shape(&self, canvas: Canvas) -> nn::ConditionShape {
+        let (role, media) = self.media(canvas);
+        // Audio alone has no frames and no raster.
+        let (frames, raster) = media.pixels().unwrap_or((
+            0,
+            Canvas {
+                width: 0,
+                height: 0,
+            },
+        ));
+        nn::ConditionShape {
+            role: match role {
+                ConditionRole::FirstFrame => nn::ConditionRole::FirstFrame,
+                ConditionRole::LastFrame => nn::ConditionRole::LastFrame,
+                ConditionRole::Reference => nn::ConditionRole::Reference,
+            },
+            frames,
+            height: raster.height,
+            width: raster.width,
+            audio_samples: media
+                .audio()
+                .map_or(0, |clip| u32::try_from(clip.samples).unwrap_or(u32::MAX)),
+        }
+    }
+
     /// The condition's described role and what the media reader decodes its
     /// bytes into. `canvas` is the generated canvas, which a keyframe is
     /// fitted to.
@@ -1902,7 +1931,7 @@ fn target_canvas(
     })
 }
 
-fn plan_keyframe(
+pub(crate) fn plan_keyframe(
     index: usize,
     condition: &ConditionSpec,
     image: &ImageMetadata,

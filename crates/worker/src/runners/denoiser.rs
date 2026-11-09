@@ -442,13 +442,6 @@ fn stated_request(warm: &WarmRequest, conditioning: &[u8]) -> Result<WarmRequest
             "a media request's conditioning does not decode: {error}"
         ))
     })?;
-    let count = |role: ConditionRole| {
-        decoded
-            .conditions
-            .iter()
-            .filter(|condition| condition.role == role)
-            .count() as u32
-    };
     let conditions = decoded
         .conditions
         .iter()
@@ -475,15 +468,44 @@ fn stated_request(warm: &WarmRequest, conditioning: &[u8]) -> Result<WarmRequest
             }
         })
         .collect();
-    Ok(WarmRequest {
-        first_frames: count(ConditionRole::FirstFrame),
-        last_frames: count(ConditionRole::LastFrame),
-        references: count(ConditionRole::Reference),
-        text_tokens: decoded.prompt_tokens,
+    Ok(opened(
+        warm,
         conditions,
-        vision_spans: decoded.vision_spans,
+        decoded.prompt_tokens,
+        decoded.vision_spans,
+    ))
+}
+
+/// `warm` as a request presenting `conditions`, a prompt of `text_tokens` tokens and the vision
+/// spans `vision_spans` states it: the role counts follow the conditions, and the task, the canvas,
+/// the frames and the rung stay the bucket's.
+///
+/// A served request's opening states its request through this from its conditioning
+/// ([`stated_request`]), and the recorded walk states each of the bucket's admitted condition sets
+/// ([`WarmRequest::openings`]) through it, so both open the same request.
+fn opened(
+    warm: &WarmRequest,
+    conditions: Vec<nn::ConditionShape>,
+    text_tokens: u32,
+    vision_spans: Vec<(u32, u32)>,
+) -> WarmRequest {
+    let count = |role: nn::ConditionRole| {
+        conditions
+            .iter()
+            .filter(|condition| condition.role == role)
+            .count() as u32
+    };
+    WarmRequest {
+        first_frames: count(nn::ConditionRole::FirstFrame),
+        last_frames: count(nn::ConditionRole::LastFrame),
+        references: count(nn::ConditionRole::Reference),
+        text_tokens,
+        conditions,
+        vision_spans,
+        // An opened request is one request: the sets its layout admits are the bucket's.
+        openings: Vec::new(),
         ..warm.clone()
-    })
+    }
 }
 
 /// One bucket and the request it was derived from.
@@ -1445,21 +1467,46 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         Ok(())
     }
 
-    /// Opens `bucket`'s warm request and walks the step its graph captures, on recording forwards
-    /// of `walk` ([`Runner::record_walk`]).
+    /// Opens `bucket`'s warm request and every condition set a request of it may open with, and
+    /// walks the step its graph captures, on recording forwards of `walk` ([`Runner::record_walk`]).
     ///
-    /// The opening and the step each start at the stream region's first address, as the replay's
-    /// eager opening and the captured graph do. The state tables and the condition media regions
-    /// are placeholders of the extents the request's own would have; the warm request states the
-    /// bucket's conditions, so the conditioning encode a request of the bucket runs is walked too.
+    /// Each opening and the step start at the stream region's first address, as the replay's eager
+    /// opening and the captured graph do. A condition set ([`WarmRequest::openings`]) is opened as
+    /// a served request presenting it is ([`opened`]), so the conditioning encode of its media is
+    /// walked with the opening. The state tables are placeholders of the layout's.
     fn walk_recorded(&self, walk: &Walk, bucket: Bucket) -> Result<()> {
         let warm = &self.plan_of(bucket)?.warm;
         let layout = layout_of(bucket)?;
         let state = walk.tables(&self.model.state_tables(&layout))?;
         let group = self.group.as_deref();
+        self.walk_opening(walk, bucket, warm, &state)?;
+        for conditions in &warm.openings {
+            walk.arena().reset();
+            let stated = opened(warm, conditions.clone(), warm.text_tokens, Vec::new());
+            self.walk_opening(walk, bucket, &stated, &state)?;
+        }
+        walk.arena().reset();
+        let step = self
+            .schedule(bucket)?
+            .first()
+            .copied()
+            .ok_or_else(|| self.no_step(bucket))?;
+        self.step(&walk.forward(group)?, bucket, step, &state)
+    }
+
+    /// Opens `stated` in `bucket` on a recording forward of `walk`, through the opening a replay
+    /// runs ([`Self::open`]): its condition media regions are placeholders of the extents the
+    /// request's own pieces would have, and `state` the layout's placeholder tables.
+    fn walk_opening(
+        &self,
+        walk: &Walk,
+        bucket: Bucket,
+        stated: &WarmRequest,
+        state: &[TensorView],
+    ) -> Result<()> {
         let pieces = self
             .model
-            .condition_pieces(&warm.view())
+            .condition_pieces(&stated.view())
             .map_err(Error::from)?;
         // The media reader's regions hold every condition's pixels, then every condition's samples,
         // in its own element type.
@@ -1486,20 +1533,18 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         let opening = Opening {
             index: 0,
             seed: nn::capability::Seed(0),
-            stated: warm,
+            stated,
             pieces: &pieces,
             pixels,
             samples,
             restored: false,
         };
-        self.open(&walk.forward(group)?, bucket, &opening, &state)?;
-        walk.arena().reset();
-        let step = self
-            .schedule(bucket)?
-            .first()
-            .copied()
-            .ok_or_else(|| self.no_step(bucket))?;
-        self.step(&walk.forward(group)?, bucket, step, &state)
+        self.open(
+            &walk.forward(self.group.as_deref())?,
+            bucket,
+            &opening,
+            state,
+        )
     }
 
     /// Writes the pending request's own state tables over the ones the capture read.
@@ -2864,6 +2909,7 @@ mod product_tests {
             conditions: Vec::new(),
             vision_spans: Vec::new(),
             condition_rows: None,
+            openings: Vec::new(),
         };
         let conditioning = proto::video::Conditions {
             conditions: Vec::new(),

@@ -145,6 +145,7 @@ mod tests {
             conditions: Vec::<ConditionShape>::new(),
             vision_spans: Vec::new(),
             condition_rows: None,
+            openings: Vec::new(),
         }
     }
 

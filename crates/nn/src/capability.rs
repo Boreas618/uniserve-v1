@@ -400,6 +400,16 @@ pub struct WarmRequest {
     /// The condition rows this request's layout holds, as one rung of the deployment's ladder;
     /// `None` is the deployment's whole capacity. A request of the bucket keeps the bucket's rung.
     pub condition_rows: Option<u32>,
+    /// The condition sets a request of this layout may open with, each in request order as the
+    /// request presents them.
+    ///
+    /// A request's opening encodes its own conditions eagerly over the denoiser's stream region,
+    /// outside any captured graph, so the recorded walk opens this layout once per set to measure
+    /// that encode and record its programs. They are not [`Self::conditions`]: the warm request's
+    /// own layout states no condition, and a set here is laid out only when it is opened. Empty for
+    /// a layout whose requests carry no condition, or whose conditions follow the client's media
+    /// rather than anything the deployment serves.
+    pub openings: Vec<Vec<ConditionShape>>,
 }
 
 impl WarmRequest {

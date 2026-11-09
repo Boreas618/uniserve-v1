@@ -20,9 +20,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use nn::capability::{
-    Clip, Conditioning, DecodedMedia, Decoder, Denoiser, Encoder, EncoderInputs, EncoderLayout,
-    EncoderOutputs, EncoderPrompt, ImageShape, LatentShape, Latents, Layout, MediaFormat, Seed,
-    StateTable, Step, TokenBatch, VideoRequest, WarmPrompt, WarmRequest,
+    Clip, ConditionPiece, ConditionRole, ConditionShape, Conditioning, DecodedMedia, Decoder,
+    Denoiser, Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageShape,
+    LatentShape, Latents, Layout, MediaFormat, MediaRole, Seed, StateTable, Step, TokenBatch,
+    VideoRequest, WarmPrompt, WarmRequest,
 };
 use nn::{Forward, Result};
 use ops::logits::{GatherArgs, GatherDescriptor, LogitsGather};
@@ -209,6 +210,7 @@ fn warm() -> WarmRequest {
         conditions: Vec::new(),
         vision_spans: Vec::new(),
         condition_rows: None,
+        openings: Vec::new(),
     }
 }
 
@@ -441,4 +443,174 @@ fn an_encoder_records_its_vision_prompts() {
     assert_eq!(footprint.keys, keys(&[2, 4]));
     assert_eq!(footprint.peak, 4096);
     assert_eq!(footprint.widest, Some(one));
+}
+
+/// A denoiser like [`Stepping`] that takes keyframes: each condition is one piece of its pixels,
+/// and a conditioning encode of `n` pieces reserves `n × 16` KiB and launches `gather(8 · n)`,
+/// against 3 KiB and `gather(3)` without any.
+///
+/// Its encode refuses media without the pixels of each piece, so an opening that laid out no
+/// region for them fails instead of reporting.
+struct Anchoring;
+
+impl Denoiser for Anchoring {
+    fn layout(&self, request: &VideoRequest<'_>) -> Layout {
+        Stepping.layout(request)
+    }
+
+    fn schedule(&self, request: &VideoRequest<'_>) -> Result<Vec<Step>> {
+        Stepping.schedule(request)
+    }
+
+    fn condition_pieces(&self, request: &VideoRequest<'_>) -> Result<Vec<ConditionPiece>> {
+        Ok((0_u32..)
+            .zip(request.conditions)
+            .map(|(condition, shape)| ConditionPiece {
+                condition,
+                role: match shape.role {
+                    ConditionRole::FirstFrame => MediaRole::FirstFrame,
+                    ConditionRole::LastFrame => MediaRole::LastFrame,
+                    ConditionRole::Reference => MediaRole::Reference,
+                },
+                rows: 4,
+                audio_rows: 0,
+                pixels: Some([
+                    1,
+                    3,
+                    u64::from(shape.frames),
+                    u64::from(shape.height),
+                    u64::from(shape.width),
+                ]),
+                track: None,
+                draw: None,
+                draw_offset: 0,
+            })
+            .collect())
+    }
+
+    fn draw_noise(&self, f: &Forward, seed: Seed, layout: Layout, latents: Latents) -> Result<()> {
+        Stepping.draw_noise(f, seed, layout, latents)
+    }
+
+    fn prepare_conditioning(&self, f: &Forward, cond: Conditioning<'_>) -> Result<()> {
+        let pieces = cond.media.len() as u64;
+        if pieces == 0 {
+            return Stepping.prepare_conditioning(f, cond);
+        }
+        if cond.media.iter().any(|piece| piece.pixels.is_none()) {
+            return Err(nn::Error::Unsupported(
+                "a keyframe without its pixels".into(),
+            ));
+        }
+        launch(f, 16384 * pieces, 8 * pieces as u32)
+    }
+
+    fn prepare_latents(&self, f: &Forward, cond: Conditioning<'_>, latents: Latents) -> Result<()> {
+        Stepping.prepare_latents(f, cond, latents)
+    }
+
+    fn denoise(
+        &self,
+        f: &Forward,
+        step: Step,
+        latents: Latents,
+        cond: Conditioning<'_>,
+    ) -> Result<()> {
+        Stepping.denoise(f, step, latents, cond)
+    }
+
+    fn evaluations(&self) -> u32 {
+        1
+    }
+
+    fn constant_tables(&self) -> Vec<StateTable> {
+        Stepping.constant_tables()
+    }
+
+    fn prepare_constants(&self, f: &Forward, tables: &[TensorView]) -> Result<()> {
+        Stepping.prepare_constants(f, tables)
+    }
+
+    fn layout_tables(&self, layout: &Layout) -> Result<Vec<StateTable>> {
+        Stepping.layout_tables(layout)
+    }
+
+    fn prepare_layout(&self, layout: &Layout, out: &mut [Vec<u8>]) -> Result<()> {
+        Stepping.prepare_layout(layout, out)
+    }
+
+    fn state_tables(&self, layout: &Layout) -> Vec<StateTable> {
+        Stepping.state_tables(layout)
+    }
+
+    fn prepare_state(
+        &self,
+        request: &VideoRequest<'_>,
+        layout: &Layout,
+        out: &mut [Vec<u8>],
+    ) -> Result<()> {
+        Stepping.prepare_state(request, layout, out)
+    }
+
+    fn prepare_evaluation(&self, index: u32, out: &mut [Vec<u8>]) -> Result<()> {
+        Stepping.prepare_evaluation(index, out)
+    }
+}
+
+/// A keyframe of the warm request's 16x16 canvas.
+fn keyframe(role: ConditionRole) -> ConditionShape {
+    ConditionShape {
+        role,
+        frames: 1,
+        height: 16,
+        width: 16,
+        audio_samples: 0,
+    }
+}
+
+/// A denoiser runner's footprint holds the opening of every condition set its bucket admits beside
+/// the warm request's own: the conditioning encode of the widest set is what sets the stream's
+/// peak, and each set's programs are recorded.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_denoiser_records_the_openings_its_conditions_admit() {
+    let model = Arc::new(Anchoring);
+    let warm = WarmRequest {
+        first_frames: 1,
+        last_frames: 1,
+        openings: vec![
+            vec![keyframe(ConditionRole::FirstFrame)],
+            vec![
+                keyframe(ConditionRole::FirstFrame),
+                keyframe(ConditionRole::LastFrame),
+            ],
+        ],
+        ..warm()
+    };
+    let mut runner = DenoiserRunner::new(
+        binding(),
+        Arc::clone(&model),
+        vec![warm.clone()],
+        DenoiserShape {
+            stack: DType::BF16,
+            sample: DType::F32,
+            width: 16,
+            text_width: 16,
+        },
+        Arc::new(ops::Generation::new(0, [])),
+    )
+    .expect("a runner of one bucket");
+    runner.attach_pools(pools());
+
+    let footprint = runner.record_walk().expect("a recorded walk");
+
+    // The constants, the warm opening (draw, conditioning, latents), the step, and the encode of
+    // one keyframe and of two.
+    assert_eq!(footprint.keys, keys(&[1, 2, 3, 4, 5, 8, 16]));
+    // Two keyframes' opening: the draw, their 32 KiB encode, then the latents' start.
+    assert_eq!(footprint.peak, 2048 + 32768 + 4096);
+    assert_eq!(
+        footprint.widest,
+        Some(Bucket::denoise(1, model.layout(&warm.view())).serving(1, 16, 16))
+    );
 }
