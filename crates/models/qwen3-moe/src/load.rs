@@ -11,17 +11,18 @@
 //! published once for the whole stack by its [`Rotary`].
 use std::collections::HashMap;
 
-use nn::blocks::{GateUp, GatedMlp, GatedMlpSpec};
+use nn::blocks::{
+    AttentionKind, GateUp, GatedMlp, GatedMlpSpec, QkNormNames, QkvAttention, QkvAttentionSpec,
+};
 use nn::family::Split;
 use nn::layers::{
-    Bias, ExpertNames, ExpertSlots, Linear, Moe, MoeSpec, PagedAttention, PagedSpec, Parallel,
-    ParallelLMHead, QkNorm, QkvBias, QkvLinear, QkvNames, QkvSpec, RmsNorm, Rotary, RotarySpec,
-    Rounding, VocabParallelEmbedding,
+    Bias, ExpertNames, ExpertSlots, Moe, MoeSpec, ParallelLMHead, QkNorm, QkvBias, QkvNames,
+    QkvSpec, RmsNorm, Rotary, RotarySpec, Rounding, VocabParallelEmbedding,
 };
 use nn::quantization::Declaration;
 use nn::weights::WeightLoader;
 
-use crate::model::{AttentionLayer, DecoderLayer, LoadOptions, Mlp, Qwen3Moe};
+use crate::model::{DecoderLayer, LoadOptions, Mlp, Qwen3Moe};
 use crate::{Config, Error, Partition, Result};
 
 /// The module names a Qwen3-MoE checkpoint states a routed block under: `mlp.gate` routes, and
@@ -92,7 +93,6 @@ pub fn load(
         rank: partition.expert_rank,
     };
 
-    let head_dim = u64::from(config.head_dim);
     let q_heads = partition.local_attention_heads(&config);
     let kv_heads = partition.local_key_value_heads(&config);
 
@@ -151,44 +151,40 @@ pub fn load(
             eps,
         )?;
 
-        let mut attention = scope.scope("self_attn");
-        let bias = if config.attention_bias {
-            (Bias::Present, QkvBias::Present)
-        } else {
-            (Bias::Absent, QkvBias::Absent)
-        };
-        let attention = AttentionLayer {
-            qkv: QkvLinear::load(
-                &mut attention,
-                QkvSpec {
+        let attention = QkvAttention::load(
+            &mut scope.scope("self_attn"),
+            QkvAttentionSpec {
+                qkv: QkvSpec {
                     hidden: config.hidden_size,
                     heads: config.num_attention_heads,
                     kv_heads: config.num_key_value_heads,
                     head_dim: config.head_dim,
                 },
-                QkvNames::Separate(["q_proj", "k_proj", "v_proj"]),
-                bias.1,
-                tensor,
-            )?,
-            o_proj: Linear::load(
-                &mut attention.scope("o_proj"),
-                config.num_attention_heads * config.head_dim,
-                config.hidden_size,
-                bias.0,
-                Parallel::Row(tensor),
-            )?,
-            q_norm: attention.scope("q_norm").tensor("weight", &[head_dim])?,
-            k_norm: attention.scope("k_norm").tensor("weight", &[head_dim])?,
-            attention: PagedAttention::new(PagedSpec {
-                head_dim: config.head_dim,
-                heads: q_heads,
-                kv_heads,
-                page_size: options.page_tokens,
-                max_kv_len: config.max_position_embeddings,
-                window: None,
+                names: QkvNames::Separate(["q_proj", "k_proj", "v_proj"]),
+                bias: if config.attention_bias {
+                    QkvBias::Present
+                } else {
+                    QkvBias::Absent
+                },
+                output: "o_proj",
+                output_bias: if config.attention_bias {
+                    Bias::Present
+                } else {
+                    Bias::Absent
+                },
+                qk_norm: QkNormNames::Fused {
+                    query: "q_norm",
+                    key: "k_norm",
+                },
+                kind: AttentionKind::Paged {
+                    page_size: options.page_tokens,
+                    max_kv_len: config.max_position_embeddings,
+                    window: None,
+                },
                 scale: score_scale,
-            })?,
-        };
+            },
+            tensor,
+        )?;
 
         let mlp = if config.sparse(layer) {
             let map = match &slot_table {

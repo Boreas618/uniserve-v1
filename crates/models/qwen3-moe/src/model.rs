@@ -36,13 +36,12 @@
 //! captures a graph, selects a program or owns a runtime object (`AGENTS.md`, Model Library
 //! Boundary).
 
-use nn::blocks::GatedMlp;
+use nn::blocks::{GatedMlp, Keys, QkvAttention, RopeFactors};
 use nn::capability::{CausalLm, KvView, TokenBatch};
 use nn::layers::{
-    Gains, Linear, Moe, PagedAttention, ParallelLMHead, QkvLinear, ResidualStream, RmsNorm, Rotary,
-    TRTLLM_WORKSPACE_BYTES, VocabParallelEmbedding,
+    Moe, PagedAttention, ParallelLMHead, ResidualStream, RmsNorm, Rotary, TRTLLM_WORKSPACE_BYTES,
+    VocabParallelEmbedding,
 };
-use nn::weights::Weight;
 use nn::{Arena, DType, Forward, Shape, Strides, TensorView};
 
 use crate::{Config, Error, Partition, Result};
@@ -96,22 +95,10 @@ pub struct Qwen3Moe {
 pub(crate) struct DecoderLayer {
     pub(crate) input_norm: RmsNorm,
     pub(crate) post_attention_norm: RmsNorm,
-    pub(crate) attention: AttentionLayer,
+    /// The attention: Q/K/V column parallel over the heads, per-head gains fused into the stack's
+    /// rotation, paged attention, and the row-parallel output projection.
+    pub(crate) attention: QkvAttention,
     pub(crate) mlp: Mlp,
-}
-
-/// The attention sublayer: the query, key and value projections, the row-parallel output
-/// projection, the per-head gains of the stack's fused Q/K normalization and rotation, and the
-/// paged attention layer.
-///
-/// Each projection is held in the representation its checkpoint stores, which the loader decided;
-/// the forward calls the same methods either way.
-pub(crate) struct AttentionLayer {
-    pub(crate) qkv: QkvLinear,
-    pub(crate) o_proj: Linear,
-    pub(crate) q_norm: Weight,
-    pub(crate) k_norm: Weight,
-    pub(crate) attention: PagedAttention,
 }
 
 /// The feed-forward sublayer.
@@ -144,10 +131,6 @@ struct Extents {
     padded: u64,
     /// The hidden width.
     hidden: u64,
-    /// The fused output width of the query projection (this rank's heads).
-    query: u64,
-    /// The fused width of the key and value projections (this rank's heads).
-    key_value: u64,
     /// Elements per rotary factor row (`head_dim / 2`).
     factors: u64,
     /// Bytes of the attention program's workspace.
@@ -157,13 +140,7 @@ struct Extents {
 impl Extents {
     /// The extents of one forward over `tokens` tokens; `packed` states whether the checkpoint's
     /// projections are packed, which reserves the row-padded buffers at the class that holds them.
-    fn new(
-        config: &Config,
-        partition: &Partition,
-        tokens: u64,
-        options: &LoadOptions,
-        packed: bool,
-    ) -> Result<Self> {
+    fn new(config: &Config, tokens: u64, options: &LoadOptions, packed: bool) -> Result<Self> {
         let padded = if packed {
             let counted = u32::try_from(tokens)
                 .map_err(|_| Error::Config(format!("{tokens} activation rows")))?;
@@ -175,14 +152,6 @@ impl Extents {
             tokens,
             padded,
             hidden: element(config.hidden_size, "hidden_size")?,
-            query: element(
-                partition.local_attention_heads(config) * config.head_dim,
-                "the query width",
-            )?,
-            key_value: element(
-                partition.local_key_value_heads(config) * config.head_dim,
-                "the key/value width",
-            )?,
             factors: element(config.head_dim / 2, "head_dim / 2")?,
             workspace: options.attention_workspace_bytes,
         })
@@ -209,12 +178,6 @@ struct Buffers {
     normalized: TensorView,
     update: TensorView,
     residual: TensorView,
-    query: TensorView,
-    query_rotated: TensorView,
-    key: TensorView,
-    key_rotated: TensorView,
-    value: TensorView,
-    attended: TensorView,
 }
 
 impl Buffers {
@@ -242,16 +205,6 @@ impl Buffers {
             residual: arena
                 .tensor(dtype, rows(extents.hidden))
                 .map_err(Error::from)?,
-            query: padded(extents.query)?,
-            query_rotated: arena
-                .tensor(dtype, rows(extents.query))
-                .map_err(Error::from)?,
-            key: padded(extents.key_value)?,
-            key_rotated: arena
-                .tensor(dtype, rows(extents.key_value))
-                .map_err(Error::from)?,
-            value: padded(extents.key_value)?,
-            attended: padded(extents.query)?,
         })
     }
 }
@@ -318,7 +271,6 @@ impl Qwen3Moe {
     fn extents(&self, tokens: u64) -> Result<Extents> {
         Extents::new(
             &self.config,
-            &self.partition,
             tokens,
             &self.options,
             self.projections_packed(),
@@ -330,7 +282,7 @@ impl Qwen3Moe {
     fn projections_packed(&self) -> bool {
         self.layers
             .first()
-            .is_some_and(|layer| layer.attention.qkv.query().is_packed())
+            .is_some_and(|layer| layer.attention.query().is_packed())
     }
 
     /// Run every decoder layer over `hidden`, answering the last layer's update together with the
@@ -454,8 +406,21 @@ impl DecoderLayer {
         }
 
         f.fenced(ATTENTION, format_args!("layers.{layer}.self_attn"), || {
-            self.attention.forward(
-                f, batch, cache, layer, rotary, buffers, normalized, cosine, sine, update,
+            let rope = RopeFactors {
+                rotary,
+                cosine,
+                sine,
+            };
+            let keys = Keys::Paged {
+                batch,
+                cache,
+                group: 0,
+                layer,
+                workspace: buffers.workspace,
+            };
+            Ok::<(), Error>(
+                self.attention
+                    .forward(f, normalized, Some(rope), keys, update)?,
             )
         })?;
 
@@ -478,87 +443,6 @@ impl DecoderLayer {
         })?;
         Ok(update)
     }
-}
-
-impl AttentionLayer {
-    /// Project, normalize and rotate Q and K, write them to the cache, attend, and project out.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the call carries the reference's operands and the forward's buffers"
-    )]
-    fn forward(
-        &self,
-        f: &Forward,
-        batch: &TokenBatch,
-        cache: &KvView<'_>,
-        layer: usize,
-        rotary: &Rotary,
-        buffers: &Buffers,
-        normalized: TensorView,
-        cosine: TensorView,
-        sine: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
-        self.qkv
-            .forward(f, normalized, buffers.query, buffers.key, buffers.value)?;
-
-        let query = buffers.query.reshape(headed(buffers.query, &self.q_norm)?);
-        let key = buffers.key.reshape(headed(buffers.key, &self.k_norm)?);
-        let value = buffers.value.reshape(key.shape);
-        let query_rotated = buffers.query_rotated.reshape(query.shape);
-        let key_rotated = buffers.key_rotated.reshape(key.shape);
-        let attended = buffers.attended.reshape(query.shape);
-
-        rotary
-            .apply(
-                f,
-                query,
-                key,
-                Some(Gains {
-                    query: self.q_norm.view(),
-                    key: self.k_norm.view(),
-                }),
-                cosine,
-                sine,
-                query_rotated,
-                key_rotated,
-            )
-            .map_err(Error::from)?;
-
-        self.attention
-            .forward(
-                f,
-                batch,
-                cache,
-                0,
-                layer,
-                query_rotated,
-                key_rotated,
-                value,
-                attended,
-                buffers.workspace,
-            )
-            .map_err(Error::from)?;
-
-        // Row parallel: the projection sums each rank's partial output over the query-head split.
-        self.o_proj
-            .forward(f, attended.reshape(buffers.attended.shape), out)?;
-        Ok(())
-    }
-}
-
-/// The shape of `projection` seen as `[rows, heads, head_dim]`, with `head_dim` from a per-head
-/// normalization weight.
-fn headed(projection: TensorView, norm: &Weight) -> Result<Shape> {
-    let head_dim = norm.view().shape.numel();
-    let rows = projection.rows();
-    let columns = projection.shape.last();
-    if head_dim == 0 || rows == 0 || !columns.is_multiple_of(head_dim) {
-        return Err(Error::Config(format!(
-            "a {head_dim}-element head does not divide {columns} columns of {rows} rows"
-        )));
-    }
-    Ok(Shape::new(&[rows, columns / head_dim, head_dim]))
 }
 
 impl CausalLm for Qwen3Moe {

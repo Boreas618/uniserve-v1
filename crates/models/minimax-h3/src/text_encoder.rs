@@ -34,19 +34,21 @@
 //! *replicated* on every rank: it is small, every rank needs its features, and its row-parallel
 //! projections would otherwise need a bias added once after the reduction.
 
-use nn::blocks::{GateUp, GatedMlp, GatedMlpSpec};
+use nn::blocks::{
+    AttentionKind, GateUp, GatedMlp, GatedMlpSpec, Keys, QkNormNames, QkvAttention,
+    QkvAttentionSpec, RopeFactors,
+};
 use nn::capability::{
     Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageShape, StateTable,
     TableValues,
 };
 use nn::family::Split;
 use nn::layers::{
-    Bias, DenseAttention, DenseSpec, Gains, IndexRows, Linear, Parallel, Precision, QkNorm,
-    QkvBias, QkvLinear, QkvNames, QkvSpec, Residual, ResidualStream, RmsNorm, Rotary, RotarySpec,
-    Rounding, Sections, Spectrum, Varlen, VocabParallelEmbedding,
+    Bias, IndexRows, Precision, QkNorm, QkvBias, QkvNames, QkvSpec, Residual, ResidualStream,
+    RmsNorm, Rotary, RotarySpec, Rounding, Sections, Spectrum, Varlen, VocabParallelEmbedding,
 };
 use nn::weights::{Scope, WeightLoader};
-use nn::{Arena, Forward, Shape, TensorView, Weight};
+use nn::{Arena, Forward, Shape, TensorView};
 use ops::activation::Activation;
 
 use crate::config::TextEncoderConfig;
@@ -243,18 +245,6 @@ impl Rank {
 struct Buffers {
     /// `[tokens, hidden]` one normalization.
     normalized: TensorView,
-    /// `[tokens, query]` the query projection.
-    query: TensorView,
-    /// `[tokens, query]` the normalized, rotated query.
-    rotated_query: TensorView,
-    /// `[tokens, key_value]` the key projection.
-    key: TensorView,
-    /// `[tokens, key_value]` the normalized, rotated key.
-    rotated_key: TensorView,
-    /// `[tokens, key_value]` the value projection.
-    value: TensorView,
-    /// `[tokens, query]` the attended rows.
-    attended: TensorView,
     /// `[tokens, hidden]` the attention's output projection.
     projected: TensorView,
     /// `[tokens, hidden]` the MLP's output: a layer's unsummed update.
@@ -274,8 +264,6 @@ impl Buffers {
     fn new(arena: &Arena, plan: &Plan, dtype: nn::DType) -> Result<Self> {
         let tokens = u64::from(plan.rows);
         let hidden = u64::from(plan.hidden);
-        let query = u64::from(plan.query);
-        let key_value = u64::from(plan.key_value);
         let factors = u64::from(plan.head_dim / 2);
         let merged = u64::from(plan.merged);
         let out_hidden = hidden;
@@ -289,12 +277,6 @@ impl Buffers {
         };
         Ok(Self {
             normalized: reserve(Shape::new(&[tokens, hidden]))?,
-            query: reserve(Shape::new(&[tokens, query]))?,
-            rotated_query: reserve(Shape::new(&[tokens, query]))?,
-            key: reserve(Shape::new(&[tokens, key_value]))?,
-            rotated_key: reserve(Shape::new(&[tokens, key_value]))?,
-            value: reserve(Shape::new(&[tokens, key_value]))?,
-            attended: reserve(Shape::new(&[tokens, query]))?,
             projected: reserve(Shape::new(&[tokens, hidden]))?,
             down: reserve(Shape::new(&[tokens, hidden]))?,
             cosine: factors_of(factors)?,
@@ -305,12 +287,6 @@ impl Buffers {
                 out_hidden,
             ]))?,
         })
-    }
-
-    /// `view`'s rows as `[rows, heads, head_dim]` for the rotation and attention operators.
-    fn as_heads(&self, view: TensorView, heads: u32, head_dim: u32) -> Result<TensorView> {
-        let rows = view.rows();
-        Ok(view.reshape(Shape::new(&[rows, u64::from(heads), u64::from(head_dim)])))
     }
 
     /// The `count` elements of a one-dimensional view starting at `first`.
@@ -336,15 +312,10 @@ impl Buffers {
 /// One decoder layer: pre-norm attention, then the gated MLP.
 struct Layer {
     input_norm: RmsNorm,
-    /// The query, key and value projections, split over the tensor-parallel ranks by heads.
-    qkv: QkvLinear,
-    /// The output projection, row parallel over the query heads: its forward sums the ranks'
-    /// partial outputs.
-    output: Linear,
-    /// The queries' per-head normalization.
-    query_norm: Weight,
-    /// The keys' per-head normalization.
-    key_norm: Weight,
+    /// The attention: Q/K/V split over the tensor-parallel ranks by heads, per-head gains fused
+    /// into the stack's M-RoPE rotation, causal dense attention, and the row-parallel output
+    /// projection.
+    attention: QkvAttention,
     post_norm: RmsNorm,
     /// The SwiGLU MLP, column parallel in and row parallel out over the tensor-parallel group.
     mlp: GatedMlp,
@@ -352,30 +323,41 @@ struct Layer {
 
 impl Layer {
     /// The layer the module at `scope` states, at `split`'s rank of the tensor-parallel group.
-    fn load(scope: &mut Scope<'_, '_>, config: &TextEncoderConfig, split: Split) -> Result<Self> {
-        let head_dim = u64::from(config.head_dim);
-        let mut attention = scope.scope("self_attn");
-        let qkv = QkvLinear::load(
-            &mut attention,
-            QkvSpec {
-                hidden: config.hidden_size,
-                heads: config.num_attention_heads,
-                kv_heads: config.num_key_value_heads,
-                head_dim: config.head_dim,
+    /// `scale` is the softmax scale the stack's spectrum states for a head.
+    fn load(
+        scope: &mut Scope<'_, '_>,
+        config: &TextEncoderConfig,
+        split: Split,
+        scale: f32,
+    ) -> Result<Self> {
+        let attention = QkvAttention::load(
+            &mut scope.scope("self_attn"),
+            QkvAttentionSpec {
+                qkv: QkvSpec {
+                    hidden: config.hidden_size,
+                    heads: config.num_attention_heads,
+                    kv_heads: config.num_key_value_heads,
+                    head_dim: config.head_dim,
+                },
+                names: QkvNames::Separate(["q_proj", "k_proj", "v_proj"]),
+                bias: QkvBias::Absent,
+                output: "o_proj",
+                output_bias: Bias::Absent,
+                qk_norm: QkNormNames::Fused {
+                    query: "q_norm",
+                    key: "k_norm",
+                },
+                // A call's key bound is its own prompt's rows, which the encoder admits whatever
+                // their count: the layer states no ceiling below the descriptor's range.
+                kind: AttentionKind::Dense {
+                    max_keys: u32::MAX,
+                    causal: true,
+                    window: None,
+                },
+                scale,
             },
-            QkvNames::Separate(["q_proj", "k_proj", "v_proj"]),
-            QkvBias::Absent,
             split,
         )?;
-        let output = Linear::load(
-            &mut attention.scope("o_proj"),
-            config.query_width(),
-            config.hidden_size,
-            Bias::Absent,
-            Parallel::Row(split),
-        )?;
-        let query_norm = attention.scope("q_norm").tensor("weight", &[head_dim])?;
-        let key_norm = attention.scope("k_norm").tensor("weight", &[head_dim])?;
         // The gate's product is rounded once (`Rounding::Fused`), as the reference's
         // `act_fn(gate) * up` in one expression.
         let mlp = GatedMlp::load(
@@ -399,10 +381,7 @@ impl Layer {
                 config.hidden_size,
                 config.rms_norm_eps,
             )?,
-            qkv,
-            output,
-            query_norm,
-            key_norm,
+            attention,
             post_norm: RmsNorm::load(
                 &mut scope.scope("post_attention_layernorm"),
                 config.hidden_size,
@@ -422,16 +401,10 @@ impl Layer {
         reason = "the call carries the reference's recurrence: the carried update, the residual \
                   stream, the prompt's factor tables and the plan's buffers"
     )]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the call carries the reference's recurrence, the prompt's factor tables, the \
-                  batch's attention descriptor and the plan's buffers"
-    )]
     fn forward(
         &self,
         encoder: &TextEncoder,
         f: &Forward,
-        attention: &DenseAttention,
         offsets: TensorView,
         buffers: &Buffers,
         carried: Option<TensorView>,
@@ -455,51 +428,22 @@ impl Layer {
                 .map_err(Error::from)?,
         }
 
-        let heads = (encoder.rank.query_heads, encoder.rank.key_value_heads);
-        self.qkv.forward(
-            f,
-            buffers.normalized,
-            buffers.query,
-            buffers.key,
-            buffers.value,
-        )?;
-        encoder
-            .rotary
-            .apply(
-                f,
-                buffers.as_heads(buffers.query, heads.0, encoder.config.head_dim)?,
-                buffers.as_heads(buffers.key, heads.1, encoder.config.head_dim)?,
-                Some(Gains {
-                    query: self.query_norm.view(),
-                    key: self.key_norm.view(),
-                }),
-                cosine,
-                sine,
-                buffers.as_heads(buffers.rotated_query, heads.0, encoder.config.head_dim)?,
-                buffers.as_heads(buffers.rotated_key, heads.1, encoder.config.head_dim)?,
-            )
-            .map_err(Error::from)?;
-        attention
-            .forward(
-                f,
-                buffers.as_heads(buffers.rotated_query, heads.0, encoder.config.head_dim)?,
-                buffers.as_heads(buffers.rotated_key, heads.1, encoder.config.head_dim)?,
-                buffers.as_heads(buffers.value, heads.1, encoder.config.head_dim)?,
-                Some(Varlen {
-                    cu_q: offsets,
-                    cu_k: offsets,
-                    max_q: None,
-                    max_k: u32::try_from(buffers.value.rows()).map_err(|_| {
-                        invalid_input("a prompt longer than a key bound counts".to_owned())
-                    })?,
-                }),
-                buffers.as_heads(buffers.attended, heads.0, encoder.config.head_dim)?,
-            )
-            .map_err(Error::from)?;
-        // Row parallel: the projection sums the ranks' partial outputs itself.
-        self.output
-            .forward(f, buffers.attended, buffers.projected)
-            .map_err(Error::from)?;
+        let rope = RopeFactors {
+            rotary: &encoder.rotary,
+            cosine,
+            sine,
+        };
+        let rows = u32::try_from(buffers.normalized.rows())
+            .map_err(|_| invalid_input("a prompt longer than a key bound counts".to_owned()))?;
+        let keys = Keys::Dense(Some(Varlen {
+            cu_q: offsets,
+            cu_k: offsets,
+            max_q: None,
+            max_k: rows,
+        }));
+        // Row parallel: the output projection sums the ranks' partial outputs itself.
+        self.attention
+            .forward(f, buffers.normalized, Some(rope), keys, buffers.projected)?;
 
         self.post_norm
             .forward(
@@ -519,7 +463,6 @@ pub struct TextEncoder {
     config: TextEncoderConfig,
     partition: Partition,
     dtype: nn::DType,
-    rank: Rank,
     embedding: VocabParallelEmbedding,
     /// The stack's one M-RoPE rotary: the prompt's factor tables, and every layer's rotation.
     rotary: Rotary,
@@ -574,12 +517,14 @@ impl TextEncoder {
                 },
             },
         )?;
+        let scale = rotary.spectrum().score_scale(config.head_dim)?;
         let layers = (0..retained)
             .map(|index| {
                 Layer::load(
                     &mut loader.scope(format!("{PREFIX}.layers.{index}")),
                     config,
                     split,
+                    scale,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -603,7 +548,6 @@ impl TextEncoder {
             // Every sub-layer's output joins the stream unscaled.
             residual: Residual::default(),
             deepstack_layers,
-            rank,
         })
     }
 
@@ -798,15 +742,6 @@ impl TextEncoder {
                 "the batch states no key bound its rows read".to_owned(),
             ));
         }
-        let attention = DenseAttention::new(DenseSpec {
-            head_dim: self.config.head_dim,
-            heads: self.rank.query_heads,
-            kv_heads: self.rank.key_value_heads,
-            max_keys: inputs.batch.max_kv_len,
-            causal: true,
-            window: None,
-            scale: self.rotary.spectrum().score_scale(self.config.head_dim)?,
-        })?;
 
         self.rotary
             .factors(f, prepared.positions, buffers.cosine, buffers.sine)
@@ -821,7 +756,6 @@ impl TextEncoder {
                 layer.forward(
                     self,
                     f,
-                    &attention,
                     offsets,
                     &buffers,
                     carried,

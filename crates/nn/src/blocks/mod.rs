@@ -10,6 +10,10 @@
 //! the forward's arena under a mark it releases before it returns: the arena's peak is one block's
 //! intermediates, and a captured graph replays over the same addresses.
 
+mod attention;
 mod mlp;
 
+pub use attention::{
+    AttentionKind, Keys, QkNormNames, QkvAttention, QkvAttentionSpec, RopeFactors,
+};
 pub use mlp::{GateUp, GatedMlp, GatedMlpSpec};

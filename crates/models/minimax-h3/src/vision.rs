@@ -50,12 +50,12 @@
 //! `gelu_pytorch_tanh` (`VisionConfig::hidden_act`), the patch mergers a plain `nn.GELU()`, which is
 //! the exact `erf` form. [`Gelu`] takes the approximation, and the tower holds one of each.
 
+use nn::blocks::{AttentionKind, Keys, QkNormNames, QkvAttention, QkvAttentionSpec, RopeFactors};
 use nn::capability::ImageInput;
 use nn::family::Split;
 use nn::layers::{
-    Bias, DenseAttention, DenseSpec, Gelu, LayerNorm, Linear, Parallel, PositionInterpolate,
-    Precision, QkNorm, QkvBias, QkvLinear, QkvNames, QkvSpec, Residual, Rotary, RotarySpec,
-    Spectrum, Varlen,
+    Bias, Gelu, LayerNorm, Linear, Parallel, PositionInterpolate, Precision, QkNorm, QkvBias,
+    QkvNames, QkvSpec, Residual, Rotary, RotarySpec, Spectrum, Varlen,
 };
 use nn::weights::{Scope, WeightLoader};
 use nn::{Arena, Forward, Shape, TensorView, Weight};
@@ -281,18 +281,6 @@ pub struct Buffers {
     hidden: TensorView,
     /// `[patches, hidden]` one normalization, or the position blend the stream starts from.
     normalized: TensorView,
-    /// `[patches, heads · head_dim]` the queries.
-    query: TensorView,
-    /// `[patches, heads · head_dim]` the keys.
-    key: TensorView,
-    /// `[patches, heads · head_dim]` the values.
-    value: TensorView,
-    /// `[patches, heads · head_dim]` the rotated queries.
-    rotated_query: TensorView,
-    /// `[patches, heads · head_dim]` the rotated keys.
-    rotated_key: TensorView,
-    /// `[patches, heads · head_dim]` the attended rows.
-    attended: TensorView,
     /// `[patches, hidden]` the attention projection.
     projected: TensorView,
     /// `[patches, intermediate]` the MLP's first projection.
@@ -331,12 +319,6 @@ impl Buffers {
         Ok(Self {
             hidden: reserve(Shape::new(&[rows, hidden]))?,
             normalized: reserve(Shape::new(&[rows, hidden]))?,
-            query: reserve(Shape::new(&[rows, hidden]))?,
-            key: reserve(Shape::new(&[rows, hidden]))?,
-            value: reserve(Shape::new(&[rows, hidden]))?,
-            rotated_query: reserve(Shape::new(&[rows, hidden]))?,
-            rotated_key: reserve(Shape::new(&[rows, hidden]))?,
-            attended: reserve(Shape::new(&[rows, hidden]))?,
             projected: reserve(Shape::new(&[rows, hidden]))?,
             gate: reserve(Shape::new(&[rows, intermediate]))?,
             activated: reserve(Shape::new(&[rows, intermediate]))?,
@@ -344,21 +326,6 @@ impl Buffers {
             merged: reserve(Shape::new(&[blocks, width]))?,
             merged_activated: reserve(Shape::new(&[blocks, width]))?,
         })
-    }
-
-    /// `view`'s rows as `[patches, heads, head_dim]` for the attention and rotation operators.
-    fn as_heads(&self, view: TensorView, heads: u32, head_dim: u32) -> Result<TensorView> {
-        let rows = view.rows();
-        if view.last() != u64::from(heads) * u64::from(head_dim) {
-            return Err(invalid(
-                "VisionTower",
-                format!(
-                    "a {}-wide row does not split into {heads} heads of {head_dim}",
-                    view.last()
-                ),
-            ));
-        }
-        Ok(view.reshape(Shape::new(&[rows, u64::from(heads), u64::from(head_dim)])))
     }
 }
 
@@ -429,42 +396,47 @@ pub struct Outputs<'a> {
 /// One pre-norm block: attention and an ungated MLP, each added to the residual stream.
 struct Block {
     input_norm: LayerNorm,
-    /// The query, key and value windows of the checkpoint's fused `attn.qkv`.
-    qkv: QkvLinear,
-    output: Linear,
+    /// The attention: the query, key and value windows of the checkpoint's fused `attn.qkv`, the
+    /// tower's 2-D rotation without a norm, dense attention per time step, and `attn.proj`.
+    attention: QkvAttention,
     output_norm: LayerNorm,
     first: Linear,
     second: Linear,
 }
 
 impl Block {
-    /// The block the module at `scope` states.
-    fn load(scope: &mut Scope<'_, '_>, config: &VisionConfig) -> Result<Self> {
+    /// The block the module at `scope` states; `scale` is the softmax scale of the tower's heads.
+    fn load(scope: &mut Scope<'_, '_>, config: &VisionConfig, scale: f32) -> Result<Self> {
         let hidden = config.hidden_size;
         let intermediate = config.intermediate_size;
         let head_dim = BlockRows::head_dim(config)?;
-        let mut attention = scope.scope("attn");
         // The checkpoint fuses the three `[hidden, hidden]` matrices into one `qkv` module, query
         // first; each projection is its own window of it, so three products read the same bytes
         // as the reference's one fused product.
-        let qkv = QkvLinear::load(
-            &mut attention,
-            QkvSpec {
-                hidden,
-                heads: config.num_heads,
-                kv_heads: config.num_heads,
-                head_dim,
+        let attention = QkvAttention::load(
+            &mut scope.scope("attn"),
+            QkvAttentionSpec {
+                qkv: QkvSpec {
+                    hidden,
+                    heads: config.num_heads,
+                    kv_heads: config.num_heads,
+                    head_dim,
+                },
+                names: QkvNames::Fused("qkv"),
+                bias: QkvBias::Present,
+                output: "proj",
+                output_bias: Bias::Present,
+                qk_norm: QkNormNames::None,
+                // A block's key bound is its own grid's patches: the layer states no ceiling below
+                // the descriptor's range.
+                kind: AttentionKind::Dense {
+                    max_keys: u32::MAX,
+                    causal: false,
+                    window: None,
+                },
+                scale,
             },
-            QkvNames::Fused("qkv"),
-            QkvBias::Present,
             Split::WHOLE,
-        )?;
-        let output = Linear::load(
-            &mut attention.scope("proj"),
-            hidden,
-            hidden,
-            Bias::Present,
-            Parallel::None,
         )?;
         let mut mlp = scope.scope("mlp");
         let first = Linear::load(
@@ -483,8 +455,7 @@ impl Block {
         )?;
         Ok(Self {
             input_norm: LayerNorm::load(&mut scope.scope("norm1"), hidden, LAYER_NORM_EPS)?,
-            qkv,
-            output,
+            attention,
             output_norm: LayerNorm::load(&mut scope.scope("norm2"), hidden, LAYER_NORM_EPS)?,
             first,
             second,
@@ -497,55 +468,31 @@ impl Block {
         tower: &VisionTower,
         f: &Forward,
         image: &ImageTables,
-        attention: &DenseAttention,
         rows: &BlockRows,
         buffers: &Buffers,
     ) -> Result<()> {
-        let heads = tower.config.num_heads;
-        let head_dim = BlockRows::head_dim(&tower.config)?;
         let hidden = buffers.hidden;
 
         self.input_norm
             .forward(f, hidden, None, buffers.normalized)
             .map_err(Error::from)?;
-        self.qkv.forward(
-            f,
-            buffers.normalized,
-            buffers.query,
-            buffers.key,
-            buffers.value,
-        )?;
-
-        // Both projections rotate by the patch's own 2-D factors; nothing normalizes them.
-        tower.rotary.apply(
-            f,
-            buffers.as_heads(buffers.query, heads, head_dim)?,
-            buffers.as_heads(buffers.key, heads, head_dim)?,
-            None,
-            image.cosine,
-            image.sine,
-            buffers.as_heads(buffers.rotated_query, heads, head_dim)?,
-            buffers.as_heads(buffers.rotated_key, heads, head_dim)?,
-        )?;
-
-        // One sequence per time step, packed in one launch: the key bound is every step together
-        // and the longest row is one step, so a video block of several steps launches as an image.
-        attention.forward(
-            f,
-            buffers.as_heads(buffers.rotated_query, heads, head_dim)?,
-            buffers.as_heads(buffers.rotated_key, heads, head_dim)?,
-            buffers.as_heads(buffers.value, heads, head_dim)?,
-            Some(Varlen {
-                cu_q: image.lengths,
-                cu_k: image.lengths,
-                max_q: Some(rows.sequence),
-                max_k: rows.patches,
-            }),
-            buffers.as_heads(buffers.attended, heads, head_dim)?,
-        )?;
-        self.output
-            .forward(f, buffers.attended, buffers.projected)
-            .map_err(Error::from)?;
+        // Both projections rotate by the patch's own 2-D factors; nothing normalizes them. One
+        // sequence per time step, packed in one launch: the key bound is every step together and
+        // the longest query run is one step, so a video block of several steps launches as an
+        // image.
+        let rope = RopeFactors {
+            rotary: &tower.rotary,
+            cosine: image.cosine,
+            sine: image.sine,
+        };
+        let keys = Keys::Dense(Some(Varlen {
+            cu_q: image.lengths,
+            cu_k: image.lengths,
+            max_q: Some(rows.sequence),
+            max_k: rows.patches,
+        }));
+        self.attention
+            .forward(f, buffers.normalized, Some(rope), keys, buffers.projected)?;
         tower
             .residual
             .forward(f, hidden, buffers.projected, None, hidden)
@@ -696,9 +643,6 @@ pub struct VisionTower {
     position: Weight,
     /// The learned table's side and the side it is resampled from: one square grid.
     position_grid: u32,
-    /// The query/key row counts of one dense bidirectional call; its key bound is the grid's.
-    heads: u32,
-    head_dim: u32,
     /// The 2-D rotation of every block's queries and keys, by the factor tables the host prepared.
     rotary: Rotary,
     layers: Vec<Block>,
@@ -736,9 +680,10 @@ impl VisionTower {
         let head_dim = BlockRows::head_dim(config)?;
         // The position table must be a square grid: its rows are indexed by `row · side + column`.
         let position_grid = BlockRows::position_grid(config)?;
+        let scale = spectrum(config)?.score_scale(head_dim)?;
         let mut tower = loader.scope(PREFIX);
         let layers = (0..config.depth)
-            .map(|index| Block::load(&mut tower.scope(format!("blocks.{index}")), config))
+            .map(|index| Block::load(&mut tower.scope(format!("blocks.{index}")), config, scale))
             .collect::<Result<Vec<_>>>()?;
         let deepstack = (0..config.deepstack_visual_indexes.len())
             .map(|index| {
@@ -779,8 +724,6 @@ impl VisionTower {
             patch,
             position,
             position_grid,
-            heads,
-            head_dim,
             rotary,
             layers,
             merger,
@@ -858,22 +801,9 @@ impl VisionTower {
             .forward(f, buffers.hidden, buffers.normalized, None, buffers.hidden)
             .map_err(Error::from)?;
 
-        // One bidirectional launch over the grid's time steps: the descriptor's key bound is the
-        // block's own patches (the reference's attention declares none), and its scale the head's
-        // `head_dim^-0.5`.
-        let attention = DenseAttention::new(DenseSpec {
-            head_dim: self.head_dim,
-            heads: self.heads,
-            kv_heads: self.heads,
-            max_keys: rows.patches,
-            causal: false,
-            window: None,
-            scale: self.rotary.spectrum().score_scale(self.head_dim)?,
-        })?;
-
         let mut next = 0;
         for (index, block) in self.layers.iter().enumerate() {
-            block.forward(self, f, image, &attention, &rows, buffers)?;
+            block.forward(self, f, image, &rows, buffers)?;
             if self
                 .deepstack_layers
                 .get(next)

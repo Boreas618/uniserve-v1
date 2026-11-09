@@ -176,3 +176,278 @@ fn a_tensor_parallel_gated_mlp_reduces_in_its_down_projection() {
         .is_err()
     );
 }
+
+// ---- QKV attention ------------------------------------------------------------------------------
+
+use nn::blocks::{AttentionKind, Keys, QkNormNames, QkvAttention, QkvAttentionSpec, RopeFactors};
+use nn::layers::{
+    Bias, Precision, QkNorm, QkvBias, QkvNames, QkvSpec, Rotary, RotarySpec, Spectrum, Varlen,
+};
+use nn::{KvGroup, KvPlanes, KvView, PhaseKind, TokenBatch};
+
+const HEADS: u64 = 4;
+const KV_HEADS: u64 = 2;
+const HEAD_DIM: u64 = 32;
+
+/// The tensors of an attention module `attn` with separate projections and per-head norm gains.
+fn attention_checkpoint(directory: &std::path::Path) -> Checkpoint {
+    checkpoint(
+        directory,
+        &[
+            ("attn.q_proj.weight", &[HEADS * HEAD_DIM, HIDDEN]),
+            ("attn.k_proj.weight", &[KV_HEADS * HEAD_DIM, HIDDEN]),
+            ("attn.v_proj.weight", &[KV_HEADS * HEAD_DIM, HIDDEN]),
+            ("attn.o_proj.weight", &[HIDDEN, HEADS * HEAD_DIM]),
+            ("attn.q_norm.weight", &[HEAD_DIM]),
+            ("attn.k_norm.weight", &[HEAD_DIM]),
+        ],
+    )
+}
+
+fn attention_spec(qk_norm: QkNormNames<'static>, kind: AttentionKind) -> QkvAttentionSpec<'static> {
+    QkvAttentionSpec {
+        qkv: QkvSpec {
+            hidden: HIDDEN as u32,
+            heads: HEADS as u32,
+            kv_heads: KV_HEADS as u32,
+            head_dim: HEAD_DIM as u32,
+        },
+        names: QkvNames::Separate(["q_proj", "k_proj", "v_proj"]),
+        bias: QkvBias::Absent,
+        output: "o_proj",
+        output_bias: Bias::Absent,
+        qk_norm,
+        kind,
+        scale: 0.125,
+    }
+}
+
+const DENSE: AttentionKind = AttentionKind::Dense {
+    max_keys: 1024,
+    causal: false,
+    window: None,
+};
+
+const FUSED: QkNormNames<'static> = QkNormNames::Fused {
+    query: "q_norm",
+    key: "k_norm",
+};
+
+/// The stack's rotary over the block's heads, fused with the q/k norm or not.
+fn rotary(loader: &mut WeightLoader<'_>, qk_norm: QkNorm) -> Rotary {
+    Rotary::load(
+        &mut loader.scope("rotary_emb"),
+        Spectrum::Default {
+            theta: 10_000.0,
+            dim: HEAD_DIM as u32,
+            precision: Precision::F64,
+        },
+        RotarySpec {
+            head_dim: HEAD_DIM as u32,
+            heads: HEADS as u32,
+            kv_heads: KV_HEADS as u32,
+            qk_norm,
+        },
+    )
+    .unwrap()
+}
+
+/// Each q/k-norm form launches its own programs between the projections and the attention: the
+/// gains fused into the rotation, a per-head RmsNorm of each projection, or the rotation alone.
+#[test]
+fn each_qk_norm_form_launches_its_own_programs() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = attention_checkpoint(directory.path());
+    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let fused = rotary(&mut loader, QkNorm::Fused { epsilon: 1e-6 });
+    let bare = rotary(&mut loader, QkNorm::None);
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let (x, out) = (view(&arena, &[6, HIDDEN]), view(&arena, &[6, HIDDEN]));
+    let factors = || {
+        arena
+            .tensor(DType::F32, Shape::new(&[6, HEAD_DIM / 2]))
+            .unwrap()
+    };
+    let (cosine, sine) = (factors(), factors());
+    let rope = |rotary| {
+        Some(RopeFactors {
+            rotary,
+            cosine,
+            sine,
+        })
+    };
+
+    let cases = [
+        (
+            FUSED,
+            rope(&fused),
+            &[
+                "gemm",
+                "gemm",
+                "gemm",
+                "qk_norm_rope",
+                "dense_attention",
+                "gemm",
+            ][..],
+        ),
+        (
+            QkNormNames::Separate {
+                query: "q_norm",
+                key: "k_norm",
+                epsilon: 1e-6,
+            },
+            None,
+            &[
+                "gemm",
+                "gemm",
+                "gemm",
+                "rms_norm",
+                "rms_norm",
+                "dense_attention",
+                "gemm",
+            ][..],
+        ),
+        (
+            QkNormNames::None,
+            rope(&bare),
+            &[
+                "gemm",
+                "gemm",
+                "gemm",
+                "rope_apply",
+                "rope_apply",
+                "dense_attention",
+                "gemm",
+            ][..],
+        ),
+    ];
+    for (qk_norm, rope, expected) in cases {
+        let block = QkvAttention::load(
+            &mut loader.scope("attn"),
+            attention_spec(qk_norm, DENSE),
+            Split::WHOLE,
+        )
+        .unwrap();
+        let used = arena.used();
+        let (result, launches) = launched(|| block.forward(&f, x, rope, Keys::Dense(None), out));
+        result.unwrap();
+        assert_eq!(launches, expected, "{qk_norm:?}");
+        assert_eq!(arena.used(), used, "the intermediates are released");
+    }
+
+    // A norm fused into the rotation needs the rotation.
+    let block = QkvAttention::load(
+        &mut loader.scope("attn"),
+        attention_spec(FUSED, DENSE),
+        Split::WHOLE,
+    )
+    .unwrap();
+    assert!(block.forward(&f, x, None, Keys::Dense(None), out).is_err());
+    // Packed sequences name their tables and their bounds.
+    let offsets = arena.tensor(DType::I32, Shape::new(&[3])).unwrap();
+    let varlen = Varlen {
+        cu_q: offsets,
+        cu_k: offsets,
+        max_q: Some(3),
+        max_k: 6,
+    };
+    assert!(
+        block
+            .forward(&f, x, rope(&fused), Keys::Dense(Some(varlen)), out)
+            .is_ok()
+    );
+}
+
+/// A paged block writes its keys and values into its layer's planes before it reads them, and
+/// refuses keys of the other kind.
+#[test]
+fn a_paged_block_writes_its_layers_planes_then_reads_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = attention_checkpoint(directory.path());
+    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let fused = rotary(&mut loader, QkNorm::Fused { epsilon: 1e-6 });
+    let paged = AttentionKind::Paged {
+        page_size: 64,
+        max_kv_len: 4096,
+        window: None,
+    };
+    let block = QkvAttention::load(
+        &mut loader.scope("attn"),
+        attention_spec(FUSED, paged),
+        Split::WHOLE,
+    )
+    .unwrap();
+
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let tensor = |dtype: DType, dims: &[u64]| arena.tensor(dtype, Shape::new(dims)).unwrap();
+    let tokens = 4;
+    let batch = TokenBatch {
+        positions: tensor(DType::I32, &[tokens]),
+        slot_mapping: tensor(DType::I32, &[tokens]),
+        seq_lens: tensor(DType::I32, &[1]),
+        query_offsets: tensor(DType::I32, &[2]),
+        logits_rows: tensor(DType::I32, &[1]),
+        phase: PhaseKind::Prefill,
+        page_size: 64,
+        num_tokens: tokens as u32,
+        max_kv_len: 64,
+        draft_lens: None,
+    };
+    let pages = [1, 64, KV_HEADS, HEAD_DIM];
+    let planes = [KvPlanes {
+        key: tensor(DType::BF16, &pages),
+        value: tensor(DType::BF16, &pages),
+        key_initialized: tensor(DType::U8, &[1, 1, 1, 1]),
+        value_initialized: tensor(DType::U8, &[1, 1, 1, 1]),
+        key_scale: None,
+        value_scale: None,
+    }];
+    let groups = [KvGroup {
+        block_tables: tensor(DType::I32, &[1, 1]),
+        page_size: 64,
+        dtype: DType::BF16,
+        layers: &planes,
+    }];
+    let cache = KvView { groups: &groups };
+    let (x, out) = (
+        view(&arena, &[tokens, HIDDEN]),
+        view(&arena, &[tokens, HIDDEN]),
+    );
+    let (cosine, sine) = (
+        tensor(DType::F32, &[tokens, HEAD_DIM / 2]),
+        tensor(DType::F32, &[tokens, HEAD_DIM / 2]),
+    );
+    let rope = RopeFactors {
+        rotary: &fused,
+        cosine,
+        sine,
+    };
+    let keys = Keys::Paged {
+        batch: &batch,
+        cache: &cache,
+        group: 0,
+        layer: 0,
+        workspace: tensor(DType::U8, &[1 << 20]),
+    };
+    let (result, launches) = launched(|| block.forward(&f, x, Some(rope), keys, out));
+    result.unwrap();
+    assert_eq!(
+        launches,
+        [
+            "gemm",
+            "gemm",
+            "gemm",
+            "qk_norm_rope",
+            "kv_write",
+            "paged_attention",
+            "gemm"
+        ]
+    );
+    assert!(
+        block
+            .forward(&f, x, Some(rope), Keys::Dense(None), out)
+            .is_err()
+    );
+}
