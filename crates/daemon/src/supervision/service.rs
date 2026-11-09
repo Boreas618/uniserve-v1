@@ -652,6 +652,9 @@ pub(crate) fn run_leader(
         // goes to its engine's connection, and a connection that cannot be
         // written closes that engine below.
         let mut closed = Vec::new();
+        // Whether a connection was welcomed this round. Its requests wait for the next round, so
+        // this round does not wait for its descriptors.
+        let mut welcomed = false;
         while let Ok((engine, command)) = commands.try_recv() {
             let Some(peer) = engines.get_mut(&engine) else {
                 tracing::warn!(engine, "a command names an engine that is not connected");
@@ -840,7 +843,13 @@ pub(crate) fn run_leader(
                             }
                             let _ = wake.send(());
                             peer.welcomed = true;
-                            continue;
+                            // The connection's requests are read next round. This round files
+                            // it under its final number below (a stated engine, or a client),
+                            // and a request routed now would carry its arrival number: a
+                            // member's answer and a launch's exit come back addressed to that
+                            // number, which no connection holds once it moved, and are dropped.
+                            welcomed = true;
+                            break;
                         }
                         Ok(None) => break,
                         Err(_) => {
@@ -1046,7 +1055,9 @@ pub(crate) fn run_leader(
 
         // The clients leave the numbered registry before any command is read:
         // a command names a launch's engine, and a client that happened to
-        // arrive first must not be the connection it names.
+        // arrive first must not be the connection it names. Nor is any of
+        // their requests read before this: a connection's requests wait for
+        // the round after its welcome.
         for (arrived, number) in request_links_new.drain(..) {
             if let Some(mut peer) = engines.remove(&arrived) {
                 let client = next_client;
@@ -1114,7 +1125,11 @@ pub(crate) fn run_leader(
         descriptors.extend(engines.values().map(|peer| peer.connection.descriptor()));
         descriptors.extend(clients.values().map(|peer| peer.connection.descriptor()));
         descriptors.extend(members.iter().map(|member| member.connection.descriptor()));
-        wait(&descriptors, EXIT_POLL_INTERVAL);
+        // A connection welcomed this round may hold requests already read off its socket, which
+        // no descriptor would announce: the next round reads them at once.
+        if !welcomed {
+            wait(&descriptors, EXIT_POLL_INTERVAL);
+        }
         stop.drain();
     }
 }
