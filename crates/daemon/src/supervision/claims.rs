@@ -117,12 +117,12 @@ impl ClaimHolder {
             return Ok(held.claimed.clone());
         }
 
-        let socket = storage::socket::default_socket();
+        let socket = storage::default_socket();
         let mut arguments = claim.server_arguments.clone();
         if self.remote_pages {
             arguments.extend(["--tcp".to_owned(), "0.0.0.0:0".to_owned()]);
         }
-        storage::socket::ensure(&self.executable, &socket, START_TIMEOUT, &arguments)
+        service::ensure(&self.executable, "storage-server", &socket, &arguments, START_TIMEOUT)
             .context("starting this node's storage server")?;
         let mut client = storage::Client::connect(
             &socket,

@@ -156,7 +156,6 @@ fn requests_come_back_from_their_messages_unchanged() {
         Request::from(generation()),
         Request::Diffusion(DiffusionRequest {
             request_id: RequestId(42),
-            task: "ref2va".to_owned(),
             prompt_token_ids: vec![5, 6],
             conditioning: b"{\"task\":\"ref2va\"}".to_vec(),
             conditions: vec![ConditionExtent {

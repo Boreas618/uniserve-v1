@@ -11,10 +11,9 @@
 //! numerical schedule the solver steps through - the FP32 sigmas and network times - is computed
 //! from it by the schedule module, and the solver updates latents with it.
 
-use nn::VideoTask;
+use crate::VideoTask;
 use serde_json::{Map, Value};
 
-use super::canvas::{Canvas, DMD_CANVASES, NAMED_CANVASES};
 use super::field;
 use crate::encoding::Clip;
 use crate::{Error, Result};
@@ -412,12 +411,6 @@ pub struct DenoiserConfig {
     pub attention: AttentionKind,
     /// The tasks it serves, in canonical order.
     pub tasks: Vec<VideoTask>,
-    /// The canvases it generates, or `None` when it generates the canvas rule's canvas of every
-    /// named ratio at the class a request states.
-    ///
-    /// A DMD student generates the twelve buckets it was trained on; the base release and an
-    /// OmniRef student follow the canvas rule.
-    pub canvases: Option<&'static [Canvas]>,
     /// The clip rule the checkpoint's video VAE states, which every layout needs.
     ///
     /// A request's conditions are cut into clips of the encoder's raster, so the rows they occupy -
@@ -429,14 +422,6 @@ pub struct DenoiserConfig {
 }
 
 impl DenoiserConfig {
-    /// The canvases a deployment may prepare layouts for.
-    ///
-    /// A checkpoint that generates only some canvases offers those; one that follows the canvas
-    /// rule offers every named aspect ratio's canvas at the class's short edge.
-    pub fn offered_canvases(&self) -> &'static [Canvas] {
-        self.canvases.unwrap_or(&NAMED_CANVASES)
-    }
-
     /// One DiT with the schedule and attention the checkpoint states for it.
     pub fn new(
         transformer: TransformerConfig,
@@ -472,14 +457,11 @@ impl DenoiserConfig {
                 transformer.output_heads
             )));
         }
-        let canvases =
-            matches!(schedule.grid, ScheduleGrid::Dmd { .. }).then_some(&DMD_CANVASES[..]);
         Ok(Self {
             transformer,
             schedule,
             attention,
             tasks,
-            canvases,
             clip,
         })
     }
@@ -619,24 +601,6 @@ mod tests {
             latents: 5,
             token_drop: 3,
         }
-    }
-
-    #[test]
-    fn a_dmd_denoiser_generates_the_twelve_trained_canvases_and_others_the_rule() {
-        let transformer = TransformerConfig::parse(&transformer(), "test").expect("parsed");
-        let dmd = DenoiserConfig::new(
-            transformer,
-            ScheduleSpec::dmd(vec![999, 125], super::super::NUM_TRAIN_TIMESTEPS, shifts())
-                .expect("ladder"),
-            AttentionKind::DENSE,
-            vec![
-                VideoTask::TextToVideoAudio,
-                VideoTask::FirstLastToVideoAudio,
-            ],
-            clip(),
-        )
-        .expect("a DMD denoiser");
-        assert_eq!(dmd.canvases, Some(&DMD_CANVASES[..]));
     }
 
     #[test]

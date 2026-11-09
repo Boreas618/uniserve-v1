@@ -33,7 +33,6 @@ libc.workspace = true
 llm-multimodal.workspace = true
 minijinja.workspace = true
 minijinja-contrib.workspace = true
-models.workspace = true
 # The operators' names, which the epoch record keys its programs by (`epoch`).
 ops.workspace = true
 # `Program` and the Program Server's client, which an epoch's programs are
@@ -41,7 +40,9 @@ ops.workspace = true
 program-server.workspace = true
 prometheus-client.workspace = true
 prost.workspace = true
+processing.workspace = true
 proto.workspace = true
+service.workspace = true
 reqwest = { workspace = true, features = ["http2", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true

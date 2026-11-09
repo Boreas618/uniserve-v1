@@ -12,13 +12,6 @@ pub enum TokenizeError {
     /// The model tokenizer cannot encode request content.
     #[error(transparent)]
     Tokenizer(#[from] crate::tokenizer::TokenizerError),
-    /// The model tokenizer cannot encode the text a family rule frames.
-    #[error(transparent)]
-    Vocabulary(#[from] models::VocabularyError),
-    /// A family rule refuses the request's content, such as an image it
-    /// cannot size.
-    #[error(transparent)]
-    Facts(#[from] models::FactsError),
     /// Chat rendering or semantic request validation fails.
     #[error(transparent)]
     Chat(#[from] crate::output::chat::Error),
@@ -31,9 +24,6 @@ pub enum TokenizeError {
     /// The lowered request violates the canonical generation contract.
     #[error(transparent)]
     Generation(#[from] proto::request::GenerationRequestError),
-    /// The requested output resolution is not served.
-    #[error(transparent)]
-    Resolution(#[from] models::omni::resolution::ResolutionError),
     /// The profile cannot size the request's images.
     #[error(transparent)]
     Assets(#[from] crate::model::assets::Error),
@@ -104,9 +94,9 @@ pub enum ServeError {
         #[source]
         source: media::MediaError,
     },
-    /// The video service refuses a video request or cannot process it.
+    /// The video model refuses a video request, or its processing fails.
     #[error(transparent)]
-    Video(#[from] models::video::plan::VideoInputError),
+    Video(#[from] processing::InputError),
     /// Request tokenization fails before engine submission.
     #[error("request `{request_id}` cannot be tokenized")]
     Tokenize {

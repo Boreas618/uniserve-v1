@@ -670,7 +670,11 @@ async fn receive(
 /// # Errors
 ///
 /// Fails when the handoff fails or the deployment's serving fails.
-pub async fn take_over(descriptor: i32, shutdown: CancellationToken) -> anyhow::Result<()> {
+pub async fn take_over(
+    descriptor: i32,
+    catalogue: processing::Catalogue,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
     // SAFETY: the daemon that started this process placed the handoff
     // socket at this descriptor, which nothing else in this process owns.
     let stream = UnixStream::from(unsafe { OwnedFd::from_raw_fd(descriptor) });
@@ -680,7 +684,7 @@ pub async fn take_over(descriptor: i32, shutdown: CancellationToken) -> anyhow::
         (Message::Prepare(prepare), _) => prepare,
         (other, _) => anyhow::bail!("the daemon sent {other:?} first"),
     };
-    match prepared_successor(&mut channel, *prepare, shutdown).await {
+    match prepared_successor(&mut channel, *prepare, &catalogue, shutdown).await {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = send(
@@ -699,12 +703,13 @@ pub async fn take_over(descriptor: i32, shutdown: CancellationToken) -> anyhow::
 async fn prepared_successor(
     channel: &mut Channel,
     prepare: Prepare,
+    catalogue: &processing::Catalogue,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let (mut config, _) = crate::options::resolve_text(&prepare.config, &[])?;
     config.server_config.api_key = prepare.api_key;
     let stated = Stated::from_paths(prepare.stated);
-    let prepared = Leader::prepare(&config, &stated).await?;
+    let prepared = Leader::prepare(catalogue, &config, &stated).await?;
     // Another listening address is bound before the handover, so that a
     // refused bind leaves the previous daemon serving; the listener it hands
     // over then closes once the previous daemon stops accepting.
@@ -722,7 +727,7 @@ async fn prepared_successor(
         prepare.processes.clone(),
         config.host_identity.clone(),
         config.served_model_name().to_owned(),
-        config.program_server.clone(),
+        crate::engine::control::ensure_program_server(&config.program_config)?,
     )?;
     send(
         channel,
@@ -894,6 +899,7 @@ async fn prepared_successor(
     first.start_standby();
     for (index, (handed, options, served, observer, client)) in adopted.enumerate() {
         let replica = crate::leader::Replica::new(
+            leader.catalogue.clone(),
             &options,
             Arc::new(client),
             observer,
@@ -1091,7 +1097,6 @@ fn adopted_epoch(
         generation: None,
     };
     let process = crate::epoch::ManagedProcess {
-        role: crate::epoch::Role::MainProcess,
         group: crate::engine::control::ENGINE_GROUP.to_owned(),
         rank: 0,
         pid: None,
@@ -1134,6 +1139,5 @@ mod tests {
         assert_eq!(process.generation, 12);
         assert_eq!(process.epoch, Some(7));
         assert_eq!(process.state, crate::epoch::ProcessState::Serving);
-        assert_eq!(process.role, crate::epoch::Role::MainProcess);
     }
 }

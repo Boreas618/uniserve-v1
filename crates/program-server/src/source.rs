@@ -1160,7 +1160,7 @@ mod tests {
     fn nothing() -> ToolchainConfig {
         ToolchainConfig {
             nvcc: None,
-            python: PathBuf::from("/nonexistent/python"),
+            python: Some(PathBuf::from("/nonexistent/python")),
             wasm: None,
             cargo: None,
             max_jobs: 1,

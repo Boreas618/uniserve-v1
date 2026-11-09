@@ -128,8 +128,6 @@ pub struct GenerateRequest {
     pub constraint: GenerationConstraint,
     /// How text is sampled and decoded.
     pub sampling_params: SamplingParams,
-    /// How images are generated, for a request that generates them.
-    pub image_params: Option<ImageSamplingParams>,
     /// Scheduling priority; lower is earlier.
     pub priority: i32,
     /// Salt that isolates the request's prefix-cache and encoder-cache
@@ -148,36 +146,4 @@ pub struct AdapterSelection {
     /// What keeps its cache entries apart from every other adapter's, one
     /// loaded into the same slot before included.
     pub identity: String,
-}
-
-/// Image-generation controls: dimensions, denoise steps, guidance controls,
-/// seed, and image-count bounds.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct ImageSamplingParams {
-    /// Named output-resolution preset.
-    pub resolution: Option<models::omni::resolution::ResolutionName>,
-    /// Explicit output width in pixels.
-    pub width: Option<u32>,
-    /// Explicit output height in pixels.
-    pub height: Option<u32>,
-    /// Diffusion step count.
-    pub steps: Option<u16>,
-    /// Classifier-free guidance scale for text conditioning.
-    pub cfg_text_scale: Option<f32>,
-    /// Classifier-free guidance scale for image conditioning.
-    pub cfg_img_scale: Option<f32>,
-    /// Fractional diffusion interval over which guidance applies.
-    pub cfg_interval: Option<[f32; 2]>,
-    /// Guidance renormalization algorithm.
-    pub cfg_renorm_type: Option<proto::request::CfgRenorm>,
-    /// Minimum scale at which guidance renormalization applies.
-    pub cfg_renorm_min: Option<f32>,
-    /// Diffusion timestep shift.
-    pub timestep_shift: Option<f32>,
-    /// Optional deterministic seed stated by the request itself, where a
-    /// request carries its own sampler state; `Qwen3` preprocessing resolves
-    /// its seed from `SamplingParams::seed` alone.
-    pub seed: Option<u64>,
-    /// Maximum number of generated images.
-    pub max_images: Option<u16>,
 }

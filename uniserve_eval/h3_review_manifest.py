@@ -28,25 +28,29 @@ import tomllib
 from pathlib import Path
 
 
-def condition_media(row: dict[str, object]) -> list[str]:
-    """The media a row conditions on, as `type: path (role)`.
+def reference_media(row: dict[str, object]) -> list[str]:
+    """The media a row references, as `type: path`, with any keyframe anchor.
 
-    A workload row states its inputs under `conditions`, one entry per input,
-    each naming the media it reads and the role it plays in the request.
+    A workload row states its inputs under `input_references`, one entry per
+    input, each naming the media it reads; an anchor keyframe also names the
+    frame it pins (`-1` is the last frame).
     """
-    conditions = row.get("conditions") or []
-    if not isinstance(conditions, list):
+    references = row.get("input_references") or []
+    if not isinstance(references, list):
         return []
     found: list[str] = []
-    for condition in conditions:
-        if not isinstance(condition, dict):
+    for reference in references:
+        if not isinstance(reference, dict):
             continue
-        media = condition.get("media")
+        media = reference.get("media")
         if not media:
             continue
-        kind = condition.get("type", "input")
-        role = condition.get("role")
-        found.append(f"{kind}: `{media}`" + (f" ({role})" if role else ""))
+        kind = reference.get("type", "input")
+        anchor = reference.get("frame_index")
+        found.append(
+            f"{kind}: `{media}`"
+            + (f" (keyframe at frame {anchor})" if anchor is not None else "")
+        )
     return found
 
 
@@ -156,7 +160,7 @@ def manifest(
             or cell["server"]
         )
         row = measured_row(config.parent.parent / cell["dataset_path"])
-        task = cell.get("video", {}).get("task", "")
+        task = (cell.get("provenance") or {}).get("task", "")
         seed = row.get("seed", "")
         base_mp4s = cell_mp4s(baseline / name) if baseline is not None else []
         cand_mp4s = cell_mp4s(candidate / name) if candidate is not None else []
@@ -165,7 +169,7 @@ def manifest(
 
     lines.append("")
     for name, task, checkpoint, row, base_mp4s, cand_mp4s in rows:
-        inputs = condition_media(row)
+        inputs = reference_media(row)
         base_text = mp4_name(
             base_mp4s, "not on this host" if baseline is None else "missing"
         )

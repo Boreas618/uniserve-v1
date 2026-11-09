@@ -152,8 +152,9 @@ pub struct ToolchainConfig {
     pub nvcc: Option<PathBuf>,
     /// The interpreter of the Program Server's Python environment, created from
     /// `python/pyproject.toml` and `python/uv.lock`. Triton and CuTe DSL are the
-    /// environment's two toolchains.
-    pub python: PathBuf,
+    /// environment's two toolchains; `None` refuses their packages and runs no
+    /// package's Python compile script.
+    pub python: Option<PathBuf>,
     /// The wasm precompiler, `scheduling-precompile`, which builds a policy module with
     /// the schedule crate's own engine. `None` refuses a policy package.
     pub wasm: Option<PathBuf>,
@@ -183,12 +184,13 @@ impl Toolchains {
     /// A missing toolchain is recorded with its reason; it does not fail the
     /// server, because only a build that needs it does.
     pub fn discover(config: &ToolchainConfig) -> Result<Toolchains> {
-        let interpreter = resolve(&config.python);
+        let interpreter = config.python.as_deref().map(resolve);
+        let interpreter = interpreter.as_deref();
         Ok(Toolchains {
             nvcc: Nvcc::discover(config),
-            triton: Triton::discover(config, &interpreter),
-            cute_dsl: CuteDsl::discover(config, &interpreter),
-            wasm: Wasm::discover(config, &interpreter),
+            triton: Triton::discover(config, interpreter),
+            cute_dsl: CuteDsl::discover(config, interpreter),
+            wasm: Wasm::discover(config, interpreter),
         })
     }
 
@@ -289,12 +291,15 @@ impl Nvcc {
         }
         let version = parse_nvcc_version(&text)
             .ok_or_else(|| format!("{} --version names no release: {text}", path.display()))?;
-        let interpreter = resolve(&config.python);
         Ok(Nvcc {
             path,
             version,
             max_jobs: config.max_jobs,
-            interpreter: interpreter.is_file().then_some(interpreter),
+            interpreter: config
+                .python
+                .as_deref()
+                .map(resolve)
+                .filter(|interpreter| interpreter.is_file()),
         })
     }
 }
@@ -334,7 +339,8 @@ struct Triton {
 }
 
 impl Triton {
-    fn discover(config: &ToolchainConfig, interpreter: &Path) -> Discovered<Triton> {
+    fn discover(config: &ToolchainConfig, interpreter: Option<&Path>) -> Discovered<Triton> {
+        let interpreter = named_interpreter(interpreter)?;
         let version = python_version(interpreter, "triton")?;
         Ok(Triton {
             interpreter: interpreter.to_path_buf(),
@@ -375,7 +381,8 @@ struct CuteDsl {
 }
 
 impl CuteDsl {
-    fn discover(config: &ToolchainConfig, interpreter: &Path) -> Discovered<CuteDsl> {
+    fn discover(config: &ToolchainConfig, interpreter: Option<&Path>) -> Discovered<CuteDsl> {
+        let interpreter = named_interpreter(interpreter)?;
         let version = python_version(interpreter, "cutlass")?;
         Ok(CuteDsl {
             interpreter: interpreter.to_path_buf(),
@@ -422,7 +429,7 @@ struct Wasm {
 }
 
 impl Wasm {
-    fn discover(config: &ToolchainConfig, interpreter: &Path) -> Discovered<Wasm> {
+    fn discover(config: &ToolchainConfig, interpreter: Option<&Path>) -> Discovered<Wasm> {
         let precompiler = config
             .wasm
             .clone()
@@ -434,7 +441,9 @@ impl Wasm {
             version,
             max_jobs: config.max_jobs,
             cargo: config.cargo.as_deref().map(resolve),
-            interpreter: interpreter.is_file().then(|| interpreter.to_path_buf()),
+            interpreter: interpreter
+                .filter(|interpreter| interpreter.is_file())
+                .map(Path::to_path_buf),
         })
     }
 }
@@ -503,6 +512,14 @@ impl Toolchain for Nothing {
     fn max_jobs(&self) -> usize {
         1
     }
+}
+
+/// The interpreter the configuration names, or why a Python toolchain is
+/// missing without one.
+fn named_interpreter(interpreter: Option<&Path>) -> Discovered<&Path> {
+    interpreter.ok_or_else(|| {
+        "no Python interpreter named: pass --python <the Program Server's interpreter>".to_owned()
+    })
 }
 
 /// Asks the Python environment for the version of one of its distributions.

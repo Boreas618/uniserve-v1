@@ -374,6 +374,60 @@ pub struct EncoderOutputs {
     pub hidden: TensorView,
 }
 
+/// A request a denoiser's graph is captured with before any request of its layout arrives.
+///
+/// A capture happens before the first request of a shape, and the model's per-layout tables are
+/// written from a request, so a model states one request per layout its deployment serves
+/// ([`crate::family::VideoModel::candidates`]) and **the bucket is derived from it**
+/// ([`Denoiser::layout`]) rather than stated beside it. A bucket and a warm request that disagreed
+/// about a count would put a graph's tables in one shape and its graph in another, which no launch
+/// refuses.
+#[derive(Clone, Debug)]
+pub struct WarmRequest {
+    /// Canvas width in pixels.
+    pub width: u32,
+    /// Canvas height in pixels.
+    pub height: u32,
+    /// Frames of the request; the model snaps it to a legal count.
+    pub frames: u32,
+    /// Frames per second of the output.
+    pub fps: u32,
+    /// Frame-one anchors.
+    pub first_frames: u32,
+    /// Last-frame anchors.
+    pub last_frames: u32,
+    /// Reference images or clips.
+    pub references: u32,
+    /// Prompt tokens the request presents, vision tokens included.
+    pub text_tokens: u32,
+    /// The encoded condition media, in request order: anchors, then references.
+    pub conditions: Vec<ConditionShape>,
+    /// Per-image prompt spans, in request order.
+    pub vision_spans: Vec<(u32, u32)>,
+    /// The condition rows this request's layout holds, as one rung of the deployment's ladder;
+    /// `None` is the deployment's whole capacity. A request of the bucket keeps the bucket's rung.
+    pub condition_rows: Option<u32>,
+}
+
+impl WarmRequest {
+    /// The request as the model's capability reads one.
+    pub fn view(&self) -> VideoRequest<'_> {
+        VideoRequest {
+            width: self.width,
+            height: self.height,
+            frames: self.frames,
+            fps: self.fps,
+            first_frames: self.first_frames,
+            last_frames: self.last_frames,
+            references: self.references,
+            text_tokens: self.text_tokens,
+            conditions: &self.conditions,
+            vision_spans: &self.vision_spans,
+            condition_rows: self.condition_rows,
+        }
+    }
+}
+
 /// A video request's numerical layout input: what the denoiser must lay out (specs/worker.md 4.3).
 ///
 /// Every field is a request fact the worker already holds — it decoded the media, encoded the
@@ -381,8 +435,6 @@ pub struct EncoderOutputs {
 /// canvas, the roles' counts, the prompt's token count and each condition's raster.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct VideoRequest<'a> {
-    /// The task the request asks for.
-    pub task: VideoTask,
     /// Canvas width in pixels.
     pub width: u32,
     /// Canvas height in pixels.
@@ -446,17 +498,6 @@ pub enum ConditionRole {
     LastFrame,
     /// Conditions the generation as a whole.
     Reference,
-}
-
-/// The tasks a video model serves.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum VideoTask {
-    /// Text to video and audio.
-    TextToVideoAudio,
-    /// First and last frame to video and audio.
-    FirstLastToVideoAudio,
-    /// Reference media to video and audio.
-    ReferenceToVideoAudio,
 }
 
 /// The latent layout a denoiser prepares for one request.
@@ -818,23 +859,21 @@ pub trait Denoiser {
         )))
     }
 
-    /// The denoising steps one request of `task` runs, in order.
+    /// The denoising steps `request` runs, in order.
     ///
-    /// The runner executes one step per call and cannot derive the schedule: the steer belongs to
-    /// the model's checkpoint, and `Step::index` and `Step::count` are what a solver checks itself
+    /// The runner executes one step per call and cannot derive the schedule: it belongs to the
+    /// model's checkpoint, and `Step::index` and `Step::count` are what a solver checks itself
     /// against, so a runner holding its own sigma table would be a second source of truth for a
-    /// value the model states.
+    /// value the model states. A model whose schedule depends on what a request conditions on reads
+    /// that from `request`.
     ///
-    /// The task is the key rather than a positional index because a request names its task: a
-    /// vector of schedules whose first element is the one a request starts with says which
-    /// schedule to take by position, and a second modality inserted at the front changes every
-    /// caller silently.
-    ///
-    /// A model that states no schedule for `task` refuses by name. Empty would be the same value
-    /// as a schedule that exists and has no steps, which is the opposite fact.
-    fn schedule(&self, task: VideoTask) -> Result<Vec<Step>> {
+    /// A model that states no schedule for `request` refuses by name. Empty would be the same
+    /// value as a schedule that exists and has no steps, which is the opposite fact.
+    fn schedule(&self, request: &VideoRequest<'_>) -> Result<Vec<Step>> {
         Err(Error::Unsupported(format!(
-            "a denoiser that states no schedule for {task:?}"
+            "a denoiser that states no schedule for a request of {} anchor(s) and {} reference(s)",
+            request.first_frames + request.last_frames,
+            request.references
         )))
     }
 

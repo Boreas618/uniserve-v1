@@ -17,7 +17,6 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
-use models::video::plan::{MAX_VIDEO_SECONDS, ProcessorConfig, canvas};
 use scheduler::{SchedulerHandle, SimEngine, SimWorker};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
@@ -28,7 +27,7 @@ use crate::input::media::MediaConnector;
 use crate::input::video::VideoService;
 use crate::input::{InputProcessor, RequestRenderer};
 use crate::leader::Leader;
-use crate::model::{ModelConfig, ModelParameters, SamplingDefaults};
+use crate::model::{ModelConfig, SamplingDefaults};
 use crate::openai::video_jobs::VideoJobs;
 use crate::options::ChatTemplateContentFormat;
 use crate::options::{ImageFetchConfig, LoggingConfig, ServerArgs, ServerConfig, VideoJobConfig};
@@ -63,15 +62,15 @@ pub(crate) fn router_with(engine: Leader, server: &ServerConfig) -> Router {
     )
 }
 
-/// Builds an engine for a model with `parameters` over one default
+/// Builds an engine for a model of `family` over one default
 /// `SimEngine`.
 ///
 /// The tokenizer is [`configured_tokenizer`], whose
 /// `<|im_end|>` (ID 2) is the end-of-sequence token, and the chat template
 /// renders only the first message's content. A MiniMax H3 model serves the
 /// API's longest duration capacity, as a default video deployment does.
-pub(crate) fn sim_engine(parameters: ModelParameters) -> Leader {
-    let model = sim_model(parameters);
+pub(crate) fn sim_engine(family: processing::Family) -> Leader {
+    let model = sim_model(family);
     let core = sim_core(scheduler::sim_args(SERVED_MODEL), SimEngine::new());
     engine_over(model, configured_tokenizer(), vec![core])
 }
@@ -159,10 +158,10 @@ pub(crate) fn packaged_policy(
     })
 }
 
-/// Builds an engine for a model with `parameters` over started schedulers,
+/// Builds an engine for a model of `family` over started schedulers,
 /// one per data-parallel rank; see [`sim_engine`].
-pub(crate) fn sim_engine_over(parameters: ModelParameters, cores: Vec<SchedulerHandle>) -> Leader {
-    engine_over(sim_model(parameters), configured_tokenizer(), cores)
+pub(crate) fn sim_engine_over(family: processing::Family, cores: Vec<SchedulerHandle>) -> Leader {
+    engine_over(sim_model(family), configured_tokenizer(), cores)
 }
 
 /// A client of `cores`, which serve the request interface on a thread of
@@ -230,10 +229,145 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
     .expect("a client")
 }
 
+/// A chat family whose outputs are parsed in the Qwen3 formats.
+pub(crate) const CHAT: processing::Family = processing::Family {
+    id: "chat",
+    model_types: &["chat"],
+    pipeline_classes: &[],
+    serving: processing::Serving::Chat(processing::ChatProfile {
+        reasoning: Some(processing::ReasoningFormat::Qwen3),
+        tool_calls: Some(processing::ToolCallFormat::Qwen3),
+    }),
+};
+
+/// A video family whose processor is [`TestProcessor`].
+pub(crate) const VIDEO: processing::Family = processing::Family {
+    id: "video",
+    model_types: &[],
+    pipeline_classes: &["TestVideoPipeline"],
+    serving: processing::Serving::Video(&TestVideo),
+};
+
+/// The video family [`VIDEO`] serves.
+struct TestVideo;
+
+impl processing::VideoFamily for TestVideo {
+    fn default_prompt_tokens(&self) -> u32 {
+        4096
+    }
+
+    fn processor_files(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
+    fn bind(
+        &self,
+        _: processing::VideoBinding<'_>,
+    ) -> Result<Box<dyn processing::VideoProcessor>, String> {
+        Ok(Box::new(TestProcessor))
+    }
+}
+
+/// A video model of one rule and plain plans, for the daemon's own behavior: a request shorter
+/// than a second is refused before its media is fetched, and every image reference is one
+/// condition whose rows are its height.
+pub(crate) struct TestProcessor;
+
+impl processing::VideoProcessor for TestProcessor {
+    fn capabilities(&self) -> serde_json::Value {
+        serde_json::json!({"sizes": ["64x64"]})
+    }
+
+    fn denoise_steps(&self) -> u32 {
+        4
+    }
+
+    fn check(&self, request: &processing::VideoSpec) -> Result<(), processing::InputError> {
+        match request.length {
+            Some(processing::Length::Seconds(seconds)) if seconds < 1.0 => Err(
+                processing::InputError::invalid("seconds", "a video lasts at least a second"),
+            ),
+            _ => Ok(()),
+        }
+    }
+
+    fn plan(
+        &self,
+        request: &processing::VideoSpec,
+        media: &[processing::MediaMetadata],
+        vocabulary: &dyn processing::Vocabulary,
+    ) -> Result<processing::VideoPlan, processing::InputError> {
+        use proto::video::{Canvas, ConditionMedia, ConditionRole, ImageFit};
+
+        let conditions = request
+            .references
+            .iter()
+            .zip(media)
+            .map(|(reference, media)| {
+                let processing::MediaMetadata::Image(image) = media else {
+                    return Err(processing::InputError::Internal(
+                        "the test processor plans images".to_owned(),
+                    ));
+                };
+                let canvas = Canvas {
+                    width: image.width,
+                    height: image.height,
+                };
+                Ok(processing::ConditionPlan {
+                    role: match reference.frame_index {
+                        Some(0) => ConditionRole::FirstFrame,
+                        Some(_) => ConditionRole::LastFrame,
+                        None => ConditionRole::Reference,
+                    },
+                    media: ConditionMedia::Image(ImageFit {
+                        resized: canvas,
+                        left: 0,
+                        top: 0,
+                        size: canvas,
+                    }),
+                    vision: None,
+                    latent_units: vec![image.height],
+                    audio_rows: 0,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let prompt_token_ids = vocabulary
+            .encode(&request.prompt)
+            .map_err(|error| processing::InputError::Internal(error.to_string()))?;
+        Ok(processing::VideoPlan {
+            size: request.size.unwrap_or(Canvas {
+                width: 64,
+                height: 64,
+            }),
+            num_frames: 22,
+            fps: 24,
+            seed: request.seed.unwrap_or(42),
+            prompt_token_ids,
+            vision_spans: Vec::new(),
+            condition_rows: conditions
+                .iter()
+                .flat_map(|condition| condition.latent_units.iter())
+                .sum(),
+            conditions,
+            video_units: 2,
+        })
+    }
+}
+
+/// The video service of [`TestProcessor`] under the default media policy.
+pub(crate) fn test_video_service() -> VideoService {
+    VideoService::new(
+        Box::new(TestProcessor),
+        &crate::options::MediaConfig::default(),
+        configured_tokenizer(),
+    )
+    .unwrap()
+}
+
 /// The simulated model's facts.
-pub(crate) fn sim_model(parameters: ModelParameters) -> ModelConfig {
+pub(crate) fn sim_model(family: processing::Family) -> ModelConfig {
     ModelConfig {
-        parameters,
+        family,
         sampling_defaults: SamplingDefaults::default(),
         max_model_len: 4096,
         primary_eos_token_id: Some(2),
@@ -242,9 +376,8 @@ pub(crate) fn sim_model(parameters: ModelParameters) -> ModelConfig {
 }
 
 /// Serves `model` with `tokenizer` over `cores` without request or stats
-/// logging. A MiniMax H3 model serves [`sim_video_service`]; any other
-/// model renders chat requests with a template of the first message's
-/// content.
+/// logging. A video model serves [`test_video_service`]; a chat model
+/// renders chat requests with a template of the first message's content.
 pub(crate) fn engine_over(
     model: ModelConfig,
     tokenizer: DynTokenizer,
@@ -262,9 +395,9 @@ pub(crate) fn leader_over(
     model_name: String,
     clients: Vec<std::sync::Arc<EngineClient>>,
 ) -> Leader {
-    let renderer = match &model.parameters {
-        ModelParameters::MiniMaxH3 => RequestRenderer::Video(sim_video_service(MAX_VIDEO_SECONDS)),
-        _ => RequestRenderer::Chat(
+    let renderer = match model.video() {
+        Some(_) => RequestRenderer::Video(test_video_service()),
+        None => RequestRenderer::Chat(
             HfChatRenderer::new(
                 Some("{{ messages[0].content }}".to_string()),
                 HashMap::new(),
@@ -298,54 +431,6 @@ pub(crate) fn leader_over(
         &options,
         test_updates(),
     )
-}
-
-/// The video service of a four-step text-to-video denoiser that generates
-/// every canvas of the canvas rule, with the released checkpoint's vision
-/// processor geometry and the default media policy.
-pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
-    VideoService::new(
-        models::video::DenoiserInfo {
-            tasks: vec!["t2va".to_owned()],
-            schedule_points: 5,
-            video_shift: 12.0,
-            audio_shift: 3.0,
-            frame_rate: 24,
-            audio_sample_rate: 32_000,
-            frames: models::video::FrameClips {
-                min_frames: 22,
-                clip_frames: 17,
-                clip_latent_frames: 5,
-                tail_latent_frames: 2,
-            },
-            // The base checkpoint's canvas of each named ratio at 768p.
-            canvases: [(21, 9), (16, 9), (4, 3), (1, 1), (3, 4), (9, 16)]
-                .map(|(width, height): (u32, u32)| models::video::ServedCanvas {
-                    short_edge: 768,
-                    aspect_ratio: format!("{width}:{height}"),
-                    canvas: canvas(f64::from(width), f64::from(height)).unwrap(),
-                })
-                .to_vec(),
-            references: models::video::ReferenceLimits::default(),
-            condition_packing: models::video::ConditionPacking::default(),
-        },
-        ProcessorConfig {
-            patch_size: 16,
-            temporal_patch_size: 2,
-            merge_size: 2,
-            image_min_pixels: 65_536,
-            image_max_pixels: 16_777_216,
-            video_min_pixels: 4_096,
-            video_max_pixels: 25_165_824,
-        },
-        max_video_seconds,
-        1,
-        &crate::options::MediaConfig::default(),
-        // A text-to-video denoiser takes no references to size.
-        models::video::plan::ReferenceConfig::new(&models::video::ReferenceLimits::default()),
-        configured_tokenizer(),
-    )
-    .unwrap()
 }
 
 /// How long a fixture's request may take to answer before it is a stall.

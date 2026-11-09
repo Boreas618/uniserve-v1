@@ -677,17 +677,10 @@ impl Scheduler {
             );
             return;
         };
-        let Some(task) = denoiser.task(&request.task) else {
+        if !denoiser.takes_conditions && !request.conditions.is_empty() {
             reject(
                 RejectionKind::Invalid,
-                format!("the deployment's denoiser does not serve {}", request.task),
-            );
-            return;
-        };
-        if task.conditioned == request.conditions.is_empty() {
-            reject(
-                RejectionKind::Invalid,
-                format!("the conditions do not fit the task {}", request.task),
+                "the deployment's denoiser takes no conditions".to_string(),
             );
             return;
         }
@@ -1110,8 +1103,8 @@ impl Scheduler {
         };
         Some(format!(
             "an input image resizes to {size} for latent encoding, which the workers encode \
-             under CUDA graphs only at the sizes they captured: {}; serve with \
-             cuda_graph_config.policy = \"off\" to encode every size",
+             under CUDA graphs only at the sizes they captured: {}; add the size to \
+             cuda_graph_config.flow_shapes to encode it",
             if sizes.is_empty() {
                 "none".to_owned()
             } else {

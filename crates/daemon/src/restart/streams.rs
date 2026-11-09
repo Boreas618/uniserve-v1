@@ -490,7 +490,6 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::model::ModelParameters;
     use crate::options::VideoJobConfig;
     use crate::test_support::{configured_tokenizer, leader_over, sim_client, sim_core, sim_model};
 
@@ -551,7 +550,7 @@ mod tests {
         let core = sim_core(scheduler::sim_args("refused-handoff"), SimEngine::new());
         let client = std::sync::Arc::new(sim_client(vec![core]));
         let leader = std::sync::Arc::new(leader_over(
-            sim_model(ModelParameters::Qwen3),
+            sim_model(crate::test_support::CHAT),
             configured_tokenizer(),
             "refused-handoff".into(),
             vec![client],
@@ -592,7 +591,7 @@ mod tests {
         let core = sim_core(scheduler::sim_args("refused-handoff-2"), SimEngine::new());
         let client = std::sync::Arc::new(sim_client(vec![core]));
         let leader = std::sync::Arc::new(leader_over(
-            sim_model(ModelParameters::Qwen3),
+            sim_model(crate::test_support::CHAT),
             configured_tokenizer(),
             "refused-handoff-2".into(),
             vec![client],

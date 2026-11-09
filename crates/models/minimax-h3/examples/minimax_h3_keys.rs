@@ -480,10 +480,10 @@ fn main() {
         // rows, which is a deployment no conditioned request asks for.
         let partition = minimax_h3::Partition::serving(
             &config,
-            nn::VideoTask::ReferenceToVideoAudio,
+            minimax_h3::VideoTask::ReferenceToVideoAudio,
             minimax_h3::partition::Ulysses::of(
                 ulysses,
-                minimax_h3::partition::Projection::Exchange,
+                nn::family::Projection::Exchange,
             ),
             tensor_parallel,
             0,
@@ -531,8 +531,8 @@ fn main() {
     // The reference task where the checkpoint states it, because it reserves the most rows; an
     // export that states only others is sized by the last of them.
     let stated = config.tasks();
-    let widest = if stated.contains(&nn::VideoTask::ReferenceToVideoAudio) {
-        nn::VideoTask::ReferenceToVideoAudio
+    let widest = if stated.contains(&minimax_h3::VideoTask::ReferenceToVideoAudio) {
+        minimax_h3::VideoTask::ReferenceToVideoAudio
     } else {
         *stated
             .last()
@@ -541,7 +541,7 @@ fn main() {
     let serving = minimax_h3::Partition::serving(
         &config,
         widest,
-        minimax_h3::partition::Ulysses::of(ulysses, minimax_h3::partition::Projection::Exchange),
+        minimax_h3::partition::Ulysses::of(ulysses, nn::family::Projection::Exchange),
         tensor_parallel,
         0,
         0,

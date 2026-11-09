@@ -64,7 +64,7 @@ pub struct DaemonOptions {
     /// The leader's process socket, which engines connect to.
     pub socket: PathBuf,
     /// The `uniserve` executable that starts this node's Storage Server
-    /// when it has none, as its `storage serve` command.
+    /// when it has none, as its `storage-server serve` command.
     pub executable: PathBuf,
     /// How long the leader waits for the members and a member for the
     /// leader.

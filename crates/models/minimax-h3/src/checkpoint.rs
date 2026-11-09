@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use nn::VideoTask;
+use crate::VideoTask;
 use serde_json::{Map, Value};
 
 use crate::{Error, Result};
@@ -596,7 +596,7 @@ fn single(object: &Map<String, Value>, key: &str) -> Result<f32> {
 mod tests {
     use std::fs;
 
-    use nn::VideoTask;
+    use crate::VideoTask;
 
     use super::*;
 

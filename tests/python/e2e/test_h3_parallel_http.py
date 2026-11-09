@@ -426,7 +426,7 @@ def test_component_bindings_release_cancelled_requests(
         ]
     tokenizer = AutoTokenizer.from_pretrained(Path(model_value) / "tokenizer")
     payloads = []
-    for seconds, tokens, _frames in shapes:
+    for _seconds, tokens, frames in shapes:
         # The evaluator's FastH3 prompt synthesis yields exactly `tokens`
         # prompt tokens, so each request lands in its intended text capacity.
         case = BenchmarkPoint(
@@ -438,10 +438,10 @@ def test_component_bindings_release_cancelled_requests(
             # The point only synthesizes the prompt; its metric is never read.
             metrics=(MetricDefinition(("videos_per_second",), "higher"),),
             load=LoadConfig(num_prompts=1),
-            video=VideoConfig(seconds=seconds, prompt_tokens=tokens),
+            video=VideoConfig(prompt_tokens=tokens),
         )
         prompt = MiniMaxH3Dataset(case).load(tokenizer)[0].prompt
-        payloads.append(t2va_request("MiniMax-H3", prompt, seconds, 1000))
+        payloads.append(t2va_request("MiniMax-H3", prompt, frames, 1000))
     log = tmp_path / "h3-components.log"
     environment = {
         "CUDA_VISIBLE_DEVICES": ",".join(
@@ -483,7 +483,6 @@ def test_component_bindings_release_cancelled_requests(
                 response.content, declared_mime=response.headers["content-type"]
             )
             assert media.frame_count == frames
-            # The 16:9 target's canvas.
             assert (media.width, media.height) == (1344, 768)
             assert (media.audio_channels, media.audio_sample_rate) == (2, 32000)
             (tmp_path / f"{seconds}s.mp4").write_bytes(response.content)
@@ -557,8 +556,6 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         # alongside BF16 weights and two resident request slots.
         "--mem-fraction-static",
         "0.92",
-        "--set",
-        "cuda_graph_config.policy=full",
     ]
 
     def completed(client, job_id):
@@ -582,73 +579,60 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         caps = client.get("/v1/capabilities").json()
         assert caps["model"] == "FastH3"
         video = caps["video"]
-        assert video["tasks"] == ["t2va", "fl2va"]
-        assert video["task_conditions"] == {
-            "t2va": {"conditions": []},
-            "fl2va": {
-                "keyframe_frame_indices": [[0], [-1], [0, -1]],
-                "aspect_ratio": "auto or W:H",
-            },
-        }
-        # The default deployment prepares the 768p 16:9 and 9:16 buckets.
-        assert video["canvas"]["short_edges"] == [768]
-        assert video["canvas"]["aspect_ratios"] == ["16:9", "9:16"]
-        assert video["canvas"]["canvases"] == [
-            {
-                "short_edge": 768,
-                "aspect_ratio": "16:9",
-                "width": 1344,
-                "height": 768,
-            },
-            {
-                "short_edge": 768,
-                "aspect_ratio": "9:16",
-                "width": 768,
-                "height": 1344,
-            },
-        ]
-        # The schedule counts sigma points: one per trained rung and the
-        # clean endpoint.
-        schedule = video["schedule"]
-        assert schedule["num_inference_steps"] == expected_steps + 1
-        # A request states its work in these fields alone; the checkpoint
-        # fixes the schedule.
+        assert video["model"]["tasks"] == ["t2va", "fl2va"]
+        # The schedule counts denoiser evaluations: one per trained rung.
+        assert video["model"]["num_inference_steps"] == expected_steps
+        # The request API's fields, whatever the model.
         assert set(video["request_fields"]) == {
             "model",
             "prompt",
-            "task",
-            "conditions",
-            "target",
+            "negative_prompt",
+            "size",
+            "seconds",
+            "num_frames",
+            "fps",
             "seed",
+            "num_inference_steps",
+            "guidance_scale",
+            "input_references",
+            "extra_params",
         }
-        river = t2va_request("FastH3", "A river", 5, 1001)
+        river = t2va_request("FastH3", "A river", 124, 1001)
         for payload in (
             # Longer than the deployment's default 15-second capacity.
-            {**river, "target": {**river["target"], "duration_seconds": 16}},
-            # Buckets the deployment did not prepare.
-            {**river, "target": {**river["target"], "aspect_ratio": "1:1"}},
-            {**river, "target": {**river["target"], "short_edge": 480}},
+            {"model": "FastH3", "prompt": "A river", "seconds": 16},
+            # A frame count the model does not generate.
+            {**river, "num_frames": 125},
+            # Sizes the default deployment (1344x768 and 768x1344) does not
+            # serve.
+            {**river, "size": "768x768"},
+            {**river, "size": "848x480"},
+            # A duration and a frame count together.
+            {**river, "seconds": 5},
+            # A field the request API does not have.
+            {**river, "task": "t2va"},
         ):
             response = client.post("/v1/videos", json=payload)
             assert response.status_code == 400, (payload, response.text)
         payload = t2va_request(
             "FastH3",
             "A river flows through a forest, with birds singing.",
-            5,
+            124,
             1001,
         )
-        # Multipart fields carry the same names; the target is JSON text.
-        form = {**payload, "target": json.dumps(payload["target"])}
+        # Multipart fields carry the same names as text parts.
         response = client.post(
             "/v1/videos",
-            files={name: (None, str(value)) for name, value in form.items()},
+            files={name: (None, str(value)) for name, value in payload.items()},
         )
         response.raise_for_status()
         job_id = response.json()["id"]
         job = completed(client, job_id)
-        assert job["seconds"] == 5 and job["num_frames"] == 124
+        # The job reports the generated shape; its seconds are the generated
+        # duration as the OpenAI-style string.
         assert job["size"] == "1344x768"
-        assert job["actual_seconds"] == 124 / 24
+        assert job["num_frames"] == 124 and job["fps"] == 24
+        assert float(job["seconds"]) == pytest.approx(124 / 24, abs=1e-3)
         assert job["completed_steps"] == job["total_steps"] == expected_steps
         assert job["expires_at"] > job["completed_at"]
         assert job_id in {
@@ -692,11 +676,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         for seed in range(3):
             active = client.post(
                 "/v1/videos",
-                json={
-                    **payload,
-                    "target": {**payload["target"], "duration_seconds": 15},
-                    "seed": seed,
-                },
+                json={**payload, "num_frames": 362, "seed": seed},
             ).json()["id"]
             deadline = time.monotonic() + 600
             while time.monotonic() < deadline:
@@ -726,16 +706,3 @@ def test_video_jobs_retain_content_and_cancel_active_work(
             ).frame_count
             == 124
         )
-
-    # The eager policy covers decoding as well as the learned denoising steps.
-    # Keep the exact checkpoint, capacity, prompt and seed from the full run.
-    command[-1] = "cuda_graph_config.policy=off"
-    with (
-        server_process(
-            command, base, tmp_path / "video-eager.log", timeout_s=900
-        ),
-        httpx.Client(base_url=base, timeout=600) as client,
-    ):
-        eager = client.post("/v1/videos/sync", json=payload)
-        eager.raise_for_status()
-        _assert_media_values_close(eager.content, first.content)

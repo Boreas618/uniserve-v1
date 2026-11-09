@@ -1,0 +1,20 @@
+[package]
+name = "processing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Request processing's model contract: what a model family supplies to the
+# daemon that turns public requests into engine requests. A chat family names
+# the output formats its checkpoints write; a video family binds the request
+# processor that validates and plans its requests. It holds no runtime object
+# and reads no file of its own.
+[dependencies]
+proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

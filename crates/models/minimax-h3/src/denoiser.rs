@@ -231,7 +231,7 @@ impl Layouts {
             self.config.attention,
             crate::config::AttentionKind::Sparse { .. }
         );
-        for canvas in self.config.offered_canvases() {
+        for canvas in crate::config::offered_canvases() {
             let mut frames = crate::CLIP_FRAMES + crate::CLIP_LATENTS;
             while frames <= MAX_FRAMES {
                 if sparse {
@@ -284,7 +284,7 @@ impl Layouts {
         };
         let tile = self.config.attention.capacity_rows();
         let mut bound = 0;
-        for canvas in self.config.offered_canvases() {
+        for canvas in crate::config::offered_canvases() {
             let mut frames = crate::CLIP_FRAMES + crate::CLIP_LATENTS;
             while frames <= MAX_FRAMES {
                 if let Ok(segment) = packing::segment_packing(
@@ -390,7 +390,7 @@ impl Layouts {
     /// `t2va` request at a capacity sized for `fl2va` carried 2048 empty rows through all of them,
     /// and an image reference at a capacity sized for a reference video carried 40000.
     fn condition_rows_of(&self, request: &VideoRequest) -> u32 {
-        if request.task == nn::capability::VideoTask::TextToVideoAudio {
+        if crate::VideoTask::of(request) == crate::VideoTask::TextToVideoAudio {
             0
         } else {
             request
@@ -1641,7 +1641,7 @@ fn flattened(error: Error) -> nn::Error {
 pub fn schedule_for(
     config: &DenoiserConfig,
     schedule: &Schedule,
-    task: nn::capability::VideoTask,
+    task: crate::VideoTask,
 ) -> Result<Vec<nn::Step>> {
     if !config.tasks.contains(&task) {
         return Err(Error::config(format!(
@@ -1690,7 +1690,7 @@ impl nn::capability::Denoiser for Denoiser {
         Ok(evaluation.max(fold))
     }
 
-    /// The denoising steps this checkpoint runs for `task`.
+    /// The denoising steps this checkpoint runs for `request`'s task ([`crate::VideoTask::of`]).
     ///
     /// Both modalities advance on one step counter - [`Schedule::num_steps`] refuses a grid whose two
     /// ladders disagree, and the solver refuses a step a modality does not have - so the video ladder
@@ -1700,7 +1700,8 @@ impl nn::capability::Denoiser for Denoiser {
     /// exactly why a wrong key would go unnoticed: a runner that took the first schedule would run
     /// the right numbers for a task the checkpoint does not serve, and the deployment would serve a
     /// task its own contract denies.
-    fn schedule(&self, task: nn::capability::VideoTask) -> nn::Result<Vec<nn::Step>> {
+    fn schedule(&self, request: &VideoRequest<'_>) -> nn::Result<Vec<nn::Step>> {
+        let task = crate::VideoTask::of(request);
         schedule_for(&self.config, &self.schedule, task).map_err(flattened)
     }
 
@@ -3413,7 +3414,7 @@ impl Denoiser {
         let conditioned = config
             .tasks
             .iter()
-            .any(|task| !matches!(task, nn::capability::VideoTask::TextToVideoAudio));
+            .any(|task| !matches!(task, crate::VideoTask::TextToVideoAudio));
         let groups = Groups::of(conditioned);
         let (times, table) = crate::modulation::entries(
             &schedule.timesteps(Modality::Video),
@@ -3705,8 +3706,7 @@ mod tests {
             )
             .expect("the base checkpoint's schedule"),
             attention: AttentionKind::DENSE,
-            tasks: vec![nn::capability::VideoTask::TextToVideoAudio],
-            canvases: None,
+            tasks: vec![crate::VideoTask::TextToVideoAudio],
             clip: crate::encoding::Clip {
                 frames: 17,
                 latents: 5,
@@ -3738,8 +3738,7 @@ mod tests {
             )
             .expect("a uniform grid"),
             attention: AttentionKind::DENSE,
-            tasks: vec![nn::capability::VideoTask::TextToVideoAudio],
-            canvases: None,
+            tasks: vec![crate::VideoTask::TextToVideoAudio],
             clip: crate::encoding::Clip {
                 frames: 17,
                 latents: 5,
@@ -3751,7 +3750,7 @@ mod tests {
         let steps = schedule_for(
             &config,
             &schedule,
-            nn::capability::VideoTask::TextToVideoAudio,
+            crate::VideoTask::TextToVideoAudio,
         )
         .expect("the task this checkpoint serves");
 
@@ -3776,7 +3775,7 @@ mod tests {
         let error = schedule_for(
             &config,
             &schedule,
-            nn::capability::VideoTask::ReferenceToVideoAudio,
+            crate::VideoTask::ReferenceToVideoAudio,
         )
         .expect_err("a task this checkpoint does not serve");
         let message = error.to_string();
@@ -3786,7 +3785,6 @@ mod tests {
 
     fn request(frames: u32, width: u32, height: u32) -> VideoRequest<'static> {
         VideoRequest {
-            task: nn::capability::VideoTask::TextToVideoAudio,
             width,
             height,
             frames,
@@ -3854,9 +3852,13 @@ mod tests {
                 - packed_rows(&rules.config, &rules.arrangement, &rung).unwrap(),
             1024
         );
+        // A request of no anchor and no reference is `t2va`, whatever rung it states.
         let plain = rules.cover(&VideoRequest {
-            task: nn::capability::VideoTask::TextToVideoAudio,
             condition_rows: Some(1024),
+            first_frames: 0,
+            last_frames: 0,
+            references: 0,
+            conditions: &[],
             ..conditioned()
         });
         assert_eq!(plain.condition_rows, 0);
@@ -4148,7 +4150,7 @@ mod tests {
             .expect("a sparse deployment bounds its tiles");
         let tile = rules.config.attention.capacity_rows();
         let mut largest = 0;
-        for canvas in rules.config.offered_canvases() {
+        for canvas in crate::config::offered_canvases() {
             let mut frames = crate::CLIP_FRAMES + crate::CLIP_LATENTS;
             while frames <= MAX_FRAMES {
                 if let Ok(segment) = packing::segment_packing(
@@ -4343,7 +4345,6 @@ mod tests {
             },
         ];
         VideoRequest {
-            task: nn::capability::VideoTask::ReferenceToVideoAudio,
             first_frames: 1,
             references: 2,
             text_tokens: 15,
@@ -4382,7 +4383,6 @@ mod tests {
             },
         ];
         let request = VideoRequest {
-            task: nn::capability::VideoTask::ReferenceToVideoAudio,
             first_frames: 1,
             references: 2,
             text_tokens: 15,
@@ -4593,7 +4593,6 @@ mod tests {
         }];
         let shapes = &shapes;
         let request = VideoRequest {
-            task: nn::capability::VideoTask::ReferenceToVideoAudio,
             references: 1,
             conditions: shapes,
             ..request(121, 832, 480)

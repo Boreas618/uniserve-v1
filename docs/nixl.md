@@ -39,6 +39,6 @@ patchelf --set-rpath "$native_root/nixl/lib:$native_root/ucx/lib" \
     "$native_root/nixl/lib/libnixl_capi.so"
 ```
 
-Set `LD_LIBRARY_PATH` to include `artifacts/native/nixl/lib` before starting serving. A separately launched Storage Server can select the library explicitly with `uniserve storage serve --nixl-library /absolute/path/to/libnixl_capi.so`. NIXL finds its UCX plugin beside `libnixl.so`; `UCX_NET_DEVICES` can select the host's RDMA ports.
+Set `LD_LIBRARY_PATH` to include `artifacts/native/nixl/lib` before starting serving. A separately launched Storage Server can select the library explicitly with `uniserve storage-server serve --nixl-library /absolute/path/to/libnixl_capi.so`. NIXL finds its UCX plugin beside `libnixl.so`; `UCX_NET_DEVICES` can select the host's RDMA ports.
 
 The NIXL backend uses pinned registration and disables its registration cache (`REG_NONBLOCK_MEM_TYPES=` and `RCACHE_ENABLE=n`). A released CUDA mapping can be reused at the same virtual address, so registrations must follow the backing allocation's lifetime. On hosts in the same NVLink fabric, the Transfer Server uses imported CUDA fabric handles when available and RDMA otherwise.

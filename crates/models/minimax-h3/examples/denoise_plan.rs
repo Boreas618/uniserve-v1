@@ -143,8 +143,7 @@ fn run() -> Result<(), String> {
     let unit = network.attention.capacity_rows();
     let cases = match cases {
         Some(cases) => cases,
-        None => network
-            .offered_canvases()
+        None => minimax_h3::config::offered_canvases()
             .iter()
             .map(|canvas| Case {
                 height: canvas.height,
@@ -189,7 +188,6 @@ fn run() -> Result<(), String> {
         let rules =
             Layouts::new(network.clone(), arrangement).map_err(|error| error.to_string())?;
         let request = nn::capability::VideoRequest {
-            task: nn::capability::VideoTask::TextToVideoAudio,
             width: case.width,
             height: case.height,
             frames: case.frames,

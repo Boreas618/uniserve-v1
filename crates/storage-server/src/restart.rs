@@ -3,7 +3,7 @@
 //! close.
 //!
 //! An operator's [`Request::Restart`] starts the successor (`uniserve
-//! storage serve ... --predecessor FD`) with one end of a socket pair at that
+//! storage-server serve ... --predecessor FD`) with one end of a socket pair at that
 //! descriptor and answers with its process id. The server serves on until
 //! nothing is in flight: no request waits, no shoot-down runs, neither the
 //! connector nor the Transfer Server runs a task, and every reply was
@@ -243,7 +243,7 @@ impl Server {
     }
 
     /// The arguments a successor server starts with, before
-    /// `--predecessor`: those of the `uniserve storage serve` that started
+    /// `--predecessor`: those of the `uniserve storage-server serve` that started
     /// this one, without `--daemon`.
     pub fn set_relaunch(&mut self, arguments: Vec<String>) {
         self.relaunch = arguments;
@@ -677,7 +677,7 @@ impl Server {
     }
 }
 
-/// The arguments of a `uniserve storage serve` that a successor starts with:
+/// The arguments of a `uniserve storage-server serve` that a successor starts with:
 /// `arguments` (this process's, the program's name first) without the
 /// program's name, `--daemon` and an earlier `--predecessor`.
 pub fn relaunch_arguments(arguments: Vec<OsString>) -> Vec<String> {
@@ -706,7 +706,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use ::storage::protocol::{Item, Location, Mode, TensorRecord};
-    use ::storage::{Client, socket};
+    use ::storage::Client;
 
     use super::*;
 
@@ -734,7 +734,7 @@ mod tests {
     fn a_successor_serves_what_the_server_held() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("storage.sock");
-        let (listener, lock) = socket::bind(&path).unwrap().unwrap();
+        let (listener, lock) = service::bind(&path).unwrap().unwrap();
         let server = Server::new(listener, 64, 0, None, None).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let (thread, waker) = running(server, Arc::clone(&stop));
@@ -856,7 +856,7 @@ mod tests {
         let _ = std::process::Command::new("kill")
             .arg(pid.to_string())
             .status();
-        let _lock = socket::SocketLock::resume(lock, path.clone());
+        let _lock = service::SocketLock::resume(lock, path.clone());
         let stop = Arc::new(AtomicBool::new(false));
         let (thread, waker) = running(resumed, Arc::clone(&stop));
 
@@ -909,7 +909,7 @@ mod tests {
     fn a_successor_starts_with_the_serve_arguments_but_detaching() {
         let arguments = [
             "/bin/uniserve",
-            "storage",
+            "storage-server",
             "serve",
             "--socket",
             "/tmp/s.sock",
@@ -924,7 +924,7 @@ mod tests {
         assert_eq!(
             relaunch_arguments(arguments),
             [
-                "storage",
+                "storage-server",
                 "serve",
                 "--socket",
                 "/tmp/s.sock",

@@ -1,6 +1,6 @@
 # Evaluation
 
-The evaluator runs fixed workloads against the deployments in the [guide](minimax_h3.md) and validates every MP4: canvas, frame count, frame rate and stereo soundtrack. Each run writes its resolved commands, request data, per-request latencies, media validation and GPU storage observations under `artifacts/`. Resolve a plan before running it, and run points serially, one server and one harness at a time, from the checkout whose `.venv` holds the environment:
+The evaluator runs fixed workloads against the deployments in the [guide](minimax_h3.md) and validates every MP4 against the shape its request states: size, frame count, frame rate and stereo soundtrack, and for UniServe also the shape the server reports generating. Each run writes its resolved commands, request data, per-request latencies, media validation and GPU storage observations under `artifacts/`. Resolve a plan before running it, and run points serially, one server and one harness at a time, from the checkout whose `.venv` holds the environment:
 
 ```bash
 uv sync --locked --python /usr/bin/python3.12 --extra gpu --extra bench
@@ -69,15 +69,17 @@ No measurement of these suites is recorded.
 
 `uniserve_eval/minimax_h3.toml` runs these workloads on UniServe, SGLang, vLLM-Omni and FastVideo:
 
-| Workload | Request | Measured seeds |
-| --- | --- | --- |
-| W1 | t2va, official prompt, 1344×768, 5 seconds (124 frames) | 0–7 |
-| W2 | t2va, official prompt, 1344×768, 15 seconds (362 frames) | 0–3 |
-| W3 | fl2va, official first keyframe, automatic canvas, 8 seconds (192 frames) | 0–7 |
-| W4 | ref2va, reference image and voice, 5 seconds | 0–7 |
-| W5 | ref2va, reference video with its soundtrack and a reference voice, 5 seconds | 0–7 |
+| Workload | Request | Output | Measured seeds |
+| --- | --- | --- | --- |
+| W1 | t2va, official prompt | 1344×768, 124 frames | 0–7 |
+| W2 | t2va, official prompt | 1344×768, 362 frames | 0–3 |
+| W3 | fl2va, official first keyframe (1920×1080) | 1344×768, 192 frames | 0–7 |
+| W4 | ref2va, reference image and voice | 1344×768, 124 frames | 0–7 |
+| W5 | ref2va, reference video with its soundtrack and a reference voice | 1344×768, 124 frames | 0–7 |
 
-Each point sends one unmeasured warmup at seed 42, then its measured requests one at a time. The manifests in `uniserve_eval/workloads/minimax_h3/` hold every request; each row's `metadata.condition_media` gives every condition file's path under `UNISERVE_MINIMAX_H3_INPUTS`, its source URL and its SHA-256. Reference media decode with FFmpeg 8.1.2.
+Every output is 24 fps with a stereo 32-kHz soundtrack. A point states the output's `size`, `fps`, `audio_sample_rate` and `audio_channels` in its `video` table, and each manifest row states its `num_frames`, which must be a count the model generates; UniServe receives exactly that shape in its `/v1/videos` body and derives the task from the row's `input_references`. A baseline point also states the requested target its native MiniMax-H3 form names: SGLang and vLLM-Omni an `aspect_ratio` (`16:9`, or `auto` where the canvas follows the keyframe or the default) and a `duration_seconds` (5, 8 or 15) that resolve to the stated shape, FastVideo the `duration_seconds`.
+
+Each point sends one unmeasured warmup at seed 42, then its measured requests one at a time. The manifests in `uniserve_eval/workloads/minimax_h3/` hold every request; each row's `metadata.condition_media` gives every reference file's path under `UNISERVE_MINIMAX_H3_INPUTS`, its source URL and its SHA-256. Reference media decode with FFmpeg 8.1.2.
 
 ```bash
 export UNISERVE_MINIMAX_H3_MODEL=/workspace/models/MiniMax-H3
@@ -93,7 +95,7 @@ Cross-engine results are not equal-work ratios: the engines differ in reference-
 
 ## OmniRef reference compositions
 
-The reference matrix runs FastH3 OmniRef (`FastVideo/FastVideo-FastH3-Omni-8-Step-V1`) on nine reference compositions of MiniMax-H3's ref2va interface, each at 5, 10 and 15 seconds, every target 16:9 (1344×768). A workload is `ref-<composition>-<seconds>s`:
+The reference matrix runs FastH3 OmniRef (`FastVideo/FastVideo-FastH3-Omni-8-Step-V1`) on nine reference compositions of MiniMax-H3's ref2va interface, each at 124, 243 and 362 frames (5, 10 and 15 seconds at 24 fps), every output 1344×768. A workload is `ref-<composition>-<seconds>s`:
 
 | Composition | References | Prompt tokens with vision | Condition rows | Enlarged: prompt tokens | Enlarged: condition rows |
 | --- | --- | --- | --- | --- | --- |
@@ -134,7 +136,7 @@ FastH3 OmniRef runs on H200 with the SM90 kernel of its 128-row sparse-attention
 
 MiniMax-H3's quality is confirmed by a person watching and listening to the videos a fixed set of requests generates, not by an automatic quality gate. The set covers every combination the service offers — the `t2va`, `fl2va` and `ref2va` tasks against FastH3 DMD, FastH3 OmniRef and base MiniMax-H3 — as six cells. FastH3 DMD serves `t2va` and `fl2va`, FastH3 OmniRef serves `ref2va`, and the base release serves `t2va` and `fl2va` through its `transformer` partition and `ref2va` through its `transformer_ref` partition.
 
-Each cell sends one unmeasured warmup at seed 42 and one measured request at seed 0, the seed-0 rows of W1, W3 and W4 of [MiniMax-H3 workloads](#minimax-h3-workloads): `t2va` with the official prompt at 16:9 for 5 seconds, `fl2va` with the official first keyframe on its automatic canvas for 8 seconds, and `ref2va` with the reference image and voice for 5 seconds. The rows are frozen in `uniserve_eval/workloads/minimax_h3/check-*.jsonl` and their `-warmup.jsonl` companions as copies of the W1, W3 and W4 rows, so the set does not follow later changes to the performance workloads. `uniserve_eval/check_h3.toml` names the six cells.
+Each cell sends one unmeasured warmup at seed 42 and one measured request at seed 0, the seed-0 rows of W1, W3 and W4 of [MiniMax-H3 workloads](#minimax-h3-workloads): `t2va` with the official prompt for 124 frames, `fl2va` with the official first keyframe for 192 frames, and `ref2va` with the reference image and voice for 124 frames, each at 1344×768. The rows are frozen in `uniserve_eval/workloads/minimax_h3/check-*.jsonl` and their `-warmup.jsonl` companions as copies of the W1, W3 and W4 rows, so the set does not follow later changes to the performance workloads. `uniserve_eval/check_h3.toml` names the six cells.
 
 Every measured video is written to a fixed path under `artifacts/`, `artifacts/minimax_h3/check/<checkpoint>-<task>/<request id>.mp4`, so a confirmed cell keeps the path a person watches and no cell writes into another's directory: `<checkpoint>` is `fasth3-dmd`, `fasth3-omniref` or `base`, `<task>` is `t2va`, `fl2va` or `ref2va`, and `<request id>` is the row's ID, such as `w1-measured-seed0`. Each point's bundle, with its requests, media index and summary, is under `artifacts/minimax_h3/check/results/<point>`.
 
@@ -160,7 +162,7 @@ candidate's obligation: the delivered service must pass every cell **in any orde
 A `check-h3` run alone says the baseline still measures what it measured; a `check-h3-reversed` run that
 passes says the ordering requirement is gone.
 
-The automatic checks are the two this document defines for every video point and nothing more: MP4 validity (canvas, frame count, frame rate and stereo 32-kHz soundtrack, which the `video` task validates) and the performance metrics the profile marks as protected, each checked to be finite and positive. The set adds no gate, tolerance or metric; the confirmation is the person's judgement of the six videos.
+The automatic checks are the two this document defines for every video point and nothing more: MP4 validity (size, frame count, frame rate and stereo 32-kHz soundtrack against the stated shape, and the shape the server reports generating, which the `video` task validates) and the performance metrics the profile marks as protected, each checked to be finite and positive. The set adds no gate, tolerance or metric; the confirmation is the person's judgement of the six videos.
 
 The four servers place four GPUs each, with `configs/minimax_h3/ulysses4.toml` for the two transformer partitions and `configs/minimax_h3/ulysses4-reference.toml` for the two reference partitions, and use port 18083 one server at a time. `--reuse-deployment` keeps a checkpoint loaded across its consecutive points, so the four checkpoints load once each. The profile reads `UNISERVE_FAST_H3_MODEL` from the [FastH3 post](#fasth3-post) and `UNISERVE_MINIMAX_H3_MODEL`, `UNISERVE_MINIMAX_H3_OMNIREF`, `UNISERVE_MINIMAX_H3_INPUTS` and `UNISERVE_MINIMAX_H3_FFMPEG` from [MiniMax-H3 workloads](#minimax-h3-workloads):
 
@@ -173,9 +175,9 @@ The four servers place four GPUs each, with `configs/minimax_h3/ulysses4.toml` f
 
 A run on a changed service moves `artifacts/minimax_h3/check/` and `artifacts/minimax_h3/check/results/` aside first: the evaluator refuses a non-empty result directory and never replaces a different MP4 at an existing fixed path.
 
-A plan asks the Rust rules through the `uniserve rules` subcommand, so the binary the commands run must be the one built from this tree. `UNISERVE_EXECUTABLE` names it, for the rules and for every server the profiles start; `--executable` names another binary for the servers of one run. A binary that predates the subcommand answers an unknown command and no JSON, and the failure reads as a missing command rather than a stale binary.
+`UNISERVE_EXECUTABLE` names the binary every server the profiles start runs; `--executable` names another binary for the servers of one run.
 
-The page a person reviews is written by `uniserve_eval/h3_review_manifest.py`: per cell, the task, the checkpoint the cell confirms, the prompt, the seed, the input files the request conditions on, and the MP4. Given `--results` and `--candidate-results` it puts the candidate's MP4 on the same line as the baseline's, which is what makes the six videos reviewable side by side.
+The page a person reviews is written by `uniserve_eval/h3_review_manifest.py`: per cell, the task, the checkpoint the cell confirms, the prompt, the seed, the input files the request references, with the frame each keyframe anchors, and the MP4. Given `--results` and `--candidate-results` it puts the candidate's MP4 on the same line as the baseline's, which is what makes the six videos reviewable side by side.
 
 ```bash
 .venv/bin/python -m uniserve_eval.h3_review_manifest \

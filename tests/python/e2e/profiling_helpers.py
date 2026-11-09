@@ -82,8 +82,8 @@ def serve(
         str(port),
         "--worker-executable",
         str(worker_executable()),
-        "--program-server",
-        str(program_server),
+        "--set",
+        f"program_config.socket={program_server}",
     ]
     for option in options:
         command += ["--set", option]
@@ -97,7 +97,7 @@ def serve(
         ):
             yield base_url
     finally:
-        stop_storage_server(runtime / "uniserve" / "storage.sock")
+        stop_storage_server(runtime / "uniserve" / "storage-server.sock")
         shutil.rmtree(runtime, ignore_errors=True)
 
 

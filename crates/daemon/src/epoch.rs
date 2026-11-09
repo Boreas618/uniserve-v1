@@ -141,15 +141,6 @@ pub struct EpochRecord {
     pub generation: Option<u64>,
 }
 
-/// The role of a process a node's daemon manages (§2.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    /// The deployment's application process on the leader.
-    Frontend,
-    /// The node's main process for one epoch.
-    MainProcess,
-}
-
 /// The state of a process a node's daemon manages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessState {
@@ -166,11 +157,10 @@ pub enum ProcessState {
     Failed(String),
 }
 
-/// One process a node's daemon manages, as `GET /admin/config` reports it.
+/// One main process a node's daemon manages, as `GET /admin/config` reports
+/// it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedProcess {
-    /// What it is.
-    pub role: Role,
     /// The worker group it runs in (`engine`, `worker`, ...): the group a
     /// launch generation is allocated for (§2.5).
     pub group: String,
@@ -178,7 +168,7 @@ pub struct ManagedProcess {
     pub rank: u64,
     /// Its process id on its node, once started.
     pub pid: Option<u32>,
-    /// The epoch a main process belongs to; `None` for the frontend.
+    /// The epoch it serves, once its own report named it.
     pub epoch: Option<u64>,
     /// The build identity it was started from.
     pub build: String,
@@ -1088,10 +1078,6 @@ fn program_report(program: &Program) -> Value {
 /// One managed process as JSON.
 fn process_report(process: &ManagedProcess) -> Value {
     serde_json::json!({
-        "role": match process.role {
-            Role::Frontend => "frontend",
-            Role::MainProcess => "main_process",
-        },
         "pid": process.pid,
         "epoch": process.epoch,
         "group": process.group,
@@ -1923,7 +1909,6 @@ mod tests {
     fn the_process_table_reports_the_processes_the_daemon_supervises() {
         let epochs = Epochs::new();
         epochs.set_processes(vec![ManagedProcess {
-            role: Role::MainProcess,
             group: "engine".to_owned(),
             rank: 0,
             pid: Some(41),
@@ -1940,7 +1925,6 @@ mod tests {
         // beside it.
         assert!(epochs.processes().is_empty());
         *locked(&table) = vec![ManagedProcess {
-            role: Role::MainProcess,
             group: "engine".to_owned(),
             rank: 0,
             pid: Some(42),
@@ -2630,7 +2614,6 @@ mod tests {
         // A serving process's launch generation is the base: its standby is
         // one more, and so is the next allocation after that.
         epochs.set_processes(vec![ManagedProcess {
-            role: Role::MainProcess,
             group: "engine".to_owned(),
             rank: 0,
             pid: Some(42),
@@ -2661,23 +2644,12 @@ mod tests {
         );
     }
 
-    /// The process table names each process's role, epoch and state.
+    /// The process table names each process's epoch and state.
     #[test]
     fn the_process_table_reports_what_the_daemon_manages() {
         let epochs = Epochs::new();
         epochs.set_processes(vec![
             ManagedProcess {
-                role: Role::Frontend,
-                group: "frontend".to_owned(),
-                rank: 0,
-                pid: Some(41),
-                epoch: None,
-                build: "2.0.0+0123456789abcdef".to_owned(),
-                generation: 0,
-                state: ProcessState::Serving,
-            },
-            ManagedProcess {
-                role: Role::MainProcess,
                 group: "engine".to_owned(),
                 rank: 0,
                 pid: Some(42),
@@ -2688,10 +2660,8 @@ mod tests {
             },
         ]);
         let report = epochs.report();
-        assert_eq!(report["processes"][0]["role"], Value::from("frontend"));
-        assert_eq!(report["processes"][1]["role"], Value::from("main_process"));
-        assert_eq!(report["processes"][1]["epoch"], Value::from(7));
-        assert_eq!(report["processes"][1]["state"], Value::from("parked"));
+        assert_eq!(report["processes"][0]["epoch"], Value::from(7));
+        assert_eq!(report["processes"][0]["state"], Value::from("parked"));
     }
 
     /// The epoch's engine configuration is written by the daemon into each

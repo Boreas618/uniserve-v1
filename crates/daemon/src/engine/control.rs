@@ -77,6 +77,35 @@ fn own_executable(executable: &str) -> bool {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()) == own
 }
 
+/// How long a Program Server this daemon starts may take to listen: it
+/// discovers its toolchains, which imports the compilers of its Python
+/// environment, and loads every installed package first.
+const PROGRAM_SERVER_START: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Makes sure this host's Program Server serves on the socket `settings`
+/// names, and returns that socket: when none serves, the Program Server is
+/// started with `settings` as a host service of this executable
+/// (`service::ensure`), which outlives this daemon.
+///
+/// # Errors
+///
+/// Fails when no Program Server serves and none can be started.
+pub fn ensure_program_server(
+    settings: &program_server::command::Settings,
+) -> anyhow::Result<PathBuf> {
+    let socket = settings.socket();
+    let executable = std::env::current_exe().context("locating this executable")?;
+    ::service::ensure(
+        &executable,
+        "program-server",
+        &socket,
+        &settings.arguments(),
+        PROGRAM_SERVER_START,
+    )
+    .context("starting this host's Program Server")?;
+    Ok(socket)
+}
+
 pub struct EngineControl {
     /// The request socket engine processes connect back to.
     requests: Listener,
@@ -89,10 +118,8 @@ pub struct EngineControl {
     /// The deployment the engines serve.
     deployment: String,
     /// This node's Program Server socket, which every engine process is told
-    /// where to resolve an epoch's policy modules from (§5.3, §7.3); `None`
-    /// leaves an engine with no policy store, and it refuses every policy
-    /// precopy with a reason rather than serving without one.
-    program_server: Option<PathBuf>,
+    /// to resolve an epoch's modules from (§5.3, §7.3).
+    program_server: PathBuf,
     /// Where this daemon writes the file each of its main processes reads:
     /// the process's launch file (§2.3).
     runtime: PathBuf,
@@ -104,8 +131,9 @@ pub struct EngineControl {
 
 impl EngineControl {
     /// Binds the request socket at `socket` for the engines of `deployment`,
-    /// which run on host `host` through the daemon whose
-    /// process socket is `processes`.
+    /// which run on host `host` through the daemon whose process socket is
+    /// `processes` and resolve their modules at the Program Server on
+    /// `program_server` ([`ensure_program_server`]).
     ///
     /// # Errors
     ///
@@ -115,8 +143,9 @@ impl EngineControl {
         processes: String,
         host: String,
         deployment: String,
-        program_server: Option<PathBuf>,
+        program_server: PathBuf,
     ) -> anyhow::Result<Self> {
+
         // A socket a stopped daemon left behind is replaced.
         let _ = std::fs::remove_file(socket);
         let address = if processes.starts_with("unix:") {
@@ -607,10 +636,6 @@ impl EngineControl {
         let devices = local_devices(&self.host, config)?;
         let queue_depth = u32::try_from(config.device.queue_depth.get())
             .context("`device_config.queue_depth` exceeds the launch file's field")?;
-        let program_server = self.program_server.as_ref().context(
-            "this node has no Program Server socket, so a main process could resolve no policy \
-             module: it is not started without one",
-        )?;
         // A new epoch takes the identity of its first engine; an engine that
         // replaces a lost one goes on with its epoch.
         if args.epoch == 0 {
@@ -626,7 +651,7 @@ impl EngineControl {
         args.requests = self.request_address.clone();
         args.processes = self.processes.clone();
         args.engine = engine;
-        args.program_server = program_server.display().to_string();
+        args.program_server = self.program_server.display().to_string();
         args.devices = devices;
         args.group = ENGINE_GROUP.to_owned();
         args.rank = 0;
@@ -1680,7 +1705,7 @@ mod tests {
             "unix:/run/processes.sock".into(),
             "rank-0".into(),
             "model".into(),
-            Some(std::path::PathBuf::from("/run/program-server.sock")),
+            std::path::PathBuf::from("/run/program-server.sock"),
         )
         .unwrap();
         let own = std::env::current_exe().unwrap();

@@ -1,9 +1,9 @@
 """Builds fixed-length MiniMax H3 text-to-video-with-audio prompts.
 
 The prompt length is a workload dimension (``VideoConfig.prompt_tokens``)
-alongside the video duration. This adapter synthesizes one prompt whose token
-count under the model's tokenizer equals the target exactly, and every
-example repeats that prompt with the same seed.
+alongside the frame count (``VideoConfig.num_frames``). This adapter
+synthesizes one prompt whose token count under the model's tokenizer equals
+the target exactly, and every example repeats that prompt with the same seed.
 """
 
 from __future__ import annotations
@@ -100,7 +100,6 @@ class MiniMaxH3Dataset(Dataset):
                 prompt=prompt,
                 prompt_len=target,
                 seed=_SEED,
-                seconds=float(self.point.video.seconds),
             )
             for index in range(self.point.load.num_prompts)
         ]

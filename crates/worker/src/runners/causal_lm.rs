@@ -1770,9 +1770,9 @@ pub struct CausalLmRunner<M: CausalLm> {
 /// checkpoint's mapped tensors), so the engine gives each device's runner a share of the one model
 /// it loaded. Delegation keeps the model type out of the worker: a runner is generic over
 /// `nn::CausalLm`, and this is that trait over a shared object.
-pub struct Shared<M>(Arc<M>);
+pub struct Shared<M: ?Sized>(Arc<M>);
 
-impl<M> Shared<M> {
+impl<M: ?Sized> Shared<M> {
     /// The shared model.
     pub fn new(model: Arc<M>) -> Self {
         Self(model)
@@ -1780,13 +1780,13 @@ impl<M> Shared<M> {
 
 }
 
-impl<M> Clone for Shared<M> {
+impl<M: ?Sized> Clone for Shared<M> {
     fn clone(&self) -> Self {
         Self(Arc::clone(&self.0))
     }
 }
 
-impl<M: CausalLm> CausalLm for Shared<M> {
+impl<M: CausalLm + ?Sized> CausalLm for Shared<M> {
     fn embed_input_ids(
         &self,
         f: &nn::Forward,

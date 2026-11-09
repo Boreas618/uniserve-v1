@@ -15,7 +15,6 @@ from tests.python.e2e.http_helpers import (
     find_free_port,
     require_uniserve_binary,
     server_process,
-    t2va_request,
     worker_executable,
 )
 from tests.python.e2e.test_h3_parallel_http import _assert_media_values_close
@@ -30,6 +29,17 @@ FRAME_COUNTS = tuple(107 + 17 * index for index in range(16))
 # the prompt capacity `--max-model-len`, 16384.
 PROMPT_TOKENS = (1, 777, 1024, 1025, 3000, 16384, 9000, 64)
 TEXT_CAPACITIES = "1024"
+
+
+def _request(prompt: str, seconds: float, seed: int) -> dict[str, object]:
+    """A 1344x768 t2va request for a duration the server aligns to frames."""
+    return {
+        "model": "FastH3",
+        "prompt": prompt,
+        "size": "1344x768",
+        "seconds": seconds,
+        "seed": seed,
+    }
 
 
 def _prompt(tokenizer, target: int) -> str:
@@ -129,8 +139,6 @@ def test_every_admitted_duration_and_prompt_length_replays(
         "video_config.max_seconds=15",
         "--set",
         f"video_config.text_capacities={TEXT_CAPACITIES}",
-        "--set",
-        "cuda_graph_config.policy=full",
     ]
     tokenizer = AutoTokenizer.from_pretrained(Path(model) / "tokenizer")
 
@@ -140,7 +148,7 @@ def test_every_admitted_duration_and_prompt_length_replays(
         ),
         httpx.Client(base_url=base, timeout=900) as client,
     ):
-        capabilities = client.get("/v1/capabilities").json()["video"]
+        capabilities = client.get("/v1/capabilities").json()["video"]["model"]
         assert (
             capabilities["min_seconds"],
             capabilities["max_seconds"],
@@ -154,8 +162,8 @@ def test_every_admitted_duration_and_prompt_length_replays(
             before = _settled(client)
             response = client.post(
                 "/v1/videos/sync",
-                json=t2va_request(
-                    "FastH3", _prompt(tokenizer, tokens), seconds, 2000 + index
+                json=_request(
+                    _prompt(tokenizer, tokens), seconds, 2000 + index
                 ),
             )
             response.raise_for_status()
@@ -164,7 +172,7 @@ def test_every_admitted_duration_and_prompt_length_replays(
                 declared_mime=response.headers["content-type"],
             )
             assert media.frame_count == frames, (seconds, tokens)
-            # The 16:9 target's canvas.
+            assert response.headers["x-video-num-frames"] == str(frames)
             assert (media.width, media.height) == (1344, 768)
             assert (media.audio_channels, media.audio_sample_rate) == (
                 2,
@@ -181,8 +189,8 @@ def test_every_admitted_duration_and_prompt_length_replays(
 
         # Two layouts in flight together keep their own slots and state.
         payloads = [
-            t2va_request("FastH3", _prompt(tokenizer, 500), 7.3, 3001),
-            t2va_request("FastH3", _prompt(tokenizer, 9000), 12.2, 3002),
+            _request(_prompt(tokenizer, 500), 7.3, 3001),
+            _request(_prompt(tokenizer, 9000), 12.2, 3002),
         ]
         ids = [
             client.post("/v1/videos", json=payload).json()["id"]

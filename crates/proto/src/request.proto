@@ -148,9 +148,9 @@ message EngineInfo {
   // The limits every request is checked against, resolved against the
   // workers' capacities.
   GenerationLimits limits = 1;
-  // The video denoiser as its model family describes it
-  // (`models::video::DenoiserInfo`, JSON); empty when the engine generates
-  // no video.
+  // The video denoiser as its model family describes it to its request
+  // processing (`nn::family::Description::details`); empty when the engine
+  // generates no video.
   bytes video_denoiser = 2;
   // Condition units one latent encoding call covers at once; zero when no
   // worker encodes latents.
@@ -864,7 +864,7 @@ message ReadoutSlot {
 }
 
 message DiffusionRequest {
-  string task = 1;
+  reserved 1;
   repeated uint32 prompt_token_ids = 2;
   bytes conditioning = 3;
   repeated ConditionExtent conditions = 4;

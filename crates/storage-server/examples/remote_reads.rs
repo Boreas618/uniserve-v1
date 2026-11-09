@@ -2,7 +2,7 @@
 //! checking the path between hosts and measuring its links.
 //!
 //! Each host runs a Storage Server that listens for other hosts on an
-//! address they reach (`uniserve storage serve --tcp ADDRESS:0
+//! address they reach (`uniserve storage-server serve --tcp ADDRESS:0
 //! --nixl-library PATH`), and this program against it, in one of two roles
 //! of one deployment (`--deployment`, the same on both hosts):
 //!

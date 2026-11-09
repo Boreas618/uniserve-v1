@@ -14,7 +14,7 @@ import pytest
 def media():
     """Encoded fixture with the real H3 shape, audio and frame contract."""
     result = io.BytesIO()
-    frames = 107  # Four requested seconds align upward to 107 frames.
+    frames = 107  # 17 * 6 + 5, a frame count H3 generates.
     with av.open(result, "w", format="mp4") as container:
         video = container.add_stream("libx264", rate=24)
         video.width, video.height, video.pix_fmt = 1344, 768, "yuv420p"

@@ -39,6 +39,7 @@
 //! Every stage writes `walk.txt`: one `operator<TAB>key` per launch, which `tools/walk_gaps.py` reads
 //! against the store's list.
 
+use minimax_h3::VideoTask;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -55,7 +56,7 @@ use minimax_h3::transformer::{Transformer, rotated_axes};
 // The block's capability methods: `draw_noise`, `layout`, `state_tables` and the rest are the
 // trait's, and the stage that drives the whole block calls them the way the worker does.
 use nn::capability::Denoiser as _;
-use nn::capability::{VideoRequest, VideoTask};
+use nn::capability::{VideoRequest};
 use nn::{
     Arena, Backing, Checkpoint, DType, DevicePtr, Forward, RetainedWeights, Shape, TensorView,
     WeightKey, WeightLoader,
@@ -521,7 +522,6 @@ fn stage_denoise(args: &Args) -> Result<()> {
     let arrangement = partition.arrangement(&denoiser_config)?;
     let layouts = Layouts::new(denoiser_config.clone(), arrangement)?;
     let request = VideoRequest {
-        task: VideoTask::TextToVideoAudio,
         width: args.width,
         height: args.height,
         frames: args.frames,
@@ -1199,7 +1199,6 @@ fn stage_block(args: &Args) -> Result<()> {
     let arrangement = partition.arrangement(&denoiser)?;
     let layouts = Layouts::new(denoiser.clone(), arrangement)?;
     let request = VideoRequest {
-        task: VideoTask::TextToVideoAudio,
         width: args.width,
         height: args.height,
         frames: args.frames,

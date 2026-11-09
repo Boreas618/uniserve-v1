@@ -1,10 +1,8 @@
 //! The canvases a checkpoint generates, as the table a request selects one from.
 //!
 //! A canvas is named by the pair a request states it with: the resolution class (the target's
-//! short edge) and the aspect ratio. Most checkpoints generate the canvas rule's canvas of every
-//! named ratio at the class a request states, which the request rules compute; a FastH3 DMD
-//! student was trained on twelve buckets and generates only those, so its table is a fact of the
-//! checkpoint and is stated here (specs/worker.md 9, `docs/minimax_h3/minimax_h3.md`).
+//! short edge) and the aspect ratio. Every H3 checkpoint generates the 768p class only: the canvas
+//! rule's canvas of every named ratio at that class (`docs/minimax_h3/minimax_h3.md`).
 
 /// One canvas a checkpoint generates: how a request names it and the raster it resolves to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -34,13 +32,10 @@ pub const NAMED_ASPECT_RATIOS: [(u32, u32); 6] =
 /// ratio's canvas.
 pub const CANVAS_SHORT_EDGE: u32 = 768;
 
-/// The canvases a deployment with no stated ladder serves: the canvas rule's named table.
+/// The canvases every H3 checkpoint generates, and so the ones a deployment prepares layouts for.
 ///
-/// **This is the name an enumeration should ask**, not a typed list of rasters: a row keyed for a
-/// canvas the engine can never be asked for is a cell no launch reads, and 480x832 - the encoder's
-/// own test raster - is not one of these. `DenoiserConfig::offered_canvases` is the deployment's own
-/// answer where a checkpoint states a ladder; where none is stated it is this table, so a walk that
-/// cannot read the checkpoint and a walk that can agree on the default.
+/// An enumeration of layouts walks this table: a row keyed for a canvas the engine can never be
+/// asked for is a cell no launch reads.
 pub const fn offered_canvases() -> &'static [Canvas] {
     &NAMED_CANVASES
 }
@@ -50,7 +45,7 @@ pub const fn offered_canvases() -> &'static [Canvas] {
 /// The rule resolves a ratio into a canvas whose short edge starts at the class, whose area is at
 /// most `768 * 1344` and whose sides are the nearest multiples of [`super::CANVAS_MULTIPLE`]; the
 /// request rules compute it for any ratio a request names, and this table is the result for the
-/// named ones. A checkpoint that generates only some canvases states its own table instead.
+/// named ones.
 pub const NAMED_CANVASES: [Canvas; 6] = [
     Canvas {
         short_edge: 768,
@@ -90,86 +85,6 @@ pub const NAMED_CANVASES: [Canvas; 6] = [
     },
 ];
 
-/// The twelve canvases a FastH3 DMD student generates.
-///
-/// The 768p six are the canvas rule's canvases at [`CANVAS_SHORT_EDGE`]. The 480p six are the
-/// training table's own rasters rather than the rule's: at 21:9 the student generates 992x416,
-/// where the rule at a 480-pixel short edge with the rule's area cap gives a different raster.
-pub const DMD_CANVASES: [Canvas; 12] = [
-    Canvas {
-        short_edge: 768,
-        aspect: (21, 9),
-        width: 1536,
-        height: 672,
-    },
-    Canvas {
-        short_edge: 768,
-        aspect: (16, 9),
-        width: 1344,
-        height: 768,
-    },
-    Canvas {
-        short_edge: 768,
-        aspect: (4, 3),
-        width: 1024,
-        height: 768,
-    },
-    Canvas {
-        short_edge: 768,
-        aspect: (1, 1),
-        width: 768,
-        height: 768,
-    },
-    Canvas {
-        short_edge: 768,
-        aspect: (3, 4),
-        width: 768,
-        height: 1024,
-    },
-    Canvas {
-        short_edge: 768,
-        aspect: (9, 16),
-        width: 768,
-        height: 1344,
-    },
-    Canvas {
-        short_edge: 480,
-        aspect: (21, 9),
-        width: 992,
-        height: 416,
-    },
-    Canvas {
-        short_edge: 480,
-        aspect: (16, 9),
-        width: 832,
-        height: 480,
-    },
-    Canvas {
-        short_edge: 480,
-        aspect: (4, 3),
-        width: 640,
-        height: 480,
-    },
-    Canvas {
-        short_edge: 480,
-        aspect: (1, 1),
-        width: 480,
-        height: 480,
-    },
-    Canvas {
-        short_edge: 480,
-        aspect: (3, 4),
-        width: 480,
-        height: 640,
-    },
-    Canvas {
-        short_edge: 480,
-        aspect: (9, 16),
-        width: 480,
-        height: 832,
-    },
-];
-
 impl Canvas {
     /// Whether this canvas's raster is the ruled one for its class and ratio.
     pub fn is_ruled(&self) -> bool {
@@ -190,29 +105,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_dmd_table_names_twelve_distinct_canvases() {
-        assert_eq!(DMD_CANVASES.len(), NAMED_ASPECT_RATIOS.len() * 2);
-        for (index, canvas) in DMD_CANVASES.iter().enumerate() {
-            assert!(
-                !DMD_CANVASES[..index].contains(canvas),
-                "{} {} is named twice",
-                canvas.short_edge,
-                canvas.name()
-            );
+    fn the_named_table_names_every_ratio_once_on_the_vae_grid() {
+        let ratios = NAMED_CANVASES.map(|canvas| canvas.aspect);
+        assert_eq!(ratios, NAMED_ASPECT_RATIOS);
+        for canvas in NAMED_CANVASES {
             // Every canvas survives the video VAE's 16x spatial compression on a whole number of
             // 2x2 transformer patches.
-            assert_eq!(canvas.width % super::super::CANVAS_MULTIPLE, 0);
-            assert_eq!(canvas.height % super::super::CANVAS_MULTIPLE, 0);
-            assert!(canvas.is_ruled());
+            assert_eq!(canvas.short_edge, CANVAS_SHORT_EDGE);
+            assert!(canvas.is_ruled(), "{}", canvas.name());
         }
-        let ratios = DMD_CANVASES.map(|canvas| canvas.aspect);
-        assert_eq!(&ratios[..6], &NAMED_ASPECT_RATIOS);
-        assert_eq!(&ratios[6..], &NAMED_ASPECT_RATIOS);
     }
 
     #[test]
     fn a_canvas_is_named_by_its_aspect_ratio() {
-        assert_eq!(DMD_CANVASES[1].name(), "16:9");
-        assert_eq!((DMD_CANVASES[1].width, DMD_CANVASES[1].height), (1344, 768));
+        assert_eq!(NAMED_CANVASES[1].name(), "16:9");
+        assert_eq!((NAMED_CANVASES[1].width, NAMED_CANVASES[1].height), (1344, 768));
     }
 }

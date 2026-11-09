@@ -93,7 +93,7 @@ PROMPT = (
 
 
 #: The socket of the module's Program Server, which every deployment of this
-#: file reaches through ``--program-server``. Set by :func:`program_server`.
+#: file names as ``program_config.socket``. Set by :func:`program_server`.
 PROGRAM_SERVER: Path | None = None
 
 
@@ -117,12 +117,13 @@ def program_server_option() -> list[str]:
     """The command-line option that gives a deployment its programs' server.
 
     Every deployment serves a scheduling policy, and a policy's module comes
-    from this host's Program Server (design 6.1); without the option the leader
-    resolves the epoch's programs nowhere and the deployment never serves.
+    from this host's Program Server (design 6.1); without the option the daemon
+    starts a Program Server of its own on the default socket, which holds none
+    of the module's packages.
     """
     if PROGRAM_SERVER is None:
         pytest.fail("the module's Program Server is not running")
-    return ["--program-server", str(PROGRAM_SERVER)]
+    return ["--set", f"program_config.socket={PROGRAM_SERVER}"]
 
 
 def _checkpoint() -> str:
@@ -185,9 +186,9 @@ def _stop_storage_server(socket: Path) -> None:
 
 
 def _storage_list(runtime: Path) -> str:
-    """What the test's Storage Server holds (``uniserve storage list``)."""
+    """What the test's Storage Server holds (``storage-server list``)."""
     return subprocess.run(
-        [str(require_uniserve_binary()), "storage", "list"],
+        [str(require_uniserve_binary()), "storage-server", "list"],
         check=True,
         capture_output=True,
         text=True,
@@ -217,7 +218,7 @@ def runtime(tmp_path: Path) -> Iterator[Path]:
     try:
         yield directory
     finally:
-        _stop_storage_server(directory / "uniserve" / "storage.sock")
+        _stop_storage_server(directory / "uniserve" / "storage-server.sock")
         log = directory / "uniserve" / "storage-server.log"
         if log.is_file():
             shutil.copy(log, tmp_path / "storage-server.log")
@@ -1419,7 +1420,7 @@ def _restart_with_a_json_body(
 
 def _storage_pid(runtime: Path) -> int:
     """The process id of the Storage Server serving the test's socket."""
-    socket = str(runtime / "uniserve" / "storage.sock").encode()
+    socket = str(runtime / "uniserve" / "storage-server.sock").encode()
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
@@ -1451,7 +1452,7 @@ def test_a_storage_server_restart_keeps_the_deployment_serving(
         streaming.start()
         _wait_until(lambda: len(read) >= 32, 300, "the count did not stream")
         restarted = subprocess.run(
-            [str(require_uniserve_binary()), "storage", "restart"],
+            [str(require_uniserve_binary()), "storage-server", "restart"],
             check=True,
             capture_output=True,
             text=True,

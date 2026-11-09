@@ -25,7 +25,8 @@ use minimax_h3::config::Config;
 use minimax_h3::denoiser::{self, Layouts};
 use minimax_h3::partition::{Partition, Ulysses};
 use nn::capability::{ConditionRole, ConditionShape, VideoRequest};
-use nn::{DType, VideoTask};
+use nn::{DType};
+use minimax_h3::VideoTask;
 
 fn main() -> ExitCode {
     match run() {
@@ -123,7 +124,7 @@ fn run() -> Result<(), String> {
     let serving = Partition::serving(
         &config,
         task,
-        Ulysses::of(args.ulysses, minimax_h3::partition::Projection::Exchange),
+        Ulysses::of(args.ulysses, nn::family::Projection::Exchange),
         1,
         0,
         0,
@@ -187,7 +188,6 @@ fn run() -> Result<(), String> {
         .filter(|shape| shape.role == ConditionRole::Reference)
         .count() as u32;
     let request = VideoRequest {
-        task,
         width: args.width,
         height: args.height,
         frames: args.frames,

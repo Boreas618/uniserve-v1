@@ -33,11 +33,11 @@ mod video_vae;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use nn::VideoTask;
+use crate::VideoTask;
 
 pub use audio_vae::AudioVaeConfig;
 pub use canvas::{
-    CANVAS_SHORT_EDGE, Canvas, DMD_CANVASES, NAMED_ASPECT_RATIOS, NAMED_CANVASES, offered_canvases,
+    CANVAS_SHORT_EDGE, Canvas, NAMED_ASPECT_RATIOS, NAMED_CANVASES, offered_canvases,
 };
 pub use denoiser::{
     AttentionKind, DenoiserConfig, SPARSE_TILE_ROWS, ScheduleGrid, ScheduleSpec, Shifts,
@@ -348,7 +348,7 @@ fn shift(sidecar: &serde_json::Value, path: &str) -> Result<f32> {
 pub(crate) mod tests_support {
     use std::collections::BTreeMap;
 
-    use nn::VideoTask;
+    use crate::VideoTask;
     use serde_json::Value;
 
     use super::*;
@@ -541,7 +541,7 @@ pub(crate) mod tests_support {
 
 #[cfg(test)]
 mod tests {
-    use nn::VideoTask;
+    use crate::VideoTask;
 
     use super::tests_support::*;
     use super::*;
@@ -578,13 +578,11 @@ mod tests {
             )
             .expect("the grid")
         );
-        assert_eq!(denoiser.canvases, None);
-        assert_eq!(denoiser.offered_canvases(), &NAMED_CANVASES[..]);
         assert!(config.only_denoiser().is_none());
     }
 
     #[test]
-    fn a_dmd_export_reads_its_ladder_its_sparse_attention_and_its_twelve_canvases() {
+    fn a_dmd_export_reads_its_ladder_and_its_sparse_attention() {
         let layout = Layout {
             dits: vec![(
                 Dit::Base,
@@ -606,7 +604,6 @@ mod tests {
             denoiser.attention,
             AttentionKind::sparse(64, 0.8, None).expect("sparse")
         );
-        assert_eq!(denoiser.canvases, Some(&DMD_CANVASES[..]));
     }
 
     #[test]

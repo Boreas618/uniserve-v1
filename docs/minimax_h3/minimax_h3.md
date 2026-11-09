@@ -33,8 +33,8 @@ The first sync builds the `uniserve` executable and installs the NCCL and CUPTI 
 
 | Checkpoint | Tasks | Resolutions | Denoiser forwards |
 | --- | --- | --- | --- |
-| [`FastVideo/FastVideo-FastH3-8-Step-V2`](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2), [`-NVFP4`](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2-NVFP4) | `t2va`, `fl2va` | 768p, 480p | 8 |
-| [`FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree), [`-NVFP4`](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4) | `t2va`, `fl2va` | 768p, 480p | 4 |
+| [`FastVideo/FastVideo-FastH3-8-Step-V2`](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2), [`-NVFP4`](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2-NVFP4) | `t2va`, `fl2va` | 768p | 8 |
+| [`FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree), [`-NVFP4`](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4) | `t2va`, `fl2va` | 768p | 4 |
 | FastH3 OmniRef exports | `ref2va` | 768p | The export's schedule |
 | [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) `transformer` | `t2va`, `fl2va` | 768p | 49 |
 | [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) `transformer_ref` | `ref2va` | 768p | 49 |
@@ -104,7 +104,7 @@ curl --fail-with-body http://127.0.0.1:8000/health
 curl --fail-with-body http://127.0.0.1:8000/v1/capabilities | python -m json.tool
 ```
 
-`/v1/capabilities` reports the served tasks and condition rules, the canvases with the `short_edge` and `aspect_ratio` that select each, in the order the deployment names them, durations, the output frame rate (`fps`) and audio sample rate, the frame rule of the video VAE (`frames`), schedule, prompt capacity, and media policy.
+`/v1/capabilities` reports, under `video.model`, the served tasks with their reference rules, the served `sizes` in the order the deployment names them, the canvas rule (`canvas_rule`), the output frame rate (`fps`) and audio sample rate, the frame rule of the video VAE (`frames`), the shortest and longest durations (`min_seconds`, `max_seconds`, and the model's own `model_max_seconds`), `num_inference_steps` and the schedule's shifts; beside it, `video` holds the prompt capacity (`max_prompt_tokens`), the media policy (`media`) and the accepted request fields (`request_fields`), and `video_jobs` the job store's settings.
 
 ### Deployments
 
@@ -125,7 +125,7 @@ The deployment files are in `configs/minimax_h3/`, in the TOML format [Configura
 | `ulysses8-reference.toml` | Eight on one host | Ulysses8 `transformer_ref` | TP8 |
 | `ulysses8-reference-two-host.toml` | Four on each of two hosts | Ulysses8 `transformer_ref` | TP4 on `rank-0` |
 
-A component placed with `weights = "host"` keeps the dense projection weights of its repeated layer stack in page-locked host storage. Each rank holds a few layer-sized device slots, the fewest of at least four that divide the layer count (five for FastH3's 50 layers), and copies each layer into its slot on its own stream up to that count less two layers ahead of its use, while the layers before it compute. Biases and every other weight stay on the device, and the released device storage becomes capacity. `fasth3-dp8-text-tp8-host-weights.toml` places every replica's denoiser this way, and each replica holds its own host copy. The option requires `--set cuda_graph_config.policy=off`. On eight RTX PRO 6000 it serves the BF16 checkpoint for throughput with `--max-running-requests 8 --max-model-len 10240 --set video_config.text_capacities=1024 --set video_config.aspect_ratios=16:9 --set cuda_graph_config.policy=off --mem-fraction-static 0.92`, the options of the `rtx-pro-6000-8-dp8-bf16` evaluation server.
+A component placed with `weights = "host"` keeps the dense projection weights of its repeated layer stack in page-locked host storage. Each rank holds a few layer-sized device slots, the fewest of at least four that divide the layer count (five for FastH3's 50 layers), and copies each layer into its slot on its own stream up to that count less two layers ahead of its use, while the layers before it compute. Biases and every other weight stay on the device, and the released device storage becomes capacity. `fasth3-dp8-text-tp8-host-weights.toml` places every replica's denoiser this way, and each replica holds its own host copy. On eight RTX PRO 6000 it serves the BF16 checkpoint for throughput with `--max-running-requests 8 --max-model-len 10240 --set video_config.text_capacities=1024 --set video_config.sizes=1344x768 --mem-fraction-static 0.92`, the options of the `rtx-pro-6000-8-dp8-bf16` evaluation server.
 
 A Ulysses denoiser's `sequence_parallel` table also selects how each layer's Q/K/V/gate projection reaches every rank's heads. With `projection = "gather"`, the default, every rank all-gathers the other ranks' input rows and projects its own heads, holding the projection weights partitioned by head. With `projection = "exchange"`, every rank projects its own rows for all heads, holding the whole weights, and sends each rank that rank's heads. For FastH3 the exchange transfers two thirds of the gather's bytes with eight ranks and more than the gather with four, and every rank holds the whole Q/K/V/gate weights of the 50 layers, 14.4 GiB in BF16, instead of its share of them. `projection_rows = <rows>` makes the exchange project and send each rank's rows in steps of that many rows, each step's transfer overlapping the next step's projection; without it the exchange sends the whole shard at once. A step holds whole attention tiles: a multiple of the checkpoint's 64- or 128-row tile, so a multiple of 128 suits every FastH3 checkpoint. Every mode produces the same values and serves every precision preset, and none applies to the `hybrid` and `allgather` kinds:
 
@@ -141,8 +141,8 @@ One replica across every GPU gives the lowest latency; replicas serve more reque
 | 4 x GB200 | Latency and throughput | `ulysses4.toml` | `--max-running-requests 2` |
 | 8 x GB200, two hosts | Latency | `ulysses8-two-host.toml` | `--max-running-requests 2` |
 | 8 x GB200, two hosts | Throughput | `fasth3-ulysses4x2-two-host.toml` | `--max-running-requests 4` |
-| 8 x RTX PRO 6000 | Latency | `ulysses8.toml` | `--max-running-requests 2 --set cuda_graph_config.policy=off --mem-fraction-static 0.92 --set video_config.text_capacities=1024,10240` |
-| 8 x RTX PRO 6000 | Throughput | `fasth3-ulysses4x2.toml` | `--max-running-requests 4 --set cuda_graph_config.policy=off --mem-fraction-static 0.92 --set video_config.text_capacities=1024,10240` |
+| 8 x RTX PRO 6000 | Latency | `ulysses8.toml` | `--max-running-requests 2 --mem-fraction-static 0.92 --set video_config.text_capacities=1024,10240` |
+| 8 x RTX PRO 6000 | Throughput | `fasth3-ulysses4x2.toml` | `--max-running-requests 4 --mem-fraction-static 0.92 --set video_config.text_capacities=1024,10240` |
 | 4 x H200 | Latency and throughput | `ulysses4.toml` | `--max-running-requests 2 --mem-fraction-static 0.92 --set video_config.text_capacities=1024` |
 | 8 x H200 | Latency, up to 10240 prompt tokens | `ulysses8.toml` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 10240 --set video_config.text_capacities=1024` |
 | 8 x H200 | Throughput, up to 5 s and 1024 prompt tokens | `fasth3-dp8-text-tp8.toml` | `--max-running-requests 8 --set video_config.max_seconds=5 --max-model-len 1024` |
@@ -168,8 +168,8 @@ uniserve serve --nnodes 2 --node-rank 1 --dist-init-addr <rank-0 address>:<port>
 
 | Option | Meaning |
 | --- | --- |
-| `video_config.max_seconds` | Longest admitted duration, 4 to 15 seconds; 15 by default. |
-| `video_config.resolutions`, `video_config.aspect_ratios` | The canvases startup prepares: each resolution with each aspect ratio, `768p` and `16:9,9:16` by default. The served checkpoint names the canvas of each pair, and the workers refuse at startup a pair it does not generate: FastH3 DMD exports generate `21:9`, `16:9`, `4:3`, `1:1`, `3:4` and `9:16` at `768p` and `480p`, the base checkpoint and OmniRef those ratios at `768p`. A request for any other canvas is refused. |
+| `video_config.max_seconds` | Longest admitted duration, 4 to 15 seconds; 15 by default. A value outside that range is refused at startup. |
+| `video_config.sizes` | The output sizes startup prepares, each `WxH` in pixels, `1344x768,768x1344` by default; the sizes are listed under [Generate a video](#generate-a-video). The workers refuse at startup a size the checkpoint does not generate, naming the sizes it does, and a request for any other size is refused. |
 | `--max-model-len` | Longest prompt presentation in tokens, vision tokens included; 16384 by default. The text encoder itself accepts up to 262144 positions; the default bounds the prompt capacities startup prepares layouts and storage for (`video_config.text_capacities`). The official keyframe request presents 1935 tokens and the official video-plus-audio request 6913. |
 | `video_config.text_capacities` | Prompt capacities below `--max-model-len` that startup prepares; `--max-model-len` itself is always the largest, and each prompt runs in the smallest capacity that holds it. By default 1024, then steps of 2048. |
 | `--max-running-requests` | Concurrently resident requests, up to the workers' request slots. |
@@ -179,9 +179,8 @@ uniserve serve --nnodes 2 --node-rank 1 --dist-init-addr <rank-0 address>:<port>
 | `mm_processor_kwargs` | Options of the video processor, as a JSON object; an option it does not take is refused at startup. Two size `ref2va` references. `reference_image_short_edge` is the short edge, in pixels, an image reference is encoded at, at most: a multiple of 32 up to the edge the served checkpoint declares, which is the default (2048 for MiniMax-H3 and OmniRef). A reference is only ever reduced: an image with a longer short edge scales down to it and a video with more pixels than the canvas of its aspect scales down to that canvas, while smaller references keep their own size on the 32-pixel grid. `"enlarge_references": true` also enlarges smaller ones to those sizes, as the released pipeline does. |
 | `media_config.max_request_bytes` | Largest request body and fetched media in total, such as `512MiB`; 256 MiB by default. |
 | `--mem-fraction-static` | Device storage each worker process may hold for weights and KV cache; 0.70 by default. |
-| `cuda_graph_config.policy` | `auto` (default) captures CUDA graphs at startup; `off` runs eagerly. |
 
-Startup prepares, and with graphs captures, every layout a request reaches: each frame count up to `video_config.max_seconds` at each canvas, and for a task with conditions each rung of the condition ladder. A layout's condition rows are real rows of every denoising step, so a request runs in the smallest rung that holds its conditions and its steps cost its own rows, not the deployment's capacity. The server derives the ladder from the condition capacity, and it takes no option: 1,024 rows, doubling, with a rung halfway between two doublings from 4,096 rows up, and the capacity last. A rung is one more captured graph per frame count and canvas, about a second of startup each at five seconds, and the rungs share one arena. Fewer canvases, capacities and seconds start faster and hold less storage. Until then the log reports `worker still busy during Worker startup`. The first startup also compiles kernels. Serving all 12 FastH3 canvases needs fewer text capacities, such as `--set video_config.text_capacities=1024,10240`. 768p 21:9 needs more request storage than the other canvases. A deployment that does not fit fails before it reports ready and logs what each component holds.
+Startup prepares, and with graphs captures, every layout a request reaches: each frame count up to `video_config.max_seconds` at each canvas, and for a task with conditions each rung of the condition ladder. A layout's condition rows are real rows of every denoising step, so a request runs in the smallest rung that holds its conditions and its steps cost its own rows, not the deployment's capacity. The server derives the ladder from the condition capacity, and it takes no option: 1,024 rows, doubling, with a rung halfway between two doublings from 4,096 rows up, and the capacity last. A rung is one more captured graph per frame count and canvas, about a second of startup each at five seconds, and the rungs share one arena. Fewer canvases, capacities and seconds start faster and hold less storage. The first startup also compiles kernels. Serving every FastH3 size needs fewer text capacities, such as `--set video_config.text_capacities=1024,10240`. 1536x672 needs more request storage than the other sizes. A deployment that does not fit fails before it reports ready and logs what each component holds.
 
 A base denoiser counts one condition row per token: a five-second reference video with its soundtrack occupies about 38,000 rows, a 16:9 reference image at a 2048-pixel short edge about 7,300 and one at its own 2560×1440 size 3,600. OmniRef packs each condition into whole 128-row tiles: an image or audio track takes `ceil(rows / 128)` tiles, and a video's token grid of latent frames × height/32 × width/32 takes `ceil(frames / 4) × ceil(height / 32 / 4) × ceil(width / 32 / 8)`. The official video-plus-audio request therefore occupies 38,124 rows on the base reference denoiser and 47,104 on OmniRef. The deployment's text capacity, condition capacity and seconds, and the storage they need, bound a request's packed sequence (prompt, conditions and generated rows).
 
@@ -205,46 +204,65 @@ The image compiles the native kernels for Hopper, data-center Blackwell and RTX 
 
 ## Generate a video
 
-`POST /v1/videos/sync` returns the MP4; the body is JSON, or `multipart/form-data` with `conditions` and `target` as JSON text.
+`POST /v1/videos/sync` returns the MP4; the body is JSON, or `multipart/form-data` whose text parts carry the same fields, with `input_references` and `extra_params` as JSON text. The response states what was generated in `x-video-size`, `x-video-num-frames` and `x-video-fps`.
 
 ```bash
 curl --fail-with-body --max-time 600 http://127.0.0.1:8000/v1/videos/sync \
   -H 'Content-Type: application/json' \
-  -d '{"model":"FastH3","task":"t2va","prompt":"A clear stream flows through a green forest while birds sing.","target":{"short_edge":768,"aspect_ratio":"16:9","duration_seconds":5},"seed":1000}' \
+  -d '{"model":"FastH3","prompt":"A clear stream flows through a green forest while birds sing.","size":"1344x768","seconds":5,"seed":1000}' \
   --output forest.mp4
 ```
 
-A keyframe request anchors the first (`frame_index` 0) or last (`-1`) frame to an image; a reference request lists its references in order, and the prompt names them `<Picture 1>`, `<Video 1>` and `<Audio 1>`:
+A reference with a `frame_index` anchors a generated frame: an image keyframe at the first (`0`) or last (`-1`) frame. A reference without one conditions the generation as a whole; the references are listed in order, and the prompt names them `<Picture 1>`, `<Video 1>` and `<Audio 1>`:
 
 ```json
 {
   "model": "MiniMax-H3",
-  "task": "ref2va",
   "prompt": "subject_definitions:\n<Subject 1> is the man in <Picture 1>.\n<Audio 1> is the voice timbre reference for <Subject 1>'s voice. ...",
-  "conditions": [
-    {"type": "image", "uri": "file:///srv/media/subject.png", "role": "reference"},
-    {"type": "audio", "uri": "file:///srv/media/voice.mp3", "role": "reference"}
+  "input_references": [
+    {"type": "image", "url": "file:///srv/media/subject.png"},
+    {"type": "audio", "url": "file:///srv/media/voice.mp3"}
   ],
-  "target": {"short_edge": 768, "aspect_ratio": "auto", "duration_seconds": 5}
+  "seconds": 5
 }
 ```
 
-| `target.short_edge` | `21:9` | `16:9` | `4:3` | `1:1` | `3:4` | `9:16` |
-| --- | --- | --- | --- | --- | --- | --- |
-| 768 | 1536×672 | 1344×768 | 1024×768 | 768×768 | 768×1024 | 768×1344 |
-| 480 (FastH3) | 992×416 | 832×480 | 640×480 | 480×480 | 480×640 | 480×832 |
+The request fields are the same for every video model; any other field is refused, naming it.
 
 | Field | Rule |
 | --- | --- |
 | `model`, `prompt` | Required: the served model name and plain text without the model's vision tokens. |
-| `task` | Required: `t2va`, `fl2va` or `ref2va`, one the served denoiser serves. |
-| `conditions` | In request order. `t2va` takes none; `fl2va` one or two image keyframes; `ref2va` up to the references the served checkpoint declares, which `/v1/capabilities` reports (9 images, 3 videos and 3 audio tracks, 12 in total, for MiniMax-H3 and OmniRef), plus up to two keyframes. Each has `type` (`image`, `video`, `video_audio` for a video that must have a soundtrack, or `audio`), `uri` (`data:`, `http(s)://` or `file://`), `role` (`keyframe` or `reference`), and optionally `frame_index` or `start_time_seconds`, an offset into a video reference. |
-| `target` | Required: `short_edge`, `aspect_ratio` (a served ratio, or `auto`: the keyframe's aspect for `fl2va`, 16:9 otherwise) and `duration_seconds` (4 to the served maximum; a reference request whose only audio-bearing reference sets the duration may omit it). |
-| `seed` | Default 42. |
+| `negative_prompt` | What the generation steers away from, for a model that takes one. |
+| `size` | The output size, `WxH` in pixels. |
+| `seconds` | The duration, a number or a numeric string; the model aligns it to a frame count it generates. Exclusive with `num_frames`. |
+| `num_frames` | The exact frame count, one the model generates. Exclusive with `seconds`. |
+| `fps`, `seed`, `num_inference_steps`, `guidance_scale` | The output frame rate, the noise seed, the denoiser evaluations and the classifier-free guidance scale, each for a model that takes it. |
+| `input_references` | Reference media in request order, each with `type` (`image`, `video` or `audio`), `url` (`data:`, `http(s)://` or `file://`), and optionally `frame_index`, the generated frame it anchors, counted from the last when negative, and `start_time_seconds`, where a video or audio reference starts. |
+| `extra_params` | Options the model defines, as a JSON object. |
 
-Any other field is refused, naming it. The served checkpoint fixes the schedule, which `/v1/capabilities` reports, and every request generates one video. A video has `duration_seconds × fps` frames, rounded half to even and extended to the next count of the frame rule (`frames`): at MiniMax-H3's 24 fps and its counts of the form 17n + 5, 4 seconds give 107 frames, 5 give 124, 8 give 192 and 15 give 362.
+### MiniMax-H3 mapping
 
-`POST /v1/videos` creates an asynchronous job instead; `GET /v1/videos/{id}` reports its state (`queued`, `in_progress`, `completed`, `failed`) and progress, `GET /v1/videos/{id}/content` returns the MP4, `GET /v1/videos` lists jobs and `DELETE` cancels one. Jobs live in the server process for `video_job_config.retention` seconds (one hour by default), within `video_job_config.max_bytes` of retained MP4s (1 GiB by default); a job whose video does not fit fails with `artifact_capacity_exceeded`. Synchronous requests do not use the job store.
+| Field | MiniMax-H3 |
+| --- | --- |
+| Task | Derived from `input_references`: none is `t2va`; image keyframes alone, with `frame_index` `0`, `-1` or both in that order, are `fl2va`; any reference without a `frame_index` makes the request `ref2va`, which takes up to two keyframes beside its references. The task must be one the served denoiser serves. |
+| `input_references` | `ref2va` takes up to the references the served checkpoint declares, which `/v1/capabilities` reports (9 images, 3 videos and 3 audio tracks, 12 in total, for MiniMax-H3 and OmniRef). A video reference contributes its soundtrack when it has one. `start_time_seconds` applies to video references. |
+| `size` | One of the deployment's `video_config.sizes`. Without it, an `fl2va` request's canvas follows its first keyframe by the canvas rule (a 768-pixel short edge, an area of at most 768 × 1344 pixels, sides multiples of 32), and must be a served size; every other request takes the first served size's short edge at 16:9. |
+| `seconds` | 4 to `video_config.max_seconds`. A video has `seconds × 24` frames, rounded half to even and extended to the next count of the frame rule, 17n + 5: 4 seconds give 107 frames, 5 give 124, 8 give 192 and 15 give 362. A `ref2va` request whose references carry exactly one soundtrack may omit it and lasts as long as that soundtrack after its start. |
+| `num_frames` | Must already be a count of the frame rule within the duration range, such as 107 or 124. |
+| `fps` | 24 when stated. |
+| `num_inference_steps` | When stated, the schedule's denoiser evaluations, which the served checkpoint fixes and `/v1/capabilities` reports. |
+| `seed` | 42 when not stated. |
+| `negative_prompt`, `guidance_scale`, `extra_params` | Refused: the schedule runs without classifier-free guidance, and the model defines no extra parameter. |
+
+The sizes MiniMax-H3 generates:
+
+| Short edge | `21:9` | `16:9` | `4:3` | `1:1` | `3:4` | `9:16` |
+| --- | --- | --- | --- | --- | --- | --- |
+| 768 | 1536x672 | 1344x768 | 1024x768 | 768x768 | 768x1024 | 768x1344 |
+
+Every request generates one video.
+
+`POST /v1/videos` creates an asynchronous job instead and returns its record, which states the generated `size`, `num_frames`, `fps` and `seconds` (the generated duration as a decimal string); `GET /v1/videos/{id}` reports its state (`queued`, `in_progress`, `completed`, `failed`) and progress, `GET /v1/videos/{id}/content` returns the MP4, `GET /v1/videos` lists jobs and `DELETE` cancels one. Jobs live in the server process for `video_job_config.retention` seconds (one hour by default), within `video_job_config.max_bytes` of retained MP4s (1 GiB by default); a job whose video does not fit fails with `artifact_capacity_exceeded`. Synchronous requests do not use the job store.
 
 ## Precision
 

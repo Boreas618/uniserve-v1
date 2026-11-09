@@ -187,8 +187,8 @@ def _serves_a_deployment(args: list[str]) -> bool:
     executable.
 
     The subcommand is the second word. `uniserve program-server serve` and
-    `uniserve storage serve` are other commands: `serve` is theirs too, and they
-    take no deployment options.
+    `uniserve storage-server serve` are other commands: `serve` is theirs too,
+    and they take no deployment options.
     """  # noqa: D205
     return len(args) > 1 and args[1] == "serve"
 
@@ -244,7 +244,7 @@ def stop_storage_server(runtime: Path) -> None:
     line: it outlives the server, and holds the deployment's host and
     device storage until it stops.
     """  # noqa: D205
-    socket = str(runtime / "uniserve" / "storage.sock").encode()
+    socket = str(runtime / "uniserve" / "storage-server.sock").encode()
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
@@ -391,7 +391,7 @@ def second_host(
                 process.wait(timeout=120)
                 outlived = True
         if started:
-            storage_socket = f"{runtime}/uniserve/storage.sock"
+            storage_socket = f"{runtime}/uniserve/storage-server.sock"
             kept = shlex.quote(str(log.with_suffix(".storage.log")))
             _on_host(
                 host,
@@ -454,21 +454,21 @@ def post_sse(
 def t2va_request(
     model: str,
     prompt: str,
-    seconds: float,
+    num_frames: int,
     seed: int,
     *,
-    aspect_ratio: str = "16:9",
+    size: str = "1344x768",
 ) -> dict[str, Any]:
-    """A MiniMax-H3 text-to-video-and-audio request at a named canvas."""
+    """A text-to-video-and-audio request for an exact size and frame count.
+
+    The body carries no references, which is how MiniMax-H3 tells a t2va
+    request; ``num_frames`` must already be a count the model generates.
+    """
     return {
         "model": model,
         "prompt": prompt,
-        "task": "t2va",
-        "target": {
-            "short_edge": 768,
-            "aspect_ratio": aspect_ratio,
-            "duration_seconds": seconds,
-        },
+        "size": size,
+        "num_frames": num_frames,
         "seed": seed,
     }
 

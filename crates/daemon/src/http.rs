@@ -82,7 +82,12 @@ const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.
 /// Fails when the configuration is invalid, the daemon cannot start or
 /// fails, the engine cannot start, the listener cannot be bound or report
 /// its address, the server fails, or the engine shutdown fails.
-pub async fn serve(config: ServerArgs, stated: Stated, shutdown: CancellationToken) -> Result<()> {
+pub async fn serve(
+    config: ServerArgs,
+    stated: Stated,
+    catalogue: processing::Catalogue,
+    shutdown: CancellationToken,
+) -> Result<()> {
     config
         .validate(&stated)
         .context("invalid serving configuration")?;
@@ -135,7 +140,7 @@ pub async fn serve(config: ServerArgs, stated: Stated, shutdown: CancellationTok
         .as_ref()
         .and_then(Daemon::commands);
     let engine = tokio::select! {
-        engine = Leader::start(&config, &stated, address, commands.as_ref(), updates) => {
+        engine = Leader::start(&catalogue, &config, &stated, address, commands.as_ref(), updates) => {
             engine.map(Arc::new)
         }
         () = shutdown.cancelled() => return stop_daemon(daemon).await,
@@ -307,7 +312,7 @@ async fn stop_daemon(daemon: Arc<std::sync::Mutex<Option<Daemon>>>) -> Result<()
 /// Releases `deployment`'s weights and caches at this host's Storage
 /// Server, whose claim this daemon held until it stopped.
 fn retire_deployment(deployment: &str) -> Result<()> {
-    let socket = storage::socket::default_socket();
+    let socket = storage::default_socket();
     let mut operator = storage::Client::connect(&socket, storage::Role::Operator)
         .with_context(|| format!("connecting to the storage server at {}", socket.display()))?;
     let released = operator
@@ -593,7 +598,6 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::*;
-    use crate::model::ModelParameters;
     use crate::test_support::{SERVED_MODEL, post_json, router, router_with, send, sim_engine};
 
     /// A `GET` request to `path`.
@@ -626,7 +630,7 @@ mod tests {
     /// generation is paused, and logs what it did.
     #[tokio::test]
     async fn the_admin_api_pauses_generation_and_logs_it() {
-        let app = router(sim_engine(ModelParameters::Qwen3));
+        let app = router(sim_engine(crate::test_support::CHAT));
         let (status, _, body) = send(&app, get_request("/admin/status")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["deployment"]["deployment"], json!(SERVED_MODEL));
@@ -706,7 +710,7 @@ mod tests {
     /// run through their endpoints alone.
     #[tokio::test]
     async fn a_sleeping_deployment_serves_once_it_wakes() {
-        let app = router(sim_engine(ModelParameters::Qwen3));
+        let app = router(sim_engine(crate::test_support::CHAT));
         let (status, _, body) = send(&app, post_json("/admin/sleep", &json!({}))).await;
         assert_eq!(
             (status, &body["state"]),
@@ -752,7 +756,7 @@ mod tests {
     /// it ended, why and each worker's file.
     #[tokio::test]
     async fn a_profiling_session_runs_until_the_operator_ends_it() {
-        let app = router(sim_engine(ModelParameters::Qwen3));
+        let app = router(sim_engine(crate::test_support::CHAT));
         let (status, _, body) = send(&app, get_request("/admin/profile")).await;
         assert_eq!((status, &body["session"]), (StatusCode::OK, &json!(null)));
 
@@ -796,7 +800,7 @@ mod tests {
     /// request that runs no collector or names an unknown option is refused.
     #[tokio::test]
     async fn a_session_ends_after_its_seconds_and_a_faulty_request_is_refused() {
-        let app = router(sim_engine(ModelParameters::Qwen3));
+        let app = router(sim_engine(crate::test_support::CHAT));
         let output = tempfile::tempdir().expect("a profile directory");
         let (status, _, body) = send(
             &app,
@@ -832,7 +836,7 @@ mod tests {
     /// no adapter's.
     #[tokio::test]
     async fn a_loaded_adapter_is_served_under_its_name_until_unloaded() {
-        let app = router(sim_engine(ModelParameters::Qwen3));
+        let app = router(sim_engine(crate::test_support::CHAT));
         let adapter = json!({"lora_name": "tuned", "lora_path": "/adapters/tuned"});
         let (status, _, body) = send(&app, post_json("/admin/load_lora_adapter", &adapter)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -883,7 +887,7 @@ mod tests {
     /// resolved is refused before the engine is asked.
     #[tokio::test]
     async fn a_weight_update_from_an_unknown_checkpoint_is_refused() {
-        let app = router(sim_engine(ModelParameters::Qwen3));
+        let app = router(sim_engine(crate::test_support::CHAT));
         let (status, _, _) = send(
             &app,
             post_json("/admin/update_weights", &json!({"path": "/nowhere"})),
@@ -911,7 +915,7 @@ mod tests {
     async fn routes_follow_the_served_tasks() {
         let not_found = json!({"detail": "Not Found"});
 
-        let chat = router(sim_engine(ModelParameters::Qwen3));
+        let chat = router(sim_engine(crate::test_support::CHAT));
         let (status, _, _) = send(
             &chat,
             post_json("/v1/chat/completions", &chat_body(2, false)),
@@ -927,7 +931,7 @@ mod tests {
             assert_eq!((status, body), (StatusCode::NOT_FOUND, not_found.clone()));
         }
 
-        let video = router(sim_engine(ModelParameters::MiniMaxH3));
+        let video = router(sim_engine(crate::test_support::VIDEO));
         let (status, _, _) = send(&video, get_request("/v1/capabilities")).await;
         assert_eq!(status, StatusCode::OK);
         let (status, _, body) = send(
@@ -943,7 +947,7 @@ mod tests {
     #[tokio::test]
     async fn the_api_key_guards_every_route_but_health_and_metrics() {
         let router = router_with(
-            sim_engine(ModelParameters::Qwen3),
+            sim_engine(crate::test_support::CHAT),
             &ServerConfig {
                 api_key: Some("secret".to_owned()),
                 request_id_headers: true,
@@ -976,7 +980,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_past_the_timeout_answers_504() {
         let router = router_with(
-            sim_engine(ModelParameters::Qwen3),
+            sim_engine(crate::test_support::CHAT),
             &ServerConfig {
                 request_timeout: Some(Duration::ZERO),
                 ..ServerConfig::default()
@@ -998,7 +1002,7 @@ mod tests {
     #[tokio::test]
     async fn a_full_server_sheds_requests_until_a_stream_ends() {
         let router = router_with(
-            sim_engine(ModelParameters::Qwen3),
+            sim_engine(crate::test_support::CHAT),
             &ServerConfig {
                 max_concurrent_requests: NonZeroU64::new(1),
                 ..ServerConfig::default()
@@ -1036,7 +1040,7 @@ mod tests {
     /// count an extension method under `other`.
     #[tokio::test]
     async fn http_metrics_bound_the_method_label() {
-        let router = router(sim_engine(ModelParameters::Qwen3));
+        let router = router(sim_engine(crate::test_support::CHAT));
         let request = Request::builder()
             .method("PURGE")
             .uri("/v1/models")
@@ -1076,7 +1080,7 @@ mod tests {
     /// connections, and returns once drained.
     #[tokio::test]
     async fn shutdown_drains_requests_in_flight_and_refuses_new_connections() {
-        let engine = Arc::new(sim_engine(ModelParameters::Qwen3));
+        let engine = Arc::new(sim_engine(crate::test_support::CHAT));
         let (listener, address) = loopback().await;
         let shutdown = CancellationToken::new();
         let server = tokio::spawn({
@@ -1121,7 +1125,7 @@ mod tests {
     /// shutdown budget runs out.
     #[tokio::test]
     async fn shutdown_stops_waiting_when_its_budget_runs_out() {
-        let engine = Arc::new(sim_engine(ModelParameters::Qwen3));
+        let engine = Arc::new(sim_engine(crate::test_support::CHAT));
         let (listener, address) = loopback().await;
         let budget = Duration::from_millis(200);
         let mut config = ServerArgs::default();

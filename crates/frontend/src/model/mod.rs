@@ -22,16 +22,15 @@ pub mod generation;
 // binds the worker's capabilities onto it before request preprocessing and
 // discovery share it immutably.
 //
-// The checkpoint's files are resolved and read here ([`assets`]); what a
-// family makes of them is the family's rules in the `models` crate, which read
-// the checkpoint's tokenizer (`crate::tokenizer`) through
-// `models::Vocabulary`. The streaming reasoning
-// and tool-call parsers are output processing's (`crate::output`).
+// The checkpoint's files are resolved and read here ([`assets`]); which family
+// a checkpoint is, and what that family serves, is the executable's catalogue
+// of families (`processing::Catalogue`), whose request processing reads the
+// checkpoint's tokenizer (`crate::tokenizer`) through `processing::Vocabulary`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-use models::ModelDescription;
+use processing::{Catalogue, ChatProfile, Family, Serving, VideoFamily};
 
 use crate::model::assets::{
     GenerationConfig, HfTokenizerConfig, ResolvedModelFiles, load_generation_config,
@@ -57,23 +56,13 @@ pub struct SamplingDefaults {
     pub max_output_tokens: Option<u32>,
 }
 
-/// Model-specific numerical and prompt settings; the selected variant owns its facts.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ModelParameters {
-    /// Qwen3 chat framing and structured text output.
-    Qwen3,
-    /// MiniMax-H3 video generation. What the placed denoiser serves (tasks,
-    /// schedule, canvases) belongs to the loaded worker, whose startup
-    /// handshake reports it, and the duration capacity to the deployment's
-    /// engine settings.
-    MiniMaxH3,
-}
-
 /// Immutable model facts shared by startup, request preprocessing, and discovery.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelConfig {
-    /// Loaded model-specific settings, including the family identity.
-    pub parameters: ModelParameters,
+    /// The checkpoint's family, which states what it serves. What a video
+    /// family's placed denoiser serves belongs to the loaded workers, whose
+    /// startup handshake reports it.
+    pub family: Family,
     /// Checkpoint defaults applied only to omitted request fields.
     pub sampling_defaults: SamplingDefaults,
     /// Combined input/output token ceiling: the configured `--max-model-len`,
@@ -94,20 +83,20 @@ impl ModelConfig {
     /// Context length of a model whose configuration declares none and for
     /// which no `max_model_len` is configured.
     pub const DEFAULT_MAX_MODEL_LEN: u32 = 8192;
-    /// Resolves vocabulary, checkpoint defaults, and model-specific settings once.
+    /// Resolves vocabulary, checkpoint defaults, and the family once.
     ///
-    /// The family comes from the `model_type` of `files.config_path`. A
-    /// configured `max_model_len` takes precedence over the checkpoint's
-    /// `max_position_embeddings`, and
-    /// [`ModelConfig::DEFAULT_MAX_MODEL_LEN`] applies when neither is set.
+    /// The family is the one of `catalogue` that claims the `model_type` of
+    /// `files.config_path`, and it must serve chat. A configured
+    /// `max_model_len` takes precedence over the checkpoint's
+    /// `max_position_embeddings`, and [`ModelConfig::DEFAULT_MAX_MODEL_LEN`]
+    /// applies when neither is set.
     ///
     /// # Errors
     ///
     /// Fails when a present metadata file cannot be read or parsed, or when
-    /// `model_type` is missing or names no family served from a root
-    /// configuration.
+    /// `model_type` is missing or names no chat family of `catalogue`.
     pub async fn from_files(
-        _model: &str,
+        catalogue: &Catalogue,
         files: &ResolvedModelFiles,
         max_model_len: Option<u32>,
         tokenizer: &HuggingFaceTokenizer,
@@ -118,11 +107,11 @@ impl ModelConfig {
             .ok_or(assets::Error::MissingField {
                 field: "model_type",
             })?;
-        let description =
-            ModelDescription::from_model_type(actual_model_type).ok_or_else(|| {
-                assets::Error::UnsupportedModelType {
-                    actual: actual_model_type.to_owned(),
-                }
+        let family = catalogue
+            .by_model_type(actual_model_type)
+            .filter(|family| matches!(family.serving, Serving::Chat(_)))
+            .ok_or_else(|| assets::Error::UnsupportedModelType {
+                actual: actual_model_type.to_owned(),
             })?;
 
         let generation_config = load_generation_config(files.generation_config_path.as_deref())?;
@@ -130,22 +119,9 @@ impl ModelConfig {
         let (primary_eos_token_id, eos_token_ids) =
             stop_token_ids(&tokenizer_config, &generation_config, tokenizer);
 
-        let parameters = match description {
-            ModelDescription::Qwen3 => ModelParameters::Qwen3,
-            // `from_model_type` resolves only families described by a root
-            // configuration; a pipeline family resolves through `from_pipeline`.
-            ModelDescription::MiniMaxH3 => {
-                return Err(assets::Error::UnsupportedModelType {
-                    actual: actual_model_type.to_owned(),
-                });
-            }
-        };
-
-        let sampling_defaults = generation_defaults(&generation_config);
-
         Ok(Self {
-            parameters,
-            sampling_defaults,
+            family,
+            sampling_defaults: generation_defaults(&generation_config),
             max_model_len: max_model_len
                 .or(model_config.max_position_embeddings())
                 .unwrap_or(Self::DEFAULT_MAX_MODEL_LEN),
@@ -157,45 +133,47 @@ impl ModelConfig {
     /// Resolves a family that ships as a diffusers pipeline.
     ///
     /// A pipeline checkpoint has no root generation or tokenizer metadata, so
-    /// the result carries no sampling defaults and no EOS tokens. Its
-    /// denoising step count belongs to the loaded numerical plan, which the
-    /// worker handshake binds. `max_model_len` overrides the family's prompt
-    /// bound.
+    /// the result carries no sampling defaults and no EOS tokens.
+    /// `max_model_len` overrides the family's prompt bound.
     ///
     /// # Errors
     ///
     /// Returns [`assets::Error::UnsupportedPipeline`] for a family that does
-    /// not ship as a pipeline.
-    pub fn from_pipeline(
-        description: ModelDescription,
-        max_model_len: Option<u32>,
-    ) -> assets::Result<Self> {
-        let (parameters, default_max_model_len) = match description {
-            // The checkpoint's text encoder accepts 262,144 positions. The
-            // default is the prompt length a deployment prepares layouts and
-            // storage for: startup prepares every text capacity up to it.
-            ModelDescription::MiniMaxH3 => (ModelParameters::MiniMaxH3, 16_384),
-            ModelDescription::Qwen3 => {
-                return Err(assets::Error::UnsupportedPipeline {
-                    class_name: description.id().to_owned(),
-                });
-            }
+    /// not serve video.
+    pub fn from_pipeline(family: Family, max_model_len: Option<u32>) -> assets::Result<Self> {
+        let Serving::Video(video) = family.serving else {
+            return Err(assets::Error::UnsupportedPipeline {
+                class_name: family.id.to_owned(),
+            });
         };
-
         Ok(Self {
-            parameters,
+            family,
             sampling_defaults: SamplingDefaults::default(),
-            max_model_len: max_model_len.unwrap_or(default_max_model_len),
+            max_model_len: max_model_len.unwrap_or(video.default_prompt_tokens()),
             primary_eos_token_id: None,
             eos_token_ids: BTreeSet::new(),
         })
     }
 
-    /// Stable public model-family identifier derived from the loaded settings.
-    pub const fn description(&self) -> ModelDescription {
-        match &self.parameters {
-            ModelParameters::Qwen3 => ModelDescription::Qwen3,
-            ModelParameters::MiniMaxH3 => ModelDescription::MiniMaxH3,
+    /// The family's stable identifier.
+    pub const fn id(&self) -> &'static str {
+        self.family.id
+    }
+
+    /// The output formats of a chat family; `None` for a family that serves
+    /// no chat.
+    pub const fn chat(&self) -> Option<ChatProfile> {
+        match self.family.serving {
+            Serving::Chat(profile) => Some(profile),
+            Serving::Video(_) => None,
+        }
+    }
+
+    /// The video family; `None` for a family that serves no video.
+    pub fn video(&self) -> Option<&'static dyn VideoFamily> {
+        match self.family.serving {
+            Serving::Video(video) => Some(video),
+            Serving::Chat(_) => None,
         }
     }
 }
@@ -247,7 +225,12 @@ mod tests {
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
-    use super::{ModelConfig, ModelDescription, ModelParameters};
+    use processing::{
+        Catalogue, ChatProfile, Family, ReasoningFormat, Serving, ToolCallFormat, VideoBinding,
+        VideoFamily, VideoProcessor,
+    };
+
+    use super::ModelConfig;
     use crate::model::assets::ResolvedModelFiles;
     use crate::tokenizer::HuggingFaceTokenizer;
 
@@ -328,43 +311,70 @@ mod tests {
     ) {
         let (directory, files) = configured_files(model_type);
         let tokenizer = HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap();
-        let config =
-            ModelConfig::from_files(directory.path().to_str().unwrap(), &files, None, &tokenizer)
-                .await;
+        let catalogue = Catalogue::new([CHAT, VIDEO]).unwrap();
+        let config = ModelConfig::from_files(&catalogue, &files, None, &tokenizer).await;
         (directory, tokenizer, config)
     }
 
-    #[tokio::test]
-    async fn configured_descriptions_resolve_their_serving_behavior() {
-        for (description, model_type) in [
-            (ModelDescription::Qwen3, "qwen3"),
-            (ModelDescription::Qwen3, "qwen3_moe"),
-        ] {
-            let (_directory, _tokenizer, profile) = resolved_config(model_type).await;
-            let profile = profile.unwrap();
-            assert_eq!(profile.description(), description);
-            assert_eq!(profile.max_model_len, 4096);
-            assert_eq!(profile.sampling_defaults.max_output_tokens, Some(512));
-            match profile.parameters {
-                ModelParameters::Qwen3 => assert_eq!(description, ModelDescription::Qwen3),
-                ModelParameters::MiniMaxH3 => {
-                    assert_eq!(description, ModelDescription::MiniMaxH3);
-                }
-            }
+    /// A chat family of the two `model_type`s these checkpoints declare.
+    const CHAT: Family = Family {
+        id: "chat",
+        model_types: &["qwen3", "qwen3_moe"],
+        pipeline_classes: &[],
+        serving: Serving::Chat(ChatProfile {
+            reasoning: Some(ReasoningFormat::Qwen3),
+            tool_calls: Some(ToolCallFormat::Qwen3),
+        }),
+    };
+
+    /// A video family that binds nothing: these tests read only its prompt bound.
+    struct Video;
+
+    impl VideoFamily for Video {
+        fn default_prompt_tokens(&self) -> u32 {
+            16_384
+        }
+
+        fn processor_files(&self) -> &'static [(&'static str, &'static str)] {
+            &[]
+        }
+
+        fn bind(&self, _: VideoBinding<'_>) -> Result<Box<dyn VideoProcessor>, String> {
+            Err("this family binds no processor".to_owned())
         }
     }
 
-    #[test]
-    fn a_pipeline_family_resolves_from_its_pipeline_class() {
-        assert_eq!(
-            ModelDescription::from_pipeline_class("MiniMaxH3ModularPipeline"),
-            Some(ModelDescription::MiniMaxH3)
-        );
-        assert_eq!(ModelDescription::from_model_type("minimax_h3"), None);
+    const VIDEO: Family = Family {
+        id: "video",
+        model_types: &["video"],
+        pipeline_classes: &["VideoModularPipeline"],
+        serving: Serving::Video(&Video),
+    };
 
-        let profile = ModelConfig::from_pipeline(ModelDescription::MiniMaxH3, None).unwrap();
-        assert_eq!(profile.description(), ModelDescription::MiniMaxH3);
+    #[tokio::test]
+    async fn a_checkpoint_resolves_to_the_chat_family_of_its_model_type() {
+        for model_type in ["qwen3", "qwen3_moe"] {
+            let (_directory, _tokenizer, profile) = resolved_config(model_type).await;
+            let profile = profile.unwrap();
+            assert_eq!(profile.family, CHAT);
+            assert_eq!(profile.max_model_len, 4096);
+            assert_eq!(profile.sampling_defaults.max_output_tokens, Some(512));
+        }
+    }
+
+    /// A root configuration selects only a chat family: a video family is a pipeline's.
+    #[tokio::test]
+    async fn a_root_configuration_selects_no_video_family() {
+        let (_directory, _tokenizer, config) = resolved_config("video").await;
+        assert!(config.is_err());
+    }
+
+    #[test]
+    fn a_pipeline_family_takes_its_default_prompt_bound() {
+        let profile = ModelConfig::from_pipeline(VIDEO, None).unwrap();
+        assert_eq!(profile.family, VIDEO);
         assert_eq!(profile.max_model_len, 16_384);
+        assert!(ModelConfig::from_pipeline(CHAT, None).is_err());
     }
 
     #[tokio::test]

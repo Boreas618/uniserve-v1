@@ -117,7 +117,7 @@ fn media_of(batch: &Batch) -> Result<&crate::batch::MediaColumns> {
 }
 
 /// The decoder's runner: one device stream, the canvas its model serves, and its graphs.
-pub struct DecoderRunner<M: Decoder + Send + Sync> {
+pub struct DecoderRunner<M: Decoder + Send + Sync + ?Sized> {
     id: RunnerId,
     phases: Vec<ipc::PhaseId>,
     model: Arc<M>,
@@ -227,7 +227,7 @@ fn clip_is_releasable(
     )))
 }
 
-impl<M: Decoder + Send + Sync> DecoderRunner<M> {
+impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
     /// Binds a decoder to one device stream.
     ///
     /// Every decode bucket in `buckets` is mapped through the model's own `layout_of` here, so the
@@ -1150,7 +1150,7 @@ fn timeline_frame(column: &Column, first: u32, height: u32, width: u32) -> ops::
     TensorView::new(column.device.ptr, DType::U8, Shape::new(&[1])).offset_elements(elements)
 }
 
-impl<M: Decoder + Send + Sync> Runner for DecoderRunner<M> {
+impl<M: Decoder + Send + Sync + ?Sized> Runner for DecoderRunner<M> {
     fn phases(&self) -> &[ipc::PhaseId] {
         &self.phases
     }
@@ -1352,7 +1352,7 @@ impl<M: Decoder + Send + Sync> Runner for DecoderRunner<M> {
     }
 }
 
-impl<M: Decoder + Send + Sync> DecoderRunner<M> {
+impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
     /// Captures one bucket of `generation`: the walk here, the graph kept by the lifecycle.
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;

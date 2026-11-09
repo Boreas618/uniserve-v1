@@ -81,21 +81,6 @@ impl std::str::FromStr for FlashInferBackend {
 #[error("unsupported FlashInfer backend {0:?}")]
 pub struct FlashInferBackendParseError(String);
 
-/// Which GPU computations a rank captures as CUDA graphs at startup.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GraphPolicy {
-    /// Every call serves eagerly.
-    Off,
-    /// Captures graphs unless serving does not capture the attention
-    /// provider's calls, and then serves eagerly.
-    #[default]
-    Auto,
-    /// Requires graphs and refuses an attention provider serving does not
-    /// capture.
-    Full,
-}
-
 /// How a parked standby worker keeps the device storage its graphs and
 /// scratch address.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

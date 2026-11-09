@@ -58,7 +58,7 @@ use minimax_h3::video_vae::{Canvas, VideoDecoder};
 use nn::capability::Denoiser as _;
 use nn::capability::{
     ConditionRole, ConditionShape, Encoder, EncoderInputs, EncoderOutputs, ImageInput, ImageShape,
-    TokenBatch, VideoRequest, VideoTask,
+    TokenBatch, VideoRequest,
 };
 use nn::{PhaseKind, TensorView};
 
@@ -1062,7 +1062,6 @@ fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
 
     let (height, width) = request.raster;
     let asked = VideoRequest {
-        task: VideoTask::TextToVideoAudio,
         width,
         height,
         frames: request.clip,
@@ -1215,7 +1214,6 @@ fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
     // packed rows are one per 2x2 patch of its single latent frame. Both are the model's arithmetic:
     // the canvas comes from the layout rule, and the rows from the packing's own count.
     let probe = VideoRequest {
-        task: VideoTask::ReferenceToVideoAudio,
         width,
         height,
         frames: request.clip,

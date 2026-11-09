@@ -95,7 +95,7 @@ pub struct Deployment {
     /// modulation cache holds, and the cache's width is a program key - so a file that stated one
     /// task's rows left every request of another without a cell, and a tool that appended the other
     /// tasks' rows was a second statement of the same deployment fact.
-    pub tasks: Vec<nn::VideoTask>,
+    pub tasks: Vec<crate::VideoTask>,
 
     /// The clip lengths the delivery serves, in video frames.
     ///
@@ -117,7 +117,7 @@ impl Deployment {
         config: Config,
         types: Types,
         rungs: Vec<u32>,
-        tasks: Vec<nn::VideoTask>,
+        tasks: Vec<crate::VideoTask>,
     ) -> Result<Self> {
         if tasks.is_empty() {
             return Err(Error::config(
@@ -133,11 +133,7 @@ impl Deployment {
                 "{unserved:?} is not a task this checkpoint serves"
             )));
         }
-        let dies = config.denoisers.values().next().ok_or_else(|| {
-            Error::config("the checkpoint states no DiT, so it states no canvases".to_owned())
-        })?;
-        let canvases = dies
-            .offered_canvases()
+        let canvases = crate::config::offered_canvases()
             .iter()
             .map(|canvas| (canvas.height, canvas.width))
             .collect();
@@ -175,7 +171,7 @@ impl Deployment {
     /// replaces one partition's weights for one task. **A table in this file would answer for every
     /// checkpoint** - a base checkpoint holding no `transformer_ref` would be reported as serving
     /// `ref2va`, and the deployment that believed it would load no such partition.
-    pub fn checkpoint_tasks(root: &std::path::Path) -> Result<Vec<nn::VideoTask>> {
+    pub fn checkpoint_tasks(root: &std::path::Path) -> Result<Vec<crate::VideoTask>> {
         Ok(Config::read(root, None)?.serving())
     }
 
@@ -280,7 +276,7 @@ impl Deployment {
         // deployment serves and this call does not state is a request with no cell.
         let mut groups: Vec<Groups> = Vec::new();
         for task in &self.tasks {
-            let groups_of = Groups::of(!matches!(task, nn::VideoTask::TextToVideoAudio));
+            let groups_of = Groups::of(!matches!(task, crate::VideoTask::TextToVideoAudio));
             if !groups.contains(&groups_of) {
                 groups.push(groups_of);
             }

@@ -45,7 +45,8 @@ use nn::{Forward, Shape, TensorView};
 use ops::gemm::WeightOrder;
 
 use crate::config::TransformerConfig;
-use crate::partition::{Partition, Projection};
+use crate::partition::Partition;
+use nn::family::Projection;
 use crate::{Error, Result};
 
 /// A query, key, value or gate projection, as one rank's attention reads it: this rank's heads of

@@ -50,7 +50,7 @@ use crate::input::{
 use crate::metrics::log_stats::StatsLogger;
 use crate::metrics::stats::{self as metrics, RequestStats};
 use crate::migration::{Migrator, RequestEvents};
-use crate::model::{ModelConfig, ModelParameters};
+use crate::model::ModelConfig;
 use crate::options::{ReasoningParser, ServerArgs, Stated};
 use crate::output::RequestOutputStream;
 
@@ -85,6 +85,9 @@ const SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25 * 
 /// Construction spawns Tokio tasks, so every constructor must be called
 /// within a Tokio runtime.
 pub struct Leader {
+    /// The model families the executable serves, which every preparation of an epoch resolves
+    /// its checkpoint with.
+    pub(crate) catalogue: processing::Catalogue,
     /// The single model name the API serves.
     served_model_name: String,
     /// The model the request and scheduler metrics are labelled with.
@@ -235,6 +238,7 @@ pub(crate) fn replica_configs(
 
 /// What a leader prepares before it has an engine (`Leader::prepare`).
 pub(crate) struct Prepared {
+    catalogue: processing::Catalogue,
     model_config: ModelConfig,
     tokenizer: crate::tokenizer::DynTokenizer,
     renderer: LoadedRenderer,
@@ -567,20 +571,21 @@ impl Leader {
     /// start, or when the model cannot be bound to the capabilities its
     /// workers report.
     pub(crate) async fn start(
+        catalogue: &processing::Catalogue,
         config: &ServerArgs,
         stated: &Stated,
         daemon: String,
         commands: Option<&crate::supervision::ProcessCommands>,
         updates: Arc<crate::updates::driver::Driver>,
     ) -> anyhow::Result<Self> {
-        let prepared = Self::prepare(config, stated).await?;
+        let prepared = Self::prepare(catalogue, config, stated).await?;
         info!(parallel = ?prepared.engine.parallel, "starting the engine process");
         let control = Arc::new(EngineControl::new(
             &config.request_socket(),
             daemon,
             config.host_identity.clone(),
             config.served_model_name().to_owned(),
-            config.program_server.clone(),
+            crate::engine::control::ensure_program_server(&config.program_config)?,
         )?);
         let replicas = replica_configs(&prepared.engine)?;
         let clients =
@@ -623,6 +628,7 @@ impl Leader {
         )?;
         for (index, (client, served, observer)) in clients.enumerate() {
             let replica = Replica::new(
+                leader.catalogue.clone(),
                 config,
                 Arc::new(client),
                 observer,
@@ -669,7 +675,7 @@ impl Leader {
     /// them would pin a program no call reaches: every operator it runs is filled from the store.
     fn named_programs(&self, config: &ServerArgs) -> crate::epoch::FilledPrograms {
         let mut filled = crate::epoch::FilledPrograms::of(config);
-        if self.video_denoiser().is_some() {
+        if self.video_service().is_some() {
             filled.kernels.clear();
         }
         filled
@@ -839,7 +845,6 @@ impl Leader {
             let mut processes = self.epochs().processes();
             processes.retain(|process| process.generation != engine);
             processes.push(crate::epoch::ManagedProcess {
-                role: crate::epoch::Role::MainProcess,
                 group: crate::engine::control::ENGINE_GROUP.to_owned(),
                 rank: 0,
                 pid: None,
@@ -866,17 +871,21 @@ impl Leader {
     /// # Errors
     ///
     /// As [`Leader::start`], before the engine starts.
-    pub(crate) async fn prepare(config: &ServerArgs, stated: &Stated) -> anyhow::Result<Prepared> {
+    pub(crate) async fn prepare(
+        catalogue: &processing::Catalogue,
+        config: &ServerArgs,
+        stated: &Stated,
+    ) -> anyhow::Result<Prepared> {
         let LoadedModel {
             config: model_config,
             tokenizer,
             renderer,
-        } = ModelConfig::load(config)
+        } = ModelConfig::load(config, catalogue)
             .await
             .with_context(|| format!("failed to resolve model assets for `{}`", config.model()))?;
         // Options of another model family than the served one are refused
         // rather than ignored.
-        stated.refuse_foreign_options(model_config.description())?;
+        stated.refuse_foreign_options(&model_config.family)?;
         let max_model_len = model_config.max_model_len;
 
         // The options state the scheduler and the rank layout; the loaded model
@@ -885,8 +894,7 @@ impl Leader {
         // implies a context length: the deployment states the length its
         // prompt capacities are checked against.
         anyhow::ensure!(
-            !matches!(model_config.parameters, ModelParameters::MiniMaxH3)
-                || config.max_model_len.is_some(),
+            model_config.video().is_none() || config.max_model_len.is_some(),
             "a deployment of the media class states no `max_model_len`: the pipeline keeps no \
              key/value cache, so a length that decides one is the deployment's to state rather \
              than a checkpoint's to imply"
@@ -894,6 +902,7 @@ impl Leader {
         let mut engine = config.engine_config()?;
         let control_tokens = special_token_ids(&model_config);
         let model = &mut engine.model;
+        model.base = base_release(&model.model)?;
         model.max_model_len = max_model_len;
         model.generation_limits = model_config.generation_limits(config.dtype);
         model.bos = control_tokens.bos;
@@ -904,16 +913,15 @@ impl Leader {
         // returns the outputs its caller asked for.
         model.canvas_sampling = None;
         model.prefill_outputs = true;
-        // Video workers prepare exactly the canvases their denoiser names for
-        // the configured resolutions and aspect ratios, refusing a pair it
-        // does not generate, and report them back as the only canvases
-        // requests may target. Other models prepare none.
-        if !matches!(model_config.parameters, ModelParameters::MiniMaxH3) {
-            engine.video.resolutions.clear();
-            engine.video.aspect_ratios.clear();
+        // Video workers prepare exactly the configured sizes, refusing one
+        // their model does not generate, and report them back as the only
+        // sizes requests may target. Other models prepare none.
+        if model_config.video().is_none() {
+            engine.video.sizes.clear();
         }
 
         Ok(Prepared {
+            catalogue: catalogue.clone(),
             model_config,
             tokenizer,
             renderer,
@@ -938,6 +946,7 @@ impl Leader {
         updates: Arc<crate::updates::driver::Driver>,
     ) -> anyhow::Result<Self> {
         let Prepared {
+            catalogue,
             model_config,
             tokenizer,
             renderer,
@@ -959,38 +968,25 @@ impl Leader {
                 );
                 RequestRenderer::Chat(*renderer)
             }
-            LoadedRenderer::Video(vision) => {
+            LoadedRenderer::Video { family, files } => {
                 anyhow::ensure!(
                     !info.video_denoiser.is_empty(),
                     "the video worker reported no video denoiser"
                 );
-                let denoiser = models::video::DenoiserInfo::decode(&info.video_denoiser)
-                    .context("the video worker described its denoiser unreadably")?;
-                denoiser
-                    .validate()
-                    .map_err(|message| anyhow::anyhow!("the video worker's denoiser: {message}"))?;
-                // Reference images are banded to the units one latent
-                // encoding round covers on the deployment's latent encoder
-                // while a request's prompt is encoded.
-                let latent_encoding_units = info.latent_encoding_units.max(1);
-                // The video processor's options are its reference sizing,
-                // within what the denoiser declares.
-                let references = models::video::plan::ReferenceConfig::from_kwargs(
-                    &config.mm_processor_kwargs,
-                    &denoiser.references,
-                )
-                .map_err(|message| anyhow::anyhow!("invalid mm_processor_kwargs: {message}"))?;
+                // Reference images are banded to the units one latent encoding round covers on
+                // the deployment's latent encoder while a request's prompt is encoded.
+                let processor = family
+                    .bind(processing::VideoBinding {
+                        description: &info.video_denoiser,
+                        latent_encoding_units: info.latent_encoding_units.max(1),
+                        max_seconds: config.video_config.max_seconds,
+                        processor_options: &config.mm_processor_kwargs,
+                        files: &files,
+                    })
+                    .map_err(|message| anyhow::anyhow!("binding the video processor: {message}"))?;
                 RequestRenderer::Video(
-                    VideoService::new(
-                        denoiser,
-                        vision,
-                        config.video_config.max_seconds,
-                        latent_encoding_units,
-                        &config.media_config,
-                        references,
-                        Arc::clone(&tokenizer),
-                    )
-                    .context("failed to bind the video denoiser")?,
+                    VideoService::new(processor, &config.media_config, Arc::clone(&tokenizer))
+                        .context("failed to bind the video service")?,
                 )
             }
         };
@@ -1006,6 +1002,7 @@ impl Leader {
         let images = MediaConnector::from_image_options(&config.image_fetch_config)
             .context("failed to initialize the image URL fetcher")?;
         let engine = Self::observed(
+            catalogue,
             config.served_model_name().to_owned(),
             model_name,
             vec![Arc::new(client)],
@@ -1037,6 +1034,7 @@ impl Leader {
         updates: Arc<crate::updates::driver::Driver>,
     ) -> Self {
         Self::observed(
+            processing::Catalogue::default(),
             served_model_name,
             model_name,
             clients,
@@ -1055,6 +1053,7 @@ impl Leader {
         reason = "a leader's model, engine and options, and its statistics' observer"
     )]
     fn observed(
+        catalogue: processing::Catalogue,
         served_model_name: String,
         model_name: String,
         clients: Vec<Arc<EngineClient>>,
@@ -1086,6 +1085,7 @@ impl Leader {
                     .enumerate()
                     .map(|(index, client)| {
                         Replica::new(
+                            catalogue.clone(),
                             &replica_options,
                             client,
                             Arc::clone(&observer),
@@ -1104,6 +1104,7 @@ impl Leader {
             replica.monitor();
         }
         Self {
+            catalogue,
             served_model_name,
             model_name,
             processor: Arc::new(processor),
@@ -1126,10 +1127,10 @@ impl Leader {
     }
 
 
-    /// The video denoiser this deployment serves; `None` for a model that
+    /// The video service of this deployment; `None` for a model that
     /// generates no video.
-    pub fn video_denoiser(&self) -> Option<&models::video::DenoiserInfo> {
-        self.processor.video_service().map(VideoService::denoiser)
+    pub fn video_service(&self) -> Option<&VideoService> {
+        self.processor.video_service()
     }
 
     /// The tasks this engine serves.
@@ -1802,10 +1803,7 @@ impl Leader {
         &self,
         config: &ServerArgs,
     ) -> Vec<crate::engine::control::ProgramServer> {
-        let socket = config
-            .program_server
-            .clone()
-            .unwrap_or_else(program_server::command::default_socket);
+        let socket = config.program_config.socket();
         let mut servers = Vec::new();
         for replica in self.replicas() {
             let Some(control) = replica.control.get() else {
@@ -2092,6 +2090,9 @@ pub(crate) fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_
 /// One independent replica's engine lifecycle and its
 /// epochs (`crate::updates::entry`).
 pub(crate) struct Replica {
+    /// The model families the executable serves, which an update of this replica resolves its
+    /// target checkpoint with.
+    pub(crate) catalogue: processing::Catalogue,
     pub(crate) registry: std::sync::Weak<Replicas>,
     pub(crate) ordinal: usize,
     served_model_name: String,
@@ -2150,6 +2151,7 @@ pub(crate) struct Replica {
 
 impl Replica {
     pub(crate) fn new(
+        catalogue: processing::Catalogue,
         options: &ServerArgs,
         client: Arc<EngineClient>,
         observer: Arc<crate::observe::Observer>,
@@ -2159,6 +2161,7 @@ impl Replica {
     ) -> Arc<Self> {
         let hold = Arc::new(RequestHold::new());
         let replica = Arc::new(Replica {
+            catalogue,
             registry,
             ordinal,
             served_model_name: options.served_model_name().to_owned(),
@@ -3261,7 +3264,7 @@ impl Replica {
                 .map_err(UpdateError::Refused)?;
             config.model = Some(model_path.to_owned());
             config.load_config.weights = None;
-            let prepared = Leader::prepare(&config, &Stated::from_paths(Vec::new()))
+            let prepared = Leader::prepare(&self.catalogue, &config, &Stated::from_paths(Vec::new()))
                 .await
                 .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
             let served = locked(&self.served)
@@ -3287,6 +3290,8 @@ impl Replica {
         if let Some(args) = locked(&self.served).as_mut() {
             if !streamed {
                 args.engine_config.model.model = model_path.to_owned();
+                args.engine_config.model.base = base_release(model_path)
+                    .map_err(UpdateError::Failed)?;
             }
             args.engine_config
                 .load
@@ -3510,6 +3515,15 @@ struct SpecialTokenIds {
     end_of_image: u32,
 }
 
+/// The local snapshot of the base release the checkpoint at `model` continues, when it pins one
+/// (`frontend::model::assets::pipeline::pinned_snapshot`): an engine opens the checkpoint and its
+/// base as one checkpoint, and reads where the weights already are.
+fn base_release(model: &str) -> anyhow::Result<Option<String>> {
+    let snapshot = frontend::model::assets::pipeline::pinned_snapshot(std::path::Path::new(model))
+        .with_context(|| format!("reading the base release {model} pins"))?;
+    Ok(snapshot.map(|path| path.to_string_lossy().into_owned()))
+}
+
 /// Resolves the control tokens the engine uses for the loaded model.
 ///
 /// `bos` and `end_of_image` are each `0`: every profile the daemon serves
@@ -3549,7 +3563,6 @@ mod tests {
 
     use super::{EngineState, Leader, keeps_standby};
     use crate::input::GenerateRequest;
-    use crate::model::ModelParameters;
     use crate::openai::ChatCompletionRequest;
     use crate::openai::chat_completions::{
         ChatResponseContext, collect_chat_completion, lower_chat_request,
@@ -3567,7 +3580,7 @@ mod tests {
     /// so a test that reads them names its own engine.
     fn qwen3_engine(worker: SimEngine, engine_model: &str) -> Leader {
         let core = sim_core(scheduler::sim_args(engine_model), worker);
-        sim_engine_over(ModelParameters::Qwen3, vec![core])
+        sim_engine_over(crate::test_support::CHAT, vec![core])
     }
 
     /// `request` as the chat route lowers it for the served model.
@@ -3645,7 +3658,7 @@ mod tests {
         let core = sim_core(scheduler::sim_args("lost-engine-model"), SimEngine::new());
         let client = Arc::new(sim_client(vec![core]));
         let engine = leader_over(
-            sim_model(ModelParameters::Qwen3),
+            sim_model(crate::test_support::CHAT),
             configured_tokenizer(),
             "lost-engine-model".into(),
             vec![Arc::clone(&client)],
@@ -3684,7 +3697,7 @@ mod tests {
             clients.push(Arc::new(sim_client(vec![core])));
         }
         let engine = leader_over(
-            sim_model(ModelParameters::Qwen3),
+            sim_model(crate::test_support::CHAT),
             configured_tokenizer(),
             "sim-model".into(),
             clients.clone(),
@@ -3832,7 +3845,7 @@ mod tests {
             }),
         )
         .expect("start a sim scheduler");
-        let engine = sim_engine_over(ModelParameters::Qwen3, vec![core]);
+        let engine = sim_engine_over(crate::test_support::CHAT, vec![core]);
 
         let releaser = tokio::spawn(async move {
             let _ = release_tx.send(());
@@ -3966,7 +3979,7 @@ mod tests {
         let cores = (0..2)
             .map(|_| sim_core(scheduler::sim_args(engine_model), SimEngine::new()))
             .collect();
-        let engine = sim_engine_over(ModelParameters::Qwen3, cores);
+        let engine = sim_engine_over(crate::test_support::CHAT, cores);
 
         // Both requests are submitted before either stream is read, so the
         // first is still in flight when the second is routed.

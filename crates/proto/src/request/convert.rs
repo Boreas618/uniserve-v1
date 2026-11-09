@@ -602,7 +602,6 @@ impl From<&DiffusionRequest> for wire::DiffusionRequest {
     fn from(request: &DiffusionRequest) -> Self {
         let sampling = &request.sampling;
         Self {
-            task: request.task.clone(),
             prompt_token_ids: request.prompt_token_ids.clone(),
             conditioning: request.conditioning.clone(),
             conditions: request
@@ -662,7 +661,6 @@ impl TryFrom<wire::DiffusionRequest> for DiffusionRequest {
         let sampling = present(request.sampling, "diffusion sampling")?;
         Ok(Self {
             request_id: RequestId::default(),
-            task: request.task,
             prompt_token_ids: request.prompt_token_ids,
             conditioning: request.conditioning,
             conditions: request

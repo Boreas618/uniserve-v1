@@ -1,20 +1,18 @@
 //! Command-line parsing for the `uniserve` binary.
 //!
-//! One executable runs every UniServe process, each as a command: `serve` (a
-//! node's daemon, and on the leader the application), `frontend` (the
-//! deployment's application process), `engine` (a node's main process for one
-//! epoch), `storage` (a host's Storage Server) and `program-server` (a host's
-//! Program Server). The binary's own options, its log levels, are global; each
-//! command declares its own. `serve` and `frontend` take the serving command
-//! line (`daemon::options::ServerArgs`), which resolves one configuration from
-//! a `--config` file, a few flags and `--set` assignments.
-
-use std::ffi::OsString;
+//! One executable runs every UniServe process, each as a command. The public
+//! commands are `serve` (a node's daemon, and on the leader the application),
+//! `storage-server` (a host's Storage Server) and `program-server` (a host's
+//! Program Server); the host services' commands are their crates' own
+//! (`storage_server::command`, `program_server::command`). `engine` (a node's
+//! main process for one epoch) is started by the daemon and hidden from the
+//! help. The binary's own options, its log levels, are global; each command
+//! declares its own. `serve` takes the serving command line
+//! (`daemon::options::ServerArgs`), which resolves one configuration from a
+//! `--config` file, a few flags and `--set` assignments.
 
 use clap::{Args, Parser, Subcommand};
 use daemon::options::ServerArgs;
-
-use crate::storage::StorageArgs;
 
 /// Top-level parser for the `uniserve` binary.
 #[derive(Debug, Parser)]
@@ -50,14 +48,6 @@ pub(crate) enum Command {
         override_usage = "uniserve serve [MODEL] [OPTIONS] [--config FILE] [--set PATH=VALUE]..."
     )]
     Serve(Box<ServerArgs>),
-    /// Run the deployment's application process: the HTTP and OpenAI API,
-    /// input and output processing, facts and migration, on the leader node.
-    /// The node's daemon starts it with the deployment's configuration.
-    #[command(
-        hide = true,
-        override_usage = "uniserve frontend [MODEL] [OPTIONS] [--config FILE] [--set PATH=VALUE]..."
-    )]
-    Frontend(Box<ServerArgs>),
     /// Run the main process of this node and epoch: its schedulers and the
     /// request interface.
     #[command(hide = true)]
@@ -68,20 +58,10 @@ pub(crate) enum Command {
     },
     /// The Storage Server of this host and the operator's commands against
     /// it.
-    Storage(Box<StorageArgs>),
-    /// Answer the video request rules as JSON: one request on standard
-    /// input, one answer on standard output. The rules are the `models`
-    /// crate's; this command computes none of them.
-    #[command(
-        hide = true,
-        override_usage = "uniserve rules < request.json > answer.json"
-    )]
-    Rules,
-    /// A command whose parser belongs to another crate, such as the Program
-    /// Server's: the executable hands the arguments to that parser instead of
-    /// restating its surface here.
-    #[command(hide = true, external_subcommand)]
-    External(Vec<OsString>),
+    StorageServer(Box<storage_server::command::Args>),
+    /// The Program Server of this host and the operator's commands against
+    /// it.
+    ProgramServer(Box<program_server::command::Args>),
 }
 
 #[cfg(test)]
@@ -112,22 +92,14 @@ mod tests {
     fn each_process_is_a_command() {
         for (args, expected) in [
             (vec!["uniserve", "serve", "model"], "serve"),
-            (vec!["uniserve", "frontend", "model"], "frontend"),
-            (vec!["uniserve", "storage", "list"], "storage"),
-            (vec!["uniserve", "program-server"], "program-server"),
+            (vec!["uniserve", "storage-server", "list"], "storage-server"),
+            (vec!["uniserve", "program-server", "list"], "program-server"),
         ] {
             let cli = Cli::try_parse_from(args).expect("parses");
             let name = match cli.command {
                 Command::Serve(_) => "serve",
-                Command::Frontend(_) => "frontend",
-                Command::Storage(_) => "storage",
-                Command::Rules => "rules",
-                Command::External(arguments) => {
-                    match arguments.first().and_then(|name| name.to_str()) {
-                        Some("program-server") => "program-server",
-                        _ => "other",
-                    }
-                }
+                Command::StorageServer(_) => "storage-server",
+                Command::ProgramServer(_) => "program-server",
                 Command::Engine { .. } => "other",
             };
             assert_eq!(name, expected);

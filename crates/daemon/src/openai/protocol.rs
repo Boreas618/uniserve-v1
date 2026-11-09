@@ -425,8 +425,6 @@ pub struct ChatCompletionRequest {
     /// Output modalities requested from the model.
     #[serde(default = "default_modalities")]
     pub modalities: Vec<ChatModality>,
-    /// Image-generation controls when image output is requested.
-    pub image_config: Option<ChatImageConfig>,
     /// Sampling temperature in the inclusive range `[0, 2]`.
     #[validate(range(min = 0.0, max = 2.0))]
     pub temperature: Option<f32>,
@@ -503,37 +501,6 @@ pub enum ChatModality {
 /// Returns the default response modalities.
 fn default_modalities() -> Vec<ChatModality> {
     vec![ChatModality::Text]
-}
-
-#[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-/// Image-generation controls embedded in a chat request.
-pub struct ChatImageConfig {
-    /// Named output resolution preset.
-    pub resolution: Option<models::omni::resolution::ResolutionName>,
-    /// Explicit output height in pixels.
-    pub height: Option<u32>,
-    /// Explicit output width in pixels.
-    pub width: Option<u32>,
-    /// Number of denoising steps per image.
-    pub steps: Option<u16>,
-    /// Text classifier-free-guidance scale.
-    pub guidance_scale: Option<f32>,
-    /// Image classifier-free-guidance scale.
-    pub image_guidance_scale: Option<f32>,
-    /// Image-generation random seed.
-    pub seed: Option<u64>,
-    /// Maximum number of generated images.
-    pub num_images: Option<u16>,
-    /// Classifier-free-guidance renormalization policy.
-    pub cfg_norm: Option<proto::request::CfgRenorm>,
-    /// Minimum scale applied by guidance renormalization.
-    pub cfg_renorm_min: Option<f32>,
-    /// Fractional denoising interval in which guidance is active.
-    pub cfg_interval: Option<[f32; 2]>,
-    /// Diffusion scheduler timestep shift.
-    pub timestep_shift: Option<f32>,
 }
 
 #[serde_with::skip_serializing_none]
@@ -743,21 +710,6 @@ fn validate_chat_cross_parameters(
         .collect::<std::collections::BTreeSet<_>>();
     if unique.len() != request.modalities.len() {
         return Err(validator::ValidationError::new("modalities_duplicate"));
-    }
-
-    let image_output = request.modalities.contains(&ChatModality::Image);
-    if !image_output && request.image_config.is_some() {
-        return Err(validator::ValidationError::new(
-            "image_config_without_image",
-        ));
-    }
-    if let Some(config) = &request.image_config {
-        if config.width.is_some() != config.height.is_some() {
-            return Err(validator::ValidationError::new("image_config_dimensions"));
-        }
-        if config.num_images == Some(0) || config.steps == Some(0) {
-            return Err(validator::ValidationError::new("image_config_bounds"));
-        }
     }
 
     // An explicit `auto` without a non-empty tool list is refused; an absent

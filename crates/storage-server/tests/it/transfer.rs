@@ -63,8 +63,8 @@ pub(crate) fn transfer_server(socket: &Path, gpus: Gpus) -> Launch {
     arguments.push(format!("STORAGE_TEST_SOCKET={}", socket.display()).into());
     // Its log at the level the test's environment names, warnings when
     // unset.
-    let level = std::env::var("UNISERVE_STORAGE_LOG").unwrap_or_else(|_| "warn".into());
-    arguments.push(format!("UNISERVE_STORAGE_LOG={level}").into());
+    let level = std::env::var("UNISERVE_STORAGE_SERVER_LOG").unwrap_or_else(|_| "warn".into());
+    arguments.push(format!("UNISERVE_STORAGE_SERVER_LOG={level}").into());
     arguments.push(std::env::current_exe().unwrap().into());
     arguments.extend(
         [

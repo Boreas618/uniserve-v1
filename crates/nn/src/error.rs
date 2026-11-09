@@ -86,6 +86,11 @@ pub enum Error {
     /// A capability of the design that this crate does not implement yet, named precisely.
     #[error("unsupported: {0}")]
     Unsupported(String),
+
+    /// A model family's own failure: its configuration, its partition or its load, with the
+    /// model's error as the source.
+    #[error(transparent)]
+    Model(Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl Error {

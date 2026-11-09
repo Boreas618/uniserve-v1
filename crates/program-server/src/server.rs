@@ -151,15 +151,37 @@ impl ProgramServer {
     ///
     /// # Errors
     ///
-    /// Fails when the socket cannot be bound or a listener cannot be made.
+    /// Fails when another server owns the socket, the socket cannot be bound
+    /// or a listener cannot be made.
     pub fn serve_until(self: Arc<Self>, stop: Arc<std::sync::atomic::AtomicBool>) -> Result<()> {
+        let Some((listener, lock)) = service::bind(&self.socket)? else {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("a program server answers on {}", self.socket.display()),
+            )));
+        };
+        self.serve_on(listener, lock, stop)
+    }
+
+    /// Serves on `listener`, the socket `lock` makes this server the owner of
+    /// ([`service::bind`]), until `stop` is set; the lock removes the socket
+    /// on the way out.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the listener cannot be made non-blocking.
+    pub fn serve_on(
+        self: Arc<Self>,
+        listener: std::os::unix::net::UnixListener,
+        lock: service::SocketLock,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
         // The queue's driver runs beside the listener: it starts the builds
         // the request queue holds and wakes the requests waiting on them.
         std::thread::spawn({
             let queue = Arc::clone(&self.queue);
             move || Queue::drive(queue)
         });
-        let listener = bind(&self.socket)?;
         listener.set_nonblocking(true)?;
         tracing::info!(
             "program server listening on {} with {} package(s)",
@@ -196,8 +218,7 @@ impl ProgramServer {
             });
         }
         self.queue.stop();
-        // A socket file left behind would keep the next server from binding.
-        let _ = std::fs::remove_file(&self.socket);
+        drop(lock);
         Ok(())
     }
 
@@ -1321,29 +1342,6 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Binds the server's socket. A socket no process answers on is left from a
-/// server that ended, and is replaced.
-fn bind(socket: &Path) -> Result<std::os::unix::net::UnixListener> {
-    if let Some(parent) = socket.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    match std::os::unix::net::UnixListener::bind(socket) {
-        Ok(listener) => Ok(listener),
-        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-            // A Program Server that still answers is not replaced.
-            if std::os::unix::net::UnixStream::connect(socket).is_ok() {
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!("a program server answers on {}", socket.display()),
-                )));
-            }
-            fs::remove_file(socket)?;
-            Ok(std::os::unix::net::UnixListener::bind(socket)?)
-        }
-        Err(error) => Err(Error::Io(error)),
-    }
 }
 
 /// The descriptors a `prepare` asks for, as the server's request.

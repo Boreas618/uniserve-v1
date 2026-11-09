@@ -1,9 +1,9 @@
 //! Load-time model resolution and model-owned request tokenization.
 //!
 //! `ModelConfig::load` resolves checkpoint facts, the tokenizer, and what renders requests
-//! at startup: a diffusers pipeline index selects a video model, planned against its
-//! conditioner's vision processor, and otherwise the root `config.json` selects a
-//! token-generating model with its chat template. [`InputProcessor::new`] then binds the
+//! at startup, by the family of the executable's catalogue the checkpoint declares: a diffusers
+//! pipeline index selects a video family, whose processor reads the pipeline files the family
+//! names, and otherwise the root `config.json` selects a chat family with its chat template. [`InputProcessor::new`] then binds the
 //! generation limits the started workers report and the request
 //! renderer they complete ([`RequestRenderer`]), and the result is shared immutably by the
 //! serving runtime.
@@ -11,15 +11,14 @@
 //! [`InputProcessor`] binds tokenizer assets, generation limits, sampling policy, and
 //! output processing. [`InputProcessor::preprocess`] tokenizes a `GenerateRequest` into a
 //! [`GenerationRequest`] and the `OutputParams` (`crate::output`) the daemon retains.
-//! A MiniMax H3 deployment's `VideoService` produces its `DiffusionRequest`s.
+//! A video deployment's `VideoService` produces its `DiffusionRequest`s.
 
 use std::sync::Arc;
 
 use crate::model::assets::{PipelineCheckpoint, ResolvedModelFiles};
-use crate::model::{ModelConfig, ModelParameters};
+use crate::model::ModelConfig;
 use crate::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
-use models::ModelDescription;
-use models::video::plan::ProcessorConfig;
+use processing::{Catalogue, ReasoningFormat, Serving, ToolCallFormat, VideoFamily};
 use proto::request::{
     CachePolicy, GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest,
     ImageGenerationConfig,
@@ -48,27 +47,23 @@ pub struct InputProcessor {
     // Worker-advertised generation features and resource limits.
     pub(super) limits: GenerationLimits,
     pub(super) parse_reasoning: bool,
-    // Whether a Qwen3-family chat template instructs the tool-call format
-    // `Qwen25ToolParser` reads; false for every other family.
-    qwen3_tool_calls: bool,
+    // Whether the chat family writes tool calls and its checkpoint's template
+    // asks for them in that format.
+    tool_calls: bool,
 }
 
 #[derive(Debug, Error)]
 /// Failure while resolving a configured model and its assets.
 pub enum ModelResolutionError {
-    /// A conditioner's processor config cannot be read.
+    /// A file a video family's processor reads cannot be read.
     #[error("reading {}", path.display())]
     ProcessorFile {
-        /// The config file.
+        /// The file.
         path: std::path::PathBuf,
         /// The read's failure.
         #[source]
         source: std::io::Error,
     },
-    /// The conditioner's processor configs are not processor configs or
-    /// disagree.
-    #[error("invalid media checkpoint contract")]
-    ProcessorConfig(#[source] models::video::plan::ProcessorConfigError),
     /// Model files or profile metadata cannot be resolved.
     #[error(transparent)]
     Assets(#[from] crate::model::assets::Error),
@@ -102,9 +97,14 @@ pub(crate) struct LoadedModel {
 pub(crate) enum LoadedRenderer {
     /// A token model's chat template.
     Chat { renderer: Box<HfChatRenderer> },
-    /// A video pipeline's conditioner vision processor geometry; the video
-    /// service built from the denoiser handshake plans requests against it.
-    Video(ProcessorConfig),
+    /// A video family and the contents of the pipeline files its processor
+    /// reads; the processor is bound from the denoiser handshake.
+    Video {
+        /// The family.
+        family: &'static dyn VideoFamily,
+        /// The files [`VideoFamily::processor_files`] names, in that order.
+        files: Vec<String>,
+    },
 }
 
 /// What renders the served model's API requests into engine requests.
@@ -150,6 +150,7 @@ pub(crate) async fn pipeline_tokenizer(
 pub(crate) trait LoadModel {
     fn load(
         config: &crate::options::ServerArgs,
+        catalogue: &Catalogue,
     ) -> impl std::future::Future<Output = std::result::Result<LoadedModel, ModelResolutionError>>;
 }
 
@@ -163,52 +164,46 @@ impl LoadModel for ModelConfig {
     /// and for a pipeline the model's default prompt limit.
     async fn load(
         config: &crate::options::ServerArgs,
+        catalogue: &Catalogue,
     ) -> std::result::Result<LoadedModel, ModelResolutionError> {
         let max_model_len = config.max_model_len.map(std::num::NonZeroU32::get);
         // A diffusers pipeline declares its class and component folders in a
         // root index rather than a root `config.json`, so the index selects the
-        // profile and locates the tokenizer component before any other asset
+        // family and locates the tokenizer component before any other asset
         // is resolved. A component export reads the components its pinned
         // base supplies from the Hub cache at the pinned revision, as its
         // workers do. A family that a root `config.json` describes is
         // selected by that file alone, even when the checkpoint publishes an
         // index beside it.
-        if let Some(pipeline) = PipelineCheckpoint::resolve(config.model()).await? {
-            let description = ModelDescription::from_pipeline_class(pipeline.class_name())
-                .ok_or_else(|| crate::model::assets::Error::UnsupportedPipeline {
-                    class_name: pipeline.class_name().to_owned(),
+        if let Some(pipeline) = PipelineCheckpoint::resolve(config.model()).await?
+            && let Some(family) = catalogue.by_pipeline_class(pipeline.class_name())
+            && let Serving::Video(video) = family.serving
+        {
+            let tokenizer: DynTokenizer = Arc::new(pipeline_tokenizer(&pipeline).await?);
+            let mut files = Vec::with_capacity(video.processor_files().len());
+            for (component, name) in video.processor_files() {
+                let path = pipeline.component_file(component, name).await?;
+                let text = std::fs::read_to_string(&path).map_err(|source| {
+                    ModelResolutionError::ProcessorFile {
+                        path: path.clone(),
+                        source,
+                    }
                 })?;
-            if description.is_pipeline() {
-                let tokenizer: DynTokenizer = Arc::new(pipeline_tokenizer(&pipeline).await?);
-                // The conditioner's Qwen3-VL processor fixes how condition media
-                // is patched; requests are planned against it.
-                let mut processor = Vec::with_capacity(2);
-                for name in ["preprocessor_config.json", "video_preprocessor_config.json"] {
-                    processor.push(pipeline.component_file("processor", name).await?);
-                }
-                let read = |path: &std::path::PathBuf| {
-                    std::fs::read_to_string(path).map_err(|source| {
-                        ModelResolutionError::ProcessorFile {
-                            path: path.clone(),
-                            source,
-                        }
-                    })
-                };
-                let vision = ProcessorConfig::parse(&read(&processor[0])?, &read(&processor[1])?)
-                    .map_err(ModelResolutionError::ProcessorConfig)?;
-                let model = Self::from_pipeline(description, max_model_len)?;
-                return Ok(LoadedModel {
-                    config: model,
-                    tokenizer,
-                    renderer: LoadedRenderer::Video(vision),
-                });
+                files.push(text);
             }
+            return Ok(LoadedModel {
+                config: Self::from_pipeline(family, max_model_len)?,
+                tokenizer,
+                renderer: LoadedRenderer::Video {
+                    family: video,
+                    files,
+                },
+            });
         }
 
         let files = ResolvedModelFiles::new(config.model()).await?;
         let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&files.tokenizer_path)?);
-        let model =
-            Self::from_files(config.model(), &files, max_model_len, tokenizer.as_ref()).await?;
+        let model = Self::from_files(catalogue, &files, max_model_len, tokenizer.as_ref()).await?;
         // No served model's template renders image parts: the families whose
         // prompts carried images are not served by this daemon.
         let renderer = HfChatRenderer::load(&files, &config.chat_config, None)?;
@@ -246,19 +241,22 @@ impl InputProcessor {
         limits: GenerationLimits,
         parse_reasoning: bool,
     ) -> std::result::Result<Self, ModelResolutionError> {
-        let needs = match &config.parameters {
-            ModelParameters::Qwen3 => GenerationFeatures::UNDERSTANDING,
-            ModelParameters::MiniMaxH3 => GenerationFeatures::empty(),
+        let needs = match config.chat() {
+            Some(_) => GenerationFeatures::UNDERSTANDING,
+            None => GenerationFeatures::empty(),
         };
         validate_runtime_features(&config, &limits, needs)?;
 
-        // A Qwen3-family checkpoint serves tool calls only when its template
-        // asks for the format the Qwen3 parser reads; otherwise requests with
-        // tools are refused rather than returned with unparsed calls.
-        let qwen3_tool_calls = match (&config.parameters, &renderer) {
-            (ModelParameters::Qwen3, RequestRenderer::Chat(renderer)) => {
-                crate::input::chat::template::template_instructs_json_tool_calls(renderer)
-            }
+        // A chat checkpoint serves tool calls only when its family writes them
+        // and its template asks for them in that format; otherwise requests
+        // with tools are refused rather than returned with unparsed calls.
+        let tool_calls = match (config.chat(), &renderer) {
+            (Some(profile), RequestRenderer::Chat(renderer)) => match profile.tool_calls {
+                Some(ToolCallFormat::Qwen3) => {
+                    crate::input::chat::template::template_instructs_json_tool_calls(renderer)
+                }
+                None => false,
+            },
             _ => false,
         };
         Ok(Self {
@@ -267,7 +265,7 @@ impl InputProcessor {
             renderer,
             limits,
             parse_reasoning,
-            qwen3_tool_calls,
+            tool_calls,
         })
     }
 
@@ -284,7 +282,7 @@ impl InputProcessor {
         }
     }
 
-    /// The video service of a MiniMax H3 deployment; `None` for other models.
+    /// The video service of a video deployment; `None` for other models.
     pub fn video_service(&self) -> Option<&VideoService> {
         match &self.renderer {
             RequestRenderer::Video(video) => Some(video),
@@ -312,15 +310,14 @@ impl InputProcessor {
 
     /// Returns whether the model parses tool calls from its output.
     pub fn supports_tool_calling(&self) -> bool {
-        match self.config.parameters {
-            ModelParameters::Qwen3 => self.qwen3_tool_calls,
-            ModelParameters::MiniMaxH3 => false,
-        }
+        self.tool_calls
     }
 
     /// Returns whether the model produces structured reasoning output.
     pub fn supports_reasoning(&self) -> bool {
-        matches!(self.config.parameters, ModelParameters::Qwen3)
+        self.config
+            .chat()
+            .is_some_and(|profile| profile.reasoning.is_some())
     }
 
     /// Validates the prompt and requested modalities against the loaded model.
@@ -338,7 +335,7 @@ impl InputProcessor {
             request_id: request_id.to_owned(),
             feature,
         };
-        if matches!(self.config.parameters, ModelParameters::MiniMaxH3) {
+        if self.config.chat().is_none() {
             return Err(reject("generation_endpoint"));
         }
         if has_input_image && !self.supports_image_input() {
@@ -368,14 +365,8 @@ impl InputProcessor {
                 return Err(reject("reasoning"));
             }
         }
-        let needs = match &self.config.parameters {
-            ModelParameters::Qwen3 => GenerationFeatures::UNDERSTANDING,
-            ModelParameters::MiniMaxH3 => {
-                unreachable!("video generation refused above")
-            }
-        };
         self.limits
-            .covers(needs)
+            .covers(GenerationFeatures::UNDERSTANDING)
             .map_err(|feature| reject(feature.name()))
     }
 
@@ -401,7 +392,6 @@ impl InputProcessor {
             prompt,
             constraint,
             sampling_params,
-            image_params,
             priority,
             cache_salt,
             adapter,
@@ -417,13 +407,8 @@ impl InputProcessor {
             multimodal_inputs: Default::default(),
             constraint,
             sampling: EngineSamplingParams {
-                // The request's one seed: an image-generation seed takes
-                // precedence over the text sampling seed, whose signed bit
-                // pattern seeds the engine.
-                seed: image_params
-                    .as_ref()
-                    .and_then(|image| image.seed)
-                    .or_else(|| sampling_params.seed.map(|seed| seed as u64)),
+                // The text sampling seed's signed bit pattern seeds the engine.
+                seed: sampling_params.seed.map(|seed| seed as u64),
                 ..EngineSamplingParams::default()
             },
             image: ImageParams::default(),
@@ -453,17 +438,12 @@ impl InputProcessor {
         // No partially prepared request is exposed to the submission boundary.
         // The closure gathers every `TokenizeError` so it maps once to `ServeError::Tokenize`.
         let processor = (|| -> std::result::Result<_, crate::input::TokenizeError> {
-            let processor = match &self.config.parameters {
-                ModelParameters::Qwen3 => self.preprocess_qwen3_input(
-                    chat_only(prompt),
-                    &sampling_params,
-                    &mut generation,
-                    &mut decode,
-                )?,
-                ModelParameters::MiniMaxH3 => {
-                    unreachable!("generation features checked above")
-                }
-            };
+            let processor = self.preprocess_chat_input(
+                chat_only(prompt),
+                &sampling_params,
+                &mut generation,
+                &mut decode,
+            )?;
             generation.validate()?;
             Ok(processor)
         })()
@@ -508,14 +488,15 @@ fn validate_runtime_features(
     limits
         .covers(needs)
         .map_err(|feature| ModelResolutionError::MissingFeature {
-            description: config.description().id(),
+            description: config.id(),
             feature,
         })
 }
 
 impl InputProcessor {
-    /// Renders a Qwen chat prompt and fills its token, sampling, and cache requirements.
-    fn preprocess_qwen3_input(
+    /// Renders a chat prompt and fills its token, sampling, and cache requirements; the output
+    /// is parsed in the formats the chat family writes.
+    fn preprocess_chat_input(
         &self,
         chat_request: ChatRequest,
         sampling_params: &SamplingParams,
@@ -523,13 +504,22 @@ impl InputProcessor {
         decode: &mut TextDecodeOptions,
     ) -> std::result::Result<ChatOutputProcessor, crate::input::TokenizeError> {
         chat_request.validate()?;
-        let processor = ChatOutputProcessor::qwen3(
-            chat_request
-                .tool_parsing_enabled()
-                .then_some(chat_request.tools.as_slice()),
-            std::sync::Arc::clone(&self.tokenizer),
-            self.parse_reasoning,
-        )?;
+        let profile = self.config.chat().unwrap_or(processing::ChatProfile {
+            reasoning: None,
+            tool_calls: None,
+        });
+        let tools = (profile.tool_calls.is_some() && chat_request.tool_parsing_enabled())
+            .then_some(chat_request.tools.as_slice());
+        let processor = match (profile.reasoning, profile.tool_calls) {
+            (Some(ReasoningFormat::Qwen3), _) | (None, Some(ToolCallFormat::Qwen3)) => {
+                ChatOutputProcessor::qwen3(
+                    tools,
+                    std::sync::Arc::clone(&self.tokenizer),
+                    self.parse_reasoning && profile.reasoning.is_some(),
+                )?
+            }
+            (None, None) => ChatOutputProcessor::new(None, None),
+        };
         let rendered_text = self
             .chat_renderer()
             .ok_or(crate::output::chat::Error::MissingChatTemplate)?

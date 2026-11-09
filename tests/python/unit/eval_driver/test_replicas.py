@@ -18,6 +18,7 @@ from uniserve_eval.types import (
     LoadConfig,
     MetricDefinition,
     TaskName,
+    VideoConfig,
 )
 
 pytestmark = pytest.mark.unit
@@ -115,6 +116,10 @@ def test_requests_go_to_the_replica_with_the_fewest_in_flight(tmp_path, media):
                     time.sleep(delay_for_slow)
                 self.send_response(200)
                 self.send_header("content-type", "video/mp4")
+                # The fixture's shape, which the server reports generating.
+                self.send_header("x-video-size", "1344x768")
+                self.send_header("x-video-num-frames", "107")
+                self.send_header("x-video-fps", "24")
                 self.send_header("content-length", str(len(media)))
                 self.end_headers()
                 self.wfile.write(media)
@@ -132,7 +137,8 @@ def test_requests_go_to_the_replica_with_the_fewest_in_flight(tmp_path, media):
     manifest = tmp_path / "rows.jsonl"
     manifest.write_text(
         "".join(
-            json.dumps({"id": prompt, "prompt": prompt, "seconds": 4}) + "\n"
+            json.dumps({"id": prompt, "prompt": prompt, "num_frames": 107})
+            + "\n"
             for prompt in ("slow", "fast-1", "fast-2")
         )
     )
@@ -146,6 +152,9 @@ def test_requests_go_to_the_replica_with_the_fewest_in_flight(tmp_path, media):
         endpoint=VIDEOS_SYNC,
         metrics=(MetricDefinition(("videos_per_second",), "higher"),),
         load=LoadConfig(num_prompts=3, max_concurrency=2, warmup_requests=0),
+        video=VideoConfig(
+            size="1344x768", fps=24, audio_sample_rate=32000, audio_channels=2
+        ),
     )
     try:
         result = asyncio.run(run_point(urls, point, tmp_path / "result"))

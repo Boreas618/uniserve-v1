@@ -61,7 +61,7 @@ fn config(temporary: &Path, upstream: Option<&Path>) -> ServerConfig {
         limits: Limits::default(),
         toolchains: ToolchainConfig {
             nvcc: None,
-            python: PathBuf::from("/python/bin/python"),
+            python: Some(PathBuf::from("/python/bin/python")),
             wasm: None,
             cargo: None,
             max_jobs: 1,

@@ -5,7 +5,7 @@ set of requests covering every combination the service offers, each with a
 fixed seed, whose MP4s land in a fixed directory under ``artifacts/``. This
 test holds ``uniserve_eval/check_h3.toml`` and its frozen manifests to that
 contract: each cell exactly once, one measured row at seed 0 and one warmup
-row at seed 42 copied unchanged from the performance workloads, condition
+row at seed 42 copied unchanged from the performance workloads, reference
 media and their anchors kept, and a fixed per-cell MP4 directory. The same six
 cells also run reversed, which is the candidate's obligation, and their MP4s
 go to a sibling directory so neither order overwrites the other. The only
@@ -170,20 +170,26 @@ def test_the_profile_states_each_cell_without_precision_flags() -> None:
         command = raw["servers"][point["server"]]["command"]
         served = command[command.index("--served-model-name") + 1]
         assert served == point["model"], name
-        assert point["video"]["task"] == cell.task
-        # W1 targets 16:9; W3 and W4 resolve their canvas from the condition
-        # media they are sent.
-        assert point["video"]["aspect_ratio"] == (
-            "16:9" if cell.task == "t2va" else "auto"
-        )
+        assert point["provenance"]["task"] == cell.task
+        # Every cell states the 768p 16:9 output at 24 fps with the model's
+        # stereo 32 kHz soundtrack; W3's 16:9 keyframe keeps that canvas.
+        assert {
+            key: point["video"][key]
+            for key in ("size", "fps", "audio_sample_rate", "audio_channels")
+        } == {
+            "size": "1344x768",
+            "fps": 24,
+            "audio_sample_rate": 32000,
+            "audio_channels": 2,
+        }
         assert point["video"]["media_dir"] == (
             f"artifacts/minimax_h3/check/{cell.directory}"
         )
         assert point["load"]["num_prompts"] == 1
         if cell.task == "t2va":
-            assert "condition_root" not in point["video"]
+            assert "reference_root" not in point["video"]
         else:
-            assert point["video"]["condition_root"] == (
+            assert point["video"]["reference_root"] == (
                 "${UNISERVE_MINIMAX_H3_INPUTS}"
             )
         # The point reads a frozen check manifest, not a performance one.
@@ -209,10 +215,16 @@ def test_the_profile_states_each_cell_without_precision_flags() -> None:
             point["load"]["warmup_manifest"]
             == forward["load"]["warmup_manifest"]
         )
-        assert point["video"]["task"] == cell.task
-        assert (
-            point["video"]["aspect_ratio"] == forward["video"]["aspect_ratio"]
-        )
+        assert point["provenance"] == forward["provenance"]
+        assert {
+            key: value
+            for key, value in point["video"].items()
+            if key != "media_dir"
+        } == {
+            key: value
+            for key, value in forward["video"].items()
+            if key != "media_dir"
+        }
         assert point["video"]["media_dir"] == (
             f"artifacts/minimax_h3/check-reversed/{cell.directory}"
         )
@@ -230,7 +242,6 @@ def test_the_suite_covers_every_cell_exactly_once(config) -> None:
     )
     for name, cell in {**_CELLS, **_REVERSED}.items():
         point = config.benchmarks[name]
-        assert point.video.task == cell.task
         assert point.provenance == {
             "checkpoint": cell.checkpoint,
             "task": cell.task,
@@ -258,15 +269,18 @@ def test_each_cell_measures_the_seed_zero_row_of_its_workload(
     assert measured == source
     assert measured["metadata"]["task"] == cell.task
     assert measured["metadata"]["partition"] == "measured"
-    # The condition media and their anchors survive the copy.
+    # The reference media and their anchors survive the copy: fl2va's one
+    # first-frame keyframe, ref2va's global references without an anchor.
     if cell.task == "fl2va":
-        (keyframe,) = measured["conditions"]
-        assert keyframe["role"] == "keyframe"
+        (keyframe,) = measured["input_references"]
+        assert keyframe["type"] == "image"
         assert keyframe["frame_index"] == 0
     elif cell.task == "ref2va":
-        assert {row["role"] for row in measured["conditions"]} == {"reference"}
+        assert all(
+            "frame_index" not in row for row in measured["input_references"]
+        )
     else:
-        assert "conditions" not in measured
+        assert "input_references" not in measured
 
 
 @pytest.mark.parametrize("name", _CELLS, ids=tuple(_CELLS))

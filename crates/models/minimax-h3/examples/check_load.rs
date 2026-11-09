@@ -27,7 +27,8 @@
 use std::path::PathBuf;
 
 use nn::weights::{HostStore, WeightLoader};
-use nn::{DType, VideoTask};
+use nn::{DType};
+use minimax_h3::VideoTask;
 
 use minimax_h3::checkpoint::{Layout, Sidecars};
 use minimax_h3::config::Config;
@@ -175,7 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut failures = Vec::new();
     for component in chosen {
         let directories = component.directories();
-        println!("component {} ({})", component.name(), component.block());
+        println!("component {}", component.name());
         // **What the load deliberately leaves alone, printed with its reason.** A tensor the
         // checkpoint holds, the load does not ask for and nobody has named is the finding this
         // column exists to make visible; a named exclusion is a decision, and a reader who cannot

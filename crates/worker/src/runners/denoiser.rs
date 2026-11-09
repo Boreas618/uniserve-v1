@@ -44,7 +44,7 @@
 use std::sync::{Arc, Mutex};
 
 use ipc::TimingCounters;
-use nn::capability::{Conditioning, Denoiser, LatentShape, Latents, Layout, Step, VideoRequest};
+use nn::capability::{Conditioning, Denoiser, LatentShape, Latents, Layout, Step, WarmRequest};
 use ops::{DType, Shape, TensorView};
 use platform::DeviceId;
 
@@ -63,62 +63,6 @@ use crate::runners::lifecycle::{Lifecycle, walk_capture, warmed_capture};
 use crate::runners::products::{self, Product, Products};
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
-
-/// The request a bucket is walked with before any request of its layout arrives.
-///
-/// A capture happens before the first request of a shape, and the model's per-layout tables are
-/// written from a request - so the deployment states one request per served task and canvas, and
-/// **the bucket is derived from it** (`Denoiser::layout`) rather than stated beside it. A bucket and
-/// a warm request that disagreed about a count would put a graph's tables in one shape and its
-/// graph in another, which no launch refuses.
-#[derive(Clone, Debug)]
-pub struct WarmRequest {
-    /// The task this bucket serves, and the key its schedule is asked for.
-    pub task: nn::VideoTask,
-    /// Canvas width in pixels.
-    pub width: u32,
-    /// Canvas height in pixels.
-    pub height: u32,
-    /// Frames of the request; the model snaps it to a legal count.
-    pub frames: u32,
-    /// Frames per second of the output.
-    pub fps: u32,
-    /// Frame-one anchors.
-    pub first_frames: u32,
-    /// Last-frame anchors.
-    pub last_frames: u32,
-    /// Reference images or clips.
-    pub references: u32,
-    /// Prompt tokens the request presents, vision tokens included.
-    pub text_tokens: u32,
-    /// The encoded condition media, in request order: anchors, then references.
-    pub conditions: Vec<nn::ConditionShape>,
-    /// Per-image prompt spans, in request order.
-    pub vision_spans: Vec<(u32, u32)>,
-    /// The condition rows this request's layout holds, as one rung of the deployment's ladder;
-    /// `None` is the deployment's whole capacity. A request of the bucket keeps the bucket's rung.
-    pub condition_rows: Option<u32>,
-}
-
-impl WarmRequest {
-    /// The request as the model's capability reads one.
-    pub fn view(&self) -> VideoRequest<'_> {
-        VideoRequest {
-            task: self.task,
-            width: self.width,
-            height: self.height,
-            frames: self.frames,
-            fps: self.fps,
-            first_frames: self.first_frames,
-            last_frames: self.last_frames,
-            references: self.references,
-            text_tokens: self.text_tokens,
-            conditions: &self.conditions,
-            vision_spans: &self.vision_spans,
-            condition_rows: self.condition_rows,
-        }
-    }
-}
 
 /// The figures a denoiser's columns are sized by, which the deployment states once at open.
 #[derive(Clone, Copy, Debug)]
@@ -147,9 +91,9 @@ pub struct DenoiserShape {
     /// The width of the rows the denoiser reads (`nn::Denoiser::text_width`), which `text` is sized
     /// by while `source`, holding what the encoder wrote, is sized by [`Self::width`].
     ///
-    /// **The shape is where the model's statement lives, not the runner.** The planning boundary asks
-    /// the model once (`src/model_runner.rs`) and puts the answer here, so a runner never asks the model
-    /// a second time and two statements of one width cannot drift.
+    /// **The shape is where the model's statement lives, not the runner.** The engine asks the model
+    /// once when it binds the runner and puts the answer here, so a runner never asks the model a
+    /// second time and two statements of one width cannot drift.
     pub text_width: u32,
 }
 
@@ -465,9 +409,9 @@ struct Pending {
 /// the rotary clock from that length. So the task, the canvas and the frames stay the plan's, and
 /// everything the request itself states replaces the plan's figures.
 fn stated_request(warm: &WarmRequest, conditioning: &[u8]) -> Result<WarmRequest> {
-    use models::video::{ConditionRole, Conditioning};
+    use proto::video::{ConditionRole, Conditions};
 
-    let decoded = Conditioning::decode(conditioning).map_err(|error| {
+    let decoded = Conditions::decode(conditioning).map_err(|error| {
         Error::Invalid(format!(
             "a media request's conditioning does not decode: {error}"
         ))
@@ -506,38 +450,14 @@ fn stated_request(warm: &WarmRequest, conditioning: &[u8]) -> Result<WarmRequest
         })
         .collect();
     Ok(WarmRequest {
-        task: match decoded.task {
-            models::video::VideoTask::T2va => nn::VideoTask::TextToVideoAudio,
-            models::video::VideoTask::Fl2va => nn::VideoTask::FirstLastToVideoAudio,
-            models::video::VideoTask::Ref2va => nn::VideoTask::ReferenceToVideoAudio,
-        },
         first_frames: count(ConditionRole::FirstFrame),
         last_frames: count(ConditionRole::LastFrame),
         references: count(ConditionRole::Reference),
-        text_tokens: u32::try_from(decoded.text_tags.len())
-            .map_err(|_| Error::Invalid("a prompt of more tokens than a u32 counts".into()))?,
+        text_tokens: decoded.prompt_tokens,
         conditions,
-        vision_spans: vision_spans(&decoded.text_tags),
+        vision_spans: decoded.vision_spans,
         ..warm.clone()
     })
-}
-
-/// The prompt rows each vision block occupies, as `(first row, rows)`: the runs tagged zero.
-fn vision_spans(tags: &[u8]) -> Vec<(u32, u32)> {
-    let mut spans = Vec::new();
-    let mut first = None;
-    for (row, tag) in tags.iter().copied().chain(std::iter::once(1)).enumerate() {
-        match (tag, first) {
-            (0, None) => first = Some(row as u32),
-            (0, Some(_)) => {}
-            (_, Some(start)) => {
-                spans.push((start, row as u32 - start));
-                first = None;
-            }
-            (_, None) => {}
-        }
-    }
-    spans
 }
 
 /// One bucket and the request it was derived from.
@@ -550,7 +470,7 @@ pub struct BucketPlan {
 }
 
 /// The denoiser's runner: one device stream, the buckets its plan captures, and its model.
-pub struct DenoiserRunner<M: Denoiser + Send + Sync> {
+pub struct DenoiserRunner<M: Denoiser + Send + Sync + ?Sized> {
     id: RunnerId,
     phases: Vec<ipc::PhaseId>,
     model: Arc<M>,
@@ -622,7 +542,7 @@ struct Preparation {
     restore: Option<ipc::LatentRestore>,
 }
 
-impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
+impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
     /// Binds a denoiser to one device stream.
     ///
     /// The buckets are derived here from the deployment's warm requests, one per task and canvas it
@@ -765,7 +685,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     /// is the opposite fact.
     pub fn schedule(&self, bucket: Bucket) -> Result<Vec<Step>> {
         let plan = self.plan_of(bucket)?;
-        self.model.schedule(plan.warm.task).map_err(Error::from)
+        self.model.schedule(&plan.warm.view()).map_err(Error::from)
     }
 
 
@@ -1584,19 +1504,29 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         Ok(())
     }
 
-    /// The refusal for a bucket whose task the model states no schedule for.
+    /// The refusal for a bucket whose request the model states no schedule for.
     ///
-    /// It names the chain a reader needs - the bucket, the task the bucket's schedule was asked for,
-    /// and the fact that the answer had no step - because the model's own refusal names the task and
-    /// this one is reached through the bucket.
+    /// It names the chain a reader needs - the bucket, the request the bucket's schedule was asked
+    /// for, and the fact that the answer had no step - because the model's own refusal names the
+    /// request and this one is reached through the bucket.
     fn no_step(&self, bucket: Bucket) -> Error {
-        let task = self
+        let request = self
             .plan_of(bucket)
-            .map(|plan| format!("{:?}", plan.warm.task))
-            .unwrap_or_else(|_| "no task".to_owned());
+            .map(|plan| {
+                let warm = &plan.warm;
+                format!(
+                    "{}x{} of {} frames with {} anchor(s) and {} reference(s)",
+                    warm.width,
+                    warm.height,
+                    warm.frames,
+                    warm.first_frames + warm.last_frames,
+                    warm.references
+                )
+            })
+            .unwrap_or_else(|_| "no request".to_owned());
         Error::Invalid(format!(
             "the schedule of bucket {bucket} states no step to capture; the bucket asked for the \
-             {task} schedule"
+             schedule of a request of {request}"
         ))
     }
 
@@ -1842,7 +1772,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     }
 }
 
-impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
+impl<M: Denoiser + Send + Sync + ?Sized> Runner for DenoiserRunner<M> {
     /// The constants are folded from the weights, so they are folded again from the new ones. A
     /// runner that has not filled them yet does so before its first capture anyway.
     fn weights_changed(&mut self) -> Result<()> {
@@ -2333,7 +2263,7 @@ fn pieces(regions: &[(u64, u64)], start: u64, bytes: u64) -> Result<Vec<(u64, u6
     Ok(pieces)
 }
 
-impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
+impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
     /// Captures one bucket of `generation`: the walk here, the graph kept by the lifecycle.
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
@@ -2365,7 +2295,7 @@ fn layout_of(bucket: Bucket) -> Result<Layout> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nn::capability::{Seed, StateTable};
+    use nn::capability::{Seed, StateTable, VideoRequest};
 
     /// A trajectory's bytes lie back to back over the video and the audio column, so a range that
     /// straddles the two is two pieces, and a range past the trajectory is refused.
@@ -2796,7 +2726,6 @@ mod product_tests {
     #[test]
     fn a_staged_request_states_its_own_prompt_length_within_the_plan() {
         let warm = WarmRequest {
-            task: nn::VideoTask::TextToVideoAudio,
             width: 768,
             height: 768,
             frames: 107,
@@ -2809,16 +2738,16 @@ mod product_tests {
             vision_spans: Vec::new(),
             condition_rows: None,
         };
-        let conditioning = models::video::Conditioning {
-            task: models::video::VideoTask::T2va,
-            text_tags: vec![1; 9],
+        let conditioning = proto::video::Conditions {
             conditions: Vec::new(),
+            prompt_tokens: 9,
+            vision_spans: Vec::new(),
         };
         let stated = stated_request(
             &warm,
             &conditioning.encode().expect("a conditioning encodes"),
         )
-        .expect("a t2va conditioning states a request");
+        .expect("an unconditioned request states a request");
         assert_eq!(stated.text_tokens, 9);
         assert_eq!(
             (stated.width, stated.height, stated.frames),
@@ -2829,13 +2758,6 @@ mod product_tests {
             stated_request(&warm, b"not a conditioning").is_err(),
             "a blob that does not decode is refused, because the capture's capacity is no request"
         );
-    }
-
-    /// A vision block is one run of zero tags, wherever it ends.
-    #[test]
-    fn a_vision_span_is_a_run_of_zero_tags() {
-        assert_eq!(vision_spans(&[1, 0, 0, 1, 0]), vec![(1, 2), (4, 1)]);
-        assert!(vision_spans(&[1, 1]).is_empty());
     }
 
     /// A task whose request carries no condition element reads no source rows, so a store holding

@@ -374,7 +374,7 @@ impl Leader {
         // The target's engine configuration is resolved as a deployment's start resolves it: the
         // options state the scheduler and the rank layout, and the model's files complete what they
         // determine. Its launch file carries it whole (§2.3).
-        let engine = Leader::prepare(&target, &crate::options::Stated::from_paths(Vec::new()))
+        let engine = Leader::prepare(&self.catalogue, &target, &crate::options::Stated::from_paths(Vec::new()))
             .await
             .map_err(|error| UpdateError::Refused(format!("{error:#}")))?
             .engine;
@@ -683,7 +683,7 @@ impl Replica {
         // The target's engine configuration is resolved as a deployment's
         // start resolves it: from the options, completed by what the model's
         // files determine, and divided into the deployment's replicas.
-        let prepared = Leader::prepare(&target, &stated)
+        let prepared = Leader::prepare(&self.catalogue, &target, &stated)
             .await
             .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
         let replicas = crate::leader::replica_configs(&prepared.engine)
@@ -951,7 +951,7 @@ mod tests {
         )
         .expect("start a sim scheduler");
         let leader =
-            crate::test_support::sim_engine_over(crate::model::ModelParameters::Qwen3, vec![core]);
+            crate::test_support::sim_engine_over(crate::test_support::CHAT, vec![core]);
         let replica = Arc::clone(&leader.replicas()[0]);
         let client = replica.hold().client().expect("the replica serves");
         let epoch = client.epoch();

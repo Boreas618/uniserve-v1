@@ -1,31 +1,22 @@
 //! `uniserve`: the one executable of every UniServe process.
 //!
-//! `main` parses the command line and runs its command, one module each:
-//! `serve` (a node's daemon, and on the leader the application), `frontend`
-//! (the deployment's application process), `engine` (a node's main process
-//! for one epoch), `storage` (a host's Storage Server) and `program-server` (a
-//! host's Program Server). `serve` installs tracing and builds the Tokio
-//! runtime; its module hands the resolved configuration to `daemon::serve`
-//! with a cancellation token that fires on Ctrl-C or SIGTERM. `storage` runs
-//! before any thread exists, because a Storage Server started with `--daemon`
-//! forks.
+//! `main` parses the command line and runs its command: `serve` (a node's
+//! daemon, and on the leader the application, [`serve`]), `engine` (a node's
+//! main process for one epoch), and the host services `storage-server` and
+//! `program-server`, whose commands are their crates' own. `serve` installs
+//! tracing and builds the Tokio runtime; its module hands the resolved
+//! configuration to `daemon::serve` with a cancellation token that fires on
+//! Ctrl-C or SIGTERM. The host services run before any thread exists,
+//! because a service started with `--daemon` forks.
 //!
 //! The runtime, the cancellation token and the supervision lifeline are the
 //! executable's own: every command that starts threads takes them from here.
 
 mod cli;
-mod engine;
-mod engine_main;
-mod frontend;
 mod logging;
-mod model_runner;
-mod program_server;
-mod rules;
 mod serve;
-mod storage;
 
 use std::env;
-use std::ffi::OsString;
 
 use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
@@ -135,33 +126,37 @@ fn main() -> Result<std::process::ExitCode> {
     };
     match cli.command {
         Command::Serve(args) => serve::run(*args, &command_matches(), &cli.log),
-        Command::Frontend(args) => frontend::run(*args, &command_matches(), &cli.log),
-        Command::Engine { launch } => engine::run(&launch, lifeline, &cli.log),
-        Command::Storage(args) => Ok(storage::run(*args)),
-        Command::Rules => rules::run(),
-        Command::External(arguments) => run_external(&arguments),
+        Command::Engine { launch } => {
+            follow_lifeline(lifeline);
+            logging::init_tracing(
+                "Engine",
+                cli.log.log_level.as_deref(),
+                cli.log.log_level_http.as_deref(),
+            );
+            engine::run(&launch, &catalogue()?).map(|()| std::process::ExitCode::SUCCESS)
+        }
+        Command::StorageServer(args) => {
+            storage_server::command::run(*args).map(|()| std::process::ExitCode::SUCCESS)
+        }
+        Command::ProgramServer(args) => program_server::command::run(*args)
+            .map(|()| std::process::ExitCode::SUCCESS)
+            .map_err(anyhow::Error::new),
     }
 }
 
-/// Runs a command whose parser another crate owns, with the arguments the
-/// top-level parser did not claim.
-///
-/// The Program Server's command line is the `program_server` crate's
-/// (`command`, `options`, `run`), so this executable mounts it rather than
-/// restating its surface. An unknown command is an error like any other.
-fn run_external(arguments: &[OsString]) -> Result<std::process::ExitCode> {
-    let Some(name) = arguments.first().and_then(|name| name.to_str()) else {
-        anyhow::bail!("missing command");
-    };
-    match name {
-        "program-server" => {
-            let matches = program_server::command().get_matches_from(arguments);
-            let options = program_server::options(&matches).map_err(anyhow::Error::new)?;
-            program_server::run(options).map_err(anyhow::Error::new)?;
-            Ok(std::process::ExitCode::SUCCESS)
-        }
-        other => anyhow::bail!("unknown command {other}"),
-    }
+/// The model families this executable's main processes load: with [`processing`], the one place
+/// a concrete model is named. A model is added with its crate and one entry in each.
+fn catalogue() -> Result<engine::Catalogue> {
+    engine::Catalogue::new([qwen3_moe::family::FAMILY, minimax_h3::family::FAMILY])
+}
+
+/// The model families this executable's daemon serves requests of.
+pub(crate) fn processing() -> Result<processing::Catalogue> {
+    processing::Catalogue::new([
+        qwen3_moe::processing::FAMILY,
+        minimax_h3::processing::FAMILY,
+    ])
+    .map_err(anyhow::Error::msg)
 }
 
 /// The lifeline this process inherited from the daemon that supervises it
@@ -184,7 +179,7 @@ fn take_lifeline() -> Option<i32> {
 /// Ends this process once its daemon is gone: the end of the lifeline's
 /// pipe arrives once the daemon, and every successor a hot restart handed
 /// its processes to, ended, however they ended.
-pub(crate) fn follow_lifeline(lifeline: Option<i32>) {
+fn follow_lifeline(lifeline: Option<i32>) {
     let Some(descriptor) = lifeline else {
         return;
     };

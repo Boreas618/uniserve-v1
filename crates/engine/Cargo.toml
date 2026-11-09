@@ -1,0 +1,35 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# A node's main process for one epoch: its control thread, its schedulers,
+# one executor per device and its blocking pool, and the program-layer
+# update between them. It dispatches by computational capability and names no
+# concrete model: the executable hands it the model families it serves.
+[dependencies]
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+ipc.workspace = true
+nn.workspace = true
+ops.workspace = true
+platform.workspace = true
+program-server.workspace = true
+proto.workspace = true
+scheduler.workspace = true
+serde_json.workspace = true
+storage.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
+worker.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# A test states the arguments a deployment pinned on a program, which are a TOML table
+# (`program_server::Program`).
+toml.workspace = true
+
+[lints]
+workspace = true

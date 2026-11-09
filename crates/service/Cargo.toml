@@ -1,0 +1,21 @@
+[package]
+name = "service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# A host service: one server per host and serving user on a Unix socket in
+# the user's runtime directory, owned by a lock, started detached from its
+# starter when absent. The Storage Server and the Program Server are both
+# host services; this crate depends on no workspace crate and links no CUDA.
+[dependencies]
+libc.workspace = true
+signal-hook-registry.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

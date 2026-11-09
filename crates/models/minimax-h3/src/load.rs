@@ -3,17 +3,14 @@
 //! An H3 checkpoint is a diffusers pipeline directory whose components are its subdirectories, and
 //! `nn::Checkpoint` learns such a root: `checkpoint.component("transformer")` gives one
 //! component's shard set with each shard's own identity, and `WeightLoader::reborrow` gives one
-//! loader per component over the same store and precision policy (specs/worker.md 8). The blocks a
-//! rank holds are the [`Partition`]'s, so this module only builds them, and registers each under the
-//! name its runner addresses: the capability's name, not the checkpoint directory's.
+//! loader per component over the same store and precision policy. The blocks a rank holds are the
+//! [`Partition`]'s, so this module only builds them.
 //!
 //! ## What the caller gets back
 //!
-//! [`MinimaxH3`]: the blocks the worker serves, and the same components behind them as handles.
-//! A block is boxed as `Arc<dyn Encoder>` or `Arc<dyn Decoder>` and those traits publish no
-//! descriptors, so a deployment that can answer "which programs must be compiled for me?" can only
-//! answer it from the concrete components - and that is what the handles are for. They are the same
-//! values the blocks hold, so the weights exist once.
+//! [`MinimaxH3`]: the concrete components this rank places, each behind one `Arc`. The model's
+//! family hands them to execution as capability objects (`crate::family`), and the concrete
+//! handles are what the model's programs are enumerated from, so the weights exist once.
 //!
 //! ## Testing
 //!
@@ -32,7 +29,6 @@
 //! model can store FP32 throughout, and `auto` must follow each of them. [`stored_dtype`] is the one
 //! place that reads it.
 
-use nn::{Block, BlockName};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -49,18 +45,8 @@ use crate::{Error, Partition, Result};
 /// together, and the layers beside them name their block this way.
 pub use crate::partition::Component;
 
-/// A loaded deployment: the blocks this rank serves, and the components they were built from.
-///
-/// The blocks are what the worker serves, each by the capability it implements. The second is what
-/// makes the
-/// deployment able to answer for itself: a block is boxed as `Arc<dyn Encoder>` and the trait does
-/// not publish descriptors, so the model's programs can only be enumerated from the components
-/// before they are erased - `keys` walks these handles, and nothing else in the crate reads them.
-///
-/// Every handle is the *same* value the block holds, not a copy: the component is constructed once,
-/// shared by the model and by the walk, and the weights exist once.
+/// A loaded deployment: the components this rank places, each constructed once.
 pub struct MinimaxH3 {
-    model: nn::Model,
     text_encoder: Option<Arc<TextEncoder>>,
     transformer: Option<Arc<Denoiser>>,
     transformer_ref: Option<Arc<Denoiser>>,
@@ -73,7 +59,6 @@ impl std::fmt::Debug for MinimaxH3 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("MinimaxH3")
-            .field("model", &self.model)
             .field(
                 "text_encoder",
                 &self.text_encoder.as_ref().map(|_| "TextEncoder"),
@@ -681,7 +666,6 @@ pub fn load(
         None
     };
 
-    let mut blocks = Vec::new();
     let mut text_encoder: Option<Arc<TextEncoder>> = None;
     let mut transformer: Option<Arc<Denoiser>> = None;
     let mut transformer_ref: Option<Arc<Denoiser>> = None;
@@ -689,7 +673,7 @@ pub fn load(
     let mut video_decoder: Option<Arc<crate::video_vae::VideoDecoder>> = None;
     let mut audio_decoder: Option<Arc<BigVgan>> = None;
     for component in partition.blocks.iter() {
-        let block = match component {
+        match component {
             Component::TextEncoder => {
                 let source = checkpoint.component("text_encoder")?;
                 // The encoder composes its names with `format!` inside its layers, so a name the
@@ -725,8 +709,7 @@ pub fn load(
                     &partition,
                     dtype,
                 )?);
-                text_encoder = Some(Arc::clone(&encoder));
-                Block::Encoder(encoder)
+                text_encoder = Some(encoder);
             }
             Component::Transformer | Component::TransformerRef => {
                 let dit = match component {
@@ -792,10 +775,9 @@ pub fn load(
                 }
                 let denoiser = Arc::new(denoiser);
                 match dit {
-                    Dit::Base => transformer = Some(Arc::clone(&denoiser)),
-                    Dit::Reference => transformer_ref = Some(Arc::clone(&denoiser)),
+                    Dit::Base => transformer = Some(denoiser),
+                    Dit::Reference => transformer_ref = Some(denoiser),
                 }
-                Block::Denoiser(denoiser)
             }
             Component::VideoPostprocessor => {
                 // Weightless: the splice's only constants are the reference's ImageNet means and standard
@@ -826,8 +808,7 @@ pub fn load(
                 )?;
                 let postprocessor =
                     Arc::new(crate::output::VideoPostprocessor::new(dtype, mean, std)?);
-                video_postprocessor = Some(Arc::clone(&postprocessor));
-                nn::Block::Decoder(postprocessor)
+                video_postprocessor = Some(postprocessor);
             }
             Component::AudioDecoder => {
                 // The audio decoder has no layout tables - every table it reads is a weight bound
@@ -842,8 +823,7 @@ pub fn load(
                 )?;
                 let mut shards = loader.reborrow(source)?;
                 let decoder = Arc::new(BigVgan::load(&config.audio_vae, &mut shards)?);
-                audio_decoder = Some(Arc::clone(&decoder));
-                Block::Decoder(decoder)
+                audio_decoder = Some(decoder);
             }
             Component::VideoDecoder => {
                 require(
@@ -867,8 +847,7 @@ pub fn load(
                     canvases,
                     &mut shards,
                 )?);
-                video_decoder = Some(Arc::clone(&decoder));
-                Block::Decoder(decoder)
+                video_decoder = Some(decoder);
             }
             Component::LatentEncoder => {
                 // No block of its own: the two condition encoders are the `denoiser` block's
@@ -877,10 +856,7 @@ pub fn load(
                 // requires a DiT beside it.
                 continue;
             }
-        };
-        // The runner addresses a block by the capability it serves, not by the checkpoint's
-        // directory: both DiT partitions are the `denoiser` block.
-        blocks.push((BlockName::new(component.block()), block));
+        }
     }
 
     // A conditioned deployment is served as the checkpoint states it: the encoders are attached to
@@ -890,7 +866,6 @@ pub fn load(
     // request that carries media it holds no encoder for.
 
     Ok(MinimaxH3 {
-        model: nn::Model::new(blocks),
         text_encoder,
         transformer,
         transformer_ref,

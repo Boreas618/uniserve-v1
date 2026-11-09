@@ -12,10 +12,10 @@ image-plus-audio request takes refuses it, naming its rows, and then serves
 the image-only request that fits. Every deployment serves under CUDA
 graphs: a request with conditions denoises in a captured layout widened to
 the deployment's condition capacity, and the encoding of reference media
-whose shape no graph holds runs eagerly. Condition media are read from
-``file://`` URIs under
+whose shape no graph holds runs eagerly. Reference media are read from
+``file://`` URLs under
 ``--media-directory``. Every served response is a complete MP4 at
-the canvas and frame count the request resolves to.
+the size and frame count the request resolves to.
 """
 
 from __future__ import annotations
@@ -44,34 +44,30 @@ WORKLOADS = ROOT / "uniserve_eval" / "workloads" / "minimax_h3"
 
 
 def _request(workload: str, inputs: Path) -> dict:
-    """The seed-42 request of a packaged conditioned workload.
+    """The seed-42 request of a packaged referenced workload.
 
     A workload's warmup manifest holds its seed-42 request: the prompt, the
-    duration and the condition media in request order, named relative to the
-    inputs directory. Conditioned workloads resolve their canvas from
-    ``auto``.
+    frame count and the reference media in request order, named relative to
+    the inputs directory. The request states no size, so the server's own
+    default holds: the first keyframe's canvas for fl2va, the deployment's
+    first served size for ref2va.
     """
     manifest = WORKLOADS / f"{workload}-warmup.jsonl"
     row = json.loads(manifest.read_text().splitlines()[0])
-    conditions = [
+    references = [
         {
             **{
-                key: value for key, value in condition.items() if key != "media"
+                key: value for key, value in reference.items() if key != "media"
             },
-            "uri": f"file://{(inputs / condition['media']).resolve()}",
+            "url": f"file://{(inputs / reference['media']).resolve()}",
         }
-        for condition in row["conditions"]
+        for reference in row["input_references"]
     ]
     return {
         "model": "MiniMax-H3",
-        "task": row["metadata"]["task"],
         "prompt": row["prompt"],
-        "conditions": conditions,
-        "target": {
-            "short_edge": 768,
-            "aspect_ratio": "auto",
-            "duration_seconds": row["seconds"],
-        },
+        "num_frames": row["num_frames"],
+        "input_references": references,
         "seed": row["seed"],
     }
 
@@ -116,6 +112,12 @@ def _command(model, deployment, port, inputs, options) -> list[str]:
 
 def _check_media(response, *, width, height, frames) -> None:
     assert response.status_code == 200, response.text
+    # The server reports the shape it generated.
+    assert (
+        response.headers["x-video-size"],
+        response.headers["x-video-num-frames"],
+        response.headers["x-video-fps"],
+    ) == (f"{width}x{height}", str(frames), "24")
     media = inspect_video_bytes(
         response.content, declared_mime=response.headers["content-type"]
     )
@@ -153,13 +155,13 @@ def test_base_first_frame_request(tmp_path: Path) -> None:
         ),
         httpx.Client(base_url=base, timeout=3600) as client,
     ):
-        video = client.get("/v1/capabilities").json()["video"]
+        video = client.get("/v1/capabilities").json()["video"]["model"]
         assert set(video["tasks"]) == {"t2va", "fl2va"}
 
         response = client.post("/v1/videos/sync", json=_request("w3", inputs))
         (tmp_path / "fl2va.mp4").write_bytes(response.content)
-        # The 16:9 keyframe resolves the 1344x768 canvas; eight seconds
-        # are 192 frames.
+        # The 16:9 keyframe resolves the 1344x768 canvas of the 192 frames
+        # the row states.
         _check_media(response, width=1344, height=768, frames=192)
 
 
@@ -179,7 +181,7 @@ def test_fasth3_first_frame_request(tmp_path: Path) -> None:
     # keyframes a request may bring in tiles of their own.
     options = [
         "--set",
-        "video_config.aspect_ratios=16:9",
+        "video_config.sizes=1344x768",
         "--set",
         "video_config.max_seconds=8",
         "--max-model-len",
@@ -196,7 +198,7 @@ def test_fasth3_first_frame_request(tmp_path: Path) -> None:
         ),
         httpx.Client(base_url=base, timeout=3600) as client,
     ):
-        video = client.get("/v1/capabilities").json()["video"]
+        video = client.get("/v1/capabilities").json()["video"]["model"]
         assert video["tasks"] == ["t2va", "fl2va"]
 
         response = client.post("/v1/videos/sync", json=_request("w3", inputs))
@@ -245,9 +247,9 @@ def _reference_requests(command, base, tmp_path, *, inputs):
         server_process(command, base, tmp_path / "server.log", timeout_s=3600),
         httpx.Client(base_url=base, timeout=3600) as client,
     ):
-        video = client.get("/v1/capabilities").json()["video"]
+        video = client.get("/v1/capabilities").json()["video"]["model"]
         assert video["tasks"] == ["ref2va"]
-        steps = video["schedule"]["num_inference_steps"]
+        steps = video["num_inference_steps"]
 
         for name in ("w4", "w5"):
             before = _graph_replays(client)
@@ -255,8 +257,8 @@ def _reference_requests(command, base, tmp_path, *, inputs):
                 "/v1/videos/sync", json=_request(name, inputs)
             )
             (tmp_path / f"{name}.mp4").write_bytes(response.content)
-            # References leave the auto canvas at 16:9; five seconds align
-            # up to 124 frames.
+            # References take the deployment's first served size, 1344x768,
+            # at the 124 frames the row states.
             _check_media(response, width=1344, height=768, frames=124)
             assert _graph_replays(client) - before >= steps, name
 
@@ -374,7 +376,10 @@ def test_omniref_refuses_conditions_above_capacity(tmp_path: Path) -> None:
         SMALL_CAPACITY_OPTIONS,
     )
     packed = _request("w4", inputs)
-    image_only = {**packed, "conditions": packed["conditions"][:1]}
+    image_only = {
+        **packed,
+        "input_references": packed["input_references"][:1],
+    }
     with (
         server_process(command, base, tmp_path / "server.log", timeout_s=3600),
         httpx.Client(base_url=base, timeout=3600) as client,

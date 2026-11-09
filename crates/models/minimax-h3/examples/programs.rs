@@ -25,7 +25,8 @@ use minimax_h3::denoiser::Denoiser;
 use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
 use minimax_h3::modulation::Groups;
 use minimax_h3::output::VideoPostprocessor;
-use minimax_h3::partition::{Partition, Projection, Ulysses};
+use minimax_h3::partition::{Partition, Ulysses};
+use nn::family::Projection;
 use minimax_h3::programs::{Deployment, Types};
 use minimax_h3::tiled_encode::ClipEncoder;
 use minimax_h3::video_vae::VideoDecoder;
@@ -52,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // from it (`Partition::serving`), and the packed row bound - hence the gated activation's `wide`
     // form and the sparse tile class - follows from that capacity. A walk that built the partition
     // from `Partition::single()` stated a bound serving never asks for.
-    let mut task: Option<nn::VideoTask> = None;
+    let mut task: Option<minimax_h3::VideoTask> = None;
     let mut types: Option<PathBuf> = None;
     // The prompt lengths the deployment serves, and its tensor-parallel degree: both are the
     // deployment's, and the degree decides the shard widths the store must hold.
@@ -148,9 +149,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--ulysses" => ulysses = Some(value.parse()?),
             "--task" => {
                 task = Some(match value.as_str() {
-                    "t2va" => nn::VideoTask::TextToVideoAudio,
-                    "fl2va" => nn::VideoTask::FirstLastToVideoAudio,
-                    "ref2va" => nn::VideoTask::ReferenceToVideoAudio,
+                    "t2va" => minimax_h3::VideoTask::TextToVideoAudio,
+                    "fl2va" => minimax_h3::VideoTask::FirstLastToVideoAudio,
+                    "ref2va" => minimax_h3::VideoTask::ReferenceToVideoAudio,
                     other => {
                         return Err(
                             format!("{other} is not an H3 task (t2va, fl2va, ref2va)").into()
@@ -244,7 +245,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let task = task.ok_or("--task is the deployment's and has no default")?;
     // A task that conditions cannot be walked unconditioned, and the reverse: the capacity, the
     // modulation cache's groups and the blocks a deployment holds are three statements of one fact.
-    let conditioned_task = !matches!(task, nn::VideoTask::TextToVideoAudio);
+    let conditioned_task = !matches!(task, minimax_h3::VideoTask::TextToVideoAudio);
     if conditioned_task != conditioned {
         return Err(format!(
             "--task {task:?} and --conditioned {conditioned} disagree: a task either holds the \

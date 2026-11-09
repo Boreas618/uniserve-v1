@@ -158,7 +158,7 @@ impl Scheduler {
         // A stated bound the worker cannot hold is lowered here, never refused, when nothing
         // checks a decision against it: these three size a batch. A policy's own limits are the
         // mechanism's check and are refused instead, before weights
-        // (`crate::model_runner`'s `tier_refusal`). Each clamp names the option, the figure the
+        // (the engine's `tier_refusal`). Each clamp names the option, the figure the
         // deployment stated and the figure the rank holds - a lowered bound whose numbers are
         // missing from the log is the same defect one severity down.
         let requested_seqs = config.max_running_requests.max(1);
@@ -451,7 +451,7 @@ impl Scheduler {
         size: crate::kv_cache::HostCacheSize,
         kv_storage: bool,
     ) -> anyhow::Result<()> {
-        let socket = storage::socket::default_socket();
+        let socket = storage::default_socket();
         let mut kv_offload = match crate::kv_cache::KvOffloadManager::connect(
             &socket,
             deployment,

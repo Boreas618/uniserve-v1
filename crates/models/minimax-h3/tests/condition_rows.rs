@@ -4,10 +4,11 @@
 //! statements are held against each other here over every kind of condition.
 
 use minimax_h3::packing::{self, Condition, Frame, Role};
-use models::video::plan::{
+use minimax_h3::processing::plan::{
     AudioClip, ConditionInput, FramePosition, KeyframeFit, Prepared, VideoClip,
 };
-use models::video::{Canvas, ConditionPacking, FrameClips};
+use minimax_h3::processing::{ConditionPacking, FrameClips};
+use proto::video::Canvas;
 
 const CLIPS: FrameClips = FrameClips {
     min_frames: 22,

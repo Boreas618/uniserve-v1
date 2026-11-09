@@ -79,7 +79,10 @@ PROMPT = (
     "A red fox trots across a snowy meadow at sunrise, its breath steaming, "
     "while birds call from the pines."
 )
+# The shortest request duration bounds the deployment; its 107 frames are
+# what each request asks for.
 SECONDS = 4.0
+FRAMES = 107
 SEED = 4242
 
 
@@ -226,7 +229,7 @@ def _serve(
         "--max-model-len",
         "1024",
         "--set",
-        "video_config.aspect_ratios=16:9",
+        "video_config.sizes=1344x768",
         "--set",
         f"video_config.max_seconds={SECONDS:g}",
     ]
@@ -241,7 +244,7 @@ def _serve(
         ):
             yield base_url, log, runtime
     finally:
-        _stop_storage_server(runtime / "uniserve" / "storage.sock")
+        _stop_storage_server(runtime / "uniserve" / "storage-server.sock")
         shutil.rmtree(runtime, ignore_errors=True)
 
 
@@ -278,7 +281,7 @@ def _assert_same_video(actual: bytes, expected: bytes) -> None:
 def _start_job(base_url: str) -> str:
     response = httpx.post(
         f"{base_url}/v1/videos",
-        json=t2va_request(NAME, PROMPT, SECONDS, SEED),
+        json=t2va_request(NAME, PROMPT, FRAMES, SEED),
         timeout=60,
     )
     assert response.status_code in (200, 202), response.text
@@ -376,12 +379,12 @@ def test_a_preempted_video_request_continues_its_trajectory_exactly(
     with _serve(tmp_path) as (base_url, log, runtime):
         steps = httpx.get(f"{base_url}/v1/capabilities", timeout=60).json()[
             "video"
-        ]["schedule"]["num_inference_steps"]
+        ]["model"]["num_inference_steps"]
         assert steps >= 4, steps
 
         reference = httpx.post(
             f"{base_url}/v1/videos/sync",
-            json=t2va_request(NAME, PROMPT, SECONDS, SEED),
+            json=t2va_request(NAME, PROMPT, FRAMES, SEED),
             timeout=1800,
         )
         assert reference.status_code == 200, reference.text
@@ -447,11 +450,11 @@ def test_a_video_request_continues_under_another_parallel_configuration(
     with _serve(tmp_path, serving) as (base_url, log, runtime):
         steps = httpx.get(f"{base_url}/v1/capabilities", timeout=60).json()[
             "video"
-        ]["schedule"]["num_inference_steps"]
+        ]["model"]["num_inference_steps"]
         assert steps >= 4, steps
         reference = httpx.post(
             f"{base_url}/v1/videos/sync",
-            json=t2va_request(NAME, PROMPT, SECONDS, SEED),
+            json=t2va_request(NAME, PROMPT, FRAMES, SEED),
             timeout=1800,
         )
         assert reference.status_code == 200, reference.text

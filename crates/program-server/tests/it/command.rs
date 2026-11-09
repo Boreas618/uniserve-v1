@@ -1,56 +1,64 @@
 //! The `uniserve program-server` command (design section 6.1): the arguments
-//! the executable mounts and the daemon names, parsed into what the server
-//! needs. No server runs here: the test checks the contract the executable and
-//! the daemon depend on.
+//! an operator types and a daemon passes, read into the server's
+//! configuration. No server runs here.
 
 use std::path::PathBuf;
 
-use program_server::command::{Action, command, default_socket, options};
-use program_server::manifest::ToolchainKind;
+use clap::Parser as _;
+use program_server::command::{Args, Command, ServeArgs, Settings};
 use program_server::store::Root;
 
-#[test]
-fn serve_takes_the_socket_the_roots_the_targets_and_the_limits() {
-    let matches = command()
-        .try_get_matches_from([
-            "program-server",
-            "serve",
-            "--socket",
-            "/run/uniserve/program-server.sock",
-            "--package-root",
-            "/var/lib/uniserve/packages",
-            "--store-root",
-            "/var/lib/uniserve/modules",
-            "--store-root",
-            "/shared/uniserve/modules",
-            "--target",
-            "sm_100a",
-            "--max-jobs",
-            "4",
-            "--host-reserve",
-            "8589934592",
-            "--python",
-            "/srv/program-server/bin/python",
-        ])
-        .expect("the daemon's command line parses");
-    let parsed = options(&matches).expect("the options are read");
+fn serve(arguments: &[&str]) -> ServeArgs {
+    let args = Args::try_parse_from(["program-server", "serve"].iter().chain(arguments))
+        .expect("the serve command parses");
+    match args.command {
+        Command::Serve(serve) => *serve,
+        other => panic!("a serve command, not {other:?}"),
+    }
+}
 
+#[test]
+fn serve_takes_the_roots_the_targets_and_the_limits() {
+    let serve = serve(&[
+        "--socket",
+        "/run/uniserve/program-server.sock",
+        "--package-root",
+        "/var/lib/uniserve/packages",
+        "--store-root",
+        "/var/lib/uniserve/modules",
+        "--store-root",
+        "/shared/uniserve/modules",
+        "--target",
+        "sm_100a",
+        "--max-jobs",
+        "4",
+        "--host-reserve",
+        "8589934592",
+        "--python",
+        "/srv/program-server/bin/python",
+    ]);
+    assert!(!serve.daemon);
+
+    let devices = serve
+        .settings
+        .devices()
+        .expect("named targets need no driver");
+    assert_eq!(devices.len(), 1, "one --target is one device");
+    assert_eq!(devices[0].arch.as_str(), "sm_100a");
+
+    let config = serve.settings.config(devices);
     assert_eq!(
-        parsed.socket,
+        config.socket,
         PathBuf::from("/run/uniserve/program-server.sock")
     );
-    let Action::Serve(serve) = parsed.action else {
-        panic!("a serve command");
-    };
     assert_eq!(
-        serve.package_root,
+        config.package_root,
         PathBuf::from("/var/lib/uniserve/packages")
     );
     // The first store root is the one this host writes; a shared root after
     // it is read-only (design section 5.3).
-    let configuration = serve.config(parsed.socket.clone());
     assert_eq!(
-        configuration.store_roots,
+        config.store_roots,
         vec![
             Root {
                 path: PathBuf::from("/var/lib/uniserve/modules"),
@@ -62,146 +70,97 @@ fn serve_takes_the_socket_the_roots_the_targets_and_the_limits() {
             },
         ]
     );
-    assert_eq!(serve.limits.max_jobs, 4);
-    assert_eq!(serve.limits.host_reserve, 8589934592);
-    assert_eq!(serve.devices.len(), 1, "one --target is one device");
-    assert_eq!(serve.devices[0].arch.as_str(), "sm_100a");
-    assert_eq!(configuration.package_root, serve.package_root);
-    assert!(configuration.upstream.is_none(), "the upstream is optional");
+    assert_eq!(config.limits.max_jobs, 4);
+    assert_eq!(config.limits.host_reserve, 8589934592);
+    assert_eq!(
+        config.toolchains.python,
+        Some(PathBuf::from("/srv/program-server/bin/python"))
+    );
+    assert!(config.upstream.is_none(), "the upstream is optional");
 }
 
+/// A daemon starts a host's Program Server from its deployment's settings:
+/// the flags it passes after the socket read back as the same settings.
 #[test]
-fn serve_defaults_to_the_standard_socket_and_requires_its_interpreter() {
-    let roots = [
-        "program-server",
-        "serve",
-        "--package-root",
-        "/var/lib/uniserve/packages",
-        "--store-root",
-        "/var/lib/uniserve/modules",
-    ];
-    // The interpreter is the caller's to name: nothing searches for one.
-    let unnamed = command()
-        .try_get_matches_from(roots)
-        .expect("the roots parse");
-    let refused = options(&unnamed).expect_err("a serve command without --python is refused");
-    assert!(
-        refused.to_string().contains("--python"),
-        "the refusal names the flag: {refused}"
-    );
-
-    let matches = command()
-        .try_get_matches_from(
-            roots
-                .into_iter()
-                .chain(["--python", "/srv/program-server/bin/python"]),
-        )
-        .expect("a serve command needs its roots and its interpreter");
-    let parsed = options(&matches).unwrap();
-
-    assert_eq!(parsed.socket, default_socket());
-    let Action::Serve(serve) = parsed.action else {
-        panic!("a serve command");
+fn settings_survive_the_command_line() {
+    let settings = Settings {
+        socket: None,
+        package_root: Some(PathBuf::from("/var/lib/uniserve/packages")),
+        store_roots: vec![
+            PathBuf::from("/var/lib/uniserve/modules"),
+            PathBuf::from("/shared/uniserve/modules"),
+        ],
+        upstream: Some(PathBuf::from("/run/uniserve/leader.sock")),
+        targets: vec!["sm_100a".into(), "sm_90a".into()],
+        max_jobs: Some(2),
+        host_reserve: Some(1 << 30),
+        nvcc: Some(PathBuf::from("/usr/local/cuda/bin/nvcc")),
+        python: Some(PathBuf::from("/srv/program-server/bin/python")),
+        wasm: Some(PathBuf::from("/srv/bin/scheduling-precompile")),
+        cargo: Some(PathBuf::from("/srv/bin/cargo")),
     };
-    // nvcc is named by --nvcc or CUDA_HOME when a build needs it, and the
-    // interpreter is the one named.
-    assert!(serve.toolchains.nvcc.is_none());
-    assert_eq!(
-        serve.toolchains.python,
-        PathBuf::from("/srv/program-server/bin/python")
-    );
-    assert!(serve.toolchains.wasm.is_none());
-    assert!(
-        serve.devices.is_empty(),
-        "no --target names this host's devices"
-    );
+    let arguments = settings.arguments();
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    assert_eq!(serve(&arguments).settings, settings);
+    assert!(Settings::default().arguments().is_empty());
 }
 
+/// An operator states nothing but the interpreter: the roots are this user's
+/// own, and a host without an interpreter is missing only its Python
+/// toolchains.
 #[test]
-fn a_second_server_of_one_host_names_its_upstream() {
-    let matches = command()
-        .try_get_matches_from([
-            "program-server",
-            "serve",
-            "--package-root",
-            "/mnt/upstream/packages",
-            "--store-root",
-            "/var/lib/uniserve/modules",
-            "--upstream",
-            "/run/uniserve/leader.sock",
-            "--nvcc",
-            "/usr/local/cuda/bin/nvcc",
-            "--python",
-            "/srv/program-server/bin/python",
-        ])
-        .unwrap();
-    let parsed = options(&matches).unwrap();
-    let Action::Serve(serve) = parsed.action else {
-        panic!("a serve command");
-    };
-    assert_eq!(
-        serve.upstream,
-        Some(PathBuf::from("/run/uniserve/leader.sock")),
-        "install is refused and names the upstream"
+fn serve_needs_no_flag() {
+    let serve = serve(&[]);
+    let config = serve.settings.config(Vec::new());
+    assert_eq!(config.socket, program_server::default_socket());
+    assert!(config.package_root.ends_with("uniserve/programs/packages"));
+    assert_eq!(config.store_roots.len(), 1);
+    assert!(
+        config.store_roots[0]
+            .path
+            .ends_with("uniserve/programs/modules")
     );
-    assert_eq!(
-        serve.toolchains.nvcc,
-        Some(PathBuf::from("/usr/local/cuda/bin/nvcc"))
-    );
-    // A toolchain the host has not got is discovered as missing; the command
-    // does not refuse it, because only a build that needs it fails.
-    assert_eq!(ToolchainKind::Nvcc.as_str(), "nvcc");
+    assert!(config.store_roots[0].writable);
+    assert!(config.toolchains.python.is_none());
+    assert!(config.toolchains.nvcc.is_none());
 }
 
 #[test]
 fn install_names_a_package_on_the_server_host_and_list_needs_nothing() {
-    let matches = command()
-        .try_get_matches_from([
-            "program-server",
-            "install",
-            "/var/lib/uniserve/upload/rms_norm-triton",
-            "--socket",
-            "/run/uniserve/program-server.sock",
-        ])
-        .unwrap();
-    let parsed = options(&matches).unwrap();
-    assert_eq!(
-        parsed.socket,
-        PathBuf::from("/run/uniserve/program-server.sock")
-    );
-    match parsed.action {
-        Action::Install { package } => assert_eq!(
-            package,
-            PathBuf::from("/var/lib/uniserve/upload/rms_norm-triton")
-        ),
+    let args = Args::try_parse_from([
+        "program-server",
+        "install",
+        "/var/lib/uniserve/upload/rms_norm-triton",
+        "--socket",
+        "/run/uniserve/program-server.sock",
+    ])
+    .unwrap();
+    match args.command {
+        Command::Install { socket, package } => {
+            assert_eq!(
+                socket,
+                Some(PathBuf::from("/run/uniserve/program-server.sock"))
+            );
+            assert_eq!(
+                package,
+                PathBuf::from("/var/lib/uniserve/upload/rms_norm-triton")
+            );
+        }
         other => panic!("an install command, not {other:?}"),
     }
 
-    let matches = command()
-        .try_get_matches_from(["program-server", "list"])
-        .unwrap();
-    assert!(matches!(options(&matches).unwrap().action, Action::List));
+    let args = Args::try_parse_from(["program-server", "list"]).unwrap();
+    assert!(matches!(args.command, Command::List { socket: None }));
 }
 
 #[test]
-fn a_command_without_a_subcommand_or_a_root_is_refused() {
-    // The command refuses at parse time, before anything runs: a server that
-    // does not know which of its three jobs it was given, or where its
-    // packages are, cannot start.
+fn a_command_without_a_subcommand_or_a_package_is_refused() {
     assert!(
-        command().try_get_matches_from(["program-server"]).is_err(),
+        Args::try_parse_from(["program-server"]).is_err(),
         "program-server needs a subcommand"
     );
     assert!(
-        command()
-            .try_get_matches_from(["program-server", "serve"])
-            .is_err(),
-        "a serve command names the package root it serves from"
-    );
-    assert!(
-        command()
-            .try_get_matches_from(["program-server", "install"])
-            .is_err(),
+        Args::try_parse_from(["program-server", "install"]).is_err(),
         "an install command names the package it installs"
     );
 }

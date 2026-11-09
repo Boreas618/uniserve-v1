@@ -6,20 +6,14 @@ use std::sync::Arc;
 
 use daemon::input::chat::HfChatRenderer;
 use daemon::input::media::ImageInput;
-use daemon::input::video::VideoGenerationRequest;
-use daemon::input::video::VideoService;
 use daemon::input::{InputProcessor, ModelResolutionError, RequestRenderer};
 use daemon::model::ModelConfig;
 use daemon::model::assets::ResolvedModelFiles;
 use daemon::openai::ApiError;
 use daemon::options::ChatTemplateContentFormat;
-use daemon::options::MediaConfig;
 use daemon::output::OutputParams;
 use daemon::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
-use models::ModelDescription;
-use models::video::DenoiserInfo;
-use models::video::ServedCanvas;
-use models::video::plan::{ProcessorConfig, canvas};
+use processing::{Catalogue, ChatProfile, Family, ReasoningFormat, Serving, ToolCallFormat};
 use proto::request::{GenerationLimits, GenerationRequest};
 use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
@@ -46,89 +40,26 @@ const SPECIAL_TOKENS: &[&str] = &[
     "</answer>",
 ];
 
-/// What a released base denoiser reports in its handshake: text-to-video
-/// over every canvas of the canvas rule, on the 50-point schedule.
-fn base_denoiser() -> DenoiserInfo {
-    DenoiserInfo {
-        tasks: vec!["t2va".to_owned()],
-        schedule_points: 50,
-        video_shift: 12.0,
-        audio_shift: 3.0,
-        frame_rate: 24,
-        audio_sample_rate: 32_000,
-        frames: models::video::FrameClips {
-            min_frames: 22,
-            clip_frames: 17,
-            clip_latent_frames: 5,
-            tail_latent_frames: 2,
-        },
-        // The canvas rule's canvas of each named ratio, at 768p.
-        canvases: [(21, 9), (16, 9), (4, 3), (1, 1), (3, 4), (9, 16)]
-            .map(|(width, height): (u32, u32)| ServedCanvas {
-                short_edge: 768,
-                aspect_ratio: format!("{width}:{height}"),
-                canvas: canvas(f64::from(width), f64::from(height)).unwrap(),
-            })
-            .to_vec(),
-        references: models::video::ReferenceLimits::default(),
-        condition_packing: models::video::ConditionPacking::default(),
-    }
-}
+/// A chat family of Qwen3's `model_type`s whose outputs are parsed in its formats.
+const CHAT: Family = Family {
+    id: "chat",
+    model_types: &["qwen3", "qwen3_moe"],
+    pipeline_classes: &[],
+    serving: Serving::Chat(ChatProfile {
+        reasoning: Some(ReasoningFormat::Qwen3),
+        tool_calls: Some(ToolCallFormat::Qwen3),
+    }),
+};
 
-/// The video service of `denoiser` with a `max_video_seconds` capacity, the
-/// released checkpoint's Qwen3-VL processor geometry, a one-rank latent
-/// encoder and the default media policy.
-fn video_service(
-    denoiser: DenoiserInfo,
-    max_video_seconds: f64,
-    tokenizer: &DynTokenizer,
-) -> VideoService {
-    VideoService::new(
-        denoiser,
-        ProcessorConfig {
-            patch_size: 16,
-            temporal_patch_size: 2,
-            merge_size: 2,
-            image_min_pixels: 65_536,
-            image_max_pixels: 16_777_216,
-            video_min_pixels: 4_096,
-            video_max_pixels: 25_165_824,
-        },
-        max_video_seconds,
-        1,
-        &MediaConfig::default(),
-        // A text-to-video denoiser takes no references to size.
-        models::video::plan::ReferenceConfig::new(&models::video::ReferenceLimits::default()),
-        Arc::clone(tokenizer),
-    )
-    .unwrap()
-}
-
-/// A t2va request body with `fields` merged over a 5-second 16:9 target.
-fn video_request(fields: serde_json::Value) -> VideoGenerationRequest {
-    let mut body = serde_json::json!({
-        "model": "minimax_h3",
-        "prompt": "exact token sequence",
-        "task": "t2va",
-        "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0},
-    });
-    body.as_object_mut()
-        .unwrap()
-        .extend(fields.as_object().unwrap().clone());
-    serde_json::from_value(body).unwrap()
-}
-
-/// Resolves `description` over a synthetic checkpoint with worker limits that
-/// cover every generation feature; see `try_resolved_model`.
-fn resolved_model(
-    description: ModelDescription,
-    model_type: &str,
-) -> (tempfile::TempDir, DynTokenizer, InputProcessor) {
-    try_resolved_model(description, model_type, runtime_limits()).unwrap()
+/// Resolves a chat checkpoint of `model_type` over a synthetic checkpoint with
+/// worker limits that cover every generation feature; see
+/// `try_resolved_model`.
+fn resolved_model(model_type: &str) -> (tempfile::TempDir, DynTokenizer, InputProcessor) {
+    try_resolved_model(model_type, runtime_limits()).unwrap()
 }
 
 /// Writes a synthetic checkpoint to a temporary directory and binds an
-/// `InputProcessor` for `description` over it with the given worker limits.
+/// `InputProcessor` for it with the given worker limits.
 ///
 /// The tokenizer maps each ASCII code point from 1 to 127 to one token whose
 /// ID is the code point (no merges), plus `SPECIAL_TOKENS`, so outside the
@@ -141,7 +72,6 @@ fn resolved_model(
 /// Returns the `InputProcessor::new` error, for example when `limits` do not
 /// cover a feature the profile needs. Other setup failures panic.
 fn try_resolved_model(
-    description: ModelDescription,
     model_type: &str,
     limits: GenerationLimits,
 ) -> Result<(tempfile::TempDir, DynTokenizer, InputProcessor), ModelResolutionError> {
@@ -204,28 +134,17 @@ fn try_resolved_model(
         Some(ChatTemplateContentFormat::String),
     )
     .unwrap();
-    // A diffusers pipeline checkpoint has no root `config.json`, so MiniMax H3
-    // is built by `ModelConfig::from_pipeline` and served by a video service
-    // with the server's default 15-second maximum video duration.
-    let config = match description {
-        ModelDescription::MiniMaxH3 => ModelConfig::from_pipeline(description, Some(4096)).unwrap(),
-        _ => tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(ModelConfig::from_files(
-                directory.path().to_str().unwrap(),
-                &files,
-                Some(4096),
-                tokenizer.as_ref(),
-            ))
-            .unwrap(),
-    };
-    let renderer = match description {
-        ModelDescription::MiniMaxH3 => {
-            RequestRenderer::Video(video_service(base_denoiser(), 15.0, &tokenizer))
-        }
-        _ => RequestRenderer::Chat(renderer),
-    };
+    let config = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(ModelConfig::from_files(
+            &Catalogue::new([CHAT]).unwrap(),
+            &files,
+            Some(4096),
+            tokenizer.as_ref(),
+        ))
+        .unwrap();
+    let renderer = RequestRenderer::Chat(renderer);
     let model = InputProcessor::new(config, Arc::clone(&tokenizer), renderer, limits, true)?;
     Ok((directory, tokenizer, model))
 }
@@ -263,29 +182,6 @@ fn preprocess_chat(
         .map_err(ApiError::from)
 }
 
-/// Processes a video request through the processor's video service, as
-/// `Engine::generate_video` does.
-async fn preprocess_video(
-    processor: &InputProcessor,
-    request_id: &str,
-    request: &VideoGenerationRequest,
-) -> Result<
-    (
-        proto::request::DiffusionRequest,
-        daemon::input::video::ProcessedVideo,
-    ),
-    ApiError,
-> {
-    processor
-        .video_service()
-        .expect("the processor serves video")
-        .process(request_id, request, processor.config().max_model_len)
-        .await
-        // No worker reads the published condition media here.
-        .map(|(request, video, _media)| (request, video))
-        .map_err(ApiError::from)
-}
-
 /// A single-turn text chat request to the served model, with the wire
 /// `fields` set on top.
 fn chat_request(fields: serde_json::Value) -> daemon::openai::ChatCompletionRequest {
@@ -310,7 +206,7 @@ fn model_resolution_refuses_a_missing_runtime_branch() {
     limits
         .features
         .remove(proto::request::GenerationFeatures::UNDERSTANDING);
-    let error = match try_resolved_model(ModelDescription::Qwen3, "qwen3", limits) {
+    let error = match try_resolved_model("qwen3", limits) {
         Ok(_) => panic!("incomplete worker limits must fail model resolution"),
         Err(error) => error,
     };
@@ -320,260 +216,9 @@ fn model_resolution_refuses_a_missing_runtime_branch() {
     );
 }
 
-#[tokio::test]
-async fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment() {
-    let (_directory, tokenizer, model) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
-    let id = String::from("video");
-    let prepare = |fields: serde_json::Value| {
-        let request = video_request(fields);
-        let model = &model;
-        let id = &id;
-        async move { preprocess_video(model, id, &request).await }
-    };
-
-    // The t2va presentation is the prompt tokenized without chat framing.
-    // The seed defaults to the reference's 42. Five seconds are 120 frames at 24 fps,
-    // which extend upward to the next count of the form `17n + 5`: 124
-    // frames, decoded as seven 17-frame units plus a tail.
-    let (request, accepted) = prepare(serde_json::json!({})).await.unwrap();
-    assert_eq!(
-        request.prompt_token_ids,
-        tokenizer.encode("exact token sequence", false).unwrap()
-    );
-    let sampling = request.sampling;
-    assert_eq!(sampling.seed, 42);
-    assert_eq!((sampling.num_frames, sampling.video_units), (124, 7));
-    assert_eq!((sampling.width, sampling.height), (1344, 768));
-    assert_eq!(accepted.duration_seconds, 5.0);
-    let (seeded, _) = prepare(serde_json::json!({"seed": 17})).await.unwrap();
-    assert_eq!(seeded.sampling.seed, 17);
-
-    // The admitted interval is [4, 15] seconds inclusive. Fractional
-    // durations round half to even before alignment: 5.1875 s is 124.5
-    // frames, which rounds to 124 and keeps 124 output frames, where rounding
-    // away from zero would reach 125 and extend to 141. 7.3 s is 175.2 frames
-    // and 175 is already aligned.
-    for (seconds, frames) in [
-        (4.0, 107),
-        (4.25, 107),
-        (5.1875, 124),
-        (7.3, 175),
-        (10.0, 243),
-        (14.0, 345),
-        (15.0, 362),
-    ] {
-        let target = serde_json::json!({
-            "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": seconds}
-        });
-        let sampling = prepare(target).await.unwrap().0.sampling;
-        assert_eq!(sampling.num_frames, frames, "{seconds} s");
-        assert_eq!(sampling.video_units, (frames - 5) / 17, "{seconds} s");
-    }
-
-    // The canvas follows the named aspect ratio; `auto` is 16:9.
-    for (ratio, canvas) in [
-        ("auto", (1344, 768)),
-        ("21:9", (1536, 672)),
-        ("4:3", (1024, 768)),
-        ("1:1", (768, 768)),
-        ("3:4", (768, 1024)),
-        ("9:16", (768, 1344)),
-    ] {
-        let target = serde_json::json!({
-            "target": {"short_edge": 768, "aspect_ratio": ratio, "duration_seconds": 5.0}
-        });
-        let (_, prepared) = prepare(target).await.unwrap();
-        assert_eq!(
-            (prepared.canvas.width, prepared.canvas.height),
-            canvas,
-            "{ratio}"
-        );
-    }
-
-    // A blank prompt, and a task the served denoiser does not serve, are
-    // refused naming their field.
-    for (fields, param) in [
-        (serde_json::json!({"prompt": "  "}), "prompt"),
-        (serde_json::json!({"task": "fl2va"}), "task"),
-    ] {
-        let error = prepare(fields.clone()).await.unwrap_err();
-        assert!(
-            matches!(
-                error,
-                daemon::openai::ApiError::InvalidRequest { param: Some(name), .. }
-                    if name == param
-            ),
-            "{fields}: {error:?}"
-        );
-    }
-
-    // The target alone sets the duration and canvas: a t2va request needs a
-    // duration within the finite [4, 15] second range and the 768 short edge.
-    for target in [
-        serde_json::json!({"short_edge": 768, "aspect_ratio": "16:9"}),
-        serde_json::json!({"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 3.99}),
-        serde_json::json!({"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 15.01}),
-        serde_json::json!({"short_edge": 720, "aspect_ratio": "16:9", "duration_seconds": 5.0}),
-        serde_json::json!({"short_edge": 768, "aspect_ratio": "2:1", "duration_seconds": 5.0}),
-    ] {
-        let error = prepare(serde_json::json!({"target": target}))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                daemon::openai::ApiError::InvalidRequest { param: Some(name), .. }
-                    if name.starts_with("target.")
-            ),
-            "{target}: {error:?}"
-        );
-    }
-}
-
-/// A FastH3 DMD deployment serves the training buckets its workers prepared,
-/// on the export's own schedule: other canvases are refused, and the
-/// capabilities report the canvases with the names that select them, the
-/// short edges and ratios they serve, the schedule and the deployment's
-/// duration capacity.
-#[tokio::test]
-async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
-    let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
-    let canvas = |width, height| models::video::Canvas { width, height };
-    let served = |short_edge, aspect_ratio: &str, width, height| ServedCanvas {
-        short_edge,
-        aspect_ratio: aspect_ratio.to_owned(),
-        canvas: canvas(width, height),
-    };
-    // 768p 16:9, then 480p 21:9 and 16:9.
-    let denoiser = DenoiserInfo {
-        tasks: vec!["t2va".to_owned()],
-        schedule_points: 9,
-        video_shift: 10.0,
-        audio_shift: 3.0,
-        frame_rate: 24,
-        audio_sample_rate: 32_000,
-        frames: models::video::FrameClips {
-            min_frames: 22,
-            clip_frames: 17,
-            clip_latent_frames: 5,
-            tail_latent_frames: 2,
-        },
-        canvases: vec![
-            served(768, "16:9", 1344, 768),
-            served(480, "21:9", 992, 416),
-            served(480, "16:9", 832, 480),
-        ],
-        references: models::video::ReferenceLimits::default(),
-        condition_packing: models::video::ConditionPacking::default(),
-    };
-    let model = InputProcessor::new(
-        loaded.config().clone(),
-        Arc::clone(&tokenizer),
-        RequestRenderer::Video(video_service(denoiser, 10.0, &tokenizer)),
-        runtime_limits(),
-        true,
-    )
-    .unwrap();
-    let capabilities = model.video_capabilities();
-    assert_eq!(capabilities["tasks"], serde_json::json!(["t2va"]));
-    assert_eq!(capabilities["min_seconds"], 4.0);
-    assert_eq!(capabilities["max_seconds"], 10.0);
-    assert_eq!(capabilities["model_max_seconds"], 15.0);
-    assert_eq!(capabilities["fps"], 24);
-    assert_eq!(
-        capabilities["canvas"]["canvases"],
-        serde_json::json!([
-            {"short_edge": 768, "aspect_ratio": "16:9", "width": 1344, "height": 768},
-            {"short_edge": 480, "aspect_ratio": "21:9", "width": 992, "height": 416},
-            {"short_edge": 480, "aspect_ratio": "16:9", "width": 832, "height": 480},
-        ])
-    );
-    assert_eq!(
-        capabilities["canvas"]["short_edges"],
-        serde_json::json!([768, 480])
-    );
-    assert_eq!(
-        capabilities["canvas"]["aspect_ratios"],
-        serde_json::json!(["16:9", "21:9"])
-    );
-    assert_eq!(
-        capabilities["canvas"]["sizes"],
-        serde_json::json!({
-            "768": {"16:9": {"width": 1344, "height": 768}},
-            "480": {
-                "21:9": {"width": 992, "height": 416},
-                "16:9": {"width": 832, "height": 480},
-            },
-        })
-    );
-    assert_eq!(
-        capabilities["schedule"],
-        serde_json::json!({"num_inference_steps": 9, "flow_shift": 10.0, "audio_flow_shift": 3.0})
-    );
-    assert_eq!(capabilities["max_prompt_tokens"], 4096);
-
-    let id = String::from("capacity");
-    let (request, prepared) = preprocess_video(
-        &model,
-        &id,
-        &video_request(serde_json::json!({
-            "target": {"short_edge": 768, "aspect_ratio": "auto", "duration_seconds": 10.0}
-        })),
-    )
-    .await
-    .unwrap();
-    assert_eq!(request.sampling.num_frames, 243);
-    assert_eq!(prepared.num_frames, 243);
-    // The checkpoint's nine sigma points fix eight evaluations per request.
-    assert_eq!(model.video_service().unwrap().num_inference_steps(), 8);
-    assert_eq!(prepared.canvas, canvas(1344, 768));
-
-    // A 480 short edge names the 480p training bucket of the ratio.
-    let (narrow_request, narrow) = preprocess_video(
-        &model,
-        &id,
-        &video_request(serde_json::json!({
-            "target": {"short_edge": 480, "aspect_ratio": "21:9", "duration_seconds": 5.0}
-        })),
-    )
-    .await
-    .unwrap();
-    assert_eq!(narrow.canvas, canvas(992, 416));
-    assert_eq!(
-        (
-            narrow_request.sampling.width,
-            narrow_request.sampling.height
-        ),
-        (992, 416)
-    );
-
-    // A duration beyond the capacity, an unprepared bucket at either short
-    // edge, and an unserved short edge are refused.
-    for target in [
-        serde_json::json!({"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 10.5}),
-        serde_json::json!({"short_edge": 768, "aspect_ratio": "9:16", "duration_seconds": 5.0}),
-        serde_json::json!({"short_edge": 768, "aspect_ratio": "21:9", "duration_seconds": 5.0}),
-        serde_json::json!({"short_edge": 480, "aspect_ratio": "1:1", "duration_seconds": 5.0}),
-        serde_json::json!({"short_edge": 720, "aspect_ratio": "16:9", "duration_seconds": 5.0}),
-    ] {
-        assert!(
-            preprocess_video(
-                &model,
-                &id,
-                &video_request(serde_json::json!({"target": target}))
-            )
-            .await
-            .is_err(),
-            "{target}"
-        );
-    }
-}
-
-/// Text preprocessing refuses a prompt longer than the model's
-/// `max_model_len`.
 #[test]
 fn context_length_limits_preprocessed_requests() {
-    let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::Qwen3, "qwen3");
+    let (_directory, tokenizer, loaded) = resolved_model("qwen3");
     let renderer = HfChatRenderer::new(
         Some(CHAT_TEMPLATE.to_string()),
         HashMap::new(),
@@ -612,7 +257,7 @@ fn context_length_limits_preprocessed_requests() {
 /// length is rejected rather than replaced by the 128-token checkpoint default.
 #[test]
 fn sampling_defaults_preserve_explicit_zero_controls() {
-    let (_directory, _tokenizer, model) = resolved_model(ModelDescription::Qwen3, "qwen3");
+    let (_directory, _tokenizer, model) = resolved_model("qwen3");
     let mut request: daemon::openai::ChatCompletionRequest =
         serde_json::from_value(serde_json::json!({
             "model": SERVED_MODEL, "messages": [{"role": "user", "content": "hello"}]
@@ -656,7 +301,7 @@ fn sampling_defaults_preserve_explicit_zero_controls() {
 /// prompt positions whose logprobs are requested.
 #[test]
 fn cache_salt_isolates_and_prompt_logprobs_disable_cache_reads() {
-    let (_directory, _tokenizer, processor) = resolved_model(ModelDescription::Qwen3, "qwen3");
+    let (_directory, _tokenizer, processor) = resolved_model("qwen3");
     let preprocess = |fields: serde_json::Value| {
         preprocess_chat(
             &processor,
@@ -691,7 +336,7 @@ fn cache_salt_isolates_and_prompt_logprobs_disable_cache_reads() {
 /// the same buffered request still requests them.
 #[test]
 fn streamed_chat_does_not_request_undeliverable_prompt_logprobs() {
-    let (_directory, _tokenizer, processor) = resolved_model(ModelDescription::Qwen3, "qwen3");
+    let (_directory, _tokenizer, processor) = resolved_model("qwen3");
     for stream in [true, false] {
         let request: daemon::openai::ChatCompletionRequest =
             serde_json::from_value(serde_json::json!({
@@ -733,7 +378,7 @@ const XML_CALL_TEMPLATE: &str = "{%- if tools -%}<|im_start|>system\n# Tools\n<t
 
 /// Rebinds a resolved Qwen3-family model to `template`.
 fn with_template(model_type: &str, template: &str) -> InputProcessor {
-    let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::Qwen3, model_type);
+    let (_directory, tokenizer, loaded) = resolved_model(model_type);
     let renderer = HfChatRenderer::new(
         Some(template.to_string()),
         HashMap::new(),
@@ -755,7 +400,7 @@ fn with_template(model_type: &str, template: &str) -> InputProcessor {
 /// refusal, not a text answer.
 #[test]
 fn a_chat_request_for_image_output_is_refused_by_name() {
-    let (_directory, _tokenizer, processor) = resolved_model(ModelDescription::Qwen3, "qwen3");
+    let (_directory, _tokenizer, processor) = resolved_model("qwen3");
     for modalities in [vec!["image"], vec!["text", "image"]] {
         let request: daemon::openai::ChatCompletionRequest =
             serde_json::from_value(serde_json::json!({
@@ -828,7 +473,7 @@ fn qwen3_family_declares_tool_calling_only_for_json_calls() {
 /// (`u32::MAX`).
 #[test]
 fn negative_seeds_and_logprob_counts_are_reinterpreted() {
-    let (_directory, _, model) = resolved_model(ModelDescription::Qwen3, "qwen3");
+    let (_directory, _, model) = resolved_model("qwen3");
     for seed in [-1, -2] {
         let (request, _) = preprocess_chat(
             &model,

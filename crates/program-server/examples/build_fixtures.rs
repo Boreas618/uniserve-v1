@@ -79,7 +79,7 @@ fn run_with(options: Options) -> Result<(), String> {
         limits: Limits::default(),
         toolchains: ToolchainConfig {
             nvcc: options.nvcc.clone(),
-            python,
+            python: Some(python),
             wasm: None,
             cargo: None,
             max_jobs: options.jobs,

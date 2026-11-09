@@ -1,10 +1,11 @@
-"""The MiniMax-H3 base checkpoint serves text-to-video on every named canvas.
+"""The MiniMax-H3 base checkpoint serves text-to-video at every 768p size.
 
 Serves the diffusers root's ``transformer`` on the published Ulysses-4
-deployment, preparing every named aspect ratio of the canvas rule, and
-requests one five-second ``t2va`` video at each. Every response is a complete
-MP4 at the ratio's canvas; the capabilities report the handshake's schedule
-and the prepared canvases, and the request body without a task is refused.
+deployment, serving the 768p size of every aspect ratio the model names, and
+requests one 124-frame ``t2va`` video at each. Every response is a complete
+MP4 at the requested size whose headers report the generated shape; the
+capabilities report the handshake's schedule, and a body naming a task is
+refused.
 """
 
 from __future__ import annotations
@@ -23,24 +24,27 @@ from tests.python.e2e.http_helpers import (
     t2va_request,
     worker_executable,
 )
-from uniserve_eval import video_rules
 from uniserve_eval.transport.video import inspect_video_bytes
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("minimax_h3")]
 
 
-def test_base_text_to_video_on_every_named_canvas(tmp_path: Path) -> None:
+def test_base_text_to_video_at_every_768p_size(tmp_path: Path) -> None:
     model = os.environ.get("UNISERVE_MINIMAX_H3_MODEL")
     if not model or not Path(model).is_dir():
         pytest.fail(
             "UNISERVE_MINIMAX_H3_MODEL must name a MiniMax-H3 diffusers root"
         )
-    # The base checkpoint's canvas of each named aspect ratio at 768p, as the
-    # request rules answer them.
-    canvases = {
-        f"{width}:{height}": video_rules.canvas(width, height)
-        for width, height in video_rules.NAMED_ASPECT_RATIOS
-    }
+    # The 768p canvas of each aspect ratio MiniMax-H3 names: 21:9, 16:9, 4:3,
+    # 1:1, 3:4 and 9:16.
+    sizes = [
+        "1536x672",
+        "1344x768",
+        "1024x768",
+        "768x768",
+        "768x1024",
+        "768x1344",
+    ]
     deployment = (
         Path(__file__).resolve().parents[3]
         / "configs"
@@ -62,9 +66,9 @@ def test_base_text_to_video_on_every_named_canvas(tmp_path: Path) -> None:
         "--port",
         str(port),
         # Five seconds bound the layouts startup prepares: two frame counts
-        # at each of the six canvases and one text capacity.
+        # at each of the six sizes and one text capacity.
         "--set",
-        f"video_config.aspect_ratios={','.join(canvases)}",
+        f"video_config.sizes={','.join(sizes)}",
         "--set",
         "video_config.max_seconds=5",
         "--max-model-len",
@@ -78,57 +82,53 @@ def test_base_text_to_video_on_every_named_canvas(tmp_path: Path) -> None:
         server_process(command, base, tmp_path / "server.log", timeout_s=3600),
         httpx.Client(base_url=base, timeout=1800) as client,
     ):
-        video = client.get("/v1/capabilities").json()["video"]
+        video = client.get("/v1/capabilities").json()["video"]["model"]
         # The base DiT generates from the prompt alone and from keyframes.
         assert video["tasks"] == ["t2va", "fl2va"]
+        # The released schedule's 50 sigma points are 49 denoiser evaluations.
+        assert video["num_inference_steps"] == 49
         assert video["schedule"] == {
-            "num_inference_steps": 50,
             "flow_shift": 12.0,
             "audio_flow_shift": 3.0,
         }
-        assert video["canvas"]["canvases"] == [
-            {
-                "short_edge": 768,
-                "aspect_ratio": ratio,
-                "width": width,
-                "height": height,
-            }
-            for ratio, (width, height) in canvases.items()
-        ]
-        assert video["canvas"]["short_edges"] == [768]
-        assert video["canvas"]["aspect_ratios"] == list(canvases)
 
-        legacy = client.post(
+        # The request API derives the task from the references; a body that
+        # names one carries an unknown field.
+        named = client.post(
             "/v1/videos/sync",
-            json={"model": "MiniMax-H3", "prompt": prompt, "seconds": 5},
+            json={
+                **t2va_request("MiniMax-H3", prompt, 124, 42),
+                "task": "t2va",
+            },
         )
-        assert legacy.status_code == 400
-        assert "task" in legacy.json()["error"]["message"]
+        assert named.status_code == 400
+        assert "task" in named.json()["error"]["message"]
 
-        for ratio, (width, height) in canvases.items():
+        for size in sizes:
+            width, height = (int(side) for side in size.split("x"))
             response = client.post(
                 "/v1/videos/sync",
-                json=t2va_request(
-                    "MiniMax-H3", prompt, 5.0, 42, aspect_ratio=ratio
-                ),
+                json=t2va_request("MiniMax-H3", prompt, 124, 42, size=size),
             )
-            assert response.status_code == 200, (ratio, response.text)
+            assert response.status_code == 200, (size, response.text)
+            assert (
+                response.headers["x-video-size"],
+                response.headers["x-video-num-frames"],
+                response.headers["x-video-fps"],
+            ) == (size, "124", "24")
             media = inspect_video_bytes(
                 response.content,
                 declared_mime=response.headers["content-type"],
             )
-            (tmp_path / f"{ratio.replace(':', 'x')}.mp4").write_bytes(
-                response.content
-            )
-            assert (media.width, media.height) == (width, height), ratio
-            # Five seconds at 24 fps align up to 124 frames.
-            assert media.frame_count == 124, ratio
+            (tmp_path / f"{size}.mp4").write_bytes(response.content)
+            assert (media.width, media.height) == (width, height), size
+            assert media.frame_count == 124, size
             assert media.fps_numerator == 24 * media.fps_denominator
             assert media.video_codec == "h264"
             assert (media.audio_codec, media.audio_channels) == ("aac", 2)
             assert media.audio_sample_rate == 32_000
             assert abs(media.audio_duration_s - 124 / 24) <= 1 / 24
-            assert media.video_variance > 0 and media.audio_rms > 0, ratio
+            assert media.video_variance > 0 and media.audio_rms > 0, size
 
             # The server reports each generation phase it observed, from
             # scheduling to completion; the phases tile the inference time.
@@ -139,8 +139,8 @@ def test_base_text_to_video_on_every_named_canvas(tmp_path: Path) -> None:
                 "denoising",
                 "decoding",
                 "finalizing",
-            }, ratio
+            }, size
             assert min(stages.values()) >= 0
             assert stages["denoising"] > stages["decoding"] > 0
             inference = float(response.headers["x-inference-time-s"])
-            assert abs(sum(stages.values()) - inference) <= 0.01, ratio
+            assert abs(sum(stages.values()) - inference) <= 0.01, size

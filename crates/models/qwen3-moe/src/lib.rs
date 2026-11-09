@@ -19,10 +19,12 @@
 //! tensor views, and every device operation is a call to a layer.
 
 pub mod config;
+pub mod family;
 pub mod keys;
 pub mod load;
 pub mod model;
 pub mod partition;
+pub mod processing;
 pub mod reference;
 pub mod representation;
 pub mod weights;

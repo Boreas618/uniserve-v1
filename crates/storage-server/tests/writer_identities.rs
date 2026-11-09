@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use storage::{
-    Access, Claim, Client, Error, Key, Mode, Role, Scope, StorageRecord, TensorRecord, socket,
+    Access, Claim, Client, Error, Key, Mode, Role, Scope, StorageRecord, TensorRecord,
 };
 use storage_server::Server;
 
@@ -57,7 +57,7 @@ impl Running {
     fn start() -> Self {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let socket = directory.path().join("storage.sock");
-        let (listener, lock) = socket::bind(&socket)
+        let (listener, lock) = service::bind(&socket)
             .expect("a bound socket")
             .expect("no server");
         let mut ends = [0; 2];

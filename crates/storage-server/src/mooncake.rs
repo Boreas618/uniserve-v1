@@ -2,7 +2,7 @@
 //! page pools.
 //!
 //! The Storage Server runs the connector as a child process
-//! (`uniserve storage connector`), so that a fault in Mooncake ends
+//! (`uniserve storage-server connector`), so that a fault in Mooncake ends
 //! the connector and never the server; the server starts it again. The
 //! connector connects to the server as [`Role::Connector`], maps every page
 //! pool the server sends it, registers each with Mooncake
