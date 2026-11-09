@@ -410,8 +410,8 @@ pub const MINIMUM_OVERLAP: u32 = 64;
 
 use nn::Forward;
 use nn::layers::{
-    Attention, Bias, Cast, Epilogue, LayerNorm, Linear, MergedColumnLinear, PackedSwiGlu, Parallel,
-    ResidualStream, RmsNorm, Rotary, Rows, Sections,
+    Attention, Bias, Cast, Epilogue, GateBias, GatedActivation, Halves, LayerNorm, Linear,
+    MergedColumnLinear, Parallel, ResidualStream, RmsNorm, Rotary, Rounding, Rows, Sections,
 };
 use nn::weights::{Weight, WeightLoader};
 use nn::{DType, DecodedMedia, Decoder, Shape, StateTable, TableValues, TensorView};
@@ -439,7 +439,7 @@ struct Layer {
     /// `scale1`, then the second normalization.
     attended: RmsNorm,
     gate_up: Linear,
-    gated: PackedSwiGlu,
+    gated: GatedActivation,
     down: Linear,
     /// `scale2`, then the next layer's first normalization; the last layer folds into `last`.
     fed: Option<RmsNorm>,
@@ -809,7 +809,11 @@ impl VideoDecoder {
                 // The feed-forward's projection is packed: its rows hold the value half and then the
                 // gate half, so it is twice the feed-forward's width.
                 gate_up: projection("ff.net.0.proj", width, 2 * ffn)?,
-                gated: PackedSwiGlu::new(None)?,
+                gated: GatedActivation::new(
+                    ops::activation::Activation::Silu,
+                    Rounding::ValueProduct,
+                    GateBias::None,
+                )?,
                 down: projection("ff.net.2", ffn, width)?,
                 fed,
             });
@@ -1143,7 +1147,7 @@ impl VideoDecoder {
             layer.output.forward(f, attended, update)?;
             layer.attended.forward(f, update, stream, normalized)?;
             layer.gate_up.forward(f, normalized, gate_up)?;
-            layer.gated.forward(f, gate_up, gated, None)?;
+            layer.gated.forward(f, Halves::ValueFirst(gate_up), gated)?;
             layer.down.forward(f, gated, update)?;
             if let Some(fed) = &layer.fed {
                 fed.forward(f, update, stream, normalized)?;

@@ -731,7 +731,8 @@ pub fn padded_samples(samples: u64, hop: u64) -> Result<u64> {
 use nn::Forward;
 use nn::layers::{
     AdaptivePool, Attention, Conv1d, Conv3d, ConvGeometry, FrameMoments, FrameNormPad, FramePad,
-    GatedActivation, LayerNorm, Linear, Posterior, Residual, Snake, Transpose, WeightOrder,
+    GateBias, GatedActivation, Halves, LayerNorm, Linear, Posterior, Residual, Rounding, Snake,
+    Transpose, WeightOrder,
 };
 use nn::weights::{Scope, Weight, WeightLoader};
 use nn::{DType, Shape, Strides, TensorView};
@@ -2305,7 +2306,11 @@ impl GeGlu {
             gate,
             value,
             output,
-            product: GatedActivation::new(ops::activation::Activation::GeluTanh),
+            product: GatedActivation::new(
+                ops::activation::Activation::GeluTanh,
+                Rounding::Fused,
+                GateBias::None,
+            )?,
         })
     }
 
@@ -2327,7 +2332,8 @@ impl GeGlu {
         let product = f
             .arena()
             .tensor(DType::F32, Shape::new(&[frames, hidden]))?;
-        self.product.forward(f, gate, value, product)?;
+        self.product
+            .forward(f, Halves::Split { gate, value }, product)?;
         Ok(self.output.forward(f, product, out)?)
     }
 }

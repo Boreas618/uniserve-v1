@@ -49,7 +49,7 @@ mod tile_stitch;
 mod transpose;
 mod unpatchify;
 
-pub use activation::{GatedActivation, Gelu, PackedSwiGlu, Silu, Snake, SwiGlu};
+pub use activation::{GateBias, GatedActivation, Gelu, Halves, Rounding, Silu, Snake};
 pub use attention::{Attention, AttentionBackend, TRTLLM_WORKSPACE_BYTES};
 pub use audio::AudioActivation;
 pub use bias::BiasAdd;

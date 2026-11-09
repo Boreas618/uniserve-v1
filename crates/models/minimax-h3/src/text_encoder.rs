@@ -40,8 +40,9 @@ use nn::capability::{
 };
 use nn::family::Split;
 use nn::layers::{
-    Attention, Bias, GatedActivation, Linear, Parallel, QkvBias, QkvLinear, QkvNames, QkvSpec,
-    Residual, ResidualStream, RmsNorm, Rotary, Rows, Sections, VocabParallelEmbedding,
+    Attention, Bias, GateBias, GatedActivation, Halves, Linear, Parallel, QkvBias, QkvLinear,
+    QkvNames, QkvSpec, Residual, ResidualStream, RmsNorm, Rotary, Rounding, Rows, Sections,
+    VocabParallelEmbedding,
 };
 use nn::weights::{Scope, WeightLoader};
 use nn::{Arena, Forward, Shape, TensorView, Weight};
@@ -549,9 +550,11 @@ impl Layer {
         self.up
             .forward(f, buffers.normalized, buffers.up)
             .map_err(Error::from)?;
-        encoder
-            .activation
-            .forward(f, buffers.gate, buffers.up, buffers.activated)?;
+        let halves = Halves::Split {
+            gate: buffers.gate,
+            value: buffers.up,
+        };
+        encoder.activation.forward(f, halves, buffers.activated)?;
         Ok(self.down.forward(f, buffers.activated, buffers.down)?)
     }
 }
@@ -649,7 +652,8 @@ impl TextEncoder {
             layers,
             tower: VisionTower::load(loader, &config.vision, dtype)?,
             rows: Rows::new(dtype, hidden).map_err(Error::from)?,
-            activation: GatedActivation::new(ACTIVATION),
+            activation: GatedActivation::new(ACTIVATION, Rounding::Fused, GateBias::None)
+                .map_err(Error::from)?,
             // Every sub-layer's output joins the stream unscaled.
             residual: Residual::default(),
             deepstack_layers,

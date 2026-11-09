@@ -24,8 +24,8 @@
 
 use nn::family::Split;
 use nn::layers::{
-    Attention, Bias, GatedActivation, Linear, Parallel, QkvBias, QkvLinear, QkvNames, QkvSpec,
-    Residual, RmsNorm,
+    Attention, Bias, GateBias, GatedActivation, Halves, Linear, Parallel, QkvBias, QkvLinear,
+    QkvNames, QkvSpec, Residual, RmsNorm, Rounding,
 };
 use nn::weights::WeightLoader;
 use nn::{Forward, Shape, TensorView};
@@ -57,7 +57,7 @@ pub struct RefinerBlock {
     output: Linear,
     gate_up: Linear,
     down: Linear,
-    /// The stepwise gated activation (`GatedActivation::with_stepwise`): the refiner rounds
+    /// The stepwise gated activation (`Rounding::Stepwise`): the refiner rounds
     /// `silu(gate)` and the product one step at a time.
     gated: GatedActivation,
     attention: Attention,
@@ -147,7 +147,11 @@ impl RefinerBlock {
             output,
             gate_up,
             down,
-            gated: GatedActivation::new(ops::activation::Activation::Silu).with_stepwise(),
+            gated: GatedActivation::new(
+                ops::activation::Activation::Silu,
+                Rounding::Stepwise,
+                GateBias::None,
+            )?,
             attention,
             residual: Residual::default(),
             hidden_size: config.hidden_size,
@@ -208,8 +212,8 @@ impl RefinerBlock {
         // Feed-forward: normalize, project the packed value and gate halves, gate, project back.
         self.norm2.forward(f, hidden, None, rows.normed)?;
         self.gate_up.forward(f, rows.normed, rows.packed)?;
-        let (value, gate) = crate::transformer::projection_halves(rows.packed);
-        self.gated.forward(f, gate, value, rows.ffn)?;
+        self.gated
+            .forward(f, Halves::ValueFirst(rows.packed), rows.ffn)?;
         self.down.forward(f, rows.ffn, rows.update)?;
         self.residual
             .forward(f, hidden, rows.update, None, hidden)?;

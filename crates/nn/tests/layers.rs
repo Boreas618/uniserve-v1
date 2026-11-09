@@ -7,9 +7,10 @@
 //! region that is never read, because construction only inspects extents and strides.
 
 use nn::{
-    AdaptivePool, Arena, Conv3d, ConvGeometry, DType, DevicePtr, Epilogue, Forward, FrameNormPad,
-    KvGroup, KvPlanes, KvView, LayerNorm, Linear, Modulation, Patch, Residual, ResidualStream,
-    RmsNorm, Rotary, Rotate, Rotation, Scale, Shape, Snake, SwiGlu, TensorView, VsaTiles, Weight,
+    Activation, AdaptivePool, Arena, Conv3d, ConvGeometry, DType, DevicePtr, Epilogue, Forward,
+    FrameNormPad, GateBias, GatedActivation, Halves, KvGroup, KvPlanes, KvView, LayerNorm, Linear,
+    Modulation, Patch, Residual, ResidualStream, RmsNorm, Rotary, Rotate, Rotation, Rounding,
+    Scale, Shape, Snake, TensorView, VsaTiles, Weight,
 };
 use ops::gemm::WeightOrder;
 
@@ -238,22 +239,54 @@ fn a_normalization_reads_the_residual_stream_its_epilogue_folds() {
 }
 
 #[test]
-fn the_fused_activation_needs_a_width_and_biases_that_match_it() {
-    assert!(SwiGlu::new(0).is_err());
-    let layer = SwiGlu::new(64).unwrap();
-    assert_eq!(layer.width(), 64);
-
-    assert!(layer.with_biases(Some(weight(&[64])), None).is_ok());
+fn a_gated_product_reads_halves_and_biases_of_its_output_width() {
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let view = |dims: &[u64]| arena.tensor(DType::BF16, Shape::new(dims)).unwrap();
+    let (gate, value, out) = (view(&[3, 64]), view(&[3, 64]), view(&[3, 64]));
+    let bias = |width| {
+        let view = view(&[width]);
+        Weight {
+            backing: nn::Backing::new(view.ptr, width * 2),
+            view,
+        }
+    };
+    let halves = Halves::Split { gate, value };
+    let swiglu = |value: Option<Weight>| {
+        GatedActivation::new(
+            Activation::Silu,
+            Rounding::ValueProduct,
+            GateBias::Split { value, gate: None },
+        )
+        .unwrap()
+    };
+    assert!(swiglu(None).forward(&f, halves, out).is_ok());
+    assert!(swiglu(Some(bias(64))).forward(&f, halves, out).is_ok());
+    assert!(swiglu(Some(bias(32))).forward(&f, halves, out).is_err());
     assert!(
-        SwiGlu::new(64)
-            .unwrap()
-            .with_biases(Some(weight(&[32])), None)
+        GatedActivation::new(
+            Activation::Silu,
+            Rounding::ValueProduct,
+            GateBias::Split {
+                value: None,
+                gate: Some(weight(&[64, 2]))
+            },
+        )
+        .is_err()
+    );
+
+    // A packed projection is twice the output's width, and its bias is the packed one.
+    let packed = view(&[3, 128]);
+    let fused = GatedActivation::new(Activation::Silu, Rounding::Fused, GateBias::None).unwrap();
+    assert!(fused.forward(&f, Halves::ValueFirst(packed), out).is_ok());
+    assert!(
+        fused
+            .forward(&f, Halves::ValueFirst(view(&[3, 96])), out)
             .is_err()
     );
     assert!(
-        SwiGlu::new(64)
-            .unwrap()
-            .with_biases(None, Some(weight(&[64, 2])))
+        swiglu(Some(bias(64)))
+            .forward(&f, Halves::ValueFirst(packed), out)
             .is_err()
     );
 }

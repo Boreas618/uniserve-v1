@@ -38,8 +38,8 @@
 
 use nn::capability::{CausalLm, KvView, TokenBatch};
 use nn::layers::{
-    Attention, Linear, Moe, ParallelLMHead, QkvLinear, ResidualStream, RmsNorm, Rotary, SwiGlu,
-    TRTLLM_WORKSPACE_BYTES, VocabParallelEmbedding,
+    Attention, GatedActivation, Halves, Linear, Moe, ParallelLMHead, QkvLinear, ResidualStream,
+    RmsNorm, Rotary, TRTLLM_WORKSPACE_BYTES, VocabParallelEmbedding,
 };
 use nn::weights::Weight;
 use nn::{Arena, DType, Forward, Shape, Strides, TensorView};
@@ -136,7 +136,7 @@ pub(crate) struct DenseMlp {
     pub(crate) gate_proj: Linear,
     pub(crate) up_proj: Linear,
     pub(crate) down_proj: Linear,
-    pub(crate) activation: SwiGlu,
+    pub(crate) activation: GatedActivation,
 }
 
 /// One forward's activation extents, in elements: the widths the forward reserves its buffers at.
@@ -612,8 +612,11 @@ impl DenseMlp {
         self.up_proj.forward(f, normalized, dense.up)?;
         // `silu(gate) · up`, written into the gate buffer: the activation applies to the branch
         // named `gate`, so the argument order is `(f, gate, value, out)` as in every gated layer.
-        self.activation
-            .forward(f, dense.gate, dense.up, dense.gate)?;
+        let halves = Halves::Split {
+            gate: dense.gate,
+            value: dense.up,
+        };
+        self.activation.forward(f, halves, dense.gate)?;
         Ok(self.down_proj.forward(f, dense.gate, out)?)
     }
 }

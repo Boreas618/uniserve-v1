@@ -74,10 +74,10 @@ pub use group::{Group, Transfer};
 pub use layers::{
     Activation, AdaptivePool, Attention, AttentionBackend, AudioActivation, Axpby, Candidates,
     Cast, Conv1d, Conv3d, ConvGeometry, ConvTranspose1d, CrossFade, Epilogue, FrameMoments,
-    FrameNormPad, FramePad, GatedActivation, Gelu, LayerNorm, Linear, Modulation, Moe, Noise,
-    NoiseKey, PackedSwiGlu, ParallelLMHead, Patch, PcmInterleave, Residual, ResidualStream,
-    RgbBytes, RmsNorm, Rotary, Rotate, Rotation, Sampler, SamplerState, Samples, Scale, Sections,
-    SegmentAttention, SegmentTables, Silu, Snake, SwiGlu, TRTLLM_WORKSPACE_BYTES, UlyssesExchange,
+    FrameNormPad, FramePad, GateBias, GatedActivation, Gelu, Halves, LayerNorm, Linear, Modulation,
+    Moe, Noise, NoiseKey, ParallelLMHead, Patch, PcmInterleave, Residual, ResidualStream, RgbBytes,
+    RmsNorm, Rotary, Rotate, Rotation, Rounding, Sampler, SamplerState, Samples, Scale, Sections,
+    SegmentAttention, SegmentTables, Silu, Snake, TRTLLM_WORKSPACE_BYTES, UlyssesExchange,
     VsaTiles, gather_rows,
 };
 pub use ops::PhaseKind;

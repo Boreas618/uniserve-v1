@@ -14,8 +14,9 @@ use std::f64::consts::PI;
 
 use nn::family::Split;
 use nn::layers::{
-    Attention, Bias, ExpertNames, ExpertSlots, Linear, Moe, MoeSpec, Parallel, ParallelLMHead,
-    QkvBias, QkvLinear, QkvNames, QkvSpec, RmsNorm, Rotary, SwiGlu, VocabParallelEmbedding,
+    Attention, Bias, ExpertNames, ExpertSlots, GateBias, GatedActivation, Linear, Moe, MoeSpec,
+    Parallel, ParallelLMHead, QkvBias, QkvLinear, QkvNames, QkvSpec, RmsNorm, Rotary, Rounding,
+    VocabParallelEmbedding,
 };
 use nn::quantization::Declaration;
 use nn::weights::{Scope, WeightLoader};
@@ -336,7 +337,12 @@ fn dense_block(scope: &mut Scope<'_, '_>, tensor: Split, config: &Config) -> Res
         Bias::Absent,
         Parallel::Row(tensor),
     )?;
-    let activation = SwiGlu::new(gate_proj.n())?;
+    // SwiGLU over the two projections' outputs, in the swiglu kernel's value-product order.
+    let activation = GatedActivation::new(
+        ops::activation::Activation::Silu,
+        Rounding::ValueProduct,
+        GateBias::None,
+    )?;
     Ok(DenseMlp {
         gate_proj,
         up_proj,

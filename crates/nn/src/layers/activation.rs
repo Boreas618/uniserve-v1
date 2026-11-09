@@ -1,19 +1,29 @@
-//! The gated activation of a transformer's MLP: the activation of one projection half times the
-//! other.
+//! Activations: the gated activation of a transformer's MLP, and the plain GELU, SiLU and Snake.
 //!
-//! Two packings occur, each an operator of its own (`ops::activation`): [`GatedActivation`] over
-//! two arbitrary views, and [`SwiGlu`] over one packed `[value, gate]` projection with its packed
-//! bias. The H3 block's MLP uses the packed form; the
-//! expert GEMMs use the separate forms.
+//! A gated MLP projects one hidden state into two halves and multiplies the activation of one half
+//! by the other. [`GatedActivation`] states that product once; its [`Rounding`] names the FP32
+//! evaluation order and rounding points a model's baseline uses, and its input comes as two views or
+//! as one packed `[value, gate]` projection ([`Halves`]):
 //!
-//! **Every gated activation in this module may write in place.** `out` may be the same view as one
-//! of its inputs — the reference's own `_swiglu` does exactly that, and a captured graph wants it,
-//! because the arena is fixed at capture and the input buffer is where the result belongs. It is
-//! safe because the activation is elementwise over unit-strided rows: each element is read before it
-//! is written. What is *not* safe is `out` as a shifted view of an input, where a row's write lands
-//! on a position a later read has not reached yet; the operators' shape and stride checks refuse
-//! mismatched extents but cannot see a shift inside one row, so the layer's documentation is the
-//! contract the caller holds.
+//! ```text
+//! Rounding::Fused         out = round(act(gate) · value)                    act_and_mul
+//! Rounding::Stepwise      out = round(round(act(gate)) · value)             act_and_mul
+//! Rounding::ValueProduct  out = round((value · gate) / (1 + exp(−gate)))    swiglu, value_first_swiglu
+//! ```
+//!
+//! The three orders round differently, so a model keeps the one its reference computes: the H3 DiT,
+//! refiner and VAE evaluate the activation and the product as separate rounded steps; the
+//! SwiGLU kernels multiply value and gate before dividing by the sigmoid's denominator. A packed
+//! projection under `ValueProduct` is read in one pass with its packed bias; under `Fused` or
+//! `Stepwise` its halves are read as two strided views of the packed rows.
+//!
+//! **Every gated activation may write in place.** `out` may be the same view as one of its inputs —
+//! the reference's own `_swiglu` does exactly that, and a captured graph wants it, because the arena
+//! is fixed at capture and the input buffer is where the result belongs. It is safe because the
+//! activation is elementwise over unit-strided rows: each element is read before it is written.
+//! What is *not* safe is `out` as a shifted view of an input, where a row's write lands on a position
+//! a later read has not reached yet; the operators' shape and stride checks refuse mismatched extents
+//! but cannot see a shift inside one row, so this documentation is the contract the caller holds.
 
 use ops::DType;
 use ops::TensorView;
@@ -34,195 +44,226 @@ const BLOCK: u32 = 1024;
 /// whole vector of a half-precision row, which is what this memory-bound step runs at.
 const PACKED_BLOCK: u32 = 4096;
 
-/// `out = act(gate) · value` over two views.
+/// The FP32 evaluation order and rounding points of a gated product; see the module table.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Rounding {
+    /// `act(gate) · value` in FP32, rounded once.
+    Fused,
+    /// `act(gate)` rounded to the gate's element type, then the product rounded.
+    Stepwise,
+    /// `(value · gate) / (1 + exp(−gate))` in FP32, rounded once: the SwiGLU kernels' order, SiLU
+    /// only.
+    ValueProduct,
+}
+
+/// The biases a gated product adds to its halves before the activation.
+#[derive(Clone, Copy, Debug)]
+pub enum GateBias {
+    /// No bias.
+    None,
+    /// One `[width]` bias per half of a split input.
+    Split {
+        /// Added to the value half.
+        value: Option<Weight>,
+        /// Added to the gate half.
+        gate: Option<Weight>,
+    },
+    /// One `[2 · width]` bias over a packed `[value, gate]` projection.
+    Packed(Weight),
+}
+
+/// The two halves a gated product reads.
+#[derive(Clone, Copy, Debug)]
+pub enum Halves {
+    /// Two `[rows, width]` views, each with unit stride along its rows.
+    Split {
+        /// The half the activation applies to.
+        gate: TensorView,
+        /// The half the activation multiplies.
+        value: TensorView,
+    },
+    /// One `[rows, 2 · width]` projection holding the value half and then the gate half of each
+    /// row, as a checkpoint that fuses `[up, gate]` value-first stores it.
+    ValueFirst(TensorView),
+}
+
+impl Halves {
+    /// The gate and value halves of a value-first packed projection, as strided views of its rows:
+    /// `value` at element zero and `gate` one half along, both striding over the packed row.
+    fn split(projection: TensorView) -> (TensorView, TensorView) {
+        let width = projection.last() / 2;
+        let shape = ops::Shape::new(&[projection.rows(), width]);
+        let strides = projection.strides;
+        let value = TensorView::with_strides(
+            projection.element(&[0, 0]),
+            projection.dtype,
+            shape,
+            strides,
+        );
+        let gate = TensorView::with_strides(
+            projection.element(&[0, width]),
+            projection.dtype,
+            shape,
+            strides,
+        );
+        (gate, value)
+    }
+}
+
+/// The gated activation `out = act(gate) · value`, at a stated [`Rounding`].
 pub struct GatedActivation {
     activation: Activation,
-    stepwise: bool,
+    rounding: Rounding,
+    bias: GateBias,
 }
 
 impl GatedActivation {
-    /// The activation `activation` applied to the gate half.
-    pub const fn new(activation: Activation) -> Self {
-        Self {
+    /// The product gated by `activation`, evaluated at `rounding`, with `bias` added to the halves.
+    ///
+    /// # Errors
+    ///
+    /// `ValueProduct` with an activation other than SiLU, a bias under `Fused` or `Stepwise` (whose
+    /// operator adds none), or a bias that is not one vector.
+    pub fn new(activation: Activation, rounding: Rounding, bias: GateBias) -> Result<Self> {
+        const OWNER: &str = "GatedActivation";
+        if rounding == Rounding::ValueProduct && activation != Activation::Silu {
+            return Err(Error::shape(
+                OWNER,
+                format!("the value-product order is SiLU's, not {activation}'s"),
+            ));
+        }
+        let vectors: &[Option<Weight>] = match bias {
+            GateBias::None => &[],
+            GateBias::Split { value, gate } => &[value, gate],
+            GateBias::Packed(bias) => &[Some(bias)],
+        };
+        if rounding != Rounding::ValueProduct && vectors.iter().any(Option::is_some) {
+            return Err(Error::shape(
+                OWNER,
+                "an activation-first product adds no bias; the projection carries it".to_owned(),
+            ));
+        }
+        for vector in vectors.iter().flatten() {
+            if vector.shape().rank() != 1 {
+                return Err(Error::shape(
+                    OWNER,
+                    format!("a bias is one vector, not {:?}", vector.shape().dims()),
+                ));
+            }
+        }
+        Ok(Self {
             activation,
-            stepwise: false,
+            rounding,
+            bias,
+        })
+    }
+
+    /// `out = act(gate) · value` over `input`'s halves into `out`, `[rows, width]`.
+    ///
+    /// # Errors
+    ///
+    /// Halves whose width is not `out`'s, a bias of another width or packing than the input, or the
+    /// operator's refusal.
+    pub fn forward(&self, f: &Forward, input: Halves, out: TensorView) -> Result<()> {
+        const OWNER: &str = "GatedActivation";
+        let width = out.shape.last();
+        match (self.rounding, input) {
+            (Rounding::ValueProduct, Halves::ValueFirst(projection)) => {
+                let bias = match self.bias {
+                    GateBias::None => None,
+                    GateBias::Packed(bias) => Some(bias),
+                    GateBias::Split { .. } => {
+                        return Err(Error::shape(
+                            OWNER,
+                            "a packed projection takes a packed bias".to_owned(),
+                        ));
+                    }
+                };
+                self.value_first(f, projection, bias, out)
+            }
+            (Rounding::ValueProduct, Halves::Split { gate, value }) => {
+                let (value_bias, gate_bias) = match self.bias {
+                    GateBias::None => (None, None),
+                    GateBias::Split { value, gate } => (value, gate),
+                    GateBias::Packed(_) => {
+                        return Err(Error::shape(
+                            OWNER,
+                            "two halves take a bias per half".to_owned(),
+                        ));
+                    }
+                };
+                self.swiglu(f, gate, value, value_bias, gate_bias, out)
+            }
+            (rounding, input) => {
+                let (gate, value) = match input {
+                    Halves::Split { gate, value } => (gate, value),
+                    Halves::ValueFirst(projection) => {
+                        if projection.shape.last() != 2 * width {
+                            return Err(Error::shape(
+                                OWNER,
+                                format!(
+                                    "a packed row of {} elements for {width} output channels",
+                                    projection.shape.last()
+                                ),
+                            ));
+                        }
+                        Halves::split(projection)
+                    }
+                };
+                self.act_and_mul(f, gate, value, rounding == Rounding::Stepwise, out)
+            }
         }
     }
 
-    /// Evaluate the activation step by step, matching the eager expression's rounding rather than
-    /// the contraction-free default.
-    pub const fn with_stepwise(mut self) -> Self {
-        self.stepwise = true;
-        self
-    }
-
-    /// The descriptor one gated activation of `width` channels launches.
-    ///
-    /// The two row strides are the inputs' own, and `elements` is
-    /// the output's element count — the descriptor's `wide` form is a second program, so it is part of
-    /// the key and not a heuristic. The form follows the widest span a launch addresses, the strided
-    /// inputs included: a packed projection's last row sits twice as far in as the output's, so an
-    /// output well inside 32 bits can still read past them.
-    fn descriptor(
-        dtype: DType,
-        width: u64,
-        activation: Activation,
-        gate_stride: u64,
-        value_stride: u64,
-        elements: u64,
+    /// `act_and_mul`: the activation of the gate in FP32 (rounded first when `stepwise`), times the
+    /// value.
+    fn act_and_mul(
+        &self,
+        f: &Forward,
+        gate: TensorView,
+        value: TensorView,
         stepwise: bool,
-    ) -> Result<activation::ActAndMulDescriptor> {
+        out: TensorView,
+    ) -> Result<()> {
+        let width = out.shape.last();
+        let (gate_stride, value_stride) = (gate.strides.get(0), value.strides.get(0));
+        // The 64-bit form follows the furthest element either input row reaches: the halves of one
+        // packed projection stride over twice the output's row.
+        let elements = out.shape.numel();
         let rows = elements.div_ceil(width.max(1));
         let span = elements.max(rows.saturating_mul(gate_stride.max(value_stride)));
-        Ok(activation::ActAndMulDescriptor {
-            dtype,
+        let descriptor = activation::ActAndMulDescriptor {
+            dtype: out.dtype,
             width: u32::try_from(width).map_err(|_| {
                 Error::shape("GatedActivation", "a row wider than a u32".to_owned())
             })?,
             block: PACKED_BLOCK,
-            activation,
+            activation: self.activation,
             gate_stride,
             value_stride,
             wide: span >= 1 << 31,
             pdl: PDL,
             stepwise,
-        })
+        };
+        let args = activation::ActAndMulArgs { gate, value, out };
+        f.operate::<activation::ActAndMul>(&descriptor, args)
     }
 
-    /// `out = act(gate) · value`.
-    ///
-    /// `gate` and `value` have `out`'s extents; their rows may be strided (the halves of one packed
-    /// projection included), and `out` is contiguous. `out` may be `gate` or `value`: each element is
-    /// read before it is written, but a *shifted* view of either is not allowed (module docs).
-    pub fn forward(
+    /// `swiglu`: the value-product order over two views, with a bias per half.
+    fn swiglu(
         &self,
         f: &Forward,
         gate: TensorView,
         value: TensorView,
+        value_bias: Option<Weight>,
+        gate_bias: Option<Weight>,
         out: TensorView,
     ) -> Result<()> {
         let width = out.shape.last();
-        let descriptor = Self::descriptor(
-            out.dtype,
-            width,
-            self.activation,
-            gate.strides.get(0),
-            value.strides.get(0),
-            out.shape.numel(),
-            self.stepwise,
-        )?;
-        let args = activation::ActAndMulArgs { gate, value, out };
-
-        f.operate::<activation::ActAndMul>(&descriptor, args)
-    }
-}
-
-/// `out = (value + bias) · silu(gate + bias)` over separate views.
-pub struct SwiGlu {
-    width: u32,
-    value_bias: Option<Weight>,
-    gate_bias: Option<Weight>,
-    absmax: bool,
-}
-
-impl SwiGlu {
-    /// The gated activation of a projection of `width` output channels.
-    ///
-    /// Qwen3's dense MLPs have no bias; a checkpoint whose MLP has one adds it with
-    /// [`SwiGlu::with_biases`].
-    pub fn new(width: u32) -> Result<Self> {
-        if width == 0 {
-            return Err(Error::shape(
-                "SwiGlu",
-                "a width of zero channels has no activation".to_owned(),
-            ));
-        }
-        Ok(Self {
-            width,
-            value_bias: None,
-            gate_bias: None,
-            absmax: false,
-        })
-    }
-
-    /// The same activation with the per-half biases the checkpoint carries.
-    pub fn with_biases(
-        mut self,
-        value_bias: Option<Weight>,
-        gate_bias: Option<Weight>,
-    ) -> Result<Self> {
-        for (name, bias) in [("value", &value_bias), ("gate", &gate_bias)] {
-            if let Some(bias) = bias {
-                if bias.shape().rank() != 1 {
-                    return Err(Error::shape(
-                        "SwiGlu",
-                        format!(
-                            "the {name} bias is one vector, not {:?}",
-                            bias.shape().dims()
-                        ),
-                    ));
-                }
-                if bias.shape().numel() != u64::from(self.width) {
-                    return Err(Error::shape(
-                        "SwiGlu",
-                        format!(
-                            "a {name} bias of {} elements for {} channels",
-                            bias.shape().numel(),
-                            self.width
-                        ),
-                    ));
-                }
-            }
-        }
-        self.value_bias = value_bias;
-        self.gate_bias = gate_bias;
-        Ok(self)
-    }
-
-    /// Channels of one output row.
-    pub const fn width(&self) -> u32 {
-        self.width
-    }
-
-    /// `out[r, c] = silu((gate + gate_bias)[r, c]) · (value + value_bias)[r, c]`; the three views are
-    /// `[rows, width]`.
-    ///
-    /// The gate comes first, as in [`GatedActivation`], so the two gated activations cannot be read
-    /// one for the other: `gate` is the branch the activation is applied to.
-    ///
-    /// `out` may be the *same* view as `gate` — the dense MLP's only call site passes it so, writing
-    /// the result into the arena buffer the gate arrived in, and the reference's `_swiglu` is
-    /// in-place for the same reason. Each element is read before it is written; a shifted view of
-    /// `gate` (or of `value`) is not allowed (module docs).
-    pub fn forward(
-        &self,
-        f: &Forward,
-        gate: TensorView,
-        value: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
-        self.run(f, gate, value, out, None)
-    }
-
-    fn run(
-        &self,
-        f: &Forward,
-        gate: TensorView,
-        value: TensorView,
-        out: TensorView,
-        partials: Option<TensorView>,
-    ) -> Result<()> {
-        if self.absmax != partials.is_some() {
-            return Err(Error::shape(
-                "SwiGlu",
-                "the magnitude buffer is present exactly when the layer records it".to_owned(),
-            ));
-        }
-        let width = u64::from(self.width);
-        for (name, view) in [("value", value), ("gate", gate), ("out", out)] {
+        for (name, view) in [("value", value), ("gate", gate)] {
             if view.shape.last() != width {
                 return Err(Error::shape(
-                    "SwiGlu",
+                    "GatedActivation",
                     format!(
                         "the {name} row is {} elements wide, {width} expected",
                         view.shape.last()
@@ -230,120 +271,92 @@ impl SwiGlu {
                 ));
             }
         }
+        for bias in [value_bias, gate_bias].iter().flatten() {
+            if bias.shape().numel() != width {
+                return Err(Error::shape(
+                    "GatedActivation",
+                    format!(
+                        "a bias of {} elements for {width} channels",
+                        bias.shape().numel()
+                    ),
+                ));
+            }
+        }
+        let width = u32::try_from(width)
+            .ok()
+            .filter(|width| *width > 0)
+            .ok_or_else(|| Error::shape("GatedActivation", format!("a row of {width} channels")))?;
         let descriptor = activation::SwigluDescriptor {
             dtype: out.dtype,
-            width: self.width,
-            block: self.width.next_power_of_two(),
+            width,
+            block: width.next_power_of_two(),
             value_stride: value.strides.get(0),
             gate_stride: gate.strides.get(0),
-            value_bias: self.value_bias.is_some(),
-            gate_bias: self.gate_bias.is_some(),
-            absmax: self.absmax,
+            value_bias: value_bias.is_some(),
+            gate_bias: gate_bias.is_some(),
+            absmax: false,
         };
         let args = activation::SwigluArgs {
             value,
             gate,
-            value_bias: self.value_bias.as_ref().map(Weight::view),
-            gate_bias: self.gate_bias.as_ref().map(Weight::view),
+            value_bias: value_bias.as_ref().map(Weight::view),
+            gate_bias: gate_bias.as_ref().map(Weight::view),
             out,
-            partials,
+            partials: None,
         };
-
         f.operate::<activation::Swiglu>(&descriptor, args)
     }
-}
 
-/// `out = silu(gate) · value` over one packed `[value, gate]` projection: the gate half is the one
-/// the activation applies to, as in [`GatedActivation`] and [`SwiGlu`].
-pub struct PackedSwiGlu {
-    bias: Option<Weight>,
-    absmax: bool,
-}
-
-impl PackedSwiGlu {
-    /// The descriptor one packed gated activation of `width` channels launches.
-    ///
-    /// `input_stride` is the row stride of the projection's output; the bias's presence and the
-    /// absolute-max mode are the layer's.
-    fn descriptor(
-        dtype: DType,
-        width: u64,
-        input_stride: u64,
-        bias: bool,
-        absmax: bool,
-    ) -> Result<activation::ValueFirstSwigluDescriptor> {
-        Ok(activation::ValueFirstSwigluDescriptor {
-            dtype,
-            width: u32::try_from(width)
-                .map_err(|_| Error::shape("PackedSwiGlu", "a row wider than a u32".to_owned()))?,
-            block: PACKED_BLOCK,
-            input_stride,
-            bias,
-            absmax,
-        })
-    }
-
-    /// The gated activation of a projection whose rows hold the value half then the gate half, with
-    /// the packed `[value_bias, gate_bias]` bias when the checkpoint has one.
-    pub fn new(bias: Option<Weight>) -> Result<Self> {
-        if let Some(bias) = &bias
-            && bias.shape().rank() != 1
-        {
-            return Err(Error::shape(
-                "PackedSwiGlu",
-                format!(
-                    "the packed bias is one vector, not {:?}",
-                    bias.shape().dims()
-                ),
-            ));
-        }
-        Ok(Self {
-            bias,
-            absmax: false,
-        })
-    }
-
-    /// The activation of a packed `[..., 2 · width]` projection into `[..., width]`.
-    ///
-    /// `out` may overlap the leading half of `projection` (the value half), element for element; it
-    /// must not be a shifted view of either half (module docs).
-    pub fn forward(
+    /// `value_first_swiglu`: the value-product order over one packed projection and its packed bias.
+    fn value_first(
         &self,
         f: &Forward,
         projection: TensorView,
+        bias: Option<Weight>,
         out: TensorView,
-        partials: Option<TensorView>,
     ) -> Result<()> {
-        if self.absmax != partials.is_some() {
-            return Err(Error::shape(
-                "PackedSwiGlu",
-                "the magnitude buffer is present exactly when the layer records it".to_owned(),
-            ));
-        }
         let width = out.shape.last();
         if projection.shape.last() != 2 * width {
             return Err(Error::shape(
-                "PackedSwiGlu",
+                "GatedActivation",
                 format!(
                     "a packed row of {} elements for {width} output channels",
                     projection.shape.last()
                 ),
             ));
         }
-        let descriptor = Self::descriptor(
-            out.dtype,
-            width,
-            projection.strides.get(0),
-            self.bias.is_some(),
-            self.absmax,
-        )?;
+        let descriptor = activation::ValueFirstSwigluDescriptor {
+            dtype: out.dtype,
+            width: u32::try_from(width).map_err(|_| {
+                Error::shape("GatedActivation", "a row wider than a u32".to_owned())
+            })?,
+            block: PACKED_BLOCK,
+            input_stride: projection.strides.get(0),
+            bias: bias.is_some(),
+            absmax: false,
+        };
         let args = activation::ValueFirstSwigluArgs {
             value_gate: projection,
-            bias: self.bias.as_ref().map(Weight::view),
+            bias: bias.as_ref().map(Weight::view),
             out,
-            partials,
+            partials: None,
         };
         f.operate::<activation::ValueFirstSwiglu>(&descriptor, args)
+    }
+
+    /// Gate `input` into a fresh `[rows, width]` buffer of `dtype` reserved from the arena.
+    ///
+    /// # Errors
+    ///
+    /// An arena too small for the buffer, or [`Self::forward`]'s refusals.
+    pub fn apply(&self, f: &Forward, input: Halves, dtype: DType) -> Result<TensorView> {
+        let (rows, width) = match input {
+            Halves::Split { gate, .. } => (gate.rows(), gate.last()),
+            Halves::ValueFirst(projection) => (projection.rows(), projection.last() / 2),
+        };
+        let out = f.arena().tensor(dtype, ops::Shape::new(&[rows, width]))?;
+        self.forward(f, input, out)?;
+        Ok(out)
     }
 }
 
@@ -514,7 +527,7 @@ mod tests {
     /// half of that. A 32-bit launch there wraps a row's offset and reads another row's memory.
     ///
     /// The halves of one packed `[rows, 2 · width]` projection keep the packed row stride, which is
-    /// what the forward reads from the views it is handed.
+    /// what the stepwise product reads them through.
     #[test]
     fn a_packed_projection_goes_wide_on_its_input_span() {
         let width = 14_336u64;
@@ -525,17 +538,13 @@ mod tests {
                 .tensor(DType::BF16, Shape::new(&[rows, 2 * width]))
                 .expect("a counting arena");
             let half = Shape::new(&[rows, width]);
-            let gate = TensorView::with_strides(packed.ptr, packed.dtype, half, packed.strides);
-            let value = TensorView::with_strides(
-                packed.ptr.offset(width * 2),
-                packed.dtype,
-                half,
-                packed.strides,
-            );
             let out = arena.tensor(DType::BF16, half).expect("a counting arena");
-            let activation = GatedActivation::new(Activation::Silu).with_stepwise();
-            let (walked, launches) =
-                crate::forward::recorded(|| activation.forward(&f, gate, value, out));
+            let activation =
+                GatedActivation::new(Activation::Silu, Rounding::Stepwise, GateBias::None)
+                    .expect("a stepwise SiLU product");
+            let (walked, launches) = crate::forward::recorded(|| {
+                activation.forward(&f, Halves::ValueFirst(packed), out)
+            });
             walked.expect("the recorded forward");
             let (operator, key) = &launches[0];
             assert_eq!(operator, "act_and_mul");
@@ -543,5 +552,31 @@ mod tests {
         };
         assert!(!wide(74_898), "74898 rows stay inside 32 bits");
         assert!(wide(74_899), "74899 rows do not");
+    }
+
+    /// The value-product order is SiLU's, and an activation-first product has no bias operand.
+    #[test]
+    fn a_gated_product_refuses_an_order_its_activation_or_bias_does_not_have() {
+        let arena = crate::Arena::counting();
+        let bias = arena
+            .tensor(DType::BF16, Shape::new(&[8]))
+            .expect("a counting arena");
+        let bias = Weight {
+            backing: crate::Backing::new(bias.ptr, 16),
+            view: bias,
+        };
+        let split = GateBias::Split {
+            value: Some(bias),
+            gate: None,
+        };
+        assert!(
+            GatedActivation::new(Activation::GeluTanh, Rounding::ValueProduct, GateBias::None)
+                .is_err()
+        );
+        assert!(
+            GatedActivation::new(Activation::GeluTanh, Rounding::Fused, GateBias::None).is_ok()
+        );
+        assert!(GatedActivation::new(Activation::Silu, Rounding::Stepwise, split).is_err());
+        assert!(GatedActivation::new(Activation::Silu, Rounding::ValueProduct, split).is_ok());
     }
 }
