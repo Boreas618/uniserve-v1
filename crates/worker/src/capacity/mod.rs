@@ -14,7 +14,7 @@
 pub mod device;
 mod plan;
 
-pub use plan::{MemoryConfig, MemoryRequest, Report, plan_rank};
+pub use plan::{MemoryConfig, MemoryRequest, Report, block_table_width, plan_rank};
 
 use ipc::Call;
 

@@ -28,8 +28,9 @@
 #             the rows whose operator is one of the ten sampler operators; that
 #             example also prints the model's, which this script takes from the
 #             checkpoint instead, so the two halves stay told apart.
-#   commit    cargo run -q -p executor --example runner_keys -- \
-#                 --rows 1,2,4,8 --tokens 128,512 --sampled true --vocabulary 151936
+#   runner    cargo run -q -p worker --example runner_keys -- \
+#                 --rows 1,2,4,8 --tokens 128,512 --sampled true --vocabulary 151936 \
+#                 --max-model-len 40960 --page-size 64
 #
 # The file's header states both commands and the deployment values it was
 # generated with.

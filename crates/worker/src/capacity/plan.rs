@@ -288,6 +288,13 @@ impl MemoryConfig {
 /// ledger refuses a rank whose process does not fit beside its cache.
 const PROCESS_ALLOWANCE: u64 = 4 << 30;
 
+/// The pages a request's block table holds: as many as a request of `max_model_len` tokens fills
+/// at `page_size` tokens a page. Every table of the cache is this wide, and the runner's gather of a
+/// batch's tables copies this many columns a row.
+pub fn block_table_width(max_model_len: u32, page_size: u32) -> u32 {
+    max_model_len.div_ceil(page_size)
+}
+
 /// Resolve a rank's memory from what it states and the deployment's configuration: the arenas
 /// sized and, for a rank that keeps a paged cache, the pool fitted to the device's grant and its
 /// unit count agreed over `group`.
@@ -394,7 +401,7 @@ fn fit(
         .map(|group| group.block_size)
         .filter(|size| *size > 0)
         .ok_or_else(|| Error::Invalid("the model's cache states no page size".into()))?;
-    memory.width = config.model.max_model_len.div_ceil(block_size);
+    memory.width = block_table_width(config.model.max_model_len, block_size);
     // The cache's fixed storage beside its units: block tables of the width a request of the
     // model's length needs and import scratch. Every unit index column is
     // charged with each unit instead, because the unit count is not known until the pool is fitted

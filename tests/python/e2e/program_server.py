@@ -18,6 +18,7 @@ the ``uniserve`` binary.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -128,14 +129,28 @@ def program_target() -> str:
     return f"sm_{major}{minor}a"
 
 
+# The deployment every test serving through this helper states: its CUDA graph
+# buckets (``cuda_graph_config.decode_batch_sizes`` and ``prefill_token_sizes``)
+# and no ``kv_cache_config.block_size``, so the cache takes 64-token pages, the
+# largest page the trtllm attention reads. The runner's own keys follow from
+# them.
+DECODE_BATCH_SIZES = (1, 2, 4, 8)
+PREFILL_TOKEN_SIZES = (512,)
+PAGE_SIZE = 64
+
+
 def deployment_keys(store: Path, checkpoint: Path) -> Path:
     """The key lines this file's deployment serves, generated beside `store`.
 
     The model's own rows come from its walk over the checkpoint's metadata
     (``qwen3-moe --example keys``, which opens no shard and no device), and the
-    worker's rows (the sampler's chain and the logits gathers) are merged in by
-    ``ops --example qwen3_moe_keys``. So the list is the code's own statement of
-    this bf16 deployment, and no stored file can drift from it.
+    sampler's rows (its chain and the head's gathers) are merged in by
+    ``ops --example qwen3_moe_keys``. The runner's own operators, the slot
+    commit and the step's gathers of block tables and input tokens, come from
+    ``worker --example runner_keys`` over this deployment's buckets, the
+    checkpoint's vocabulary and model length, and the cache's page. So the list
+    is the code's own statement of this bf16 deployment, and no stored file can
+    drift from it.
     """
     model = subprocess.run(
         [
@@ -183,11 +198,46 @@ def deployment_keys(store: Path, checkpoint: Path) -> Path:
         raise AssertionError(
             f"merging the worker's keys failed: {merged.stderr[-4000:]}"
         )
-    rows = [
-        line
-        for line in merged.stdout.splitlines()
-        if line.strip() and not line.startswith("#")
-    ]
+    config = json.loads((checkpoint / "config.json").read_text())
+    runner = subprocess.run(
+        [
+            "cargo",
+            "run",
+            "-q",
+            "--package",
+            "worker",
+            "--example",
+            "runner_keys",
+            "--",
+            "--rows",
+            ",".join(map(str, DECODE_BATCH_SIZES)),
+            "--tokens",
+            ",".join(map(str, PREFILL_TOKEN_SIZES)),
+            "--sampled",
+            "true",
+            "--vocabulary",
+            str(config["vocab_size"]),
+            "--max-model-len",
+            str(config["max_position_embeddings"]),
+            "--page-size",
+            str(PAGE_SIZE),
+        ],
+        cwd=repository(),
+        capture_output=True,
+        text=True,
+        timeout=3600,
+    )
+    if runner.returncode != 0:
+        raise AssertionError(
+            f"the runner's key list failed: {runner.stderr[-4000:]}"
+        )
+    rows = sorted(
+        {
+            line
+            for line in (merged.stdout + runner.stdout).splitlines()
+            if line.strip() and not line.startswith("#")
+        }
+    )
     if not rows:
         raise AssertionError(
             "the key generators stated no row for this deployment"
