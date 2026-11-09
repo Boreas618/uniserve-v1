@@ -1186,12 +1186,19 @@ mod tests {
         assert!(sum_frame_samples("N/A\n").is_err());
     }
 
-    /// The `ffprobe` named by `UNISERVE_FFPROBE`, whose directory also
-    /// holds `ffmpeg`; the live tests are skipped without it.
-    fn ffmpeg_tools() -> Option<(PathBuf, PathBuf)> {
-        let ffprobe = PathBuf::from(std::env::var_os("UNISERVE_FFPROBE")?);
+    /// The `ffprobe` named by `UNISERVE_FFPROBE` and the `ffmpeg` in its
+    /// directory, which encodes the probed media.
+    ///
+    /// # Panics
+    ///
+    /// When `UNISERVE_FFPROBE` is unset: the live test is ignored by default
+    /// and fails when requested without its tools.
+    fn ffmpeg_tools() -> (PathBuf, PathBuf) {
+        let ffprobe = PathBuf::from(std::env::var_os("UNISERVE_FFPROBE").expect(
+            "UNISERVE_FFPROBE must name an ffprobe beside an ffmpeg with libx264, libx265 and libmp3lame",
+        ));
         let ffmpeg = ffprobe.with_file_name("ffmpeg");
-        Some((ffprobe, ffmpeg))
+        (ffprobe, ffmpeg)
     }
 
     fn encode(ffmpeg: &PathBuf, directory: &std::path::Path, name: &str, arguments: &str) -> Bytes {
@@ -1208,11 +1215,9 @@ mod tests {
 
     /// Probing real media with `ffprobe` reports what a decoder outputs.
     #[tokio::test]
+    #[ignore = "requires UNISERVE_FFPROBE: an ffprobe beside an ffmpeg with libx264, libx265 and libmp3lame"]
     async fn ffprobe_reports_decoded_media() {
-        let Some((ffprobe, ffmpeg)) = ffmpeg_tools() else {
-            eprintln!("UNISERVE_FFPROBE is not set; skipping the live ffprobe test");
-            return;
-        };
+        let (ffprobe, ffmpeg) = ffmpeg_tools();
         let directory = tempfile::tempdir().unwrap();
         let prober = MediaProber::new(ProbeConfig {
             ffprobe: ffprobe.clone(),

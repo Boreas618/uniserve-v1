@@ -592,13 +592,12 @@ mod tests {
     /// present to the reference's token ids and resolves the vision markers and placeholders to
     /// the reference's ids.
     #[tokio::test]
+    #[ignore = "requires UNISERVE_MINIMAX_H3_MODEL: the root of a MiniMax-H3 checkpoint"]
     async fn a_pipeline_tokenizer_matches_the_reference() {
         use processing::Vocabulary as _;
 
-        let Ok(root) = std::env::var("UNISERVE_MINIMAX_H3_MODEL") else {
-            eprintln!("UNISERVE_MINIMAX_H3_MODEL is not set; skipping the tokenizer parity test");
-            return;
-        };
+        let root = std::env::var("UNISERVE_MINIMAX_H3_MODEL")
+            .expect("UNISERVE_MINIMAX_H3_MODEL must name the root of a MiniMax-H3 checkpoint");
         let pipeline = PipelineCheckpoint::resolve(&root).await.unwrap().unwrap();
         let tokenizer = pipeline_tokenizer(&pipeline).await.unwrap();
         let fixture = vectors();
