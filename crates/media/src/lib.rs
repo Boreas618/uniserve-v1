@@ -51,6 +51,8 @@ pub mod error;
 mod ffi;
 pub mod mux;
 pub mod read;
+#[cfg(test)]
+mod reference;
 pub mod resample;
 pub mod runner;
 

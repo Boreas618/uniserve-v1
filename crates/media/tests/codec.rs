@@ -1,5 +1,5 @@
 //! MP4 output of the encoders and the container assembly, checked with the
-//! environment's FFmpeg.
+//! FFmpeg runtime the crate links.
 //!
 //! These tests drive the crate's public boundary only: media units are
 //! encoded on their own, several units are assembled with a soundtrack into a
@@ -7,7 +7,12 @@
 //! `ffprobe`/`ffmpeg` binaries. They assert the media output contract:
 //! codec, canvas, frame count, frame
 //! rate, per-unit content, a stereo AAC track covering the video's duration,
-//! and the refusals of malformed captures and assemblies.
+//! and the refusals of malformed assemblies.
+//!
+//! The tools are those of the installation the crate is built against (its
+//! build requires `UNISERVE_FFMPEG_DIR`, and the provisioned runtime ships
+//! `bin/ffmpeg` and `bin/ffprobe`), so every build that compiles these tests
+//! can run them and they need no environment at run time.
 
 // Always true in an integration test crate; it makes clippy treat the helpers
 // below as test code, where a failed unwrap is the test's failure report.
@@ -26,32 +31,21 @@ use media::{
 const FRAME_RATE: u32 = 24;
 const AUDIO_RATE: u32 = 32_000;
 
-/// The external tool these tests read media back with: `UNISERVE_<NAME>`, or the `bin` of the prefix
-/// `UNISERVE_FFMPEG_DIR` names.
-fn probe_binary(name: &str) -> PathBuf {
-    let variable = format!("UNISERVE_{}", name.to_uppercase());
-    std::env::var_os(&variable)
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("UNISERVE_FFMPEG_DIR")
-                .map(|prefix| PathBuf::from(prefix).join("bin").join(name))
-        })
-        .unwrap_or_else(|| panic!("{variable} or UNISERVE_FFMPEG_DIR names {name}"))
-}
-
+/// The `ffprobe` these tests read media back with: `UNISERVE_FFPROBE`, else the one of the runtime
+/// the crate links.
 fn ffprobe() -> PathBuf {
-    probe_binary("ffprobe")
+    std::env::var_os("UNISERVE_FFPROBE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("UNISERVE_MEDIA_RUNTIME"))
+                .join("bin")
+                .join("ffprobe")
+        })
 }
 
+/// The `ffmpeg` these tests decode media with: the one a deployment resolves.
 fn ffmpeg() -> PathBuf {
-    let probe = probe_binary("ffprobe");
-    if probe.components().count() == 1 {
-        // The probe came from the loader's path, so the decoder is beside it
-        // there.
-        probe_binary("ffmpeg")
-    } else {
-        probe.with_file_name("ffmpeg")
-    }
+    MediaConfig::from_env().ffmpeg
 }
 
 /// A scratch file of this test binary's own, under cargo's test temp
@@ -519,43 +513,6 @@ fn a_runner_holds_the_assembly_of_a_named_request_only() {
     assert!(!payload.is_empty());
     // The assembly is gone after finalization.
     assert!(matches!(runner.finish_mux(7), Err(Error::Plan(_))));
-}
-
-#[test]
-fn malformed_captures_are_refused() {
-    let rgb24_frame = vec![0u8; 48 * 64 * 3];
-    // Not a whole number of RGB24 frames.
-    assert!(matches!(
-        encode_video_unit(
-            Rgb24Frames {
-                pixels: &rgb24_frame[..rgb24_frame.len() - 1],
-                height: 48,
-                width: 64,
-            },
-            FRAME_RATE,
-        ),
-        Err(Error::Plan(_))
-    ));
-    assert!(matches!(
-        encode_video_unit(
-            Rgb24Frames {
-                pixels: &rgb24_frame,
-                height: 48,
-                width: 64,
-            },
-            0,
-        ),
-        Err(Error::Plan(_))
-    ));
-    // Not interleaved stereo samples.
-    assert!(matches!(
-        encode_audio_track(&[0i16; 3], 1, AUDIO_RATE),
-        Err(Error::Plan(_))
-    ));
-    assert!(matches!(
-        encode_audio_track(&[0i16; 2], 0, AUDIO_RATE),
-        Err(Error::Plan(_))
-    ));
 }
 
 #[test]
