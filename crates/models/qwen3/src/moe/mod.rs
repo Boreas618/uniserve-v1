@@ -201,7 +201,7 @@ impl CausalLm for Qwen3Moe {
         })
     }
 
-    fn logits(&self, f: &Forward, hidden: TensorView, out: TensorView) -> nn::Result<()> {
+    fn compute_logits(&self, f: &Forward, hidden: TensorView, out: TensorView) -> nn::Result<()> {
         // The head reserves its shard's projection and the group's gather itself.
         self.head.forward(f, hidden, out)
     }

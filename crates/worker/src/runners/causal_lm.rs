@@ -1731,13 +1731,13 @@ impl<M: CausalLm + ?Sized> CausalLm for Shared<M> {
         self.0.forward(f, batch, cache, hidden)
     }
 
-    fn logits(
+    fn compute_logits(
         &self,
         f: &nn::Forward,
         hidden: ops::TensorView,
         out: ops::TensorView,
     ) -> nn::Result<()> {
-        self.0.logits(f, hidden, out)
+        self.0.compute_logits(f, hidden, out)
     }
 
     fn join_expert_step(&self, f: &nn::Forward) -> nn::Result<()> {
@@ -5136,7 +5136,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             ops::Shape::new(&[rows, u64::from(self.model.vocabulary())]),
         )?;
         self.model
-            .logits(forward, gathered, logits)
+            .compute_logits(forward, gathered, logits)
             .map_err(Error::from)?;
         // The sampler reads its request state per row: `parameters` is `[rows, PARAMETER_COLUMNS]`
         // and `slots` is `[rows]`. A bucket narrower than the largest reads its own rows from the

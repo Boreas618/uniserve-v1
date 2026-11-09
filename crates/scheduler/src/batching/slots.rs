@@ -1,6 +1,6 @@
 //! The batch column values the mechanism computes (design §9: the mechanism
 //! writes the batch in the layout the kernels read): the KV slot each query
-//! token writes, and the forward row whose hidden state feeds `logits()`.
+//! token writes, and the forward row whose hidden state feeds `compute_logits()`.
 //!
 //! Everything else the kernels read is a fact of the calls the mechanism
 //! builds, which it can state as it builds them; these two are computed from a

@@ -1348,7 +1348,7 @@ pub trait CausalLm {
     ///
     /// `hidden` is the `[rows, hidden]` view of the rows named by `TokenBatch::logits_rows`; the
     /// worker gathered them. `out` is `[rows, vocabulary]`.
-    fn logits(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()>;
+    fn compute_logits(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()>;
 
     /// Runs every expert layer of one step with no tokens of this rank's own.
     ///
