@@ -50,6 +50,7 @@
 pub mod blocks;
 pub mod capability;
 pub mod checkpoint;
+pub mod codec;
 pub mod config;
 pub mod diffusion;
 pub mod error;

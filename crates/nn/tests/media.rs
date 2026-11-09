@@ -10,6 +10,7 @@
 
 use std::path::Path;
 
+use nn::codec::{DacEncoder, DacSpec};
 use nn::diffusion::{Euler, Grid};
 use nn::layers::{CausalPad, Conv1d, ConvSpec, ConvTranspose1d, Padding};
 use nn::vocoder::{BigVgan, BigVganSpec};
@@ -296,4 +297,58 @@ fn a_bigvgan_generator_upsamples_through_its_stages() {
     assert_eq!(count("conv_transpose1d"), 1);
     assert_eq!(launches.first().map(|(op, _)| op.as_str()), Some("conv1d"));
     assert!(generator.forward(&f, input, view(&[2, 1, 16])).is_err());
+}
+
+/// A DAC encoder loads `encoder.block`'s numbered modules, runs three Snake residual units and a
+/// widening convolution per stage, and refuses a track that is not a whole number of hops.
+#[test]
+fn a_dac_encoder_widens_and_strides_through_its_stages() {
+    let mut tensors = normalized_conv("enc.0", [2, 1, 7], Some(2));
+    for unit in 0..3 {
+        let base = format!("enc.1.block.{unit}.block");
+        tensors.extend(normalized_conv(&format!("{base}.1"), [2, 2, 7], Some(2)));
+        tensors.extend(normalized_conv(&format!("{base}.3"), [2, 2, 1], Some(2)));
+        tensors.push((format!("{base}.0.alpha"), vec![2]));
+        tensors.push((format!("{base}.2.alpha"), vec![2]));
+    }
+    tensors.push(("enc.1.block.3.alpha".to_owned(), vec![2]));
+    tensors.extend(normalized_conv("enc.1.block.4", [4, 2, 4], Some(4)));
+    tensors.push(("enc.2.alpha".to_owned(), vec![4]));
+    tensors.extend(normalized_conv("enc.3", [8, 4, 3], Some(8)));
+    let header: Vec<(&str, &str, &[u64])> = tensors
+        .iter()
+        .map(|(name, shape)| (name.as_str(), "F32", shape.as_slice()))
+        .collect();
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = checkpoint(directory.path(), &header);
+    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let spec = DacSpec {
+        channels: 2,
+        strides: vec![2],
+        latent_channels: 8,
+    };
+    let encoder = DacEncoder::load(&mut loader.scope("enc"), &spec).unwrap();
+    assert_eq!(encoder.hop(), 2);
+    let no_stage = DacSpec {
+        strides: Vec::new(),
+        ..spec
+    };
+    assert!(DacEncoder::load(&mut loader.scope("enc"), &no_stage).is_err());
+
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let view = |dims: &[u64]| arena.tensor(DType::F32, Shape::new(dims)).unwrap();
+    let ((), launches) = recorded(|| {
+        encoder
+            .forward(&f, view(&[2, 1, 16]), view(&[2, 8, 8]))
+            .unwrap()
+    });
+    let count = |name: &str| launches.iter().filter(|(op, _)| op == name).count();
+    assert_eq!(count("snake"), 3 * 2 + 1 + 1);
+    assert_eq!(count("conv1d"), 1 + 3 * 2 + 1 + 1);
+    assert!(
+        encoder
+            .forward(&f, view(&[2, 1, 15]), view(&[2, 8, 7]))
+            .is_err()
+    );
 }

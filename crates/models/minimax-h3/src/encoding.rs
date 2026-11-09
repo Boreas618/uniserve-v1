@@ -730,31 +730,14 @@ pub fn padded_samples(samples: u64, hop: u64) -> Result<u64> {
 
 use nn::Forward;
 use nn::layers::{
-    AdaptiveAvgPool2d, Bias, CausalPad, Conv1d, Conv3d, ConvSpec, DenseAttention, DenseSpec,
-    GateBias, GatedActivation, GroupNorm, Halves, LayerNorm, Linear, Padding, Posterior, Residual,
-    Rounding, Snake, Transpose, WeightOrder,
+    AdaptiveAvgPool2d, CausalPad, Conv1d, Conv3d, ConvSpec, DenseAttention, DenseSpec, GateBias,
+    GatedActivation, GroupNorm, Halves, LayerNorm, Linear, Padding, Posterior, Residual, Rounding,
+    Transpose, WeightOrder,
 };
-use nn::weights::{Scope, Weight, WeightLoader};
+use nn::weights::{Scope, WeightLoader};
 use nn::{DType, Shape, Strides, TensorView};
 
-/// A weight-normalized 1-d convolution of `from` to `to` channels with `kernel` taps, `padding`
-/// zeros each side and `dilation`: the DAC encoder's convolution form.
-fn normalized(
-    from: u32,
-    to: u32,
-    kernel: u32,
-    padding: u32,
-    dilation: u32,
-    bias: Bias,
-) -> ConvSpec<1> {
-    ConvSpec {
-        padding: [padding],
-        dilation: [dilation],
-        bias,
-        weight_norm: true,
-        ..ConvSpec::new(from, to, [kernel])
-    }
-}
+use nn::codec::{DacEncoder, DacSpec};
 
 /// One causal convolution of the encoder and the normalization that feeds it.
 ///
@@ -1701,10 +1684,9 @@ pub const LONGEST_TRACK: u32 = (crate::config::MAX_FRAMES
 ///
 /// `[1, 1, samples]` mono audio in, `[latent_channels, frames]` latents out, with `frames =
 /// samples / 800` — the product of the checkpoint's encoder rates `(2, 4, 4, 5, 5)` and the hop the
-/// decoder inverts. The network is the reference's `Encoder`: an input convolution of width
-/// `encoder_dim`, five stages that each run three dilated residual units at the incoming width and then
-/// a strided widening convolution, a Snake and a convolution to `latent_dim`, and then the attention
-/// projection that every frame of the track attends over its predecessors.
+/// decoder inverts. The network is the reference's DAC `Encoder` ([`DacEncoder`]) to `latent_dim`
+/// features, then this family's attention projection (`pre_block`) that every frame of the track
+/// attends over its predecessors, the mean convolution and the latent normalization.
 ///
 /// **The projection's attention is causal** (`DenseInput(causal=True)` in the reference), which is what
 /// makes a latent frame depend only on the audio before it. It runs in FP32 like everything else in this
@@ -1713,11 +1695,8 @@ pub struct AudioEncoder {
     config: crate::AudioVaeConfig,
     /// The most latent frames one track may have: the attention's key bound.
     frames: u32,
-    input: Conv1d,
-    stages: Vec<EncoderStage>,
-    tail: Snake,
-    tail_alpha: Weight,
-    output: Conv1d,
+    /// The DAC network from the waveform to `latent_dim` features.
+    encoder: DacEncoder,
     projection: Projection,
     mean: Conv1d,
     /// The latent space's affine, `(latent - mean) / std` per channel. The reference's `LatentEncoder`
@@ -1725,25 +1704,6 @@ pub struct AudioEncoder {
     /// statistics are the same ones the audio decoder restores.
     normalize: Conv1d,
     transpose: Transpose,
-}
-
-/// One encoder stage: three dilated residual units at `inner`, then a widening strided convolution.
-struct EncoderStage {
-    /// The width the units and the Snake run at: half the stage's output width.
-    inner: u32,
-    /// Latent samples divide by this.
-    rate: u32,
-    units: Vec<EncoderUnit>,
-    snake: Snake,
-    alpha: Weight,
-    widen: Conv1d,
-}
-
-/// One residual unit: snake, dilated convolution, snake, one-by-one-wide convolution, added back.
-struct EncoderUnit {
-    convs: [Conv1d; 2],
-    snakes: [Snake; 2],
-    alphas: [Weight; 2],
 }
 
 /// The attention projection that narrows latent features to the latent channels.
@@ -1824,45 +1784,9 @@ impl AudioEncoder {
         Ok(frames)
     }
 
-    /// The sample count each stage's residual units run at, from the track's padded length.
-    ///
-    /// The units of stage `k` add over the extent that stage receives - the track's length halved
-    /// and fifthed once per rate, `[2, 4, 4, 5, 5]` here - so a track of `L` samples launches the
-    /// residual add at `L`, `L/2`, `L/8`, `L/32` and `L/160`, five programs and not one.
-    /// [`Self::encode`] walks this list.
-    ///
-    /// The length is the **padded** one, because the pad is applied before the first convolution
-    /// (see [`Self::encode`]) - a track that is not a whole number of latent frames never reaches a
-    /// stage, so it states no row.
-    pub fn stage_extents(config: &crate::AudioVaeConfig, samples: u64) -> Result<Vec<u64>> {
-        let hop = config
-            .encoder_rates
-            .iter()
-            .map(|rate| u64::from(*rate))
-            .product::<u64>()
-            .max(1);
-        if !samples.is_multiple_of(hop) {
-            let padded = padded_samples(samples, hop)?;
-            return Err(Error::config(format!(
-                "{samples} samples is not a whole number of {hop}-sample latent frames: the stages \
-                 run the padded track ({padded} samples), so an unpadded length states no program"
-            )));
-        }
-        let mut extent = samples;
-        let mut extents = Vec::with_capacity(config.encoder_rates.len());
-        for rate in &config.encoder_rates {
-            extents.push(extent);
-            extent /= u64::from(*rate).max(1);
-        }
-        Ok(extents)
-    }
-
     /// The samples one latent frame covers: the product of the encoder's rates.
     pub fn hop(&self) -> u64 {
-        self.stages
-            .iter()
-            .map(|stage| u64::from(stage.rate))
-            .product()
+        self.encoder.hop()
     }
 
     /// The encoder the checkpoint's `encoder`, `pre_block` and `mean_proj` modules state, read in
@@ -1879,79 +1803,14 @@ impl AudioEncoder {
         // The audio encoder computes in FP32 throughout, so every weight is read in it.
         let mut root = loader.scope("");
         let mut root = root.pinned(DType::F32);
-        let mut network = root.scope("encoder.block");
-        let mut width = config.encoder_dim;
-        let input = Conv1d::load(
-            &mut network.scope("0"),
-            normalized(1, width, 7, 3, 1, Bias::Present),
+        let encoder = DacEncoder::load(
+            &mut root.scope("encoder.block"),
+            &DacSpec {
+                channels: config.encoder_dim,
+                strides: config.encoder_rates.clone(),
+                latent_channels: config.latent_dim,
+            },
         )?;
-
-        let mut stages = Vec::with_capacity(config.encoder_rates.len());
-        for (index, rate) in config.encoder_rates.iter().enumerate() {
-            let inner = width;
-            width = width.checked_mul(2).ok_or_else(|| {
-                Error::config("the encoder's widths overflow a descriptor".to_owned())
-            })?;
-            // `EncoderBlock.block` is five entries: three residual units at 0, 1 and 2, the stage's
-            // Snake at 3, and the widening convolution at 4.
-            let mut stage = network.scope(format!("{}.block", index + 1));
-            let mut units = Vec::with_capacity(3);
-            // The three units are the same shape at dilations 1, 3 and 9: the first convolution is
-            // seven wide and dilated, its padding keeping the length, and the second is the reference's
-            // `Conv1d(channels, channels, 1)`, a pointwise mix.
-            for (unit, dilation) in [1u32, 3, 9].into_iter().enumerate() {
-                // A residual unit's `block` is its Snake (0), the dilated convolution (1), a second
-                // Snake (2) and the pointwise convolution (3).
-                let mut module = stage.scope(format!("{unit}.block"));
-                let first = Conv1d::load(
-                    &mut module.scope("1"),
-                    normalized(inner, inner, 7, 3 * dilation, dilation, Bias::Present),
-                )?;
-                let second = Conv1d::load(
-                    &mut module.scope("3"),
-                    normalized(inner, inner, 1, 0, 1, Bias::Present),
-                )?;
-                units.push(EncoderUnit {
-                    convs: [first, second],
-                    snakes: [Snake::new(u64::from(inner))?, Snake::new(u64::from(inner))?],
-                    alphas: [
-                        module.scope("0").tensor("alpha", &[u64::from(inner)])?,
-                        module.scope("2").tensor("alpha", &[u64::from(inner)])?,
-                    ],
-                });
-            }
-            let snake = Snake::new(u64::from(inner))?;
-            let alpha = stage.scope("3").tensor("alpha", &[u64::from(inner)])?;
-            let widen = Conv1d::load(
-                &mut stage.scope("4"),
-                ConvSpec {
-                    stride: [*rate],
-                    ..normalized(inner, width, 2 * rate, rate.div_ceil(2), 1, Bias::Present)
-                },
-            )?;
-            stages.push(EncoderStage {
-                inner,
-                rate: *rate,
-                units,
-                snake,
-                alpha,
-                widen,
-            });
-        }
-
-        let tail = Snake::new(u64::from(width))?;
-        // The network ends with a Snake and the output convolution.
-        let stages_end = config.encoder_rates.len();
-        let tail_alpha = network
-            .scope(stages_end + 1)
-            .tensor("alpha", &[u64::from(width)])?;
-        // The network's last convolution is three wide, not seven: the reference's `Conv1d(width,
-        // latent_dim, 3, padding=1)`.
-        let output = Conv1d::load(
-            &mut network.scope(stages_end + 2),
-            normalized(width, config.latent_dim, 3, 1, 1, Bias::Present),
-        )?;
-
         let projection = Projection::load(config, &mut root.scope("pre_block"), frames)?;
         let channels = u64::from(config.latent_channels);
         // The reference's mean projection is `nn.Conv1d(latent_channels, latent_channels, 1)`, so the
@@ -1973,11 +1832,7 @@ impl AudioEncoder {
         Ok(Self {
             config: config.clone(),
             frames,
-            input,
-            stages,
-            tail,
-            tail_alpha,
-            output,
+            encoder,
             projection,
             mean,
             normalize,
@@ -2037,59 +1892,12 @@ impl AudioEncoder {
             )));
         }
 
-        let width = u64::from(self.config.encoder_dim);
-        let mut hidden = f
-            .arena()
-            .tensor(DType::F32, Shape::new(&[batch, width, length]))?;
-        self.input.forward(f, samples, hidden)?;
-
-        // A stage runs its three units at the stage's inner width, which is the width it receives, then
-        // snaked and widened into the next width. Each unit needs two buffers - the two its convolutions
-        // write, because the second snake reads what the first convolution wrote - and they are the
-        // stage's shape, so the stage reserves them once and the three units take turns: a unit writes
-        // `first` from the residual stream before reading it, and `second` from its own convolution. The
-        // residual stream itself is `hidden`, which no unit writes.
-        // The extents this track launches at, from the one expression the statement also reads.
-        let extents = Self::stage_extents(&self.config, length)?;
-        for (index, stage) in self.stages.iter().enumerate() {
-            let extent = extents.get(index).copied().unwrap_or(frames);
-            let inner = u64::from(stage.inner);
-            let inner_shape = Shape::new(&[batch, inner, extent]);
-            let first = f.arena().tensor(DType::F32, inner_shape)?;
-            let second = f.arena().tensor(DType::F32, inner_shape)?;
-            for unit in &stage.units {
-                unit.snakes[0].forward(f, hidden, unit.alphas[0].view(), first)?;
-                unit.convs[0].forward(f, first, second)?;
-                unit.snakes[1].forward(f, second, unit.alphas[1].view(), first)?;
-                unit.convs[1].forward(f, first, second)?;
-                let residual = matrix(hidden)?;
-                Residual::default().forward(f, residual, matrix(second)?, None, residual)?;
-            }
-            let widened = extent / u64::from(stage.rate);
-            let next = f.arena().tensor(
-                DType::F32,
-                Shape::new(&[batch, u64::from(self.width_of(stage)), widened]),
-            )?;
-            let scratch = f.arena().tensor(DType::F32, inner_shape)?;
-            stage
-                .snake
-                .forward(f, hidden, stage.alpha.view(), scratch)?;
-            stage.widen.forward(f, scratch, next)?;
-            hidden = next;
-        }
-
-        // The tail runs at the latent frame count, which is the last stage's own `extent` divided by
-        // its rate - `frames`, from the same expression that refused an unpadded track.
         let extent = frames;
-
-        // The tail Snake and the convolution to the latent width.
         let wide = u64::from(self.config.latent_dim);
-        let tail_shape = Shape::new(&[batch, wide, extent]);
-        let tail_scratch = f.arena().tensor(DType::F32, tail_shape)?;
-        self.tail
-            .forward(f, hidden, self.tail_alpha.view(), tail_scratch)?;
-        let features = f.arena().tensor(DType::F32, tail_shape)?;
-        self.output.forward(f, tail_scratch, features)?;
+        let features = f
+            .arena()
+            .tensor(DType::F32, Shape::new(&[batch, wide, extent]))?;
+        self.encoder.forward(f, samples, features)?;
 
         // The projection attends over the frame axis, so it runs once per batch row and never mixes
         // rows: a row's features are a `[wide, extent]` matrix, transposed to frame-major for the
@@ -2134,31 +1942,6 @@ impl AudioEncoder {
         }
         Ok(())
     }
-
-    /// The width a stage writes: its inner width doubled.
-    fn width_of(&self, stage: &EncoderStage) -> u32 {
-        stage.inner * 2
-    }
-}
-
-/// A `[batch, rows, columns]` view as `[batch · rows, columns]`: the row axis the operators that work
-/// a row at a time read.
-///
-/// Valid for a contiguous view, which every arena tensor and every slice of one is: the batch axis is
-/// the outermost, so folding it into the row axis keeps every row where it is.
-fn matrix(view: TensorView) -> Result<TensorView> {
-    if view.shape.rank() != 3 || view.shape.dim(0) == 0 {
-        return Err(Error::config(format!(
-            "{:?} is not a batched matrix",
-            view.shape.dims()
-        )));
-    }
-    let rows = view.shape.dim(0) * view.shape.dim(1);
-    Ok(TensorView::new(
-        view.ptr,
-        view.dtype,
-        Shape::new(&[rows, view.shape.dim(2)]),
-    ))
 }
 
 impl Projection {
