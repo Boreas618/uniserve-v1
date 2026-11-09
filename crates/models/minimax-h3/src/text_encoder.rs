@@ -36,6 +36,7 @@
 
 use nn::capability::{
     Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageShape, StateTable,
+    TableValues,
 };
 use nn::layers::{
     Attention, Embedding, GatedActivation, Linear, RmsNorm, Rotary, Rows, ScaledResidual, Sections,
@@ -741,7 +742,7 @@ impl TextEncoder {
         &self,
         prompt: &EncoderPrompt<'_>,
         layout: &EncoderLayout,
-        out: &mut [Vec<u8>],
+        out: &mut [TableValues],
     ) -> Result<()> {
         write_state(&self.config, prompt.ids, layout, out)
     }
@@ -973,24 +974,18 @@ impl Encoder for TextEncoder {
         }
     }
 
-    fn state_tables(&self, layout: &EncoderLayout) -> Vec<StateTable> {
-        match Plan::of_layout(&self.config, &self.partition, layout) {
-            Ok(plan) => self.tables(&plan, layout.rows),
-            // A layout the model cannot serve still needs its table list answered; the shapes are
-            // arithmetic on the grids, and `prepare_state` refuses the layout itself.
-            Err(_) => {
-                let merge = self.config.vision.spatial_merge_size;
-                let (patches, time, merged) = layout_counts(layout, merge);
-                table_specs(&self.config, layout.rows, &patches, &time, merged)
-            }
-        }
+    fn state_tables(&self, layout: &EncoderLayout) -> nn::Result<Vec<StateTable>> {
+        // A layout the model cannot serve is refused here, by the plan that cannot hold it, rather
+        // than answered with tables no encode of it would read.
+        let plan = Plan::of_layout(&self.config, &self.partition, layout)?;
+        Ok(self.tables(&plan, layout.rows))
     }
 
     fn prepare_state(
         &self,
         prompt: &EncoderPrompt<'_>,
         layout: &EncoderLayout,
-        out: &mut [Vec<u8>],
+        out: &mut [TableValues],
     ) -> nn::Result<()> {
         self.prepare_state_bytes(prompt, layout, out)
             .map_err(nn::Error::from)
@@ -1025,7 +1020,7 @@ fn write_state(
     config: &TextEncoderConfig,
     ids: &[u32],
     layout: &EncoderLayout,
-    out: &mut [Vec<u8>],
+    out: &mut [TableValues],
 ) -> Result<()> {
     let grids = layout
         .images
@@ -1084,7 +1079,7 @@ fn write_state(
                 .map_err(|_| Error::config("an M-RoPE coordinate wider than an i32".to_owned()))?;
         }
     }
-    write_i32(&mut out[0], &positions, "prompt_positions")?;
+    out[0].write("prompt_positions", &TableValues::I32(positions.to_vec()))?;
 
     let destinations =
         positions::vision_destinations(ids, config.image_token_id, config.video_token_id);
@@ -1095,7 +1090,10 @@ fn write_state(
             plan.merged
         )));
     }
-    write_i32(&mut out[1], &destinations, "vision_destinations")?;
+    out[1].write(
+        "vision_destinations",
+        &TableValues::I32(destinations.to_vec()),
+    )?;
     if plan.images.is_empty() {
         return Ok(());
     }
@@ -1148,11 +1146,11 @@ fn write_state(
             )));
         }
     }
-    write_i32(&mut out[2], &index, "vision_position_index")?;
-    write_f32(&mut out[3], &weight, "vision_position_weight")?;
-    write_f32(&mut out[4], &cosine, "vision_cosine")?;
-    write_f32(&mut out[5], &sine, "vision_sine")?;
-    write_i32(&mut out[6], &lengths, "vision_lengths")
+    out[2].write("vision_position_index", &TableValues::I32(index.to_vec()))?;
+    out[3].write("vision_position_weight", &TableValues::F32(weight.to_vec()))?;
+    out[4].write("vision_cosine", &TableValues::F32(cosine.to_vec()))?;
+    out[5].write("vision_sine", &TableValues::F32(sine.to_vec()))?;
+    Ok(out[6].write("vision_lengths", &TableValues::I32(lengths.to_vec()))?)
 }
 
 /// The grids [`positions::rope_index`] reads: one list per placeholder kind, in prompt order.
@@ -1221,27 +1219,6 @@ fn table_specs(
         ));
     }
     tables
-}
-
-/// The patch rows, time steps and merged rows a layout states, by plain arithmetic.
-///
-/// Used where a failure cannot be reported (a table list) so that the caller still learns the
-/// shapes; [`Plan::of_layout`] is what refuses a grid that cannot be served.
-fn layout_counts(layout: &EncoderLayout, merge: u32) -> (Vec<u32>, Vec<u32>, u32) {
-    let mut patches = Vec::with_capacity(layout.images.len());
-    let mut time = Vec::with_capacity(layout.images.len());
-    let mut merged = 0_u32;
-    for image in &layout.images {
-        let [steps, height, width] = image.grid;
-        let rows = steps.saturating_mul(height).saturating_mul(width);
-        let blocks = (height / merge.max(1))
-            .saturating_mul(width / merge.max(1))
-            .max(1);
-        patches.push(rows);
-        time.push(steps);
-        merged = merged.saturating_add(steps.saturating_mul(blocks));
-    }
-    (patches, time, merged)
 }
 
 /// The two grid lists [`positions::rope_index`] reads, one entry per vision placeholder run.
@@ -1328,36 +1305,6 @@ fn run_grids(
         )));
     }
     Ok((images, videos))
-}
-
-/// Write `values` into `buffer` as little-endian up to its stated length.
-fn write_i32(buffer: &mut [u8], values: &[i32], name: &'static str) -> Result<()> {
-    let bytes = values.len() * 4;
-    if buffer.len() != bytes {
-        return Err(Error::config(format!(
-            "the {name} table holds {} bytes for {bytes}",
-            buffer.len()
-        )));
-    }
-    for (chunk, value) in buffer.as_chunks_mut::<4>().0.iter_mut().zip(values) {
-        *chunk = value.to_le_bytes();
-    }
-    Ok(())
-}
-
-/// Write `values` into `buffer` as little-endian FP32 up to its stated length.
-fn write_f32(buffer: &mut [u8], values: &[f32], name: &'static str) -> Result<()> {
-    let bytes = values.len() * 4;
-    if buffer.len() != bytes {
-        return Err(Error::config(format!(
-            "the {name} table holds {} bytes for {bytes}",
-            buffer.len()
-        )));
-    }
-    for (chunk, value) in buffer.as_chunks_mut::<4>().0.iter_mut().zip(values) {
-        *chunk = value.to_le_bytes();
-    }
-    Ok(())
 }
 
 /// A refusal of a call whose inputs do not describe the plan.
@@ -1548,28 +1495,25 @@ mod tests {
         assert!(Rank::new(&config, &out_of_range).is_err());
     }
 
-    /// A host buffer of the size `table` states.
-    fn buffer_for(table: &StateTable) -> Vec<u8> {
-        let width = table.dtype.bytes().expect("a whole number of bytes");
-        vec![0_u8; (table.shape.numel() * width) as usize]
+    /// A host table of the type and extents `table` states, as the worker hands it over.
+    fn buffer_for(table: &StateTable) -> TableValues {
+        TableValues::zeroed(table).expect("a host table")
     }
 
-    /// The `index`-th i32 of a host table.
-    fn i32_at(bytes: &[u8], index: usize) -> i32 {
-        i32::from_le_bytes(
-            bytes[index * 4..index * 4 + 4]
-                .try_into()
-                .expect("four bytes"),
-        )
+    /// The `index`-th element of an i32 host table.
+    fn i32_at(table: &TableValues, index: usize) -> i32 {
+        match table {
+            TableValues::I32(values) => values[index],
+            TableValues::F32(_) => panic!("an f32 table read as i32"),
+        }
     }
 
-    /// The `index`-th f32 of a host table.
-    fn f32_at(bytes: &[u8], index: usize) -> f32 {
-        f32::from_le_bytes(
-            bytes[index * 4..index * 4 + 4]
-                .try_into()
-                .expect("four bytes"),
-        )
+    /// The `index`-th element of an f32 host table.
+    fn f32_at(table: &TableValues, index: usize) -> f32 {
+        match table {
+            TableValues::F32(values) => values[index],
+            TableValues::I32(_) => panic!("an i32 table read as f32"),
+        }
     }
 
     #[test]
@@ -1766,8 +1710,8 @@ mod tests {
         // sequence lengths, the image's one single-step sequence first. The factors carry the
         // tower's own head width, not the language model's.
         let tower_head = BlockRows::head_dim(&config.vision).expect("a head width");
-        assert_eq!(out[2].len(), 48 * positions::POSITION_TAPS as usize * 4);
-        assert_eq!(out[4].len(), 48 * (tower_head / 2) as usize * 4);
+        assert_eq!(out[2].len(), 48 * positions::POSITION_TAPS as usize);
+        assert_eq!(out[4].len(), 48 * (tower_head / 2) as usize);
         let lengths = (0..5).map(|row| i32_at(&out[6], row)).collect::<Vec<_>>();
         assert_eq!(lengths, vec![0, 16, 0, 16, 32]);
 
@@ -1865,7 +1809,7 @@ mod tests {
         };
         let tables = table_specs(&config, 3, &[], &[], 0);
         let mut out = tables.iter().map(buffer_for).collect::<Vec<_>>();
-        out[0].truncate(8);
+        out[0] = TableValues::I32(vec![0; 2]);
         assert!(write_state(&config, &[1, 2, 3], &layout, &mut out).is_err());
         // A layout that reserves rows the prompt does not present is refused too.
         let mut out = tables.iter().map(buffer_for).collect::<Vec<_>>();

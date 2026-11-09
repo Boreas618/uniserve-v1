@@ -40,7 +40,7 @@
 //! in the order `Layouts::state_tables` names them; nothing of a request reaches a capture as a
 //! host value, and no table is uploaded from inside a forward.
 
-use nn::capability::{ConditionRole, LatentShape, Layout, StateTable, VideoRequest};
+use nn::capability::{ConditionRole, LatentShape, Layout, StateTable, TableValues, VideoRequest};
 use nn::{DType, Forward, Shape, TensorView, Weight, WeightLoader};
 
 use crate::attention::{Factors, Visible};
@@ -753,7 +753,7 @@ impl Layouts {
         &self,
         request: &VideoRequest<'_>,
         layout: &Layout,
-        out: &mut [Vec<u8>],
+        out: &mut [TableValues],
     ) -> Result<()> {
         let (sparsity, reference_keep) = match self.config.attention {
             crate::config::AttentionKind::Sparse {
@@ -812,7 +812,7 @@ impl Layouts {
         // at the prompt's last row. The prompt's row count is the media clock's own start.
         let refiner_q = integers(&[0, layout.text_rows as i32]);
         let refiner_k = integers(&[0, request.text_tokens as i32]);
-        let filled: [(&str, Vec<u8>); 16] = [
+        let filled: [(&str, TableValues); 16] = [
             ("audio_indices", integers(&audio)),
             ("audio_slots", integers(&audio_slots)),
             ("audio_sources", integers(&audio_sources)),
@@ -833,40 +833,16 @@ impl Layouts {
             ("tile_segments", integers(&tables.tile_segments)),
             ("token_tags", integers(&tables.token_tags)),
         ];
-        for (name, bytes) in filled {
-            let position = specs
-                .iter()
-                .position(|table| table.name == name)
-                .ok_or_else(|| Error::config(format!("{name} is not a table of this layout")))?;
-            let buffer = out
-                .get_mut(position)
-                .ok_or_else(|| Error::config(format!("the worker holds no buffer for {name}")))?;
-            if buffer.len() != bytes.len() {
-                return Err(Error::config(format!(
-                    "{name} is {} bytes, its buffer {}",
-                    bytes.len(),
-                    buffer.len()
-                )));
-            }
-            buffer.copy_from_slice(&bytes);
+        for (name, values) in &filled {
+            place(&specs, out, name, values)?;
         }
-        let position = specs
-            .iter()
-            .position(|table| table.name == "variable_block_sizes")
-            .ok_or_else(|| Error::config("the block-size table is missing".to_owned()))?;
-        let buffer = out
-            .get_mut(position)
-            .ok_or_else(|| Error::config("the worker holds no block-size buffer".to_owned()))?;
-        let bytes = integers(&sizes);
-        if buffer.len() != bytes.len() || tiles != sizes.len() {
+        if tiles != sizes.len() {
             return Err(Error::config(format!(
-                "variable_block_sizes is {} bytes for {tiles} tiles, its buffer {}",
-                bytes.len(),
-                buffer.len()
+                "variable_block_sizes holds {} sizes for {tiles} tiles",
+                sizes.len()
             )));
         }
-        buffer.copy_from_slice(&bytes);
-        Ok(())
+        place(&specs, out, "variable_block_sizes", &integers(&sizes))
     }
 
     /// Write one request's tables, in `Layouts::state_tables`' order.
@@ -879,7 +855,7 @@ impl Layouts {
         &self,
         request: &VideoRequest<'_>,
         layout: &Layout,
-        out: &mut [Vec<u8>],
+        out: &mut [TableValues],
     ) -> Result<()> {
         if matches!(
             self.config.attention,
@@ -920,7 +896,7 @@ impl Layouts {
         // keys stop at the prompt's last row - a padding row is never a key of any document.
         let refiner_k = integers(&[0, text_tokens as i32]);
         let refiner_q = integers(&[0, layout.text_rows as i32]);
-        for (name, bytes) in [
+        for (name, values) in [
             ("audio_indices", integers(&audio_indices)),
             ("audio_slots", integers(&audio_slots)),
             ("audio_sources", integers(&audio_sources)),
@@ -940,23 +916,7 @@ impl Layouts {
             ("prefix_index", integers(&tables.prefix_index)),
             ("token_tags", integers(&tables.token_tags)),
         ] {
-            let position = specs
-                .iter()
-                .position(|table| table.name == name)
-                .ok_or_else(|| Error::config(format!("{name} is not a table of this layout")))?;
-            let Some(buffer) = out.get_mut(position) else {
-                return Err(Error::config(format!(
-                    "the worker holds no buffer for {name}"
-                )));
-            };
-            if buffer.len() != bytes.len() {
-                return Err(Error::config(format!(
-                    "{name} is {} bytes, its buffer {}",
-                    bytes.len(),
-                    buffer.len()
-                )));
-            }
-            buffer.copy_from_slice(&bytes);
+            place(&specs, out, name, &values)?;
         }
         // The step is the worker's to write through `prepare_evaluation`: one i32 a replay
         // changes.
@@ -964,13 +924,13 @@ impl Layouts {
             .iter()
             .position(|table| table.name == "step")
             .ok_or_else(|| Error::config("the step table is missing".to_owned()))?;
-        if let Some(buffer) = out.get_mut(position)
-            && !buffer.is_empty()
-            && buffer.len() != 4
+        if let Some(table) = out.get(position)
+            && (table.dtype() != DType::I32 || table.len() != 1)
         {
             return Err(Error::config(format!(
-                "the step table is {} bytes, not one i32",
-                buffer.len()
+                "the step table is {} {} elements, not one i32",
+                table.len(),
+                table.dtype()
             )));
         }
         Ok(())
@@ -1335,38 +1295,51 @@ fn gcd(left: u32, right: u32) -> u32 {
     }
 }
 
-/// Coordinates as little-endian FP32, axis-major: every row's first axis, then every row's second.
+/// Coordinates as FP32, axis-major: every row's first axis, then every row's second.
 ///
 /// The packing states one coordinate triple per row; `nn::Rotary`'s sectioned rotation indexes a
 /// table by `[axis, token]` and a row-major table would rotate each row by another row's angles.
-fn coordinates(points: &[[f64; 3]]) -> Vec<u8> {
-    // Axis-major FP32, which is the table's declared type: a coordinate is a place on a rescaled
-    // clock or raster, and the rotary reads one real number per axis per token.
-    let mut bytes = Vec::with_capacity(points.len() * 3 * 4);
-    for axis in 0..3 {
-        for point in points {
-            bytes.extend_from_slice(&(point[axis] as f32).to_le_bytes());
-        }
-    }
-    bytes
+fn coordinates(points: &[[f64; 3]]) -> TableValues {
+    // FP32, which is the table's declared type: a coordinate is a place on a rescaled clock or
+    // raster, and the rotary reads one real number per axis per token.
+    TableValues::F32(
+        (0..3)
+            .flat_map(|axis| points.iter().map(move |point| point[axis] as f32))
+            .collect(),
+    )
 }
 
-/// Integers as little-endian int32.
-fn integers(values: &[i32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(values.len() * 4);
-    for value in values {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    bytes
+/// Integers as an int32 table.
+fn integers(values: &[i32]) -> TableValues {
+    TableValues::I32(values.to_vec())
 }
 
 /// The AdaLN row of every packed row: `3 * group + tag`.
-fn modulation_indices(groups: &[i32], tags: &[i32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(groups.len() * 4);
-    for (group, tag) in groups.iter().zip(tags) {
-        bytes.extend_from_slice(&(3 * group + tag).to_le_bytes());
-    }
-    bytes
+fn modulation_indices(groups: &[i32], tags: &[i32]) -> TableValues {
+    TableValues::I32(
+        groups
+            .iter()
+            .zip(tags)
+            .map(|(group, tag)| 3 * group + tag)
+            .collect(),
+    )
+}
+
+/// Write `values` into the table of `specs` named `name`, which `out` holds in `specs`' order.
+fn place(
+    specs: &[StateTable],
+    out: &mut [TableValues],
+    name: &str,
+    values: &TableValues,
+) -> Result<()> {
+    let position = specs
+        .iter()
+        .position(|table| table.name == name)
+        .ok_or_else(|| Error::config(format!("{name} is not a table of this layout")))?;
+    out.get_mut(position)
+        .ok_or_else(|| Error::config(format!("the worker holds no table for {name}")))?
+        .write(name, values)?;
+    Ok(())
 }
 
 /// One checkpoint's denoiser: the DiT, the schedule it is evaluated on, its solver and the AdaLN
@@ -1695,7 +1668,7 @@ impl nn::capability::Denoiser for Denoiser {
         Ok(Vec::new())
     }
 
-    fn prepare_layout(&self, _layout: &Layout, out: &mut [Vec<u8>]) -> nn::Result<()> {
+    fn prepare_layout(&self, _layout: &Layout, out: &mut [TableValues]) -> nn::Result<()> {
         if out.is_empty() {
             Ok(())
         } else {
@@ -1706,22 +1679,22 @@ impl nn::capability::Denoiser for Denoiser {
         }
     }
 
-    fn state_tables(&self, layout: &Layout) -> Vec<StateTable> {
-        self.rules.table_specs(layout).unwrap_or_default()
+    fn state_tables(&self, layout: &Layout) -> nn::Result<Vec<StateTable>> {
+        self.rules.table_specs(layout).map_err(nn::Error::from)
     }
 
     fn prepare_state(
         &self,
         request: &VideoRequest<'_>,
         layout: &Layout,
-        out: &mut [Vec<u8>],
+        out: &mut [TableValues],
     ) -> nn::Result<()> {
         self.rules
             .write_state(request, layout, out)
             .map_err(nn::Error::from)
     }
 
-    fn prepare_evaluation(&self, index: u32, out: &mut [Vec<u8>]) -> nn::Result<()> {
+    fn prepare_evaluation(&self, index: u32, out: &mut [TableValues]) -> nn::Result<()> {
         if index >= self.evaluations {
             return Err(nn::Error::from(Error::config(format!(
                 "evaluation {index} is outside the {} this schedule has",
@@ -3131,21 +3104,14 @@ mod tests {
             let table = specs.iter().find(|table| table.name == name).unwrap();
             assert_eq!(table.shape.dims(), &[2], "{name}");
         }
-        let mut out: Vec<Vec<u8>> = specs
+        let mut out: Vec<TableValues> = specs
             .iter()
-            .map(|table| {
-                vec![0_u8; (table.shape.numel() as usize) * table.dtype.bytes().unwrap() as usize]
-            })
+            .map(|table| TableValues::zeroed(table).unwrap())
             .collect();
         rule.write_state(&request, &layout, &mut out).unwrap();
         let values = |name: &str| -> Vec<i32> {
             let index = names.iter().position(|table| *table == name).unwrap();
-            out[index]
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|word| i32::from_le_bytes(*word))
-                .collect()
+            decode_i32(&out[index])
         };
         assert_eq!(
             values("refiner_cu_seq_lens_q"),
@@ -3185,11 +3151,9 @@ mod tests {
             assert_eq!(table.shape.dim(0), rows / tile, "{name}");
         }
         // The tables fill, and every block size is at most one tile's rows.
-        let mut out: Vec<Vec<u8>> = specs
+        let mut out: Vec<TableValues> = specs
             .iter()
-            .map(|table| {
-                vec![0_u8; (table.shape.numel() as usize) * table.dtype.bytes().unwrap() as usize]
-            })
+            .map(|table| TableValues::zeroed(table).unwrap())
             .collect();
         rule.write_state(&request, &layout, &mut out).unwrap();
         let sizes = specs
@@ -3730,20 +3694,22 @@ mod tests {
         let unique: std::collections::BTreeSet<_> = names.iter().collect();
         assert_eq!(unique.len(), names.len(), "a name repeats: {names:?}");
         // The step is the one table the model never fills: the worker writes its single index
-        // before each replay, so `write_state` must leave its bytes as the caller offered them.
+        // before each replay, so `write_state` must leave its values as the caller offered them.
         const OFFERED: u8 = 0xAB;
-        let mut state: Vec<Vec<u8>> = tables
+        const WORD: u32 = u32::from_ne_bytes([OFFERED; 4]);
+        let mut state: Vec<TableValues> = tables
             .iter()
-            .map(|table| {
-                vec![
-                    OFFERED;
-                    (table.shape.numel() as usize) * table.dtype.bytes().unwrap() as usize
-                ]
+            .map(|table| match TableValues::zeroed(table).unwrap() {
+                TableValues::I32(values) => TableValues::I32(vec![WORD as i32; values.len()]),
+                TableValues::F32(values) => {
+                    TableValues::F32(vec![f32::from_bits(WORD); values.len()])
+                }
             })
             .collect();
         rule.write_state(&request, &layout, &mut state)
             .expect("a dense layout's state is writable");
-        for (table, bytes) in tables.iter().zip(&state) {
+        for (table, values) in tables.iter().zip(&state) {
+            let bytes = values.to_bytes();
             if table.name == "step" {
                 assert!(
                     bytes.iter().all(|byte| *byte == OFFERED),
@@ -3800,11 +3766,9 @@ mod tests {
         request.text_tokens = 12;
         let (layout, _) = rule.layout(&request).unwrap();
         let tables = rule.table_specs(&layout).unwrap();
-        let mut out: Vec<Vec<u8>> = tables
+        let mut out: Vec<TableValues> = tables
             .iter()
-            .map(|table| {
-                vec![0_u8; (table.shape.numel() as usize) * table.dtype.bytes().unwrap() as usize]
-            })
+            .map(|table| TableValues::zeroed(table).unwrap())
             .collect();
         rule.write_state(&request, &layout, &mut out).unwrap();
         // A prompt of 12 rows is text, so every write index points into the text rows and every
@@ -3852,6 +3816,9 @@ mod tests {
         // 24 latent frames is not a frame count a request snaps to: no rounding produces 5n + 2 = 24.
         layout.video.frames = 24;
         assert!(rule.packing_of(&layout).is_err());
+        // Its table list is refused with it: the capability answers the error, not an empty list
+        // a runner would upload nothing for.
+        assert!(rule.table_specs(&layout).is_err());
         // A prefix that holds no text row is not a layout this deployment packs either.
         let (mut layout, _) = rule.layout(&request(121, 1344, 768)).unwrap();
         layout.text_rows = 0;
@@ -3908,23 +3875,22 @@ mod tests {
         let request = request(121, 1344, 768);
         let (layout, _) = rule.layout(&request).unwrap();
         let tables = rule.table_specs(&layout).unwrap();
-        let mut out: Vec<Vec<u8>> = tables
+        let mut out: Vec<TableValues> = tables
             .iter()
-            .map(|table| {
-                vec![0_u8; table.shape.numel() as usize * table.dtype.bytes().unwrap() as usize]
-            })
+            .map(|table| TableValues::zeroed(table).unwrap())
             .collect();
         let refused = rule.write_state(&request, &layout, &mut out);
         assert!(refused.is_err());
     }
 
-    fn decode_i32(bytes: &[u8]) -> Vec<i32> {
-        let (chunks, _) = bytes.as_chunks::<4>();
-        chunks
-            .iter()
-            .map(|chunk| i32::from_le_bytes(*chunk))
-            .collect()
+    /// The values of an i32 host table.
+    fn decode_i32(table: &TableValues) -> Vec<i32> {
+        match table {
+            TableValues::I32(values) => values.clone(),
+            TableValues::F32(_) => panic!("an f32 table read as i32"),
+        }
     }
+
     #[test]
     fn each_kind_resolves_its_state_tables_by_its_own_names() {
         // The names are positional: the worker passes its views in `table_specs`' order, so a set

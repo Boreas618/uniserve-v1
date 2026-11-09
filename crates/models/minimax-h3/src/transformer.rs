@@ -484,8 +484,8 @@ impl FusedHeads {
                 bias.dtype
             )));
         }
-        let values = host_f32(dtype, &weight.bytes, &format!("{name}.weight"))?;
-        let biases = host_f32(dtype, &bias.bytes, &format!("{name}.bias"))?;
+        let values = dtype.decode(&weight.bytes).map_err(nn::Error::from)?;
+        let biases = dtype.decode(&bias.bytes).map_err(nn::Error::from)?;
         let blocks = u64::from(block_count);
         let per_head = out * hidden;
         let mut fused = vec![0_f32; (blocks * per_head) as usize];
@@ -510,14 +510,16 @@ impl FusedHeads {
                 &format!("denoiser.{modality_name}.student_heads.weight"),
                 nn::DType::F32,
                 Shape::new(&[blocks, per_head]),
-                &host_bytes(nn::DType::F32, &fused)?,
+                &nn::DType::F32.encode(&fused).map_err(nn::Error::from)?,
                 "minimax-h3",
             )?,
             bias: loader.constant(
                 &format!("denoiser.{modality_name}.student_heads.bias"),
                 nn::DType::F32,
                 Shape::new(&[blocks, out]),
-                &host_bytes(nn::DType::F32, &fused_bias)?,
+                &nn::DType::F32
+                    .encode(&fused_bias)
+                    .map_err(nn::Error::from)?,
                 "minimax-h3",
             )?,
             out: u32::try_from(out)
@@ -557,58 +559,6 @@ fn fuse_block(
         }
     }
     (weight, bias)
-}
-
-/// A checkpoint tensor's values as FP32, for a derivation that must be exact on the host.
-///
-/// Shared with the decoders' load-boundary folds, which read the checkpoint's own bytes for the same
-/// reason: a host product is only exact if nothing rounds on the way in.
-pub(crate) fn host_f32(dtype: nn::DType, bytes: &[u8], name: &str) -> Result<Vec<f32>> {
-    match dtype {
-        nn::DType::BF16 => Ok(bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| f32::from_bits(u32::from(u16::from_le_bytes(*pair)) << 16))
-            .collect()),
-        nn::DType::F32 => Ok(bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|word| f32::from_le_bytes(*word))
-            .collect()),
-        other => Err(Error::Unsupported(format!(
-            "{name} is {other}; a parallel-decoding student's heads are fused on the host in FP32, \
-             which this build does for BF16 and F32 only"
-        ))),
-    }
-}
-
-/// FP32 values as the little-endian bytes of `dtype`, rounded the way the checkpoint's own type
-/// rounds (BF16: round to nearest even).
-pub(crate) fn host_bytes(dtype: nn::DType, values: &[f32]) -> Result<Vec<u8>> {
-    match dtype {
-        nn::DType::BF16 => {
-            let mut bytes = Vec::with_capacity(values.len() * 2);
-            for value in values {
-                let bits = value.to_bits();
-                // Round to nearest even on the eight dropped bits before truncating.
-                let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
-                bytes.extend_from_slice(&((rounded >> 16) as u16).to_le_bytes());
-            }
-            Ok(bytes)
-        }
-        nn::DType::F32 => {
-            let mut bytes = Vec::with_capacity(values.len() * 4);
-            for value in values {
-                bytes.extend_from_slice(&value.to_le_bytes());
-            }
-            Ok(bytes)
-        }
-        other => Err(Error::Unsupported(format!(
-            "a fused head cannot be stored as {other}"
-        ))),
-    }
 }
 
 impl Transformer {
@@ -1151,27 +1101,5 @@ mod tests {
         let (weight, bias) = fuse_block(&values, &biases, 1, 2, 1, &[1.0]);
         assert_eq!(weight, vec![100.0, 200.0]);
         assert_eq!(bias, vec![9.0]);
-    }
-
-    #[test]
-    fn a_bf16_head_round_trips_through_the_host_path() {
-        // Every BF16 value is an FP32 value, so a tensor that is already BF16 must come back bit
-        // for bit: the fusion reads and writes the checkpoint's own type.
-        let values = [0.0_f32, 1.0, -2.5, 0.125, 1.0 / 3.0];
-        let bytes = host_bytes(nn::DType::BF16, &values).expect("a BF16 encoding");
-        let back = host_f32(nn::DType::BF16, &bytes, "test").expect("a BF16 decoding");
-        let again = host_bytes(nn::DType::BF16, &back).expect("a second encoding");
-        assert_eq!(bytes, again);
-        assert_eq!(back[0], 0.0);
-        assert_eq!(back[1], 1.0);
-        assert_eq!(back[2], -2.5);
-        assert_eq!(back[3], 0.125);
-        assert!((back[4] - 1.0 / 3.0).abs() < 0.004, "{} ", back[4]);
-    }
-
-    #[test]
-    fn a_head_type_the_host_fusion_cannot_read_is_refused() {
-        assert!(host_f32(nn::DType::I32, &[0, 0, 0, 0], "test").is_err());
-        assert!(host_bytes(nn::DType::I32, &[0.0]).is_err());
     }
 }

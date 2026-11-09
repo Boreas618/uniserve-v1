@@ -291,7 +291,7 @@ impl VideoPostprocessor {
     /// `value` at the raster's precision: what the reference's ramp holds in the decoded type.
     fn rounded(&self, value: f32) -> f32 {
         match self.dtype {
-            DType::F16 => nn::weights::half_to_f32(nn::weights::f32_to_half(value)),
+            DType::F16 => ops::values::f16_to_f32(ops::values::f32_to_f16(value)),
             _ => value,
         }
     }
@@ -332,7 +332,7 @@ impl nn::capability::Decoder for VideoPostprocessor {
     fn prepare_layout(
         &self,
         _layout: &nn::capability::Layout,
-        out: &mut [Vec<u8>],
+        out: &mut [nn::TableValues],
     ) -> nn::Result<()> {
         if out.is_empty() {
             return Ok(());

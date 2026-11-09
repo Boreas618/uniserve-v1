@@ -129,6 +129,7 @@ pub mod tolerance;
 pub mod transpose;
 pub mod twins;
 pub mod unpatchify;
+pub mod values;
 
 pub use descriptor::{Float, Key};
 pub use error::{Error, Result};

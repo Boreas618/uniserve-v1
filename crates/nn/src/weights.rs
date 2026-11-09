@@ -37,6 +37,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ops::fp4::ScaleLayout;
+use ops::values::{bf16_to_f32, f16_to_f32, f32_to_f16};
 use ops::{DType, Shape, TensorView};
 use sha2::{Digest, Sha256};
 
@@ -2580,10 +2581,8 @@ pub fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec
     for index in 0..count {
         let chunk = &bytes[index * source_bytes..][..source_bytes];
         let value = match from {
-            DType::BF16 => {
-                f32::from_bits(u32::from(u16::from_le_bytes([chunk[0], chunk[1]])) << 16)
-            }
-            DType::F16 => half_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])),
+            DType::BF16 => bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])),
+            DType::F16 => f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])),
             DType::F32 => f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
             // A PCM sample is an integer that F32 holds exactly, so the read is lossless.
             DType::I16 => f32::from(i16::from_le_bytes([chunk[0], chunk[1]])),
@@ -2595,10 +2594,13 @@ pub fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec
             }
         };
         match to {
+            // A weight narrowed to BF16 at load keeps its top sixteen bits: the loader truncates where
+            // `DType::encode` and `torch` round to nearest. Served weights were narrowed this way, so
+            // the rule stands until a measured run replaces it.
             DType::BF16 => {
                 converted.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes())
             }
-            DType::F16 => converted.extend_from_slice(&f32_to_half(value).to_le_bytes()),
+            DType::F16 => converted.extend_from_slice(&f32_to_f16(value).to_le_bytes()),
             DType::F32 => converted.extend_from_slice(&value.to_le_bytes()),
             DType::I16 => converted.extend_from_slice(&f32_to_i16(value).to_le_bytes()),
             other => {
@@ -2668,119 +2670,6 @@ fn from_f32(dtype: DType, values: &[f32], tensor: &str) -> Result<Vec<u8>> {
         .flat_map(|value| value.to_le_bytes())
         .collect();
     convert(DType::F32, dtype, &bytes, tensor)
-}
-
-/// `value` divided by `2^shift`, rounded to nearest with ties to even.
-fn round_even(value: u32, shift: u32) -> u32 {
-    if shift == 0 {
-        return value;
-    }
-    let quotient = value >> shift;
-    let remainder = value & ((1 << shift) - 1);
-    let half = 1 << (shift - 1);
-    if remainder > half || (remainder == half && quotient & 1 == 1) {
-        quotient + 1
-    } else {
-        quotient
-    }
-}
-
-/// The bfloat16 bit pattern nearest to `value`.
-///
-/// A bf16 is an `f32` whose low sixteen bits are dropped, with round-to-nearest-even: the rounding
-/// adds one less than half a unit in the last place, and the surviving bit decides a tie. That is
-/// what the device's own conversion does, so a producer that narrows on the host and a layer that
-/// narrows on the card agree bit for bit.
-///
-/// A `NaN` is returned as a `NaN` with its sign and payload's top bits: the rounding add would
-/// otherwise carry a large payload into an infinity, and a boundary that turns a `NaN` into an
-/// infinity is a boundary that hides a divergence.
-pub fn f32_to_bf16(value: f32) -> u16 {
-    let bits = value.to_bits();
-    if value.is_nan() {
-        // Quiet, with the payload's top six bits: an `f32` NaN is any exponent of all ones with a
-        // non-zero mantissa, and the truncation keeps both.
-        return ((bits >> 16) as u16) | 0x0040;
-    }
-    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
-    (rounded >> 16) as u16
-}
-
-/// The `f32` value of an IEEE half-precision bit pattern.
-///
-/// Public because a container that must hold `f32` (the diagnosis' `.npy`, which numpy reads) is
-/// written from a payload the device produced at the checkpoint's own width: the widening is one
-/// exact conversion and belongs beside its inverse rather than in every producer that needs it.
-pub fn half_to_f32(half: u16) -> f32 {
-    let sign = u32::from(half & 0x8000) << 16;
-    let exponent = (half >> 10) & 0x1f;
-    let mantissa = u32::from(half & 0x03ff);
-    let bits = match exponent {
-        0 => {
-            if mantissa == 0 {
-                sign
-            } else {
-                // A subnormal half is `mantissa · 2^-24`. Normalizing it left until the leading bit
-                // reaches the half's implicit position gives the float's exponent and fraction.
-                let leading = 31 - mantissa.leading_zeros();
-                let shift = 10 - leading;
-                let fraction = (mantissa << shift) & 0x03ff;
-                let exponent = 127 - 15 + 1 - shift as i32;
-                sign | ((exponent as u32) << 23) | (fraction << 13)
-            }
-        }
-        0x1f => sign | 0x7f80_0000 | (mantissa << 13),
-        _ => sign | ((u32::from(exponent) + 127 - 15) << 23) | (mantissa << 13),
-    };
-    f32::from_bits(bits)
-}
-
-/// The IEEE half-precision bit pattern nearest to `value`.
-///
-/// Public with [`half_to_f32`]: a producer that narrows a tensor to the deployment's type and a
-/// producer that widens one for a file are the same two functions read in opposite directions.
-pub fn f32_to_half(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = (bits >> 23) & 0xff;
-    let mantissa = bits & 0x007f_ffff;
-    if exponent == 0 {
-        // A zero or subnormal `f32` underflows to a signed zero in the half's exponent range; the
-        // largest half subnormal is still an order of magnitude above the largest `f32` subnormal.
-        return sign;
-    }
-    if exponent == 0xff {
-        return sign | 0x7c00 | if mantissa == 0 { 0 } else { 0x0200 };
-    }
-    let unbiased = exponent as i32 - 127;
-    if unbiased > 15 {
-        return sign | 0x7c00;
-    }
-    if unbiased >= -14 {
-        // A normal half: drop thirteen mantissa bits, round to nearest with ties to even, and let
-        // the rounding carry into the exponent — a carry out of the largest finite half is the
-        // infinity that nearest-rounding gives.
-        let half_exponent = ((unbiased + 15) as u32) << 10;
-        let total = half_exponent + round_even(mantissa, 13);
-        return if total >= 0x7c00 {
-            sign | 0x7c00
-        } else {
-            sign | total as u16
-        };
-    }
-    // A subnormal half is a whole number of `2^-24` units: the significand at the float's own scale
-    // (`1.m · 2^23`) divided by `2^(-unbiased - 1)`, rounded to nearest with ties to even.
-    let significand = mantissa | 0x0080_0000;
-    let shift = (-unbiased - 1) as u32;
-    if shift > 24 {
-        return sign;
-    }
-    let rounded = round_even(significand, shift);
-    if rounded >= 0x0400 {
-        // Rounded up out of the subnormals into the smallest normal.
-        return sign | 0x0400;
-    }
-    sign | rounded as u16
 }
 
 #[cfg(test)]
@@ -2985,81 +2874,6 @@ mod tests {
         // the pinned value is therefore `row * blocks + column + 1`, not the position itself.
         assert_eq!(swizzled[index], (5 * blocks + 6 + 1) as u8);
     }
-
-    #[test]
-    fn half_round_trips_the_values_a_checkpoint_holds() {
-        // A subnormal half has an absolute precision of 2^-24, not a relative one, so the bound is
-        // half a unit there and relative only from the smallest normal upward.
-        const SMALLEST_NORMAL: f32 = 6.103_515_6e-5;
-        const HALF_UNIT: f32 = 2.980_232_2e-8;
-        for value in [0.0_f32, 1.0, -1.0, 0.5, 0.1, 65_504.0, 1e-5, 1.192_092_9e-7] {
-            let back = half_to_f32(f32_to_half(value));
-            let bound = if value.abs() < SMALLEST_NORMAL {
-                HALF_UNIT
-            } else {
-                value.abs() * 1e-3
-            };
-            assert!((back - value).abs() <= bound, "{value:e} became {back:e}");
-        }
-    }
-
-    #[test]
-    fn a_half_conversion_holds_the_subnormal_range_and_the_specials() {
-        // A quarter of the half's magnitude range is subnormal, and a checkpoint holds RMS weights
-        // and epsilon-like constants there; the encoding is a whole number of 2^-24 units.
-        for (value, units) in [
-            (1e-5_f32, 168_u16),
-            (5.960_464_5e-8, 1),
-            (1.192_092_9e-7, 2),
-            (6.097_555_6e-5, 1023),
-        ] {
-            assert_eq!(f32_to_half(value), units, "{value:e}");
-            assert!(
-                (half_to_f32(units) - value).abs() <= 5.960_464_5e-8,
-                "{value:e}"
-            );
-        }
-        // Below half a unit of the smallest subnormal the value is zero; past half a unit it is
-        // one, and exactly half a unit ties between 0 and 1, where even wins.
-        assert_eq!(f32_to_half(2.0e-8), 0);
-        assert_eq!(f32_to_half(-2.0e-8), 0x8000);
-        assert_eq!(f32_to_half(2.980_232_2e-8), 0);
-        assert_eq!(f32_to_half(4.5e-8), 1);
-        // A value that rounds up out of the subnormals becomes the smallest normal.
-        assert_eq!(f32_to_half(6.101e-5), 0x0400);
-        // Ties round to even, and the largest finite magnitude's neighbourhood rounds to infinity.
-        assert_eq!(half_to_f32(f32_to_half(65504.0)), 65504.0);
-        assert_eq!(f32_to_half(65_520.0), 0x7c00);
-        assert_eq!(f32_to_half(70_000.0), 0x7c00);
-        assert!(f32_to_half(f32::NAN) & 0x7c00 == 0x7c00);
-        assert!(f32_to_half(f32::NAN) & 0x03ff != 0);
-        assert_eq!(f32_to_half(f32::INFINITY), 0x7c00);
-        assert_eq!(half_to_f32(0x8000), -0.0);
-    }
-
-    #[test]
-    fn a_bf16_conversion_rounds_like_the_hardware() {
-        // A value whose low half is zero keeps exactly its top sixteen bits.
-        let tiny = f32::from_bits(0x0c00_0000);
-        let large = f32::from_bits(0x7f7f_0000);
-        for value in [0.0_f32, 1.0, -1.0, 2.0, 0.5, tiny, large] {
-            assert_eq!(
-                f32_to_bf16(value),
-                (value.to_bits() >> 16) as u16,
-                "{value:e}"
-            );
-        }
-        // Half a unit in the last place ties between two neighbours and the even one wins; a value
-        // past the tie rounds up.
-        assert_eq!(f32_to_bf16(1.0 + 2.0_f32.powi(-8)), 0x3f80);
-        assert_eq!(f32_to_bf16(1.0 + 3.0 * 2.0_f32.powi(-9)), 0x3f81);
-        // The specials keep their meaning: an infinity is the top exponent with a zero mantissa, and
-        // a NaN stays a NaN instead of carrying into that infinity.
-        assert_eq!(f32_to_bf16(f32::INFINITY), 0x7f80);
-        assert_eq!(f32_to_bf16(f32::NEG_INFINITY), 0xff80);
-        assert!(f32::from_bits(u32::from(f32_to_bf16(f32::NAN)) << 16).is_nan());
-    }
-
     #[test]
     fn a_key_names_the_checkpoint_the_type_the_layout_and_the_region() {
         let key = WeightKey {

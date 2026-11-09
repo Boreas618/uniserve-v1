@@ -775,7 +775,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
     /// Allocates and fills `bucket`'s layout tables, on the device thread, outside any step.
     fn fill(&mut self, bucket: Bucket) -> Result<()> {
         let layout = layout_of(bucket)?;
-        let tables = self.model.state_tables(&layout);
+        let tables = self.model.state_tables(&layout).map_err(Error::from)?;
         if tables.is_empty() {
             return Ok(());
         }
@@ -1070,7 +1070,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             group.as_deref(),
         );
         let layout = layout_of(bucket)?;
-        let tables = self.model.state_tables(&layout);
+        let tables = self.model.state_tables(&layout).map_err(Error::from)?;
         let key = Self::key(bucket);
         let state = self
             .tables
@@ -1456,7 +1456,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             }
         }
         if self.diag.enabled() && !forward.is_recording() {
-            let tables = self.model.state_tables(&layout);
+            let tables = self.model.state_tables(&layout).map_err(Error::from)?;
             for (table, view) in tables.iter().zip(state.iter()) {
                 self.dump("state", table.name, *view);
             }
@@ -1477,7 +1477,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
     fn walk_recorded(&self, walk: &Walk, bucket: Bucket) -> Result<()> {
         let warm = &self.plan_of(bucket)?.warm;
         let layout = layout_of(bucket)?;
-        let state = walk.tables(&self.model.state_tables(&layout))?;
+        let state = walk.tables(&self.model.state_tables(&layout).map_err(Error::from)?)?;
         let group = self.group.as_deref();
         self.walk_opening(walk, bucket, warm, &state)?;
         for conditions in &warm.openings {
@@ -1558,7 +1558,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             )));
         };
         let layout = layout_of(bucket)?;
-        let tables = self.model.state_tables(&layout);
+        let tables = self.model.state_tables(&layout).map_err(Error::from)?;
         if tables.is_empty() {
             return Ok(());
         }
@@ -1826,7 +1826,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
     /// running one changes nothing the running one reads.
     fn write_step(&mut self, bucket: Bucket) -> Result<()> {
         let layout = layout_of(bucket)?;
-        let tables = self.model.state_tables(&layout);
+        let tables = self.model.state_tables(&layout).map_err(Error::from)?;
         let Some(position) = tables.iter().position(|table| table.name == "step") else {
             return Ok(());
         };
@@ -1865,7 +1865,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             group.as_deref(),
         );
         let layout = layout_of(bucket)?;
-        let tables = self.model.state_tables(&layout);
+        let tables = self.model.state_tables(&layout).map_err(Error::from)?;
         let key = Self::key(bucket);
         let state = self
             .tables
@@ -1920,7 +1920,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             group.as_deref(),
         );
         let layout = layout_of(bucket)?;
-        let tables = self.model.state_tables(&layout);
+        let tables = self.model.state_tables(&layout).map_err(Error::from)?;
         let key = Self::key(bucket);
         let state = self
             .tables
@@ -2467,7 +2467,7 @@ fn layout_of(bucket: Bucket) -> Result<Layout> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nn::capability::{Seed, StateTable, VideoRequest};
+    use nn::capability::{Seed, StateTable, TableValues, VideoRequest};
 
     /// A trajectory's bytes lie back to back over the video and the audio column, so a range that
     /// straddles the two is two pieces, and a range past the trajectory is refused.
@@ -2727,24 +2727,24 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn prepare_layout(&self, _layout: &Layout, _out: &mut [Vec<u8>]) -> nn::Result<()> {
+        fn prepare_layout(&self, _layout: &Layout, _out: &mut [TableValues]) -> nn::Result<()> {
             Ok(())
         }
 
-        fn state_tables(&self, _layout: &Layout) -> Vec<StateTable> {
-            Vec::new()
+        fn state_tables(&self, _layout: &Layout) -> nn::Result<Vec<StateTable>> {
+            Ok(Vec::new())
         }
 
         fn prepare_state(
             &self,
             _request: &VideoRequest<'_>,
             _layout: &Layout,
-            _out: &mut [Vec<u8>],
+            _out: &mut [TableValues],
         ) -> nn::Result<()> {
             Ok(())
         }
 
-        fn prepare_evaluation(&self, _index: u32, _out: &mut [Vec<u8>]) -> nn::Result<()> {
+        fn prepare_evaluation(&self, _index: u32, _out: &mut [TableValues]) -> nn::Result<()> {
             Ok(())
         }
     }

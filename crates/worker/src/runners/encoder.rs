@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use ipc::TimingCounters;
 use nn::capability::{
     Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageInput, ImageShape,
-    MediaFormat, StateTable, TokenBatch, WarmPrompt,
+    MediaFormat, StateTable, TableValues, TokenBatch, WarmPrompt,
 };
 use ops::{DType, PhaseKind, TensorView};
 use platform::DeviceId;
@@ -424,7 +424,7 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
     /// Allocates and fills `bucket`'s layout tables, on the device thread, outside any step.
     fn fill(&mut self, bucket: Bucket) -> Result<()> {
         let layout = self.layout(bucket);
-        let tables = self.model.state_tables(&layout);
+        let tables = self.model.state_tables(&layout).map_err(Error::from)?;
         if tables.is_empty() {
             return Ok(());
         }
@@ -711,22 +711,21 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
         tables: &[StateTable],
         held: &mut Vec<platform::PinnedBuffer>,
     ) -> Result<Vec<TensorView>> {
-        let mut host = Vec::with_capacity(tables.len());
-        for table in tables {
-            let bytes = usize::try_from(Tables::plan_bytes(std::slice::from_ref(table))?)
-                .map_err(|_| Error::Invalid("a table is larger than memory".into()))?;
-            host.push(vec![0_u8; bytes]);
-        }
+        let mut values = tables
+            .iter()
+            .map(|table| TableValues::zeroed(table).map_err(Error::from))
+            .collect::<Result<Vec<_>>>()?;
         self.model
-            .prepare_state(&EncoderPrompt { ids: &self.ids }, layout, &mut host)
+            .prepare_state(&EncoderPrompt { ids: &self.ids }, layout, &mut values)
             .map_err(Error::from)?;
 
         let mut state = Vec::with_capacity(tables.len());
-        for (table, bytes) in tables.iter().zip(&host) {
+        for (table, values) in tables.iter().zip(&values) {
+            let bytes = values.to_bytes();
             let mut buffer = platform::PinnedBuffer::new(self.device, bytes.len().max(1))?;
             // SAFETY: the buffer was allocated above and no device work reads it yet.
             unsafe {
-                buffer.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+                buffer.as_mut_slice()[..bytes.len()].copy_from_slice(&bytes);
             }
             state.push(TensorView::new(
                 ops::DevicePtr::new(buffer.address()),
@@ -761,7 +760,7 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
             tokens,
             images: images.to_vec(),
         };
-        let tables = self.model.state_tables(&layout);
+        let tables = self.model.state_tables(&layout).map_err(Error::from)?;
         let state = state(&layout, &tables)?;
 
         // Each block reads its own run of the patch rows: `time × rows × columns` of them.
@@ -835,7 +834,7 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
             group.as_deref(),
         );
         let layout = self.layout(bucket);
-        let tables = self.model.state_tables(&layout);
+        let tables = self.model.state_tables(&layout).map_err(Error::from)?;
         let key = Self::key(bucket);
         if !tables.is_empty() {
             self.fill(bucket)?;
@@ -1017,7 +1016,12 @@ impl<M: Encoder + Send + Sync + ?Sized> Runner for EncoderRunner<M> {
         let patch_width = u64::from(self.warm.format.patch_width());
         for bucket in self.capture_order() {
             footprint.walk(Some(bucket), |walk| {
-                let state = walk.tables(&self.model.state_tables(&self.layout(bucket)))?;
+                let state = walk.tables(
+                    &self
+                        .model
+                        .state_tables(&self.layout(bucket))
+                        .map_err(Error::from)?,
+                )?;
                 self.encode(&walk.forward(group.as_deref())?, bucket, &state)
             })?;
 

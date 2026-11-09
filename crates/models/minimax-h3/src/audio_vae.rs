@@ -829,7 +829,7 @@ impl Decoder for BigVgan {
     fn prepare_layout(
         &self,
         _layout: &nn::capability::Layout,
-        out: &mut [Vec<u8>],
+        out: &mut [nn::TableValues],
     ) -> nn::Result<()> {
         if out.is_empty() {
             Ok(())

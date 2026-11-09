@@ -62,8 +62,8 @@ use nn::layers::{
     Conv1d, Conv3d, ConvGeometry, CrossFade, Linear, RmsNorm, Rotary, Rotation, ScaledAdd,
     ScaledResidual, Sections, TileGrid, TileStitch, WeightOrder,
 };
-use nn::weights::{f32_to_bf16, f32_to_half, half_to_f32};
 use nn::{Arena, Backing, DType, DevicePtr, Forward, Shape, Strides, TensorView, Weight};
+use ops::values::{f16_to_f32, f32_to_bf16, f32_to_f16};
 
 /// Every harness failure: a missing asset, a refused launch, a device or Program Server error.
 type Outcome<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -161,7 +161,7 @@ fn encode(dtype: DType, values: &[f32]) -> Outcome<Vec<u8>> {
             .collect(),
         DType::F16 => values
             .iter()
-            .flat_map(|value| f32_to_half(*value).to_le_bytes())
+            .flat_map(|value| f32_to_f16(*value).to_le_bytes())
             .collect(),
         DType::BF16 => values
             .iter()
@@ -184,7 +184,7 @@ fn decode(dtype: DType, bytes: &[u8]) -> Outcome<Vec<f32>> {
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|half| half_to_f32(u16::from_le_bytes(*half)))
+            .map(|half| f16_to_f32(u16::from_le_bytes(*half)))
             .collect(),
         DType::BF16 => bytes
             .as_chunks::<2>()
@@ -1600,7 +1600,7 @@ mod device {
         let looped = bench.tensor(dtype, &[channels, overlap, height, width])?;
         let faded = bench.tensor(dtype, &[channels, overlap, height, width])?;
         let term = bench.tensor(dtype, &[1, pixels])?;
-        let rounded = |value: f32| half_to_f32(f32_to_half(value));
+        let rounded = |value: f32| f16_to_f32(f32_to_f16(value));
 
         // `[channels, 1, overlap, pixels]`: the frames as the rows `CrossFade` blends along.
         let band = |view: TensorView, frames: u64| {

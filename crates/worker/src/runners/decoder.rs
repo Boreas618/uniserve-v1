@@ -1609,7 +1609,7 @@ mod tests {
         }
     }
     use super::*;
-    use nn::capability::StateTable;
+    use nn::capability::{StateTable, TableValues};
 
     /// The clip the stub decoder serves, and the layout it decodes it from.
     const SERVED: (u32, u32, u32) = (2, 3, 4);
@@ -1648,10 +1648,8 @@ mod tests {
             ])
         }
 
-        fn prepare_layout(&self, _layout: &Layout, out: &mut [Vec<u8>]) -> nn::Result<()> {
-            for buffer in out {
-                buffer.fill(0);
-            }
+        fn prepare_layout(&self, _layout: &Layout, _out: &mut [TableValues]) -> nn::Result<()> {
+            // The tables arrive zeroed, which is what this decoder states for them.
             Ok(())
         }
 

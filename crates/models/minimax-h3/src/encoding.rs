@@ -54,6 +54,7 @@ const NORM_EPS: f32 = 1e-5;
 use crate::config::VideoVaeConfig;
 use crate::video_vae::{MINIMUM_OVERLAP, Seams, TILE_PIXELS};
 use crate::{Error, Result};
+use ops::values::f32_to_bf16;
 
 /// The spatial compression of the video encoder: input pixels per latent position.
 pub const SPATIAL_RATIO: u32 = 16;
@@ -220,7 +221,7 @@ impl nn::capability::MediaFormat for ConditionFormat {
         for channel in 0..channels {
             for byte in 0..=u8::MAX {
                 table[channel * 256 + usize::from(byte)] =
-                    bfloat16((f32::from(byte) - mean[channel]) / std[channel]).to_le_bytes();
+                    f32_to_bf16((f32::from(byte) - mean[channel]) / std[channel]).to_le_bytes();
             }
         }
         let table = &table;
@@ -285,13 +286,6 @@ impl nn::capability::MediaFormat for ConditionFormat {
         }
         Ok(())
     }
-}
-
-/// `value` rounded to the nearest BF16, ties to even: the bits `torch`'s conversion writes.
-fn bfloat16(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let bias = 0x7fff + ((bits >> 16) & 1);
-    (bits.wrapping_add(bias) >> 16) as u16
 }
 
 /// The extents of one tensor of the encoder's stack, in frames, rows and columns.
@@ -2624,6 +2618,7 @@ impl GeGlu {
 mod tests {
     use super::*;
     use nn::capability::MediaFormat as _;
+    use ops::values::bf16_to_f32;
 
     /// The format of a tower of `patch`-pixel patches, two-frame tubelets and `2 x 2` merges.
     fn format(patch: u32) -> ConditionFormat {
@@ -2653,7 +2648,7 @@ mod tests {
 
     fn row_value(rows: &[u8], index: usize) -> f32 {
         let bits = u16::from_le_bytes([rows[2 * index], rows[2 * index + 1]]);
-        f32::from_bits(u32::from(bits) << 16)
+        bf16_to_f32(bits)
     }
 
     /// Patch rows run over merge blocks: the four patches of a `2 x 2` block are consecutive rows,
@@ -2680,7 +2675,7 @@ mod tests {
             .patches(&planes, 1, [1, 2, 4], &mut out)
             .expect("one frame fills one temporal patch");
         let pixel = |byte: u8| (f32::from(byte) - 127.5) / 127.5;
-        let rounded = |value: f32| f32::from_bits(u32::from(bfloat16(value)) << 16);
+        let rounded = |value: f32| bf16_to_f32(f32_to_bf16(value));
         // The rows of the first block are pixels (0,0), (0,1), (1,0), (1,1); the second block's
         // first row is pixel (0,2). A row is channel-major with its two frames inside a channel, and
         // the one frame fills both.
@@ -2725,8 +2720,7 @@ mod tests {
         format
             .patches(&planes, 3, [2, 2, 2], &mut out)
             .expect("three frames fill two temporal patches");
-        let pixel =
-            |byte: u8| f32::from_bits(u32::from(bfloat16((f32::from(byte) - 127.5) / 127.5)) << 16);
+        let pixel = |byte: u8| bf16_to_f32(f32_to_bf16((f32::from(byte) - 127.5) / 127.5));
         // Inside a channel the tubelet holds its frames in order, four pixels each.
         assert_eq!(row_value(&out, 0), pixel(10));
         assert_eq!(row_value(&out, 4), pixel(20));
@@ -2760,15 +2754,6 @@ mod tests {
         format.track(&pcm, 2, &mut track).expect("two samples");
         assert_eq!(&track[..3], &[1.0, 2.0, 0.0]);
         assert_eq!(&track[800..803], &[-1.0, -2.0, 0.0]);
-    }
-
-    #[test]
-    fn a_bfloat16_rounds_to_nearest_even() {
-        assert_eq!(bfloat16(1.0), 0x3f80);
-        // Halfway between 0x3f80 and 0x3f81 rounds to the even one, and past it to the odd one.
-        assert_eq!(bfloat16(f32::from_bits(0x3f80_8000)), 0x3f80);
-        assert_eq!(bfloat16(f32::from_bits(0x3f80_8001)), 0x3f81);
-        assert_eq!(bfloat16(f32::from_bits(0x3f81_8000)), 0x3f82);
     }
 
     use crate::video_vae::tests::video_config;

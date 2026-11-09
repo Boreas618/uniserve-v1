@@ -477,7 +477,7 @@ use nn::layers::{
     ScaledResidualRmsNorm, Sections, WeightedRmsNorm,
 };
 use nn::weights::{Weight, WeightLayout, WeightLoader, WeightRequest};
-use nn::{DType, DecodedMedia, Decoder, Shape, StateTable, TensorView};
+use nn::{DType, DecodedMedia, Decoder, Shape, StateTable, TableValues, TensorView};
 use ops::gemm::WeightOrder;
 
 /// The element type of the decoder's projections and of the rows they read and write, and the type
@@ -596,12 +596,12 @@ pub(crate) fn table_specs(
     ])
 }
 
-/// Write the host bytes of [`table_specs`], in its order, checking every buffer's length.
-pub(crate) fn table_bytes_into(
+/// Write the host values of [`table_specs`], in its order, each checked against its table.
+pub(crate) fn table_values_into(
     config: &VideoVaeConfig,
     latent_height: u32,
     latent_width: u32,
-    out: &mut [Vec<u8>],
+    out: &mut [TableValues],
 ) -> Result<()> {
     let tables = table_specs(config, latent_height, latent_width)?;
     if out.len() != tables.len() {
@@ -611,27 +611,20 @@ pub(crate) fn table_bytes_into(
             out.len()
         )));
     }
-    let values = positions(&largest_tile(config, latent_height, latent_width)?)?;
-    let mut bytes = Vec::with_capacity(values.len() * 4);
-    for value in values {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    out[0] = bytes;
+    let positions = TableValues::F32(positions(&largest_tile(
+        config,
+        latent_height,
+        latent_width,
+    )?)?);
     let clip = Canvas::clip(config, latent_height, latent_width);
-    out[1] = crate::decoding::stitch_table(config, &clip)?
-        .iter()
-        .flatten()
-        .flat_map(|word| word.to_le_bytes())
-        .collect();
-    for (buffer, table) in out.iter().zip(&tables) {
-        let expected = table.shape.numel() as usize * (table.dtype.bits() as usize / 8);
-        if buffer.len() != expected {
-            return Err(Error::config(format!(
-                "{} is {} bytes and the table needs {expected}",
-                table.name,
-                buffer.len()
-            )));
-        }
+    let stitch = TableValues::I32(
+        crate::decoding::stitch_table(config, &clip)?
+            .into_iter()
+            .flatten()
+            .collect(),
+    );
+    for ((held, table), values) in out.iter_mut().zip(&tables).zip([positions, stitch]) {
+        held.write(table.name, &values)?;
     }
     Ok(())
 }
@@ -770,7 +763,7 @@ impl VideoDecoder {
         let identity: Vec<u8> = (0..channels * channels)
             .flat_map(|index| {
                 let one = index / channels == index % channels;
-                nn::weights::f32_to_half(if one { 1.0 } else { 0.0 }).to_le_bytes()
+                ops::values::f32_to_f16(if one { 1.0 } else { 0.0 }).to_le_bytes()
             })
             .collect();
         declared(&declared_sizes, "video_vae.identity", identity.len())?;
@@ -1185,14 +1178,14 @@ impl VideoDecoder {
         table_specs(&self.config, latent_height, latent_width)
     }
 
-    /// Write the host bytes of each table of [`Self::tables`], in the same order.
-    pub fn table_bytes(
+    /// Write the host values of each table of [`Self::tables`], in the same order.
+    pub fn table_values(
         &self,
         latent_height: u32,
         latent_width: u32,
-        out: &mut [Vec<u8>],
+        out: &mut [TableValues],
     ) -> Result<()> {
-        table_bytes_into(&self.config, latent_height, latent_width, out)
+        table_values_into(&self.config, latent_height, latent_width, out)
     }
 
     /// The rasters this decoder serves: the deployment's canvases, every one of them.
@@ -1457,9 +1450,9 @@ impl Decoder for VideoDecoder {
     fn prepare_layout(
         &self,
         layout: &nn::capability::Layout,
-        out: &mut [Vec<u8>],
+        out: &mut [TableValues],
     ) -> nn::Result<()> {
-        self.table_bytes(layout.video.height, layout.video.width, out)
+        self.table_values(layout.video.height, layout.video.width, out)
             .map_err(|error| nn::Error::Shape {
                 owner: "VideoDecoder",
                 problem: error.to_string(),
@@ -2136,16 +2129,18 @@ pub(crate) mod tests {
         // here are the served ones - 768p at 768 x 1344 (48 x 84 latents) and 672p at 672 x 1536
         // (42 x 96) - and they are the same table, not two of the same shape by coincidence.
         let config = video_config();
-        let mut vertical = vec![Vec::new(), Vec::new()];
-        let mut wide = vec![Vec::new(), Vec::new()];
-        table_bytes_into(&config, 48, 84, &mut vertical).expect("the vertical canvas");
-        table_bytes_into(&config, 42, 96, &mut wide).expect("the wide canvas");
-        assert_eq!(vertical[0].len(), wide[0].len());
-        let tables = table_specs(&config, 48, 84).expect("the one table");
-        // The buffer is the descriptor's own expression: elements times the element's size. Written as
-        // a number it was `5,391` elements against `21,564` bytes - the same table in two units.
-        let expected = tables[0].shape.numel() * u64::from(tables[0].dtype.bits()) / 8;
-        assert_eq!(vertical[0].len() as u64, expected);
+        let zeroed = |height, width| -> Vec<TableValues> {
+            table_specs(&config, height, width)
+                .expect("the tables")
+                .iter()
+                .map(|table| TableValues::zeroed(table).expect("a host table"))
+                .collect()
+        };
+        let mut vertical = zeroed(48, 84);
+        let mut wide = zeroed(42, 96);
+        table_values_into(&config, 48, 84, &mut vertical).expect("the vertical canvas");
+        table_values_into(&config, 42, 96, &mut wide).expect("the wide canvas");
+        assert_eq!(vertical[0], wide[0]);
     }
 
     #[test]
@@ -2153,10 +2148,14 @@ pub(crate) mod tests {
         // The worker sizes `out` from `table_specs`, so a count that disagrees with the block is a
         // protocol error and must surface as one rather than as a partially written table.
         let config = video_config();
-        let mut none: Vec<Vec<u8>> = Vec::new();
-        assert!(table_bytes_into(&config, 48, 84, &mut none).is_err());
-        let mut three = vec![Vec::new(), Vec::new(), Vec::new()];
-        assert!(table_bytes_into(&config, 48, 84, &mut three).is_err());
+        let mut none: Vec<TableValues> = Vec::new();
+        assert!(table_values_into(&config, 48, 84, &mut none).is_err());
+        let mut three = vec![TableValues::I32(Vec::new()); 3];
+        assert!(table_values_into(&config, 48, 84, &mut three).is_err());
+        // A table of the right count whose extents are not the layout's is refused by its name.
+        let mut short = vec![TableValues::F32(Vec::new()), TableValues::I32(Vec::new())];
+        let error = table_values_into(&config, 48, 84, &mut short).expect_err("short tables");
+        assert!(error.to_string().contains("video_positions"), "{error}");
     }
 
     #[test]

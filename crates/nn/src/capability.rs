@@ -570,14 +570,14 @@ pub struct LatentShape {
 ///   rotary positions of its raster, the packed row of each clip's latent voxel. These are the
 ///   model's mathematical layout, which the worker cannot compute, and they are the same for
 ///   every request of one shape — so they are filled once per layout
-///   ([`Denoiser::prepare_layout`], host bytes only) and shared.
+///   ([`Denoiser::prepare_layout`], host values only) and shared.
 /// - **state** ([`Denoiser::state_tables`]) is per *request* of a layout: a table derived from the
 ///   request itself (its prompt clock, its spans, its mask) is one table per request.
-///   [`Denoiser::prepare_state`] writes **host bytes only**; the worker allocates each table and
-///   uploads those bytes. The list is deterministic for a layout, and the worker keys its storage
+///   [`Denoiser::prepare_state`] writes **host values only**; the worker allocates each table and
+///   uploads those values. The list is deterministic for a layout, and the worker keys its storage
 ///   by `(layout, name)` beside the layout constants'.
 /// - **evaluation** ([`Denoiser::prepare_evaluation`]) is per *evaluation index*: one solver
-///   coefficient set, again host bytes the worker uploads, so a request's schedule is chosen
+///   coefficient set, again host values the worker uploads, so a request's schedule is chosen
 ///   without capturing a graph per step.
 ///
 /// No `prepare_*` allocates, takes an allocator, synchronizes or reads anything back; allocation is
@@ -590,6 +590,110 @@ pub struct StateTable {
     pub dtype: DType,
     /// The extents.
     pub shape: Shape,
+}
+
+/// The host values of one [`StateTable`], typed by the element type the table states.
+///
+/// The runtime allocates one per table at the table's extents ([`TableValues::zeroed`]), hands the
+/// model the list in the order the model stated the tables, and uploads each once the model has
+/// written it. The model writes values, never bytes: [`TableValues::write`] checks that the values
+/// are the table's element type and fill it exactly, and refuses by the table's name otherwise.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TableValues {
+    /// A table of `i32` indices, offsets or counts.
+    I32(Vec<i32>),
+    /// A table of `f32` coefficients or coordinates.
+    F32(Vec<f32>),
+}
+
+impl TableValues {
+    /// A table of `table`'s element type and extents, every element zero.
+    ///
+    /// # Errors
+    ///
+    /// When the table states an element type a host table is not written in (anything but
+    /// `I32` and `F32`), or more elements than the host can address.
+    pub fn zeroed(table: &StateTable) -> Result<Self> {
+        let elements = usize::try_from(table.shape.numel()).map_err(|_| Error::Shape {
+            owner: "TableValues",
+            problem: format!("table `{}` holds more elements than memory", table.name),
+        })?;
+        match table.dtype {
+            DType::I32 => Ok(Self::I32(vec![0; elements])),
+            DType::F32 => Ok(Self::F32(vec![0.0; elements])),
+            other => Err(Error::Shape {
+                owner: "TableValues",
+                problem: format!(
+                    "table `{}` states {other}, and a host table is written as i32 or f32",
+                    table.name
+                ),
+            }),
+        }
+    }
+
+    /// The elements the table holds.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::I32(values) => values.len(),
+            Self::F32(values) => values.len(),
+        }
+    }
+
+    /// Whether the table holds no element.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The element type of the values.
+    pub fn dtype(&self) -> DType {
+        match self {
+            Self::I32(_) => DType::I32,
+            Self::F32(_) => DType::F32,
+        }
+    }
+
+    /// Write `values` over the whole table named `name`.
+    ///
+    /// # Errors
+    ///
+    /// When `values` is another element type than the table, or another count of elements.
+    pub fn write(&mut self, name: &str, values: &Self) -> Result<()> {
+        let refuse = |problem: String| Error::Shape {
+            owner: "TableValues",
+            problem: format!("table `{name}`: {problem}"),
+        };
+        match (self, values) {
+            (Self::I32(held), Self::I32(values)) if held.len() == values.len() => {
+                held.copy_from_slice(values);
+                Ok(())
+            }
+            (Self::F32(held), Self::F32(values)) if held.len() == values.len() => {
+                held.copy_from_slice(values);
+                Ok(())
+            }
+            (held, values) => Err(refuse(format!(
+                "{} {} elements written into a table of {} {}",
+                values.len(),
+                values.dtype(),
+                held.len(),
+                held.dtype()
+            ))),
+        }
+    }
+
+    /// The table's bytes as the device reads them: each element little-endian.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::I32(values) => values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+            Self::F32(values) => values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        }
+    }
 }
 
 /// The seed a noise draw is addressed by.
@@ -814,7 +918,7 @@ pub struct DecodedMedia {
 /// A tower that turns inputs into conditioning (a text encoder, a vision tower, a video encoder).
 ///
 /// The protocol is the denoiser's, in the denoiser's words: the model says what shape an encode
-/// has, which tables that shape needs and writes their host bytes; the worker allocates and
+/// has, which tables that shape needs and writes their host values; the worker allocates and
 /// uploads them. A tower's per-grid tables (its rotary clocks, its tap tables, the prompt rows its
 /// images replace) are mathematics the worker cannot reproduce, and they are the same for every
 /// request of one shape.
@@ -826,23 +930,23 @@ pub trait Encoder {
     ///
     /// Deterministic for a layout, so the worker keys storage by `(layout, name)` and shares one
     /// set between every request of that shape.
-    fn state_tables(&self, layout: &EncoderLayout) -> Vec<StateTable>;
+    fn state_tables(&self, layout: &EncoderLayout) -> Result<Vec<StateTable>>;
 
-    /// Write the host bytes of each table of `layout`, in [`Self::state_tables`]' order.
+    /// Write the host values of each table of `layout`, in [`Self::state_tables`]' order.
     ///
     /// `prompt` is the request's own tokens, on the host and unspliced: two of a tower's tables (the
     /// interleaved M-RoPE positions and the prompt rows its images replace) are arithmetic over the
     /// token ids, and that arithmetic belongs to the model rather than to the runner. The ids are
     /// deliberately **not** part of the layout: every table's shape follows from the layout's
-    /// counts, only the bytes follow from the ids, so two prompts of one shape share one capture.
+    /// counts, only the values follow from the ids, so two prompts of one shape share one capture.
     ///
-    /// `out[i]` is `state_tables(layout)[i]`'s bytes, row-major in its element type, already the
+    /// `out[i]` holds `state_tables(layout)[i]`'s values, row-major, already the
     /// right length; the worker uploads it. No allocation, no synchronization, no read-back.
     fn prepare_state(
         &self,
         prompt: &EncoderPrompt<'_>,
         layout: &EncoderLayout,
-        out: &mut [Vec<u8>],
+        out: &mut [TableValues],
     ) -> Result<()>;
 
     /// Encode `inputs` into `out`.
@@ -977,32 +1081,32 @@ pub trait Denoiser {
     /// every request of that shape.
     fn layout_tables(&self, layout: &Layout) -> Result<Vec<StateTable>>;
 
-    /// Write the host bytes of each layout constant of `layout`, in [`Self::layout_tables`]' order.
+    /// Write the host values of each layout constant of `layout`, in [`Self::layout_tables`]' order.
     ///
-    /// Same rule as [`Self::prepare_state`]: host bytes only, already the right length, uploaded by
+    /// Same rule as [`Self::prepare_state`]: host values only, already the right length, uploaded by
     /// the worker, and deterministic for a layout so two requests of one shape agree.
-    fn prepare_layout(&self, layout: &Layout, out: &mut [Vec<u8>]) -> Result<()>;
+    fn prepare_layout(&self, layout: &Layout, out: &mut [TableValues]) -> Result<()>;
 
     /// The tables a request of `layout` needs, in the order [`Self::prepare_state`] fills them.
     ///
     /// Deterministic for a layout: the worker keys its storage by `(layout, name)`, so two
     /// requests of the same shape share one set.
-    fn state_tables(&self, layout: &Layout) -> Vec<StateTable>;
+    fn state_tables(&self, layout: &Layout) -> Result<Vec<StateTable>>;
 
-    /// Write the host bytes of each table of `layout`, in [`Self::state_tables`]' order.
+    /// Write the host values of each table of `layout`, in [`Self::state_tables`]' order.
     ///
-    /// `out[i]` is `state_tables(layout)[i]`'s bytes, row-major in its element type, and is already
+    /// `out[i]` holds `state_tables(layout)[i]`'s values, row-major, and is already
     /// the right length; the worker uploads it.
     fn prepare_state(
         &self,
         request: &VideoRequest<'_>,
         layout: &Layout,
-        out: &mut [Vec<u8>],
+        out: &mut [TableValues],
     ) -> Result<()>;
 
-    /// Write the host bytes of evaluation `index`'s coefficient tables, in
+    /// Write the host values of evaluation `index`'s coefficient tables, in
     /// [`Self::constant_tables`]' layout order.
-    fn prepare_evaluation(&self, index: u32, out: &mut [Vec<u8>]) -> Result<()>;
+    fn prepare_evaluation(&self, index: u32, out: &mut [TableValues]) -> Result<()>;
 }
 
 /// One clip's place on a timeline, as the runner states it.
@@ -1041,12 +1145,12 @@ pub trait Decoder {
     /// failure takes - the runner uploads nothing, the decode reads nothing, and nothing said so.
     fn layout_tables(&self, layout: &Layout) -> Result<Vec<StateTable>>;
 
-    /// Write the host bytes of each table of `layout`, in [`Self::layout_tables`]' order.
+    /// Write the host values of each table of `layout`, in [`Self::layout_tables`]' order.
     ///
-    /// `out[i]` is `layout_tables(layout)[i]`'s bytes, row-major in its element type, and is
-    /// already the right length; the worker uploads it. Host bytes only: no allocation, no
+    /// `out[i]` holds `layout_tables(layout)[i]`'s values, row-major, and is
+    /// already the right length; the worker uploads it. Host values only: no allocation, no
     /// synchronization and no read-back, so a decode captured after this call is capture-safe.
-    fn prepare_layout(&self, layout: &Layout, out: &mut [Vec<u8>]) -> Result<()>;
+    fn prepare_layout(&self, layout: &Layout, out: &mut [TableValues]) -> Result<()>;
 
     /// The element type this decoder reads its latents in and writes its decoded media in.
     ///
@@ -1368,5 +1472,34 @@ mod batch_tests {
         let mut empty = batch(4);
         empty.num_tokens = 0;
         assert!(empty.check().is_err());
+    }
+
+    /// A host table is allocated in the type its statement names and accepts exactly its own
+    /// values: another element type or another count is refused by the table's name.
+    #[test]
+    fn a_host_table_holds_its_own_type_and_extent() {
+        let table = StateTable {
+            name: "offsets",
+            dtype: DType::I32,
+            shape: Shape::new(&[2, 2]),
+        };
+        let mut values = TableValues::zeroed(&table).unwrap();
+        assert_eq!(values, TableValues::I32(vec![0; 4]));
+        values
+            .write("offsets", &TableValues::I32(vec![1, -2, 3, 4]))
+            .unwrap();
+        assert_eq!(values.to_bytes()[4..8], (-2_i32).to_le_bytes());
+
+        let short = values.write("offsets", &TableValues::I32(vec![1, 2]));
+        let mistyped = values.write("offsets", &TableValues::F32(vec![0.0; 4]));
+        for refused in [short, mistyped] {
+            assert!(refused.unwrap_err().to_string().contains("offsets"));
+        }
+        let narrow = StateTable {
+            name: "half",
+            dtype: DType::BF16,
+            shape: Shape::new(&[1]),
+        };
+        assert!(TableValues::zeroed(&narrow).is_err());
     }
 }

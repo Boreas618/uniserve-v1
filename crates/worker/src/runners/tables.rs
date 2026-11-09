@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use nn::capability::StateTable;
+use nn::capability::{StateTable, TableValues};
 use ops::TensorView;
 use platform::{DeviceId, PoolKind};
 
@@ -90,7 +90,7 @@ impl Tables {
 
     /// Allocates and fills `layout`'s tables for `generation`, once.
     ///
-    /// `fill` writes the host bytes of each table in `tables`' order into buffers this method sized
+    /// `fill` writes the host values of each table in `tables`' order into buffers this method sized
     /// from the model's own extents; a table already held is left as it is, so a second load of one
     /// layout allocates nothing. The bytes travel to the device on `stream`, ordered before the
     /// capture that reads them. This runs at load, never on the request path (4.3).
@@ -101,7 +101,7 @@ impl Tables {
         generation: u64,
         layout: &str,
         tables: &[StateTable],
-        fill: impl FnOnce(&mut [Vec<u8>]) -> Result<()>,
+        fill: impl FnOnce(&mut [TableValues]) -> Result<()>,
     ) -> Result<()> {
         let missing: Vec<&StateTable> = tables
             .iter()
@@ -118,17 +118,12 @@ impl Tables {
             "the runner has no pools to allocate its model's tables from",
         ))?;
         let allocator = Arc::clone(allocator);
-        let mut host: Vec<Vec<u8>> = Vec::with_capacity(missing.len());
-        for table in &missing {
-            let bytes = Self::plan_bytes(std::slice::from_ref(*table))?;
-            host.push(vec![
-                0u8;
-                usize::try_from(bytes).map_err(|_| {
-                    Error::Invalid("a state table is larger than memory".into())
-                })?
-            ]);
-        }
-        fill(&mut host)?;
+        let mut values = missing
+            .iter()
+            .map(|table| TableValues::zeroed(table).map_err(Error::from))
+            .collect::<Result<Vec<_>>>()?;
+        fill(&mut values)?;
+        let host: Vec<Vec<u8>> = values.iter().map(TableValues::to_bytes).collect();
 
         // Allocate under the lock, copy outside it: the copy is stream work, and a pinned lock
         // across a device call would block every other runner on this device.
@@ -185,19 +180,14 @@ impl Tables {
         generation: u64,
         layout: &str,
         tables: &[StateTable],
-        fill: impl FnOnce(&mut [Vec<u8>]) -> Result<()>,
+        fill: impl FnOnce(&mut [TableValues]) -> Result<()>,
     ) -> Result<()> {
-        let mut host: Vec<Vec<u8>> = Vec::with_capacity(tables.len());
-        for table in tables {
-            let bytes = Self::plan_bytes(std::slice::from_ref(table))?;
-            host.push(vec![
-                0u8;
-                usize::try_from(bytes).map_err(|_| {
-                    Error::Invalid("a state table is larger than memory".into())
-                })?
-            ]);
-        }
-        fill(&mut host)?;
+        let mut values = tables
+            .iter()
+            .map(|table| TableValues::zeroed(table).map_err(Error::from))
+            .collect::<Result<Vec<_>>>()?;
+        fill(&mut values)?;
+        let host: Vec<Vec<u8>> = values.iter().map(TableValues::to_bytes).collect();
         for (table, bytes) in tables.iter().zip(&host) {
             let held = self
                 .entries

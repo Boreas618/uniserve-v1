@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 use nn::capability::{
     Clip, ConditionPiece, ConditionRole, ConditionShape, Conditioning, DecodedMedia, Decoder,
     Denoiser, Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageShape,
-    LatentShape, Latents, Layout, MediaFormat, MediaRole, Seed, StateTable, Step, TokenBatch,
-    VideoRequest, WarmPrompt, WarmRequest,
+    LatentShape, Latents, Layout, MediaFormat, MediaRole, Seed, StateTable, Step, TableValues,
+    TokenBatch, VideoRequest, WarmPrompt, WarmRequest,
 };
 use nn::{Forward, Result};
 use ops::logits::{GatherArgs, GatherDescriptor, LogitsGather};
@@ -176,23 +176,23 @@ impl Denoiser for Stepping {
         Ok(Vec::new())
     }
 
-    fn prepare_layout(&self, _: &Layout, _: &mut [Vec<u8>]) -> Result<()> {
+    fn prepare_layout(&self, _: &Layout, _: &mut [TableValues]) -> Result<()> {
         Ok(())
     }
 
-    fn state_tables(&self, _: &Layout) -> Vec<StateTable> {
-        vec![StateTable {
+    fn state_tables(&self, _: &Layout) -> Result<Vec<StateTable>> {
+        Ok(vec![StateTable {
             name: "step",
             dtype: DType::I32,
             shape: Shape::new(&[1]),
-        }]
+        }])
     }
 
-    fn prepare_state(&self, _: &VideoRequest<'_>, _: &Layout, _: &mut [Vec<u8>]) -> Result<()> {
+    fn prepare_state(&self, _: &VideoRequest<'_>, _: &Layout, _: &mut [TableValues]) -> Result<()> {
         Ok(())
     }
 
-    fn prepare_evaluation(&self, _: u32, _: &mut [Vec<u8>]) -> Result<()> {
+    fn prepare_evaluation(&self, _: u32, _: &mut [TableValues]) -> Result<()> {
         Ok(())
     }
 }
@@ -254,7 +254,7 @@ impl Decoder for Decoding {
         Ok(Vec::new())
     }
 
-    fn prepare_layout(&self, _: &Layout, _: &mut [Vec<u8>]) -> Result<()> {
+    fn prepare_layout(&self, _: &Layout, _: &mut [TableValues]) -> Result<()> {
         Ok(())
     }
 
@@ -364,19 +364,19 @@ impl Encoder for Prompting {
         }
     }
 
-    fn state_tables(&self, layout: &EncoderLayout) -> Vec<StateTable> {
-        vec![StateTable {
+    fn state_tables(&self, layout: &EncoderLayout) -> Result<Vec<StateTable>> {
+        Ok(vec![StateTable {
             name: "positions",
             dtype: DType::I32,
             shape: Shape::new(&[u64::from(layout.tokens)]),
-        }]
+        }])
     }
 
     fn prepare_state(
         &self,
         _: &EncoderPrompt<'_>,
         _: &EncoderLayout,
-        _: &mut [Vec<u8>],
+        _: &mut [TableValues],
     ) -> Result<()> {
         Ok(())
     }
@@ -535,11 +535,11 @@ impl Denoiser for Anchoring {
         Stepping.layout_tables(layout)
     }
 
-    fn prepare_layout(&self, layout: &Layout, out: &mut [Vec<u8>]) -> Result<()> {
+    fn prepare_layout(&self, layout: &Layout, out: &mut [TableValues]) -> Result<()> {
         Stepping.prepare_layout(layout, out)
     }
 
-    fn state_tables(&self, layout: &Layout) -> Vec<StateTable> {
+    fn state_tables(&self, layout: &Layout) -> Result<Vec<StateTable>> {
         Stepping.state_tables(layout)
     }
 
@@ -547,12 +547,12 @@ impl Denoiser for Anchoring {
         &self,
         request: &VideoRequest<'_>,
         layout: &Layout,
-        out: &mut [Vec<u8>],
+        out: &mut [TableValues],
     ) -> Result<()> {
         Stepping.prepare_state(request, layout, out)
     }
 
-    fn prepare_evaluation(&self, index: u32, out: &mut [Vec<u8>]) -> Result<()> {
+    fn prepare_evaluation(&self, index: u32, out: &mut [TableValues]) -> Result<()> {
         Stepping.prepare_evaluation(index, out)
     }
 }

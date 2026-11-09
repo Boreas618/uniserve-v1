@@ -190,12 +190,12 @@ pub fn compare_buffers(
                 f32::from_ne_bytes(element::<4>(shadow, offset)?) as f64,
             ),
             DType::BF16 => (
-                bf16_to_f32(&element::<2>(real, offset)?) as f64,
-                bf16_to_f32(&element::<2>(shadow, offset)?) as f64,
+                ops::values::bf16_to_f32(u16::from_ne_bytes(element::<2>(real, offset)?)) as f64,
+                ops::values::bf16_to_f32(u16::from_ne_bytes(element::<2>(shadow, offset)?)) as f64,
             ),
             DType::F16 => (
-                f16_to_f32(u16::from_ne_bytes(element::<2>(real, offset)?)) as f64,
-                f16_to_f32(u16::from_ne_bytes(element::<2>(shadow, offset)?)) as f64,
+                ops::values::f16_to_f32(u16::from_ne_bytes(element::<2>(real, offset)?)) as f64,
+                ops::values::f16_to_f32(u16::from_ne_bytes(element::<2>(shadow, offset)?)) as f64,
             ),
             DType::I32 => (
                 i32::from_ne_bytes(element::<4>(real, offset)?) as f64,
@@ -273,39 +273,6 @@ fn missing(offset: usize, width: usize) -> Error {
     Error::Invariant(format!(
         "a twin buffer has no element of {width} bytes at offset {offset}"
     ))
-}
-
-fn bf16_to_f32(bytes: &[u8]) -> f32 {
-    f32::from_bits((u16::from_ne_bytes([bytes[0], bytes[1]]) as u32) << 16)
-}
-
-fn f16_to_f32(bits: u16) -> f32 {
-    f32::from_bits(halves_to_f32_bits(bits))
-}
-
-/// IEEE 754 half to single, including subnormals, infinities and NaN.
-fn halves_to_f32_bits(bits: u16) -> u32 {
-    let sign = u32::from(bits & 0x8000) << 16;
-    let exponent = (bits >> 10) & 0x1f;
-    let mantissa = u32::from(bits & 0x03ff);
-    match exponent {
-        0 => {
-            if mantissa == 0 {
-                return sign;
-            }
-            // Subnormal: normalize into a single-precision value.
-            let mut exponent = 127 - 15 + 1;
-            let mut mantissa = mantissa;
-            while mantissa & 0x0400 == 0 {
-                mantissa <<= 1;
-                exponent -= 1;
-            }
-            let mantissa = (mantissa & 0x03ff) << 13;
-            sign | ((exponent as u32) << 23) | mantissa
-        }
-        0x1f => sign | 0x7f80_0000 | (mantissa << 13),
-        _ => sign | ((u32::from(exponent) + 127 - 15) << 23) | (mantissa << 13),
-    }
 }
 
 /// Host staging for the comparison: two page-locked buffers, grown as pairs need.

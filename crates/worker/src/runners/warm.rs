@@ -51,7 +51,8 @@ mod tests {
     use super::*;
 
     use nn::capability::{
-        ConditionShape, Conditioning, LatentShape, Layout, Seed, StateTable, Step, VideoRequest,
+        ConditionShape, Conditioning, LatentShape, Layout, Seed, StateTable, Step, TableValues,
+        VideoRequest,
     };
     use nn::{Error, Forward, Latents, Result};
 
@@ -115,19 +116,24 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn prepare_layout(&self, _: &Layout, _: &mut [Vec<u8>]) -> Result<()> {
+        fn prepare_layout(&self, _: &Layout, _: &mut [TableValues]) -> Result<()> {
             Ok(())
         }
 
-        fn state_tables(&self, _: &Layout) -> Vec<StateTable> {
-            Vec::new()
+        fn state_tables(&self, _: &Layout) -> Result<Vec<StateTable>> {
+            Ok(Vec::new())
         }
 
-        fn prepare_state(&self, _: &VideoRequest<'_>, _: &Layout, _: &mut [Vec<u8>]) -> Result<()> {
+        fn prepare_state(
+            &self,
+            _: &VideoRequest<'_>,
+            _: &Layout,
+            _: &mut [TableValues],
+        ) -> Result<()> {
             Ok(())
         }
 
-        fn prepare_evaluation(&self, _: u32, _: &mut [Vec<u8>]) -> Result<()> {
+        fn prepare_evaluation(&self, _: u32, _: &mut [TableValues]) -> Result<()> {
             Ok(())
         }
     }
