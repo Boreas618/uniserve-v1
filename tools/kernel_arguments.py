@@ -9,10 +9,10 @@ A Triton operator's arguments are written down three times, by three different h
 3. the operator's Rust ``fn launch`` in ``crates/ops/src/*.rs``, which packs one ``Arguments`` chain
    in launch order, and whose constexprs come from the descriptor key.
 
-Nothing in the tree compares them. ``key_coverage`` says whether a package declares a descriptor
-key, ``build_store`` says whether it builds, and the recorder says whether the model launches it -
-and a kernel that reads its stage from its draw's slot satisfies all three. This script reports the
-three orders side by side and names where they disagree.
+Nothing in the tree compares them. The Program Server says whether a package declares a descriptor
+key and whether it builds, and the recorded walk says whether the model launches it - and a kernel
+that reads its stage from its draw's slot satisfies all three. This script reports the three orders
+side by side and names where they disagree.
 
 **The package is asked, not parsed.** Each ``build.py`` is imported and its ``spec(fields,
 parameters, target)`` called once per declared descriptor shape, which is what the Program Server

@@ -50,7 +50,7 @@ use tokens::{checkpoint_tokens, understanding_limits};
 use video::{SharedCodec, prompt_capacity};
 
 use nn::family::{
-    Exchange, ExpertOrder, Family, Split, TextModel, TextPlacement, VideoModel, VideoPlacement,
+    ExpertOrder, Family, Split, TextModel, TextPlacement, VideoModel, VideoPlacement,
 };
 use proto::config::EngineArgs;
 
@@ -691,10 +691,6 @@ impl ModelRunner {
                         size: mapping.expert_parallel,
                         rank: mapping.expert_rank,
                     },
-                    exchange: (self.union.is_some()).then_some(Exchange {
-                        capacity: self.exchange_capacity(),
-                        attention_ranks: mapping.attention_ranks,
-                    }),
                 };
                 let model = checkpoint.load(&mut loader, &placement, experts)?;
                 Ok(Loaded::Text(model))

@@ -92,17 +92,8 @@ impl TextCheckpoint for Qwen3MoeCheckpoint {
         )
         .map_err(model_error)?;
 
-        // The model's own defaults stand for the page and the attention workspace; a deployment's
-        // exchange sizes the expert step's buffers.
-        let exchange = placement.exchange.unwrap_or(nn::family::Exchange {
-            capacity: 0,
-            attention_ranks: 0,
-        });
-        let options = LoadOptions {
-            exchange_capacity: exchange.capacity,
-            exchange_attention: exchange.attention_ranks,
-            ..LoadOptions::default()
-        };
+        // The model's own defaults stand for the page and the attention workspace.
+        let options = LoadOptions::default();
 
         // The checkpoint states its own representation: a calibrated export is read packed and a
         // dense one dense. The scale layout is the one the serving programs are built for.

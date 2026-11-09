@@ -19,7 +19,6 @@
 
 pub mod config;
 pub mod family;
-pub mod keys;
 pub mod load;
 pub mod model;
 pub mod partition;
@@ -28,7 +27,7 @@ pub mod representation;
 pub mod weights;
 
 pub use config::{Activation, Config, RopeScaling, YaRn};
-pub use model::{LoadOptions, Plan, Qwen3Moe};
+pub use model::{LoadOptions, Qwen3Moe};
 pub use partition::Partition;
 pub use representation::{Adopted, Representation, Role};
 

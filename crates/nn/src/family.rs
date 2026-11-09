@@ -117,19 +117,6 @@ pub struct TextPlacement {
     pub tensor: Split,
     /// The expert-parallel split of the routed experts.
     pub experts: Split,
-    /// The expert exchange of a deployment whose experts are split; `None` without one.
-    pub exchange: Option<Exchange>,
-}
-
-/// The exchange that carries a step's rows between the members of an expert split.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Exchange {
-    /// Rows one rank's exchange carries at most: the load-time bound its step buffers are shaped
-    /// by.
-    pub capacity: u64,
-    /// Leading members of the exchange that hold no experts: the attention ranks of a deployment
-    /// whose experts live on dedicated ranks.
-    pub attention_ranks: u32,
 }
 
 /// A loaded causal language model, as execution plans and serves it.

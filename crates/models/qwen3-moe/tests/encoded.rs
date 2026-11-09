@@ -537,12 +537,14 @@ fn a_whole_calibrated_checkpoint_loads_its_projections_packed_and_its_router_den
     )
     .expect("the calibrated checkpoint loads");
 
-    // The walk states both: the projections' product once per row class, and the experts' products
-    // which carry no row count. One row and two hundred lie in two classes (`PACKED_M_CLASSES`); a
-    // pair inside one class compiles one program, so it would state half as many keys.
-    let keys = model
-        .keys(nn::DType::BF16, 0, &[1, 200])
-        .expect("the deployment's programs");
+    // The forward launches both: the projections' product once per row class, and the experts'
+    // products, which carry no row count. One row and two hundred lie in two classes
+    // (`PACKED_M_CLASSES`); a pair inside one class compiles one program, so it would launch half as
+    // many keys.
+    let mut keys = std::collections::BTreeSet::new();
+    for tokens in [1, 200] {
+        keys.extend(recorded_forward(&model, tokens));
+    }
     let named: Vec<&str> = keys.iter().map(|(operator, _)| operator.as_str()).collect();
     // `q` is `[2 · head_dim, hidden]`, `o` is `[hidden, 2 · head_dim]`, and `k` and `v` are one
     // geometry between them — so three packed products per row class, and no dense MLP's at all.
@@ -561,6 +563,87 @@ fn a_whole_calibrated_checkpoint_loads_its_projections_packed_and_its_router_den
         named.contains(&"topk_softmax"),
         "the router is dense: {named:?}"
     );
+}
+
+/// The programs a launch reported, as `(operator, key)` pairs.
+#[derive(Default)]
+struct Launches(std::collections::BTreeSet<(String, String)>);
+
+impl ops::capture::Sink for Launches {
+    fn launched(&mut self, operator: &'static str, key: &str) {
+        self.0.insert((operator.to_owned(), key.to_owned()));
+    }
+}
+
+/// The programs one prefill forward of `tokens` tokens launches, walked on a recording forward.
+///
+/// Every view addresses a counting arena that no memory backs: a recording forward reads nothing
+/// and launches nothing, and reports each launch's program to the capture sink.
+fn recorded_forward(
+    model: &qwen3_moe::Qwen3Moe,
+    tokens: u64,
+) -> std::collections::BTreeSet<(String, String)> {
+    use nn::PhaseKind;
+    use nn::capability::{CausalLm, KvGroup, KvPlanes, KvView, TokenBatch};
+
+    let config = model.config();
+    let arena = nn::Arena::counting();
+    let f = nn::Forward::recording(&arena);
+    let tensor = |dtype: DType, dims: &[u64]| {
+        arena
+            .tensor(dtype, Shape::new(dims))
+            .unwrap_or_else(|error| panic!("a counting arena holds any reservation: {error}"))
+    };
+
+    // The fixture's checkpoint states 128 positions, so a batch of more tokens than that is
+    // several sequences of at most 128 each; the attention reads a row's keys in whole pages.
+    let page_size = 64_u32;
+    let row_keys = tokens.min(128).div_ceil(u64::from(page_size)) * u64::from(page_size);
+    let rows = tokens.div_ceil(128);
+    let row_pages = row_keys / u64::from(page_size);
+    let pages = rows * row_pages;
+    let batch = TokenBatch {
+        positions: tensor(DType::I32, &[tokens]),
+        slot_mapping: tensor(DType::I32, &[tokens]),
+        seq_lens: tensor(DType::I32, &[rows]),
+        query_offsets: tensor(DType::I32, &[rows + 1]),
+        logits_rows: tensor(DType::I32, &[rows]),
+        phase: PhaseKind::Prefill,
+        page_size,
+        num_tokens: u32::try_from(tokens).unwrap_or_else(|_| panic!("{tokens} tokens")),
+        max_kv_len: u32::try_from(row_keys).unwrap_or_else(|_| panic!("{row_keys} keys")),
+        draft_lens: None,
+    };
+    let planes_shape = [
+        pages,
+        u64::from(page_size),
+        config.num_key_value_heads as u64,
+        config.head_dim as u64,
+    ];
+    let layers: Vec<KvPlanes> = (0..config.num_hidden_layers)
+        .map(|_| KvPlanes {
+            key: tensor(DType::BF16, &planes_shape),
+            value: tensor(DType::BF16, &planes_shape),
+            key_initialized: tensor(DType::U8, &[pages, 1, 1, 1]),
+            value_initialized: tensor(DType::U8, &[pages, 1, 1, 1]),
+            key_scale: None,
+            value_scale: None,
+        })
+        .collect();
+    let groups = [KvGroup {
+        block_tables: tensor(DType::I32, &[rows, row_pages]),
+        page_size,
+        dtype: DType::BF16,
+        layers: &layers,
+    }];
+    let hidden = tensor(DType::BF16, &[tokens, config.hidden_size as u64]);
+
+    let mut launches = Launches::default();
+    ops::capture::set_sink(Some(&mut launches));
+    let walked = model.forward(&f, &batch, &KvView { groups: &groups }, hidden);
+    ops::capture::set_sink(None);
+    walked.unwrap_or_else(|error| panic!("the recorded forward: {error}"));
+    launches.0
 }
 
 /// The published block scales of `projection` at `rank`, in the product's arrangement, as the store

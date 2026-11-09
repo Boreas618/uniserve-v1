@@ -249,14 +249,14 @@ impl Config {
 
     /// Whether any layer keeps a dense feed-forward block instead of routing to experts.
     ///
-    /// The activation plan carries a dense buffer pair exactly when this is true, so a checkpoint
-    /// whose layers all route plans no dense feed-forward memory.
+    /// The forward reserves a dense buffer pair exactly when this is true, so a checkpoint whose
+    /// layers all route reserves no dense feed-forward memory.
     pub fn has_dense_layers(&self) -> bool {
         (0..self.num_hidden_layers).any(|layer| !self.sparse(layer))
     }
 
-    /// Whether any layer routes tokens to experts, which is what makes an encoded expert step part
-    /// of the plan.
+    /// Whether any layer routes tokens to experts, which is what gives a calibrated checkpoint an
+    /// encoded expert step.
     pub fn has_sparse_layers(&self) -> bool {
         (0..self.num_hidden_layers).any(|layer| self.sparse(layer))
     }

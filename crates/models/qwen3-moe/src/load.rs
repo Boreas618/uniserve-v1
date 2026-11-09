@@ -283,9 +283,9 @@ fn load_with(
     };
     let config = Config::read(root)?;
     partition.validate(&config)?;
-    // The plan reserves the encoded step's buffers from this option, so a deployment that names the
-    // wrong encoding would size an arena its own step writes past. The checkpoint decides it, and
-    // the loader is where the two meet.
+    // The model reports this option to execution as its experts' encoding, so a deployment that
+    // names the wrong one would be served as the other. The checkpoint decides it, and the loader
+    // is where the two meet.
     let encoded = matches!(quantization, Quantization::Nvfp4(_))
         && config.num_experts > 0
         && config.has_sparse_layers();
