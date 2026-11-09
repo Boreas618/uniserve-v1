@@ -150,8 +150,6 @@ pub trait TextModel: CausalLm + Send + Sync {
 /// The paged key/value cache a causal language model reads, as one rank holds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CacheShape {
-    /// Tokens one page holds.
-    pub page_tokens: u32,
     /// Layers that store keys and values.
     pub layers: u32,
     /// Key/value heads each layer stores on this rank.

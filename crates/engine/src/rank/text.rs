@@ -78,8 +78,8 @@ impl ModelRunner {
                     // A request may ask for any top-k it likes, so the candidate width is the
                     // vocabulary: a narrower buffer would silently sample a different set.
                     width: model.vocabulary(),
-                    // The model's page, which the resident cache was planned with.
-                    page_size: model.cache().page_tokens,
+                    // The deployment's page, which the resident cache was planned with.
+                    page_size: super::memory::PAGE_TOKENS,
                     max_kv_len: self.engine_config().model.max_model_len,
                 };
                 let stream = platform::Stream::new(device)

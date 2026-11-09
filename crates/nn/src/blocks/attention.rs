@@ -54,8 +54,8 @@ pub enum AttentionKind {
         window: Option<u32>,
     },
     /// Paged causal attention over the prefix cache.
+    /// The page size is the cache's, which the forward reads ([`crate::KvGroup::page_size`]).
     Paged {
-        page_size: u32,
         max_kv_len: u32,
         window: Option<u32>,
     },
@@ -92,6 +92,10 @@ pub struct RopeFactors<'a> {
 
 /// What one forward's keys are: packed sequences, or the paged cache of one layer.
 #[derive(Clone, Copy)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one value per attention call, built on the stack and consumed by that call"
+)]
 pub enum Keys<'a> {
     /// The forward's own keys, as one sequence (`None`) or the sequences a [`Varlen`] names.
     Dense(Option<Varlen>),
@@ -101,8 +105,6 @@ pub enum Keys<'a> {
         cache: &'a KvView<'a>,
         group: usize,
         layer: usize,
-        /// The paged program's transient scratch.
-        workspace: TensorView,
     },
 }
 
@@ -195,19 +197,16 @@ impl QkvAttention {
                 window,
                 scale: spec.scale,
             })?),
-            AttentionKind::Paged {
-                page_size,
-                max_kv_len,
-                window,
-            } => Attention::Paged(PagedAttention::new(PagedSpec {
-                head_dim,
-                heads,
-                kv_heads,
-                page_size,
-                max_kv_len,
-                window,
-                scale: spec.scale,
-            })?),
+            AttentionKind::Paged { max_kv_len, window } => {
+                Attention::Paged(PagedAttention::new(PagedSpec {
+                    head_dim,
+                    heads,
+                    kv_heads,
+                    max_kv_len,
+                    window,
+                    scale: spec.scale,
+                })?)
+            }
         };
         Ok(Self {
             qkv,
@@ -349,11 +348,8 @@ impl QkvAttention {
                     cache,
                     group,
                     layer,
-                    workspace,
                 },
-            ) => attention.forward(
-                f, batch, cache, group, layer, query, key, value, attended, workspace,
-            )?,
+            ) => attention.forward(f, batch, cache, group, layer, query, key, value, attended)?,
             _ => {
                 return Err(Error::Unsupported(
                     "QkvAttention: the forward's keys are not of the block's attention kind"

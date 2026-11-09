@@ -367,7 +367,10 @@ fn a_group_carries_each_layers_own_page_scales() {
         dtype: DType::F8E4M3,
         layers: &layers,
     }];
-    let view = KvView { groups: &groups };
+    let view = KvView {
+        groups: &groups,
+        workspace: TensorView::new(DevicePtr::new(0x40_0000), DType::U8, Shape::new(&[1 << 20])),
+    };
 
     let first = view.planes(0, 0).unwrap();
     let second = view.planes(0, 1).unwrap();
@@ -460,7 +463,10 @@ fn a_layer_reads_the_planes_its_own_index_names() {
         layers: &layers,
     };
     let groups = [group];
-    let cache = KvView { groups: &groups };
+    let cache = KvView {
+        groups: &groups,
+        workspace: TensorView::new(DevicePtr::new(0x40_0000), DType::U8, Shape::new(&[1 << 20])),
+    };
 
     // Every field of the second layer's planes is the second layer's, not the first's: a reader that
     // took one field from the wrong plane would read another layer's keys, values or flags.

@@ -980,6 +980,11 @@ fn prompt_token(
     Ok(PromptToken::HostArgmax)
 }
 
+/// The bytes the trtllm-gen paged-attention program takes as its workspace: its `workspace_size`
+/// argument. A forward reserves them from its arena ([`KvView::workspace`]) and the model clears
+/// the decode's arrival counters at its head once per forward.
+const ATTENTION_WORKSPACE_BYTES: u64 = 512 << 20;
+
 /// Whether this process was asked to state each batch's cache addresses (`UNISERVE_RUNNER_DUMP`).
 ///
 /// Read once: a deployment either asks for the line or does not, and a step must not read the
@@ -3017,7 +3022,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         )?;
         let slots: Vec<i32> = self.staging.slots(rows).to_vec();
         let ids = self.input_ids(bucket);
-        self.with_kv(&slots, Some((pages, &lengths)), false, |cache| {
+        self.with_kv(&arena, &slots, Some((pages, &lengths)), false, |cache| {
             self.model
                 .embed_input_ids(&forward, ids, hidden)
                 .map_err(Error::from)?;
@@ -4818,13 +4823,17 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// The view lives as long as the closure: `KvGroup` borrows its layer planes, so the planes,
     /// tables and groups are locals of one scope and the model reads them borrowed. A `quiet` walk
     /// reads the resident block tables where they stand rather than gathering them on the stream.
+    /// The attention program's workspace is reserved from `arena` here, in the forward's order, so a
+    /// replay finds it at the address its capture used.
     fn with_kv<R>(
         &self,
+        arena: &nn::Arena,
         slots: &[i32],
         scratch_pages: Option<(u32, &[i32])>,
         quiet: bool,
         operation: impl FnOnce(&KvView<'_>) -> Result<R>,
     ) -> Result<R> {
+        let workspace = arena.tensor(DType::U8, ops::Shape::new(&[ATTENTION_WORKSPACE_BYTES]))?;
         let groups = self.kv.groups();
         let mut layers: Vec<Vec<nn::KvPlanes>> = Vec::with_capacity(groups);
         let mut tables = Vec::with_capacity(groups);
@@ -4858,7 +4867,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 layers: &layers[group],
             })
             .collect();
-        operation(&KvView { groups: &view })
+        operation(&KvView {
+            groups: &view,
+            workspace,
+        })
     }
 
     /// Walks one bucket's forward under the active capture with `generation`'s kernels.
@@ -4929,7 +4941,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // A recording or a capture issues no table copy of its own: the tables are read where they
         // stand, which is what a replay addresses.
         let quiet = self.capturing || forward.is_recording();
-        self.with_kv(&slots, None, quiet, |cache| {
+        self.with_kv(forward.arena(), &slots, None, quiet, |cache| {
             self.model
                 .embed_input_ids(forward, ids, hidden)
                 .map_err(Error::from)?;
@@ -5124,19 +5136,15 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // candidates are ordered by token id before the inverse CDF, so a draw of zero selects the
         // lowest id rather than the largest logit.
         if bucket.variant.greedy() {
-            sampling
-                .sampler
-                .greedy(forward, logits, &state, &samples)?;
+            sampling.sampler.greedy(forward, logits, &state, &samples)?;
         } else {
-            sampling
-                .sampler
-                .forward(
-                    forward,
-                    logits,
-                    &state,
-                    self.columns.draws.shaped(&[rows]),
-                    &samples,
-                )?;
+            sampling.sampler.forward(
+                forward,
+                logits,
+                &state,
+                self.columns.draws.shaped(&[rows]),
+                &samples,
+            )?;
         }
         // A bucket that draws may end a greedy request's prompt, whose first token is the argmax of
         // the row - a decision the graph cannot make for one row of a bucket that draws. The view

@@ -33,6 +33,36 @@ use crate::tensor::{DType, Shape, TensorView};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
+/// The row classes the packed product is compiled for.
+///
+/// The product's `m` is a compile-time constant of its module (`nvfp4_gemm/cute_dsl` bakes
+/// `UNISERVE_NVFP4_M` into the program and its entry refuses any other row count), and its
+/// smallest tile is 128 rows, so a decode request of one or fifteen rows cannot be a module of
+/// its own. The row count a launch states is therefore **the smallest class that holds the
+/// request's rows**, and the caller reserves its output at that class.
+pub const PACKED_M_CLASSES: [u32; 5] = [128, 256, 1024, 4096, 16384];
+
+/// The packed product's row class for `rows` activation rows: the smallest declared class that
+/// holds them.
+///
+/// # Errors
+///
+/// A row count above the largest class has no module to serve it, so it is refused by name with
+/// both numbers rather than clamped.
+pub fn packed_rows(rows: u32) -> Result<u32> {
+    PACKED_M_CLASSES
+        .iter()
+        .copied()
+        .find(|class| *class >= rows)
+        .ok_or_else(|| {
+            Error::Shape(format!(
+                "nvfp4_gemm: {rows} activation rows: the largest packed tile class is {}, which no \
+                 program covers",
+                PACKED_M_CLASSES[PACKED_M_CLASSES.len() - 1]
+            ))
+        })
+}
+
 /// Elements one E4M3 block scale covers: NVFP4's sixteen-element block.
 pub const BLOCK_ELEMENTS: u32 = 16;
 
@@ -552,6 +582,29 @@ impl Op for Nvfp4Gemm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_class_is_the_smallest_declared_one_that_holds_the_rows() {
+        for (rows, class) in [
+            (1, 128),
+            (15, 128),
+            (128, 128),
+            (129, 256),
+            (256, 256),
+            (257, 1024),
+            (1024, 1024),
+            (1025, 4096),
+            (4096, 4096),
+            (4097, 16384),
+            (16384, 16384),
+        ] {
+            assert_eq!(packed_rows(rows).unwrap(), class, "{rows} rows");
+        }
+        assert_eq!(PACKED_M_CLASSES, [128, 256, 1024, 4096, 16384]);
+        let error = packed_rows(16385).unwrap_err().to_string();
+        assert!(error.contains("16385"), "{error}");
+        assert!(error.contains("16384"), "{error}");
+    }
 
     #[test]
     fn a_scale_matrix_is_the_matrix_it_covers() {

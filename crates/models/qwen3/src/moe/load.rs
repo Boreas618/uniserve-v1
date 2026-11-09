@@ -19,7 +19,7 @@ use nn::layers::{
 use nn::quantization::Declaration;
 use nn::weights::WeightLoader;
 
-use super::{COMPONENTS, LoadOptions, Qwen3Moe};
+use super::{COMPONENTS, Qwen3Moe};
 use crate::config::MoeConfig;
 use crate::decoder::{DecoderStack, LayerForm};
 use crate::{Error, Result};
@@ -68,17 +68,13 @@ pub fn load(
     tensor: Split,
     experts: Split,
     loader: &mut WeightLoader<'_>,
-    options: LoadOptions,
     order: &ExpertOrder,
 ) -> Result<Qwen3Moe> {
     config.check_splits(tensor, experts)?;
     loader.declare(declaration);
-    // The model reports this option to execution as its experts' encoding, so the declaration
-    // decides it once here.
-    let options = LoadOptions {
-        experts_encoded: declaration.is_encoded() && config.has_sparse_layers(),
-        ..options
-    };
+    // The model reports its experts' encoding to execution, so the declaration decides it once
+    // here.
+    let experts_encoded = declaration.is_encoded() && config.has_sparse_layers();
     let text = &config.text;
 
     // The embedding and the head are vocabulary parallel over the tensor group; a tied head reads
@@ -109,7 +105,6 @@ pub fn load(
     let (slots, slot_table) = expert_slots(config, order, loader)?;
     let form = LayerForm {
         attention: AttentionKind::Paged {
-            page_size: options.page_tokens,
             max_kv_len: text.max_position_embeddings,
             window: None,
         },
@@ -168,7 +163,7 @@ pub fn load(
         stack,
         norm,
         head,
-        options,
+        experts_encoded,
     })
 }
 

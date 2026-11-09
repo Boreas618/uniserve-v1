@@ -83,7 +83,6 @@ pub use layers::{
     ConvTranspose1d, Epilogue, GateBias, GatedActivation, Gelu, GroupNorm, Halves, IndexRows,
     LayerNorm, Linear, Modulation, Moe, Noise, NoiseKey, Padding, ParallelLMHead, PcmInterleave,
     Residual, ResidualStream, RgbBytes, RmsNorm, Rotary, Rounding, Scale, Silu, Snake,
-    TRTLLM_WORKSPACE_BYTES,
 };
 pub use ops::PhaseKind;
 pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};

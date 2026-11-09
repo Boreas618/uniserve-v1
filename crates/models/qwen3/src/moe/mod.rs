@@ -37,11 +37,8 @@ pub mod load;
 use nn::blocks::Keys;
 use nn::capability::{CausalLm, KvView, TokenBatch};
 use nn::family::Split;
-use nn::layers::{
-    PagedAttention, ParallelLMHead, ResidualStream, RmsNorm, TRTLLM_WORKSPACE_BYTES,
-    VocabParallelEmbedding,
-};
-use nn::{DType, Forward, Shape, TensorView};
+use nn::layers::{PagedAttention, ParallelLMHead, ResidualStream, RmsNorm, VocabParallelEmbedding};
+use nn::{DType, Forward, TensorView};
 
 use crate::config::MoeConfig;
 use crate::decoder::{Components, DecoderStack, Hidden, Mlp};
@@ -56,30 +53,6 @@ pub(crate) const COMPONENTS: Components = Components {
     mlp: Some("models.qwen3.transformer.MoE"),
 };
 
-/// What a deployment sets when it loads a Qwen3-MoE model.
-#[derive(Clone, Copy, Debug)]
-pub struct LoadOptions {
-    /// Bytes of transient scratch the loaded attention program needs per forward.
-    pub attention_workspace_bytes: u64,
-    /// Tokens one prefix-cache page holds; the deployment's cache decides it.
-    pub page_tokens: u32,
-    /// Whether the checkpoint's experts were read as calibrated NVFP4, which makes every routed
-    /// layer's step encode its activations and read the packed products.
-    pub experts_encoded: bool,
-}
-
-impl Default for LoadOptions {
-    /// A single-rank BF16 deployment: 64-token pages and the trtllm-gen attention program's
-    /// workspace.
-    fn default() -> Self {
-        Self {
-            attention_workspace_bytes: TRTLLM_WORKSPACE_BYTES,
-            page_tokens: 64,
-            experts_encoded: false,
-        }
-    }
-}
-
 /// The Qwen3-MoE causal language model.
 pub struct Qwen3Moe {
     config: MoeConfig,
@@ -90,7 +63,9 @@ pub struct Qwen3Moe {
     stack: DecoderStack,
     norm: RmsNorm,
     head: ParallelLMHead,
-    options: LoadOptions,
+    /// Whether the checkpoint's experts were read as calibrated NVFP4, which makes every routed
+    /// layer's step encode its activations and read the packed products.
+    experts_encoded: bool,
 }
 
 impl Qwen3Moe {
@@ -111,20 +86,15 @@ impl Qwen3Moe {
 
     /// Whether the checkpoint's expert stacks were read as calibrated NVFP4.
     pub const fn experts_encoded(&self) -> bool {
-        self.options.experts_encoded
-    }
-
-    /// The tokens one prefix-cache page holds, which the deployment's cache chose.
-    pub const fn page_tokens(&self) -> u32 {
-        self.options.page_tokens
+        self.experts_encoded
     }
 
     /// Run every decoder layer over `hidden`, answering the last layer's update together with the
     /// residual stream it has not yet been added into; the caller's output norm performs that add.
     ///
-    /// The rotary tables, the attention workspace and the stack's buffers are reserved from `f`'s
-    /// arena in a fixed order before the first layer, so a replayed graph finds every operand at
-    /// the address it was captured with.
+    /// The rotary tables and the stack's buffers are reserved from `f`'s arena in a fixed order
+    /// before the first layer, so a replayed graph finds every operand at the address it was
+    /// captured with; the attention program's workspace is the runtime's ([`KvView::workspace`]).
     fn layers(
         &self,
         f: &Forward,
@@ -134,10 +104,6 @@ impl Qwen3Moe {
     ) -> Result<Hidden> {
         let tokens = batch.tokens();
         let (cosine, sine) = self.stack.factors(f, batch.positions, tokens)?;
-        let workspace = f.arena().tensor(
-            DType::U8,
-            Shape::new(&[self.options.attention_workspace_bytes.max(1)]),
-        )?;
         let buffers = self.stack.buffers(
             f.arena(),
             tokens,
@@ -145,9 +111,9 @@ impl Qwen3Moe {
             self.dtype,
             None,
         )?;
-        // The arena is not zero here: every bucket's extents share one range, so the decode
-        // program's arrival counters are cleared once before the first layer reads them.
-        PagedAttention::zero_counters(f, workspace)?;
+        // The workspace is the runtime's and not zero here: every bucket's forward reuses it, so the
+        // decode program's arrival counters are cleared once before the first layer reads them.
+        PagedAttention::zero_counters(f, cache.workspace)?;
 
         // The first layer reads the embedding in `hidden` and writes the first sum into the
         // forward's residual region; from there on the stream lives there and every layer
@@ -165,7 +131,6 @@ impl Qwen3Moe {
                 cache,
                 group: 0,
                 layer,
-                workspace,
             },
             &buffers,
             |_, state| Ok(state),

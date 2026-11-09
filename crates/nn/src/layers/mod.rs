@@ -43,9 +43,7 @@ mod vsa;
 
 pub use activation::{GateBias, GatedActivation, Gelu, Halves, Rounding, Silu, Snake};
 pub use affine::ChannelAffine;
-pub use attention::{
-    DenseAttention, DenseSpec, PagedAttention, PagedSpec, TRTLLM_WORKSPACE_BYTES, Varlen,
-};
+pub use attention::{DenseAttention, DenseSpec, PagedAttention, PagedSpec, Varlen};
 pub use conv::{
     CausalPad, Conv1d, Conv3d, ConvSpec, ConvTranspose1d, Padding, ResnetBlock3d, ResnetSpec,
 };
@@ -55,8 +53,8 @@ pub use head::ParallelLMHead;
 pub use indexed::StepIndexed;
 pub use layout::{Access, Copy, Patchify};
 pub use linear::{
-    Bias, ENCODE_CHUNK, Linear, MergedColumnLinear, PACKED_M_CLASSES, Parallel, QkvBias, QkvLinear,
-    QkvNames, QkvSpec, encode_block, packed_rows,
+    Bias, ENCODE_CHUNK, Linear, MergedColumnLinear, Parallel, QkvBias, QkvLinear, QkvNames,
+    QkvSpec, encode_block,
 };
 pub use moe::{DispatchViews, ExpertNames, ExpertSlots, Moe, MoeSpec, WEIGHT_SCALE_LAYOUT};
 pub use noise::{Key as NoiseKey, Noise};

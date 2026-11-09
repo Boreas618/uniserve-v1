@@ -654,10 +654,16 @@ fn recorded_forward(
         layers: &layers,
     }];
     let hidden = tensor(DType::BF16, &[tokens, u64::from(model.hidden())]);
+    // The attention program's scratch is the runtime's; a recording forward reads none of it.
+    let workspace = tensor(DType::U8, &[1 << 20]);
 
     let mut launches = Launches::default();
     ops::capture::set_sink(Some(&mut launches));
-    let walked = model.forward(&f, &batch, &KvView { groups: &groups }, hidden);
+    let cache = KvView {
+        groups: &groups,
+        workspace,
+    };
+    let walked = model.forward(&f, &batch, &cache, hidden);
     ops::capture::set_sink(None);
     walked.unwrap_or_else(|error| panic!("the recorded forward: {error}"));
     launches.0

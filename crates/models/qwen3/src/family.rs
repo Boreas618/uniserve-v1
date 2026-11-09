@@ -16,7 +16,7 @@ use nn::{Checkpoint, DType, WeightLoader};
 use nn::quantization::Declaration;
 
 use crate::config::MoeConfig;
-use crate::moe::{LoadOptions, Qwen3Moe};
+use crate::moe::Qwen3Moe;
 
 /// The Qwen3 family.
 pub const FAMILY: Family = Family::Text(&Qwen3MoeFamily);
@@ -67,9 +67,6 @@ impl TextCheckpoint for Qwen3MoeCheckpoint {
         placement: &TextPlacement,
         experts: &ExpertOrder,
     ) -> nn::Result<Arc<dyn TextModel>> {
-        // The model's own defaults stand for the page and the attention workspace.
-        let options = LoadOptions::default();
-
         // The checkpoint states its own representation: a calibrated export is read packed and a
         // dense one dense.
         let model = crate::moe::load::load(
@@ -78,7 +75,6 @@ impl TextCheckpoint for Qwen3MoeCheckpoint {
             placement.tensor,
             placement.experts,
             loader,
-            options,
             experts,
         )?;
         Ok(Arc::new(model))
@@ -101,7 +97,6 @@ impl TextModel for Qwen3Moe {
     fn cache(&self) -> CacheShape {
         let text = &self.config().text;
         CacheShape {
-            page_tokens: self.page_tokens(),
             layers: text.num_hidden_layers,
             // A tensor rank stores the heads its attention holds; the load checked the split
             // divides them.

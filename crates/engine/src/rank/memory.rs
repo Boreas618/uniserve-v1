@@ -13,6 +13,10 @@ use super::report::{MediaBounds, media_rank_report, rank_report};
 use super::video::prompt_capacity;
 use super::{Loaded, ModelRunner};
 
+/// Tokens one page of a causal language model's paged cache holds: the largest page the attention
+/// programs read. The model reads it from the cache it is handed (`nn::KvGroup::page_size`).
+pub(crate) const PAGE_TOKENS: u32 = 64;
+
 impl ModelRunner {
     /// The device's graph storage: the buckets it captures and the pools' reservations.
     ///
@@ -164,11 +168,11 @@ impl ModelRunner {
         // rank that keeps none states its absence.
         let (request, report) = match loaded {
             Loaded::Text(model) => {
-                // The KV layout is the model's own: its page, its layer count, the heads each layer
-                // stores on this rank and the width of a head.
+                // The KV layout is the model's layer count, the heads each layer stores on this rank
+                // and the width of a head, in the deployment's pages.
                 let shape = model.cache();
                 let cache = (worker::memory::CachePlan::dense(
-                    shape.page_tokens,
+                    PAGE_TOKENS,
                     shape.layers,
                     shape.kv_heads,
                     shape.head_dim,

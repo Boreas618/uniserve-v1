@@ -201,6 +201,10 @@ pub struct KvGroup<'a> {
 pub struct KvView<'a> {
     /// The attention groups, in the order the model's attention layers index them.
     pub groups: &'a [KvGroup<'a>],
+    /// `[bytes]` u8: the paged-attention program's transient scratch, which the runtime reserves
+    /// for the forward at the size the loaded program needs. Its head holds the decode's arrival
+    /// counters, which the model clears once per forward ([`crate::layers::PagedAttention::zero_counters`]).
+    pub workspace: TensorView,
 }
 
 impl<'a> KvView<'a> {

@@ -369,7 +369,6 @@ fn a_paged_block_writes_its_layers_planes_then_reads_them() {
     let mut loader = WeightLoader::meta(&checkpoint, None, None);
     let fused = rotary(&mut loader, QkNorm::Fused { epsilon: 1e-6 });
     let paged = AttentionKind::Paged {
-        page_size: 64,
         max_kv_len: 4096,
         window: None,
     };
@@ -411,7 +410,10 @@ fn a_paged_block_writes_its_layers_planes_then_reads_them() {
         dtype: DType::BF16,
         layers: &planes,
     }];
-    let cache = KvView { groups: &groups };
+    let cache = KvView {
+        groups: &groups,
+        workspace: tensor(DType::U8, &[1 << 20]),
+    };
     let (x, out) = (
         view(&arena, &[tokens, HIDDEN]),
         view(&arena, &[tokens, HIDDEN]),
@@ -430,7 +432,6 @@ fn a_paged_block_writes_its_layers_planes_then_reads_them() {
         cache: &cache,
         group: 0,
         layer: 0,
-        workspace: tensor(DType::U8, &[1 << 20]),
     };
     let (result, launches) = launched(|| block.forward(&f, x, Some(rope), keys, out));
     result.unwrap();

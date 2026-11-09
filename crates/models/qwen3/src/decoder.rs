@@ -421,7 +421,7 @@ impl DecoderStack {
         let held = if packed {
             let counted = u32::try_from(tokens)
                 .map_err(|_| crate::Error::Config(format!("{tokens} activation rows")))?;
-            u64::from(nn::layers::packed_rows(counted)?)
+            u64::from(ops::fp4::packed_rows(counted).map_err(nn::Error::from)?)
         } else {
             tokens
         };

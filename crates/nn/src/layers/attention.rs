@@ -228,8 +228,6 @@ pub struct PagedSpec {
     pub heads: u32,
     /// Key and value heads one token carries on this rank.
     pub kv_heads: u32,
-    /// Tokens one cache page holds.
-    pub page_size: u32,
     /// The longest key reduction the deployment serves; it enters the descriptor, so a deployment
     /// that serves longer sequences needs another layer, not another launch.
     pub max_kv_len: u32,
@@ -253,14 +251,13 @@ impl PagedAttention {
     ///
     /// # Errors
     ///
-    /// A zero head, page or head count, query heads that do not group the key heads, or a key
-    /// bound shorter than one page.
+    /// A zero head or head count, or query heads that do not group the key heads.
     pub fn new(spec: PagedSpec) -> Result<Self> {
         const OWNER: &str = "PagedAttention";
-        if spec.head_dim == 0 || spec.heads == 0 || spec.kv_heads == 0 || spec.page_size == 0 {
+        if spec.head_dim == 0 || spec.heads == 0 || spec.kv_heads == 0 {
             return Err(Error::shape(
                 OWNER,
-                "a head, a page and both head counts must be nonzero".to_owned(),
+                "a head and both head counts must be nonzero".to_owned(),
             ));
         }
         if !spec.heads.is_multiple_of(spec.kv_heads) {
@@ -269,15 +266,6 @@ impl PagedAttention {
                 format!(
                     "{} query heads do not group {} key heads",
                     spec.heads, spec.kv_heads
-                ),
-            ));
-        }
-        if spec.max_kv_len < spec.page_size {
-            return Err(Error::shape(
-                OWNER,
-                format!(
-                    "a {}-key bound is shorter than a {}-token page",
-                    spec.max_kv_len, spec.page_size
                 ),
             ));
         }
@@ -312,8 +300,8 @@ impl PagedAttention {
     /// projections, the output and the program's workspace.
     ///
     /// `query` and `out` are `[tokens, q_heads, head_dim]`, `key` and `value`
-    /// `[tokens, kv_heads, head_dim]`; `workspace` is `[bytes]` of the attention program's transient
-    /// scratch (512 MiB for the trtllm-gen program), zeroed by the worker before its first use.
+    /// `[tokens, kv_heads, head_dim]`. The page size is the cache group's, which the batch states
+    /// too; the program's transient scratch is the cache's [`KvView::workspace`].
     #[allow(
         clippy::too_many_arguments,
         reason = "the design's attention call carries the batch, the cache, the layer index and the \
@@ -330,14 +318,51 @@ impl PagedAttention {
         key: TensorView,
         value: TensorView,
         out: TensorView,
-        workspace: TensorView,
     ) -> Result<()> {
         // One selection for both halves: the layer's index names its planes once, and the read is
         // handed what the write was handed.
         let planes = cache.planes(group, layer)?;
         let group_view = cache.group(group)?;
-        self.write(f, batch, planes, key, value)?;
-        self.attend(f, batch, group_view, planes, query, out, workspace)
+        let page = self.page_of(batch, group_view)?;
+        self.write(f, batch, planes, page, key, value)?;
+        self.attend(
+            f,
+            batch,
+            group_view,
+            planes,
+            page,
+            query,
+            out,
+            cache.workspace,
+        )
+    }
+
+    /// The tokens one page of `group` holds, which the batch's views address too.
+    ///
+    /// The page size enters every descriptor this layer launches, and the cache is laid out in it, so
+    /// a batch that states another one, a page of no tokens, or a page longer than the layer's key
+    /// bound is refused before anything is addressed.
+    fn page_of(&self, batch: &TokenBatch, group: &KvGroup<'_>) -> Result<u32> {
+        let page = group.page_size;
+        if page == 0 || batch.page_size != page {
+            return Err(Error::shape(
+                "PagedAttention",
+                format!(
+                    "the cache has {page} tokens per page and the batch {}",
+                    batch.page_size
+                ),
+            ));
+        }
+        if self.spec.max_kv_len < page {
+            return Err(Error::shape(
+                "PagedAttention",
+                format!(
+                    "a {}-key bound is shorter than a {page}-token page",
+                    self.spec.max_kv_len
+                ),
+            ));
+        }
+        Ok(page)
     }
 
     /// Write the batch's keys and values into `planes`; slots of `-1` write nothing.
@@ -346,6 +371,7 @@ impl PagedAttention {
         f: &Forward,
         batch: &TokenBatch,
         planes: &crate::capability::KvPlanes,
+        page: u32,
         key: TensorView,
         value: TensorView,
     ) -> Result<()> {
@@ -419,9 +445,9 @@ impl PagedAttention {
                     ),
                 ));
             }
-            return self.write_quantized(f, batch, planes, key, value);
+            return self.write_quantized(f, batch, planes, page, key, value);
         }
-        let descriptor = self.write_descriptor(key.dtype, planes.key.dtype);
+        let descriptor = self.write_descriptor(key.dtype, planes.key.dtype, page);
         let args = kv::Args {
             key,
             value,
@@ -446,10 +472,11 @@ impl PagedAttention {
         f: &Forward,
         batch: &TokenBatch,
         planes: &crate::capability::KvPlanes,
+        page: u32,
         key: TensorView,
         value: TensorView,
     ) -> Result<()> {
-        let descriptor = self.scaled_write_descriptor(key.dtype);
+        let descriptor = self.scaled_write_descriptor(key.dtype, page);
         let rows = u64::from(self.spec.kv_heads) * u64::from(self.spec.head_dim);
         for (name, cache, scale, initialized, source) in [
             (
@@ -538,6 +565,7 @@ impl PagedAttention {
         query: DType,
         key_value: DType,
         output: DType,
+        page: u32,
     ) -> Descriptor {
         Descriptor {
             phase,
@@ -545,7 +573,7 @@ impl PagedAttention {
             key_value,
             output,
             head_dim: self.spec.head_dim,
-            page_size: self.spec.page_size,
+            page_size: page,
             q_heads: self.spec.heads,
             kv_heads: self.spec.kv_heads,
             mask: Mask::Causal,
@@ -558,11 +586,11 @@ impl PagedAttention {
     ///
     /// Both are key fields and they differ in an E4M3 deployment, which is why the projection's own
     /// dtype cannot stand in for the cache's.
-    fn write_descriptor(&self, projection: DType, cache: DType) -> KvDescriptor {
+    fn write_descriptor(&self, projection: DType, cache: DType, page: u32) -> KvDescriptor {
         KvDescriptor {
             dtype: projection,
             kv: cache,
-            page: self.spec.page_size,
+            page,
             heads: self.spec.kv_heads,
             head_dim: self.spec.head_dim,
             tile: kv_tile(self.spec.head_dim),
@@ -572,11 +600,11 @@ impl PagedAttention {
 
     /// The descriptor the quantizing cache write launches with: the projection's type, one plane's
     /// page scales and the geometry both share.
-    fn scaled_write_descriptor(&self, projection: DType) -> kv::ScaledWriteDescriptor {
+    fn scaled_write_descriptor(&self, projection: DType, page: u32) -> kv::ScaledWriteDescriptor {
         kv::ScaledWriteDescriptor {
             dtype: projection,
             scale: DType::F32,
-            page: self.spec.page_size,
+            page,
             heads: self.spec.kv_heads,
             head_dim: self.spec.head_dim,
             block: kv_tile(self.spec.head_dim),
@@ -603,6 +631,7 @@ impl PagedAttention {
         batch: &TokenBatch,
         group: &KvGroup<'_>,
         planes: &KvPlanes,
+        page: u32,
         query: TensorView,
         out: TensorView,
         workspace: TensorView,
@@ -610,15 +639,6 @@ impl PagedAttention {
         // The batch's own parts are read by pointer arithmetic inside the programs, so they are
         // checked against each other once here, before any of them is addressed.
         batch.check()?;
-        if group.page_size != self.spec.page_size || batch.page_size != self.spec.page_size {
-            return Err(Error::shape(
-                "PagedAttention::attend",
-                format!(
-                    "the layer is built for {} tokens per page, the cache and batch have {} and {}",
-                    self.spec.page_size, group.page_size, batch.page_size
-                ),
-            ));
-        }
         let phase = match batch.phase {
             PhaseKind::Prefill => Phase::Prefill,
             PhaseKind::Decode => Phase::Decode,
@@ -649,7 +669,7 @@ impl PagedAttention {
             group.block_tables,
             batch.query_offsets.numel().saturating_sub(1),
         )?;
-        let descriptor = self.descriptor(phase, query.dtype, planes.key.dtype, out.dtype);
+        let descriptor = self.descriptor(phase, query.dtype, planes.key.dtype, out.dtype, page);
         // An FP8 plane stores each page divided by its own FP32 scale; the plane's element type
         // decides whether the call carries one, so a mismatch in either direction is an argument
         // error rather than a silently unscaled read. The scales are this layer's, so two layers of
@@ -716,12 +736,6 @@ fn page_scale(plane: TensorView, scale: Option<TensorView>) -> Result<Option<Ten
     }
 }
 
-/// The bytes the trtllm-gen attention program needs as its workspace.
-///
-/// The program's `workspace_size` argument; the worker carves it from its scratch pool and zeroes
-/// it once.
-pub const TRTLLM_WORKSPACE_BYTES: u64 = 512 << 20;
-
 #[cfg(test)]
 mod tests {
     use ops::{DType, DevicePtr, Shape};
@@ -775,7 +789,6 @@ mod tests {
             head_dim: 128,
             heads: 32,
             kv_heads,
-            page_size: 64,
             max_kv_len,
             window: None,
             scale: 0.088,
@@ -787,8 +800,6 @@ mod tests {
         assert_eq!(paged(4, 40_960).unwrap().spec().max_kv_len, 40_960);
         // 32 query heads do not group 5 key heads.
         assert!(paged(5, 40_960).is_err());
-        // A bound shorter than one page cannot address a page.
-        assert!(paged(4, 32).is_err());
     }
 
     #[test]
@@ -867,19 +878,21 @@ mod tests {
         let key = tensor(DType::BF16, &[tokens, 4, 128]);
         let value = tensor(DType::BF16, &[tokens, 4, 128]);
         let out = tensor(DType::BF16, &[tokens, 32, 128]);
-        let workspace = tensor(DType::U8, &[TRTLLM_WORKSPACE_BYTES]);
+        let workspace = tensor(DType::U8, &[512 << 20]);
         let (walked, launches) = crate::forward::recorded(|| {
             attention.forward(
                 &f,
                 &batch,
-                &KvView { groups: &groups },
+                &KvView {
+                    groups: &groups,
+                    workspace,
+                },
                 0,
                 0,
                 query,
                 key,
                 value,
                 out,
-                workspace,
             )
         });
         walked.unwrap();

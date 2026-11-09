@@ -74,39 +74,6 @@ pub enum Parallel {
     Row(Split),
 }
 
-/// The row classes the packed product is compiled for.
-///
-/// The product's `m` is a compile-time constant of its module (`nvfp4_gemm/cute_dsl` bakes
-/// `UNISERVE_NVFP4_M` into the program and its entry refuses any other row count), and its
-/// smallest tile is 128 rows, so a decode request of one or fifteen rows cannot be a module of
-/// its own. The row count a launch states is therefore **the smallest class that holds the
-/// request's rows**, and the caller reserves its output at that class.
-pub const PACKED_M_CLASSES: [u32; 5] = [128, 256, 1024, 4096, 16384];
-
-/// The packed product's row class for `rows` activation rows: the smallest declared class that
-/// holds them.
-///
-/// # Errors
-///
-/// A row count above the largest class has no module to serve it, so it is refused by name with
-/// both numbers rather than clamped.
-pub fn packed_rows(rows: u32) -> Result<u32> {
-    PACKED_M_CLASSES
-        .iter()
-        .copied()
-        .find(|class| *class >= rows)
-        .ok_or_else(|| {
-            Error::shape(
-                "Linear",
-                format!(
-                    "{rows} activation rows: the largest packed tile class is {}, which no \
-                     program covers",
-                    PACKED_M_CLASSES[PACKED_M_CLASSES.len() - 1]
-                ),
-            )
-        })
-}
-
 /// The tile one encoding of a `columns`-wide row runs in.
 ///
 /// The package refuses a tile that does not divide the row (`nvfp4_quantize`'s `build.py` raises on
@@ -424,7 +391,7 @@ impl Linear {
         }
     }
 
-    /// Whether the weight is packed, so the product writes whole row classes ([`packed_rows`]).
+    /// Whether the weight is packed, so the product writes whole row classes ([`ops::fp4::packed_rows`]).
     pub const fn is_packed(&self) -> bool {
         matches!(self.form, Form::Packed(_))
     }
@@ -433,7 +400,7 @@ impl Linear {
     /// row-parallel.
     ///
     /// `input` is `[m, k]` and `out` is `[m, n]`. A packed product is launched at the row class of
-    /// `m` ([`packed_rows`]) and writes whole tiles, so `out` must address a region that holds the
+    /// `m` ([`ops::fp4::packed_rows`]) and writes whole tiles, so `out` must address a region that holds the
     /// class's rows; its first `m` rows are the answer.
     ///
     /// # Errors
@@ -499,7 +466,7 @@ impl Linear {
 
     /// [`Self::forward`] into an output of `dtype` reserved from the forward's arena.
     ///
-    /// A packed product writes whole row classes ([`packed_rows`]), so the reservation holds the
+    /// A packed product writes whole row classes ([`ops::fp4::packed_rows`]), so the reservation holds the
     /// class's rows and the answer is the view of its first `m` rows; a dense product's
     /// reservation is exactly `[m, n]`.
     ///
@@ -512,7 +479,7 @@ impl Linear {
         let held = if self.is_packed() {
             let counted = u32::try_from(rows)
                 .map_err(|_| Error::shape("Linear", format!("{rows} activation rows")))?;
-            u64::from(packed_rows(counted)?)
+            u64::from(ops::fp4::packed_rows(counted)?)
         } else {
             rows
         };
@@ -557,7 +524,7 @@ impl Linear {
         }
         let counted = u32::try_from(rows)
             .map_err(|_| Error::shape("Linear", format!("{rows} activation rows")))?;
-        let class = u64::from(packed_rows(counted)?);
+        let class = u64::from(ops::fp4::packed_rows(counted)?);
 
         // 1. Encode the activation into the layout the product reads, into this forward's scratch.
         //
@@ -1002,7 +969,7 @@ mod tests {
     ) -> (Result<()>, Vec<(String, String)>, u64) {
         let arena = crate::Arena::counting();
         let f = Forward::recording(&arena);
-        let class = u64::from(packed_rows(rows as u32).expect("a row class"));
+        let class = u64::from(ops::fp4::packed_rows(rows as u32).expect("a row class"));
         let activations = arena
             .tensor(input, Shape::new(&[rows, u64::from(projection.k())]))
             .expect("a counting arena");
@@ -1116,29 +1083,6 @@ mod tests {
         );
         let (refused, ..) = recorded_forward(&packed, 4, DType::F32);
         assert!(refused.unwrap_err().to_string().contains("f32"));
-    }
-
-    #[test]
-    fn the_class_is_the_smallest_declared_one_that_holds_the_rows() {
-        for (rows, class) in [
-            (1, 128),
-            (15, 128),
-            (128, 128),
-            (129, 256),
-            (256, 256),
-            (257, 1024),
-            (1024, 1024),
-            (1025, 4096),
-            (4096, 4096),
-            (4097, 16384),
-            (16384, 16384),
-        ] {
-            assert_eq!(packed_rows(rows).unwrap(), class, "{rows} rows");
-        }
-        assert_eq!(PACKED_M_CLASSES, [128, 256, 1024, 4096, 16384]);
-        let error = packed_rows(16385).unwrap_err().to_string();
-        assert!(error.contains("16385"), "{error}");
-        assert!(error.contains("16384"), "{error}");
     }
 
     #[test]
