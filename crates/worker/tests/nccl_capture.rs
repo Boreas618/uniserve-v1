@@ -1,42 +1,37 @@
-//! Probe for an open question of the design: **NCCL with graph capture in one process**.
+//! NCCL with graph capture in one process.
 //!
-//! The design gives each device one worker thread and one stream, and captures every bucket of
-//! that stream into a graph. A tensor-parallel or expert-parallel
-//! collective inside a captured bucket is then an NCCL call issued from the capturing thread, in a
-//! process that drives more than one GPU - which is exactly the case the design leaves unverified.
+//! The worker gives each device one thread and one stream, and captures every bucket of that
+//! stream into a graph. A tensor-parallel or expert-parallel collective inside a captured bucket is
+//! then an NCCL call issued from the capturing thread, in a process that drives more than one GPU.
+//! This test holds that contract:
 //!
-//! The probe answers:
+//! 1. One process holds both ranks of a two-rank communicator, each on its own device and thread,
+//!    and completes a collective on their streams.
+//! 2. That collective is captured into a graph on each rank's stream, instantiated and replayed,
+//!    and the replay still communicates.
 //!
-//! 1. Can one process hold both ranks of a two-rank communicator, each on its own device and
-//!    thread, and complete a collective on their streams?
-//! 2. Can that collective be captured into a graph on each rank's stream, instantiated and
-//!    replayed - and does the replay still communicate?
-//! 3. If either is refused, at which call and with what message?
-//!
-//! It prints one answer line, `probe(nccl-capture): ANSWER 12 ...`, followed by both ranks'
-//! readings.
+//! A refusal fails the test naming the call that refused and its message.
 //!
 //! Each collective starts from a fill of the rank's own value, because the two passes read the same
 //! buffer: the sum a pass leaves is evidence only if it began at the pass's own input.
 //!
-//! Run (caller, one host with two free GPUs; a few seconds):
+//! It needs two CUDA devices on one host and NCCL, and is ignored by default; requested without
+//! them it fails. Run it (a few seconds) with:
 //!
 //! ```text
-//! cargo test -p worker --test nccl_capture -- --nocapture
+//! cargo test -p worker --test nccl_capture -- --ignored
 //! ```
-//!
-//! With fewer than two devices it prints why and returns, so it is safe on a CPU-only host.
 
-#![allow(
-    clippy::expect_used,
-    reason = "a probe's prerequisite failure must fail the test, not be handled"
-)]
+// Always true in an integration test crate; it makes clippy treat the helpers below as test code,
+// where a failed prerequisite is the test's failure report.
+#![cfg(test)]
+
 use std::sync::{Arc, Barrier};
 
 use platform::nccl::ReduceOp;
 use platform::{CaptureMode, Communicator, DataType, Device, DeviceId, DeviceRange, PoolKind};
 
-/// The probe's device storage is 64 bytes and is not booked against a device allowance.
+/// The test's device storage is 64 bytes and is not booked against a device allowance.
 struct Unbounded;
 
 impl platform::Budget for Unbounded {
@@ -45,14 +40,10 @@ impl platform::Budget for Unbounded {
     }
 }
 
-/// One rank's answer.
+/// What one rank read back.
 #[derive(Debug)]
 struct RankReport {
     rank: i32,
-    #[allow(
-        dead_code,
-        reason = "printed with the rank's readings when the probe reports"
-    )]
     device: DeviceId,
     /// The four f32 the buffer held after one uncaptured collective.
     eager: [f32; 4],
@@ -91,7 +82,7 @@ fn run_rank(
     let communicator = Communicator::init(device, size, rank, &id)
         .map_err(|error| format!("Communicator::init: {error}"))?;
 
-    // Question 1: an uncaptured collective. A refusal here is about one process holding both
+    // An uncaptured collective first. A refusal here is about one process holding both
     // ranks, not about capture.
     let range = DeviceRange::from(&buffer);
     communicator
@@ -105,7 +96,7 @@ fn run_rank(
     // Both ranks reach capture with a completed collective behind them.
     barrier.wait();
 
-    // Question 2: the same collective inside a capture, instantiated and replayed.
+    // Then the same collective inside a capture, instantiated and replayed.
     let capture = platform::Capture::begin(&stream, CaptureMode::Relaxed)
         .map_err(|error| format!("Capture::begin: {error}"))?;
     let captured = communicator.all_reduce(
@@ -145,9 +136,7 @@ fn run_rank(
     let replayed = read_back(&host, &buffer, &stream)?;
 
     // The graphs must be destroyed before the communicator they hold: NCCL's own teardown of a
-    // communicator whose captured graphs still exist hangs (the caller measured that order in a C
-    // probe on four devices, and this probe hung at exactly this point in its first version). The
-    // worker's pools and generations follow the same rule: a generation's graph execs are
+    // communicator whose captured graphs still exist hangs. The worker's pools and generations follow the same rule: a generation's graph execs are
     // destroyed before the communicator their collective node names.
     drop(exec);
     drop(graph);
@@ -164,7 +153,7 @@ fn run_rank(
 
 /// Puts this rank's own value in all four f32 of `buffer`, through the pinned staging buffer.
 ///
-/// Each collective in the probe starts from this fill: the answer it reads is a sum over both
+/// Each collective in the test starts from this fill: what it reads is a sum over both
 /// ranks only if this rank's contribution is its own value and not a previous pass's result.
 fn fill(
     value: f32,
@@ -211,28 +200,16 @@ fn read_back(
 }
 
 #[test]
-#[ignore = "requires a CUDA device: two GPUs on one host"]
+#[ignore = "requires two CUDA devices on one host and NCCL"]
 fn one_process_captures_a_collective_across_two_devices() {
-    let devices = match DeviceId::count() {
-        Ok(count) => count,
-        Err(error) => {
-            println!("probe(nccl-capture): no driver, the probe needs two GPUs: {error}");
-            return;
-        }
-    };
-    if devices < 2 {
-        println!("probe(nccl-capture): {devices} device(s); the probe needs two on one host");
-        return;
-    }
+    let devices = DeviceId::count().expect("the CUDA driver reports its devices");
+    assert!(
+        devices >= 2,
+        "the collective needs two CUDA devices on one host, and {devices} are visible"
+    );
     let ids = [DeviceId(0), DeviceId(1)];
     let size = 2i32;
-    let unique = match platform::nccl::UniqueId::new() {
-        Ok(id) => id,
-        Err(error) => {
-            println!("probe(nccl-capture): no UniqueId: {error}");
-            return;
-        }
-    };
+    let unique = platform::nccl::UniqueId::new().expect("NCCL creates a unique id");
     let barrier = Barrier::new(size as usize);
 
     let mut reports: Vec<RankReport> = Vec::new();
@@ -253,31 +230,23 @@ fn one_process_captures_a_collective_across_two_devices() {
         }
     });
 
-    let Some(error) = failure else {
-        assert_probe_answer(&reports);
-        return;
-    };
-    println!("probe(nccl-capture): ANSWER 12 the collective does not work in one process: {error}");
-    panic!("NCCL with graph capture in one process: {error}");
-}
+    if let Some(error) = failure {
+        panic!("NCCL with graph capture in one process: {error}");
+    }
+    assert_eq!(reports.len(), 2, "both ranks reported: {reports:?}");
 
-/// Asserts what the worker's design needs and prints the answer.
-fn assert_probe_answer(reports: &[RankReport]) {
     // Each rank's four elements hold its own value (16 for rank 0, 32 for rank 1), so a sum over
     // both ranks leaves every element at 48. A rank that saw only itself reads 16 or 32.
     let expected = 16.0 + 32.0;
-    let rank0 = reports
-        .iter()
-        .find(|report| report.rank == 0)
-        .expect("rank 0 reported");
-    for (what, values) in [("eager", rank0.eager), ("replayed", rank0.replayed)] {
-        assert!(
-            values.iter().all(|value| (*value - expected).abs() < 1e-4),
-            "the {what} collective leaves rank 0 with {values:?}; a rank that saw both ranks reads {expected}"
-        );
+    for report in &reports {
+        for (what, values) in [("eager", report.eager), ("replayed", report.replayed)] {
+            assert!(
+                values.iter().all(|value| (*value - expected).abs() < 1e-4),
+                "the {what} collective leaves rank {} on {:?} with {values:?}; a rank that saw \
+                 both ranks reads {expected}",
+                report.rank,
+                report.device
+            );
+        }
     }
-    println!(
-        "probe(nccl-capture): ANSWER 12 one process captures and replays a collective across two devices"
-    );
-    println!("probe(nccl-capture): {reports:?}");
 }
