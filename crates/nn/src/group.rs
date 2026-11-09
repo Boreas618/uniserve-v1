@@ -5,7 +5,13 @@
 //! boundary's collectives take `&mut Communicator` because NCCL calls into one communicator must
 //! not interleave, while a forward holds its resources immutably. [`Group`] is the box the worker
 //! puts its communicator in: it owns the communicator, serializes access to it on the one worker
-//! thread, and offers the collectives a layer needs through `&self`.
+//! thread, and offers the collectives a forward issues through `&self`.
+//!
+//! A layer never calls a collective here: it calls the collective of its [`Forward`], which issues
+//! it through this group on the forward's stream, or, on a recording forward, checks its views
+//! against the forward's split and issues nothing.
+//!
+//! [`Forward`]: crate::Forward
 //!
 //! One worker thread issues every job of its device, so the lock here is not
 //! contention: it is the type-level statement that a forward borrows the group and does not own it,
@@ -32,10 +38,91 @@ const LANE_PRIORITY: i32 = -5;
 /// How many collectives a group holds in flight on its lane.
 const LANDINGS: usize = 16;
 
-/// A collective running on a group's lane, until a stream takes it up ([`Group::finish`]).
+/// A collective running on a group's lane, until a stream takes it up
+/// ([`Forward::finish`](crate::Forward::finish)).
+///
+/// A recording forward answers a transfer that holds no landing: it issued nothing, so finishing it
+/// orders nothing.
 #[must_use = "what a transfer writes is readable only on a stream that finished it"]
 pub struct Transfer {
-    landing: usize,
+    landing: Option<usize>,
+}
+
+impl Transfer {
+    /// The transfer a recording forward answers for a collective it did not issue.
+    pub(crate) const fn recorded() -> Self {
+        Self { landing: None }
+    }
+}
+
+/// The element count of one rank and the collective's element type, refusing views the
+/// communicator could not move.
+pub(crate) fn collective(
+    send: TensorView,
+    recv: TensorView,
+    collective: &'static str,
+) -> Result<(usize, CollectiveType)> {
+    if send.dtype != recv.dtype {
+        return Err(Error::shape(
+            collective,
+            format!("collects {} against {}", send.dtype, recv.dtype),
+        ));
+    }
+    let count = usize::try_from(send.numel())
+        .map_err(|_| Error::shape(collective, "a collective element count above usize::MAX"))?;
+    let dtype = ops::collective_type(send.dtype).ok_or_else(|| {
+        Error::Unsupported(format!(
+            "{collective}: {} has no NCCL element type",
+            send.dtype
+        ))
+    })?;
+    Ok((count, dtype))
+}
+
+/// The element counts of an all-gather over `ranks` members, `send`'s and the `ranks` times as
+/// many `recv` must hold, and its element type.
+pub(crate) fn gathered(
+    send: TensorView,
+    recv: TensorView,
+    ranks: u64,
+) -> Result<(usize, usize, CollectiveType)> {
+    let (count, dtype) = collective(send, send, "all_gather")?;
+    let expected = count
+        .checked_mul(usize::try_from(ranks).unwrap_or(usize::MAX))
+        .ok_or_else(|| Error::shape("Group::all_gather", "the gathered count overflows"))?;
+    if recv.numel() != expected as u64 || recv.dtype != send.dtype {
+        return Err(Error::shape(
+            "Group::all_gather",
+            format!(
+                "receives {} {} elements, {expected} of {} expected",
+                recv.numel(),
+                recv.dtype,
+                send.dtype
+            ),
+        ));
+    }
+    Ok((count, expected, dtype))
+}
+
+/// The element count of an all-to-all over `ranks` members, which both buffers hold as `ranks`
+/// equal blocks, and its element type.
+pub(crate) fn exchanged(
+    send: TensorView,
+    recv: TensorView,
+    ranks: u64,
+) -> Result<(usize, CollectiveType)> {
+    let (elements, dtype) = collective(send, recv, "all_to_all")?;
+    let ranks = usize::try_from(ranks).unwrap_or(usize::MAX);
+    if recv.numel() != send.numel() || !elements.is_multiple_of(ranks.max(1)) {
+        return Err(Error::shape(
+            "Group::all_to_all",
+            format!(
+                "sends {elements} elements and receives {}, which are not {ranks} equal blocks",
+                recv.numel()
+            ),
+        ));
+    }
+    Ok((elements, dtype))
 }
 
 /// A rank's NCCL communicator, borrowed by forwards.
@@ -86,19 +173,19 @@ impl Group {
     /// Sum every rank's `view` into every rank's `view`, in place.
     ///
     /// `view` is the same shape and dtype on every rank; the collective is issued on `stream`.
-    pub fn all_reduce_sum(&self, view: TensorView, stream: &Stream) -> Result<()> {
+    pub(crate) fn all_reduce_sum(&self, view: TensorView, stream: &Stream) -> Result<()> {
         self.all_reduce(view, view, ReduceOp::Sum, stream)
     }
 
     /// Reduce `send` from every rank into every rank's `recv` with `op`.
-    pub fn all_reduce(
+    pub(crate) fn all_reduce(
         &self,
         send: TensorView,
         recv: TensorView,
         op: ReduceOp,
         stream: &Stream,
     ) -> Result<()> {
-        let (count, dtype) = self.collective(send, recv, "all_reduce")?;
+        let (count, dtype) = collective(send, recv, "all_reduce")?;
         let bytes = dtype.bytes() * count;
         self.locked()
             .all_reduce(
@@ -116,22 +203,13 @@ impl Group {
     /// Gather `send` from every rank into `recv`, rank-major.
     ///
     /// `recv` holds `ranks` times `send`'s elements, in rank order.
-    pub fn all_gather(&self, send: TensorView, recv: TensorView, stream: &Stream) -> Result<()> {
-        let (count, dtype) = self.collective(send, send, "all_gather")?;
-        let expected = count
-            .checked_mul(usize::try_from(self.ranks).unwrap_or(usize::MAX))
-            .ok_or_else(|| Error::shape("Group::all_gather", "the gathered count overflows"))?;
-        if recv.numel() != expected as u64 || recv.dtype != send.dtype {
-            return Err(Error::shape(
-                "Group::all_gather",
-                format!(
-                    "receives {} {} elements, {expected} of {} expected",
-                    recv.numel(),
-                    recv.dtype,
-                    send.dtype
-                ),
-            ));
-        }
+    pub(crate) fn all_gather(
+        &self,
+        send: TensorView,
+        recv: TensorView,
+        stream: &Stream,
+    ) -> Result<()> {
+        let (count, expected, dtype) = gathered(send, recv, self.ranks)?;
         let bytes = dtype.bytes();
         self.locked()
             .all_gather(
@@ -150,18 +228,14 @@ impl Group {
     ///
     /// `send` and `recv` are the whole buffers, `ranks` blocks each, and NCCL's `count` is one
     /// block's elements.
-    pub fn all_to_all(&self, send: TensorView, recv: TensorView, stream: &Stream) -> Result<()> {
-        let (elements, dtype) = self.collective(send, recv, "all_to_all")?;
+    pub(crate) fn all_to_all(
+        &self,
+        send: TensorView,
+        recv: TensorView,
+        stream: &Stream,
+    ) -> Result<()> {
+        let (elements, dtype) = exchanged(send, recv, self.ranks)?;
         let ranks = usize::try_from(self.ranks).unwrap_or(usize::MAX);
-        if recv.numel() != send.numel() || !elements.is_multiple_of(ranks.max(1)) {
-            return Err(Error::shape(
-                "Group::all_to_all",
-                format!(
-                    "sends {elements} elements and receives {}, which are not {ranks} equal blocks",
-                    recv.numel()
-                ),
-            ));
-        }
         let bytes = dtype.bytes() * elements;
         self.locked()
             .all_to_all(
@@ -179,7 +253,7 @@ impl Group {
     ///
     /// `stream` goes on at once, and what `recv` holds is readable on a stream that took the
     /// transfer up ([`Self::finish`]). The buffers belong to the transfer until then.
-    pub fn start_all_to_all(
+    pub(crate) fn start_all_to_all(
         &self,
         send: TensorView,
         recv: TensorView,
@@ -192,7 +266,9 @@ impl Group {
         self.landings[landing]
             .record(&self.lane)
             .map_err(Error::Platform)?;
-        Ok(Transfer { landing })
+        Ok(Transfer {
+            landing: Some(landing),
+        })
     }
 
     /// Starts delivering rows `first..first + count` of this rank's rows to every member, and
@@ -202,7 +278,7 @@ impl Group {
     /// rank's rows of the interval are already in its own block. A row lands where the sequence
     /// holds it, so an interval of every member arrives without a copy and the sequence is whole
     /// once each interval's transfer is finished.
-    pub fn start_gather_rows(
+    pub(crate) fn start_gather_rows(
         &self,
         gathered: TensorView,
         owner_rows: u64,
@@ -211,7 +287,7 @@ impl Group {
         stream: &Stream,
     ) -> Result<Transfer> {
         let width = gathered.shape.last();
-        let (elements, dtype) = self.collective(gathered, gathered, "gather_rows")?;
+        let (elements, dtype) = collective(gathered, gathered, "gather_rows")?;
         let elements = elements.min(usize::try_from(count * width).unwrap_or(usize::MAX));
         let bytes = dtype.bytes() * elements;
         let block = |member: u64| {
@@ -239,13 +315,18 @@ impl Group {
         self.landings[landing]
             .record(&self.lane)
             .map_err(Error::Platform)?;
-        Ok(Transfer { landing })
+        Ok(Transfer {
+            landing: Some(landing),
+        })
     }
 
-    /// Orders `stream` after `transfer`.
-    pub fn finish(&self, transfer: Transfer, stream: &Stream) -> Result<()> {
+    /// Orders `stream` after `transfer`; a recorded transfer orders nothing.
+    pub(crate) fn finish(&self, transfer: Transfer, stream: &Stream) -> Result<()> {
+        let Some(landing) = transfer.landing else {
+            return Ok(());
+        };
         stream
-            .wait_event(&self.landings[transfer.landing])
+            .wait_event(&self.landings[landing])
             .map_err(Error::Platform)
     }
 
@@ -275,30 +356,6 @@ impl Group {
         self.communicator
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// The element count of one rank and the collective's element type.
-    fn collective(
-        &self,
-        send: TensorView,
-        recv: TensorView,
-        collective: &'static str,
-    ) -> Result<(usize, CollectiveType)> {
-        if send.dtype != recv.dtype {
-            return Err(Error::shape(
-                collective,
-                format!("collects {} against {}", send.dtype, recv.dtype),
-            ));
-        }
-        let count = usize::try_from(send.numel())
-            .map_err(|_| Error::shape(collective, "a collective element count above usize::MAX"))?;
-        let dtype = ops::collective_type(send.dtype).ok_or_else(|| {
-            Error::Unsupported(format!(
-                "{collective}: {} has no NCCL element type",
-                send.dtype
-            ))
-        })?;
-        Ok((count, dtype))
     }
 }
 

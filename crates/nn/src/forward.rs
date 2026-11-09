@@ -1,5 +1,5 @@
 //! What one forward borrows from the worker: the stream, the loaded kernels, the activation
-//! arena and the communicator.
+//! arena and the communicator its collectives are issued through.
 //!
 //! A layer receives [`Forward`] and nothing else about the runtime: it cannot create a stream,
 //! allocate device memory, capture a graph, or look up a program (`AGENTS.md`,
@@ -27,7 +27,7 @@ use ops::{Generation, Op, Stream};
 
 use crate::error::{Error, Result};
 use crate::exchange::ExchangeViews;
-use crate::group::Group;
+use crate::group::{self, Group, Transfer};
 use crate::tensor::{DType, DevicePtr, Shape, TensorView};
 
 /// The alignment every arena reservation starts at.
@@ -237,8 +237,12 @@ pub struct Forward<'a> {
     pub kernels: Option<&'a Generation>,
     /// The activation region of this captured bucket.
     pub arena: &'a Arena,
-    /// The communicator of this rank's parallel group, when the block is partitioned.
-    pub group: Option<&'a Group>,
+    /// The communicator of this rank's parallel group, when a launching forward's block is
+    /// partitioned. Layers reach it only through this forward's collectives.
+    group: Option<&'a Group>,
+    /// The split a recording forward answers in place of a group's: the rank whose shapes the
+    /// walk follows, and the member count.
+    split: Option<Split>,
     /// The expert exchange's received views, when the block's experts are split across ranks.
     pub exchange: Option<&'a ExchangeViews>,
     /// The operator this forward shadows, when it is a 7.3 comparison pass.
@@ -262,6 +266,27 @@ pub struct Forward<'a> {
     /// A forward captured into a graph captures its probes, and every replay then runs them. Nothing
     /// a forward computes depends on a fence being present.
     pub fence: Option<&'a dyn Fence>,
+}
+
+/// How a partitioned block is split across a group: this rank's index and the member count.
+///
+/// A layer's shape arithmetic over a partition (a vocabulary shard, a gather buffer, a rank's
+/// share of tiles) reads this from [`Forward::split`], so a recording forward with a split answers
+/// the same shapes the launching forward of that rank does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Split {
+    /// This rank's index in the group, below `ranks`.
+    pub rank: u64,
+    /// How many ranks the group has; at least one.
+    pub ranks: u64,
+}
+
+/// Where one collective of a forward goes.
+enum Collective<'a> {
+    /// Issued through the group on the forward's stream.
+    Launch(&'a Group, &'a Stream),
+    /// Checked against a recording forward's split and not issued.
+    Record(Split),
 }
 
 /// Times a model's components on the device (`docs/profiling.md`, fence probes).
@@ -315,6 +340,7 @@ impl<'a> Forward<'a> {
             kernels: Some(kernels),
             arena,
             group: None,
+            split: None,
             exchange: None,
             shadow: None,
             live_tokens: None,
@@ -329,12 +355,16 @@ impl<'a> Forward<'a> {
     /// `operate` then formats the descriptor and reports it to the installed capture sink
     /// ([`ops::capture::Sink`]), so running a model's `forward` against this collects the exact set of
     /// programs it launches — the same set a device would launch, from the same code.
+    ///
+    /// A recording forward is unsplit until [`Self::with_split`] states the rank whose walk it
+    /// follows; its collectives then check their views and issue nothing.
     pub fn recording(arena: &'a Arena) -> Self {
         Self {
             stream: None,
             kernels: None,
             arena,
             group: None,
+            split: None,
             exchange: None,
             shadow: None,
             live_tokens: None,
@@ -350,14 +380,12 @@ impl<'a> Forward<'a> {
 
     /// The stream this forward's launches and collectives are issued on.
     ///
-    /// A recording forward has none: every `operate` returns before a kernel is resolved, and a
-    /// collective — which has to reach other ranks — refuses here by name rather than pretending.
+    /// A recording forward has none: every `operate` returns before a kernel is resolved, and its
+    /// collectives issue nothing.
     pub fn stream(&self) -> Result<&'a Stream> {
         self.stream.ok_or_else(|| {
             Error::Unsupported(
-                "this forward records the programs a graph launches and has no stream, so it cannot \
-                 collect across ranks"
-                    .to_owned(),
+                "this forward records the programs a graph launches and has no stream".to_owned(),
             )
         })
     }
@@ -374,9 +402,172 @@ impl<'a> Forward<'a> {
     }
 
     /// The same forward over a parallel group.
+    ///
+    /// The group's rank and member count are this forward's [`Split`], and its collectives are
+    /// issued through the group on this forward's stream.
     pub fn with_group(mut self, group: &'a Group) -> Self {
         self.group = Some(group);
         self
+    }
+
+    /// The same recording forward split as rank `rank` of `ranks`.
+    ///
+    /// A recording forward has no communicator, so this states the split the walk follows: every
+    /// layer answers the shapes rank `rank` of a group of `ranks` launches with, and every collective
+    /// checks its views against that split and issues nothing.
+    ///
+    /// # Errors
+    ///
+    /// When `ranks` is zero or `rank` is not below it, and on a launching forward, whose split is
+    /// its group's.
+    pub fn with_split(mut self, rank: u64, ranks: u64) -> Result<Self> {
+        if !self.is_recording() {
+            return Err(Error::Unsupported(
+                "a launching forward is split by the group it is given".to_owned(),
+            ));
+        }
+        if rank >= ranks {
+            return Err(Error::shape(
+                "Forward::with_split",
+                format!("rank {rank} is not a member of a group of {ranks}"),
+            ));
+        }
+        self.split = Some(Split { rank, ranks });
+        Ok(self)
+    }
+
+    /// This forward's split: its group's rank and member count, the split a recording forward was
+    /// given, or `None` when the block is not partitioned.
+    ///
+    /// A group of one member is a split: its collectives are issued as for any group.
+    pub fn split(&self) -> Option<Split> {
+        match self.group {
+            Some(group) => Some(Split {
+                // NCCL reports a member's rank as a non-negative `int`.
+                rank: u64::try_from(group.rank()).unwrap_or(0),
+                ranks: group.ranks(),
+            }),
+            None => self.split,
+        }
+    }
+
+    /// Sums every rank's `view` into every rank's `view`, in place.
+    ///
+    /// `view` is the same shape and element type on every rank. A launching forward issues the
+    /// collective through its group on its stream; a recording forward checks `view` and issues
+    /// nothing, which leaves every shape as it is.
+    ///
+    /// # Errors
+    ///
+    /// When the forward has no split, or the communicator cannot move `view`'s element type.
+    pub fn all_reduce(&self, view: TensorView) -> Result<()> {
+        match self.collective("all_reduce")? {
+            Collective::Launch(group, stream) => group.all_reduce_sum(view, stream),
+            Collective::Record(_) => group::collective(view, view, "all_reduce").map(drop),
+        }
+    }
+
+    /// Gathers every rank's `send` into `recv`, in rank order.
+    ///
+    /// `recv` holds the split's member count times `send`'s elements. A recording forward checks the
+    /// views against its split and issues nothing.
+    ///
+    /// # Errors
+    ///
+    /// When the forward has no split, or `recv` does not hold every member's `send`.
+    pub fn all_gather(&self, send: TensorView, recv: TensorView) -> Result<()> {
+        match self.collective("all_gather")? {
+            Collective::Launch(group, stream) => group.all_gather(send, recv, stream),
+            Collective::Record(split) => group::gathered(send, recv, split.ranks).map(drop),
+        }
+    }
+
+    /// Exchanges equal blocks with every rank: block `j` of `send` goes to rank `j`, and block `j`
+    /// of `recv` is what rank `j` sent here.
+    ///
+    /// Both buffers hold the split's member count of equal blocks. A recording forward checks the
+    /// views against its split and issues nothing.
+    ///
+    /// # Errors
+    ///
+    /// When the forward has no split, or the buffers are not equal blocks of one element type.
+    pub fn all_to_all(&self, send: TensorView, recv: TensorView) -> Result<()> {
+        match self.collective("all_to_all")? {
+            Collective::Launch(group, stream) => group.all_to_all(send, recv, stream),
+            Collective::Record(split) => group::exchanged(send, recv, split.ranks).map(drop),
+        }
+    }
+
+    /// Starts [`Self::all_to_all`] beside this forward's stream, which goes on at once.
+    ///
+    /// What `recv` holds is readable after [`Self::finish`] took the transfer up; the buffers
+    /// belong to the transfer until then. A recording forward checks the views and answers a
+    /// transfer that orders nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::all_to_all`].
+    pub fn start_all_to_all(&self, send: TensorView, recv: TensorView) -> Result<Transfer> {
+        match self.collective("all_to_all")? {
+            Collective::Launch(group, stream) => group.start_all_to_all(send, recv, stream),
+            Collective::Record(split) => {
+                group::exchanged(send, recv, split.ranks)?;
+                Ok(Transfer::recorded())
+            }
+        }
+    }
+
+    /// Starts delivering rows `first..first + count` of this rank's `owner_rows` rows to every
+    /// member, and theirs here, in place in `gathered`.
+    ///
+    /// `gathered` is the whole sequence `[members * owner_rows, width]`, member by member, and this
+    /// rank's rows of the interval are already in its own block. The rows are readable after
+    /// [`Self::finish`] took the transfer up. A recording forward answers a transfer that orders
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// When the forward has no split, or the communicator cannot move `gathered`'s element type.
+    pub fn start_gather_rows(
+        &self,
+        gathered: TensorView,
+        owner_rows: u64,
+        first: u64,
+        count: u64,
+    ) -> Result<Transfer> {
+        match self.collective("gather_rows")? {
+            Collective::Launch(group, stream) => {
+                group.start_gather_rows(gathered, owner_rows, first, count, stream)
+            }
+            Collective::Record(_) => {
+                group::collective(gathered, gathered, "gather_rows")?;
+                Ok(Transfer::recorded())
+            }
+        }
+    }
+
+    /// Orders this forward's stream after `transfer`: what it received is readable from here on.
+    ///
+    /// # Errors
+    ///
+    /// When the forward has no split, or the wait could not be issued.
+    pub fn finish(&self, transfer: Transfer) -> Result<()> {
+        match self.collective("finish")? {
+            Collective::Launch(group, stream) => group.finish(transfer, stream),
+            Collective::Record(_) => Ok(()),
+        }
+    }
+
+    /// Where a collective named `name` goes: the group and stream of a launching forward, or the
+    /// split of a recording one.
+    fn collective(&self, name: &'static str) -> Result<Collective<'a>> {
+        match (self.group, self.split) {
+            (Some(group), _) => Ok(Collective::Launch(group, self.stream()?)),
+            (None, Some(split)) => Ok(Collective::Record(split)),
+            (None, None) => Err(Error::Unsupported(format!(
+                "{name}: a collective runs over a group, and this forward carries none"
+            ))),
+        }
     }
 
     /// Waits for what this forward issued so far, when it is not being captured.

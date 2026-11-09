@@ -120,13 +120,13 @@ impl Embedding {
 
         f.operate::<EmbeddingOp>(&descriptor, args)?;
         if self.is_sharded() {
-            let group = f.group.ok_or_else(|| {
-                Error::Unsupported(
+            if f.split().is_none() {
+                return Err(Error::Unsupported(
                     "Embedding: a vocabulary-sharded table needs the group its ranks sum over"
                         .to_owned(),
-                )
-            })?;
-            group.all_reduce_sum(out, f.stream()?)?;
+                ));
+            }
+            f.all_reduce(out)?;
         }
         Ok(())
     }

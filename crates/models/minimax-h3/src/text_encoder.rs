@@ -936,7 +936,7 @@ impl TextEncoder {
 
     /// Sum a row-parallel projection's partial product over the group.
     fn reduce(&self, f: &Forward, view: TensorView) -> Result<()> {
-        let Some(group) = f.group else {
+        if f.split().is_none() {
             return if self.rank.degree == 1 {
                 Ok(())
             } else {
@@ -945,8 +945,8 @@ impl TextEncoder {
                     self.rank.degree
                 )))
             };
-        };
-        group.all_reduce_sum(view, f.stream()?).map_err(Error::from)
+        }
+        f.all_reduce(view).map_err(Error::from)
     }
 
     /// Refuse a call whose batch, layout or outputs do not agree.

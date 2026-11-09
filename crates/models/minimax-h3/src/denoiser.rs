@@ -3162,14 +3162,14 @@ impl Denoiser {
             nn::layers::Rows::new(SAMPLE_DTYPE, width)?.replace(f, interval, predicted, slots)?;
         }
         let sequence = arena.tensor(SAMPLE_DTYPE, Shape::new(&[tokens, width]))?;
-        let group = f.group.ok_or_else(|| {
-            Error::Unsupported(
+        if f.split().is_none() {
+            return Err(Error::Unsupported(
                 "a sequence shard collects its predictions over a group, and this forward \
                  carries none"
                     .to_owned(),
-            )
-        })?;
-        group.all_gather(interval, sequence, f.stream()?)?;
+            ));
+        }
+        f.all_gather(interval, sequence)?;
         let rows = arena.tensor(SAMPLE_DTYPE, Shape::new(&[indices.shape.dim(0), width]))?;
         nn::layers::gather_rows(f, sequence, indices, rows)?;
         Ok(rows)

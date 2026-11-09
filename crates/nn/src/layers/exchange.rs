@@ -48,7 +48,8 @@ impl UlyssesExchange {
     /// sent here.
     pub fn exchange(&self, f: &Forward, send: TensorView, recv: TensorView) -> Result<()> {
         self.check_views(send, recv)?;
-        self.group(f)?.all_to_all(send, recv, f.stream()?)
+        self.require_split(f)?;
+        f.all_to_all(send, recv)
     }
 
     /// Starts [`Self::exchange`] beside the forward's stream, which goes on at once.
@@ -59,7 +60,8 @@ impl UlyssesExchange {
         recv: TensorView,
     ) -> Result<crate::Transfer> {
         self.check_views(send, recv)?;
-        self.group(f)?.start_all_to_all(send, recv, f.stream()?)
+        self.require_split(f)?;
+        f.start_all_to_all(send, recv)
     }
 
     /// Starts delivering rows `first..first + count` of this rank's `owner_rows` to every member and
@@ -72,13 +74,14 @@ impl UlyssesExchange {
         first: u64,
         count: u64,
     ) -> Result<crate::Transfer> {
-        self.group(f)?
-            .start_gather_rows(gathered, owner_rows, first, count, f.stream()?)
+        self.require_split(f)?;
+        f.start_gather_rows(gathered, owner_rows, first, count)
     }
 
     /// Orders the forward's stream after `transfer`: what it received is readable from here on.
     pub fn finish(&self, f: &Forward, transfer: crate::Transfer) -> Result<()> {
-        self.group(f)?.finish(transfer, f.stream()?)
+        self.require_split(f)?;
+        f.finish(transfer)
     }
 
     /// Gathers every member's `rows` into `out`, in member order: the whole sequence's rows.
@@ -94,7 +97,8 @@ impl UlyssesExchange {
                 ),
             ));
         }
-        self.group(f)?.all_gather(rows, out, f.stream()?)
+        self.require_split(f)?;
+        f.all_gather(rows, out)
     }
 
     /// The geometry one exchange needs, checked before the collective is issued.
@@ -132,24 +136,24 @@ impl UlyssesExchange {
         Ok(())
     }
 
-    fn group<'a>(&self, f: &Forward<'a>) -> Result<&'a crate::Group> {
-        let group = f.group.ok_or_else(|| {
+    /// Refuses a forward that is not split over this exchange's member count.
+    fn require_split(&self, f: &Forward) -> Result<()> {
+        let split = f.split().ok_or_else(|| {
             Error::Unsupported(
                 "UlyssesExchange: a sequence-parallel exchange needs the group it runs over"
                     .to_owned(),
             )
         })?;
-        if group.ranks() != self.ranks {
+        if split.ranks != self.ranks {
             return Err(Error::shape(
                 "UlyssesExchange",
                 format!(
                     "the layer is built for {} ranks and the group has {}",
-                    self.ranks,
-                    group.ranks()
+                    self.ranks, split.ranks
                 ),
             ));
         }
-        Ok(group)
+        Ok(())
     }
 }
 

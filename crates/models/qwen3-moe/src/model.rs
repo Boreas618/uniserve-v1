@@ -787,10 +787,8 @@ impl DecoderLayer {
             // update is a partial sum, summed once after the experts as after the attention's
             // output projection. An expert group's exchange returns the whole sum and runs with no
             // tensor group.
-            if let Some(group) = f.group {
-                group
-                    .all_reduce_sum(update, f.stream()?)
-                    .map_err(Error::from)?;
+            if f.split().is_some() {
+                f.all_reduce(update).map_err(Error::from)?;
             }
             Ok::<(), Error>(())
         })?;
@@ -859,10 +857,8 @@ impl AttentionLayer {
         self.o_proj
             .forward(f, attended.reshape(buffers.attended.shape), out)?;
         // Row parallel: each rank's partial output is summed over the query-head split.
-        if let Some(group) = f.group {
-            group
-                .all_reduce_sum(out, f.stream()?)
-                .map_err(Error::from)?;
+        if f.split().is_some() {
+            f.all_reduce(out).map_err(Error::from)?;
         }
         Ok(())
     }

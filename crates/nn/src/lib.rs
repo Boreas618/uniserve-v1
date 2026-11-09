@@ -66,7 +66,7 @@ pub use capability::{
 pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, Reading, TensorLocation};
 pub use error::{Error, Result};
 pub use exchange::ExchangeViews;
-pub use forward::{Arena, AttentionProbe, Fence, Forward};
+pub use forward::{Arena, AttentionProbe, Fence, Forward, Split};
 pub use group::{Group, Transfer};
 pub use layers::{
     Activation, AdaptivePool, Attention, AttentionBackend, AudioActivation, Candidates, Conv1d,

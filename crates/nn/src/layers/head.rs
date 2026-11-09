@@ -112,8 +112,7 @@ impl ParallelLMHead {
         let linear = Linear::new(self.weight, None, ops::gemm::WeightOrder::NxK)?;
         linear.forward(f, hidden, projected)?;
 
-        let group = f.group;
-        let ranks = group.map_or(1, crate::Group::ranks);
+        let ranks = f.split().map_or(1, |split| split.ranks);
         let gathered = if ranks > 1 {
             let gathered = gathered.ok_or_else(|| {
                 Error::shape(
@@ -137,14 +136,7 @@ impl ParallelLMHead {
                     ),
                 ));
             }
-            group
-                .ok_or_else(|| {
-                    Error::Unsupported(
-                        "ParallelLMHead: a sharded head needs the group its ranks gather over"
-                            .to_owned(),
-                    )
-                })?
-                .all_gather(projected, gathered, f.stream()?)?;
+            f.all_gather(projected, gathered)?;
             gathered
         } else {
             projected
