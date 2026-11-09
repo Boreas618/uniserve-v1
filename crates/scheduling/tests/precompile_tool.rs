@@ -7,6 +7,8 @@
 //! is built with, and the artifact the main process then loads — because the
 //! two processes never share memory, only files.
 
+#![cfg(test)]
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};

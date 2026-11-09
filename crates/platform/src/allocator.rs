@@ -290,6 +290,11 @@ impl Buffer {
         self.block.bytes()
     }
 
+    /// Whether the region holds no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn device(&self) -> DeviceId {
         self.device
     }

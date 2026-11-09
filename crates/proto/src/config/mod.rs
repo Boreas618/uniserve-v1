@@ -316,7 +316,7 @@ impl SchedulerConfig {
             max_batch: positive(max_batch),
             max_num_batched_tokens,
             max_running_requests: engine.max_running_requests.get(),
-            canvas: engine.model.canvas_sampling.clone(),
+            canvas: engine.model.canvas_sampling,
             draft_tokens: engine.speculative.num_draft_tokens as usize,
             graph_tiers,
         }
@@ -415,7 +415,7 @@ impl Default for MoeConfig {
 }
 
 /// CUDA graph capture (`cuda_graph_config`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CudaGraphConfig {
     /// Decode batch sizes captured, strictly increasing; the worker's
@@ -452,16 +452,6 @@ impl CudaGraphConfig {
             &sizes(&self.decode_batch_sizes),
             &sizes(&self.prefill_token_sizes),
         )
-    }
-}
-
-impl Default for CudaGraphConfig {
-    fn default() -> Self {
-        Self {
-            decode_batch_sizes: None,
-            prefill_token_sizes: None,
-            flow_shapes: None,
-        }
     }
 }
 
@@ -985,6 +975,10 @@ impl EngineConfig {
     /// the grouped expert GEMM, the expert exchange); the scheduling policy's parameters (the
     /// scheduler section, the batched token budget, the speculative cost figures); the probes'
     /// switches, which change at a step boundary; and the media section, which the frontend reads.
+    #[expect(
+        clippy::expect_used,
+        reason = "a configuration is plain data with string keys, which JSON always encodes"
+    )]
     pub fn build_hash(&self) -> String {
         let mut build = self.clone();
         build.attention_backend = String::new();

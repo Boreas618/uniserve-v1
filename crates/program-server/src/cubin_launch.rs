@@ -430,6 +430,11 @@ impl Word {
         self.bytes.len()
     }
 
+    /// Whether the word occupies no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
     /// What the word is, for the run's record: a scalar's kind, a baked constant's name, or the
     /// buffer a pointer addresses.
     pub fn kind(&self) -> &str {

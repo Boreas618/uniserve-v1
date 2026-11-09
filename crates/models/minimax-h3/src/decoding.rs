@@ -225,6 +225,10 @@ impl ClipDecoder {
     /// `[3, rows]` table, `table` its `video_stitch` table, and `out` the clip's raster `[channels,
     /// frames, rows, columns]` in the decoder's element type. The transformer runs over every tile at
     /// once and leaves each tile's tokens in one buffer, which the stitch reads.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the clip's latents, its two layout tables and its output are separate device views"
+    )]
     pub fn decode_clip(
         &self,
         f: &Forward,

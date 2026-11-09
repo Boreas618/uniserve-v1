@@ -1776,7 +1776,7 @@ fn one_key_keeps_a_copy_at_each_location() {
     let near = Location::Host { numa_node: Some(0) };
     let far = Location::Host { numa_node: Some(1) };
     let on = |location| StorageRecord {
-        location: location,
+        location,
         bytes: 4,
         segment: None,
         fabric: None,
