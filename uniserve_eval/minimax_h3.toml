@@ -19,9 +19,9 @@
 # - UNISERVE_MINIMAX_H3_FFMPEG names the bin directory of the FFmpeg 8.1.2
 #   build whose ffprobe probes condition media and whose ffmpeg decodes
 #   reference videos for UniServe.
-# - UNISERVE_MINIMAX_H3_SHARED_SCRATCH names the directory the SGLang servers
-#   save their inputs and outputs under; for the two-host SGLang Ref2VA server
-#   it is one rank-0 and rank-1 both mount.
+# - UNISERVE_MINIMAX_H3_SHARED_SCRATCH names the directory the SGLang and
+#   FastVideo servers save their inputs and outputs under; for the two-host
+#   SGLang Ref2VA server it is one rank-0 and rank-1 both mount.
 #
 # Workloads (uniserve_eval/workloads/minimax_h3/), each a t2va, fl2va or
 # ref2va request whose output is 1344x768 at 24 fps with a 32 kHz stereo
@@ -2311,7 +2311,7 @@ videos_per_second = "higher"
 host = "127.0.0.1"
 port = 18083
 ready_path = "/health"
-command = ["${UNISERVE_MINIMAX_H3_FASTVIDEO}/bin/fastvideo", "serve", "--config", "uniserve_eval/servers/minimax_h3/fastvideo-omniref.yaml", "--generator.model_path", "${UNISERVE_MINIMAX_H3_FASTVIDEO_OMNIREF}"]
+command = ["${UNISERVE_MINIMAX_H3_FASTVIDEO}/bin/fastvideo", "serve", "--config", "uniserve_eval/servers/minimax_h3/fastvideo-omniref.yaml", "--generator.model_path", "${UNISERVE_MINIMAX_H3_FASTVIDEO_OMNIREF}", "--server.output_dir", "${UNISERVE_MINIMAX_H3_SHARED_SCRATCH}/fastvideo-minimax-h3/outputs"]
 
 [servers.fastvideo-gb200-4-omniref.environment]
 PATH = "${UNISERVE_MINIMAX_H3_FASTVIDEO}/bin:${PATH}"
