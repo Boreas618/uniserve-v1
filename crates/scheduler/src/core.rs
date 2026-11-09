@@ -54,6 +54,10 @@ pub(crate) fn unnamed_deployment() -> String {
 /// text, and every other section's default. Pair them with [`SchedulerHandle::with_worker`] and
 /// [`SchedulerConfig::default`].
 #[cfg(feature = "testing")]
+#[expect(
+    clippy::expect_used,
+    reason = "the default is a positive constant and the simulated group has one rank"
+)]
 pub fn sim_args(model: impl Into<String>) -> EngineArgs {
     use std::num::NonZeroUsize;
     let group = WorkerGroupConfig::placed(

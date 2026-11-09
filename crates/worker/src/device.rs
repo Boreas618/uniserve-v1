@@ -715,6 +715,10 @@ impl Watchdog {
 }
 
 /// What one turn of the device thread finished (4.5's interleaving).
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a step is returned once per turn of the device thread"
+)]
 enum Step {
     /// The command finished; its submission completes with this output.
     Done(BatchOutput),
@@ -1669,8 +1673,7 @@ impl Device {
             .ok_or_else(|| {
                 Error::State(
                     "this device has no Storage Server client: a standby cannot give its resident \
-                     cache segments back or map them again"
-                        .into(),
+                     cache segments back or map them again",
                 )
             })
     }

@@ -31,12 +31,9 @@ impl MainProcess {
             if front == 0 && self.daemon_closed {
                 continue;
             }
-            loop {
-                // A frame from a closed front ends that front and nothing else: its requests stay
-                // parked for the takeover that claims them.
-                let Some(connection) = self.control.front_mut(front) else {
-                    break;
-                };
+            // A frame from a closed front ends that front and nothing else: its requests stay parked
+            // for the takeover that claims them.
+            while let Some(connection) = self.control.front_mut(front) {
                 let message = match connection.try_recv() {
                     Ok(Some(message)) => message,
                     Ok(None) => break,
@@ -376,12 +373,11 @@ impl MainProcess {
             failure,
             "answering the epoch's program layer"
         );
-        if let Some(rank) = reply {
-            if let Some(channel) = self.control.peer_mut(rank) {
-                if let Err(error) = channel.send(&status) {
-                    tracing::warn!(%error, rank, "answering a peer's program command failed");
-                }
-            }
+        if let Some(rank) = reply
+            && let Some(channel) = self.control.peer_mut(rank)
+            && let Err(error) = channel.send(&status)
+        {
+            tracing::warn!(%error, rank, "answering a peer's program command failed");
         }
         self.report(status);
     }

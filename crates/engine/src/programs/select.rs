@@ -255,7 +255,7 @@ fn key_phase(key: &str) -> Option<PhaseKind> {
 pub(crate) fn key_fits_phase(key: &str, phase: Option<PhaseKind>) -> bool {
     match phase {
         None => true,
-        Some(phase) => key_phase(key).map_or(true, |held| held == phase),
+        Some(phase) => key_phase(key).is_none_or(|held| held == phase),
     }
 }
 

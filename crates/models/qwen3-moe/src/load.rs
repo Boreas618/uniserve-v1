@@ -199,6 +199,10 @@ fn slot_row(module: &str, order: &[u32], experts: usize) -> Result<Vec<u32>> {
 ///
 /// Every layer's row is one weight's row, because a retained weight takes a whole allocation
 /// granule: one table per layer would hold 2 MiB each for 512 bytes of content.
+#[expect(
+    clippy::type_complexity,
+    reason = "the slots by layer and the one table they publish are returned together, once"
+)]
 fn expert_slots(
     config: &Config,
     order: &ExpertOrder,

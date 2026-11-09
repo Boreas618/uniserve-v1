@@ -3004,11 +3004,10 @@ impl Replica {
     /// engine treats as the end of the process.
     pub(crate) async fn end_standby(&self) {
         let standby = { locked(&self.standby).take() };
-        if let Some(standby) = standby {
-            if let Err(error) = tokio::task::spawn_blocking(move || standby.client.shutdown()).await
-            {
-                warn!("the standby's shutdown did not complete: {error}");
-            }
+        if let Some(standby) = standby
+            && let Err(error) = tokio::task::spawn_blocking(move || standby.client.shutdown()).await
+        {
+            warn!("the standby's shutdown did not complete: {error}");
         }
     }
 
@@ -4105,9 +4104,11 @@ mod tests {
     /// The engine configuration of a deployment of `data` schedulers of `tensor` ranks each,
     /// whose experts the schedulers exchange when `experts` holds.
     fn deployment(tensor: usize, data: usize, experts: bool) -> proto::config::EngineConfig {
-        let mut options = crate::options::ServerArgs::default();
-        options.tensor_parallel_size = std::num::NonZeroUsize::new(tensor).unwrap();
-        options.data_parallel_size = std::num::NonZeroUsize::new(data).unwrap();
+        let mut options = crate::options::ServerArgs {
+            tensor_parallel_size: std::num::NonZeroUsize::new(tensor).unwrap(),
+            data_parallel_size: std::num::NonZeroUsize::new(data).unwrap(),
+            ..Default::default()
+        };
         options.moe_config.expert_parallel = experts;
         options.engine_config().expect("the configuration resolves")
     }

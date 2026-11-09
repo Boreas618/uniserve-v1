@@ -455,6 +455,10 @@ mod tests {
         // The daemon's end stays open and answers nothing, which is silence. Dropping it would be a
         // disconnect - a socket that is readable at once, and `Ready::Daemon` is the right answer to
         // that - so a test that asserts `Idle` must keep it.
+        #[expect(
+            clippy::mem_forget,
+            reason = "the daemon's end stays open for the test's life; dropping it is a disconnect"
+        )]
         std::mem::forget(theirs);
         Control {
             daemon: Connection::from_unix(ours).expect("a connection over the pair"),

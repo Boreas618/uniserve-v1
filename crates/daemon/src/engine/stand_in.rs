@@ -50,6 +50,10 @@ pub(crate) struct PrecopyPayload {
 /// The service's end of the daemon's channel, with stand-in main processes
 /// behind it: every command is answered as the protocol says, recording what
 /// each engine was sent.
+#[expect(
+    clippy::type_complexity,
+    reason = "a stand-in hands back its commands and the record of what it saw, once"
+)]
 pub(crate) fn main_processes(
     answers: Vec<(u64, Answer)>,
 ) -> (ProcessCommands, Arc<Mutex<Vec<(u64, Seen)>>>) {
@@ -59,6 +63,10 @@ pub(crate) fn main_processes(
 
 /// As [`main_processes`], and the programs each `Precopy` carried: a joining
 /// main process must be handed the epoch's own programs, not none.
+#[expect(
+    clippy::type_complexity,
+    reason = "a stand-in hands back its commands and the record of what it saw, once"
+)]
 pub(crate) fn main_processes_recording(
     answers: Vec<(u64, Answer)>,
 ) -> (

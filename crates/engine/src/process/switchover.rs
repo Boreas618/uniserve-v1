@@ -79,25 +79,25 @@ impl MainProcess {
         // answer is owed to the daemon's switchover wait, so silence here is a timeout with no cause
         // in the log. Failing it by name reverts the update and leaves the process serving what it
         // held.
-        if let (Some(since), true) = (self.warming_since, !self.warming.is_empty()) {
-            if since.elapsed() > self.watchdog.stall_bound() * 2 {
-                let (device, generation) = self
-                    .warming
-                    .first()
-                    .map_or((0, 0), |(device, _, generation)| (*device, *generation));
-                let failure = UpdateFailure::Device {
-                    device,
-                    error: format!(
-                        "warming generation {generation} on device {device} did not finish in {}s",
-                        since.elapsed().as_secs()
-                    ),
-                    batch: None,
-                };
-                self.warming.clear();
-                self.warming_since = None;
-                self.pending_switch = None;
-                return self.failure(failure);
-            }
+        if let (Some(since), true) = (self.warming_since, !self.warming.is_empty())
+            && since.elapsed() > self.watchdog.stall_bound() * 2
+        {
+            let (device, generation) = self
+                .warming
+                .first()
+                .map_or((0, 0), |(device, _, generation)| (*device, *generation));
+            let failure = UpdateFailure::Device {
+                device,
+                error: format!(
+                    "warming generation {generation} on device {device} did not finish in {}s",
+                    since.elapsed().as_secs()
+                ),
+                batch: None,
+            };
+            self.warming.clear();
+            self.warming_since = None;
+            self.pending_switch = None;
+            return self.failure(failure);
         }
         let mut pending = Vec::with_capacity(self.warming.len());
         for (device, submission, generation) in std::mem::take(&mut self.warming) {
@@ -140,14 +140,14 @@ impl MainProcess {
         }
         // The switchover's answer is owed to the warmup, and it is sent here - after admission
         // opened - so that `Switched` states the one thing it means: this process can serve.
-        if self.warming.is_empty() {
-            if let Some((generation, reply)) = self.pending_switch.take() {
-                tracing::info!(
-                    generation,
-                    "answering the switchover now that admission is open"
-                );
-                self.answer(reply, ProgramStatus::Switched { generation });
-            }
+        if self.warming.is_empty()
+            && let Some((generation, reply)) = self.pending_switch.take()
+        {
+            tracing::info!(
+                generation,
+                "answering the switchover now that admission is open"
+            );
+            self.answer(reply, ProgramStatus::Switched { generation });
         }
         Ok(None)
     }

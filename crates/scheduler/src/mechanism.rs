@@ -408,15 +408,15 @@ fn validate_work(plan: &Plan, room: &Room, live: &Live<'_>) -> Result<(), Policy
             ),
         ));
     }
-    if let Some(budget) = room.prefill_tokens {
-        if prefill_tokens > u64::from(budget) {
-            return Err(invalid(
-                Call::Dispatch,
-                format!(
-                    "the plan's prefill work charges {prefill_tokens} tokens, the epoch may still write {budget}"
-                ),
-            ));
-        }
+    if let Some(budget) = room.prefill_tokens
+        && prefill_tokens > u64::from(budget)
+    {
+        return Err(invalid(
+            Call::Dispatch,
+            format!(
+                "the plan's prefill work charges {prefill_tokens} tokens, the epoch may still write {budget}"
+            ),
+        ));
     }
     if let Some(tier) = room.graph_tiers.iter().copied().max() {
         for ((_, kind), tokens) in &groups {
@@ -1760,7 +1760,7 @@ mod tests {
         };
         let admitting = Plan {
             admit: vec![RequestId(1)],
-            ..plan(vec![work.clone()])
+            ..plan(vec![work])
         };
         validate_plan(&admitting, &room(), &live).expect("a plan may run what it admits");
         // The same work without the admission names a request that is not
@@ -1972,19 +1972,13 @@ mod tests {
     fn the_watchdog_finds_a_resident_request_that_stopped_advancing_but_not_a_waiting_one() {
         let mut live = live(
             vec![
-                {
-                    let r = request(1, RequestState::Resident);
-                    r
-                },
+                { request(1, RequestState::Resident) },
                 {
                     let mut r = request(2, RequestState::Resident);
                     r.waiting_transfer = true;
                     r
                 },
-                {
-                    let r = request(3, RequestState::Resident);
-                    r
-                },
+                { request(3, RequestState::Resident) },
             ],
             Vec::new(),
             &[],
@@ -2042,18 +2036,12 @@ mod tests {
     #[test]
     fn a_static_policy_goes_through_the_same_validators_the_live_path_does() {
         let mut live = live(
-            vec![
-                {
-                    let r = request(1, RequestState::Queued);
-                    r
-                },
-                {
-                    let mut r = request(2, RequestState::Resident);
-                    r.phase = Some(PhaseId(1));
-                    r.next_tokens = 1;
-                    r
-                },
-            ],
+            vec![{ request(1, RequestState::Queued) }, {
+                let mut r = request(2, RequestState::Resident);
+                r.phase = Some(PhaseId(1));
+                r.next_tokens = 1;
+                r
+            }],
             vec![RequestId(1)],
             &[(0, PhaseKind::Prefill), (1, PhaseKind::Decode)],
         );

@@ -271,10 +271,6 @@ const KV_OFFLOAD_POLL: Duration = Duration::from_millis(1);
 /// host KV cache: for the batches in flight, which carry offloads, and for
 /// the batches of the remaining offloads.
 const PAGE_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
-/// Number of batches carrying `BatchKind::Prefill` calls that may await
-/// their results before ready decode work takes precedence over further
-/// prefill (`Scheduler::select_batch_kind`).
-
 /// Builds an image-completion event from a base64 PNG payload and, when the
 /// request feeds the image back from the device, the decoded image product's
 /// values (`feedback`).

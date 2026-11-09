@@ -12,6 +12,11 @@
 //!
 //! `--keys` names a key file: a build of a source kind then takes the package of the first operator
 //! the file lists. The exit status is 1 when any build fails.
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "each check is an assertion run under catch_unwind, and a failed expectation is its report"
+)]
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -80,6 +85,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    #[expect(
+        clippy::type_complexity,
+        reason = "a check is its name and its function, listed once here"
+    )]
     let checks: [(&str, fn(&Args)); 6] = [
         (
             "a Triton package builds a cubin module",

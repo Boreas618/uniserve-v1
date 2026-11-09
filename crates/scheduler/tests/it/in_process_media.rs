@@ -143,8 +143,9 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() {
     // of what this case asserts, and a construct that differs from the one
     // known to serve text would make a refusal unattributable.
     let (args, limits) = support::config(&pool, "in-process-media");
-    let engine = SchedulerHandle::over_batches(&args, limits, pool.clone() as Arc<dyn Batches>)
-        .expect("the text deployment serves");
+    let engine =
+        SchedulerHandle::over_batches(&args, limits, Arc::clone(&pool) as Arc<dyn Batches>)
+            .expect("the text deployment serves");
     install(&engine, &pool);
 
     // Text is served **before** any rejection, so the rejection cannot be what

@@ -1139,22 +1139,22 @@ impl Switch {
                 // is a process that holds no programs, which is the behaviour
                 // a minor-4 engine has.
                 let held = promoted.program_generation;
-                if let (true, Some(epoch)) = (held != 0, self.record.generation) {
-                    if held != epoch {
-                        self.failed(
-                            roster,
-                            Failure {
-                                kind: "stale_programs".to_owned(),
-                                reason: format!(
-                                    "the promoted process on {host} holds program generation \
+                if let (true, Some(epoch)) = (held != 0, self.record.generation)
+                    && held != epoch
+                {
+                    self.failed(
+                        roster,
+                        Failure {
+                            kind: "stale_programs".to_owned(),
+                            reason: format!(
+                                "the promoted process on {host} holds program generation \
                                      {held} and this epoch's is {epoch}: the frontend is not \
                                      moved onto programs the epoch does not serve"
-                                ),
-                                device: None,
-                            },
-                        );
-                        return;
-                    }
+                            ),
+                            device: None,
+                        },
+                    );
+                    return;
                 }
                 self.promoted(roster, &host, promoted.generation);
             }

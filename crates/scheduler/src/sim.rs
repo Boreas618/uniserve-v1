@@ -124,6 +124,10 @@ const DEFAULT_DENOISE_STEPS: u16 = 50;
 const DEFAULT_IMAGE_HW: (u32, u32) = (512, 512);
 
 /// Work sent to the simulator thread.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one job crosses the channel at a time, so a boxed batch would only add an allocation"
+)]
 enum Job {
     Batch(ExecutionBatch),
     Shutdown,
@@ -147,6 +151,10 @@ pub struct SimLoss {
     closed: Arc<Mutex<bool>>,
     /// The report the worker's next poll answers with, taken once: the
     /// group, why it failed, and the requests whose work is gone.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the group, the reason and the lost requests are one report, taken once"
+    )]
     pending: Arc<Mutex<Option<(WorkerGroupId, String, Vec<ipc::RequestKey>)>>>,
     /// Wakes a scheduler parked on this worker, so the loss is answered
     /// without waiting out its park.
@@ -339,6 +347,10 @@ pub struct SimWorker {
 /// What the simulated worker observed at its boundary, in the order it
 /// happened: a batch the scheduler submitted and a result it was handed back.
 #[derive(Debug, Clone, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a simulated worker records each event once, for a test to read"
+)]
 pub enum BatchEvent {
     /// A batch as the worker accepted it.
     Submitted(ExecutionBatch),

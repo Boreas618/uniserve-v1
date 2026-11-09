@@ -1410,7 +1410,7 @@ impl<'a> ProgramSwitch<'a> {
         for (process, generation) in self.processes.iter().zip(self.generations.clone()) {
             send(
                 self.commands,
-                &process,
+                process,
                 process::Command {
                     kind: Some(command::Kind::Switchover(process::Switchover {
                         generation,
@@ -1420,7 +1420,7 @@ impl<'a> ProgramSwitch<'a> {
             )?;
             await_report(
                 self.commands,
-                &process,
+                process,
                 &mut self.update,
                 COMMAND_TIMEOUT,
                 "Switchover",
@@ -1535,7 +1535,7 @@ impl<'a> ProgramSwitch<'a> {
         for (process, generation) in self.processes.iter().zip(self.generations.clone()) {
             send(
                 self.commands,
-                &process,
+                process,
                 process::Command {
                     kind: Some(command::Kind::Purge(process::Purge { generation })),
                 },
@@ -1543,7 +1543,7 @@ impl<'a> ProgramSwitch<'a> {
             )?;
             await_report(
                 self.commands,
-                &process,
+                process,
                 &mut self.update,
                 COMMAND_TIMEOUT,
                 "Purge",
@@ -1686,6 +1686,54 @@ fn unanswerable(host: &str, error: impl std::fmt::Display) -> crate::epoch::Fail
     }
 }
 
+/// The CUDA ordinals `host`'s ranks serve, in rank order and without repeats.
+///
+/// A deployment that states no `device_config.devices` still gives each
+/// host's ranks the ordinals the shorthand numbers them from zero; one that
+/// does state an order has already had it folded into the ranks by
+/// [`proto::config::WorkerGroupConfig::shorthand`]. Reading the ranks is the
+/// one account of both, and it is what the launch file states as the devices
+/// of this node's process (§2.3, §7.4).
+///
+/// # Errors
+///
+/// Fails when a rank of `host` does not run on a CUDA device, or when no rank
+/// of the deployment runs on `host`.
+fn local_devices(host: &str, config: &proto::config::EngineConfig) -> anyhow::Result<Vec<u32>> {
+    let mut devices = Vec::new();
+    for group in &config.parallel.worker_groups {
+        for rank in &group.ranks {
+            if rank.host != host {
+                continue;
+            }
+            let ordinal = rank
+                .device
+                .strip_prefix("cuda:")
+                .with_context(|| {
+                    format!(
+                        "host {host} runs a rank on {:?}: a main process serves CUDA devices",
+                        rank.device
+                    )
+                })?
+                .parse::<u32>()
+                .with_context(|| {
+                    format!(
+                        "the device ordinal of rank {:?} does not parse",
+                        rank.device
+                    )
+                })?;
+            if !devices.contains(&ordinal) {
+                devices.push(ordinal);
+            }
+        }
+    }
+    anyhow::ensure!(
+        !devices.is_empty(),
+        "the rank layout names no device for this rank: no rank of the deployment runs on {host}"
+    );
+    Ok(devices)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1709,10 +1757,12 @@ mod tests {
         let own = std::env::current_exe().unwrap();
         // The deployment's own engine configuration, as the options resolve it, on this control's
         // host: an epoch's start reads the ranks it places.
-        let mut options = ServerArgs::default();
-        options.model = Some("/models/qwen3".to_owned());
-        options.served_model_name = Some("model".to_owned());
-        options.host_identity = "rank-0".to_owned();
+        let mut options = ServerArgs {
+            model: Some("/models/qwen3".to_owned()),
+            served_model_name: Some("model".to_owned()),
+            host_identity: "rank-0".to_owned(),
+            ..Default::default()
+        };
         options.device_config.devices = vec![0];
         options.device_config.queue_depth = std::num::NonZeroUsize::new(4).unwrap();
         options.worker_config.executable = own;
@@ -1922,52 +1972,4 @@ mod tests {
         assert_eq!(failure.kind, "policy_reverted");
         assert!(failure.reason.contains("priority"), "{}", failure.reason);
     }
-}
-
-/// The CUDA ordinals `host`'s ranks serve, in rank order and without repeats.
-///
-/// A deployment that states no `device_config.devices` still gives each
-/// host's ranks the ordinals the shorthand numbers them from zero; one that
-/// does state an order has already had it folded into the ranks by
-/// [`proto::config::WorkerGroupConfig::shorthand`]. Reading the ranks is the
-/// one account of both, and it is what the launch file states as the devices
-/// of this node's process (§2.3, §7.4).
-///
-/// # Errors
-///
-/// Fails when a rank of `host` does not run on a CUDA device, or when no rank
-/// of the deployment runs on `host`.
-fn local_devices(host: &str, config: &proto::config::EngineConfig) -> anyhow::Result<Vec<u32>> {
-    let mut devices = Vec::new();
-    for group in &config.parallel.worker_groups {
-        for rank in &group.ranks {
-            if rank.host != host {
-                continue;
-            }
-            let ordinal = rank
-                .device
-                .strip_prefix("cuda:")
-                .with_context(|| {
-                    format!(
-                        "host {host} runs a rank on {:?}: a main process serves CUDA devices",
-                        rank.device
-                    )
-                })?
-                .parse::<u32>()
-                .with_context(|| {
-                    format!(
-                        "the device ordinal of rank {:?} does not parse",
-                        rank.device
-                    )
-                })?;
-            if !devices.contains(&ordinal) {
-                devices.push(ordinal);
-            }
-        }
-    }
-    anyhow::ensure!(
-        !devices.is_empty(),
-        "the rank layout names no device for this rank: no rank of the deployment runs on {host}"
-    );
-    Ok(devices)
 }

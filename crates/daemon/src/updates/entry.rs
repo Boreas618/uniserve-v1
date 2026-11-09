@@ -199,9 +199,8 @@ impl Leader {
         // A change of what the main processes build is the epoch layer's
         // (§7.4): one switch for the deployment, decided before either of the
         // other two layers looks at the change.
-        if let Some(applied) = self
-            .apply_epoch(&current, &target, &update, request.dry_run)
-            .await?
+        if let Some(applied) =
+            Box::pin(self.apply_epoch(&current, &target, &update, request.dry_run)).await?
         {
             return Ok(applied);
         }
@@ -365,8 +364,8 @@ impl Leader {
         // keeps its number, and an epoch's storage ends with the epoch it was claimed for.
         let target_epoch = epochs
             .records()
-            .iter()
-            .map(|(epoch, _)| *epoch)
+            .keys()
+            .copied()
             .max()
             .unwrap_or(previous_epoch)
             .max(previous_epoch)
@@ -376,7 +375,7 @@ impl Leader {
         // determine. Its launch file carries it whole (§2.3).
         let engine = Leader::prepare(
             &self.catalogue,
-            &target,
+            target,
             &crate::options::Stated::from_paths(Vec::new()),
         )
         .await
@@ -427,14 +426,14 @@ impl Leader {
             start: control
                 .epoch_start(&args, spawn_generation)
                 .map_err(UpdateError::Failed)?,
-            previous_epoch: previous_epoch,
+            previous_epoch,
             previous_generation,
             spawn_generation,
             keeps: update.previous_epoch,
         };
         let programs = next.programs.clone();
-        let servers = self.program_servers(&target);
-        let leader = self.program_leader_host(&target, &servers);
+        let servers = self.program_servers(target);
+        let leader = self.program_leader_host(target, &servers);
         // A session does not cross epochs (`docs/profiling.md`): its ranks write their files while
         // the epoch still executes, before the switch parks it.
         if !dry_run {
@@ -466,13 +465,11 @@ impl Leader {
     /// acknowledges (§7.4).
     pub async fn commit(&self) -> Result<serde_json::Value, UpdateError> {
         let _replacing = self.replicas.replacing.lock().await;
-        if self.updates.running() {
-            if self.updates.commit() {
-                return Ok(self
-                    .updates
-                    .report()
-                    .unwrap_or_else(|| serde_json::json!({})));
-            }
+        if self.updates.running() && self.updates.commit() {
+            return Ok(self
+                .updates
+                .report()
+                .unwrap_or_else(|| serde_json::json!({})));
         }
         Ok(serde_json::json!({ "commit": "no update in flight" }))
     }
@@ -590,10 +587,6 @@ impl Leader {
 /// Completes a recorded decision. Publication progress survives both an
 /// error response and daemon handoff; node and engine operations are
 /// idempotent when a response was lost after the operation took effect.
-#[expect(
-    clippy::unwrap_used,
-    reason = "the deployment replacement lock retains the decision until its final take"
-)]
 impl Replica {
     /// Reports what the replica executes and what its configuration is: the
     /// engine that takes requests with its state, the digest of the

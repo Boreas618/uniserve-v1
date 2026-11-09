@@ -316,7 +316,7 @@ impl SchedulerConfig {
             max_batch: positive(max_batch),
             max_num_batched_tokens,
             max_running_requests: engine.max_running_requests.get(),
-            canvas: engine.model.canvas_sampling.clone(),
+            canvas: engine.model.canvas_sampling,
             draft_tokens: engine.speculative.num_draft_tokens as usize,
             graph_tiers,
         }
@@ -417,6 +417,7 @@ impl Default for MoeConfig {
 /// CUDA graph capture (`cuda_graph_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 pub struct CudaGraphConfig {
     /// Decode batch sizes captured, strictly increasing; the worker's
     /// catalog when unset.
@@ -452,16 +453,6 @@ impl CudaGraphConfig {
             &sizes(&self.decode_batch_sizes),
             &sizes(&self.prefill_token_sizes),
         )
-    }
-}
-
-impl Default for CudaGraphConfig {
-    fn default() -> Self {
-        Self {
-            decode_batch_sizes: None,
-            prefill_token_sizes: None,
-            flow_shapes: None,
-        }
     }
 }
 
@@ -999,6 +990,10 @@ impl EngineConfig {
         build.speculative.refill_token_cost = None;
         build.profiling.fence_probes = ProfilingConfig::default().fence_probes;
         build.profiling.fence_probes_off = Vec::new();
+        #[expect(
+            clippy::expect_used,
+            reason = "a configuration of plain fields and string-keyed maps always serializes"
+        )]
         let bytes = serde_json::to_vec(&build).expect("a configuration serializes");
         let digest = <sha2::Sha256 as sha2::Digest>::digest(&bytes);
         digest.iter().map(|byte| format!("{byte:02x}")).collect()

@@ -265,13 +265,13 @@ impl MainProcess {
                 Err(error) => failure = Some(error),
             }
         }
-        if delivered == 0 {
-            if let Some(error) = failure {
-                tracing::warn!(
-                    %error,
-                    "reporting the engine's metrics failed: no front of this process is live"
-                );
-            }
+        if delivered == 0
+            && let Some(error) = failure
+        {
+            tracing::warn!(
+                %error,
+                "reporting the engine's metrics failed: no front of this process is live"
+            );
         }
     }
 

@@ -132,11 +132,9 @@ impl ModelRunner {
         // one, and the first writes the states it computed.
         let reports = report.is_some();
         let longest = u64::from(capacities.iter().copied().max().unwrap_or(0));
-        let element = u64::from(
-            dtype
-                .bytes()
-                .context("the encoder's states have no whole-byte element")?,
-        );
+        let element = dtype
+            .bytes()
+            .context("the encoder's states have no whole-byte element")?;
         let (encoder_pool, encoder_info) = worker::memory::encoders::EncoderHostPool::start(
             client,
             device,

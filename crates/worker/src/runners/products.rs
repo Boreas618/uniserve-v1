@@ -609,6 +609,11 @@ impl Held {
     pub fn len(&self) -> usize {
         crate::lock(&self.entries).len()
     }
+
+    /// Whether the store holds no product.
+    pub fn is_empty(&self) -> bool {
+        crate::lock(&self.entries).is_empty()
+    }
 }
 
 impl Products for Held {

@@ -251,7 +251,7 @@ fn install(handle: &SchedulerHandle, pool: &Serving) {
 #[test]
 fn the_facts_boot_a_main_process_that_serves_a_request() {
     let serving = Arc::new(Serving::new(vec![pool()]));
-    let batches: Arc<dyn Batches> = serving.clone();
+    let batches: Arc<dyn Batches> = Arc::clone(&serving) as Arc<dyn Batches>;
     // The boot's whole shape: the facts of a launch file, the worker's batch
     // path, one handle. Nothing is launched: the pool is the rank.
     let (args, limits) = launch();
