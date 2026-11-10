@@ -388,10 +388,10 @@ pub(super) fn schedulers(
     // holds, not what it was launched for), and its longest sequence is the model's bound. The
     // inventory is the worker's to hold and the boot's to state, because neither number can be
     // derived from a batch.
-    let inventory = worker::batch::Inventory {
+    let inventory = ipc::execution::Inventory {
         group: launch.group.clone(),
         ranks: vec![rank.clone()],
-        layout: worker::batch::PoolLayout {
+        layout: ipc::execution::PoolLayout {
             queue_depth: model_runner.queue_depth(),
             ranks: model_runner.world_size(),
             // Every component the rank reports is placed on the group's ranks. A text rank reports
@@ -419,7 +419,7 @@ pub(super) fn schedulers(
             endpoint: None,
         });
     }
-    let batches: Arc<dyn worker::batch::Batches> = Arc::new(stated);
+    let batches: Arc<dyn ipc::execution::Batches> = Arc::new(stated);
 
     // The control thread forwards what a scheduler produced, so it sleeps until a step says there
     // is something: a request's tokens reach the daemon when they exist, not at the next pass.

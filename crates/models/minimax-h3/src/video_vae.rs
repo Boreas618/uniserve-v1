@@ -947,7 +947,7 @@ pub struct ClipScratch {
 impl Decoder for VideoDecoder {
     /// The voxels of every tile, in the order `decode_clip` reads them: each tile's own latent slice,
     /// frame by frame, so a voxel in an overlap has one row per tile that holds it.
-    fn latent_rows(&self, layout: &nn::capability::Layout) -> nn::Result<Option<Vec<u32>>> {
+    fn latent_rows(&self, layout: &proto::video::Layout) -> nn::Result<Option<Vec<u32>>> {
         let clip = Canvas::clip(&self.config, layout.video.height, layout.video.width);
         let tiles = grid(&self.config, &clip)?.tiles(self.config.spatial_compression());
         Ok(Some(nn::tiling::voxels(
@@ -958,7 +958,7 @@ impl Decoder for VideoDecoder {
         )))
     }
 
-    fn layout_tables(&self, layout: &nn::capability::Layout) -> nn::Result<Vec<StateTable>> {
+    fn layout_tables(&self, layout: &proto::video::Layout) -> nn::Result<Vec<StateTable>> {
         // A layout whose extents contradict the checkpoint is a named error and not an empty list: a
         // runner that made a mistake hears which one, where an empty answer would have reached the
         // decode as a block with no tables and read nothing.
@@ -967,7 +967,7 @@ impl Decoder for VideoDecoder {
 
     fn prepare_layout(
         &self,
-        layout: &nn::capability::Layout,
+        layout: &proto::video::Layout,
         out: &mut [TableValues],
     ) -> nn::Result<()> {
         Ok(self.table_values(layout.video.height, layout.video.width, out)?)
@@ -995,7 +995,7 @@ impl Decoder for VideoDecoder {
     fn gather_latents(
         &self,
         f: &Forward,
-        layout: &nn::capability::Layout,
+        layout: &proto::video::Layout,
         trajectory: TensorView,
         first: u32,
         block: TensorView,
@@ -1036,7 +1036,7 @@ impl Decoder for VideoDecoder {
     /// request's. So this states that canvas's layout and refuses any other clip by both extents:
     /// a runner that handed it another canvas would capture a graph whose constants belong to a
     /// different raster.
-    fn layout_of(&self, clip: nn::capability::Clip) -> nn::Result<nn::capability::Layout> {
+    fn layout_of(&self, clip: nn::capability::Clip) -> nn::Result<proto::video::Layout> {
         let refuse = |problem: String| -> nn::Error { Error::config(problem).into() };
         // `pixels` answers `(height, width)` in that order, and this destructures it in the same
         // order: the two were once written the other way round, which a square canvas cannot show.
@@ -1071,8 +1071,8 @@ impl Decoder for VideoDecoder {
                     clip.frames
                 ))
             })?;
-        Ok(nn::capability::Layout {
-            video: nn::capability::LatentShape {
+        Ok(proto::video::Layout {
+            video: proto::video::LatentShape {
                 channels: self.config.latent_channels,
                 frames: canvas.frames,
                 height: canvas.height,
@@ -1566,8 +1566,8 @@ pub(crate) mod tests {
         // dimension of its own: the values are `3 · rows` in a flat buffer and `[3, rows]` as declared,
         // so the twenty-four-radian frame row of each axis is contiguous. Neither number is a frame
         // count and neither multiplies the other.
-        let layout = nn::capability::Layout {
-            video: nn::capability::LatentShape {
+        let layout = proto::video::Layout {
+            video: proto::video::LatentShape {
                 channels: config.latent_channels,
                 frames: clip.frames,
                 height: raster.height,

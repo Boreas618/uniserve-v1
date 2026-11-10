@@ -825,7 +825,7 @@ impl Scheduler {
     /// scheduler no longer holds, leaves the batch without columns; it is then refused at
     /// submission by name rather than served at a canvas nothing captured.
     ///
-    /// The per-request record is `::worker::batch::StagedRequest`: the request's conditioning
+    /// The per-request record is `ipc::execution::StagedRequest`: the request's conditioning
     /// exactly as the model family planned it, and the step, seed and canvas the request states.
     /// What the model prepares on the device - the encoded conditioning rows, the latent
     /// trajectory - is not here, because the mechanism cannot read it and a placeholder for it
@@ -883,9 +883,9 @@ impl Scheduler {
         let extent = self
             .running_media
             .get(&first.request_key.request_id)
-            .map_or(::worker::plan::Extent::None, |state| {
+            .map_or(ipc::execution::Extent::None, |state| {
                 let sampling = &state.request.sampling;
-                ::worker::plan::Extent::Request {
+                ipc::execution::Extent::Request {
                     frames: sampling.num_frames,
                     width: sampling.width,
                     height: sampling.height,
@@ -894,7 +894,7 @@ impl Scheduler {
                     condition_rows: sampling.condition_rows,
                 }
             });
-        let mut stated = ::worker::plan::Computation {
+        let mut stated = ipc::execution::Computation {
             call: media_call,
             rows,
             tokens,
@@ -902,7 +902,7 @@ impl Scheduler {
         };
         // The worker's answer is the authority on the extent: it is the bucket its own runner
         // planned the computation into, and a batch captured for one canvas serves no other.
-        let Some(bucket) = self.worker.media(phase, &stated) else {
+        let Some(extent) = self.worker.media(phase, &stated) else {
             tracing::debug!(
                 "a media batch is dropped: no device of this rank serves a {:?} computation of \
                  {rows} row(s) and {tokens} token(s) at phase {}",
@@ -911,7 +911,6 @@ impl Scheduler {
             );
             return;
         };
-        let extent = bucket.extent;
         stated.extent = extent;
         let mut requests = Vec::with_capacity(batch.requests.len());
         for (call, placed) in &batch.requests {
@@ -922,7 +921,7 @@ impl Scheduler {
                 );
                 return;
             };
-            requests.push(::worker::batch::StagedRequest {
+            requests.push(ipc::execution::StagedRequest {
                 request: call.request_key,
                 conditioning: state.request.conditioning.clone(),
                 step: self.step_of(call.request_key.request_id, call.call_id, state),
@@ -935,7 +934,7 @@ impl Scheduler {
                 unit: placed.decode.as_ref().map_or(0, |range| range.cursor),
             });
         }
-        batch.media = Some(::worker::batch::MediaColumns::staged(stated, &requests));
+        batch.media = Some(ipc::execution::MediaColumns::staged(stated, &requests));
         batch.columns = prompts;
     }
 
@@ -974,8 +973,8 @@ impl Scheduler {
     ///
     /// `None` when the batch names a request this scheduler is not running, which the caller has
     /// the same answer for as for any other media batch it cannot state.
-    fn prompt_columns(&self, batch: &ExecutionBatch) -> Option<::worker::batch::BatchColumns> {
-        let mut columns = ::worker::batch::BatchColumns::default();
+    fn prompt_columns(&self, batch: &ExecutionBatch) -> Option<ipc::execution::BatchColumns> {
+        let mut columns = ipc::execution::BatchColumns::default();
         columns.rows.query_offsets.push(0);
         for (call, _) in &batch.requests {
             let state = self.running_media.get(&call.request_key.request_id)?;

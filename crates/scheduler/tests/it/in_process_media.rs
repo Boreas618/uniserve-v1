@@ -10,12 +10,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ipc::execution::Batches;
 use ipc::{DiffusionSamplingParams, ImageParams, RequestId, SamplingParams};
 use proto::request::DiffusionRequest;
 use scheduler::{
     BatchCapacity, Event, GenerationConstraint, GenerationRequest, SchedulerHandle, Stage,
 };
-use worker::batch::Batches;
 
 use crate::support::{self, Serving};
 

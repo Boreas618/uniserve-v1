@@ -38,9 +38,9 @@ use platform::DeviceId;
 use proto::program::PhaseKind;
 
 use crate::arena::Pools;
-use crate::batch::{Batch, BatchOutput, CallId, Job, Jobs, answered};
+use crate::batch::{Job, Jobs, answered};
 use crate::memory::encoders::EncoderHostPool;
-use crate::plan::{Bucket, Buckets, Variant};
+use crate::plan::{Bucket, Buckets};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::{Column, Region, encode_i32};
 use crate::runners::lifecycle::{Lifecycle, RunnerLifecycle};
@@ -48,6 +48,8 @@ use crate::runners::products::{self, Product, Products};
 use crate::runners::recording::Footprint;
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
+use ipc::execution::Variant;
+use ipc::execution::{Batch, BatchOutput, CallId};
 
 /// The figures an encoder's columns are sized by, which the model package states once at open.
 #[derive(Clone, Copy, Debug)]

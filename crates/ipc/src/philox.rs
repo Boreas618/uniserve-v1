@@ -113,11 +113,13 @@ pub fn request_sampling_key(
 /// Where one sampled row's draw lies: its request's stream and the logical
 /// position of the token it samples.
 ///
-/// The scheduler writes one per sampling row (`worker::batch::BatchColumns::draws`)
+/// The scheduler writes one per sampling row (`crate::execution::BatchColumns::draws`)
 /// and the causal-LM runner turns it into the row's uniform with
 /// [`DrawAddress::uniform`] before the replay, so every rank of a tensor group,
 /// which reads the same batch, draws the same token.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct DrawAddress {
     /// The request's stream, [`request_sampling_key`].
     pub key: u64,

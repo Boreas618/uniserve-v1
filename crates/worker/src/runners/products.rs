@@ -55,7 +55,7 @@ pub const CONDITION_MEDIA: ops::DType = ops::DType::F32;
 
 /// One kind of media product a request has.
 ///
-/// The kinds are the model's own: `nn::capability::Layout` states the rows, elements and shapes of
+/// The kinds are the model's own: `proto::video::Layout` states the rows, elements and shapes of
 /// each, so the worker sizes a region from the model's declaration and never from a guess. They
 /// are one list rather than one mechanism per product because they differ only in their size and in
 /// which call produces them.

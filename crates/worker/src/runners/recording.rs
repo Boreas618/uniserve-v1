@@ -220,7 +220,7 @@ mod tests {
     /// forward reserved - including scratch a forward handed back - attributed to its bucket.
     #[test]
     fn a_walk_reports_its_programs_and_its_peak() {
-        let bucket = Bucket::decode(4, crate::plan::Variant::DecodeGreedy);
+        let bucket = Bucket::decode(4, ipc::execution::Variant::DecodeGreedy);
         let mut footprint = Footprint::default();
         footprint
             .walk(Some(bucket), |walk| {
@@ -247,8 +247,8 @@ mod tests {
     /// it; a narrower walk after it adds its keys and moves neither.
     #[test]
     fn the_widest_walk_sets_the_peak() {
-        let wide = Bucket::prefill(1, 64, crate::plan::Variant::PrefillWrite);
-        let narrow = Bucket::decode(1, crate::plan::Variant::DecodeGreedy);
+        let wide = Bucket::prefill(1, 64, ipc::execution::Variant::PrefillWrite);
+        let narrow = Bucket::decode(1, ipc::execution::Variant::DecodeGreedy);
         let mut footprint = Footprint::default();
         footprint
             .walk(Some(wide), |walk| forward(&walk.forward(None)?, 8192, 8))

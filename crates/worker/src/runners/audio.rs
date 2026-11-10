@@ -22,12 +22,13 @@
 
 use std::sync::{Arc, Mutex};
 
-use nn::capability::{DecodedMedia, Decoder, LatentShape, Layout};
+use nn::capability::{DecodedMedia, Decoder};
 use ops::{DType, Shape, TensorView};
 use platform::DeviceId;
+use proto::video::{LatentShape, Layout};
 
-use crate::batch::{Batch, BatchOutput, CallId, Job, Jobs, answered};
-use crate::plan::{Bucket, Buckets, Extent, Variant};
+use crate::batch::{Job, Jobs, answered};
+use crate::plan::{Bucket, Buckets};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
 use crate::runners::lifecycle::{Lifecycle, RunnerLifecycle};
@@ -35,6 +36,8 @@ use crate::runners::output::interleave_pcm;
 use crate::runners::products::{Product, Products};
 use crate::runners::recording::Footprint;
 use crate::{Error, Result};
+use ipc::execution::{Batch, BatchOutput, CallId};
+use ipc::execution::{Extent, Variant};
 
 /// The two columns one track's decode is staged into, sized for the largest track this runner serves.
 struct AudioColumns {
@@ -46,7 +49,7 @@ struct AudioColumns {
 }
 
 /// The media computation a batch states, or the refusal this runner gives a batch with none.
-fn media_of(batch: &Batch) -> Result<&crate::batch::MediaColumns> {
+fn media_of(batch: &Batch) -> Result<&ipc::execution::MediaColumns> {
     batch.media.as_ref().ok_or_else(|| {
         Error::Invalid(
             "an audio decoder runner serves a media batch; this one states no computation".into(),

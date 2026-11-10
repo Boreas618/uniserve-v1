@@ -3,12 +3,10 @@
 //! A [`Call`] is one immutable call of a request ([`RequestKey`]):
 //! its [`CallKind`], the [`CallCoordinates`] it executes at, the products it
 //! reads and writes, the [`Bounds`] the scheduler reserved for it and, for a
-//! sampling call, its token processor inputs ([`SamplingState`]). A
-//! [`Batch`] carries the calls of one numerical call.
+//! sampling call, its token processor inputs ([`SamplingState`]).
 //!
-//! Types with invariants carry a `validate` method, which
-//! [`Batch::validate`] reaches. The `ensure_valid!` and `invalid_message!`
-//! macros come from the crate root.
+//! Types with invariants carry a `validate` method. The `ensure_valid!` and
+//! `invalid_message!` macros come from the crate root.
 
 use super::*;
 use proto::config::DEFAULT_BLOCK;
@@ -124,9 +122,8 @@ impl CallKind {
 
 /// Hard resource maxima the scheduler reserves before a call runs.
 ///
-/// [`Call::validate`] checks `max_tokens` against `input_token_ids`;
-/// [`Batch::validate`] checks `max_transfer_bytes` against installed cache
-/// inputs. Neither checks `max_completion_bytes`.
+/// [`Call::validate`] checks `max_tokens` against `input_token_ids`; it checks
+/// neither `max_transfer_bytes` nor `max_completion_bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct Bounds {
     /// Maximum tokens the call may process or produce.
@@ -539,9 +536,8 @@ impl Call {
 
     /// Tensor outputs backed by scheduler-allocated persistent buffers.
     ///
-    /// [`Batch::validate`] requires a [`BufferAllocation`] large enough for each
-    /// of these. Latent trajectories are addressed through [`LatentParams`]
-    /// instead.
+    /// Each needs a [`BufferAllocation`] large enough for it. Latent
+    /// trajectories are addressed through [`LatentParams`] instead.
     pub fn buffer_outputs(&self) -> impl Iterator<Item = &TensorRef> {
         self.outputs
             .iter()
@@ -576,7 +572,7 @@ impl Call {
     /// identities, product ownership, generations, output indices, dtypes,
     /// cross-request inputs, the predicate, and the image index
     /// of a latent preparation. Relationships to other calls and to the
-    /// batch's allocation tables belong to [`Batch::validate`].
+    /// batch's allocation tables are the scheduler's to keep.
     pub fn validate(&self) -> ValidationResult<()> {
         // Establish call identity, component, coordinates, and token capacity.
         ensure_valid!(self.call_id.batch_id > 0, "call id must be positive");

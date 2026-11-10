@@ -697,7 +697,7 @@ impl std::fmt::Debug for Pools {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::Variant;
+    use ipc::execution::Variant;
 
     /// A stream's own plan replaces the even share, and the budget counts what each stream reserves.
     #[test]
@@ -771,7 +771,7 @@ mod tests {
             variant: Variant::DecodeGreedy,
             rows,
             tokens: 1,
-            extent: crate::plan::Extent::None,
+            extent: ipc::execution::Extent::None,
             serves: None,
             capacity: 0,
         }

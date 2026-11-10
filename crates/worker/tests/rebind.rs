@@ -38,6 +38,7 @@ use std::process::Command;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use ipc::execution::{Shape as PlanShape, Variant};
 use nn::forward::Forward;
 use ops::{
     Arguments, CubinMetadata, DType, DevicePtr, Generation, Kernel, KernelEntry, LaunchGrid, Op,
@@ -49,7 +50,7 @@ use platform::{
 };
 use worker::captured::Captured;
 use worker::graph::Graphs;
-use worker::plan::{Bucket, Shape as PlanShape, Variant};
+use worker::plan::Bucket;
 use worker::runners::causal_lm::Recording;
 
 const DEVICE: DeviceId = DeviceId(0);

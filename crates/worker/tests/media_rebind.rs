@@ -19,10 +19,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use nn::capability::{DecodedMedia, Decoder, LatentShape, Layout};
+use nn::capability::{DecodedMedia, Decoder};
 use nn::{Forward, Result, StateTable, TableValues};
 use ops::{DType, TensorView};
 use platform::{Allocator, Budget, Device, DeviceId, PoolKind, Stream};
+use proto::video::{LatentShape, Layout};
 use worker::arena::Pools;
 use worker::batch::Job;
 use worker::plan::{Bucket, Buckets};

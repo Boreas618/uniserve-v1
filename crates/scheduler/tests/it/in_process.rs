@@ -10,9 +10,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use ipc::execution::{Batch, Batches, Inventory, Submission};
 use proto::config::EngineArgs;
 use scheduler::{SchedulerConfig, SchedulerHandle};
-use worker::batch::{Batch, Batches, Inventory, Submission};
 
 /// How long a command answer may take.
 ///
@@ -48,24 +48,20 @@ impl Pool {
 }
 
 impl Batches for Pool {
-    fn submit(&self, batch: Batch) -> Result<Submission, worker::Error> {
+    fn submit(&self, batch: Batch) -> Result<Submission, Box<ipc::execution::Fault>> {
         self.submitted
             .lock()
             .expect("the pool's batches")
             .push(batch);
-        Err(worker::Error::Invalid(
-            "this test's pool serves no batch".to_owned(),
-        ))
+        Err("this test's pool serves no batch".into())
     }
 
-    fn shadow(&self, batch: Batch) -> Result<Submission, worker::Error> {
+    fn shadow(&self, batch: Batch) -> Result<Submission, Box<ipc::execution::Fault>> {
         self.submitted
             .lock()
             .expect("the pool's batches")
             .push(batch);
-        Err(worker::Error::Invalid(
-            "this test's pool runs no shadow batch".to_owned(),
-        ))
+        Err("this test's pool runs no shadow batch".into())
     }
 
     fn inventory(&self) -> &[Inventory] {

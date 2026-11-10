@@ -1,7 +1,7 @@
 //! The in-process path serving a request, without a device.
 //!
 //! `in_process.rs` states what `SchedulerHandle::over_batches` refuses; this
-//! states what it does. The pool here is `worker::batch::Batches` and answers
+//! states what it does. The pool here is `ipc::execution::Batches` and answers
 //! every batch it is handed with the mechanism's own values — one
 //! `CallOutput::completed` per call it was given, and the batch's timing — so
 //! the whole path runs: the policy admits, the mechanism assembles columns and
@@ -16,11 +16,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ipc::execution::{Batch, Batches};
 use ipc::{ImageParams, SamplingParams};
 use scheduler::{
     BatchCapacity, Event, GenerationConstraint, GenerationRequest, SchedulerHandle, Stage,
 };
-use worker::batch::{Batch, Batches};
 
 use crate::support::SAMPLED;
 

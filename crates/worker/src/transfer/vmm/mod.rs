@@ -149,7 +149,7 @@ impl CudaExports {
 
     pub(crate) fn check(&self) -> Result<()> {
         match &*lock(&self.failed) {
-            Some(failed) => Err(Error::Shared(Arc::clone(&failed.error))),
+            Some(failed) => Err(Error::Shared(Arc::<Error>::clone(&failed.error))),
             None => Ok(()),
         }
     }

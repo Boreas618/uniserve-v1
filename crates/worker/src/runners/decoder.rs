@@ -34,13 +34,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use nn::capability::{Clip, DecodedMedia, Decoder, Layout, Splicer};
+use nn::capability::{Clip, DecodedMedia, Decoder, Splicer};
 use ops::{DType, Shape, TensorView};
 use platform::DeviceId;
+use proto::video::Layout;
 
 use crate::arena::Pools;
-use crate::batch::{Batch, BatchOutput, CallId, Job, Jobs, answered};
-use crate::plan::{Bucket, Buckets, Extent, Variant};
+use crate::batch::{Job, Jobs, answered};
+use crate::plan::{Bucket, Buckets};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
 use crate::runners::lifecycle::{Lifecycle, RunnerLifecycle};
@@ -49,6 +50,8 @@ use crate::runners::products::{Product, Products};
 use crate::runners::recording::{Footprint, Walk};
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
+use ipc::execution::{Batch, BatchOutput, CallId};
+use ipc::execution::{Extent, Variant};
 
 /// How long a clip waits for its predecessor's tail before it names the rank that never answered.
 const TAIL_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -111,7 +114,7 @@ impl DecoderColumns {
 /// its own function because it is the one part of `submit` that is a fact about the batch alone - a
 /// device-free test can state a batch with no computation and read the message, where a test of
 /// `submit` itself would need a constructed runner and therefore a device.
-fn media_of(batch: &Batch) -> Result<&crate::batch::MediaColumns> {
+fn media_of(batch: &Batch) -> Result<&ipc::execution::MediaColumns> {
     batch.media.as_ref().ok_or_else(|| {
         Error::Invalid(
             "a decoder runner serves a media batch; this one states no computation".into(),
@@ -485,7 +488,7 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
     /// The bucket's extent names one raster, so a batch of two requests for it describes two clips in
     /// one graph - a plan the mechanism does not make, and one whose second clip would be decoded
     /// from the first clip's columns.
-    fn clip_of(media: &crate::batch::MediaColumns) -> Result<&Vec<Vec<u8>>> {
+    fn clip_of(media: &ipc::execution::MediaColumns) -> Result<&Vec<Vec<u8>>> {
         let [buffers] = media.inputs.as_slice() else {
             return Err(Error::Invalid(format!(
                 "a decode bucket holds one clip and this batch carries {} request(s)",
@@ -1555,7 +1558,7 @@ mod tests {
 
     fn layout_of_served() -> Layout {
         Layout {
-            video: nn::capability::LatentShape {
+            video: proto::video::LatentShape {
                 channels: 8,
                 frames: 1,
                 height: 1,
@@ -1662,12 +1665,12 @@ mod tests {
         // A bucket's extent names one raster, so two requests in one batch of it describe two clips in
         // one graph: the second would be decoded from the first's columns. The refusal names the count
         // rather than serving one and silently dropping the other.
-        let media = crate::batch::MediaColumns {
-            computation: crate::plan::Computation {
+        let media = ipc::execution::MediaColumns {
+            computation: ipc::execution::Computation {
                 call: ipc::MediaCall::VideoDecoding,
                 rows: 2,
                 tokens: 0,
-                extent: crate::plan::Extent::Clip {
+                extent: ipc::execution::Extent::Clip {
                     frames: SERVED.0,
                     height: SERVED.1,
                     width: SERVED.2,
@@ -1681,7 +1684,7 @@ mod tests {
             "the refusal counts the batch: {error}"
         );
 
-        let one = crate::batch::MediaColumns {
+        let one = ipc::execution::MediaColumns {
             inputs: vec![vec![vec![0_u8; 8]]],
             ..media
         };
@@ -1701,12 +1704,12 @@ mod tests {
         // read by `media.request`. The blob is the clip only as a fallback: `stage` takes the
         // trajectory from the product store first, so this ordering is what a batch without a
         // published product has to satisfy.
-        let media = crate::batch::MediaColumns {
-            computation: crate::plan::Computation {
+        let media = ipc::execution::MediaColumns {
+            computation: ipc::execution::Computation {
                 call: ipc::MediaCall::VideoDecoding,
                 rows: 1,
                 tokens: 0,
-                extent: crate::plan::Extent::Clip {
+                extent: ipc::execution::Extent::Clip {
                     frames: SERVED.0,
                     height: SERVED.1,
                     width: SERVED.2,
@@ -1740,11 +1743,11 @@ mod tests {
             page_offloads: Vec::new(),
             latent_restores: Vec::new(),
             host_outputs: Vec::new(),
-            id: crate::batch::BatchId(1),
+            id: ipc::execution::BatchId(1),
             phase: ipc::PhaseId(0),
             calls: Vec::new(),
-            shape: crate::plan::Shape::decode(1, Variant::DecodeGreedy),
-            columns: crate::batch::BatchColumns::default(),
+            shape: ipc::execution::Shape::decode(1, Variant::DecodeGreedy),
+            columns: ipc::execution::BatchColumns::default(),
             generation: 1,
             cache_units: Vec::new(),
             block_tables: Vec::new(),

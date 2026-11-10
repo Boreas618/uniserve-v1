@@ -41,10 +41,11 @@
 //! host value, and no table is uploaded from inside a forward.
 
 use nn::blocks::ModulationTable;
-use nn::capability::{ConditionRole, LatentShape, Layout, StateTable, TableValues, VideoRequest};
+use nn::capability::{ConditionRole, StateTable, TableValues, VideoRequest};
 use nn::diffusion::{TimestepTable, TimestepTableSpec};
 use nn::family::Split;
 use nn::{DType, Forward, Shape, TensorView, WeightLoader};
+use proto::video::{LatentShape, Layout};
 
 use crate::attention::Factors;
 use crate::config::{CANVAS_RULE, DenoiserConfig, FRAMES, MAX_FRAMES};

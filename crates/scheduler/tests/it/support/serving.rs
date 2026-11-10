@@ -10,13 +10,13 @@ use std::sync::Mutex;
 use proto::config::EngineArgs;
 use scheduler::SchedulerConfig;
 
-use ipc::{MainProcessEndpoint, MainProcessInfo, TimingCounters};
-use proto::config::BlockConfig;
-use worker::batch::{
+use ipc::execution::Outcome;
+use ipc::execution::{
     Batch, BatchOutput, Batches, CallOutput, Inventory, PoolLayout, RowState, Submission,
     SubmissionId,
 };
-use worker::completion::Outcome;
+use ipc::{MainProcessEndpoint, MainProcessInfo, TimingCounters};
+use proto::config::BlockConfig;
 
 /// The token this pool samples for the `index`th call of every batch.
 pub(crate) const SAMPLED: u32 = 1000;
@@ -126,7 +126,7 @@ impl Serving {
 }
 
 impl Batches for Serving {
-    fn submit(&self, batch: Batch) -> Result<Submission, worker::Error> {
+    fn submit(&self, batch: Batch) -> Result<Submission, Box<ipc::execution::Fault>> {
         self.submitted
             .lock()
             .expect("the pool's batches")
@@ -134,7 +134,7 @@ impl Batches for Serving {
         Ok(self.serve(batch))
     }
 
-    fn shadow(&self, batch: Batch) -> Result<Submission, worker::Error> {
+    fn shadow(&self, batch: Batch) -> Result<Submission, Box<ipc::execution::Fault>> {
         Ok(self.serve(batch))
     }
 

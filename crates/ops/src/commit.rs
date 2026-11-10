@@ -41,40 +41,7 @@ use crate::tensor::{DType, TensorView};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
-/// The rows of the commit column table, in order.
-pub const COMMIT_FIELDS: usize = 8;
-
-/// The column table's row indices.
-pub mod column {
-    /// The row's destination slot.
-    pub const SLOT: usize = 0;
-    /// The row's mode: decode, explicit, verify or cache.
-    pub const MODE: usize = 1;
-    /// The task the row sampled, or -1 when it sampled none.
-    pub const TASK: usize = 2;
-    /// The host cache length of an explicit row.
-    pub const CACHE_LENGTH: usize = 3;
-    /// The host logical position of an explicit row.
-    pub const LOGICAL: usize = 4;
-    /// The host sampling position of an explicit row.
-    pub const SAMPLING: usize = 5;
-    /// The verification base's visible length.
-    pub const VISIBLE: usize = 6;
-    /// Whether the row counts penalties.
-    pub const PENALTIES: usize = 7;
-}
-
-/// The mode of a commit row.
-pub mod mode {
-    /// One accepted token: the three lengths advance by one.
-    pub const DECODE: i64 = 0;
-    /// The host columns state the lengths.
-    pub const EXPLICIT: i64 = 1;
-    /// A verified span: the lengths move to `base + points`.
-    pub const VERIFY: i64 = 2;
-    /// The lengths are left as they are.
-    pub const CACHE: i64 = 3;
-}
+use proto::program::commit::COMMIT_FIELDS;
 
 /// One compilation of `slot_commit`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

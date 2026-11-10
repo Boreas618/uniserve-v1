@@ -20,8 +20,9 @@
 use std::collections::HashMap;
 
 use crate::captured::Captured;
-use crate::plan::{Bucket, Shape};
+use crate::plan::Bucket;
 use crate::{Error, Result};
+use ipc::execution::Shape;
 
 /// Every captured graph of one runner.
 #[derive(Default, Debug)]
@@ -293,7 +294,7 @@ impl Graphs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::Variant;
+    use ipc::execution::Variant;
 
     /// The selection rule, over keys only: the newest generation at or below the one asked for, and
     /// the smallest bucket within it. This is what lets a bucket an update did not prepare keep

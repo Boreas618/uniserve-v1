@@ -19,18 +19,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use ipc::execution::Variant;
 use nn::capability::{
     Clip, ConditionPiece, ConditionRole, ConditionShape, Conditioning, DecodedMedia, Decoder,
     Denoiser, Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageShape,
-    LatentShape, Latents, Layout, MediaRole, PatchFormat, PixelNorm, Seed, StateTable, Step,
-    TableValues, TokenBatch, VideoRequest, WarmPrompt, WarmRequest,
+    Latents, MediaRole, PatchFormat, PixelNorm, Seed, StateTable, Step, TableValues, TokenBatch,
+    VideoRequest, WarmPrompt, WarmRequest,
 };
 use nn::{Forward, Result};
 use ops::logits::{GatherArgs, GatherDescriptor, LogitsGather};
 use ops::{DType, Op, Shape, TensorView};
 use platform::{Allocator, Budget, Device, DeviceId, PoolKind, Stream};
+use proto::video::{LatentShape, Layout};
 use worker::arena::Pools;
-use worker::plan::{Bucket, Buckets, Variant};
+use worker::plan::{Bucket, Buckets};
 use worker::runner::{Binding, Runner, RunnerId};
 use worker::runners::denoiser::{DenoiserRunner, DenoiserShape};
 use worker::runners::encoder::{EncoderRunner, EncoderShape, WarmVision};

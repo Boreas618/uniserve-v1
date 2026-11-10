@@ -245,7 +245,7 @@ impl Decoder for AudioDecoder {
         nn::DType::F32
     }
 
-    fn layout_tables(&self, _layout: &nn::capability::Layout) -> nn::Result<Vec<StateTable>> {
+    fn layout_tables(&self, _layout: &proto::video::Layout) -> nn::Result<Vec<StateTable>> {
         // Every table this decoder reads is a weight, bound at load: nothing follows from the
         // layout, so the runner uploads nothing for it.
         Ok(Vec::new())
@@ -253,7 +253,7 @@ impl Decoder for AudioDecoder {
 
     fn prepare_layout(
         &self,
-        _layout: &nn::capability::Layout,
+        _layout: &proto::video::Layout,
         out: &mut [nn::TableValues],
     ) -> nn::Result<()> {
         if out.is_empty() {
@@ -268,7 +268,7 @@ impl Decoder for AudioDecoder {
 
     /// The waveform one decode of `audio` writes: the track's latent frames times the decoder's hop,
     /// in [`PCM_CHANNELS`] channels.
-    fn pcm_window(&self, audio: &nn::capability::LatentShape) -> nn::Result<(u64, u32)> {
+    fn pcm_window(&self, audio: &proto::video::LatentShape) -> nn::Result<(u64, u32)> {
         Ok((track_samples(&self.config, audio.frames), PCM_CHANNELS))
     }
 

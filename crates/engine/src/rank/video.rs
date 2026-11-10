@@ -4,11 +4,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
+use ipc::execution::Variant;
 use nn::family::{VideoModel, VideoServing};
 use ops::{DType, Generation};
 use platform::DeviceId;
 use worker::blocking::BlockingKind;
-use worker::plan::{Buckets, Variant};
+use worker::plan::Buckets;
 use worker::runner::{Binding, NamedRunner, RunnerId};
 
 use super::buckets::{host_phases, phase, served_phases, unit_phases};
@@ -199,7 +200,7 @@ impl ModelRunner {
             let mut seen: Vec<(u32, u32)> = Vec::new();
             let mut buckets = Vec::new();
             for bucket in denoise_set.iter() {
-                let worker::plan::Extent::Latents(layout) = bucket.extent else {
+                let ipc::execution::Extent::Latents(layout) = bucket.extent else {
                     continue;
                 };
                 let Some(audio) = layout.audio else {

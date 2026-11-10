@@ -189,7 +189,7 @@ The [architecture guide](docs/architecture.md) describes how the daemons, the en
 src/                    The root package, `uniserve`: the command line, logging, the `serve` and `programs` commands, and `main.rs`, which dispatches every command and registers the model families
 crates/engine/          The main process of a node and epoch: its control thread, schedulers, executors and blocking pool, and the catalogue that resolves a checkpoint to its model family
 crates/proto/           The interfaces across builds: the request interface and the process interface (Protobuf), and the video condition vocabulary
-crates/ipc/             Scheduler-to-main-process messages, rank channels and the launch descriptor
+crates/ipc/             The batch the scheduler submits and the worker serves, scheduler-to-main-process messages, rank channels and the launch descriptor
 crates/scheduling/      The scheduling interface between the scheduler's mechanism and its policy
 crates/storage/         The Storage Server's protocol and client
 crates/storage-server/  The Storage Server, its Mooncake connector and its Transfer Server

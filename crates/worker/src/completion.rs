@@ -1,169 +1,30 @@
 //! Shared operation results, waits, and completion observers.
 
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use crate::Error;
 
-use crate::{Error, Result, lock};
-
-/// The operation's result. Physical storage requires a successful retirement
-/// signal; a task result alone does not establish that a device has stopped.
-#[derive(Debug)]
-pub enum Outcome<T = ()> {
-    Success(T),
-    Failed(Arc<Error>),
-    Cancelled,
-}
-
-impl<T: Clone> Clone for Outcome<T> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Success(value) => Self::Success(value.clone()),
-            Self::Failed(error) => Self::Failed(Arc::clone(error)),
-            Self::Cancelled => Self::Cancelled,
-        }
-    }
-}
-
-struct State<C, T> {
-    outcome: Option<Outcome<T>>,
-    callbacks: Vec<C>,
-}
-
-/// One completion shared by an operation and its consumers.
+/// How an operation of the worker ended, with the worker's own error when it failed.
 ///
-/// `C` is the observer type: a shared [`crate::transfer::Notify`] for
-/// physical retirements, which one observer may watch together with other
-/// signals, or a one-shot boxed closure for host task results. Completing an
-/// operation returns its callbacks so the owner can dispatch them after
-/// releasing its lock. `T` is the operation's value.
-pub struct Completion<C, T = ()> {
-    state: Mutex<State<C, T>>,
-    /// Signalled when the outcome lands, so a waiter sleeps instead of polling.
-    ready: Condvar,
-}
+/// Physical storage requires a successful retirement signal; a task result alone does not
+/// establish that a device has stopped.
+///
+/// The variants are `ipc::execution::Outcome`'s: a submission's outcome is the same type over a
+/// [`ipc::execution::Fault`], which the worker's error converts into where a submission completes.
+pub type Outcome<T = ()> = ipc::execution::Outcome<T, Error>;
 
-impl<C, T> Default for Completion<C, T> {
-    fn default() -> Self {
-        Self {
-            state: Mutex::new(State {
-                outcome: None,
-                callbacks: Vec::new(),
-            }),
-            ready: Condvar::new(),
-        }
-    }
-}
-
-impl<C, T: Clone> Completion<C, T> {
-    fn state(&self) -> MutexGuard<'_, State<C, T>> {
-        // No user code mutates state under the lock. A panicking reference
-        // visitor cannot leave a partially completed operation.
-        lock(&self.state)
-    }
-
-    pub fn done(&self) -> bool {
-        self.state().outcome.is_some()
-    }
-
-    pub fn succeeded(&self) -> bool {
-        matches!(self.state().outcome, Some(Outcome::Success(_)))
-    }
-
-    /// The outcome, once the operation ended.
-    pub fn outcome(&self) -> Option<Outcome<T>> {
-        self.state().outcome.clone()
-    }
-
-    /// Waits for the operation's outcome.
-    pub fn wait(&self) -> Outcome<T> {
-        let mut state = self.state();
-        while state.outcome.is_none() {
-            state = self
-                .ready
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        state
-            .outcome
-            .clone()
-            .unwrap_or_else(|| Outcome::Failed(Arc::new(Error::State("completion has no outcome"))))
-    }
-
-    /// Waits at most `timeout` for the outcome: what a serve loop does between
-    /// batches, where `Duration::ZERO` is a poll.
-    pub fn wait_timeout(&self, timeout: Duration) -> Option<Outcome<T>> {
-        let deadline = Instant::now() + timeout;
-        let mut state = self.state();
-        while state.outcome.is_none() {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return None;
-            }
-            state = self
-                .ready
-                .wait_timeout(state, left)
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .0;
-        }
-        state.outcome.clone()
-    }
-
-    /// Register a callback, or return it for immediate dispatch if already done.
-    pub(crate) fn subscribe(&self, callback: C) -> Option<C> {
-        let mut state = self.state();
-        if state.outcome.is_some() {
-            return Some(callback);
-        }
-
-        state.callbacks.push(callback);
-        None
-    }
-
-    pub(crate) fn complete(&self, result: Result<T>) -> Result<Vec<C>> {
-        let outcome = match result {
-            Ok(value) => Outcome::Success(value),
-            Err(error) => Outcome::Failed(Arc::new(error)),
-        };
-        self.settle(outcome)
-            .ok_or(Error::State("operation has already completed"))
-    }
-
-    /// Records `outcome` when the operation has none yet, wakes every waiter, and answers the
-    /// callbacks to run; `None` when an outcome was already recorded, which this one does not
-    /// replace.
-    pub(crate) fn settle(&self, outcome: Outcome<T>) -> Option<Vec<C>> {
-        let mut state = self.state();
-        if state.outcome.is_some() {
-            return None;
-        }
-        state.outcome = Some(outcome);
-        let callbacks = std::mem::take(&mut state.callbacks);
-        drop(state);
-        self.ready.notify_all();
-        Some(callbacks)
-    }
-
-    /// Cancel an unresolved completion. This does not stop its producer.
-    pub(crate) fn cancel(&self) -> (bool, Vec<C>) {
-        let mut state = self.state();
-        match state.outcome {
-            Some(Outcome::Cancelled) => return (true, Vec::new()),
-            Some(_) => return (false, Vec::new()),
-            None => {}
-        }
-
-        state.outcome = Some(Outcome::Cancelled);
-        let callbacks = std::mem::take(&mut state.callbacks);
-        drop(state);
-        self.ready.notify_all();
-        (true, callbacks)
-    }
-}
+/// One completion shared by an operation and its consumers, failing with the worker's own error.
+///
+/// `C` is the observer type: a shared [`crate::transfer::Notify`] for physical retirements, which
+/// one observer may watch together with other signals, or a one-shot boxed closure for host task
+/// results. `T` is the operation's value. The type is `ipc::execution::Completion`, which a
+/// submission is built on too.
+pub type Completion<C, T = ()> = ipc::execution::Completion<C, T, Error>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Result;
     use crate::transfer::{Notify, Retirement, notify};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 

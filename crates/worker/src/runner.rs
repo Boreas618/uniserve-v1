@@ -16,7 +16,8 @@ use ipc::PhaseId;
 use ops::Generation;
 
 use crate::Result;
-use crate::batch::{Batch, Jobs};
+use crate::batch::Jobs;
+use ipc::execution::Batch;
 
 /// The worker's name for one runner on a device.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -57,7 +58,10 @@ pub trait Runner: Send {
 
     /// Turns `output`, the answer a replay gave when it launched, into its answer now that its work
     /// has landed.
-    fn landed(&mut self, output: crate::batch::BatchOutput) -> Result<crate::batch::BatchOutput> {
+    fn landed(
+        &mut self,
+        output: ipc::execution::BatchOutput,
+    ) -> Result<ipc::execution::BatchOutput> {
         Ok(output)
     }
 
@@ -288,7 +292,7 @@ pub trait Runner: Send {
     /// the worker, alternating with serving batches", and only the runner owns the model and the
     /// arena that a capture, a replay or a rebind needs. The worker cannot perform those jobs
     /// itself, so the runner that returned them performs them here.
-    fn serve(&mut self, job: &crate::batch::Job) -> Result<crate::batch::BatchOutput>;
+    fn serve(&mut self, job: &crate::batch::Job) -> Result<ipc::execution::BatchOutput>;
 }
 
 /// One runner the device worker owns: its name, the phases it serves, and the runner itself.

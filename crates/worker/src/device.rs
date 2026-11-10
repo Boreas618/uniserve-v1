@@ -21,12 +21,13 @@ use ops::Generation;
 use platform::DeviceId;
 
 use crate::arena::{Pools, StreamId};
-use crate::batch::{Batch, BatchOutput, Job, Submission, SubmissionId};
+use crate::batch::Job;
 use crate::job::{Command, JobQueue, jobs_of, phase_of};
 use crate::plan::Bucket;
 use crate::runner::{NamedRunner, RunnerId};
 use crate::stream::events::{DRAIN_LIMIT, EventPool, JobId, drain_event};
 use crate::{Error, Result};
+use ipc::execution::{Batch, BatchOutput, Submission, SubmissionId};
 
 /// A device worker's handle.
 pub struct Worker {
@@ -567,15 +568,15 @@ impl Worker {
             None,
         )?;
         match submission.wait() {
-            crate::completion::Outcome::Success(_) => Ok(std::mem::take(
+            ipc::execution::Outcome::Success(_) => Ok(std::mem::take(
                 &mut *pools
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             )),
-            crate::completion::Outcome::Failed(error) => Err(Error::Invalid(format!(
+            ipc::execution::Outcome::Failed(error) => Err(Error::Invalid(format!(
                 "mapping the host KV cache: {error}"
             ))),
-            crate::completion::Outcome::Cancelled => Err(Error::Invalid(
+            ipc::execution::Outcome::Cancelled => Err(Error::Invalid(
                 "mapping the host KV cache was cancelled".into(),
             )),
         }
@@ -619,7 +620,7 @@ impl Worker {
         match answered.recv() {
             Ok(result) => result,
             Err(_) => match submission.wait() {
-                crate::Outcome::Failed(error) => Err(Error::Shared(error)),
+                ipc::execution::Outcome::Failed(error) => Err(Error::Shared(error)),
                 _ => Err(Error::State("the rank's device ended before it answered")),
             },
         }
@@ -659,13 +660,13 @@ impl Worker {
     /// # What the caller must state
     ///
     /// A computation that **states** an extent is matched to the graph captured for exactly that, so
-    /// a 25-frame step cannot be served by a 13-frame graph. [`crate::plan::Extent::None`] is the
+    /// a 25-frame step cannot be served by a 13-frame graph. [`ipc::execution::Extent::None`] is the
     /// caller saying it does not know - which is every media computation the engine forms, because a
     /// denoising step's layout is the model's arithmetic and a decode's clip is derived inside the
     /// runner - and the bucket's own extent is then the answer, with its rows and tokens still room
     /// to spare. **A caller that states nothing gets the bucket the runners planned; a caller that
     /// states something gets that or nothing.**
-    pub fn media(&self, computation: &crate::plan::Computation) -> Option<crate::plan::Bucket> {
+    pub fn media(&self, computation: &ipc::execution::Computation) -> Option<crate::plan::Bucket> {
         self.media.select_media(computation)
     }
 
@@ -733,7 +734,7 @@ pub struct Watch {
     /// The command's number.
     pub job: JobId,
     /// The batch it serves, when it serves one.
-    pub batch: Option<crate::batch::BatchId>,
+    pub batch: Option<ipc::execution::BatchId>,
     /// When the device thread began it.
     pub started: std::time::Instant,
     /// How long it has been in flight at the reading.

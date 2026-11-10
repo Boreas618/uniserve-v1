@@ -16,11 +16,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ipc::execution::Batches;
 use ipc::{ImageParams, RequestId, SamplingParams};
 use scheduler::{
     BatchCapacity, Event, GenerationConstraint, GenerationRequest, SchedulerHandle, Stage,
 };
-use worker::batch::Batches;
 
 use crate::support::{self, Serving};
 

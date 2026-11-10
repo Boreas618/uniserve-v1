@@ -310,6 +310,70 @@ pub mod operator {
     }
 }
 
+/// The commit table a batch's producer writes and the `slot_commit` operator reads: one row of
+/// [`commit::COMMIT_FIELDS`] columns per call, which states how the call's step advances its slot's
+/// device state.
+///
+/// Stated here because the scheduler writes the rows and the kernel library launches the operator
+/// over them, and neither links the other.
+pub mod commit {
+    /// The rows of the commit column table, in order.
+    pub const COMMIT_FIELDS: usize = 8;
+
+    /// The column table's row indices.
+    pub mod column {
+        /// The row's destination slot.
+        pub const SLOT: usize = 0;
+        /// The row's mode: decode, explicit, verify or cache.
+        pub const MODE: usize = 1;
+        /// The task the row sampled, or -1 when it sampled none.
+        pub const TASK: usize = 2;
+        /// The host cache length of an explicit row.
+        pub const CACHE_LENGTH: usize = 3;
+        /// The host logical position of an explicit row.
+        pub const LOGICAL: usize = 4;
+        /// The host sampling position of an explicit row.
+        pub const SAMPLING: usize = 5;
+        /// The verification base's visible length.
+        pub const VISIBLE: usize = 6;
+        /// Whether the row counts penalties.
+        pub const PENALTIES: usize = 7;
+    }
+
+    /// The mode of a commit row.
+    pub mod mode {
+        /// One accepted token: the three lengths advance by one.
+        pub const DECODE: i64 = 0;
+        /// The host columns state the lengths.
+        pub const EXPLICIT: i64 = 1;
+        /// A verified span: the lengths move to `base + points`.
+        pub const VERIFY: i64 = 2;
+        /// The lengths are left as they are.
+        pub const CACHE: i64 = 3;
+    }
+}
+
+/// The sampler's parameter columns of one row, which a batch's producer writes and the sampling
+/// operators read.
+///
+/// Stated here because the scheduler writes the rows and the kernel library reads them, and neither
+/// links the other.
+pub mod sampler {
+    /// The columns of one row of sampling parameters, in the order the worker writes them.
+    ///
+    /// The offsets are fixed (the temperature first, the repetition, frequency and presence penalties
+    /// at 4, 5 and 6, and the top-k width, the nucleus threshold and the min-p threshold after them);
+    /// the op reads only the parameters it names.
+    pub const PARAMETER_COLUMNS: u32 = 8;
+
+    /// The offset of the temperature among a row's parameters.
+    pub const TEMPERATURE: u32 = 0;
+    /// The offset of the top-k width (0 to keep every candidate).
+    pub const TOP_K: u32 = 1;
+    /// The offset of the nucleus threshold.
+    pub const TOP_P: u32 = 2;
+}
+
 #[cfg(test)]
 mod tests {
     use super::PhaseKind;

@@ -27,7 +27,7 @@ impl WorkerInfo {
     /// longest sequence another pool does not, or when its layout disagrees with the ranks it
     /// reports; fails as [`WorkerInfo::from_workers`] does when two pools share an identity or
     /// replicas of one component expose different numerical outputs.
-    pub fn from_inventory(pools: &[worker::batch::Inventory]) -> anyhow::Result<Self> {
+    pub fn from_inventory(pools: &[ipc::execution::Inventory]) -> anyhow::Result<Self> {
         ensure!(
             !pools.is_empty(),
             "a worker serves at least one pool, and it reports none"
@@ -379,11 +379,11 @@ mod tests {
         placed_ranks: usize,
         components: BTreeMap<String, BlockConfig>,
         max_model_len: u32,
-    ) -> worker::batch::Inventory {
-        worker::batch::Inventory {
+    ) -> ipc::execution::Inventory {
+        ipc::execution::Inventory {
             group: group.to_owned(),
             ranks,
-            layout: worker::batch::PoolLayout {
+            layout: ipc::execution::PoolLayout {
                 queue_depth: 2,
                 ranks: placed_ranks,
                 components,
@@ -394,7 +394,7 @@ mod tests {
 
     /// A media pool that decodes and encodes on one host, so its own encoder
     /// is an admissible pairing for its decoder.
-    fn media_pool(host: &str) -> worker::batch::Inventory {
+    fn media_pool(host: &str) -> ipc::execution::Inventory {
         let mut info = rank(host, 64, None);
         info.media_components = BTreeMap::from([
             (MediaCall::VideoDecoding, "decode".to_owned()),

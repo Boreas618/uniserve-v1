@@ -1,7 +1,7 @@
 //! One batch's worker columns, filled from the calls the mechanism planned.
 //!
 //! A batch is one numerical call of one phase on one component (§4.4, `M499`),
-//! and the worker reads it in the layout the kernels address: `worker::batch::BatchRows`
+//! and the worker reads it in the layout the kernels address: `ipc::execution::BatchRows`
 //! — one [`BatchRow`] per call with the half-open row range it owns, then
 //! the token and row columns — beside the sampler's own columns. Nothing is
 //! converted between the mechanism and the model: the mechanism writes exactly
@@ -35,11 +35,11 @@
 //! of them: a token column is as long as the batch's tokens, a row column as
 //! long as its rows — the sequences, so a verification of three candidates is
 //! one call and three rows — and the commit table as long as its calls. Their
-//! single statement is [`::worker::batch::BatchColumns`]' own documentation,
+//! single statement is [`ipc::execution::BatchColumns`]' own documentation,
 //! which the worker's `check` and its staging both read: compare a column
 //! with the wrong one of the three and a legitimate batch is refused.
 //!
-//! - **commit**: the eight columns `ops::commit::column` names, one row per
+//! - **commit**: the eight columns `proto::program::commit::column` names, one row per
 //!   call: how the step advances the slot's device state. A decode advances by
 //!   its sampled token; a prefill that samples installs its token at the host
 //!   coordinates; a prefill that samples nothing only states its cache extent;
@@ -56,8 +56,9 @@
 
 use std::ops::Range;
 
-use ::worker::batch::{BatchColumns, BatchRow, BatchRows, RowKind, commit};
+use ipc::execution::{BatchColumns, BatchRow, BatchRows, RowKind};
 use ipc::{Call, CallKind, ForwardMode};
+use proto::program::commit;
 use proto::request::SamplingParams;
 
 use super::slots;
@@ -82,10 +83,10 @@ const fn row_kind(kind: CallKind) -> Option<RowKind> {
 
 /// The sampler's parameter columns of one row.
 ///
-/// The order is `ops::sampler`'s, which fixes it for the kernels that read the
+/// The order is `proto::program::sampler`'s, which fixes it for the kernels that read the
 /// table (`PARAMETER_COLUMNS` columns per row): temperature, the top-k width,
 /// the nucleus threshold, the min-p threshold, then the repetition, frequency
-/// and presence penalties. The eighth column is named by no op — `ops::sampler`
+/// and presence penalties. The eighth column is named by no op — the sampler
 /// reads only the parameters it names — so it is zero.
 pub(crate) fn sampler_parameters(sampling: &SamplingParams) -> [f32; SAMPLER_PARAMETERS] {
     let mut columns = [0.0f32; SAMPLER_PARAMETERS];
@@ -108,13 +109,12 @@ fn uses_penalties(sampling: &SamplingParams) -> bool {
         || sampling.presence_penalty != 0.0
 }
 
-/// The sampler's columns per row, `ops::sampler::PARAMETER_COLUMNS`.
-pub(crate) const SAMPLER_PARAMETERS: usize = 8;
+/// The sampler's columns per row (`proto::program::sampler::PARAMETER_COLUMNS`).
+pub(crate) const SAMPLER_PARAMETERS: usize = proto::program::sampler::PARAMETER_COLUMNS as usize;
 
-/// The column of a row's parameters that states its temperature, in
-/// `ops::sampler`'s order (`ops::sampler::TEMPERATURE`, which the engine does
-/// not depend on directly).
-const TEMPERATURE_COLUMN: usize = 0;
+/// The column of a row's parameters that states its temperature
+/// (`proto::program::sampler::TEMPERATURE`).
+const TEMPERATURE_COLUMN: usize = proto::program::sampler::TEMPERATURE as usize;
 
 /// The columns of the batch formed by `requests`, whose calls' rows embed the
 /// tokens `inputs` states for them and sample with the parameters `sampling`
@@ -402,8 +402,8 @@ pub(crate) fn columns(
 ///
 /// A verification's candidates are decode-class rows: they draw, so they are
 /// sampled too.
-pub(crate) fn batch_shape(columns: &BatchColumns) -> ::worker::plan::Shape {
-    use ::worker::plan::Variant;
+pub(crate) fn batch_shape(columns: &BatchColumns) -> ipc::execution::Shape {
+    use ipc::execution::Variant;
 
     let rows = u32::try_from(columns.rows()).unwrap_or(u32::MAX);
     let tokens = u32::try_from(columns.tokens()).unwrap_or(u32::MAX);
@@ -439,7 +439,7 @@ pub(crate) fn batch_shape(columns: &BatchColumns) -> ::worker::plan::Shape {
     } else {
         Variant::DecodeSampled
     };
-    ::worker::plan::Shape {
+    ipc::execution::Shape {
         rows,
         tokens,
         variant,
@@ -964,7 +964,7 @@ mod tests {
         );
         assert_eq!(
             batch_shape(&columns).variant,
-            ::worker::plan::Variant::PrefillOutput,
+            ipc::execution::Variant::PrefillOutput,
             "the batch ends a prompt, so it projects logits"
         );
     }
@@ -988,10 +988,10 @@ mod tests {
             &[0.5, 40.0, 0.9, 0.05, 1.1, 0.2, 0.3],
             "ops::sampler's order: temperature, top-k, top-p, min-p, repetition, frequency, presence"
         );
-        let shape = ::worker::plan::Shape::prefill(
+        let shape = ipc::execution::Shape::prefill(
             columns.rows() as u32,
             columns.tokens() as u32,
-            ::worker::plan::Variant::PrefillWrite,
+            ipc::execution::Variant::PrefillWrite,
         );
         columns
             .check(&shape)
@@ -1014,7 +1014,7 @@ mod tests {
         )
         .expect("a sampling prefill");
         let shape = batch_shape(&sampling_batch);
-        assert_eq!(shape.variant, ::worker::plan::Variant::PrefillOutput);
+        assert_eq!(shape.variant, ipc::execution::Variant::PrefillOutput);
         assert_eq!(
             (shape.rows, shape.tokens),
             (sampling_batch.rows() as u32, sampling_batch.tokens() as u32),
@@ -1038,7 +1038,7 @@ mod tests {
         )
         .expect("a chunked prefill");
         let shape = batch_shape(&writing_batch);
-        assert_eq!(shape.variant, ::worker::plan::Variant::PrefillWrite);
+        assert_eq!(shape.variant, ipc::execution::Variant::PrefillWrite);
         writing_batch
             .check(&shape)
             .expect("a chunked prefill is a well-formed PrefillWrite batch");
@@ -1064,7 +1064,7 @@ mod tests {
         .expect("a greedy decode");
         assert_eq!(
             batch_shape(&one_greedy).variant,
-            ::worker::plan::Variant::DecodeGreedy,
+            ipc::execution::Variant::DecodeGreedy,
             "no draw path produces a greedy token, so a greedy row is served from the greedy bucket"
         );
 
@@ -1080,7 +1080,7 @@ mod tests {
         .expect("a sampling decode");
         assert_eq!(
             batch_shape(&one_sampling).variant,
-            ::worker::plan::Variant::DecodeSampled
+            ipc::execution::Variant::DecodeSampled
         );
 
         // One batch serves one variant, so a burst that mixes the two is
@@ -1104,7 +1104,7 @@ mod tests {
         .expect("a mixed decode");
         assert_eq!(
             batch_shape(&mixed).variant,
-            ::worker::plan::Variant::DecodeSampled,
+            ipc::execution::Variant::DecodeSampled,
             "the sampler graph serves both rows, and a greedy row's token is its argmax"
         );
 
@@ -1127,7 +1127,7 @@ mod tests {
         .expect("a greedy verification");
         assert_eq!(
             batch_shape(&greedy_verify).variant,
-            ::worker::plan::Variant::DecodeGreedy
+            ipc::execution::Variant::DecodeGreedy
         );
         let sampling_verify = columns(
             &requests,
@@ -1141,7 +1141,7 @@ mod tests {
         .expect("a sampling verification");
         assert_eq!(
             batch_shape(&sampling_verify).variant,
-            ::worker::plan::Variant::DecodeSampled
+            ipc::execution::Variant::DecodeSampled
         );
     }
 
@@ -1200,9 +1200,9 @@ mod tests {
         // A verification is served from a decode bucket: one token per row,
         // three candidate rows, and the sampler graph because they draw.
         columns
-            .check(&::worker::plan::Shape::decode(
+            .check(&ipc::execution::Shape::decode(
                 3,
-                ::worker::plan::Variant::DecodeSampled,
+                ipc::execution::Variant::DecodeSampled,
             ))
             .expect("the fill satisfies the worker's check for a multi-row call");
     }

@@ -2,7 +2,8 @@
 //! with.
 
 use ipc::PhaseId;
-use worker::plan::{Buckets, Variant};
+use ipc::execution::Variant;
+use worker::plan::Buckets;
 
 /// The buckets of a member of an expert union: each causal bucket, and the join, captured for the
 /// step sizes it meets.
@@ -37,7 +38,7 @@ pub(super) fn expert_classes(buckets: &Buckets, capacity: u64) -> Buckets {
                 // A decode beside a peer's prefill of a few prompts: the step is that prefill's
                 // rows, which a graph of the whole capacity would shape every expert layer for.
                 let beside = bucket.variant.is_decode()
-                    || bucket.variant == worker::plan::Variant::ExpertJoin;
+                    || bucket.variant == ipc::execution::Variant::ExpertJoin;
                 if beside && small < PREFILL_BESIDE && PREFILL_BESIDE.saturating_mul(4) <= capacity
                 {
                     classes.push(bucket.at_capacity(PREFILL_BESIDE));

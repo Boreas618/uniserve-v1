@@ -5,8 +5,8 @@
 use std::time::Instant;
 
 use anyhow::{Context as _, Result};
+use ipc::execution::Outcome;
 use ipc::{ProgramStatus, UpdateFailure};
-use worker::completion::Outcome;
 
 use super::MainProcess;
 use super::device_command;

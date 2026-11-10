@@ -57,7 +57,7 @@ pub(super) struct ShadowPass {
     /// 2): a pass that shadowed every batch of a shape would keep a slow
     /// comparison in flight for as long as traffic lasts, and it would neither
     /// settle nor leave the device to the requests it serves.
-    pub(super) shapes: std::collections::HashSet<::worker::plan::Shape>,
+    pub(super) shapes: std::collections::HashSet<ipc::execution::Shape>,
     /// Where the ask's answer goes, in the shape every stage's answer takes.
     pub(super) answer: crossbeam_channel::Sender<Result<(), String>>,
 }
@@ -512,7 +512,7 @@ impl Scheduler {
     /// Records that a batch of this step was submitted as a shadow pass: the
     /// ask is answered when the step ends, so an answer never claims a pass
     /// that has not run.
-    pub(super) fn note_shadowed(&mut self, shape: Option<::worker::plan::Shape>) {
+    pub(super) fn note_shadowed(&mut self, shape: Option<ipc::execution::Shape>) {
         if let Some(pass) = self.shadow_pass.as_mut() {
             pass.shadowed = true;
             pass.shapes.extend(shape);

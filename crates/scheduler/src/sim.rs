@@ -31,10 +31,93 @@ use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
 use ipc::philox;
 use ipc::{
-    BatchOutput, Call, CallKind, CallOutput, CallStatus, ErrorCode, FinishFlags, MainProcessInfo,
-    NewRequest, SamplingState, TensorRef, TimingCounters,
+    Call, CallKind, CallStatus, ErrorCode, MainProcessInfo, NewRequest, SamplingState, TensorRef,
+    TimingCounters,
 };
 use ipc::{ImageParams, RequestId, SamplingParams, TokenLogprob};
+
+// The simulated worker's completion record: a call's tokens and the stop conditions it observed,
+// its media artifact and products, in the simulator's own terms. The serving path reports
+// `ipc::execution::BatchOutput` instead; `CallCompletion::from_wire` reads this one.
+
+/// Device-observed finish candidates for a token call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct FinishFlags {
+    /// Whether an end-of-sequence token was selected.
+    pub eos: bool,
+    /// Whether the configured length limit was reached.
+    pub length: bool,
+    /// Whether a configured stop condition matched.
+    pub stop: bool,
+}
+
+/// The completion record the simulated worker emits once for every call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallOutput {
+    /// Request completed by the call.
+    pub request_key: ipc::RequestKey,
+    /// Request-local call identifier.
+    pub call_id: ipc::CallId,
+    /// Terminal execution status.
+    pub status: ipc::CallStatus,
+    /// Error classification when `status` is [`ipc::CallStatus::Error`].
+    pub error_code: Option<ipc::ErrorCode>,
+    /// Why the rank refused the call's request, on an
+    /// [`ipc::ErrorCode::InputError`] completion whose rank states it; the engine
+    /// rejects the request with it.
+    pub error_message: Option<String>,
+    /// Worker timing measurements for the call.
+    pub timing_counters: ipc::TimingCounters,
+    /// Accepted cache prefix available to a successor.
+    pub cache_visible_len: u32,
+    /// Cache extent initialized by execution, including rejected speculative positions.
+    pub cache_computed_len: u32,
+    /// Solver steps the call's trajectory has completed, which is also the
+    /// index of its next step (diffusers' `step_index`): the step a
+    /// denoising call's update publishes.
+    pub step_index: u32,
+    /// Token identifiers accepted by the sampler.
+    pub committed_tokens: Vec<u32>,
+    /// Each committed token's log-probabilities, in `committed_tokens`
+    /// order, when the request asks for its generated tokens': the token's
+    /// own entry, then its requested top candidates. A verification reports
+    /// one for every token it commits, accepted drafts and the token after
+    /// them alike; empty otherwise.
+    pub token_logprobs: Vec<Vec<ipc::TokenLogprob>>,
+    /// Ranked candidates for each scored prompt position, in input order.
+    pub prompt_logprobs: Vec<Vec<ipc::TokenLogprob>>,
+    /// Device-observed terminal conditions.
+    pub finish_flags: FinishFlags,
+    /// Completed artifact and its external storage lifetime, when produced.
+    pub media_output: Option<ipc::MediaOutput>,
+    /// Physical cache export, including this rank's tensor locations.
+    pub cache_output: Option<ipc::CacheTransfer>,
+    /// Draft tokens the drafter proposed after the call's last committed
+    /// token, in order, for the request's next verification: as many as
+    /// the call's `DraftWork::proposals` asked for, none otherwise.
+    pub draft_token_ids: Vec<u32>,
+    /// A successful video latent preparation's report of how each
+    /// denoising rank's request slot pages hold the request's samples:
+    /// every rank reports its own, and joining the ranks' completions
+    /// gathers them. The engine keys and records the trajectory's pages by
+    /// them when it stores the trajectory.
+    pub latent_layouts: Vec<ipc::RankLatentLayout>,
+}
+
+/// One simulated batch's complete result.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BatchOutput {
+    /// Batch identity copied from the submission.
+    pub batch_id: u64,
+    /// Call completions, one per call the batch carried.
+    pub completions: Vec<CallOutput>,
+    /// Product values published by completed calls.
+    pub products: Vec<ipc::TensorExport>,
+    /// Aggregate worker execution time in microseconds, when measured.
+    pub worker_exec_us: Option<u64>,
+    /// Model-forward statistics, when reported by the worker.
+    pub forward_stats: Option<ipc::ForwardStats>,
+}
 
 const DEFAULT_TEXT_LEN: usize = 8;
 /// The scheduler-facing result of one whole batch: its completions, each with
@@ -43,7 +126,7 @@ const DEFAULT_TEXT_LEN: usize = 8;
 ///
 /// A completion's media is claimed before anything else reads it, and a failure
 /// to claim it belongs to the call: the batch's other results stay usable.
-fn batch_result(report: ipc::BatchOutput, commands: &[ipc::BatchCommand]) -> BatchResult {
+fn batch_result(report: BatchOutput, commands: &[ipc::BatchCommand]) -> BatchResult {
     let results = report
         .completions
         .into_iter()

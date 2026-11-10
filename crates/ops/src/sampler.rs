@@ -44,19 +44,7 @@ use crate::tensor::{DType, Shape, TensorView};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
-/// The columns of one row of sampling parameters, in the order the worker writes them.
-///
-/// The offsets are fixed (the temperature first, the repetition, frequency and presence penalties
-/// at 4, 5 and 6, and the top-k width, the nucleus threshold and the min-p threshold after them);
-/// the op reads only the parameters it names.
-pub const PARAMETER_COLUMNS: u32 = 8;
-
-/// The offset of the temperature among a row's parameters.
-pub const TEMPERATURE: u32 = 0;
-/// The offset of the top-k width (0 to keep every candidate).
-pub const TOP_K: u32 = 1;
-/// The offset of the nucleus threshold.
-pub const TOP_P: u32 = 2;
+use proto::program::sampler::PARAMETER_COLUMNS;
 
 /// One compilation of `logits_shape`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

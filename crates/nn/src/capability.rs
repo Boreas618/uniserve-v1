@@ -20,6 +20,7 @@
 //! a model whose blocks attend differently has one per group.
 
 use proto::program::PhaseKind;
+use proto::video::{LatentShape, Layout};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -451,40 +452,6 @@ pub enum ConditionRole {
     Reference,
 }
 
-/// The latent layout a denoiser prepares for one request.
-///
-/// Ordered and hashed as a plain value of numbers: it is a bucket's extent (`worker::plan::Extent`),
-/// and a captured graph is keyed by the bucket it holds.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct Layout {
-    /// The video latent tensor.
-    pub video: LatentShape,
-    /// The audio latent tensor, when the task produces audio.
-    pub audio: Option<LatentShape>,
-    /// Text conditioning rows the layout reserves.
-    pub text_rows: u32,
-    /// Condition rows of the reference media.
-    pub condition_rows: u32,
-    /// Elements of every condition's initial-noise draw, in request order.
-    ///
-    /// The reference draws one chained stream — conditions, then video, then audio — and a model
-    /// can derive the video and audio counts from [`Self::video`] and [`Self::audio`] but not the
-    /// conditions': those are drawn at each condition's own unpacked latent shape before any
-    /// packing, which is not what [`Self::condition_rows`] counts. Zero for a request with no
-    /// conditions.
-    pub condition_elements: u32,
-}
-
-impl Layout {
-    /// The prefix source a request of this layout gathers its packed prefix from.
-    pub const fn prefix(&self) -> PrefixSource {
-        PrefixSource {
-            text_rows: self.text_rows,
-            condition_rows: self.condition_rows,
-        }
-    }
-}
-
 /// The rows one request's packed prefix is gathered from, which the runtime allocates and fills and
 /// the denoiser's packing addresses.
 ///
@@ -501,6 +468,14 @@ pub struct PrefixSource {
 }
 
 impl PrefixSource {
+    /// The prefix source a request of `layout` gathers its packed prefix from.
+    pub const fn of(layout: &Layout) -> Self {
+        Self {
+            text_rows: layout.text_rows,
+            condition_rows: layout.condition_rows,
+        }
+    }
+
     /// The row of zeros: the row past the text and condition rows.
     pub const fn zero_row(&self) -> u32 {
         self.text_rows + self.condition_rows
@@ -510,19 +485,6 @@ impl PrefixSource {
     pub const fn rows(&self) -> u32 {
         self.zero_row() + 1
     }
-}
-
-/// The extents of one latent tensor.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct LatentShape {
-    /// Channels of the latent space.
-    pub channels: u32,
-    /// Latent frames (or audio latent steps).
-    pub frames: u32,
-    /// Latent rows.
-    pub height: u32,
-    /// Latent columns.
-    pub width: u32,
 }
 
 /// A table a model needs on the device but does not own.

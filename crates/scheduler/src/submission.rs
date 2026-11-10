@@ -5,7 +5,7 @@
 //! every path of the mechanism that executes something comes through it.
 //!
 //! A serving scheduler's door is `::worker::Batches` (2.4, 4.4): the mechanism's
-//! own completion type is filled from `::worker::batch::BatchOutput` there, and
+//! own completion type is filled from `ipc::execution::BatchOutput` there, and
 //! nothing of the wire is involved. A test supplies a simulated worker through
 //! the `Worker` trait instead; that arm is built only with the `testing`
 //! feature, so a serving build holds the first alone.
@@ -20,11 +20,11 @@ use crate::worker::ExecutionBatch;
 #[cfg(feature = "testing")]
 use crate::worker::Worker;
 use crate::worker::{WorkerError, WorkerInfo, WorkerSubmitError};
-use ::worker::batch::{
+use ipc::BatchCommand;
+use ipc::execution::Outcome;
+use ipc::execution::{
     Batch as DeviceBatch, BatchId as DeviceBatchId, Batches, CallId as DeviceCallId, Submission,
 };
-use ::worker::completion::Outcome;
-use ipc::BatchCommand;
 
 /// What dispatch and the views ask of the epoch: the pools it serves, and
 /// which of them can take a submission now.
@@ -318,7 +318,8 @@ impl Submissions {
         }
     }
 
-    /// The bucket this worker would serve `computation` in, when it serves one (2.4).
+    /// The extent of the bucket this worker would serve `computation` in, when it serves one
+    /// (2.4).
     ///
     /// The mechanism asks before it forms a media batch, because the batch states the extent its
     /// kernels were captured for and only the worker's own plan knows it: a bucket planned for
@@ -329,8 +330,8 @@ impl Submissions {
     pub(super) fn media(
         &self,
         phase: ipc::PhaseId,
-        computation: &::worker::plan::Computation,
-    ) -> Option<::worker::plan::Bucket> {
+        computation: &ipc::execution::Computation,
+    ) -> Option<ipc::execution::Extent> {
         match &self.path {
             #[cfg(feature = "testing")]
             Path::Supplied(_) => None,
@@ -890,7 +891,7 @@ impl InProcess {
                 id: DeviceBatchId(batch.id),
                 phase,
                 calls: (0..calls.len() as u64).map(DeviceCallId).collect(),
-                shape: ::worker::plan::Shape {
+                shape: ipc::execution::Shape {
                     rows: computation.rows,
                     tokens: computation.tokens,
                     variant,
@@ -1040,9 +1041,9 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use ::worker::batch::SubmissionId;
-    use ::worker::batch::{BatchOutput, Inventory, MediaColumns, PoolLayout, StagedRequest};
-    use ::worker::plan::{Bucket, Computation, Extent, Variant};
+    use ipc::execution::{BatchOutput, Inventory, MediaColumns, PoolLayout, StagedRequest};
+    use ipc::execution::{Computation, Extent, Variant};
+    use ipc::execution::{Fault, SubmissionId};
     use ipc::{Call, CallKind, MediaCall};
 
     /// What one in-process submission carried to the worker.
@@ -1053,11 +1054,11 @@ mod tests {
         media: Option<MediaColumns>,
     }
 
-    /// The worker's own devices, as a double: it states one pool, answers the bucket its plan
+    /// The worker's own devices, as a double: it states one pool, answers the extent of the bucket its plan
     /// would serve, and records every batch the mechanism hands it.
     struct Devices {
         inventory: Vec<Inventory>,
-        bucket: Option<Bucket>,
+        extent: Option<Extent>,
         delivered: Arc<Mutex<Vec<Delivered>>>,
         /// The devices the double runs batches on: a video decode on its unit's, in turn, and
         /// any other batch on all of them, as `Workers` routes.
@@ -1065,7 +1066,7 @@ mod tests {
     }
 
     impl Devices {
-        fn one(bucket: Option<Bucket>) -> (Arc<Self>, Arc<Mutex<Vec<Delivered>>>) {
+        fn one(extent: Option<Extent>) -> (Arc<Self>, Arc<Mutex<Vec<Delivered>>>) {
             let delivered = Arc::new(Mutex::new(Vec::new()));
             let inventory = Inventory {
                 group: "gpu".to_owned(),
@@ -1079,7 +1080,7 @@ mod tests {
             (
                 Arc::new(Self {
                     inventory: vec![inventory],
-                    bucket,
+                    extent,
                     delivered: Arc::clone(&delivered),
                     devices: 1,
                 }),
@@ -1089,17 +1090,17 @@ mod tests {
 
         /// The double over `devices` devices.
         fn several(
-            bucket: Option<Bucket>,
+            extent: Option<Extent>,
             devices: usize,
         ) -> (Arc<Self>, Arc<Mutex<Vec<Delivered>>>) {
-            let (one, delivered) = Self::one(bucket);
+            let (one, delivered) = Self::one(extent);
             let one = Arc::into_inner(one).expect("the double has one owner");
             (Arc::new(Self { devices, ..one }), delivered)
         }
     }
 
     impl Batches for Devices {
-        fn submit(&self, batch: DeviceBatch) -> ::worker::Result<Submission> {
+        fn submit(&self, batch: DeviceBatch) -> Result<Submission, Box<Fault>> {
             self.delivered
                 .lock()
                 .expect("the recorder is not poisoned")
@@ -1114,7 +1115,7 @@ mod tests {
             ))
         }
 
-        fn shadow(&self, batch: DeviceBatch) -> ::worker::Result<Submission> {
+        fn shadow(&self, batch: DeviceBatch) -> Result<Submission, Box<Fault>> {
             self.submit(batch)
         }
 
@@ -1122,15 +1123,15 @@ mod tests {
             &self,
             _phase: ipc::PhaseId,
             _computation: &Computation,
-        ) -> ::worker::Result<Option<Bucket>> {
-            Ok(self.bucket)
+        ) -> Result<Option<Extent>, Box<Fault>> {
+            Ok(self.extent)
         }
 
         fn inventory(&self) -> &[Inventory] {
             &self.inventory
         }
 
-        fn devices(&self, batch: &DeviceBatch) -> ::worker::Result<Vec<usize>> {
+        fn devices(&self, batch: &DeviceBatch) -> Result<Vec<usize>, Box<Fault>> {
             match &batch.media {
                 Some(media) if media.computation.call == MediaCall::VideoDecoding => {
                     Ok(vec![media.request(0)?.unit as usize % self.devices])
@@ -1144,22 +1145,15 @@ mod tests {
         }
     }
 
-    /// The bucket a denoise is planned into: one step over one small request, the extent a media
+    /// The extent a denoise is planned into: one step over one small request, the extent a media
     /// batch states.
-    fn denoise_bucket() -> Bucket {
-        Bucket {
-            variant: Variant::Denoise,
-            rows: 1,
-            tokens: 0,
-            extent: Extent::Request {
-                frames: 5,
-                width: 128,
-                height: 128,
-                text_rows: 4,
-                condition_rows: 0,
-            },
-            serves: None,
-            capacity: 0,
+    fn denoise_extent() -> Extent {
+        Extent::Request {
+            frames: 5,
+            width: 128,
+            height: 128,
+            text_rows: 4,
+            condition_rows: 0,
         }
     }
 
@@ -1206,7 +1200,7 @@ mod tests {
             call: call_kind,
             rows,
             tokens: 0,
-            extent: denoise_bucket().extent,
+            extent: denoise_extent(),
         };
         let mut batch = ExecutionBatch::new(
             id,
@@ -1235,7 +1229,7 @@ mod tests {
     /// own translation is compared with itself elsewhere, because `views` is the crate's.
     #[test]
     fn a_media_batch_is_served_at_the_phase_its_call_names_and_the_step_generation() {
-        let (devices, delivered) = Devices::one(Some(denoise_bucket()));
+        let (devices, delivered) = Devices::one(Some(denoise_extent()));
         let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
         let generation = 7;
         submissions.set_generation(generation);
@@ -1279,7 +1273,7 @@ mod tests {
         assert_eq!(media.computation.rows, 1);
         assert_eq!(
             media.computation.extent,
-            denoise_bucket().extent,
+            denoise_extent(),
             "the extent is the bucket's, which is what the worker answered"
         );
     }
@@ -1290,7 +1284,7 @@ mod tests {
     /// batch ends, so a pool that always took the next batch would serve them one row at a time.
     #[test]
     fn a_pool_holds_no_more_batches_than_its_queue_depth() {
-        let (devices, delivered) = Devices::one(Some(denoise_bucket()));
+        let (devices, delivered) = Devices::one(Some(denoise_extent()));
         let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
         let pool = submissions.info().workers[0].0.clone();
 
@@ -1330,7 +1324,7 @@ mod tests {
     /// against the pool as a whole, the depth would admit the step and one clip.
     #[test]
     fn each_device_holds_its_own_queue_depth() {
-        let (devices, delivered) = Devices::several(Some(denoise_bucket()), 4);
+        let (devices, delivered) = Devices::several(Some(denoise_extent()), 4);
         let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
         let pool = submissions.info().workers[0].0.clone();
         let decode = |id: u64, unit: u32| {
@@ -1377,7 +1371,7 @@ mod tests {
     /// same number.
     #[test]
     fn every_batch_of_a_step_carries_the_same_generation() {
-        let (devices, delivered) = Devices::one(Some(denoise_bucket()));
+        let (devices, delivered) = Devices::one(Some(denoise_extent()));
         let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
         submissions.set_generation(3);
         submissions
@@ -1401,7 +1395,7 @@ mod tests {
     /// mechanism could not state what its kernels read, and it is not served on invented values.
     #[test]
     fn a_batch_the_mechanism_could_not_state_is_refused_by_name() {
-        let (devices, delivered) = Devices::one(Some(denoise_bucket()));
+        let (devices, delivered) = Devices::one(Some(denoise_extent()));
         let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
         let batch = ExecutionBatch::new(
             5,
@@ -1430,11 +1424,11 @@ mod tests {
     /// carrying a token call, are each refused rather than served twice over.
     #[test]
     fn one_batch_is_one_computation() {
-        let (devices, _) = Devices::one(Some(denoise_bucket()));
+        let (devices, _) = Devices::one(Some(denoise_extent()));
         let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
 
         let mut both = media_batch(6, MediaCall::Denoising, 1);
-        both.columns = Some(::worker::batch::BatchColumns::default());
+        both.columns = Some(ipc::execution::BatchColumns::default());
         let refusal = format!(
             "{}",
             submissions
@@ -1465,7 +1459,7 @@ mod tests {
             call: MediaCall::Denoising,
             rows: 1,
             tokens: 0,
-            extent: denoise_bucket().extent,
+            extent: denoise_extent(),
         };
         assert_eq!(
             variant.variant(),

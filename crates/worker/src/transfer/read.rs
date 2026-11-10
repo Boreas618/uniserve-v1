@@ -313,7 +313,8 @@ impl Read {
                     .retirement
                     .complete(Err(Error::transport(format!(
                         "borrowed transfer source release failed: {error}"
-                    )))),
+                    ))))
+                    .map_err(Error::from),
             }
         }?;
         notify(callbacks);

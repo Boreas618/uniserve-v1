@@ -39,8 +39,7 @@ impl BatchCommand {
 
     /// Returns a discriminant that distinguishes command variants.
     ///
-    /// [`Batch::validate`] uses it in the identity that detects repeated
-    /// commands.
+    /// Two commands of one request with one index are the same command.
     pub const fn variant_index(&self) -> u8 {
         match self {
             Self::Start { .. } => 0,

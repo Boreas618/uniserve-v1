@@ -1,7 +1,8 @@
 //! Scheduler-to-main-process protocol and its rank transports.
 //!
-//! [`NewRequest`] admits static state, [`Batch`] submits planned calls, and
-//! [`BatchOutput`] returns completions and products. [`MainProcessInfo`]
+//! [`NewRequest`] admits static state, [`execution::Batch`] is the batch the
+//! scheduler submits and the worker serves, and [`execution::BatchOutput`]
+//! returns its completions. [`MainProcessInfo`]
 //! describes a peer main process's ranks before execution begins. Numeric
 //! request, call, point, and generation identities remain stable across
 //! serialization.
@@ -15,7 +16,7 @@
 //! node, TCP to a rank on another node. A rank's main process connects to the
 //! scheduler's and sends its [`PeerRegistration`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +32,11 @@ impl ValidationError {
     /// Constructs a validation error from contextual text.
     pub(crate) fn message(message: impl Into<String>) -> Self {
         Self(message.into())
+    }
+
+    /// What the message violates, without the protocol's prefix.
+    pub fn reason(&self) -> &str {
+        &self.0
     }
 }
 
@@ -74,6 +80,8 @@ macro_rules! ensure_valid {
 pub mod channel;
 /// Failures at the channel boundary.
 pub mod error;
+/// The batch the scheduler submits and the worker serves, and what it produces (§2.4, §4.4).
+pub mod execution;
 /// The unit a channel carries: a length and one encoded message.
 pub mod frame;
 pub mod launch;

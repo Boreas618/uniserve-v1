@@ -263,9 +263,10 @@ fn capture_graph(stream: &Stream, kernel: &Function, data: &mut u64, value: &mut
 #[test]
 #[ignore = "requires a CUDA device"]
 fn a_purge_keeps_the_graph_a_live_generation_still_serves() {
+    use ipc::execution::Variant;
     use worker::captured::Captured;
     use worker::graph::Graphs;
-    use worker::plan::{Bucket, Variant};
+    use worker::plan::Bucket;
 
     let device = Device::new(DEVICE).expect("a CUDA device");
     let allowance = Arc::new(Allowance::default());

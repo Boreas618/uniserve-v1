@@ -15,17 +15,17 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ipc::execution::Outcome;
+use ipc::execution::{
+    Batch, BatchOutput, Batches, CallOutput, Inventory, PoolLayout, RowState, Submission,
+    SubmissionId,
+};
 use ipc::{ImageParams, MainProcessEndpoint, MainProcessInfo, SamplingParams, TimingCounters};
 use proto::config::BlockConfig;
 use scheduler::{
     BatchCapacity, Event, GenerationConstraint, GenerationRequest, SchedulerConfig,
     SchedulerHandle, Stage,
 };
-use worker::batch::{
-    Batch, BatchOutput, Batches, CallOutput, Inventory, PoolLayout, RowState, Submission,
-    SubmissionId,
-};
-use worker::completion::Outcome;
 
 /// How long a command answer may take.
 ///
@@ -198,12 +198,12 @@ impl Serving {
 }
 
 impl Batches for Serving {
-    fn submit(&self, batch: Batch) -> Result<Submission, worker::Error> {
+    fn submit(&self, batch: Batch) -> Result<Submission, Box<ipc::execution::Fault>> {
         *self.submitted.lock().expect("the pool's batches") += 1;
         Ok(self.serve(batch))
     }
 
-    fn shadow(&self, batch: Batch) -> Result<Submission, worker::Error> {
+    fn shadow(&self, batch: Batch) -> Result<Submission, Box<ipc::execution::Fault>> {
         Ok(self.serve(batch))
     }
 

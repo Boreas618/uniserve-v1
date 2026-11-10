@@ -255,7 +255,7 @@ impl TransferTicket {
             ));
         }
 
-        self.retirement.complete(Ok(()))
+        Ok(self.retirement.complete(Ok(()))?)
     }
 
     pub(crate) fn value(&self) -> Option<&Spans> {

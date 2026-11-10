@@ -43,7 +43,7 @@ pub enum MainProcessRequest {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
         /// Fully lowered batch.
-        batch: Box<Batch>,
+        batch: Box<crate::execution::Batch>,
     },
     /// Requests orderly worker shutdown.
     Close {
@@ -94,7 +94,7 @@ impl MainProcessRequest {
     }
 
     /// Returns the batch carried by this request, if any.
-    pub const fn batch(&self) -> Option<&Batch> {
+    pub const fn batch(&self) -> Option<&crate::execution::Batch> {
         match self {
             Self::Submit { batch, .. } => Some(batch),
             _ => None,
@@ -107,7 +107,7 @@ impl MainProcessRequest {
     }
 
     /// Constructs a batch-submission request.
-    pub fn submit(batch: Batch) -> Self {
+    pub fn submit(batch: crate::execution::Batch) -> Self {
         Self::Submit {
             message_id: None,
             batch: Box::new(batch),
@@ -206,7 +206,7 @@ pub enum MainProcessResponse {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
         /// Physical batch result.
-        result: BatchOutput,
+        result: crate::execution::BatchOutput,
     },
     /// Acknowledges a successful control request.
     Ok {
@@ -262,7 +262,7 @@ impl MainProcessResponse {
     }
 
     /// Returns the batch result carried by this response, if any.
-    pub const fn output(&self) -> Option<&BatchOutput> {
+    pub const fn output(&self) -> Option<&crate::execution::BatchOutput> {
         match self {
             Self::Result { result, .. } => Some(result),
             _ => None,
@@ -278,7 +278,7 @@ impl MainProcessResponse {
     }
 
     /// Constructs a batch-result response.
-    pub fn result(result: BatchOutput) -> Self {
+    pub fn result(result: crate::execution::BatchOutput) -> Self {
         Self::Result {
             message_id: None,
             result,

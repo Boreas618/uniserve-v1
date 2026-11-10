@@ -101,7 +101,7 @@ pub struct ExecutionBatch {
     /// and nothing re-derives the layout from the calls. `None` means the
     /// mechanism could not state them — a batch no worker may serve, as
     /// opposed to one served on invented values.
-    pub columns: Option<worker::batch::BatchColumns>,
+    pub columns: Option<ipc::execution::BatchColumns>,
     /// A media computation's own columns, and `None` for every token batch (2.4).
     ///
     /// One batch is one computation: a media batch states the computation its kernels were
@@ -113,7 +113,7 @@ pub struct ExecutionBatch {
     /// bucket the worker states it would serve that computation in, and the buffers from the
     /// request's own stated parameters. A media batch whose inputs the mechanism cannot state is
     /// left without columns and is refused at submission by name, never served on invented bytes.
-    pub media: Option<worker::batch::MediaColumns>,
+    pub media: Option<ipc::execution::MediaColumns>,
 }
 
 /// Batches compare by what the mechanism decided: their identity, their

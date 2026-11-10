@@ -27,14 +27,14 @@ use ops::{DType, Generation, TensorView};
 use platform::DeviceId;
 
 use crate::arena::{Pools, StreamId};
-use crate::batch::{
-    Batch, BatchColumns, BatchId, BatchOutput, BatchRow, BatchRows, CallId, CallOutput, Job, Jobs,
-    RowKind, RowState,
+use crate::batch::{Job, Jobs};
+use crate::plan::{Bucket, Buckets};
+use ipc::execution::Shape;
+use ipc::execution::{
+    Batch, BatchColumns, BatchId, BatchOutput, BatchRow, BatchRows, CallId, CallOutput, RowKind,
+    RowState,
 };
-use crate::plan::{Bucket, Buckets, Shape};
 
-#[cfg(test)]
-use crate::plan::Variant;
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::{Column, encode_f32, encode_i32};
 use crate::runners::lifecycle::{Lifecycle, walk_capture};
@@ -42,6 +42,8 @@ use crate::runners::recording::{Footprint, Walk};
 use crate::runners::sampling::{
     CommitColumns, SamplerState, Samples, Sampling, commit_descriptor, inert_commit,
 };
+#[cfg(test)]
+use ipc::execution::Variant;
 
 /// The capture sink, at the path the device tests of the rebind mechanism import it from.
 pub use crate::runners::lifecycle::Recording;
@@ -93,7 +95,7 @@ impl Staging {
         self.input_ids = vec![0; largest.tokens as usize];
         self.slots = vec![0; largest.rows as usize];
         self.parameters =
-            vec![0.0; largest.rows as usize * ops::sampler::PARAMETER_COLUMNS as usize];
+            vec![0.0; largest.rows as usize * proto::program::sampler::PARAMETER_COLUMNS as usize];
         self.draws = vec![ipc::philox::DrawAddress::default(); largest.rows as usize];
         // The commit table's height is ops' business; `reserve` leaves it empty and `stage` sizes
         // it to whatever the mechanism wrote, which `check` has already validated.
@@ -175,7 +177,7 @@ impl Staging {
 
         // Row columns: the mechanism's rows, then rows that sample nothing and commit nothing.
         self.slots[..rows].copy_from_slice(&columns.slots[..rows]);
-        let parameters = ops::sampler::PARAMETER_COLUMNS as usize;
+        let parameters = proto::program::sampler::PARAMETER_COLUMNS as usize;
         self.parameters[..rows * parameters]
             .copy_from_slice(&columns.parameters[..rows * parameters]);
         if columns.draws.len() != rows {
@@ -265,7 +267,7 @@ impl Staging {
         // step, so a step writes fixed addresses (4.5).
         self.commit.clear();
         if !columns.commit.is_empty() {
-            let fields = ops::commit::COMMIT_FIELDS;
+            let fields = proto::program::commit::COMMIT_FIELDS;
             if columns.commit.len() != fields * calls {
                 return Err(Error::Invariant(format!(
                     "the commit table holds {} values, {fields} fields of {calls} calls",
@@ -315,7 +317,7 @@ impl Staging {
 
     /// The staged sampling parameters, row-major.
     pub fn parameters(&self, rows: usize) -> &[f32] {
-        let parameters = ops::sampler::PARAMETER_COLUMNS as usize;
+        let parameters = proto::program::sampler::PARAMETER_COLUMNS as usize;
         &self.parameters[..rows * parameters]
     }
 
@@ -442,7 +444,7 @@ impl Columns {
     /// `vocabulary` as the width of the logits row the greedy first token is taken from.
     fn new(device: DeviceId, buckets: &Buckets, vocabulary: u32) -> Result<Self> {
         let (tokens, rows) = column_extents(buckets)?;
-        let parameters = rows * u64::from(ops::sampler::PARAMETER_COLUMNS);
+        let parameters = rows * u64::from(proto::program::sampler::PARAMETER_COLUMNS);
         Ok(Self {
             positions: Column::new(device, DType::I32, tokens)?,
             input_ids: Column::new(device, DType::I32, tokens)?,
@@ -1256,7 +1258,7 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
             && self
                 .staging
                 .staged()
-                .is_none_or(|bucket| bucket.variant != crate::plan::Variant::PrefillOutput)
+                .is_none_or(|bucket| bucket.variant != ipc::execution::Variant::PrefillOutput)
     }
 
     fn landed(&mut self, output: BatchOutput) -> Result<BatchOutput> {
@@ -1281,7 +1283,10 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
             );
             error
         };
-        batch.columns.check(&shape).map_err(refused)?;
+        batch
+            .columns
+            .check(&shape)
+            .map_err(|error| refused(error.into()))?;
         let bucket = self.bucket_for(&shape).map_err(refused)?;
         self.staging
             .stage(&batch.columns, &batch.calls, &shape, bucket)
@@ -2097,7 +2102,7 @@ impl<M: TextModel> CausalLmRunner<M> {
                 "the logits row buffer is narrower than the vocabulary".into(),
             ));
         }
-        let columns = ops::sampler::PARAMETER_COLUMNS as usize;
+        let columns = proto::program::sampler::PARAMETER_COLUMNS as usize;
         for row in 0..rows {
             let slot = self.staging.slots(rows)[row];
             let readback = usize::try_from(slot)
@@ -2106,7 +2111,8 @@ impl<M: TextModel> CausalLmRunner<M> {
                 .unwrap_or(0);
             let decision = prompt_token(
                 self.staging.logits_rows()[row] < 0,
-                self.staging.parameters(rows)[row * columns + ops::sampler::TEMPERATURE as usize],
+                self.staging.parameters(rows)
+                    [row * columns + proto::program::sampler::TEMPERATURE as usize],
                 slot,
                 readback,
             )?;
@@ -2735,7 +2741,7 @@ impl<M: TextModel> CausalLmRunner<M> {
     /// step through a warmup, because each warm walk of an attention rank needs it inside the same
     /// exchanges.
     fn joins_only(&self, bucket: Bucket) -> bool {
-        bucket.variant == crate::plan::Variant::ExpertJoin
+        bucket.variant == ipc::execution::Variant::ExpertJoin
             || self
                 .experts
                 .as_ref()
@@ -2809,7 +2815,7 @@ impl<M: TextModel> CausalLmRunner<M> {
         let parameters = self
             .columns
             .parameters
-            .shaped(&[rows, u64::from(ops::sampler::PARAMETER_COLUMNS)]);
+            .shaped(&[rows, u64::from(proto::program::sampler::PARAMETER_COLUMNS)]);
         let slots = self.columns.slots.shaped(&[rows]);
         let state = SamplerState {
             counts: sampling.counts,
@@ -2842,7 +2848,7 @@ impl<M: TextModel> CausalLmRunner<M> {
         // the row - a decision the graph cannot make for one row of a bucket that draws. The view
         // is kept (the arena's buffer is live until the next `begin`, and `read_sampled` runs before
         // that); a greedy bucket's own launch already states every token it keeps.
-        let logits = (bucket.variant == crate::plan::Variant::PrefillOutput).then_some(logits);
+        let logits = (bucket.variant == ipc::execution::Variant::PrefillOutput).then_some(logits);
         // A recording's views address no memory, so only a launching walk names where a replay's
         // tokens land.
         if !forward.is_recording() {
@@ -3159,12 +3165,12 @@ fn warm_span(bucket: Bucket) -> (Vec<i32>, Vec<i32>) {
 /// `TOP_K` 0 keeps every candidate, `TOP_P` 1 keeps all of the nucleus, `MIN_P` 0 keeps every
 /// candidate above it, and the three penalties are 0. The token the pose draws is discarded.
 fn warm_parameters(rows: usize) -> Vec<f32> {
-    let columns = ops::sampler::PARAMETER_COLUMNS as usize;
+    let columns = proto::program::sampler::PARAMETER_COLUMNS as usize;
     let mut parameters = vec![0.0; rows * columns];
     for row in 0..rows {
         let row = &mut parameters[row * columns..(row + 1) * columns];
-        row[ops::sampler::TEMPERATURE as usize] = 1.0;
-        row[ops::sampler::TOP_P as usize] = 1.0;
+        row[proto::program::sampler::TEMPERATURE as usize] = 1.0;
+        row[proto::program::sampler::TOP_P as usize] = 1.0;
     }
     parameters
 }
@@ -3182,12 +3188,12 @@ fn warm_parameters(rows: usize) -> Vec<f32> {
 /// bucket, rather than serving a token the request did not ask for. Prefill buckets are exempt - a
 /// prompt-ending greedy row inside a drawing prefill bucket is ordinary, and its first token is the
 /// host argmax of the row's kept logits (`greedy_first_tokens`).
-fn refuse_mixed_sampling(variant: crate::plan::Variant, parameters: &[f32]) -> Result<()> {
+fn refuse_mixed_sampling(variant: ipc::execution::Variant, parameters: &[f32]) -> Result<()> {
     if !variant.is_decode() {
         return Ok(());
     }
-    let columns = ops::sampler::PARAMETER_COLUMNS as usize;
-    let temperature = ops::sampler::TEMPERATURE as usize;
+    let columns = proto::program::sampler::PARAMETER_COLUMNS as usize;
+    let temperature = proto::program::sampler::TEMPERATURE as usize;
     let rows = parameters.len() / columns;
     for (row, stated) in parameters.chunks_exact(columns).enumerate() {
         let greedy_row = stated[temperature] == 0.0;
@@ -3348,8 +3354,8 @@ mod tests {
     /// is exempt, because a prompt-ending greedy row is ordinary there.
     #[test]
     fn a_decode_bucket_refuses_a_row_of_the_other_sampling_class() {
-        let columns = ops::sampler::PARAMETER_COLUMNS as usize;
-        let temperature = ops::sampler::TEMPERATURE as usize;
+        let columns = proto::program::sampler::PARAMETER_COLUMNS as usize;
+        let temperature = proto::program::sampler::TEMPERATURE as usize;
         // One row a stated temperature, the rest of its columns the reference values: 8 floats a row,
         // as the worker writes them.
         let rows = |stated: &[f32]| {
@@ -3364,20 +3370,24 @@ mod tests {
         };
 
         assert!(
-            refuse_mixed_sampling(crate::plan::Variant::DecodeGreedy, &rows(&[0.0, 0.0])).is_ok(),
+            refuse_mixed_sampling(ipc::execution::Variant::DecodeGreedy, &rows(&[0.0, 0.0]))
+                .is_ok(),
             "two greedy rows were refused by a greedy bucket"
         );
         assert!(
-            refuse_mixed_sampling(crate::plan::Variant::DecodeSampled, &rows(&[0.7, 1.0])).is_ok(),
+            refuse_mixed_sampling(ipc::execution::Variant::DecodeSampled, &rows(&[0.7, 1.0]))
+                .is_ok(),
             "two sampled rows were refused by a sampling bucket"
         );
         assert!(
-            refuse_mixed_sampling(crate::plan::Variant::PrefillOutput, &rows(&[0.0, 0.7])).is_ok(),
+            refuse_mixed_sampling(ipc::execution::Variant::PrefillOutput, &rows(&[0.0, 0.7]))
+                .is_ok(),
             "a prompt-ending greedy row was refused inside a drawing prefill bucket"
         );
 
-        let error = refuse_mixed_sampling(crate::plan::Variant::DecodeSampled, &rows(&[0.7, 0.0]))
-            .expect_err("a greedy row was drawn from in a sampling bucket");
+        let error =
+            refuse_mixed_sampling(ipc::execution::Variant::DecodeSampled, &rows(&[0.7, 0.0]))
+                .expect_err("a greedy row was drawn from in a sampling bucket");
         let text = error.to_string();
         assert!(
             text.contains("decode_sampled") && text.contains("row 1"),
@@ -3388,7 +3398,7 @@ mod tests {
             "the refusal does not name the temperature the row stated: {text}"
         );
 
-        let error = refuse_mixed_sampling(crate::plan::Variant::DecodeGreedy, &rows(&[0.5]))
+        let error = refuse_mixed_sampling(ipc::execution::Variant::DecodeGreedy, &rows(&[0.5]))
             .expect_err("a sampled row was argmaxed in a greedy bucket");
         assert!(
             error.to_string().contains("decode_greedy"),
@@ -3413,9 +3423,9 @@ mod tests {
         staging.reserve(&buckets)?;
         let bucket = Bucket::decode(4, Variant::DecodeSampled);
         let mut columns = decode_columns();
-        let stated = ops::sampler::PARAMETER_COLUMNS as usize;
+        let stated = proto::program::sampler::PARAMETER_COLUMNS as usize;
         for row in 0..2 {
-            columns.parameters[row * stated + ops::sampler::TEMPERATURE as usize] = 0.7;
+            columns.parameters[row * stated + proto::program::sampler::TEMPERATURE as usize] = 0.7;
         }
         let shape = Shape::decode(2, Variant::DecodeSampled);
         staging.stage(&columns, &[CallId(0), CallId(1)], &shape, bucket)?;
@@ -3515,7 +3525,7 @@ mod tests {
     /// column a fixture states is the row's destination slot, and the rest keep zero.
     fn committed(slots: &[i64]) -> Vec<i64> {
         let rows = slots.len();
-        let mut table = vec![0_i64; ops::commit::COMMIT_FIELDS * rows];
+        let mut table = vec![0_i64; proto::program::commit::COMMIT_FIELDS * rows];
         table[..rows].copy_from_slice(slots);
         table
     }
@@ -3545,7 +3555,7 @@ mod tests {
             },
             input_ids: vec![7, 8],
             slots: vec![0, 1],
-            parameters: vec![0.0; 2 * ops::sampler::PARAMETER_COLUMNS as usize],
+            parameters: vec![0.0; 2 * proto::program::sampler::PARAMETER_COLUMNS as usize],
             draws: vec![ipc::philox::DrawAddress::default(); 2],
             commit: committed(&[0, 1]),
             page_size: 16,
@@ -3570,7 +3580,7 @@ mod tests {
             },
             input_ids: vec![1, 2, 3],
             slots: vec![0],
-            parameters: vec![0.0; ops::sampler::PARAMETER_COLUMNS as usize],
+            parameters: vec![0.0; proto::program::sampler::PARAMETER_COLUMNS as usize],
             draws: vec![ipc::philox::DrawAddress::default()],
             commit: committed(&[0]),
             page_size: 16,
@@ -3699,7 +3709,7 @@ mod tests {
             },
             input_ids: (0..tokens).map(|token| token + 1).collect(),
             slots: vec![0],
-            parameters: vec![0.0; ops::sampler::PARAMETER_COLUMNS as usize],
+            parameters: vec![0.0; proto::program::sampler::PARAMETER_COLUMNS as usize],
             draws: vec![ipc::philox::DrawAddress::default()],
             commit: committed(&[0]),
             page_size: 16,
@@ -3771,7 +3781,7 @@ mod tests {
         assert_eq!(&staging.slots(rows)[2..], &[-1; 6]);
         assert_eq!(&staging.logits_rows()[2..], &[-1; 6]);
         assert!(
-            staging.parameters(rows)[2 * ops::sampler::PARAMETER_COLUMNS as usize..]
+            staging.parameters(rows)[2 * proto::program::sampler::PARAMETER_COLUMNS as usize..]
                 .iter()
                 .all(|value| *value == 0.0),
             "an empty row states sampling parameters"
@@ -3813,15 +3823,19 @@ mod tests {
         assert_eq!(commit_block(5), 8);
 
         // The mechanism's `[fields, rows]` table, column-major, becomes `[fields, capacity]`.
-        let mut staged = vec![0_i64; ops::commit::COMMIT_FIELDS * rows];
+        let mut staged = vec![0_i64; proto::program::commit::COMMIT_FIELDS * rows];
         for row in 0..rows {
-            staged[ops::commit::column::SLOT * rows + row] = row as i64 + 7;
-            staged[ops::commit::column::MODE * rows + row] = ops::commit::mode::DECODE;
+            staged[proto::program::commit::column::SLOT * rows + row] = row as i64 + 7;
+            staged[proto::program::commit::column::MODE * rows + row] =
+                proto::program::commit::mode::DECODE;
         }
         let table = commit_table(&staged, rows, capacity)?;
-        assert_eq!(table.len(), ops::commit::COMMIT_FIELDS * capacity);
-        let slots = &table
-            [ops::commit::column::SLOT * capacity..(ops::commit::column::SLOT + 1) * capacity];
+        assert_eq!(
+            table.len(),
+            proto::program::commit::COMMIT_FIELDS * capacity
+        );
+        let slots = &table[proto::program::commit::column::SLOT * capacity
+            ..(proto::program::commit::column::SLOT + 1) * capacity];
         assert_eq!(&slots[..rows], &[7, 8, 9]);
         // The row past the batch is **inert**, not zero: a zero slot is slot 0, a real destination,
         // so a launch that ever ran over the whole capacity would commit phantom tokens into the
@@ -3866,10 +3880,12 @@ mod tests {
     fn a_warm_pose_commits_nothing_but_is_recorded() {
         let rows = 5;
         let table = inert_commit(rows);
-        assert_eq!(table.len(), ops::commit::COMMIT_FIELDS * rows);
-        for field in 0..ops::commit::COMMIT_FIELDS {
+        assert_eq!(table.len(), proto::program::commit::COMMIT_FIELDS * rows);
+        for field in 0..proto::program::commit::COMMIT_FIELDS {
             let column = &table[field * rows..(field + 1) * rows];
-            if field == ops::commit::column::SLOT || field == ops::commit::column::TASK {
+            if field == proto::program::commit::column::SLOT
+                || field == proto::program::commit::column::TASK
+            {
                 assert_eq!(column, &[-1_i64; 5], "field {field} names no destination");
             } else {
                 assert!(
@@ -4196,7 +4212,7 @@ mod sampled_output_tests {
     #[test]
     #[ignore = "requires a CUDA device"]
     fn a_narrower_sampling_bucket_reads_its_own_rows() {
-        let columns = u64::from(ops::sampler::PARAMETER_COLUMNS);
+        let columns = u64::from(proto::program::sampler::PARAMETER_COLUMNS);
         let largest = 8;
         let narrow = 2;
         let parameters = Column::new(platform::DeviceId(0), DType::F32, largest * columns)
@@ -4231,20 +4247,23 @@ mod sampled_output_tests {
     /// ran on it was a bucket the batch check would have rejected.
     #[test]
     fn a_warm_pose_states_a_draw_a_sampled_bucket_can_make() {
-        let columns = ops::sampler::PARAMETER_COLUMNS as usize;
+        let columns = proto::program::sampler::PARAMETER_COLUMNS as usize;
         let parameters = warm_parameters(2);
         assert_eq!(parameters.len(), 2 * columns, "a row per row");
         for row in 0..2 {
             let row = &parameters[row * columns..(row + 1) * columns];
-            assert_eq!(row[ops::sampler::TEMPERATURE as usize], 1.0);
-            assert_eq!(row[ops::sampler::TOP_P as usize], 1.0);
-            assert_eq!(row[ops::sampler::TOP_K as usize], 0.0);
+            assert_eq!(row[proto::program::sampler::TEMPERATURE as usize], 1.0);
+            assert_eq!(row[proto::program::sampler::TOP_P as usize], 1.0);
+            assert_eq!(row[proto::program::sampler::TOP_K as usize], 0.0);
         }
-        refuse_mixed_sampling(crate::plan::Variant::DecodeSampled, &parameters)
+        refuse_mixed_sampling(ipc::execution::Variant::DecodeSampled, &parameters)
             .expect("the pose of a sampled bucket is not a greedy row");
         assert!(
-            refuse_mixed_sampling(crate::plan::Variant::DecodeSampled, &vec![0.0; 2 * columns])
-                .is_err(),
+            refuse_mixed_sampling(
+                ipc::execution::Variant::DecodeSampled,
+                &vec![0.0; 2 * columns]
+            )
+            .is_err(),
             "the zeroed pose the capture used to state is not a draw"
         );
     }

@@ -7,9 +7,7 @@
 //! as a [`CacheTransfer`] identified by a [`BufferId`] alone.
 //!
 //! The validators here are the wire contract. A message is checked once,
-//! where it is built: the engine runs them through `Batch::validate` for a
-//! batch and each rank's projection of it, and a rank through
-//! `BatchOutput::validate` for a batch's result.
+//! where it is built.
 
 use super::*;
 

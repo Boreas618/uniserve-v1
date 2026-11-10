@@ -38,7 +38,7 @@ pub fn distinct<M: Denoiser + ?Sized>(
     candidates: &[WarmRequest],
 ) -> nn::Result<Vec<WarmRequest>> {
     let mut kept: Vec<WarmRequest> = Vec::new();
-    let mut layouts: Vec<nn::Layout> = Vec::new();
+    let mut layouts: Vec<proto::video::Layout> = Vec::new();
     for candidate in candidates {
         let layout = model.layout(&candidate.view())?;
         if !layouts.contains(&layout) {
@@ -54,10 +54,10 @@ mod tests {
     use super::*;
 
     use nn::capability::{
-        ConditionShape, Conditioning, LatentShape, Layout, Seed, StateTable, Step, TableValues,
-        VideoRequest,
+        ConditionShape, Conditioning, Seed, StateTable, Step, TableValues, VideoRequest,
     };
     use nn::{Error, Forward, Latents, Result};
+    use proto::video::{LatentShape, Layout};
 
     /// A denoiser whose layout is the only behaviour the collapse reads.
     ///

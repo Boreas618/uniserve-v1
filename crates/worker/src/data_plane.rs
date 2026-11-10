@@ -24,9 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
-use crate::batch::Submission;
 use crate::capacity::device::{DeviceBooking, DeviceBudget};
-use crate::completion::Outcome;
 use crate::device::Worker;
 use crate::memory::allocation::Backing as _;
 use crate::memory::prefix_cache::PrefixCache;
@@ -36,6 +34,7 @@ use crate::memory::retained::Retained;
 use crate::memory::weights::{LoadedWeight, WeightStore, retained_key};
 use crate::profiling::session::Change;
 use crate::{Error, Result, lock};
+use ipc::execution::Submission;
 
 /// What a load of the served model reads: which checkpoint, and which expert sits in which slot.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -184,9 +183,11 @@ fn rejected(what: &str, error: impl std::fmt::Display) -> Error {
 /// Waits for a storage command of `worker`'s queue.
 fn done(what: &str, submission: Submission) -> Result<()> {
     match submission.wait() {
-        Outcome::Success(_) => Ok(()),
-        Outcome::Failed(error) => Err(Error::Interface(format!("{what}: {error}"))),
-        Outcome::Cancelled => Err(Error::Interface(format!("{what} was cancelled"))),
+        ipc::execution::Outcome::Success(_) => Ok(()),
+        ipc::execution::Outcome::Failed(error) => Err(Error::Interface(format!("{what}: {error}"))),
+        ipc::execution::Outcome::Cancelled => {
+            Err(Error::Interface(format!("{what} was cancelled")))
+        }
     }
 }
 

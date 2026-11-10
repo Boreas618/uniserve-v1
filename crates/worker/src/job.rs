@@ -25,10 +25,10 @@ use ipc::PhaseId;
 use ops::Generation;
 use platform::DeviceId;
 
-use crate::batch::{Batch, BatchOutput, Job, Submission, SubmissionId, SubmissionState};
-use crate::completion::Outcome;
+use crate::batch::Job;
 use crate::stream::events::{EventPool, JobId};
 use crate::{Error, Result, lock};
+use ipc::execution::{Batch, BatchOutput, Submission, SubmissionId, SubmissionState};
 
 /// One command waiting for the device thread, or being performed by it.
 pub(crate) struct Entry {
@@ -40,7 +40,7 @@ pub(crate) struct Entry {
     /// The submission's number, for the watchdog's report.
     pub(crate) submission_id: Option<SubmissionId>,
     /// The batch the command serves, when it serves one.
-    pub(crate) batch: Option<crate::batch::BatchId>,
+    pub(crate) batch: Option<ipc::execution::BatchId>,
     /// What this command is doing, written when it is queued: the first half of a failure's report,
     /// which the device thread completes with the job it was performing.
     pub(crate) label: String,
@@ -65,7 +65,7 @@ pub(crate) enum Command {
     /// Prepare the next generation (7.3 step 2).
     Precopy(Arc<Generation>),
     /// Run one shadow batch: the paired forwards a scheduler's `shadow` pass built against the
-    /// next generation (7.3 step 2, `crate::batch::Batches`).
+    /// next generation (7.3 step 2, `ipc::execution::Batches`).
     Shadow(Batch),
     /// Carve the shadow harness of every runner from the device allocator (7.3 step 2).
     SetShadow,
@@ -174,7 +174,7 @@ struct Current {
     /// The job in hand: a landing clears the watchdog's view only of its own job.
     job: JobId,
     submission: Option<SubmissionId>,
-    batch: Option<crate::batch::BatchId>,
+    batch: Option<ipc::execution::BatchId>,
     started: std::time::Instant,
 }
 
@@ -224,7 +224,7 @@ impl JobQueue {
         &self,
         command: Command,
         submission: Option<(SubmissionId, Arc<SubmissionState>)>,
-        batch: Option<crate::batch::BatchId>,
+        batch: Option<ipc::execution::BatchId>,
     ) -> Result<JobId> {
         let mut state = lock(&self.state);
         if state.closed {
@@ -280,7 +280,7 @@ impl JobQueue {
         &self,
         command: Command,
         submission: &Submission,
-        batch: Option<crate::batch::BatchId>,
+        batch: Option<ipc::execution::BatchId>,
     ) -> Result<JobId> {
         let (state, id) = submission.parts();
         self.push(command, Some((id, state)), batch)
@@ -423,7 +423,7 @@ impl JobQueue {
             // rule that asked whether this step was the last one could only be wrong - the steps
             // after the first are all requeued, so none of them was ever the last.
             let outcome = match result {
-                Ok(output) => Outcome::Success(output),
+                Ok(output) => ipc::execution::Outcome::Success(output),
                 Err(error) => {
                     // The label names the work, not the error: the error already says what broke,
                     // and the caller's question is which bucket, generation or operator was in hand.
@@ -432,7 +432,8 @@ impl JobQueue {
                         None => entry.label.clone(),
                     };
                     submission.note_failure(label);
-                    Outcome::Failed(Arc::new(error))
+                    let fault: Arc<ipc::execution::Fault> = Arc::new(error);
+                    ipc::execution::Outcome::Failed(fault)
                 }
             };
             submission.finish(outcome);
@@ -466,8 +467,8 @@ impl JobQueue {
     /// Queues a join of `runner`, answered to nobody: the rank that opened the step waits for this
     /// rank inside the step, not for this command.
     pub(crate) fn join_step(&self, runner: crate::runner::RunnerId) -> Result<()> {
-        let id = crate::batch::SubmissionId(self.next_submission());
-        let (submission, _) = crate::batch::Submission::pending(id);
+        let id = ipc::execution::SubmissionId(self.next_submission());
+        let (submission, _) = ipc::execution::Submission::pending(id);
         let jobs = vec![Job::Join { runner }];
         self.submit(
             Command::Steps {
@@ -574,8 +575,8 @@ pub(crate) fn phase_of(batch: &Batch) -> PhaseId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batch::{BatchColumns, Submission};
-    use crate::plan::{Shape, Variant};
+    use ipc::execution::{BatchColumns, Outcome, Submission};
+    use ipc::execution::{Shape, Variant};
 
     fn queue() -> (Arc<JobQueue>, Arc<EventPool>) {
         let events = EventPool::new();
@@ -591,7 +592,7 @@ mod tests {
             page_offloads: Vec::new(),
             latent_restores: Vec::new(),
             host_outputs: Vec::new(),
-            id: crate::batch::BatchId(1),
+            id: ipc::execution::BatchId(1),
             phase: ipc::PhaseId(0),
             calls: Vec::new(),
             shape: Shape::decode(1, Variant::DecodeGreedy),
@@ -608,7 +609,7 @@ mod tests {
     #[test]
     fn a_submission_completes_when_its_command_is_performed() {
         let (queue, _events) = queue();
-        let (submission, _) = Submission::pending(crate::batch::SubmissionId(0));
+        let (submission, _) = Submission::pending(ipc::execution::SubmissionId(0));
         queue
             .submit(Command::Batch(batch()), &submission, None)
             .expect("a command is queued");
@@ -620,7 +621,7 @@ mod tests {
         assert!(matches!(entry.command, Command::Batch(..)));
         assert!(queue.watchdog_is_running());
 
-        queue.complete(entry, Ok(crate::batch::BatchOutput::default()), None);
+        queue.complete(entry, Ok(ipc::execution::BatchOutput::default()), None);
         assert!(matches!(submission.outcome(), Some(Outcome::Success(_))));
         assert!(queue.in_flight().is_empty());
     }
@@ -630,32 +631,32 @@ mod tests {
     #[test]
     fn the_watched_job_names_its_batch_until_it_lands() {
         let (queue, _events) = queue();
-        let (first, _) = Submission::pending(crate::batch::SubmissionId(0));
-        let (second, _) = Submission::pending(crate::batch::SubmissionId(1));
+        let (first, _) = Submission::pending(ipc::execution::SubmissionId(0));
+        let (second, _) = Submission::pending(ipc::execution::SubmissionId(1));
         let mut next = batch();
-        next.id = crate::batch::BatchId(2);
+        next.id = ipc::execution::BatchId(2);
         queue
             .submit(
                 Command::Batch(batch()),
                 &first,
-                Some(crate::batch::BatchId(1)),
+                Some(ipc::execution::BatchId(1)),
             )
             .expect("queued");
         queue
             .submit(
                 Command::Batch(next),
                 &second,
-                Some(crate::batch::BatchId(2)),
+                Some(ipc::execution::BatchId(2)),
             )
             .expect("queued");
 
         let landing = queue.next(Some(Duration::from_millis(10))).expect("first");
         let in_hand = queue.next(Some(Duration::from_millis(10))).expect("second");
-        queue.complete(landing, Ok(crate::batch::BatchOutput::default()), None);
+        queue.complete(landing, Ok(ipc::execution::BatchOutput::default()), None);
         let watched = queue.in_flight();
         assert_eq!(watched.len(), 1, "the second replay is still watched");
-        assert_eq!(watched[0].batch, Some(crate::batch::BatchId(2)));
-        queue.complete(in_hand, Ok(crate::batch::BatchOutput::default()), None);
+        assert_eq!(watched[0].batch, Some(ipc::execution::BatchId(2)));
+        queue.complete(in_hand, Ok(ipc::execution::BatchOutput::default()), None);
         assert!(queue.in_flight().is_empty());
     }
 
@@ -663,8 +664,8 @@ mod tests {
     #[test]
     fn commands_run_in_order_and_a_failure_is_reported() {
         let (queue, _events) = queue();
-        let (first, _) = Submission::pending(crate::batch::SubmissionId(0));
-        let (second, _) = Submission::pending(crate::batch::SubmissionId(1));
+        let (first, _) = Submission::pending(ipc::execution::SubmissionId(0));
+        let (second, _) = Submission::pending(ipc::execution::SubmissionId(1));
         queue
             .submit(Command::Batch(batch()), &first, None)
             .expect("queued");
@@ -674,12 +675,12 @@ mod tests {
 
         let entry = queue.next(Some(Duration::from_millis(10))).expect("first");
         assert!(matches!(entry.command, Command::Batch(..)));
-        queue.complete(entry, Ok(crate::batch::BatchOutput::default()), None);
+        queue.complete(entry, Ok(ipc::execution::BatchOutput::default()), None);
         let entry = queue.next(Some(Duration::from_millis(10))).expect("second");
         assert!(matches!(entry.command, Command::Purge(..)));
         let capture = Job::Capture {
             runner: crate::runner::RunnerId(0),
-            bucket: crate::plan::Bucket::decode(128, crate::plan::Variant::DecodeGreedy),
+            bucket: crate::plan::Bucket::decode(128, ipc::execution::Variant::DecodeGreedy),
             generation: 2,
         };
         queue.complete(
@@ -706,7 +707,7 @@ mod tests {
     #[test]
     fn a_capture_pass_interleaves_with_a_serving_batch() {
         let (queue, _events) = queue();
-        let bucket = crate::plan::Bucket::decode(2, crate::plan::Variant::DecodeGreedy);
+        let bucket = crate::plan::Bucket::decode(2, ipc::execution::Variant::DecodeGreedy);
         let jobs: Vec<Job> = (0..3)
             .map(|_| Job::Capture {
                 runner: crate::runner::RunnerId(0),
@@ -714,7 +715,7 @@ mod tests {
                 generation: 2,
             })
             .collect();
-        let (precopy, _) = Submission::pending(crate::batch::SubmissionId(0));
+        let (precopy, _) = Submission::pending(ipc::execution::SubmissionId(0));
         queue
             .submit(
                 Command::Steps {
@@ -725,7 +726,7 @@ mod tests {
                 None,
             )
             .expect("the precopy is queued");
-        let (served, _) = Submission::pending(crate::batch::SubmissionId(1));
+        let (served, _) = Submission::pending(ipc::execution::SubmissionId(1));
         queue
             .submit(Command::Batch(batch()), &served, None)
             .expect("the batch is queued");
@@ -783,7 +784,7 @@ mod tests {
     #[test]
     fn a_failed_step_fails_its_submission_and_drops_the_rest() {
         let (queue, _events) = queue();
-        let bucket = crate::plan::Bucket::decode(2, crate::plan::Variant::DecodeGreedy);
+        let bucket = crate::plan::Bucket::decode(2, ipc::execution::Variant::DecodeGreedy);
         let jobs: Vec<Job> = (0..3)
             .map(|_| Job::Capture {
                 runner: crate::runner::RunnerId(0),
@@ -791,7 +792,7 @@ mod tests {
                 generation: 2,
             })
             .collect();
-        let (precopy, _) = Submission::pending(crate::batch::SubmissionId(0));
+        let (precopy, _) = Submission::pending(ipc::execution::SubmissionId(0));
         queue
             .submit(
                 Command::Steps {
@@ -830,7 +831,7 @@ mod tests {
     #[test]
     fn a_failure_in_a_later_step_fails_its_submission() {
         let (queue, _events) = queue();
-        let bucket = crate::plan::Bucket::decode(2, crate::plan::Variant::DecodeGreedy);
+        let bucket = crate::plan::Bucket::decode(2, ipc::execution::Variant::DecodeGreedy);
         let jobs: Vec<Job> = (0..3)
             .map(|_| Job::Capture {
                 runner: crate::runner::RunnerId(0),
@@ -838,7 +839,7 @@ mod tests {
                 generation: 2,
             })
             .collect();
-        let (warmup, _) = Submission::pending(crate::batch::SubmissionId(0));
+        let (warmup, _) = Submission::pending(ipc::execution::SubmissionId(0));
         queue
             .submit(
                 Command::Steps {
@@ -886,7 +887,7 @@ mod tests {
     #[test]
     fn the_last_requeued_step_finishes_its_submission() {
         let (queue, _events) = queue();
-        let bucket = crate::plan::Bucket::decode(2, crate::plan::Variant::DecodeGreedy);
+        let bucket = crate::plan::Bucket::decode(2, ipc::execution::Variant::DecodeGreedy);
         let jobs: Vec<Job> = (0..2)
             .map(|_| Job::Capture {
                 runner: crate::runner::RunnerId(0),
@@ -894,7 +895,7 @@ mod tests {
                 generation: 2,
             })
             .collect();
-        let (warmup, _) = Submission::pending(crate::batch::SubmissionId(0));
+        let (warmup, _) = Submission::pending(ipc::execution::SubmissionId(0));
         queue
             .submit(
                 Command::Steps {
@@ -944,7 +945,7 @@ mod tests {
             .expect("the wait");
         assert_eq!(entry.id, id);
         assert!(matches!(entry.command, Command::After(..)));
-        queue.complete(entry, Ok(crate::batch::BatchOutput::default()), None);
+        queue.complete(entry, Ok(ipc::execution::BatchOutput::default()), None);
 
         // The pool has no deferred work under this job, which is not a failure of the wait.
         assert!(!events.owns(id));

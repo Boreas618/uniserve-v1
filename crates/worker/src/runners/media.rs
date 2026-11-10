@@ -31,11 +31,12 @@ use nn::capability::MediaFormat;
 use crate::runners::conditions;
 
 use crate::Result;
-use crate::batch::{Batch, BatchOutput, CallId, CallOutput, Job, Jobs, RowState};
+use crate::batch::{Job, Jobs};
 use crate::host::{HostAction, Lane, Outcome};
-use crate::plan::Variant;
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::products::{CONDITION_MEDIA, Product, Products};
+use ipc::execution::Variant;
+use ipc::execution::{Batch, BatchOutput, CallId, CallOutput, RowState};
 
 /// One request's conditions, as its media reading leaves them for the calls that read them.
 ///
@@ -907,7 +908,7 @@ impl MediaStage {
     }
 
     /// The regions `conditioning`'s conditions are read into, and the read that fills them.
-    fn prepare_read(&self, staged: &crate::batch::StagedRequest) -> Result<ConditionRead> {
+    fn prepare_read(&self, staged: &ipc::execution::StagedRequest) -> Result<ConditionRead> {
         let conditioning =
             proto::video::Conditions::decode(&staged.conditioning).map_err(|error| {
                 crate::Error::Invalid(format!(
@@ -1134,8 +1135,8 @@ impl MediaStage {
 /// rest would complete a call whose stage never ran - the mux of that request would then wait for
 /// units nothing encoded.
 fn stage_batch(
-    computation: crate::plan::Computation,
-    requests: &[crate::batch::StagedRequest],
+    computation: ipc::execution::Computation,
+    requests: &[ipc::execution::StagedRequest],
     units_of: &dyn Fn(u32) -> Result<Vec<u32>>,
 ) -> Result<Vec<StagedCall>> {
     let mut staged_calls = Vec::with_capacity(requests.len());
@@ -1177,7 +1178,7 @@ struct StagedCall {
 /// the runner's own dispatch to the protocol: a video unit reads the postprocessor's raster, an
 /// audio encode reads the decoder's window, and the mux reads only what the two encodes wrote.
 fn staged(
-    computation: crate::plan::Computation,
+    computation: ipc::execution::Computation,
     canvas: (u32, u32),
     units: &[u32],
     index: usize,
@@ -1257,7 +1258,7 @@ impl Runner for MediaStage {
         media.check()?;
         let computation = media.computation;
         let requests = (0..batch.calls.len())
-            .map(|index| media.request(index))
+            .map(|index| media.request(index).map_err(crate::Error::from))
             .collect::<Result<Vec<_>>>()?;
         let staged_calls = stage_batch(computation, &requests, &|frames| (self.units_of)(frames))?;
         let mut prepared = Vec::with_capacity(staged_calls.len());
@@ -1473,7 +1474,7 @@ mod tests {
     #[test]
     fn a_batch_of_two_requests_stages_both_at_their_own_entries() {
         let requests = [
-            crate::batch::StagedRequest {
+            ipc::execution::StagedRequest {
                 unit: 0,
                 request: ipc::RequestKey::new(1, ipc::RequestId(7), 0),
                 conditioning: Vec::new(),
@@ -1486,7 +1487,7 @@ mod tests {
                 handed: 0,
             },
             // The second request's first unit is already through; the first request's is not.
-            crate::batch::StagedRequest {
+            ipc::execution::StagedRequest {
                 unit: 1,
                 request: ipc::RequestKey::new(1, ipc::RequestId(8), 0),
                 conditioning: Vec::new(),
@@ -1499,11 +1500,11 @@ mod tests {
                 handed: 0,
             },
         ];
-        let video = crate::plan::Computation {
+        let video = ipc::execution::Computation {
             call: ipc::MediaCall::VideoEncoding,
             rows: 2,
             tokens: 0,
-            extent: crate::plan::Extent::None,
+            extent: ipc::execution::Extent::None,
         };
         let units_of = |frames: u32| match frames {
             56 => Ok(vec![22_u32, 22, 12]),
@@ -1548,11 +1549,11 @@ mod tests {
 
     #[test]
     fn a_host_call_states_the_stage_and_the_product_it_reads() {
-        let video = crate::plan::Computation {
+        let video = ipc::execution::Computation {
             call: ipc::MediaCall::VideoEncoding,
             rows: 1,
             tokens: 0,
-            extent: crate::plan::Extent::None,
+            extent: ipc::execution::Extent::None,
         };
         let units = [17_u32, 22];
 
@@ -1584,7 +1585,7 @@ mod tests {
         );
 
         // Only the muxing call that hands over nothing finishes the artifact.
-        let mux = crate::plan::Computation {
+        let mux = ipc::execution::Computation {
             call: ipc::MediaCall::Muxing,
             ..video
         };
@@ -1597,7 +1598,7 @@ mod tests {
             (Stage::Mux, None)
         );
 
-        let audio = crate::plan::Computation {
+        let audio = ipc::execution::Computation {
             call: ipc::MediaCall::AudioEncoding,
             ..video
         };
@@ -1606,7 +1607,7 @@ mod tests {
             (Stage::Track, Some(Product::Track))
         );
 
-        let mux = crate::plan::Computation {
+        let mux = ipc::execution::Computation {
             call: ipc::MediaCall::Muxing,
             ..audio
         };
@@ -1627,7 +1628,7 @@ mod tests {
         );
 
         // A device computation is another runner's: this one serves the artifact's three calls.
-        let denoise = crate::plan::Computation {
+        let denoise = ipc::execution::Computation {
             call: ipc::MediaCall::Denoising,
             ..video
         };

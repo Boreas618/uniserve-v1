@@ -223,8 +223,8 @@ impl TensorRef {
     }
 
     /// Returns the maximum storage size in bytes: the bound's maximum element
-    /// count times the element width, saturating. `Batch::validate` requires
-    /// each buffer output's allocation to be at least this large.
+    /// count times the element width, saturating: what a buffer output's
+    /// allocation must hold at least.
     pub fn max_bytes(&self) -> u64 {
         self.shape_bound
             .max_elements()

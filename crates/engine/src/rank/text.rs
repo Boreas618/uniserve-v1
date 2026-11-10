@@ -3,10 +3,10 @@
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
+use ipc::execution::Variant;
 use ops::Generation;
 use platform::DeviceId;
 use worker::memory::Memory;
-use worker::plan::Variant;
 use worker::runner::{Binding, NamedRunner, RunnerId};
 use worker::runners::causal_lm::{CausalLmRunner, KvProvider, Shared};
 use worker::runners::resident::ResidentCache;

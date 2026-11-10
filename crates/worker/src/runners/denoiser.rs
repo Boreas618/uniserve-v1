@@ -27,7 +27,7 @@
 //!
 //! **The seam from the mechanism.** A media batch's columns state, per request, what the mechanism
 //! owns: the request's conditioning exactly as the model family planned it, and the step, seed and
-//! canvas the request states ([`crate::batch::StagedRequest`], written by the scheduler's media
+//! canvas the request states ([`ipc::execution::StagedRequest`], written by the scheduler's media
 //! arm). A step also reads its encoded conditioning rows, which the encoder published to the
 //! product store, and the request's latent trajectory, which this runner owns.
 //!
@@ -44,17 +44,18 @@
 use std::sync::{Arc, Mutex};
 
 use ipc::TimingCounters;
-use nn::capability::{Conditioning, Denoiser, LatentShape, Latents, Layout, Step, WarmRequest};
+use nn::capability::{Conditioning, Denoiser, Latents, Step, WarmRequest};
 use ops::{DType, Shape, TensorView};
 use platform::DeviceId;
+use proto::video::{LatentShape, Layout};
 
 use ::storage::manifest::{Encoding, Field, Logical, Segment, Span, StorageLayout};
 
 use crate::arena::Pools;
-use crate::batch::{Batch, BatchOutput, CallId, CallOutput, Job, Jobs, RowState};
+use crate::batch::{Job, Jobs};
 use crate::memory::latent::host::LatentHostPool;
 use crate::memory::latent::restore;
-use crate::plan::{Bucket, Extent, Variant};
+use crate::plan::Bucket;
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
 use crate::runners::lifecycle::{Lifecycle, RunnerLifecycle};
@@ -62,6 +63,8 @@ use crate::runners::products::{self, Product, Products};
 use crate::runners::recording::{Footprint, Walk};
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
+use ipc::execution::{Batch, BatchOutput, CallId, CallOutput, RowState};
+use ipc::execution::{Extent, Variant};
 
 /// The figures a denoiser's columns are sized by, which the deployment states once at open.
 #[derive(Clone, Copy, Debug)]
@@ -204,7 +207,7 @@ impl DenoiseColumns {
             if let Some(track) = layout.audio {
                 audio = audio.max(numel(&track)?);
             }
-            width = width.max(u64::from(layout.prefix().rows()));
+            width = width.max(u64::from(nn::capability::PrefixSource::of(layout).rows()));
         }
         let (source_width, text_width) = conditioning_width(&shape);
         let mut text = Column::new(device, shape.stack, rows * width * text_width)?;
@@ -273,7 +276,7 @@ const STEP_PRODUCTS: &[Product] = &[Product::Text];
 /// that required it refused every step with `absent(request, Source)` before the conditioner could
 /// run. The encoder's rows are the conditioner's input as well as a prompt's: where they land is
 /// decided by [`DenoiserRunner::seed`], not by asking the store for a second name for them.
-fn step_products(_layout: &nn::capability::Layout) -> &'static [Product] {
+fn step_products(_layout: &proto::video::Layout) -> &'static [Product] {
     STEP_PRODUCTS
 }
 
@@ -302,9 +305,12 @@ pub(crate) fn grouped<'a>(
 ///
 /// **`width` is `source`'s alone.** A conditioner may widen what the denoiser reads, so `text`'s
 /// width is the model's statement and the pair is resolved in [`conditioning_width`].
-fn conditioning_row(shape: &DenoiserShape, layout: &nn::capability::Layout) -> (u64, u64) {
+fn conditioning_row(shape: &DenoiserShape, layout: &proto::video::Layout) -> (u64, u64) {
     let width = u64::from(shape.width.max(1));
-    (u64::from(layout.prefix().rows()), width)
+    (
+        u64::from(nn::capability::PrefixSource::of(layout).rows()),
+        width,
+    )
 }
 
 /// The two widths one request's conditioning columns hold: `(source, text)`.
@@ -809,7 +815,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
     ///
     /// Read from the columns rather than recomputed, so the view a step hands the model and the row
     /// size [`Self::seed`] fills are the ones the buffers were allocated for.
-    fn conditioning_row(&self, layout: &nn::capability::Layout) -> (u64, u64, u64) {
+    fn conditioning_row(&self, layout: &proto::video::Layout) -> (u64, u64, u64) {
         let (rows, _) = conditioning_row(&self.shape, layout);
         (rows, self.columns.source_width, self.columns.text_width)
     }
@@ -978,7 +984,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         })?;
         let stride = rows * text_width * element;
         let row = text_width * element;
-        let zero = u64::from(layout.prefix().zero_row()) * row;
+        let zero = u64::from(nn::capability::PrefixSource::of(&layout).zero_row()) * row;
         for pending in &self.pending {
             let start = usize::try_from(u64::from(pending.index) * stride + zero)
                 .map_err(|_| Error::Invalid("a row is larger than memory".into()))?;
@@ -1091,7 +1097,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
     fn submit_preparation(
         &mut self,
         batch: &Batch,
-        media: &crate::batch::MediaColumns,
+        media: &ipc::execution::MediaColumns,
     ) -> Result<Jobs> {
         let computation = media.computation;
         let bucket = self
@@ -2818,7 +2824,7 @@ mod product_tests {
     #[test]
     fn a_layout_without_conditioning_elements_reads_only_the_prompts_states() {
         let mut layout = Layout {
-            video: nn::capability::LatentShape {
+            video: proto::video::LatentShape {
                 channels: 16,
                 frames: 2,
                 height: 2,

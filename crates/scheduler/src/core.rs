@@ -36,13 +36,13 @@ use crate::{SchedulerConfig, SchedulerStats};
 use anyhow::Context as _;
 use ipc::MainProcessInfo;
 use ipc::RequestId;
+use ipc::execution::Batches;
 use proto::config::EngineArgs;
 #[cfg(feature = "testing")]
 use proto::config::EngineConfig;
 #[cfg(test)]
 use proto::config::{BlockConfig, BlockDistribution};
 pub use proto::config::{WorkerGroupConfig, WorkerGroupRole, WorkerRank};
-use worker::batch::Batches;
 
 /// A storage scope no other deployment names.
 pub(crate) fn unnamed_deployment() -> String {

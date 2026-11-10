@@ -533,7 +533,7 @@ fn check_video_tasks(info: &MainProcessInfo) -> anyhow::Result<()> {
 #[derive(Debug, Clone)]
 pub struct CallResult {
     /// Validated completion values; media storage is carried by `media` below.
-    pub output: ipc::CallOutput,
+    pub output: crate::sim::CallOutput,
     /// Claimed immutable output storage, or its request-local acquisition error.
     pub media: Result<Option<Arc<ipc::SharedMedia>>, ipc::SharedMediaError>,
 }
@@ -892,9 +892,10 @@ impl ExecuteError {
     /// on trial as a whole; `None` for a batch whose failed calls failed
     /// otherwise, whose failure the scheduler reconciles by their requests
     /// alone.
+    #[cfg(feature = "testing")]
     pub fn non_finite<'a>(
         batch_id: u64,
-        outputs: impl IntoIterator<Item = &'a ipc::CallOutput>,
+        outputs: impl IntoIterator<Item = &'a crate::sim::CallOutput>,
     ) -> Option<Self> {
         let code = ipc::ErrorCode::NumericalFault;
         outputs

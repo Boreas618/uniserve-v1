@@ -1,6 +1,7 @@
-//! Call completions and batch results: the [`CallOutput`] a rank emits
-//! once for every call, the media artifacts it materializes, and the
-//! [`BatchOutput`] that answers one batch.
+//! What a call's completion states besides its tokens: its status and error
+//! class, its timing, the media artifacts it materializes and the latent page
+//! layouts it reports. The completion itself is
+//! [`crate::execution::CallOutput`].
 
 use super::*;
 
@@ -79,17 +80,6 @@ impl std::fmt::Display for ErrorCode {
     }
 }
 
-/// Device-observed finish candidates for a token call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-pub struct FinishFlags {
-    /// Whether an end-of-sequence token was selected.
-    pub eos: bool,
-    /// Whether the configured length limit was reached.
-    pub length: bool,
-    /// Whether a configured stop condition matched.
-    pub stop: bool,
-}
-
 /// Per-call timing counters. Accounting only; never state identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct TimingCounters {
@@ -136,60 +126,6 @@ pub struct MediaOutput {
     pub bytes: u64,
 }
 
-/// The completion record a worker emits once for every call, after its copy
-/// event is query-ready and its pinned fields are validated on the host.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CallOutput {
-    /// Request completed by the call.
-    pub request_key: RequestKey,
-    /// Request-local call identifier.
-    pub call_id: CallId,
-    /// Terminal execution status.
-    pub status: CallStatus,
-    /// Error classification when `status` is [`CallStatus::Error`].
-    pub error_code: Option<ErrorCode>,
-    /// Why the rank refused the call's request, on an
-    /// [`ErrorCode::InputError`] completion whose rank states it; the engine
-    /// rejects the request with it.
-    pub error_message: Option<String>,
-    /// Worker timing measurements for the call.
-    pub timing_counters: TimingCounters,
-    /// Accepted cache prefix available to a successor.
-    pub cache_visible_len: u32,
-    /// Cache extent initialized by execution, including rejected speculative positions.
-    pub cache_computed_len: u32,
-    /// Solver steps the call's trajectory has completed, which is also the
-    /// index of its next step (diffusers' `step_index`): the step a
-    /// denoising call's update publishes.
-    pub step_index: u32,
-    /// Token identifiers accepted by the sampler.
-    pub committed_tokens: Vec<u32>,
-    /// Each committed token's log-probabilities, in `committed_tokens`
-    /// order, when the request asks for its generated tokens': the token's
-    /// own entry, then its requested top candidates. A verification reports
-    /// one for every token it commits, accepted drafts and the token after
-    /// them alike; empty otherwise.
-    pub token_logprobs: Vec<Vec<TokenLogprob>>,
-    /// Ranked candidates for each scored prompt position, in input order.
-    pub prompt_logprobs: Vec<Vec<TokenLogprob>>,
-    /// Device-observed terminal conditions.
-    pub finish_flags: FinishFlags,
-    /// Completed artifact and its external storage lifetime, when produced.
-    pub media_output: Option<MediaOutput>,
-    /// Physical cache export, including this rank's tensor locations.
-    pub cache_output: Option<CacheTransfer>,
-    /// Draft tokens the drafter proposed after the call's last committed
-    /// token, in order, for the request's next verification: as many as
-    /// the call's `DraftWork::proposals` asked for, none otherwise.
-    pub draft_token_ids: Vec<u32>,
-    /// A successful video latent preparation's report of how each
-    /// denoising rank's request slot pages hold the request's samples:
-    /// every rank reports its own, and joining the ranks' completions
-    /// gathers them. The engine keys and records the trajectory's pages by
-    /// them when it stores the trajectory.
-    pub latent_layouts: Vec<RankLatentLayout>,
-}
-
 /// How one denoising rank's request slot pages hold a video request's
 /// latent samples.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,111 +136,4 @@ pub struct RankLatentLayout {
     /// JSON): the logical sample tensors, the part of each the rank holds
     /// and where its values lie in the pages.
     pub layout: String,
-}
-
-impl CallOutput {
-    /// Validates completion identity, status, accepted lengths, and the
-    /// ownership of a cache export.
-    ///
-    /// Rules that relate a completion to the kind of the call it answers
-    /// belong to the engine, which holds the call: a cache export answers a
-    /// successful cache-export call.
-    pub fn validate(&self) -> ValidationResult<()> {
-        ensure_valid!(
-            self.call_id.batch_id > 0,
-            "completion call id must be positive"
-        );
-        if let Some(export) = &self.cache_output {
-            export.validate()?;
-            ensure_valid!(
-                self.status == CallStatus::Ok
-                    && export.source.owner == self.request_key
-                    && export.source.producer_call_id == self.call_id,
-                "cache export does not belong to its successful completion"
-            );
-        }
-
-        ensure_valid!(
-            self.cache_visible_len <= self.cache_computed_len,
-            "completion selected cache length exceeds computed length"
-        );
-        match self.status {
-            CallStatus::Error => ensure_valid!(
-                self.error_code.is_some(),
-                "an error completion must carry an error code"
-            ),
-            CallStatus::Ok | CallStatus::Predicated => ensure_valid!(
-                self.error_code.is_none(),
-                "a non-error completion must not carry an error code"
-            ),
-        }
-        ensure_valid!(
-            self.error_message.is_none() || self.error_code == Some(ErrorCode::InputError),
-            "only an input-error completion states why the rank refused its request"
-        );
-        ensure_valid!(
-            self.latent_layouts.is_empty() || self.status == CallStatus::Ok,
-            "latent layouts belong to a successful completion"
-        );
-        if self.status == CallStatus::Predicated {
-            ensure_valid!(
-                self.committed_tokens.as_slice().is_empty() && self.draft_token_ids.is_empty(),
-                "a predicated completion must select its parent without semantic output"
-            );
-            ensure_valid!(
-                !self.finish_flags.eos && !self.finish_flags.length && !self.finish_flags.stop,
-                "a predicated completion must not select a terminal outcome"
-            );
-        }
-        if let Some(output) = self.media_output.as_ref() {
-            output.handle.validate()?;
-            ensure_valid!(
-                output.bytes > 0,
-                "media output byte length must be positive"
-            );
-        }
-        Ok(())
-    }
-}
-
-/// One batch's complete result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BatchOutput {
-    /// Batch identity copied from the submission.
-    pub batch_id: u64,
-    /// Call completions, one per call the batch carried.
-    pub completions: Vec<CallOutput>,
-    /// Product values published by completed calls.
-    pub products: Vec<TensorExport>,
-    /// Aggregate worker execution time in microseconds, when measured.
-    pub worker_exec_us: Option<u64>,
-    /// Model-forward statistics, when reported by the worker.
-    pub forward_stats: Option<ForwardStats>,
-}
-
-impl BatchOutput {
-    /// Iterates over call completions in report order.
-    pub fn completions(&self) -> impl Iterator<Item = &CallOutput> {
-        self.completions.iter()
-    }
-
-    /// Validates completion and product identities for this batch.
-    pub fn validate(&self) -> ValidationResult<()> {
-        let mut identities = HashSet::with_capacity(self.completions.len());
-        for completion in &self.completions {
-            completion.validate()?;
-            ensure_valid!(
-                completion.call_id.batch_id == self.batch_id,
-                "completion identity belongs to another logical batch"
-            );
-            ensure_valid!(
-                identities.insert(completion.call_id),
-                "completion report repeats a call"
-            );
-        }
-        for payload in &self.products {
-            payload.validate()?;
-        }
-        Ok(())
-    }
 }

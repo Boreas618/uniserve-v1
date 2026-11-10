@@ -15,7 +15,7 @@
 //! neither inventing a value:
 //!
 //! - [`BatchReport::from_output`] / [`CallCompletion::from_output`] for the
-//!   in-process worker, which reports `::worker::batch::BatchOutput`: the
+//!   in-process worker, which reports `ipc::execution::BatchOutput`: the
 //!   device's own account of each call (2.4).
 //! - `CallCompletion::from_wire` / `BatchReport::from_wire` for a simulated
 //!   worker, which reports in `ipc`'s types; built only with the `testing`
@@ -118,7 +118,7 @@ impl CallCompletion {
     /// token is stated as the one candidate the device named, never a
     /// neighbour invented to fill the list.
     pub(crate) fn from_output(
-        output: ::worker::batch::CallOutput,
+        output: ipc::execution::CallOutput,
         request_key: RequestKey,
         call_id: CallId,
     ) -> Self {
@@ -238,19 +238,19 @@ impl BatchReport {
     /// is worse than stopping.
     pub(crate) fn from_output(
         batch: u64,
-        outcome: ::worker::completion::Outcome<::worker::batch::BatchOutput>,
+        outcome: ipc::execution::Outcome<ipc::execution::BatchOutput>,
         calls: &[(RequestKey, CallId)],
     ) -> Result<Self, crate::worker::WorkerError> {
         let output = match outcome {
-            ::worker::completion::Outcome::Success(output) => output,
-            ::worker::completion::Outcome::Failed(error) => {
+            ipc::execution::Outcome::Success(output) => output,
+            ipc::execution::Outcome::Failed(error) => {
                 return Err(anyhow::anyhow!("batch {batch} failed: {error}"));
             }
-            ::worker::completion::Outcome::Cancelled => {
+            ipc::execution::Outcome::Cancelled => {
                 return Err(anyhow::anyhow!("batch {batch} was cancelled by the worker"));
             }
         };
-        let mut reported: Vec<Option<::worker::batch::CallOutput>> = vec![None; calls.len()];
+        let mut reported: Vec<Option<ipc::execution::CallOutput>> = vec![None; calls.len()];
         for completion in output.calls {
             let index = completion.call.0 as usize;
             anyhow::ensure!(
@@ -304,8 +304,8 @@ impl BatchReport {
 mod tests {
     use super::*;
 
-    use ::worker::batch::{BatchOutput, CallId as DeviceCallId, CallOutput as DeviceCall};
-    use ::worker::completion::Outcome;
+    use ipc::execution::Outcome;
+    use ipc::execution::{BatchOutput, CallId as DeviceCallId, CallOutput as DeviceCall};
 
     /// What one device call reports: `committed` tokens, the batches it stands
     /// at, and the log-probability of each when the deployment planned them.
@@ -313,7 +313,7 @@ mod tests {
         let mut call = DeviceCall::completed(
             DeviceCallId(index),
             committed.to_vec(),
-            ::worker::batch::RowState {
+            ipc::execution::RowState {
                 step_index: 1,
                 cache_computed_len: 3,
                 cache_visible_len: 3,
@@ -434,7 +434,7 @@ mod tests {
     fn a_failed_batch_is_an_error() {
         let error = BatchReport::from_output(
             4,
-            Outcome::Failed(std::sync::Arc::new(::worker::Error::State("device gone"))),
+            Outcome::Failed(std::sync::Arc::new(ipc::execution::Refusal("device gone"))),
             &submitted(1),
         )
         .expect_err("a failed batch is not a completion");

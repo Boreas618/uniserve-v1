@@ -194,7 +194,7 @@ pub(crate) fn submissions(worker: Box<dyn Worker>) -> submission::Submissions {
 /// The mechanism's door to the worker crate's batch path, the in-process
 /// submission path of §2.4 and §7.3's splice.
 pub(crate) fn submissions_over(
-    batches: Arc<dyn ::worker::batch::Batches>,
+    batches: Arc<dyn ipc::execution::Batches>,
 ) -> anyhow::Result<submission::Submissions> {
     submission::Submissions::over_batches(batches)
 }

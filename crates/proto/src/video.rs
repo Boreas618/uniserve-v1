@@ -8,6 +8,9 @@
 //! workers decode them and hand each stage its part. The vocabulary is the video pipeline's, not
 //! one model's: any video model whose request processing plans a condition states it in these
 //! terms.
+//!
+//! The latent [`Layout`] a denoiser prepares for one request is stated here too: the model states
+//! it, the worker captures a graph for it and the scheduler names it in the batch it submits.
 
 use serde::{Deserialize, Serialize};
 
@@ -352,6 +355,45 @@ impl Conditions {
         }
         Ok(())
     }
+}
+
+/// The latent layout a denoiser prepares for one request.
+///
+/// Ordered and hashed as a plain value of numbers: it is a bucket's extent
+/// (`ipc::execution::Extent`), and a captured graph is keyed by the bucket it holds. The model
+/// states it (`nn::capability::Denoiser::layout`), the worker captures a graph for it and the
+/// scheduler names it back in the batch it submits, so it is stated here, below all three.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub struct Layout {
+    /// The video latent tensor.
+    pub video: LatentShape,
+    /// The audio latent tensor, when the task produces audio.
+    pub audio: Option<LatentShape>,
+    /// Text conditioning rows the layout reserves.
+    pub text_rows: u32,
+    /// Condition rows of the reference media.
+    pub condition_rows: u32,
+    /// Elements of every condition's initial-noise draw, in request order.
+    ///
+    /// The reference draws one chained stream — conditions, then video, then audio — and a model
+    /// can derive the video and audio counts from [`Self::video`] and [`Self::audio`] but not the
+    /// conditions': those are drawn at each condition's own unpacked latent shape before any
+    /// packing, which is not what [`Self::condition_rows`] counts. Zero for a request with no
+    /// conditions.
+    pub condition_elements: u32,
+}
+
+/// The extents of one latent tensor.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub struct LatentShape {
+    /// Channels of the latent space.
+    pub channels: u32,
+    /// Latent frames (or audio latent steps).
+    pub frames: u32,
+    /// Latent rows.
+    pub height: u32,
+    /// Latent columns.
+    pub width: u32,
 }
 
 #[cfg(test)]

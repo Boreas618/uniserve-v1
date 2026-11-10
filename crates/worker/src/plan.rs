@@ -20,347 +20,11 @@
 
 use std::collections::BTreeSet;
 
-use crate::error::{Error, Result};
 use std::fmt;
 
-/// The kind of forward a captured graph serves.
-///
-/// A bucket only ever holds a forward of its own variant: a decode row cannot be served by a
-/// prefill graph, and a prefill that projects logits has different outputs from one that only
-/// writes the KV cache.
-///
-/// # The catalog, as it is
-///
-/// | variant | writes | sampler |
-/// --- | --- | ---
-/// | [`Variant::PrefillWrite`] | the KV cache | runs over every row, and every row's draw is discarded (`logits_rows` are all `-1`) |
-/// | [`Variant::PrefillOutput`] | the KV cache **and** every sampling row's logits | runs over every row of the bucket; a row that ends a prompt keeps its token |
-/// | [`Variant::PrefillGreedy`] | the same, for a batch whose prompt endings are all greedy | runs, greedily |
-/// | [`Variant::DecodeGreedy`] | one token per row | runs, greedily |
-/// | [`Variant::DecodeSampled`] | one token per row | runs, one draw per row |
-///
-/// A prefill bucket carries the sampler because the logits are computed anyway, and because it is
-/// what makes a first token possible without a decode step spent only on choosing it. The draw is
-/// the expensive tail: its candidate selection walks every row of the bucket for milliseconds, which
-/// a batch of greedy prompt endings and a batch that ends no prompt both have no use for. So those
-/// two take the greedy tail, and only a batch with a drawing row pays for the draw.
-///
-/// **One rule keeps the two paths of a prompt ending agreeing:** in such a batch, a draw is replaced on the
-/// host by the argmax of the row's own logits **only for a strictly greedy row whose slot held
-/// nothing before the step**. Every penalty is the identity over an empty history, so the draw and
-/// the argmax answer the same token there; a row with history is refused by name, because its token
-/// is the argmax of the *penalized* logits, which only the captured sampler computes.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum Variant {
-    /// Decode rows drawn from the slot state, sampled greedily.
-    DecodeGreedy,
-    /// Decode rows drawn from the slot state, sampled with the bucket's sampler graph.
-    DecodeSampled,
-    /// Prefill rows of host tokens writing the KV cache, keeping no hidden state.
-    PrefillWrite,
-    /// Prefill rows of host tokens that also project each row's last hidden state.
-    PrefillOutput,
-    /// A [`Self::PrefillOutput`] whose rows that end a prompt are all greedy: each row's first
-    /// token is the argmax of its shaped logits, and nothing is drawn.
-    PrefillGreedy,
-    /// One encode of prompt rows: the text model's and the vision tower's outputs, kept as the
-    /// conditioning the denoiser reads.
-    Encode,
-    /// One denoising step of one latent layout: the diffusion model's velocity, applied to the
-    /// latents in place (a request's steps are one batch each, never a loop inside a batch).
-    Denoise,
-    /// One clip decoded from latents into a raster.
-    Decode,
-    /// One audio track decoded from latents into interleaved PCM.
-    ///
-    /// A variant of its own because the graph is: a clip's decode is a stack of three-dimensional
-    /// convolutions over a voxel grid, and a track's is the vocoder's upsampling and dilated
-    /// one-dimensional convolutions. One bucket cannot hold both, and a capture is keyed by the
-    /// graph a bucket runs.
-    AudioDecode,
-    /// One video unit encoded on the host: the postprocessor's `[frames, rows, columns, 3]` raster
-    /// into the encoded unit the assembly appends.
-    VideoEncode,
-    /// One request's audio track encoded on the host: the decoder's interleaved PCM into the track
-    /// the assembly carries.
-    AudioEncode,
-    /// One request's encoded units and track assembled into its MP4, on the host.
-    Mux,
-    /// One request's trajectory opened. The denoiser draws the request's noise at its first step,
-    /// so this call computes nothing: it is the mechanism's step between a prompt's encoding and
-    /// the first denoising call.
-    LatentPrepare,
-    /// One request's condition media read on the host: its bytes decoded and laid out as the
-    /// model's encoders read them, in storage a later call of the request reads.
-    MediaRead,
-    /// A condition encoder's own call, whose work a later call computes: the vision tower runs
-    /// inside the text encoding that splices its rows, and the latent encoders inside the
-    /// denoiser's first step, whose conditioner writes their rows. So this call computes nothing:
-    /// it is the mechanism's step between the media read and the call that consumes it.
-    ConditionEncode,
-    /// A rank's part in an expert step it has no tokens for: every expert layer, and nothing else.
-    ExpertJoin,
-}
+use ipc::execution::{Computation, Extent, Shape, Variant};
 
-impl Variant {
-    /// The call kind this variant serves, as a profiling session's `stages` and the fence probes'
-    /// histograms name it (`ipc::CallKind`).
-    pub const fn stage(self) -> &'static str {
-        match self {
-            Self::DecodeGreedy | Self::DecodeSampled => "decode",
-            Self::PrefillWrite | Self::PrefillOutput | Self::PrefillGreedy => "prefill",
-            Self::Encode => "text_encoding",
-            Self::Denoise => "denoising",
-            Self::Decode => "video_decoding",
-            Self::AudioDecode => "audio_decoding",
-            Self::VideoEncode => "video_encoding",
-            Self::AudioEncode => "audio_encoding",
-            Self::Mux => "muxing",
-            Self::LatentPrepare => "latent_preparation",
-            Self::MediaRead => "media_reading",
-            Self::ConditionEncode => "condition_encoding",
-            Self::ExpertJoin => "expert_join",
-        }
-    }
-
-    /// The variant's name, as a capture report prints it.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::DecodeGreedy => "decode_greedy",
-            Self::DecodeSampled => "decode_sampled",
-            Self::PrefillWrite => "prefill_write",
-            Self::PrefillOutput => "prefill_output",
-            Self::PrefillGreedy => "prefill_greedy",
-            Self::Encode => "encode",
-            Self::Denoise => "denoise",
-            Self::Decode => "decode",
-            Self::AudioDecode => "audio_decode",
-            Self::VideoEncode => "video_encode",
-            Self::AudioEncode => "audio_encode",
-            Self::Mux => "mux",
-            Self::LatentPrepare => "latent_prepare",
-            Self::MediaRead => "media_read",
-            Self::ConditionEncode => "condition_encode",
-            Self::ExpertJoin => "expert_join",
-        }
-    }
-
-    /// Whether this variant is a media computation rather than a causal-LM forward.
-    ///
-    /// The two families never share a bucket: a media bucket carries an [`Extent`] the language
-    /// model has no use for, and a causal-LM runner refuses one by name rather than serving it
-    /// from a graph shaped for another computation.
-    pub const fn media(self) -> bool {
-        matches!(
-            self,
-            Self::Encode
-                | Self::Denoise
-                | Self::Decode
-                | Self::AudioDecode
-                | Self::VideoEncode
-                | Self::AudioEncode
-                | Self::Mux
-                | Self::LatentPrepare
-                | Self::MediaRead
-                | Self::ConditionEncode
-        )
-    }
-
-    /// Whether this variant is performed in this process rather than on a device (§2.4).
-    ///
-    /// The artifact's three host calls capture no graph: their work is encoding and muxing, which
-    /// the process's media lane does. A bucket of one states which device serves the call and never
-    /// an extent, so no canvas narrows it.
-    pub const fn host(self) -> bool {
-        matches!(
-            self,
-            Self::VideoEncode
-                | Self::AudioEncode
-                | Self::Mux
-                | Self::MediaRead
-                | Self::ConditionEncode
-        )
-    }
-
-    /// The computation a media call is, and `None` for a call no variant states yet.
-    ///
-    /// The three decoders produce one raster for one muxer. The text encoding is the one encode a
-    /// device runs as a call of its own; the vision and latent encodings are computed by the calls
-    /// that consume them ([`Variant::ConditionEncode`]). A call with no variant is not served, which
-    /// the mechanism reads as a capability the worker does not state rather than as a batch to
-    /// send anyway.
-    pub const fn of_media(call: ipc::MediaCall) -> Option<Self> {
-        match call {
-            ipc::MediaCall::TextEncoding => Some(Self::Encode),
-            ipc::MediaCall::VisionEncoding | ipc::MediaCall::LatentEncoding => {
-                Some(Self::ConditionEncode)
-            }
-            ipc::MediaCall::Denoising => Some(Self::Denoise),
-            ipc::MediaCall::ImageDecoding | ipc::MediaCall::VideoDecoding => Some(Self::Decode),
-            // The audio half of a response: its own bucket, matching the `AudioDecoding` call this
-            // file mapped to nothing while the model served video alone.
-            ipc::MediaCall::AudioDecoding => Some(Self::AudioDecode),
-            // The three host calls: their work is encoding and muxing in this process, and each is
-            // a phase of its own because each is a call the mechanism submits and waits on.
-            ipc::MediaCall::VideoEncoding => Some(Self::VideoEncode),
-            ipc::MediaCall::AudioEncoding => Some(Self::AudioEncode),
-            ipc::MediaCall::Muxing => Some(Self::Mux),
-            ipc::MediaCall::LatentPreparation => Some(Self::LatentPrepare),
-            ipc::MediaCall::MediaReading => Some(Self::MediaRead),
-        }
-    }
-
-    /// Whether a bucket of this variant picks each row's token by taking the largest candidate
-    /// rather than by drawing one (4.4's greedy path).
-    ///
-    /// A greedy request states temperature zero, whose shaping divides by one, so the row's largest
-    /// candidate *is* its token. No draw can produce it - the draw runs in token-id order - so the
-    /// two are separate launch sequences and a bucket is homogeneous in which one it takes. A
-    /// prefill that ends no prompt keeps no token, so it takes the cheaper of the two.
-    pub const fn greedy(self) -> bool {
-        matches!(
-            self,
-            Self::DecodeGreedy | Self::PrefillGreedy | Self::PrefillWrite
-        )
-    }
-
-    /// Whether a bucket of this variant runs the sampler (4.4).
-    ///
-    /// Every bucket the causal-LM runner serves does, which is every variant this predicate is asked
-    /// about: a media bucket is refused by name before a graph is chosen for it (`Bucket::causal_lm`),
-    /// so it never reaches this question. A prefill's sampler is a tail over logits the forward
-    /// computes anyway, so it costs the graph almost nothing and makes a sampled first token possible
-    /// without a decode step spent only on drawing; the mechanism says which rows end a prompt by
-    /// putting them in `logits_rows`, and a row that ends none has its draw discarded. See
-    /// [`Variant`]'s catalog, and the one rule under which a captured draw may be replaced by the
-    /// host's argmax.
-    pub const fn samples(self) -> bool {
-        true
-    }
-
-    /// Whether a forward of this variant draws its inputs from the slot state one token per row.
-    pub const fn is_decode(self) -> bool {
-        matches!(self, Self::DecodeGreedy | Self::DecodeSampled)
-    }
-}
-
-impl fmt::Display for Variant {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.name())
-    }
-}
-
-/// One forward's size: what it asks a captured graph to hold.
-///
-/// `tokens` is the number of tokens the forward writes to the KV cache and `rows` the number of
-/// sequences it evaluates. A decode forward evaluates one token per row, so its `tokens == rows`;
-/// a prefill evaluates a chunk of host tokens, which may be more than its rows.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct Shape {
-    pub rows: u32,
-    pub tokens: u32,
-    pub variant: Variant,
-}
-
-impl Shape {
-    /// A decode forward of `rows` rows.
-    pub const fn decode(rows: u32, variant: Variant) -> Self {
-        Self {
-            rows,
-            tokens: rows,
-            variant,
-        }
-    }
-
-    /// A prefill or encode forward of `rows` rows holding `tokens` tokens.
-    pub const fn prefill(rows: u32, tokens: u32, variant: Variant) -> Self {
-        Self {
-            rows,
-            tokens,
-            variant,
-        }
-    }
-}
-
-impl fmt::Display for Shape {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{}/{} rows/{} tokens",
-            self.variant, self.rows, self.tokens
-        )
-    }
-}
-
-/// One media computation as the mechanism states it, so that a plan can say whether it serves it.
-///
-/// The three fields are what a media graph's capture depends on: which computation it is, how many
-/// requests it holds, and - for a decode or a denoising step - the shape its kernels are captured
-/// for. An encode states rows and tokens like a prefill, so its extent is [`Extent::None`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Computation {
-    /// The media call the mechanism is about to run.
-    pub call: ipc::MediaCall,
-    /// The requests in the batch.
-    pub rows: u32,
-    /// An encode's tokens; zero for a denoising step and a decode, which are sized by their extent.
-    pub tokens: u32,
-    /// The latent layout of a denoising step, the raster of a decode, and [`Extent::None`] for an
-    /// encode.
-    pub extent: Extent,
-}
-
-impl Computation {
-    /// The variant that computes this call, or `None` when no variant states it.
-    pub const fn variant(self) -> Option<Variant> {
-        Variant::of_media(self.call)
-    }
-
-    /// Whether this is a computation the worker serves at all, before any plan is consulted.
-    pub const fn stated(self) -> bool {
-        self.variant().is_some()
-    }
-}
-
-/// What a media bucket's computation is sized by, where a causal-LM bucket is sized by tokens
-/// alone.
-///
-/// The language model's four variants leave it `None`, so their buckets are `(variant, rows,
-/// tokens)` exactly as before and no causal-LM path reads this field. A media bucket states the
-/// shape its graph is captured for: a denoising step is one latent layout, a decode is one clip.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum Extent {
-    /// No media extent: a causal-LM bucket, sized by its tokens.
-    None,
-    /// One denoising step's latent layout (`nn::capability::Layout`).
-    Latents(nn::capability::Layout),
-    /// What a request asks for, which the mechanism states to find its bucket: the output frames and
-    /// the canvas. A layout's frame count is the request's own, because the video's extent sets the
-    /// sparse selection budget and the audio timeline, so a longer bucket is not a padded one.
-    Request {
-        /// Output frames after the model's alignment.
-        frames: u32,
-        /// Raster columns of a frame.
-        width: u32,
-        /// Raster rows of a frame.
-        height: u32,
-        /// Prompt rows the layout must hold.
-        text_rows: u32,
-        /// Condition rows the layout must hold, as the denoiser packs them. A layout's condition
-        /// rows are real rows of every step, so a request rides the smallest layout that holds its
-        /// own, and a request without any the layout that holds none.
-        condition_rows: u32,
-    },
-    /// One decoded clip's raster.
-    Clip {
-        /// Frames in the clip.
-        frames: u32,
-        /// Raster rows of a frame.
-        height: u32,
-        /// Raster columns of a frame.
-        width: u32,
-    },
-}
+use crate::error::{Error, Result};
 
 /// A captured size: the rows and tokens a bucket's graph holds, and what it computes.
 ///
@@ -429,7 +93,7 @@ impl Bucket {
     ///
     /// The layout is the extent because it *is* the size of the work: a step's velocity is one
     /// tensor per canvas, and two layouts of the same row count are different graphs.
-    pub const fn denoise(rows: u32, layout: nn::capability::Layout) -> Self {
+    pub const fn denoise(rows: u32, layout: proto::video::Layout) -> Self {
         Self {
             variant: Variant::Denoise,
             rows,
@@ -445,7 +109,7 @@ impl Bucket {
     /// The layout is the extent for the reason a denoise step's is: the track's latent shape, and
     /// the window it decodes to, are the model's own arithmetic, and there is no raster here for a
     /// clip-shaped extent to name - a track-only decode has no clip at all.
-    pub const fn audio(rows: u32, layout: nn::capability::Layout) -> Self {
+    pub const fn audio(rows: u32, layout: proto::video::Layout) -> Self {
         Self {
             variant: Variant::AudioDecode,
             rows,
@@ -931,8 +595,8 @@ mod tests {
     /// A request finds the bucket of its own timeline, canvas and prompt, and never a longer one.
     #[test]
     fn a_request_selects_the_bucket_of_its_own_timeline() {
-        let layout = |frames: u32, text_rows: u32| nn::capability::Layout {
-            video: nn::capability::LatentShape {
+        let layout = |frames: u32, text_rows: u32| proto::video::Layout {
+            video: proto::video::LatentShape {
                 channels: 24,
                 frames,
                 height: 48,
@@ -970,8 +634,8 @@ mod tests {
     /// step. Conditions no layout holds find none.
     #[test]
     fn a_request_selects_the_layout_of_its_own_conditions() {
-        let layout = |condition_rows: u32| nn::capability::Layout {
-            video: nn::capability::LatentShape {
+        let layout = |condition_rows: u32| proto::video::Layout {
+            video: proto::video::LatentShape {
                 channels: 24,
                 frames: 37,
                 height: 48,
@@ -1062,8 +726,8 @@ mod tests {
     /// variant states - audio decoding, a mux - is served nowhere rather than by the nearest graph.
     #[test]
     fn a_media_computation_is_planned_only_into_a_bucket_captured_for_it() {
-        let layout = nn::capability::Layout {
-            video: nn::capability::LatentShape {
+        let layout = proto::video::Layout {
+            video: proto::video::LatentShape {
                 channels: 16,
                 frames: 13,
                 height: 60,
@@ -1094,8 +758,8 @@ mod tests {
 
         // One frame more is another graph, and no capture is made in the serving path.
         let other = Computation {
-            extent: Extent::Latents(nn::capability::Layout {
-                video: nn::capability::LatentShape {
+            extent: Extent::Latents(proto::video::Layout {
+                video: proto::video::LatentShape {
                     channels: 16,
                     frames: 25,
                     height: 60,
@@ -1179,8 +843,8 @@ mod tests {
         // the layout rather than from the clip the denoiser took it from.
         let track = Bucket::audio(
             1,
-            nn::capability::Layout {
-                audio: Some(nn::capability::LatentShape {
+            proto::video::Layout {
+                audio: Some(proto::video::LatentShape {
                     channels: 8,
                     frames: 3,
                     height: 2,
@@ -1283,8 +947,8 @@ mod tests {
     /// serve tokens shaped by a graph captured for a canvas.
     #[test]
     fn a_media_bucket_is_sized_by_its_extent_and_refused_by_a_causal_lm_runner() {
-        let layout = nn::capability::Layout {
-            video: nn::capability::LatentShape {
+        let layout = proto::video::Layout {
+            video: proto::video::LatentShape {
                 channels: 16,
                 frames: 13,
                 height: 60,
@@ -1327,8 +991,8 @@ mod tests {
         // than a token count nobody holds.
         let other = Bucket::denoise(
             1,
-            nn::capability::Layout {
-                video: nn::capability::LatentShape {
+            proto::video::Layout {
+                video: proto::video::LatentShape {
                     channels: 16,
                     frames: 25,
                     height: 60,

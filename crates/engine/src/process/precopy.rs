@@ -8,11 +8,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
+use ipc::execution::Outcome;
+use ipc::execution::Submission;
 use ipc::{ProgramStatus, UpdateFailure};
 use ops::{Generation, KernelEntry};
 use proto::program::{Program, Programs};
-use worker::batch::Submission;
-use worker::completion::Outcome;
 use worker::device::Worker;
 use worker::host::HostTask;
 
@@ -53,7 +53,12 @@ fn missing_kernel(submissions: &[Submission]) -> Option<(String, String)> {
         let Some(Outcome::Failed(error)) = submission.outcome() else {
             continue;
         };
-        if let Some((operator, descriptor)) = named(&error) {
+        // A submission carries its failure across the crossing as a fault; the worker raised it,
+        // so it is the worker's own error.
+        let Some(error) = error.downcast_ref::<worker::Error>() else {
+            continue;
+        };
+        if let Some((operator, descriptor)) = named(error) {
             return Some((operator.to_owned(), descriptor.to_owned()));
         }
     }
