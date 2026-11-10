@@ -143,9 +143,11 @@ fn content(plan: &CachePlan, group: usize) -> [u8; 32] {
     digest.numbers(&layers);
     digest.number(u64::from(entry.total_kv_heads));
     digest.number(u64::from(entry.head_dim));
+    // A state page holds its checkpoints' field runs, which are its content's shape.
     if entry.state() {
         digest.text("state");
         digest.number(u64::from(entry.units_per_page));
+        digest.number(u64::from(plan.state_fields()));
     }
     digest.finish()
 }
