@@ -669,9 +669,9 @@ impl Scheduler {
     /// Ends the starved requests no preemption can let grow: the units one
     /// holds and the units its next call needs are more than the whole cache
     /// gives, so it could not go on with every other request gone. Its
-    /// sequence is as long as the cache holds, and it ends there as a request
-    /// ends at its token limit, once its calls in flight drain, rather than
-    /// starving until the watchdog fails it.
+    /// sequence is as long as the cache holds, and it ends there with the
+    /// cache-capacity finish (`FinishReason::CacheCapacity`), once its calls
+    /// in flight drain, rather than starving until the watchdog fails it.
     pub(super) fn finish_outgrown(&mut self) {
         let capacity = self.storage.capacity_units();
         let outgrown: Vec<(RequestId, usize)> = self
@@ -700,7 +700,7 @@ impl Scheduler {
                  the cache holds"
             );
             if let Some(state) = self.running.get_mut(&id) {
-                state.terminal_intent.finish(FinishReason::MaxTokens);
+                state.terminal_intent.finish(FinishReason::CacheCapacity);
             }
         }
     }

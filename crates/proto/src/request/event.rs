@@ -32,6 +32,10 @@ pub enum FinishReason {
     Repetition,
     /// Execution or output processing failed.
     Error,
+    /// The request's sequence reached the length the whole KV cache holds:
+    /// its next call needs more cache units than the cache has, so it ends
+    /// there rather than starving.
+    CacheCapacity,
 }
 
 /// Typed payload identifying the exact stop condition that ended generation.

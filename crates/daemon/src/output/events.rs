@@ -34,6 +34,8 @@ pub enum FinishReason {
     Abort,
     /// Repetition detection ended generation.
     Repetition,
+    /// The sequence reached the length the engine's whole KV cache holds.
+    CacheCapacity,
 }
 
 impl FinishReason {
@@ -51,17 +53,20 @@ impl FinishReason {
             Engine::MaxTokens => Self::Length,
             Engine::Cancelled | Engine::Aborted => Self::Abort,
             Engine::Repetition => Self::Repetition,
+            Engine::CacheCapacity => Self::CacheCapacity,
             Engine::Error => return None,
         })
     }
 
-    /// The reason's name: `stop`, `length`, `abort`, or `repetition`.
+    /// The reason's name: `stop`, `length`, `abort`, `repetition` or
+    /// `cache_capacity`.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Stop(_) => "stop",
             Self::Length => "length",
             Self::Abort => "abort",
             Self::Repetition => "repetition",
+            Self::CacheCapacity => "cache_capacity",
         }
     }
 }

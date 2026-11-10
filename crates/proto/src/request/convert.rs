@@ -989,6 +989,7 @@ impl From<&FinishReason> for wire::FinishReason {
             FinishReason::Aborted => Self::Aborted,
             FinishReason::Repetition => Self::Repetition,
             FinishReason::Error => Self::Error,
+            FinishReason::CacheCapacity => Self::CacheCapacity,
         }
     }
 }
@@ -1005,6 +1006,7 @@ impl From<wire::FinishReason> for FinishReason {
             wire::FinishReason::Aborted => Self::Aborted,
             wire::FinishReason::Repetition => Self::Repetition,
             wire::FinishReason::Error => Self::Error,
+            wire::FinishReason::CacheCapacity => Self::CacheCapacity,
         }
     }
 }

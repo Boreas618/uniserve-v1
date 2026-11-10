@@ -660,8 +660,9 @@ fn requests_that_wait_for_each_others_units_recompute_the_last_admitted() {
 }
 
 /// A request alone whose sequence grows past the whole cache ends where the
-/// cache is full, as it would at its token limit: giving up any request would
-/// not let it grow, so it is not left to starve until the watchdog fails it.
+/// cache is full, with the cache-capacity finish rather than its token
+/// limit's: giving up any request would not let it grow, so it is not left to
+/// starve until the watchdog fails it.
 #[test]
 fn a_request_longer_than_the_cache_ends_at_the_length_the_cache_holds() {
     let (handle, _workers, thread) = start(SimWorkers::filling(0));
@@ -670,7 +671,7 @@ fn a_request_longer_than_the_cache_ends_at_the_length_the_cache_holds() {
     let mut long = handle.submit(request(1, 10, 40 * BLOCK as usize)).unwrap();
     match terminal(&mut long) {
         Some(Event::Finished {
-            reason: FinishReason::MaxTokens,
+            reason: FinishReason::CacheCapacity,
             completion_tokens,
             ..
         }) => {
