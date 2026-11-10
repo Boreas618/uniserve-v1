@@ -21,9 +21,10 @@ The scenarios are chosen for the width being a launch value rather than a field:
 candidate, a width below the kernel's tile, exactly one tile, one tile plus one, several
 tiles, a row whose ids repeat, and a row carrying an id that is not a token at all.
 
-The destination buffers are pre-filled with the operator's own sentinels (`-1` ids,
-`nan` values), which no candidate can produce, so a slot the program failed to write
-fails the comparison instead of passing as a zero that a legitimate token could be.
+The operator fills the slots past its candidates with `-1` ids and `-inf` values. The
+destination buffers are pre-filled with `-1` ids and `nan` values, which no candidate and
+no filled slot can be, so a slot the program failed to write fails the comparison instead
+of passing as a zero that a legitimate token could be.
 
 A sentinel has three properties, and the third is the one a row with a repeated id taught
 here: it is distinct from every value the producer can emit, **and** from every other
@@ -69,10 +70,10 @@ def scenario(width, rows, seed, duplicate=False, outside=False):
 
 
 def wanted(width, values, ids):
-    """The row the operator must write: the counted candidates ranked, then the sentinel tail."""
+    """The row the operator must write: the counted candidates ranked, then the `-1`/`-inf` tail."""
     rows = ids.shape[0]
     want_ids = np.full((rows, width), -1, dtype=np.int32)
-    want_values = np.full((rows, width), np.nan, dtype=np.float32)
+    want_values = np.full((rows, width), -np.inf, dtype=np.float32)
     for row in range(rows):
         keep = np.flatnonzero((ids[row] >= 0) & (ids[row] < width))
         order = keep[np.argsort(ids[row][keep], kind="stable")]
@@ -157,12 +158,17 @@ def run_interpreter(package, key, seed):
             (ROWS, width), float("nan"), dtype=torch.float32
         )
         got_ids = torch.full((ROWS, width), -1, dtype=torch.int32)
+        # The id space is the row's width, so the `outside` id lies past it. The count plane is
+        # the program's scratch: its contents on entry are not part of the contract.
+        counts = torch.full((ROWS, width), 12345, dtype=torch.int32)
         kernels._candidate_order_kernel[(ROWS,)](
             torch.tensor(values),
             torch.tensor(ids),
             got_values,
             got_ids,
+            counts,
             ROWS,
+            width,
             width,
             BLOCK=128,
         )
@@ -209,12 +215,20 @@ def run_module(directory, seed):
         got_ids = torch.full(
             (ROWS, width), -1, dtype=torch.int32, device=device
         )
+        counts = torch.full(
+            (ROWS, width), 12345, dtype=torch.int32, device=device
+        )
+        # The tensors stay referenced until the launch completed: a temporary's storage would be
+        # released and reused before the kernel reads it.
+        sources = (torch.tensor(values).cuda(), torch.tensor(ids).cuda())
         holders = [
-            ctypes.c_void_p(torch.tensor(values).cuda().data_ptr()),
-            ctypes.c_void_p(torch.tensor(ids).cuda().data_ptr()),
+            ctypes.c_void_p(sources[0].data_ptr()),
+            ctypes.c_void_p(sources[1].data_ptr()),
             ctypes.c_void_p(got_values.data_ptr()),
             ctypes.c_void_p(got_ids.data_ptr()),
+            ctypes.c_void_p(counts.data_ptr()),
             ctypes.c_uint64(ROWS),
+            ctypes.c_uint32(width),
             ctypes.c_uint32(width),
         ]
         pointers = (ctypes.c_void_p * len(holders))(
