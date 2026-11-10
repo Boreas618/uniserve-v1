@@ -224,7 +224,6 @@ impl Scheduler {
             policy: None,
             policy_report: None,
             shadow_pass: None,
-            serving: tokio::sync::watch::Sender::new(false),
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             policy_precopy: None,
             policy_prepared: None,
@@ -265,18 +264,6 @@ impl Scheduler {
     /// The serving generation's cell, for the handle that writes it.
     pub fn generation_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
         Arc::clone(&self.generation)
-    }
-
-    /// A receiver for [`Self::note_policy_serves`], for whoever waits until a
-    /// policy actually serves this scheduler (§7.3).
-    pub fn serving_receiver(&self) -> tokio::sync::watch::Receiver<bool> {
-        self.serving.subscribe()
-    }
-
-    /// Reports that a policy instance serves from here on. Idempotent: a later
-    /// switchover reports it too, and a waiter only waits for the first.
-    pub(super) fn note_policy_serves(&self) {
-        self.serving.send_replace(true);
     }
 
     /// Returns the effective scheduler configuration.

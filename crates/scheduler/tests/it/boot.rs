@@ -164,3 +164,45 @@ fn the_facts_boot_a_main_process_that_serves_a_request() {
         "the worker was handed the work the facts' budgets admit"
     );
 }
+
+/// The serving path's warm-up of a main process on CUDA devices runs its requests only once the
+/// process opens admission, not when the epoch's first policy starts serving: the switchover that
+/// installs the policy only queues the device's bucket captures, and a warm-up batch reaching the
+/// device before them finds no graph to replay, which fails the worker.
+#[test]
+fn the_serving_warmup_waits_for_admission_to_open() {
+    let serving = Arc::new(serving());
+    let batches = Arc::clone(&serving) as Arc<dyn Batches>;
+    let (mut args, limits) = launch();
+    // The warm-up runs only where the ranks execute on CUDA devices.
+    for group in &mut args.engine_config.parallel.worker_groups {
+        for rank in &mut group.ranks {
+            rank.device = "cuda:0".to_owned();
+        }
+    }
+    let handle = SchedulerHandle::over_batches(&args, limits, batches)
+        .expect("the launch boots a scheduler");
+
+    install(&handle, &serving);
+    // The policy serves and could form a batch from here on; the device's captures are still
+    // running, so nothing may reach it. A warm-up started by the policy would have submitted its
+    // prefill by now: the scheduler plans a queued request at its next step.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        serving.submitted().is_empty(),
+        "a warm-up batch reached the device before admission opened"
+    );
+
+    // Admission opens: the warm-up's prefill and decode reach the device.
+    handle.warm_serving_path();
+    let deadline = Instant::now() + FIRST_TOKEN;
+    while serving.submitted().len() < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let submitted = serving.submitted();
+    assert!(
+        submitted.len() >= 2,
+        "the opened warm-up runs a prefill and a decode, but the device received {} batches",
+        submitted.len()
+    );
+}

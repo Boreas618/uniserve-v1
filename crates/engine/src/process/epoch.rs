@@ -303,7 +303,15 @@ impl MainProcess {
         self.data
             .book_serving()
             .context("booking what the ranks hold in their devices' ledgers")?;
-        self.resume_schedulers()
+        self.resume_schedulers()?;
+        // The serving path's warm-up submits ordinary requests straight to each scheduler, so it
+        // obeys the rule above too: it starts here, where every bucket its batches replay is
+        // captured, and not at the switchover that installed the policy. Only an epoch's first
+        // opening starts it; a reopening after a drain finds it started.
+        for scheduler in &self.schedulers {
+            scheduler.warm_serving_path();
+        }
+        Ok(())
     }
 
     /// Parks every scheduler, keeping what each parks with for the resume.

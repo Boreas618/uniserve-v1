@@ -783,28 +783,21 @@ impl Scheduler {
             }
             let engine = policy::process_engine().map_err(|error| error.to_string())?;
             let ceilings = ceilings_of(BatchCapacity::of(&self.info));
-            self.adopt(PolicySlot::from_candidate(engine, ceilings, candidate));
             // From here the mechanism decides: a scheduler with no policy
-            // forms no batch, and the serving path's warm-up waits for this.
-            self.note_policy_serves();
+            // forms no batch.
+            self.adopt(PolicySlot::from_candidate(engine, ceilings, candidate));
             return Ok(None);
         };
-        let mut serves = false;
         if stage == Stage::Switchover {
             let Some(candidate) = self.policy_prepared.take() else {
                 return Err("a switchover arrived without a prepared policy".to_owned());
             };
             policy.adopt(candidate);
-            serves = true;
         }
         policy.request(stage);
         let applied = policy.boundary(state).map_err(|error| error.to_string());
         if applied.is_ok() && matches!(stage, Stage::Switchover | Stage::Revert) {
             self.seed_from_policy();
-        }
-        if serves {
-            // A policy instance serves from this boundary on (§7.3 step 3).
-            self.note_policy_serves();
         }
         applied
     }

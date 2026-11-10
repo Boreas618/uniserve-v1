@@ -1,21 +1,26 @@
 //! Serving warmup through the scheduler.
 //!
-//! Once the epoch's first policy serves, the engine admits real requests of the
+//! When the process opens admission, the scheduler admits real requests of the
 //! shapes the workers prepared for, so the serving path of every captured row
 //! count and diffusion LM step has run before the first client request that
 //! needs it.
 //!
-//! It runs after the first policy, not at startup, because it is the serving
-//! path that is warmed and the serving path is the policy's: a scheduler with no
-//! policy forms no batch, so a warm-up at startup would wait forever for
-//! requests nothing could decide. Startup therefore records the intent
-//! ([`after_serving`]) and does not wait for it, and a warm-up that fails is
-//! logged while serving continues — a device that cannot run these shapes fails
-//! the first client request that needs them, in the open. The scheduler and its allocators form every batch
-//! as they form a client's; a rank states only the shapes
+//! It runs at the opening of admission, not at startup or at the epoch's first
+//! switchover, because its requests are batches like a client's: the scheduler
+//! plans them into the device's captured buckets, and the switchover only
+//! queues those captures, which run behind it for as long as a model's bucket
+//! catalogue takes. A batch planned before its bucket is captured finds no graph
+//! to replay, which fails the worker. Admission opens once every capture has
+//! run, and a scheduler that admits has a policy (one with none forms no batch),
+//! so the owner of admission starts the warm-up then
+//! ([`crate::SchedulerHandle::warm_serving_path`]) and does not wait for it; a
+//! warm-up that fails is logged while serving continues — a device that cannot
+//! run these shapes fails the first client request that needs them, in the
+//! open. The scheduler and its allocators form every batch as they form a
+//! client's; a rank states only the shapes
 //! (`MainProcessInfo::diffusion_lm_step_rows`) and takes no part in forming
-//! them. The ranks warmed their kernels and captured their graphs
-//! before they reported; these requests warm the serving path around them.
+//! them. The ranks warmed their kernels and captured their graphs before
+//! admission opened; these requests warm the serving path around them.
 //!
 //! The requests are ordinary generation requests with a one-token prompt:
 //!
@@ -39,7 +44,6 @@ use anyhow::Context as _;
 use ipc::SamplingParams;
 use ipc::{CallKind, ForwardMode};
 
-use crate::core::SchedulerHandle;
 use crate::handle::EventRx;
 use proto::config::EngineArgs;
 
@@ -102,16 +106,13 @@ impl Warm {
     }
 }
 
-/// Runs the warm-up once the epoch's first policy serves, on a thread of its own
-/// ([`Warm`] is what it holds).
-pub(crate) fn after_serving(core: &SchedulerHandle, args: &EngineArgs) {
-    let intent = core.warmup();
-    let serving = core.serving();
-    let args = args.clone();
+/// Runs the warm-up of `args`' deployment on a thread of its own ([`Warm`] is
+/// what it holds), from the opening of admission
+/// ([`crate::SchedulerHandle::warm_serving_path`]).
+pub(crate) fn start(intent: Warm, args: EngineArgs) {
     let spawned = std::thread::Builder::new()
         .name("warmup".to_owned())
         .spawn(move || {
-            wait_serving(serving);
             if let Err(error) = warm(&intent, &args) {
                 // Serving continues: the shapes this warms are the ones a client
                 // request reaches anyway, where its failure is visible.
@@ -120,22 +121,6 @@ pub(crate) fn after_serving(core: &SchedulerHandle, args: &EngineArgs) {
         });
     if let Err(error) = spawned {
         tracing::warn!(%error, "the warm-up thread could not start; the engine serves on");
-    }
-}
-
-/// Blocks until a policy instance serves, given the scheduler's serving signal.
-///
-/// The signal is the scheduler's `watch`, polled: the waiters are ordinary
-/// threads (the warm-up's), and a closed channel means the scheduler is gone.
-pub(crate) fn wait_serving(mut serving: tokio::sync::watch::Receiver<bool>) {
-    loop {
-        if *serving.borrow_and_update() {
-            return;
-        }
-        if serving.has_changed().is_err() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -336,6 +321,7 @@ mod tests {
     use ipc::CanvasSampling;
 
     use super::*;
+    use crate::core::SchedulerHandle;
     use crate::sim::{SimEngine, SimWorker};
 
     /// The warm-up's groups on `sim`, which reports running on a CUDA device, in

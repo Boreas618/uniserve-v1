@@ -185,8 +185,10 @@ pub struct SchedulerHandle {
     batches: Option<Arc<dyn Batches>>,
     /// Request ids, shared with the warm-up's view of this scheduler.
     next_id: Arc<AtomicU64>,
-    /// Set once a policy instance actually serves (§7.3); see `wait_serving`.
-    serving: tokio::sync::watch::Receiver<bool>,
+    /// The launch the serving path's warm-up states its requests from, until
+    /// its owner starts it ([`Self::warm_serving_path`]); `None` once started,
+    /// and for a handle that has no device path to warm.
+    serving_warmup: Mutex<Option<EngineArgs>>,
     /// The generation each of this scheduler's batches is stamped with: the
     /// number the control thread's switchover arm last wrote (§7.3). One cell
     /// per rank, shared with the scheduler thread and the in-process submission
@@ -252,10 +254,10 @@ impl SchedulerHandle {
         scheduler.set_progress(progress);
         let mut handle = Self::spawn(scheduler, engine.model.model.clone(), waker)?;
         handle.batches = Some(batches);
-        // The serving path's warm-up is the serving path's: it runs once the
-        // epoch's first policy serves, on a thread of its own, and startup does
-        // not wait for it.
-        crate::warmup::after_serving(&handle, args);
+        // The serving path's warm-up runs only when the process opens
+        // admission ([`Self::warm_serving_path`]): before then the device may
+        // still be capturing the buckets its batches replay.
+        handle.serving_warmup = Mutex::new(Some(args.clone()));
         Ok(handle)
     }
 
@@ -422,7 +424,6 @@ impl SchedulerHandle {
         let stats = scheduler.stats_handle();
         let failure = scheduler.failure_handle();
         // Taken before the scheduler moves onto its thread.
-        let serving = scheduler.serving_receiver();
         let generation = scheduler.generation_handle();
         let trial = scheduler.on_trial();
 
@@ -453,7 +454,7 @@ impl SchedulerHandle {
             trial,
             batches: None,
             next_id: Arc::new(AtomicU64::new(1)),
-            serving,
+            serving_warmup: Mutex::new(None),
             generation,
             thread: Mutex::new(Some(thread)),
         })
@@ -488,10 +489,28 @@ impl SchedulerHandle {
             .store(generation, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// The scheduler's serving signal, for a thread that waits on it without
-    /// holding the handle ([`crate::warmup::after_serving`]).
-    pub fn serving(&self) -> tokio::sync::watch::Receiver<bool> {
-        self.serving.clone()
+    /// Starts the serving path's warm-up ([`crate::warmup`]) on a thread of its
+    /// own and returns at once.
+    ///
+    /// The caller is the owner of admission and calls this when it opens
+    /// admission: the warm-up's requests are ordinary requests, so the
+    /// scheduler plans them into the device's captured buckets, and they may
+    /// only reach it once every bucket a batch can replay has been captured -
+    /// the same rule client requests are admitted under. A scheduler with no
+    /// policy forms no batch, so admission also implies a serving policy.
+    ///
+    /// Only the first call starts it; later ones (an admission reopened after a
+    /// drain) and a handle without the in-process device path do nothing. A
+    /// warm-up that fails is logged and serving continues.
+    pub fn warm_serving_path(&self) {
+        let args = self
+            .serving_warmup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(args) = args {
+            crate::warmup::start(self.warmup(), args);
+        }
     }
 
     /// One of §7.3's steps 3 to 6, applied at this scheduler's next boundary
