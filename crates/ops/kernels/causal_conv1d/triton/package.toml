@@ -1,0 +1,40 @@
+# The causal_conv1d operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# One program convolves `block` channels of one row of a batch, continuing from
+# the row's request slot's last `width − 1` inputs and leaving its own there
+# (and a checkpoint of them when the row names one). The channel count and the
+# tap count are compiled in, the row count is the grid's, and a row's tokens
+# come from the batch's offsets.
+
+op = "causal_conv1d"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/causal_conv1d.py", "src/build.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_bf16_channels_8192_width_4_block_256`.
+[kernel.descriptors]
+# A channel count of any multiple of sixteen (each row's channels start on a sixteen-byte bound),
+# any tap count of at least two, and a channel block that is a `tl.arange` extent.
+dimensions = { dtype = ["bf16", "f16", "f32"], channels = { multiple = 16 }, width = { min = 2 }, block = { power_of_two = true } }
+
+[parameters]

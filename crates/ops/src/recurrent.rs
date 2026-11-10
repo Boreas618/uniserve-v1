@@ -83,19 +83,16 @@ impl RowColumns {
         }
         Ok(rows)
     }
-
-    /// Pass the four columns in their launch order.
-    fn pass(&self, arguments: &mut Arguments) {
-        arguments
-            .view(self.query_offsets)
-            .view(self.seq_lens)
-            .view(self.slots)
-            .view(self.checkpoints);
-    }
 }
 
 /// Check that `bank` is `[slots, dims…]` of `dtype`, contiguous, and answer its slot count.
-fn check_bank(operator: &'static str, name: &str, bank: &TensorView, dtype: DType, dims: &[u64]) -> Result<u64> {
+fn check_bank(
+    operator: &'static str,
+    name: &str,
+    bank: &TensorView,
+    dtype: DType,
+    dims: &[u64],
+) -> Result<u64> {
     let refuse = |problem: String| Error::argument(operator, format!("the {name} bank {problem}"));
     if bank.dtype != dtype {
         return Err(refuse(format!("holds {}, not {dtype}", bank.dtype)));
@@ -231,9 +228,14 @@ impl Op for CausalConv1d {
         let rows = args.rows.seq_lens.shape.dim(0);
 
         let mut arguments = Arguments::new();
-        arguments.view(args.x).view(args.weight).view(args.out);
-        args.rows.pass(&mut arguments);
         arguments
+            .view(args.x)
+            .view(args.weight)
+            .view(args.out)
+            .view(args.rows.query_offsets)
+            .view(args.rows.seq_lens)
+            .view(args.rows.slots)
+            .view(args.rows.checkpoints)
             .view(args.state)
             .view(args.checkpoint)
             .i32(args.x.strides.get(0) as i32);
@@ -458,7 +460,13 @@ impl Op for GatedDeltaRule {
         }
         let dims = [value_heads, key_dim, value_dim];
         let slots = check_bank(Self::NAME, "state", &args.state, DType::F32, &dims)?;
-        let kept = check_bank(Self::NAME, "checkpoint", &args.checkpoint, DType::F32, &dims)?;
+        let kept = check_bank(
+            Self::NAME,
+            "checkpoint",
+            &args.checkpoint,
+            DType::F32,
+            &dims,
+        )?;
         if kept != slots {
             return Err(Error::argument(
                 Self::NAME,
@@ -492,9 +500,11 @@ impl Op for GatedDeltaRule {
             .view(args.a)
             .view(args.b)
             .view(args.a_log)
-            .view(args.dt_bias);
-        args.rows.pass(&mut arguments);
-        arguments
+            .view(args.dt_bias)
+            .view(args.rows.query_offsets)
+            .view(args.rows.seq_lens)
+            .view(args.rows.slots)
+            .view(args.rows.checkpoints)
             .view(args.state)
             .view(args.checkpoint)
             .view(args.out)
