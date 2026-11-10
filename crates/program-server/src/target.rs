@@ -9,9 +9,10 @@
 //! under the GPU model's name.
 //!
 //! Which targets this host builds for is a property of its devices: the
-//! `serve` command is given them as `--target`s or reads their architectures
-//! from the driver ([`Target::of`]). The Program Server itself launches no
-//! kernel and allocates no device memory (design section 6.1).
+//! `serve` command is given them as `--target`s or by its caller, which reads
+//! their compute capabilities from the driver ([`Target::arch`]). The Program
+//! Server itself links no device driver, launches no kernel and allocates no
+//! device memory (design section 6.1).
 
 use std::fmt;
 
@@ -43,20 +44,16 @@ impl Target {
         &self.0
     }
 
-    /// The architecture target of `device`: its architecture-specific
-    /// instruction set, such as `sm_100a`.
+    /// The architecture target of a device of compute capability
+    /// `(major, minor)`: its architecture-specific instruction set, such as
+    /// `sm_100a`.
     ///
     /// The suffixed name is the one kernels are built for: the plain name
     /// omits the family's instructions, and a module built for it runs a
-    /// fraction as fast. Reads two device attributes and creates no context.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the driver cannot report the device's compute capability.
-    pub fn of(device: platform::DeviceId) -> platform::Result<Self> {
-        let major = device.attribute(platform::DeviceAttribute::ComputeCapabilityMajor)?;
-        let minor = device.attribute(platform::DeviceAttribute::ComputeCapabilityMinor)?;
-        Ok(Self(format!("sm_{major}{minor}a")))
+    /// fraction as fast. The caller reads the capability from the driver; the
+    /// Program Server links none.
+    pub fn arch((major, minor): (i32, i32)) -> Self {
+        Self(format!("sm_{major}{minor}a"))
     }
 }
 

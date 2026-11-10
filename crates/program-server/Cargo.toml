@@ -17,9 +17,6 @@ publish = false
 [dependencies]
 clap.workspace = true
 libc.workspace = true
-# `platform` reads the host's device count and each device's compute capability, the
-# architecture targets the server builds for when no `--target` names them (`Target::of`).
-platform = { path = "../platform" }
 prost.workspace = true
 # The program vocabulary: programs, slots and phases (`proto::program`).
 proto.workspace = true

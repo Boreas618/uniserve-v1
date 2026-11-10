@@ -271,16 +271,16 @@ impl Settings {
     }
 
     /// The devices this server builds for: one per `--target`, or else this
-    /// host's devices by their architectures.
+    /// host's devices by their architectures, which `host` reads.
     ///
     /// A `--target` names an architecture, and stands for the GPU model too:
     /// the command line does not know the model.
     ///
     /// # Errors
     ///
-    /// Fails when no target is given and the driver cannot report the host's
+    /// Fails when no target is given and `host` cannot report the host's
     /// devices.
-    pub fn devices(&self) -> Result<Vec<Device>> {
+    pub fn devices(&self, host: HostTargets<'_>) -> Result<Vec<Device>> {
         if !self.targets.is_empty() {
             return Ok(self
                 .targets
@@ -292,13 +292,9 @@ impl Settings {
                 .collect());
         }
 
-        let count = platform::DeviceId::count()
-            .map_err(|error| Error::Protocol(format!("counting this host's devices: {error}")))?;
+        // The host's devices, each architecture once.
         let mut devices: Vec<Device> = Vec::new();
-        for ordinal in 0..count {
-            let target = Target::of(platform::DeviceId(ordinal)).map_err(|error| {
-                Error::Protocol(format!("reading device {ordinal}'s architecture: {error}"))
-            })?;
+        for target in host().map_err(Error::Protocol)? {
             if devices.iter().all(|device| device.arch != target) {
                 devices.push(Device {
                     arch: target.clone(),
@@ -310,6 +306,14 @@ impl Settings {
     }
 }
 
+/// Reads the architecture target of each of this host's devices
+/// ([`Target::arch`]): what `serve` builds for when no `--target` names one.
+///
+/// The executable that runs the command links the device driver and supplies
+/// this; the Program Server links none.
+/// It fails with the reason the driver could not report a device.
+pub type HostTargets<'a> = &'a dyn Fn() -> std::result::Result<Vec<Target>, String>;
+
 /// Runs the command. `serve --daemon` forks, so the caller has started no
 /// thread.
 ///
@@ -317,9 +321,9 @@ impl Settings {
 ///
 /// Fails when the server cannot start, the package cannot be installed, or the
 /// running server cannot be reached.
-pub fn run(args: Args) -> Result<()> {
+pub fn run(args: Args, host: HostTargets<'_>) -> Result<()> {
     match args.command {
-        Command::Serve(serve) => run_serve(*serve),
+        Command::Serve(serve) => run_serve(*serve, host),
         Command::Install { socket, package } => {
             let mut client = Client::connect(&socket_or_default(socket))?;
             let installed = client.install(&absolute(package))?;
@@ -346,14 +350,14 @@ pub fn run(args: Args) -> Result<()> {
             }
             Ok(())
         }
-        Command::Build(build) => run_build(*build),
+        Command::Build(build) => run_build(*build, host),
     }
 }
 
 /// Builds the key lists' modules into the store and prints one line per key:
 /// `ok`, the operator, the key and the backends that built it, or `FAILED`,
 /// the operator and the key. Every line is tab-separated.
-fn run_build(args: BuildArgs) -> Result<()> {
+fn run_build(args: BuildArgs, host: HostTargets<'_>) -> Result<()> {
     let python = absolute(args.python);
     if !python.is_file() {
         return Err(Error::Io(std::io::Error::new(
@@ -387,7 +391,7 @@ fn run_build(args: BuildArgs) -> Result<()> {
         python: Some(python),
         ..Settings::default()
     };
-    let config = settings.config(settings.devices()?);
+    let config = settings.config(settings.devices(host)?);
 
     let report = crate::build::build(
         &config,
@@ -434,7 +438,7 @@ fn run_build(args: BuildArgs) -> Result<()> {
 }
 
 /// Serves until the process is stopped.
-fn run_serve(serve: ServeArgs) -> Result<()> {
+fn run_serve(serve: ServeArgs, host: HostTargets<'_>) -> Result<()> {
     let socket = serve.settings.socket();
 
     // Forked before any thread exists.
@@ -454,7 +458,7 @@ fn run_serve(serve: ServeArgs) -> Result<()> {
         return Ok(());
     };
 
-    let config = serve.settings.config(serve.settings.devices()?);
+    let config = serve.settings.config(serve.settings.devices(host)?);
     let server = std::sync::Arc::new(ProgramServer::open(&config)?);
     if let Some(ready) = ready {
         ready.signal();

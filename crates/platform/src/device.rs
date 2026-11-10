@@ -83,10 +83,7 @@ impl Device {
     /// Retains `id`'s primary context and reads the device's fixed attributes.
     pub fn new(id: DeviceId) -> Result<Self> {
         let context = PrimaryContext::retain(id)?;
-        let architecture = (
-            id.attribute(DeviceAttribute::ComputeCapabilityMajor)?,
-            id.attribute(DeviceAttribute::ComputeCapabilityMinor)?,
-        );
+        let architecture = id.compute_capability()?;
         // The first call that needs the context finishes its initialization here, on this thread
         // and outside any capture. Without it the expert exchange cells (alltoall, megamoe) never
         // finish capturing their `expert_join` bucket: most likely the initialization then falls
@@ -186,6 +183,15 @@ impl DeviceId {
             "cuDeviceGetAttribute",
         )?;
         Ok(value)
+    }
+
+    /// The device's compute capability as `(major, minor)`: two attributes, read without
+    /// creating a context.
+    pub fn compute_capability(self) -> Result<(i32, i32)> {
+        Ok((
+            self.attribute(DeviceAttribute::ComputeCapabilityMajor)?,
+            self.attribute(DeviceAttribute::ComputeCapabilityMinor)?,
+        ))
     }
 
     pub fn uuid(self) -> Result<DeviceUuid> {

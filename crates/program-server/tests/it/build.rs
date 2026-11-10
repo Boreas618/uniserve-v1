@@ -609,7 +609,8 @@ fn build_store(
         python.to_str().unwrap(),
     ])
     .expect("the build command parses");
-    program_server::command::run(args).map_err(Box::new)
+    // `--target` names the architecture, so the host's devices are never read.
+    program_server::command::run(args, &|| Ok(Vec::new())).map_err(Box::new)
 }
 
 /// The installed revisions of the cubin package in a built store.

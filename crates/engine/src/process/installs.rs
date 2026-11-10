@@ -95,7 +95,9 @@ impl MainProcess {
             let device = platform::Device::new(ordinal)
                 .map_err(|error| invalid(format!("opening device {}: {error}", ordinal.0)))?;
             // `targets` holds each distinct architecture once, so a device's own is read from it.
-            let target = Target::of(ordinal)
+            let target = ordinal
+                .compute_capability()
+                .map(Target::arch)
                 .map_err(|error| invalid(format!("reading device {}: {error}", ordinal.0)))?;
             if !self.targets.contains(&target) {
                 return Err(invalid(format!("device {} has no build target", ordinal.0)));

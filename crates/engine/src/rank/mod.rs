@@ -268,7 +268,9 @@ impl ModelRunner {
         // The architecture-specific instruction set of every device the rank serves, each once.
         let mut targets: Vec<Target> = Vec::with_capacity(devices.len());
         for device in &devices {
-            let target = Target::of(*device)
+            let target = device
+                .compute_capability()
+                .map(Target::arch)
                 .with_context(|| format!("reading device {}'s architecture", device.0))?;
             if !targets.contains(&target) {
                 targets.push(target);

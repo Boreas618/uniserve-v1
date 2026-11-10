@@ -377,7 +377,7 @@ mod device {
             )?;
             let device = platform::Device::new(DEVICE)?;
             let stream = Stream::new(DEVICE)?;
-            let target = Target::of(DEVICE)?;
+            let target = Target::arch(DEVICE.compute_capability()?);
             let mut client = Client::connect(Path::new(&socket))?;
             let mut backends: BTreeMap<String, Vec<String>> = BTreeMap::new();
             for package in client.list()?.packages {

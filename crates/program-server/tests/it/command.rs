@@ -41,7 +41,7 @@ fn serve_takes_the_roots_the_targets_and_the_limits() {
 
     let devices = serve
         .settings
-        .devices()
+        .devices(&|| panic!("named targets read no host device"))
         .expect("named targets need no driver");
     assert_eq!(devices.len(), 1, "one --target is one device");
     assert_eq!(devices[0].arch.as_str(), "sm_100a");
