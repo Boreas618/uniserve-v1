@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::metrics::{EngineLabels, METRICS};
@@ -116,6 +116,28 @@ pub(crate) struct Replicas {
     /// The update layer, so a replica that loses its engine asks whether an
     /// update in flight owns that decision (§7.2, §7.4).
     pub(crate) updates: std::sync::Weak<crate::updates::driver::Driver>,
+    /// The new requests that wait for a replica to accept them: while
+    /// generation is paused, the engine sleeps, or no engine is ready
+    /// (`LeaderStatus::held`).
+    pub(crate) held: AtomicUsize,
+}
+
+/// Counts one new request in [`Replicas::held`] while it waits for a
+/// replica, whichever way the wait ends: served, failed, or dropped with its
+/// client.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn new(held: &'a AtomicUsize) -> Self {
+        held.fetch_add(1, Ordering::Relaxed);
+        Self(held)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Keeps deployment updates and replica recovery out of a daemon handoff.
@@ -239,6 +261,8 @@ impl Leader {
             {
                 return Ok(Arc::clone(replica));
             }
+            // The request waits on every replica at once, and counts once.
+            let _waiting = Waiting::new(&self.replicas.held);
             let mut ready: futures::stream::FuturesUnordered<_> = replicas
                 .into_iter()
                 .map(|replica| async move { replica.hold.ready(None).await.map(|_| replica) })
@@ -334,6 +358,7 @@ impl Leader {
         state.replacing = self.replicas.replacing.try_lock().is_err()
             || states.iter().any(|state| state.replacing);
         state.in_flight = states.iter().map(|state| state.in_flight).sum();
+        state.held = self.replicas.held.load(Ordering::Relaxed);
         state
     }
 
@@ -1077,6 +1102,7 @@ impl Leader {
             replacing: tokio::sync::Mutex::new(()),
             adapters: Arc::clone(&adapters),
             updates: Arc::downgrade(&updates),
+            held: AtomicUsize::new(0),
         });
         for replica in replicas.serving.borrow().iter() {
             replica.monitor();
@@ -1801,8 +1827,31 @@ pub struct LeaderStatus {
     pub replacing: bool,
     /// The requests the serving engine has in flight.
     pub in_flight: usize,
+    /// The new requests the daemon holds before any engine takes them: while
+    /// generation is paused, the engine sleeps, or no engine is ready.
+    pub held: usize,
+    /// The launch generation of the main process that serves (the scheduler
+    /// node's, for a worker group over several hosts); `None` while none
+    /// serves, or for an engine this daemon did not start. It names that
+    /// process's row in `GET /admin/config`'s `processes`.
+    pub generation: Option<u64>,
+    /// The parked standby beside the serving engine (`worker_config.standby`),
+    /// `None` while there is none.
+    pub standby: Option<StandbyStatus>,
     /// The executable the serving engine and its workers run.
     pub executable: Option<String>,
+}
+
+/// The parked standby of [`LeaderStatus::standby`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct StandbyStatus {
+    /// The launch generation of each of its main processes, one per host in
+    /// the world's order: the serving `generation` a promotion leaves is its
+    /// first.
+    pub generations: Vec<u64>,
+    /// Whether it holds the epoch's programs and captured its graphs, so that
+    /// a promotion has nothing left to build.
+    pub prepared: bool,
 }
 
 /// How the requests in flight continue through an in-place weight update
@@ -3342,6 +3391,17 @@ impl Replica {
             asleep: self.asleep.load(Ordering::Acquire),
             replacing: self.replacing.try_lock().is_err(),
             in_flight: hold.client().map_or(0, |client| client.in_flight()),
+            // The leader's status counts the deployment's held requests.
+            held: 0,
+            generation: hold.client().and_then(|client| client.engine()),
+            standby: locked(&self.standby).as_ref().map(|standby| StandbyStatus {
+                generations: standby
+                    .generations
+                    .iter()
+                    .map(|(_, generation)| *generation)
+                    .collect(),
+                prepared: standby.prepared,
+            }),
             executable: locked(&self.served).as_ref().map(|args| {
                 args.engine_config
                     .worker

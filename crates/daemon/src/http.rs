@@ -641,6 +641,8 @@ mod tests {
         assert_eq!(body["deployment"]["deployment"], json!(SERVED_MODEL));
         assert_eq!(body["deployment"]["engine"], json!("ready"));
         assert_eq!(body["deployment"]["paused"], json!(false));
+        assert_eq!(body["deployment"]["held"], json!(0));
+        assert_eq!(body["deployment"]["standby"], json!(null));
 
         let (status, _, body) = send(&app, post_json("/admin/pause_generation", &json!({}))).await;
         assert_eq!(
@@ -662,12 +664,26 @@ mod tests {
                 .await
             }
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The status counts the request the daemon holds.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (_, _, body) = send(&app, get_request("/admin/status")).await;
+            if body["deployment"]["held"] == json!(1) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the held request is not reported: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(!waiting.is_finished(), "a paused deployment holds requests");
         let (status, _, _) = send(&app, post_json("/admin/continue_generation", &json!({}))).await;
         assert_eq!(status, StatusCode::OK);
         let (status, _, _) = waiting.await.unwrap();
         assert_eq!(status, StatusCode::OK);
+        let (_, _, body) = send(&app, get_request("/admin/status")).await;
+        assert_eq!(body["deployment"]["held"], json!(0));
 
         // Each operation started and succeeded in the log.
         let (_, _, body) = send(&app, get_request("/admin/events?after=0")).await;
