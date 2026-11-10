@@ -3242,6 +3242,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             checkpoints: Vec::new(),
             state_copies: Vec::new(),
             drafts: Vec::new(),
+            vision: Vec::new(),
         };
         self.staging
             .stage(&columns, &warm_call_ids(bucket), &bucket.shape(), bucket)
@@ -3849,6 +3850,7 @@ mod tests {
             checkpoints: Vec::new(),
             state_copies: Vec::new(),
             drafts: Vec::new(),
+            vision: Vec::new(),
         }
     }
 
@@ -3877,6 +3879,7 @@ mod tests {
             checkpoints: Vec::new(),
             state_copies: Vec::new(),
             drafts: Vec::new(),
+            vision: Vec::new(),
         }
     }
 
@@ -4009,6 +4012,7 @@ mod tests {
             checkpoints: Vec::new(),
             state_copies: Vec::new(),
             drafts: Vec::new(),
+            vision: Vec::new(),
         };
         columns.input_ids.truncate(count);
         staging.stage(

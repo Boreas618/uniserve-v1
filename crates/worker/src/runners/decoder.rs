@@ -1743,6 +1743,8 @@ mod tests {
             page_offloads: Vec::new(),
             latent_restores: Vec::new(),
             host_outputs: Vec::new(),
+            images: Vec::new(),
+            frees: Vec::new(),
             id: ipc::execution::BatchId(1),
             phase: ipc::PhaseId(0),
             calls: Vec::new(),

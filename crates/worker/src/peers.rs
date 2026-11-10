@@ -664,6 +664,8 @@ mod tests {
             page_offloads: Vec::new(),
             latent_restores: Vec::new(),
             host_outputs: Vec::new(),
+            images: Vec::new(),
+            frees: Vec::new(),
             media: None,
         }
     }

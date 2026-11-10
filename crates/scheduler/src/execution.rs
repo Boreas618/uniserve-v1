@@ -109,12 +109,14 @@ impl Scheduler {
             // The in-process arm has nothing to tell: the rows and buffers a
             // lifecycle command closes are this scheduler's own
             // pools, so the command is answered here, where it would have been
-            // submitted. Its `Finish` and `Free` have nothing left to reach. A batch that carries
-            // page offloads, of the host KV cache or of a preempted trajectory, is work for the
-            // worker and goes to it.
+            // submitted. Its `Finish` has nothing left to reach, nor its `Free` unless a rank
+            // holds image features, whose storage is the rank's (`Batch::frees`). A batch that
+            // carries page offloads, of the host KV cache or of a preempted trajectory, is work
+            // for the worker and goes to it.
             if batch.requests.is_empty()
                 && batch.page_offloads.is_none()
                 && self.worker.serves_in_process()
+                && !(self.holds_image_features() && !crate::submission::frees(&batch).is_empty())
             {
                 self.acknowledge_commands(&batch.commands);
                 // Nothing went to a worker, so no result will ever end this batch: it leaves
@@ -306,6 +308,14 @@ impl Scheduler {
                 self.inflight.pending_submissions.push_back(batch);
             }
         }
+    }
+
+    /// Whether a rank of this scheduler holds image features in storage of its own, which the
+    /// products' frees must reach (`Batch::frees`).
+    pub(super) fn holds_image_features(&self) -> bool {
+        self.info
+            .image_encoders
+            .contains_key(crate::encodings::VISION_FEATURES)
     }
 
     pub(super) fn step_nonblocking(&mut self) -> bool {

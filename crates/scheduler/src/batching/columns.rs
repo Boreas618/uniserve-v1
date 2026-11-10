@@ -274,6 +274,7 @@ pub(crate) fn columns(
     let mut parameters: Vec<f32> = Vec::new();
     let mut draw_addresses: Vec<ipc::philox::DrawAddress> = Vec::new();
     let drafts: Vec<ipc::DraftWork> = requests.iter().map(|(call, _)| call.draft).collect();
+    let mut vision: Vec<ipc::execution::VisionRows> = Vec::new();
     for (index, (call, call_rows)) in requests.iter().enumerate() {
         let inputs = inputs.get(index)?;
         let sampling = *sampling.get(index)?;
@@ -288,13 +289,19 @@ pub(crate) fn columns(
             .rows
             .iter()
             .try_fold(0u32, |total, row| total.checked_add(row.query_len))?;
-        if usize::try_from(tokens_of_call).ok()? != inputs.len() {
+        // The call's rows in context order: its input tokens, with each vision block's rows
+        // before the token it precedes.
+        let first = call.coordinates.logical_position;
+        let batch_token = u32::try_from(input_ids.len()).ok()?;
+        let context = Context::of(first, inputs, &call.vision_inputs, batch_token)?;
+        if usize::try_from(tokens_of_call).ok()? != context.ids.len() {
             return None;
         }
-
-        let first = call.coordinates.logical_position;
-        rows.positions
-            .extend(slots::positions_of(first, tokens_of_call)?);
+        rows.positions.extend_from_slice(&context.positions);
+        vision.extend(context.vision);
+        // A token's cache slot follows its cache position, which an image block's rows advance
+        // otherwise than its rotary position does; a text-only request's two are equal.
+        let cache_first = call.coordinates.cache_visible_len;
 
         // One `-1` per token whose row writes no cache page: the write decision
         // is per row, so it expands over the row's tokens here and nowhere else.
@@ -315,9 +322,9 @@ pub(crate) fn columns(
         let mapped = slots::slot_mapping_where(
             table,
             block_size,
-            first..first.checked_add(tokens_of_call)?,
+            cache_first..cache_first.checked_add(tokens_of_call)?,
             |position| {
-                let offset = usize::try_from(position - first).unwrap_or(usize::MAX);
+                let offset = usize::try_from(position - cache_first).unwrap_or(usize::MAX);
                 writes.get(offset).copied().unwrap_or(false)
             },
         );
@@ -362,7 +369,7 @@ pub(crate) fn columns(
         }
         let slot = i32::try_from(request).ok()?;
         slots.extend(std::iter::repeat_n(slot, call_rows.rows.len()));
-        input_ids.extend_from_slice(inputs);
+        input_ids.extend_from_slice(&context.ids);
         // One parameter row per row of the call, the same values: the
         // request's sampling parameters apply to every row it samples.
         let row = sampler_parameters(sampling);
@@ -379,9 +386,15 @@ pub(crate) fn columns(
             call.request_key.request_id.0,
             call.request_key.request_epoch,
         );
+        // A call with image blocks is one row, whose sampled token follows the logical end of
+        // its context.
         let mut end = u64::from(first);
         for row in &call_rows.rows {
-            end = end.checked_add(u64::from(row.query_len))?;
+            end = if call.vision_inputs.is_empty() {
+                end.checked_add(u64::from(row.query_len))?
+            } else {
+                u64::from(context.end)
+            };
             draw_addresses.push(ipc::philox::DrawAddress { key, position: end });
         }
 
@@ -454,7 +467,9 @@ pub(crate) fn columns(
         } else {
             0
         };
-        cells[commit::column::LOGICAL] = if explicit {
+        cells[commit::column::LOGICAL] = if explicit && !call.vision_inputs.is_empty() {
+            i64::from(context.end)
+        } else if explicit {
             i64::from(first).saturating_add(i64::from(query))
         } else if verify {
             i64::from(first)
@@ -518,7 +533,68 @@ pub(crate) fn columns(
         } else {
             drafts
         },
+        vision,
     })
+}
+
+/// One call's rows in context order, as the columns state them.
+struct Context {
+    /// The ids the embedding reads: an image block's rows carry zero, which the worker's feature
+    /// rows replace.
+    ids: Vec<i32>,
+    /// Each row's rotary position: a text token's logical position, and an image block's first
+    /// logical position on every row of the block.
+    positions: Vec<i32>,
+    /// The call's image blocks, at their batch token indices.
+    vision: Vec<ipc::execution::VisionRows>,
+    /// The logical position after the call's context.
+    end: u32,
+}
+
+impl Context {
+    /// The rows of a call at logical position `first` whose input tokens are `inputs` and whose
+    /// image blocks are `blocks`, the call's first row being the batch's token `batch_token`.
+    ///
+    /// Answers `None` for a block past the call's tokens or blocks out of order.
+    fn of(
+        first: u32,
+        inputs: &[i32],
+        blocks: &[ipc::VisionInput],
+        batch_token: u32,
+    ) -> Option<Self> {
+        let mut context = Self {
+            ids: Vec::with_capacity(inputs.len()),
+            positions: Vec::with_capacity(inputs.len()),
+            vision: Vec::with_capacity(blocks.len()),
+            end: first,
+        };
+        let mut blocks = blocks.iter().peekable();
+        for text in 0..=inputs.len() {
+            let text = u32::try_from(text).ok()?;
+            while let Some(block) = blocks.next_if(|block| block.offset == text) {
+                let token = batch_token.checked_add(u32::try_from(context.ids.len()).ok()?)?;
+                context.vision.push(ipc::execution::VisionRows {
+                    token,
+                    rows: block.rows,
+                    start: context.end,
+                    feature: block.feature.buffer_id(),
+                });
+                let start = i32::try_from(context.end).ok()?;
+                for _ in 0..block.rows {
+                    context.ids.push(0);
+                    context.positions.push(start);
+                }
+                context.end = context.end.checked_add(block.positions)?;
+            }
+            if let Some(id) = inputs.get(text as usize) {
+                context.ids.push(*id);
+                context.positions.push(i32::try_from(context.end).ok()?);
+                context.end = context.end.checked_add(1)?;
+            }
+        }
+        // A block whose offset no token reached is out of order or past the call's tokens.
+        blocks.peek().is_none().then_some(context)
+    }
 }
 
 /// The captured shape a batch of these columns is served from.
@@ -650,7 +726,9 @@ mod tests {
             dtype: proto::tensor::DType::I64,
             shape_bound: Default::default(),
         });
+        // A text call's cache rows start where its rotary positions do.
         call.coordinates.logical_position = position;
+        call.coordinates.cache_visible_len = position;
         call.input_token_ids = (0..query_lens.iter().sum()).map(|_| 1u32).collect();
         call
     }
@@ -870,6 +948,70 @@ mod tests {
         );
         assert_eq!(batch(9, 12)[0].uniform(), draws[0].uniform());
         assert_ne!(batch(1, 13)[0].uniform(), draws[0].uniform());
+    }
+
+    /// An image block's rows sit in the call's one row between the tokens around it: they embed
+    /// no id, rotate from the logical position after the text before them, take cache slots at
+    /// the call's cache positions, and the text after them continues the image's span later.
+    #[test]
+    fn an_image_block_takes_cache_rows_and_its_span_of_positions() {
+        // An earlier image left the cache two positions ahead of the rotary position.
+        let mut prefill_call = call(prefill(), 6, &[7]);
+        prefill_call.coordinates.cache_visible_len = 8;
+        prefill_call.input_token_ids = vec![1, 2, 3];
+        let feature = prefill_call.token_output.clone().unwrap();
+        prefill_call.vision_inputs = vec![ipc::VisionInput {
+            offset: 2,
+            feature: feature.clone(),
+            rows: 4,
+            positions: 2,
+        }];
+        let requests = vec![(prefill_call, dispatch(1, &[7], &[true]))];
+        let columns = columns(
+            &requests,
+            &tables_of(&requests),
+            &[vec![1, 2, 3]],
+            &[&sampling()],
+            &[0],
+            BLOCK_SIZE,
+            2048,
+            None,
+            &[],
+        )
+        .expect("a prefill batch with an image block");
+
+        assert_eq!(columns.input_ids, vec![1, 2, 0, 0, 0, 0, 3]);
+        assert_eq!(columns.rows.positions, vec![6, 7, 8, 8, 8, 8, 10]);
+        assert_eq!(
+            columns.vision,
+            vec![ipc::execution::VisionRows {
+                token: 2,
+                rows: 4,
+                start: 8,
+                feature: feature.buffer_id(),
+            }]
+        );
+        // Cache positions 8..15: pages 2 and 3 of the table, units 7 and 9.
+        let unit = |unit: i32, offset: i32| unit * BLOCK_SIZE as i32 + offset;
+        assert_eq!(
+            columns.rows.slot_mapping,
+            vec![
+                unit(7, 0),
+                unit(7, 1),
+                unit(7, 2),
+                unit(7, 3),
+                unit(9, 0),
+                unit(9, 1),
+                unit(9, 2)
+            ]
+        );
+        assert_eq!(commit_cell(&columns, commit::column::CACHE_LENGTH, 0), 15);
+        assert_eq!(
+            commit_cell(&columns, commit::column::LOGICAL, 0),
+            11,
+            "the sampled token follows the image's span"
+        );
+        assert_eq!(columns.draws[0].position, 11);
     }
 
     #[test]

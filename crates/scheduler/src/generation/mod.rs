@@ -159,25 +159,6 @@ pub(super) fn consumes_image_features(call: &Call) -> bool {
     call.kind == CallKind::Forward(ForwardMode::Prefill) && call.latent_feature_input.is_some()
 }
 
-/// Returns the forward rows a prefill `call` stages in its numerical call:
-/// one per vision block, and one per run of prompt tokens before, between or
-/// after its blocks; one for any other prefill.
-pub(super) fn prefill_rows(call: &Call) -> usize {
-    let mut rows = call.vision_inputs.len();
-    let mut text_start = 0u32;
-    for input in &call.vision_inputs {
-        if input.offset > text_start {
-            rows += 1;
-            text_start = input.offset;
-        }
-    }
-    let text = u32::try_from(call.input_token_ids.len()).unwrap_or(u32::MAX);
-    if text > text_start {
-        rows += 1;
-    }
-    rows.max(1)
-}
-
 /// Prompt extension, a context prefill, writes prompt tokens into the prefix cache together
 /// with the vision blocks of the input images between them
 /// (`Call::vision_inputs`): a prefill with no latent image extension. It
@@ -822,8 +803,11 @@ pub(crate) fn validate_generation_result(
     // A feature write must reach exactly `start + tokens` when the encoder
     // declared an exact token count, and otherwise stay within the call's
     // token capacity above `start`. A context prefill with vision blocks
-    // declares its exact extent: its prompt tokens and blocks.
-    if consumes_image_features(call) || !call.vision_inputs.is_empty() {
+    // writes the extent its columns state, its prompt tokens and blocks, which
+    // the request's progress advances by itself (`context_advance`): its rows
+    // are the batch's, and the rank reports positions rather than an extent
+    // of its own choosing.
+    if consumes_image_features(call) {
         let (start, num_cache_tokens) = image_cache.ok_or(GenerationResultError::Progress {
             detail: "image_kv_input_missing",
         })?;

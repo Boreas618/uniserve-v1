@@ -717,7 +717,11 @@ impl InProcess {
                     ))
                 });
         }
-        let (device, calls) = self.describe(&batch).map_err(WorkerSubmitError::Failed)?;
+        let (device, calls) = if batch.requests.is_empty() {
+            (self.frees_only(&batch), Vec::new())
+        } else {
+            self.describe(&batch).map_err(WorkerSubmitError::Failed)?
+        };
         let devices = self
             .batches
             .devices(&device)
@@ -836,17 +840,46 @@ impl InProcess {
     /// whose calls name no device phase or several, and columns that do not
     /// fit their shape are refused rather than served on invented values.
     ///
-    /// The batch's lifecycle commands do not travel: `ipc::execution::Batch`
-    /// has no field for them, because the resources such a command retires —
-    /// a request's row, its buffers, its pages — belong to this process's
-    /// worker once it holds the columns. A batch that completes reports no
-    /// command as failed, which the mechanism reads as its commands having
-    /// been applied.
+    /// Of the batch's lifecycle commands only its frees travel
+    /// (`Batch::frees`): a product's storage is the rank's, and the rank
+    /// releases it before it serves the batch. The other resources a command
+    /// retires — a request's row, its pages — belong to this process's worker
+    /// once it holds the columns. A batch that completes reports no command
+    /// as failed, which the mechanism reads as its commands having been
+    /// applied.
     fn describe(
         &self,
         batch: &ExecutionBatch,
     ) -> anyhow::Result<(DeviceBatch, Vec<(ipc::RequestKey, ipc::CallId)>)> {
         self.describe_with(batch, self.generation)
+    }
+
+    /// A batch of commands alone whose products the rank holds: the frees of image features,
+    /// served by the rank that encodes images, which releases them and answers no call.
+    fn frees_only(&self, batch: &ExecutionBatch) -> DeviceBatch {
+        let phase = wire_phase(ipc::CallKind::Media(ipc::MediaCall::VisionEncoding))
+            .unwrap_or(ipc::PhaseId(0));
+        DeviceBatch {
+            id: ipc::execution::BatchId(batch.id),
+            phase,
+            calls: Vec::new(),
+            shape: ipc::execution::Shape {
+                rows: 0,
+                tokens: 0,
+                variant: ipc::execution::Variant::ConditionEncode,
+            },
+            columns: Default::default(),
+            generation: self.generation,
+            cache_units: Vec::new(),
+            block_tables: Vec::new(),
+            page_loads: Vec::new(),
+            page_offloads: Vec::new(),
+            latent_restores: Vec::new(),
+            host_outputs: Vec::new(),
+            images: Vec::new(),
+            frees: frees(batch),
+            media: None,
+        }
     }
 
     /// The batch as the worker reads it, on generation `generation`.
@@ -934,8 +967,23 @@ impl InProcess {
         }
         let mut device = device.clone();
         device.generation = generation;
+        // The products whose last reader completed reach the rank that holds them.
+        device.frees = frees(batch);
         Ok((device, calls))
     }
+}
+
+/// The products a batch's commands release: the rank frees each before it serves the batch, its
+/// last reader having completed. The batch's other commands are the mechanism's own.
+pub(crate) fn frees(batch: &ExecutionBatch) -> Vec<ipc::BufferId> {
+    batch
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            ipc::BatchCommand::Free { buffer } => Some(*buffer),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The phase id the device worker addresses a batch by (2.4, 4.4).
@@ -1146,6 +1194,8 @@ mod tests {
             page_offloads: Vec::new(),
             latent_restores: Vec::new(),
             host_outputs: Vec::new(),
+            images: Vec::new(),
+            frees: Vec::new(),
             media: Some(media),
         });
     }

@@ -213,12 +213,21 @@ pub struct CanvasStep {
 /// attention block, before the call's input token `offset`: the call's
 /// context is its input tokens `[0, offset)`, then the block, then the
 /// tokens from `offset` on. Blocks sharing an offset follow in list order.
+///
+/// The block's `rows` take as many cache positions; its rows rotate from the
+/// logical position after the context before it, and the text after it
+/// continues `positions` logical positions later.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VisionInput {
     /// Input tokens of the call that precede the block.
     pub offset: u32,
     /// Vision-encoder features the block injects.
     pub feature: TensorRef,
+    /// Cache rows the block writes: the feature's rows.
+    pub rows: u32,
+    /// Logical positions the block advances the context by: its image's span when it is the
+    /// image's last block, zero otherwise.
+    pub positions: u32,
 }
 
 /// What a token call does for its request's draft cache, in a deployment

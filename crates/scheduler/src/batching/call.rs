@@ -172,22 +172,19 @@ impl Scheduler {
             Vec::new()
         };
 
-        let context_segments = if is_prompt_extend(&call) && !call.vision_inputs.is_empty() {
+        if is_prompt_extend(&call) && !call.vision_inputs.is_empty() {
             let segments = self.context_segments(request_id, &call);
-            let Some(segments) = segments.filter(|segments| {
+            if !segments.is_some_and(|segments| {
                 cache_lengths
                     .as_ref()
                     .is_some_and(|lengths| segments.iter().sum::<u32>() == lengths.input)
-            }) else {
+            }) {
                 self.invariant_broken(
                     "a context prefill's vision blocks are the request's next vision blocks",
                 );
                 return None;
-            };
-            segments
-        } else {
-            Vec::new()
-        };
+            }
+        }
 
         // What the call states to the device: its rows, the tables it reads
         // through, its fresh units and host page loads. The batch's device
@@ -273,19 +270,11 @@ impl Scheduler {
                         .map(|page| page.units().to_vec())
                 });
             }
-            // A context prefill with vision blocks appends one forward row per
-            // segment, in context order: the prompt tokens between blocks, and
-            // each block, which the worker evaluates as one attention block.
-            // Every other call that appends prefix cache has one row. Each row attends
-            // to the visible prefix and the rows before it, and persists its
-            // tokens in the prefix cache.
-            if !context_segments.is_empty() {
-                let mut end = lengths.visible;
-                for &segment in &context_segments {
-                    end += segment;
-                    layout.push(end, segment, true);
-                }
-            } else if lengths.input > 0 {
+            // A call that appends prefix cache has one row, a context prefill's
+            // vision blocks included: its prompt tokens and blocks in context
+            // order, one causal sequence over the visible prefix, which a
+            // recurrent layer advances through as through any prompt.
+            if lengths.input > 0 {
                 // A draft refill writes no cache of the target: its
                 // tokens' K/V are the request's already.
                 layout.push(
@@ -374,21 +363,14 @@ impl Scheduler {
         };
         call.component = entry;
 
-        // An image extension writes its block's prefix cache, and a context prefill
-        // with vision blocks exactly its bound: its prompt tokens and blocks.
-        let image_cache = if consumes_image_features(&call) || !call.vision_inputs.is_empty() {
+        // An image extension writes its block's prefix cache, whose extent its
+        // result is checked against.
+        let image_cache = if consumes_image_features(&call) {
             let Some(lengths) = cache_lengths else {
                 self.invariant_broken("an image extension declares its cache input range");
                 return None;
             };
-            Some((
-                lengths.visible,
-                if consumes_image_features(&call) {
-                    num_image_cache_tokens
-                } else {
-                    Some(lengths.input)
-                },
-            ))
+            Some((lengths.visible, num_image_cache_tokens))
         } else {
             None
         };

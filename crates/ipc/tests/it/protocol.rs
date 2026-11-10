@@ -192,7 +192,12 @@ fn validation_allows_shared_encoder_features_and_rejects_foreign_request_state()
     let mut feature = output_product(CallId::new(3, 0));
     feature.request_key = foreign_key;
     let mut call = ar_decode_call();
-    call.vision_inputs = vec![VisionInput { offset: 0, feature }];
+    call.vision_inputs = vec![VisionInput {
+        offset: 0,
+        feature,
+        rows: 4,
+        positions: 0,
+    }];
     call.validate().unwrap();
 
     // Only encoder features may belong to another request; the same tensor
@@ -433,6 +438,7 @@ fn token_batch() -> execution::Batch {
             checkpoints: Vec::new(),
             state_copies: Vec::new(),
             drafts: Vec::new(),
+            vision: Vec::new(),
         },
         generation: 3,
         cache_units: Vec::new(),
@@ -441,6 +447,8 @@ fn token_batch() -> execution::Batch {
         page_offloads: Vec::new(),
         latent_restores: Vec::new(),
         host_outputs: Vec::new(),
+        images: Vec::new(),
+        frees: Vec::new(),
         media: None,
     }
 }
@@ -889,6 +897,8 @@ fn a_batch_names_one_host_encoder_output_per_request() {
             (key_for_request(1), output.clone()),
             (key_for_request(1), output),
         ],
+        images: Vec::new(),
+        frees: Vec::new(),
         ..token_batch()
     };
     assert!(refusal(batch.validate()).contains("two host encoder outputs"));

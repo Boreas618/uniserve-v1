@@ -198,6 +198,32 @@ impl Scheduler {
                 self.config.max_num_batched_tokens
             ));
         }
+        // A vision block's features are one product of the rows it writes, which the rank's
+        // feature storage holds whole.
+        if let Some(row_bytes) = self
+            .info()
+            .image_encoders
+            .get(crate::encodings::VISION_FEATURES)
+            .map(|output| output.row_bytes)
+        {
+            let largest = req
+                .multimodal_inputs
+                .images
+                .iter()
+                .flat_map(|image| &image.encoders)
+                .filter(|input| input.encoder == crate::ImageEncoder::Vision)
+                .filter_map(|input| input.num_cache_tokens)
+                .max()
+                .unwrap_or(0);
+            let bytes = u64::from(largest).saturating_mul(row_bytes);
+            if bytes > self.generation_limits.max_vision_feature_bytes {
+                return Err(format!(
+                    "an input image's vision block of {largest} tokens takes {bytes} bytes of \
+                     features, beyond the {} bytes one encoding holds",
+                    self.generation_limits.max_vision_feature_bytes
+                ));
+            }
+        }
         if let Some(feature) = self.missing_required_feature(req) {
             return Err(format!(
                 "generation request requires worker feature `{feature}`, but the worker does not support it"

@@ -403,6 +403,12 @@ pub struct Batch {
     /// computing them, and an export writes the rows it computed to the reserved pages before the
     /// call completes.
     pub host_outputs: Vec<(crate::RequestKey, crate::HostOutput)>,
+    /// The images the batch's vision encodings read, by call: each encodes into the feature
+    /// product its call declares, which later prefills read ([`VisionRows`]).
+    pub images: Vec<ImageEncoding>,
+    /// The persistent products whose last reader has completed, which the rank releases before it
+    /// serves the batch (`crate::BatchCommand::Free`).
+    pub frees: Vec<crate::BufferId>,
     /// A media computation's columns, and `None` for every causal-LM batch.
     ///
     /// One batch is one computation (2.4): a media batch states its inputs here and carries no token
@@ -780,6 +786,35 @@ pub struct BatchColumns {
     /// (`crate::Call::draft`), which a worker that speculates with its model's drafter reads; empty
     /// for a batch whose calls draft nothing.
     pub drafts: Vec<crate::DraftWork>,
+    /// The image blocks the batch's prefill rows write, in token order: each block's token rows
+    /// carry no id the embedding reads, and the worker writes the feature product's rows there.
+    pub vision: Vec<VisionRows>,
+}
+
+/// One vision encoding of a batch: the image a call reads and the feature product it writes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageEncoding {
+    /// The request the call belongs to.
+    pub request: crate::RequestKey,
+    /// The image's encoded bytes, base64 (`crate::Call::input_image`).
+    pub image: std::sync::Arc<str>,
+    /// The feature product the call declares (`crate::Call::encoder_output`).
+    pub output: crate::BufferId,
+}
+
+/// One image block of a prefill batch: `rows` consecutive token rows from `token`, holding the
+/// rows of the vision-encoder product `feature`, which rotate from logical position `start`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisionRows {
+    /// The batch's token index of the block's first row.
+    pub token: u32,
+    /// The block's rows: the feature's rows, one cache position each.
+    pub rows: u32,
+    /// The logical position the block's first row rotates from: the position after the context
+    /// before it.
+    pub start: u32,
+    /// The feature product the rows are.
+    pub feature: crate::BufferId,
 }
 
 /// One copy of a request slot's recurrent state between its banks and a state page of the cache.

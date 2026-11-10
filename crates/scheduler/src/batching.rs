@@ -401,7 +401,7 @@ impl Scheduler {
                 // otherwise it waits for a later pass, as a call without
                 // resources does below.
                 let prefill = call.kind == CallKind::Forward(ForwardMode::Prefill);
-                if prefill && generation::prefill_rows(&call) > rows_left.context {
+                if prefill && rows_left.context == 0 {
                     if let Some(state) = self.running.get_mut(&id) {
                         state.num_cache_units_sent = state
                             .num_cache_units_sent
@@ -439,9 +439,7 @@ impl Scheduler {
                 if call.canvas.is_some() {
                     rows_left.canvas = rows_left.canvas.saturating_sub(1);
                 } else if prefill {
-                    rows_left.context = rows_left
-                        .context
-                        .saturating_sub(generation::prefill_rows(&call));
+                    rows_left.context = rows_left.context.saturating_sub(1);
                 }
 
                 // Identify the call by its batch and row, and stamp the
@@ -854,6 +852,9 @@ impl Scheduler {
                 .unwrap_or_default(),
             latent_restores: Vec::new(),
             host_outputs: Vec::new(),
+            images: Vec::new(),
+            // Stated at submission, which reads the batch's commands.
+            frees: Vec::new(),
             media: None,
         });
     }
@@ -971,6 +972,26 @@ impl Scheduler {
         stated.extent = extent;
         let mut requests = Vec::with_capacity(batch.requests.len());
         for (call, placed) in &batch.requests {
+            // A token request's vision encoding reads nothing of a video request's record: its
+            // image travels with the call (`Batch::images`).
+            if media_call == ipc::MediaCall::VisionEncoding
+                && call.input_image.is_some()
+                && self.running.contains_key(&call.request_key.request_id)
+            {
+                requests.push(ipc::execution::StagedRequest {
+                    request: call.request_key,
+                    conditioning: Vec::new(),
+                    step: 0,
+                    steps: 0,
+                    seed: 0,
+                    width: 0,
+                    height: 0,
+                    frames: 0,
+                    handed: 0,
+                    unit: 0,
+                });
+                continue;
+            }
             let Some(state) = self.running_media.get(&call.request_key.request_id) else {
                 tracing::debug!(
                     "a media batch is dropped: {:?} names a request this scheduler is not running",
@@ -1040,6 +1061,21 @@ impl Scheduler {
                         .map(|output| (call.request_key, output))
                 })
                 .collect(),
+            // A token request's vision encoding reads its image and writes the feature product
+            // its call declares.
+            images: batch
+                .requests
+                .iter()
+                .filter_map(|(call, _)| {
+                    Some(ipc::execution::ImageEncoding {
+                        request: call.request_key,
+                        image: call.input_image.clone()?,
+                        output: call.encoder_output.as_ref()?.buffer_id(),
+                    })
+                })
+                .collect(),
+            // Stated at submission, which reads the batch's commands.
+            frees: Vec::new(),
             media: Some(ipc::execution::MediaColumns::staged(stated, &requests)),
         });
     }

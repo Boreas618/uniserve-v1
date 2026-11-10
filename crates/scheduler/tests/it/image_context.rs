@@ -320,10 +320,11 @@ fn an_image_prompt_is_written_by_one_context_prefill() {
         feature.buffer_id()
     );
     assert_eq!(prefill.coordinates.cache_visible_len, 0);
-    // Text before the image, the image block, text after it.
-    assert_eq!(forward.query_lens, vec![10, 9, 6]);
-    assert_eq!(forward.seq_lens, vec![10, 19, 25]);
-    assert_eq!(forward.write_cache, vec![true, true, true]);
+    // Text before the image, the image block and text after it are one causal row.
+    assert_eq!(forward.query_lens, vec![25]);
+    assert_eq!(forward.seq_lens, vec![25]);
+    assert_eq!(forward.write_cache, vec![true]);
+    assert_eq!(prefill.vision_inputs[0].rows, 9);
     assert_eq!(calls[2].0.coordinates.cache_visible_len, 25);
 }
 
@@ -364,8 +365,8 @@ fn a_context_prefill_writes_every_image_it_reaches() {
             .collect::<Vec<_>>(),
         vec![(4, encodes[0]), (12, encodes[1])]
     );
-    assert_eq!(forward.query_lens, vec![4, 5, 8, 7, 8]);
-    assert_eq!(forward.seq_lens, vec![4, 9, 17, 24, 32]);
+    assert_eq!(forward.query_lens, vec![32]);
+    assert_eq!(forward.seq_lens, vec![32]);
 }
 
 /// The rows a worker stages per call bound numerical segments, even when one
@@ -466,7 +467,7 @@ fn a_context_chunk_ends_before_an_image_block_it_cannot_hold() {
         chunks,
         vec![
             (12, vec![], vec![12]),
-            (7, vec![0], vec![9, 7]),
+            (7, vec![0], vec![16]),
             (11, vec![], vec![11]),
         ]
     );

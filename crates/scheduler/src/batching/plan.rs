@@ -75,7 +75,7 @@ impl Scheduler {
         rows: PassRows,
     ) -> Option<Call> {
         let canvas_rows = rows.canvas;
-        let (logical_position, cache_visible_len) = self.scheduled_token_lengths(id)?;
+        let (_, cache_visible_len) = self.scheduled_token_lengths(id)?;
         let context_pending = self.running.get(&id).is_some_and(|st| {
             self.num_scheduled_prompt_tokens(id)
                 .is_some_and(|count| count < st.req.prompt_token_ids.len() as u32)
@@ -151,8 +151,10 @@ impl Scheduler {
                 let proposals = self.proposals_for(id, cache_visible_len);
                 // The cache holds the verified tokens and, for the drafter's
                 // chained steps, the positions of the drafts it proposes.
+                // The cache, not the rotary position, is what the tokens occupy: an image's
+                // block takes other counts of the two.
                 let capacity_target = decode_capacity_target(
-                    logical_position as usize,
+                    cache_visible_len as usize,
                     drafts.len() + proposals as usize,
                 );
                 if !self.ensure_decode_capacity(id, cache_visible_len as usize, capacity_target) {
@@ -207,9 +209,8 @@ impl Scheduler {
                 // attached as a host input only when no exact selected-point
                 // product is eligible for device continuation.
                 let input_token = st.next_token;
-                let pos = logical_position;
                 let relay_input = projected_successor || self.can_reuse_resolved_token_product(id);
-                let capacity_target = decode_capacity_target(pos as usize, 0);
+                let capacity_target = decode_capacity_target(cache_visible_len as usize, 0);
                 if !self.ensure_decode_capacity(id, cache_visible_len as usize, capacity_target) {
                     return None;
                 }
@@ -333,8 +334,8 @@ impl Scheduler {
     /// A context prefill holds prompt tokens and whole vision blocks, within
     /// the pass's `budget` and the long-prefill threshold; a block that would
     /// not fit waits for the next chunk, which it starts, and a chunk that
-    /// starts with a block may exceed the threshold within the budget. Its
-    /// forward rows (`generation::prefill_rows`) stay within `context_rows`.
+    /// starts with a block may exceed the threshold within the budget. It is
+    /// one forward row, which `context_rows` must leave room for.
     /// Returns `None` when nothing can be planned now, including when the
     /// next block does not fit this pass or the request's cache capacity is
     /// unavailable.
@@ -344,6 +345,9 @@ impl Scheduler {
         budget: usize,
         context_rows: usize,
     ) -> Option<Call> {
+        if context_rows == 0 {
+            return None;
+        }
         let cursor = self.num_scheduled_prompt_tokens(id)? as usize;
         let (_, cache_visible_len) = self.scheduled_token_lengths(id)?;
 
@@ -450,7 +454,6 @@ impl Scheduler {
             let prompt_len = state.req.prompt_token_ids.len();
             let mut end = cursor;
             let mut used = 0usize;
-            let mut rows = 0usize;
             let mut blocks = Vec::new();
             let mut block_tokens = 0u32;
             let sc = self.scheduled_context(id);
@@ -460,28 +463,24 @@ impl Scheduler {
             loop {
                 let next = state.input_block(block);
                 let text_stop = next.map_or(prompt_len, |(image, _)| image.position as usize);
-                // A run of prompt tokens is one forward row, as is a block.
-                let room = if rows < context_rows {
-                    limit.saturating_sub(used)
-                } else {
-                    0
-                };
-                let taken = text_stop.saturating_sub(end).min(room);
-                if taken > 0 {
-                    rows += 1;
-                }
+                let taken = text_stop
+                    .saturating_sub(end)
+                    .min(limit.saturating_sub(used));
                 end += taken;
                 used += taken;
-                let Some((_, input)) = next else {
+                let Some((image, input)) = next else {
                     break;
+                };
+                // An image's positions count once its last block is written.
+                let positions = if block.encoder + 1 == image.encoders.len() {
+                    image.num_positions
+                } else {
+                    0
                 };
                 let Some(feature) = state.context_features.get(in_flight + blocks.len()) else {
                     break;
                 };
-                if end < text_stop
-                    || input.encoder != crate::ImageEncoder::Vision
-                    || rows >= context_rows
-                {
+                if end < text_stop || input.encoder != crate::ImageEncoder::Vision {
                     break;
                 }
                 // Submission validated every vision block's exact cache length.
@@ -500,8 +499,9 @@ impl Scheduler {
                 blocks.push(VisionInput {
                     offset: u32::try_from(end - cursor).unwrap_or(u32::MAX),
                     feature: feature.clone(),
+                    rows: tokens,
+                    positions,
                 });
-                rows += 1;
                 used += tokens as usize;
                 block_tokens = block_tokens.saturating_add(tokens);
                 block = state.next_block(block)?;

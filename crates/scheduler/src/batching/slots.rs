@@ -168,6 +168,7 @@ pub(crate) fn query_offsets(query_lens: &[u32]) -> Option<Vec<i32>> {
 /// rows embed no host token (a decode keeps its token in the mechanism's own
 /// request state) still evaluates one position per row, so the count comes from
 /// the call's forward rows.
+#[cfg(test)]
 pub(crate) fn positions_of(first: u32, tokens: u32) -> Option<Vec<i32>> {
     let mut positions = Vec::with_capacity(usize::try_from(tokens).ok()?);
     for offset in 0..tokens {
