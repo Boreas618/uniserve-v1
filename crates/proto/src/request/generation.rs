@@ -858,7 +858,7 @@ pub struct CachePolicy {
     /// no public page (`write`), since its pages are neither epoch's. Its
     /// private continuation retains them for subsequent migrations.
     #[serde(default)]
-    pub state_seeds: Vec<u64>,
+    pub state_seeds: Vec<[u8; 32]>,
     /// Private recovered pages of a prior request. This is runtime
     /// provenance, independent of the content keys of shared cache pages.
     pub resume: Option<CacheResume>,
@@ -1424,7 +1424,7 @@ mod tests {
                 read: false,
                 write: false,
                 isolation_key: Some(91),
-                state_seeds: vec![5],
+                state_seeds: vec![[5; 32]],
                 resume: None,
             },
             image_generation: policy,

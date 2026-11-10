@@ -32,7 +32,6 @@ use ::storage::Key;
 use ::storage::protocol::{PageShape, Reply, Request};
 use ipc::{PageCopy, PagePoolInfo};
 use platform::{CopyBatch, DeviceAttribute, DeviceId, SourceOrder, Stream};
-use sha2::{Digest, Sha256};
 
 use super::plan::{CacheGroupPlan, CachePlan};
 use super::planes::{CachePlanes, UnitColumn};
@@ -95,60 +94,53 @@ pub(crate) fn token_bytes(plan: &CachePlan) -> u64 {
 
 /// The digest of the byte layout of `group`'s pages: the page encoding,
 /// the cache dtype and this group's shape and logical layers. It
-/// identifies the group's page pool (`PageShape::layout`).
+/// identifies the group's page pool (`PageShape::layout`) and is part of
+/// the group's page identity ([`page_identities`]).
 fn layout(plan: &CachePlan, group: usize) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"uniserve-page-layout\0");
-    digest.update(PAGE_ENCODING.to_le_bytes());
-    digest.update([u8::from(plan.quantized)]);
-    digest.update(plan.plane_bytes.to_le_bytes());
-    digest.update(plan.columns.to_le_bytes());
-    {
-        let entry = &plan.groups[group];
-        digest.update(entry.window.unwrap_or(0).to_le_bytes());
-        digest.update(entry.block_size.to_le_bytes());
-        digest.update((entry.layer_ids.len() as u64).to_le_bytes());
-        for layer in &entry.layer_ids {
-            digest.update(layer.to_le_bytes());
-        }
-        digest.update(entry.total_kv_heads.to_le_bytes());
-        digest.update(entry.head_dim.to_le_bytes());
-        digest.update(entry.dtype.name().as_bytes());
-        digest.update([0]);
-        // A state group's pages are its units' bytes, as many as its
-        // checkpoints fill.
-        if entry.state {
-            digest.update(b"state\0");
-            digest.update(entry.units_per_page.to_le_bytes());
-        }
+    let entry = &plan.groups[group];
+    let mut digest = ::storage::key::Digest::new(b"uniserve-page-layout");
+    digest.number(u64::from(PAGE_ENCODING));
+    digest.number(u64::from(plan.quantized));
+    digest.number(plan.plane_bytes);
+    digest.number(u64::from(plan.columns));
+    digest.number(u64::from(entry.window.unwrap_or(0)));
+    digest.number(u64::from(entry.block_size));
+    let layers: Vec<u64> = entry
+        .layer_ids
+        .iter()
+        .map(|&layer| u64::from(layer))
+        .collect();
+    digest.numbers(&layers);
+    digest.number(u64::from(entry.total_kv_heads));
+    digest.number(u64::from(entry.head_dim));
+    digest.text(entry.dtype.name());
+    // A state group's pages are its units' bytes, as many as its
+    // checkpoints fill.
+    if entry.state {
+        digest.text("state");
+        digest.number(u64::from(entry.units_per_page));
     }
-    digest.finalize().into()
+    digest.finish()
 }
 
-/// The digest of what determines a group's pages: its upstream component
-/// fingerprints and its own page layout. It seeds the group's page keys.
-fn content(fingerprint: &str, layout: &[u8; 32]) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"uniserve-page-content\0");
-    digest.update((fingerprint.len() as u64).to_le_bytes());
-    digest.update(fingerprint.as_bytes());
-    digest.update(layout);
-    digest.finalize().into()
-}
-
-/// The key seed of each of `plan`'s groups' page pools for a model of
-/// `fingerprint` (`HostKvCache::start` reports them).
-pub fn page_contents(plan: &CachePlan, fingerprints: &[String]) -> Vec<[u8; 32]> {
+/// The page identity of each of `plan`'s groups for a model whose weights
+/// are `fingerprint` (`PrefixCacheInfo::identities`): the weights and the
+/// group's page layout, as `|`-separated components. The engine seeds the
+/// group's page keys at every cache level from it (`storage::key::page_seed`),
+/// so a page computed by other weights or laid out otherwise is another
+/// page on the device, in the host page pools and in the KV storage.
+pub fn page_identities(plan: &CachePlan, fingerprint: &str) -> Vec<String> {
     (0..plan.groups.len())
-        .map(|group| content(&fingerprints[group], &layout(plan, group)))
+        .map(|group| {
+            let layout = ::storage::Key(layout(plan, group)).hex();
+            format!("{fingerprint}|page-layout:{layout}")
+        })
         .collect()
 }
 
 /// What a rank whose pages the engine copies through the host KV cache
 /// keeps until the engine sizes it (`uniserve.host_cache`).
 pub(crate) struct HostCacheSetup {
-    /// Each group's upstream component identities.
-    pub(crate) fingerprint: Vec<String>,
     /// Where an engine on another host reaches the host's Storage Server.
     pub(crate) endpoint: Option<String>,
     /// The cache's device.
@@ -172,7 +164,6 @@ impl HostCacheSetup {
             retained,
             cache.plan(),
             self.device,
-            &self.fingerprint,
             self.endpoint.as_deref(),
             tokens,
         )?;
@@ -186,8 +177,7 @@ impl HostKvCache {
     /// Storage Server, registered with `device`. A sliding-window group's
     /// pool holds the windows the engine offloads before aligned
     /// boundaries, page by page, as a full-attention group's holds every
-    /// published page. `fingerprint` is the pages' key digest
-    /// (`Fingerprints::pages`).
+    /// published page.
     /// Each group's pool holds the pages of `tokens` tokens, the count the
     /// engine sizes every rank of the epoch's host KV cache at; a pool the
     /// deployment already has for the same pages, which a previous epoch
@@ -197,7 +187,6 @@ impl HostKvCache {
         retained: &Retained,
         plan: &CachePlan,
         device: DeviceId,
-        fingerprints: &[String],
         endpoint: Option<&str>,
         tokens: u64,
     ) -> Result<(Self, Vec<PagePoolInfo>)> {
@@ -205,7 +194,6 @@ impl HostKvCache {
         let mut infos = Vec::new();
         for (index, group) in plan.groups.iter().enumerate() {
             let layout = layout(plan, index);
-            let content = content(&fingerprints[index], &layout);
             // The pool lies on the host NUMA node closest to the device, so
             // the copies between them cross no inter-node link.
             let numa_node = device
@@ -272,7 +260,6 @@ impl HostKvCache {
             infos.push(PagePoolInfo {
                 group_id: index as u32,
                 pool,
-                content,
                 endpoint: endpoint.map(str::to_owned),
             });
         }

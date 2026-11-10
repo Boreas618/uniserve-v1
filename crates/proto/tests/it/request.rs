@@ -86,7 +86,7 @@ fn generation() -> GenerationRequest {
             read: false,
             write: true,
             isolation_key: Some(99),
-            state_seeds: vec![7],
+            state_seeds: vec![[7; 32]],
             resume: Some(proto::request::CacheResume {
                 epoch: 3,
                 request_id: 5,

@@ -52,10 +52,12 @@ pub struct PrefixCacheInfo {
     pub inherited_start: u32,
     #[serde(default)]
     pub inherited_units: u32,
-    /// Upstream numerical component identities of each cache group, in
-    /// group order. Each string names its resident layers and their loading
-    /// inputs. Pipeline stages union these components; an unrelated group
-    /// or a downstream output head changes none of a group's keys.
+    /// The page identity of each cache group, in group order: `|`-separated
+    /// components naming the weights that compute the group's pages and the
+    /// pages' layout. Pipeline stages union these components; an unrelated
+    /// group or a downstream output head changes none of a group's keys. The
+    /// engine seeds the group's page keys from it at every cache level
+    /// (`storage::key::page_seed`); empty for a consumer without a model.
     #[serde(default)]
     pub identities: Vec<String>,
     /// The bytes one token of the rank's pages takes in the host KV cache,
@@ -72,25 +74,6 @@ pub struct PrefixCacheInfo {
 }
 
 impl PrefixCacheInfo {
-    /// One stable prefix-chain root per cache group. Empty declarations
-    /// denote unkeyed pools of protocol consumers without models.
-    pub fn seeds(&self) -> Vec<u64> {
-        use sha2::{Digest, Sha256};
-        (0..self.groups.len())
-            .map(|group| {
-                self.identities
-                    .get(group)
-                    .filter(|value| !value.is_empty())
-                    .map_or(0, |identity| {
-                        let digest = Sha256::digest(identity.as_bytes());
-                        let mut seed = [0; 8];
-                        seed.copy_from_slice(&digest[..8]);
-                        u64::from_le_bytes(seed)
-                    })
-            })
-            .collect()
-    }
-
     /// The units below the first segment given back: every unit of planes
     /// not split.
     pub fn allocatable_units(&self) -> u32 {
@@ -139,13 +122,9 @@ pub struct CacheTable {
 pub struct PagePoolInfo {
     /// The cache group whose pages the pool holds.
     pub group_id: u32,
-    /// The pool's identity at the rank's host's Storage Server.
+    /// The pool's identity at the rank's host's Storage Server. Its pages
+    /// are keyed by the group's page chain (`PrefixCacheInfo::identities`).
     pub pool: u64,
-    /// The digest of what determines the group's page encoding (the model
-    /// fingerprint, the page encoding version, the cache dtype, the block
-    /// size and the cache group list), which seeds the group's page keys;
-    /// equal on every rank of a group.
-    pub content: [u8; 32],
     /// Where an engine on another host reaches the pool's Storage Server
     /// (`StorageLaunch::tcp`).
     pub endpoint: Option<String>,

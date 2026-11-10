@@ -3,7 +3,7 @@
 //! Resident memory is device storage the epoch keeps until it retires: the KV
 //! cache planes, the latent pages, the retained weights and the encoder cache. Every one of
 //! them is an exclusive storage at the host's Storage Server, keyed by the
-//! inputs `crate::keys` composes, so a restarted main process of the same
+//! inputs `storage::key` composes, so a restarted main process of the same
 //! scope and epoch maps what its predecessor left instead of loading it
 //! again.
 
@@ -38,7 +38,7 @@ use crate::Result;
 /// Each owner is built by the process that knows its geometry and handed here,
 /// so that the main process holds one value for what a sleep gives back and a
 /// wake restores. The retained weights and the encoder cache join as their
-/// loaders publish; their storage is already keyed by `crate::keys`.
+/// loaders publish; their storage is already keyed by `storage::key`.
 pub struct Memory {
     /// The KV cache planes, their block tables and their host pages, or `None` on a rank that
     /// keeps no paged cache: a media rank's resident state is each request's own footprint.
@@ -202,6 +202,14 @@ impl Memory {
     pub fn host_token_bytes(&self) -> u64 {
         self.prefix_cache.as_ref().map_or(0, |cache| {
             prefix_cache::host::token_bytes(lock(cache).plan())
+        })
+    }
+
+    /// The page identity of each of this rank's cache groups for weights of `fingerprint`
+    /// (`PrefixCacheInfo::identities`); empty on a rank that keeps no paged cache.
+    pub fn page_identities(&self, fingerprint: &str) -> Vec<String> {
+        self.prefix_cache.as_ref().map_or_else(Vec::new, |cache| {
+            prefix_cache::host::page_identities(lock(cache).plan(), fingerprint)
         })
     }
 

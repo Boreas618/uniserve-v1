@@ -47,7 +47,7 @@ pub struct Kept {
     pub epoch: u64,
     /// The prefix seeds of the pages a token request continues with
     /// (`CachePolicy::state_seeds`), when the epochs' pages differ.
-    pub prefix_seeds: Option<Vec<u64>>,
+    pub prefix_seeds: Option<Vec<[u8; 32]>>,
     /// The latent seed of the trajectories a request continues with
     /// (`Trajectory::state_seed`: a video request's, or the image a token
     /// request had begun), when the epochs' trajectories differ.

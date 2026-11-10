@@ -188,11 +188,6 @@ impl PrefixCache {
         })
     }
 
-    /// Whether the rank copies pages through the host KV cache.
-    pub fn copies_pages(&self) -> bool {
-        self.pages.is_some()
-    }
-
     /// Copy pages through `cache` from now on, on the copy stream `stream`.
     pub(crate) fn set_host_kv_cache(&mut self, cache: HostKvCache, stream: Stream) -> Result<()> {
         let column = UnitColumn::bind(&self.planes, Some(&stream))?;

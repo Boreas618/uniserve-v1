@@ -542,7 +542,7 @@ impl Worker {
     pub fn map_host_cache(
         &self,
         tokens: u64,
-        keys: &crate::batch::HostCacheKeys,
+        keys: &crate::batch::HostCacheEndpoint,
     ) -> Result<Vec<ipc::PagePoolInfo>> {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
@@ -1191,7 +1191,6 @@ impl Device {
                 let client = self.storage()?;
                 for cache in self.caches() {
                     let setup = crate::memory::prefix_cache::host::HostCacheSetup {
-                        fingerprint: keys.fingerprints.clone(),
                         endpoint: keys.endpoint.clone(),
                         device: self.device,
                         copy: self.copy_stream.clone(),

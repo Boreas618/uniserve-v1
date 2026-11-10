@@ -112,7 +112,12 @@ impl From<&GenerationRequest> for wire::GenerationRequest {
                 read: request.cache.read,
                 write: request.cache.write,
                 isolation_key: request.cache.isolation_key,
-                state_seeds: request.cache.state_seeds.clone(),
+                state_seeds: request
+                    .cache
+                    .state_seeds
+                    .iter()
+                    .map(|seed| seed.to_vec())
+                    .collect(),
                 resume: request.cache.resume.map(|resume| wire::CacheResume {
                     epoch: resume.epoch,
                     request_id: resume.request_id,
@@ -226,7 +231,12 @@ impl TryFrom<wire::GenerationRequest> for GenerationRequest {
                 read: cache.read,
                 write: cache.write,
                 isolation_key: cache.isolation_key,
-                state_seeds: cache.state_seeds,
+                state_seeds: cache
+                    .state_seeds
+                    .iter()
+                    .map(|seed| <[u8; 32]>::try_from(seed.as_slice()))
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| WireError::new("a state seed is not 32 bytes"))?,
                 resume: cache.resume.map(|resume| CacheResume {
                     epoch: resume.epoch,
                     request_id: resume.request_id,

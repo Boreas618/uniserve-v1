@@ -21,13 +21,8 @@
 use std::collections::BTreeMap;
 
 use nn::{Backing, DType, RetainedWeights, Shape, WeightKey};
-use sha2::{Digest, Sha256};
 
 use crate::{Error, Result};
-
-/// The domain tag of a retained weight's key, so a weight's key can never collide with the key of
-/// another kind of storage this rank publishes (the cache's planes, the products, the latents).
-const WEIGHT_KEY_DOMAIN: &[u8] = b"uniserve-retained-weight\0";
 
 /// Where a rank's retained weights live: the Storage Server, behind the rank's client (§8).
 ///
@@ -115,13 +110,7 @@ impl<S: WeightStorage + ?Sized> WeightStorage for std::sync::Arc<S> {
 /// The digest covers [`nn::WeightKey`]'s canonical text, which is every file's identity, the
 /// element type, the layout name and the region - and nothing about which program reads it.
 pub fn retained_key(weight: &WeightKey) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(WEIGHT_KEY_DOMAIN);
-    // Length-prefixed, so no two canonical texts can be concatenated into one key.
-    let text = weight.to_string();
-    digest.update((text.len() as u64).to_le_bytes());
-    digest.update(text.as_bytes());
-    digest.finalize().into()
+    ::storage::key::weight(&weight.to_string()).0
 }
 
 /// One weight a model's load reached, in the load's order.

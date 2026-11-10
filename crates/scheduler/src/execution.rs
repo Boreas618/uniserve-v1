@@ -686,6 +686,7 @@ impl Scheduler {
         let device_hit = hit.cached_tokens.min(state.req.prompt_token_ids.len());
         if let admission::HostHit::Serving(boundary) = admission::host_prefix(
             &mut self.kv_offload,
+            self.storage.cache().map(|cache| &cache.coordinator),
             state,
             &target,
             device_hit,

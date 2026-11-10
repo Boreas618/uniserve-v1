@@ -379,7 +379,7 @@ impl Scheduler {
             max_reserved_cache_tokens: max_cache_tokens,
             prefix_page_hashes: Vec::new(),
             prefix_published: Vec::new(),
-            page_keys: Vec::new(),
+            host_keyed: false,
             offload_boundary: 0,
             generated_token_ids,
             round_token_ids,
@@ -1503,8 +1503,15 @@ impl Scheduler {
                 // continuing another epoch's state reads none: the host's
                 // pages are keyed by the epoch that serves.
                 let mut host_tokens = 0;
-                let mut answer =
-                    host_prefix(&mut self.kv_offload, head, &target, cached_tokens, n, 0);
+                let mut answer = host_prefix(
+                    &mut self.kv_offload,
+                    self.storage.cache().map(|cache| &cache.coordinator),
+                    head,
+                    &target,
+                    cached_tokens,
+                    n,
+                    0,
+                );
                 // A lookup is a round trip to this host's Storage Server, which answers well
                 // within a millisecond. Taking the answer at the next step instead admitted a burst
                 // of prompts one per step: GSM8K at 64 slots ran 1320 prefill batches with the
@@ -1519,8 +1526,15 @@ impl Scheduler {
                             kv_offload.poll();
                         }
                         std::thread::yield_now();
-                        answer =
-                            host_prefix(&mut self.kv_offload, head, &target, cached_tokens, n, 0);
+                        answer = host_prefix(
+                            &mut self.kv_offload,
+                            self.storage.cache().map(|cache| &cache.coordinator),
+                            head,
+                            &target,
+                            cached_tokens,
+                            n,
+                            0,
+                        );
                     }
                 }
                 match answer {
@@ -1845,12 +1859,7 @@ impl Scheduler {
         if !state.req.cache.read || state.has_context_images() || state.rebuilds_images() {
             return;
         }
-        state.page_keys = kv_offload.page_keys(
-            worker,
-            &state.req.prompt_token_ids,
-            state.req.cache.isolation_key,
-            state.req.prompt_token_ids.len(),
-        );
+        state.host_keyed = kv_offload.serves(worker);
         let computed = state.num_computed_prompt_tokens as usize;
         state.offload_boundary = computed;
         let Some((device, boundary)) = kv_offload.admit(id) else {
@@ -1945,13 +1954,14 @@ pub(super) enum HostHit {
 /// prompt token to compute, as in the device cache.
 pub(super) fn host_prefix(
     kv_offload: &mut Option<KvOffloadManager>,
+    coordinator: Option<&PrefixCacheCoordinator>,
     state: &RequestState,
     target: &(crate::WorkerGroupId, String),
     device_hit: usize,
     limit: usize,
     min_deepening: usize,
 ) -> HostHit {
-    let Some(kv_offload) = kv_offload.as_mut() else {
+    let (Some(kv_offload), Some(coordinator)) = (kv_offload.as_mut(), coordinator) else {
         return HostHit::Nothing;
     };
     let Some(step) = kv_offload.step(&target.0) else {
@@ -1967,11 +1977,11 @@ pub(super) fn host_prefix(
     if limit <= device_hit {
         return HostHit::Nothing;
     }
-    let keys = kv_offload.page_keys(
-        &target.0,
-        &state.req.prompt_token_ids,
-        state.req.cache.isolation_key,
-        limit,
+    // The host pools hold a page under the key the device cache chains it
+    // under: one chain, one key per page at every level.
+    let keys = coordinator.prefix_hashes(
+        &state.req.prompt_token_ids[..limit.min(state.req.prompt_token_ids.len())],
+        PrefixScope::of(&state.req.cache),
     );
     match kv_offload.admission(
         state.req.request_id,

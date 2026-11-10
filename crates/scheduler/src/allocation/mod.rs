@@ -204,7 +204,7 @@ impl PrefixCacheManager {
                     .map(GroupShape::from_group)
                     .collect(),
             );
-            coordinator.set_seeds(prefix_cache.seeds());
+            coordinator.set_seeds(crate::kv_cache::prefix_seeds(prefix_cache));
             PrefixCacheManager {
                 block_pool,
                 coordinator,

@@ -485,9 +485,9 @@ fn cache_stages_merge_into_the_narrowest_pool() {
     assert_eq!(merged.num_units, 1024);
     assert_eq!(merged.groups[0].layer_ids.len(), 16);
     assert_eq!(merged.groups[1].layer_ids, first.groups[1].layer_ids);
-    assert_eq!(merged.seeds(), second.merge(&first).unwrap().seeds());
-    assert_ne!(merged.seeds()[0], first.seeds()[0]);
-    assert_eq!(merged.seeds()[1], first.seeds()[1]);
+    assert_eq!(merged.identities, second.merge(&first).unwrap().identities);
+    assert_ne!(merged.identities[0], first.identities[0]);
+    assert_eq!(merged.identities[1], first.identities[1]);
 
     second.groups[1].units_per_page = 3;
     assert!(first.merge(&second).is_err());

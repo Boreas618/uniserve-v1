@@ -22,8 +22,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use sha2::{Digest, Sha256};
-
 use ipc::PhaseId;
 use ipc::execution::{
     Batch, Batches, Computation, EpochOperation, Extent, Fault, HostPools, Inventory, Submission,
@@ -208,17 +206,11 @@ fn held(planes: Option<&Arc<CachePlanes>>) -> serde_json::Value {
 /// The digest a set of weights is known by: what roots the prefix hash chains of the pages computed
 /// with them, so a page of another checkpoint never matches.
 pub fn identity_of(log: &[LoadedWeight]) -> String {
-    let mut digest = Sha256::new();
+    let mut digest = ::storage::key::Digest::new(b"uniserve-weights-identity");
     for weight in log {
-        let text = weight.key.to_string();
-        digest.update((text.len() as u64).to_le_bytes());
-        digest.update(text.as_bytes());
+        digest.text(&weight.key.to_string());
     }
-    digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    ::storage::Key(digest.finish()).hex()
 }
 
 impl DataPlane {
@@ -438,25 +430,14 @@ impl DataPlane {
         lock(&self.target).clone()
     }
 
-    /// The hexadecimal key seed of each of `rank`'s cache groups for weights of `identity`, when it
-    /// copies pages through a host KV cache; none when it keeps none, which keys nothing.
-    fn page_contents(rank: &Rank, identity: &str) -> Vec<String> {
-        let Some(cache) = rank
-            .cache
-            .as_ref()
-            .filter(|cache| lock(cache).copies_pages())
-        else {
+    /// The page identity of each of `rank`'s cache groups for weights of `identity`
+    /// (`PrefixCacheInfo::identities`); none for a rank that keeps no paged cache.
+    fn page_identities(rank: &Rank, identity: &str) -> Vec<String> {
+        let Some(cache) = rank.cache.as_ref() else {
             return Vec::new();
         };
         let plan = Arc::clone(lock(cache).planes());
-        let plan = plan.plan();
-        worker::memory::prefix_cache::host::page_contents(
-            plan,
-            &vec![identity.to_owned(); plan.groups.len()],
-        )
-        .iter()
-        .map(|content| content.iter().map(|byte| format!("{byte:02x}")).collect())
-        .collect()
+        worker::memory::prefix_cache::host::page_identities(plan.plan(), identity)
     }
 
     /// What the rank's pages are computed from, which keys them in the host KV cache: the identity
@@ -729,21 +710,19 @@ impl DataPlane {
             moved_weights.push((identity, load.pairs.len()));
             rank.serving = load.log;
         }
-        // The pages in the host KV cache were computed from the weights this replaces, so later
-        // pages are keyed by the new ones: a prompt no longer finds the old.
-        let contents_identity = self.identity_of_ranks();
+        // The cached pages were computed from the weights this replaces, so later pages are keyed
+        // by the new ones at every cache level: a prompt no longer finds the old.
+        let pages_identity = self.identity_of_ranks();
         let mut reports = Vec::with_capacity(moved_weights.len());
         for (rank, (identity, moved)) in self.ranks.iter().zip(moved_weights) {
             let rank = lock(rank);
-            let groups = Self::planes_of(&rank).map_or(0, |planes| planes.plan().groups.len());
-            let page_contents = Self::page_contents(&rank, &contents_identity);
+            let identities = Self::page_identities(&rank, &pages_identity);
             reports.push(
                 serde_json::json!({
                     "group": rank.storage.scope().group,
                     "rank": rank.storage.scope().rank,
                     "identity": identity,
-                    "identities": vec![identity.clone(); groups],
-                    "page_contents": page_contents,
+                    "identities": identities,
                     "moved": moved,
                 })
                 .to_string(),

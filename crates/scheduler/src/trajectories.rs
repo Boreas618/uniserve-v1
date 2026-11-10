@@ -43,9 +43,8 @@
 //! of the rank's pages of the trajectory
 //! (`storage::manifest::Storage::paged`): the digest of the logical regions
 //! of the samples its bytes hold and where they lie in it, with the content
-//! of the values, `SHA-256(
-//! "uniserve-latent-content" || seed || trajectory || steps)`: the latent
-//! seed of what the deployment's denoising computes ([`latent_seed`]: the
+//! of the values (`storage::key::latent_content` of the seed, the
+//! trajectory and its steps): the latent seed of what the deployment's denoising computes ([`latent_seed`]: the
 //! weights' values and the function and format identities of the denoising
 //! ranks' models), the trajectory's identity (`Trajectory::id` for a video
 //! request, [`image_trajectory`] for a token request's image) and the steps
@@ -93,7 +92,8 @@ use ipc::{
     RequestId, RequestKey,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use storage::key::latent_content as content;
+pub(crate) use storage::key::{image_trajectory, latent_seed};
 use storage::manifest::region::{Span, atoms};
 use storage::manifest::{Storage as PagedStorage, StorageLayout};
 use storage::protocol::{PageSlot, Reply, Request};
@@ -104,20 +104,6 @@ use crate::worker::WorkerGroupId;
 
 /// The version of [`Record`]: a record of another version names no pages.
 const RECORD_VERSION: u32 = 1;
-
-/// The identity that keys the trajectory of image `image_index` (from one)
-/// of a token request whose trajectory identity is `trajectory`
-/// (`GenerationRequest::trajectory`): each image of the request has a
-/// trajectory of its own, which its index among the request's images, a
-/// fact of the request, tells apart.
-pub(crate) fn image_trajectory(trajectory: u64, image_index: u32) -> u64 {
-    let mut digest = Sha256::new();
-    digest.update(b"uniserve-image-trajectory\0");
-    digest.update(trajectory.to_le_bytes());
-    digest.update(image_index.to_le_bytes());
-    let digest = digest.finalize();
-    u64::from_le_bytes(digest[..8].try_into().unwrap_or_default())
-}
 
 /// One denoising rank's host latent pool.
 #[derive(Clone)]
@@ -173,38 +159,6 @@ impl StoredRank {
     fn pages(&self) -> u64 {
         self.layout.bytes.div_ceil(self.pool.page_bytes.max(1))
     }
-}
-
-/// The latent seed of what a deployment's denoising computes, from the
-/// identities its denoising ranks report (`LatentPoolInfo::identity`): the
-/// first eight bytes of the SHA-256 of the distinct identities in order, so
-/// that every build derives the same seed from the same identities, and a
-/// parallel configuration of other ranks computing the same derives the
-/// same seed. Zero when no rank reports one.
-pub(crate) fn latent_seed<'a>(identities: impl IntoIterator<Item = &'a str>) -> u64 {
-    let distinct: std::collections::BTreeSet<&str> = identities.into_iter().collect();
-    if distinct.is_empty() {
-        return 0;
-    }
-    let mut digest = Sha256::new();
-    digest.update(b"uniserve-latent-seed\0");
-    for identity in distinct {
-        digest.update((identity.len() as u64).to_le_bytes());
-        digest.update(identity.as_bytes());
-    }
-    let digest = digest.finalize();
-    u64::from_le_bytes(digest[..8].try_into().unwrap_or_default())
-}
-
-/// The digest of what a trajectory's values are after `steps` steps: what
-/// computed them (`seed`) and the trajectory.
-fn content(seed: u64, trajectory: u64, steps: u32) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"uniserve-latent-content\0");
-    digest.update(seed.to_le_bytes());
-    digest.update(trajectory.to_le_bytes());
-    digest.update(steps.to_le_bytes());
-    digest.finalize().into()
 }
 
 /// The keys of the pages that hold a rank's part of a trajectory whose

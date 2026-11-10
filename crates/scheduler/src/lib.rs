@@ -85,7 +85,7 @@ pub use crate::worker::{
 };
 // The engine schedules requests in the request vocabulary its daemon
 // submits them in.
-pub use crate::kv_cache::{HostCacheSize, IndexedPage};
+pub use crate::kv_cache::{HostCacheSize, IndexedPage, prefix_seeds};
 #[cfg(feature = "testing")]
 pub use crate::service::{EpochPolicy, serve_requests};
 pub use crate::submission::Submissions;

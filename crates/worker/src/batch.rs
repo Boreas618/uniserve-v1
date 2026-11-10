@@ -253,12 +253,11 @@ impl std::fmt::Debug for Job {
     }
 }
 
-/// What a rank's pages are computed from, which keys them in the host KV cache: an epoch that
-/// computes the same pages finds what another epoch of the deployment left there.
+/// Where the host KV cache of a rank is reached: the rank's pages are keyed by the page identities
+/// it reports (`PrefixCacheInfo::identities`), so an epoch that computes the same pages finds what
+/// another epoch of the deployment left there.
 #[derive(Clone, Debug, Default)]
-pub struct HostCacheKeys {
-    /// Each cache group's upstream component identities, in group order.
-    pub fingerprints: Vec<String>,
+pub struct HostCacheEndpoint {
     /// Where an engine on another host reaches this rank's Storage Server.
     pub endpoint: Option<String>,
 }
@@ -281,7 +280,7 @@ pub struct Workers {
     /// before it is handed over rather than after the first batch finds none.
     inventory: Vec<Inventory>,
     /// What keys this rank's pages in the host KV cache, when the deployment keeps one.
-    host_cache: Option<HostCacheKeys>,
+    host_cache: Option<HostCacheEndpoint>,
 }
 
 impl Workers {
@@ -301,7 +300,7 @@ impl Workers {
 
     /// States that this rank keeps a host KV cache, with what keys its pages.
     #[must_use]
-    pub fn keeping_host_cache(mut self, keys: HostCacheKeys) -> Self {
+    pub fn keeping_host_cache(mut self, keys: HostCacheEndpoint) -> Self {
         self.host_cache = Some(keys);
         self
     }

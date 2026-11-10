@@ -1436,17 +1436,24 @@ fn promote_schedulers(promote: wire::Promote, routing: &Arc<Routing>) {
                                 pages: indexed
                                     .pages
                                     .iter()
-                                    .map(|page| crate::kv_cache::IndexedPage {
-                                        group: page.group,
-                                        hash: page.hash,
-                                        tokens: page.tokens.clone(),
-                                        units: page.units.clone(),
-                                        resume: page.resume.as_ref().map(|resume| {
-                                            proto::request::CacheResume {
-                                                epoch: resume.epoch,
-                                                request_id: resume.request_id,
-                                            }
-                                        }),
+                                    // A page whose key is not 32 bytes is no
+                                    // page of this build's chains: it is not
+                                    // imported, and a prompt computes it.
+                                    .filter_map(|page| {
+                                        Some(crate::kv_cache::IndexedPage {
+                                            group: page.group,
+                                            hash: storage::Key(
+                                                page.hash.as_slice().try_into().ok()?,
+                                            ),
+                                            tokens: page.tokens.clone(),
+                                            units: page.units.clone(),
+                                            resume: page.resume.as_ref().map(|resume| {
+                                                proto::request::CacheResume {
+                                                    epoch: resume.epoch,
+                                                    request_id: resume.request_id,
+                                                }
+                                            }),
+                                        })
                                     })
                                     .collect(),
                                 held_units: indexed.held_units,
@@ -1550,7 +1557,7 @@ fn park_schedulers(id: u64, lend: bool, front: usize, routing: &Arc<Routing>) {
                                     .into_iter()
                                     .map(|page| wire::IndexedPage {
                                         group: page.group,
-                                        hash: page.hash,
+                                        hash: page.hash.0.to_vec(),
                                         tokens: page.tokens,
                                         units: page.units,
                                         resume: page.resume.map(|resume| wire::CacheResume {

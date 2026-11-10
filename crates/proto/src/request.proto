@@ -163,10 +163,10 @@ message EngineInfo {
   // The KV cache segments of each worker group, which an engine that
   // succeeds this one on the same devices maps.
   repeated CacheSegments segments = 7;
-  // The roots of the prefix hash chains of the pages the engine's workers
-  // compute: equal between epochs whose models and numerics agree, whose
-  // pages a successor reuses.
-  repeated uint64 prefix_seeds = 10;
+  // The page seeds (32-byte keys) of the page chains of the cache groups
+  // the engine's workers compute: equal between epochs whose models,
+  // numerics and page layouts agree, whose pages a successor reuses.
+  repeated bytes prefix_seeds = 10;
   // The seed of the keys of the latent trajectories the engine's denoiser
   // (a video model's, or an image model's) stores at preemption: equal
   // between epochs whose denoising computes the same, which continue each
@@ -605,11 +605,12 @@ message UnitRange {
   uint32 end = 2;
 }
 
-// One published page: its cache group, its chained hash, its tokens and its
-// units in the planes of the engine that published it.
+// One published page: its cache group, its page key (32 bytes, the key of
+// its page chain), its tokens and its units in the planes of the engine
+// that published it.
 message IndexedPage {
   uint32 group = 1;
-  uint64 hash = 2;
+  bytes hash = 2;
   repeated uint32 tokens = 3;
   repeated uint32 units = 4;
   // Absent for public reuse; present for a private continuation of these units.
@@ -802,9 +803,9 @@ message CachePolicy {
   bool read = 1;
   bool write = 2;
   optional uint64 isolation_key = 3;
-  // The prefix seeds of the epoch whose state a migrated request continues
-  // with (an epoch change's `in_flight = keep`).
-  repeated uint64 state_seeds = 6;
+  // The page seeds (32 bytes each) of the epoch whose state a migrated
+  // request continues with (an epoch change's `in_flight = keep`).
+  repeated bytes state_seeds = 6;
   CacheResume resume = 5;
 }
 

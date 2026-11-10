@@ -263,7 +263,7 @@ impl Worker for Segmented {
                 serde_json::Value::Null
             }
             EpochOperation::UpdateWeights => {
-                serde_json::json!({ "group": null, "page_contents": [] })
+                serde_json::json!({ "group": null })
             }
             EpochOperation::AdoptCache { .. } => serde_json::json!({ "inherited": 0 }),
             other => anyhow::bail!("no storage operation {other:?}"),

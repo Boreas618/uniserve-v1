@@ -25,7 +25,6 @@ use ::storage::Key;
 use ::storage::protocol::{PageShape, Reply, Request};
 use ipc::{LatentPageCopy, LatentPoolInfo, LatentPoolRef};
 use platform::{DeviceAttribute, DeviceId};
-use sha2::{Digest, Sha256};
 
 use crate::memory::allocation::Backing;
 use crate::memory::allocation::ElementType;
@@ -96,13 +95,11 @@ pub struct LatentHostPool {
 /// The digest of the byte layout of a pool's pages: the page encoding, the
 /// values' element type and the values of a page.
 fn layout(pages: &BankPages) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"uniserve-latent-page-layout\0");
-    digest.update(PAGE_ENCODING.to_le_bytes());
-    digest.update(pages.dtype.name().as_bytes());
-    digest.update([0]);
-    digest.update(pages.page_values.to_le_bytes());
-    digest.finalize().into()
+    let mut digest = ::storage::key::Digest::new(b"uniserve-latent-page-layout");
+    digest.number(u64::from(PAGE_ENCODING));
+    digest.text(pages.dtype.name());
+    digest.number(u64::from(pages.page_values));
+    digest.finish()
 }
 
 /// The digest of what determines the rank's share of every request's
@@ -111,13 +108,11 @@ fn layout(pages: &BankPages) -> [u8; 32] {
 /// video worker's statement of its plan and the rank's share of the
 /// denoiser).
 fn rank_region(pages: &BankPages, region: &str) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"uniserve-latent-region\0");
-    digest.update(layout(pages));
-    digest.update(pages.trajectory_pages.to_le_bytes());
-    digest.update((region.len() as u64).to_le_bytes());
-    digest.update(region.as_bytes());
-    digest.finalize().into()
+    let mut digest = ::storage::key::Digest::new(b"uniserve-latent-region");
+    digest.bytes(&layout(pages));
+    digest.number(u64::from(pages.trajectory_pages));
+    digest.text(region);
+    digest.finish()
 }
 
 /// The digest that identifies the rank's pool (`PageShape::layout`): the

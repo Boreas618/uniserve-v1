@@ -22,7 +22,7 @@ pub(super) struct Warming {
 pub(super) struct Reserved {
     pub(super) page: Page,
     pub(super) reference: PageRef,
-    pub(super) hash: u64,
+    pub(super) hash: storage::Key,
     pub(super) tokens: Vec<u32>,
     pub(super) source: Arc<ipc::MainProcessEndpoint>,
     pub(super) resume: proto::request::CacheResume,
@@ -315,7 +315,12 @@ impl Scheduler {
                 cached: 0,
                 isolation_key: state.req.cache.isolation_key,
                 state_seeds: if state.req.cache.state_seeds.is_empty() {
-                    cache.coordinator.seeds().to_vec()
+                    cache
+                        .coordinator
+                        .seeds()
+                        .iter()
+                        .map(|seed| seed.0)
+                        .collect()
                 } else {
                     state.req.cache.state_seeds.clone()
                 },

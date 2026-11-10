@@ -377,8 +377,13 @@ pub(super) fn schedulers(
     // it, with the model's facts, and the limits this rank captured.
     let (args, limits) = model_runner.scheduler_args(launch, model, host_cache)?;
     let mut rank = rank.clone();
-    if host_cache && let Some(cache) = rank.prefix_cache.as_mut() {
-        cache.host_token_bytes = memory.host_token_bytes();
+    if let Some(cache) = rank.prefix_cache.as_mut() {
+        // Every cache level keys the rank's pages from the weights it serves and the pages'
+        // layout (`storage::key::page_seed`).
+        cache.identities = memory.page_identities(&data.serving_identity()?);
+        if host_cache {
+            cache.host_token_bytes = memory.host_token_bytes();
+        }
     }
 
     // The scheduler submits through the same devices this process drives, so a batch and a
@@ -413,10 +418,7 @@ pub(super) fn schedulers(
     let mut stated = worker::batch::Workers::shared(workers.iter().map(Arc::clone).collect())?
         .stating(vec![inventory]);
     if host_cache {
-        stated = stated.keeping_host_cache(worker::batch::HostCacheKeys {
-            fingerprints: vec![data.serving_identity()?; memory.cache_groups()],
-            endpoint: None,
-        });
+        stated = stated.keeping_host_cache(worker::batch::HostCacheEndpoint { endpoint: None });
     }
     let batches: Arc<dyn ipc::execution::Batches> = Arc::new(crate::data_plane::RankBatches {
         workers: stated,

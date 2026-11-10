@@ -99,7 +99,7 @@ pub(crate) enum Command {
     /// because the copy stream the pages then move on belongs to the cache this thread drives.
     MapHostCache {
         tokens: u64,
-        keys: crate::batch::HostCacheKeys,
+        keys: crate::batch::HostCacheEndpoint,
         pools: Arc<std::sync::Mutex<Vec<ipc::PagePoolInfo>>>,
     },
     /// Copy published pages to the host KV cache, with no batch to carry them.

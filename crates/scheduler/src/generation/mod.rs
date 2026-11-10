@@ -1553,16 +1553,17 @@ pub(crate) struct RequestState {
     /// Worst-case cache token extent computed at submission; its units are
     /// reserved only when `reserve_worstcase` is set.
     pub(super) max_reserved_cache_tokens: usize,
-    /// Per-group chained hashes of the complete prompt pages, retained for
-    /// publishing reusable prompt pages as prefill completes.
-    pub(super) prefix_page_hashes: Vec<Vec<u64>>,
+    /// Per-group page keys of the complete prompt pages, retained for
+    /// publishing reusable prompt pages as prefill completes; every cache
+    /// level keys the pages by them.
+    pub(super) prefix_page_hashes: Vec<Vec<storage::Key>>,
     /// Per group, the leading prompt pages already published to the prefix
     /// cache, or reused from it.
     pub(super) prefix_published: Vec<usize>,
-    /// The host KV cache's keys of the request's full prompt pages, by cache
-    /// group, when the host KV cache serves its prefill worker
-    /// (`KvOffloadManager::page_keys`).
-    pub(super) page_keys: Vec<Vec<storage::Key>>,
+    /// Whether the host KV cache serves the request's prefill worker and the
+    /// request reads it: its published pages are offloaded there under
+    /// their page keys (`prefix_page_hashes`).
+    pub(super) host_keyed: bool,
     /// The prompt tokens through which the request's sliding windows were
     /// considered for offload: the aligned boundaries after it are still to
     /// come.

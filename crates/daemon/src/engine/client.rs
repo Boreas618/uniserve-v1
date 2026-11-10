@@ -46,9 +46,10 @@ pub struct EngineInfo {
     /// take scheduling limits in place; `None` from an engine that does not
     /// state it.
     pub capacity: Option<wire::BatchCapacity>,
-    /// The root of the prefix hash chains of the pages the engine's workers
-    /// compute: equal between epochs whose models and numerics agree.
-    pub prefix_seeds: Vec<u64>,
+    /// The page seeds of the page chains the engine's workers compute
+    /// (`storage::key::page_seed`): equal between epochs whose models,
+    /// numerics and page layouts agree.
+    pub prefix_seeds: Vec<[u8; 32]>,
     /// The seed of the keys of the trajectories the engine stores at
     /// preemption (a video request's, or an image's): equal between epochs
     /// whose denoising computes the same; zero without a denoiser or host
@@ -65,7 +66,13 @@ impl From<wire::EngineInfo> for EngineInfo {
             schedulers: info.schedulers,
             segments: info.segments,
             capacity: info.capacity,
-            prefix_seeds: info.prefix_seeds,
+            // A seed of another length is no engine's: the build checks keep
+            // daemons and engines of one wire version.
+            prefix_seeds: info
+                .prefix_seeds
+                .iter()
+                .filter_map(|seed| <[u8; 32]>::try_from(seed.as_slice()).ok())
+                .collect(),
             latent_seed: info.latent_seed,
         }
     }

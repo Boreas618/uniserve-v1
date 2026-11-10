@@ -414,12 +414,12 @@ impl MainProcess {
             }),
             segments,
             prefix_seeds: info.prefix_cache.as_ref().map_or_else(Vec::new, |cache| {
-                cache
-                    .seeds()
+                scheduler::prefix_seeds(cache)
                     .into_iter()
                     .zip(&cache.groups)
                     .filter_map(|(seed, group)| {
-                        (!matches!(group.kind, ipc::CacheGroupKind::Draft)).then_some(seed)
+                        (!matches!(group.kind, ipc::CacheGroupKind::Draft))
+                            .then_some(seed.0.to_vec())
                     })
                     .collect()
             }),

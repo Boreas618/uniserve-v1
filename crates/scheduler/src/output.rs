@@ -1878,14 +1878,13 @@ impl Scheduler {
         let prompt = std::mem::take(&mut state.req.prompt_token_ids);
         let generated_tokens = std::mem::take(&mut state.generated_token_ids);
         let mut hashes = std::mem::take(&mut state.prefix_page_hashes);
-        let mut page_keys = std::mem::take(&mut state.page_keys);
         let mut published = std::mem::take(&mut state.prefix_published);
         let published_before = published.clone();
         let visible = state.cache_visible_len as usize;
         let draft_valid = state.draft.valid as usize;
         let cache_write =
             state.req.cache.write && !state.has_context_images() && !state.rebuilds_images();
-        let isolation_key = state.req.cache.isolation_key;
+        let host_keyed = state.host_keyed;
         let cache_policy = state.req.cache.clone();
         let scope = crate::kv_cache::PrefixScope::of(&cache_policy);
         // Past its prompt, the cache of a request that generates text alone
@@ -1921,11 +1920,6 @@ impl Scheduler {
             prefix_cache
                 .coordinator
                 .extend_hashes(&mut hashes, tokens, scope);
-            if let Some((kv_offload, worker)) = kv_offload.as_ref()
-                && !page_keys.is_empty()
-            {
-                kv_offload.extend_page_keys(worker, &mut page_keys, tokens, isolation_key);
-            }
         }
 
         let mut reserved = Vec::new();
@@ -1967,7 +1961,7 @@ impl Scheduler {
                     PublishedPages {
                         tokens,
                         hashes: &hashes,
-                        page_keys: &page_keys,
+                        page_keys: if host_keyed { &hashes } else { &[] },
                         before: &published_before,
                         after: &published,
                     },
@@ -1998,7 +1992,6 @@ impl Scheduler {
         state.req.prompt_token_ids = prompt;
         state.generated_token_ids = generated_tokens;
         state.prefix_page_hashes = hashes;
-        state.page_keys = page_keys;
         state.prefix_published = published;
         if !advanced {
             self.invariant_broken("an admitted request's cache tables match the cache groups");
@@ -2012,7 +2005,7 @@ impl Scheduler {
 /// group published before and after the call just accepted.
 struct PublishedPages<'a> {
     tokens: CachedTokens<'a>,
-    hashes: &'a [Vec<u64>],
+    hashes: &'a [Vec<storage::Key>],
     page_keys: &'a [Vec<storage::Key>],
     before: &'a [usize],
     after: &'a [usize],

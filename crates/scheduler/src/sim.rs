@@ -895,7 +895,7 @@ impl Worker for SimWorker {
             | EpochOperation::Sleep
             | EpochOperation::Wake => serde_json::Value::Null,
             EpochOperation::UpdateWeights => {
-                serde_json::json!({ "group": null, "page_contents": [] })
+                serde_json::json!({ "group": null })
             }
             EpochOperation::AdoptCache { .. }
             | EpochOperation::PublishCache { .. }

@@ -44,7 +44,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use ipc::{CallId, EncoderPoolInfo, HostOutput, RequestKey};
-use storage::key::Digest;
+use storage::key::{encoder_output as content, encoder_page as page_key};
 use storage::protocol::{PageSlot, Reply, Request};
 use storage::{Key, Scope};
 
@@ -97,24 +97,6 @@ pub(crate) struct RankEncoders<'a> {
     /// Whether the rank runs on the engine's host.
     pub local: bool,
     pub pool: &'a EncoderPoolInfo,
-}
-
-/// The key of page `page` of an output whose content key is `content`.
-fn page_key(content: &[u8; 32], page: u32) -> Key {
-    let mut digest = Digest::new(b"encoder-page");
-    digest.bytes(content);
-    digest.number(u64::from(page));
-    Key(digest.finish())
-}
-
-/// The content key of output `name`, computed by `identity` from what
-/// `inputs` digests.
-fn content(name: &str, identity: &str, inputs: &[u8; 32]) -> [u8; 32] {
-    let mut digest = Digest::new(b"encoder-output");
-    digest.text(name);
-    digest.text(identity);
-    digest.bytes(inputs);
-    digest.finish()
 }
 
 /// Where an output's lookup stands.

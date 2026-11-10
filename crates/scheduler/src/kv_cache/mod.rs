@@ -31,11 +31,12 @@
 //!   them. After a call completes, [`PrefixCacheCoordinator::release_window`]
 //!   retires the pages that lie entirely before the oldest history position
 //!   any later reader needs.
-//! - Prefix identity: a published page is keyed by a chained 64-bit hash per
-//!   group, but a match also requires equal tokens, the same group and the
-//!   same loaded `MainProcessEndpoint`. The token comparison guards against hash
-//!   collisions, and the endpoint comparison confines reuse to the loaded
-//!   worker incarnation that computed and retains the page.
+//! - Prefix identity: a published page is keyed by its page key, the
+//!   group's chain of 256-bit keys (`storage::key::page_key`) under which the
+//!   host page pools and the KV storage hold the same page, but a match also
+//!   requires equal tokens, the same group and the same loaded
+//!   `MainProcessEndpoint`. The endpoint comparison confines reuse to the
+//!   loaded worker incarnation that computed and retains the page.
 //! - Reuse: each group's attention type has a manager ([`manager`]) that
 //!   says which pages a reuse at a boundary needs: every full-attention
 //!   page before it, and each sliding-window group's window of pages just
@@ -65,6 +66,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use ipc::MainProcessEndpoint;
 use ipc::{CacheGroup, UnitId};
+use storage::Key;
 
 use crate::lock;
 
@@ -87,31 +89,10 @@ pub(crate) use offload::{
 /// resumed by its tokens recomputes at most this many decoded tokens.
 pub(crate) const DEFAULT_STATE_INTERVAL: usize = 256;
 
-/// Computes an incremental per-page prefix hash with 64-bit FNV-1a.
-///
-/// `parent` is the hash of the preceding page (or the chain seed for the
-/// first page), so equal hashes identify equal complete prefixes up to hash
-/// collisions. `group_id` and `modality_tag` separate chains that hash the
-/// same tokens for different cache groups or modalities. FNV-1a is not
-/// collision resistant, so callers must still compare exact tokens before
-/// reusing a page.
-pub(crate) fn block_hash(parent: u64, group_id: u32, modality_tag: u8, tokens: &[u32]) -> u64 {
-    use std::hash::Hasher as _;
-
-    let mut hasher = fnv::FnvHasher::default();
-    hasher.write(&parent.to_le_bytes());
-    hasher.write(&group_id.to_le_bytes());
-    hasher.write(&[modality_tag]);
-    hasher.write(&(tokens.len() as u32).to_le_bytes());
-    for token in tokens {
-        hasher.write(&token.to_le_bytes());
-    }
-    hasher.finish()
-}
-
-/// The modality byte of a page hash: every published page holds text
-/// (understanding-branch) tokens. The byte is part of the page keys the host
-/// KV cache and KV storage find pages by, so its value is fixed.
+/// The modality byte of a page key: every published page holds text
+/// (understanding-branch) tokens. The byte is part of the page key every
+/// cache level finds pages by (`storage::key::page_key`), so its value is
+/// fixed.
 pub(crate) const TEXT_MODALITY_TAG: u8 = 0;
 
 /// Ownership state of one physical cache unit.
@@ -135,7 +116,7 @@ pub(crate) enum UnitState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexedPage {
     pub group: u32,
-    pub hash: u64,
+    pub hash: Key,
     pub tokens: Vec<u32>,
     pub units: Vec<u32>,
     pub resume: Option<proto::request::CacheResume>,
@@ -160,7 +141,7 @@ pub(crate) struct BlockPoolStats {
 
 /// Identity of one published prefix page.
 struct PublishedPage {
-    hash: u64,
+    hash: Key,
     group: u32,
     /// Exact token content used to disambiguate equal prefix hashes.
     tokens: Vec<u32>,
@@ -210,7 +191,7 @@ struct PoolInner {
     freed_log: Vec<u32>,
     /// First units of every published page copy of a hash. Copies differ by
     /// group, source worker or, after a hash collision, by tokens.
-    hash_to_pages: HashMap<u64, Vec<u32>>,
+    hash_to_pages: HashMap<Key, Vec<u32>>,
     stats: BlockPoolStats,
     /// Units `1..=scratch`, which the pool never allocates.
     scratch: u32,
@@ -393,7 +374,7 @@ impl PoolInner {
     /// Returns the first unit of a published copy with this exact identity.
     fn find_page(
         &self,
-        hash: u64,
+        hash: Key,
         group: u32,
         tokens: &[u32],
         source: &MainProcessEndpoint,
@@ -970,7 +951,7 @@ impl BlockPool {
         &self,
         page: &PageRef,
         group: u32,
-        hash: u64,
+        hash: Key,
         tokens: &[u32],
         source: &Arc<MainProcessEndpoint>,
         resume: Option<proto::request::CacheResume>,
@@ -1038,7 +1019,7 @@ impl BlockPool {
     /// which checks the identity again.
     pub(crate) fn lookup(
         &self,
-        hash: u64,
+        hash: Key,
         group: u32,
         tokens: &[u32],
         source: &MainProcessEndpoint,
@@ -1058,7 +1039,7 @@ impl BlockPool {
     pub(crate) fn acquire(
         &self,
         head: UnitId,
-        hash: u64,
+        hash: Key,
         group: u32,
         tokens: &[u32],
         source: &MainProcessEndpoint,
@@ -1762,7 +1743,7 @@ pub(crate) struct PrefixLookup {
     /// through [`PrefixCacheCoordinator::publish_computed`] as prefill
     /// completes, and extends them over the tokens the request generates.
     /// Empty when prefix caching does not apply to the request.
-    pub(crate) page_hashes: Vec<Vec<u64>>,
+    pub(crate) page_hashes: Vec<Vec<Key>>,
     /// Leading prompt tokens acquired from the prefix cache. A final
     /// partial page is copied before the resumed computation appends to it.
     pub(crate) cached_tokens: usize,
@@ -1812,7 +1793,7 @@ struct PrefixSelection {
 struct TailPage {
     head: UnitId,
     cached: bool,
-    hash: u64,
+    hash: Key,
     tokens: usize,
 }
 
@@ -1822,7 +1803,7 @@ struct TailPage {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PrefixScope<'a> {
     pub(crate) isolation_key: Option<u64>,
-    pub(crate) state_seeds: &'a [u64],
+    pub(crate) state_seeds: &'a [[u8; 32]],
     pub(crate) resume: Option<proto::request::CacheResume>,
 }
 
@@ -1837,18 +1818,18 @@ impl<'a> PrefixScope<'a> {
     }
 }
 
-/// The seed of the prefix hash chains of the pages a worker computes, from
-/// the identity it reports of its model and of what its forwards compute
-/// (`PrefixCacheInfo::identity`): the first eight bytes of its SHA-256, so
-/// that every build derives the same seed from the same identity. Zero for
-/// a worker that reports none.
-pub(crate) fn prefix_seed(identity: &str) -> u64 {
-    use sha2::Digest as _;
-    if identity.is_empty() {
-        return 0;
-    }
-    let digest = sha2::Sha256::digest(identity.as_bytes());
-    u64::from_le_bytes(digest[..8].try_into().unwrap_or_default())
+/// The page seed of a cache group whose ranks report page identity
+/// `identity` (`PrefixCacheInfo::identities`): the root of its page chain
+/// at every cache level (`storage::key::page_seed`).
+pub(crate) fn prefix_seed(identity: &str) -> Key {
+    storage::key::page_seed(identity)
+}
+
+/// The page seed of each cache group of `cache`, in group order.
+pub fn prefix_seeds(cache: &ipc::PrefixCacheInfo) -> Vec<Key> {
+    (0..cache.groups.len())
+        .map(|group| prefix_seed(cache.identities.get(group).map_or("", String::as_str)))
+        .collect()
 }
 
 /// Coordinates capacity, window release and prefix state across cache
@@ -1860,8 +1841,9 @@ pub(crate) fn prefix_seed(identity: &str) -> u64 {
 pub(crate) struct PrefixCacheCoordinator {
     groups: Vec<GroupShape>,
     prefix_enabled: bool,
-    /// Root of each group's hash chain; an isolation key is mixed into it.
-    hash_seeds: Vec<u64>,
+    /// The page seed of each group's chain; a request's isolation key is
+    /// mixed into its root (`storage::key::page_root`).
+    hash_seeds: Vec<Key>,
 }
 
 impl PrefixCacheCoordinator {
@@ -1869,34 +1851,32 @@ impl PrefixCacheCoordinator {
     /// enabled and a zero chain seed.
     pub(crate) fn new(groups: Vec<GroupShape>) -> Self {
         Self {
-            hash_seeds: vec![0; groups.len()],
+            hash_seeds: vec![Key([0; 32]); groups.len()],
             groups,
             prefix_enabled: true,
         }
     }
 
     /// Root subsequent page hashes at each group's upstream computation.
-    pub(crate) fn set_seeds(&mut self, seeds: Vec<u64>) {
+    pub(crate) fn set_seeds(&mut self, seeds: Vec<Key>) {
         assert_eq!(seeds.len(), self.groups.len());
         self.hash_seeds = seeds;
     }
 
-    pub(crate) fn seeds(&self) -> &[u64] {
+    pub(crate) fn seeds(&self) -> &[Key] {
         &self.hash_seeds
     }
 
-    fn group_seed(&self, group: usize, scope: PrefixScope<'_>) -> u64 {
+    /// The root of `group`'s page chain for a request of `scope`.
+    fn group_seed(&self, group: usize, scope: PrefixScope<'_>) -> Key {
         // A predecessor without speculation has no draft group. Its
         // required state retains its roots; new optional draft state starts
         // under the serving computation's own key when refilled.
-        let root = scope
+        let seed = scope
             .state_seeds
             .get(group)
-            .copied()
-            .unwrap_or(self.hash_seeds[group]);
-        scope
-            .isolation_key
-            .map_or(root, |key| root ^ key.rotate_left(17))
+            .map_or(self.hash_seeds[group], |seed| Key(*seed));
+        storage::key::page_root(&seed, scope.isolation_key)
     }
 
     /// Returns the cache groups in table order.
@@ -2322,12 +2302,12 @@ impl PrefixCacheCoordinator {
     ///
     /// A trailing partial page is not hashed, so only complete pages are ever
     /// published. The chains are rooted at the pool's seed, or at the seed
-    /// of the epoch whose state the request continues with. An isolation key
-    /// is rotated and XORed into the root, so requests with different keys
-    /// compute different hash chains and, barring a hash collision, reuse
-    /// none of each other's pages. A key of zero leaves the root unchanged
-    /// and therefore shares pages with requests that carry no key.
-    fn prefix_hashes(&self, prompt: &[u32], scope: PrefixScope) -> Vec<Vec<u64>> {
+    /// of the epoch whose state the request continues with, and the
+    /// request's isolation key, so requests with different keys compute
+    /// different chains and reuse none of each other's pages
+    /// (`storage::key::page_root`). Every cache level keys a page by its
+    /// key in this chain.
+    pub(crate) fn prefix_hashes(&self, prompt: &[u32], scope: PrefixScope) -> Vec<Vec<Key>> {
         let mut hashes = vec![Vec::new(); self.groups.len()];
         self.extend_hashes(&mut hashes, CachedTokens::prompt(prompt), scope);
         hashes
@@ -2341,7 +2321,7 @@ impl PrefixCacheCoordinator {
     /// one chain per group, each a prefix of the chain over `tokens`.
     pub(crate) fn extend_hashes(
         &self,
-        hashes: &mut [Vec<u64>],
+        hashes: &mut [Vec<Key>],
         tokens: CachedTokens<'_>,
         scope: PrefixScope,
     ) {
@@ -2354,7 +2334,7 @@ impl PrefixCacheCoordinator {
             for page in chain.len()..complete {
                 let start = page * shape.block_size;
                 let span = tokens.span(start..start + key);
-                parent = block_hash(parent, group as u32, TEXT_MODALITY_TAG, &span);
+                parent = storage::key::page_key(&parent, group as u32, TEXT_MODALITY_TAG, &span);
                 chain.push(parent);
             }
         }
@@ -2373,7 +2353,7 @@ impl PrefixCacheCoordinator {
         &self,
         pool: &BlockPool,
         prompt: &[u32],
-        hashes: &[Vec<u64>],
+        hashes: &[Vec<Key>],
         source: &MainProcessEndpoint,
         scope: PrefixScope,
         public: bool,
@@ -2473,7 +2453,7 @@ impl PrefixCacheCoordinator {
                     .checked_sub(1)
                     .map_or_else(|| self.group_seed(group, scope), |page| hashes[group][page]);
                 let span = &prompt[full * shape.block_size..end];
-                let hash = block_hash(parent, group as u32, TEXT_MODALITY_TAG, span);
+                let hash = storage::key::page_key(&parent, group as u32, TEXT_MODALITY_TAG, span);
                 let Some((head, cached)) = pool.lookup(hash, group as u32, span, source, resume)
                 else {
                     return false;
@@ -2814,7 +2794,7 @@ impl PrefixCacheCoordinator {
                 .checked_sub(1)
                 .map_or(seed, |index| hashes[group][index]);
             let span = tokens.span(page * shape.block_size..computed);
-            let hash = block_hash(parent, group as u32, TEXT_MODALITY_TAG, &span);
+            let hash = storage::key::page_key(&parent, group as u32, TEXT_MODALITY_TAG, &span);
             if public && self.prefix_enabled {
                 pool.publish(reference, group as u32, hash, &span, source, None);
             }
@@ -2851,7 +2831,7 @@ impl PrefixCacheCoordinator {
         pool: &BlockPool,
         allocation: &CacheAllocation,
         tokens: CachedTokens<'_>,
-        hashes: &[Vec<u64>],
+        hashes: &[Vec<Key>],
         computed_tokens: usize,
         draft_tokens: usize,
         published: &mut Vec<usize>,
@@ -4180,7 +4160,7 @@ mod tests {
         assert_eq!(own.cached_tokens, 0);
         let kept = PrefixScope {
             isolation_key: None,
-            state_seeds: &[prefix_seed("previous")],
+            state_seeds: &[prefix_seed("previous").0],
             resume: None,
         };
         let continued = serving.probe_prefix(&pool, &prompt, true, false, kept, &source);

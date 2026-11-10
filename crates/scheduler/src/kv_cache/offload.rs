@@ -58,13 +58,12 @@
 //!   (`storage_server::STAGING_POOL_BYTES` on each rank), through which
 //!   the pages pass the same way.
 //!
-//! A page's key chains the keys of its group's pages before it: `h_i =
-//! SHA-256(h_{i-1} || group || modality || tokens)` over full pages, each
-//! token a little-endian `u32`, from `h_{-1} = SHA-256("uniserve-page" ||
-//! content || isolation key)`, where the content is what the ranks report
-//! for the group and the isolation key keeps tenants' prefixes apart as L1
-//! does. The keys of every group form one key space: for each key, the
-//! lookups say where its page is.
+//! A page has one key at every level: the key the device prefix cache
+//! chains it under (`storage::key::page_key`), rooted at the group's page
+//! seed, which the ranks' page identities give it, and the request's
+//! isolation key (`PrefixCacheCoordinator::prefix_hashes`). The keys of
+//! every group form one key space: for each key, the lookups say where its
+//! page is.
 //!
 //! An epoch's host KV cache holds one token count on every rank
 //! ([`HostCacheDemand`]): the epoch asks for its device KV cache's tokens
@@ -89,12 +88,11 @@ use std::time::{Duration, Instant};
 
 use ipc::{PageCopy, PrefixCacheInfo};
 use ipc::{RequestId, UnitId};
-use sha2::{Digest, Sha256};
 use storage::protocol::{Event, PageAnchor, PageLevel, PageSlot, PageWindow, Reply, Request};
 use storage::{Client, Key, Role, Scope};
 
 use super::manager::{self, AttentionManager};
-use super::{CachedTokens, GroupShape, PageRef};
+use super::{GroupShape, PageRef};
 use crate::worker::WorkerGroupId;
 
 /// The fewest tokens an L3 hit must add to the pools' hit to be prefetched:
@@ -232,7 +230,6 @@ struct RankPool {
 #[derive(Clone)]
 struct CachePools {
     ranks: Vec<RankPool>,
-    content: [u8; 32],
     manager: AttentionManager,
     /// The group holds the draft cache: its pages bound no reuse, a hit
     /// loads its leading pages every rank holds, and a page's key covers
@@ -588,7 +585,7 @@ impl KvOffloadManager {
     /// Serve `worker`, whose ranks (`ranks`, in rank order) are the scopes
     /// of the deployment named by the group and their ranks, when every rank
     /// reports a page pool for every one of its cache groups, of the same
-    /// content for a group on every rank, and its server is reachable.
+    /// page identity for a group on every rank, and its server is reachable.
     /// Returns whether the host KV cache serves it.
     pub(crate) fn add_worker(&mut self, worker: &WorkerGroupId, ranks: &[RankCache<'_>]) -> bool {
         let Some(first) = ranks.first() else {
@@ -602,23 +599,25 @@ impl KvOffloadManager {
             .iter()
             .map(|shape| CachePools {
                 ranks: Vec::with_capacity(ranks.len()),
-                content: [0; 32],
                 manager: GroupShape::from_group(shape).manager(),
                 draft: shape.kind.is_draft(),
             })
             .collect();
         for (rank, report) in ranks.iter().enumerate() {
-            if report.cache.groups != *shapes || report.cache.page_pools.len() != shapes.len() {
+            // Every rank keys a group's pages alike: one page seed, one key.
+            if report.cache.groups != *shapes
+                || report.cache.identities != first.cache.identities
+                || report.cache.page_pools.len() != shapes.len()
+            {
                 return false;
             }
             for pool in &report.cache.page_pools {
                 let Some(group) = groups.get_mut(pool.group_id as usize) else {
                     return false;
                 };
-                if group.ranks.len() != rank || (rank > 0 && group.content != pool.content) {
+                if group.ranks.len() != rank {
                     return false;
                 }
-                group.content = pool.content;
                 let client = if report.local {
                     0
                 } else {
@@ -652,32 +651,6 @@ impl KvOffloadManager {
             .insert(worker.clone(), GroupCachePools { groups, step });
         tracing::info!(worker = %worker.0, groups = shapes.len(), "the host KV cache serves the worker group");
         true
-    }
-
-    /// Key `worker`'s pages from now on by `contents`, the seed of each of
-    /// its cache groups' pages after its weights changed: the pages written
-    /// before keep the old keys, which no later prompt finds. Does nothing
-    /// for a worker the host KV cache does not serve.
-    pub(crate) fn reseed(
-        &mut self,
-        worker: &WorkerGroupId,
-        contents: &[[u8; 32]],
-    ) -> Result<(), String> {
-        let Some(pools) = self.workers.get_mut(worker) else {
-            return Ok(());
-        };
-        if pools.groups.len() != contents.len() {
-            return Err(format!(
-                "worker group {} reports {} page key seeds for {} cache groups",
-                worker.0,
-                contents.len(),
-                pools.groups.len()
-            ));
-        }
-        for (group, content) in pools.groups.iter_mut().zip(contents) {
-            group.content = *content;
-        }
-        Ok(())
     }
 
     /// Whether the host KV cache serves `worker`.
@@ -736,79 +709,6 @@ impl KvOffloadManager {
             .collect()
     }
 
-    /// The keys of `worker`'s cache groups for the full pages of the first
-    /// `tokens` tokens of `prompt`, by group.
-    pub(crate) fn page_keys(
-        &self,
-        worker: &WorkerGroupId,
-        prompt: &[u32],
-        isolation_key: Option<u64>,
-        tokens: usize,
-    ) -> Vec<Vec<Key>> {
-        let Some(pools) = self.workers.get(worker) else {
-            return Vec::new();
-        };
-        let mut keys = vec![Vec::new(); pools.groups.len()];
-        self.extend_page_keys(
-            worker,
-            &mut keys,
-            CachedTokens::prompt(&prompt[..tokens.min(prompt.len())]),
-            isolation_key,
-        );
-        keys
-    }
-
-    /// Extends each group's key chain in `keys` over the full pages of
-    /// `tokens` it does not cover yet, as [`Self::page_keys`] chains a
-    /// prompt's pages, so that the pages a request generated carry the keys
-    /// of the same pages of its migration's prompt. `keys` holds one chain
-    /// per group of `worker`, each a prefix of the chain over `tokens`; it is
-    /// left as it is for a worker the host KV cache does not serve.
-    pub(crate) fn extend_page_keys(
-        &self,
-        worker: &WorkerGroupId,
-        keys: &mut [Vec<Key>],
-        tokens: CachedTokens<'_>,
-        isolation_key: Option<u64>,
-    ) {
-        let Some(pools) = self.workers.get(worker) else {
-            return;
-        };
-        for (index, (group, chain)) in pools.groups.iter().zip(keys.iter_mut()).enumerate() {
-            let block = group.manager.block_size();
-            // A draft cache page's key covers the token after it.
-            let key = block + usize::from(group.draft);
-            let mut parent: [u8; 32] = match chain.last() {
-                Some(last) => last.0,
-                None => {
-                    let mut digest = Sha256::new();
-                    digest.update(b"uniserve-page");
-                    digest.update(group.content);
-                    match isolation_key {
-                        Some(key) => {
-                            digest.update([1]);
-                            digest.update(key.to_le_bytes());
-                        }
-                        None => digest.update([0]),
-                    }
-                    digest.finalize().into()
-                }
-            };
-            for page in chain.len()..(tokens.len() + block).saturating_sub(key) / block {
-                let mut digest = Sha256::new();
-                digest.update(parent);
-                // The group, and text (`TEXT_MODALITY_TAG`).
-                digest.update((index as u32).to_le_bytes());
-                digest.update([0_u8]);
-                for token in tokens.span(page * block..page * block + key).iter() {
-                    digest.update(token.to_le_bytes());
-                }
-                parent = digest.finalize().into();
-                chain.push(Key(parent));
-            }
-        }
-    }
-
     fn submit(&mut self, client: usize, request: &Request, purpose: Purpose) -> bool {
         match self.clients[client].submit(request, &[]) {
             Ok(id) => {
@@ -827,7 +727,7 @@ impl KvOffloadManager {
     /// most `limit`: `None` while pins, lookups or prefetches are in flight,
     /// else the boundary of the hit (at least `device`), which the caller
     /// takes with [`KvOffloadManager::admit`]. `keys` are the request's page
-    /// keys by group ([`KvOffloadManager::page_keys`]), covering `limit`
+    /// keys by group (`PrefixCacheCoordinator::prefix_hashes`), covering `limit`
     /// tokens. The first call pins every group's keys from `device` on in
     /// every rank's pool and looks them up. Pins taken for another device
     /// match are released and taken again.
@@ -2000,7 +1900,7 @@ mod tests {
     }
 
     /// The prefix cache report of a rank with `groups`, whose page pools
-    /// are `pools` of contents `contents`.
+    /// are `pools` of pages of the identities `contents` name.
     fn report(groups: Vec<CacheGroup>, pools: &[u64], contents: &[u8]) -> PrefixCacheInfo {
         PrefixCacheInfo {
             num_units: 64,
@@ -2008,12 +1908,10 @@ mod tests {
             groups,
             page_pools: pools
                 .iter()
-                .zip(contents)
                 .enumerate()
-                .map(|(group, (pool, content))| PagePoolInfo {
+                .map(|(group, pool)| PagePoolInfo {
                     group_id: group as u32,
                     pool: *pool,
-                    content: [*content; 32],
                     endpoint: None,
                 })
                 .collect(),
@@ -2022,10 +1920,24 @@ mod tests {
             held_segments: 0,
             inherited_start: 0,
             inherited_units: 0,
-            identities: Vec::new(),
+            identities: contents
+                .iter()
+                .map(|content| format!("content-{content}"))
+                .collect(),
             host_token_bytes: 0,
             storage_endpoint: None,
         }
+    }
+
+    /// The page keys of the complete pages of `prompt` on a rank reporting
+    /// `cache`, by group: the device cache's chain, which every level keys
+    /// pages by.
+    fn page_keys(cache: &PrefixCacheInfo, prompt: &[u32]) -> Vec<Vec<Key>> {
+        let mut coordinator = super::super::PrefixCacheCoordinator::new(
+            cache.groups.iter().map(GroupShape::from_group).collect(),
+        );
+        coordinator.set_seeds(super::super::prefix_seeds(cache));
+        coordinator.prefix_hashes(prompt, super::super::PrefixScope::default())
     }
 
     /// An epoch asks for its device KV cache's tokens times the ratio, the
@@ -2136,7 +2048,7 @@ mod tests {
         // Eight pages that only L3 holds: 512 tokens are worth a prefetch,
         // and every page arrives within the wait.
         let prompt: Vec<u32> = (0..8 * 64 + 1).collect();
-        let keys = kv_offload.page_keys(&text, &prompt, None, 512);
+        let keys = page_keys(&cache, &prompt[..512]);
         let mut boundary = None;
         poll_until(&mut kv_offload, |kv_offload| {
             boundary = kv_offload.admission(RequestId(1), &text, &keys, 0, 512, 0);
@@ -2177,7 +2089,7 @@ mod tests {
         // A request offloaded ten full-attention pages and the window before
         // token 384 (pages 4 and 5), anchored to the full page before it.
         let prompt: Vec<u32> = (0..10 * 64 + 1).collect();
-        let keys = kv_offload.page_keys(&text, &prompt, None, prompt.len());
+        let keys = page_keys(&cache, &prompt);
         let block_pool = BlockPool::new(64, 0);
         kv_offload.offload(
             &text,
@@ -2229,45 +2141,6 @@ mod tests {
                 (1, 5)
             ]
         );
-    }
-
-    /// Keys extended over the tokens a request generated are the keys of
-    /// its migration's prompt, which continues with them.
-    #[test]
-    fn keys_extended_over_generated_tokens_are_the_migrations_keys() {
-        let server = Running::start();
-        let (_worker, pools) = worker_pools(&server, &[4, 5]);
-        let mut kv_offload =
-            KvOffloadManager::connect(&server.socket, "model", 0, DEFAULT_BOUNDARY_INTERVAL, false)
-                .unwrap();
-        let cache = report(
-            vec![cache_group(None), cache_group(Some(128))],
-            &pools,
-            &[4, 5],
-        );
-        let text = WorkerGroupId("text".into());
-        assert!(kv_offload.add_worker(
-            &text,
-            &[RankCache {
-                local: true,
-                cache: &cache,
-            }]
-        ));
-        let prompt: Vec<u32> = (0..200).collect();
-        let generated: Vec<u32> = (500..700).collect();
-        let migrated: Vec<u32> = prompt.iter().chain(&generated).copied().collect();
-        let mut keys = kv_offload.page_keys(&text, &prompt, Some(3), prompt.len());
-        kv_offload.extend_page_keys(
-            &text,
-            &mut keys,
-            CachedTokens::new(&prompt, &generated),
-            Some(3),
-        );
-        assert_eq!(
-            keys,
-            kv_offload.page_keys(&text, &migrated, Some(3), migrated.len())
-        );
-        assert!(keys.iter().all(|group| !group.is_empty()));
     }
 
     /// A prompt offloads its sliding windows before every interval of pages
@@ -2343,7 +2216,7 @@ mod tests {
         ));
 
         let prompt: Vec<u32> = (0..100 * 64 + 1).collect();
-        let keys = kv_offload.page_keys(&text, &prompt, None, prompt.len())[0][..100].to_vec();
+        let keys = page_keys(&cache, &prompt)[0][..100].to_vec();
         let block_pool = BlockPool::new(128, 0);
         let free = block_pool.free_units();
         kv_offload.offload(

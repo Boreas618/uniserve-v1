@@ -296,7 +296,14 @@ impl Scheduler {
         let state_seeds = self
             .storage
             .cache()
-            .map(|cache| cache.coordinator.seeds().to_vec())
+            .map(|cache| {
+                cache
+                    .coordinator
+                    .seeds()
+                    .iter()
+                    .map(|seed| seed.0)
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         let mut kept = 0;
         for state in self.running.values_mut() {
@@ -341,10 +348,8 @@ impl Scheduler {
         }
     }
 
-    /// Roots the prefix hash chains at the identity the weight update
-    /// `results` report (one per worker), and gives the host KV cache each
-    /// worker group's page key seeds they report, which the ranks of a group
-    /// agree on.
+    /// Roots the page chains of every cache level at the page identities
+    /// the weight update `results` report (one per worker).
     fn reseed_pages(&mut self, results: &[String]) -> Result<(), String> {
         if let Some(cache) = self.storage.cache.as_mut() {
             // Pipeline stages contribute different layers to the same
@@ -397,49 +402,10 @@ impl Scheduler {
                 })
                 .collect();
             if !identities.is_empty() {
-                store.reseed(crate::trajectories::latent_seed(
+                store.reseed(storage::key::latent_seed(
                     identities.iter().map(String::as_str),
                 ));
             }
-        }
-        let Some(kv_offload) = self.kv_offload.as_mut() else {
-            return Ok(());
-        };
-        let mut seeds: BTreeMap<String, Vec<[u8; 32]>> = BTreeMap::new();
-        for result in results {
-            let value: serde_json::Value = serde_json::from_str(result)
-                .map_err(|error| format!("a worker's weight update report: {error}"))?;
-            let (Some(group), Some(contents)) =
-                (value["group"].as_str(), value["page_contents"].as_array())
-            else {
-                continue;
-            };
-            if contents.is_empty() {
-                continue;
-            }
-            let contents = contents
-                .iter()
-                .map(|content| {
-                    content
-                        .as_str()
-                        .and_then(seed)
-                        .ok_or_else(|| "a page key seed is not 32 hexadecimal bytes".to_owned())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            match seeds.get(group) {
-                Some(agreed) if *agreed != contents => {
-                    return Err(format!(
-                        "the ranks of worker group {group} report other page key seeds"
-                    ));
-                }
-                Some(_) => {}
-                None => {
-                    seeds.insert(group.to_owned(), contents);
-                }
-            }
-        }
-        for (group, contents) in seeds {
-            kv_offload.reseed(&WorkerGroupId(group), &contents)?;
         }
         Ok(())
     }
@@ -905,18 +871,6 @@ impl Scheduler {
         tracing::info!("the scheduler woke");
         Ok(results)
     }
-}
-
-/// A page key seed from its hexadecimal text.
-fn seed(text: &str) -> Option<[u8; 32]> {
-    if text.len() != 64 {
-        return None;
-    }
-    let mut seed = [0; 32];
-    for (index, byte) in seed.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(text.get(2 * index..2 * index + 2)?, 16).ok()?;
-    }
-    Some(seed)
 }
 
 /// Returns whether the request holds a unit from `first` on.

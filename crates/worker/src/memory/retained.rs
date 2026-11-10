@@ -26,7 +26,6 @@ use ::storage::protocol::Access;
 use ::storage::{Claim, Client, GpuLedger, Item, Key, Location, Mode, Role, Scope, StorageRecord};
 use ipc::StorageLaunch;
 use platform::{DeviceId, Protection};
-use sha2::{Digest, Sha256};
 
 use crate::memory::allocation::Backing;
 use crate::memory::allocation::Storage;
@@ -358,24 +357,7 @@ impl Retained {
     }
 
     fn storage_key(&self, name: &str, bytes: usize, gpu: &[u8; 16], epoch: u64) -> Key {
-        let mut digest = Sha256::new();
-        digest.update(b"uniserve-exclusive-storage\0");
-        for part in [
-            self.scope.deployment.as_bytes(),
-            self.scope.group.as_bytes(),
-            name.as_bytes(),
-        ] {
-            digest.update((part.len() as u64).to_le_bytes());
-            digest.update(part);
-        }
-        digest.update(self.scope.rank.to_le_bytes());
-        digest.update(epoch.to_le_bytes());
-        // A byte storage: dtype uint8, shape [bytes], stride 1.
-        digest.update(b"uint8");
-        digest.update((bytes as u64).to_le_bytes());
-        digest.update(1_u64.to_le_bytes());
-        digest.update(gpu);
-        Key(digest.finalize().into())
+        ::storage::key::exclusive(&self.scope, name, bytes as u64, gpu, epoch)
     }
 
     /// Publishes the storage of part `index`, which `descriptor` maps, as an
@@ -987,11 +969,7 @@ impl Retained {
     /// published it, so two ranks of one host asking for one key would both read the first one's
     /// allocation: over the peer link, on every forward. Each device keeps its own copy instead.
     fn device_key(key: &[u8; 32], gpu: &[u8; 16]) -> Key {
-        let mut digest = Sha256::new();
-        digest.update(b"uniserve-device-weight\0");
-        digest.update(key);
-        digest.update(gpu);
-        Key(digest.finalize().into())
+        ::storage::key::device_weight(&Key(*key), gpu)
     }
 
     /// The mapped storage of the weight retained under `key` on `device`, when the server holds it.
