@@ -126,28 +126,6 @@ impl From<ipc::ValidationError> for Error {
 
 pub use ipc::ErrorCode;
 
-/// Failure texts that mark a context-corrupting CUDA failure, which requires
-/// teardown even if allocation also failed.
-///
-/// A driver failure the worker observed itself carries its result code and
-/// is classified by it. These texts classify failures that carry only a
-/// message, such as an error from a peer that embeds a lower-level failure.
-const FATAL_CUDA_MESSAGES: &[&str] = &[
-    "illegal memory access",
-    "cudaerrorillegaladdress",
-    "device-side assert",
-    "cudaerrorlaunchfailure",
-    "unspecified launch failure",
-    "unrecoverable",
-    "uncorrectable ecc",
-    "misaligned address",
-];
-
-/// Failure texts that mark an allocation failure, used like
-/// [`FATAL_CUDA_MESSAGES`].
-const OUT_OF_MEMORY_MESSAGES: &[&str] =
-    &["out of memory", "cuda oom", "cublas_status_alloc_failed"];
-
 /// A classified failure, as the main process reports it.
 ///
 /// The code and fatality are inline; the message is boxed, so a `Result` that
@@ -175,12 +153,12 @@ impl Failure {
         }
     }
 
-    /// Classify an internal error. `context` prefixes the message, naming the
+    /// Classify an internal error by its type. `context` prefixes the message, naming the
     /// operation that failed.
     ///
-    /// A CUDA driver failure is classified by its result code. Any other
-    /// failure is classified, in order, by a fatal CUDA text in its message,
-    /// an out-of-storage text in its message, then its own kind.
+    /// A CUDA driver failure, the worker's own or one an operator launch or a model layer
+    /// raised, is classified by its result code; any other failure by its own kind. The message
+    /// never decides the class.
     pub fn classify(error: Error, context: Option<&str>) -> Self {
         let mut message = report(&error);
         if let Some(context) = context.filter(|context| !context.is_empty()) {
@@ -188,22 +166,7 @@ impl Failure {
         }
         let code = match driver_failure(&error) {
             Some(failure) => driver_code(failure),
-            None => {
-                let lowered = message.to_lowercase();
-                if FATAL_CUDA_MESSAGES
-                    .iter()
-                    .any(|text| lowered.contains(text))
-                {
-                    ErrorCode::FatalWorkerFailure
-                } else if OUT_OF_MEMORY_MESSAGES
-                    .iter()
-                    .any(|text| lowered.contains(text))
-                {
-                    ErrorCode::ResourceError
-                } else {
-                    kind_code(&error)
-                }
-            }
+            None => kind_code(&error),
         };
         Self::new(code, message)
     }
@@ -244,12 +207,29 @@ pub fn report(error: &dyn std::error::Error) -> String {
     message
 }
 
-/// The CUDA failure an error is, directly or as a shared failure.
+/// The CUDA failure an error is: the worker's own, an operator launch's, a model layer's, or one
+/// a shared failure or the work in flight carries.
 fn driver_failure(error: &Error) -> Option<&platform::Error> {
     match error {
         Error::Cuda(failure) => Some(failure),
+        Error::Ops(failure) => ops_driver_failure(failure),
+        Error::Nn(nn::Error::Platform(failure)) => Some(failure),
+        Error::Nn(
+            nn::Error::Ops(failure)
+            | nn::Error::Launch {
+                source: failure, ..
+            },
+        ) => ops_driver_failure(failure),
         Error::Shared(shared) => shared.downcast_ref::<Error>().and_then(driver_failure),
         Error::InFlight { error, .. } => driver_failure(error),
+        _ => None,
+    }
+}
+
+/// The CUDA failure an operator's failure is, when it is one.
+fn ops_driver_failure(error: &ops::Error) -> Option<&platform::Error> {
+    match error {
+        ops::Error::Platform(failure) => Some(failure),
         _ => None,
     }
 }
@@ -298,18 +278,36 @@ mod tests {
         })
     }
 
+    /// A driver failure an operator launch or a model layer raised is classified by its result
+    /// code, as the worker's own is, and the message only reports it.
     #[test]
-    fn fatal_cuda_messages_outrank_allocation_failures() {
-        let error = Failure::classify(
+    fn a_driver_failure_inside_a_launch_is_classified_by_its_code() {
+        let platform = || platform::Error::Driver {
+            call: "cuLaunchKernel",
+            code: 700,
+            name: "CUDA_ERROR_ILLEGAL_ADDRESS",
+            message: "an illegal memory access was encountered",
+        };
+        for error in [
+            Error::Ops(ops::Error::Platform(platform())),
+            Error::Nn(nn::Error::Platform(platform())),
+            Error::Nn(nn::Error::Ops(ops::Error::Platform(platform()))),
+        ] {
+            let failure = Failure::classify(error, Some("decode"));
+            assert_eq!(failure.code, ErrorCode::FatalWorkerFailure);
+            assert!(failure.fatal);
+            assert!(failure.message().starts_with("decode: "));
+        }
+    }
+
+    /// A message that only quotes a driver failure is classified by the error's own kind.
+    #[test]
+    fn a_message_does_not_decide_the_class() {
+        let quoted = Failure::classify(
             Error::Interface("CUDA out of memory after an illegal memory access".into()),
-            Some("decode"),
+            None,
         );
-        assert_eq!(error.code, ErrorCode::FatalWorkerFailure);
-        assert!(error.fatal);
-        assert_eq!(
-            error.message(),
-            "decode: CUDA out of memory after an illegal memory access"
-        );
+        assert_eq!(quoted.code, ErrorCode::UnsupportedSetup);
     }
 
     #[test]
