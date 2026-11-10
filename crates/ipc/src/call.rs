@@ -54,37 +54,25 @@ pub enum ForwardMode {
 
 impl ForwardMode {}
 
-/// The storage action performed between concrete producers and consumers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[repr(u8)]
-pub enum TransferMode {
-    CacheExport,
-}
-
-impl TransferMode {
-    /// Every transfer mode in declaration order.
-    pub const ALL: [Self; 1] = [Self::CacheExport];
-}
-
 /// Exactly one call classification. The sum preserves the distinct
-/// forward, media, and storage contracts without parallel opcode metadata.
+/// forward and media contracts without parallel opcode metadata.
 ///
 /// Serde represents a kind by its inner enum's snake_case name alone
-/// (`untagged`), which round-trips only while the names of [`ForwardMode`],
-/// [`MediaCall`], and [`TransferMode`] stay disjoint.
+/// (`untagged`), which round-trips only while the names of [`ForwardMode`]
+/// and [`MediaCall`] stay disjoint. A request's KV cache reaches another
+/// worker group by the scheduler's device-direct hand-off, not by a call.
+/// `cache_export` named a removed transfer kind and is not reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CallKind {
     Forward(ForwardMode),
     Media(MediaCall),
-    Transfer(TransferMode),
 }
 
 impl CallKind {
     /// Computations accepted as individual scheduled request items. A rank's
     /// reports list its supported calls in this order.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 15] = [
         Self::Forward(ForwardMode::Prefill),
         Self::Forward(ForwardMode::Decode),
         Self::Forward(ForwardMode::Verify),
@@ -100,7 +88,6 @@ impl CallKind {
         Self::Media(MediaCall::VideoEncoding),
         Self::Media(MediaCall::AudioEncoding),
         Self::Media(MediaCall::Muxing),
-        Self::Transfer(TransferMode::CacheExport),
     ];
 
     /// Returns whether a call of this kind advances its request's state.
@@ -117,8 +104,8 @@ impl CallKind {
 
 /// Hard resource maxima the scheduler reserves before a call runs.
 ///
-/// [`Call::validate`] checks `max_tokens` against `input_token_ids`; it checks
-/// neither `max_transfer_bytes` nor `max_completion_bytes`.
+/// [`Call::validate`] checks `max_tokens` against `input_token_ids`; it does
+/// not check `max_completion_bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct Bounds {
     /// Maximum tokens the call may process or produce.
@@ -131,8 +118,6 @@ pub struct Bounds {
     pub max_cache_units: u32,
     /// Maximum host-visible completion data in bytes.
     pub max_completion_bytes: u64,
-    /// Maximum cross-call transfer data in bytes.
-    pub max_transfer_bytes: u64,
 }
 
 /// Branch-local token processor inputs for one sampling call.
@@ -308,8 +293,6 @@ pub struct Call {
     pub input_image: Option<std::sync::Arc<str>>,
     /// Published cache extent consumed by this call (a latent preparation or denoising step).
     pub cache_input: Option<BufferId>,
-    /// Identity under which a cache export publishes cache state.
-    pub cache_output: Option<BufferId>,
     /// What the call does for its request's draft cache; the default, for
     /// a deployment that does not speculate, does nothing.
     pub draft: DraftWork,
@@ -432,7 +415,6 @@ impl Call {
             canvas: None,
             input_image: None,
             cache_input: None,
-            cache_output: None,
             draft: DraftWork::default(),
             latent_restore: None,
             host_output: None,
@@ -494,9 +476,7 @@ impl Call {
 
     /// Resource identities published by this call.
     pub fn output_buffers(&self) -> impl Iterator<Item = BufferId> + '_ {
-        self.tensor_outputs()
-            .map(TensorRef::buffer_id)
-            .chain(self.cache_output)
+        self.tensor_outputs().map(TensorRef::buffer_id)
     }
 
     /// Returns whether successful execution advances request state.
@@ -507,8 +487,7 @@ impl Call {
     /// Validates the invariants one call carries on its own.
     ///
     /// Checks identity, component, coordinates, the token bound, canonical
-    /// sampling-state sets, the encoded-image source, cache export
-    /// identities, product ownership, generations, output indices, dtypes,
+    /// sampling-state sets, the encoded-image source, product ownership, generations, output indices, dtypes,
     /// cross-request inputs, the predicate, and the stored trajectory of a
     /// latent preparation. Relationships to other calls and to the
     /// batch's allocation tables are the scheduler's to keep.
@@ -579,19 +558,6 @@ impl Call {
         // resource class reserved for the call. The cache output shares the
         // output-index space with the tensor outputs.
         let mut output_indices = HashSet::with_capacity(self.outputs.len());
-        let publishes_cache = matches!(self.kind, CallKind::Transfer(TransferMode::CacheExport));
-        ensure_valid!(
-            self.cache_output.is_some() == publishes_cache,
-            "a cache export requires one cache output identity"
-        );
-        if let Some(output) = self.cache_output {
-            output.validate()?;
-            ensure_valid!(
-                output.owner == self.request_key && output.producer_call_id == self.call_id,
-                "cache output is not owned by its producing call"
-            );
-            output_indices.insert(output.output_index);
-        }
         let consumes_cache = matches!(
             self.kind,
             CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising)

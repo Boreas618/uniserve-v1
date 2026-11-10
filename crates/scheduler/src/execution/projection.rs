@@ -4,7 +4,7 @@
 //! successor before its predecessor's result returns.
 
 use super::*;
-use ipc::{CallCoordinates, ForwardMode, TransferMode};
+use ipc::{CallCoordinates, ForwardMode};
 
 /// A request's context projected through its in-flight calls
 /// (`Scheduler::scheduled_context`).
@@ -314,11 +314,6 @@ impl Scheduler {
         let Some(predecessor) = queue.back() else {
             return false;
         };
-
-        // A cache export is never queued behind an unresolved call.
-        if matches!(target, CallKind::Transfer(TransferMode::CacheExport)) {
-            return false;
-        }
 
         // Decode successors pipeline behind the prompt and the decodes,
         // using each predecessor's actual inputs.

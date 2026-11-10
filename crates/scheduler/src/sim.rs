@@ -15,7 +15,7 @@
 //! `control_plane` example drive the scheduler through it in place of GPU
 //! workers.
 
-use ipc::{ForwardMode, MediaCall, TransferMode};
+use ipc::{ForwardMode, MediaCall};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -1912,9 +1912,6 @@ impl SimEngine {
             | CallKind::Media(MediaCall::TextEncoding)
             | CallKind::Media(MediaCall::VisionEncoding)
             | CallKind::Media(MediaCall::LatentEncoding) => {}
-            CallKind::Transfer(TransferMode::CacheExport) => {
-                set_cache_lengths(&mut record, request.cache_visible_len);
-            }
             CallKind::Media(MediaCall::LatentPreparation) => {
                 // A restored trajectory opens at its stored step; any other
                 // at step zero.
@@ -2738,7 +2735,6 @@ mod tests {
             input_image: None,
             draft: Default::default(),
             cache_input: None,
-            cache_output: None,
             input_token_ids: Vec::new(),
             canvas: None,
             sampling_state: None,

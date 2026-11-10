@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::completion::CallCompletion;
-use ipc::{ForwardMode, MediaCall, TransferMode};
+use ipc::{ForwardMode, MediaCall};
 
 use crate::kv_cache::manager::AttentionManager;
 use crate::kv_cache::{CachedTokens, KvOffloadManager, OffloadKind, PageRef};
@@ -567,8 +567,7 @@ impl Scheduler {
             | CallKind::Forward(ForwardMode::Verify)
             | CallKind::Media(MediaCall::LatentPreparation)
             | CallKind::Media(MediaCall::Denoising)
-            | CallKind::Media(MediaCall::VideoEncoding)
-            | CallKind::Transfer(TransferMode::CacheExport) => {}
+            | CallKind::Media(MediaCall::VideoEncoding) => {}
         }
     }
 

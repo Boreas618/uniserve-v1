@@ -234,51 +234,6 @@ impl PrefixCacheInfo {
             .unwrap_or(0)
     }
 
-    /// Bounds the logical export of a `tokens`-long visible cache extent,
-    /// independently of the producing TP size.
-    ///
-    /// An export carries each group's keys and values over the group's
-    /// layers (`layer_ids`) and `total_kv_heads`; a sliding-window group
-    /// carries at most `window` tokens, the history its readers need. With
-    /// FP8 the bound also reserves one FP32 scale for each key and value
-    /// head, layer and token, because a partial-page suffix may carry a
-    /// complete scale for every head group.
-    pub fn transfer_bytes(&self, tokens: u32) -> u64 {
-        let width = match self.dtype {
-            PrefixCacheDtype::Float16 | PrefixCacheDtype::BFloat16 => 2,
-            PrefixCacheDtype::Float32 => 4,
-            PrefixCacheDtype::Float8E4m3Fn => 1,
-        };
-
-        // FP8 scales are FP32.
-        let scale_bytes = if self.dtype == PrefixCacheDtype::Float8E4m3Fn {
-            4
-        } else {
-            0
-        };
-
-        // Exports carry the K/V pages a request needs alone: a worker
-        // refuses to export the cache of a model that keeps state per
-        // request slot, and the draft cache stays with its rank.
-        self.groups
-            .iter()
-            .filter(|group| !group.kind.is_state() && !group.kind.is_draft())
-            .map(|group| {
-                let published = group
-                    .kind
-                    .window()
-                    .map_or(tokens, |window| tokens.min(window));
-                let head_bytes = u64::from(group.head_dim) * width + scale_bytes;
-
-                // Key and value tensors over every layer and head of the group.
-                (2 * group.layer_ids.len() as u64)
-                    .saturating_mul(u64::from(group.total_kv_heads))
-                    .saturating_mul(head_bytes)
-                    .saturating_mul(u64::from(published))
-            })
-            .fold(0u64, u64::saturating_add)
-    }
-
     /// Validates the pool size, page shapes and each group's layer and head
     /// layout.
     ///

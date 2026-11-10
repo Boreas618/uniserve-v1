@@ -51,7 +51,6 @@ fn ar_decode_call() -> Call {
         input_image: None,
         draft: Default::default(),
         cache_input: None,
-        cache_output: None,
         input_token_ids: Vec::new(),
         canvas: None,
         sampling_state: None,

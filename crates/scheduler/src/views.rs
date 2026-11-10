@@ -85,7 +85,7 @@ use crate::policy::TrialState;
 /// A phase id is the kind's own (`PhaseKind::id`), so it means the same thing
 /// in every epoch: `PhaseKind` appends a kind and never renumbers one, and an
 /// id a removed kind numbered names no phase.
-const PHASES: [PhaseKind; 17] = [
+const PHASES: [PhaseKind; 16] = [
     PhaseKind::TextEncoding,
     PhaseKind::VisionEncoding,
     PhaseKind::LatentEncoding,
@@ -101,7 +101,6 @@ const PHASES: [PhaseKind; 17] = [
     PhaseKind::AudioEncode,
     PhaseKind::Mux,
     PhaseKind::LatentPrepare,
-    PhaseKind::CacheExport,
     PhaseKind::Refill,
 ];
 
@@ -142,7 +141,6 @@ pub(crate) fn call_phase(kind: CallKind) -> PhaseKind {
         CallKind::Media(MediaCall::MediaReading) => PhaseKind::MediaRead,
         CallKind::Media(MediaCall::LatentPreparation) => PhaseKind::LatentPrepare,
         CallKind::Media(MediaCall::Muxing) => PhaseKind::Mux,
-        CallKind::Transfer(TransferMode::CacheExport) => PhaseKind::CacheExport,
     }
 }
 
@@ -172,7 +170,6 @@ pub(crate) fn phase_call(kind: PhaseKind) -> Option<CallKind> {
         PhaseKind::AudioEncode => CallKind::Media(MediaCall::AudioEncoding),
         PhaseKind::Mux => CallKind::Media(MediaCall::Muxing),
         PhaseKind::LatentPrepare => CallKind::Media(MediaCall::LatentPreparation),
-        PhaseKind::CacheExport => CallKind::Transfer(TransferMode::CacheExport),
         PhaseKind::Other => return None,
     })
 }
@@ -563,7 +560,6 @@ fn next_tokens(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> u3
             .canvas
             .map_or(0, |canvas| canvas.canvas_length),
         Some(CallKind::Media(_)) => 1,
-        Some(CallKind::Transfer(_)) => 0,
     }
 }
 
@@ -635,17 +631,10 @@ fn cached_pages(state: &RequestState) -> u32 {
     })
 }
 
-/// Whether a resident request waits for a transfer right now.
-fn waiting_transfer(scheduler: &Scheduler, id: RequestId) -> bool {
-    scheduler
-        .inflight
-        .pending_calls
-        .get(&id)
-        .is_some_and(|calls| {
-            calls
-                .iter()
-                .any(|call| call.call.bounds.max_transfer_bytes > 0)
-        })
+/// Whether a resident request waits for a transfer right now: its KV cache is being copied to its
+/// decode group by the device-direct hand-off.
+fn waiting_transfer(state: &RequestState) -> bool {
+    state.hand_off == crate::generation::HandOff::Copying
 }
 
 /// The view of a token request the scheduler holds.
@@ -677,7 +666,7 @@ pub(crate) fn request(
         cached_pages: cached_pages(state),
         last_emitted_at: recorded.last_emitted_at,
         class: RequestClass::Token,
-        waiting_transfer: waiting_transfer(scheduler, id),
+        waiting_transfer: waiting_transfer(state),
         next_tokens: next_tokens(scheduler, state, id),
         reservation_units: reservation_units(scheduler, state),
         prefetch_tokens: recorded.prefetch_tokens,
@@ -1380,7 +1369,6 @@ mod tests {
             CallKind::Media(MediaCall::MediaReading),
             CallKind::Media(MediaCall::LatentPreparation),
             CallKind::Media(MediaCall::Muxing),
-            CallKind::Transfer(TransferMode::CacheExport),
         ];
         for call in calls {
             let phase = call_phase(call);

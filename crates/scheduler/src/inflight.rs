@@ -90,7 +90,7 @@ pub(super) struct PendingBatch {
 fn query_tokens(call: &ipc::Call) -> u64 {
     match call.kind {
         ipc::CallKind::Forward(_) => call.input_token_ids.len().max(1) as u64,
-        ipc::CallKind::Media(_) | ipc::CallKind::Transfer(_) => 0,
+        ipc::CallKind::Media(_) => 0,
     }
 }
 

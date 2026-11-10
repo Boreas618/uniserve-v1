@@ -36,7 +36,7 @@ use proto::tensor::DType;
 /// [`register_call`] stamps the real identity, and generation zero marks the
 /// product for a fresh generation there. The shape bound is empty: it carries
 /// identity, not a device geometry. `output_index` must be unique among the
-/// call's outputs, including `cache_output`; `Call::validate` rejects repeats.
+/// call's outputs; `Call::validate` rejects repeats.
 fn output_tensor(output_index: u16, dtype: DType) -> TensorRef {
     TensorRef {
         request_key: RequestKey::new(0, RequestId(0), 0),
@@ -617,12 +617,10 @@ fn finish_plan(
     } else {
         0
     };
-    let max_transfer_bytes = call.bounds.max_transfer_bytes;
     call.bounds = Bounds {
         max_tokens: call.bounds.max_tokens,
         max_cache_units: 0,
         max_completion_bytes: logprob_bytes,
-        max_transfer_bytes,
     };
     Ok(call)
 }
@@ -654,8 +652,8 @@ pub(crate) enum PlanningError {
 /// Identity exhaustion is checked before changing the shared generation counter.
 ///
 /// The caller must already have set `call.call_id` to the call's batch and
-/// row. Every output with generation zero, `cache_output` first and then the
-/// tensor outputs in `Call::tensor_outputs` order, receives the next value of
+/// row. Every output with generation zero, in `Call::tensor_outputs` order,
+/// receives the next value of
 /// the engine-wide counter; generations are nonzero and fit in `u32`. On
 /// error nothing is changed, and the caller treats it as engine-fatal.
 pub(super) fn register_call(
@@ -667,11 +665,7 @@ pub(super) fn register_call(
     let required_generations = call
         .tensor_outputs()
         .filter(|product| product.generation == 0)
-        .count()
-        + usize::from(
-            call.cache_output
-                .is_some_and(|output| output.generation == 0),
-        );
+        .count();
     let first_generation = (*next_product_generation).max(1);
     if required_generations > 0 {
         let last_generation = first_generation
@@ -689,13 +683,6 @@ pub(super) fn register_call(
         Ok::<_, PlanningError>(generation)
     };
     call.request_key = request_key;
-    if let Some(output) = &mut call.cache_output {
-        output.owner = request_key;
-        output.producer_call_id = call_id;
-        if output.generation == 0 {
-            output.generation = acquire_generation()?;
-        }
-    }
     for product in call.tensor_outputs_mut() {
         product.request_key = request_key;
         product.producer_call_id = call_id;

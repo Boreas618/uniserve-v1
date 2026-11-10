@@ -124,7 +124,7 @@ use terminal::{Terminal, Usage, latch_finish};
 pub(crate) mod stats_report;
 
 pub use epoch::{GroupCache, ParkedCache};
-use ipc::{ForwardMode, TransferMode};
+use ipc::ForwardMode;
 pub use policy::{
     Arrival, BatchCapacity, Candidate, Limits, PREFETCH_FLOOR_TOKENS, Parameters, PolicyBytes,
     PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyUsage, ProgramSource, Progress,
@@ -587,8 +587,7 @@ fn batch_kind(call_variant: CallKind) -> BatchKind {
             | MediaCall::AudioEncoding
             | MediaCall::AudioDecoding
             | MediaCall::Muxing,
-        )
-        | CallKind::Transfer(TransferMode::CacheExport) => BatchKind::Media,
+        ) => BatchKind::Media,
     }
 }
 
@@ -616,8 +615,8 @@ const OUTPUT_TERMINAL_RESERVE: usize = 2;
 struct CacheLengths {
     /// Tokens the call's cache-writing forward row appends: the prompt slice
     /// length, the feature write's token capacity, or one for decode and
-    /// verify. Zero for cache export and install, and for a canvas step,
-    /// which only read the request's prefix cache.
+    /// verify. Zero for a canvas step, which only reads the request's
+    /// prefix cache.
     input: u32,
     /// Scheduled visible cache length before the call.
     visible: u32,

@@ -4,7 +4,7 @@
 //! grows and activates for it.
 
 use super::*;
-use ipc::{ForwardMode, TransferMode};
+use ipc::ForwardMode;
 
 use crate::kv_cache::Checkpoint;
 
@@ -143,8 +143,7 @@ impl Scheduler {
                 visible,
                 input: 1 + generation::verify_drafts(&call).len() as u32,
             }),
-            CallKind::Forward(ForwardMode::TokenDenoising)
-            | CallKind::Transfer(TransferMode::CacheExport) => {
+            CallKind::Forward(ForwardMode::TokenDenoising) => {
                 Some(CacheLengths { visible, input: 0 })
             }
             _ => None,

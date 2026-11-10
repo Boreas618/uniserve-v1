@@ -6,7 +6,7 @@
 //! produces a value or the mechanism already owns it; the short version is that the worker states *what
 //! execution did* — the tokens it accepted, the cache extent it initialized and
 //! what a successor may read, the log-probabilities a client asked for, the
-//! artifact and the cache export — and the mechanism keeps *its own rules*: the
+//! artifact — and the mechanism keeps *its own rules*: the
 //! stop conditions are evaluated here from the sampled token
 //! (`OutputSender::und_token_outcome`), and the call's budget, cache window and
 //! sampling rows are the plan's.

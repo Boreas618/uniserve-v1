@@ -196,7 +196,6 @@ pub enum PhaseKind {
     Mux,
     // Background work.
     LatentPrepare,
-    CacheExport,
     /// A draft-cache refill: a prefill-class chunk of a decoding request
     /// (design §4.4, `Plan::refill`).
     Refill,
@@ -215,7 +214,7 @@ pub enum PhaseClass {
     Token,
     /// Media work.
     Media,
-    /// Latent preparation, cache export, and work with no phase.
+    /// Latent preparation and work with no phase.
     Background,
 }
 
@@ -237,9 +236,7 @@ impl PhaseKind {
             | PhaseKind::VideoEncode
             | PhaseKind::AudioEncode
             | PhaseKind::Mux => PhaseClass::Media,
-            PhaseKind::LatentPrepare | PhaseKind::CacheExport | PhaseKind::Other => {
-                PhaseClass::Background
-            }
+            PhaseKind::LatentPrepare | PhaseKind::Other => PhaseClass::Background,
         }
     }
 
@@ -248,7 +245,8 @@ impl PhaseKind {
     /// plan, a policy's `Plan` and a batch's phase are all numbered here, so this is the one table
     /// they can agree on.
     ///
-    /// Ids 7, 8, 9 and 18 are reserved: they numbered kinds that no longer exist.
+    /// Ids 7, 8, 9, 18 and 19 are reserved: they numbered kinds that no longer exist (19 was the
+    /// cache export, superseded by the scheduler's device-direct hand-off).
     ///
     /// [`PhaseKind::Other`] is a policy-side placeholder for a kind a policy does not know: it has
     /// no phase of its own, so its id is `u32::MAX`.
@@ -269,7 +267,6 @@ impl PhaseKind {
             Self::AudioEncode => 15,
             Self::Mux => 16,
             Self::LatentPrepare => 17,
-            Self::CacheExport => 19,
             Self::Refill => 20,
             Self::Other => u32::MAX,
         })

@@ -171,7 +171,6 @@ impl ExecutionDomainStats {
             CallKind::Forward(ForwardMode::Decode | ForwardMode::Verify) => 1,
             CallKind::Forward(ForwardMode::TokenDenoising) => 3,
             CallKind::Forward(_)
-            | CallKind::Transfer(_)
             | CallKind::Media(
                 MediaCall::TextEncoding | MediaCall::VisionEncoding | MediaCall::LatentEncoding,
             ) => 0,
