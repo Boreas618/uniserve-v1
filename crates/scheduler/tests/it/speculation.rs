@@ -96,7 +96,10 @@ fn drafting(batch: &Batch, accepted: usize) -> Outcome<BatchOutput> {
                 tokens.push(sample(first + index as u64 + 1));
             }
             last = first + tokens.len() as u64 - 1;
-            record.token_logprobs = vec![testkit::text::LOGPROB; tokens.len()];
+            record.token_logprobs = tokens
+                .iter()
+                .map(|&token| testkit::text::scored(token))
+                .collect();
             record.tokens = tokens;
         }
         // The drafter proposes after the committed tokens; a wrong draft is a

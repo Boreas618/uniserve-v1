@@ -167,6 +167,7 @@ fn runtime_limits() -> GenerationLimits {
         max_latent_feature_bytes: u64::MAX,
         max_vision_feature_bytes: u64::MAX,
         encoder_cache_entries: 32,
+        max_logprobs: 20,
     }
 }
 

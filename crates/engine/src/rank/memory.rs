@@ -308,6 +308,11 @@ impl ModelRunner {
         // rank rather than a second one derived here. A media rank adds what its denoiser serves,
         // which the frontend plans a request against and no capacity figure implies.
         let mut info = planned.info.clone();
+        // A text rank's sampler reports the deployment's candidates at every position it scores
+        // (`CausalLmRunner::reporting`), which bounds what a request may ask for.
+        if let Loaded::Text(_) = loaded {
+            info.max_logprobs = self.engine_config().max_logprobs;
+        }
         // A rank that takes images states its encodings: the feature row an image block's
         // encoding writes, and the slots that hold them, each the largest image's.
         if let Loaded::Text(model) = loaded

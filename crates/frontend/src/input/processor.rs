@@ -469,6 +469,8 @@ impl InputProcessor {
             let processor =
                 self.preprocess_chat_input(prompt, max_tokens, &images, &mut generation)?;
             generation.validate()?;
+            // The workers compute a position's candidates in their graphs, as many as they state.
+            self.limits.covers_logprobs(&generation.sampling)?;
             Ok(processor)
         })()
         .map_err(|source| ServeError::Tokenize {

@@ -223,6 +223,8 @@ message ChatResponseOptions {
   // The response timestamp, in seconds since the UNIX epoch, shared by every
   // chunk.
   uint64 created = 9;
+  // How many of a generated position's candidates `top_logprobs` lists.
+  uint32 top_logprobs = 10;
 }
 
 // The incremental detokenizer and the stop-string decisions of the events

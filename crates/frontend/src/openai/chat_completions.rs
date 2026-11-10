@@ -263,6 +263,10 @@ pub struct ChatResponseContext {
     pub include_usage: bool,
     /// Whether generated-token logprobs were requested.
     pub requested_logprobs: bool,
+    /// How many of a generated position's candidates `top_logprobs` lists, in the engine's order
+    /// (the sampled token first): the request's `top_logprobs`, zero when unset and every one for
+    /// `-1` - vLLM's `chat_top_logprobs_limit`.
+    pub top_logprobs: u32,
     /// Whether prompt-token logprobs were requested. Only non-streaming
     /// responses carry them; [`validate_request_compat`] rejects a streamed
     /// request that asks for a positive or `-1` count, and
@@ -292,6 +296,9 @@ impl ChatResponseContext {
                 .and_then(|options| options.include_usage)
                 .unwrap_or(false),
             requested_logprobs: request.logprobs,
+            top_logprobs: request
+                .top_logprobs
+                .map_or(0, |count| u32::try_from(count).unwrap_or(u32::MAX)),
             include_prompt_logprobs: request.prompt_logprobs.is_some(),
             include_reasoning: request.include_reasoning,
             return_token_ids: request.return_token_ids.unwrap_or(false),
@@ -315,6 +322,7 @@ pub fn chat_response(
         request_id,
         response_model,
         requested_logprobs,
+        top_logprobs,
         include_prompt_logprobs,
         include_reasoning,
         return_token_ids,
@@ -356,6 +364,7 @@ pub fn chat_response(
                 server_error!("chat response requested logprobs but generation returned none")
             })?,
             return_tokens_as_token_ids,
+            top_logprobs,
         )?)
     } else {
         None
@@ -776,6 +785,7 @@ impl ChatStreamEmitter {
                             decoded_logprobs_to_openai_chat(
                                 lp,
                                 self.context.return_tokens_as_token_ids,
+                                self.context.top_logprobs,
                             )
                         })
                         .transpose()?
@@ -1434,7 +1444,8 @@ pub fn decoded_prompt_logprobs_to_maps(
         .collect()
 }
 
-/// Converts decoded generated-token candidates into chat logprob content.
+/// Converts decoded generated-token candidates into chat logprob content, each position listing
+/// its first `top_logprobs` candidates.
 ///
 /// # Errors
 ///
@@ -1443,11 +1454,14 @@ pub fn decoded_prompt_logprobs_to_maps(
 pub fn decoded_logprobs_to_openai_chat(
     logprobs: &DecodedLogprobs,
     return_tokens_as_token_ids: bool,
+    top_logprobs: u32,
 ) -> Result<ChatLogProbs, ApiError> {
     let content = logprobs
         .positions
         .iter()
-        .map(|position| position_to_chat_logprobs_content(position, return_tokens_as_token_ids))
+        .map(|position| {
+            position_to_chat_logprobs_content(position, return_tokens_as_token_ids, top_logprobs)
+        })
         .try_collect()?;
     Ok(ChatLogProbs {
         content: Some(content),
@@ -1482,13 +1496,14 @@ fn position_top_logprobs_map(
 
 /// Converts one decoded candidate distribution into OpenAI chat log-probability content.
 ///
-/// The first candidate is the sampled token. `top_logprobs` lists every
-/// candidate at the position, including the sampled token. `bytes` holds the
-/// UTF-8 encoding of the rendered token string, which is the `token_id:<id>`
-/// placeholder when `return_tokens_as_token_ids` is set.
+/// The first candidate is the sampled token, then the position's most likely tokens without it.
+/// `top_logprobs` lists the first `limit` of those candidates, the sampled token first, as vLLM's
+/// chat response does. `bytes` holds the UTF-8 encoding of the rendered token string, which is the
+/// `token_id:<id>` placeholder when `return_tokens_as_token_ids` is set.
 fn position_to_chat_logprobs_content(
     position: &DecodedPositionLogprobs,
     return_tokens_as_token_ids: bool,
+    limit: u32,
 ) -> Result<ChatLogProbsContent, ApiError> {
     let chosen = position.entries.first().ok_or_else(|| {
         server_error!("decoded chat logprobs position unexpectedly had no token candidates")
@@ -1501,6 +1516,7 @@ fn position_to_chat_logprobs_content(
         top_logprobs: position
             .entries
             .iter()
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
             .map(|entry| {
                 let token = format_token(entry, return_tokens_as_token_ids);
                 TopLogProb {
@@ -1597,6 +1613,7 @@ mod tests {
             response_model: "m".to_string(),
             include_usage: false,
             requested_logprobs: true,
+            top_logprobs: 0,
             include_prompt_logprobs: false,
             include_reasoning,
             return_token_ids: true,
@@ -1652,6 +1669,7 @@ mod tests {
             response_model: "m".to_string(),
             include_usage: true,
             requested_logprobs: true,
+            top_logprobs: 0,
             include_prompt_logprobs: false,
             include_reasoning: true,
             return_token_ids: true,
@@ -1713,6 +1731,7 @@ mod tests {
             response_model: "m".to_string(),
             include_usage: false,
             requested_logprobs: true,
+            top_logprobs: 0,
             include_prompt_logprobs: false,
             include_reasoning: true,
             return_token_ids: true,
@@ -1770,6 +1789,7 @@ mod tests {
             response_model: "m".to_string(),
             include_usage: false,
             requested_logprobs: true,
+            top_logprobs: 0,
             include_prompt_logprobs: false,
             include_reasoning: true,
             return_token_ids: true,

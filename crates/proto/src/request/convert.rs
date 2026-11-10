@@ -690,6 +690,7 @@ impl From<&GenerationLimits> for wire::GenerationLimits {
             max_latent_feature_bytes: limits.max_latent_feature_bytes,
             max_vision_feature_bytes: limits.max_vision_feature_bytes,
             encoder_cache_entries: limits.encoder_cache_entries,
+            max_logprobs: limits.max_logprobs,
         }
     }
 }
@@ -712,6 +713,7 @@ impl From<wire::GenerationLimits> for GenerationLimits {
             max_latent_feature_bytes: limits.max_latent_feature_bytes,
             max_vision_feature_bytes: limits.max_vision_feature_bytes,
             encoder_cache_entries: limits.encoder_cache_entries,
+            max_logprobs: limits.max_logprobs,
         }
     }
 }

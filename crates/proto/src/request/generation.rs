@@ -162,9 +162,48 @@ pub struct GenerationLimits {
     pub max_vision_feature_bytes: u64,
     /// Maximum concurrently pinned encoder-cache entries.
     pub encoder_cache_entries: u32,
+    /// The most likely tokens a request may ask for at a generated or a prompt position
+    /// (`n_logprobs`, `n_prompt_logprobs`): what the workers' samplers compute for every row.
+    pub max_logprobs: u32,
 }
 
 impl GenerationLimits {
+    /// Checks that the workers compute as many candidates at a position as `sampling` asks for
+    /// at a generated or a prompt one.
+    ///
+    /// A position's candidates are computed by the workers' captured graphs, `max_logprobs` of
+    /// them for every row, so a request may ask for that many and no more (vLLM's rule).
+    ///
+    /// # Errors
+    ///
+    /// `LogprobCount`, naming the request field that asks for more.
+    pub fn covers_logprobs(
+        &self,
+        sampling: &SamplingParams,
+    ) -> Result<(), GenerationResourceError> {
+        for (requested, asked, parameter) in [
+            (
+                sampling.n_logprobs,
+                sampling.generated_logprobs_requested(),
+                "logprobs",
+            ),
+            (
+                sampling.n_prompt_logprobs,
+                sampling.prompt_logprobs_requested(),
+                "prompt_logprobs",
+            ),
+        ] {
+            if asked && requested > self.max_logprobs {
+                return Err(GenerationResourceError::LogprobCount {
+                    parameter,
+                    requested,
+                    available: self.max_logprobs,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Checks whether the runtime covers every feature required by a request.
     ///
     /// A failure carries the missing feature set for admission diagnostics.
@@ -231,12 +270,14 @@ impl GenerationRequest {
     /// [`GenerationRequest::max_cache_tokens`] error; `MissingRuntimeBound` for a
     /// reachable encoder kind whose feature-byte limit is zero; and
     /// `MissingRuntimeBound` or `EncoderCacheCapacity` when reserved
-    /// encoder-cache entries exceed `encoder_cache_entries`.
+    /// encoder-cache entries exceed `encoder_cache_entries`; and `LogprobCount` when the
+    /// request asks for more candidates at a generated or a prompt position than `max_logprobs`.
     pub fn validate_resources(
         &self,
         limits: &GenerationLimits,
     ) -> Result<(), GenerationResourceError> {
         self.max_cache_tokens(limits)?;
+        limits.covers_logprobs(&self.sampling)?;
 
         // Each encoder kind reachable from context images needs a nonzero
         // feature-product size.
@@ -336,6 +377,16 @@ pub enum GenerationResourceError {
         /// Requested cache entry count.
         requested: usize,
         /// Available cache entry count.
+        available: u32,
+    },
+    /// More candidates asked for at a position than the deployment computes (vLLM's message).
+    #[error("requested {parameter} of {requested}, which is greater than max allowed: {available}")]
+    LogprobCount {
+        /// The request field: `logprobs` (generated positions) or `prompt_logprobs`.
+        parameter: &'static str,
+        /// The candidates asked for; a request for every candidate asks for `u32::MAX`.
+        requested: u32,
+        /// The deployment's `max_logprobs`.
         available: u32,
     },
 }
@@ -647,6 +698,7 @@ mod tests {
             max_latent_feature_bytes: 1 << 20,
             max_vision_feature_bytes: 1 << 20,
             encoder_cache_entries: 4,
+            max_logprobs: 20,
         }
     }
 

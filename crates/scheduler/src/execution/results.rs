@@ -801,11 +801,20 @@ impl Scheduler {
                     // outputs still being produced when cancellation arrived.
                     continue;
                 };
-                // A rank reports the log-probability of every token its sampler selected, because
-                // whether a row's request asked for them is not a fact its captured graph can
-                // branch on; a request that did not ask reports none.
-                if !state.req.sampling.generated_logprobs_requested() {
+                // A rank reports the scores of every token its sampler selected, with the
+                // deployment's candidates, because whether a row's request asked for them is not a
+                // fact its captured graph can branch on; a request that did not ask reports none,
+                // and one that did keeps the candidates it asked for.
+                let sampling = &state.req.sampling;
+                if sampling.generated_logprobs_requested() {
+                    for entries in &mut record.token_logprobs {
+                        crate::completion::requested_candidates(entries, sampling.n_logprobs);
+                    }
+                } else {
                     record.token_logprobs.clear();
+                }
+                for entries in &mut record.prompt_logprobs {
+                    crate::completion::requested_candidates(entries, sampling.n_prompt_logprobs);
                 }
                 if let Err(error) = generation::validate_generation_result(
                     &call,

@@ -385,7 +385,11 @@ fn batch_output() -> execution::BatchOutput {
         calls: vec![
             execution::CallOutput::completed(execution::CallId(0), vec![99], state),
             execution::CallOutput {
-                token_logprobs: vec![-0.25],
+                token_logprobs: vec![vec![ipc::TokenLogprob {
+                    token_id: 5,
+                    logprob: -0.25,
+                    rank: 1,
+                }]],
                 ..execution::CallOutput::completed(execution::CallId(1), vec![5], state)
             },
         ],
@@ -467,6 +471,7 @@ fn full_caps() -> MainProcessInfo {
     MainProcessInfo {
         encoder_cache_entries: 64,
         encoder_entry_bytes: 128 << 20,
+        max_logprobs: 20,
         media_components: video_components(),
         supported_calls: CallKind::ALL.to_vec(),
         // A full-attention group with 64-token pages of one unit and a
@@ -876,7 +881,7 @@ fn a_completion_agrees_with_its_status() {
     assert!(refusal(predicated.validate()).contains("predicated completion"));
 
     let misaligned = execution::CallOutput {
-        token_logprobs: vec![-0.5, -0.25],
+        token_logprobs: vec![Vec::new(), Vec::new()],
         ..completed()
     };
     assert!(refusal(misaligned.validate()).contains("do not align"));

@@ -58,7 +58,9 @@ use super::{ATTENTION_WORKSPACE_BYTES, CausalLmRunner, LOGITS_DTYPE};
 use crate::runner::Runner;
 use crate::runners::columns::{Column, encode_f32, encode_i32};
 use crate::runners::recording::{Footprint, Walk};
-use crate::runners::sampling::{SamplerState, Samples, commit_block, commit_descriptor};
+use crate::runners::sampling::{
+    SamplerState, Samples, Scores, TopLogprobs, commit_block, commit_descriptor, scored,
+};
 use crate::runners::state::StateRows;
 use crate::{Error, Result};
 
@@ -159,11 +161,81 @@ struct Plan {
     tokens: usize,
 }
 
-/// What a call accepted: its committed tokens and their log-probabilities.
+/// What a call accepted: its committed tokens and their scores (`sampling::scored`).
 #[derive(Clone, Debug, Default)]
 struct Accepted {
     tokens: Vec<u32>,
-    logprobs: Vec<f32>,
+    logprobs: Vec<Vec<ipc::TokenLogprob>>,
+}
+
+/// One launch sequence's scores of its sampled tokens, in columns the host reads back: each
+/// token's log-probability and rank, and its row's most likely tokens.
+struct ScoreColumns {
+    logprobs: Column,
+    ranks: Column,
+    /// `[tokens, candidates]` f32 and i32, for a sampler that reports candidates.
+    values: Option<Column>,
+    ids: Option<Column>,
+    candidates: u32,
+}
+
+impl ScoreColumns {
+    fn new(device: DeviceId, tokens: u64, candidates: u32) -> Result<Self> {
+        let wide = tokens * u64::from(candidates);
+        Ok(Self {
+            logprobs: Column::new(device, DType::F32, tokens.max(1))?,
+            ranks: Column::new(device, DType::I32, tokens.max(1))?,
+            values: (candidates > 0)
+                .then(|| Column::new(device, DType::F32, wide))
+                .transpose()?,
+            ids: (candidates > 0)
+                .then(|| Column::new(device, DType::I32, wide))
+                .transpose()?,
+            candidates,
+        })
+    }
+
+    /// The scores of `rows` rows, with the candidates' scratch taken from `arena`.
+    fn views(&self, arena: &nn::Arena, rows: u64) -> Result<Scores> {
+        let width = u64::from(self.candidates);
+        let top = match (&self.values, &self.ids) {
+            (Some(values), Some(ids)) => Some(TopLogprobs {
+                values: values.shaped(&[rows, width]),
+                ids: ids.shaped(&[rows, width]),
+                workspace: arena.tensor(DType::I32, ops::sampler::top_k_workspace(rows, width))?,
+            }),
+            _ => None,
+        };
+        Ok(Scores {
+            logprobs: self.logprobs.extent(0..rows),
+            ranks: self.ranks.extent(0..rows),
+            top,
+        })
+    }
+
+    /// Row `index`'s sampled `token` and its scores, as the device wrote them.
+    fn scored(&self, index: usize, token: u32, vocabulary: u32) -> Vec<ipc::TokenLogprob> {
+        let width = self.candidates as usize;
+        let read = |column: &Option<Column>| {
+            column.as_ref().map_or(Vec::new(), |column| {
+                // SAFETY: the column's host side holds `[tokens, candidates]` elements of four
+                // bytes, `index` is a sampled row, and the stream has completed the launches that
+                // wrote them.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        column.host.as_ptr().cast::<u32>().add(index * width),
+                        width,
+                    )
+                    .to_vec()
+                }
+            })
+        };
+        let values: Vec<f32> = read(&self.values).into_iter().map(f32::from_bits).collect();
+        let ids: Vec<i32> = read(&self.ids).into_iter().map(|id| id as i32).collect();
+        let logprob = Speculation::read_f32(&self.logprobs, index + 1)[index];
+        let rank = Speculation::read_i32(&self.ranks, index + 1)[index].max(0) as u32;
+        scored(token, logprob, rank, &values, &ids, vocabulary)
+    }
 }
 
 /// The longest prefix of `drafts` the samples `sampled` agree with, then the sample after it: the
@@ -218,9 +290,9 @@ pub(crate) struct Speculation {
     adjustments: Column,
     bans: Column,
     greedy: Column,
-    greedy_logprobs: Column,
+    greedy_scores: ScoreColumns,
     drawn: Column,
-    drawn_logprobs: Column,
+    drawn_scores: ScoreColumns,
     // The commit.
     table: Column,
     commit_tokens: Column,
@@ -252,7 +324,8 @@ pub(crate) struct Speculation {
 impl Speculation {
     /// The columns of a runner on `device` whose batches hold at most `tokens` tokens in `rows`
     /// rows, over `slots` request slots, verifying at most `drafts` drafts per call, with a
-    /// `vocabulary`-wide head and sequences of at most `max_kv_len` keys in pages of `page` tokens.
+    /// `vocabulary`-wide head reporting `candidates` most likely tokens a sampled one, and
+    /// sequences of at most `max_kv_len` keys in pages of `page` tokens.
     #[allow(
         clippy::too_many_arguments,
         reason = "the device, the batch bounds, the slots, the draft limit and the model's widths"
@@ -264,6 +337,7 @@ impl Speculation {
         slots: u32,
         drafts: u32,
         vocabulary: u32,
+        candidates: u32,
         max_kv_len: u32,
         page: u32,
     ) -> Result<Self> {
@@ -307,9 +381,9 @@ impl Speculation {
             adjustments: i32s(2 * tokens)?,
             bans: i32s(rows * u64::from(ops::sampler::ban_words(vocabulary)))?,
             greedy: i32s(tokens)?,
-            greedy_logprobs: f32s(tokens)?,
+            greedy_scores: ScoreColumns::new(device, tokens, candidates)?,
             drawn: i32s(tokens)?,
-            drawn_logprobs: f32s(tokens)?,
+            drawn_scores: ScoreColumns::new(device, tokens, candidates)?,
             table: i32s(COMMIT_FIELDS as u64 * capacity)?,
             commit_tokens: i32s(capacity)?,
             points: i32s(capacity)?,
@@ -949,7 +1023,7 @@ impl<M: TextModel> CausalLmRunner<M> {
                 &state,
                 &Samples {
                     tokens: spec.greedy.extent(0..rows),
-                    logprobabilities: Some(spec.greedy_logprobs.extent(0..rows)),
+                    scores: Some(spec.greedy_scores.views(arena, rows)?),
                 },
             )?;
         }
@@ -961,7 +1035,7 @@ impl<M: TextModel> CausalLmRunner<M> {
                 spec.draws.extent(0..rows),
                 &Samples {
                     tokens: spec.drawn.extent(0..rows),
-                    logprobabilities: Some(spec.drawn_logprobs.extent(0..rows)),
+                    scores: Some(spec.drawn_scores.views(arena, rows)?),
                 },
             )?;
         }
@@ -976,19 +1050,17 @@ impl<M: TextModel> CausalLmRunner<M> {
             .as_ref()
             .ok_or(Error::State("speculation"))?;
         let rows = plan.samples.len();
-        let (greedy, greedy_logprobs, drawn, drawn_logprobs) = (
+        let (greedy, drawn) = (
             Speculation::read_i32(&spec.greedy, rows),
-            Speculation::read_f32(&spec.greedy_logprobs, rows),
             Speculation::read_i32(&spec.drawn, rows),
-            Speculation::read_f32(&spec.drawn_logprobs, rows),
         );
         let mut tokens = Vec::with_capacity(rows);
         let mut logprobs = Vec::with_capacity(rows);
         for (index, row) in plan.samples.iter().enumerate() {
-            let (token, logprob) = if row.parameters[TEMPERATURE as usize] == 0.0 {
-                (greedy[index], greedy_logprobs[index])
+            let (token, scores) = if row.parameters[TEMPERATURE as usize] == 0.0 {
+                (greedy[index], &spec.greedy_scores)
             } else {
-                (drawn[index], drawn_logprobs[index])
+                (drawn[index], &spec.drawn_scores)
             };
             let token = u32::try_from(token)
                 .ok()
@@ -1000,7 +1072,7 @@ impl<M: TextModel> CausalLmRunner<M> {
                     ))
                 })?;
             tokens.push(token);
-            logprobs.push(logprob);
+            logprobs.push(scores.scored(index, token, spec.vocabulary));
         }
         Ok(plan
             .calls

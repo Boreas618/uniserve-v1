@@ -361,7 +361,17 @@ fn logprobs_reach_the_requests_that_asked_for_them_alone() {
                     let mut output =
                         testkit::completed(batch, testkit::Tokens::Draw, testkit::Extent::Stated);
                     for call in &mut output.calls {
-                        call.token_logprobs = vec![LOGPROB; call.tokens.len()];
+                        call.token_logprobs = call
+                            .tokens
+                            .iter()
+                            .map(|&token_id| {
+                                vec![ipc::TokenLogprob {
+                                    token_id,
+                                    logprob: LOGPROB,
+                                    rank: 1,
+                                }]
+                            })
+                            .collect();
                     }
                     ipc::execution::Outcome::Success(output)
                 },

@@ -114,6 +114,7 @@ pub(crate) fn text_rank() -> MainProcessInfo {
         buffer_pool_bytes: 257_u64 * (256 << 20),
         encoder_cache_entries: 256,
         encoder_entry_bytes: 256 << 20,
+        max_logprobs: 20,
         max_batch_calls: 1024,
         max_unresolved_calls: 2,
         ..MainProcessInfo::default()
@@ -162,6 +163,7 @@ pub(crate) fn generation_limits(calls: &[CallKind]) -> GenerationLimits {
             max_vit_grid_tokens: u32::MAX,
             max_vision_feature_bytes: 256 << 20,
             encoder_cache_entries: 256,
+            max_logprobs: 20,
             ..Default::default()
         }
     } else if calls.contains(&CallKind::Media(MediaCall::LatentPreparation)) && !decodes {
@@ -176,6 +178,7 @@ pub(crate) fn generation_limits(calls: &[CallKind]) -> GenerationLimits {
             max_latent_feature_bytes: 256 << 20,
             max_vision_feature_bytes: 256 << 20,
             encoder_cache_entries: 256,
+            max_logprobs: 20,
             ..Default::default()
         }
     } else {

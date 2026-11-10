@@ -3,8 +3,9 @@
 # One module covers one descriptor of `[kernel.descriptors]` for one
 # architecture of `[kernel.architectures]`, built by `src/build.py`.
 #
-# One program reads one row's selected log-probability, so the row count is a
-# launch value and the module serves every batch.
+# One program reads one row's selected log-probability and counts the row's
+# entries above it for its rank, so the row count is a launch value and the
+# module serves every batch.
 
 op = "logprob_gather"
 backend = "triton"
@@ -27,8 +28,10 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-# `columns_151936_ids_i64_pdl_true`.
+# `columns_151936_ids_i64_tile_4096_pdl_true`.
+# The rank's count walks a row in steps of `min(tile, 4096)` lanes, a
+# `tl.arange` extent, so a tile below 4096 must be a power of two.
 [kernel.descriptors]
-dimensions = { columns = { min = 1 }, ids = ["i64", "i32"], pdl = ["true", "false"] }
+dimensions = { columns = { min = 1 }, ids = ["i64", "i32"], tile = { min = 1 }, pdl = ["true", "false"] }
 
 [parameters]

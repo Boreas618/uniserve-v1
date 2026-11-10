@@ -51,6 +51,8 @@ fn resolve_generation_limits(
     limits.max_latent_feature_bytes = limits.max_latent_feature_bytes.min(feature_bytes);
     limits.max_vision_feature_bytes = limits.max_vision_feature_bytes.min(feature_bytes);
     limits.encoder_cache_entries = limits.encoder_cache_entries.min(info.encoder_cache_entries);
+    // A request's candidates are what the workers' samplers compute.
+    limits.max_logprobs = limits.max_logprobs.min(info.max_logprobs);
     // Encoder caching requires a buffer pool.
     if info.buffer_pool_bytes == 0 {
         limits.encoder_cache_entries = 0;

@@ -455,6 +455,15 @@ impl WorkerInfo {
             .filter(|capacity| *capacity > 0)
             .min()
             .unwrap_or(0);
+        // A request's candidates are computed wherever its tokens are sampled, so every rank that
+        // samples must compute as many; a rank that samples nothing reports none and bounds nothing.
+        merged.max_logprobs = self
+            .workers
+            .iter()
+            .map(|(_, info)| info.max_logprobs)
+            .filter(|candidates| *candidates > 0)
+            .min()
+            .unwrap_or(0);
 
         merged.validate()?;
         check_video_tasks(&merged)?;

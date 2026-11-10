@@ -271,15 +271,20 @@ pub struct CallOutput {
     pub cache_computed_len: u32,
     /// The accepted prefix a successor may read: the slot's sampling position after the commit.
     pub cache_visible_len: u32,
-    /// The log-probability of each accepted token, aligned with [`CallOutput::tokens`]: the raw
-    /// distribution's, `log_softmax` of the model's logits before penalties, temperature and
+    /// The scores of each accepted token, aligned with [`CallOutput::tokens`], on the raw
+    /// distribution: `log_softmax` of the model's logits before penalties, temperature and
     /// filtering (vLLM's default `raw_logprobs`).
     ///
-    /// A causal-LM step reports one for every token it sampled, whether or not the request asked,
-    /// because a captured graph cannot branch on a request parameter; the scheduler drops them for
-    /// the requests that did not ask. A call that sampled nothing reports none.
-    pub token_logprobs: Vec<f32>,
-    /// Ranked log-probabilities for each scored prompt position, in input order.
+    /// A token's entries are the token itself - its log-probability and its one-based competition
+    /// rank - then its position's most likely tokens, the largest first, as many as the
+    /// deployment's `max_logprobs`; the token may be among them. A causal-LM step reports them for
+    /// every token it sampled, whether or not the request asked, because a captured graph cannot
+    /// branch on a request parameter; the scheduler keeps the candidates each request asks for and
+    /// drops the rest. A call that sampled nothing reports none.
+    pub token_logprobs: Vec<Vec<crate::TokenLogprob>>,
+    /// The scores of each prompt position the call scored, in input order, in the form of
+    /// [`CallOutput::token_logprobs`]: the prompt token itself, then the position's most likely
+    /// tokens.
     pub prompt_logprobs: Vec<Vec<crate::TokenLogprob>>,
     /// The finished artifact and its storage lifetime, when the call produced one.
     pub media_output: Option<crate::MediaOutput>,

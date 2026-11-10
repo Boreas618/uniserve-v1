@@ -256,6 +256,7 @@ fn limits_come_back_from_their_message_unchanged() {
         max_latent_feature_bytes: 6,
         max_vision_feature_bytes: 7,
         encoder_cache_entries: 10,
+        max_logprobs: 20,
     };
     let message = wire::GenerationLimits::from(&limits);
     assert_eq!(GenerationLimits::from(message), limits);

@@ -42,7 +42,8 @@ use crate::runners::columns::{Column, encode_f32, encode_i32};
 use crate::runners::lifecycle::{Lifecycle, walk_capture};
 use crate::runners::recording::{Footprint, Walk};
 use crate::runners::sampling::{
-    Adjustments, CommitColumns, SamplerState, Samples, Sampling, commit_descriptor, inert_commit,
+    Adjustments, CommitColumns, SamplerState, Samples, Sampling, Scores, commit_descriptor,
+    inert_commit, scored,
 };
 #[cfg(test)]
 use ipc::execution::Variant;
@@ -456,6 +457,11 @@ struct Columns {
     readback: [platform::PinnedBuffer; 2],
     /// `[rows]` f32 the raw log-probability of each sampled id, read back beside it.
     logprob_readback: [platform::PinnedBuffer; 2],
+    /// `[rows]` i32 each sampled id's rank in its raw distribution, read back beside it.
+    rank_readback: [platform::PinnedBuffer; 2],
+    /// `[rows, candidates]` f32 then `[rows, candidates]` i32: each row's most likely tokens, read
+    /// back beside them, for a runner whose sampler reports candidates ([`CausalLmRunner::reporting`]).
+    top_readback: Option<[platform::PinnedBuffer; 2]>,
 }
 
 /// The width of the per-token columns and of the per-row columns, over the buckets a runner serves.
@@ -548,7 +554,28 @@ impl Columns {
                 platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
                 platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
             ],
+            rank_readback: [
+                platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
+                platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
+            ],
+            top_readback: None,
         })
+    }
+
+    /// Sizes the candidates' readback for `candidates` most likely tokens a row, over the widest
+    /// row count `buckets` hold; none for a sampler that reports none.
+    fn report(&mut self, device: DeviceId, buckets: &Buckets, candidates: u32) -> Result<()> {
+        let (_, rows) = column_extents(buckets)?;
+        let bytes = usize::try_from(2 * rows * u64::from(candidates) * 4)
+            .map_err(|_| Error::Invalid("a candidates readback larger than memory".into()))?;
+        self.top_readback = match bytes {
+            0 => None,
+            bytes => Some([
+                platform::PinnedBuffer::new(device, bytes)?,
+                platform::PinnedBuffer::new(device, bytes)?,
+            ]),
+        };
+        Ok(())
     }
 }
 
@@ -593,8 +620,8 @@ struct PendingCompare {
 struct Sampled {
     /// `[rows]` i32 sampled token ids, in the bucket's row order.
     tokens: TensorView,
-    /// `[rows]` f32 each sampled id's log-probability under the raw logits.
-    logprobs: TensorView,
+    /// Each sampled id's scores under the raw logits.
+    scores: Scores,
 }
 
 /// The classes of the rows a batch carries, as a reader of a refusal needs them.
@@ -1220,6 +1247,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             self.slots,
             drafts,
             self.model.vocabulary(),
+            self.candidates(),
             self.max_kv_len,
             self.kv.page_size(),
         )?;
@@ -1233,9 +1261,10 @@ impl<M: TextModel> CausalLmRunner<M> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )?;
         let vocabulary = self.model.vocabulary();
-        self.verifier = Some(super::sampling::Sampler::new(
-            vocabulary, self.slots, vocabulary, drafts,
-        )?);
+        self.verifier = Some(
+            super::sampling::Sampler::new(vocabulary, self.slots, vocabulary, drafts)?
+                .reporting(self.candidates())?,
+        );
         self.speculation = Some(speculation);
         Ok(self)
     }
@@ -1319,6 +1348,32 @@ impl<M: TextModel> CausalLmRunner<M> {
     pub fn in_tensor_group(mut self, group: std::sync::Arc<nn::Group>) -> Self {
         self.tensor = Some(group);
         self
+    }
+
+    /// Makes this runner report each sampled token's `candidates` most likely alternatives beside
+    /// it - the deployment's `max_logprobs`, which bounds what a request may ask for - computed in
+    /// every sampling bucket's graph. Zero reports none, and adds no launch.
+    ///
+    /// # Errors
+    ///
+    /// A count above the vocabulary, or a readback the host cannot pin.
+    pub fn reporting(mut self, candidates: u32) -> Result<Self> {
+        if let Some(sampling) = self.sampling.take() {
+            self.sampling = Some(sampling.reporting(candidates)?);
+        }
+        if let Some(verifier) = self.verifier.take() {
+            self.verifier = Some(verifier.reporting(candidates)?);
+        }
+        self.columns
+            .report(self.device, &self.buckets, candidates)?;
+        Ok(self)
+    }
+
+    /// The most likely alternatives each sampled token is reported with.
+    pub fn candidates(&self) -> u32 {
+        self.sampling
+            .as_ref()
+            .map_or(0, |sampling| sampling.sampler.candidates())
     }
 
     /// The pools' books, for the caller that reports mapped bytes against the budget.
@@ -2570,10 +2625,40 @@ impl<M: TextModel> CausalLmRunner<M> {
             )?;
             platform::memcpy_async(
                 self.columns.logprob_readback[turn].address(),
-                samples.logprobs.ptr.address(),
+                samples.scores.logprobs.ptr.address(),
                 bytes,
                 &self.stream,
             )?;
+            platform::memcpy_async(
+                self.columns.rank_readback[turn].address(),
+                samples.scores.ranks.ptr.address(),
+                bytes,
+                &self.stream,
+            )?;
+            // The candidates, values then ids, each `[rows, candidates]` and contiguous.
+            if let (Some(top), Some(readback)) =
+                (samples.scores.top, self.columns.top_readback.as_ref())
+            {
+                let width = top.values.shape.last() as usize;
+                let plane = rows * width * std::mem::size_of::<i32>();
+                if 2 * plane > readback[turn].len() {
+                    return Err(Error::Invariant(
+                        "the candidates' readback buffer is smaller than the bucket".into(),
+                    ));
+                }
+                platform::memcpy_async(
+                    readback[turn].address(),
+                    top.values.ptr.address(),
+                    plane,
+                    &self.stream,
+                )?;
+                platform::memcpy_async(
+                    readback[turn].address() + plane as u64,
+                    top.ids.ptr.address(),
+                    plane,
+                    &self.stream,
+                )?;
+            }
             // The two per-slot lengths the completion reports: the logical position execution
             // initialized and the sampling position a successor may read.
             platform::memcpy_async(
@@ -2607,6 +2692,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             bucket,
             launched,
             turn,
+            sampled,
             ..
         } = flight;
         let rows = bucket.rows as usize;
@@ -2654,16 +2740,45 @@ impl<M: TextModel> CausalLmRunner<M> {
             logical,
             sampling,
         );
-        // SAFETY: the copy above filled `rows` f32 with the sampled ids' log-probabilities.
-        let logprobs = unsafe {
-            std::slice::from_raw_parts(
-                self.columns.logprob_readback[turn].as_ptr().cast::<f32>(),
-                rows,
-            )
+        let width = sampled
+            .and_then(|sampled| sampled.scores.top)
+            .map_or(0, |top| top.values.shape.last() as usize);
+        // SAFETY: the copies above filled `rows` f32 with the sampled ids' log-probabilities and
+        // `rows` i32 with their ranks, and, for a sampler that reports candidates, `rows · width`
+        // f32 then `rows · width` i32 with each row's most likely tokens.
+        let samples = unsafe {
+            let (values, candidates) = match (&self.columns.top_readback, width) {
+                (Some(readback), width) if width > 0 => {
+                    let base = readback[turn].as_ptr();
+                    (
+                        std::slice::from_raw_parts(base.cast::<f32>(), rows * width),
+                        std::slice::from_raw_parts(
+                            base.add(rows * width * std::mem::size_of::<f32>())
+                                .cast::<i32>(),
+                            rows * width,
+                        ),
+                    )
+                }
+                _ => (&[][..], &[][..]),
+            };
+            RowSamples {
+                ids,
+                logprobs: std::slice::from_raw_parts(
+                    self.columns.logprob_readback[turn].as_ptr().cast::<f32>(),
+                    rows,
+                ),
+                ranks: std::slice::from_raw_parts(
+                    self.columns.rank_readback[turn].as_ptr().cast::<i32>(),
+                    rows,
+                ),
+                values,
+                candidates,
+                width,
+                vocabulary: self.model.vocabulary(),
+            }
         };
         let calls = calls_output(
-            ids,
-            logprobs,
+            &samples,
             &flight.logits_rows,
             &flight.rows,
             &flight.calls,
@@ -3257,11 +3372,13 @@ impl<M: TextModel> CausalLmRunner<M> {
             adjustments: self.columns.adjustments.shaped(&[rows, 2]),
             bans: self.columns.bans.shaped(&[rows, words]),
         };
-        // Every sampling bucket reports its tokens' log-probabilities: whether a row's request asked
-        // for them is request data a captured graph cannot branch on, and the scores reuse the
-        // sampler's dead shaped row, so the only extra memory is one f32 per row. The scheduler keeps
-        // them for the requests that asked.
-        let samples = Samples::reserve(arena, DType::I32, rows, true)?;
+        // Every sampling bucket reports its tokens' log-probabilities, ranks and most likely
+        // alternatives: whether a row's request asked for them is request data a captured graph
+        // cannot branch on, and the scores reuse the sampler's dead shaped row, so the extra memory
+        // is a few words a row. The scheduler keeps them for the requests that asked, as many
+        // alternatives as each asked for.
+        let samples =
+            Samples::reserve(arena, DType::I32, rows, Some(sampling.sampler.candidates()))?;
         // A greedy bucket takes each row's largest candidate; every other sampling bucket draws one
         // from the row's distribution. The two are different launch sequences in the sampler layer
         // (`Sampler::greedy` and `Sampler::forward`). A greedy row in a drawing bucket draws from the
@@ -3284,9 +3401,9 @@ impl<M: TextModel> CausalLmRunner<M> {
                 bucket,
                 Sampled {
                     tokens: samples.tokens,
-                    logprobs: samples.logprobabilities.ok_or(Error::State(
-                        "a sampling bucket reserved no log-probabilities",
-                    ))?,
+                    scores: samples
+                        .scores
+                        .ok_or(Error::State("a sampling bucket reserved no scores"))?,
                 },
             );
         }
@@ -3459,13 +3576,13 @@ fn length_at(column: &[i32], row: usize) -> u32 {
 /// rows, one sampled id and one `logits_rows` entry each). A sample belongs to the call that owns
 /// its batch row; a row whose logits entry is negative contributes nothing.
 pub fn calls_output(
-    ids: &[i32],
-    logprobs: &[f32],
+    samples: &RowSamples<'_>,
     sampling_rows: &[i32],
     rows: &BatchRows,
     calls: &[CallId],
     states: &[RowState],
 ) -> Result<Vec<CallOutput>> {
+    let ids = samples.ids;
     if ids.len() < sampling_rows.len() {
         return Err(Error::Invariant(format!(
             "the bucket sampled {} rows and the batch names {}",
@@ -3517,11 +3634,47 @@ pub fn calls_output(
             Error::Invariant(format!("the batch names no call id for its row {position}"))
         })?;
         entry.tokens.push(ids[index] as u32);
-        if let Some(logprob) = logprobs.get(index) {
-            entry.token_logprobs.push(*logprob);
+        if let Some(scored) = samples.scored(index) {
+            entry.token_logprobs.push(scored);
         }
     }
     Ok(output)
+}
+
+/// What a replay's readback holds per bucket row: the sampled ids and their scores, as the
+/// completion reads them.
+pub struct RowSamples<'a> {
+    /// `[rows]` the sampled ids.
+    pub ids: &'a [i32],
+    /// `[rows]` each sampled id's raw log-probability; empty for a step that reports none.
+    pub logprobs: &'a [f32],
+    /// `[rows]` each sampled id's rank in its raw distribution.
+    pub ranks: &'a [i32],
+    /// `[rows, width]` each row's most likely tokens' log-probabilities, row-major.
+    pub values: &'a [f32],
+    /// `[rows, width]` their ids.
+    pub candidates: &'a [i32],
+    /// The candidates a row reports.
+    pub width: usize,
+    /// The vocabulary a candidate id lies in.
+    pub vocabulary: u32,
+}
+
+impl RowSamples<'_> {
+    /// Row `index`'s sampled token and its scores ([`scored`]), when the step reports scores.
+    fn scored(&self, index: usize) -> Option<Vec<ipc::TokenLogprob>> {
+        let logprob = *self.logprobs.get(index)?;
+        let rank = self.ranks.get(index).copied().unwrap_or(0).max(0) as u32;
+        let span = index * self.width..(index + 1) * self.width;
+        Some(scored(
+            self.ids[index] as u32,
+            logprob,
+            rank,
+            self.values.get(span.clone()).unwrap_or_default(),
+            self.candidates.get(span).unwrap_or_default(),
+            self.vocabulary,
+        ))
+    }
 }
 
 /// The call ids of a bucket's warm pose: one per call `warm_calls` states.
@@ -4417,14 +4570,35 @@ mod sampled_output_tests {
         }
     }
 
-    /// Each sampled token carries its own row's log-probability, and a row that samples nothing
-    /// reports none.
+    /// The readback of a step that sampled `ids` and reports no scores.
+    fn unscored(ids: &[i32]) -> RowSamples<'_> {
+        RowSamples {
+            ids,
+            logprobs: &[],
+            ranks: &[],
+            values: &[],
+            candidates: &[],
+            width: 0,
+            vocabulary: 1_000,
+        }
+    }
+
+    /// Each sampled token carries its own row's log-probability, rank and candidates, and a row
+    /// that samples nothing reports none.
     #[test]
-    fn a_sampled_token_carries_its_rows_logprob() {
+    fn a_sampled_token_carries_its_rows_scores() {
         let batch = rows(&[(0, 0..1), (1, 1..2)]);
+        let samples = RowSamples {
+            ids: &[111, 222],
+            logprobs: &[-0.5, -2.0],
+            ranks: &[2, 9],
+            values: &[-0.25, -0.5, -0.75, -1.0],
+            candidates: &[7, 111, 3, 4],
+            width: 2,
+            vocabulary: 1_000,
+        };
         let output = calls_output(
-            &[111, 222],
-            &[-0.5, -2.0],
+            &samples,
             &[0, -1],
             &batch,
             &[CallId(7), CallId(9)],
@@ -4432,7 +4606,19 @@ mod sampled_output_tests {
         )
         .expect("the batch's calls");
         assert_eq!(output[0].tokens, vec![111]);
-        assert_eq!(output[0].token_logprobs, vec![-0.5]);
+        let entry = |token_id, logprob, rank| ipc::TokenLogprob {
+            token_id,
+            logprob,
+            rank,
+        };
+        assert_eq!(
+            output[0].token_logprobs,
+            vec![vec![
+                entry(111, -0.5, 2),
+                entry(7, -0.25, 1),
+                entry(111, -0.5, 2)
+            ]]
+        );
         assert!(output[1].tokens.is_empty() && output[1].token_logprobs.is_empty());
     }
 
@@ -4442,8 +4628,7 @@ mod sampled_output_tests {
     fn sampled_rows_are_named_by_their_calls() {
         let batch = rows(&[(0, 0..1), (1, 1..2)]);
         let output = calls_output(
-            &[111, 222],
-            &[],
+            &unscored(&[111, 222]),
             &[1, 0],
             &batch,
             &[CallId(7), CallId(9)],
@@ -4492,8 +4677,7 @@ mod sampled_output_tests {
     #[test]
     fn a_call_that_samples_nothing_still_completes() {
         let output = calls_output(
-            &[0],
-            &[],
+            &unscored(&[0]),
             &[-1],
             &rows(&[(0, 0..4)]),
             &[CallId(1)],
@@ -4553,17 +4737,22 @@ mod sampled_output_tests {
     fn a_row_no_call_owns_is_refused() {
         let batch = rows(&[(0, 0..1)]);
         calls_output(
-            &[5],
-            &[],
+            &unscored(&[5]),
             &[3],
             &batch,
             &[CallId(1)],
             &[RowState::default()],
         )
         .expect_err("row 3 belongs to no call");
-        calls_output(&[], &[], &[0], &batch, &[CallId(1)], &[RowState::default()])
-            .expect_err("no id was sampled for row 0");
-        calls_output(&[5], &[], &[0], &batch, &[CallId(1)], &[])
+        calls_output(
+            &unscored(&[]),
+            &[0],
+            &batch,
+            &[CallId(1)],
+            &[RowState::default()],
+        )
+        .expect_err("no id was sampled for row 0");
+        calls_output(&unscored(&[5]), &[0], &batch, &[CallId(1)], &[])
             .expect_err("one call, no trajectory position");
     }
 

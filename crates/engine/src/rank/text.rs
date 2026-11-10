@@ -114,6 +114,8 @@ impl ModelRunner {
                     // sequence, which the resident cache's block-table rows were sized for.
                     self.engine_config().model.max_model_len,
                 )?;
+                // Every sampling graph reports the deployment's candidates beside each token.
+                let runner = runner.reporting(self.engine_config().max_logprobs)?;
                 let runner = match member {
                     Some(member) => runner.in_union(member),
                     None => runner,

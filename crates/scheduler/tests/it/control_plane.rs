@@ -224,6 +224,7 @@ fn generation_request(
         max_latent_feature_bytes: 256 << 20,
         max_vision_feature_bytes: 256 << 20,
         encoder_cache_entries: 256,
+        max_logprobs: 20,
     };
     let request = GenerationRequest {
         request_id,

@@ -112,28 +112,15 @@ impl CallCompletion {
     /// Two things the device reports differently from a worker, both stated
     /// rather than filled in: a call has no timing of its own (the batch
     /// measures the step, and `BatchReport::timing` carries it), and a token's
-    /// log-probability arrives as one number per accepted token, not as ranked
-    /// candidates. The mechanism's type wants candidates whose first entry is
-    /// the accepted token — which is what `generation` checks — so the accepted
-    /// token is stated as the one candidate the device named, never a
-    /// neighbour invented to fill the list.
+    /// scores carry every candidate the deployment computes (its
+    /// `max_logprobs`), which the completion keeps as the request asked
+    /// ([`requested_candidates`]).
     pub(crate) fn from_output(
         output: ipc::execution::CallOutput,
         request_key: RequestKey,
         call_id: CallId,
     ) -> Self {
-        let token_logprobs = output
-            .tokens
-            .iter()
-            .zip(&output.token_logprobs)
-            .map(|(token, logprob)| {
-                vec![TokenLogprob {
-                    token_id: *token,
-                    logprob: *logprob,
-                    rank: 1,
-                }]
-            })
-            .collect();
+        let token_logprobs = output.token_logprobs;
         Self {
             request_key,
             call_id,
@@ -300,6 +287,25 @@ impl BatchReport {
     }
 }
 
+/// Keeps of one scored position the candidates its request asks for: the position's own token,
+/// then the first `count` of the position's most likely tokens without the token itself, which is
+/// vLLM's set (`{token} ∪ top-count`, the token first). A worker reports the deployment's
+/// `max_logprobs` candidates a position whatever the request asked, so the request's own count
+/// is applied here.
+pub(crate) fn requested_candidates(entries: &mut Vec<TokenLogprob>, count: u32) {
+    let Some(own) = entries.first().map(|entry| entry.token_id) else {
+        return;
+    };
+    let mut kept = 1;
+    for index in 1..entries.len().min(1 + count as usize) {
+        if entries[index].token_id != own {
+            entries.swap(kept, index);
+            kept += 1;
+        }
+    }
+    entries.truncate(kept);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,7 +325,17 @@ mod tests {
                 cache_visible_len: 3,
             },
         );
-        call.token_logprobs = logprobs.to_vec();
+        call.token_logprobs = committed
+            .iter()
+            .zip(logprobs)
+            .map(|(&token_id, &logprob)| {
+                vec![TokenLogprob {
+                    token_id,
+                    logprob,
+                    rank: 1,
+                }]
+            })
+            .collect();
         call
     }
 
@@ -371,9 +387,8 @@ mod tests {
         assert_eq!(report.calls[1].request_key, calls[1].0);
         assert_eq!(report.calls[1].call_id, calls[1].1);
         assert_eq!(report.calls[1].committed_tokens, vec![7]);
-        // A device names one log-probability per accepted token; the mechanism
-        // records the accepted token as the one candidate, which is the shape
-        // `generation` checks against the tokens it emits.
+        // A device names the scores of each accepted token, the token first,
+        // which is the shape `generation` checks against the tokens it emits.
         assert_eq!(report.calls[0].token_logprobs.len(), 1);
         assert_eq!(report.calls[0].token_logprobs[0].len(), 1);
         assert_eq!(report.calls[0].token_logprobs[0][0].token_id, 5);
@@ -381,6 +396,41 @@ mod tests {
         assert_eq!(report.calls[0].token_logprobs[0][0].rank, 1);
         assert_eq!(report.timing.device_us, 11);
         assert!(report.command_results.is_empty());
+    }
+
+    /// A position keeps its own token and as many of its candidates as its request asks for,
+    /// without repeating its own token among them.
+    #[test]
+    fn a_position_keeps_the_candidates_its_request_asks_for() {
+        let entry = |token_id, logprob, rank| TokenLogprob {
+            token_id,
+            logprob,
+            rank,
+        };
+        let reported = vec![
+            entry(5, -1.0, 2),
+            entry(9, -0.5, 1),
+            entry(5, -1.0, 2),
+            entry(3, -2.0, 3),
+            entry(4, -3.0, 4),
+        ];
+        let kept = |count| {
+            let mut entries = reported.clone();
+            requested_candidates(&mut entries, count);
+            entries
+                .iter()
+                .map(|entry| entry.token_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kept(0), vec![5]);
+        assert_eq!(kept(1), vec![5, 9]);
+        assert_eq!(
+            kept(2),
+            vec![5, 9],
+            "the token is among its two most likely"
+        );
+        assert_eq!(kept(3), vec![5, 9, 3]);
+        assert_eq!(kept(10), vec![5, 9, 3, 4]);
     }
 
     /// A call the batch does not have is refused, not filed against a

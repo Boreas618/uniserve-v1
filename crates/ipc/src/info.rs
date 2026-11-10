@@ -595,6 +595,10 @@ pub struct MainProcessInfo {
     pub encoder_cache_entries: u32,
     /// Maximum bytes in one encoder feature product, independent of pool size.
     pub encoder_entry_bytes: u64,
+    /// The most likely tokens this rank's sampler reports at a scored position
+    /// (`top_logprobs`, `prompt_logprobs`); zero for a rank that reports none.
+    #[serde(default)]
+    pub max_logprobs: u32,
     /// Maximum unresolved calls per request.
     pub max_unresolved_calls: u32,
     /// Concurrent tasks this rank's bounded host task pool admits. The
@@ -752,6 +756,7 @@ impl Default for MainProcessInfo {
             buffer_pool_bytes: 0,
             encoder_cache_entries: 0,
             encoder_entry_bytes: 0,
+            max_logprobs: 0,
             max_unresolved_calls: 1,
             host_task_capacity: 1,
         }

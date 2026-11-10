@@ -12,6 +12,10 @@ impl ModelConfig {
     ) -> proto::request::GenerationLimits {
         // No family this daemon serves states a capacity before its workers do.
         let mut limits = proto::request::GenerationLimits::default();
+        // A text family bounds no position's candidates of its own: its workers' samplers do.
+        if self.chat().is_some() {
+            limits.max_logprobs = u32::MAX;
+        }
         // A family that takes images states no bound of its own on their encodings: the
         // engine takes each limit as the smaller of this one and its workers', so the workers'
         // feature storage and encoder cache bound them.

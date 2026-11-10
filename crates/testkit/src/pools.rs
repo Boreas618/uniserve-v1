@@ -96,6 +96,7 @@ fn launch(model: impl Into<String>) -> EngineArgs {
                 max_latent_feature_bytes: 256 << 20,
                 max_vision_feature_bytes: 256 << 20,
                 encoder_cache_entries: 256,
+                max_logprobs: 20,
                 ..Default::default()
             },
             bos: 0,
@@ -114,6 +115,7 @@ fn launch(model: impl Into<String>) -> EngineArgs {
         deployment: format!("deployment-{}", uuid::Uuid::new_v4().simple()),
         max_running_requests,
         max_num_batched_tokens: None,
+        max_logprobs: 20,
         attention_backend: String::new(),
         prefill_attention_backend: None,
         decode_attention_backend: None,

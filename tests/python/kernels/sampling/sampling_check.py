@@ -29,7 +29,9 @@ Operators, in the order the data meets them:
   sum, pick the lowest id whose share the draw reaches. A token id, so exact.
 - `argmax` — the greedy token: the largest value's index, the lowest index among ties.
 - `logprob_gather` — one token's log-probability per row, read out of the FP32 row
-  `log_softmax` produced. Values move, so the comparison is exact.
+  `log_softmax` produced, and its competition rank: one plus the entries strictly above it,
+  ties sharing a rank. Values move and ranks count, so the comparison is exact; a negative
+  token scores nothing, with rank zero.
 - `top_k` — the `width` largest logits of a row, sorted descending, with their vocabulary
   ids; a tie keeps the **lower vocabulary id first**. A selection, so exact, and the case it
   turns on is the tie: a radix select that breaks ties by arrival order passes every row
@@ -627,7 +629,7 @@ def math_log(value):
 
 
 def run_logprob_gather(case):
-    """Report one token's log-probability per row and compare it exactly."""
+    """Report one token's log-probability and rank per row and compare them exactly."""
     import logprob_gather as kernels
 
     generator = torch.Generator().manual_seed(case["seed"])
@@ -644,7 +646,16 @@ def run_logprob_gather(case):
         tokens[-1] = columns - 1
         if rows > 2:
             tokens[1] = columns - 1
+    if case["ties"]:
+        # The token's value repeated beside it and once above it: tied entries share the rank of
+        # the first of them, so only the larger one counts.
+        logprobabilities[0, 1] = logprobabilities[0, tokens[0]]
+        logprobabilities[0, 2] = 0.0
+    if case["unscored"]:
+        # A row of a prompt the batch does not score names no token.
+        tokens[-1] = -1
     out = torch.full((rows,), float("nan"), dtype=torch.float32)
+    ranks = torch.full((rows,), -7, dtype=torch.int32)
 
     launch(
         kernels._logprob_gather_kernel,
@@ -652,17 +663,33 @@ def run_logprob_gather(case):
         logprobabilities,
         tokens,
         out,
+        ranks,
         rows,
         columns,
+        STEP=case["step"],
+        PDL=False,
     )
 
-    expected = logprobabilities.cpu()[torch.arange(rows), tokens.long()]
+    reference = logprobabilities.cpu()
+    scored = tokens >= 0
+    expected = torch.where(
+        scored, reference[torch.arange(rows), tokens.clamp(min=0).long()], 0.0
+    )
+    expected_ranks = torch.where(
+        scored,
+        1 + (reference > expected[:, None]).sum(dim=1).to(torch.int32),
+        0,
+    ).to(torch.int32)
     failures, line = compare_exact("out", out.cpu(), expected)
+    rank_failures, rank_line = compare_exact("ranks", ranks.cpu(), expected_ranks)
+    failures += rank_failures
     print(
         f"{'exact' if failures == 0 else 'FAIL'}: logprob_gather, {case['label']} — "
-        f"{rows} rows of {columns}, tokens {tokens.tolist()[:4]}"
+        f"{rows} rows of {columns}, tokens {tokens.tolist()[:4]}, "
+        f"ranks {ranks.tolist()[:4]}"
     )
     print(line)
+    print(rank_line)
     return failures
 
 
@@ -1036,6 +1063,9 @@ def cases(operator, flags):
                 "tokens": (0, columns_mid(flags), 1, 3),
                 "edges": True,
                 "masked": False,
+                "ties": False,
+                "unscored": False,
+                "step": 1024,
                 "seed": 1,
             },
             {
@@ -1045,7 +1075,34 @@ def cases(operator, flags):
                 "tokens": (63, 5),
                 "edges": False,
                 "masked": True,
+                "ties": False,
+                "unscored": False,
+                "step": 64,
                 "seed": 2,
+            },
+            {
+                "label": "tied entries share a rank, a row of a step the width does not divide",
+                "rows": 3,
+                "columns": 100,
+                "tokens": (7, 40, 99),
+                "edges": False,
+                "masked": False,
+                "ties": True,
+                "unscored": False,
+                "step": 32,
+                "seed": 3,
+            },
+            {
+                "label": "an unscored row reports nothing",
+                "rows": 2,
+                "columns": 64,
+                "tokens": (3, 9),
+                "edges": False,
+                "masked": False,
+                "ties": False,
+                "unscored": True,
+                "step": 64,
+                "seed": 4,
             },
         ]
     if operator == "argmax":
@@ -1156,7 +1213,7 @@ def descriptor_key(operator, flags):
     if operator == "argmax":
         return f"dtype_{flags.dtype}_width_{flags.width}_ids_i32_pdl_{pdl}"
     if operator == "logprob_gather":
-        return f"columns_{flags.columns}_ids_i32_pdl_{pdl}"
+        return f"columns_{flags.columns}_ids_i32_tile_{min(flags.columns, 4096)}_pdl_{pdl}"
     if operator == "top_k":
         return f"dtype_{flags.dtype}_tile_{TOP_K_TILE}_ids_i32_pdl_{pdl}"
     return (

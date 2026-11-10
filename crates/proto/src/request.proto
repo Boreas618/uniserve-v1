@@ -932,6 +932,7 @@ message GenerationLimits {
   uint64 max_latent_feature_bytes = 11;
   uint64 max_vision_feature_bytes = 12;
   uint32 encoder_cache_entries = 15;
+  uint32 max_logprobs = 16;
 }
 
 // ---------------------------------------------------------------- handover

@@ -16,6 +16,16 @@ pub const EOS: u32 = 151_645;
 /// The raw log-probability the fake reports for every token it samples.
 pub const LOGPROB: f32 = -0.5;
 
+/// The scores the fake reports for a sampled `token` (`ipc::execution::CallOutput::token_logprobs`):
+/// the token itself at [`LOGPROB`], its position's most likely, and no other candidate.
+pub fn scored(token: u32) -> Vec<ipc::TokenLogprob> {
+    vec![ipc::TokenLogprob {
+        token_id: token,
+        logprob: LOGPROB,
+        rank: 1,
+    }]
+}
+
 /// Where a fake's text ends and what it samples there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EndOfText {

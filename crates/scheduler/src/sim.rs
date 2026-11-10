@@ -1398,6 +1398,7 @@ impl SimEngine {
             max_latent_feature_bytes: 256 << 20,
             max_vision_feature_bytes: 256 << 20,
             encoder_cache_entries: 256,
+            max_logprobs: 20,
             ..Default::default()
         }
     }
@@ -1412,6 +1413,7 @@ impl SimEngine {
             buffer_pool_bytes: 257_u64 * (256 << 20),
             encoder_cache_entries: 256,
             encoder_entry_bytes: 256 << 20,
+            max_logprobs: 20,
             max_batch_calls: 1024,
             max_unresolved_calls: 2,
             // One batch in flight (`queue_depth` 1) of up to

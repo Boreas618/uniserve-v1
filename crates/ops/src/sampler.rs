@@ -820,6 +820,9 @@ pub struct LogprobDescriptor {
     pub columns: u32,
     /// Element type of the token ids.
     pub ids: DType,
+    /// The lanes the rank's count reads at a time: a chunk of the row, so the count costs the same
+    /// registers at any width.
+    pub tile: u32,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
 }
@@ -829,6 +832,7 @@ impl fmt::Display for LogprobDescriptor {
         Key::new()
             .field("columns", self.columns)
             .field("ids", self.ids)
+            .field("tile", self.tile)
             .field("pdl", self.pdl)
             .finish(formatter)
     }
@@ -839,13 +843,17 @@ impl fmt::Display for LogprobDescriptor {
 pub struct LogprobArgs {
     /// `[rows, columns]` FP32 log-probabilities.
     pub logprobabilities: TensorView,
-    /// `[rows]` the tokens whose log-probability is reported.
+    /// `[rows]` the tokens whose log-probability is reported; a negative token names no position.
     pub tokens: TensorView,
-    /// `[rows]` FP32.
+    /// `[rows]` FP32: the token's log-probability, `0` for a row whose token names no position.
     pub out: TensorView,
+    /// `[rows]` i32: the token's one-based competition rank in its row - one plus the entries
+    /// strictly above it, so tied entries share a rank - and `0` for a row whose token names no
+    /// position.
+    pub ranks: TensorView,
 }
 
-/// The log-probability of one chosen token per row.
+/// The log-probability of one chosen token per row, and its rank in the row.
 pub struct LogprobGather;
 
 impl Op for LogprobGather {
@@ -876,6 +884,16 @@ impl Op for LogprobGather {
                 format!("expected f32 log-probabilities, found {}", args.out.dtype),
             ));
         }
+        args.ranks.require_shape(Self::NAME, Shape::new(&[rows]))?;
+        if args.ranks.dtype != DType::I32 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!("expected i32 ranks, found {}", args.ranks.dtype),
+            ));
+        }
+        if descriptor.tile == 0 {
+            return Err(Error::argument(Self::NAME, "a rank's count needs a tile"));
+        }
         Ok(())
     }
 
@@ -892,6 +910,7 @@ impl Op for LogprobGather {
             .view(args.logprobabilities)
             .view(args.tokens)
             .view(args.out)
+            .view(args.ranks)
             .u64(rows)
             .u32(descriptor.columns);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
@@ -901,12 +920,13 @@ impl Op for LogprobGather {
         let _ = stream;
         LogprobArgs {
             out: twins.shadow_of(args.out),
+            ranks: twins.shadow_of(args.ranks),
             ..args
         }
     }
 
-    // A copy of one already-computed log-probability per row; the arithmetic happened in
-    // `log_softmax`, and this moves its result.
+    // A copy of one already-computed log-probability per row, and a count of the entries above it;
+    // the arithmetic happened in `log_softmax`, and this moves and compares its result.
     fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
         Tolerance::exact()
     }

@@ -17,14 +17,19 @@
 //! values + ids                     → candidate_order → the same rows in ascending token id
 //! ordered values                   → softmax        → probabilities [rows, width] f32
 //! probabilities + draws            → inverse_cdf    → tokens [rows]
-//! logprobs + tokens                → logprob_gather → logp [rows] f32                    (when asked)
+//! logprobs + tokens                → logprob_gather → logp [rows] f32, rank [rows] i32  (when asked)
+//! logprobs                         → top_k          → top [rows, n] f32, ids [rows, n]  (n > 0)
 //! ```
 //!
 //! The reported log-probabilities are the raw distribution's: `log_softmax` of the model's logits
 //! before the logit adjustments, penalties, temperature and filtering - vLLM's default
 //! (`logprobs_mode = raw_logprobs`), so a logit bias, an allowed set or a banned token changes which
 //! token is chosen and not the score reported for it. Both paths write them over the shaped row
-//! once the selection no longer reads it.
+//! once the selection no longer reads it. Each chosen token is reported with its competition rank
+//! in that distribution, and with the row's `n` most likely tokens when the sampler reports
+//! candidates ([`Sampler::reporting`]): `n` is the deployment's `max_logprobs`, a request takes the
+//! first of them it asks for, and a captured graph computes them for every row because whether a
+//! row's request asked is not a fact it can branch on.
 //!
 //! ## Logit adjustments
 //!
@@ -190,21 +195,123 @@ impl Candidates {
 pub struct Samples {
     /// `[rows]` the sampled token of each row.
     pub tokens: TensorView,
-    /// `[rows]` f32 the log-probability of each sampled token, when the step reports them.
-    pub logprobabilities: Option<TensorView>,
+    /// The scores of each sampled token, when the step reports them.
+    pub scores: Option<Scores>,
 }
 
 impl Samples {
-    /// Reserve the step's outputs from `arena`: the tokens, and the log-probabilities when asked.
-    pub fn reserve(arena: &Arena, tokens: DType, rows: u64, logprobs: bool) -> Result<Self> {
+    /// Reserve the step's outputs from `arena`: the tokens, and their scores with `candidates`
+    /// top tokens a row when `candidates` is stated.
+    pub fn reserve(
+        arena: &Arena,
+        tokens: DType,
+        rows: u64,
+        candidates: Option<u32>,
+    ) -> Result<Self> {
         Ok(Self {
             tokens: arena.tensor(tokens, Shape::new(&[rows]))?,
-            logprobabilities: match logprobs {
-                true => Some(arena.tensor(DType::F32, Shape::new(&[rows]))?),
-                false => None,
+            scores: match candidates {
+                Some(candidates) => Some(Scores::reserve(arena, rows, candidates)?),
+                None => None,
             },
         })
     }
+}
+
+/// The scores of one token per row on the model's raw distribution: its log-probability, its rank,
+/// and the row's most likely tokens.
+#[derive(Clone, Copy, Debug)]
+pub struct Scores {
+    /// `[rows]` f32 the token's log-probability.
+    pub logprobs: TensorView,
+    /// `[rows]` i32 the token's one-based competition rank in its row, `0` for a row whose token
+    /// names no position (`ops::sampler::LogprobGather`).
+    pub ranks: TensorView,
+    /// The row's most likely tokens, when the sampler reports any.
+    pub top: Option<TopLogprobs>,
+}
+
+/// A row's `n` most likely tokens and their log-probabilities, the largest first and ties in
+/// ascending id order (`ops::sampler::TopK`'s order).
+#[derive(Clone, Copy, Debug)]
+pub struct TopLogprobs {
+    /// `[rows, n]` f32 the candidates' log-probabilities, descending.
+    pub values: TensorView,
+    /// `[rows, n]` i32 the candidates' ids.
+    pub ids: TensorView,
+    /// The ordering's scratch, which `top_k` fills (`ops::sampler::top_k_workspace`).
+    pub workspace: TensorView,
+}
+
+impl Scores {
+    /// Reserve the scores of `rows` rows from `arena`, with `candidates` top tokens a row when it
+    /// is above zero.
+    pub fn reserve(arena: &Arena, rows: u64, candidates: u32) -> Result<Self> {
+        let logprobs = arena.tensor(DType::F32, Shape::new(&[rows]))?;
+        let ranks = arena.tensor(DType::I32, Shape::new(&[rows]))?;
+        let top = match candidates {
+            0 => None,
+            candidates => {
+                let width = u64::from(candidates);
+                Some(TopLogprobs {
+                    values: arena.tensor(DType::F32, Shape::new(&[rows, width]))?,
+                    ids: arena.tensor(DType::I32, Shape::new(&[rows, width]))?,
+                    workspace: arena
+                        .tensor(DType::I32, ops::sampler::top_k_workspace(rows, width))?,
+                })
+            }
+        };
+        Ok(Self {
+            logprobs,
+            ranks,
+            top,
+        })
+    }
+
+    /// The candidates a row reports, `0` when the scores carry none.
+    pub fn candidates(&self) -> u64 {
+        self.top.map_or(0, |top| top.values.shape.last())
+    }
+}
+
+/// One scored token as the completion reports it: the token itself with its log-probability and
+/// rank, then the row's top candidates read back beside it, the largest first.
+///
+/// `values` and `ids` are the row's candidates as `top_k` wrote them, and a candidate's rank is its
+/// competition rank among them - one plus the candidates strictly above it - which is its rank in
+/// the row, since every entry above a kept candidate is kept before it. A candidate whose id is
+/// outside the vocabulary (a row with fewer finite entries than candidates) is not reported. The
+/// token itself may be among its candidates; the scheduler keeps the candidates each request asks
+/// for and drops that repetition.
+pub fn scored(
+    token: u32,
+    logprob: f32,
+    rank: u32,
+    values: &[f32],
+    ids: &[i32],
+    vocabulary: u32,
+) -> Vec<ipc::TokenLogprob> {
+    let mut entries = Vec::with_capacity(1 + values.len());
+    entries.push(ipc::TokenLogprob {
+        token_id: token,
+        logprob,
+        rank,
+    });
+    for (index, (&value, &id)) in values.iter().zip(ids).enumerate() {
+        let Some(id) = u32::try_from(id).ok().filter(|id| *id < vocabulary) else {
+            continue;
+        };
+        let above = values[..index]
+            .iter()
+            .filter(|other| **other > value)
+            .count();
+        entries.push(ipc::TokenLogprob {
+            token_id: id,
+            logprob: value,
+            rank: above as u32 + 1,
+        });
+    }
+    entries
 }
 
 /// The sampling step of a language model.
@@ -215,6 +322,8 @@ pub struct Sampler {
     extras: u32,
     block: u32,
     tokens: DType,
+    /// The most likely tokens a scored row reports beside its own ([`Self::reporting`]).
+    candidates: u32,
 }
 
 impl Sampler {
@@ -250,7 +359,33 @@ impl Sampler {
             extras,
             block: launch::row_tile(vocabulary),
             tokens: DType::I32,
+            candidates: 0,
         })
+    }
+
+    /// The same sampler, reporting each scored row's `candidates` most likely tokens beside its
+    /// own: the deployment's `max_logprobs`, which bounds what a request may ask for.
+    ///
+    /// # Errors
+    ///
+    /// A count above the vocabulary, which has no that many tokens to rank.
+    pub fn reporting(mut self, candidates: u32) -> Result<Self> {
+        if candidates > self.vocabulary {
+            return Err(refused(
+                "Sampler",
+                format!(
+                    "{candidates} reported candidates of a vocabulary of {}",
+                    self.vocabulary
+                ),
+            ));
+        }
+        self.candidates = candidates;
+        Ok(self)
+    }
+
+    /// The most likely tokens a scored row reports beside its own.
+    pub const fn candidates(&self) -> u32 {
+        self.candidates
     }
 
     /// The vocabulary width of a logit row.
@@ -398,14 +533,13 @@ impl Sampler {
         Ok(())
     }
 
-    /// Write the log-probability of each row's sampled token into `samples`, when it carries a
-    /// row for them.
+    /// Write the scores of each row's sampled token into `samples`, when it carries them.
     ///
     /// The scores are those of the model's raw distribution: `log_softmax` of the unshaped
     /// `logits`, before penalties, temperature and candidate filtering, which is what
     /// `docs/architecture.md` states the engine reports and vLLM's default (`raw_logprobs`)
     /// answers. `scratch` is a `[rows, vocabulary]` f32 view the caller no longer reads; the
-    /// scores of the whole vocabulary are written there before one per row is gathered.
+    /// scores of the whole vocabulary are written there before each row's are read.
     fn report(
         &self,
         f: &Forward,
@@ -413,25 +547,75 @@ impl Sampler {
         scratch: TensorView,
         samples: &Samples,
     ) -> Result<()> {
-        let Some(logprobabilities) = samples.logprobabilities else {
+        let Some(scores) = samples.scores else {
             return Ok(());
         };
+        self.log_softmax(f, logits, scratch)?;
+        self.score(f, scratch, samples.tokens, &scores)
+    }
+
+    /// Write `log_softmax` of each row of `logits` into `out`, a `[rows, vocabulary]` f32 view:
+    /// the raw distribution a row's scores are read from.
+    pub fn log_softmax(&self, f: &Forward, logits: TensorView, out: TensorView) -> Result<()> {
         let softmax = self.log_softmax_descriptor(logits.dtype);
-        let args = LogSoftmaxArgs {
-            x: logits,
-            out: scratch,
-        };
+        let args = LogSoftmaxArgs { x: logits, out };
 
         f.operate::<LogSoftmax>(&softmax, args)?;
+        Ok(())
+    }
 
+    /// Score one token per row of `logprobabilities`, a `[rows, vocabulary]` f32 view of the raw
+    /// distribution: its log-probability and rank, and the row's most likely tokens when `scores`
+    /// carries room for them. A negative token names no position and scores nothing (rank `0`);
+    /// its candidates are written all the same, and its reader ignores them.
+    pub fn score(
+        &self,
+        f: &Forward,
+        logprobabilities: TensorView,
+        tokens: TensorView,
+        scores: &Scores,
+    ) -> Result<()> {
+        let rows = logprobabilities.rows();
         let gather = self.logprob_descriptor();
         let args = LogprobArgs {
-            logprobabilities: scratch,
-            tokens: samples.tokens,
-            out: logprobabilities,
+            logprobabilities,
+            tokens,
+            out: scores.logprobs,
+            ranks: scores.ranks,
         };
 
         f.operate::<LogprobGather>(&gather, args)?;
+
+        let Some(top) = scores.top else {
+            return Ok(());
+        };
+        let width = top.values.shape.last();
+        if top.values.shape.dims() != [rows, width] || top.ids.shape.dims() != [rows, width] {
+            return Err(refused(
+                "Sampler",
+                format!(
+                    "{rows} scored rows with candidates of {:?} and ids of {:?}",
+                    top.values.shape.dims(),
+                    top.ids.shape.dims()
+                ),
+            ));
+        }
+        // The candidates are the row's largest log-probabilities, in `top_k`'s order: the program
+        // reads its kept count as a launch value, so this is the draw's module over a narrower row
+        // of kept candidates.
+        let descriptor = TopKDescriptor {
+            width: u32::try_from(width)
+                .map_err(|_| refused("Sampler", "a candidate count wider than u32"))?,
+            ..self.top_descriptor()
+        };
+        let args = TopKArgs {
+            logits: logprobabilities,
+            values: top.values,
+            ids: top.ids,
+            workspace: top.workspace,
+        };
+
+        f.operate::<TopK>(&descriptor, args)?;
         Ok(())
     }
 
@@ -544,11 +728,13 @@ impl Sampler {
         }
     }
 
-    /// The reported log-probability of the token each row drew.
+    /// The reported log-probability and rank of the token each row drew: the rank's count walks
+    /// the row in the same tiles the log-softmax does.
     fn logprob_descriptor(&self) -> LogprobDescriptor {
         LogprobDescriptor {
             columns: self.vocabulary,
             ids: self.tokens,
+            tile: self.block,
             pdl: launch::PDL,
         }
     }
@@ -593,16 +779,27 @@ impl Sampler {
             .tokens
             .require_shape("Sampler", Shape::new(&[rows]))
             .map_err(Error::from)?;
-        if let Some(logprobabilities) = samples.logprobabilities {
-            logprobabilities
-                .require_shape("Sampler", Shape::new(&[rows]))
-                .map_err(Error::from)?;
-            if logprobabilities.dtype != DType::F32 {
+        if let Some(scores) = samples.scores {
+            for (name, view, dtype) in [
+                ("log-probabilities", scores.logprobs, DType::F32),
+                ("ranks", scores.ranks, DType::I32),
+            ] {
+                view.require_shape("Sampler", Shape::new(&[rows]))
+                    .map_err(Error::from)?;
+                if view.dtype != dtype {
+                    return Err(refused(
+                        "Sampler",
+                        format!("expected {dtype} {name}, found {}", view.dtype),
+                    ));
+                }
+            }
+            if scores.candidates() != u64::from(self.candidates) {
                 return Err(refused(
                     "Sampler",
                     format!(
-                        "expected f32 log-probabilities, found {}",
-                        logprobabilities.dtype
+                        "the sampler reports {} candidates and the scores hold {}",
+                        self.candidates,
+                        scores.candidates()
                     ),
                 ));
             }
@@ -1153,6 +1350,13 @@ pub(crate) fn seed_row(row: &mut [i32], history: &[u32]) {
 }
 
 impl Sampling {
+    /// The same state, its sampler reporting each scored row's `candidates` most likely tokens
+    /// ([`Sampler::reporting`]).
+    pub(crate) fn reporting(mut self, candidates: u32) -> Result<Self> {
+        self.sampler = self.sampler.reporting(candidates)?;
+        Ok(self)
+    }
+
     /// The sampler and its zeroed count table for `slots` request slots over `vocabulary` tokens.
     ///
     /// A request may ask for any top-k it likes, so the candidate width is the vocabulary: a
@@ -1407,7 +1611,9 @@ mod tests {
         let arena = Arena::new(DevicePtr::new(0x10_0000), 1 << 20);
         let rows = 4;
         let candidates = Candidates::reserve(&arena, rows, 1_024, 32).unwrap();
-        let samples = Samples::reserve(&arena, DType::I32, rows, true).unwrap();
+        let samples = Samples::reserve(&arena, DType::I32, rows, Some(4)).unwrap();
+        let scores = samples.scores.unwrap();
+        let top = scores.top.unwrap();
         let order = [
             candidates.shaped,
             candidates.values,
@@ -1417,7 +1623,10 @@ mod tests {
             candidates.ordered_ids,
             candidates.valid,
             samples.tokens,
-            samples.logprobabilities.unwrap(),
+            scores.logprobs,
+            scores.ranks,
+            top.values,
+            top.ids,
         ];
         let mut previous = 0;
         for view in order {
@@ -1433,12 +1642,58 @@ mod tests {
         assert_eq!(candidates.ordered_ids.dtype, DType::I32);
         assert_eq!(candidates.valid.shape.dims(), &[rows]);
         assert_eq!(samples.tokens.shape.dims(), &[rows]);
-        // Without log-probabilities the step reserves neither the row of log-probabilities nor the
-        // whole-vocabulary log-softmax output.
+        assert_eq!(top.values.shape.dims(), &[rows, 4]);
+        assert_eq!(top.ids.dtype, DType::I32);
+        // Without scores the step reserves none of them; scores without candidates reserve no top
+        // tokens.
         let arena = Arena::new(DevicePtr::new(0x10_0000), 1 << 20);
         let _ = Candidates::reserve(&arena, rows, 1_024, 32).unwrap();
-        let samples = Samples::reserve(&arena, DType::I32, rows, false).unwrap();
-        assert!(samples.logprobabilities.is_none());
+        let samples = Samples::reserve(&arena, DType::I32, rows, None).unwrap();
+        assert!(samples.scores.is_none());
+        let samples = Samples::reserve(&arena, DType::I32, rows, Some(0)).unwrap();
+        assert!(samples.scores.unwrap().top.is_none());
+    }
+
+    /// A scored token is reported first, then its row's candidates in their order with their
+    /// competition ranks - tied candidates share the rank of the first of them - and a candidate
+    /// the row had no value for is not reported.
+    #[test]
+    fn a_scored_token_reports_itself_then_its_ranked_candidates() {
+        let entries = scored(
+            7,
+            -1.5,
+            3,
+            &[-0.25, -1.0, -1.0, -1.5, f32::NEG_INFINITY],
+            &[2, 9, 11, 7, 1_024],
+            1_024,
+        );
+        let listed: Vec<(u32, f32, u32)> = entries
+            .iter()
+            .map(|entry| (entry.token_id, entry.logprob, entry.rank))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                (7, -1.5, 3),
+                (2, -0.25, 1),
+                (9, -1.0, 2),
+                (11, -1.0, 2),
+                (7, -1.5, 4),
+            ]
+        );
+        // Without candidates only the token is reported.
+        assert_eq!(scored(5, -0.5, 1, &[], &[], 8).len(), 1);
+    }
+
+    /// A sampler reports at most as many candidates as its vocabulary has tokens.
+    #[test]
+    fn a_sampler_reports_no_more_candidates_than_its_vocabulary() {
+        let sampler = Sampler::new(1_024, 4, 64, 0)
+            .unwrap()
+            .reporting(20)
+            .unwrap();
+        assert_eq!(sampler.candidates(), 20);
+        assert!(Sampler::new(16, 4, 16, 0).unwrap().reporting(17).is_err());
     }
 
     /// The refusals a caller meets before either path launches. `check` is the one body both paths
@@ -1459,11 +1714,11 @@ mod tests {
         };
         let samples = Samples {
             tokens: TensorView::new(DevicePtr::new(0x2000), DType::I32, Shape::new(&[2])),
-            logprobabilities: Some(TensorView::new(
-                DevicePtr::new(0x2000),
-                DType::F32,
-                Shape::new(&[2]),
-            )),
+            scores: Some(Scores {
+                logprobs: TensorView::new(DevicePtr::new(0x2000), DType::F32, Shape::new(&[2])),
+                ranks: ints(&[2]),
+                top: None,
+            }),
         };
         sampler
             .check(view(&[2, 1_024]), &state(true), &samples)
@@ -1597,7 +1852,7 @@ mod tests {
         };
         let samples = Samples {
             tokens: TensorView::new(DevicePtr::new(0x2000), DType::I32, Shape::new(&[2])),
-            logprobabilities: None,
+            scores: None,
         };
         assert_eq!(
             sampler.check(view(&[2, 1_024]), &state, &samples).unwrap(),
@@ -1607,7 +1862,7 @@ mod tests {
         // output is a different one is refused by name rather than launched into a wrong view.
         let narrow = Samples {
             tokens: TensorView::new(DevicePtr::new(0x2000), DType::I64, Shape::new(&[2])),
-            logprobabilities: None,
+            scores: None,
         };
         let text = format!(
             "{}",

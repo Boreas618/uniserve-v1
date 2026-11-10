@@ -448,8 +448,8 @@ fn complete(
         },
     };
 
-    // A causal-LM step reports the raw log-probability of every token it samples, asked for or
-    // not (`CallOutput::token_logprobs`); the scheduler keeps them for the requests that ask. A
+    // A causal-LM step reports the raw scores of every token it samples, asked for or not
+    // (`CallOutput::token_logprobs`); the scheduler keeps them for the requests that ask. A
     // row whose logits the mechanism did not ask for (`logits_rows` states -1 for it: a chunk that
     // ends no prompt) samples nothing, as a device's projection skips it.
     let samples = rows.logits_rows.get(row).is_none_or(|&logits| logits >= 0);
@@ -457,7 +457,7 @@ fn complete(
         return CallOutput::completed(batch.calls[index], Vec::new(), state);
     }
     let mut output = CallOutput::completed(batch.calls[index], vec![token], state);
-    output.token_logprobs = vec![crate::text::LOGPROB];
+    output.token_logprobs = vec![crate::text::scored(token)];
     output
 }
 

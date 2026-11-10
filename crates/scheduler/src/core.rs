@@ -94,6 +94,7 @@ pub fn sim_args(model: impl Into<String>) -> EngineArgs {
         deployment: unnamed_deployment(),
         max_running_requests,
         max_num_batched_tokens: None,
+        max_logprobs: 20,
         attention_backend: String::new(),
         prefill_attention_backend: None,
         decode_attention_backend: None,

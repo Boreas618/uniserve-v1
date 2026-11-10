@@ -950,6 +950,11 @@ pub struct EngineConfig {
     pub max_running_requests: NonZeroUsize,
     /// Token work admitted in one scheduling step; the engine's default when unset.
     pub max_num_batched_tokens: Option<NonZeroUsize>,
+    /// The most likely tokens a request may ask for at a generated or a prompt position
+    /// (`top_logprobs`, `prompt_logprobs`): every sampling graph computes this many for each row
+    /// it samples, so it is a property of the captured graphs and a request asking for more is
+    /// refused. Zero reports no candidate.
+    pub max_logprobs: u32,
     /// The attention program's backend, and the ones that fill prompt processing and one decoding
     /// token when they differ.
     pub attention_backend: String,

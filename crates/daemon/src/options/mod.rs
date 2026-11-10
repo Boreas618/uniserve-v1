@@ -203,6 +203,12 @@ pub struct ServerArgs {
     /// models only.
     #[arg(skip)]
     pub max_num_batched_tokens: Option<NonZeroUsize>,
+    /// The most likely tokens a request may ask for at a generated or a
+    /// prompt position (`top_logprobs`, `prompt_logprobs`), which every
+    /// sampling graph computes; a request asking for more is refused. Token
+    /// models only.
+    #[arg(long, default_value_t = ServerArgs::default().max_logprobs)]
+    pub max_logprobs: u32,
     /// Each rank's share of its device's total storage for weights, static
     /// allocations and the KV cache, in (0, 1]. A deployment group's
     /// `mem_fraction_static` overrides it.
@@ -339,6 +345,8 @@ impl Default for ServerArgs {
             program_config: program_server::command::Settings::default(),
             max_running_requests: positive(128),
             max_num_batched_tokens: None,
+            // vLLM's default, which clients asking for `top_logprobs` expect to be served.
+            max_logprobs: 20,
             mem_fraction_static: 0.7,
             tensor_parallel_size: NonZeroUsize::MIN,
             data_parallel_size: NonZeroUsize::MIN,
@@ -581,6 +589,7 @@ impl ServerArgs {
             deployment: self.served_model_name().to_owned(),
             max_running_requests: self.max_running_requests,
             max_num_batched_tokens: self.max_num_batched_tokens,
+            max_logprobs: self.max_logprobs,
             attention_backend: self.attention_backend.clone(),
             prefill_attention_backend: self.prefill_attention_backend.clone(),
             decode_attention_backend: self.decode_attention_backend.clone(),
