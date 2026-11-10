@@ -199,47 +199,23 @@ impl MainProcess {
     }
 
     /// Routes a request to the scheduler that serves it: the rank the routing policy's `route`
-    /// decision names (`scheduler::Router`, whose documentation states which instance decides).
-    ///
-    /// A node with one scheduler serves every request it is submitted on that rank and asks no
-    /// policy. A decision that names a rank this node does not hold, or one whose scheduler
-    /// stopped, is the policy's failure: the previous program routes the request instead, and when
-    /// none can the request is refused and the failure is the update's (`Err` carries both).
+    /// decision names (`scheduler::Router::route`, whose documentation states which instance
+    /// decides, how a node of one scheduler routes, and how a failed decision is retried by the
+    /// previous program). A refusal no previous program could answer is the update's failure
+    /// (`Err` carries both).
     pub(super) fn route(
         &mut self,
         id: u64,
         request: &proto::request::Request,
     ) -> std::result::Result<usize, (String, Option<UpdateFailure>)> {
-        if self.schedulers.len() <= 1 {
-            return Ok(0);
-        }
         let arrival = scheduler::Arrival::of(ipc::RequestId(id), request, None);
         let ranks = self.ranks();
-        let refusal = match self.router.route(&arrival, &ranks) {
-            Ok(rank) => return Ok(rank),
-            Err(refusal) => refusal,
-        };
-        match refusal.reverted {
-            // The previous program serves again: it routes this request.
-            Some(reverted) if !reverted.fatal => {
-                tracing::warn!(
-                    backend = %reverted.program.backend,
-                    revision = reverted.program.revision,
-                    reason = %reverted.reason,
-                    "the routing policy failed and the previous policy routes again"
-                );
-                self.router
-                    .route(&arrival, &ranks)
-                    .map_err(|refusal| (refusal.reason, None))
-            }
-            Some(reverted) => Err((
-                refusal.reason,
-                Some(UpdateFailure::Policy {
-                    error: format!("the routing policy failed: {}", reverted.reason),
-                }),
-            )),
-            None => Err((refusal.reason, None)),
-        }
+        self.router.route(&arrival, &ranks).map_err(|refusal| {
+            let failure = refusal.reverted.map(|reverted| UpdateFailure::Policy {
+                error: format!("the routing policy failed: {}", reverted.reason),
+            });
+            (refusal.reason, failure)
+        })
     }
 
     /// Routes a per-request command to the scheduler that holds the request.

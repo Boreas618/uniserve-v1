@@ -1371,12 +1371,46 @@ impl Router {
 
     /// `route`: the index of the rank in `ranks` that serves `arrival`.
     ///
-    /// A request that resumes a stored cache is routed to the rank recorded
-    /// for it by the policy itself (`RequestView::cache_rank`), and the answer
-    /// is checked like any other. An answer that names no live rank offered
-    /// fails the policy: the previous program is instantiated on `ranks` and
-    /// routes later requests, and this one is refused.
+    /// A node with one scheduler serves every request on that rank and asks
+    /// no policy. A request that resumes a stored cache is routed to the rank
+    /// recorded for it by the policy itself (`RequestView::cache_rank`), and
+    /// the answer is checked like any other. An answer that names no live rank
+    /// offered fails the policy: the previous program is instantiated on
+    /// `ranks` and routes this request and later ones. When no previous
+    /// program can take over, the request is refused and the refusal's
+    /// `reverted` is fatal: the update failed.
     pub fn route(&mut self, arrival: &Arrival, ranks: &[RankView]) -> Result<usize, RouteRefusal> {
+        if ranks.len() <= 1 {
+            return Ok(0);
+        }
+        let refusal = match self.decide(arrival, ranks) {
+            Ok(rank) => return Ok(rank),
+            Err(refusal) => refusal,
+        };
+        match refusal.reverted {
+            // The previous program serves again: it routes this request.
+            Some(reverted) if !reverted.fatal => {
+                tracing::warn!(
+                    backend = %reverted.program.backend,
+                    revision = reverted.program.revision,
+                    reason = %reverted.reason,
+                    "the routing policy failed and the previous policy routes again"
+                );
+                self.decide(arrival, ranks).map_err(|refusal| RouteRefusal {
+                    reason: refusal.reason,
+                    reverted: None,
+                })
+            }
+            reverted => Err(RouteRefusal {
+                reason: refusal.reason,
+                reverted,
+            }),
+        }
+    }
+
+    /// One `route` answer of the serving instance, checked; a failure reverts
+    /// the instance ([`Self::route`]).
+    fn decide(&mut self, arrival: &Arrival, ranks: &[RankView]) -> Result<usize, RouteRefusal> {
         let Some(slot) = self.slot.as_mut() else {
             return Err(RouteRefusal {
                 reason: "no routing policy serves: the epoch's first switchover has not put \
@@ -1990,20 +2024,24 @@ mod tests {
         assert_eq!(router.route(&arrival, &ranks).expect("a rank"), 1);
 
         // A program that names a rank it was not offered fails, and the
-        // program before it routes again.
+        // program before it routes the request and those after it.
         let prepared = Router::prepare(&source(&toy(5)), program("b", 2), &ranks, &ceilings())
             .expect("the candidate prepares");
         router.adopt(prepared);
         router
             .switchover(&ranks)
             .expect("the switchover installs it");
-        let refusal = router
-            .route(&arrival, &ranks)
-            .expect_err("rank 5 is not offered");
-        let reverted = refusal.reverted.expect("the failing program is reported");
-        assert!(!reverted.fatal);
+        assert_eq!(
+            router
+                .route(&arrival, &ranks)
+                .expect("the previous program routes"),
+            1
+        );
         assert_eq!(router.program().map(|p| p.backend.as_str()), Some("a"));
         assert_eq!(router.route(&arrival, &ranks).expect("a rank"), 1);
+
+        // A node of one scheduler routes every request there and asks no policy.
+        assert_eq!(router.route(&arrival, &ranks[..1]).expect("rank 0"), 0);
     }
 
     #[test]
