@@ -455,6 +455,7 @@ impl MainProcess {
         };
 
         let never_installed = self
+            .update
             .generations
             .iter()
             .all(|generation| generation.is_empty());
@@ -466,7 +467,7 @@ impl MainProcess {
             );
             return self.abandon_precopy(generation, failure, precopy.reply);
         }
-        let replaced = replaced_operators(&selection.programs, &self.serving_programs);
+        let replaced = replaced_operators(&selection.programs, &self.update.serving_programs);
         precopy.programs = selection
             .programs
             .into_iter()
@@ -650,7 +651,7 @@ impl MainProcess {
         // program changed. The set is empty on an epoch's first precopy - nothing
         // serves, so no kernel has an old one to be paired against - and asking every
         // scheduler there waits for a step an idle epoch never runs.
-        let changed = changed_operators(&precopy.programs, &self.serving_programs);
+        let changed = changed_operators(&precopy.programs, &self.update.serving_programs);
         if changed.is_empty() {
             tracing::info!(
                 generation,
@@ -733,7 +734,7 @@ impl MainProcess {
         // serves now, and a precopy that finished is not serving until the switchover (steps 2
         // and 3). They wait here, so a descriptor lookup still reads the serving generation and a
         // revert has nothing to undo.
-        self.prepared = std::mem::take(&mut precopy.next);
+        self.update.prepared = std::mem::take(&mut precopy.next);
         // What serves after the switchover: what serves now, with every operator this precopy
         // installed replaced whole - its slots may divide it differently than the serving ones.
         let replaced: std::collections::BTreeSet<&str> = precopy
@@ -741,13 +742,16 @@ impl MainProcess {
             .keys()
             .map(|slot| slot.op.as_str())
             .collect();
-        self.prepared_programs = self
+        self.update.prepared_programs = self
+            .update
             .serving_programs
             .iter()
             .filter(|(slot, _)| !replaced.contains(slot.op.as_str()))
             .map(|(slot, program)| (slot.clone(), program.clone()))
             .collect();
-        self.prepared_programs.extend(precopy.programs.clone());
+        self.update
+            .prepared_programs
+            .extend(precopy.programs.clone());
         if let Err(error) = self.update.precopied(generation) {
             // The generation this precopy built is not the one the machine waits for - a revert or a
             // later precopy took its place while the builds ran. The revert path discards what was
@@ -792,7 +796,7 @@ impl MainProcess {
         // that loaded it.
         let mut next = Vec::with_capacity(loaded.len());
         for (index, entries) in loaded.into_iter().enumerate() {
-            let current = Arc::clone(&self.generations[index]);
+            let current = Arc::clone(&self.update.generations[index]);
             next.push(Arc::new(current.replace(generation, entries)));
         }
 

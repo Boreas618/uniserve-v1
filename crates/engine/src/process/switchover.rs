@@ -37,12 +37,10 @@ fn switchover_answer(warming: usize, generation: u64) -> SwitchoverAnswer {
 /// one message behind the revert that its own rollback threshold caused, so its commit arrives after
 /// the update ended. The state that holds is the one before the update - it serves, nothing was
 /// committed - and that is the answer. A protocol message never ends a process that can still serve.
-fn answer_commit(update: &mut worker::hot_update::HotUpdate, generation: u64) -> ProgramStatus {
+fn answer_commit(update: &mut crate::process::update::HotUpdate, generation: u64) -> ProgramStatus {
     // An epoch switch commits its target, whose programs were committed when the daemon handed them
     // over: the generation it names already serves with nothing on trial, so the answer is that.
-    if update.current() == generation
-        && matches!(update.phase(), worker::hot_update::Phase::Serving)
-    {
+    if update.current() == generation && matches!(update.phase(), super::update::Phase::Serving) {
         return ProgramStatus::Committed { generation };
     }
     match update.commit(generation) {
@@ -215,11 +213,12 @@ impl MainProcess {
         // would move the scheduling policy to `generation` first, then fail on the devices, and
         // report a device fault for a stale number.
         let stale = self
+            .update
             .prepared
             .iter()
             .map(|built| built.number())
             .find(|number| *number != generation);
-        let refused = if self.prepared.is_empty() {
+        let refused = if self.update.prepared.is_empty() {
             Some(format!(
                 "a switchover to generation {generation}, which this process prepared nothing \
                  for: the precopy that builds it either failed or never arrived"
@@ -277,12 +276,15 @@ impl MainProcess {
             };
             return self.revert(generation, failure).map(Some);
         }
-        self.retired = std::mem::replace(&mut self.generations, std::mem::take(&mut self.prepared));
+        self.update.retired = std::mem::replace(
+            &mut self.update.generations,
+            std::mem::take(&mut self.update.prepared),
+        );
         // The programs move with the generations, as one record: the next precopy's changed set is
         // measured against what serves, and a revert serves the programs the retired pair holds.
-        self.retired_programs = std::mem::replace(
-            &mut self.serving_programs,
-            std::mem::take(&mut self.prepared_programs),
+        self.update.retired_programs = std::mem::replace(
+            &mut self.update.serving_programs,
+            std::mem::take(&mut self.update.prepared_programs),
         );
 
         // The first request served on a generation must not pay for a capture, so every
@@ -374,8 +376,8 @@ impl MainProcess {
             // again. Its graphs and kernels live until the purge, which is the worker's book to
             // keep - and the programs it was built from go with the record of it, since no revert
             // can serve it.
-            self.retired.clear();
-            self.retired_programs.clear();
+            self.update.retired.clear();
+            self.update.retired_programs.clear();
             self.commit_policy(generation);
         }
         Ok(status)
@@ -441,13 +443,13 @@ impl MainProcess {
         self.revert_policy(generation);
         // The generation that served before the update serves again, and the one built for the
         // update keeps nothing: its kernels are released and its captures are never taken over.
-        let kept = !self.retired.is_empty();
+        let kept = !self.update.retired.is_empty();
         if kept {
-            self.generations = std::mem::take(&mut self.retired);
-            self.serving_programs = std::mem::take(&mut self.retired_programs);
+            self.update.generations = std::mem::take(&mut self.update.retired);
+            self.update.serving_programs = std::mem::take(&mut self.update.retired_programs);
         }
-        self.prepared.clear();
-        self.prepared_programs.clear();
+        self.update.prepared.clear();
+        self.update.prepared_programs.clear();
         // The warmups still queued warm the generation this revert went back from: what runs when
         // they reach the device is the generation that serves, so nothing hangs - the list is what
         // stopped describing serving, and a failure read from a stale entry would revert an update
@@ -482,7 +484,7 @@ impl MainProcess {
                 // The precopy's discard: the generation's graphs and kernels go, and the generation
                 // that serves is untouched. A reverse switchover here would be refused by name -
                 // nothing was switched over - and would end the epoch over an update that never cut.
-                worker::hot_update::Phase::Precopied { .. } => worker.discard(generation),
+                super::update::Phase::Precopied { .. } => worker.discard(generation),
                 _ => worker.revert(current),
             };
             let submission = queued.with_context(|| {
@@ -498,7 +500,7 @@ impl MainProcess {
         // would otherwise keep its graphs, its kernels and its arena until the process exits - a
         // whole generation of device memory - so it is released here, now that every device has
         // finished going back and no batch of it can be in flight.
-        if matches!(phase, worker::hot_update::Phase::Probation { .. }) {
+        if matches!(phase, super::update::Phase::Probation { .. }) {
             match self.purge(generation) {
                 Ok(ProgramStatus::Purged { .. }) => {}
                 Ok(other) => tracing::warn!(
@@ -574,8 +576,8 @@ mod tests {
 
     /// The state a daemon's late messages meet: an update that went to probation and was reverted by
     /// the rollback threshold, so every command still in flight names a generation no longer there.
-    fn update_on_probation_then_reverted() -> worker::hot_update::HotUpdate {
-        let mut update = worker::hot_update::HotUpdate::new(1);
+    fn update_on_probation_then_reverted() -> crate::process::update::HotUpdate {
+        let mut update = crate::process::update::HotUpdate::new(1);
         update.begin_precopy(2).expect("a precopy may begin");
         update.precopied(2).expect("the precopy lands");
         update

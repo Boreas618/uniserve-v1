@@ -31,7 +31,7 @@ impl MainProcess {
                     .extend(recorded.iter().cloned());
             }
         }
-        if let Some(serving) = self.generations.first() {
+        if let Some(serving) = self.update.generations.first() {
             for (operator, key, _) in serving.iter() {
                 keys.entry(operator.to_owned())
                     .or_default()

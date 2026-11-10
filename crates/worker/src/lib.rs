@@ -38,7 +38,6 @@ pub mod config;
 pub mod control;
 pub mod error;
 pub mod host;
-pub mod hot_update;
 pub mod keys;
 pub mod memory;
 pub mod parallel;

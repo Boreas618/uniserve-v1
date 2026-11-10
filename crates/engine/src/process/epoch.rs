@@ -133,7 +133,7 @@ impl MainProcess {
                 reply,
             );
         }
-        let Some(generation) = self.prepared.first().map(|built| built.number()) else {
+        let Some(generation) = self.update.prepared.first().map(|built| built.number()) else {
             return Ok(());
         };
         self.discard_policy();
@@ -153,8 +153,8 @@ impl MainProcess {
                 }
             }
         }
-        self.prepared.clear();
-        self.prepared_programs.clear();
+        self.update.prepared.clear();
+        self.update.prepared_programs.clear();
         Ok(())
     }
 
@@ -214,8 +214,9 @@ impl MainProcess {
         // succeeded and move the frontend onto a process with no kernels.
         // A standby that took the epoch's programs serves them already: its precopy, switchover
         // and commit ran when the daemon handed them over, so its generation is the serving one.
-        let held = self.prepared.len()
+        let held = self.update.prepared.len()
             + self
+                .update
                 .generations
                 .iter()
                 .filter(|generation| !generation.is_empty())

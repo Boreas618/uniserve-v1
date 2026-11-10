@@ -5,11 +5,11 @@
 
 use std::time::{Duration, Instant};
 
+use super::update::Action;
 use anyhow::{Result, bail};
 use ipc::{ProgramStatus, UpdateFailure};
 use worker::control::Ready;
 use worker::device::Probe;
-use worker::hot_update::Action;
 use worker::watchdog::Running;
 
 use super::MainProcess;
@@ -115,10 +115,7 @@ impl MainProcess {
             let stall = self.watchdog.deadline(oldest(&running));
             let mut due = reported + METRICS_EVERY;
             if self.rollback.is_some()
-                && matches!(
-                    self.update.phase(),
-                    worker::hot_update::Phase::Probation { .. }
-                )
+                && matches!(self.update.phase(), super::update::Phase::Probation { .. })
             {
                 due = due.min(Instant::now() + PROBATION_POLL);
             }

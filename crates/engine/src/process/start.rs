@@ -5,13 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::update::HotUpdate;
 use anyhow::{Context as _, Result, bail};
 use program_server::Client;
 use proto::config::EngineArgs;
-use proto::program::Programs;
 use worker::blocking::{BlockingKind, ThreadPool};
 use worker::control::{Control, Endpoints};
-use worker::hot_update::HotUpdate;
 use worker::runners::products::GroupProducts;
 use worker::watchdog::Watchdog;
 
@@ -142,7 +141,7 @@ impl MainProcess {
                 .watchdog_timeout()
                 .unwrap_or_else(|| model_runner.watchdog_timeout()),
         )?;
-        let update = HotUpdate::new(epoch.generation);
+        let mut update = HotUpdate::new(epoch.generation);
 
         let mut workers = Vec::with_capacity(model_runner.devices().len());
         let mut generations = Vec::with_capacity(model_runner.devices().len());
@@ -321,6 +320,7 @@ impl MainProcess {
         let stats_reporters = (0..schedulers.len())
             .map(|_| scheduler::SchedulerStatsReporter::default())
             .collect();
+        update.generations = generations;
         let mut process = Self {
             control: control
                 .take()
@@ -354,9 +354,6 @@ impl MainProcess {
             warming_steps: Vec::new(),
             policy_probe_at: None,
             policy_missing_since: None,
-            prepared: Vec::new(),
-            retired: Vec::new(),
-            generations,
             targets: model_runner.targets().to_vec(),
             program_server: model_runner.program_server().to_path_buf(),
             process,
@@ -374,9 +371,6 @@ impl MainProcess {
             max_running_requests: u32::try_from(build.max_running_requests.get())
                 .unwrap_or(u32::MAX),
             catalogue: model_runner.prefill_catalogue(),
-            serving_programs: Programs::new(),
-            retired_programs: Programs::new(),
-            prepared_programs: Programs::new(),
             standby: launch.standby(),
             promoted: false,
             parked: None,

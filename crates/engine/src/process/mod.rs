@@ -68,6 +68,7 @@ mod requests;
 mod serve;
 mod start;
 mod switchover;
+mod update;
 mod weights;
 
 use std::path::{Path, PathBuf};
@@ -77,14 +78,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 use ipc::execution::Outcome;
 use ipc::execution::Submission;
-use ops::Generation;
 use program_server::{Client, Target};
-use proto::program::Programs;
+use update::HotUpdate;
 use worker::blocking::ThreadPool;
 use worker::control::Control;
 use worker::device::Worker;
 use worker::host::Lane;
-use worker::hot_update::HotUpdate;
 use worker::memory::Memory;
 use worker::memory::retained::Retained;
 use worker::watchdog::Watchdog;
@@ -244,26 +243,6 @@ pub(crate) struct MainProcess {
     /// command timeout, and reads the answer in the watchdog's stall bound rather than waiting.
     policy_probe_at: Option<Instant>,
     policy_missing_since: Option<Instant>,
-    /// The generations the last precopy built and the switchover has not taken:
-    /// one per device, in `workers` order. A revert drops them, because the
-    /// generation they hold never serves.
-    prepared: Vec<Arc<Generation>>,
-    /// The generations serving before the current ones, kept through probation so
-    /// a revert can serve them again. Their graphs stay in the
-    /// workers either way; this is the process's own record of what to serve.
-    retired: Vec<Arc<Generation>>,
-    /// The generation each device serves now, in `workers` order.
-    generations: Vec<Arc<Generation>>,
-    /// The kernel programs the serving generation was built from, by slot. The shadow
-    /// pass pairs a *changed* operator's kernel with the one serving, so "changed" is a fact about
-    /// programs and never about generation numbers.
-    serving_programs: Programs,
-    /// The programs of the generation `retired` holds: a revert serves that generation again, and
-    /// the changed set of the update after it is measured against the programs it serves under.
-    retired_programs: Programs,
-    /// The programs of the generation `prepared` holds, waiting for the switchover to make them
-    /// serving.
-    prepared_programs: Programs,
     /// What this node resolves a module for.
     targets: Vec<Target>,
     /// The Program Server's socket, which a policy's source resolves its module through.
@@ -372,7 +351,8 @@ impl MainProcess {
     /// the last `Precopy` or switchover and `0` before any - never the launch number, which is what
     /// `Promoted.generation` states and a different question entirely.
     fn served_generation(&self) -> u64 {
-        self.prepared
+        self.update
+            .prepared
             .first()
             .map(|generation| generation.number())
             .unwrap_or_else(|| self.update.current())

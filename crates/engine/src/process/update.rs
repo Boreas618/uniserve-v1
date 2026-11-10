@@ -6,11 +6,13 @@
 //! boundary, probation keeps the old generation until the update is confirmed,
 //! and purge releases the old generation once its last batch has completed.
 //!
-//! This module is the state and the decision table only. It calls no driver, no
-//! scheduler and no Program Server:
+//! This module is the main process's one record of the update - the generation
+//! numbers, the phase, and the devices' serving, prepared and retired
+//! generations with the programs each was built from - and its decision table.
+//! It calls no driver, no scheduler and no Program Server:
 //!
-//! - the precopy driver (`src/engine.rs`) resolves modules, builds the
-//!   [`Generation`](crate::generation) and calls each rank's `precopy`;
+//! - the precopy driver (`process::precopy`) resolves modules, builds each
+//!   device's `ops::Generation` and calls each rank's `precopy`;
 //! - the scheduler switches the policy at the batch boundary;
 //! - the control thread reports [`ipc::ProgramStatus`] and the daemon drives
 //!   commit and revert.
@@ -22,13 +24,17 @@
 
 use std::time::{Duration, Instant};
 
-use ipc::UpdateFailure;
+use std::sync::Arc;
 
-use crate::{Error, Result};
+use ipc::UpdateFailure;
+use ops::Generation;
+use proto::program::Programs;
+
+use worker::{Error, Result};
 
 /// What the main process is doing of the program layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Phase {
+pub(crate) enum Phase {
     /// One generation serves and no update is in flight.
     Serving,
     /// §7.3 step 2: the new generation is being resolved, loaded, rebound or
@@ -53,7 +59,7 @@ pub enum Phase {
 
 impl Phase {
     /// The generation this phase is about, if any.
-    pub const fn generation(self) -> Option<u64> {
+    pub(crate) const fn generation(self) -> Option<u64> {
         match self {
             Self::Serving => None,
             Self::Precopying { generation }
@@ -63,7 +69,7 @@ impl Phase {
     }
 
     /// Whether an update is in flight.
-    pub const fn updating(self) -> bool {
+    pub(crate) const fn updating(self) -> bool {
         !matches!(self, Self::Serving)
     }
 }
@@ -71,7 +77,7 @@ impl Phase {
 /// What a failure of the given kind means while the main process is in the
 /// current phase (§7.3 steps 2 and 4, §2.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Action {
+pub(crate) enum Action {
     /// The new generation is discarded and serving goes on with the old one.
     /// Nothing was switched over, so no update is reverted (§7.3 step 2).
     Discard,
@@ -86,7 +92,7 @@ pub enum Action {
 /// One main process's program-layer update: which generation serves, which one
 /// is being installed, and what is left to purge.
 #[derive(Debug)]
-pub struct HotUpdate {
+pub(crate) struct HotUpdate {
     /// The generation whose kernels serve now.
     current: u64,
     phase: Phase,
@@ -118,11 +124,31 @@ pub struct HotUpdate {
     /// The generation an update was attempted on, kept for the report that
     /// names it after the phase returned to serving.
     failed_generation: Option<u64>,
+    /// The generations the last precopy built and the switchover has not taken:
+    /// one per device, in `workers` order. A revert drops them, because the
+    /// generation they hold never serves.
+    pub(super) prepared: Vec<Arc<Generation>>,
+    /// The generations serving before the current ones, kept through probation so
+    /// a revert can serve them again. Their graphs stay in the
+    /// workers either way; this is the process's own record of what to serve.
+    pub(super) retired: Vec<Arc<Generation>>,
+    /// The generation each device serves now, in `workers` order.
+    pub(super) generations: Vec<Arc<Generation>>,
+    /// The kernel programs the serving generation was built from, by slot. The shadow
+    /// pass pairs a *changed* operator's kernel with the one serving, so "changed" is a fact about
+    /// programs and never about generation numbers.
+    pub(super) serving_programs: Programs,
+    /// The programs of the generation `retired` holds: a revert serves that generation again, and
+    /// the changed set of the update after it is measured against the programs it serves under.
+    pub(super) retired_programs: Programs,
+    /// The programs of the generation `prepared` holds, waiting for the switchover to make them
+    /// serving.
+    pub(super) prepared_programs: Programs,
 }
 
 impl HotUpdate {
     /// A main process that started on `generation`.
-    pub fn new(generation: u64) -> Self {
+    pub(crate) fn new(generation: u64) -> Self {
         Self {
             current: generation,
             phase: Phase::Serving,
@@ -132,43 +158,54 @@ impl HotUpdate {
             probation_started: None,
             failure: None,
             failed_generation: None,
+            // The devices' generations are the start's to record once it built them.
+            prepared: Vec::new(),
+            retired: Vec::new(),
+            generations: Vec::new(),
+            serving_programs: Programs::new(),
+            retired_programs: Programs::new(),
+            prepared_programs: Programs::new(),
         }
     }
 
     /// The phase the update is in.
-    pub fn phase(&self) -> Phase {
+    pub(crate) fn phase(&self) -> Phase {
         self.phase
     }
 
     /// The generation whose kernels serve now.
-    pub fn current(&self) -> u64 {
+    pub(crate) fn current(&self) -> u64 {
         self.current
     }
 
     /// The generation a revert returns to, while an update is on probation.
-    pub fn previous(&self) -> Option<u64> {
+    #[cfg(test)]
+    pub(crate) fn previous(&self) -> Option<u64> {
         self.previous
     }
 
     /// The generations released and not yet purged, in release order.
-    pub fn awaiting_purge(&self) -> &[u64] {
+    #[cfg(test)]
+    pub(crate) fn awaiting_purge(&self) -> &[u64] {
         &self.purgeable
     }
 
     /// The first error that failed the last update, if one did.
-    pub fn failure(&self) -> Option<&UpdateFailure> {
+    #[cfg(test)]
+    pub(crate) fn failure(&self) -> Option<&UpdateFailure> {
         self.failure.as_ref()
     }
 
     /// The generation whose update failed last, for the report that names it.
-    pub fn failed_generation(&self) -> Option<u64> {
+    #[cfg(test)]
+    pub(crate) fn failed_generation(&self) -> Option<u64> {
         self.failed_generation
     }
 
     /// §7.3 step 2 begins: `generation` replaces what serves. Only one update
     /// runs at a time; a generation that is not newer than the serving one is
     /// refused, so a replayed command cannot move time backwards.
-    pub fn begin_precopy(&mut self, generation: u64) -> Result<()> {
+    pub(crate) fn begin_precopy(&mut self, generation: u64) -> Result<()> {
         if self.phase.updating() {
             return Err(Error::State("a program-layer update is already in flight"));
         }
@@ -188,7 +225,7 @@ impl HotUpdate {
     }
 
     /// §7.3 step 2 finished for `generation`.
-    pub fn precopied(&mut self, generation: u64) -> Result<()> {
+    pub(crate) fn precopied(&mut self, generation: u64) -> Result<()> {
         match self.phase {
             Phase::Precopying {
                 generation: expected,
@@ -202,7 +239,7 @@ impl HotUpdate {
 
     /// §7.3 step 2 failed: the new generation is discarded, serving is
     /// unaffected, and the failure is kept for the report.
-    pub fn precopy_failed(&mut self, generation: u64, failure: UpdateFailure) -> Result<()> {
+    pub(crate) fn precopy_failed(&mut self, generation: u64, failure: UpdateFailure) -> Result<()> {
         match self.phase {
             Phase::Precopying {
                 generation: expected,
@@ -219,7 +256,7 @@ impl HotUpdate {
 
     /// §7.3 step 3: the update cuts over at a batch boundary, at `now`. The
     /// generation serving until now is kept for probation and revert.
-    pub fn switchover(&mut self, generation: u64, now: Instant) -> Result<()> {
+    pub(crate) fn switchover(&mut self, generation: u64, now: Instant) -> Result<()> {
         match self.phase {
             Phase::Precopied {
                 generation: expected,
@@ -239,7 +276,7 @@ impl HotUpdate {
     /// one of §7.3 step 4's automatic-revert conditions. The threshold comes
     /// from `update_config.rollback`; the phase rules live here, and the control
     /// thread only polls this.
-    pub fn probation_expired(&self, now: Instant, threshold: Duration) -> bool {
+    pub(crate) fn probation_expired(&self, now: Instant, threshold: Duration) -> bool {
         match (self.phase, self.probation_started) {
             (Phase::Probation { .. }, Some(started)) => {
                 now.saturating_duration_since(started) >= threshold
@@ -250,7 +287,7 @@ impl HotUpdate {
 
     /// §7.3 step 5: probation ends in a commit. The old generation stays until
     /// its purge.
-    pub fn commit(&mut self, generation: u64) -> Result<()> {
+    pub(crate) fn commit(&mut self, generation: u64) -> Result<()> {
         match self.phase {
             Phase::Probation {
                 generation: expected,
@@ -270,7 +307,7 @@ impl HotUpdate {
     /// §7.3 step 4: probation ends in a revert, or an update is abandoned
     /// before the switchover. The generation serving before the update serves
     /// again, and the failed generation is purged with the old one.
-    pub fn revert(&mut self, generation: u64, failure: UpdateFailure) -> Result<()> {
+    pub(crate) fn revert(&mut self, generation: u64, failure: UpdateFailure) -> Result<()> {
         match self.phase {
             Phase::Probation {
                 generation: expected,
@@ -327,7 +364,7 @@ impl HotUpdate {
     /// switchover replaced. What is refused is a purge of the generation the
     /// update is preparing - that one is neither serving nor replaced, and its
     /// graphs are the ones being built.
-    pub fn request_purge(&mut self, generation: u64) -> Result<()> {
+    pub(crate) fn request_purge(&mut self, generation: u64) -> Result<()> {
         if self.phase.generation() == Some(generation) {
             return Err(Error::Invalid(format!(
                 "generation {generation} is the one this process is preparing and cannot be purged"
@@ -362,12 +399,13 @@ impl HotUpdate {
     /// The generation whose purge runs now: the daemon asked for it, and the device performs the
     /// release behind every batch its queue already holds (§7.3 step 6). The caller releases its
     /// graphs and kernels and reports [`Self::purged`].
-    pub fn purge_due(&self) -> Option<u64> {
+    #[cfg(test)]
+    pub(crate) fn purge_due(&self) -> Option<u64> {
         self.purging
     }
 
     /// The purge of `generation` finished.
-    pub fn purged(&mut self, generation: u64) -> Result<()> {
+    pub(crate) fn purged(&mut self, generation: u64) -> Result<()> {
         if self.purging != Some(generation) {
             return Err(Error::State("no such purge is pending"));
         }
@@ -377,7 +415,7 @@ impl HotUpdate {
     }
 
     /// What `failure` means in the current phase (§7.3 steps 2 and 4, §2.5).
-    pub fn action(&self, failure: &UpdateFailure) -> Action {
+    pub(crate) fn action(&self, failure: &UpdateFailure) -> Action {
         if matches!(failure, UpdateFailure::Precopy { .. }) {
             return Action::Discard;
         }

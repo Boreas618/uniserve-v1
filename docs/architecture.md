@@ -223,7 +223,7 @@ A main process's orderly close ends with a reset of its primary contexts before 
 
 ```text
 src/                    the root package, uniserve: the command line (cli.rs), logging, the serve command (serve.rs), the programs command (programs.rs) and main.rs, which dispatches every command and registers the model families
-crates/engine/          a node's main process for one epoch: its control thread, schedulers, executors and blocking pool (process/), program resolution (programs/), each rank's load and report (rank/), the recorded start of `uniserve programs` (process/record.rs), and the resolution of a checkpoint to its model family (catalogue.rs)
+crates/engine/          a node's main process for one epoch: its control thread, schedulers, executors and blocking pool (process/), the program-layer update record (process/update.rs), the data plane of storage operations and loads inside an epoch (data_plane.rs), program resolution (programs/), each rank's load and report (rank/), the recorded start of `uniserve programs` (process/record.rs), and the resolution of a checkpoint to its model family (catalogue.rs)
 crates/nn/              the shared computation library: tensor views, the borrowed forward (forward.rs), layers/ and blocks/, diffusion schedules, VAE tiling, the vocoder and codec, capability traits (capability.rs), the model family contract (family.rs), checkpoint reading, weight loading and adapter fusion (adapter.rs)
 crates/processing/      request processing's model contract: what a family serves, chat profiles, the video processor, its request and plan, media metadata, the vocabulary, and the family-neutral frame, canvas, cover-crop and resampling rules
 crates/models/          the model families, each a crate: qwen3/ (the Qwen3 decoder, Qwen3MoeForCausalLM, Qwen3-VL and its processor), minimax-h3/ (its request processing under src/processing/)
@@ -260,6 +260,6 @@ Dependency direction, as the crates' manifests state it (a crate on the right de
 | `capacity/` | capacity planning from the runners' manifests and the device's measured storage |
 | `transfer/` | the transfer mechanisms: in-process, POSIX shared memory, CUDA VMM and the channel |
 | `stream`, `device`, `blocking`, `host`, `watchdog`, `profiling` | streams and their scratch, the device and its context, the blocking pools and their host work, the watchdog and its stall bound, and the profiler |
-| `config`, `parallel`, `data_plane` | the rank layout and devices resolved before a model loads; host collectives, process-group plans and weight prefetch plans; the updates inside an epoch of what a rank holds at the Storage Server |
+| `config`, `parallel` | the rank layout and devices resolved before a model loads; host collectives, process-group plans and weight prefetch plans |
 | `keys` | the Storage Server keys of derived state: retained weights, KV pages, encoder outputs and latents |
-| `hot_update`, `shadow` | the program-layer update and the shadow harness that proves it |
+| `shadow` | the shadow harness that proves a program-layer update |
