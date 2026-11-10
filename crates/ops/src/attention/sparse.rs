@@ -139,7 +139,8 @@ pub struct SparseArgs {
 
 /// The call structure a package's entry receives.
 ///
-/// Mirrored by hand in `crates/ops/kernels/sparse_attention/<backend>/include/uniserve_sparse_attention.h`;
+/// Mirrored by hand in `crates/ops/include/uniserve_sparse_attention.h`, which every
+/// `sparse_attention` package links into its `include/`;
 /// the layout is pinned by [`SPARSE_CALL_LAYOUT`], the assertions below and the test beside them.
 #[repr(C)]
 #[derive(Debug)]

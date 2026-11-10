@@ -39,6 +39,9 @@ form = "native"
 [module.entries]
 launch = "uniserve_conv1d"
 
+# The three convolution operators are one cuDNN program: `src/` links the sources under
+# `kernels/conv/cudnn/src/` and `include/` the operator header under `crates/ops/include/`, and an
+# installation copies the files the links name.
 [source]
 kind = "cuda"
 files = [

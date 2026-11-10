@@ -75,8 +75,9 @@ impl fmt::Display for Descriptor {
 
 /// The call structure a convolution package's entry receives.
 ///
-/// Mirrored by hand in the package's header (`include/uniserve_conv.h`); the assertions below and
-/// the test beside this module pin its layout. The spatial extents are passed as three axes, so one
+/// Mirrored by hand in `crates/ops/include/uniserve_conv.h`, which each convolution package links
+/// into its `include/`; the assertions below and the test beside this module pin its layout. The
+/// spatial extents are passed as three axes, so one
 /// structure serves the 1-d and the 3-d operator and the unused axes are 1.
 #[repr(C)]
 pub struct Call {

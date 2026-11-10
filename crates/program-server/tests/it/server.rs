@@ -123,6 +123,32 @@ fn an_installation_numbers_the_next_revision_of_its_operator_and_backend() {
     assert_eq!(server.list().unwrap().packages.len(), 2);
 }
 
+/// A source the tree shares between packages through a symbolic link is installed as the bytes it
+/// names: the revision holds its sources whatever becomes of the tree it was installed from.
+#[test]
+fn an_installation_holds_what_a_linked_source_names() {
+    let temporary = tempfile::tempdir().unwrap();
+    let configuration = config(temporary.path(), None);
+    let server = ProgramServer::open(&configuration).unwrap();
+    let shared = temporary.path().join("shared.py");
+    std::fs::write(&shared, b"# the shared kernel\n").unwrap();
+    let source = package(&temporary.path().join("linked"));
+    std::fs::remove_file(source.join("src/rms.py")).unwrap();
+    std::os::unix::fs::symlink(&shared, source.join("src/rms.py")).unwrap();
+
+    server.install(&source).unwrap();
+    let installed = configuration
+        .package_root
+        .join("rms_norm/triton/1/src/rms.py");
+    assert!(
+        !installed.is_symlink(),
+        "the revision holds a file, not the link"
+    );
+    assert_eq!(std::fs::read(&installed).unwrap(), b"# the shared kernel\n");
+    std::fs::remove_file(&shared).unwrap();
+    assert_eq!(std::fs::read(&installed).unwrap(), b"# the shared kernel\n");
+}
+
 #[test]
 fn a_server_that_is_not_the_upstream_refuses_an_installation_and_names_it() {
     let temporary = tempfile::tempdir().unwrap();

@@ -1558,6 +1558,11 @@ const BYTECODE_CACHE: &str = "__pycache__";
 
 /// Copies a directory tree, keeping relative paths and file modes, without
 /// Python bytecode ([`BYTECODE_CACHE`]).
+///
+/// A symbolic link is copied as what it names: an installed revision holds
+/// every byte it builds from, so a source several packages share in the tree
+/// (an operator's ABI header, one convolution source behind three operators)
+/// is one file there and a file of each package's revision.
 fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     for entry in fs::read_dir(from)? {
         let entry = entry?;
@@ -1566,13 +1571,9 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
         }
         let source = entry.path();
         let destination = to.join(entry.file_name());
-        let kind = entry.file_type()?;
-        if kind.is_dir() {
+        if fs::metadata(&source)?.is_dir() {
             fs::create_dir_all(&destination)?;
             copy_tree(&source, &destination)?;
-        } else if kind.is_symlink() {
-            let target = fs::read_link(&source)?;
-            std::os::unix::fs::symlink(target, &destination)?;
         } else {
             fs::copy(&source, &destination)?;
             fs::File::open(&destination)?.sync_all()?;
@@ -1581,9 +1582,10 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Whether two directory trees hold the same entries: the same names, the same
-/// bytes in every file and the same target in every link, as [`copy_tree`]
-/// reproduces them. Python bytecode is not compared ([`BYTECODE_CACHE`]).
+/// Whether two directory trees hold the same entries: the same names and the
+/// same bytes in every file, a symbolic link read as what it names, as
+/// [`copy_tree`] reproduces them. Python bytecode is not compared
+/// ([`BYTECODE_CACHE`]).
 fn same_tree(left: &Path, right: &Path) -> Result<bool> {
     let entries = |path: &Path| -> Result<BTreeMap<std::ffi::OsString, fs::FileType>> {
         let mut entries = BTreeMap::new();
@@ -1592,7 +1594,7 @@ fn same_tree(left: &Path, right: &Path) -> Result<bool> {
             if entry.file_name() == BYTECODE_CACHE {
                 continue;
             }
-            entries.insert(entry.file_name(), entry.file_type()?);
+            entries.insert(entry.file_name(), fs::metadata(entry.path())?.file_type());
         }
         Ok(entries)
     };
@@ -1608,8 +1610,6 @@ fn same_tree(left: &Path, right: &Path) -> Result<bool> {
         let (from, to) = (left.join(name), right.join(name));
         let same = if kind.is_dir() && other.is_dir() {
             same_tree(&from, &to)?
-        } else if kind.is_symlink() && other.is_symlink() {
-            fs::read_link(&from)? == fs::read_link(&to)?
         } else if kind.is_file() && other.is_file() {
             // Sizes first: a changed source usually changes its length, and
             // the comparison then reads neither file.

@@ -213,7 +213,8 @@ pub struct FusedLayer {
 
 /// The call structure the package's entry receives.
 ///
-/// Mirrored by hand in `crates/ops/kernels/expert_exchange/<backend>/include/uniserve_expert_exchange.h`.
+/// Mirrored by hand in `crates/ops/include/uniserve_expert_exchange.h`, the one header every
+/// `expert_exchange` package links into its `include/`.
 #[repr(C)]
 pub struct Call {
     pub transport: *mut c_void,

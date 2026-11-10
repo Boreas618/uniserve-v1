@@ -1,7 +1,9 @@
 //! The package headers' mirrors checked against the layout the operator passes.
 //!
-//! A native operator's call structure is a `#[repr(C)]` struct in this crate and a C struct in each
-//! package that serves it, and the two are written by hand. The layout is therefore stated twice -
+//! A native operator's call structure is a `#[repr(C)]` struct in this crate and a C struct in the
+//! header the packages that serve it compile against (one per operator under `crates/ops/include/`,
+//! linked into each package's `include/`, or a package's own entry header), and the two are written
+//! by hand. The layout is therefore stated twice -
 //! and, where an operator declares a `CallLayout`, three times, because the offsets are also written
 //! as literals next to the struct. Nothing in the compiler holds the C side to the Rust side: a header
 //! left behind at a struct change compiles cleanly, loads cleanly under `dlopen(RTLD_NOW)` because the
