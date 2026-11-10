@@ -208,7 +208,7 @@ impl From<JsonRejection> for ApiError {
 impl From<ServeError> for ApiError {
     /// Maps one serving error into the OpenAI error vocabulary.
     ///
-    /// Unsupported features or sampling controls, context limits, input
+    /// Unsupported features, context limits, input
     /// images that cannot be fetched or decoded, refused video requests, and
     /// tokenization failures become invalid requests, a refused video request
     /// naming its field; engine and video-processing failures become server errors, as output-processing failures do
@@ -218,12 +218,6 @@ impl From<ServeError> for ApiError {
     /// carry as their error source rather than in their own `Display`.
     fn from(error: ServeError) -> Self {
         match error {
-            ServeError::UnsupportedSamplingControl {
-                control, reason, ..
-            } => Self::invalid_request(
-                format!("`{control}` is not supported by this model: {reason}."),
-                Some(control),
-            ),
             error @ (ServeError::UnsupportedFeature { .. }
             | ServeError::ContextLengthExceeded { .. }) => {
                 Self::invalid_request(error.to_string(), None)

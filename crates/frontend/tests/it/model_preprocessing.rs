@@ -181,8 +181,12 @@ fn preprocess_chat(
     request: frontend::openai::ChatCompletionRequest,
     images: Vec<ImageInput>,
 ) -> Result<(GenerationRequest, OutputParams), ApiError> {
-    let (request, _) =
-        frontend::openai::chat_completions::lower_chat_request(request_id, SERVED_MODEL, request)?;
+    let (request, _) = frontend::openai::chat_completions::lower_chat_request(
+        request_id,
+        SERVED_MODEL,
+        request,
+        processor,
+    )?;
     processor
         .preprocess(request, images)
         .map_err(ApiError::from)

@@ -38,7 +38,7 @@ use tracing_futures::Instrument as _;
 use crate::input::chat::{
     ChatContent, ChatContentPart, ChatMessage as ServingChatMessage, ChatRequest, ChatToolChoice,
 };
-use crate::input::{GenerateRequest, Prompt, SamplingParams};
+use crate::input::{GenerateRequest, InputProcessor, Prompt, ServeError};
 use crate::openai::RequestId;
 use crate::openai::error::{bail_invalid_request, bail_server_error, server_error};
 use crate::openai::{
@@ -52,6 +52,7 @@ use crate::openai::{Generation, Server};
 use crate::output::chat::{
     AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantToolCall,
 };
+use crate::output::text::TextDecodeOptions;
 use crate::output::text::{
     DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs, DecodedTokenLogprob,
 };
@@ -90,10 +91,11 @@ async fn chat_completions(
     } else {
         engine.served_model_name().to_owned()
     };
-    let (mut request, response) = match lower_chat_request(request_id, &model, body) {
-        Ok(lowered) => lowered,
-        Err(error) => return error.into_response(),
-    };
+    let (mut request, response) =
+        match lower_chat_request(request_id, &model, body, engine.processor()) {
+            Ok(lowered) => lowered,
+            Err(error) => return error.into_response(),
+        };
     request.adapter = adapter;
     let request_span = tracing::info_span!(
         "chat_completions",
@@ -1435,10 +1437,33 @@ pub fn lower_chat_request(
     request_id: String,
     served_model_name: &str,
     request: ChatCompletionRequest,
+    processor: &InputProcessor,
 ) -> Result<(GenerateRequest, ChatResponseContext), ApiError> {
     validate_request_compat(&request, served_model_name)?;
     let context =
         ChatResponseContext::from_request(&request, request_id.clone(), served_model_name);
+
+    // Stream chunks have no `prompt_logprobs` field. Validation accepts a
+    // streamed `prompt_logprobs: 0` for vLLM compatibility, but lowering it
+    // would score every prompt position and disable prefix-cache reads for
+    // output the client never receives, so the sampling lowering drops it.
+    let logit_bias = convert_logit_bias(request.logit_bias.clone())?;
+    let sampling =
+        processor
+            .sampling(&request, logit_bias)
+            .map_err(|source| ServeError::Tokenize {
+                request_id: request_id.clone(),
+                source,
+            })?;
+    let decode = TextDecodeOptions {
+        skip_special_tokens: request.skip_special_tokens,
+        include_stop_str_in_output: request.include_stop_str_in_output,
+        stop_strings: request
+            .stop
+            .map(|stop| stop.into_vec())
+            .filter(|stop| !stop.is_empty()),
+        min_tokens: request.min_tokens.unwrap_or(0),
+    };
 
     // Template kwargs may not replace the variables the renderer derives
     // from the request itself.
@@ -1452,11 +1477,6 @@ pub fn lower_chat_request(
             "chat_template_kwargs may not set `{name}`, which the request itself determines."
         );
     }
-    // Stream chunks have no `prompt_logprobs` field. Validation accepts a
-    // streamed `prompt_logprobs: 0` for vLLM compatibility, but lowering it
-    // would score every prompt position and disable prefix-cache reads for
-    // output the client never receives, so it is dropped here.
-    let prompt_logprobs = request.prompt_logprobs.filter(|_| !request.stream);
     let messages = request
         .messages
         .into_iter()
@@ -1477,30 +1497,10 @@ pub fn lower_chat_request(
             },
         }),
         constraint: convert_modalities(&request.modalities),
-        sampling_params: SamplingParams {
-            temperature: request.temperature,
-            top_p: request.top_p,
-            top_k: request.top_k,
-            min_p: request.min_p,
-            seed: request.seed,
-            max_tokens: request.max_completion_tokens,
-            min_tokens: request.min_tokens,
-            frequency_penalty: request.frequency_penalty,
-            presence_penalty: request.presence_penalty,
-            repetition_penalty: request.repetition_penalty,
-            ignore_eos: request.ignore_eos,
-            stop: request.stop.map(|stop| stop.into_vec()).unwrap_or_default(),
-            stop_token_ids: request.stop_token_ids.unwrap_or_default(),
-            bad_words: request.bad_words.unwrap_or_default(),
-            allowed_token_ids: request.allowed_token_ids,
-            logit_bias: convert_logit_bias(request.logit_bias)?,
-            logprobs: request
-                .logprobs
-                .then_some(request.top_logprobs.unwrap_or(0)),
-            prompt_logprobs,
-            skip_special_tokens: request.skip_special_tokens,
-            include_stop_str_in_output: request.include_stop_str_in_output,
-        },
+        sampling,
+        max_tokens: request.max_completion_tokens,
+        stop_token_ids: request.stop_token_ids.unwrap_or_default(),
+        decode,
         priority: request.priority.unwrap_or(0),
         cache_salt: request.cache_salt,
         adapter: None,

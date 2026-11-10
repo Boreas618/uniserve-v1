@@ -1,89 +1,71 @@
-//! Token sampling resolution: the model's sampling defaults under a request's
-//! controls ([`resolve_sampling`]), and its generation length
-//! ([`resolve_max_tokens`]).
+//! Token sampling resolution: a chat request's sampling controls over the
+//! model's defaults ([`lower`]), lowered once into the engine's
+//! `SamplingParams`, and its generation length ([`resolve_max_tokens`]).
 
-use proto::request::SamplingParams as EngineSamplingParams;
+use proto::request::SamplingParams;
 
-use super::{SamplingParams, TokenizeError};
+use super::TokenizeError;
 use crate::model::SamplingDefaults;
+use crate::openai::ChatCompletionRequest;
 use crate::tokenizer::HuggingFaceTokenizer;
 
-/// Resolves a request's engine sampling parameters: the model's `defaults`
-/// under the request's `controls`, with the request's resolved `seed`.
+/// The engine's sampling parameters of `request`: each control it sets over
+/// the model's `defaults`, its logit biases (`logit_bias`, already keyed by
+/// token ID), and its bad words tokenized with `tokenizer`.
+///
+/// Temperature, top-k, top-p, min-p and repetition penalty fall back to the
+/// model's defaults, then to the neutral value; every other control is the
+/// request's own. A streamed request's prompt logprobs are not computed: a
+/// stream chunk has no field for them.
 ///
 /// # Errors
 ///
-/// As [`apply_sampling`].
-pub(super) fn resolve_sampling(
-    tokenizer: &HuggingFaceTokenizer,
+/// Fails when a bad word cannot be tokenized or the parameters fail
+/// `SamplingParams::validate`.
+pub(crate) fn lower(
+    request: &ChatCompletionRequest,
+    logit_bias: Option<std::collections::HashMap<u32, f32>>,
     defaults: &SamplingDefaults,
-    controls: &SamplingParams,
-    seed: Option<u64>,
-) -> Result<EngineSamplingParams, TokenizeError> {
-    let mut sampling = EngineSamplingParams {
-        temperature: defaults.temperature.unwrap_or(1.0),
-        top_k: defaults.top_k.unwrap_or(0),
-        top_p: defaults.top_p.unwrap_or(1.0),
-        min_p: defaults.min_p.unwrap_or(0.0),
-        repetition_penalty: defaults.repetition_penalty.unwrap_or(1.0),
-        seed,
-        ..EngineSamplingParams::default()
-    };
-    apply_sampling(tokenizer, controls, &mut sampling)?;
-    Ok(sampling)
-}
-
-/// Applies public controls once, preserving model biases.
-///
-/// Temperature, top-k, top-p, min-p, and repetition penalty override the
-/// caller's defaults only when the request sets them. Frequency and presence
-/// penalties, `min_tokens`, `ignore_eos`, and every logprob, allowed-token, and
-/// bad-word field are replaced from the request. Biases already in
-/// `logit_bias` are summed per token with the request's biases.
-///
-/// Must be called once per request: a second call would add the request
-/// biases again.
-///
-/// # Errors
-///
-/// Fails when a bad word cannot be tokenized or the result fails
-/// `SamplingParams::validate`. `sampling` may be partially updated on error.
-fn apply_sampling(
     tokenizer: &HuggingFaceTokenizer,
-    controls: &SamplingParams,
-    sampling: &mut EngineSamplingParams,
-) -> Result<(), TokenizeError> {
-    sampling.temperature = controls.temperature.unwrap_or(sampling.temperature);
-    sampling.top_k = controls.top_k.unwrap_or(sampling.top_k);
-    sampling.top_p = controls.top_p.unwrap_or(sampling.top_p);
-    sampling.min_p = controls.min_p.unwrap_or(sampling.min_p);
-    sampling.repetition_penalty = controls
-        .repetition_penalty
-        .unwrap_or(sampling.repetition_penalty);
-    sampling.ignore_eos = controls.ignore_eos;
-    sampling.min_tokens = controls.min_tokens.unwrap_or(0) as usize;
-    sampling.frequency_penalty = controls.frequency_penalty.unwrap_or(0.0);
-    sampling.presence_penalty = controls.presence_penalty.unwrap_or(0.0);
+) -> Result<SamplingParams, TokenizeError> {
     // The ordered map yields `logit_bias` sorted by token ID.
-    let mut biases = sampling
-        .logit_bias
-        .drain(..)
-        .collect::<std::collections::BTreeMap<_, _>>();
-    if let Some(request) = &controls.logit_bias {
-        for (&token, &bias) in request {
-            *biases.entry(token).or_insert(0.0) += bias;
-        }
-    }
-    sampling.logit_bias = biases.into_iter().collect();
-    sampling.return_logprobs = controls.logprobs.is_some();
-    sampling.n_logprobs = logprob_count(controls.logprobs);
-    sampling.return_prompt_logprobs = controls.prompt_logprobs.is_some();
-    sampling.n_prompt_logprobs = logprob_count(controls.prompt_logprobs);
-    sampling.allowed_token_ids = controls.allowed_token_ids.clone();
-    sampling.bad_words_ids =
-        tokenize_bad_words(&controls.bad_words, tokenizer)?.unwrap_or_default();
+    let logit_bias = logit_bias
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>()
+        .into_iter()
+        .collect();
+    let logprobs = request
+        .logprobs
+        .then_some(request.top_logprobs.unwrap_or(0));
+    let prompt_logprobs = request.prompt_logprobs.filter(|_| !request.stream);
+    let bad_words = request.bad_words.as_deref().unwrap_or_default();
+    let sampling = SamplingParams {
+        temperature: request.temperature.or(defaults.temperature).unwrap_or(1.0),
+        top_k: request.top_k.or(defaults.top_k).unwrap_or(0),
+        top_p: request.top_p.or(defaults.top_p).unwrap_or(1.0),
+        min_p: request.min_p.or(defaults.min_p).unwrap_or(0.0),
+        repetition_penalty: request
+            .repetition_penalty
+            .or(defaults.repetition_penalty)
+            .unwrap_or(1.0),
+        // The seed's signed bit pattern seeds the engine.
+        seed: request.seed.map(|seed| seed as u64),
+        ignore_eos: request.ignore_eos,
+        min_tokens: request.min_tokens.unwrap_or(0) as usize,
+        frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
+        presence_penalty: request.presence_penalty.unwrap_or(0.0),
+        logit_bias,
+        return_logprobs: logprobs.is_some(),
+        n_logprobs: logprob_count(logprobs),
+        return_prompt_logprobs: prompt_logprobs.is_some(),
+        n_prompt_logprobs: logprob_count(prompt_logprobs),
+        allowed_token_ids: request.allowed_token_ids.clone(),
+        bad_words_ids: tokenize_bad_words(bad_words, tokenizer)?.unwrap_or_default(),
+        ..SamplingParams::default()
+    };
     sampling.validate()?;
-    Ok(())
+    Ok(sampling)
 }
 
 /// Converts a wire logprob count into the engine count.

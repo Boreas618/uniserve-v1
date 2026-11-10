@@ -57,17 +57,6 @@ pub enum ServeError {
         /// Stable feature name.
         feature: &'static str,
     },
-    /// A request sets a sampling control the model's generation does not
-    /// define.
-    #[error("request `{request_id}` sets `{control}`, but {reason}")]
-    UnsupportedSamplingControl {
-        /// Identifier of the rejected request.
-        request_id: String,
-        /// Wire name of the control.
-        control: &'static str,
-        /// Why the model's generation has no such control.
-        reason: &'static str,
-    },
     /// The prompt exceeds the profile context limit.
     #[error(
         "request `{request_id}` has {prompt_tokens} prompt tokens, exceeding the {max_tokens}-token profile limit"

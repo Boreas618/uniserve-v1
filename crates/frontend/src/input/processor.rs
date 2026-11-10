@@ -28,13 +28,12 @@ use proto::request::{ImageParams, RequestId, SamplingParams as EngineSamplingPar
 use thiserror::Error;
 
 use crate::input::chat::{ChatRequest, HfChatRenderer};
-use crate::input::request::{GenerateRequest, Prompt, SamplingParams};
+use crate::input::request::{GenerateRequest, Prompt};
 use crate::input::sampling::resolve_max_tokens;
 use crate::input::video::VideoService;
 use crate::input::{Result, ServeError};
 use crate::output::OutputParams;
 use crate::output::chat::ChatOutputProcessor;
-use crate::output::text::TextDecodeOptions;
 
 /// Owns the tokenizer and template resources used to produce final engine inputs.
 /// Runtime capabilities are fixed at construction, before this value is shared.
@@ -384,9 +383,8 @@ impl InputProcessor {
     ///
     /// # Errors
     ///
-    /// Returns `ServeError::UnsupportedFeature` from feature validation,
-    /// `ServeError::UnsupportedSamplingControl` for a control the model's
-    /// generation does not define, and `ServeError::Tokenize` for every
+    /// Returns `ServeError::UnsupportedFeature` from feature validation and
+    /// `ServeError::Tokenize` for every
     /// failure during tokenization, validation, and resource sizing.
     pub fn preprocess(
         &self,
@@ -397,7 +395,10 @@ impl InputProcessor {
             request_id,
             prompt,
             constraint,
-            sampling_params,
+            sampling,
+            max_tokens,
+            stop_token_ids,
+            decode,
             priority,
             cache_salt,
             adapter,
@@ -412,17 +413,13 @@ impl InputProcessor {
             negative_prompt_token_ids: Vec::new(),
             multimodal_inputs: Default::default(),
             constraint,
-            sampling: EngineSamplingParams {
-                // The text sampling seed's signed bit pattern seeds the engine.
-                seed: sampling_params.seed.map(|seed| seed as u64),
-                ..EngineSamplingParams::default()
-            },
+            sampling,
             image: ImageParams::default(),
             max_images: 1,
             max_und_tokens: 0,
-            include_stop_token: false,
-            stop_strings: sampling_params.stop.clone(),
-            stop_token_ids: sampling_params.stop_token_ids.clone(),
+            include_stop_token: decode.include_stop_str_in_output,
+            stop_strings: decode.stop_strings.clone().unwrap_or_default(),
+            stop_token_ids,
             priority,
             cache: CachePolicy {
                 isolation_key: crate::input::cache_isolation_key(
@@ -437,18 +434,13 @@ impl InputProcessor {
             generated_images: Vec::new(),
             trajectory: Default::default(),
         };
-        let mut decode = sampling_params.decode_options();
 
         // Each model fills its actual computation inputs in the same request.
         // No partially prepared request is exposed to the submission boundary.
         // The closure gathers every `TokenizeError` so it maps once to `ServeError::Tokenize`.
         let processor = (|| -> std::result::Result<_, crate::input::TokenizeError> {
-            let processor = self.preprocess_chat_input(
-                chat_only(prompt),
-                &sampling_params,
-                &mut generation,
-                &mut decode,
-            )?;
+            let processor =
+                self.preprocess_chat_input(chat_only(prompt), max_tokens, &mut generation)?;
             generation.validate()?;
             Ok(processor)
         })()
@@ -504,9 +496,8 @@ impl InputProcessor {
     fn preprocess_chat_input(
         &self,
         chat_request: ChatRequest,
-        sampling_params: &SamplingParams,
+        max_tokens: Option<u32>,
         generation: &mut GenerationRequest,
-        decode: &mut TextDecodeOptions,
     ) -> std::result::Result<ChatOutputProcessor, crate::input::TokenizeError> {
         chat_request.validate()?;
         let profile = self.config.chat().unwrap_or(processing::ChatProfile {
@@ -532,52 +523,70 @@ impl InputProcessor {
         let prompt_token_ids = self.tokenizer.encode(&rendered_text, false)?;
 
         let prompt_len = prompt_token_ids.len() as u32;
-        let (sampling, max_tokens, stop_token_ids) =
-            self.resolve_sampling(sampling_params, generation.sampling.seed, prompt_len)?;
+        let max_tokens = self.resolve_length(generation, max_tokens, prompt_len)?;
 
         generation.prompt_token_ids = prompt_token_ids;
-        generation.sampling = sampling;
-        generation.stop_token_ids = stop_token_ids;
         generation.max_und_tokens = max_tokens as usize;
-        generation.include_stop_token = decode.include_stop_str_in_output;
         // Prompt logprobs require computation for every prompt token, which a prefix-cache
         // read would skip.
         generation.cache.read &= !generation.sampling.prompt_logprobs_requested();
         Ok(processor)
     }
 
-    /// Resolves model defaults and request controls into validated engine
-    /// sampling parameters under the request's resolved `seed`, with the
-    /// generation length and the stop tokens.
-    fn resolve_sampling(
+    /// The engine's sampling parameters of a chat `request`: its controls
+    /// over the model's sampling defaults, lowered once, with its logit
+    /// biases keyed by token ID.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a bad word cannot be tokenized or the parameters violate
+    /// the engine's sampling contract.
+    pub fn sampling(
         &self,
-        sampling: &SamplingParams,
-        seed: Option<u64>,
-        prompt_len: u32,
-    ) -> std::result::Result<(EngineSamplingParams, u32, Vec<u32>), crate::input::TokenizeError>
-    {
-        let defaults = &self.config.sampling_defaults;
+        request: &crate::openai::ChatCompletionRequest,
+        logit_bias: Option<std::collections::HashMap<u32, f32>>,
+    ) -> std::result::Result<EngineSamplingParams, crate::input::TokenizeError> {
+        super::sampling::lower(
+            request,
+            logit_bias,
+            &self.config.sampling_defaults,
+            &self.tokenizer,
+        )
+    }
 
+    /// Resolves the request's generation length for a prompt of
+    /// `prompt_len` tokens, and adds the checkpoint's EOS tokens other than
+    /// the primary one to `generation`'s stop tokens unless it ignores EOS.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the prompt leaves no room in the context, or the request's
+    /// `min_tokens` exceeds the resolved length.
+    fn resolve_length(
+        &self,
+        generation: &mut GenerationRequest,
+        max_tokens: Option<u32>,
+        prompt_len: u32,
+    ) -> std::result::Result<u32, crate::input::TokenizeError> {
         let max_tokens = resolve_max_tokens(
-            sampling.max_tokens,
-            defaults.max_output_tokens,
+            max_tokens,
+            self.config.sampling_defaults.max_output_tokens,
             Some(self.config.max_model_len),
             prompt_len,
         )?;
-        let min_tokens = sampling.min_tokens.unwrap_or(0);
+        let min_tokens = generation.sampling.min_tokens as u32;
 
         // Unless the request ignores EOS, the checkpoint's EOS ids other than the primary one
         // become explicit stop tokens.
-        let mut stop_token_ids = sampling.stop_token_ids.clone();
-        if !sampling.ignore_eos {
+        if !generation.sampling.ignore_eos {
             for token_id in self
                 .config
                 .eos_token_ids
                 .iter()
                 .filter(|token| Some(**token) != self.config.primary_eos_token_id)
             {
-                if !stop_token_ids.contains(token_id) {
-                    stop_token_ids.push(*token_id);
+                if !generation.stop_token_ids.contains(token_id) {
+                    generation.stop_token_ids.push(*token_id);
                 }
             }
         }
@@ -588,10 +597,7 @@ impl InputProcessor {
                 max_tokens,
             });
         }
-
-        let core = super::sampling::resolve_sampling(&self.tokenizer, defaults, sampling, seed)?;
-
-        Ok((core, max_tokens, stop_token_ids))
+        Ok(max_tokens)
     }
 }
 

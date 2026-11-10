@@ -12,14 +12,14 @@ mod error;
 pub mod media;
 pub mod processor;
 mod request;
-mod sampling;
+pub(crate) mod sampling;
 pub mod video;
 
 pub use error::{ServeError, SubmitError, TokenizeError};
 pub use media::ImageInput;
 pub use processor::{InputProcessor, ModelResolutionError, RequestRenderer};
 pub use processor::{LoadedModel, LoadedRenderer};
-pub use request::{AdapterSelection, GenerateRequest, Prompt, SamplingParams};
+pub use request::{AdapterSelection, GenerateRequest, Prompt};
 
 /// Result type returned by serving-runtime calls.
 pub type Result<T> = std::result::Result<T, ServeError>;
