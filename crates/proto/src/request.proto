@@ -166,7 +166,8 @@ message EngineInfo {
   // The page seeds (32-byte keys) of the page chains of the cache groups
   // the engine's workers compute: equal between epochs whose models,
   // numerics and page layouts agree, whose pages a successor reuses.
-  repeated bytes prefix_seeds = 10;
+  repeated bytes prefix_seeds = 11;
+  reserved 10;
   // The seed of the keys of the latent trajectories the engine's denoiser
   // (a video model's, or an image model's) stores at preemption: equal
   // between epochs whose denoising computes the same, which continue each
@@ -329,6 +330,8 @@ message EngineCommand {
     // Install completed expert copies at the common drained step boundary.
     CommitExperts commit_experts = 18;
   }
+  reserved 15;
+  reserved "throttle_transfers";
 }
 
 message CacheWarm {
@@ -363,7 +366,6 @@ message RequestsDescribed {
   string error = 2;
   repeated RequestPrefix requests = 3;
 }
-
 
 // A named operation of the data plane: an expert redistribution's stages, a
 // LoRA adapter's load and unload.
@@ -598,7 +600,8 @@ message UnitRange {
 // that published it.
 message IndexedPage {
   uint32 group = 1;
-  bytes hash = 2;
+  bytes hash = 6;
+  reserved 2;
   repeated uint32 tokens = 3;
   repeated uint32 units = 4;
   // Absent for public reuse; present for a private continuation of these units.
@@ -793,7 +796,8 @@ message CachePolicy {
   optional uint64 isolation_key = 3;
   // The page seeds (32 bytes each) of the epoch whose state a migrated
   // request continues with (an epoch change's `in_flight = keep`).
-  repeated bytes state_seeds = 6;
+  repeated bytes state_seeds = 7;
+  reserved 6;
   CacheResume resume = 5;
 }
 
