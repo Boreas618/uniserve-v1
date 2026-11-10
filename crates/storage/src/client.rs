@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use crate::protocol::{
     Claim, ClientMessage, ErrorKind, Event, GpuLedger, Hello, HostStorage, Item, Key, Link,
-    Listing, Location, Mode, Priority, Region, Registered, Reply, Request, Role, Scope,
+    Listing, Location, Mode, PeerPool, Priority, Region, Registered, Reply, Request, Role, Scope,
     ServerMessage, Span, StorageRecord, TensorRecord, Throttle, TransferTotal, VERSION, Welcome,
 };
 use crate::transport::Connection;
@@ -78,8 +78,9 @@ impl Client {
     }
 
     /// Connect to the server of another host at `address` (`host:port`,
-    /// its `Endpoint`) as [`Role::Peer`], the Transfer Server of this host
-    /// that READs storage there. Connecting, and every blocking call after
+    /// its `Endpoint`) as [`Role::Peer`]: the Transfer Server of this host
+    /// that READs storage there, or a scheduler that pins the pages it
+    /// reads there ([`Client::peer_pin`]). Connecting, and every blocking call after
     /// it ([`Client::call`]), fails once `timeout` passes without an
     /// answer, so a host that stopped answering fails the caller's task
     /// instead of holding it.
@@ -486,6 +487,36 @@ impl Client {
         match Self::expect(self.call(&Request::Unexpose { exposure }, &[])?)?.reply {
             Reply::Unexposed => Ok(()),
             other => Err(unexpected("unexpose", &other)),
+        }
+    }
+
+    /// See [`Request::PeerPin`]: pin the published pages of `keys` in the
+    /// pools of `deployment` whose layout `layouts` lists, for this
+    /// connection, a [`Role::Peer`]. Returns the pools that hold at least
+    /// one of them, each with one slot per key.
+    pub fn peer_pin(
+        &mut self,
+        deployment: String,
+        layouts: Vec<Key>,
+        keys: Vec<Key>,
+    ) -> Result<Vec<PeerPool>> {
+        let request = Request::PeerPin {
+            deployment,
+            layouts,
+            keys,
+        };
+        match Self::expect(self.call(&request, &[])?)?.reply {
+            Reply::PeerPinned { pools } => Ok(pools),
+            other => Err(unexpected("peer pin", &other)),
+        }
+    }
+
+    /// See [`Request::PeerUnpin`]: end this connection's pins of the pages
+    /// of `keys` in `pool`.
+    pub fn peer_unpin(&mut self, pool: u64, keys: Vec<Key>) -> Result<()> {
+        match Self::expect(self.call(&Request::PeerUnpin { pool, keys }, &[])?)?.reply {
+            Reply::PeerUnpinned => Ok(()),
+            other => Err(unexpected("peer unpin", &other)),
         }
     }
 

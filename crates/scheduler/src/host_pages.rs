@@ -178,7 +178,7 @@ impl<P> Servers<P> {
     ) -> bool {
         let reserve = Request::Reserve {
             pool,
-            writer: writer.clone(),
+            writer: Some(writer.clone()),
             keys,
             window,
         };

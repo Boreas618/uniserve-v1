@@ -72,6 +72,16 @@
 //! ended ([`Request::Unexpose`]), or its connection closes: the source's
 //! Transfer Server then lets the registrations go ([`Event::Deregister`]),
 //! and with them the GPU contexts they held.
+//!
+//! Another host's scheduler finds pages it lacks in this host's pools the
+//! same way, as a [`Role::Peer`]: it pins the committed pages of a
+//! deployment's published epochs by key ([`Request::PeerPin`]), has its own
+//! host's Transfer Server READ the pinned slots as a [`Region::Remote`]
+//! page pool, and unpins them ([`Request::PeerUnpin`]); its pins end with
+//! its connection too. A peer connection states no credential: the TCP
+//! endpoint is unauthenticated, and a host relies on the isolation of the
+//! network it listens on to keep other processes from reading or pinning
+//! the pages and host tensors it serves.
 
 use serde::{Deserialize, Serialize};
 
@@ -80,8 +90,11 @@ use serde::{Deserialize, Serialize};
 /// until ordinary eviction; only an epoch's uncommitted publications are
 /// discarded when it retires. A [`Reply::Ledger`] answering a
 /// [`Request::Ledger`] carries what the deployment's transfer tasks copied
-/// ([`TransferTotal`]).
-pub const VERSION: u32 = 19;
+/// ([`TransferTotal`]). A peer pins pages by key ([`Request::PeerPin`]), a
+/// head reserves slots that its transfer tasks write ([`Request::Reserve`]
+/// without a writer), and a task may take its turn at
+/// [`Priority::Request`].
+pub const VERSION: u32 = 20;
 
 /// The most bytes a [`Request::Read`] answers with: a weight manifest of the
 /// largest models the library serves fits many times over, and a reply of
@@ -167,10 +180,13 @@ pub enum Role {
     /// context there, as it measured it ([`Request::Measured`]), and any
     /// staging it books ([`Request::Book`]).
     Transfer,
-    /// Another host's Transfer Server, which READs storage of this host
-    /// through NIXL for the tasks of its own host: it asks the server to
-    /// expose regions ([`Request::Expose`]). It connects to the server's
-    /// TCP endpoint.
+    /// A process of another host, connected to the server's TCP endpoint:
+    /// that host's Transfer Server, which READs storage of this host through
+    /// NIXL for the tasks of its own host and asks the server to expose
+    /// regions ([`Request::Expose`]), or that host's scheduler, which pins
+    /// the published pages it reads ([`Request::PeerPin`]). A peer states
+    /// no credential: the endpoint is unauthenticated and relies on network
+    /// isolation.
     Peer,
     /// An operator's client, which lists what the server holds and retires
     /// deployments that are no longer served.
@@ -665,18 +681,32 @@ pub enum Priority {
     Warming,
     /// Weight moves and every other copy no promotion waits for.
     Background,
+    /// What a request waits for at its admission: the pages a scheduler
+    /// reads from another host's pools for a prompt. Such a load is short
+    /// and bounded per request, so it ranks above a promotion, whose copies
+    /// yield to it between chunks.
+    Request,
 }
 
 impl Priority {
+    /// The number of priorities.
+    pub const COUNT: usize = 4;
+
     /// Every priority, highest first.
-    pub const ORDER: [Priority; 3] = [Priority::Promotion, Priority::Warming, Priority::Background];
+    pub const ORDER: [Priority; Self::COUNT] = [
+        Priority::Request,
+        Priority::Promotion,
+        Priority::Warming,
+        Priority::Background,
+    ];
 
     /// The priority's position in [`Self::ORDER`]: 0 is the highest.
     pub fn rank(self) -> usize {
         match self {
-            Priority::Promotion => 0,
-            Priority::Warming => 1,
-            Priority::Background => 2,
+            Priority::Request => 0,
+            Priority::Promotion => 1,
+            Priority::Warming => 2,
+            Priority::Background => 3,
         }
     }
 }
@@ -963,11 +993,17 @@ pub enum Request {
     /// recently used.
     Lookup { pool: u64, keys: Vec<Key> },
     /// A slot for each key the pool holds no page of, to be written by the
-    /// worker of `writer`. With `window`, the keys are the pages of one
-    /// sliding window, which the pool evicts whole.
+    /// worker of `writer`, or, with no writer, by the head's own transfer
+    /// tasks ([`Request::Transfer`] into the pool), as the pages a head
+    /// reads from another host's pool. With `window`, the keys are the
+    /// pages of one sliding window, which the pool evicts whole. When the
+    /// head's connection closes first, its reservations end once no worker
+    /// of their writer is connected, and those without a writer once every
+    /// task the head submitted ended, so no slot is reused while a copy may
+    /// still write it.
     Reserve {
         pool: u64,
-        writer: Scope,
+        writer: Option<Scope>,
         keys: Vec<Key>,
         window: Option<PageWindow>,
     },
@@ -989,6 +1025,25 @@ pub enum Request {
         reader: Scope,
         keys: Vec<Key>,
     },
+    /// From another host's scheduler ([`Role::Peer`]): pin the committed
+    /// pages of `keys` in every live pool of `deployment` whose
+    /// [`PageShape::layout`] `layouts` lists, for that host's Transfer
+    /// Server to READ ([`Region::Remote`] of a [`Region::Pool`]). Only pages
+    /// of epochs every epoch of the deployment shares are found: a page an
+    /// epoch on trial or a rolled-back epoch published is not. A pinned
+    /// page stays readable and is not evicted until the peer unpins it
+    /// ([`Request::PeerUnpin`]) or its connection closes. Answered with
+    /// [`Reply::PeerPinned`]. The request carries no credential (see
+    /// [`Role::Peer`]).
+    PeerPin {
+        deployment: String,
+        layouts: Vec<Key>,
+        keys: Vec<Key>,
+    },
+    /// From another host's scheduler: the reads of the pages of `keys` it
+    /// pinned in `pool` ended; one of its pins of each ends. A key it holds
+    /// no pin of is skipped.
+    PeerUnpin { pool: u64, keys: Vec<Key> },
     /// Where the server accepts connections from other hosts.
     Endpoint,
     /// Read the pages of `keys` the pool does not hold from the KV storage
@@ -1219,6 +1274,12 @@ pub enum Reply {
         slots: Vec<Option<u64>>,
     },
     Unpinned,
+    /// The pools a [`Request::PeerPin`] pinned pages in: only those that
+    /// hold at least one of its keys, in pool order.
+    PeerPinned {
+        pools: Vec<PeerPool>,
+    },
+    PeerUnpinned,
     /// The `host:port` other hosts connect to; `None` when the server
     /// accepts local connections only.
     Endpoint {
@@ -1275,6 +1336,17 @@ pub enum Reply {
         kind: ErrorKind,
         message: String,
     },
+}
+
+/// The pages a [`Request::PeerPin`] pinned in one pool: the pool, the shape
+/// of its pages (whose kv head range says which heads a page holds), and
+/// one slot per key of the request, `None` for a key the pool holds no
+/// published page of. Slot `s` lies at byte `s × page_bytes` of the pool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerPool {
+    pub pool: u64,
+    pub shape: PageShape,
+    pub slots: Vec<Option<u64>>,
 }
 
 /// What a server holds.

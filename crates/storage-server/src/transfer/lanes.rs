@@ -279,7 +279,7 @@ impl Budget {
 /// The pieces of one lane, by priority.
 #[derive(Default)]
 struct Queue {
-    levels: [VecDeque<Piece>; 3],
+    levels: [VecDeque<Piece>; Priority::COUNT],
 }
 
 /// What the lanes share with the main thread.

@@ -205,7 +205,7 @@ fn a_page_one_server_commits_is_prefetched_by_another_through_mooncake() {
         &mut head,
         Request::Reserve {
             pool,
-            writer: scope(),
+            writer: Some(scope()),
             keys: vec![key],
             window: None,
         },

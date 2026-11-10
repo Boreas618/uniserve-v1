@@ -110,7 +110,7 @@ pub(super) struct Transfers {
     /// submitted, and the bytes copied of them as the Transfer Server
     /// reported its progress. A hot restart hands them over, so an epoch
     /// change's head reads how much its update moved across restarts.
-    totals: BTreeMap<String, [Total; 3]>,
+    totals: BTreeMap<String, [Total; Priority::COUNT]>,
 }
 
 /// The bytes one deployment's tasks of one priority submitted and copied.
@@ -176,6 +176,14 @@ impl Transfers {
                 };
             }
         }
+    }
+
+    /// Whether a task `client` submitted has not ended yet: the Transfer
+    /// Server may still write its destinations.
+    pub(super) fn submitted_by(&self, client: ClientId) -> bool {
+        self.tasks
+            .values()
+            .any(|task| task.owner == Owner::Client(client))
     }
 
     /// Records task `task` and counts its bytes in its deployment's total.
@@ -998,6 +1006,9 @@ impl Server {
         }
         if end.is_some() {
             self.transfers.tasks.remove(&task);
+            if let Owner::Client(client) = owner {
+                self.submitter_task_ended(client);
+            }
         }
         match (owner, end) {
             (Owner::Client(client), Some(end)) => {
@@ -1010,6 +1021,15 @@ impl Server {
             }
             (Owner::Move { number, index }, Some(end)) => self.moved(number, index, &end),
             (Owner::Move { .. }, None) => {}
+        }
+    }
+
+    /// A task of `client` ended: once the last task of a client whose
+    /// connection closed ended, the page slots it reserved for its tasks
+    /// to write end ([`crate::pages::Pools::head_tasks_ended`]).
+    fn submitter_task_ended(&mut self, client: ClientId) {
+        if !self.clients.contains_key(&client) && !self.transfers.submitted_by(client) {
+            self.pages.head_tasks_ended(client);
         }
     }
 
@@ -1079,15 +1099,18 @@ impl Server {
         };
         for (task, entry) in std::mem::take(&mut self.transfers.tasks) {
             match entry.owner {
-                Owner::Client(client) => self.events.push((
-                    client,
-                    Event::Transferred {
-                        task,
-                        bytes: entry.copied,
-                        end: failed.clone(),
-                    },
-                    Vec::new(),
-                )),
+                Owner::Client(client) => {
+                    self.events.push((
+                        client,
+                        Event::Transferred {
+                            task,
+                            bytes: entry.copied,
+                            end: failed.clone(),
+                        },
+                        Vec::new(),
+                    ));
+                    self.submitter_task_ended(client);
+                }
                 Owner::Move { number, index } => self.moved(number, index, &failed),
             }
         }

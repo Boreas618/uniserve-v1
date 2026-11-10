@@ -526,15 +526,15 @@ fn a_transfer_is_refused_whole_unless_every_span_fits_storage_of_its_deployment(
 /// A head, a worker, and a source and a destination tensor of `bytes`
 /// each, for transfers slow enough to observe: the host link is halved to
 /// its floor.
-struct Slow {
-    head: Client,
-    worker: Client,
-    source: std::fs::File,
-    destination: std::fs::File,
-    bytes: u64,
+pub(crate) struct Slow {
+    pub(crate) head: Client,
+    pub(crate) worker: Client,
+    pub(crate) source: std::fs::File,
+    pub(crate) destination: std::fs::File,
+    pub(crate) bytes: u64,
 }
 
-fn slow(server: &Running, bytes: u64) -> Slow {
+pub(crate) fn slow(server: &Running, bytes: u64) -> Slow {
     let mut head = head(&server.socket);
     let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
     let mut worker = worker(&server.socket, scope("text", 0), 1, claim);

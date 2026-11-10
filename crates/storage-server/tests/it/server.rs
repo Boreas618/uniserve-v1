@@ -29,7 +29,7 @@ pub(crate) static FORKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub(crate) struct Running {
     pub(crate) socket: PathBuf,
     /// The loopback address other hosts' heads connect to.
-    tcp: String,
+    pub(crate) tcp: String,
     stop: Arc<AtomicBool>,
     wake: OwnedFd,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -604,7 +604,7 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
     let mut ask = |request: Request| remote.call(&request, &[]).unwrap().reply;
     let Reply::Reserved { slots } = ask(Request::Reserve {
         pool,
-        writer: scope("text", 0),
+        writer: Some(scope("text", 0)),
         keys: vec![key(1), key(2)],
         window: None,
     }) else {
@@ -726,7 +726,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
         .call(
             &Request::Reserve {
                 pool,
-                writer: scope("text", 0),
+                writer: Some(scope("text", 0)),
                 keys: vec![key(1)],
                 window: None,
             },
@@ -1184,7 +1184,7 @@ fn epochs_retain_their_own_storage_and_a_claim_retires_one() {
 }
 
 /// The engine of `epoch` of the deployment, which sends its page requests.
-fn engine_head(socket: &Path, epoch: u64) -> Client {
+pub(crate) fn engine_head(socket: &Path, epoch: u64) -> Client {
     Client::connect(
         socket,
         Role::Head {
@@ -1196,7 +1196,7 @@ fn engine_head(socket: &Path, epoch: u64) -> Client {
 }
 
 /// A page pool of four 16-byte pages that `worker` maps.
-fn trial_pool(worker: &mut Client) -> u64 {
+pub(crate) fn trial_pool(worker: &mut Client) -> u64 {
     use ::storage::protocol::{PageShape, Reply, Request};
 
     let shape = PageShape {
@@ -1222,14 +1222,14 @@ fn trial_pool(worker: &mut Client) -> u64 {
 }
 
 /// `head` writes and commits the pages of `keys` in `pool`.
-fn publish(head: &mut Client, pool: u64, keys: &[Key]) {
+pub(crate) fn publish(head: &mut Client, pool: u64, keys: &[Key]) {
     use ::storage::protocol::{PageSlot, Reply, Request};
 
     let Reply::Reserved { slots } = head
         .call(
             &Request::Reserve {
                 pool,
-                writer: scope("text", 0),
+                writer: Some(scope("text", 0)),
                 keys: keys.to_vec(),
                 window: None,
             },
@@ -1507,7 +1507,7 @@ fn a_rollback_discards_what_the_epoch_on_trial_published() {
         .call(
             &::storage::protocol::Request::Reserve {
                 pool,
-                writer: scope("text", 0),
+                writer: Some(scope("text", 0)),
                 keys: vec![key(8)],
                 window: None,
             },

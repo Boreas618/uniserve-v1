@@ -538,8 +538,7 @@ impl Server {
             }
             if client.pidfd.is_none() && !matches!(hello.role, Role::Head { .. } | Role::Peer) {
                 return Welcome::Refused {
-                    message: "a connection from another host is a head's or a Transfer Server's"
-                        .into(),
+                    message: "a connection from another host is a head's or a peer's".into(),
                 };
             }
             if matches!(hello.role, Role::Connector) {
@@ -747,6 +746,27 @@ impl Server {
                 Role::Peer,
             ) => self.expose(deployment, regions),
             (Request::Unexpose { exposure }, Role::Peer) => Ok(self.unexpose(id, *exposure)),
+            (
+                Request::PeerPin {
+                    deployment,
+                    layouts,
+                    keys,
+                },
+                Role::Peer,
+            ) => {
+                // A peer reads what every epoch of the deployment shares:
+                // the visibility of no epoch of its own.
+                let visibility = self.visibility(deployment, pages::DISCARDED);
+                let pools = self
+                    .pages
+                    .peer_pin(id, deployment, layouts, keys, &visibility);
+                Ok(Outcome::Reply(Reply::PeerPinned { pools }, Vec::new()))
+            }
+            (Request::PeerUnpin { pool, keys }, Role::Peer) => {
+                pool_of(&mut self.pages, *pool)?.peer_unpin(id, keys);
+                self.pages.settle();
+                Ok(Outcome::Reply(Reply::PeerUnpinned, Vec::new()))
+            }
             (Request::Finished { task, results }, Role::Connector) => {
                 self.finished(*task, results);
                 // A download that failed freed the slots it had reserved.
@@ -2023,10 +2043,15 @@ impl Server {
         self.ledgers.disconnect(id);
         match &client.role {
             Some(Role::Head { .. }) => {
+                // The head's tasks are cancelled below, but each may still
+                // write its destinations until the Transfer Server reports
+                // its end, so the slots they write wait for that.
+                let tasks_running = self.transfers.submitted_by(id);
                 let clients = &self.clients;
                 self.pages
-                    .head_gone(id, &|scope| connected_worker(clients, scope));
+                    .head_gone(id, &|scope| connected_worker(clients, scope), tasks_running);
             }
+            Some(Role::Peer) => self.pages.peer_gone(id),
             Some(Role::Worker { scope, .. }) if !connected_worker(&self.clients, scope) => {
                 self.pages.worker_gone(scope);
             }
@@ -2596,10 +2621,12 @@ impl Server {
                 keys,
                 window,
             } => {
-                of_deployment(writer)?;
+                if let Some(writer) = writer {
+                    of_deployment(writer)?;
+                }
                 let slots = self
                     .pages
-                    .reserve(*pool, writer, id, keys, *window, &visibility)
+                    .reserve(*pool, writer.as_ref(), id, keys, *window, &visibility)
                     .ok_or_else(|| invalid(&format!("page pool {pool} does not exist")))?;
                 reply(Reply::Reserved { slots })
             }
@@ -2826,6 +2853,8 @@ fn request_name(request: &Request) -> &'static str {
         Request::Abort { .. } => "abort",
         Request::Pin { .. } => "pin",
         Request::Unpin { .. } => "unpin",
+        Request::PeerPin { .. } => "peer pin",
+        Request::PeerUnpin { .. } => "peer unpin",
         Request::Endpoint => "endpoint",
         Request::Prefetch { .. } => "prefetch",
         Request::HostCache { .. } => "host_cache",

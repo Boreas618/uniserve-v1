@@ -9,10 +9,10 @@
 //! | State | Meaning |
 //! | --- | --- |
 //! | free | Unused |
-//! | reserved | Being written by the worker of its writer scope |
+//! | reserved | Being written by the worker of its writer scope, or by a transfer task of its head |
 //! | fetching | Being written by the connector, from the KV storage |
 //! | ready | Holds a committed page and may be read |
-//! | pinned | Ready and being read by workers; not evictable |
+//! | pinned | Ready and being read by workers or another host's Transfer Server; not evictable |
 //! | uploading | Ready and being read by the connector; not evictable |
 //!
 //! A reservation takes a free slot, or evicts the least recently used ready
@@ -25,15 +25,20 @@
 //! the anchor leaves its pool, the window ends too. A head's reservations and pins end with the head's
 //! `commit`, `abort` or `unpin`. When the head's connection closes first,
 //! they end once no worker of their writer or reader scope is connected,
-//! because that worker's copies may still run until its process ends. The
-//! connector's fetches and uploads end when it reports them, or when its
-//! connection closes.
+//! because that worker's copies may still run until its process ends; a
+//! reservation without a writer scope, which the head's own transfer tasks
+//! write, ends once every task the head submitted ended. A peer's pins
+//! (another host's scheduler, whose Transfer Server READs the slots) end
+//! with its `peer_unpin` or its connection. The connector's fetches and
+//! uploads end when it reports them, or when its connection closes.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::os::fd::OwnedFd;
 
-use ::storage::protocol::{Key, ListedPool, PageAnchor, PageShape, PageSlot, PageWindow, Scope};
+use ::storage::protocol::{
+    Key, ListedPool, PageAnchor, PageShape, PageSlot, PageWindow, PeerPool, Scope,
+};
 use serde::{Deserialize, Serialize};
 
 type ClientId = u64;
@@ -58,8 +63,12 @@ enum Slot {
     Free,
     Reserved {
         key: Key,
-        writer: Scope,
-        /// The head that reserved the slot, while it is connected.
+        /// The worker scope that writes the page; `None` when the head's
+        /// own transfer tasks write it.
+        writer: Option<Scope>,
+        /// The head that reserved the slot, while it is connected; for a
+        /// slot without a writer scope, also after it left, until its
+        /// transfer tasks ended.
         head: Option<ClientId>,
         /// The epoch whose head reserved the slot, which publishes its page.
         #[serde(default)]
@@ -77,6 +86,10 @@ enum Slot {
         /// The readers pinning the page, each with the head that pinned it
         /// while that head is connected.
         pins: Vec<(Scope, Option<ClientId>)>,
+        /// The peers pinning the page (other hosts' schedulers, whose
+        /// Transfer Servers READ it), one entry per pin.
+        #[serde(default)]
+        peers: Vec<ClientId>,
         /// The connector's uploads of the page in flight.
         uploads: u32,
         /// The epoch that published the page (`Visibility`); zero for a
@@ -117,8 +130,8 @@ impl Visibility {
 
 impl Slot {
     /// Whether a ready slot may be evicted: nobody reads it.
-    fn idle(pins: &[(Scope, Option<ClientId>)], uploads: u32) -> bool {
-        pins.is_empty() && uploads == 0
+    fn idle(pins: &[(Scope, Option<ClientId>)], peers: &[ClientId], uploads: u32) -> bool {
+        pins.is_empty() && peers.is_empty() && uploads == 0
     }
 }
 
@@ -540,7 +553,7 @@ impl Pools {
     pub(super) fn reserve(
         &mut self,
         pool: u64,
-        writer: &Scope,
+        writer: Option<&Scope>,
         head: ClientId,
         keys: &[Key],
         window: Option<PageWindow>,
@@ -620,10 +633,76 @@ impl Pools {
 
     /// End the reservations and pins of a head whose connection closed: at
     /// once for a scope no connected worker has, and otherwise when that
-    /// worker's connection closes (`worker_gone`).
-    pub(super) fn head_gone(&mut self, head: ClientId, connected: &dyn Fn(&Scope) -> bool) {
+    /// worker's connection closes (`worker_gone`). Its reservations without
+    /// a writer scope end at once when `tasks_running` is false, and
+    /// otherwise when its last transfer task ends (`head_tasks_ended`): a
+    /// task may write them until then.
+    pub(super) fn head_gone(
+        &mut self,
+        head: ClientId,
+        connected: &dyn Fn(&Scope) -> bool,
+        tasks_running: bool,
+    ) {
         for pool in self.pools.values_mut() {
-            pool.orphan(head, connected);
+            pool.orphan(head, connected, tasks_running);
+        }
+        self.settle();
+    }
+
+    /// The last transfer task of `head`, whose connection closed, ended:
+    /// the reservations it held for its tasks to write end.
+    pub(super) fn head_tasks_ended(&mut self, head: ClientId) {
+        for pool in self.pools.values_mut() {
+            pool.release_task_reservations(head);
+        }
+        self.settle();
+    }
+
+    /// Pin, for `peer`, the committed pages of `keys` that every epoch of
+    /// `deployment` shares (`visibility`), in each live pool of the
+    /// deployment whose layout `layouts` lists. Returns the pools that hold
+    /// at least one of the pages, in pool order, with one slot per key.
+    pub(super) fn peer_pin(
+        &mut self,
+        peer: ClientId,
+        deployment: &str,
+        layouts: &[Key],
+        keys: &[Key],
+        visibility: &Visibility,
+    ) -> Vec<PeerPool> {
+        let mut ids: Vec<u64> = self
+            .pools
+            .iter()
+            .filter(|(id, pool)| {
+                pool.deployment == deployment
+                    && layouts.contains(&pool.shape.layout)
+                    && !self.releasing.contains(id)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        ids.sort_unstable();
+
+        let mut pinned = Vec::new();
+        for id in ids {
+            let Some(pool) = self.pools.get_mut(&id) else {
+                continue;
+            };
+            let slots = pool.peer_pin(peer, keys, visibility);
+            if slots.iter().any(Option::is_some) {
+                pinned.push(PeerPool {
+                    pool: id,
+                    shape: pool.shape,
+                    slots,
+                });
+            }
+        }
+        pinned
+    }
+
+    /// The connection of `peer` closed: every pin it holds ends.
+    pub(super) fn peer_gone(&mut self, peer: ClientId) {
+        for pool in self.pools.values_mut() {
+            pool.peer_unpin_all(peer);
         }
         self.settle();
     }
@@ -690,11 +769,12 @@ impl Pool {
         if let Slot::Ready {
             touched,
             pins,
+            peers,
             uploads,
             ..
         } = &mut self.slots[slot as usize]
         {
-            if Slot::idle(pins, *uploads) {
+            if Slot::idle(pins, peers, *uploads) {
                 self.evictable.remove(touched);
                 self.evictable.insert(tick, slot);
             }
@@ -703,13 +783,14 @@ impl Pool {
     }
 
     /// A slot for each key the pool holds no page of that `visibility`
-    /// reads, written by the worker of `writer` for `head`. A page of the
+    /// reads, written by the worker of `writer` (by `head`'s transfer tasks
+    /// when `None`) for `head`. A page of the
     /// key that another epoch keeps to itself, and nobody reads, gives way.
     /// With `window`, the pages of `keys` the pool reserves or holds become
     /// one window, whose id is returned.
     fn reserve(
         &mut self,
-        writer: &Scope,
+        writer: Option<&Scope>,
         head: ClientId,
         keys: &[Key],
         window: Option<PageWindow>,
@@ -726,7 +807,7 @@ impl Pool {
                 };
                 self.slots[slot as usize] = Slot::Reserved {
                     key: *key,
-                    writer: writer.clone(),
+                    writer: writer.cloned(),
                     head: Some(head),
                     epoch: visibility.epoch,
                 };
@@ -803,7 +884,7 @@ impl Pool {
             self.member_of.remove(&slot);
             let idle = matches!(
                 &self.slots[slot as usize],
-                Slot::Ready { pins, uploads, .. } if Slot::idle(pins, *uploads)
+                Slot::Ready { pins, peers, uploads, .. } if Slot::idle(pins, peers, *uploads)
             );
             if idle {
                 self.free_slot(slot);
@@ -837,6 +918,7 @@ impl Pool {
             key,
             touched: tick,
             pins: Vec::new(),
+            peers: Vec::new(),
             uploads: 0,
             epoch,
         };
@@ -868,8 +950,8 @@ impl Pool {
         };
         let unseen_idle = matches!(
             &self.slots[held as usize],
-            Slot::Ready { epoch, pins, uploads, .. }
-                if !visibility.sees(*epoch) && Slot::idle(pins, *uploads)
+            Slot::Ready { epoch, pins, peers, uploads, .. }
+                if !visibility.sees(*epoch) && Slot::idle(pins, peers, *uploads)
         );
         if unseen_idle {
             self.free_slot(held);
@@ -930,12 +1012,13 @@ impl Pool {
                 key: held,
                 touched,
                 pins,
+                peers,
                 uploads,
                 ..
             } = &mut self.slots[*slot as usize]
                 && held == key
             {
-                if Slot::idle(pins, *uploads) {
+                if Slot::idle(pins, peers, *uploads) {
                     self.evictable.remove(touched);
                 }
                 *uploads += 1;
@@ -950,6 +1033,7 @@ impl Pool {
                 key: held,
                 touched,
                 pins,
+                peers,
                 uploads,
                 ..
             } = &mut self.slots[*slot as usize]
@@ -957,7 +1041,7 @@ impl Pool {
                 && *uploads > 0
             {
                 *uploads -= 1;
-                if Slot::idle(pins, *uploads) {
+                if Slot::idle(pins, peers, *uploads) {
                     let (touched, slot) = (*touched, *slot);
                     self.idle_again(touched, slot);
                 }
@@ -974,11 +1058,12 @@ impl Pool {
                 Slot::Ready {
                     touched,
                     pins,
+                    peers,
                     uploads,
                     ..
                 } if *uploads > 0 => {
                     *uploads = 0;
-                    if pins.is_empty() {
+                    if pins.is_empty() && peers.is_empty() {
                         self.evictable.insert(*touched, slot);
                     }
                 }
@@ -1020,10 +1105,11 @@ impl Pool {
                 key,
                 touched,
                 pins,
+                peers,
                 uploads,
                 ..
             } => {
-                if Slot::idle(pins, *uploads) {
+                if Slot::idle(pins, peers, *uploads) {
                     self.evictable.remove(touched);
                 }
                 *key
@@ -1047,12 +1133,13 @@ impl Pool {
                 Slot::Ready {
                     epoch: published,
                     pins,
+                    peers,
                     uploads,
                     ..
                 } if *published != DISCARDED && discarded(*published) => {
                     *published = DISCARDED;
                     pages += 1;
-                    Slot::idle(pins, *uploads)
+                    Slot::idle(pins, peers, *uploads)
                 }
                 Slot::Reserved {
                     epoch: published, ..
@@ -1103,6 +1190,7 @@ impl Pool {
                 let Slot::Ready {
                     touched,
                     pins,
+                    peers,
                     uploads,
                     epoch,
                     ..
@@ -1113,7 +1201,7 @@ impl Pool {
                 if !visibility.sees(*epoch) {
                     return None;
                 }
-                if Slot::idle(pins, *uploads) {
+                if Slot::idle(pins, peers, *uploads) {
                     self.evictable.remove(touched);
                 }
                 *touched = tick;
@@ -1138,6 +1226,7 @@ impl Pool {
         let Slot::Ready {
             touched,
             pins,
+            peers,
             uploads,
             ..
         } = &mut self.slots[slot as usize]
@@ -1146,7 +1235,7 @@ impl Pool {
         };
         if let Some(position) = pins.iter().position(matches) {
             pins.remove(position);
-            if Slot::idle(pins, *uploads) {
+            if Slot::idle(pins, peers, *uploads) {
                 let touched = *touched;
                 self.idle_again(touched, slot);
             }
@@ -1171,12 +1260,22 @@ impl Pool {
     }
 
     /// End `head`'s reservations and pins of scopes without a connected
-    /// worker, and orphan the others.
-    fn orphan(&mut self, head: ClientId, connected: &dyn Fn(&Scope) -> bool) {
+    /// worker, and orphan the others. Its reservations without a writer
+    /// scope stay with `head` while its transfer tasks run.
+    fn orphan(&mut self, head: ClientId, connected: &dyn Fn(&Scope) -> bool, tasks_running: bool) {
         for slot in 0..self.slots.len() as u32 {
             match &mut self.slots[slot as usize] {
                 Slot::Reserved {
-                    writer,
+                    writer: None,
+                    head: owner,
+                    ..
+                } if *owner == Some(head) => {
+                    if !tasks_running {
+                        self.free_slot(slot);
+                    }
+                }
+                Slot::Reserved {
+                    writer: Some(writer),
                     head: owner,
                     ..
                 } if *owner == Some(head) => {
@@ -1211,7 +1310,11 @@ impl Pool {
     fn release_orphans(&mut self, scope: &Scope) {
         for slot in 0..self.slots.len() as u32 {
             match &self.slots[slot as usize] {
-                Slot::Reserved { writer, head, .. } if head.is_none() && writer == scope => {
+                Slot::Reserved {
+                    writer: Some(writer),
+                    head: None,
+                    ..
+                } if writer == scope => {
                     self.free_slot(slot);
                 }
                 Slot::Ready { pins, .. } => {
@@ -1228,15 +1331,112 @@ impl Pool {
         }
     }
 
+    /// End the reservations without a writer scope that `head`, whose
+    /// connection closed, held for its transfer tasks.
+    fn release_task_reservations(&mut self, head: ClientId) {
+        for slot in 0..self.slots.len() as u32 {
+            if matches!(
+                &self.slots[slot as usize],
+                Slot::Reserved { writer: None, head: owner, .. } if *owner == Some(head)
+            ) {
+                self.free_slot(slot);
+            }
+        }
+    }
+
+    /// Pin the committed pages of `keys` that every epoch shares for
+    /// `peer`: `None` for a key the pool holds no such page of. A page of
+    /// the reading epoch alone is not shared, so `visibility` is asked
+    /// whether the page is shared rather than whether it is seen.
+    fn peer_pin(
+        &mut self,
+        peer: ClientId,
+        keys: &[Key],
+        visibility: &Visibility,
+    ) -> Vec<Option<u64>> {
+        keys.iter()
+            .map(|key| {
+                let slot = *self.index.get(key)?;
+                let tick = self.touch();
+                let Slot::Ready {
+                    touched,
+                    pins,
+                    peers,
+                    uploads,
+                    epoch,
+                    ..
+                } = &mut self.slots[slot as usize]
+                else {
+                    return None;
+                };
+                if !visibility.shared(*epoch) {
+                    return None;
+                }
+                if Slot::idle(pins, peers, *uploads) {
+                    self.evictable.remove(touched);
+                }
+                *touched = tick;
+                peers.push(peer);
+                Some(u64::from(slot))
+            })
+            .collect()
+    }
+
+    /// One pin of `peer` of each page of `keys` ends.
+    pub(super) fn peer_unpin(&mut self, peer: ClientId, keys: &[Key]) {
+        for key in keys {
+            let Some(&slot) = self.index.get(key) else {
+                continue;
+            };
+            self.peer_unpin_slot(slot, peer, false);
+        }
+    }
+
+    /// Every pin of `peer` ends.
+    fn peer_unpin_all(&mut self, peer: ClientId) {
+        for slot in 0..self.slots.len() as u32 {
+            self.peer_unpin_slot(slot, peer, true);
+        }
+    }
+
+    /// End one pin of `peer` of `slot`, or every one with `all`.
+    fn peer_unpin_slot(&mut self, slot: u32, peer: ClientId, all: bool) {
+        let Slot::Ready {
+            touched,
+            pins,
+            peers,
+            uploads,
+            ..
+        } = &mut self.slots[slot as usize]
+        else {
+            return;
+        };
+        let held = peers.len();
+        if all {
+            peers.retain(|holder| *holder != peer);
+        } else if let Some(position) = peers.iter().position(|holder| *holder == peer) {
+            peers.remove(position);
+        }
+        if peers.len() < held && Slot::idle(pins, peers, *uploads) {
+            let touched = *touched;
+            self.idle_again(touched, slot);
+        }
+    }
+
     fn listed(&self, pool: u64) -> ListedPool {
         let (mut ready, mut reserved, mut pinned, mut uploading) = (0, 0, 0, 0);
         for slot in &self.slots {
             match slot {
                 Slot::Free | Slot::Fetching { .. } => {}
                 Slot::Reserved { .. } => reserved += 1,
-                Slot::Ready { pins, uploads, .. } => {
+                Slot::Ready {
+                    pins,
+                    peers,
+                    uploads,
+                    ..
+                } => {
                     ready += 1;
-                    pinned += u64::from(!pins.is_empty());
+                    pinned += u64::from(!pins.is_empty() || !peers.is_empty());
                     uploading += u64::from(*uploads > 0);
                 }
             }
@@ -1412,7 +1612,7 @@ mod tests {
     /// Reserve and commit `keys` in `pool`, as one window with `window`.
     fn store(pools: &mut Pools, pool: u64, keys: &[Key], window: Option<PageWindow>) {
         let slots = pools
-            .reserve(pool, &scope(0), 1, keys, window, &all())
+            .reserve(pool, Some(&scope(0)), 1, keys, window, &all())
             .unwrap();
         assert!(
             slots
@@ -1432,7 +1632,7 @@ mod tests {
         let (mut pools, id) = pools(2);
         assert!(matches!(
             pools
-                .reserve(id, &scope(0), 1, &[key(1), key(2)], None, &all())
+                .reserve(id, Some(&scope(0)), 1, &[key(1), key(2)], None, &all())
                 .unwrap()[..],
             [PageSlot::Reserved { .. }, PageSlot::Reserved { .. }]
         ));
@@ -1448,13 +1648,13 @@ mod tests {
         assert_eq!(held(&mut pools, id, &[key(1)]), [true]);
         assert_eq!(
             pools
-                .reserve(id, &scope(0), 1, &[key(1)], None, &all())
+                .reserve(id, Some(&scope(0)), 1, &[key(1)], None, &all())
                 .unwrap(),
             vec![PageSlot::Present]
         );
         assert!(matches!(
             pools
-                .reserve(id, &scope(0), 1, &[key(3)], None, &all())
+                .reserve(id, Some(&scope(0)), 1, &[key(3)], None, &all())
                 .unwrap()[..],
             [PageSlot::Reserved { .. }]
         ));
@@ -1464,7 +1664,7 @@ mod tests {
     #[test]
     fn pinned_and_reserved_slots_are_not_evicted() {
         let (mut pools, id) = pools(2);
-        pools.reserve(id, &scope(0), 1, &[key(1), key(2)], None, &all());
+        pools.reserve(id, Some(&scope(0)), 1, &[key(1), key(2)], None, &all());
         let pool = pools.get_mut(id).unwrap();
         pool.commit(&[key(1)]);
         let slot = pool_slot_of(pool, key(1));
@@ -1474,7 +1674,7 @@ mod tests {
         );
         assert_eq!(
             pools
-                .reserve(id, &scope(0), 1, &[key(3)], None, &all())
+                .reserve(id, Some(&scope(0)), 1, &[key(3)], None, &all())
                 .unwrap(),
             vec![PageSlot::Full]
         );
@@ -1482,7 +1682,7 @@ mod tests {
         pools.get_mut(id).unwrap().unpin(&scope(1), &[key(1)]);
         assert!(matches!(
             pools
-                .reserve(id, &scope(0), 1, &[key(3)], None, &all())
+                .reserve(id, Some(&scope(0)), 1, &[key(3)], None, &all())
                 .unwrap()[..],
             [PageSlot::Reserved { .. }]
         ));
@@ -1490,7 +1690,7 @@ mod tests {
         pools.get_mut(id).unwrap().abort(&[key(2)]);
         assert!(matches!(
             pools
-                .reserve(id, &scope(0), 1, &[key(4)], None, &all())
+                .reserve(id, Some(&scope(0)), 1, &[key(4)], None, &all())
                 .unwrap()[..],
             [PageSlot::Reserved { .. }]
         ));
@@ -1624,7 +1824,7 @@ mod tests {
         assert_eq!(pool.lookup(&[key(1)], &all()), [false]);
         assert_eq!(
             pools
-                .reserve(id, &scope(0), 1, &[key(1)], None, &all())
+                .reserve(id, Some(&scope(0)), 1, &[key(1)], None, &all())
                 .unwrap(),
             vec![PageSlot::Present]
         );
@@ -1641,7 +1841,7 @@ mod tests {
         let reserved = pools
             .reserve(
                 id,
-                &scope(0),
+                Some(&scope(0)),
                 1,
                 &[key(5), key(6), key(7), key(8)],
                 None,
@@ -1653,7 +1853,7 @@ mod tests {
         pools.get_mut(id).unwrap().uploaded(&pages[..1]);
         assert!(matches!(
             pools
-                .reserve(id, &scope(0), 1, &[key(9)], None, &all())
+                .reserve(id, Some(&scope(0)), 1, &[key(9)], None, &all())
                 .unwrap()[..],
             [PageSlot::Reserved { .. }]
         ));
@@ -1663,15 +1863,15 @@ mod tests {
     #[test]
     fn a_closed_head_leaves_its_slots_to_the_workers_still_connected() {
         let (mut pools, id) = pools(3);
-        pools.reserve(id, &scope(0), 7, &[key(1)], None, &all());
-        pools.reserve(id, &scope(1), 7, &[key(2)], None, &all());
-        pools.reserve(id, &scope(0), 7, &[key(3)], None, &all());
+        pools.reserve(id, Some(&scope(0)), 7, &[key(1)], None, &all());
+        pools.reserve(id, Some(&scope(1)), 7, &[key(2)], None, &all());
+        pools.reserve(id, Some(&scope(0)), 7, &[key(3)], None, &all());
         let pool = pools.get_mut(id).unwrap();
         pool.commit(&[key(3)]);
         pool.pin(&scope(1), 7, &[key(3)], &all());
 
         // The worker of rank 0 is gone; rank 1 may still copy.
-        pool.orphan(7, &|scope| scope.rank == 1);
+        pool.orphan(7, &|scope| scope.rank == 1, false);
         assert_eq!(pool.listed(1).reserved, 1);
         assert_eq!(pool.listed(1).pinned, 1);
 
