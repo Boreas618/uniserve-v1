@@ -832,17 +832,6 @@ impl SchedulerHandle {
         self.commands.ledgers()
     }
 
-    /// Halves, or restores when not `halve`, the byte budgets of the links
-    /// the deployment's transfers use on the nodes of the scheduler's
-    /// workers, which the deployment's claims cover; the receiver gets the
-    /// hosts it throttled.
-    pub fn throttle(
-        &self,
-        halve: bool,
-    ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
-        self.commands.throttle(halve)
-    }
-
     /// Resumes a parked scheduler; the receiver gets whether it did. When
     /// it `reclaim`s, the epoch it lent cache units to writes none of them
     /// any more, and it takes them back.

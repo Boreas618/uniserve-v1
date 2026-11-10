@@ -727,15 +727,6 @@ pub trait Worker: Send {
         let _ = (epochs, to_host, cache_keys);
         Ok(Vec::new())
     }
-    /// Halves, or restores when not `halve`, the byte budgets of the links
-    /// the deployment's transfers use on the nodes of the worker's
-    /// workers, and returns those nodes' hosts. The default suits an
-    /// worker that retains no storage and runs no transfer, which throttles
-    /// no host.
-    fn throttle(&mut self, halve: bool) -> Result<Vec<String>, WorkerError> {
-        let _ = halve;
-        Ok(Vec::new())
-    }
     /// The storage ledgers of the nodes of the worker's workers: for each
     /// node, JSON of `{"host": ..., "ledgers": [...], "host_storage": {...}}`.
     /// The default suits a worker that retains no storage, whose ledgers

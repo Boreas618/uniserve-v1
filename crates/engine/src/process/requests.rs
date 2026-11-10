@@ -170,7 +170,6 @@ pub(super) fn engine_command_name(
         Kind::Commit(_) => "commit",
         Kind::DescribeCache(_) => "describe_cache",
         Kind::DescribeStorage(_) => "describe_storage",
-        Kind::ThrottleTransfers(_) => "throttle_transfers",
         Kind::DescribeRequests(_) => "describe_requests",
         Kind::CacheWarm(_) => "cache_warm",
         Kind::CommitExperts(_) => "commit_experts",
@@ -473,13 +472,6 @@ impl MainProcess {
             Some(proto::request::wire::engine_command::Kind::DescribeStorage(describe)) => Some(
                 proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
                     id: describe.id,
-                    results: Vec::new(),
-                    error: LEDGERS.to_owned(),
-                }),
-            ),
-            Some(proto::request::wire::engine_command::Kind::ThrottleTransfers(throttle)) => Some(
-                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
-                    id: throttle.id,
                     results: Vec::new(),
                     error: LEDGERS.to_owned(),
                 }),

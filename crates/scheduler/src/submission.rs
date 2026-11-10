@@ -490,15 +490,6 @@ impl Submissions {
         }
     }
 
-    /// Halves, or restores when not `halve`, the deployment's link budgets.
-    pub(super) fn throttle(&mut self, halve: bool) -> Result<Vec<String>, WorkerError> {
-        match &mut self.path {
-            #[cfg(feature = "testing")]
-            Path::Supplied(worker) => worker.throttle(halve),
-            Path::InProcess(_) => Ok(Vec::new()),
-        }
-    }
-
     /// The storage ledgers of the pool's nodes.
     pub(super) fn ledgers(&mut self) -> Result<Vec<String>, WorkerError> {
         match &mut self.path {

@@ -404,9 +404,6 @@ pub struct SimWorker {
     results_on_wait: bool,
     /// Where the boundary events go while a test observes them.
     observer: Option<Sender<BatchEvent>>,
-    /// Where the throttles of the deployment's transfers go while a test
-    /// observes them: `true` for a halving, `false` for a restoration.
-    throttles: Option<Sender<bool>>,
     /// The storage reports of the deployment's nodes a test has the
     /// worker answer with (`Worker::ledgers`), as node daemons report
     /// them; none when unset.
@@ -536,7 +533,6 @@ impl SimWorker {
             in_flight: 0,
             results_on_wait,
             observer: None,
-            throttles: None,
             ledgers: None,
             handle: Some(handle),
             stop,
@@ -725,15 +721,6 @@ impl Worker for SimWorker {
         self.handle.is_some()
             && !self.loss.is_lost(worker)
             && self.worker_info.workers.iter().any(|(id, _)| id == worker)
-    }
-
-    /// Records the throttle for an observer; the simulator throttles no
-    /// host.
-    fn throttle(&mut self, halve: bool) -> Result<Vec<String>, crate::worker::WorkerError> {
-        if let Some(throttles) = &self.throttles {
-            let _ = throttles.send(halve);
-        }
-        Ok(Vec::new())
     }
 
     /// The storage reports a test set (`Self::report_ledgers`); none
