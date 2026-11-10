@@ -10,7 +10,7 @@
 //! - the step's tokens and calls (`max_num_batched_tokens`, `max_batch`);
 //! - the tokens the step may spend on work that writes the prefix cache,
 //!   which is the whole step except while an epoch warms and bounds new
-//!   prefix writes (`Room::prefill_tokens`, today's `Warming::prefill_tokens`).
+//!   prefix writes (`Room::prefill_tokens`).
 //!
 //! The budgets are the step's own: the mechanism starts every step with them
 //! (today `assemble_batch` starts `budget = max_num_batched_tokens` on every

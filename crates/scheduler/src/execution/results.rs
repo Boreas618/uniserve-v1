@@ -469,6 +469,7 @@ impl Scheduler {
         call_id: CallId,
     ) -> Option<(Call, InflightInput)> {
         let inflight = self.inflight.pop_pending_call(request_key, call_id)?;
+        self.running.mark(request_key.request_id);
         self.reclaim_domain_credit(inflight.call.kind, false);
         Some((inflight.call, inflight.input))
     }

@@ -247,9 +247,6 @@ pub(crate) struct MainProcess {
     /// own, one bucket per queue turn behind serving, and a model with many buckets warms for
     /// minutes, which the daemon's wait for `Switched` follows through the `Warming` reports.
     warming: Vec<(u32, Submission, u64)>,
-    /// How many switchovers this epoch has served. The epoch's first one is what
-    /// installs a policy, so only it is checked for a policy that never arrived.
-    switchovers: u32,
     /// When this process stated itself as `Ready` or `Standby`, and how many program-layer
     /// commands it has been given since the epoch began: a process that was read as ready and is
     /// given no command looks exactly like one that is working, from the daemon's side and from
@@ -288,15 +285,12 @@ pub(crate) struct MainProcess {
     /// the warmup's progress, reported to the daemon so its wait for `Switched` lasts as long as
     /// the deployment's own capture work.
     warming_steps: Vec<Option<String>>,
-    /// When the next check for a serving policy is due, and since when none serves.
-    ///
-    /// `crates/scheduler`'s first switchover with no prepared candidate adopts no policy, calls
-    /// `note_policy_serves` never, raises nothing and answers `Ok(None)`; a scheduler with no policy
-    /// forms no batch, so the epoch would sit with nothing running while the daemon believes the
-    /// cut-over succeeded. The check asks each scheduler's policy slot, which answers within its own
-    /// command timeout, and reads the answer in the watchdog's stall bound rather than waiting.
-    policy_probe_at: Option<Instant>,
-    policy_missing_since: Option<Instant>,
+    /// The schedulers' answers to the last policy switchover not read yet, each with the instant
+    /// by which it must arrive (`policy::read_policy_answers`).
+    policy_answers: Vec<(
+        crossbeam_channel::Receiver<std::result::Result<(), String>>,
+        Instant,
+    )>,
     /// What this node resolves a module for.
     targets: Vec<Target>,
     /// The Program Server's socket, which a policy's source resolves its module through.

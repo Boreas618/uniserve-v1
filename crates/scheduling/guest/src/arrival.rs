@@ -17,8 +17,6 @@
 //! | `reclaim` | the least recently used page of the short storage, then the lowest-priority last-admitted request |
 //! | `route` | the recorded cache rank, else the live rank with the fewest requests in flight, from a rotating cursor |
 //! | `place` | the replica that already holds the request; else the one with the fewest resident requests among those with capacity; a decode-stage call never lands on a prefill-only replica |
-//! | `warm` | the resumed requests' pages in the order the requests were claimed, each request's pages in prefix order, within `Room::prefill_tokens` |
-//! | `experts` | the layout unchanged |
 //!
 //! # The one judgement the interface cannot state
 //!
@@ -38,8 +36,8 @@ use crate::lru::Lru;
 use crate::phases::Phases;
 use crate::policy::Policy;
 use crate::view::{
-    CallView, ExpertLoad, ExpertOrder, PhaseClass, PhaseKind, RankView, ReplicaView, RequestClass,
-    RequestState, RequestView, Snapshot,
+    CallView, PhaseClass, PhaseKind, RankView, ReplicaView, RequestClass, RequestState,
+    RequestView, Snapshot,
 };
 use crate::waiting::{Order, Waiting};
 
@@ -677,45 +675,6 @@ impl<K: Order> Policy for Arrival<K> {
         }
     }
 
-    fn warm(&mut self, room: &Room) -> Vec<PageId> {
-        // The resumed requests' pages in the order the mechanism claimed the
-        // requests, each request's pages in prefix order (today's
-        // `warming.rs`), cut to the tokens a warming epoch may spend on new
-        // prefix writes. A page holds `page_tokens` tokens, so the budget is
-        // that many pages; a zero budget warms nothing.
-        let Some(budget) = room.prefill_tokens else {
-            // Outside a precopy the mechanism states no candidates, so this is
-            // empty either way.
-            return room
-                .warming
-                .iter()
-                .flat_map(|warming| warming.pages.iter().copied())
-                .collect();
-        };
-        let tokens_per_page = room.page_tokens.max(1);
-        let mut pages = Vec::new();
-        let mut tokens = 0u32;
-        for warming in &room.warming {
-            for page in &warming.pages {
-                if tokens.saturating_add(tokens_per_page) > budget {
-                    return pages;
-                }
-                tokens = tokens.saturating_add(tokens_per_page);
-                pages.push(*page);
-            }
-        }
-        pages
-    }
-
-    fn experts(&mut self, load: &ExpertLoad) -> ExpertOrder {
-        // `fcfs` does not change the expert layout: the identity layout
-        // it was launched with, expert `e` on rank `e % ranks`.
-        let ranks = load.ranks.max(1);
-        ExpertOrder {
-            layout: (0..load.experts).map(|expert| expert % ranks).collect(),
-        }
-    }
-
     fn limits(&self) -> Limits {
         self.limits
     }
@@ -725,7 +684,6 @@ impl<K: Order> Policy for Arrival<K> {
 mod tests {
     use super::*;
     use crate::End;
-    use crate::decision::Warming;
     use crate::ids::{ComponentId, PhaseId};
     use crate::policy::Instantiation;
     use crate::time::{Duration, Nanos};
@@ -1219,17 +1177,6 @@ mod tests {
     }
 
     #[test]
-    fn the_expert_layout_is_unchanged() {
-        let mut fcfs = policy();
-        let order = fcfs.experts(&ExpertLoad {
-            ranks: 2,
-            experts: 5,
-            tokens: vec![0; 5],
-        });
-        assert_eq!(order.layout, vec![0, 1, 0, 1, 0]);
-    }
-
-    #[test]
     fn priority_admits_and_assembles_by_priority_then_arrival() {
         let mut priority = Arrival::<crate::PriorityOrder>::default();
         priority.instantiate(&Instantiation {
@@ -1392,10 +1339,6 @@ mod tests {
             page_tokens: 16,
             prefill_tokens: Some(64),
             capacity_units: 100,
-            warming: vec![Warming {
-                request: RequestId(20),
-                pages: vec![PageId(7), PageId(8)],
-            }],
             ..Room::default()
         };
         // With the prefill window open, the step carries context work only:
@@ -1415,7 +1358,6 @@ mod tests {
         assert_eq!(plan.offload, vec![PageId(1), PageId(2)]);
         assert_eq!(plan.prefetch, vec![RequestId(22)]);
         assert_eq!(plan.refill, vec![RequestId(21)]);
-        assert_eq!(fcfs.warm(&room), vec![PageId(7), PageId(8)]);
 
         // Two prefill batches in flight close the window: the step carries
         // token progress and media work, in class order within the generation
@@ -1545,57 +1487,6 @@ mod tests {
         admit_with_phase(&mut fcfs, deep, PhaseId(1));
 
         assert_eq!(fcfs.dispatch(&room(1024, 8)).prefetch, vec![RequestId(2)]);
-    }
-
-    /// **A warming epoch warms no more than the tokens it is given.**
-    ///
-    /// `Room::prefill_tokens` is the reservation a precopy charges new prefix
-    /// writes against, in tokens; a page holds `page_tokens`, so the budget is
-    /// that many pages, and a budget of one page warms exactly one. With no
-    /// bound stated the whole candidate list is the bound, which is what the
-    /// mechanism states outside a precopy's own accounting.
-    #[test]
-    fn a_warming_epoch_warms_no_more_than_the_tokens_it_is_given() {
-        let mut fcfs = policy();
-        let candidates = || {
-            vec![
-                Warming {
-                    request: RequestId(1),
-                    pages: vec![PageId(1), PageId(2), PageId(3)],
-                },
-                Warming {
-                    request: RequestId(2),
-                    pages: vec![PageId(4)],
-                },
-            ]
-        };
-
-        let bounded = Room {
-            page_tokens: 16,
-            prefill_tokens: Some(16),
-            warming: candidates(),
-            ..Room::default()
-        };
-        assert_eq!(fcfs.warm(&bounded), vec![PageId(1)]);
-
-        let two_pages = Room {
-            page_tokens: 16,
-            prefill_tokens: Some(32),
-            warming: candidates(),
-            ..Room::default()
-        };
-        assert_eq!(fcfs.warm(&two_pages), vec![PageId(1), PageId(2)]);
-
-        let unbounded = Room {
-            page_tokens: 16,
-            prefill_tokens: None,
-            warming: candidates(),
-            ..Room::default()
-        };
-        assert_eq!(
-            fcfs.warm(&unbounded),
-            vec![PageId(1), PageId(2), PageId(3), PageId(4)]
-        );
     }
 
     /// **The two paths alternate their precedence between steps.**

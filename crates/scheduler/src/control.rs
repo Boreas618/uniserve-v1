@@ -223,12 +223,6 @@ impl Scheduler {
                 };
                 let _ = answer.send(progress);
             }
-            Command::PublishExpertLoad { load } => {
-                self.set_expert_load(load);
-            }
-            Command::TakeExpertOrder(answer) => {
-                let _ = answer.send(self.take_expert_order());
-            }
             Command::DescribePolicyState { ranks, answer } => {
                 // The state is the mechanism's, not the serving policy's: an
                 // epoch's first precopy instantiates the epoch's policy on the
@@ -783,9 +777,22 @@ impl Scheduler {
         let Some(policy) = self.policy.as_mut() else {
             // An epoch's first switchover: no policy served before, so the
             // candidate's precopy prepared the only instance this policy has.
-            let Some(candidate) = self.policy_prepared.take() else {
+            // A commit or a purge with no policy changes nothing; a switchover
+            // or a revert that would leave the scheduler with no policy fails,
+            // since a scheduler with no policy forms no batch.
+            if matches!(stage, Stage::Commit | Stage::Purge) {
                 return Ok(None);
+            }
+            let Some(candidate) = self.policy_prepared.take() else {
+                return Err(format!(
+                    "a {} found no serving policy and no policy prepared by a precopy",
+                    stage_name(stage)
+                ));
             };
+            if stage == Stage::Revert {
+                // A revert before any policy served has nothing to go back to.
+                return Err("a revert found no serving policy to revert".to_owned());
+            }
             let engine = policy::process_engine().map_err(|error| error.to_string())?;
             let ceilings = ceilings_of(BatchCapacity::of(&self.info));
             self.adopt(PolicySlot::from_candidate(engine, ceilings, candidate));
@@ -996,7 +1003,7 @@ impl Scheduler {
         if self.config.canvas.is_some() {
             return;
         }
-        for (id, st) in &mut self.running {
+        for (id, st) in self.running.iter_mut() {
             if select(*id)
                 && !st.terminal_intent.is_terminal()
                 && !self.inflight.pending_finishes.contains_key(id)

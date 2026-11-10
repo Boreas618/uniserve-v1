@@ -960,6 +960,7 @@ impl Scheduler {
             let request = scheduling::guest::RequestId(id.0);
             self.recorder.admitted(request, admitted_at);
             self.watchdog.admitted(request, admitted_at);
+            self.running.mark(id);
             self.running_media.insert(id, state);
             self.running_order.push(id);
             // A resumed request's stored trajectory is pinned while its

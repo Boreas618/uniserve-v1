@@ -344,14 +344,6 @@ impl MainProcess {
             self.open_admission()
                 .context("resuming for the epoch's first switchover")?;
         }
-        // The other silence of the switchover: a first switchover that installed no policy adopts
-        // nothing and says nothing, so this process asks the policy slots once and, if none serves,
-        // asks again one stall bound later before it names the failure. The check is queued here
-        // rather than run here, so the daemon's `Switched` is never delayed by it.
-        self.switchovers = self.switchovers.saturating_add(1);
-        if self.switchovers == 1 {
-            self.policy_probe_at = Some(Instant::now());
-        }
         match switchover_answer(self.warming.len(), generation) {
             SwitchoverAnswer::Now(status) => Ok(Some(status)),
             // `Switched` states that this process serves, and it cannot serve until the buckets a
@@ -443,8 +435,8 @@ impl MainProcess {
         generation: u64,
         failure: UpdateFailure,
     ) -> Result<ProgramStatus> {
-        self.policy_probe_at = None;
-        self.policy_missing_since = None;
+        // The answers of a switchover this revert undoes no longer decide anything.
+        self.policy_answers.clear();
         // The phase before the call decides what a device does with the update's generation: a
         // generation that was prepared but never cut over never served, so nothing goes back and it
         // is discarded; a generation on probation served, and its reverse switchover runs. The

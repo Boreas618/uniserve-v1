@@ -656,14 +656,6 @@ pub enum Command {
     /// Hands the control thread a policy failure this scheduler recorded: it
     /// reverted to the previous policy and serves on (§7.3).
     TakePolicyReport(crossbeam_channel::Sender<Option<crate::PolicyReverted>>),
-    /// The routed tokens per expert, from the worker's edge: what §4.4's
-    /// periodic `experts` decision is asked about. `None` withdraws them.
-    PublishExpertLoad {
-        load: Option<scheduling::guest::view::ExpertLoad>,
-    },
-    /// Takes the expert layout the policy last answered: the handoff to the
-    /// worker's epoch setup, which applies it (§7.6).
-    TakeExpertOrder(crossbeam_channel::Sender<Option<scheduling::guest::view::ExpertOrder>>),
     /// Reports the state a policy is instantiated with, as seen from this
     /// scheduler with every rank's load the control thread named (§7.3).
     DescribePolicyState {
@@ -1229,23 +1221,6 @@ impl CommandSender {
         progress
     }
 
-    /// Publishes the worker's routed-token counts per expert, or withdraws
-    /// them with `None`.
-    pub fn publish_expert_load(&self, load: Option<scheduling::guest::view::ExpertLoad>) {
-        let _ = self.send(Command::PublishExpertLoad { load });
-    }
-
-    /// Takes the expert layout the policy last answered, for the worker's
-    /// epoch setup that applies it (§7.6). `None` when no layout is waiting.
-    pub fn take_expert_order(&self) -> Option<scheduling::guest::view::ExpertOrder> {
-        let (answer, taken) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::TakeExpertOrder(answer));
-        taken
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .ok()
-            .flatten()
-    }
-
     /// Takes the policy failure this scheduler recorded since the last call,
     /// if it recorded one: the control thread forwards it to the daemons.
     pub fn take_policy_report(&self) -> crossbeam_channel::Receiver<Option<crate::PolicyReverted>> {
@@ -1379,43 +1354,6 @@ impl CommandSender {
             let _ = answer.send(Err("the scheduler stopped".to_owned()));
         }
         receiver
-    }
-}
-
-/// The policy slot of one scheduler thread, as the control thread holds it
-/// (§7.3).
-///
-/// The slot itself lives on the scheduler thread, which alone instantiates,
-/// adopts and reverts a policy; this handle asks that thread rather than reaching
-/// into its fields. A scheduler in the middle of a step answers when that step
-/// ends, so the call waits at most [`POLICY_SLOT_TIMEOUT`] and answers nothing
-/// rather than holding the caller.
-#[derive(Clone)]
-pub struct PolicySlotHandle {
-    commands: CommandSender,
-}
-
-/// How long a policy-slot question waits for the scheduler thread.
-const POLICY_SLOT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
-
-impl PolicySlotHandle {
-    /// Wraps the command sender of the scheduler thread whose slot this is.
-    pub(crate) fn new(commands: CommandSender) -> Self {
-        Self { commands }
-    }
-
-    /// The serving program and the prepared one, in one answer.
-    pub fn programs(&self) -> PolicyPrograms {
-        self.commands
-            .policy_programs()
-            .recv_timeout(POLICY_SLOT_TIMEOUT)
-            .unwrap_or_default()
-    }
-
-    /// The program a precopy prepared for the next switchover, `None` when none
-    /// waits.
-    pub fn prepared(&self) -> Option<crate::PolicyProgram> {
-        self.programs().prepared
     }
 }
 

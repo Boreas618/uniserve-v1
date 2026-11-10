@@ -501,15 +501,6 @@ impl SchedulerHandle {
         self.serving.clone()
     }
 
-    /// The policy slot of this scheduler, as the control thread holds it (§7.3):
-    /// the program serving and the one a precopy prepared.
-    ///
-    /// The slot lives on the scheduler thread, which alone instantiates, adopts
-    /// and reverts a policy; the handle asks that thread.
-    pub fn policy_mut(&self) -> crate::handle::PolicySlotHandle {
-        crate::handle::PolicySlotHandle::new(self.commands.clone())
-    }
-
     /// One of §7.3's steps 3 to 6, applied at this scheduler's next boundary
     /// where no batch and no submission is in flight, and answered with the step
     /// it applied at.

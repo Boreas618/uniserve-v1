@@ -1,6 +1,7 @@
 //! The scheduling policy's half of the program-layer update: every scheduler prepares, switches,
-//! commits or reverts the update's policy program on its own thread, and the control thread checks
-//! that a first switchover installed one. A policy whose token limit exceeds this rank's captured
+//! commits or reverts the update's policy program on its own thread, and the control thread reads
+//! each scheduler's answer to a switchover, so a switchover that installs no policy fails the
+//! update. A policy whose token limit exceeds this rank's captured
 //! prefill buckets is refused with where each figure came from ([`limit_refusal`]).
 
 use std::sync::Arc;
@@ -10,7 +11,6 @@ use anyhow::Result;
 use ipc::UpdateFailure;
 use proto::program::Program;
 use scheduler::{PolicyProgram, PolicySource, ProgramSource};
-use worker::watchdog::Running;
 
 use super::{MainProcess, answer};
 use crate::rank::buckets::PrefillBound;
@@ -31,10 +31,6 @@ fn report_policy_answer(
         }
     });
 }
-
-/// How often a device that is busy delays the question asked of the policy slots: a probe that finds
-/// a device running proves nothing about whether a policy serves, so it is asked again after this.
-const POLICY_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// The argument a policy's step is bounded by: the figure the policy's hard constraints check
 /// against this rank's catalogue of prefill buckets.
@@ -97,75 +93,6 @@ pub(super) fn limit_refusal(error: &str, stated: Option<&str>, catalogue: Prefil
 }
 
 impl MainProcess {
-    /// The switchover's policy check: a first switchover that installed no policy, said by name
-    /// instead of waited for.
-    ///
-    /// A first switchover with no prepared candidate adopts no policy and answers `Ok(None)`; a
-    /// scheduler with no policy forms no batch, so the epoch sits with nothing running while the
-    /// daemon believes the cut-over succeeded - the same silence the missing startup report had.
-    /// The policy slot is asked whether one serves, and the answer is read rather than waited for:
-    /// a probe is due at once after the switchover and again one stall bound later, and the failure
-    /// is only spoken when no device has a job in flight, so a busy scheduler cannot be mistaken
-    /// for one that never adopted a policy.
-    pub(super) fn advance_policy_check(
-        &mut self,
-        running: &[Running],
-    ) -> Result<Option<UpdateFailure>> {
-        let Some(due) = self.policy_probe_at else {
-            return Ok(None);
-        };
-        let now = Instant::now();
-        if now < due {
-            return Ok(None);
-        }
-        self.policy_probe_at = None;
-
-        // The scheduler's own signal, not a reading of its policy slot: `note_policy_serves` fires
-        // where a policy actually adopts, so a probe cannot disagree with the fact it reports. A
-        // probe that finds every scheduler serving clears the missing state and says nothing - a log
-        // that states both that a policy serves and that none was installed is worse than either.
-        let serving = self
-            .schedulers
-            .iter()
-            .filter(|scheduler| *scheduler.serving().borrow())
-            .count();
-        if serving == self.schedulers.len() {
-            self.policy_missing_since = None;
-            return Ok(None);
-        }
-        if !running.is_empty() {
-            // A device is busy, so the slots' silence is not evidence: look again next pass.
-            self.policy_probe_at = Some(now + POLICY_PROBE_INTERVAL);
-            return Ok(None);
-        }
-        match self.policy_missing_since {
-            None => {
-                self.policy_missing_since = Some(now);
-                self.policy_probe_at = Some(now + self.watchdog.stall_bound());
-                tracing::warn!(
-                    serving,
-                    schedulers = self.schedulers.len(),
-                    "a switchover installed no policy on every scheduler; looking again in the watchdog's stall bound"
-                );
-                Ok(None)
-            }
-            Some(since) => {
-                self.policy_missing_since = None;
-                let failure = UpdateFailure::Policy {
-                    error: format!(
-                        "the epoch's first switchover installed no policy: {} of this node's {} \
-                         schedulers serve one after {}s, and a scheduler with no policy forms no \
-                         batch, so an admitted request cannot be planned",
-                        serving,
-                        self.schedulers.len(),
-                        since.elapsed().as_secs()
-                    ),
-                };
-                self.failure(failure)
-            }
-        }
-    }
-
     /// The precopy's policy half: every scheduler prepares the update's policy program on its own
     /// state, from the module the Program Server resolves under the store's wasm key, and answers on
     /// a channel the serve pass polls.
@@ -229,38 +156,59 @@ impl MainProcess {
         );
     }
 
-    pub(super) fn switchover_policy(&self, generation: u64, _step: Option<u64>) {
-        // This states the candidate, not the serving policy: a scheduler adopts at its next batch
-        // boundary, which is after this returns, so a "serving" figure here would be a second
-        // statement of a fact `serving()` reports - and the two disagreed in a run. What this can
-        // say is whether anything was prepared to adopt.
-        let prepared = self
+    ///
+    /// A scheduler answers at its next batch boundary, after this returns, so the answers are kept
+    /// and read by later serve passes ([`Self::read_policy_answers`]): a scheduler that refuses
+    /// the switchover - it holds no policy a precopy prepared - fails the update rather than
+    /// leaving a scheduler with no policy, which forms no batch.
+    pub(super) fn switchover_policy(&mut self, generation: u64, _step: Option<u64>) {
+        tracing::info!(
+            generation,
+            schedulers = self.schedulers.len(),
+            "every scheduler is asked to switch over its policy"
+        );
+        let deadline = Instant::now() + self.watchdog.stall_bound();
+        let answers: Vec<_> = self
             .schedulers
             .iter()
-            .filter(|scheduler| scheduler.policy_mut().prepared().is_some())
-            .count();
-        if prepared == self.schedulers.len() {
-            tracing::info!(
-                generation,
-                prepared,
-                schedulers = self.schedulers.len(),
-                "every scheduler holds a prepared policy candidate"
-            );
-        } else {
-            tracing::warn!(
-                generation,
-                prepared,
-                schedulers = self.schedulers.len(),
-                "a scheduler holds no prepared policy candidate: a switchover adopts nothing there"
-            );
-        }
-        for scheduler in &self.schedulers {
-            report_policy_answer(
-                scheduler.switchover_policy(),
-                self.watchdog.stall_bound(),
-                "the policy switchover",
-            );
-        }
+            .map(|scheduler| (scheduler.switchover_policy(), deadline))
+            .collect();
+        self.policy_answers.extend(answers);
+    }
+
+    /// Reads the schedulers' answers to the last policy switchover that have arrived: one that
+    /// failed, or that did not arrive within the stall bound, fails the update by name.
+    pub(super) fn read_policy_answers(&mut self) -> Result<Option<UpdateFailure>> {
+        let now = Instant::now();
+        let mut failed = None;
+        self.policy_answers
+            .retain(|(answer, deadline)| match answer.try_recv() {
+                Ok(Ok(())) => false,
+                Ok(Err(error)) => {
+                    failed.get_or_insert(error);
+                    false
+                }
+                // A scheduler that stopped is reported by `watch_schedulers`.
+                Err(crossbeam_channel::TryRecvError::Disconnected) => false,
+                Err(crossbeam_channel::TryRecvError::Empty) if now >= *deadline => {
+                    failed.get_or_insert_with(|| {
+                        "a scheduler did not answer the policy switchover within the stall bound"
+                            .to_owned()
+                    });
+                    false
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => true,
+            });
+        let Some(error) = failed else {
+            return Ok(None);
+        };
+        // The answers of the other schedulers belong to the same switchover, which this failure
+        // ends.
+        self.policy_answers.clear();
+        tracing::error!(%error, "a scheduler's policy switchover failed");
+        self.failure(UpdateFailure::Policy {
+            error: format!("the policy switchover failed: {error}"),
+        })
     }
 
     /// The commit's policy half: probation ended in a commit, so the prepared policy is the serving

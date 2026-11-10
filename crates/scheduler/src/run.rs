@@ -242,7 +242,7 @@ impl Scheduler {
             special_tokens,
             waiting: VecDeque::new(),
             waiting_media: VecDeque::new(),
-            running: HashMap::new(),
+            running: residents::Residents::default(),
             running_media: HashMap::new(),
             speculation_meter: Default::default(),
             retiring_requests: HashMap::new(),
@@ -260,10 +260,6 @@ impl Scheduler {
             shadow_pass: None,
             serving: tokio::sync::watch::Sender::new(false),
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            expert_load: None,
-            expert_order: None,
-            expert_asked: None,
-            expert_load_new: false,
             policy_precopy: None,
             policy_prepared: None,
             progress: crate::CommandWaker::noop(),
@@ -735,6 +731,7 @@ impl Scheduler {
 
     /// Returns mutable access to a media request state.
     pub(super) fn media_state_mut(&mut self, id: RequestId) -> Option<&mut MediaFlowState> {
+        self.running.mark(id);
         self.running_media.get_mut(&id)
     }
 

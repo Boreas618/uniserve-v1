@@ -107,19 +107,6 @@ pub struct Room {
     /// whose worst-case reservation can never fit.
     #[serde(default)]
     pub capacity_units: u64,
-    /// The requests whose pages an epoch's precopy warms, in the order the
-    /// mechanism claimed them, each with its pages in prefix order. Empty
-    /// outside a precopy.
-    #[serde(default)]
-    pub warming: Vec<Warming>,
-}
-
-/// One request of an epoch's precopy warming: its pages, in prefix order.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Warming {
-    pub request: RequestId,
-    #[serde(default)]
-    pub pages: Vec<PageId>,
 }
 
 /// Which storage is short.

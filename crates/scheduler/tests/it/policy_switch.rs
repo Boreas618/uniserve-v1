@@ -21,7 +21,6 @@ use scheduler::{
 };
 use scheduling::guest::decision::Plan;
 use scheduling::guest::limits::Limits;
-use scheduling::guest::view::ExpertOrder;
 use scheduling::guest::wire::Call;
 
 use crate::support;
@@ -31,8 +30,6 @@ const MESSAGE: u32 = 4096;
 const PLAN: u32 = 8192;
 const LIMITS: u32 = 12288;
 const VICTIMS: u32 = 16384;
-const PAGES: u32 = 20480;
-const EXPERTS: u32 = 24576;
 
 /// How long a command answer may take: a precopy loads and instantiates a
 /// module on its own thread.
@@ -55,15 +52,11 @@ fn toy() -> Vec<u8> {
     let plan = serde_json::to_string(&Plan::default()).expect("a plan is JSON");
     let limits = serde_json::to_string(&limits).expect("limits are JSON");
     let victims = "[]".to_owned();
-    let pages = "[]".to_owned();
-    let experts = serde_json::to_string(&ExpertOrder::default()).expect("an expert order is JSON");
     let source = format!(
         "(module (memory (export \"memory\") 1) \
          (data (i32.const {PLAN}) \"{}\") \
          (data (i32.const {LIMITS}) \"{}\") \
          (data (i32.const {VICTIMS}) \"{}\") \
-         (data (i32.const {PAGES}) \"{}\") \
-         (data (i32.const {EXPERTS}) \"{}\") \
          (func (export \"sched_alloc\") (param i32) (result i32) i32.const {MESSAGE}) \
          (func (export \"sched_free\") (param i32 i32)) \
          (func (export \"sched_init\") (param i32 i32) (result i64) i64.const 0) \
@@ -71,25 +64,17 @@ fn toy() -> Vec<u8> {
          (func (export \"{}\") (result i64) i64.const {}) \
          (func (export \"{}\") (param i32 i32) (result i64) i64.const {}) \
          (func (export \"{}\") (param i32 i32) (result i64) i64.const {}) \
-         (func (export \"{}\") (param i32 i32) (result i64) i64.const {}) \
-         (func (export \"{}\") (param i32 i32) (result i64) i64.const {}) \
          (func (export \"{}\") (param i32 i32) (result i32) i32.const 0) \
          (func (export \"{}\") (param i32 i32) (result i32) i32.const 0))",
         escape(&plan),
         escape(&limits),
         escape(&victims),
-        escape(&pages),
-        escape(&experts),
         Call::Limits.export(),
         packed(LIMITS, limits.len()),
         Call::Dispatch.export(),
         packed(PLAN, plan.len()),
         Call::Reclaim.export(),
         packed(VICTIMS, victims.len()),
-        Call::Warm.export(),
-        packed(PAGES, pages.len()),
-        Call::Experts.export(),
-        packed(EXPERTS, experts.len()),
         Call::Route.export(),
         Call::Place.export(),
     );
@@ -118,16 +103,12 @@ fn trapping() -> Vec<u8> {
          (func (export \"{}\") (result i64) i64.const {}) \
          (func (export \"{}\") (param i32 i32) (result i64) unreachable) \
          (func (export \"{}\") (param i32 i32) (result i64) unreachable) \
-         (func (export \"{}\") (param i32 i32) (result i64) unreachable) \
-         (func (export \"{}\") (param i32 i32) (result i64) unreachable) \
          (func (export \"{}\") (param i32 i32) (result i32) unreachable) \
          (func (export \"{}\") (param i32 i32) (result i32) unreachable))",
         Call::Limits.export(),
         packed(MESSAGE, 0),
         Call::Dispatch.export(),
         Call::Reclaim.export(),
-        Call::Warm.export(),
-        Call::Experts.export(),
         Call::Route.export(),
         Call::Place.export(),
     );

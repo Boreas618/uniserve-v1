@@ -71,7 +71,7 @@ pub enum RequestClass {
 }
 
 /// The request features design §4.4 names, and the ones a `Plan` needs.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RequestView {
     pub id: RequestId,
     pub state: RequestState,
@@ -383,27 +383,4 @@ pub struct CallView {
     pub phase: PhaseId,
     #[serde(default)]
     pub kind: PhaseKind,
-}
-
-/// The expert load a periodic `experts` decision balances.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ExpertLoad {
-    /// Ranks experts may be placed on.
-    #[serde(default)]
-    pub ranks: usize,
-    /// Experts, in index order.
-    #[serde(default)]
-    pub experts: usize,
-    /// Tokens routed to each expert since the last decision.
-    #[serde(default)]
-    pub tokens: Vec<u64>,
-}
-
-/// An expert-to-rank layout: `layout[expert]` is the rank of that
-/// expert, and it must be a permutation of the ranks in the sense the existing
-/// expert rearrangement requires (design §7.6).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ExpertOrder {
-    #[serde(default)]
-    pub layout: Vec<usize>,
 }

@@ -14,12 +14,9 @@
 
 use scheduling_guest::decision::{Plan, Room, Shortage, Victim};
 use scheduling_guest::event::Event;
-use scheduling_guest::ids::PageId;
 use scheduling_guest::limits::{Limits, Parameters};
 use scheduling_guest::policy::Instantiation;
-use scheduling_guest::view::{
-    CallView, ExpertLoad, ExpertOrder, RankView, ReplicaView, RequestView, Snapshot,
-};
+use scheduling_guest::view::{CallView, RankView, ReplicaView, RequestView, Snapshot};
 use scheduling_guest::wire::{self, Call};
 use wasmtime::{Instance, Memory, Store, Trap, TypedFunc};
 
@@ -116,8 +113,6 @@ struct Exports {
     reclaim: TypedFunc<(u32, u32), u64>,
     route: TypedFunc<(u32, u32), u32>,
     place: TypedFunc<(u32, u32), u32>,
-    warm: TypedFunc<(u32, u32), u64>,
-    experts: TypedFunc<(u32, u32), u64>,
     limits: TypedFunc<(), u64>,
 }
 
@@ -134,8 +129,6 @@ impl Exports {
             reclaim: bind(store, instance, Call::Reclaim.export())?,
             route: bind(store, instance, Call::Route.export())?,
             place: bind(store, instance, Call::Place.export())?,
-            warm: bind(store, instance, Call::Warm.export())?,
-            experts: bind(store, instance, Call::Experts.export())?,
             limits: bind(store, instance, Call::Limits.export())?,
         })
     }
@@ -147,8 +140,6 @@ impl Exports {
             Call::Observe => Some(&self.observe),
             Call::Dispatch => Some(&self.dispatch),
             Call::Reclaim => Some(&self.reclaim),
-            Call::Warm => Some(&self.warm),
-            Call::Experts => Some(&self.experts),
             Call::Route | Call::Place | Call::Limits => None,
         }
     }
@@ -342,26 +333,6 @@ impl PolicyInstance {
         })
     }
 
-    /// `warm`: which pages to warm during an epoch's precopy, in order.
-    pub fn warm(&mut self, room: &Room) -> Result<Vec<PageId>, PolicyError> {
-        self.run(Call::Warm, |policy| {
-            let message = encode(Call::Warm, room)?;
-            match policy.send(Call::Warm, &message)? {
-                Some(reply) => decode(Call::Warm, Some(reply)),
-                None => Ok(Vec::new()),
-            }
-        })
-    }
-
-    /// `experts`: the layout of experts on ranks.
-    pub fn experts(&mut self, load: &ExpertLoad) -> Result<ExpertOrder, PolicyError> {
-        self.run(Call::Experts, |policy| {
-            let message = encode(Call::Experts, load)?;
-            let reply = policy.send(Call::Experts, &message)?;
-            decode(Call::Experts, reply)
-        })
-    }
-
     /// `limits`, read once here at instantiation and not called again.
     fn read_limits(&mut self) -> Result<Limits, PolicyError> {
         self.run(Call::Limits, |policy| {
@@ -540,8 +511,8 @@ fn encode<T: serde::Serialize>(call: Call, message: &T) -> Result<Vec<u8>, Polic
 
 /// Decodes a reply of the call's type; `None` is the empty reply.
 ///
-/// A decision whose answer carries something (`dispatch`, `experts`, `limits`)
-/// must answer; `reclaim` and `warm` may answer nothing, which frees nothing.
+/// A decision whose answer carries something (`dispatch`, `limits`) must
+/// answer; `reclaim` may answer nothing, which frees nothing.
 fn decode<T: serde::de::DeserializeOwned>(
     call: Call,
     reply: Option<Vec<u8>>,

@@ -28,7 +28,7 @@ use crate::decision::{Plan, Room, Shortage, Victim};
 use crate::event::Event;
 use crate::limits::Limits;
 use crate::policy::Instantiation;
-use crate::view::{CallView, ExpertLoad, ExpertOrder, RankView, ReplicaView, RequestView};
+use crate::view::{CallView, RankView, ReplicaView, RequestView};
 use crate::wire::{decode, encode, pack};
 
 /// A buffer of `len` bytes in this module's memory, which the mechanism
@@ -190,26 +190,6 @@ macro_rules! export_policy {
         }
 
         #[unsafe(no_mangle)]
-        extern "C" fn sched_warm(ptr: u32, len: u32) -> u64 {
-            // SAFETY: the mechanism's message buffer lives for this call.
-            let bytes = unsafe { $crate::abi::message(ptr, len) };
-            let room: $crate::Room = $crate::abi::room_message(bytes);
-            let pages: ::std::vec::Vec<$crate::PageId> =
-                policy(|policy| <$policy as $crate::Policy>::warm(policy, &room));
-            $crate::abi::pages_reply(&pages)
-        }
-
-        #[unsafe(no_mangle)]
-        extern "C" fn sched_experts(ptr: u32, len: u32) -> u64 {
-            // SAFETY: the mechanism's message buffer lives for this call.
-            let bytes = unsafe { $crate::abi::message(ptr, len) };
-            let load: $crate::ExpertLoad = $crate::abi::experts_message(bytes);
-            let order: $crate::ExpertOrder =
-                policy(|policy| <$policy as $crate::Policy>::experts(policy, &load));
-            $crate::abi::experts_reply(&order)
-        }
-
-        #[unsafe(no_mangle)]
         extern "C" fn sched_limits() -> u64 {
             let limits: $crate::Limits =
                 policy(|policy| <$policy as $crate::Policy>::limits(policy));
@@ -232,7 +212,7 @@ pub fn events_message(bytes: &[u8]) -> Vec<Event> {
     read(bytes, "observe")
 }
 
-/// Decodes the message of `sched_dispatch` and `sched_warm`.
+/// Decodes the message of `sched_dispatch`.
 pub fn room_message(bytes: &[u8]) -> Room {
     read(bytes, "dispatch")
 }
@@ -253,11 +233,6 @@ pub fn place_message(bytes: &[u8]) -> (CallView, Vec<ReplicaView>) {
     read(bytes, "place")
 }
 
-/// Decodes the message of `sched_experts`.
-pub fn experts_message(bytes: &[u8]) -> ExpertLoad {
-    read(bytes, "experts")
-}
-
 /// Encodes the reply of `sched_dispatch`.
 pub fn dispatch_reply(plan: &Plan) -> u64 {
     reply(plan, "dispatch")
@@ -266,16 +241,6 @@ pub fn dispatch_reply(plan: &Plan) -> u64 {
 /// Encodes the reply of `sched_reclaim`.
 pub fn victims_reply(victims: &[Victim]) -> u64 {
     reply(&victims, "reclaim")
-}
-
-/// Encodes the reply of `sched_warm`.
-pub fn pages_reply(pages: &[crate::PageId]) -> u64 {
-    reply(&pages, "warm")
-}
-
-/// Encodes the reply of `sched_experts`.
-pub fn experts_reply(order: &ExpertOrder) -> u64 {
-    reply(order, "experts")
 }
 
 /// Encodes the reply of `sched_limits`.

@@ -8,8 +8,8 @@
 //!
 //! - [`snapshot`] and [`room`] build what `init` and each step's `dispatch`
 //!   read;
-//! - [`request`], [`call`], [`replica`]s, [`rank`]s, [`shortage`] and
-//!   [`expert_load`] build the argument of one decision;
+//! - [`request`], [`call`], [`replica`]s, [`rank`]s and [`shortage`] build
+//!   the argument of one decision;
 //! - [`arrived`], [`updated`], [`admitted`], [`advanced`], [`emitted`],
 //!   [`finished`], [`stepped`], [`cached`], [`hit`], [`freed`] and
 //!   [`encoded`] format a state change the recorder decided to report;
@@ -57,22 +57,18 @@
 //!   fetch tags, so it lists none; no `PageId` is a live host page and a
 //!   `HostPages` shortage has no page victim until the storage side reports its
 //!   pages (an open item with `front`).
-//! - `ExpertLoad`: no routed-token counters reach the scheduler, so `experts`
-//!   is skipped rather than asked about a load nobody measured.
 
 use std::collections::{HashMap, HashSet};
 
-use scheduling::guest::decision::{
-    Inflight as InflightView, Room, Shortage, Storage, Warming as WarmingView,
-};
+use scheduling::guest::decision::{Inflight as InflightView, Room, Shortage, Storage};
 use scheduling::guest::event::{End, Event};
 use scheduling::guest::ids::{
     ComponentId, EncodingId, PageId, PhaseId, RequestId as ViewRequestId,
 };
 use scheduling::guest::time::Nanos;
 use scheduling::guest::view::{
-    CallView, EncodingView, ExpertLoad, PageView, PhaseKind, PhaseView, RankView, ReplicaView,
-    RequestClass, RequestState as Standing, RequestView, Snapshot,
+    CallView, EncodingView, PageView, PhaseKind, PhaseView, RankView, ReplicaView, RequestClass,
+    RequestState as Standing, RequestView, Snapshot,
 };
 
 use super::*;
@@ -379,12 +375,11 @@ pub(crate) type RecordedTable = HashMap<RequestId, Recorded>;
 /// The monotonic instant of a wall-clock time in fractional Unix seconds.
 ///
 /// Requests carry `queued_at` as Unix time; a policy compares instants of the
-/// mechanism's monotonic clock, which the process fixes at its first use.
-/// Times before this process started clamp to zero.
+/// mechanism's monotonic clock, which the process fixes at its first use. The
+/// mapping is read once, so a request's arrival is the same instant in every
+/// view of it. Times before this process started clamp to zero.
 pub(crate) fn nanos_at(unix_secs: f64) -> Nanos {
-    let now_unix = crate::clock::now_unix_secs();
-    let now_monotonic = crate::clock::now_monotonic_us() as f64 / 1e6;
-    let elapsed = unix_secs - (now_unix - now_monotonic);
+    let elapsed = unix_secs - crate::clock::monotonic_origin_unix_secs();
     Nanos((elapsed.max(0.0) * 1e9) as u64)
 }
 
@@ -444,33 +439,7 @@ pub(crate) fn room(scheduler: &Scheduler, step: u64) -> Room {
             .unwrap_or(u32::MAX),
         },
         capacity_units: scheduler.storage.capacity_units() as u64,
-        warming: warming(scheduler),
     }
-}
-
-/// The requests an epoch's precopy warms, in the order the mechanism claimed
-/// them, each with its pages in prefix order.
-///
-/// The claim order is the reservation list's own: each reserved page names the
-/// cache resume it serves, and a request's pages keep the order they were
-/// claimed in.
-fn warming(scheduler: &Scheduler) -> Vec<WarmingView> {
-    let mut views: Vec<WarmingView> = Vec::new();
-    for reserved in &scheduler.warming.reserved {
-        let Some(unit) = reserved.reference.units().first().copied() else {
-            continue;
-        };
-        let request = ViewRequestId(reserved.resume.request_id);
-        let page = device_page(unit.0);
-        match views.iter_mut().find(|view| view.request == request) {
-            Some(view) => view.pages.push(page),
-            None => views.push(WarmingView {
-                request,
-                pages: vec![page],
-            }),
-        }
-    }
-    views
 }
 
 /// The storage the mechanism finds short right now, for `reclaim`.
@@ -1178,16 +1147,6 @@ pub(crate) fn replica_catalog(scheduler: &Scheduler) -> Vec<ReplicaView> {
         .collect()
 }
 
-/// The load the experts are balanced against.
-///
-/// No worker reports the tokens it routed to each expert, so an epoch's views
-/// carry none and the mechanism makes no expert decision.
-pub(crate) fn expert_load_of(scheduler: &Scheduler) -> Option<ExpertLoad> {
-    // The routed tokens per expert are the worker's to measure; the
-    // mechanism states them only once it has been told.
-    scheduler.expert_load.clone()
-}
-
 // ---------------------------------------------------------------------------
 // The snapshot and the trial state
 // ---------------------------------------------------------------------------
@@ -1224,17 +1183,39 @@ fn first_queued(scheduler: &Scheduler) -> Option<RequestId> {
         })
 }
 
-/// A token request's view, by id, when the scheduler holds it.
-fn request_of(scheduler: &Scheduler, id: RequestId, standing: Standing) -> Option<RequestView> {
+/// The view of one request the scheduler holds, by id, with the facts the
+/// recorder observed of it; `None` for a request the scheduler no longer
+/// holds.
+///
+/// A step computes this for the requests whose view may have moved
+/// (`Scheduler::refresh_views`), never for every request: a resident is found
+/// by its map, and a queued request, whose view moves only when it arrives or
+/// returns to the queue, by a scan of its queue.
+pub(crate) fn view_of(
+    scheduler: &Scheduler,
+    id: RequestId,
+    recorded: &RecordedTable,
+) -> Option<RequestView> {
+    let facts = recorded.get(&id).copied().unwrap_or_default();
+    if let Some(state) = scheduler.running.get(&id) {
+        return Some(request(scheduler, state, Standing::Resident, &facts));
+    }
+    if let Some(flow) = scheduler.running_media.get(&id) {
+        // A media request keeps no arrival time of its own once it runs.
+        return Some(diffusion_request(
+            &flow.request,
+            Standing::Resident,
+            0.0,
+            media_phase(scheduler, id),
+            &facts,
+        ));
+    }
     if let Some(state) = scheduler
         .waiting
         .iter()
         .find(|state| state.req.request_id == id)
     {
-        return Some(request(scheduler, state, standing, &Recorded::default()));
-    }
-    if let Some(state) = scheduler.running.get(&id) {
-        return Some(request(scheduler, state, standing, &Recorded::default()));
+        return Some(request(scheduler, state, Standing::Queued, &facts));
     }
     scheduler
         .waiting_media
@@ -1243,27 +1224,12 @@ fn request_of(scheduler: &Scheduler, id: RequestId, standing: Standing) -> Optio
         .map(|pending| {
             diffusion_request(
                 &pending.request,
-                standing,
+                Standing::Queued,
                 pending.queued_at,
                 None,
-                &Recorded::default(),
+                &facts,
             )
         })
-}
-
-/// The requests waiting for admission, in the mechanism's own order.
-pub(crate) fn queued(scheduler: &Scheduler) -> Vec<ViewRequestId> {
-    scheduler
-        .waiting
-        .iter()
-        .map(|state| ViewRequestId(state.req.request_id.0))
-        .chain(
-            scheduler
-                .waiting_media
-                .iter()
-                .map(|pending| ViewRequestId(pending.request.request_id.0)),
-        )
-        .collect()
 }
 
 /// The live state a step's validators read: this moment's snapshot, with the
@@ -1272,7 +1238,7 @@ pub(crate) fn queued(scheduler: &Scheduler) -> Vec<ViewRequestId> {
 /// The validators read a `Plan`'s names against it, so it is built at the step
 /// the plan belongs to and rebuilt after `reclaim` changes the state.
 pub(crate) fn live(scheduler: &Scheduler, step: u64, recorded: &RecordedTable) -> Live<'static> {
-    let mut live = Live::of(&snapshot(scheduler, step, recorded), queued(scheduler));
+    let mut live = Live::of(&snapshot(scheduler, step, recorded));
     // The told sets are the recorder's, owned here because this state outlives
     // the borrow of the scheduler: the switch hands it over to a candidate.
     live.told_pages = std::borrow::Cow::Owned(
@@ -1302,39 +1268,6 @@ pub(crate) fn live(scheduler: &Scheduler, step: u64, recorded: &RecordedTable) -
     live
 }
 
-/// The live state a step's starvation rule reads: the views of the requests the
-/// watchdog tracks, and nothing else.
-///
-/// The rule names only a request it has seen advancing, so a step that asks
-/// whether one has waited too long states those requests' views rather than a
-/// view of every resident (design §4.4).
-pub(crate) fn watching(scheduler: &Scheduler, recorded: &RecordedTable) -> Live<'static> {
-    let mut live = Live::default();
-    let empty = Recorded::default();
-    for id in scheduler.watchdog.tracked() {
-        let key = ipc::RequestId(id.0);
-        let facts = recorded.get(&key).copied().unwrap_or(empty);
-        let view = match scheduler.running.get(&key) {
-            Some(state) => request(scheduler, state, Standing::Resident, &facts),
-            None => match scheduler.running_media.get(&key) {
-                Some(flow) => {
-                    // A media request keeps no arrival time of its own once it runs.
-                    diffusion_request(
-                        &flow.request,
-                        Standing::Resident,
-                        0.0,
-                        media_phase(scheduler, key),
-                        &facts,
-                    )
-                }
-                None => continue,
-            },
-        };
-        live.requests.insert(*id, view);
-    }
-    live
-}
-
 /// A queued request and the ranks, for `route`: the first request the
 /// mechanism is still to admit, and the ranks it may be routed to.
 pub(crate) fn arrival(
@@ -1342,7 +1275,7 @@ pub(crate) fn arrival(
     ranks: Vec<RankView>,
 ) -> Option<(RequestView, Vec<RankView>)> {
     let id = first_queued(scheduler)?;
-    let view = request_of(scheduler, id, Standing::Queued)?;
+    let view = view_of(scheduler, id, scheduler.recorder.recorded())?;
     Some((view, ranks))
 }
 
@@ -1382,7 +1315,6 @@ pub(crate) fn trial_state(
         shortage: shortage_now(scheduler),
         arrival: None,
         call: dispatch(scheduler),
-        expert_load: expert_load_of(scheduler),
     }
 }
 
@@ -1404,7 +1336,6 @@ pub(crate) fn trial_state_with_ranks(
         shortage: shortage_now(scheduler),
         arrival,
         call,
-        expert_load: expert_load_of(scheduler),
     }
 }
 

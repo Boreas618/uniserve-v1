@@ -8,8 +8,7 @@
 //!   its previous module and the switch. It is the mechanism's whole view of the
 //!   policy; nothing here reaches past it.
 //! - The validators ([`validate_plan`], [`validate_victims`],
-//!   [`validate_route`], [`validate_place`], [`validate_warm`],
-//!   [`validate_experts`]): every answer is checked against the live state and
+//!   [`validate_route`], [`validate_place`]): every answer is checked against the live state and
 //!   the step's hard limits before it is executed. A decision that names
 //!   something that does not exist, does not fit or cannot be chosen is the
 //!   policy's failure (§4.4), never the mechanism's.
@@ -21,42 +20,6 @@
 //! switch's trial evaluation (§7.3, `policy.rs`) calls the same ones the live
 //! path does: a policy that passes probation cannot later be failed by a rule
 //! it never met.
-//!
-//! # Validated and deferred
-//!
-//! Two rows of §4.4's table are decisions the mechanism checks and does not
-//! execute, because the act belongs to an edge outside this crate. Neither is
-//! silently dropped: each is called at its moment, validated, and handed to the
-//! owner that performs it.
-//!
-//! - `warm(room)` names the pages a precopy warms, in order. The decision is
-//!   taken once per precopy, validated against the pages the epoch claims
-//!   ([`validate_warm`]), and kept on the candidate (`Candidate::warm`), which
-//!   is where the owner reads it. What it needs to be executed is a
-//!   page-addressed act the mechanism does not have: `KvOffloadManager` admits
-//!   a *request's* prefix (`admission(request, worker, keys, device, limit,
-//!   min_deepening)`) and reports arrival per request, and no host page report
-//!   reaches the engine at all — `views::pages` states `on_host: false` for
-//!   every page, so no `PageId` is a live host page (`views.rs` names the open
-//!   item with `front`). Issuing loads through that client would load a
-//!   request's prefix, in an order the policy did not choose, and nothing would
-//!   tell the mechanism the load arrived; that is the fabricated client the
-//!   mechanism may not have. The owner is the storage side's host page report,
-//!   and the acceptance is: the pages a `Warming` entry names become `on_host`,
-//!   and a `warm` order that names them is performed in the policy's order.
-//! - `experts(load)` answers a layout of experts on ranks. **The mechanism's
-//!   half is done:** it is called on the mechanism's own interval
-//!   (`Scheduler::EXPERT_REBALANCE_STEPS` steps, so a program never reads time), the
-//!   layout is validated against the ranks the load states
-//!   ([`validate_experts`]), and the order is handed over with
-//!   `Command::TakeExpertOrder` — `SchedulerHandle::take_expert_order` is that
-//!   hand-off. **The application is the worker's**, and it is deferred on
-//!   that side with a named owner (§7.6): applying a layout moves weights
-//!   across ranks and pools, which is device and epoch state, and the mechanism
-//!   owns none of it; `Worker::commit_experts` is the method that retains an
-//!   order. Nothing in this tree takes the order yet, so until the worker
-//!   applies it the order changes nothing — stated here so the row is not a
-//!   surprise to a reader rather than dropped by the mechanism.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -68,8 +31,8 @@ use scheduling::guest::decision::{Plan, Room, Shortage, Storage, Victim, Work};
 use scheduling::guest::event::Event;
 use scheduling::guest::wire::Call;
 use scheduling::guest::{
-    CallView, EncodingId, EncodingView, ExpertLoad, ExpertOrder, Nanos, PageId, PageView, PhaseId,
-    PhaseKind, PhaseView, RankView, ReplicaView, RequestId, RequestState, RequestView, Snapshot,
+    CallView, EncodingId, EncodingView, Nanos, PageId, PageView, PhaseId, PhaseKind, PhaseView,
+    RankView, ReplicaView, RequestId, RequestState, RequestView, Snapshot,
 };
 
 /// The mechanism's validators, against the state at one moment (`policy.rs`'s
@@ -126,31 +89,18 @@ impl Validators for Checked<'_> {
     ) -> Result<(), PolicyError> {
         validate_place(call, replicas, index)
     }
-
-    fn warm(&self, pages: &[PageId]) -> Result<(), PolicyError> {
-        validate_warm(self.room, pages)
-    }
-
-    fn experts(&self, load: &ExpertLoad, order: &ExpertOrder) -> Result<(), PolicyError> {
-        validate_experts(load, order)
-    }
 }
 
 /// The mechanism's objects, as the validators read them.
 ///
-/// `scheduler/views.rs` builds this from the scheduler's own state each step
-/// (and the switch's trial evaluation at a batch boundary). The one thing no
-/// view carries is the waiting queue's order, which is the mechanism's own
-/// admission order, so it is here beside the requests.
+/// A step borrows the recorder's table of the views the policy was told,
+/// which the step keeps current for the requests whose views moved; the
+/// switch's trial evaluation at a batch boundary builds it from a snapshot.
 #[derive(Clone, Debug)]
 pub(crate) struct Live<'a> {
-    /// Every request the main process holds, by id.
-    pub requests: BTreeMap<RequestId, RequestView>,
-    /// The requests waiting for admission, in the mechanism's own order.
-    ///
-    /// Only membership is read: the order a plan admits in is the policy's, and
-    /// the mechanism admits in the plan's order.
-    pub queue: Vec<RequestId>,
+    /// Every request the main process holds, by id, as the policy was last
+    /// told it: a queued request is one whose view is `Queued`.
+    pub requests: std::borrow::Cow<'a, BTreeMap<RequestId, RequestView>>,
     /// Every device and host page, by id: the scheduler's own table, which the
     /// page delta maintains, borrowed for a step and owned when the state is
     /// built from a snapshot at a batch boundary.
@@ -176,8 +126,7 @@ pub(crate) struct Live<'a> {
 impl Default for Live<'_> {
     fn default() -> Self {
         Self {
-            requests: BTreeMap::new(),
-            queue: Vec::new(),
+            requests: std::borrow::Cow::Owned(BTreeMap::new()),
             pages: std::borrow::Cow::Owned(BTreeMap::new()),
             encodings: BTreeMap::new(),
             phases: BTreeMap::new(),
@@ -190,13 +139,10 @@ impl Default for Live<'_> {
 
 impl Live<'static> {
     /// The state a policy is instantiated with, as the validators read it.
-    pub(crate) fn of(snapshot: &Snapshot, queue: Vec<RequestId>) -> Self {
-        let mut live = Live {
-            queue,
-            ..Live::default()
-        };
+    pub(crate) fn of(snapshot: &Snapshot) -> Self {
+        let mut live = Live::default();
         for request in &snapshot.requests {
-            live.requests.insert(request.id, request.clone());
+            live.requests.to_mut().insert(request.id, request.clone());
         }
         for page in &snapshot.pages {
             live.pages.to_mut().insert(page.id, page.clone());
@@ -233,9 +179,11 @@ impl Live<'_> {
             .ok_or_else(|| invalid(Call::Dispatch, format!("page {} does not exist", id.0)))
     }
 
-    /// Whether `a` waits before `b` in the admission queue.
+    /// Whether `id` waits for admission.
     fn queued(&self, id: RequestId) -> bool {
-        self.queue.contains(&id)
+        self.requests
+            .get(&id)
+            .is_some_and(|view| view.state == RequestState::Queued)
     }
 }
 
@@ -915,84 +863,6 @@ pub(crate) fn validate_place(
     Ok(())
 }
 
-/// Checks a warm order: every page is one of the pages the epoch's precopy
-/// claimed, and none is named twice.
-pub(crate) fn validate_warm(room: &Room, pages: &[PageId]) -> Result<(), PolicyError> {
-    let claimed: BTreeSet<PageId> = room
-        .warming
-        .iter()
-        .flat_map(|warming| warming.pages.iter().copied())
-        .collect();
-    let mut seen = BTreeSet::new();
-    for page in pages {
-        if !claimed.contains(page) {
-            return Err(invalid(
-                Call::Warm,
-                format!(
-                    "page {} is not one of the pages this precopy claimed",
-                    page.0
-                ),
-            ));
-        }
-        if !seen.insert(*page) {
-            return Err(invalid(
-                Call::Warm,
-                format!("page {} is warmed twice", page.0),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Checks an expert order: a layout of every expert on a rank, balanced so
-/// that no rank carries more than one expert more than another (design §7.6).
-///
-/// The load is the input the order is meant to balance; an order that is legal
-/// but leaves the load unbalanced is a poor decision, not an invalid one.
-pub(crate) fn validate_experts(load: &ExpertLoad, order: &ExpertOrder) -> Result<(), PolicyError> {
-    if load.ranks == 0 || load.experts == 0 {
-        return Err(invalid(
-            Call::Experts,
-            "the mechanism asked for an expert order with no ranks or no experts",
-        ));
-    }
-    if order.layout.len() != load.experts {
-        return Err(invalid(
-            Call::Experts,
-            format!(
-                "the order places {} experts, the model has {}",
-                order.layout.len(),
-                load.experts
-            ),
-        ));
-    }
-    let mut per_rank = vec![0usize; load.ranks];
-    for (expert, rank) in order.layout.iter().enumerate() {
-        if *rank >= load.ranks {
-            return Err(invalid(
-                Call::Experts,
-                format!(
-                    "expert {expert} is placed on rank {rank}, there are {} ranks",
-                    load.ranks
-                ),
-            ));
-        }
-        per_rank[*rank] += 1;
-    }
-    let most = per_rank.iter().copied().max().unwrap_or(0);
-    let least = per_rank.iter().copied().min().unwrap_or(0);
-    if most - least > 1 {
-        return Err(invalid(
-            Call::Experts,
-            format!(
-                "the order leaves {} experts on one rank and {least} on another",
-                most
-            ),
-        ));
-    }
-    Ok(())
-}
-
 /// The tokens a completed call advanced its request by, as a policy counts
 /// them: a prompt chunk by the tokens it wrote, a verification by the drafts it
 /// checked, a token-advancing phase by one, and a denoising step by one latent
@@ -1105,6 +975,12 @@ impl Recorder {
         &self.announced_requests
     }
 
+    /// The view of every request the policy knows, as it was last told: the
+    /// table a step's validators and the starvation rule read.
+    pub(crate) fn told(&self) -> &BTreeMap<RequestId, RequestView> {
+        &self.told
+    }
+
     /// Records one state change.
     /// A page was published: a policy that mirrors the cache keeps it from now
     /// on, and no step has to walk the pool to learn it.
@@ -1193,7 +1069,7 @@ impl Recorder {
             if self.finished.remove(&id) {
                 continue;
             }
-            let changed = self.told.get(&id).is_none_or(|told| moved(told, &view));
+            let changed = self.told.get(&id).is_none_or(|told| *told != view);
             if changed {
                 self.told.insert(id, view.clone());
                 self.pending.push(Event::Updated { request: view });
@@ -1257,29 +1133,6 @@ impl Recorder {
     }
 }
 
-/// Whether a request's view moved in a way the policy must see.
-///
-/// Only the scheduling-relevant features count: a request's priority and
-/// arrival never change, and reporting an unchanged view would tell the policy
-/// twice about one state change.
-fn moved(told: &RequestView, view: &RequestView) -> bool {
-    told.state != view.state
-        || told.phase != view.phase
-        || told.prompt_tokens != view.prompt_tokens
-        || told.generated_tokens != view.generated_tokens
-        || told.cached_prefix_tokens != view.cached_prefix_tokens
-        || told.prefilled_tokens != view.prefilled_tokens
-        || told.cached_pages != view.cached_pages
-        || told.waiting_transfer != view.waiting_transfer
-        || told.next_tokens != view.next_tokens
-        || told.prefetch_tokens != view.prefetch_tokens
-        || told.refill_tokens != view.refill_tokens
-        || told.remaining_tokens != view.remaining_tokens
-        || told.migratable != view.migratable
-        || told.cache_rank != view.cache_rank
-        || told.last_emitted_at != view.last_emitted_at
-}
-
 /// The starvation watchdog (design §4.4).
 ///
 /// A resident request that is not waiting for a transfer and has not advanced
@@ -1309,18 +1162,6 @@ impl Watchdog {
         self.advancing.remove(&request);
     }
 
-    /// The first request starved past `timeout`, if any.
-    ///
-    /// A request waiting for a transfer is not starved: the mechanism cannot
-    /// progress it, so waiting is not the policy's doing. The first by id, so a
-    /// report is deterministic.
-    /// The requests this watchdog tracks, with when each last advanced: the
-    /// only requests its starvation rule can name, so a step states the live
-    /// views of these and no others.
-    pub(crate) fn tracked(&self) -> impl Iterator<Item = &RequestId> {
-        self.advancing.keys()
-    }
-
     /// When each tracked request last advanced, for a starvation report: the
     /// deadline's own bookkeeping is what says how long a request has been
     /// silent.
@@ -1328,6 +1169,11 @@ impl Watchdog {
         self.advancing.iter().map(|(id, since)| (id, *since))
     }
 
+    /// The first request starved past `timeout`, if any.
+    ///
+    /// A request waiting for a transfer is not starved: the mechanism cannot
+    /// progress it, so waiting is not the policy's doing. The first by id, so a
+    /// report is deterministic.
     pub(crate) fn starved(&self, live: &Live<'_>, now: Nanos, timeout: Nanos) -> Option<RequestId> {
         for (id, since) in &self.advancing {
             let Some(request) = live.requests.get(id) else {
@@ -1350,7 +1196,7 @@ mod tests {
     use super::*;
     use crate::policy::{PolicyReverted, TrialState};
 
-    use scheduling::guest::{ComponentId, RequestClass, Room, Storage, Warming};
+    use scheduling::guest::{ComponentId, RequestClass, Room, Storage};
 
     fn request(id: u64, state: RequestState) -> RequestView {
         RequestView {
@@ -1379,14 +1225,9 @@ mod tests {
         }
     }
 
-    fn live(
-        requests: Vec<RequestView>,
-        queue: Vec<RequestId>,
-        kinds: &[(u32, PhaseKind)],
-    ) -> Live<'_> {
+    fn live(requests: Vec<RequestView>, kinds: &[(u32, PhaseKind)]) -> Live<'static> {
         let mut live = Live {
-            requests: requests.into_iter().map(|r| (r.id, r)).collect(),
-            queue,
+            requests: std::borrow::Cow::Owned(requests.into_iter().map(|r| (r.id, r)).collect()),
             pages: std::borrow::Cow::Owned(BTreeMap::new()),
             encodings: BTreeMap::new(),
             phases: kinds
@@ -1453,7 +1294,6 @@ mod tests {
                 request(2, RequestState::Queued),
                 request(3, RequestState::Resident),
             ],
-            vec![RequestId(1), RequestId(2)],
             &[],
         );
         // Any order of queued requests is legal; the order is the policy's.
@@ -1489,7 +1329,6 @@ mod tests {
         prefilling.prefilled_tokens = 40;
         let live = live(
             vec![decoding, prefilling],
-            Vec::new(),
             &[(0, PhaseKind::Prefill), (1, PhaseKind::Decode)],
         );
 
@@ -1523,7 +1362,7 @@ mod tests {
         let mut queued = request(3, RequestState::Queued);
         queued.phase = Some(PhaseId(1));
         let mut live = live.clone();
-        live.requests.insert(queued.id, queued);
+        live.requests.to_mut().insert(queued.id, queued);
         let p = plan(vec![Work {
             request: RequestId(3),
             phase: PhaseId(1),
@@ -1550,7 +1389,6 @@ mod tests {
                     r
                 },
             ],
-            Vec::new(),
             &[(0, PhaseKind::Prefill)],
         );
         let mut r = room();
@@ -1597,12 +1435,12 @@ mod tests {
         ]);
         let error = validate_plan(&p, &r, &live).expect_err("twice");
         assert!(format!("{error}").contains("two pieces of work"));
-        live.requests.clear();
+        live.requests.to_mut().clear();
     }
 
     #[test]
     fn only_pages_no_request_continues_from_are_offloaded() {
-        let mut live = live(vec![], Vec::new(), &[]);
+        let mut live = live(vec![], &[]);
         live.pages.to_mut().insert(
             PageId(1),
             PageView {
@@ -1666,7 +1504,6 @@ mod tests {
                     r
                 },
             ],
-            Vec::new(),
             &[],
         );
         live.pages.to_mut().insert(
@@ -1752,7 +1589,7 @@ mod tests {
         // tree that measures the chunk against the queued view refuses this
         // plan and fails here.
         let queued = request(1, RequestState::Queued);
-        let live = live(vec![queued], vec![RequestId(1)], &[(0, PhaseKind::Prefill)]);
+        let live = live(vec![queued], &[(0, PhaseKind::Prefill)]);
         let work = Work {
             request: RequestId(1),
             phase: PhaseId(0),
@@ -1772,7 +1609,7 @@ mod tests {
 
     #[test]
     fn a_victim_the_policy_was_never_shown_is_a_policy_failure() {
-        let mut live = live(Vec::new(), Vec::new(), &[]);
+        let mut live = live(Vec::new(), &[]);
         live.pages.to_mut().insert(
             PageId(1),
             PageView {
@@ -1802,7 +1639,7 @@ mod tests {
         // answered from and the reclaim, so this state means the mechanism let
         // go of a told object without recording it: an invariant of its own,
         // named as such and never as the policy's wrong decision.
-        let live = live(Vec::new(), Vec::new(), &[]);
+        let live = live(Vec::new(), &[]);
         let mut live = live;
         live.told_pages.to_mut().insert(PageId(1));
         let units = Shortage {
@@ -1878,55 +1715,6 @@ mod tests {
     }
 
     #[test]
-    fn warm_and_experts_must_be_legal() {
-        let mut room = room();
-        room.warming = vec![Warming {
-            request: RequestId(1),
-            pages: vec![PageId(1), PageId(2)],
-        }];
-        validate_warm(&room, &[PageId(2), PageId(1)]).expect("any order of the claimed pages");
-        let error = validate_warm(&room, &[PageId(3)]).expect_err("not claimed");
-        assert!(format!("{error}").contains("not one of the pages"));
-
-        let load = ExpertLoad {
-            ranks: 2,
-            experts: 4,
-            tokens: vec![10, 0, 9, 1],
-        };
-        validate_experts(
-            &load,
-            &ExpertOrder {
-                layout: vec![0, 0, 1, 1],
-            },
-        )
-        .expect("balanced");
-        let error = validate_experts(
-            &load,
-            &ExpertOrder {
-                layout: vec![0, 0, 0, 0],
-            },
-        )
-        .expect_err("unbalanced");
-        assert!(format!("{error}").contains("experts on one rank"));
-        let error = validate_experts(
-            &load,
-            &ExpertOrder {
-                layout: vec![0, 1, 0],
-            },
-        )
-        .expect_err("short");
-        assert!(format!("{error}").contains("places 3 experts"));
-        let error = validate_experts(
-            &load,
-            &ExpertOrder {
-                layout: vec![0, 0, 2, 2],
-            },
-        )
-        .expect_err("no such rank");
-        assert!(format!("{error}").contains("there are 2 ranks"));
-    }
-
-    #[test]
     fn the_recorder_tells_one_update_per_change_and_none_for_an_unchanged_view() {
         let mut recorder = Recorder::default();
         let mut arrived = request(1, RequestState::Queued);
@@ -1980,7 +1768,6 @@ mod tests {
                 },
                 request(3, RequestState::Resident),
             ],
-            Vec::new(),
             &[],
         );
         let mut watchdog = Watchdog::default();
@@ -2000,7 +1787,11 @@ mod tests {
             watchdog.starved(&live, Nanos(2_000_000_000), timeout),
             Some(RequestId(1))
         );
-        live.requests.get_mut(&RequestId(1)).expect("live").state = RequestState::Finished;
+        live.requests
+            .to_mut()
+            .get_mut(&RequestId(1))
+            .expect("live")
+            .state = RequestState::Finished;
         assert_eq!(watchdog.starved(&live, Nanos(2_000_000_000), timeout), None);
         watchdog.finished(RequestId(3));
         assert_eq!(
@@ -2035,14 +1826,13 @@ mod tests {
 
     #[test]
     fn a_static_policy_goes_through_the_same_validators_the_live_path_does() {
-        let mut live = live(
+        let live = live(
             vec![request(1, RequestState::Queued), {
                 let mut r = request(2, RequestState::Resident);
                 r.phase = Some(PhaseId(1));
                 r.next_tokens = 1;
                 r
             }],
-            vec![RequestId(1)],
             &[(0, PhaseKind::Prefill), (1, PhaseKind::Decode)],
         );
         let mut plan = plan(vec![Work {
@@ -2080,6 +1870,5 @@ mod tests {
             alive: true,
         }];
         validate_route(&live.requests[&RequestId(2)], &ranks, 0).expect("a live rank");
-        live.queue.clear();
     }
 }

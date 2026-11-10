@@ -6,8 +6,7 @@
 //!
 //! - **the precopy trial** refuses five of them. §4.4 has a precopy ask every
 //!   decision on the mechanism's current state, so a trap, spent fuel, limits
-//!   over the build config's ceilings and a decision or expert order the
-//!   validators refuse are found before the program can serve: the command
+//!   over the build config's ceilings and a decision the validators refuse are found before the program can serve: the command
 //!   answers with the reason, the serving program is untouched, and no revert
 //!   happens because nothing was replaced;
 //! - **the live step** decides the sixth, and it is not a policy failure. A
@@ -36,7 +35,6 @@ use scheduling::guest::PhaseId;
 use scheduling::guest::RequestId;
 use scheduling::guest::decision::{Plan, Work};
 use scheduling::guest::limits::Limits;
-use scheduling::guest::view::{ExpertLoad, ExpertOrder};
 use scheduling::guest::wire::Call;
 
 use crate::support;
@@ -46,8 +44,6 @@ const MESSAGE: u32 = 4096;
 const PLAN: u32 = 8192;
 const LIMITS: u32 = 12288;
 const VICTIMS: u32 = 16384;
-const PAGES: u32 = 20480;
-const EXPERTS: u32 = 24576;
 
 /// How long a command answer may take.
 const ANSWER: Duration = Duration::from_secs(30);
@@ -87,7 +83,6 @@ enum Dispatch {
 struct Toy {
     limits: Limits,
     plan: Plan,
-    experts: ExpertOrder,
     observe: Observe,
     dispatch: Dispatch,
 }
@@ -104,8 +99,6 @@ impl Toy {
                 ..Limits::default()
             },
             plan: Plan::default(),
-            // A layout the previous program is recognizable by.
-            experts: ExpertOrder { layout: vec![1, 0] },
             observe: Observe::Answers,
             dispatch: Dispatch::Plan,
         }
@@ -114,7 +107,6 @@ impl Toy {
     fn wasm(&self) -> Vec<u8> {
         let plan = serde_json::to_string(&self.plan).expect("a plan is JSON");
         let limits = serde_json::to_string(&self.limits).expect("limits are JSON");
-        let experts = serde_json::to_string(&self.experts).expect("an expert order is JSON");
         let observe = match self.observe {
             Observe::Answers => {
                 "(func (export \"sched_observe\") (param i32 i32) (result i64) i64.const 0)"
@@ -150,9 +142,7 @@ impl Toy {
             "(module (memory (export \"memory\") 1) (global $admits (mut i32) (i32.const 1)) \
              (data (i32.const {PLAN}) \"{plan}\") \
              (data (i32.const {LIMITS}) \"{limits}\") \
-             (data (i32.const {EXPERTS}) \"{experts}\") \
              (data (i32.const {VICTIMS}) \"[]\") \
-             (data (i32.const {PAGES}) \"[]\") \
              (func (export \"sched_alloc\") (param i32) (result i32) i32.const {MESSAGE}) \
              (func (export \"sched_free\") (param i32 i32)) \
              (func (export \"sched_init\") (param i32 i32) (result i64) i64.const 0) \
@@ -160,21 +150,14 @@ impl Toy {
              {dispatch} \
              (func (export \"{limits_call}\") (result i64) i64.const {limits_answer}) \
              (func (export \"{reclaim_call}\") (param i32 i32) (result i64) i64.const {reclaim_answer}) \
-             (func (export \"{warm_call}\") (param i32 i32) (result i64) i64.const {warm_answer}) \
-             (func (export \"{experts_call}\") (param i32 i32) (result i64) i64.const {experts_answer}) \
              (func (export \"{route_call}\") (param i32 i32) (result i32) i32.const 0) \
              (func (export \"{place_call}\") (param i32 i32) (result i32) i32.const 0))",
             plan = escape(&plan),
             limits = escape(&limits),
-            experts = escape(&experts),
             limits_call = Call::Limits.export(),
             limits_answer = packed(LIMITS, limits.len()),
             reclaim_call = Call::Reclaim.export(),
             reclaim_answer = packed(VICTIMS, 2),
-            warm_call = Call::Warm.export(),
-            warm_answer = packed(PAGES, 2),
-            experts_call = Call::Experts.export(),
-            experts_answer = packed(EXPERTS, experts.len()),
             route_call = Call::Route.export(),
             place_call = Call::Place.export(),
         );
@@ -335,20 +318,20 @@ impl Epoch {
         answer(self.handle.switchover_policy())
     }
 
+    /// The revision of the program that serves: after a refused candidate or
+    /// a failure, the program that serves on is the one already serving.
+    fn serving_revision(&self) -> Option<u32> {
+        self.handle
+            .policy_programs()
+            .recv_timeout(ANSWER)
+            .expect("the scheduler answers with its slot's programs")
+            .running
+            .map(|program| program.revision)
+    }
+
     /// Waits for the failure report the mechanism records for a failed policy.
     fn failed(&self) -> scheduler::PolicyReverted {
         eventually(|| self.handle.take_policy_report().recv().ok().flatten())
-    }
-
-    /// The layout the serving program answers a published load with: after a
-    /// failure, the program that serves on is the one it reverted to.
-    fn serving_order(&self) -> ExpertOrder {
-        self.handle.publish_expert_load(Some(ExpertLoad {
-            ranks: 2,
-            experts: 2,
-            tokens: vec![1, 1],
-        }));
-        eventually(|| self.handle.take_expert_order())
     }
 }
 
@@ -399,7 +382,7 @@ fn a_trap_in_observe_fails_the_policy() {
     );
     // The program before the trapping one answers the next decision: its
     // layout is the one handed over, and the failed program's is not.
-    assert_eq!(epoch.serving_order().layout, vec![1, 0]);
+    assert_eq!(epoch.serving_revision(), Some(1));
     assert!(
         epoch
             .handle
@@ -431,7 +414,7 @@ fn exhausted_fuel_in_dispatch_fails_the_policy() {
         reason.contains("fuel") && reason.contains("dispatch"),
         "the reason names the spent budget and the call it was spent in: {reason}"
     );
-    assert_eq!(epoch.serving_order().layout, vec![1, 0]);
+    assert_eq!(epoch.serving_revision(), Some(1));
     epoch.no_failure();
 }
 
@@ -452,7 +435,7 @@ fn limits_over_the_build_ceiling_fail_the_policy() {
         reason.contains("limit") || reason.contains("ceiling"),
         "the reason names the limits: {reason}"
     );
-    assert_eq!(epoch.serving_order().layout, vec![1, 0]);
+    assert_eq!(epoch.serving_revision(), Some(1));
     epoch.no_failure();
 }
 
@@ -503,29 +486,7 @@ fn an_invalid_decision_fails_the_policy_and_applies_nothing() {
     );
     // Nothing of the refused plan ran, and nothing of it serves: the program
     // that answers the next decision is the one that was already serving.
-    assert_eq!(epoch.serving_order().layout, vec![1, 0]);
-    epoch.no_failure();
-}
-
-#[test]
-fn an_invalid_expert_order_fails_the_policy() {
-    let epoch = Epoch::serving(Toy::idle());
-    epoch.handle.publish_expert_load(Some(ExpertLoad {
-        ranks: 2,
-        experts: 2,
-        tokens: vec![1, 1],
-    }));
-    let reason = epoch
-        .refuse(Toy {
-            experts: ExpertOrder { layout: vec![0, 0] },
-            ..Toy::idle()
-        })
-        .to_lowercase();
-    assert!(
-        reason.contains("expert"),
-        "the reason names the order: {reason}"
-    );
-    assert_eq!(epoch.serving_order().layout, vec![1, 0]);
+    assert_eq!(epoch.serving_revision(), Some(2));
     epoch.no_failure();
 }
 
@@ -543,8 +504,6 @@ fn starving(admit: Vec<RequestId>, timeout: Nanos) -> Toy {
             ..Plan::default()
         },
         dispatch: Dispatch::PlanOnce,
-        // Distinct from the previous program's, so the revert is visible.
-        experts: ExpertOrder { layout: vec![0, 1] },
         ..Toy::idle()
     }
 }

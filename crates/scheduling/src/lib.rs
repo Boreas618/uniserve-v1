@@ -18,8 +18,7 @@
 //! The three failures of §4.4 that belong to the module itself are reported as
 //! [`PolicyError`]: a trap, running past the fuel, and limits outside the build
 //! config. A decision that names something that does not exist or cannot be
-//! chosen, work that breaks a hard limit, an expert order that is not a
-//! permutation, and a resident request starved past `limits().timeout` are
+//! chosen, work that breaks a hard limit, and a resident request starved past `limits().timeout` are
 //! found by the mechanism, which fails the policy through the same type. Either
 //! way the policy has failed: during probation the update is reverted, and after
 //! a commit the mechanism instantiates the previous policy on the state it holds

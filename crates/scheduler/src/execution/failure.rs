@@ -136,6 +136,9 @@ impl Scheduler {
         // and command ownership must be retired together.
         let (ids, commands) = self.inflight.clear_failed_calls();
         self.acknowledge_commands(&commands);
+        for id in &ids {
+            self.running.mark(*id);
+        }
         for id in ids {
             // A request whose migration began ends as it began.
             let migrating = self
@@ -342,6 +345,7 @@ impl Scheduler {
             pending.push_back(batch);
         }
         for (batch_id, request, call_id) in retired {
+            self.running.mark(request.request_id);
             let Some(inflight) = self.inflight.retire_call(batch_id, request, call_id) else {
                 self.fatal = true;
                 tracing::error!(

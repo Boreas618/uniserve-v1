@@ -30,11 +30,10 @@ use std::time::Instant;
 
 use scheduling::guest::decision::{Plan, Room, Shortage, Victim};
 use scheduling::guest::event::Event;
-use scheduling::guest::ids::PageId;
 pub use scheduling::guest::limits::{Limits, Parameters};
 use scheduling::guest::policy::Instantiation;
 use scheduling::guest::view::{
-    CallView, ExpertLoad, ExpertOrder, RankView, ReplicaView, RequestState, RequestView, Snapshot,
+    CallView, RankView, ReplicaView, RequestState, RequestView, Snapshot,
 };
 use scheduling::guest::wire::Call;
 use scheduling::{Engine, PolicyError, PolicyInstance, PolicyModule};
@@ -433,7 +432,7 @@ impl PolicySource for PolicyBytes {
 pub struct TrialState {
     /// Every object that exists: the `Snapshot` of `Policy::init`.
     pub snapshot: Snapshot,
-    /// The step's room, for `dispatch` and `warm`.
+    /// The step's room, for `dispatch`.
     pub room: Room,
     /// The shortage the mechanism faces, for `reclaim`; `None` skips the call,
     /// as the mechanism calls `reclaim` only when something is short.
@@ -443,9 +442,6 @@ pub struct TrialState {
     /// A request's first call on a block and the replicas, for `place`; `None`
     /// skips the call.
     pub call: Option<(CallView, Vec<ReplicaView>)>,
-    /// The load the experts are balanced against, for `experts`; `None` skips
-    /// the call.
-    pub expert_load: Option<ExpertLoad>,
 }
 
 /// The mechanism's validation of a decision's answer, without executing it
@@ -478,12 +474,6 @@ pub trait Validators {
         replicas: &[ReplicaView],
         index: usize,
     ) -> Result<(), PolicyError>;
-
-    /// Whether every page named may be warmed.
-    fn warm(&self, pages: &[PageId]) -> Result<(), PolicyError>;
-
-    /// Whether `order` is a legal layout of the experts of `load`.
-    fn experts(&self, load: &ExpertLoad, order: &ExpertOrder) -> Result<(), PolicyError>;
 }
 
 /// A stage of §7.3's switch, asked for by the daemon and applied by the
@@ -664,7 +654,7 @@ pub struct PolicyReverted {
     /// The program that failed.
     pub program: PolicyProgram,
     /// Why it failed (§4.4's list: a trap, fuel, bad limits, an invalid
-    /// decision, an illegal expert order, or starvation).
+    /// decision, or starvation).
     pub reason: String,
     /// Whether the epoch cannot serve on: the failed policy had no previous
     /// policy to revert to, or the previous policy did not instantiate. It is
@@ -865,12 +855,6 @@ impl PolicySlot {
         cost.call(instance, |instance| instance.place(call, replicas))
     }
 
-    /// `experts`: the layout of experts on ranks (§4.4).
-    pub fn experts(&mut self, load: &ExpertLoad) -> Result<ExpertOrder, PolicyError> {
-        let (instance, cost) = (&mut self.instance, &mut self.cost);
-        cost.call(instance, |instance| instance.experts(load))
-    }
-
     /// The calls this scheduler's policy has made and the fuel they consumed
     /// (§12's cost counters, for `Metrics.policy_fuel`/`policy_calls`).
     pub fn usage(&self) -> PolicyUsage {
@@ -882,8 +866,7 @@ impl PolicySlot {
     ///
     /// An answer that does not decode, a trap, fuel exhaustion, limits outside
     /// the build config, a decision that names something that does not exist or
-    /// cannot be chosen, and an expert order that is not a legal layout all
-    /// fail the precopy: no candidate is returned and the serving policy is
+    /// cannot be chosen all fail the precopy: no candidate is returned and the serving policy is
     /// untouched. `validators` are the mechanism's own, so the candidate is
     /// judged by what will judge it live.
     ///
@@ -904,7 +887,6 @@ impl PolicySlot {
             shortage,
             arrival,
             call,
-            expert_load,
         } = state;
         let init = Instantiation {
             parameters: program.arguments.clone(),
@@ -940,16 +922,6 @@ impl PolicySlot {
             let index = instance.place(call, replicas)?;
             validators.place(call, replicas, index)?;
         }
-        let pages = instance.warm(&room)?;
-        validators.warm(&pages)?;
-        tracing::debug!(
-            pages = pages.len(),
-            "the precopy policy named the pages to warm, in its order"
-        );
-        if let Some(load) = &expert_load {
-            let order = instance.experts(load)?;
-            validators.experts(load, &order)?;
-        }
 
         // A trial must leave a stateful program as it found it. The calls the
         // trial made are its own, and a program that decides from its own call
@@ -978,9 +950,6 @@ impl PolicySlot {
             instance,
             trial,
             state: init.state,
-            // A route-only precopy asks no warming decision: the room it has
-            // is the routing one, and warming belongs to the precopy that
-            // prepares a serving policy.
         })
     }
 
@@ -1068,12 +1037,14 @@ impl PolicySlot {
     /// instantiated again here, as a revert instantiates the previous one, and
     /// the instance and the mechanism start from the same state.
     ///
-    /// A switchover without a prepared candidate leaves the serving policy in
-    /// place: the daemon's precopy failed and the update is discarded.
+    /// A switchover without a prepared candidate fails: it would install no
+    /// policy while the daemon believes the update cut over.
     fn switch_over(&mut self, state: &TrialState) -> Result<(), PolicyError> {
         let Some(candidate) = self.candidate.take() else {
-            tracing::warn!("a policy switchover arrived without a policy prepared by a precopy");
-            return Ok(());
+            return Err(PolicyError::invalid(
+                Call::Init,
+                "a switchover arrived without a policy prepared by a precopy",
+            ));
         };
         let init = init_of(&candidate.program, state);
         let instance =
@@ -1153,9 +1124,8 @@ fn init_of(program: &PolicyProgram, state: &TrialState) -> Instantiation {
 
 /// The mechanism's validation of the control thread's only decision.
 ///
-/// The route instance answers `route` alone: a plan, victims, a dispatch, a
-/// warm list and an expert order are a scheduler thread's decisions, judged
-/// there. A route decision must name a rank that is alive.
+/// The route instance answers `route` alone: a plan, victims and a placement
+/// are a scheduler thread's decisions, judged there. A route decision must name a rank that is alive.
 pub struct RouteTrial;
 
 impl Validators for RouteTrial {
@@ -1192,14 +1162,6 @@ impl Validators for RouteTrial {
         _replicas: &[ReplicaView],
         _index: usize,
     ) -> Result<(), PolicyError> {
-        Ok(())
-    }
-
-    fn warm(&self, _pages: &[PageId]) -> Result<(), PolicyError> {
-        Ok(())
-    }
-
-    fn experts(&self, _load: &ExpertLoad, _order: &ExpertOrder) -> Result<(), PolicyError> {
         Ok(())
     }
 }
@@ -1339,9 +1301,6 @@ impl RoutePolicy {
             instance,
             trial,
             state: init.state,
-            // A route-only precopy asks no warming decision: the room it has
-            // is the routing one, and warming belongs to the precopy that
-            // prepares a serving policy.
         })
     }
 
@@ -1431,9 +1390,9 @@ mod tests {
     //! the build config, an invalid decision, and the stages of §7.3.
 
     use scheduling::guest::decision::{Plan, Shortage, Storage, Victim};
-    use scheduling::guest::ids::{PageId, RequestId};
+    use scheduling::guest::ids::RequestId;
     use scheduling::guest::time::Nanos;
-    use scheduling::guest::view::{ExpertLoad, ExpertOrder, RankView, RequestClass, RequestState};
+    use scheduling::guest::view::{RankView, RequestClass, RequestState};
 
     use super::*;
 
@@ -1513,11 +1472,6 @@ mod tests {
                 }],
             )),
             call: None,
-            expert_load: Some(ExpertLoad {
-                ranks: 1,
-                experts: 1,
-                tokens: vec![0],
-            }),
         }
     }
 
@@ -1600,14 +1554,6 @@ mod tests {
             _replicas: &[ReplicaView],
             _index: usize,
         ) -> Result<(), PolicyError> {
-            Ok(())
-        }
-
-        fn warm(&self, _pages: &[PageId]) -> Result<(), PolicyError> {
-            Ok(())
-        }
-
-        fn experts(&self, _load: &ExpertLoad, _order: &ExpertOrder) -> Result<(), PolicyError> {
             Ok(())
         }
     }
@@ -1714,15 +1660,9 @@ mod tests {
     #[test]
     fn a_precopy_asks_every_decision_the_state_names() {
         // A trap in each decision's export fails the precopy, which proves the
-        // decision was asked: reclaim, route and experts only when the state
-        // names them, warm always.
-        for call in [
-            Call::Dispatch,
-            Call::Reclaim,
-            Call::Route,
-            Call::Warm,
-            Call::Experts,
-        ] {
+        // decision was asked: reclaim and route only when the state names
+        // them.
+        for call in [Call::Dispatch, Call::Reclaim, Call::Route] {
             let mut slot = slot(&Toy::default());
             let candidate = Toy {
                 trap: Some(call),

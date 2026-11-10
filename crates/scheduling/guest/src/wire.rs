@@ -13,8 +13,7 @@
 //! - `sched_free(ptr: u32, len: u32)`: releases a buffer this module allocated,
 //!   whether the mechanism wrote it or the module returned it.
 //! - `sched_init(ptr, len) -> u64`, `sched_observe(ptr, len) -> u64`,
-//!   `sched_dispatch(ptr, len) -> u64`, `sched_reclaim(ptr, len) -> u64`,
-//!   `sched_warm(ptr, len) -> u64`, `sched_experts(ptr, len) -> u64`:
+//!   `sched_dispatch(ptr, len) -> u64`, `sched_reclaim(ptr, len) -> u64`:
 //!   the reply is `ptr << 32 | len` of a buffer the module allocated and the
 //!   mechanism frees with `sched_free`, or `0` for an empty reply.
 //! - `sched_route(ptr, len) -> u32`, `sched_place(ptr, len) -> u32`: the
@@ -41,10 +40,6 @@ pub const EXPORT_RECLAIM: &str = "sched_reclaim";
 pub const EXPORT_ROUTE: &str = "sched_route";
 /// The export that places: its message is `(&CallView, &[ReplicaView])`.
 pub const EXPORT_PLACE: &str = "sched_place";
-/// The export that warms: its message is [`crate::decision::Room`].
-pub const EXPORT_WARM: &str = "sched_warm";
-/// The export that places experts: its message is [`crate::view::ExpertLoad`].
-pub const EXPORT_EXPERTS: &str = "sched_experts";
 /// The export that reads the limits, with no message.
 pub const EXPORT_LIMITS: &str = "sched_limits";
 
@@ -58,22 +53,18 @@ pub enum Call {
     Reclaim,
     Route,
     Place,
-    Warm,
-    Experts,
     Limits,
 }
 
 impl Call {
     /// Every call, in the order a policy's life makes them.
-    pub const ALL: [Call; 9] = [
+    pub const ALL: [Call; 7] = [
         Call::Init,
         Call::Observe,
         Call::Dispatch,
         Call::Reclaim,
         Call::Route,
         Call::Place,
-        Call::Warm,
-        Call::Experts,
         Call::Limits,
     ];
 
@@ -86,8 +77,6 @@ impl Call {
             Call::Reclaim => EXPORT_RECLAIM,
             Call::Route => EXPORT_ROUTE,
             Call::Place => EXPORT_PLACE,
-            Call::Warm => EXPORT_WARM,
-            Call::Experts => EXPORT_EXPERTS,
             Call::Limits => EXPORT_LIMITS,
         }
     }
@@ -101,8 +90,6 @@ impl Call {
             Call::Reclaim => "reclaim",
             Call::Route => "route",
             Call::Place => "place",
-            Call::Warm => "warm",
-            Call::Experts => "experts",
             Call::Limits => "limits",
         }
     }

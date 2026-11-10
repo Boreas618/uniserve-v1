@@ -216,7 +216,7 @@ impl MainProcess {
             if let Some(failure) = self.watch_schedulers()? {
                 return Ok(Some(failure));
             }
-            if let Some(failure) = self.advance_policy_check(&running)? {
+            if let Some(failure) = self.read_policy_answers()? {
                 return Ok(Some(failure));
             }
             if let Some(failure) = self.watch_probation()? {

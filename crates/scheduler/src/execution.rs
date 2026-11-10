@@ -294,6 +294,7 @@ impl Scheduler {
         let mut queued = VecDeque::new();
         for mut batch in std::mem::take(&mut self.inflight.pending_submissions) {
             for (call, _) in batch.retire_requests(&requests) {
+                self.running.mark(call.request_key.request_id);
                 if let Some(pending) =
                     self.inflight
                         .retire_call(batch.id, call.request_key, call.call_id)
@@ -708,18 +709,6 @@ impl Scheduler {
     /// nothing. The slot is taken out of the scheduler for the calls and put
     /// back whatever they answer, so a failure can hand the mechanism's state
     /// to the switch without borrowing the scheduler the slot lives in.
-    /// How often the mechanism asks for an expert layout, in steps.
-    ///
-    /// §4.4 calls the decision periodic and leaves the period to the mechanism:
-    /// a fixed number of steps, not a clock, so the decision is a function of
-    /// the step count and a program never reads time. Rebalancing experts costs
-    /// a collective on every rank, so the period is long compared with a step.
-    ///
-    /// A load the worker publishes in between is asked about at the next
-    /// step: waiting a full interval to look at new numbers would leave a rank
-    /// hot for no reason.
-    const EXPERT_REBALANCE_STEPS: u64 = 64;
-
     fn policy_step(&mut self) -> Option<Plan> {
         let mut policy = self.policy.take()?;
         self.step += 1;
@@ -734,29 +723,20 @@ impl Scheduler {
         // are all read after it: a page announced now is a page this step's
         // plan may name, so the validators must already see it.
         self.pump_page_changes();
-        // Every request the mechanism holds is stated to the policy here, and
-        // `close` emits an `Updated` for the ones whose view moved: a policy's
-        // state is append-only, so a phase it is never told about is a phase it
-        // does not have, and an admitted request it never hears of again is one
-        // it can never plan work for. The filter is `close`'s, not this loop's,
-        // so a step whose requests did not move tells the policy nothing.
-        for view in views::requests(self, self.recorder.recorded()) {
-            self.recorder.update(view);
-        }
-        self.recorder.close();
-        // The policy's knowledge and the mechanism's own must be the same set,
-        // and the run of silent divergence that cost four caller runs is why
-        // this is checked at all: a request the mechanism holds and the policy
-        // never heard of is one it cannot plan work for, and a request the
-        // policy still holds after the mechanism ended it is one it offers in
-        // `admit` and the mechanism refuses as "not queued" - a policy
-        // failure, which stops the epoch.
+        // The requests whose view moved since the previous step are stated to
+        // the policy here, as `Updated` events: a policy's state is
+        // append-only, so a phase it is never told about is a phase it does not
+        // have, and an admitted request it never hears of again is one it can
+        // never plan work for.
+        self.refresh_views();
+        // The policy's knowledge and the mechanism's own must be the same: a
+        // request the mechanism holds and the policy never heard of is one it
+        // cannot plan work for, and a request the policy still holds after the
+        // mechanism ended it is one it offers in `admit` and the mechanism
+        // refuses as "not queued" - a policy failure, which stops the epoch.
         #[cfg(debug_assertions)]
         self.assert_policy_in_sync();
         let room = self.room();
-        // The starvation rule names only a request the watchdog tracks, so the
-        // step states those views and not a view of every resident.
-        let live = views::watching(self, self.recorder.recorded());
         // A resident request that has not advanced within the policy's timeout
         // is the policy's failure, not the request's (design §4.4) - but one
         // request's silence is not the deployment's (§4.4's liveness rule is
@@ -764,8 +744,13 @@ impl Scheduler {
         // The epoch ends only when nothing else could have been served, which
         // is the case a reader must be able to see from the log.
         let now = scheduling::guest::Nanos(crate::clock::now_monotonic_us().saturating_mul(1_000));
-        if let Some(request) = self.watchdog.starved(&live, now, policy.limits().timeout) {
-            let report = self.starvation_report(&live, now);
+        let starved = {
+            let live = self.live();
+            self.watchdog
+                .starved(&live, now, policy.limits().timeout)
+                .map(|request| (request, self.starvation_report(&live, now)))
+        };
+        if let Some((request, report)) = starved {
             // What could have been served instead: another resident, or a queued request. The
             // watchdog's own view names only the requests it tracks, so this is read from the
             // mechanism's queues rather than from that view.
@@ -798,26 +783,6 @@ impl Scheduler {
         if let Err(error) = policy.observe(&events) {
             return self.policy_failed(policy, error);
         }
-        // §4.4's periodic row: the mechanism owns the interval, the worker
-        // publishes the load, and the order is checked and handed to the epoch
-        // setup that applies it (§7.6). No load means nothing to decide, not a
-        // zero one: the worker has published no routed tokens yet.
-        let experts_due = self.expert_load_new
-            || self.expert_asked.is_none_or(|asked| {
-                self.step.saturating_sub(asked) >= Self::EXPERT_REBALANCE_STEPS
-            });
-        if experts_due && let Some(load) = views::expert_load_of(self) {
-            let order = match policy.experts(&load) {
-                Ok(order) => order,
-                Err(error) => return self.policy_failed(policy, error),
-            };
-            if let Err(error) = mechanism::validate_experts(&load, &order) {
-                return self.policy_failed(policy, error);
-            }
-            self.expert_order = Some(order);
-            self.expert_asked = Some(self.step);
-            self.expert_load_new = false;
-        }
         let plan = match policy.dispatch(&room) {
             Ok(plan) => plan,
             Err(error) => return self.policy_failed(policy, error),
@@ -832,8 +797,10 @@ impl Scheduler {
             return self.policy_failed(policy, error);
         }
         self.admit_plan(&plan);
-        // The rest is read against the state admission has left: the pages are
-        // the scheduler's own table borrowed for the check (design §4.4).
+        // The rest is read against the state admission has left: the admitted
+        // requests' views moved, and the pages are the scheduler's own table
+        // borrowed for the check (design §4.4).
+        self.refresh_views();
         let live = self.live();
         if let Err(error) = mechanism::validate_after_admission(&plan, &room, &live) {
             return self.policy_failed(policy, error);
@@ -854,6 +821,11 @@ impl Scheduler {
     ///
     /// Debug builds only: it is a statement about the mechanism's bookkeeping,
     /// not a decision the mechanism makes.
+    ///
+    /// It also asserts that every view the policy was told is the request's
+    /// view now: the step states only the views of the requests marked as
+    /// moved, so a view that moved without a mark is one the policy never
+    /// learns.
     #[cfg(debug_assertions)]
     fn assert_policy_in_sync(&self) {
         // The policy's ids and the mechanism's name the same request; the two
@@ -888,6 +860,36 @@ impl Scheduler {
                 id.0
             );
         }
+        for id in held.intersection(&told) {
+            let current = views::view_of(self, RequestId(id.0), self.recorder.recorded());
+            debug_assert_eq!(
+                current.as_ref(),
+                self.recorder.told().get(id),
+                "the view of request {} moved without being marked",
+                id.0
+            );
+        }
+    }
+
+    /// States to the recorder the view of every request whose view may have
+    /// moved since the last call, which `close` turns into one `Updated` per
+    /// view that differs from what the policy was told.
+    ///
+    /// The marked requests are the residents accessed mutably, the requests
+    /// whose calls entered or left flight, and the admitted ones
+    /// (`residents.rs`). A media request's next ready call also depends on the
+    /// calls other requests hold in flight on a shared component, so every
+    /// resident media request is stated each step; they are few, and a token
+    /// resident is never walked.
+    fn refresh_views(&mut self) {
+        let mut changed = self.running.take_changed();
+        changed.extend(self.running_media.keys().copied());
+        for id in changed {
+            if let Some(view) = views::view_of(self, id, self.recorder.recorded()) {
+                self.recorder.update(view);
+            }
+        }
+        self.recorder.close();
     }
 
     /// Ends the step's accounting: the step number, and the policy's per-step
@@ -1064,11 +1066,9 @@ impl Scheduler {
             shortage: views::shortage_now(self),
             arrival: None,
             call: views::dispatch(self),
-            expert_load: views::expert_load_of(self),
         }
     }
 
-    /// The objects the validators read, as they stand now.
     /// Announces the pages that appeared and went since the previous step, and
     /// keeps the mechanism's table of live pages current (design §4.4).
     ///
@@ -1105,29 +1105,18 @@ impl Scheduler {
         }
     }
 
+    /// The objects the validators read, as they stand now.
+    ///
+    /// The requests are the views the policy was told, which
+    /// [`Self::refresh_views`] keeps current, and the pages the scheduler's own
+    /// table, kept current by the page delta: a step borrows both rather than
+    /// rebuilding a view of every request or copying every page.
     fn live(&self) -> mechanism::Live<'_> {
         let mut live = mechanism::Live {
-            queue: self
-                .waiting
-                .iter()
-                .map(|state| scheduling::guest::RequestId(state.req.request_id.0))
-                .chain(
-                    self.waiting_media
-                        .iter()
-                        .map(|pending| scheduling::guest::RequestId(pending.request.request_id.0)),
-                )
-                .collect(),
-            // The page table is the scheduler's own, kept current by the page
-            // delta: a step borrows it rather than copying every page it holds.
+            requests: std::borrow::Cow::Borrowed(self.recorder.told()),
             pages: std::borrow::Cow::Borrowed(&self.pages),
             ..mechanism::Live::default()
         };
-        for request in views::requests(self, self.recorder.recorded()) {
-            live.requests.insert(request.id, request);
-        }
-        for page in &self.pages {
-            live.pages.to_mut().insert(*page.0, page.1.clone());
-        }
         for entry in views::encodings(self) {
             live.encodings.insert(entry.id, entry);
         }
@@ -1191,23 +1180,6 @@ impl Scheduler {
             scheduling::guest::Nanos(last_used),
         );
         self.recorder.encoded(entry);
-    }
-
-    /// The worker's routed-token counts per expert, which the mechanism asks
-    /// about on its own interval. The worker's edge publishes them; `None`
-    /// withdraws them.
-    pub(super) fn set_expert_load(&mut self, load: Option<scheduling::guest::ExpertLoad>) {
-        self.expert_load_new = load.is_some();
-        self.expert_load = load;
-    }
-
-    /// The expert layout the policy last answered, taken by the point that
-    /// applies it: the worker's epoch setup (§7.6), which commits it with
-    /// `Worker::commit_experts` — the worker's own method for retaining an
-    /// expert order. Taking it once is the handoff, so a layout is applied
-    /// once; the mechanism keeps no second copy.
-    pub(super) fn take_expert_order(&mut self) -> Option<scheduling::guest::ExpertOrder> {
-        self.expert_order.take()
     }
 
     /// The report of a policy failure, for the control thread to hand up.
@@ -1329,6 +1301,9 @@ impl Scheduler {
     /// `reserve_generation_resources`.
     pub(super) fn register_inflight(&mut self, call: Call, input: InflightInput, queue_us: u64) {
         let request_id = call.request_key.request_id;
+        // A call in flight changes what its request's view states (its next
+        // phase, whether it waits for a transfer).
+        self.running.mark(request_id);
         let domain = self.stats.domains.get(call.kind);
         let active = domain.active_credits.fetch_add(1, Ordering::Relaxed) + 1;
         domain.peak_credits.fetch_max(active, Ordering::Relaxed);

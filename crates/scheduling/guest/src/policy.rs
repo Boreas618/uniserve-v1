@@ -4,11 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::decision::{Plan, Room, Shortage, Victim};
 use crate::event::Event;
-use crate::ids::PageId;
 use crate::limits::{Limits, Parameters};
-use crate::view::{
-    CallView, ExpertLoad, ExpertOrder, RankView, ReplicaView, RequestView, Snapshot,
-};
+use crate::view::{CallView, RankView, ReplicaView, RequestView, Snapshot};
 
 /// The message the mechanism hands a policy module at instantiation: the
 /// program's arguments (design §5.1) and the state of everything already
@@ -61,12 +58,6 @@ pub trait Policy {
 
     /// When a request is first called on a block: which replica runs it.
     fn place(&mut self, call: &CallView, replicas: &[ReplicaView]) -> usize;
-
-    /// During an epoch's precopy: which pages to warm, in order.
-    fn warm(&mut self, room: &Room) -> Vec<PageId>;
-
-    /// Periodically: the layout of experts on ranks.
-    fn experts(&mut self, load: &ExpertLoad) -> ExpertOrder;
 
     /// Once at instantiation: the policy's limits, from its parameters, within
     /// the build config's ceilings.

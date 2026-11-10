@@ -15,8 +15,8 @@
 
 use scheduling::guest::wire::{self, Call};
 use scheduling::guest::{
-    CallView, ExpertLoad, ExpertOrder, Limits, Nanos, PageId, Parameters, PhaseId, Plan, RankView,
-    RequestId, RequestView, Room, Shortage, Snapshot, Storage, Victim, Work,
+    CallView, Limits, Nanos, PageId, Parameters, PhaseId, Plan, RankView, RequestId, RequestView,
+    Room, Shortage, Snapshot, Storage, Victim, Work,
 };
 use scheduling::{Engine, PolicyError, PolicyInstance, PolicyModule};
 
@@ -257,8 +257,6 @@ fn every_decision_reaches_its_export_and_answers() {
     let toy = Toy::new()
         .reply(Call::Dispatch.export(), &plan)
         .reply(Call::Reclaim.export(), &victims)
-        .reply(Call::Warm.export(), &vec![PageId(9)])
-        .reply(Call::Experts.export(), &ExpertOrder { layout: vec![1, 0] })
         .index(Call::Route.export(), 2)
         .index(Call::Place.export(), 1);
     let mut policy = policy(&engine, toy);
@@ -273,11 +271,6 @@ fn every_decision_reaches_its_export_and_answers() {
             .unwrap(),
         victims
     );
-    assert_eq!(policy.warm(&Room::default()).unwrap(), vec![PageId(9)]);
-    assert_eq!(
-        policy.experts(&ExpertLoad::default()).unwrap().layout,
-        vec![1, 0]
-    );
     assert_eq!(policy.route(&request(), &[]).unwrap(), 2);
 
     assert_eq!(policy.place(&call(), &[]).unwrap(), 1);
@@ -286,10 +279,10 @@ fn every_decision_reaches_its_export_and_answers() {
 }
 
 #[test]
-fn reclaim_and_warm_may_answer_nothing() {
+fn reclaim_may_answer_nothing() {
     let engine = engine();
-    // A toy whose reclaim and warm answer the empty reply frees and warms
-    // nothing; that is a decision, not a failure.
+    // A toy whose reclaim answers the empty reply frees nothing; that is a
+    // decision, not a failure.
     let mut policy = policy(&engine, Toy::new());
 
     assert!(
@@ -301,7 +294,6 @@ fn reclaim_and_warm_may_answer_nothing() {
             .unwrap()
             .is_empty()
     );
-    assert!(policy.warm(&Room::default()).unwrap().is_empty());
 }
 
 #[test]
@@ -505,7 +497,7 @@ fn a_reply_outside_the_module_memory_is_malformed() {
 #[test]
 fn a_module_without_a_decision_does_not_instantiate() {
     let engine = engine();
-    let toy = Toy::new().omit(Call::Warm.export());
+    let toy = Toy::new().omit(Call::Place.export());
     let module = PolicyModule::load(&engine, toy.wat().as_bytes()).unwrap();
 
     match module.instantiate(
@@ -514,7 +506,7 @@ fn a_module_without_a_decision_does_not_instantiate() {
         &Limits::default(),
     ) {
         Err(PolicyError::Instantiate { message }) => {
-            assert!(message.contains("sched_warm"), "{message}");
+            assert!(message.contains("sched_place"), "{message}");
         }
         Err(other) => panic!("expected a missing export, got {other:?}"),
         Ok(_) => panic!("expected a missing export, got an instance"),

@@ -28,8 +28,8 @@ use std::process::ExitCode;
 
 use scheduling::guest::wire;
 use scheduling::guest::{
-    CallView, Duration, Event, ExpertLoad, Limits, Parameters, Plan, RankView, ReplicaView,
-    RequestId, RequestView, Room, Shortage, Snapshot, Storage,
+    CallView, Duration, Event, Limits, Parameters, Plan, RankView, ReplicaView, RequestId,
+    RequestView, Room, Shortage, Snapshot, Storage,
 };
 use scheduling::{Engine, PolicyInstance};
 use serde::de::DeserializeOwned;
@@ -197,21 +197,6 @@ fn run(path: &str, precompile: bool, steps: u32) -> Result<(), Box<dyn Error>> {
     let replica = policy.place(&call, &replicas)?;
     println!("place: replica {replica}");
     before.report(&policy, "place");
-
-    let before = Meter::of(&policy);
-    let warm = policy.warm(&room)?.len();
-    println!("warm: {warm} pages");
-    before.report(&policy, "warm");
-
-    let load = ExpertLoad {
-        ranks: 2,
-        experts: 4,
-        tokens: vec![10, 0, 4, 4],
-    };
-    let before = Meter::of(&policy);
-    let layouts = policy.experts(&load)?.layout.len();
-    println!("experts: {layouts} layouts");
-    before.report(&policy, "experts");
 
     println!(
         "total: fuel {}, calls {:?}",

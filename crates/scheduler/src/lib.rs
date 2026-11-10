@@ -73,8 +73,8 @@ pub use crate::core::sim_args;
 pub use crate::core::{SchedulerHandle, WorkerGroupConfig, WorkerGroupRole, WorkerRank};
 pub use crate::handle::{
     CacheChange, Command, CommandSender, CommandWaker, Counters, EVENT_BUFFER_CAPACITY, EventRx,
-    EventSendError, EventTx, HookBarrier, PolicyPrograms, PolicySlotHandle, StageApplied,
-    StreamCancelCause, Submission, SubmitError, Wake, WeightsInFlight,
+    EventSendError, EventTx, HookBarrier, PolicyPrograms, StageApplied, StreamCancelCause,
+    Submission, SubmitError, Wake, WeightsInFlight,
 };
 #[cfg(feature = "testing")]
 pub use crate::worker::{BatchResult, CallResult, Worker};
@@ -175,6 +175,7 @@ mod mechanism;
 pub(crate) mod output;
 mod policy;
 mod preemption;
+mod residents;
 mod run;
 mod speculation;
 pub(crate) mod submission;
@@ -569,7 +570,9 @@ pub struct Scheduler {
     waiting: VecDeque<RequestState>,
     /// Media requests awaiting admission, in arrival order.
     waiting_media: VecDeque<PendingMedia>,
-    running: HashMap<RequestId, RequestState>,
+    /// The resident token requests, which mark the requests whose policy view
+    /// moved (`residents.rs`).
+    running: residents::Residents,
     running_media: HashMap<RequestId, MediaFlowState>,
     /// What the epoch measures of speculation, which the refill policy
     /// weighs.
@@ -587,19 +590,6 @@ pub struct Scheduler {
     /// The report of a policy failure the mechanism did not take from `fail`'s
     /// answer, for the control thread.
     policy_report: Option<policy::PolicyReverted>,
-    /// The routed tokens per expert the worker last published (§4.4's
-    /// `experts`): the one fact the mechanism cannot measure. `None` until the
-    /// worker publishes it, so the periodic call asks nothing it cannot state.
-    expert_load: Option<scheduling::guest::ExpertLoad>,
-    /// The expert layout the policy last answered, validated and waiting for
-    /// the worker's epoch setup, which applies it (§7.6).
-    expert_order: Option<scheduling::guest::ExpertOrder>,
-    /// The step the policy last answered an expert layout on, so the
-    /// mechanism's interval is measured from the decision, not from step zero.
-    expert_asked: Option<u64>,
-    /// A load the worker published since the last decision: a new load is
-    /// worth asking about at once, rather than after a full interval.
-    expert_load_new: bool,
     /// §7.3 step 2's paired pass: an update asked that the following step's
     /// batches also run in shadow for an epoch generation, and the answer waits
     /// for the step that shadows them.

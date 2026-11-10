@@ -21,11 +21,7 @@
 
 #[cfg(test)]
 use scheduling::guest::decision::{Plan, Victim};
-#[cfg(test)]
-use scheduling::guest::ids::PageId;
 use scheduling::guest::limits::{Limits, Parameters};
-#[cfg(test)]
-use scheduling::guest::view::ExpertOrder;
 #[cfg(test)]
 use scheduling::guest::wire::Call;
 #[cfg(test)]
@@ -42,10 +38,6 @@ const PLAN: u32 = 8192;
 const LIMITS: u32 = 12288;
 #[cfg(test)]
 const VICTIMS: u32 = 16384;
-#[cfg(test)]
-const PAGES: u32 = 20480;
-#[cfg(test)]
-const EXPERTS: u32 = 24576;
 
 /// The answer a toy policy module gives, and the calls it fails in.
 #[cfg(test)]
@@ -53,8 +45,6 @@ pub(crate) struct Toy {
     pub(crate) plan: Plan,
     pub(crate) limits: Limits,
     pub(crate) victims: Vec<Victim>,
-    pub(crate) pages: Vec<PageId>,
-    pub(crate) experts: ExpertOrder,
     /// The call whose export traps (`unreachable`).
     pub(crate) trap: Option<Call>,
     /// The call whose export never returns.
@@ -68,8 +58,6 @@ impl Default for Toy {
             plan: Plan::default(),
             limits: fitting_limits(),
             victims: Vec::new(),
-            pages: Vec::new(),
-            experts: ExpertOrder::default(),
             trap: None,
             spin: None,
         }
@@ -82,8 +70,6 @@ pub(crate) fn toy_module(toy: &Toy) -> Vec<u8> {
     let bodies = [
         (Call::Dispatch, PLAN, json(&toy.plan)),
         (Call::Reclaim, VICTIMS, json(&toy.victims)),
-        (Call::Warm, PAGES, json(&toy.pages)),
-        (Call::Experts, EXPERTS, json(&toy.experts)),
     ];
     let mut functions = vec![
         format!("(func (export \"sched_alloc\") (param i32) (result i32) i32.const {MESSAGE})"),
