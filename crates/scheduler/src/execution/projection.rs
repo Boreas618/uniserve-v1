@@ -391,7 +391,7 @@ impl Scheduler {
                             request_epoch = request_key.request_epoch,
                             "close acknowledgement does not match a retiring request"
                         );
-                        self.fatal = true;
+                        self.latch_fatal();
                         continue;
                     }
                 };

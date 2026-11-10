@@ -55,7 +55,7 @@ impl Scheduler {
                     .map_err(|error| error.to_string())
             });
         }
-        let closing = std::mem::replace(&mut self.closing, true);
+        let draining = std::mem::replace(&mut self.draining, true);
         let result = self
             .drain_batches()
             .inspect_err(|error| together.fail(error))
@@ -65,7 +65,7 @@ impl Scheduler {
             together.fail(error);
         }
         let synchronized = together.meet();
-        self.closing = closing;
+        self.draining = draining;
         result.and_then(|snapshot| {
             synchronized?;
             serde_json::to_string(&snapshot)

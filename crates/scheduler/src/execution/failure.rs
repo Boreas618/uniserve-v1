@@ -347,7 +347,7 @@ impl Scheduler {
         for (batch_id, request, call_id) in retired {
             self.running.mark(request.request_id);
             let Some(inflight) = self.inflight.retire_call(batch_id, request, call_id) else {
-                self.fatal = true;
+                self.latch_fatal();
                 tracing::error!(
                     batch_id,
                     ?request,

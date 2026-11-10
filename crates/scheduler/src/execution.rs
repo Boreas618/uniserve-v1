@@ -406,7 +406,7 @@ impl Scheduler {
 
         let mut blocked_workers = HashSet::new();
         progressed |= self.dispatch_submissions(&mut blocked_workers);
-        if self.fatal {
+        if self.failed() {
             return progressed;
         }
 
@@ -432,7 +432,7 @@ impl Scheduler {
             self.inflight.pending_submissions.extend(batches);
             progressed = true;
             self.dispatch_submissions(&mut blocked_workers);
-            if self.fatal {
+            if self.failed() {
                 return progressed;
             }
         }
@@ -466,7 +466,7 @@ impl Scheduler {
                 progressed = true;
             }
             self.dispatch_submissions(&mut blocked_workers);
-            if self.fatal {
+            if self.failed() {
                 return progressed;
             }
         }
@@ -488,7 +488,7 @@ impl Scheduler {
             self.inflight.pending_submissions.push_back(batch);
             progressed = true;
             self.dispatch_submissions(&mut blocked_workers);
-            if self.fatal {
+            if self.failed() {
                 return progressed;
             }
         }
@@ -506,7 +506,7 @@ impl Scheduler {
     fn schedule_batches(&mut self) -> Vec<ExecutionBatch> {
         // A closing scheduler lets what is in flight drain before its
         // workers close; a sleeping one runs nothing.
-        if self.closing || self.asleep || self.held {
+        if self.draining || self.asleep || self.held {
             return Vec::new();
         }
         let started = std::time::Instant::now();

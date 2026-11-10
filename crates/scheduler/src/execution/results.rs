@@ -492,7 +492,7 @@ impl Scheduler {
             {
                 tracing::error!(?buffer, "buffer free identity was already pending");
                 self.storage.buffer_pool.free(previous);
-                self.fatal = true;
+                self.latch_fatal();
             }
             self.inflight
                 .pending_commands
@@ -533,7 +533,7 @@ impl Scheduler {
                 batch_id = result_batch_id,
                 "worker returned a result for an unknown logical batch"
             );
-            self.fatal = true;
+            self.latch_fatal();
             self.fail_all_running("worker returned a result for an unknown logical batch");
             return;
         }
@@ -632,7 +632,7 @@ impl Scheduler {
             self.trajectory_batch_completed(result_batch_id, succeeded);
         }
         if invalid_result {
-            self.fatal = true;
+            self.latch_fatal();
             self.fail_all_running("worker returned an invalid call result");
             return;
         }

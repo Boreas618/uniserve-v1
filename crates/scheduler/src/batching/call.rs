@@ -40,7 +40,7 @@ impl Scheduler {
                 .then(|| (state.request_epoch, state.latest_token.clone()))
         }) else {
             tracing::error!(request_id = request_id.0, "planned call lost its request");
-            self.fatal = true;
+            self.latch_fatal();
             return None;
         };
         if self.inflight.has_pending_calls(request_id)
@@ -50,7 +50,7 @@ impl Scheduler {
                 request_id = request_id.0,
                 "scheduler attempted to issue an unsafe projected successor"
             );
-            self.fatal = true;
+            self.latch_fatal();
             return None;
         }
 
@@ -80,7 +80,7 @@ impl Scheduler {
                     request_id = request_id.0,
                     "projected successor has no execution predecessor"
                 );
-                self.fatal = true;
+                self.latch_fatal();
                 return None;
             }
             let Some(predecessor) = self
@@ -94,7 +94,7 @@ impl Scheduler {
                     request_id = request_id.0,
                     "projected successor lost its predecessor call"
                 );
-                self.fatal = true;
+                self.latch_fatal();
                 return None;
             };
             if call.kind == CallKind::Forward(ForwardMode::Decode) {
@@ -108,7 +108,7 @@ impl Scheduler {
             Some(parent)
         } else {
             if self.state_predecessor(request_id).is_none() {
-                self.fatal = true;
+                self.latch_fatal();
                 return None;
             }
             None
@@ -327,7 +327,7 @@ impl Scheduler {
                 ?error,
                 "scheduler authority exhausted product identity space"
             );
-            self.fatal = true;
+            self.latch_fatal();
             self.fail_all_running("scheduler authority exhausted product identity space");
             return None;
         }
@@ -346,7 +346,7 @@ impl Scheduler {
                 request_id = request_id.0,
                 "registered call changed its persistent buffer set"
             );
-            self.fatal = true;
+            self.latch_fatal();
             self.fail_all_running("registered call changed its persistent buffer set");
             return None;
         }
@@ -379,7 +379,7 @@ impl Scheduler {
         // the denoiser's own evaluation, not token rows of the device layout.
         if call.kind == CallKind::Media(MediaCall::Denoising) {
             let Some(state) = self.running.get_mut(&request_id) else {
-                self.fatal = true;
+                self.latch_fatal();
                 return None;
             };
             if let Some(state) = state.guidance_prefix.as_mut() {
@@ -417,7 +417,7 @@ impl Scheduler {
         // addresses; the worker's latent pool keeps the trajectory's steps.
         if call.addresses_latent_pages() {
             let Some(state) = self.running.get(&request_id) else {
-                self.fatal = true;
+                self.latch_fatal();
                 return None;
             };
             let Some(allocations) = state.allocations() else {

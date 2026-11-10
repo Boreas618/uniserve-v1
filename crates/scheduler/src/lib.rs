@@ -537,6 +537,28 @@ struct PendingMedia {
     queued_us: u64,
 }
 
+/// Where a scheduler is in its life. One state at a time; the storage
+/// conditions (`held`, `asleep`, `resizing`), the drain guard and the epoch's
+/// `trial` are separate fields because they combine with any of these.
+///
+/// Transitions: `Serving` → `Parking` at a park (`Scheduler::park`);
+/// `Parking` → `Parked` once its requests ended (`Scheduler::poll_park`);
+/// `Parked` → `Serving` at a resume (`Scheduler::resume`); any state →
+/// `Failed` when the worker dies or a scheduler invariant breaks, after which
+/// the control loop exits and the host converts it into engine-dead.
+enum Lifecycle {
+    /// Admits and runs requests.
+    Serving,
+    /// A park waits for the scheduler's requests to end; it answers once
+    /// they did.
+    Parking(epoch::Parking),
+    /// Parked: it admits and executes nothing until it resumes, and keeps
+    /// its storage and prefix cache index.
+    Parked,
+    /// Engine-fatal: the control loop stops.
+    Failed,
+}
+
 /// Single-threaded owner of scheduling, storage, execution, and request state.
 pub struct Scheduler {
     worker: submission::Submissions,
@@ -651,10 +673,9 @@ pub struct Scheduler {
     /// `assembly_priority`.
     running_order: Vec<RequestId>,
     output: output::OutputSender,
-    /// Engine-fatal latch: set when the worker/worker dies or a scheduler
-    /// invariant breaks; the control loop exits and the host converts this
-    /// into engine-dead.
-    fatal: bool,
+    /// Where the scheduler is in its life: serving, parking, parked, or
+    /// failed (`Lifecycle`).
+    lifecycle: Lifecycle,
     /// Shared scheduler counters and latency accumulators.
     pub stats: Arc<SchedulerStats>,
     /// The host KV cache, when it serves a worker group
@@ -669,12 +690,18 @@ pub struct Scheduler {
     /// The host encoder pools of the video encoders, when they serve their
     /// worker groups (`Scheduler::enable_encoder_store`).
     encoder_outputs: Option<crate::encoder_outputs::EncoderStore>,
-    /// Set once the scheduler closes its workers: it admits and schedules
-    /// nothing more while it offloads its last pages to the host KV cache
-    /// (`Scheduler::flush_offloads`).
-    closing: bool,
+    /// Set while an operation waits for the batches in flight to complete
+    /// (`Scheduler::drain_batches`, `Scheduler::flush_offloads` and the
+    /// commands that drain before they act): the scheduler admits and
+    /// schedules nothing new meanwhile. The operation restores what it found,
+    /// so a nested drain keeps the outer one's.
+    draining: bool,
     /// Whether forming batches is held for a change of the device's storage
     /// (`CacheChange::Hold`): nothing runs, and every request keeps its state.
+    ///
+    /// Orthogonal to `lifecycle`, `asleep` and `resizing`: the storage
+    /// commands that set them arrive independently of a park, and the daemon
+    /// may hold, sleep or resize a scheduler in any lifecycle state.
     held: bool,
     /// A shrink or sleep of the KV cache waiting for its units to be let go
     /// (`Scheduler::resize_cache`).
@@ -687,13 +714,7 @@ pub struct Scheduler {
     /// The workers gave back the cache and graph storage: the scheduler
     /// admits and runs nothing until it wakes.
     asleep: bool,
-    /// A park waiting for the scheduler's requests to end
-    /// (`Scheduler::park`).
-    parking: Option<epoch::Parking>,
     warming: warming::Warming,
-    /// The scheduler parked: it admits and executes nothing until it
-    /// resumes, and keeps its storage and prefix cache index.
-    parked: bool,
     /// The scheduler's epoch is on trial until its commit
     /// (`Scheduler::commit`): any fault, non-finite logits included, fails
     /// the epoch as a whole, which the daemon rolls back rather than
@@ -703,6 +724,18 @@ pub struct Scheduler {
     /// The first error of a fatal stop, which the scheduler's handle reports
     /// (`SchedulerHandle::failure`); set once.
     failure: Arc<std::sync::OnceLock<String>>,
+}
+
+impl Scheduler {
+    /// Latches engine-fatal: the control loop stops at its next pass.
+    fn latch_fatal(&mut self) {
+        self.lifecycle = Lifecycle::Failed;
+    }
+
+    /// Whether an engine-fatal fault stopped the scheduler.
+    fn failed(&self) -> bool {
+        matches!(self.lifecycle, Lifecycle::Failed)
+    }
 }
 
 impl Scheduler {
@@ -719,7 +752,7 @@ impl Scheduler {
     /// Latches engine-fatal for `reason`, which is kept as the stop's first
     /// error unless an earlier one is.
     fn fail(&mut self, reason: String) {
-        self.fatal = true;
+        self.latch_fatal();
         let _ = self.failure.set(reason);
     }
 }

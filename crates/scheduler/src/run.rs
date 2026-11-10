@@ -270,19 +270,17 @@ impl Scheduler {
             watchdog: mechanism::Watchdog::default(),
             step: 0,
             config,
-            fatal: false,
+            lifecycle: Lifecycle::Serving,
             kv_offload: None,
             state_interval: crate::kv_cache::DEFAULT_STATE_INTERVAL,
             trajectories: None,
             encoder_outputs: None,
-            closing: false,
+            draining: false,
             held: false,
             resizing: None,
             starved: Vec::new(),
             asleep: false,
-            parking: None,
             warming: super::warming::Warming::default(),
-            parked: false,
             trial: false,
             failure: Arc::default(),
             stats,
@@ -801,10 +799,10 @@ impl Scheduler {
             // ended (§7.3 step 2): the answer never claims a comparison the
             // step has not finished.
             self.settle_shadow();
-            if !self.fatal && !progressed {
+            if !self.failed() && !progressed {
                 self.park_for_progress();
             }
-            if self.fatal {
+            if self.failed() {
                 let _ = self.failure.set("the worker or a worker failed".to_owned());
                 tracing::error!(
                     failure = self.failure.get().map_or("", String::as_str),
@@ -836,10 +834,16 @@ impl Scheduler {
     /// Gives up after `PAGE_FLUSH_TIMEOUT` or when the engine fails, leaving
     /// the pages still on their way out to the host KV cache.
     pub(super) fn flush_offloads(&mut self) {
-        if self.kv_offload.is_none() || self.fatal {
+        if self.kv_offload.is_none() || self.failed() {
             return;
         }
-        self.closing = true;
+        let draining = std::mem::replace(&mut self.draining, true);
+        self.flush_pages();
+        self.draining = draining;
+    }
+
+    /// The loop of [`Self::flush_offloads`], while it drains.
+    fn flush_pages(&mut self) {
         let deadline = Instant::now() + PAGE_FLUSH_TIMEOUT;
         loop {
             let idle = self.inflight.pending_batches.is_empty()
@@ -873,7 +877,7 @@ impl Scheduler {
             {
                 return;
             }
-            if self.fatal || Instant::now() >= deadline {
+            if self.failed() || Instant::now() >= deadline {
                 tracing::warn!(
                     "published pages did not all reach the host KV cache before the workers close"
                 );
@@ -892,9 +896,9 @@ impl Scheduler {
         operation: O,
     ) -> Result<Vec<O::Reply>, String> {
         let operation: EpochOperation = operation.into();
-        let closing = std::mem::replace(&mut self.closing, true);
+        let draining = std::mem::replace(&mut self.draining, true);
         let drained = self.drain_batches();
-        self.closing = closing;
+        self.draining = draining;
         drained?;
         let answers = self.operate_workers(&operation)?;
         ipc::memory::replies::<O>(&answers)
@@ -908,7 +912,7 @@ impl Scheduler {
         together: &crate::HookBarrier,
         operation: impl FnOnce(&mut Self) -> Result<Vec<String>, String>,
     ) -> Result<Vec<String>, String> {
-        let closing = std::mem::replace(&mut self.closing, true);
+        let draining = std::mem::replace(&mut self.draining, true);
         let ran = self
             .drain_batches()
             .inspect_err(|error| together.fail(error))
@@ -921,12 +925,12 @@ impl Scheduler {
                 together.meet()?;
                 results
             });
-        self.closing = closing;
+        self.draining = draining;
         ran
     }
 
     /// Completes the batches in flight, scheduling nothing new while the
-    /// caller set `closing`.
+    /// caller set `draining`.
     ///
     /// The drain is unbounded in what it may wait for and bounded only in
     /// silence: a batch the worker never answers, and never finishes,
@@ -940,14 +944,14 @@ impl Scheduler {
         let mut silent_since = Instant::now();
         let mut held = self.drain_pending();
         while held.0 != 0 || held.1 != 0 {
-            if self.fatal {
+            if self.failed() {
                 return Err("the engine failed before the hook ran".to_owned());
             }
             if !self.step_nonblocking() {
                 self.park_for_progress();
             }
             // Comparing the two sizes is enough because a drain sets
-            // `closing`: nothing enters either pending set while it runs, so
+            // `draining`: nothing enters either pending set while it runs, so
             // the sizes can only fall. A step that scheduled a batch during a
             // drain could leave the sizes unchanged while the set changed
             // underneath them, so a change that lets a drain schedule must
@@ -1003,7 +1007,7 @@ impl Scheduler {
         // some are awaited, the park is short.
         // So is the park of a closing scheduler, which awaits its last
         // page commits.
-        let timeout = if self.closing
+        let timeout = if self.draining
             || self
                 .kv_offload
                 .as_ref()

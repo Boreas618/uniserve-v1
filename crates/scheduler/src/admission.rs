@@ -1330,7 +1330,7 @@ impl Scheduler {
     /// a policy's admission order its own rather than the arrival order.
     pub(super) fn admit_plan(&mut self, plan: &Plan) {
         // A closing scheduler admits nothing more, nor does one that sleeps.
-        if self.closing || self.admission_sleeps() {
+        if self.draining || self.admission_sleeps() {
             return;
         }
         for id in &plan.reject {

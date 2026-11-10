@@ -94,7 +94,7 @@ impl Scheduler {
         answer: crossbeam_channel::Sender<Result<ParkedCache, String>>,
         lend: bool,
     ) {
-        if self.parked {
+        if matches!(self.lifecycle, crate::Lifecycle::Parked) {
             let _ = answer.send(Ok(ParkedCache {
                 pages: self.index(),
                 lent: self
@@ -106,7 +106,7 @@ impl Scheduler {
             }));
             return;
         }
-        if self.parking.is_some() {
+        if matches!(self.lifecycle, crate::Lifecycle::Parking(_)) {
             let _ = answer.send(Err("the scheduler parks already".to_owned()));
             return;
         }
@@ -137,7 +137,7 @@ impl Scheduler {
         // Video requests leave at their next denoising step boundary, their
         // trajectories stored for the epoch that serves next.
         self.preempt_media(MigrationCause::Drain, |_| true);
-        self.parking = Some(Parking {
+        self.lifecycle = crate::Lifecycle::Parking(Parking {
             answer,
             lend,
             held_units: migrating.iter().map(|(units, _)| units).sum(),
@@ -184,7 +184,7 @@ impl Scheduler {
     /// Completes a park once no request is queued, runs or retires and no
     /// batch is in flight.
     pub(super) fn poll_park(&mut self) {
-        if self.parking.is_none()
+        if !matches!(self.lifecycle, crate::Lifecycle::Parking(_))
             || !(self.running.is_empty()
                 && self.running_media.is_empty()
                 && self.retiring_requests.is_empty()
@@ -195,14 +195,15 @@ impl Scheduler {
         {
             return;
         }
-        let Some(parking) = self.parking.take() else {
+        let crate::Lifecycle::Parking(parking) =
+            std::mem::replace(&mut self.lifecycle, crate::Lifecycle::Parked)
+        else {
             return;
         };
         // The pages reserved for the host KV cache reach it, so the
         // successor and a later eviction of the parked storage find them
         // there.
         self.flush_offloads();
-        self.parked = true;
         let index = self.index();
         let lent = if parking.lend {
             self.lend_cache(&index)
@@ -229,19 +230,18 @@ impl Scheduler {
     /// Whether admission and scheduling wait for a park: the scheduler
     /// parked, or parks once its requests end.
     pub(super) fn parks(&self) -> bool {
-        self.parked
+        matches!(self.lifecycle, crate::Lifecycle::Parked)
     }
 
     /// Resumes a parked scheduler: it admits and executes again. When it
     /// `reclaim`s, the epoch it lent cache units to at its park writes none
     /// of them any more, and the pool allocates them again.
     pub(super) fn resume(&mut self, reclaim: bool) -> Result<(), String> {
-        if self.parking.is_some() {
+        if matches!(self.lifecycle, crate::Lifecycle::Parking(_)) {
             return Err("the scheduler is still parking".to_owned());
         }
-        if self.parked {
-            self.parked = false;
-            self.closing = false;
+        if matches!(self.lifecycle, crate::Lifecycle::Parked) {
+            self.lifecycle = crate::Lifecycle::Serving;
             tracing::info!("the parked scheduler resumes");
         }
         if reclaim && let Some(cache) = self.storage.cache() {
@@ -452,19 +452,19 @@ impl Scheduler {
     /// segments they mapped read-only, and its pool allocates their units.
     /// Returns what each worker reported.
     pub(super) fn commit(&mut self) -> Result<Vec<String>, String> {
-        let closing = std::mem::replace(&mut self.closing, true);
+        let draining = std::mem::replace(&mut self.draining, true);
         while !(self.inflight.pending_batches.is_empty()
             && self.inflight.pending_submissions.is_empty())
         {
-            if self.fatal {
-                self.closing = closing;
+            if self.failed() {
+                self.draining = draining;
                 return Err("the engine failed before its commit".to_owned());
             }
             if !self.step_nonblocking() {
                 self.park_for_progress();
             }
         }
-        self.closing = closing;
+        self.draining = draining;
         let results = self.worker.commit().map_err(|error| format!("{error:#}"))?;
         if let Some(cache) = self.storage.cache() {
             cache.block_pool.take_inherited();
@@ -491,19 +491,19 @@ impl Scheduler {
                     .map(|cache| (group.to_string(), cache.num_units))
             })
             .collect();
-        let closing = std::mem::replace(&mut self.closing, true);
+        let draining = std::mem::replace(&mut self.draining, true);
         while !(self.inflight.pending_batches.is_empty()
             && self.inflight.pending_submissions.is_empty())
         {
-            if self.fatal {
-                self.closing = closing;
+            if self.failed() {
+                self.draining = draining;
                 return Err("the engine failed before it described its cache".to_owned());
             }
             if !self.step_nonblocking() {
                 self.park_for_progress();
             }
         }
-        self.closing = closing;
+        self.draining = draining;
         let reports = self
             .worker
             .operate_groups(&ipc::memory::CacheStorage.into())

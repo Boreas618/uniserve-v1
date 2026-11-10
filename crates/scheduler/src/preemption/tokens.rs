@@ -85,8 +85,7 @@ impl Scheduler {
         self.finish_outgrown();
         if self.starved.is_empty()
             || submitted
-            || self.parked
-            || self.parking.is_some()
+            || !matches!(self.lifecycle, crate::Lifecycle::Serving)
             || !self.inflight.pending_batches.is_empty()
             || !self.inflight.pending_submissions.is_empty()
             || self
