@@ -20,10 +20,12 @@
 //! 2. values, in the same shape;
 //! 3. for FP8 pools, the scales `[2, layers]` as `f32`.
 //!
-//! The state group's page holds its layers' checkpoints in the same planes,
-//! in the order the library lays them out. A page copies as one plane-sized
-//! run per field, unit and column, and one scale per field, unit and
-//! column.
+//! The state group's page holds its layers' checkpoints in the pool's state
+//! planes (`CachePlanes::state_views`), in the order the plan lays them out:
+//! a state page copies every plane of each field run, in unit then column
+//! order, and holds no key, value or scale. A K/V page copies as one
+//! plane-sized run per field, unit and column, and one scale per field, unit
+//! and column.
 
 use std::collections::BTreeMap;
 
@@ -58,6 +60,9 @@ pub(crate) struct HostKvCache {
 /// The bytes of one page of `group` on a pool of `plan`'s layout.
 fn page_bytes(plan: &CachePlan, group: &CacheGroupPlan) -> u64 {
     let planes = plan.page_planes(group);
+    if group.state() {
+        return u64::from(plan.state_fields()) * planes * plan.plane_bytes;
+    }
     let scales = if plan.quantized { 2 * planes * 4 } else { 0 };
     2 * planes * plan.plane_bytes + scales
 }
@@ -109,11 +114,12 @@ fn layout(plan: &CachePlan, group: usize) -> [u8; 32] {
     digest.number(u64::from(entry.total_kv_heads));
     digest.number(u64::from(entry.head_dim));
     digest.text(entry.dtype.name());
-    // A state group's pages are its units' bytes, as many as its
-    // checkpoints fill.
+    // A state group's pages are its checkpoints' planes, as many units as
+    // they fill, laid field run by field run.
     if entry.state() {
         digest.text("state");
         digest.number(u64::from(entry.units_per_page));
+        digest.number(u64::from(plan.state_fields()));
     }
     digest.finish()
 }
@@ -255,6 +261,23 @@ impl HostKvCache {
         let plane = plan.plane_bytes;
         let slot = pool.pages.address(copy.host_page)?;
         let count = u64::from(pool.planes);
+        let state = plan
+            .groups
+            .get(copy.group_id as usize)
+            .is_some_and(|group| group.state());
+        if state {
+            // A state page is its checkpoints' planes, field run by field run.
+            let mut runs = Vec::with_capacity(plan.state_fields() as usize * pool.planes as usize);
+            for field in 0..plan.state_fields() as usize {
+                for index in 0..pool.planes {
+                    let unit = copy.units[(index / columns) as usize].0;
+                    let device = planes.state_plane_address(field, index % columns, unit)?;
+                    let host = slot + (field as u64 * count + u64::from(index)) * plane;
+                    runs.push((device, host, plane as usize));
+                }
+            }
+            return Ok(runs);
+        }
         let mut runs = Vec::with_capacity(2 * pool.planes as usize * 2);
         for field in 0..2 {
             for index in 0..pool.planes {

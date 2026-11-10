@@ -1340,6 +1340,19 @@ impl CachePlanes {
         )
     }
 
+    /// The address of one unit's state plane of field run `field` in `column`: the
+    /// `plane_bytes` of a state page's checkpoints the cell holds.
+    pub(crate) fn state_plane_address(&self, field: usize, column: u32, unit: u32) -> Result<u64> {
+        self.require_unit(unit)?;
+        let storage = self.state.get(field).ok_or_else(|| {
+            Error::Invalid(format!(
+                "a cache pool holds {} state field runs, not {field}",
+                self.state.len()
+            ))
+        })?;
+        Ok(storage.address() + self.cell(column, unit) * self.plan.plane_bytes)
+    }
+
     /// The address of one unit's plane of `field` in `column`: the
     /// `plane_bytes` of one layer of the unit's page.
     pub(crate) fn plane_address(&self, field: usize, column: u32, unit: u32) -> Result<u64> {
