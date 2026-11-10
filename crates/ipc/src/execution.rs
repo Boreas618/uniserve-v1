@@ -411,6 +411,187 @@ pub struct Batch {
     pub media: Option<MediaColumns>,
 }
 
+impl Batch {
+    /// Checks the rules that span the batch's parts, so a batch that crosses a process boundary is
+    /// refused before any of it is staged.
+    ///
+    /// Every nested record passes its own `validate`, and across them:
+    ///
+    /// - the batch names each call once;
+    /// - a token batch has one call row per call and one call per request slot (a request runs one
+    ///   call per step), and its columns fit its shape ([`BatchColumns::check`]);
+    /// - each `(slot, group)` has at most one block table and one unit allocation, and an
+    ///   allocation's units lie inside the table of the same slot and group;
+    /// - a page read fills only units the batch newly allocates, which the worker resets first;
+    /// - a request has at most one stored trajectory to restore and one host encoder output.
+    pub fn validate(&self) -> ValidationResult<()> {
+        let mut calls = std::collections::HashSet::with_capacity(self.calls.len());
+        ensure_valid!(
+            self.calls.iter().all(|call| calls.insert(*call)),
+            "a batch repeats a call"
+        );
+
+        // A token batch's columns state one row range per call; a media batch carries its inputs
+        // in `media` and token columns only when it reads a prompt.
+        if self.media.is_none() {
+            ensure_valid!(
+                self.columns.calls() == self.calls.len(),
+                "a token batch states a different number of call rows than calls"
+            );
+            self.columns.check(&self.shape)?;
+        }
+        let mut slots = std::collections::HashSet::with_capacity(self.columns.calls());
+        ensure_valid!(
+            self.columns
+                .rows
+                .calls
+                .iter()
+                .all(|row| slots.insert(row.request)),
+            "a batch carries two calls for one request"
+        );
+        if let Some(media) = &self.media {
+            media.check()?;
+        }
+
+        let mut tables = std::collections::HashMap::with_capacity(self.block_tables.len());
+        for table in &self.block_tables {
+            table.validate()?;
+            ensure_valid!(
+                tables
+                    .insert((table.request_pool_idx, table.group_id), table)
+                    .is_none(),
+                "a batch repeats a block table"
+            );
+        }
+
+        let mut allocated = std::collections::HashSet::with_capacity(self.cache_units.len());
+        for allocation in &self.cache_units {
+            allocation.validate()?;
+            let identity = (allocation.request_pool_idx, allocation.group_id);
+            ensure_valid!(
+                allocated.insert(identity),
+                "a batch repeats a cache-unit allocation"
+            );
+            let table = tables.get(&identity).ok_or_else(|| {
+                invalid_message!("a cache-unit allocation has no matching block table")
+            })?;
+            ensure_valid!(
+                allocation
+                    .unit_ids
+                    .iter()
+                    .all(|unit| table.unit_ids.contains(unit)),
+                "a cache-unit allocation is outside its block table"
+            );
+        }
+
+        // A page read overwrites whole units, which is only sound for units this batch acquired.
+        let new_units = self
+            .cache_units
+            .iter()
+            .flat_map(|allocation| allocation.unit_ids.iter())
+            .collect::<std::collections::HashSet<_>>();
+        for copy in self.page_loads.iter().chain(&self.page_offloads) {
+            copy.validate()?;
+        }
+        ensure_valid!(
+            self.page_loads
+                .iter()
+                .all(|copy| copy.units.iter().all(|unit| new_units.contains(unit))),
+            "a page read fills units that are not new units of the batch"
+        );
+
+        let mut restored = std::collections::HashSet::with_capacity(self.latent_restores.len());
+        for (request, restore) in &self.latent_restores {
+            restore.validate()?;
+            ensure_valid!(
+                restored.insert(*request),
+                "a batch restores one trajectory twice"
+            );
+        }
+        let mut hosted = std::collections::HashSet::with_capacity(self.host_outputs.len());
+        ensure_valid!(
+            self.host_outputs
+                .iter()
+                .all(|(request, _)| hosted.insert(*request)),
+            "a batch names two host encoder outputs for one request"
+        );
+        Ok(())
+    }
+}
+
+impl CallOutput {
+    /// Checks that the completion's fields agree with its status.
+    ///
+    /// Rules that relate a completion to the kind of the call it answers belong to the mechanism,
+    /// which holds the call.
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
+            self.cache_visible_len <= self.cache_computed_len,
+            "a completion's visible cache length exceeds its computed length"
+        );
+        match self.status {
+            CallStatus::Error => ensure_valid!(
+                self.error_code.is_some(),
+                "an error completion must carry an error code"
+            ),
+            CallStatus::Ok | CallStatus::Predicated => ensure_valid!(
+                self.error_code.is_none(),
+                "a non-error completion must not carry an error code"
+            ),
+        }
+        ensure_valid!(
+            self.error_message.is_none() || self.error_code == Some(ErrorCode::InputError),
+            "only an input-error completion states why the rank refused its request"
+        );
+        ensure_valid!(
+            self.token_logprobs.is_empty() || self.token_logprobs.len() == self.tokens.len(),
+            "a completion's token log-probabilities do not align with its tokens"
+        );
+        if self.status != CallStatus::Ok {
+            ensure_valid!(
+                self.latent_layouts.is_empty() && self.cache_output.is_none(),
+                "latent layouts and a cache export belong to a successful completion"
+            );
+        }
+        if self.status == CallStatus::Predicated {
+            ensure_valid!(
+                self.tokens.is_empty() && self.draft_token_ids.is_empty(),
+                "a predicated completion must select its parent without semantic output"
+            );
+        }
+        if let Some(export) = &self.cache_output {
+            export.validate()?;
+        }
+        if let Some(output) = &self.media_output {
+            output.handle.validate()?;
+            ensure_valid!(
+                output.bytes > 0,
+                "a media output's byte length must be positive"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl BatchOutput {
+    /// Checks every completion, and that the output answers only calls `batch` carried, each once.
+    pub fn validate(&self, batch: &Batch) -> ValidationResult<()> {
+        let mut answered = std::collections::HashSet::with_capacity(self.calls.len());
+        for output in &self.calls {
+            output.validate()?;
+            ensure_valid!(
+                batch.calls.contains(&output.call),
+                "a completion answers a call its batch did not carry"
+            );
+            ensure_valid!(
+                answered.insert(output.call),
+                "a batch output repeats a call"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// One host-side call of a batch: which request, which phase, which rows it occupies.
 ///
 /// The mechanism builds these from the scheduler's plan; the worker uploads the columns

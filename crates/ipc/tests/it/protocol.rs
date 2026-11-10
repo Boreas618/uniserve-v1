@@ -788,3 +788,229 @@ fn a_decode_range_names_each_holding_rank_once() {
     };
     assert!(repeated.validate().is_err());
 }
+
+/// The message a refused batch or output states, so a test names the rule that refused it.
+fn refusal(result: ValidationResult<()>) -> String {
+    result.expect_err("the record is refused").to_string()
+}
+
+/// A block table of slot `slot` in group 0 over `units`.
+fn table(slot: u32, units: &[u32]) -> BlockTable {
+    BlockTable {
+        request_pool_idx: slot,
+        group_id: 0,
+        start_page: 0,
+        unit_ids: units.iter().copied().map(UnitId).collect(),
+        allocated_tokens: 16 * units.len() as u32,
+    }
+}
+
+/// The units newly acquired for slot `slot` in group 0.
+fn allocation(slot: u32, units: &[u32]) -> CacheUnitAllocation {
+    CacheUnitAllocation {
+        request_pool_idx: slot,
+        group_id: 0,
+        unit_ids: units.iter().copied().map(UnitId).collect(),
+        copies: Vec::new(),
+    }
+}
+
+/// A host page copy of group 0 over `units`.
+fn page_copy(units: &[u32]) -> PageCopy {
+    PageCopy {
+        rank: 0,
+        pool: 1,
+        group_id: 0,
+        slot: 3,
+        units: units.iter().copied().map(UnitId).collect(),
+    }
+}
+
+#[test]
+fn a_scheduled_token_batch_and_its_output_are_valid() {
+    let batch = execution::Batch {
+        block_tables: vec![table(1, &[5, 6]), table(2, &[7])],
+        cache_units: vec![allocation(1, &[6])],
+        page_loads: vec![page_copy(&[6])],
+        page_offloads: vec![page_copy(&[5])],
+        ..token_batch()
+    };
+    batch.validate().expect("the batch is valid");
+    batch_output()
+        .validate(&batch)
+        .expect("its output is valid");
+}
+
+#[test]
+fn a_batch_names_each_call_once_with_one_call_row_each() {
+    let mut repeated = token_batch();
+    repeated.calls[1] = repeated.calls[0];
+    assert!(refusal(repeated.validate()).contains("repeats a call"));
+
+    let mut missing = token_batch();
+    missing.calls.pop();
+    assert!(refusal(missing.validate()).contains("number of call rows"));
+}
+
+#[test]
+fn a_batch_carries_one_call_per_request() {
+    let mut batch = token_batch();
+    batch.columns.rows.calls[1].request = batch.columns.rows.calls[0].request;
+    assert!(refusal(batch.validate()).contains("two calls for one request"));
+}
+
+#[test]
+fn a_token_batch_columns_fit_its_shape() {
+    let mut batch = token_batch();
+    batch.columns.input_ids.pop();
+    assert!(refusal(batch.validate()).contains("input_ids"));
+}
+
+#[test]
+fn a_batch_states_each_block_table_once() {
+    let batch = execution::Batch {
+        block_tables: vec![table(1, &[5]), table(1, &[6])],
+        ..token_batch()
+    };
+    assert!(refusal(batch.validate()).contains("repeats a block table"));
+}
+
+#[test]
+fn a_cache_unit_allocation_lies_inside_its_block_table() {
+    let unmatched = execution::Batch {
+        block_tables: vec![table(1, &[5])],
+        cache_units: vec![allocation(2, &[5])],
+        ..token_batch()
+    };
+    assert!(refusal(unmatched.validate()).contains("no matching block table"));
+
+    let outside = execution::Batch {
+        block_tables: vec![table(1, &[5])],
+        cache_units: vec![allocation(1, &[9])],
+        ..token_batch()
+    };
+    assert!(refusal(outside.validate()).contains("outside its block table"));
+
+    let repeated = execution::Batch {
+        block_tables: vec![table(1, &[5, 6])],
+        cache_units: vec![allocation(1, &[5]), allocation(1, &[6])],
+        ..token_batch()
+    };
+    assert!(refusal(repeated.validate()).contains("repeats a cache-unit allocation"));
+}
+
+#[test]
+fn a_page_read_fills_only_new_units_of_the_batch() {
+    let batch = execution::Batch {
+        block_tables: vec![table(1, &[5, 6])],
+        cache_units: vec![allocation(1, &[6])],
+        page_loads: vec![page_copy(&[5])],
+        ..token_batch()
+    };
+    assert!(refusal(batch.validate()).contains("not new units"));
+
+    let empty = execution::Batch {
+        page_offloads: vec![page_copy(&[])],
+        ..token_batch()
+    };
+    assert!(refusal(empty.validate()).contains("page copy is empty"));
+}
+
+#[test]
+fn a_batch_names_one_host_encoder_output_per_request() {
+    let output = HostOutput {
+        pool: 1,
+        import: true,
+        row_bytes: 64,
+        rows: [0, 4],
+        slots: vec![Some(2)],
+    };
+    let batch = execution::Batch {
+        host_outputs: vec![
+            (key_for_request(1), output.clone()),
+            (key_for_request(1), output),
+        ],
+        ..token_batch()
+    };
+    assert!(refusal(batch.validate()).contains("two host encoder outputs"));
+}
+
+#[test]
+fn a_completion_agrees_with_its_status() {
+    let state = execution::RowState {
+        step_index: 3,
+        cache_computed_len: 3,
+        cache_visible_len: 3,
+    };
+    let completed = || execution::CallOutput::completed(execution::CallId(0), vec![1], state);
+
+    let longer = execution::CallOutput {
+        cache_visible_len: 4,
+        ..completed()
+    };
+    assert!(refusal(longer.validate()).contains("visible cache length"));
+
+    let uncoded = execution::CallOutput {
+        status: CallStatus::Error,
+        tokens: Vec::new(),
+        ..completed()
+    };
+    assert!(refusal(uncoded.validate()).contains("must carry an error code"));
+
+    let coded = execution::CallOutput {
+        error_code: Some(ErrorCode::ComputeError),
+        ..completed()
+    };
+    assert!(refusal(coded.validate()).contains("must not carry an error code"));
+
+    let explained = execution::CallOutput {
+        status: CallStatus::Error,
+        error_code: Some(ErrorCode::ComputeError),
+        error_message: Some("the prompt is too long".into()),
+        tokens: Vec::new(),
+        ..completed()
+    };
+    assert!(refusal(explained.clone().validate()).contains("only an input-error completion"));
+    execution::CallOutput {
+        error_code: Some(ErrorCode::InputError),
+        ..explained
+    }
+    .validate()
+    .expect("an input error states its reason");
+
+    let predicated = execution::CallOutput {
+        status: CallStatus::Predicated,
+        ..completed()
+    };
+    assert!(refusal(predicated.validate()).contains("predicated completion"));
+
+    let misaligned = execution::CallOutput {
+        token_logprobs: vec![-0.5, -0.25],
+        ..completed()
+    };
+    assert!(refusal(misaligned.validate()).contains("do not align"));
+
+    let empty_media = execution::CallOutput {
+        media_output: Some(MediaOutput {
+            handle: ArtifactHandle::PosixShm {
+                name: "uniserve-artifact".into(),
+            },
+            bytes: 0,
+        }),
+        ..completed()
+    };
+    assert!(refusal(empty_media.validate()).contains("byte length must be positive"));
+}
+
+#[test]
+fn a_batch_output_answers_each_call_of_its_batch_once() {
+    let batch = token_batch();
+
+    let mut foreign = batch_output();
+    foreign.calls[1].call = execution::CallId(9);
+    assert!(refusal(foreign.validate(&batch)).contains("did not carry"));
+
+    let mut repeated = batch_output();
+    repeated.calls[1].call = repeated.calls[0].call;
+    assert!(refusal(repeated.validate(&batch)).contains("repeats a call"));
+}
