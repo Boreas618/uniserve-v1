@@ -1124,6 +1124,15 @@ impl Device {
                 self.waits = !overlapping;
                 let output = self.perform(&label, jobs_of(runner, jobs));
                 self.waits = true;
+                // A replay the device does not leave in flight has landed once `perform` returns
+                // (it waited for the stream), so its answer is taken now. A runner may still have
+                // parked it for a landing - a profiling session runs an overlapping runner's steps
+                // one at a time, which the runner cannot see - and `landed` is where it gives it.
+                let output = if overlapping {
+                    output
+                } else {
+                    output.and_then(|output| self.runner_mut(runner)?.runner.landed(output))
+                };
                 let output = output
                     .and_then(|mut output| {
                         output.forward_stats = self.end_step(batch.id.0)?;
