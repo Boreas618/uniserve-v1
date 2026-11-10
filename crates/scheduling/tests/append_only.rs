@@ -1,7 +1,9 @@
-//! The wire between the mechanism and a policy is append-only (design §4.4):
-//! the kinds of state change and the fields of views and decisions may be
-//! added, never renamed or removed, and a policy built against one revision
-//! runs against a mechanism built from a later one.
+//! The wire between the mechanism and a policy evolves without breaking either
+//! side: kinds of state change and fields of views and decisions may be added,
+//! a kind or field is never renamed, and one removed from the interface decodes
+//! on the other side as the unknown kind or an absent field, so a policy built
+//! against one revision runs against a mechanism built from another. A removed
+//! kind's name is never reused for a different meaning.
 //!
 //! The mechanism runs in the main process and each policy is a module the
 //! Program Server builds, so a policy older than the mechanism it runs under is
