@@ -55,7 +55,7 @@ impl fmt::Display for Approximation {
 pub struct Descriptor {
     /// Element type of the input and the output.
     pub dtype: DType,
-    /// Elements one row holds; the columns the module was compiled for.
+    /// Elements one row holds: a launch word the module reads, so it is no part of the key.
     pub columns: u32,
     /// Elements one thread block evaluates.
     pub block: u32,
@@ -69,7 +69,6 @@ impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
             .field("dtype", self.dtype)
-            .field("columns", self.columns)
             .field("block", self.block)
             .field("approximate", self.approximate)
             .field("pdl", self.pdl)
@@ -174,10 +173,7 @@ mod tests {
             pdl: false,
         };
         let key = crate::descriptor::key(&exact);
-        assert_eq!(
-            key,
-            "dtype_bf16_columns_3072_block_1024_approximate_exact_pdl_false"
-        );
+        assert_eq!(key, "dtype_bf16_block_1024_approximate_exact_pdl_false");
         let tanh = crate::descriptor::key(&Descriptor {
             approximate: Approximation::Tanh,
             ..exact

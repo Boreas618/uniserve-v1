@@ -237,7 +237,7 @@ impl Op for AddRmsNorm {
 pub struct LayerNormDescriptor {
     /// Element type of the input, the weight, the bias and the output.
     pub dtype: DType,
-    /// Elements per row.
+    /// Elements one row holds: a launch word the module reads, so it is no part of the key.
     pub columns: u32,
     /// The tile one program loads at a time.
     pub tile: u32,
@@ -251,7 +251,6 @@ impl fmt::Display for LayerNormDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
             .field("dtype", self.dtype)
-            .field("columns", self.columns)
             .field("tile", self.tile)
             .field("bias", self.bias)
             .field("pdl", self.pdl)

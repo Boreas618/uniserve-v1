@@ -7,7 +7,8 @@
 # Whether the layer has a bias is part of the compilation: a program without one
 # reads two affine parameters and skips an addition. The key is the one
 # `LayerNormDescriptor`'s `Display` prints, e.g.
-# `dtype_bf16_columns_2048_tile_2048_bias_true_pdl_false`.
+# `dtype_bf16_tile_2048_bias_true_pdl_false`: the row width is a launch word
+# within the tile, so one module serves every width the tile covers.
 
 op = "layer_norm"
 backend = "triton"
@@ -31,5 +32,5 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "f16", "f32"], columns = { min = 1 }, tile = { power_of_two = true }, bias = ["false", "true"], pdl = ["false", "true"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], tile = { power_of_two = true }, bias = ["false", "true"], pdl = ["false", "true"] }
 [parameters]

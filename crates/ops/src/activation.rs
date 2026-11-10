@@ -647,7 +647,7 @@ const SILU_VALUE_ENVELOPE: f32 = 8.0;
 pub struct SiluDescriptor {
     /// Element type of the input and the output.
     pub dtype: DType,
-    /// Elements one row holds; the columns the module was compiled for.
+    /// Elements one row holds: a launch word the module reads, so it is no part of the key.
     pub columns: u32,
     /// Elements one thread block evaluates.
     pub block: u32,
@@ -659,7 +659,6 @@ impl fmt::Display for SiluDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
             .field("dtype", self.dtype)
-            .field("columns", self.columns)
             .field("block", self.block)
             .field("pdl", self.pdl)
             .finish(formatter)
@@ -771,7 +770,15 @@ mod silu_tests {
     fn the_key_is_the_shape_and_the_launch_flag_and_nothing_else() {
         assert_eq!(
             crate::descriptor::key(&descriptor(DType::BF16, false)),
-            "dtype_bf16_columns_5376_block_1024_pdl_false"
+            "dtype_bf16_block_1024_pdl_false"
+        );
+        assert_eq!(
+            crate::descriptor::key(&SiluDescriptor {
+                columns: 128,
+                ..descriptor(DType::BF16, false)
+            }),
+            crate::descriptor::key(&descriptor(DType::BF16, false)),
+            "one module serves every row width"
         );
         assert_ne!(
             crate::descriptor::key(&descriptor(DType::BF16, true)),

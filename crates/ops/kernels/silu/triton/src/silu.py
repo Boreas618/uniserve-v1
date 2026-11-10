@@ -25,8 +25,9 @@ def _silu_kernel(
 ):
     """Store one block of ``x / (1 + exp(−x))``.
 
-    The grid covers the flattened tensor, and ``columns`` is the row width the operator was
-    compiled for. ``pdl`` is the launch's flag and the module's metadata carries the decision.
+    The grid covers the flattened tensor, and ``columns`` is the row width of
+    the launch: a word the module does not specialize on. ``pdl`` is the
+    launch's flag and the module's metadata carries the decision.
     """
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
     live = offsets < elements

@@ -45,9 +45,9 @@ def _gelu_kernel(
 ):
     """Store one block of the activation of the contiguous row-major input.
 
-    Grid: ``ceil(elements / BLOCK)`` programs. ``columns`` is the row width the
-    descriptor was compiled for; a block covers consecutive elements of the
-    flattened rows, so it is not read.
+    Grid: ``ceil(elements / BLOCK)`` programs. ``columns`` is the row width of
+    the launch, which no module specializes on; a block covers consecutive
+    elements of the flattened rows, so it is not read.
     """
     _pdl_prologue(PDL)
 

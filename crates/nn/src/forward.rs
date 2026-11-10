@@ -683,7 +683,7 @@ mod tests {
         assert_eq!(launches.len(), 1, "{launches:?}");
         let (operator, key) = &launches[0];
         assert_eq!(operator, "silu");
-        assert!(key.starts_with("dtype_bf16_columns_1024_"), "{key}");
+        assert!(key.starts_with("dtype_bf16_block_"), "{key}");
     }
 
     #[test]
