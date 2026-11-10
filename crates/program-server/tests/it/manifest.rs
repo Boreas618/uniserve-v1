@@ -624,7 +624,7 @@ fn a_package_may_declare_one_descriptor_table() {
     std::fs::write(package.join("metadata.json"), METADATA).unwrap();
     std::fs::write(
         package.join("package.toml"),
-        r#"op = "bias_add"
+        r#"op = "channel_affine"
 backend = "triton"
 
 [toolchain]
