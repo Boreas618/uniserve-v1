@@ -35,6 +35,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.python.e2e.http_helpers import metric, wait_until
 from tests.python.e2e.profiling_helpers import NAME, RANGE_PASS_STORAGE, serve
 from tests.python.e2e.profiling_helpers import Load as _Load
 from tests.python.e2e.profiling_helpers import ended as _ended
@@ -114,31 +115,61 @@ def _apply(base_url: str, *assignments: str) -> dict:
     return response.json()["result"]
 
 
+def _forwards(base_url: str) -> float:
+    """The forwards the workers reported so far, which their reports carry
+    beside the fence histogram's steps
+    (``uniserve:worker_forward_mode_counts``).
+    """  # noqa: D205
+    return metric(base_url, "uniserve:worker_forward_mode_counts")
+
+
+def _forwards_reported(base_url: str) -> None:
+    """Waits until the workers reported forwards they ran from now on."""
+    forwards = _forwards(base_url)
+    wait_until(
+        lambda: _forwards(base_url) > forwards,
+        60,
+        "the workers reported no forward",
+    )
+
+
 def test_fence_probes_report_steps_and_switch_in_place(served: str):
+    def steps() -> int:
+        return _fence_count(served, "decode", 'component="step"')
+
     _chat(served)
     with _Load(served, streams=1):
-        time.sleep(5)
-    decode = _fence_count(served, "decode", 'component="step"')
+        wait_until(
+            lambda: (
+                steps() > 0
+                and _fence_count(served, "decode", "TransformerLayer") > 0
+            ),
+            60,
+            "the fence probes reported no decode step",
+        )
+    decode = steps()
     layers = _fence_count(served, "decode", "TransformerLayer")
     print(f"decode steps {decode}, layer steps {layers}")
-    assert decode > 0 and layers > 0
 
     off = _apply(served, "profiling_config.fence_probes=false")
     assert off["change"] == "in_place", off
     # The steps whose probes ran before the switch are read with the next
-    # results; none is counted after them.
+    # results; none is counted after them, while the workers report the
+    # forwards they run.
     with _Load(served, streams=1):
-        time.sleep(5)
-    settled = _fence_count(served, "decode", 'component="step"')
-    with _Load(served, streams=1):
-        time.sleep(5)
-    assert _fence_count(served, "decode", 'component="step"') == settled
+        _forwards_reported(served)
+        settled = steps()
+        _forwards_reported(served)
+        assert steps() == settled
 
     on = _apply(served, "profiling_config.fence_probes=true")
     assert on["change"] == "in_place", on
     with _Load(served, streams=1):
-        time.sleep(5)
-    assert _fence_count(served, "decode", 'component="step"') > settled
+        wait_until(
+            lambda: steps() > settled,
+            60,
+            "the fence probes counted no step once switched on",
+        )
 
 
 # Sessions that together run every collector, each holding at most one of
