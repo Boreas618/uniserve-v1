@@ -271,16 +271,17 @@ const TEMPERATURE_COLUMN: usize = proto::program::sampler::TEMPERATURE as usize;
 /// start when it resumes from a cached prefix. A call that resumes past position
 /// zero with no checkpoint there is a planning fault.
 ///
-/// `installing[i]` is whether call `i`'s request slot does not yet hold the
-/// request's bias row on its worker ([`adjusts_logits`]); a request that adjusts
-/// its logits installs the row with such a call, and every row of it reads the
-/// row afterwards. An empty `installing` installs nothing. A call whose
+/// `fresh[i]` is whether call `i`'s request slot does not yet hold the
+/// request's sampling state on its worker: the batch names the slot among its
+/// `fresh_slots`, whose penalty counts the worker clears, and a request that
+/// adjusts its logits ([`adjusts_logits`]) installs its bias row, which every
+/// row of it reads afterwards. An empty `fresh` starts nothing. A call whose
 /// `SamplingState` states a per-step allowed set is refused: the worker keeps an
 /// allowed set only as the request's own slot row.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the calls, their tables, inputs, sampling, draws, slot residency and bias \
-              installation, and the cache's geometry"
+    reason = "the calls, their tables, inputs, sampling, draws, slot residency and fresh \
+              sampling state, and the cache's geometry"
 )]
 pub(crate) fn columns(
     requests: &[(&Call, &CallLayout)],
@@ -292,14 +293,14 @@ pub(crate) fn columns(
     max_kv_len: u32,
     state: Option<StatePages>,
     resident: &[bool],
-    installing: &[bool],
+    fresh: &[bool],
 ) -> Option<BatchColumns> {
     if requests.len() != inputs.len()
         || requests.len() != sampling.len()
         || requests.len() != draws.len()
         || requests.len() != tables.len()
         || (state.is_some() && requests.len() != resident.len())
-        || (!installing.is_empty() && requests.len() != installing.len())
+        || (!fresh.is_empty() && requests.len() != fresh.len())
     {
         return None;
     }
@@ -316,6 +317,7 @@ pub(crate) fn columns(
     let mut parameters: Vec<f32> = Vec::new();
     let mut draw_addresses: Vec<ipc::philox::DrawAddress> = Vec::new();
     let mut installs: Vec<SlotBias> = Vec::new();
+    let mut fresh_slots: Vec<u32> = Vec::new();
     let mut biased: Vec<bool> = Vec::new();
     let mut banned: Vec<Vec<u32>> = Vec::new();
     let drafts: Vec<ipc::DraftWork> = requests.iter().map(|(call, _)| call.draft).collect();
@@ -426,8 +428,11 @@ pub(crate) fn columns(
         // (`Scheduler::build_token_masks`), the same for every row of the call: a verification's
         // drafts are capped where they would sample under different bans (`verify_drafts`).
         let adjusts = adjusts_logits(sampling);
-        if adjusts && installing.get(index).copied().unwrap_or(false) {
-            installs.push(slot_bias(request, sampling));
+        if fresh.get(index).copied().unwrap_or(false) {
+            fresh_slots.push(request);
+            if adjusts {
+                installs.push(slot_bias(request, sampling));
+            }
         }
         let suppressed = match &call.sampling_state {
             Some(state) if state.allowed_token_ids.is_some() => return None,
@@ -610,6 +615,11 @@ pub(crate) fn columns(
             } else {
                 Vec::new()
             },
+        },
+        fresh_slots: {
+            fresh_slots.sort_unstable();
+            fresh_slots.dedup();
+            fresh_slots
         },
     })
 }
@@ -1020,7 +1030,7 @@ mod tests {
         let plain = sampling();
         let calls: Vec<(&Call, &CallLayout)> =
             requests.iter().map(|(call, rows)| (call, rows)).collect();
-        let fill = |installing: &[bool], sampling: [&SamplingParams; 2]| {
+        let fill = |fresh: &[bool], sampling: [&SamplingParams; 2]| {
             super::columns(
                 &calls,
                 &tables_of(&requests),
@@ -1031,7 +1041,7 @@ mod tests {
                 2048,
                 None,
                 &[],
-                installing,
+                fresh,
             )
             .expect("a decode batch")
         };
@@ -1049,6 +1059,9 @@ mod tests {
         );
         assert_eq!(adjustments.biased, vec![true, false]);
         assert_eq!(adjustments.banned, vec![vec![2, 9], Vec::new()]);
+        // Both requests start their sampling state on their slots: the worker clears the counts
+        // of each, whether or not it adjusts its logits.
+        assert_eq!(columns.fresh_slots, vec![3, 4]);
         columns
             .check(&batch_shape(&columns))
             .expect("the adjustments are canonical and one per row");
@@ -1056,6 +1069,10 @@ mod tests {
         // Once the row is resident the request still reads it, and installs nothing.
         let resident = fill(&[false, false], [&restricted, &plain]);
         assert!(resident.adjustments.installs.is_empty());
+        assert!(
+            resident.fresh_slots.is_empty(),
+            "a resident slot keeps its counts"
+        );
         assert_eq!(resident.adjustments.biased, vec![true, false]);
 
         // A per-step allowed set has no device form: the batch is refused rather than served

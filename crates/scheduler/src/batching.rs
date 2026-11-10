@@ -473,9 +473,9 @@ impl Scheduler {
                     let mut generated_token_ids = st.req.generated_token_ids.clone();
                     if hand_off {
                         generated_token_ids.push(st.next_token);
-                        // The decode group's slot holds no bias row of the request yet: its first
-                        // token batch there installs it.
-                        st.bias_resident = false;
+                        // The decode group's slot holds none of the request's sampling state yet:
+                        // its first token batch there starts it.
+                        st.sampling_resident = false;
                     }
                     // Admission reserved the request row, and submission
                     // validated the parameters this admission carries.
@@ -689,7 +689,7 @@ impl Scheduler {
                 })
             });
         let mut resident = Vec::with_capacity(batch.requests.len());
-        let mut installing = Vec::with_capacity(batch.requests.len());
+        let mut fresh = Vec::with_capacity(batch.requests.len());
         let mut inputs = Vec::with_capacity(batch.requests.len());
         let mut sampling = Vec::with_capacity(batch.requests.len());
         let mut draws = Vec::with_capacity(batch.requests.len());
@@ -720,7 +720,7 @@ impl Scheduler {
             };
             inputs.push(tokens);
             resident.push(state.state_resident);
-            installing.push(!state.bias_resident);
+            fresh.push(!state.sampling_resident);
             sampling.push(&state.req.sampling);
             draws.push(state.sampling_position);
             // The layout addresses the request's current cache tables. A call
@@ -787,7 +787,7 @@ impl Scheduler {
             max_kv_len,
             state_pages,
             &resident,
-            &installing,
+            &fresh,
         );
 
         let Some(filled) = filled else {
@@ -860,8 +860,8 @@ impl Scheduler {
         for (call, _) in &batch.requests {
             if let Some(state) = self.running.get_mut(&call.request_key.request_id) {
                 state.state_resident = true;
-                // The batch installed the request's bias row on its worker, if it has one.
-                state.bias_resident = true;
+                // The batch started the request's sampling state on its worker's slot.
+                state.sampling_resident = true;
             }
         }
     }

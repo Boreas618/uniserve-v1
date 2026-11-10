@@ -612,14 +612,9 @@ impl<M: TextModel> CausalLmRunner<M> {
         // The rows' checkpoints move into the state pages behind the forward that wrote them.
         self.copy_state(generation, ipc::execution::StateDirection::Keep)?;
         self.write_samples(&plan)?;
-        // The slot bias rows the batch installs, stream-ordered before the sampling that reads them.
-        let installs = self.staging.adjustments().installs();
-        if !installs.is_empty() {
-            self.sampling
-                .as_mut()
-                .ok_or(Error::State("a speculating runner samples"))?
-                .install(installs, &stream)?;
-        }
+        // The slots the batch starts requests on, stream-ordered before the sampling that reads
+        // their counts and bias rows.
+        self.start_slots(&stream)?;
         self.sample_rows(&forward, &plan, hidden)?;
         stream.synchronize()?;
 

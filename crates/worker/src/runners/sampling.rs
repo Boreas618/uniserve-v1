@@ -1201,6 +1201,28 @@ impl Sampling {
         })
     }
 
+    /// Clears the penalty counts of each of `slots`, on `stream`, before the step that reads them:
+    /// a request that takes a slot counts only its own tokens. One device memset per slot, ordered
+    /// after the previous request's last commit on the same stream.
+    pub(crate) fn clear_counts(&self, slots: &[u32], stream: &platform::Stream) -> Result<()> {
+        let width = self.vocabulary as usize;
+        for &slot in slots {
+            if slot >= self.slots {
+                return Err(Error::Invalid(format!(
+                    "a fresh slot {slot} of a count table of {} slots",
+                    self.slots
+                )));
+            }
+            let offset = (slot as usize * width * std::mem::size_of::<i32>()) as u64;
+            // SAFETY: the range is slot `slot`'s own `vocabulary` i32 of the count table, and the
+            // table outlives the stream's work on it (the runner owns both).
+            unsafe {
+                platform::memset_d32(self.counts.ptr.address() + offset, 0, width, stream)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Writes each install's slot row of the bias table, on `stream`, before the step that reads
     /// it.
     ///

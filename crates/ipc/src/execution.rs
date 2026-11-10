@@ -786,6 +786,11 @@ pub struct BatchColumns {
     /// The logit adjustments the sampler applies before penalties, temperature and filtering:
     /// the slots' logit bias and allowed sets, and each row's banned tokens.
     pub adjustments: LogitAdjustments,
+    /// The request slots this batch starts a request's sampling state on, strictly increasing:
+    /// the batch carrying a request's first token call on a worker names its slot, and the worker
+    /// clears the slot's penalty counts before the batch samples, so a request's penalties count
+    /// its own tokens and never those of the slot's previous request.
+    pub fresh_slots: Vec<u32>,
 }
 
 /// One vision encoding of a batch: the image a call reads and the feature product it writes.
@@ -1219,6 +1224,11 @@ impl BatchColumns {
                     install.slot
                 )));
             }
+        }
+        if !increasing(&self.fresh_slots) {
+            return Err(ValidationError::message(
+                "the batch's fresh slots are not strictly increasing",
+            ));
         }
         if !adjustments.banned.iter().all(|tokens| increasing(tokens)) {
             return Err(ValidationError::message(

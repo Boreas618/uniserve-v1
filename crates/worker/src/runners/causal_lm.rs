@@ -74,6 +74,8 @@ pub struct Staging {
     draws: Vec<ipc::philox::DrawAddress>,
     /// The batch's logit adjustments, encoded as the sampler reads them.
     adjustments: Adjustments,
+    /// The request slots whose penalty counts the batch clears before it samples.
+    fresh_slots: Vec<u32>,
     commit: Vec<i64>,
     page_size: u32,
     max_kv_len: u32,
@@ -113,6 +115,7 @@ impl Staging {
             vec![0.0; largest.rows as usize * proto::program::sampler::PARAMETER_COLUMNS as usize];
         self.draws = vec![ipc::philox::DrawAddress::default(); largest.rows as usize];
         self.adjustments.reserve(largest.rows as usize, vocabulary);
+        self.fresh_slots = Vec::with_capacity(largest.rows as usize);
         // The commit table's height is ops' business; `reserve` leaves it empty and `stage` sizes
         // it to whatever the mechanism wrote, which `check` has already validated.
         self.commit = Vec::new();
@@ -226,6 +229,8 @@ impl Staging {
         self.draws[..rows].copy_from_slice(&columns.draws);
         self.adjustments
             .stage(&columns.adjustments, rows, bucket_rows)?;
+        self.fresh_slots.clear();
+        self.fresh_slots.extend_from_slice(&columns.fresh_slots);
         for index in rows..bucket_rows {
             self.slots[index] = -1;
             self.draws[index] = ipc::philox::DrawAddress::default();
@@ -388,6 +393,11 @@ impl Staging {
     /// The staged batch's logit adjustments.
     pub fn adjustments(&self) -> &Adjustments {
         &self.adjustments
+    }
+
+    /// The request slots the staged batch starts a request's sampling state on.
+    pub fn fresh_slots(&self) -> &[u32] {
+        &self.fresh_slots
     }
 
     /// `ops::commit`'s column table of the staged rows.
@@ -1899,6 +1909,10 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
                 // stages and uploads it, so a replay that skipped the upload would serve the pose
                 // the bucket was captured with.
                 self.upload(*bucket)?;
+                // The slots this batch starts requests on, and the bias rows it installs, before
+                // the replay that reads them. Only a served step starts a slot: a paired forward
+                // of the same staging keeps the slots' state as the replay left it.
+                self.start_slots(&stream)?;
                 // A row that resumes from a cached prefix continues from the checkpoint its prefix
                 // ends at: the page's state is in the slot's live banks before the graph reads them.
                 self.copy_state(*generation, ipc::execution::StateDirection::Restore)?;
@@ -2694,6 +2708,23 @@ impl<M: TextModel> CausalLmRunner<M> {
         Ok(())
     }
 
+    /// Starts the staged batch's requests' sampling state on their slots, on `stream`, before the
+    /// step that samples them: a fresh slot's penalty counts are cleared - the slot's previous
+    /// request committed its own tokens there - and the batch's bias rows are installed. Both are
+    /// stream-ordered device writes, so nothing waits for them.
+    fn start_slots(&mut self, stream: &platform::Stream) -> Result<()> {
+        let fresh = self.staging.fresh_slots();
+        let installs = self.staging.adjustments().installs();
+        if fresh.is_empty() && installs.is_empty() {
+            return Ok(());
+        }
+        let sampling = self.sampling.as_mut().ok_or(Error::State(
+            "a batch starts sampling state in a runner that samples nothing",
+        ))?;
+        sampling.clear_counts(fresh, stream)?;
+        sampling.install(installs, stream)
+    }
+
     /// Uploads the staged batch into the device columns the captured graphs address.
     ///
     /// Every column is copied into a buffer allocated when the runner bound, sized for the largest
@@ -2787,16 +2818,6 @@ impl<M: TextModel> CausalLmRunner<M> {
             return Ok(());
         }
         let stream = self.stream.clone();
-        // The slot bias rows this batch installs, stream-ordered before the replay that reads them.
-        let installs = self.staging.adjustments().installs();
-        if !installs.is_empty() {
-            self.sampling
-                .as_mut()
-                .ok_or(Error::State(
-                    "a batch installs bias rows into a runner that samples nothing",
-                ))?
-                .install(installs, &stream)?;
-        }
         for column in self.columns.staged() {
             column.push(&stream)?;
         }
@@ -3370,6 +3391,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             // No row adjusts its logits: the shaper's adjustment operands are recorded all the
             // same, so the graph a serving batch with adjustments replays is this one.
             adjustments: ipc::execution::LogitAdjustments::default(),
+            fresh_slots: Vec::new(),
         };
         self.staging
             .stage(&columns, &warm_call_ids(bucket), &bucket.shape(), bucket)
@@ -3895,6 +3917,7 @@ mod tests {
             drafts: Vec::new(),
             vision: Vec::new(),
             adjustments: ipc::execution::LogitAdjustments::default(),
+            fresh_slots: Vec::new(),
         }
     }
 
@@ -3925,6 +3948,7 @@ mod tests {
             drafts: Vec::new(),
             vision: Vec::new(),
             adjustments: ipc::execution::LogitAdjustments::default(),
+            fresh_slots: Vec::new(),
         }
     }
 
@@ -4059,6 +4083,7 @@ mod tests {
             drafts: Vec::new(),
             vision: Vec::new(),
             adjustments: ipc::execution::LogitAdjustments::default(),
+            fresh_slots: Vec::new(),
         };
         columns.input_ids.truncate(count);
         staging.stage(

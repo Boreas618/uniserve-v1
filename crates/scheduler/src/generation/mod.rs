@@ -1037,12 +1037,14 @@ pub(crate) struct RequestState {
     /// reused prefix ends at (`batching::columns`). A preempted or migrated
     /// request is admitted again as a new state, so it restores again.
     pub(crate) state_resident: bool,
-    /// Whether the worker's bias table holds the request's row in its slot
-    /// (`batching::columns::adjusts_logits`): false until the request's first
-    /// token batch on a worker group installs it, and again after a hand-off
-    /// moves the request to the decode group. A preempted or migrated request
-    /// is admitted again as a new state, so it installs again.
-    pub(crate) bias_resident: bool,
+    /// Whether the worker's slot holds the request's sampling state: its
+    /// penalty counts started from zero and its bias row
+    /// (`batching::columns::adjusts_logits`). False until the request's first
+    /// token batch on a worker group clears the counts and installs the row,
+    /// and again after a hand-off moves the request to the decode group. A
+    /// preempted or migrated request is admitted again as a new state, so its
+    /// slot starts again.
+    pub(crate) sampling_resident: bool,
     /// Allocation serial of the request's cache units already declared to the
     /// workers: units allocated at or after it are fresh for the next
     /// dispatch (`CacheAllocation::allocated_units`).

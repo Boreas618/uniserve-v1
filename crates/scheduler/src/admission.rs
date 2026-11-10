@@ -273,7 +273,7 @@ impl Scheduler {
             finish_token_ids,
             allocations: None,
             state_resident: false,
-            bias_resident: false,
+            sampling_resident: false,
             request_epoch: self.next_request_epoch,
             last_state_call_id: CallId::default(),
             latest_token: None,
