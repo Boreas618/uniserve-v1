@@ -63,7 +63,7 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
     env.set_trim_blocks(true);
     env.set_lstrip_blocks(true);
 
-    env.add_template_owned("chat".to_owned(), template)?;
+    env.add_template_owned("chat".to_owned(), generation_blocks(&template))?;
 
     // Python string and dict methods (`startswith`, `items`, ...) resolve
     // through pycompat. `TemplateMap` defers every method call to this
@@ -73,6 +73,49 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
     env.add_filter("tojson", hf_tojson_filter);
 
     Ok(env)
+}
+
+/// `template` with Hugging Face's `{% generation %}` blocks as plain blocks.
+///
+/// Transformers renders chat templates with an `AssistantTracker` extension whose
+/// `{% generation %} … {% endgeneration %}` marks the assistant's spans for the
+/// training masks `return_assistant_tokens_mask` asks for, and renders its body
+/// unchanged (Qwen3.5 and Qwen3.6 templates use it). A render that asks for no
+/// mask is the body itself, so each tag becomes an `if true` block with the same
+/// delimiters, which keeps every whitespace-control marker the template states.
+fn generation_blocks(template: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{%") {
+        let (before, tag) = rest.split_at(start);
+        out.push_str(before);
+        let open = 2 + usize::from(tag[2..].starts_with(['-', '+']));
+        let body = &tag[open..];
+        let word = body.trim_start();
+        let gap = body.len() - word.len();
+        let replaced = [("endgeneration", "endif"), ("generation", "if true")]
+            .into_iter()
+            .find(|(name, _)| {
+                word.starts_with(name)
+                    && word[name.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|next| next.is_whitespace() || next == '-' || next == '%')
+            });
+        match replaced {
+            Some((name, block)) => {
+                out.push_str(&tag[..open + gap]);
+                out.push_str(block);
+                rest = &word[name.len()..];
+            }
+            None => {
+                out.push_str(&tag[..2]);
+                rest = &tag[2..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[serde_with::skip_serializing_none]
@@ -202,6 +245,24 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn a_generation_block_renders_its_body_with_its_whitespace_control() {
+        let template = "a\n{%- generation %}b{% endgeneration -%}\n c";
+        assert_eq!(
+            super::generation_blocks(template),
+            "a\n{%- if true %}b{% endif -%}\n c"
+        );
+        let env = super::build_environment(template.to_owned()).expect("a template");
+        let rendered = env
+            .get_template("chat")
+            .and_then(|chat| chat.render(minijinja::context! {}))
+            .expect("a render");
+        assert_eq!(rendered, "abc");
+        // A word that only begins with the tag's name is left alone.
+        let other = "{% set generations = 1 %}{{ generations }}";
+        assert_eq!(super::generation_blocks(other), other);
+    }
 
     #[test]
     fn test_chat_template_state_valid_template() {
