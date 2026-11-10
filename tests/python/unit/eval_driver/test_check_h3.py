@@ -308,7 +308,9 @@ def test_each_cell_writes_its_mp4s_to_a_fixed_directory(
     """Every cell names the fixed MP4 directory a person watches."""
     cell = _CELLS[name]
     media_dir = config.benchmarks[name].video.media_dir
-    assert media_dir == f"artifacts/minimax_h3/check/{cell.directory}"
+    assert media_dir == str(
+        config.root / f"artifacts/minimax_h3/check/{cell.directory}"
+    )
     # The point's bundle goes to the profile's fixed artifact root.
     assert config.artifact_root == config.root / _ARTIFACT_ROOT
 
@@ -322,7 +324,7 @@ def test_each_cell_measures_one_request_at_a_time(config, name: str) -> None:
     assert point.load.request_rate == float("inf")
     assert (config.root / point.dataset_path).is_file()
     assert point.dataset_path.startswith(
-        "uniserve_eval/workloads/minimax_h3/check-"
+        str(config.root / "uniserve_eval/workloads/minimax_h3/check-")
     )
 
 

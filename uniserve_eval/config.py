@@ -13,6 +13,14 @@ benchmark that depend on its task and dataset.
 
 String values in server and benchmark tables may reference the process
 environment as `${NAME}` or `${NAME:-default}`; see `expand_environment`.
+
+Every path a profile states is relative to its `root` unless absolute: the
+server executable and `--worker-executable` (`server_launch`), the artifact
+root, and a benchmark's `dataset_path`, `load.warmup_manifest`,
+`load.priming_manifest`, `video.media_dir` and `video.reference_root`
+(`_resolve_paths`). The loaded `BenchmarkPoint` carries them as absolute
+paths, so the driver reads and writes the same files from any working
+directory.
 """
 
 from __future__ import annotations
@@ -221,7 +229,7 @@ def load_config(path: Path = DEFAULT_CONFIG) -> EvaluationConfig:
         for name, value in _table(raw, "servers").items()
     }
     benchmarks = {
-        name: _benchmark_point(name, value, servers)
+        name: _benchmark_point(name, value, servers, root)
         for name, value in _table(raw, "benchmarks").items()
     }
     suites = {
@@ -479,12 +487,18 @@ def _benchmark_point(
     name: str,
     raw: Any,
     servers: dict[str, ServerProfile],
+    root: Path,
 ) -> BenchmarkPoint:
-    """Validate and construct one task-aware benchmark point."""
+    """Validate and construct one task-aware benchmark point.
+
+    `root` is the profile's `EvaluationConfig.root`, which the point's
+    relative paths are resolved against (`_resolve_paths`).
+    """
     # Resolve the benchmark's named server, task, dataset adapter, and model
     # before interpreting task-specific configuration tables.
     value = expand_environment(_mapping(raw, f"benchmarks.{name}"))
     _reject_unknown(value, _ROOT_FIELDS, f"benchmarks.{name}")
+    value = _resolve_paths(value, root, f"benchmarks.{name}")
     server = value.get("server")
     if not isinstance(server, str) or server not in servers:
         raise ValueError(
@@ -549,6 +563,67 @@ def _benchmark_point(
             value.get("provenance", {}), f"benchmarks.{name}.provenance"
         ),
     )
+
+
+# The path-valued fields of a benchmark table, by the nested table that holds
+# them (`None` for the benchmark table itself).
+_PATH_FIELDS: dict[str | None, tuple[str, ...]] = {
+    None: ("dataset_path",),
+    "load": ("warmup_manifest", "priming_manifest"),
+    "video": ("media_dir", "reference_root"),
+}
+
+
+def _resolve_paths(
+    value: dict[str, Any], root: Path, context: str
+) -> dict[str, Any]:
+    """Return a benchmark table whose path fields are absolute.
+
+    A relative path in one of `_PATH_FIELDS` is joined to `root`. An empty
+    string stays empty, since it states that the field is unset (as
+    `${NAME:-}` does for an unset variable), and a value that still holds an
+    unresolved `${NAME}` stays as written, so `plan` shows it and a run
+    rejects it (`require_resolved`).
+
+    `tokenizer` names a Hub repository or a local directory, which
+    `transformers` tells apart by whether the directory exists. A relative
+    `tokenizer` is resolved against `root` under that same rule: it becomes
+    the absolute directory when `root` holds it, and stays a repository ID
+    otherwise.
+
+    Nested tables are copied before they are changed, so the parsed TOML
+    document is left as it was.
+    """
+    value = dict(value)
+    for table, fields in _PATH_FIELDS.items():
+        if table is None:
+            target = value
+        elif table in value:
+            target = _mapping(value[table], f"{context}.{table}")
+            value[table] = target
+        else:
+            continue
+        for field_name in fields:
+            path = target.get(field_name)
+            if isinstance(path, str) and path:
+                target[field_name] = _rooted(path, root)
+
+    tokenizer = value.get("tokenizer")
+    if (
+        isinstance(tokenizer, str)
+        and tokenizer
+        and not Path(tokenizer).is_absolute()
+        and (root / tokenizer).is_dir()
+    ):
+        value["tokenizer"] = str(root / tokenizer)
+    return value
+
+
+def _rooted(path: str, root: Path) -> str:
+    """Return `path` joined to `root` unless it is absolute or unresolved."""
+    if unresolved_environment(path) or Path(path).is_absolute():
+        return path
+    return str(root / path)
 
 
 def _metrics(raw: Any, context: str) -> tuple[MetricDefinition, ...]:

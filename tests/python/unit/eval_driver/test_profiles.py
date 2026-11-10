@@ -10,6 +10,7 @@ import pytest
 
 import uniserve_eval
 from uniserve_eval.config import load_config
+from uniserve_eval.datasets import load_examples
 
 pytestmark = pytest.mark.unit
 
@@ -254,3 +255,101 @@ def test_server_sampling_rejects_a_token_control(tmp_path: Path) -> None:
         ValueError, match="token-sampling controls: temperature"
     ):
         load_config(profile)
+
+
+def test_relative_paths_resolve_against_the_profile_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A profile's relative paths name files under its root, not the cwd."""
+    tree = tmp_path / "tree"
+    (tree / "profiles").mkdir(parents=True)
+    (tree / "workloads").mkdir()
+    (tree / "workloads" / "rows.jsonl").write_text(
+        '{"id": "measured", "prompt": "hello"}\n', encoding="utf-8"
+    )
+    (tree / "workloads" / "warmup.jsonl").write_text(
+        '{"id": "warmup", "prompt": "warm"}\n', encoding="utf-8"
+    )
+    profile = tree / "profiles" / "profile.toml"
+    profile.write_text(
+        """
+root = ".."
+
+[servers.local]
+port = 8000
+command = ["server"]
+
+[benchmarks.point]
+server = "local"
+task = "text"
+model = "model"
+dataset = "jsonl"
+dataset_path = "workloads/rows.jsonl"
+
+[benchmarks.point.load]
+num_prompts = 1
+warmup_manifest = "workloads/warmup.jsonl"
+
+[benchmarks.point.metrics]
+output_throughput = "higher"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    # The driver runs from a directory that holds none of the files.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    point = load_config(profile).benchmarks["point"]
+
+    rows, _ = load_examples(point)
+    assert [row.id for row in rows] == ["measured"]
+    assert point.load.warmup_manifest == str(tree / "workloads/warmup.jsonl")
+
+
+def test_an_unset_path_and_an_unresolved_reference_stay_as_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a stated, resolved relative path is joined to the root."""
+    monkeypatch.delenv("UNISERVE_TEST_UNSET_DATASET", raising=False)
+    profile = tmp_path / "profile.toml"
+    profile.write_text(
+        """
+[servers.local]
+port = 8000
+command = ["server"]
+
+[benchmarks.unset]
+server = "local"
+task = "text"
+model = "model"
+dataset = "sharegpt"
+tokenizer = "org/tokenizer"
+dataset_path = "${UNISERVE_TEST_UNSET_DATASET:-}"
+
+[benchmarks.unset.metrics]
+output_throughput = "higher"
+
+[benchmarks.unresolved]
+server = "local"
+task = "text"
+model = "model"
+dataset = "jsonl"
+dataset_path = "${UNISERVE_TEST_UNSET_DATASET}/rows.jsonl"
+
+[benchmarks.unresolved.metrics]
+output_throughput = "higher"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(profile)
+
+    assert config.benchmarks["unset"].dataset_path == ""
+    # A tokenizer the root does not hold is a Hub repository ID.
+    assert config.benchmarks["unset"].tokenizer == "org/tokenizer"
+    assert config.benchmarks["unresolved"].dataset_path == (
+        "${UNISERVE_TEST_UNSET_DATASET}/rows.jsonl"
+    )
