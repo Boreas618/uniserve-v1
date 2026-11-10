@@ -83,23 +83,24 @@ def declared_bound():
 
 def check_call_structure():
     """The call structure this script packs is the one ``include/uniserve_frame_moments.h`` asserts."""
-    if ctypes.sizeof(Call) != 88 + MESSAGE:
+    if ctypes.sizeof(Call) != 96 + MESSAGE:
         raise SystemExit(
-            f"Call is {ctypes.sizeof(Call)} bytes, the header asserts {88 + MESSAGE}"
+            f"Call is {ctypes.sizeof(Call)} bytes, the header asserts {96 + MESSAGE}"
         )
     for name, offset in (
         ("values", 0),
-        ("epsilon", 64),
-        ("mean", 72),
-        ("rstd", 80),
-        ("error", 88),
+        ("values_pixel", 32),
+        ("epsilon", 72),
+        ("mean", 80),
+        ("rstd", 88),
+        ("error", 96),
     ):
         if getattr(Call, name).offset != offset:
             raise SystemExit(
                 f"Call.{name} is at {getattr(Call, name).offset}, expected {offset}"
             )
     print(
-        f"call structure: {88 + MESSAGE} bytes, epsilon at 64, error at 88 — as the header asserts"
+        f"call structure: {96 + MESSAGE} bytes, epsilon at 72, error at 96 — as the header asserts"
     )
 
 
