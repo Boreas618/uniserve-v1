@@ -184,7 +184,8 @@ pub struct SchedulerHandle {
     /// built over a simulated worker has none; the shadow pass and the
     /// in-process submission both need it.
     batches: Option<Arc<dyn Batches>>,
-    /// Request ids, shared with the warm-up's view of this scheduler.
+    /// The ids the serving path's warm-up numbers its requests with, shared with its view of
+    /// this scheduler ([`WARMUP_REQUEST_IDS`] on).
     next_id: Arc<AtomicU64>,
     /// The launch the serving path's warm-up states its requests from, until
     /// its owner starts it ([`Self::warm_serving_path`]); `None` once started,
@@ -197,6 +198,14 @@ pub struct SchedulerHandle {
     generation: Arc<std::sync::atomic::AtomicU64>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
+
+/// The first id of the serving path's warm-up requests: the top half of the id space.
+///
+/// The daemon numbers its clients' requests from 1 up, a front or a restarted daemon taking the next
+/// 2^32 ids, so its requests never reach these; a warm-up request still in flight (its first
+/// cross-host copy waits for the hosts' transfer agents to start) and a client's first request are
+/// two requests of one scheduler and take two ids.
+pub(crate) const WARMUP_REQUEST_IDS: u64 = 1 << 63;
 
 impl SchedulerHandle {
     /// [`Self::over_batches_telling`] with nothing told of a step's progress.
@@ -491,7 +500,7 @@ impl SchedulerHandle {
             failure,
             trial,
             batches: None,
-            next_id: Arc::new(AtomicU64::new(1)),
+            next_id: Arc::new(AtomicU64::new(WARMUP_REQUEST_IDS)),
             serving_warmup: Mutex::new(None),
             generation,
             thread: Mutex::new(Some(thread)),

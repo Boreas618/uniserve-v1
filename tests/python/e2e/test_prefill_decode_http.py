@@ -93,6 +93,8 @@ OPTIONS = (
 
 # The scheduler's line for a hand-off that completed.
 HANDED_OFF = "handed a request's KV cache to its decode group"
+# The first request id of the scheduler's warm-up requests; clients' are lower.
+WARMUP_IDS = 1 << 63
 
 
 def _checkpoint() -> str:
@@ -170,14 +172,18 @@ def _greedy(base_url: str, prompt: str) -> list[str]:
 
 
 def _hand_offs(log: Path) -> list[int]:
-    """The microseconds of every hand-off the server log reports."""
+    """The microseconds of every hand-off of a client's request the server
+    log reports, in order; the serving path's warm-up requests, which may end
+    after the server answers its health, take ids from ``WARMUP_IDS`` on.
+    """  # noqa: D205
     colors = re.compile(r"\x1b\[[0-9;]*m")
-    micros = re.compile(r"micros=(\d+)")
+    fields = re.compile(r"request=(\d+).*micros=(\d+)")
     return [
-        int(found.group(1))
+        int(found.group(2))
         for line in log.read_text(errors="replace").splitlines()
         if HANDED_OFF in line
-        and (found := micros.search(colors.sub("", line))) is not None
+        and (found := fields.search(colors.sub("", line))) is not None
+        and int(found.group(1)) < WARMUP_IDS
     ]
 
 
@@ -241,9 +247,8 @@ def test_a_prefill_group_hands_requests_to_a_decode_group_on_one_host(
             },
         ),
     ):
-        before = len(_hand_offs(log))
         tokens = [_greedy(base_url, prompt) for prompt in PROMPTS]
-        micros = _hand_offs(log)[before:]
+        micros = _hand_offs(log)
 
     assert tokens == reference
     # Every request prefilled on the prefill group decoded on the decode
@@ -304,9 +309,8 @@ def test_a_prefill_group_hands_requests_to_a_decode_group_on_another_host(
             },
         ),
     ):
-        before = len(_hand_offs(log))
         tokens = [_greedy(base_url, prompt) for prompt in PROMPTS]
-        micros = _hand_offs(log)[before:]
+        micros = _hand_offs(log)
 
     assert tokens == reference
     assert len(micros) == len(PROMPTS), micros

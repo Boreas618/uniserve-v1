@@ -83,8 +83,8 @@ impl Warm {
         self.generation_limits.clone()
     }
 
-    /// A request id of this scheduler's, so warm-up requests are numbered with
-    /// a client's.
+    /// A request id no client request takes: the warm-up's requests may still run when the
+    /// first client requests arrive, and one id names one request of the scheduler.
     fn next_request_id(&self) -> ipc::RequestId {
         ipc::RequestId(
             self.next_id
