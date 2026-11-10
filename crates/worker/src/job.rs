@@ -170,12 +170,17 @@ impl Command {
     }
 }
 
+/// The command in hand: the one record of in-flight work a device keeps, which the watchdog, the
+/// stall report and a failed submission all read (2.4).
 struct Current {
     /// The job in hand: a landing clears the watchdog's view only of its own job.
     job: JobId,
-    submission: Option<SubmissionId>,
     batch: Option<ipc::execution::BatchId>,
     started: std::time::Instant,
+    /// What the job in hand is doing - its bucket, generation and operator - once the device thread
+    /// stated it: the thread that is stuck cannot say what it is stuck in, and a failure crosses
+    /// the thread boundary as a bare error.
+    activity: Option<String>,
 }
 
 struct State {
@@ -317,9 +322,9 @@ impl JobQueue {
             if let Some(entry) = state.pending.pop_front() {
                 state.current = Some(Current {
                     job: entry.id,
-                    submission: entry.submission_id,
                     batch: entry.batch,
                     started: std::time::Instant::now(),
+                    activity: None,
                 });
                 return Some(entry);
             }
@@ -347,9 +352,9 @@ impl JobQueue {
         let entry = state.pending.pop_front()?;
         state.current = Some(Current {
             job: entry.id,
-            submission: entry.submission_id,
             batch: entry.batch,
             started: std::time::Instant::now(),
+            activity: None,
         });
         Some(entry)
     }
@@ -376,9 +381,9 @@ impl JobQueue {
         let entry = state.pending.remove(index)?;
         state.current = Some(Current {
             job: entry.id,
-            submission: entry.submission_id,
             batch: entry.batch,
             started: std::time::Instant::now(),
+            activity: None,
         });
         Some(entry)
     }
@@ -443,25 +448,42 @@ impl JobQueue {
     /// Whether a command is being performed now; a test-side probe of the watchdog's source.
     #[cfg(test)]
     fn watchdog_is_running(&self) -> bool {
-        !self.in_flight().is_empty()
+        self.running(0).is_some()
     }
 
     /// What the control thread's watchdog reads (2.4): the command in flight, if any.
-    pub(crate) fn in_flight(&self) -> Vec<crate::device::Watch> {
-        let state = lock(&self.state);
-        state
+    pub(crate) fn running(&self, rank: usize) -> Option<crate::watchdog::Running> {
+        lock(&self.state)
             .current
             .as_ref()
-            .map(|current| {
-                vec![crate::device::Watch {
-                    submission: current.submission,
-                    job: current.job,
-                    batch: current.batch,
-                    started: current.started,
-                    elapsed: current.started.elapsed(),
-                }]
+            .map(|current| crate::watchdog::Running {
+                rank,
+                batch: current.batch.map(|batch| batch.0),
+                since: current.started,
             })
-            .unwrap_or_default()
+    }
+
+    /// States what the command in hand is doing; nothing when no command is in hand.
+    pub(crate) fn note_activity(&self, activity: String) {
+        if let Some(current) = lock(&self.state).current.as_mut() {
+            current.activity = Some(activity);
+        }
+    }
+
+    /// What the command in hand is doing, once the device thread stated it.
+    pub(crate) fn performing(&self) -> Option<String> {
+        lock(&self.state)
+            .current
+            .as_ref()
+            .and_then(|current| current.activity.clone())
+    }
+
+    /// Takes what the command in hand stated it was doing, for the report of how it ended.
+    pub(crate) fn take_activity(&self) -> Option<String> {
+        lock(&self.state)
+            .current
+            .as_mut()
+            .and_then(|current| current.activity.take())
     }
 
     /// Queues a join of `runner`, answered to nobody: the rank that opened the step waits for this
@@ -623,7 +645,7 @@ mod tests {
 
         queue.complete(entry, Ok(ipc::execution::BatchOutput::default()), None);
         assert!(matches!(submission.outcome(), Some(Outcome::Success(_))));
-        assert!(queue.in_flight().is_empty());
+        assert!(queue.running(0).is_none());
     }
 
     /// The watchdog reads the batch a job serves, and a replay landing while the next one is in
@@ -653,11 +675,12 @@ mod tests {
         let landing = queue.next(Some(Duration::from_millis(10))).expect("first");
         let in_hand = queue.next(Some(Duration::from_millis(10))).expect("second");
         queue.complete(landing, Ok(ipc::execution::BatchOutput::default()), None);
-        let watched = queue.in_flight();
-        assert_eq!(watched.len(), 1, "the second replay is still watched");
-        assert_eq!(watched[0].batch, Some(ipc::execution::BatchId(2)));
+        let watched = queue
+            .running(0)
+            .expect("the second replay is still watched");
+        assert_eq!(watched.batch, Some(2));
         queue.complete(in_hand, Ok(ipc::execution::BatchOutput::default()), None);
-        assert!(queue.in_flight().is_empty());
+        assert!(queue.running(0).is_none());
     }
 
     /// Commands run in submission order, and a failed command fails its submission.

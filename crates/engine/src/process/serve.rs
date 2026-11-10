@@ -237,15 +237,7 @@ impl MainProcess {
         self.workers
             .iter()
             .enumerate()
-            .filter_map(|(rank, worker)| {
-                let reading = worker.watchdog();
-                let watch = reading.longest()?;
-                Some(Running {
-                    rank,
-                    batch: watch.batch.map(|batch| batch.0),
-                    since: watch.started,
-                })
-            })
+            .filter_map(|(rank, worker)| worker.running(rank))
             .collect()
     }
 

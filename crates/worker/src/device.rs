@@ -25,7 +25,7 @@ use crate::batch::Job;
 use crate::job::{Command, JobQueue, jobs_of, phase_of};
 use crate::plan::Bucket;
 use crate::runner::{NamedRunner, RunnerId};
-use crate::stream::events::{DRAIN_LIMIT, EventPool, JobId, drain_event};
+use crate::stream::events::{DRAIN_LIMIT, EventPool, drain_event};
 use crate::{Error, Result};
 use ipc::execution::{Batch, BatchOutput, Submission, SubmissionId};
 
@@ -35,8 +35,6 @@ pub struct Worker {
     /// The phases this device's runners serve, recorded here because the runners themselves live
     /// on the device thread and a router above the workers has to choose one without asking it.
     phases: Vec<ipc::PhaseId>,
-    /// What the device thread is performing, and `None` between commands (2.4).
-    activity: Arc<std::sync::Mutex<Option<String>>>,
     /// The media computations this device's runners plan to capture, recorded here for the same
     /// reason: the mechanism asks whether a media computation is served before it forms the batch,
     /// and that answer cannot be a round trip to the device thread (2.4).
@@ -255,10 +253,6 @@ impl Worker {
             }
         }
         let counters = Arc::new(SharedCounters::default());
-        // What the device thread is performing, read by whoever reports a stall from another thread
-        // (2.4): the thread that is stuck cannot say it, and a stall line naming the stage alone
-        // says nothing about which job never answered.
-        let activity: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
         let uncompared = Arc::new(std::sync::Mutex::new(Vec::new()));
         let storage = Arc::new(std::sync::Mutex::new(None));
         let phases: Vec<ipc::PhaseId> = runners
@@ -326,7 +320,6 @@ impl Worker {
             counters: Arc::clone(&counters),
             storage: Arc::clone(&storage),
             shadow_attached: false,
-            activity: Arc::clone(&activity),
             sticky: None,
             waits: true,
             pending_landing: None,
@@ -349,7 +342,6 @@ impl Worker {
             phases,
             media,
             recorded,
-            activity,
             queue,
             thread: Some(thread),
             pools,
@@ -395,10 +387,7 @@ impl Worker {
     /// Read by whoever reports a stall: the thread that is stuck cannot say what it is stuck in, and
     /// a stall line that names only the stage says nothing about which job never answered.
     pub fn performing(&self) -> Option<String> {
-        self.activity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.queue.performing()
     }
 
     /// How many graph captures are open in this process on any stream.
@@ -687,11 +676,10 @@ impl Worker {
         self.counters.read()
     }
 
-    /// What the control thread's watchdog reads: the command in flight and how long it took (2.4).
-    pub fn watchdog(&self) -> Watchdog {
-        Watchdog {
-            jobs: self.queue.in_flight(),
-        }
+    /// What the control thread's watchdog reads of this device, the `rank`-th of its process: the
+    /// command in flight and since when, or `None` between commands (2.4).
+    pub fn running(&self, rank: usize) -> Option<crate::watchdog::Running> {
+        self.queue.running(rank)
     }
 
     /// Probes this device's context for a sticky error, which the control thread does once a
@@ -723,35 +711,6 @@ impl std::fmt::Debug for Worker {
             .debug_struct("Worker")
             .field("device", &self.device)
             .finish_non_exhaustive()
-    }
-}
-
-/// One command in flight, as the control thread's stall rule reads it (2.4).
-#[derive(Clone, Debug)]
-pub struct Watch {
-    /// The submission whose command is in flight, when the command belongs to one.
-    pub submission: Option<SubmissionId>,
-    /// The command's number.
-    pub job: JobId,
-    /// The batch it serves, when it serves one.
-    pub batch: Option<ipc::execution::BatchId>,
-    /// When the device thread began it.
-    pub started: std::time::Instant,
-    /// How long it has been in flight at the reading.
-    pub elapsed: Duration,
-}
-
-/// The watchdog's reading: the commands in flight on one device.
-#[derive(Clone, Debug, Default)]
-pub struct Watchdog {
-    /// The commands in flight, in submission order (at most one).
-    pub jobs: Vec<Watch>,
-}
-
-impl Watchdog {
-    /// The command in flight longest, which the stall rule names when it fires.
-    pub fn longest(&self) -> Option<&Watch> {
-        self.jobs.iter().max_by_key(|watch| watch.elapsed)
     }
 }
 
@@ -833,10 +792,6 @@ struct Device {
     counters: Arc<SharedCounters>,
     /// Whether this device's runners hold a shadow harness, so `SetShadow` is sent once (7.3).
     shadow_attached: bool,
-    /// What the job in hand is doing, for the report of a failed submission and for a stall report
-    /// read from another thread. The device thread is the only place that knows it, and a failure
-    /// crosses the thread boundary as a bare error.
-    activity: Arc<std::sync::Mutex<Option<String>>>,
     /// The context's first sticky error, once one has been seen (2.4).
     ///
     /// A sticky error is not recoverable: every launch after it fails, so the worker issues
@@ -947,11 +902,7 @@ impl Device {
             // taken when a command completes, so a string read before the command is the one the
             // previous command left - empty. Reading it before the command therefore wrapped no
             // fault at all, and every device failure in a run named only its batch number.
-            let detail = self
-                .activity
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
+            let detail = queue.take_activity();
             // The work in flight is this thread's knowledge alone and is gone once the command ends:
             // it travels inside the failure, so every report of it - the device's line, the
             // submission's outcome, the main process's reason - names the bucket, the rows, the
@@ -1461,11 +1412,8 @@ impl Device {
                 .ok_or_else(|| Error::Invariant("a serving job names no runner".into()))?;
             // The job in hand names the bucket, generation and operator a failure is about; the
             // command's label says which submission was running it.
-            *self
-                .activity
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some(format!("{label}, {}", job.describe()));
+            self.queue
+                .note_activity(format!("{label}, {}", job.describe()));
             // A capture is minutes of device work with no batch to show for it, and the warmup is
             // one capture per bucket in a row: the started line is what names the bucket a warmup
             // is stuck in, because a started line with no finished one is the only shape a hang

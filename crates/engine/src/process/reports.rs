@@ -171,7 +171,7 @@ impl MainProcess {
             device_ns += counters.device_ns;
             queue.push(proto::request::wire::QueueDepth {
                 rank: rank as u32,
-                depth: worker.watchdog().jobs.len() as u32,
+                depth: u32::from(worker.running(0).is_some()),
             });
             // One allocator books the device's three pools (`arena::DeviceMemory`), so the three
             // figures sum against one budget and item 5's invariant is reported as it is decided.
