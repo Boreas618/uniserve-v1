@@ -32,6 +32,9 @@ Operators, in the order the data meets them:
   `log_softmax` produced, and its competition rank: one plus the entries strictly above it,
   ties sharing a rank. Values move and ranks count, so the comparison is exact; a negative
   token scores nothing, with rank zero.
+- `top_logprobs` — a row's few most likely entries in two launches, each chunk's then the row's
+  among the chunks' (read with their ids), sorted descending with ties by ascending id. A
+  selection, so exact; the ties and a row narrower than its candidates are the cases it turns on.
 - `top_k` — the `width` largest logits of a row, sorted descending, with their vocabulary
   ids; a tie keeps the **lower vocabulary id first**. A selection, so exact, and the case it
   turns on is the tie: a radix select that breaks ties by arrival order passes every row
@@ -47,7 +50,7 @@ A `bf16` run under Triton's interpreter truncates its reference the way the inte
 truncates narrow stores: the value's own mantissa is truncated with no narrower type in
 between, because rounding to `f32` first can carry a value across a `bf16` boundary.
 
-**Two of the eight are device-only, for two different tool gaps, and the script says so instead
+**Two of the nine are device-only, for two different tool gaps, and the script says so instead
 of reporting a pass it did not observe.**
 
 - `logits_shape` rounds with `libdevice.div_rn`, `mul_rn` and `sub_rn`. The interpreter does
@@ -90,6 +93,7 @@ SIBLINGS = (
     "argmax",
     "logprob_gather",
     "top_k",
+    "top_logprobs",
 )
 
 for _sibling in SIBLINGS:
@@ -121,6 +125,7 @@ OPERATORS = (
     "argmax",
     "logprob_gather",
     "top_k",
+    "top_logprobs",
 )
 
 
@@ -693,6 +698,69 @@ def run_logprob_gather(case):
     return failures
 
 
+def run_top_logprobs(case):
+    """Keep a row's few largest entries in two launches and compare them exactly."""
+    import top_logprobs as kernels
+
+    generator = torch.Generator().manual_seed(case["seed"])
+    rows, width, candidates, tile = case["rows"], case["width"], case["candidates"], case["tile"]
+    values = -torch.rand(rows, width, generator=generator).float() * 8
+    if case["ties"]:
+        # Equal values in two chunks and inside one: the lower ids come first.
+        values[0, [3, 1, tile + 2, 2 * tile - 1]] = 0.0
+    chunks = -(-width // tile)
+    chunk_values = torch.full((rows, chunks * candidates), float("nan"), dtype=torch.float32)
+    chunk_ids = torch.full((rows, chunks * candidates), -7, dtype=torch.int32)
+    launch(
+        kernels._top_logprobs_kernel,
+        (rows, chunks),
+        values,
+        chunk_ids,
+        chunk_values,
+        chunk_ids,
+        width,
+        chunks,
+        CANDIDATES=candidates,
+        TILE=tile,
+        INDIRECT=False,
+        PDL=False,
+    )
+    merged = chunks * candidates
+    merge_tile = 1 << (merged - 1).bit_length()
+    out_values = torch.full((rows, candidates), float("nan"), dtype=torch.float32)
+    out_ids = torch.full((rows, candidates), -7, dtype=torch.int32)
+    launch(
+        kernels._top_logprobs_kernel,
+        (rows, 1),
+        chunk_values,
+        chunk_ids,
+        out_values,
+        out_ids,
+        merged,
+        1,
+        CANDIDATES=candidates,
+        TILE=merge_tile,
+        INDIRECT=True,
+        PDL=False,
+    )
+    failures = 0
+    for row in range(rows):
+        order = torch.argsort(values[row].double(), descending=True, stable=True)
+        kept = min(candidates, width)
+        wanted_ids = order[:kept].to(torch.int32)
+        wanted_values = values[row][order][:kept]
+        failures += int((out_ids[row, :kept] != wanted_ids).sum())
+        failures += int((out_values[row, :kept] != wanted_values).sum())
+        # Past the row's entries a candidate is `-inf` with id `-1`.
+        failures += int((out_ids[row, kept:] != -1).sum())
+    print(
+        f"{'exact' if failures == 0 else 'FAIL'}: top_logprobs, {case['label']} — "
+        f"{rows} x {width} keeping {candidates} in chunks of {tile}"
+    )
+    print(f"  {failures} entries differ from the reference")
+    return failures
+
+
 def run_top_k(case):
     """Keep a row's largest values with their ids, sorted, and compare exactly."""
     import top_k as kernels
@@ -785,6 +853,7 @@ RUNNERS = {
     "inverse_cdf": run_inverse_cdf,
     "argmax": run_argmax,
     "logprob_gather": run_logprob_gather,
+    "top_logprobs": run_top_logprobs,
     "top_k": run_top_k,
 }
 
@@ -1054,6 +1123,36 @@ def cases(operator, flags):
                 "tile": TOP_K_TILE,
             },
         ]
+    if operator == "top_logprobs":
+        return [
+            {
+                "label": "the vocabulary row, the deployment's twenty",
+                "rows": 3,
+                "width": flags.columns,
+                "candidates": 20,
+                "tile": 4096,
+                "ties": False,
+                "seed": 1,
+            },
+            {
+                "label": "tied entries across and within chunks",
+                "rows": 2,
+                "width": 300,
+                "candidates": 5,
+                "tile": 128,
+                "ties": True,
+                "seed": 2,
+            },
+            {
+                "label": "a row narrower than its candidates",
+                "rows": 2,
+                "width": 3,
+                "candidates": 5,
+                "tile": 4,
+                "ties": False,
+                "seed": 3,
+            },
+        ]
     if operator == "logprob_gather":
         return [
             {
@@ -1216,6 +1315,8 @@ def descriptor_key(operator, flags):
         return f"columns_{flags.columns}_ids_i32_tile_{min(flags.columns, 4096)}_pdl_{pdl}"
     if operator == "top_k":
         return f"dtype_{flags.dtype}_tile_{TOP_K_TILE}_ids_i32_pdl_{pdl}"
+    if operator == "top_logprobs":
+        return f"candidates_20_tile_4096_indirect_false_pdl_{pdl}"
     return (
         f"dtype_{flags.dtype}_vocabulary_{flags.vocabulary}_block_{flags.block}"
         f"_extras_{flags.extras}_divide_{flags.divide}_pdl_{pdl}"

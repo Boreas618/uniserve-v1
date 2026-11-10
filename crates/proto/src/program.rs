@@ -181,6 +181,7 @@ pub mod operator {
     pub const ARGMAX: &str = "argmax";
     pub const LOG_SOFTMAX: &str = "log_softmax";
     pub const LOGPROB_GATHER: &str = "logprob_gather";
+    pub const TOP_LOGPROBS: &str = "top_logprobs";
     pub const VSA_ZERO_PADDING: &str = "vsa_zero_padding";
     pub const VSA_ADD_GATED_TILES: &str = "vsa_add_gated_tiles";
     pub const VSA_COMPOSE_GATED_ROWS: &str = "vsa_compose_gated_rows";
@@ -272,6 +273,7 @@ pub mod operator {
         ARGMAX,
         LOG_SOFTMAX,
         LOGPROB_GATHER,
+        TOP_LOGPROBS,
         VSA_ZERO_PADDING,
         VSA_ADD_GATED_TILES,
         VSA_COMPOSE_GATED_ROWS,

@@ -18,7 +18,7 @@
 //! ordered values                   → softmax        → probabilities [rows, width] f32
 //! probabilities + draws            → inverse_cdf    → tokens [rows]
 //! logprobs + tokens                → logprob_gather → logp [rows] f32, rank [rows] i32  (when asked)
-//! logprobs                         → top_k          → top [rows, n] f32, ids [rows, n]  (n > 0)
+//! logprobs                         → top_logprobs ×2 → top [rows, n] f32, ids [rows, n] (n > 0)
 //! ```
 //!
 //! The reported log-probabilities are the raw distribution's: `log_softmax` of the model's logits
@@ -89,13 +89,21 @@ const CANDIDATE_TILE: u32 = 8192;
 /// and the kept count are launch scalars. Smaller than the candidate tile because an ordering pass
 /// holds two planes and a nibble's ranks at once.
 const TOP_TILE: u32 = 2048;
+/// The lanes one program of the candidates' first selection reads (`ops::sampler::TopLogprobs`): a
+/// vocabulary-wide row is selected in this many lanes' chunks in parallel, and the chunks'
+/// candidates in one more launch.
+const LOGPROB_TILE: u32 = 4096;
+/// The widest row one `top_logprobs` program selects from, which bounds the chunks' candidates the
+/// second selection reads.
+const LOGPROB_MAX_TILE: u32 = 8192;
 
 use ops::norm::{Softmax, SoftmaxArgs, SoftmaxDescriptor};
 use ops::sampler::{
     ArgMax, ArgMaxArgs, ArgMaxDescriptor, CandidateOrder, FilterArgs, FilterCandidates,
     FilterDescriptor, InverseCdf, InverseCdfArgs, InverseCdfDescriptor, LogSoftmax, LogSoftmaxArgs,
     LogSoftmaxDescriptor, LogitsShape, LogprobArgs, LogprobDescriptor, LogprobGather, OrderArgs,
-    OrderDescriptor, ShapeArgs, ShapeDescriptor, TopK, TopKArgs, TopKDescriptor,
+    OrderDescriptor, ShapeArgs, ShapeDescriptor, TopK, TopKArgs, TopKDescriptor, TopLogprobsArgs,
+    TopLogprobsDescriptor,
 };
 use ops::{DType, Shape, TensorView};
 use proto::program::sampler::PARAMETER_COLUMNS;
@@ -201,17 +209,18 @@ pub struct Samples {
 
 impl Samples {
     /// Reserve the step's outputs from `arena`: the tokens, and their scores with `candidates`
-    /// top tokens a row when `candidates` is stated.
+    /// top tokens of a `vocabulary`-wide row when `candidates` is stated.
     pub fn reserve(
         arena: &Arena,
         tokens: DType,
         rows: u64,
+        vocabulary: u32,
         candidates: Option<u32>,
     ) -> Result<Self> {
         Ok(Self {
             tokens: arena.tensor(tokens, Shape::new(&[rows]))?,
             scores: match candidates {
-                Some(candidates) => Some(Scores::reserve(arena, rows, candidates)?),
+                Some(candidates) => Some(Scores::reserve(arena, rows, vocabulary, candidates)?),
                 None => None,
             },
         })
@@ -232,33 +241,63 @@ pub struct Scores {
 }
 
 /// A row's `n` most likely tokens and their log-probabilities, the largest first and ties in
-/// ascending id order (`ops::sampler::TopK`'s order).
+/// ascending id order (`ops::sampler::TopLogprobs`' order).
 #[derive(Clone, Copy, Debug)]
 pub struct TopLogprobs {
     /// `[rows, n]` f32 the candidates' log-probabilities, descending.
     pub values: TensorView,
     /// `[rows, n]` i32 the candidates' ids.
     pub ids: TensorView,
-    /// The ordering's scratch, which `top_k` fills (`ops::sampler::top_k_workspace`).
-    pub workspace: TensorView,
+    /// `[rows, chunks · n]` f32 and i32: each chunk's candidates, which the first selection writes
+    /// and the second reads.
+    pub chunk_values: TensorView,
+    pub chunk_ids: TensorView,
+}
+
+impl TopLogprobs {
+    /// The candidates of `rows` rows of a `vocabulary`-wide distribution, `candidates` a row, with
+    /// their chunks' views beside them, from `values` and `ids` and `arena`.
+    pub fn with_chunks(
+        arena: &Arena,
+        values: TensorView,
+        ids: TensorView,
+        rows: u64,
+        vocabulary: u32,
+        candidates: u32,
+    ) -> Result<Self> {
+        let chunks = chunk_candidates(vocabulary, candidates);
+        Ok(Self {
+            values,
+            ids,
+            chunk_values: arena.tensor(DType::F32, Shape::new(&[rows, chunks]))?,
+            chunk_ids: arena.tensor(DType::I32, Shape::new(&[rows, chunks]))?,
+        })
+    }
+}
+
+/// The candidates a `vocabulary`-wide row's chunks keep, `candidates` a chunk.
+fn chunk_candidates(vocabulary: u32, candidates: u32) -> u64 {
+    ops::sampler::top_logprobs_chunks(u64::from(vocabulary), LOGPROB_TILE) * u64::from(candidates)
 }
 
 impl Scores {
-    /// Reserve the scores of `rows` rows from `arena`, with `candidates` top tokens a row when it
-    /// is above zero.
-    pub fn reserve(arena: &Arena, rows: u64, candidates: u32) -> Result<Self> {
+    /// Reserve the scores of `rows` rows of a `vocabulary`-wide distribution from `arena`, with
+    /// `candidates` top tokens a row when it is above zero.
+    pub fn reserve(arena: &Arena, rows: u64, vocabulary: u32, candidates: u32) -> Result<Self> {
         let logprobs = arena.tensor(DType::F32, Shape::new(&[rows]))?;
         let ranks = arena.tensor(DType::I32, Shape::new(&[rows]))?;
         let top = match candidates {
             0 => None,
             candidates => {
                 let width = u64::from(candidates);
-                Some(TopLogprobs {
-                    values: arena.tensor(DType::F32, Shape::new(&[rows, width]))?,
-                    ids: arena.tensor(DType::I32, Shape::new(&[rows, width]))?,
-                    workspace: arena
-                        .tensor(DType::I32, ops::sampler::top_k_workspace(rows, width))?,
-                })
+                Some(TopLogprobs::with_chunks(
+                    arena,
+                    arena.tensor(DType::F32, Shape::new(&[rows, width]))?,
+                    arena.tensor(DType::I32, Shape::new(&[rows, width]))?,
+                    rows,
+                    vocabulary,
+                    candidates,
+                )?)
             }
         };
         Ok(Self {
@@ -283,7 +322,8 @@ impl Scores {
                 Some(top) => Some(TopLogprobs {
                     values: narrow(top.values)?,
                     ids: narrow(top.ids)?,
-                    workspace: narrow(top.workspace)?,
+                    chunk_values: narrow(top.chunk_values)?,
+                    chunk_ids: narrow(top.chunk_ids)?,
                 }),
                 None => None,
             },
@@ -294,7 +334,7 @@ impl Scores {
 /// One scored token as the completion reports it: the token itself with its log-probability and
 /// rank, then the row's top candidates read back beside it, the largest first.
 ///
-/// `values` and `ids` are the row's candidates as `top_k` wrote them, and a candidate's rank is its
+/// `values` and `ids` are the row's candidates as `top_logprobs` wrote them, and a candidate's rank is its
 /// competition rank among them - one plus the candidates strictly above it - which is its rank in
 /// the row, since every entry above a kept candidate is kept before it. A candidate whose id is
 /// outside the vocabulary (a row with fewer finite entries than candidates) is not reported. The
@@ -395,6 +435,9 @@ impl Sampler {
                     self.vocabulary
                 ),
             ));
+        }
+        if candidates > 0 {
+            merge_tile(self.vocabulary, candidates)?;
         }
         self.candidates = candidates;
         Ok(self)
@@ -617,22 +660,39 @@ impl Sampler {
                 ),
             ));
         }
-        // The candidates are the row's largest log-probabilities, in `top_k`'s order: the program
-        // reads its kept count as a launch value, so this is the draw's module over a narrower row
-        // of kept candidates.
-        let descriptor = TopKDescriptor {
-            width: u32::try_from(width)
-                .map_err(|_| refused("Sampler", "a candidate count wider than u32"))?,
-            ..self.top_descriptor()
+        // The candidates are the row's largest log-probabilities: each `LOGPROB_TILE`-lane chunk's
+        // first, by one program a chunk, then the row's among the chunks' by one program a row.
+        // Both launches keep ties in ascending id order.
+        let candidates = u32::try_from(width)
+            .map_err(|_| refused("Sampler", "a candidate count wider than u32"))?;
+        let chunks = TopLogprobsDescriptor {
+            candidates,
+            tile: LOGPROB_TILE,
+            indirect: false,
+            pdl: launch::PDL,
         };
-        let args = TopKArgs {
-            logits: logprobabilities,
-            values: top.values,
-            ids: top.ids,
-            workspace: top.workspace,
+        let args = TopLogprobsArgs {
+            values: logprobabilities,
+            ids: None,
+            out_values: top.chunk_values,
+            out_ids: top.chunk_ids,
         };
 
-        f.operate::<TopK>(&descriptor, args)?;
+        f.operate::<ops::sampler::TopLogprobs>(&chunks, args)?;
+
+        let row = TopLogprobsDescriptor {
+            tile: merge_tile(self.vocabulary, candidates)?,
+            indirect: true,
+            ..chunks
+        };
+        let args = TopLogprobsArgs {
+            values: top.chunk_values,
+            ids: Some(top.chunk_ids),
+            out_values: top.values,
+            out_ids: top.ids,
+        };
+
+        f.operate::<ops::sampler::TopLogprobs>(&row, args)?;
         Ok(())
     }
 
@@ -941,6 +1001,28 @@ impl Sampler {
 
         Ok(())
     }
+}
+
+/// The lanes the second candidates' selection reads: the chunks' candidates of a
+/// `vocabulary`-wide row, rounded up to a power of two, which one program must hold.
+///
+/// # Errors
+///
+/// A count whose chunks keep more candidates than one program holds: `max_logprobs` is bounded
+/// by `LOGPROB_MAX_TILE` over the vocabulary's chunks (215 over a 151936-token vocabulary).
+fn merge_tile(vocabulary: u32, candidates: u32) -> Result<u32> {
+    let width = chunk_candidates(vocabulary, candidates);
+    let tile = width.next_power_of_two();
+    if tile > u64::from(LOGPROB_MAX_TILE) {
+        return Err(refused(
+            "Sampler",
+            format!(
+                "{candidates} reported candidates keep {width} of a {vocabulary}-token vocabulary's \
+                 chunks, more than the {LOGPROB_MAX_TILE} one selection holds"
+            ),
+        ));
+    }
+    Ok(tile as u32)
 }
 
 /// The commit table of a warm pose: `COMMIT_FIELDS` columns of `rows` i64 values, every row's slot
@@ -1628,7 +1710,7 @@ mod tests {
         let arena = Arena::new(DevicePtr::new(0x10_0000), 1 << 20);
         let rows = 4;
         let candidates = Candidates::reserve(&arena, rows, 1_024, 32).unwrap();
-        let samples = Samples::reserve(&arena, DType::I32, rows, Some(4)).unwrap();
+        let samples = Samples::reserve(&arena, DType::I32, rows, 1_024, Some(4)).unwrap();
         let scores = samples.scores.unwrap();
         let top = scores.top.unwrap();
         let order = [
@@ -1665,9 +1747,9 @@ mod tests {
         // tokens.
         let arena = Arena::new(DevicePtr::new(0x10_0000), 1 << 20);
         let _ = Candidates::reserve(&arena, rows, 1_024, 32).unwrap();
-        let samples = Samples::reserve(&arena, DType::I32, rows, None).unwrap();
+        let samples = Samples::reserve(&arena, DType::I32, rows, 1_024, None).unwrap();
         assert!(samples.scores.is_none());
-        let samples = Samples::reserve(&arena, DType::I32, rows, Some(0)).unwrap();
+        let samples = Samples::reserve(&arena, DType::I32, rows, 1_024, Some(0)).unwrap();
         assert!(samples.scores.unwrap().top.is_none());
     }
 

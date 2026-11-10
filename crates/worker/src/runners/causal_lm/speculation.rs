@@ -195,15 +195,19 @@ impl ScoreColumns {
         })
     }
 
-    /// The scores of `rows` rows, with the candidates' scratch taken from `arena`.
-    fn views(&self, arena: &nn::Arena, rows: u64) -> Result<Scores> {
+    /// The scores of `rows` rows of a `vocabulary`-wide distribution, with the candidates' chunks
+    /// taken from `arena`.
+    fn views(&self, arena: &nn::Arena, rows: u64, vocabulary: u32) -> Result<Scores> {
         let width = u64::from(self.candidates);
         let top = match (&self.values, &self.ids) {
-            (Some(values), Some(ids)) => Some(TopLogprobs {
-                values: values.shaped(&[rows, width]),
-                ids: ids.shaped(&[rows, width]),
-                workspace: arena.tensor(DType::I32, ops::sampler::top_k_workspace(rows, width))?,
-            }),
+            (Some(values), Some(ids)) => Some(TopLogprobs::with_chunks(
+                arena,
+                values.shaped(&[rows, width]),
+                ids.shaped(&[rows, width]),
+                rows,
+                vocabulary,
+                self.candidates,
+            )?),
             _ => None,
         };
         Ok(Scores {
@@ -1023,7 +1027,7 @@ impl<M: TextModel> CausalLmRunner<M> {
                 &state,
                 &Samples {
                     tokens: spec.greedy.extent(0..rows),
-                    scores: Some(spec.greedy_scores.views(arena, rows)?),
+                    scores: Some(spec.greedy_scores.views(arena, rows, spec.vocabulary)?),
                 },
             )?;
         }
@@ -1035,7 +1039,7 @@ impl<M: TextModel> CausalLmRunner<M> {
                 spec.draws.extent(0..rows),
                 &Samples {
                     tokens: spec.drawn.extent(0..rows),
-                    scores: Some(spec.drawn_scores.views(arena, rows)?),
+                    scores: Some(spec.drawn_scores.views(arena, rows, spec.vocabulary)?),
                 },
             )?;
         }

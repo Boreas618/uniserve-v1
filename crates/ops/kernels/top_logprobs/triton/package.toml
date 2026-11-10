@@ -1,0 +1,37 @@
+# The top_logprobs operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program per chunk of a row keeps the chunk's few largest entries by max
+# reductions over its registers, so a row's chunks are selected in parallel; a
+# second, indirect launch over the chunks' candidates keeps the row's. The row
+# count, the width and the chunk count are launch values; the key names the kept
+# count, the chunk and whether ids are read.
+
+op = "top_logprobs"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/top_logprobs.py", "src/build.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `candidates_20_tile_4096_indirect_false_pdl_true`.
+[kernel.descriptors]
+dimensions = { candidates = { min = 1 }, tile = { power_of_two = true, max = 8192 }, indirect = ["true", "false"], pdl = ["true", "false"] }
+
+[parameters]

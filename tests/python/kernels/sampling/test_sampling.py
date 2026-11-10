@@ -1,6 +1,6 @@
 """The sampling packages' kernels against their references.
 
-``sampling_check.py`` is one check for the eight operators of the sampling
+``sampling_check.py`` is one check for the nine operators of the sampling
 path, named by ``--op``. Two of them round with operations the interpreter
 does not reproduce (``filter_candidates``' mixed comparison and
 ``logits_shape``'s libdevice rounding); on the interpreter their check says so
@@ -27,6 +27,7 @@ SAMPLING = (
     "argmax",
     "logprob_gather",
     "top_k",
+    "top_logprobs",
 )
 
 #: The checks of one operator that run whole on Triton's interpreter.

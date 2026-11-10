@@ -3479,8 +3479,13 @@ impl<M: TextModel> CausalLmRunner<M> {
         // cannot branch on, and the scores reuse the sampler's dead shaped row, so the extra memory
         // is a few words a row. The scheduler keeps them for the requests that asked, as many
         // alternatives as each asked for.
-        let samples =
-            Samples::reserve(arena, DType::I32, rows, Some(sampling.sampler.candidates()))?;
+        let samples = Samples::reserve(
+            arena,
+            DType::I32,
+            rows,
+            self.model.vocabulary(),
+            Some(sampling.sampler.candidates()),
+        )?;
         // A greedy bucket takes each row's largest candidate; every other sampling bucket draws one
         // from the row's distribution. The two are different launch sequences in the sampler layer
         // (`Sampler::greedy` and `Sampler::forward`). A greedy row in a drawing bucket draws from the
@@ -3546,7 +3551,7 @@ impl<M: TextModel> CausalLmRunner<M> {
         let arena = forward.arena();
         let tokens = u64::from(bucket.tokens);
         let vocabulary = u64::from(self.model.vocabulary());
-        let scores = Scores::reserve(arena, tokens, sampler.candidates())?;
+        let scores = Scores::reserve(arena, tokens, self.model.vocabulary(), sampler.candidates())?;
         let chunk = SCORE_ROWS.min(tokens);
         let logits = arena.tensor(LOGITS_DTYPE, ops::Shape::new(&[chunk, vocabulary]))?;
         let logprobs = arena.tensor(DType::F32, ops::Shape::new(&[chunk, vocabulary]))?;

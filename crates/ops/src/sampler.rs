@@ -932,6 +932,151 @@ impl Op for LogprobGather {
     }
 }
 
+/// One compilation of `top_logprobs`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct TopLogprobsDescriptor {
+    /// The entries one chunk keeps: the deployment's `max_logprobs`.
+    pub candidates: u32,
+    /// The lanes one program reads: a chunk of the row, a power of two up to 8192.
+    pub tile: u32,
+    /// Whether each entry's id is read beside it (a selection over a first launch's candidates)
+    /// rather than being its column.
+    pub indirect: bool,
+    /// Launch with programmatic dependent launch.
+    pub pdl: bool,
+}
+
+impl fmt::Display for TopLogprobsDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Key::new()
+            .field("candidates", self.candidates)
+            .field("tile", self.tile)
+            .field("indirect", self.indirect)
+            .field("pdl", self.pdl)
+            .finish(formatter)
+    }
+}
+
+/// The chunks a `top_logprobs` launch of `tile` lanes splits a `width`-wide row into: the
+/// launch writes `chunks · candidates` entries a row.
+pub fn top_logprobs_chunks(width: u64, tile: u32) -> u64 {
+    width.div_ceil(u64::from(tile.max(1)))
+}
+
+/// The arguments of `top_logprobs`.
+#[derive(Clone, Copy)]
+pub struct TopLogprobsArgs {
+    /// `[rows, width]` FP32 entries: log-probabilities, or a first launch's candidates.
+    pub values: TensorView,
+    /// `[rows, width]` i32 each entry's id, for an indirect launch.
+    pub ids: Option<TensorView>,
+    /// `[rows, chunks · candidates]` FP32: each chunk's kept entries, the largest first.
+    pub out_values: TensorView,
+    /// `[rows, chunks · candidates]` i32: their ids, `-1` past a chunk's entries.
+    pub out_ids: TensorView,
+}
+
+/// The `candidates` largest entries of every chunk of every row, with their ids.
+///
+/// Each chunk's are in descending order, ties by ascending id; a launch whose row is one chunk
+/// wide is the row's own selection, and an indirect launch over a first launch's output selects
+/// the row's from its chunks' (`Sampler::score`).
+pub struct TopLogprobs;
+
+impl Op for TopLogprobs {
+    const NAME: &'static str = proto::program::operator::TOP_LOGPROBS;
+
+    type Descriptor = TopLogprobsDescriptor;
+    type Args<'a> = TopLogprobsArgs;
+
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
+        if descriptor.candidates == 0 {
+            return Err(Error::argument(Self::NAME, "a selection keeps a candidate"));
+        }
+        if !descriptor.tile.is_power_of_two() || descriptor.tile > 8192 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "a tile of {} is not a power of two up to 8192",
+                    descriptor.tile
+                ),
+            ));
+        }
+        let rows = args.values.rows();
+        let width = args.values.last();
+        args.values.require_row(Self::NAME, DType::F32, width)?;
+        match (descriptor.indirect, args.ids) {
+            (true, Some(ids)) => ids.require_shape(Self::NAME, Shape::new(&[rows, width]))?,
+            (false, None) => {}
+            _ => {
+                return Err(Error::argument(
+                    Self::NAME,
+                    "an indirect selection reads ids, and only it does",
+                ));
+            }
+        }
+        let kept = top_logprobs_chunks(width, descriptor.tile) * u64::from(descriptor.candidates);
+        args.out_values
+            .require_shape(Self::NAME, Shape::new(&[rows, kept]))?;
+        args.out_ids
+            .require_shape(Self::NAME, Shape::new(&[rows, kept]))?;
+        for (name, view, dtype) in [
+            ("ids", args.ids, DType::I32),
+            ("kept values", Some(args.out_values), DType::F32),
+            ("kept ids", Some(args.out_ids), DType::I32),
+        ] {
+            if let Some(view) = view
+                && view.dtype != dtype
+            {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!("expected {dtype} {name}, found {}", view.dtype),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let rows = args.values.rows();
+        let width = args.values.last();
+        let chunks = top_logprobs_chunks(width, descriptor.tile);
+
+        let mut arguments = Arguments::new();
+        arguments
+            .view(args.values)
+            // A direct launch reads no ids; the slot still takes a device address.
+            .view(args.ids.unwrap_or(args.out_ids))
+            .view(args.out_values)
+            .view(args.out_ids)
+            .u32(u32::try_from(width).map_err(|_| Error::argument(Self::NAME, "a row past u32"))?)
+            .u32(
+                u32::try_from(chunks)
+                    .map_err(|_| Error::argument(Self::NAME, "chunks past u32"))?,
+            );
+        kernel.launch(LaunchGrid::new([rows, chunks, 1])?, &mut arguments, stream)
+    }
+
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+        let _ = stream;
+        TopLogprobsArgs {
+            out_values: twins.shadow_of(args.out_values),
+            out_ids: twins.shadow_of(args.out_ids),
+            ..args
+        }
+    }
+
+    // A selection moves values and ids; two implementations must keep the same ones.
+    fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
+        Tolerance::exact()
+    }
+}
+
 /// One compilation of `candidate_order`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct OrderDescriptor {
