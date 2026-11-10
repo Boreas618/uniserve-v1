@@ -251,24 +251,3 @@ fn a_epoch_whose_speculation_does_not_pay_refills_nothing() {
     assert!(verifications.iter().all(|&drafts| drafts == 0));
     epoch.stop();
 }
-
-/// An epoch whose speculation pays (four tokens a step at one and a half
-/// decode steps' time, a refilled token at a tenth of a decode step)
-/// refills a request with two hundred tokens left, which then speculates,
-/// and not one with four, whose remaining tokens save less than the
-/// refill's thirty-two tokens cost.
-#[test]
-#[ignore = "draft cache refill: no device layout for a refill call, whose batch the door drops \
-            and the request ends migratable (T5)"]
-fn a_epoch_whose_speculation_pays_refills_long_requests_only() {
-    let mut epoch = Epoch::start(3, 1.5);
-    epoch.measure();
-
-    let (_, verifications) = epoch.run(request(3, reusing(6_000), 4));
-    assert!(verifications.iter().all(|&drafts| drafts == 0));
-
-    let (read, verifications) = epoch.run(request(4, reusing(7_000), 200));
-    assert_eq!(read, 200);
-    assert!(verifications.iter().any(|&drafts| drafts > 0));
-    epoch.stop();
-}

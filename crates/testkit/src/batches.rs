@@ -118,6 +118,9 @@ pub struct FakeBatches {
     extent: Extent,
     answer: Option<Answer>,
     media: Option<Media>,
+    /// The answers to media batches ([`FakeBatches::answering_media`]); token batches keep the
+    /// token and extent rules.
+    media_answers: Option<Arc<crate::Media>>,
     end: Option<EndOfText>,
     /// How many tokens each request's text holds before it ends ([`FakeBatches::with_text_len`]).
     text_len: Option<u64>,
@@ -159,6 +162,7 @@ impl FakeBatches {
             extent: Extent::default(),
             answer: None,
             media: None,
+            media_answers: None,
             end: None,
             text_len: None,
             text_starts: Mutex::new(HashMap::new()),
@@ -225,6 +229,16 @@ impl FakeBatches {
     #[must_use]
     pub fn with_media(mut self, media: Media) -> Self {
         self.media = Some(media);
+        self
+    }
+
+    /// Serves every media computation in the extent the mechanism stated ([`crate::Media::serves`])
+    /// and answers each media batch with `media`, as a rank whose media runners serve them;
+    /// token batches keep the token and extent rules, the end of text included.
+    #[must_use]
+    pub fn answering_media(mut self, media: Arc<crate::Media>) -> Self {
+        self.media = Some(Arc::new(crate::Media::serves));
+        self.media_answers = Some(media);
         self
     }
 
@@ -310,6 +324,9 @@ impl FakeBatches {
     fn answer(&self, batch: &Batch) -> Outcome<BatchOutput> {
         if let Some(answer) = &self.answer {
             return answer(batch);
+        }
+        if let (Some(media), Some(_)) = (&self.media_answers, &batch.media) {
+            return media.answer(batch);
         }
 
         let mut output = completed_until(batch, self.tokens, self.extent, self.end);

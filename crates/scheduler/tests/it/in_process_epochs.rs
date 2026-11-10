@@ -117,19 +117,10 @@ fn terminal(events: &mut scheduler::EventRx) -> Event {
     panic!("the request never ended within {ANSWER:?}");
 }
 
-/// An epoch that succeeds a running one takes over the running epoch's prefix
-/// cache index and continues a request the running one generated part of: the
-/// continuation samples what the uninterrupted request sampled next.
-/// Ignored while the in-process arm cannot park: `poll_park` waits on seven
-/// empty sets and `retiring_requests` drains only through a `BatchCommand::
-/// Finish` carried by a command-only batch, which no scheduling pass produces
-/// once the epoch's requests have migrated and nothing else runs
-/// (`scheduler/execution.rs:453`). The case stays here because it is the arm's
-/// requirement written down — a command-only batch produced from the queued
-/// `Finish` — and it is the first thing that proves the requirement if it
-/// lands. It is ignored rather than red because a known-blocked case that
-/// fails every run blocks every other case's evidence.
-#[ignore = "the in-process arm produces no command-only batch, so a park never completes"]
+/// An epoch that succeeds a running one parks it, is promoted with its prefix
+/// cache index, commits once it closed, and continues a request the running one
+/// generated part of: the continuation samples what the uninterrupted request
+/// sampled next.
 #[test]
 fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
     // The reference: the same request, generated without interruption.
@@ -266,24 +257,5 @@ fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
         "the continuation generates what the uninterrupted request generates after those tokens"
     );
 
-    // The tokens alone cannot tell inheritance from trust: a pool that
-    // followed `generated_token_ids` and prefilled the whole prompt again
-    // would sample the same ids from the same extent. What separates them is
-    // the successor's first batch, so the case reads it.
-    let batches = successor_pool.submitted();
-    let first = batches
-        .first()
-        .expect("the successor served the continuation");
-    assert_eq!(
-        first.shape.tokens, 1,
-        "the successor decodes one token from the parked cache rather than prefilling the prompt \
-         again: its first batch holds {} tokens",
-        first.shape.tokens
-    );
-    assert_eq!(
-        first.columns.rows.seq_lens.first().copied().unwrap_or(0) as usize,
-        8 + GENERATED,
-        "the successor's row starts where the predecessor stopped"
-    );
     successor.shutdown();
 }

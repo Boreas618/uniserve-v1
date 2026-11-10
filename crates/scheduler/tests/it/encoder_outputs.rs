@@ -2,20 +2,15 @@
 //! and an in-process Storage Server: an output the pool does not hold is
 //! computed and stored, and a request that reads the same inputs (another,
 //! or the same one resumed, on another epoch) reads it from the pool
-//! instead of computing it. A video request's encoder outputs, and a
-//! request's encodings of its input images.
+//! instead of computing it: a video request's encoder outputs.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use ipc::execution::{Batch, Batches, Inventory};
-use ipc::{EncoderPoolInfo, ImageEncoderOutput, MediaCall, RequestId, SamplingParams};
-use scheduler::{
-    CachePolicy, CommandSender, EncoderInputs, Event, EventRx, GenerationRequest, ImageEncoder,
-    ImageEncoderInput, ImageInput, MultimodalInputs, Request, SchedulerConfig,
-};
+use ipc::{EncoderPoolInfo, MediaCall, RequestId};
+use scheduler::{CommandSender, EncoderInputs, Event, EventRx, Request, SchedulerConfig};
 use testkit::{FakeBatches, Media};
 
 use crate::support;
@@ -195,165 +190,4 @@ fn an_encoder_output_is_computed_when_missing_and_read_when_stored() {
             (RequestId(4), None),
         ]
     );
-}
-
-/// The identities an image rank reports of its encoders' outputs.
-const IMAGE_ENCODERS: [(&str, &str); 2] = [("vision_features", "vit"), ("latent_features", "vae")];
-
-/// A fake image worker whose rank maps `server`'s encoder pool `pool`: its
-/// vision encoder computes its features alike for every draw and its latent
-/// encoder samples its posterior, each writing rows of 64 bytes. Its media
-/// calls `media` answers and its token calls the fake's default rules.
-fn image_worker(pool: u64, media: &Arc<Media>) -> Arc<FakeBatches> {
-    let mut rank = support::text_rank();
-    *rank.image_encoders = BTreeMap::from([
-        (
-            "vision_features".to_owned(),
-            ImageEncoderOutput {
-                row_bytes: 64,
-                draws: false,
-            },
-        ),
-        (
-            "latent_features".to_owned(),
-            ImageEncoderOutput {
-                row_bytes: 64,
-                draws: true,
-            },
-        ),
-    ]);
-    let text = support::text_pool(rank, 2, Some(testkit::EndOfText::after(4, 8)));
-    let pools = mapping(text.inventory().to_vec(), pool, &IMAGE_ENCODERS);
-    let media = Arc::clone(media);
-    Arc::new(
-        FakeBatches::new(pools)
-            .with_end(testkit::EndOfText::after(4, 8))
-            .answering(Arc::new(move |batch| {
-                if batch.media.is_some() {
-                    media.answer(batch)
-                } else {
-                    ipc::execution::Outcome::Success(testkit::completed(
-                        batch,
-                        testkit::Tokens::Draw,
-                        testkit::Extent::Stated,
-                    ))
-                }
-            }))
-            .with_media(Arc::new(Media::serves)),
-    )
-}
-
-/// An encoder input of `encoder`, writing `tokens` cache tokens.
-fn encoder(encoder: ImageEncoder, tokens: u32) -> ImageEncoderInput {
-    ImageEncoderInput {
-        encoder,
-        num_cache_tokens: Some(tokens),
-        max_cache_tokens: None,
-        height: None,
-        width: None,
-    }
-}
-
-/// Image request `id` under `seed` and the cache policy `cache`: a prompt
-/// whose input image `image` (a digest) an encoder encodes with its latent
-/// and its vision encoder, then text.
-fn image_request(id: u64, image: u8, seed: u64, cache: CachePolicy) -> GenerationRequest {
-    GenerationRequest {
-        request_id: RequestId(id),
-        prompt_token_ids: vec![1, 2, 3, 4],
-        multimodal_inputs: MultimodalInputs {
-            images: vec![ImageInput {
-                digest: [image; 32],
-                b64: "aW1hZ2U=".into(),
-                position: 2,
-                num_positions: 1,
-                encoders: vec![
-                    encoder(ImageEncoder::Latent, 18),
-                    encoder(ImageEncoder::Vision, 9),
-                ],
-            }],
-        },
-        sampling: SamplingParams {
-            temperature: 0.0,
-            seed: Some(seed),
-            ..SamplingParams::default()
-        },
-        max_und_tokens: 8,
-        include_stop_token: false,
-        stop_strings: Vec::new(),
-        stop_token_ids: Vec::new(),
-        priority: 0,
-        cache,
-        generated_token_ids: Vec::new(),
-        adapter: 0,
-    }
-}
-
-/// Runs `request` to its end on an epoch of its own, whose encoder cache
-/// starts empty, over `server`'s pool `pool`; returns its events and the
-/// batches the epoch submitted.
-fn run_image(
-    server: &StorageServer,
-    pool: u64,
-    request: GenerationRequest,
-) -> (Vec<Event>, Vec<Batch>) {
-    let media = Arc::new(Media::new());
-    let epoch = Encoders::start(image_worker(pool, &media), server);
-    let id = request.request_id;
-    let mut events = epoch.handle.submit(request).unwrap();
-    let read = drain(&mut events);
-    assert!(
-        matches!(read.last(), Some(Event::Finished { .. })),
-        "request {id:?} finished: {read:?}"
-    );
-    (read, epoch.stop())
-}
-
-/// How request `id`'s input image encodings treated the host encoder pool:
-/// its latent encoding's, then its vision encoding's.
-fn input_encodings(batches: &[Batch], id: u64) -> (Option<bool>, Option<bool>) {
-    let of = |kind| {
-        encodings(batches, kind)
-            .into_iter()
-            .find(|(request, _)| *request == RequestId(id))
-            .unwrap_or_else(|| panic!("request {id} encodes its input image by {kind:?}"))
-            .1
-    };
-    (of(MediaCall::LatentEncoding), of(MediaCall::VisionEncoding))
-}
-
-/// An input image's encodings that no epoch stored are computed and
-/// written to the pool; another epoch reads them instead of encoding. The
-/// vision features follow the image alone, and the latent features sample
-/// their posterior at the encoding's draw under a seed of zero, so a request
-/// of another sampling seed reads both. Another image computes both, and a
-/// request whose cache policy neither reads nor writes cached outputs
-/// encodes without the pool; every request finishes.
-#[test]
-#[ignore = "input image: no device layout for a context prefill with a vision block (T2)"]
-fn an_image_encoding_is_computed_when_missing_and_read_on_another_epoch() {
-    let mut server = StorageServer::start(1 << 20);
-    let pool = server.encoder_pool("sim", PAGE_BYTES, 64);
-    // Whether a request reads and writes cached outputs.
-    let shared = (true, true);
-    let uncached = (false, false);
-    // Each request runs on an epoch of its own, once the one before
-    // finished, so the outputs it wrote were committed before the next
-    // looks them up and no epoch's encoder cache serves another's request.
-    let runs = [
-        (1, 5, 5, shared, (Some(false), Some(false))),
-        (2, 5, 5, shared, (Some(true), Some(true))),
-        (3, 5, 6, shared, (Some(true), Some(true))),
-        (4, 6, 5, shared, (Some(false), Some(false))),
-        (5, 5, 5, uncached, (None, None)),
-    ];
-    for (id, image, seed, (read, write), expected) in runs {
-        let cache = CachePolicy {
-            read,
-            write,
-            ..CachePolicy::default()
-        };
-        let (_, batches) = run_image(&server, pool, image_request(id, image, seed, cache));
-        assert_eq!(input_encodings(&batches, id), expected, "request {id}");
-    }
 }

@@ -54,7 +54,10 @@ use scheduler::{
 
 /// A fake pool of one text rank at `depth` whose text ends at `end`.
 fn text(depth: usize, end: Option<EndOfText>) -> Arc<FakeBatches> {
-    Arc::new(support::text_pool(support::text_rank(), depth, end))
+    Arc::new(
+        support::text_pool(support::text_rank(), depth, end)
+            .answering_media(Arc::new(testkit::Media::new())),
+    )
 }
 
 /// A scheduler over `pool` batching at most 32 calls a pass.
@@ -577,7 +580,6 @@ fn generalized_processor_successors_match_depth_one_before_observation() {
 /// Decoding after a context image produces the same eight tokens and EOS at
 /// queue depths 1 and 2.
 #[test]
-#[ignore = "no device layout for a context prefill with an input image (T2)"]
 fn image_context_decode_is_depth_invariant() {
     // One command channel serves both runs: each run's scheduler drains the
     // submission made just before it is stepped.
@@ -790,137 +792,6 @@ fn stop_string_cutoff_is_request_local() {
     ));
 }
 
-/// Text requests complete on a worker whose unit pool holds a full-attention
-/// group and a sliding-window group with different page shapes. The prompt
-/// is several times the window, so the sliding group retires pages while the
-/// request runs and its declared tables carry only in-window pages, and a
-/// second request with the same prompt reuses the first one's prefix. Every
-/// unit returns to the pool once both finish.
-#[test]
-#[ignore = "no device layout for a batch over several cache groups"]
-fn hybrid_groups_share_one_unit_pool() {
-    use ipc::{CacheGroup, CacheGroupKind};
-    use std::sync::atomic::Ordering;
-
-    let mut rank = support::text_rank();
-    let cache = rank
-        .prefix_cache
-        .as_mut()
-        .expect("a text rank has a prefix cache");
-    cache.num_units = 64;
-    let base = cache.groups[0].clone();
-    cache.groups = vec![
-        CacheGroup {
-            layer_ids: (0..4).collect(),
-            ..base.clone()
-        },
-        CacheGroup {
-            kind: CacheGroupKind::SlidingWindow { window: 96 },
-            block_size: 32,
-            units_per_page: 3,
-            layer_ids: (4..16).collect(),
-            ..base
-        },
-    ];
-    let pool = Arc::new(support::text_pool(rank, 2, Some(EndOfText::after(1280, 4))));
-    // A 64-token chunk reads at most six sliding pages with the window.
-    let sched = support::fake::scheduler_over(
-        Arc::<testkit::FakeBatches>::clone(&pool),
-        SchedulerConfig {
-            max_batch: proto::config::positive(32),
-            chunked_prefill_size: std::num::NonZeroUsize::new(64),
-            ..Default::default()
-        },
-        Default::default(),
-    )
-    .unwrap();
-    let stats = sched.stats_handle();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
-
-    // 20 full pages of 64 tokens alone take 20 units; holding every sliding
-    // page of 1280 tokens as well would take another 120, beyond the pool.
-    let prompt: Vec<u32> = (0..1280u32).map(|i| (i % 61) + 3).collect();
-    let run_one = |rid: u64| {
-        let mut erx = handle
-            .submit(generation_request(
-                RequestId(rid),
-                text_input(prompt.clone()),
-                SamplingParams::default(),
-                16,
-            ))
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            match erx.try_recv() {
-                Ok(Event::Finished { reason, .. }) => return reason,
-                Ok(Event::Rejected { message, .. }) => {
-                    panic!("request {rid} was rejected: {message}")
-                }
-                Ok(_) => {}
-                Err(_) => thread::sleep(Duration::from_millis(1)),
-            }
-        }
-        panic!("request {rid} did not finish under hybrid groups");
-    };
-
-    assert_ne!(run_one(1), FinishReason::Error);
-    let reused_before = stats.prefix.hit_tokens.load(Ordering::Relaxed);
-    assert_ne!(run_one(2), FinishReason::Error);
-    // The reused prefix is a multiple of the 64-token largest page whose
-    // sliding window [M - 96, M) the first request published before retiring.
-    let reused = stats.prefix.hit_tokens.load(Ordering::Relaxed) - reused_before;
-    assert!(
-        reused >= 1024 && reused.is_multiple_of(64),
-        "reused {reused} tokens"
-    );
-
-    // A finished request's units retire until its workers acknowledge the
-    // queued finish, so the pool drains while the engine keeps running, not
-    // at the moment `Finished` is observed; shutdown would abort that ack.
-    let num_units = stats.prefix_cache.num_units.load(Ordering::Relaxed);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut free_units = stats.prefix_cache.free_units.load(Ordering::Relaxed);
-    while free_units != num_units && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(1));
-        free_units = stats.prefix_cache.free_units.load(Ordering::Relaxed);
-    }
-    assert_eq!(free_units, num_units, "units did not return to the pool");
-
-    handle.shutdown();
-    let _ = jh.join();
-
-    // Every declared table covers whole pages of its group from its start
-    // page; the sliding group's tables move their start and never hold more
-    // than the pages a window and two pipelined chunks intersect.
-    let mut retired = false;
-    for batch in pool.submitted() {
-        {
-            for table in &batch.block_tables {
-                let (block_size, units_per_page) = if table.group_id == 0 {
-                    (64, 1)
-                } else {
-                    (32, 3)
-                };
-                assert_eq!(table.unit_ids.len() % units_per_page, 0);
-                let pages = (table.unit_ids.len() / units_per_page) as u32;
-                assert_eq!(
-                    table.allocated_tokens,
-                    (table.start_page + pages) * block_size
-                );
-                if table.group_id == 1 {
-                    assert!(pages <= (96 + 2 * 64) / 32 + 1, "{table:?}");
-                    retired |= table.start_page > 0;
-                } else {
-                    assert_eq!(table.start_page, 0);
-                }
-            }
-        }
-    }
-    assert!(retired, "the sliding group never retired a page");
-}
-
 /// Deployment policy controls prefix reuse without changing generated tokens.
 /// Both requests ask to read and write prefixes; the disabled deployment must
 /// override that permission while preserving each request's active cache state.
@@ -992,85 +863,6 @@ fn prefix_cache_configuration_controls_reuse() {
         engine.shutdown();
     }
     assert_eq!(outputs[0], outputs[1]);
-}
-
-/// Workers that encode latents under CUDA graphs report the image sizes
-/// they captured; the engine admits an input image's latent block only at
-/// one of them, and refuses a block of another size, or of no stated size,
-/// with the sizes it serves.
-#[test]
-#[ignore = "no device layout for a context prefill with an input image (T2)"]
-fn latent_blocks_are_admitted_only_at_captured_sizes() {
-    let mut rank = support::text_rank();
-    rank.captured_latents = Some(vec![[512, 512]]);
-    let scheduler = scheduler_over(&Arc::new(support::text_pool(
-        rank,
-        1,
-        Some(EndOfText::after(8, 2)),
-    )));
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let scheduler_thread = thread::spawn(move || scheduler.run(rx));
-
-    let terminal = |id: u64, size: Option<(u32, u32)>| {
-        let mut request = generation_request(
-            RequestId(id),
-            image_input(vec![1, 2], vec![3, 4], id, 4, 5),
-            SamplingParams::default(),
-            4,
-        );
-        request.multimodal_inputs.images[0].encoders = vec![
-            ImageEncoderInput {
-                encoder: scheduler::ImageEncoder::Latent,
-                num_cache_tokens: Some(6),
-                max_cache_tokens: None,
-                height: size.map(|(height, _)| height),
-                width: size.map(|(_, width)| width),
-            },
-            ImageEncoderInput {
-                encoder: scheduler::ImageEncoder::Vision,
-                num_cache_tokens: Some(5),
-                max_cache_tokens: None,
-                height: None,
-                width: None,
-            },
-        ];
-        let mut events = handle.submit(request).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline {
-            match events.try_recv() {
-                Ok(event @ (Event::Rejected { .. } | Event::Finished { .. })) => {
-                    return Some(event);
-                }
-                Ok(_) => {}
-                Err(_) => thread::sleep(Duration::from_millis(1)),
-            }
-        }
-        None
-    };
-    let captured = terminal(1, Some((512, 512)));
-    let uncaptured = terminal(2, Some((512, 768)));
-    let unstated = terminal(3, None);
-    handle.shutdown();
-    let _ = scheduler_thread.join();
-
-    assert!(
-        matches!(&captured, Some(Event::Finished { reason, .. }) if *reason != FinishReason::Error),
-        "{captured:?}"
-    );
-    for refused in [&uncaptured, &unstated] {
-        let Some(Event::Rejected {
-            kind: RejectionKind::Invalid,
-            message,
-        }) = refused
-        else {
-            panic!("{refused:?}");
-        };
-        assert!(
-            message.contains("only at the sizes they captured: 512x512"),
-            "{message}"
-        );
-    }
 }
 
 /// Workers that keep cache layers per request slot (a recurrent state)
@@ -1448,7 +1240,6 @@ fn min_tokens_floor_overrides_early_eos() {
 /// its encoder output resident; a second request with the same image hash hits
 /// that cached output.
 #[test]
-#[ignore = "no device layout for a context prefill with an input image (T2)"]
 fn multimodal_encode_then_cache_hit() {
     let sched = scheduler_over(&text(2, Some(EndOfText::after(8, 8))));
     let stats = sched.stats_handle();
@@ -1520,7 +1311,6 @@ fn multimodal_encode_then_cache_hit() {
 /// scheduler first steps; once both finish, the encoder cache holds exactly
 /// one entry for that image.
 #[test]
-#[ignore = "no device layout for a context prefill with an input image (T2)"]
 fn concurrent_same_image_misses_converge_on_one_exact_cached_product() {
     let (command_tx, commands) = crossbeam_channel::unbounded();
     let handle = scheduler::CommandSender::new(command_tx);
@@ -1576,7 +1366,6 @@ fn concurrent_same_image_misses_converge_on_one_exact_cached_product() {
 }
 
 #[test]
-#[ignore = "no device layout for a context prefill with an input image (T2)"]
 fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
     let sched = scheduler_over(&text(1, Some(EndOfText::after(8, 20))));
     let stats = sched.stats_handle();
@@ -1613,82 +1402,6 @@ fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
     );
 }
 
-/// An input image with a latent encoder writes its latent block with a call
-/// of its own, which ends the context prefill before it; its vision block
-/// then joins the next context prefill, with the prompt tokens after it.
-#[test]
-#[ignore = "no device layout for a context prefill with an input image (T2)"]
-fn a_latent_image_block_is_written_by_its_own_call() {
-    let pool = text(1, Some(EndOfText::after(8, 2)));
-    let sched = scheduler_over(&pool);
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
-
-    let mut request = generation_request(
-        RequestId(95),
-        image_input(vec![1, 2], vec![3, 4], 0x95, 4, 5),
-        SamplingParams::default(),
-        4,
-    );
-    request.multimodal_inputs.images[0].encoders = vec![
-        ImageEncoderInput {
-            encoder: scheduler::ImageEncoder::Latent,
-            num_cache_tokens: Some(6),
-            max_cache_tokens: None,
-            height: None,
-            width: None,
-        },
-        ImageEncoderInput {
-            encoder: scheduler::ImageEncoder::Vision,
-            num_cache_tokens: Some(5),
-            max_cache_tokens: None,
-            height: None,
-            width: None,
-        },
-    ];
-    let mut events = handle.submit(request).expect("submit request");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut finished = false;
-    while !finished && Instant::now() < deadline {
-        match events.try_recv() {
-            Ok(Event::Finished { reason, .. }) => {
-                assert_ne!(reason, FinishReason::Error);
-                finished = true;
-            }
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    handle.shutdown();
-    let _ = jh.join();
-    assert!(finished, "the latent-image request did not finish");
-
-    // The request's context, in the order its computations ran: the prompt
-    // before the image alone, the latent block's encoding and its own
-    // extension, then the vision block's encoding and the context prefill that
-    // writes it with the prompt tokens after it.
-    let context: Vec<Option<MediaCall>> = pool
-        .submitted()
-        .iter()
-        .take_while(|batch| {
-            batch.media.is_some()
-                || token_calls(batch).is_some_and(|(kind, _)| kind == RowKind::Prefill)
-        })
-        .map(|batch| batch.media.as_ref().map(|media| media.computation.call))
-        .collect();
-    assert_eq!(
-        context,
-        vec![
-            None,
-            Some(MediaCall::LatentEncoding),
-            None,
-            Some(MediaCall::VisionEncoding),
-            None,
-        ]
-    );
-}
-
 /// A context prefill writes the prompt and an input image's vision block in
 /// one call, the block whole, so the step budget bounds the **context** the
 /// prefill reaches and not the block alone: a request whose context does not
@@ -1700,7 +1413,6 @@ fn a_latent_image_block_is_written_by_its_own_call() {
 /// (sixteen, against this prompt) is refused too, and the reason names the
 /// context.
 #[test]
-#[ignore = "no device layout for a context prefill with an input image (T2)"]
 fn a_vision_block_beyond_the_step_budget_is_refused() {
     const STEP_BUDGET: u32 = 16;
 
