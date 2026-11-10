@@ -49,7 +49,8 @@ use storage::{Client, Key, Role, Scope};
 const PEER_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// One page a peer read copies: the key, the peer pool's slot holding it
-/// and the local pool's slot reserved for it.
+/// and the local slot it lands in: a slot of the local pool reserved for it,
+/// or a slot of a staging tensor ([`PoolRead::staging`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PageRead {
     pub key: Key,
@@ -59,7 +60,8 @@ pub(crate) struct PageRead {
 
 /// The pages one transfer task reads from one peer pool into one local
 /// pool, which [`Servers::settle_read`] commits or aborts and unpins once
-/// the task ended.
+/// the task ended; or, for a converted load, into slots of a rank's staging
+/// tensor, which nothing commits.
 #[derive(Debug, Clone)]
 pub(crate) struct PoolRead {
     /// The connection to the local pool's server, which submits the task.
@@ -70,16 +72,25 @@ pub(crate) struct PoolRead {
     /// The peer's endpoint, which the task's sources name.
     pub endpoint: String,
     pub peer_pool: u64,
+    /// The shape of the peer pool's pages, which the destination slots have.
     pub shape: PageShape,
     pub pages: Vec<PageRead>,
+    /// The staging tensor the pages land in, in place of `pool`: an exclusive
+    /// host tensor of a rank, retained at the local server, whose slots hold
+    /// pages of the peer's shape (`ipc::PoolConversion`).
+    pub staging: Option<Key>,
 }
 
 impl PoolRead {
     /// The task's spans: each page whole, from its peer slot to its local
-    /// slot. Both pools have the same page shape (layout and head slice), so
-    /// a page is one span.
+    /// slot. The destination slots have the peer pool's page shape (layout
+    /// and head slice), so a page is one span.
     fn spans(&self) -> Vec<Span> {
         let bytes = self.shape.page_bytes;
+        let destination = match self.staging {
+            Some(key) => Region::Tensor { key, at: None },
+            None => Region::Pool { pool: self.pool },
+        };
         self.pages
             .iter()
             .map(|page| Span {
@@ -90,7 +101,7 @@ impl PoolRead {
                     }),
                 },
                 source_offset: page.source * bytes,
-                destination: Region::Pool { pool: self.pool },
+                destination: destination.clone(),
                 destination_offset: page.destination * bytes,
                 bytes,
                 rows: 1,
@@ -349,10 +360,13 @@ impl<S> Servers<S> {
 
     /// Settle `read` once its task ended: commit the local slots when every
     /// page landed (`complete`), abort them otherwise, and end the pins at
-    /// the peer either way.
+    /// the peer either way. A read into a staging tensor reserved no pool
+    /// slot, so only its pins end.
     pub(crate) fn settle_read(&mut self, read: &PoolRead, complete: bool) {
         let keys = read.keys();
-        self.settle(read.client, read.pool, keys.clone(), complete);
+        if read.staging.is_none() {
+            self.settle(read.client, read.pool, keys.clone(), complete);
+        }
         self.peer_unpin(read.peer, read.peer_pool, keys);
     }
 

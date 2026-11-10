@@ -66,10 +66,15 @@ pub struct PageCopy {
     pub pool: u64,
     /// The cache group of the page.
     pub group_id: u32,
-    /// The page's index in the host page pool.
+    /// The page's index in the host page pool, or in the group's staging
+    /// tensor when `staged`.
     pub host_page: u64,
     /// The page's units.
     pub units: Vec<UnitId>,
+    /// A load of a page in the group's conversion source representation
+    /// from slot `host_page` of the rank's staging tensor
+    /// (`PoolConversion`), converted into the units as it is loaded.
+    pub staged: bool,
 }
 
 impl PageCopy {

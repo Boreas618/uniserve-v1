@@ -152,6 +152,19 @@ fn content(plan: &CachePlan, group: usize) -> [u8; 32] {
     digest.finish()
 }
 
+/// The shape of `group`'s pages on a pool of `plan`'s layout: their layout digest, the rank's kv
+/// head slice and their bytes. A pool's own pages have it, and so do the pages a converted load
+/// reads, under the source plan (`CachePlan::source_plan`).
+pub(crate) fn page_shape(plan: &CachePlan, group: usize) -> PageShape {
+    let entry = &plan.groups[group];
+    PageShape {
+        layout: Key(layout(plan, group)),
+        kv_head_offset: entry.kv_head_offset,
+        kv_head_count: entry.num_kv_heads,
+        page_bytes: page_bytes(plan, entry),
+    }
+}
+
 /// The page identity of each of `plan`'s groups for a model whose weights
 /// are `fingerprint` (`PrefixCacheInfo::identities`): the weights and the
 /// group's logical page content, as `|`-separated components. The engine
@@ -185,22 +198,36 @@ pub(crate) struct HostCacheSetup {
 
 impl HostCacheSetup {
     /// Map the page pools of `cache`, `tokens` tokens in each cache group,
-    /// and copy the cache's pages through them from now on. Returns what
-    /// the rank reports of each pool.
+    /// and copy the cache's pages through them from now on; a pool that
+    /// admits converted loads also takes its staging tensors and conversion
+    /// scratch (`super::conversion`), for the pages of one request of the
+    /// widest block table. Returns what the rank reports of each pool.
     pub(crate) fn map(
         self,
         retained: &Retained,
         cache: &mut super::PrefixCache,
         tokens: u64,
     ) -> Result<Vec<HostPoolInfo>> {
-        let (host, pools) = HostKvCache::start(
+        let (host, mut pools) = HostKvCache::start(
             retained,
             cache.plan(),
             self.device,
             self.endpoint.as_deref(),
             tokens,
         )?;
-        cache.set_host_kv_cache(host, self.copy)?;
+        let conversion = super::conversion::Conversion::start(
+            retained,
+            cache.plan(),
+            self.device,
+            cache.tables().width() as u32,
+        )?;
+        let conversion = conversion.map(|(conversion, reports)| {
+            for (pool, report) in pools.iter_mut().zip(reports) {
+                pool.conversion = Some(report);
+            }
+            conversion
+        });
+        cache.set_host_kv_cache(host, self.copy, conversion)?;
         Ok(pools)
     }
 }
@@ -226,16 +253,10 @@ impl HostKvCache {
         let mut pools = BTreeMap::new();
         let mut infos = Vec::new();
         for (index, group) in plan.groups.iter().enumerate() {
-            let layout = layout(plan, index);
             // The pool lies on the host NUMA node closest to the device, so
             // the copies between them cross no inter-node link.
             let numa_node = host_pages::numa_node(device);
-            let shape = PageShape {
-                layout: Key(layout),
-                kv_head_offset: group.kv_head_offset,
-                kv_head_count: group.num_kv_heads,
-                page_bytes: page_bytes(plan, group),
-            };
+            let shape = page_shape(plan, index);
             let slots = tokens / page_tokens(group);
             if slots == 0 {
                 return Err(Error::Resource(
@@ -254,6 +275,7 @@ impl HostKvCache {
                 pool: pages.pool(),
                 shape: pages.shape(),
                 endpoint: endpoint.map(str::to_owned),
+                conversion: None,
             };
             pools.insert(
                 index as u32,

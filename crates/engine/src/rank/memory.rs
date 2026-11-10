@@ -204,6 +204,24 @@ impl ModelRunner {
                     }
                     None => cache,
                 };
+                // A deployment that reads other hosts' host KV cache pages (`kv_cache_config.peers`)
+                // into an FP8 pool also loads the pages they computed in the dense compute dtype, by
+                // converting them as they load (OD-3: never the other direction). A pool whose
+                // groups have no conversion (a state or draft group) loads only its own shape.
+                let kv = &self.engine_config().kv_cache;
+                let cache =
+                    if kv.host_tier && kv.prefix_caching && !kv.peers.is_empty() && cache.quantized
+                    {
+                        match cache.clone().with_conversion() {
+                            Ok(converting) => converting,
+                            Err(why) => {
+                                tracing::info!(%why, "the KV cache loads no converted peer page");
+                                cache
+                            }
+                        }
+                    } else {
+                        cache
+                    };
                 // The request slots' state banks are the runner's, carved from the resident pool
                 // beside the cache.
                 let slots = u32::try_from(self.engine_config().max_running_requests.get())

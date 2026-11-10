@@ -1707,6 +1707,7 @@ mod layer_view_tests {
                 dtype: ipc::PrefixCacheDtype::BFloat16,
                 groups,
                 checkpoints,
+                converts_from: None,
             },
             num_units,
         )
@@ -1928,6 +1929,7 @@ mod layer_view_tests {
                 planes: 4,
                 fields: Vec::new(),
             }],
+            converts_from: None,
         };
         let pool = planes_of(plan, 8);
         let value = pool.value_storage(0)?.address();

@@ -100,6 +100,7 @@ impl EncoderHostPool {
                 pool: pages.pool(),
                 shape: pages.shape(),
                 endpoint: endpoint.map(str::to_owned),
+                conversion: None,
             },
             identities,
         };

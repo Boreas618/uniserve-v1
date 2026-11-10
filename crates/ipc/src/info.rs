@@ -138,6 +138,29 @@ pub struct HostPoolInfo {
     /// Where an engine on another host reaches the pool's Storage Server
     /// (`StorageLaunch::tcp`).
     pub endpoint: Option<String>,
+    /// How the rank loads the group's pages another host holds in another
+    /// representation (a converted load); `None` when it loads only pages of
+    /// [`Self::shape`].
+    pub conversion: Option<PoolConversion>,
+}
+
+/// A cache group's converted loads on one rank: the pages of `source`, a
+/// dense representation of the same logical pages, are read from a peer
+/// host into slots of the rank's staging tensor and converted on the device
+/// into the group's own representation as they are loaded
+/// (`PageCopy::staged`). They are never committed to a host pool in the
+/// source representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolConversion {
+    /// The shape of the source pages: the layout of the dense
+    /// representation, the rank's kv head slice and the bytes of one page.
+    pub source: storage::protocol::PageShape,
+    /// The rank's staging tensor, an exclusive host tensor retained at its
+    /// host's Storage Server, into which a peer read writes source pages.
+    pub staging: storage::Key,
+    /// The source pages the staging tensor holds; slot `s` lies at
+    /// `s * source.page_bytes`.
+    pub slots: u32,
 }
 
 /// One run of a rank's device cache planes, as a copy between processes

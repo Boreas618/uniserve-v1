@@ -44,6 +44,16 @@
 //!   rest; a read past the wait is cancelled. A peer that cannot be reached
 //!   or answers with an error is skipped for that admission. A failure never
 //!   fails the request.
+//! - **Converted peer loads.** A rank whose pool admits converted loads
+//!   (`ipc::PoolConversion`: an FP8 pool, from its dense compute dtype)
+//!   also asks the peers for the pages of its conversion source's shape.
+//!   A page a peer holds only in that shape is read into a slot of the
+//!   rank's staging tensor instead of its pool, and nothing commits it:
+//!   the hit counts it as present once its read completes, the request's
+//!   first prefill loads it with `PageCopy::staged`, which converts it on
+//!   the device, and the slot is free again once that call's result is
+//!   accepted. The converted units are the request's own computed pages,
+//!   offloaded to the rank's pool like any it computed.
 //! - **Offloads.** Once a prompt page is published in L1, a slot is reserved
 //!   for it in every rank's pool, while the scheduler holds a reference to
 //!   its units. Full attention offloads every published page. A sliding
@@ -104,7 +114,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ipc::{PageCopy, PrefixCacheInfo};
+use ipc::{PageCopy, PoolConversion, PrefixCacheInfo};
 use ipc::{RequestId, UnitId};
 use storage::protocol::{
     Event, PageAnchor, PageLevel, PageShape, PageSlot, PageWindow, PeerPool, Reply, Request,
@@ -249,6 +259,9 @@ struct RankPool {
     /// The shape of the pool's pages, which a peer pool must have for its
     /// pages to be read into this one.
     shape: PageShape,
+    /// The rank's converted loads of the group: the source shape whose peer
+    /// pages it reads into its staging tensor and converts as it loads them.
+    conversion: Option<PoolConversion>,
 }
 
 /// The page pools of one cache group of a worker group, one per rank.
@@ -326,7 +339,7 @@ enum Asked {
     /// `sources`.
     PeerReserve {
         request: RequestId,
-        pool: RankPool,
+        pool: Box<RankPool>,
         keys: Vec<Key>,
         sources: Vec<RemoteSlot>,
     },
@@ -382,8 +395,12 @@ struct GroupPins {
     /// emptied once the pins pass to the reads.
     peers: Vec<Option<Vec<PeerPool>>>,
     /// For each rank, where a peer holds each key in a pool of the rank's
-    /// page shape; empty until the peers answered.
+    /// page shape, or of its conversion source's; empty until the peers
+    /// answered.
     remote: Vec<Vec<Option<RemoteSlot>>>,
+    /// For each rank, the staging slot holding each key's page once a
+    /// converted read of it completed.
+    staged: Vec<Vec<Option<u32>>>,
 }
 
 /// Which pages a boundary counts as present on a rank.
@@ -399,12 +416,14 @@ enum Reach {
 }
 
 /// A page a peer holds: the peer (an index of `KvOffloadManager::peers`),
-/// its pool and the slot it pinned.
+/// its pool and the slot it pinned, and whether the pool holds the page in
+/// the rank's conversion source shape rather than its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RemoteSlot {
     peer: usize,
     pool: u64,
     slot: u64,
+    converted: bool,
 }
 
 impl GroupPins {
@@ -419,7 +438,8 @@ impl GroupPins {
                 let pinned = slots
                     .as_ref()
                     .and_then(|slots| slots.get(position))
-                    .is_some_and(Option::is_some);
+                    .is_some_and(Option::is_some)
+                    || self.staged_slot(rank, position).is_some();
                 let found = || {
                     levels
                         .as_ref()
@@ -441,27 +461,41 @@ impl GroupPins {
             })
     }
 
-    /// Where a peer holds each key in a pool of each rank's page shape, the
-    /// first peer in configuration order that does.
-    fn locate(&mut self, shapes: &[PageShape]) {
-        self.remote = shapes
+    /// The staging slot of `rank`'s page at `position`, once its converted
+    /// read completed.
+    fn staged_slot(&self, rank: usize, position: usize) -> Option<u32> {
+        self.staged.get(rank)?.get(position).copied().flatten()
+    }
+
+    /// Where a peer holds each key for each rank: the first peer in
+    /// configuration order that holds it in a pool of the rank's page shape,
+    /// else the first that holds it in the rank's conversion source shape.
+    fn locate(&mut self, ranks: &[RankPool]) {
+        let find = |position: usize, shape: PageShape, converted: bool| {
+            self.peers.iter().enumerate().find_map(|(peer, pools)| {
+                pools
+                    .iter()
+                    .flatten()
+                    .filter(|pool| pool.shape == shape)
+                    .find_map(|pool| {
+                        let slot = (*pool.slots.get(position)?)?;
+                        Some(RemoteSlot {
+                            peer,
+                            pool: pool.pool,
+                            slot,
+                            converted,
+                        })
+                    })
+            })
+        };
+        self.remote = ranks
             .iter()
-            .map(|shape| {
+            .map(|rank| {
                 (0..self.keys.len())
                     .map(|position| {
-                        self.peers.iter().enumerate().find_map(|(peer, pools)| {
-                            pools
-                                .iter()
-                                .flatten()
-                                .filter(|pool| pool.shape == *shape)
-                                .find_map(|pool| {
-                                    let slot = (*pool.slots.get(position)?)?;
-                                    Some(RemoteSlot {
-                                        peer,
-                                        pool: pool.pool,
-                                        slot,
-                                    })
-                                })
+                        find(position, rank.shape, false).or_else(|| {
+                            let source = rank.conversion?.source;
+                            find(position, source, true)
                         })
                     })
                     .collect()
@@ -504,6 +538,28 @@ struct Read {
     task: Option<u64>,
     /// When the read was submitted.
     submitted: Instant,
+    /// For a converted read into a rank's staging tensor: the pages' places,
+    /// which hold their staging slots (`PageRead::destination`) once it
+    /// completes.
+    staged: Option<StagedRead>,
+}
+
+/// Where a converted read's pages belong: a cache group of a worker group
+/// and a rank, and each page's position among the group's pinned keys.
+struct StagedRead {
+    worker: WorkerGroupId,
+    group: usize,
+    rank: usize,
+    positions: Vec<usize>,
+}
+
+/// One rank's page of a host KV cache hit: a slot of its pool, pinned, or a
+/// slot of its staging tensor, holding the page in the conversion source
+/// shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HitPage {
+    Pool(u64),
+    Staged(u32),
 }
 
 /// The pages of one cache group a hit loads.
@@ -512,7 +568,7 @@ struct GroupHit {
     first: usize,
     keys: Vec<Key>,
     /// Each rank's slot of each page.
-    slots: Vec<Vec<u64>>,
+    slots: Vec<Vec<HitPage>>,
 }
 
 /// A request's hit of the host KV cache, from its admission until its loads
@@ -623,6 +679,10 @@ pub(crate) struct KvOffloadManager {
     /// The tokens each admitted request's hit read from peers, until the
     /// admission takes them ([`KvOffloadManager::take_peer_tokens`]).
     peer_tokens: HashMap<RequestId, usize>,
+    /// The free slots of each rank's staging tensor, by worker group, cache
+    /// group and rank: a slot is taken by a converted read and free again
+    /// when the read fails, its page is not loaded, or its load is accepted.
+    staging: HashMap<(WorkerGroupId, usize, usize), Vec<u32>>,
 }
 
 impl KvOffloadManager {
@@ -657,6 +717,7 @@ impl KvOffloadManager {
             next_read: 1,
             tasks: HashMap::new(),
             peer_tokens: HashMap::new(),
+            staging: HashMap::new(),
         })
     }
 
@@ -759,7 +820,19 @@ impl KvOffloadManager {
                     },
                     pool: pool.pool,
                     shape: pool.shape,
+                    conversion: pool.conversion,
                 });
+            }
+        }
+        self.staging.retain(|(owner, _, _), _| owner != worker);
+        for (index, group) in groups.iter().enumerate() {
+            for (rank, pool) in group.ranks.iter().enumerate() {
+                if let Some(conversion) = pool.conversion {
+                    self.staging.insert(
+                        (worker.clone(), index, rank),
+                        (0..conversion.slots).collect(),
+                    );
+                }
             }
         }
         let step = groups
@@ -890,6 +963,7 @@ impl KvOffloadManager {
                 fetching: Vec::new(),
                 peers: Vec::new(),
                 remote: Vec::new(),
+                staged: vec![vec![None; wanted.len()]; ranks],
             };
             for (rank, pool) in group.ranks.iter().enumerate() {
                 if wanted.is_empty() {
@@ -1182,7 +1256,14 @@ impl KvOffloadManager {
         };
         let mut asks = Vec::new();
         for (index, (group, pins_of)) in pools.groups.iter().zip(&pins.groups).enumerate() {
-            let mut layouts: Vec<Key> = group.ranks.iter().map(|rank| rank.shape.layout).collect();
+            let mut layouts: Vec<Key> = group
+                .ranks
+                .iter()
+                .flat_map(|rank| {
+                    std::iter::once(rank.shape.layout)
+                        .chain(rank.conversion.map(|conversion| conversion.source.layout))
+                })
+                .collect();
             layouts.sort_unstable_by_key(|layout| layout.0);
             layouts.dedup();
             asks.push((index, layouts, pins_of.keys.clone()));
@@ -1227,18 +1308,20 @@ impl KvOffloadManager {
     /// pages the deeper boundary needs in each rank's pool; unpin at the
     /// peers every page that is not read.
     fn read_peers(&mut self, request: RequestId, pools: &GroupCachePools) -> Option<usize> {
+        let worker = self.pins.get(&request)?.worker.clone();
         let pins = self.pins.get_mut(&request)?;
         for (group, pins_of) in pools.groups.iter().zip(pins.groups.iter_mut()) {
-            let shapes: Vec<PageShape> = group.ranks.iter().map(|rank| rank.shape).collect();
-            pins_of.locate(&shapes);
+            pins_of.locate(&group.ranks);
         }
         let pinned = Self::boundary(pools, pins, Reach::Pinned);
         let peers = Self::boundary(pools, pins, Reach::Peers);
         let deepens = peers > pinned && peers - pinned >= PREFETCH_MIN_TOKENS;
 
         // The pages each rank reads: those the deeper boundary needs that its
-        // pool did not pin and a peer holds.
+        // pool did not pin and a peer holds, into its pool, or into its
+        // staging tensor when the peer holds them in its conversion source.
         let mut reserves = Vec::new();
+        let mut converted = Vec::new();
         let mut used: Vec<(usize, u64, Key)> = Vec::new();
         if deepens {
             for (index, (group, pins_of)) in pools.groups.iter().zip(&pins.groups).enumerate() {
@@ -1251,6 +1334,9 @@ impl KvOffloadManager {
                     let slots = pins_of.slots[rank].as_deref().unwrap_or_default();
                     let mut read = Vec::new();
                     let mut sources = Vec::new();
+                    let mut staged = Vec::new();
+                    let free = self.staging.get_mut(&(worker.clone(), index, rank));
+                    let mut free = free;
                     for &position in &positions {
                         let pinned = slots.get(position).is_some_and(Option::is_some);
                         let source = pins_of
@@ -1259,11 +1345,24 @@ impl KvOffloadManager {
                             .and_then(|remote| remote.get(position))
                             .copied()
                             .flatten();
-                        if let (false, Some(source)) = (pinned, source) {
+                        let Some(source) = source.filter(|_| !pinned) else {
+                            continue;
+                        };
+                        if source.converted {
+                            // A page in the source shape lands in a staging slot; past the
+                            // staging's slots it is computed.
+                            let Some(slot) = free.as_mut().and_then(|free| free.pop()) else {
+                                continue;
+                            };
+                            staged.push((position, source, slot));
+                        } else {
                             read.push(position);
                             sources.push(source);
-                            used.push((source.peer, source.pool, pins_of.keys[position]));
                         }
+                        used.push((source.peer, source.pool, pins_of.keys[position]));
+                    }
+                    if !staged.is_empty() {
+                        converted.push((pool.clone(), index, rank, staged));
                     }
                     if !read.is_empty() {
                         let keys: Vec<Key> = read
@@ -1298,13 +1397,17 @@ impl KvOffloadManager {
             }
         }
 
+        let mut staged_reads = 0;
+        for (pool, group, rank, pages) in converted {
+            staged_reads += self.read_staged(request, &worker, &pool, group, rank, pages);
+        }
         let mut awaiting = 0;
         let mut fetching: Vec<Vec<usize>> = vec![Vec::new(); pools.groups.len()];
         for (pool, keys, group, positions, sources) in reserves {
             fetching[group].extend(positions.iter().copied());
             let purpose = Asked::PeerReserve {
                 request,
-                pool: pool.clone(),
+                pool: Box::new(pool.clone()),
                 keys: keys.clone(),
                 sources: sources.clone(),
             };
@@ -1318,17 +1421,129 @@ impl KvOffloadManager {
             }
         }
         let pins = self.pins.get_mut(&request)?;
-        if awaiting == 0 {
-            pins.stage = Stage::Settled;
-            return Some(pinned);
-        }
+        pins.reads += staged_reads;
         for (pins_of, mut positions) in pins.groups.iter_mut().zip(fetching) {
             positions.sort_unstable();
             positions.dedup();
             pins_of.fetching = positions;
         }
-        pins.stage = Stage::PeerReserving { awaiting };
-        None
+        if awaiting > 0 {
+            pins.stage = Stage::PeerReserving { awaiting };
+            return None;
+        }
+        if staged_reads > 0 {
+            pins.stage = Stage::Reading {
+                deadline: Instant::now() + prefetch_wait(peers.saturating_sub(pinned)),
+            };
+            return None;
+        }
+        pins.stage = Stage::Settled;
+        Some(pinned)
+    }
+
+    /// Read `rank`'s pages of `group` that a peer holds in the rank's
+    /// conversion source shape into the staging slots `pages` took (each
+    /// page's position, source and slot), one task per peer pool. Answers
+    /// the reads submitted; the slots of a read that cannot be submitted are
+    /// free again and its pins end.
+    fn read_staged(
+        &mut self,
+        request: RequestId,
+        worker: &WorkerGroupId,
+        pool: &RankPool,
+        group: usize,
+        rank: usize,
+        pages: Vec<(usize, RemoteSlot, u32)>,
+    ) -> usize {
+        let Some(conversion) = pool.conversion else {
+            return 0;
+        };
+        let keys: Vec<Key> = match self.pins.get(&request) {
+            Some(pins) => pins.groups[group].keys.clone(),
+            None => return 0,
+        };
+        let mut reads: BTreeMap<(usize, u64), Vec<(usize, PageRead)>> = BTreeMap::new();
+        for (position, source, slot) in pages {
+            reads.entry((source.peer, source.pool)).or_default().push((
+                position,
+                PageRead {
+                    key: keys[position],
+                    source: source.slot,
+                    destination: u64::from(slot),
+                },
+            ));
+        }
+        let mut submitted = 0;
+        for ((peer, peer_pool), pages) in reads {
+            let (positions, pages): (Vec<usize>, Vec<PageRead>) = pages.into_iter().unzip();
+            let peer_connection = self.peer_client(peer);
+            let endpoint = self.peers.get(peer).cloned();
+            let (Some(client), Some(endpoint)) = (peer_connection, endpoint) else {
+                self.free_staged(
+                    worker,
+                    group,
+                    rank,
+                    pages.iter().map(|page| page.destination),
+                );
+                continue;
+            };
+            let read = PoolRead {
+                client: pool.client,
+                pool: pool.pool,
+                peer: client,
+                endpoint,
+                peer_pool,
+                shape: conversion.source,
+                pages,
+                staging: Some(conversion.staging),
+            };
+            let number = self.next_read;
+            self.next_read += 1;
+            if self
+                .servers
+                .read_pages(&read, Asked::PeerRead { read: number })
+            {
+                self.reads.insert(
+                    number,
+                    Read {
+                        request: Some(request),
+                        read,
+                        task: None,
+                        submitted: Instant::now(),
+                        staged: Some(StagedRead {
+                            worker: worker.clone(),
+                            group,
+                            rank,
+                            positions,
+                        }),
+                    },
+                );
+                submitted += 1;
+            } else {
+                self.free_staged(
+                    worker,
+                    group,
+                    rank,
+                    read.pages.iter().map(|page| page.destination),
+                );
+                self.servers.settle_read(&read, false);
+            }
+        }
+        submitted
+    }
+
+    /// Return staging slots of `rank`'s staging tensor of `group` to its free
+    /// slots.
+    fn free_staged(
+        &mut self,
+        worker: &WorkerGroupId,
+        group: usize,
+        rank: usize,
+        slots: impl IntoIterator<Item = u64>,
+    ) {
+        if let Some(free) = self.staging.get_mut(&(worker.clone(), group, rank)) {
+            free.extend(slots.into_iter().map(|slot| slot as u32));
+        }
     }
 
     /// The connection to configured peer `peer`, which holds the pins taken
@@ -1419,6 +1634,7 @@ impl KvOffloadManager {
                 peer_pool,
                 shape: pool.shape,
                 pages,
+                staging: None,
             };
             let number = self.next_read;
             self.next_read += 1;
@@ -1433,6 +1649,7 @@ impl KvOffloadManager {
                         read,
                         task: None,
                         submitted: Instant::now(),
+                        staged: None,
                     },
                 );
                 submitted += 1;
@@ -1495,11 +1712,36 @@ impl KvOffloadManager {
                 "a peer read of host KV cache pages did not complete: its pages are computed"
             );
         }
+        let mut held = false;
         if let Some(request) = read.request
             && let Some(pins) = self.pins.get_mut(&request)
         {
             pins.reads_ended += 1;
             pins.reads_complete += usize::from(complete);
+            // The pages of a converted read that completed while its admission
+            // waits are the admission's, in their staging slots.
+            if let Some(staged) = read.staged.as_ref().filter(|_| complete)
+                && matches!(pins.stage, Stage::Reading { .. })
+                && let Some(slots) = pins
+                    .groups
+                    .get_mut(staged.group)
+                    .and_then(|group| group.staged.get_mut(staged.rank))
+            {
+                for (position, page) in staged.positions.iter().zip(&read.read.pages) {
+                    if let Some(slot) = slots.get_mut(*position) {
+                        *slot = Some(page.destination as u32);
+                    }
+                }
+                held = true;
+            }
+        }
+        if !held && let Some(staged) = &read.staged {
+            self.free_staged(
+                &staged.worker,
+                staged.group,
+                staged.rank,
+                read.read.pages.iter().map(|page| page.destination),
+            );
         }
     }
 
@@ -1522,7 +1764,7 @@ impl KvOffloadManager {
             }
         }
         let mut groups = Vec::with_capacity(pools.groups.len());
-        for (group, pins_of) in pools.groups.iter().zip(&pins.groups) {
+        for (index, (group, pins_of)) in pools.groups.iter().zip(&pins.groups).enumerate() {
             // A full-attention group loads its pages from the device match
             // to the boundary; a sliding window those of its window; the
             // draft cache its leading pages every rank pinned.
@@ -1551,10 +1793,26 @@ impl KvOffloadManager {
                 if !extra.is_empty() {
                     self.unpin(pool, extra);
                 }
+                // Staged pages the hit does not load are free again.
+                let unloaded: Vec<u64> = (0..pins_of.keys.len())
+                    .filter(|position| !positions.contains(position))
+                    .filter_map(|position| pins_of.staged_slot(rank, position))
+                    .map(u64::from)
+                    .collect();
+                self.free_staged(&pins.worker, index, rank, unloaded);
                 slots.push(
                     positions
                         .clone()
-                        .filter_map(|position| pinned.get(position).copied().flatten())
+                        .filter_map(|position| {
+                            pinned
+                                .get(position)
+                                .copied()
+                                .flatten()
+                                .map(HitPage::Pool)
+                                .or_else(|| {
+                                    pins_of.staged_slot(rank, position).map(HitPage::Staged)
+                                })
+                        })
                         .collect(),
                 );
             }
@@ -1647,12 +1905,18 @@ impl KvOffloadManager {
                 };
             }
         }
-        for (group, pins_of) in pools.groups.iter().zip(&pins.groups) {
+        for (index, (group, pins_of)) in pools.groups.iter().zip(&pins.groups).enumerate() {
             for (rank, pool) in group.ranks.iter().enumerate() {
                 let pinned = Self::pinned(&pins_of.keys, pins_of.slots[rank].as_deref());
                 if !pinned.is_empty() {
                     self.unpin(pool, pinned);
                 }
+                // Staged pages of converted reads that completed are free again.
+                let staged: Vec<u64> = (0..pins_of.keys.len())
+                    .filter_map(|position| pins_of.staged_slot(rank, position))
+                    .map(u64::from)
+                    .collect();
+                self.free_staged(&pins.worker, index, rank, staged);
             }
             // Pins the peers answered and no read took yet end too.
             for (peer, pools_of) in pins_of.peers.iter().enumerate() {
@@ -1701,14 +1965,19 @@ impl KvOffloadManager {
         let mut copies = Vec::new();
         for (index, (group, hit_of)) in pools.groups.iter().zip(&hit.groups).enumerate() {
             for (rank, pool) in group.ranks.iter().enumerate() {
-                for (offset, slot) in hit_of.slots[rank].iter().enumerate() {
+                for (offset, page) in hit_of.slots[rank].iter().enumerate() {
                     if let Some(units) = units(index, hit_of.first + offset) {
+                        let (host_page, staged) = match *page {
+                            HitPage::Pool(slot) => (slot, false),
+                            HitPage::Staged(slot) => (u64::from(slot), true),
+                        };
                         copies.push(PageCopy {
                             rank: rank as u32,
                             pool: pool.pool,
                             group_id: index as u32,
-                            host_page: *slot,
+                            host_page,
                             units,
+                            staged,
                         });
                     }
                 }
@@ -1718,12 +1987,24 @@ impl KvOffloadManager {
     }
 
     /// The pages of `request`'s hit of each cache group, which hold the
-    /// host KV cache's bytes already; empty without a hit.
+    /// host KV cache's bytes already: its leading pages every rank's pool
+    /// holds, without the converted pages after them, which the request
+    /// offloads as pages it computed. Empty without a hit.
     pub(crate) fn hit_pages(&self, request: RequestId) -> Vec<Range<usize>> {
         self.hits.get(&request).map_or_else(Vec::new, |hit| {
             hit.groups
                 .iter()
-                .map(|group| group.first..group.first + group.keys.len())
+                .map(|group| {
+                    let pooled = (0..group.keys.len())
+                        .take_while(|&offset| {
+                            group
+                                .slots
+                                .iter()
+                                .all(|slots| matches!(slots.get(offset), Some(HitPage::Pool(_))))
+                        })
+                        .count();
+                    group.first..group.first + pooled
+                })
                 .collect()
         })
     }
@@ -1742,12 +2023,32 @@ impl KvOffloadManager {
         let Some(pools) = self.workers.get(&hit.worker).cloned() else {
             return;
         };
-        for (group, hit_of) in pools.groups.iter().zip(hit.groups) {
-            if hit_of.keys.is_empty() {
-                continue;
-            }
-            for pool in &group.ranks {
-                self.unpin(pool, hit_of.keys.clone());
+        for (index, (group, hit_of)) in pools.groups.iter().zip(hit.groups).enumerate() {
+            for (rank, pool) in group.ranks.iter().enumerate() {
+                let pages = hit_of
+                    .slots
+                    .get(rank)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                // Only the pool pages were pinned there; the staged ones are free again.
+                let pinned: Vec<Key> = hit_of
+                    .keys
+                    .iter()
+                    .zip(pages)
+                    .filter(|(_, page)| matches!(page, HitPage::Pool(_)))
+                    .map(|(key, _)| *key)
+                    .collect();
+                if !pinned.is_empty() {
+                    self.unpin(pool, pinned);
+                }
+                let staged: Vec<u64> = pages
+                    .iter()
+                    .filter_map(|page| match page {
+                        HitPage::Staged(slot) => Some(u64::from(*slot)),
+                        HitPage::Pool(_) => None,
+                    })
+                    .collect();
+                self.free_staged(&hit.worker, index, rank, staged);
             }
         }
     }
@@ -2255,6 +2556,7 @@ impl KvOffloadManager {
                                         group_id: reservation.group as u32,
                                         host_page: *slot,
                                         units: page.units().to_vec(),
+                                        staged: false,
                                     },
                                     key: *key,
                                     _page: Arc::clone(page),
@@ -2499,6 +2801,7 @@ mod tests {
                         page_bytes: 16,
                     },
                     endpoint: None,
+                    conversion: None,
                 })
                 .collect(),
             scratch_units: 0,
@@ -2826,6 +3129,118 @@ mod tests {
         poll_until(&mut kv_offload, |kv_offload| !kv_offload.servers.waiting());
         let pool = listed(&server.socket, pools[0]);
         assert_eq!((pool.pinned, pool.ready), (0, 8));
+    }
+
+    /// A rank that converts asks a peer for the pages of its conversion
+    /// source's shape too: a peer that holds the prompt only in that shape
+    /// has its pages pinned for a read into the rank's staging tensor, which
+    /// reserves nothing in the rank's pool. A read that cannot run computes
+    /// the pages, and the peer's pins end.
+    #[test]
+    fn a_converted_peer_hit_that_cannot_be_read_is_computed_and_its_pins_end() {
+        let peer = Running::start();
+        let local = Running::start();
+        let scope = Scope {
+            deployment: "model".into(),
+            group: "text".into(),
+            rank: 0,
+        };
+        let mut daemon = Client::connect(
+            &peer.socket,
+            Role::Head {
+                deployment: "model".into(),
+                epoch: 1,
+            },
+        )
+        .unwrap();
+        let claim = daemon.claim(1, vec![scope.clone()], Vec::new()).unwrap();
+        daemon.publish_epochs(vec![1]).unwrap();
+        let mut peer_worker = Client::connect(
+            &peer.socket,
+            Role::Worker {
+                scope: scope.clone(),
+                generation: 1,
+                claim,
+                epoch: 1,
+            },
+        )
+        .unwrap();
+        // The peer stores the prompt in the dense representation: another
+        // layout and twice the page bytes of the converting rank's own pool.
+        let source = PageShape {
+            layout: Key([9; 32]),
+            kv_head_offset: 0,
+            kv_head_count: 8,
+            page_bytes: 32,
+        };
+        let request = Request::PagePool {
+            shape: source,
+            numa_node: None,
+            bytes: None,
+        };
+        let Reply::PagePool {
+            pool: peer_pool, ..
+        } = peer_worker.call(&request, &[]).unwrap().reply
+        else {
+            panic!("the page pool was refused");
+        };
+        let (_worker, pools) = worker_pools(&local, &[3]);
+        let mut cache = report(vec![cache_group(None)], &pools, &[3]);
+        cache.page_pools[0].conversion = Some(PoolConversion {
+            source,
+            staging: Key([7; 32]),
+            slots: 8,
+        });
+        let prompt: Vec<u32> = (0..8 * 64 + 1).collect();
+        let keys = page_keys(&cache, &prompt[..512]);
+        let reserve = Request::Reserve {
+            pool: peer_pool,
+            writer: Some(scope),
+            keys: keys[0].clone(),
+            window: None,
+        };
+        daemon.call(&reserve, &[]).unwrap();
+        let commit = Request::Commit {
+            pool: peer_pool,
+            keys: keys[0].clone(),
+        };
+        daemon.call(&commit, &[]).unwrap();
+
+        // This host runs no Transfer Server, so the converted read fails.
+        let mut kv_offload =
+            KvOffloadManager::connect(&local.socket, "model", 0, DEFAULT_BOUNDARY_INTERVAL, false)
+                .unwrap();
+        kv_offload.set_peers(vec![peer.tcp.clone()]);
+        let text = WorkerGroupId("text".into());
+        assert!(kv_offload.add_worker(
+            &text,
+            &[RankCache {
+                local: true,
+                cache: &cache,
+            }]
+        ));
+        let mut boundary = None;
+        let mut pinned = 0;
+        poll_until(&mut kv_offload, |kv_offload| {
+            boundary = kv_offload.admission(RequestId(1), &text, &keys, 0, 512, 0);
+            pinned = pinned.max(listed(&peer.socket, peer_pool).pinned);
+            boundary.is_some()
+        });
+        assert_eq!(
+            boundary,
+            Some(0),
+            "an unread converted page was counted as a hit"
+        );
+        assert_eq!(kv_offload.admit(RequestId(1)), None);
+        assert_eq!(listed(&local.socket, pools[0]).reserved, 0);
+
+        // The peer's pages in the source shape were pinned for the read, and
+        // the pins end.
+        assert!(pinned > 0, "the peer's source-shape pages were not pinned");
+        poll_until(&mut kv_offload, |_| {
+            listed(&peer.socket, peer_pool).pinned == 0
+        });
+        assert_eq!(listed(&peer.socket, peer_pool).ready, 8);
     }
 
     /// A hybrid worker's hit ends at the deepest boundary whose sliding

@@ -467,6 +467,7 @@ impl KvProvider for ResidentCache {
         loads: &[ipc::PageCopy],
         offloads: &[ipc::PageCopy],
         stream: &Stream,
+        kernels: &ops::Generation,
     ) -> Result<Option<Arc<platform::Event>>> {
         if loads.is_empty() && offloads.is_empty() {
             return Ok(None);
@@ -486,7 +487,7 @@ impl KvProvider for ResidentCache {
             reset.record(stream)?;
             copy.wait_event(&reset)?;
         }
-        let issued = cache.issue_pages(loads, offloads, &copy)?;
+        let issued = cache.issue_pages(loads, offloads, &copy, Some(kernels))?;
         if let Some(fence) = &issued.loads {
             stream.wait_event(fence)?;
         }

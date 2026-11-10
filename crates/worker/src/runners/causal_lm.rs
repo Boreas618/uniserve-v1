@@ -841,15 +841,17 @@ pub trait KvProvider: Send + Sync {
     }
 
     /// Records the batch's page copies on the cache's copy stream, and makes `stream` wait for the
-    /// loads the forward reads. Answers the fence of the offloads, which the batch's output waits
-    /// on. A provider that holds no cache refuses a copy rather than dropping it.
+    /// loads the forward reads; a staged load converts with the programs of `kernels`, the
+    /// generation the batch runs. Answers the fence of the offloads, which the batch's output
+    /// waits on. A provider that holds no cache refuses a copy rather than dropping it.
     fn issue_pages(
         &mut self,
         loads: &[ipc::PageCopy],
         offloads: &[ipc::PageCopy],
         stream: &platform::Stream,
+        kernels: &ops::Generation,
     ) -> Result<Option<Arc<platform::Event>>> {
-        let _ = stream;
+        let _ = (stream, kernels);
         if loads.is_empty() && offloads.is_empty() {
             return Ok(None);
         }
@@ -1916,6 +1918,25 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
                     .map_err(Error::from)
             })?;
         }
+        // A pool that admits converted loads launches its conversion on the copy stream as a
+        // batch's staged pages load, so the walk states one page of every group.
+        if let Some(cache) = self.kv.cache() {
+            let (plan, units) = {
+                let cache = cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (Arc::clone(cache.plan()), cache.num_units())
+            };
+            footprint.walk(None, |walk| {
+                let forward = walk.forward(None)?;
+                crate::memory::prefix_cache::conversion::record(
+                    &plan,
+                    units,
+                    &forward,
+                    &|dtype, shape| walk.placeholder(dtype, shape),
+                )
+            })?;
+        }
         // A recurrent state's copies are launched eagerly around a replay, so the walk states them
         // beside the forwards: one copy of each direction states every descriptor a batch's copies
         // launch.
@@ -2917,9 +2938,10 @@ impl<M: TextModel> CausalLmRunner<M> {
         self.kv
             .install_block_tables(&install.tables, &self.stream)?;
         self.kv.apply_cache_units(&install.units, &self.stream)?;
+        let kernels = Arc::clone(&self.lifecycle.generation);
         self.offload_fence =
             self.kv
-                .issue_pages(&install.loads, &install.offloads, &self.stream)?;
+                .issue_pages(&install.loads, &install.offloads, &self.stream, &kernels)?;
         Ok(())
     }
 

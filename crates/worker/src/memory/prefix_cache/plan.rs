@@ -98,6 +98,7 @@ impl CacheGroupPlan {
 }
 
 /// The unit pool's layout.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CachePlan {
     pub columns: u32,
     pub plane_bytes: u64,
@@ -107,6 +108,9 @@ pub struct CachePlan {
     pub dtype: PrefixCacheDtype,
     pub groups: Vec<CacheGroupPlan>,
     pub checkpoints: Vec<Checkpoint>,
+    /// The dense representation whose pages the pool loads by converting them (a converted
+    /// load, [`Self::with_conversion`]), or `None` when it loads only pages of its own.
+    pub converts_from: Option<PrefixCacheDtype>,
 }
 
 impl CachePlan {
@@ -174,7 +178,92 @@ impl CachePlan {
                 compute_dtype: ElementType::BF16,
             }],
             checkpoints: Vec::new(),
+            converts_from: None,
         }
+    }
+
+    /// The plan with converted loads admitted: pages another host computed in the groups' dense
+    /// compute dtype load into this quantized pool through `page_conversion` and
+    /// `cache_copy_region` (`super::conversion`), encoded as this pool encodes its own writes.
+    ///
+    /// Only the direction that does not lower the destination's precision is admitted: a dense
+    /// source into an FP8 pool. A plan with a state group or a draft cache admits none, because
+    /// those pages have no conversion and a hit needs every group.
+    ///
+    /// # Errors
+    ///
+    /// A pool that is not quantized, holds a state or draft group, or whose groups compute in
+    /// another dtype than one dense dtype.
+    pub fn with_conversion(mut self) -> Result<Self> {
+        if !self.quantized {
+            return Err(Error::Invalid(
+                "a dense cache loads no converted page: only an FP8 pool converts".into(),
+            ));
+        }
+        if self
+            .groups
+            .iter()
+            .any(|group| group.state() || group.draft())
+        {
+            return Err(Error::Invalid(
+                "a cache with a state or draft group loads no converted page".into(),
+            ));
+        }
+        let source = match self.groups.first().map(|group| group.compute_dtype) {
+            Some(ElementType::BF16) => PrefixCacheDtype::BFloat16,
+            Some(ElementType::F16) => PrefixCacheDtype::Float16,
+            other => {
+                return Err(Error::Invalid(format!(
+                    "a cache that computes in {other:?} loads no converted page"
+                )));
+            }
+        };
+        if self
+            .groups
+            .iter()
+            .any(|group| group.compute_dtype != self.groups[0].compute_dtype)
+        {
+            return Err(Error::Invalid(
+                "a cache whose groups compute in several dtypes loads no converted page".into(),
+            ));
+        }
+        self.converts_from = Some(source);
+        Ok(self)
+    }
+
+    /// The plan of the pool the converted pages come from: this plan's groups and columns in the
+    /// dense source dtype, as a deployment that stores that dtype lays them out, so its pages'
+    /// layout and bytes are the source pool's (`host::page_shape`). `None` without converted
+    /// loads.
+    pub fn source_plan(&self) -> Option<CachePlan> {
+        let source = self.converts_from?;
+        let element = match source {
+            PrefixCacheDtype::BFloat16 => ElementType::BF16,
+            PrefixCacheDtype::Float16 => ElementType::F16,
+            PrefixCacheDtype::Float32 => ElementType::F32,
+            PrefixCacheDtype::Float8E4m3Fn => return None,
+        };
+        let stored = self.groups.first()?.dtype.bytes() as u64;
+        // A plane is one layer's page of a group, so it grows with the element width; a dense unit
+        // holds both fields' planes and their flags per column and no scale.
+        let plane_bytes = self.plane_bytes / stored * element.bytes() as u64;
+        Some(CachePlan {
+            columns: self.columns,
+            plane_bytes,
+            quantized: false,
+            unit_bytes: u64::from(self.columns) * (2 * plane_bytes + 2),
+            dtype: source,
+            groups: self
+                .groups
+                .iter()
+                .map(|group| CacheGroupPlan {
+                    dtype: element,
+                    ..group.clone()
+                })
+                .collect(),
+            checkpoints: Vec::new(),
+            converts_from: None,
+        })
     }
 }
 
@@ -215,6 +304,7 @@ impl CachePlan {
             dtype,
             groups,
             checkpoints,
+            converts_from,
         } = self;
         if groups.is_empty() {
             return Err(Error::Invalid(
@@ -290,6 +380,7 @@ impl CachePlan {
             dtype,
             groups,
             checkpoints,
+            converts_from,
         })
     }
 
@@ -644,6 +735,7 @@ mod tests {
             dtype: PrefixCacheDtype::BFloat16,
             groups: vec![group(state)],
             checkpoints,
+            converts_from: None,
         };
         let checkpoint = |first_plane: u32, planes: u32| Checkpoint {
             first_plane,

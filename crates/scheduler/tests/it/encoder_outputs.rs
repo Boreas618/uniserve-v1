@@ -36,6 +36,7 @@ fn mapping(mut pools: Vec<Inventory>, pool: u64, identities: &[(&str, &str)]) ->
                     page_bytes: PAGE_BYTES,
                 },
                 endpoint: None,
+                conversion: None,
             },
             identities: identities
                 .iter()

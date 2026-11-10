@@ -13,6 +13,7 @@
 //! failed or unknown device completions keep their storage retained.
 
 pub(super) mod block_tables;
+pub(crate) mod conversion;
 pub mod host;
 mod manifest;
 pub(super) mod plan;
@@ -34,11 +35,12 @@ use crate::stream::Issue;
 use crate::{Error, Result};
 
 /// The host KV cache, the copy stream its copies run on and the unit column
-/// bound on that stream.
+/// bound on that stream, with the converted loads of a pool that admits them.
 struct PageCopies {
     cache: HostKvCache,
     stream: Stream,
     column: UnitColumn,
+    conversion: Option<conversion::Conversion>,
 }
 
 /// A batch's page copies, recorded on the copy stream
@@ -107,7 +109,13 @@ impl PrefixCache {
         let columns = u64::try_from(unit_columns).map_err(|_| {
             crate::Error::Invariant("a rank holds more stream columns than fit".into())
         })? * UnitColumn::bytes(num_units);
-        Ok(BlockTableStorage::bytes(&plan.group_shapes()?, request_pool_size, width) + columns)
+        // A pool that admits converted loads converts on the device, in a scratch of one page and
+        // a unit table of the widest request's pages.
+        Ok(
+            BlockTableStorage::bytes(&plan.group_shapes()?, request_pool_size, width)
+                + columns
+                + conversion::device_bytes(plan, width),
+        )
     }
 
     /// Allocate the pool and the tables on `device` (host storage when `None`), resetting device
@@ -142,13 +150,20 @@ impl PrefixCache {
         })
     }
 
-    /// Copy pages through `cache` from now on, on the copy stream `stream`.
-    pub(crate) fn set_host_kv_cache(&mut self, cache: HostKvCache, stream: Stream) -> Result<()> {
+    /// Copy pages through `cache` from now on, on the copy stream `stream`, converting staged
+    /// pages with `conversion`.
+    pub(crate) fn set_host_kv_cache(
+        &mut self,
+        cache: HostKvCache,
+        stream: Stream,
+        conversion: Option<conversion::Conversion>,
+    ) -> Result<()> {
         let column = UnitColumn::bind(&self.planes, Some(&stream))?;
         self.pages = Some(PageCopies {
             cache,
             stream,
             column,
+            conversion,
         });
         Ok(())
     }
@@ -167,13 +182,18 @@ impl PrefixCache {
     /// commits them; that output waits on the returned offload fence, and
     /// nothing else does.
     ///
-    /// Fails for a rank that maps no page pool, or when a load's unit is
-    /// in use.
+    /// A staged load (`PageCopy::staged`) converts a page of the pool's
+    /// conversion source into its units with the programs of `kernels`, the
+    /// generation the batch runs, on the copy stream.
+    ///
+    /// Fails for a rank that maps no page pool, when a load's unit is in use,
+    /// or for a staged load on a pool that admits no converted loads.
     pub(crate) fn issue_pages(
         &mut self,
         loads: &[PageCopy],
         offloads: &[PageCopy],
         issue: impl Issue,
+        kernels: Option<&ops::Generation>,
     ) -> Result<IssuedPages> {
         let copies = self.pages.as_ref().ok_or_else(|| {
             Error::Invalid("a batch copies pages but the rank maps no page pool".into())
@@ -188,12 +208,27 @@ impl PrefixCache {
             issue.record(&event)?;
             Ok(event)
         }
+        let (staged, pooled): (Vec<&PageCopy>, Vec<&PageCopy>) =
+            loads.iter().partition(|copy| copy.staged);
         let loads_fence = if loads.is_empty() {
             None
         } else {
+            let pooled: Vec<PageCopy> = pooled.into_iter().cloned().collect();
             copies
                 .cache
-                .load(&self.planes, loads, &copies.column, issue)?;
+                .load(&self.planes, &pooled, &copies.column, issue)?;
+            if !staged.is_empty() {
+                let (Some(conversion), Some(kernels)) = (copies.conversion.as_ref(), kernels)
+                else {
+                    return Err(Error::Invalid(
+                        "a batch loads a staged page and the pool converts none".into(),
+                    ));
+                };
+                // The conversion reserves nothing in an arena: its scratch is its own.
+                let arena = nn::Arena::new(ops::DevicePtr::new(0), 0);
+                let forward = nn::Forward::new(&copies.stream, kernels, &arena);
+                conversion.load(&forward, &self.planes, &staged, issue)?;
+            }
             Some(fence(issue)?)
         };
         let offloads_fence = if offloads.is_empty() {
@@ -219,7 +254,7 @@ impl PrefixCache {
         let stream = self.copy_stream().ok_or_else(|| {
             Error::Invalid("a batch copies pages but the rank maps no page pool".into())
         })?;
-        self.issue_pages(&[], offloads, &stream)?;
+        self.issue_pages(&[], offloads, &stream, None)?;
         stream.synchronize()?;
         Ok(())
     }
@@ -424,6 +459,7 @@ mod fixed_bytes_tests {
             dtype: ipc::PrefixCacheDtype::BFloat16,
             groups: Vec::new(),
             checkpoints: Vec::new(),
+            converts_from: None,
         }
     }
 
@@ -482,6 +518,7 @@ mod tests {
                     compute_dtype: crate::memory::allocation::ElementType::BF16,
                 }],
                 checkpoints: Vec::new(),
+                converts_from: None,
             })
             .validated()
             .expect("a dense plan of two layers"),

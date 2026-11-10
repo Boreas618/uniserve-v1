@@ -671,6 +671,7 @@ fn page_copy(units: &[u32]) -> PageCopy {
         group_id: 0,
         host_page: 3,
         units: units.iter().copied().map(UnitId).collect(),
+        staged: false,
     }
 }
 

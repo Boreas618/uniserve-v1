@@ -15,6 +15,23 @@ greedy tokens equal A's second answer, computed over the same pages. A
 prompt A never saw reads nothing from A; once A's Storage Server stops, B
 computes a prompt A answered, with the same tokens, and no request fails.
 
+**Converted reuse across hosts.** Deployment B stores its KV cache in FP8
+(``kv_cache_config.dtype=float8_e4m3fn``) while A stores BF16. B's pool
+admits converted loads (OD-3: a dense source into an FP8 destination): it
+asks A for the prompt's pages in A's BF16 layout too, has its Transfer
+Server READ them into its staging tensor, and loads them through
+``page_conversion`` and ``cache_copy_region``, which encode them as B's own
+writes do. B's ``prefix_cache_peer_hits`` grows by the prompt's full pages,
+and its greedy answer over the converted pages agrees with its answer over
+the same prompt's pages it computed and wrote itself (another ``cache_salt``,
+asked twice: computed cold, then reused from its device cache) by the rule
+of vLLM's ``check_logprobs_close``: token for token until their first
+difference, where each answer's token is among the other's ``TOP_LOGPROBS``
+most likely tokens. Both answers compute the prompt's last tokens over FP8
+pages; FP8 pages written whole from a page's amax and pages written token by
+token round differently, so the two are not required to be identical. A
+prompt computed whole rounds otherwise again, as the first case states.
+
 The second host is named by the suite's two-host variables (docs/testing.md,
 Two hosts): ``UNISERVE_H3_FOLLOWER``, an ssh destination with this checkout
 at the same path, and ``UNISERVE_H3_LEADER_ADDRESS``, this host's address as
@@ -27,6 +44,7 @@ isolated network.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -67,6 +85,9 @@ BLOCK_SIZE = 64
 MAX_TOKENS = 32
 # Pages a prompt must fill for its peer hit to count.
 PEER_PAGES = 16
+# The candidates two greedy answers are compared at, as vLLM's model
+# correctness tests compare logprobs.
+TOP_LOGPROBS = 5
 # The prompt tokens a deployment loaded from another host's pools.
 PEER_HITS = "uniserve:prefix_cache_peer_hits"
 
@@ -84,8 +105,8 @@ def _records(label: str, count: int = 260) -> str:
     )
 
 
-def _ask(base_url: str, prompt: str) -> tuple[int, list[str]]:
-    """Decode `prompt` greedily: its prompt tokens and the decoded tokens."""
+def _answer(base_url: str, prompt: str, **fields) -> dict:
+    """The greedy answer to `prompt`, with `fields` added to the request."""
     response = httpx.post(
         f"{base_url}/v1/chat/completions",
         json={
@@ -98,15 +119,43 @@ def _ask(base_url: str, prompt: str) -> tuple[int, list[str]]:
             "max_completion_tokens": MAX_TOKENS,
             "logprobs": True,
             "return_tokens_as_token_ids": True,
+            **fields,
         },
         timeout=600,
     )
     response.raise_for_status()
-    reply = response.json()
+    return response.json()
+
+
+def _ask(base_url: str, prompt: str) -> tuple[int, list[str]]:
+    """Decode `prompt` greedily: its prompt tokens and the decoded tokens."""
+    reply = _answer(base_url, prompt)
     tokens = [
         entry["token"] for entry in reply["choices"][0]["logprobs"]["content"]
     ]
     return reply["usage"]["prompt_tokens"], tokens
+
+
+def _candidates(base_url: str, prompt: str, **fields) -> list[tuple[str, set]]:
+    """Decode `prompt` greedily: each decoded token with its position's
+    `TOP_LOGPROBS` most likely tokens.
+    """  # noqa: D205
+    reply = _answer(base_url, prompt, top_logprobs=TOP_LOGPROBS, **fields)
+    return [
+        (entry["token"], {top["token"] for top in entry["top_logprobs"]})
+        for entry in reply["choices"][0]["logprobs"]["content"]
+    ]
+
+
+def _logprobs_close(left: list, right: list) -> bool:
+    """Whether two answers agree by vLLM's `check_logprobs_close`: token for
+    token until their first difference, where each one's token is among the
+    other's most likely tokens.
+    """  # noqa: D205
+    for (token, tops), (other, other_tops) in zip(left, right):
+        if token != other:
+            return token in other_tops and other in tops
+    return True
 
 
 def _settled(base_url: str, name: str, before: float) -> float:
@@ -123,7 +172,9 @@ def _settled(base_url: str, name: str, before: float) -> float:
     return metric(base_url, name) - before
 
 
-def _serve_command(checkpoint: str, port: int, host: str) -> list[str]:
+def _serve_command(
+    checkpoint: str, port: int, host: str, extra: tuple[str, ...] = ()
+) -> list[str]:
     return [
         str(require_uniserve_binary()),
         "serve",
@@ -146,6 +197,7 @@ def _serve_command(checkpoint: str, port: int, host: str) -> list[str]:
         f"kv_cache_config.block_size={BLOCK_SIZE}",
         "--set",
         "chat_config.reasoning_parser=none",
+        *extra,
     ]
 
 
@@ -385,3 +437,101 @@ def test_a_host_loads_a_prompts_pages_from_a_peer_hosts_host_kv_cache(
     assert dropped_hits == 0
     assert b_dropped == a_dropped
     assert b_unseen == a_unseen
+
+
+def test_an_fp8_host_loads_a_bf16_hosts_pages_by_converting_them(
+    tmp_path: Path,
+):
+    if FOLLOWER is None or LEADER_ADDRESS is None or NIXL_LIBRARY is None:
+        pytest.skip(
+            "peer reads across hosts need UNISERVE_H3_FOLLOWER, "
+            "UNISERVE_H3_LEADER_ADDRESS and UNISERVE_NIXL_LIBRARY"
+        )
+    shared = _records("Converted")
+    runtime = Path(tempfile.mkdtemp(prefix="uniserve-"))
+    socket = runtime / "uniserve" / "storage-server.sock"
+    socket.parent.mkdir(mode=0o700)
+    env = {
+        "CUDA_VISIBLE_DEVICES": granted_devices(1),
+        "XDG_RUNTIME_DIR": str(runtime),
+    }
+    peer = f"{LEADER_ADDRESS}:{find_free_port()}"
+    subprocess.run(
+        _storage_command(str(socket), peer),
+        env={**os.environ, **env},
+        check=True,
+        timeout=120,
+    )
+    port = find_free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        with server_process(
+            _serve_command(qwen3_checkpoint(), port, "127.0.0.1"),
+            base_url,
+            tmp_path / "a.log",
+            timeout_s=1800,
+            env=env,
+        ):
+            # A computes the prompt in BF16 and commits its full pages to
+            # its host pools.
+            prompt_tokens, _ = _ask(base_url, shared)
+            bf16 = _candidates(base_url, shared)
+            pages = (prompt_tokens - 1) // BLOCK_SIZE
+            deadline = time.monotonic() + 120
+            listed = ""
+            while time.monotonic() < deadline:
+                listed = subprocess.run(
+                    [
+                        str(require_uniserve_binary()),
+                        "storage-server",
+                        "list",
+                        "--socket",
+                        str(socket),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout
+                if _ready_pages(listed) >= pages:
+                    break
+                time.sleep(1)
+            assert _ready_pages(listed) >= pages, listed
+
+            with _follower_deployment(
+                tmp_path / "b.log",
+                find_free_port(),
+                FOLLOWER_DEVICE,
+                [
+                    "--set",
+                    "kv_cache_config.dtype=float8_e4m3fn",
+                    "--set",
+                    f"kv_cache_config.peers={peer}",
+                ],
+            ) as (b_url, _):
+                # The same prompt on B under a salt no cache holds: computed
+                # cold, then over the FP8 pages B wrote itself.
+                cold = _candidates(b_url, shared, cache_salt="local")
+                local = _candidates(b_url, shared, cache_salt="local")
+                peer_before = metric(b_url, PEER_HITS)
+                converted = _candidates(b_url, shared)
+                peer_hits = _settled(b_url, PEER_HITS, peer_before)
+    finally:
+        stop_storage_server(runtime)
+        storage_log = runtime / "uniserve" / "storage-server.log"
+        if storage_log.is_file():
+            shutil.copy(storage_log, tmp_path / "storage-server.log")
+        shutil.rmtree(runtime, ignore_errors=True)
+
+    (tmp_path / "answers.json").write_text(
+        json.dumps(
+            {
+                "bf16": [token for token, _ in bf16],
+                "cold": [token for token, _ in cold],
+                "local": [token for token, _ in local],
+                "converted": [token for token, _ in converted],
+            }
+        )
+    )
+    assert pages >= PEER_PAGES
+    assert peer_hits >= PEER_PAGES * BLOCK_SIZE, peer_hits
+    assert _logprobs_close(converted, local), (converted, local)
