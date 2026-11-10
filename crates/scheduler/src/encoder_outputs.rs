@@ -45,10 +45,10 @@ use std::collections::{BTreeMap, HashMap};
 
 use ipc::{CallId, EncoderPoolInfo, HostOutput, RequestKey};
 use storage::key::{encoder_output as content, encoder_page as page_key};
-use storage::protocol::{PageSlot, Reply, Request};
+use storage::protocol::{PageSlot, Reply};
 use storage::{Key, Scope};
 
-use crate::host_tier::Servers;
+use crate::host_pages::Servers;
 use crate::worker::WorkerGroupId;
 
 /// One encoder output of a request: its name (the product an encoder
@@ -294,26 +294,23 @@ impl EncoderStore {
         let pool = pool.clone();
         // A request that reads no stored output stores its own at once.
         let (submitted, stage) = if access.read {
-            let pin = Request::Pin {
-                pool: pool.pool,
-                reader: pool.scope.clone(),
-                keys: keys.clone(),
-            };
             let purpose = Purpose::Pin { request, output };
             (
-                self.servers.submit(pool.client, &pin, purpose),
+                self.servers
+                    .pin(pool.client, pool.pool, &pool.scope, keys.clone(), purpose),
                 Stage::Pinning,
             )
         } else {
-            let reserve = Request::Reserve {
-                pool: pool.pool,
-                writer: pool.scope.clone(),
-                keys: keys.clone(),
-                window: None,
-            };
             let purpose = Purpose::Reserve { request, output };
             (
-                self.servers.submit(pool.client, &reserve, purpose),
+                self.servers.reserve(
+                    pool.client,
+                    pool.pool,
+                    &pool.scope,
+                    keys.clone(),
+                    None,
+                    purpose,
+                ),
                 Stage::Reserving,
             )
         };
@@ -439,18 +436,9 @@ impl EncoderStore {
                     return;
                 }
                 // Pages its calls wrote only in part are aborted.
-                let request = if failed || !planned {
-                    Request::Abort {
-                        pool: pool.pool,
-                        keys: reserved,
-                    }
-                } else {
-                    Request::Commit {
-                        pool: pool.pool,
-                        keys: reserved,
-                    }
-                };
-                self.servers.submit(pool.client, &request, Purpose::Settle);
+                let written = !failed && planned;
+                self.servers
+                    .settle(pool.client, pool.pool, reserved, written, Purpose::Settle);
             }
             Stage::Pinning | Stage::Reserving | Stage::Compute => {}
         }
@@ -570,23 +558,16 @@ impl EncoderStore {
         if keys.is_empty() {
             return;
         }
-        let unpin = Request::Unpin {
-            pool: pool.pool,
-            reader: pool.scope.clone(),
-            keys,
-        };
-        self.servers.submit(pool.client, &unpin, Purpose::Settle);
+        self.servers
+            .unpin(pool.client, pool.pool, &pool.scope, keys, Purpose::Settle);
     }
 
     fn abort(&mut self, pool: &GroupPool, keys: Vec<Key>) {
         if keys.is_empty() {
             return;
         }
-        let abort = Request::Abort {
-            pool: pool.pool,
-            keys,
-        };
-        self.servers.submit(pool.client, &abort, Purpose::Settle);
+        self.servers
+            .settle(pool.client, pool.pool, keys, false, Purpose::Settle);
     }
 
     /// An output's pins answered `slots`: every page pinned is imported;
@@ -620,14 +601,14 @@ impl EncoderStore {
             .map(|(key, _)| *key)
             .collect();
         let reserving = stored.write && {
-            let reserve = Request::Reserve {
-                pool: pool.pool,
-                writer: pool.scope.clone(),
+            self.servers.reserve(
+                pool.client,
+                pool.pool,
+                &pool.scope,
                 keys,
-                window: None,
-            };
-            self.servers
-                .submit(pool.client, &reserve, Purpose::Reserve { request, output })
+                None,
+                Purpose::Reserve { request, output },
+            )
         };
         if let Some(stored) = self
             .requests

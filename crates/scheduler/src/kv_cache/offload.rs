@@ -89,10 +89,11 @@ use std::time::{Duration, Instant};
 use ipc::{PageCopy, PrefixCacheInfo};
 use ipc::{RequestId, UnitId};
 use storage::protocol::{Event, PageAnchor, PageLevel, PageSlot, PageWindow, Reply, Request};
-use storage::{Client, Key, Role, Scope};
+use storage::{Key, Scope};
 
 use super::manager::{self, AttentionManager};
 use super::{GroupShape, PageRef};
+use crate::host_pages::Servers;
 use crate::worker::WorkerGroupId;
 
 /// The fewest tokens an L3 hit must add to the pools' hit to be prefetched:
@@ -447,19 +448,13 @@ pub(crate) struct RankCache<'a> {
 
 /// The scheduler's side of the host KV cache and the KV storage.
 pub(crate) struct KvOffloadManager {
-    deployment: String,
-    /// The engine's epoch, which publishes the pages it commits.
-    epoch: u64,
     /// The pages of the largest block size between aligned sliding-window
     /// boundaries.
     boundary_interval: usize,
-    /// The connections to the servers: the engine's host's first, then other
-    /// hosts' by the TCP address they were reached at.
-    clients: Vec<Client>,
-    remote: HashMap<String, usize>,
+    /// The connections to the servers, as a head of the engine's epoch,
+    /// which publishes the pages it commits, and the requests in flight.
+    servers: Servers<Purpose>,
     workers: HashMap<WorkerGroupId, GroupCachePools>,
-    /// Requests submitted and not yet answered, by connection and request.
-    pending: HashMap<(usize, u64), Purpose>,
     pins: HashMap<RequestId, Pins>,
     /// The request each prefetch in flight is for, by tag.
     fetches: HashMap<u64, RequestId>,
@@ -493,21 +488,10 @@ impl KvOffloadManager {
         boundary_interval: usize,
         kv_storage: bool,
     ) -> anyhow::Result<Self> {
-        let client = Client::connect(
-            socket,
-            Role::Head {
-                deployment: deployment.to_owned(),
-                epoch,
-            },
-        )?;
         Ok(Self {
-            deployment: deployment.to_owned(),
-            epoch,
             boundary_interval: boundary_interval.max(1),
-            clients: vec![client],
-            remote: HashMap::new(),
+            servers: Servers::connect(socket, deployment, epoch, "the host KV cache")?,
             workers: HashMap::new(),
-            pending: HashMap::new(),
             pins: HashMap::new(),
             fetches: HashMap::new(),
             next_tag: 1,
@@ -520,29 +504,6 @@ impl KvOffloadManager {
             deferred: Vec::new(),
             retry_at: Instant::now(),
         })
-    }
-
-    /// The connection to a remote server at `address`, made when absent.
-    fn remote(&mut self, address: &str) -> Option<usize> {
-        if let Some(&client) = self.remote.get(address) {
-            return Some(client);
-        }
-        let role = Role::Head {
-            deployment: self.deployment.clone(),
-            epoch: self.epoch,
-        };
-        match Client::connect_tcp(address, role) {
-            Ok(client) => {
-                self.clients.push(client);
-                self.remote
-                    .insert(address.to_owned(), self.clients.len() - 1);
-                Some(self.clients.len() - 1)
-            }
-            Err(error) => {
-                tracing::warn!(address, %error, "the host KV cache cannot reach a storage server");
-                None
-            }
-        }
     }
 
     /// The token count every rank of the epoch holds in the host KV cache
@@ -566,7 +527,7 @@ impl KvOffloadManager {
             0
         } else {
             endpoint
-                .and_then(|address| self.remote(address))
+                .and_then(|address| self.servers.client(false, Some(address)))
                 .ok_or_else(|| anyhow::anyhow!("another host's Storage Server is unreachable"))?
         };
         let request = Request::HostCache {
@@ -574,7 +535,7 @@ impl KvOffloadManager {
             token_bytes,
             host_bytes,
         };
-        match self.clients[client].call(&request, &[])?.reply {
+        match self.servers.call(client, &request)? {
             Reply::HostCache { tokens } => Ok(tokens),
             other => {
                 anyhow::bail!("the Storage Server answered a host KV cache size with {other:?}")
@@ -618,7 +579,7 @@ impl KvOffloadManager {
                     let Some(client) = pool
                         .endpoint
                         .as_deref()
-                        .and_then(|address| self.remote(address))
+                        .and_then(|address| self.servers.client(false, Some(address)))
                     else {
                         return false;
                     };
@@ -627,7 +588,7 @@ impl KvOffloadManager {
                 group.ranks.push(RankPool {
                     client,
                     scope: Scope {
-                        deployment: self.deployment.clone(),
+                        deployment: self.servers.deployment().to_owned(),
                         group: worker.0.clone(),
                         rank: rank as u32,
                     },
@@ -704,16 +665,7 @@ impl KvOffloadManager {
     }
 
     fn submit(&mut self, client: usize, request: &Request, purpose: Purpose) -> bool {
-        match self.clients[client].submit(request, &[]) {
-            Ok(id) => {
-                self.pending.insert((client, id), purpose);
-                true
-            }
-            Err(error) => {
-                tracing::warn!(%error, "a host KV cache request failed");
-                false
-            }
-        }
+        self.servers.submit(client, request, purpose)
     }
 
     /// The host KV cache's answer for admitting `request` to `worker`, whose
@@ -777,13 +729,11 @@ impl KvOffloadManager {
                     pins.levels[rank] = Some(Vec::new());
                     continue;
                 }
-                let pinned = self.submit(
+                let pinned = self.servers.pin(
                     pool.client,
-                    &Request::Pin {
-                        pool: pool.pool,
-                        reader: pool.scope.clone(),
-                        keys: wanted.clone(),
-                    },
+                    pool.pool,
+                    &pool.scope,
+                    wanted.clone(),
                     Purpose::Pin {
                         request,
                         group: index,
@@ -971,13 +921,11 @@ impl KvOffloadManager {
                 }
                 let mut awaiting = 0;
                 for (group, rank, pool, keys, positions) in repins {
-                    if self.submit(
+                    if self.servers.pin(
                         pool.client,
-                        &Request::Pin {
-                            pool: pool.pool,
-                            reader: pool.scope.clone(),
-                            keys,
-                        },
+                        pool.pool,
+                        &pool.scope,
+                        keys,
                         Purpose::Repin {
                             request,
                             group,
@@ -1080,7 +1028,7 @@ impl KvOffloadManager {
         // exactly the pages they pinned: a pool counts pins per reader, so an
         // unpin of a page this request never pinned would end another
         // request's pin.
-        for purpose in self.pending.values_mut() {
+        for purpose in self.servers.pending_mut() {
             let orphan = match purpose {
                 Purpose::Pin {
                     request: pinned,
@@ -1140,15 +1088,8 @@ impl KvOffloadManager {
     }
 
     fn unpin(&mut self, pool: &RankPool, keys: Vec<Key>) {
-        self.submit(
-            pool.client,
-            &Request::Unpin {
-                pool: pool.pool,
-                reader: pool.scope.clone(),
-                keys,
-            },
-            Purpose::Settle,
-        );
+        self.servers
+            .unpin(pool.client, pool.pool, &pool.scope, keys, Purpose::Settle);
     }
 
     /// The page loads of `request`'s hit, once: `units(group, page)` names
@@ -1250,7 +1191,7 @@ impl KvOffloadManager {
     /// Whether answers are awaited, which the scheduler polls for, or pages
     /// of an eviction wait to ask their pools again.
     pub(crate) fn waiting(&self) -> bool {
-        !self.pending.is_empty()
+        self.servers.waiting()
             || !self.deferred.is_empty()
             || self
                 .pins
@@ -1293,14 +1234,12 @@ impl KvOffloadManager {
                     }),
                 }),
             };
-            if self.submit(
+            if self.servers.reserve(
                 pool.client,
-                &Request::Reserve {
-                    pool: pool.pool,
-                    writer: pool.scope.clone(),
-                    keys: keys.clone(),
-                    window,
-                },
+                pool.pool,
+                &pool.scope,
+                keys.clone(),
+                window,
                 Purpose::Reserve { offload: id, rank },
             ) {
                 submitted += 1;
@@ -1332,8 +1271,8 @@ impl KvOffloadManager {
             || self.queued.values().any(|offloads| !offloads.is_empty())
             || !self.carried.is_empty()
             || self
-                .pending
-                .values()
+                .servers
+                .pending()
                 .any(|purpose| matches!(purpose, Purpose::Reserve { .. } | Purpose::Settle))
     }
 
@@ -1388,12 +1327,8 @@ impl KvOffloadManager {
                 .push(offload.key);
         }
         for ((client, pool), keys) in by_pool {
-            let request = if succeeded {
-                Request::Commit { pool, keys }
-            } else {
-                Request::Abort { pool, keys }
-            };
-            self.submit(client, &request, Purpose::Settle);
+            self.servers
+                .settle(client, pool, keys, succeeded, Purpose::Settle);
         }
     }
 
@@ -1431,40 +1366,29 @@ impl KvOffloadManager {
     /// moved on, which may let the waiting queue's head proceed.
     pub(crate) fn poll(&mut self) -> bool {
         let mut admissions = false;
-        for client in &mut self.clients {
-            if let Err(error) = client.pump() {
-                tracing::warn!(%error, "a host KV cache connection failed");
-            }
-            while let Some((event, _)) = client.next_event() {
-                let Event::Prefetched { tag, .. } = event else {
-                    continue;
-                };
-                let Some(request) = self.fetches.remove(&tag) else {
-                    continue;
-                };
-                if let Some(Pins {
-                    stage: Stage::Fetching { arrived, .. },
-                    ..
-                }) = self.pins.get_mut(&request)
-                {
-                    *arrived += 1;
-                    admissions = true;
-                }
+        let (events, answers) = self.servers.take();
+        for event in events {
+            let Event::Prefetched { tag, .. } = event else {
+                continue;
+            };
+            let Some(request) = self.fetches.remove(&tag) else {
+                continue;
+            };
+            if let Some(Pins {
+                stage: Stage::Fetching { arrived, .. },
+                ..
+            }) = self.pins.get_mut(&request)
+            {
+                *arrived += 1;
+                admissions = true;
             }
         }
         // A prefetch past its deadline lets its admission move on.
         admissions |= self.pins.values().any(|pins| {
             matches!(pins.stage, Stage::Fetching { deadline, .. } if Instant::now() >= deadline)
         });
-        let ids: Vec<(usize, u64)> = self.pending.keys().copied().collect();
-        for id in ids {
-            let Some(answer) = self.clients[id.0].take(id.1) else {
-                continue;
-            };
-            let Some(purpose) = self.pending.remove(&id) else {
-                continue;
-            };
-            match (purpose, answer.reply) {
+        for (purpose, reply) in answers {
+            match (purpose, reply) {
                 (
                     Purpose::Pin {
                         request,
@@ -1595,19 +1519,20 @@ impl KvOffloadManager {
             };
             let id = self.next_reservation;
             self.next_reservation += 1;
-            let request = Request::Reserve {
-                pool: pool.pool,
-                writer: pool.scope.clone(),
-                keys: deferred.keys.clone(),
-                window: None,
-            };
             let purpose = Purpose::Reserve {
                 offload: id,
                 rank: deferred.rank,
             };
             // Only this rank answers: the reservation is done with its
             // answer.
-            if self.submit(pool.client, &request, purpose) {
+            if self.servers.reserve(
+                pool.client,
+                pool.pool,
+                &pool.scope,
+                deferred.keys.clone(),
+                None,
+                purpose,
+            ) {
                 self.reservations.insert(
                     id,
                     Reservation {
@@ -1718,10 +1643,9 @@ impl KvOffloadManager {
         if done {
             self.reservations.remove(&id);
         }
-        if let Some((client, pool, keys)) = aborted
-            && !keys.is_empty()
-        {
-            self.submit(client, &Request::Abort { pool, keys }, Purpose::Settle);
+        if let Some((client, pool, keys)) = aborted {
+            self.servers
+                .settle(client, pool, keys, false, Purpose::Settle);
         }
     }
 }
@@ -1734,8 +1658,8 @@ mod tests {
 
     use ipc::HostPoolInfo;
     use ipc::{CacheGroup, CacheGroupKind, PrefixCacheDtype};
-    use storage::Claim;
     use storage::protocol::PageShape;
+    use storage::{Claim, Client, Role};
     use storage_server::Server;
 
     use super::*;

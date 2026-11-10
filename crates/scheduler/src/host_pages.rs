@@ -1,17 +1,27 @@
-//! A scheduler's connections to the deployment's Storage Servers, through
-//! which it keeps derived state in their host page pools (trajectories,
-//! encoder outputs).
+//! The scheduler's client of the deployment's host page pools: the
+//! connections to the Storage Servers and the page lifecycle every store
+//! drives in them.
+//!
+//! Each store that keeps derived state in the pools (the host KV cache and
+//! KV storage, `kv_cache::offload`; latent trajectories, `trajectories`;
+//! encoder outputs, `encoder_outputs`) states only its keys, which pages it
+//! stores and when, and what each answer means to it (its purpose `P`).
+//! The page lifecycle is the same for all of them and is stated here once:
+//! a reader pins the pages it reads ([`Servers::pin`]) and unpins them when
+//! done ([`Servers::unpin`]); a writer reserves slots for the pages it
+//! writes ([`Servers::reserve`]), copies into them, and commits them, or
+//! aborts them when its copy failed ([`Servers::settle`]).
 //!
 //! The scheduler connects as a head of its engine's epoch, so what an epoch
 //! on trial commits stays its own until its commit. Requests to the servers
 //! never block the scheduler: [`Servers::submit`] sends one with what it was
-//! asked for (its purpose), and [`Servers::answers`] takes the answers that
-//! arrived, at every scheduler step.
+//! asked for (its purpose), and [`Servers::take`] takes the events and
+//! answers that arrived, at every scheduler step.
 
 use std::collections::HashMap;
 
-use storage::protocol::{Reply, Request};
-use storage::{Client, Role};
+use storage::protocol::{Event, PageWindow, Reply, Request};
+use storage::{Client, Key, Role, Scope};
 
 /// The connections to the servers of the pools one store uses, with the
 /// purpose of every request they have not answered.
@@ -89,6 +99,17 @@ impl<P> Servers<P> {
         }
     }
 
+    /// Send `request` on connection `client` and wait for its answer: for
+    /// the requests that size the pools before the store serves, never on
+    /// a scheduler step.
+    ///
+    /// # Errors
+    ///
+    /// When the server cannot be reached or the request fails.
+    pub(crate) fn call(&mut self, client: usize, request: &Request) -> anyhow::Result<Reply> {
+        Ok(self.clients[client].call(request, &[])?.reply)
+    }
+
     /// Submit `request` on connection `client`, answered for `purpose`.
     /// Returns whether it was sent.
     pub(crate) fn submit(&mut self, client: usize, request: &Request, purpose: P) -> bool {
@@ -104,6 +125,87 @@ impl<P> Servers<P> {
         }
     }
 
+    /// Pin `keys` in `pool` on connection `client` for `reader`, answered
+    /// (`Reply::Pinned`) for `purpose`: the slots of the pages the pool
+    /// holds, which it keeps until the reader unpins them.
+    pub(crate) fn pin(
+        &mut self,
+        client: usize,
+        pool: u64,
+        reader: &Scope,
+        keys: Vec<Key>,
+        purpose: P,
+    ) -> bool {
+        let pin = Request::Pin {
+            pool,
+            reader: reader.clone(),
+            keys,
+        };
+        self.submit(client, &pin, purpose)
+    }
+
+    /// End `reader`'s pins of `keys` in `pool`; nothing for no key.
+    pub(crate) fn unpin(
+        &mut self,
+        client: usize,
+        pool: u64,
+        reader: &Scope,
+        keys: Vec<Key>,
+        purpose: P,
+    ) -> bool {
+        if keys.is_empty() {
+            return true;
+        }
+        let unpin = Request::Unpin {
+            pool,
+            reader: reader.clone(),
+            keys,
+        };
+        self.submit(client, &unpin, purpose)
+    }
+
+    /// Reserve slots for `keys` in `pool` for `writer`, the pages of one
+    /// `window` evicted whole when one is named, answered
+    /// (`Reply::Reserved`) for `purpose`.
+    pub(crate) fn reserve(
+        &mut self,
+        client: usize,
+        pool: u64,
+        writer: &Scope,
+        keys: Vec<Key>,
+        window: Option<PageWindow>,
+        purpose: P,
+    ) -> bool {
+        let reserve = Request::Reserve {
+            pool,
+            writer: writer.clone(),
+            keys,
+            window,
+        };
+        self.submit(client, &reserve, purpose)
+    }
+
+    /// Commit the reserved `keys` in `pool` once their copies landed, or
+    /// abort them when `written` is false; nothing for no key.
+    pub(crate) fn settle(
+        &mut self,
+        client: usize,
+        pool: u64,
+        keys: Vec<Key>,
+        written: bool,
+        purpose: P,
+    ) -> bool {
+        if keys.is_empty() {
+            return true;
+        }
+        let request = if written {
+            Request::Commit { pool, keys }
+        } else {
+            Request::Abort { pool, keys }
+        };
+        self.submit(client, &request, purpose)
+    }
+
     /// The purposes of the requests not yet answered.
     pub(crate) fn pending(&self) -> impl Iterator<Item = &P> {
         self.pending.values()
@@ -115,11 +217,16 @@ impl<P> Servers<P> {
         self.pending.values_mut()
     }
 
-    /// The answers that arrived since the last call, each with its purpose.
-    pub(crate) fn answers(&mut self) -> Vec<(P, Reply)> {
+    /// The events and the answers that arrived since the last call, each
+    /// answer with its purpose.
+    pub(crate) fn take(&mut self) -> (Vec<Event>, Vec<(P, Reply)>) {
+        let mut events = Vec::new();
         for client in &mut self.clients {
             if let Err(error) = client.pump() {
                 tracing::warn!(%error, what = self.what, "a storage server connection failed");
+            }
+            while let Some((event, _)) = client.next_event() {
+                events.push(event);
             }
         }
         let ids: Vec<(usize, u64)> = self.pending.keys().copied().collect();
@@ -132,7 +239,13 @@ impl<P> Servers<P> {
                 answers.push((purpose, answer.reply));
             }
         }
-        answers
+        (events, answers)
+    }
+
+    /// The answers that arrived since the last call, each with its purpose,
+    /// for a store that awaits no event.
+    pub(crate) fn answers(&mut self) -> Vec<(P, Reply)> {
+        self.take().1
     }
 
     /// Whether a request awaits its answer.

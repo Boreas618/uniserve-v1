@@ -58,7 +58,7 @@ mod clock;
 mod core;
 mod encoder_outputs;
 mod handle;
-mod host_tier;
+mod host_pages;
 mod kv_cache;
 #[cfg(feature = "testing")]
 mod service;

@@ -99,7 +99,7 @@ use storage::manifest::{Storage as PagedStorage, StorageLayout};
 use storage::protocol::{PageSlot, Reply, Request};
 use storage::{Key, Scope};
 
-use crate::host_tier::Servers;
+use crate::host_pages::Servers;
 use crate::worker::WorkerGroupId;
 
 /// The version of [`Record`]: a record of another version names no pages.
@@ -523,15 +523,12 @@ impl TrajectoryStore {
         }
         let mut submitted = 0;
         for (index, (rank, keys)) in ranks.iter().zip(&keys).enumerate() {
-            let reserve = Request::Reserve {
-                pool: rank.pool.pool,
-                writer: rank.scope.clone(),
-                keys: keys.clone(),
-                window: None,
-            };
-            if !self.servers.submit(
+            if !self.servers.reserve(
                 rank.client,
-                &reserve,
+                rank.pool.pool,
+                &rank.scope,
+                keys.clone(),
+                None,
                 Purpose::Reserve {
                     request,
                     rank: index,
@@ -743,14 +740,17 @@ impl TrajectoryStore {
             if reserved.is_empty() {
                 continue;
             }
-            let abort = Request::Abort {
-                pool: rank.pool.pool,
-                keys: reserved
-                    .iter()
-                    .map(|&(page, _)| keys[page as usize])
-                    .collect(),
-            };
-            self.servers.submit(rank.client, &abort, Purpose::Settle);
+            let reserved = reserved
+                .iter()
+                .map(|&(page, _)| keys[page as usize])
+                .collect();
+            self.servers.settle(
+                rank.client,
+                rank.pool.pool,
+                reserved,
+                false,
+                Purpose::Settle,
+            );
         }
     }
 
@@ -841,14 +841,11 @@ impl TrajectoryStore {
         }
         restore.stage = RestoreStage::Pinning(vec![None; restore.sources.len()]);
         for (index, source) in restore.sources.iter().enumerate() {
-            let pin = Request::Pin {
-                pool: source.pinned.pool,
-                reader: source.pinned.reader.clone(),
-                keys: source.keys.clone(),
-            };
-            if !self.servers.submit(
+            if !self.servers.pin(
                 source.pinned.client,
-                &pin,
+                source.pinned.pool,
+                &source.pinned.reader,
+                source.keys.clone(),
                 Purpose::Pin {
                     request,
                     source: index,
@@ -1046,12 +1043,8 @@ impl TrajectoryStore {
         if keys.is_empty() {
             return;
         }
-        let unpin = Request::Unpin {
-            pool: pin.pool,
-            reader: pin.reader.clone(),
-            keys,
-        };
-        self.servers.submit(pin.client, &unpin, Purpose::Settle);
+        self.servers
+            .unpin(pin.client, pin.pool, &pin.reader, keys, Purpose::Settle);
     }
 
     /// Source `source` answered `request`'s pin with `slots`: once every
@@ -1157,13 +1150,13 @@ impl TrajectoryStore {
                             .filter(|(_, slot)| matches!(slot, PageSlot::Reserved { .. }))
                             .map(|(key, _)| *key)
                             .collect();
-                        if !reserved.is_empty() {
-                            let abort = Request::Abort {
-                                pool: rank.pool.pool,
-                                keys: reserved,
-                            };
-                            self.servers.submit(rank.client, &abort, Purpose::Settle);
-                        }
+                        self.servers.settle(
+                            rank.client,
+                            rank.pool.pool,
+                            reserved,
+                            false,
+                            Purpose::Settle,
+                        );
                     }
                 }
                 (Purpose::Settle, Reply::Error { kind, message }) => {
