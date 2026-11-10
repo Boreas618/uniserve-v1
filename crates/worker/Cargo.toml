@@ -11,6 +11,7 @@ publish = false
 # device work live beside these modules in the same crate.
 [dependencies]
 media = { path = "../media" }
+base64.workspace = true
 bytemuck.workspace = true
 crossbeam-channel.workspace = true
 platform.workspace = true

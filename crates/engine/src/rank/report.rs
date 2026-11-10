@@ -7,8 +7,9 @@ use platform::DeviceId;
 /// What this rank advertises of itself: the report the capacity plan is made against.
 ///
 /// A causal-language rank states one component - the model's single block - the forward calls it
-/// serves (the prompt and the decode, and a speculating rank's verification), and the three
-/// identities that name this process. It publishes no products (`logits`
+/// serves (the prompt and the decode, a speculating rank's verification, and the vision encoding
+/// of a model that takes `images`), and the three identities that name this process. It publishes
+/// no products (`logits`
 /// returns through the batch, not as an exported tensor), so no device product is exported and no
 /// media component is routed: the deployment is one class of computation, and saying otherwise
 /// would make the engine reserve storage for exports that never happen.
@@ -16,6 +17,7 @@ pub(crate) fn rank_report(
     device: DeviceId,
     host: &str,
     speculates: bool,
+    images: bool,
 ) -> Result<worker::capacity::Report> {
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -36,6 +38,7 @@ pub(crate) fn rank_report(
         ]
         .into_iter()
         .chain(speculates.then_some(ipc::CallKind::Forward(ipc::ForwardMode::Verify)))
+        .chain(images.then_some(ipc::CallKind::Media(ipc::MediaCall::VisionEncoding)))
         .collect(),
         media_components: std::collections::BTreeMap::new(),
         // The component this rank holds, named as the rank layout names it (`schedulers` places one

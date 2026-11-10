@@ -90,10 +90,18 @@ impl ModelRunner {
                 let provider: Box<dyn KvProvider> =
                     Box::new(ResidentCache::new(cache, device, rows)?);
                 let member = self.union_member(device, model.as_ref())?;
+                // A model that takes images also serves their vision encodings.
+                let images = model.vision().is_some();
+                let mut phases = served_phases(&self.buckets, drafts > 0);
+                if images {
+                    phases.push(super::buckets::phase(scheduler::PhaseKind::VisionEncoding));
+                    phases.sort_by_key(|phase| phase.0);
+                    phases.dedup();
+                }
                 let runner = CausalLmRunner::new(
                     Binding {
                         id: RunnerId(0),
-                        phases: served_phases(&self.buckets, drafts > 0),
+                        phases,
                         device,
                         stream,
                     },
@@ -112,6 +120,46 @@ impl ModelRunner {
                 };
                 let runner = if drafts > 0 {
                     runner.speculating(drafts)?
+                } else {
+                    runner
+                };
+                let runner = if images {
+                    // The images' reads run on the process's media lane: a text process builds no
+                    // other runner that takes it.
+                    let lane = blocking
+                        .lane::<worker::runners::vision::ImageRead>(
+                            worker::blocking::BlockingKind::Media,
+                        )
+                        .context("creating the lane that reads input images")?;
+                    let runner = runner.with_images(lane)?;
+                    // The host encoder pool an image's features are stored in and found again by
+                    // another request reading the same image: one per host, shared by its ranks
+                    // and epochs, keyed by the identity of the weights that compute them. A
+                    // recorded start, which has no Storage Server, maps none.
+                    match (client, runner.image_features()) {
+                        (Some(client), Some((row_bytes, rows))) => {
+                            let (pool, info) = worker::memory::encoders::EncoderHostPool::start(
+                                client,
+                                device,
+                                worker::memory::encoders::pool_pages(
+                                    &[u64::from(rows) * row_bytes],
+                                    self.engine_config().max_running_requests.get(),
+                                ),
+                                std::collections::BTreeMap::from([(
+                                    ipc::product::VISION_FEATURES.to_owned(),
+                                    identity.to_owned(),
+                                )]),
+                                None,
+                            )
+                            .context("mapping the host encoder pool")?;
+                            let writes = report.is_some();
+                            if let Some(report) = report {
+                                report.encoder_pool = Some(Box::new(info));
+                            }
+                            runner.with_encoder_pool(std::sync::Arc::new(pool), writes)
+                        }
+                        _ => runner,
+                    }
                 } else {
                     runner
                 };

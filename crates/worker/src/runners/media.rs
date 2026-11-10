@@ -535,8 +535,8 @@ fn planes_of(rgb: &[u8], frames: usize, height: usize, width: usize) -> Vec<u8> 
 ///
 /// The tower reads a grid's own pixels, so each frame is resized to the raster the processor sized
 /// the grid from ([`nn::capability::PatchFormat::raster`]) first and packed second.
-fn pack_block(
-    format: &MediaFormat,
+pub(crate) fn pack_block(
+    format: &nn::capability::PatchFormat,
     rgb: &[u8],
     frames: u32,
     raster: (u32, u32),
@@ -544,7 +544,7 @@ fn pack_block(
     out: &mut [u8],
 ) -> Result<()> {
     let (height, width) = raster;
-    let (rows, columns) = format.patches.raster(grid);
+    let (rows, columns) = format.raster(grid);
     let planes = planes_of(rgb, frames as usize, height as usize, width as usize);
     let planes = if (rows, columns) == (height, width) {
         planes
@@ -558,7 +558,7 @@ fn pack_block(
         }
         resized
     };
-    conditions::patches(&format.patches, &planes, frames, grid, out)
+    conditions::patches(format, &planes, frames, grid, out)
 }
 
 /// The region's bytes as the `f32` rows a condition is written into.
@@ -754,7 +754,14 @@ fn read_conditions(
                     let frames = u32::try_from(vision.frame_indices.len()).map_err(|_| {
                         crate::Error::Invalid("a video samples more frames than a u32".into())
                     })?;
-                    pack_block(format, &sampled, frames, (height, width), grid, out)?;
+                    pack_block(
+                        &format.patches,
+                        &sampled,
+                        frames,
+                        (height, width),
+                        grid,
+                        out,
+                    )?;
                 }
                 None => {
                     let (frames, canvas) = condition.media.pixels().ok_or_else(|| {
@@ -763,7 +770,7 @@ fn read_conditions(
                         )
                     })?;
                     pack_block(
-                        format,
+                        &format.patches,
                         &rgb[read.pixels.start * 3..read.pixels.end * 3],
                         frames,
                         (canvas.height, canvas.width),

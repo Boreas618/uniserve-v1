@@ -81,6 +81,8 @@ pub struct Staging {
     /// bucket's count. A captured graph states the bucket's token count as a constant, so a kernel
     /// that must bound its work by what the batch holds reads this from the device instead.
     live_tokens: i32,
+    /// The image blocks the batch's rows write, in token order.
+    vision: Vec<ipc::execution::VisionRows>,
     /// The bucket the last [`Staging::stage`] padded the columns to.
     /// The bucket the held columns were padded to. A capture must reuse a batch of exactly the
     /// bucket it captures: two buckets of one variant differ in size, and a graph captured from
@@ -197,6 +199,8 @@ impl Staging {
         self.state_copies.extend_from_slice(&columns.state_copies);
         self.drafts.clear();
         self.drafts.extend_from_slice(&columns.drafts);
+        self.vision.clear();
+        self.vision.extend_from_slice(&columns.vision);
         let parameters = proto::program::sampler::PARAMETER_COLUMNS as usize;
         self.parameters[..rows * parameters]
             .copy_from_slice(&columns.parameters[..rows * parameters]);
@@ -348,6 +352,11 @@ impl Staging {
     /// The staged batch's recurrent-state copies.
     pub fn state_copies(&self) -> &[ipc::execution::StateCopy] {
         &self.state_copies
+    }
+
+    /// The image blocks the staged batch's rows write.
+    pub fn vision(&self) -> &[ipc::execution::VisionRows] {
+        &self.vision
     }
 
     /// The staged sampling parameters, row-major.
@@ -599,6 +608,19 @@ fn row_classes(rows: &BatchRows) -> String {
         true => format!("a batch of two classes: {}", classes.join(", ")),
         false => classes.join(", "),
     }
+}
+
+/// The most nearly square patch grid of an image of `rows` merged rows, `merge` patches to a
+/// merged side, near `side` patches a side: the largest image the recorded walk encodes, whose
+/// tower activations bound every other image's.
+fn largest_grid(rows: u32, merge: u32, side: u32) -> [u32; 3] {
+    let merge = merge.max(1);
+    let mut height = (side / merge).max(1);
+    while height > 1 && !rows.is_multiple_of(height) {
+        height -= 1;
+    }
+    let width = (rows / height).max(1);
+    [1, height * merge, width * merge]
 }
 
 fn committed_before(readback: i32) -> usize {
@@ -1034,6 +1056,16 @@ pub struct CausalLmRunner<M: TextModel> {
     /// The sampler of a speculative step, whose rows count a verification's drafts in their
     /// penalties.
     verifier: Option<super::sampling::Sampler>,
+    /// The image input of a model with a vision tower: its encodings and the feature products
+    /// its prefills read.
+    images: Option<super::vision::Images>,
+    /// `[axes · tokens]` i32 the rotary coordinates of a batch with image rows, axis-major over
+    /// the bucket's tokens; allocated for a model with a vision tower.
+    rope: Option<super::columns::Column>,
+    /// The staged prefill's image blocks, resolved to their feature slots at the upload.
+    blocks: std::cell::RefCell<Vec<super::vision::Block>>,
+    /// Whether a recorded walk walks a bucket as a batch with image rows.
+    image_pose: std::cell::Cell<bool>,
 }
 
 /// One model object shared by the runners of every device a rank serves.
@@ -1118,6 +1150,10 @@ impl<M: TextModel + ?Sized> TextModel for Shared<M> {
 
     fn drafter(&self) -> Option<&dyn nn::family::Drafter> {
         self.0.drafter()
+    }
+
+    fn vision(&self) -> Option<&dyn nn::capability::Vision> {
+        self.0.vision()
     }
 }
 
@@ -1218,6 +1254,10 @@ impl<M: TextModel> CausalLmRunner<M> {
             state: None,
             speculation: None,
             verifier: None,
+            images: None,
+            rope: None,
+            blocks: std::cell::RefCell::new(Vec::new()),
+            image_pose: std::cell::Cell::new(false),
             encoded: Vec::new(),
             indices: Vec::new(),
             draws: Vec::new(),
@@ -1277,6 +1317,64 @@ impl<M: TextModel> CausalLmRunner<M> {
     /// row per token.
     pub fn speculative_rows(slots: u32, drafts: u32, rows: u32) -> u32 {
         rows.max(slots.saturating_mul(drafts + 1))
+    }
+
+    /// Serves the model's image input: its vision encodings, read on `lane`, and the image rows of
+    /// its prefills. A model without a vision tower takes none.
+    ///
+    /// # Errors
+    ///
+    /// A model whose vision tower states no image it could encode.
+    pub fn with_images(
+        mut self,
+        lane: crate::host::Lane<super::vision::ImageRead>,
+    ) -> Result<Self> {
+        let Some(vision) = self.model.vision() else {
+            return Ok(self);
+        };
+        let rows = vision.max_image_rows();
+        if rows == 0 {
+            return Err(Error::Invalid(
+                "the vision tower sizes no image to any row".into(),
+            ));
+        }
+        let (tokens, _) = column_extents(&self.buckets)?;
+        self.rope = Some(super::columns::Column::new(
+            self.device,
+            DType::I32,
+            u64::from(vision.position_axes()) * tokens,
+        )?);
+        self.images = Some(super::vision::Images::new(
+            self.device,
+            vision.patch_format(),
+            self.model.dtype(),
+            self.model.hidden(),
+            rows,
+            lane,
+        ));
+        Ok(self)
+    }
+
+    /// Copies the image encodings from and to the host encoder `pool`, writing those this rank
+    /// computes when `writes`.
+    #[must_use]
+    pub fn with_encoder_pool(
+        mut self,
+        pool: Arc<crate::memory::encoders::EncoderHostPool>,
+        writes: bool,
+    ) -> Self {
+        if let Some(images) = self.images.as_mut() {
+            images.with_pool(pool, writes);
+        }
+        self
+    }
+
+    /// What the runner's image input occupies: the bytes of one feature row, and the rows one
+    /// encoding holds at most; `None` for a model without a vision tower.
+    pub fn image_features(&self) -> Option<(u64, u32)> {
+        self.images
+            .as_ref()
+            .map(|images| (images.row_bytes(), images.slot_rows()))
     }
 
     /// Makes this runner a member of an expert union: every step goes through the union, and the
@@ -1339,6 +1437,120 @@ impl<M: TextModel> CausalLmRunner<M> {
     }
 
     /// The shape of the bucket a batch is served from.
+    /// Stages a batch of vision encodings: each call's image is read on the host lane, and a
+    /// host job per call encodes it on this stream.
+    fn submit_images(&mut self, batch: &Batch) -> Result<Jobs> {
+        let vision = self.model.vision().ok_or_else(|| {
+            Error::Invalid("a vision encoding reached a model without a vision tower".into())
+        })?;
+        let images = self.images.as_mut().ok_or_else(|| {
+            Error::Invalid("a vision encoding reached a runner that serves no image input".into())
+        })?;
+        images.stage(vision, batch)?;
+        Ok(Jobs::new(batch.calls.iter().map(|call| Job::Host {
+            runner: self.id,
+            call: *call,
+        })))
+    }
+
+    /// Encodes the staged vision encoding of `call` into its feature product.
+    fn encode_image(&mut self, call: CallId) -> Result<BatchOutput> {
+        let started = Instant::now();
+        let vision = self.model.vision().ok_or_else(|| {
+            Error::Invalid("a vision encoding reached a model without a vision tower".into())
+        })?;
+        let images = self.images.as_mut().ok_or_else(|| {
+            Error::Invalid("a vision encoding reached a runner that serves no image input".into())
+        })?;
+        let index = usize::try_from(call.0)
+            .map_err(|_| Error::Invalid("a call index wider than memory".into()))?;
+        let kernels = self.lifecycle.generation_named(images.generation())?;
+        // The encode is an eager forward over the stream's region, which the recorded walk sized
+        // for the largest image; a replay that reads the region runs behind it on this stream.
+        let arena = self.lifecycle.arena()?;
+        images.encode(
+            vision,
+            index,
+            &self.stream,
+            &arena,
+            &kernels,
+            self.tensor.as_deref(),
+        )?;
+        Ok(BatchOutput {
+            calls: vec![ipc::execution::CallOutput::completed(
+                call,
+                Vec::new(),
+                ipc::execution::RowState::default(),
+            )],
+            timing: ipc::TimingCounters {
+                host_us: started.elapsed().as_micros() as u64,
+                ..Default::default()
+            },
+            forward_stats: None,
+        })
+    }
+
+    /// Stages the image rows of the staged batch, whose tokens rotate from `positions`: the blocks'
+    /// feature slots, and every token's rotary coordinates on every axis, the image rows' at the
+    /// coordinates the model states for their grids. A batch without image rows stages none.
+    fn stage_image_rows(&mut self, positions: &[i32]) -> Result<()> {
+        let blocks = match self.images.as_ref() {
+            Some(images) if !self.staging.vision().is_empty() => {
+                images.blocks(self.staging.vision())?
+            }
+            _ => Vec::new(),
+        };
+        if !blocks.is_empty()
+            && let (Some(rope), Some(vision)) = (self.rope.as_mut(), self.model.vision())
+        {
+            let coordinates = super::vision::rope_positions(vision, positions, &blocks)?;
+            encode_i32(&mut self.encoded, &coordinates);
+            rope.write(&self.encoded)?;
+            if !self.capturing {
+                rope.push(&self.stream)?;
+            }
+        }
+        *self.blocks.borrow_mut() = blocks;
+        Ok(())
+    }
+
+    /// The `[axes, tokens]` rotary coordinates of a batch of `tokens` tokens with image rows, or
+    /// of the recorded walk of one; `None` for a text batch.
+    fn rope_view(&self, tokens: u32) -> Option<TensorView> {
+        match (&self.rope, self.model.vision()) {
+            (Some(rope), Some(vision))
+                if !self.staging.vision().is_empty() || self.image_pose.get() =>
+            {
+                Some(rope.shaped(&[u64::from(vision.position_axes()), u64::from(tokens)]))
+            }
+            _ => None,
+        }
+    }
+
+    /// Writes the staged prefill's image blocks into their rows of `hidden`, on this stream.
+    fn write_image_rows(&self, hidden: TensorView) -> Result<()> {
+        let blocks = self.blocks.borrow();
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        let row_bytes = hidden.shape.last() * self.model.dtype().bytes().unwrap_or(0);
+        for block in blocks.iter() {
+            let destination = hidden.ptr.address() + u64::from(block.token) * row_bytes;
+            let bytes = block.features.rows() * row_bytes;
+            // SAFETY: the feature slot holds its product until the engine frees it, which it
+            // does only after this batch completed; the hidden rows are this forward's own.
+            unsafe {
+                platform::memcpy_async(
+                    destination,
+                    block.features.ptr.address(),
+                    bytes as usize,
+                    &self.stream,
+                )
+            }?;
+        }
+        Ok(())
+    }
+
     fn bucket_for(&self, shape: &Shape) -> Result<Bucket> {
         let bucket = self.buckets.require(shape)?;
         // A media bucket is refused by name rather than replayed: its graph is shaped for a latent
@@ -1358,6 +1570,17 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
         &self.phases
     }
 
+    /// A model that takes images serves their vision encodings, which no captured graph holds: an
+    /// encoding is the tower's eager forward over the image's own grid.
+    fn media_plan(&self) -> Vec<crate::plan::Bucket> {
+        match self.images {
+            Some(_) => vec![crate::plan::Bucket::host(
+                ipc::execution::Variant::ConditionEncode,
+            )],
+            None => Vec::new(),
+        }
+    }
+
     fn stream(&self) -> Option<&platform::Stream> {
         Some(&self.stream)
     }
@@ -1374,6 +1597,7 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
     /// what the host chose.
     fn overlaps_staged(&self) -> bool {
         self.overlaps_replays()
+            && self.staging.vision().is_empty()
             && self
                 .staging
                 .staged()
@@ -1388,6 +1612,22 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
     }
 
     fn submit(&mut self, batch: Batch) -> Result<Jobs> {
+        // The products whose last reader completed are released first: their slots' last reads
+        // are on this stream, ahead of whatever this batch writes there.
+        if let Some(images) = self.images.as_mut() {
+            images.free(&batch.frees);
+        }
+        // A batch of frees alone serves no call.
+        if batch.calls.is_empty() && !batch.frees.is_empty() {
+            return Ok(Jobs::default());
+        }
+        if batch
+            .media
+            .as_ref()
+            .is_some_and(|media| media.computation.call == ipc::MediaCall::VisionEncoding)
+        {
+            return self.submit_images(&batch);
+        }
         let shape = batch.shape;
         // What a refusal is about, said before it happens: the classes the rows carry are the fact
         // no other owner of this batch can report, and a batch that mixes them is refused for them.
@@ -1569,6 +1809,14 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
         if let Err(error) = self.bind_state(&pools) {
             tracing::error!(%error, "the recurrent state's banks were not bound; a forward will fail");
         }
+        if let Some(images) = self.images.as_mut() {
+            let mut locked = pools
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Err(error) = images.bind(&mut locked) {
+                tracing::error!(%error, "the feature slots were not carved; an image will fail");
+            }
+        }
         if let Err(error) = self.kv.attach_pools(pools) {
             tracing::warn!(%error, "the cache provider took no pools; a gathered table will fail");
         }
@@ -1591,6 +1839,53 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
             footprint.walk(Some(bucket), |walk| self.walk_recorded(walk, bucket))?;
         }
         self.record_speculation(&mut footprint)?;
+        // A model with a vision tower walks every prefill bucket again as a batch with image
+        // rows, which turns by the multi-axis rotary, and encodes the largest image the processor
+        // sizes, whose tower activations the stream's region must hold.
+        let image_input = self.images.as_ref().map(|images| {
+            (
+                images.format(),
+                images.slot_rows(),
+                images.largest_patches(),
+            )
+        });
+        if let Some((format, slot_rows, largest)) = image_input {
+            let prefills: Vec<Bucket> = self
+                .capture_plan()
+                .into_iter()
+                .filter(|bucket| !bucket.variant.is_decode() && !self.joins_only(*bucket))
+                .collect();
+            self.image_pose.set(true);
+            let walked = prefills.iter().try_for_each(|bucket| {
+                footprint.walk(Some(*bucket), |walk| self.walk_recorded(walk, *bucket))
+            });
+            self.image_pose.set(false);
+            walked?;
+            let vision = self
+                .model
+                .vision()
+                .ok_or_else(|| Error::Invariant("image input without a vision tower".into()))?;
+            let side = f64::from(largest).sqrt() as u32;
+            let grid = largest_grid(slot_rows, format.merge, side);
+            let patches: u64 = grid.iter().map(|extent| u64::from(*extent)).product();
+            let group = self.tensor.clone();
+            footprint.walk(None, |walk| {
+                let pixels = walk.placeholder(
+                    format.dtype,
+                    ops::Shape::new(&[patches, u64::from(format.width())]),
+                )?;
+                let tables = walk.tables(&vision.image_tables(grid).map_err(Error::from)?)?;
+                let rows = vision.image_rows(grid).map_err(Error::from)?;
+                let out = walk.placeholder(
+                    self.model.dtype(),
+                    ops::Shape::new(&[u64::from(rows), u64::from(self.model.hidden())]),
+                )?;
+                let forward = walk.forward(group.as_deref())?;
+                vision
+                    .encode_image(&forward, grid, pixels, &tables, out)
+                    .map_err(Error::from)
+            })?;
+        }
         // A recurrent state's copies are launched eagerly around a replay, so the walk states them
         // beside the forwards: one copy of each direction states every descriptor a batch's copies
         // launch.
@@ -1709,8 +2004,14 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
                 // remaining question in two - a wrong answer here is what the runner *staged*, and a
                 // right answer here is capture or replay - without a second deployment to compare
                 // against.
-                let eager = eager_replay();
-                if eager {
+                // A batch with image rows walks eagerly: the feature rows it writes into the
+                // hidden rows are each request's own, which no captured graph holds.
+                let images = !self.staging.vision().is_empty();
+                let eager = eager_replay() || images;
+                if images {
+                    let kernels = self.lifecycle.generation_named(*generation)?;
+                    self.walk(*bucket, &kernels)?;
+                } else if eager {
                     tracing::warn!(
                         bucket = %bucket,
                         generation = *generation,
@@ -1797,6 +2098,8 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
                 "a runner that steps no trajectory was asked to prepare call {}",
                 call.0
             ))),
+            // A vision encoding: the image the host lane read, encoded on this stream.
+            Job::Host { call, .. } if self.images.is_some() => self.encode_image(*call),
             // A host call is no device work: the media stage performs it, and a device runner
             // handed one was given a job another runner returned.
             Job::Host { call, .. } => Err(Error::Invariant(format!(
@@ -2603,6 +2906,8 @@ impl<M: TextModel> CausalLmRunner<M> {
         if self.staging.staged().is_none() {
             return Err(Error::State("a step needs a staged batch"));
         }
+        let positions = self.staging.batch_rows().positions[..tokens].to_vec();
+        self.stage_image_rows(&positions)?;
         let batch = self.staging.batch_rows();
 
         encode_i32(&mut self.encoded, &batch.positions[..tokens]);
@@ -2740,7 +3045,8 @@ impl<M: TextModel> CausalLmRunner<M> {
             num_tokens: bucket.tokens,
             max_kv_len: self.max_kv_len,
             draft_lens: None,
-            rope_positions: None,
+            // A batch with image rows, or the walk of one, rotates by its multi-axis coordinates.
+            rope_positions: self.rope_view(bucket.tokens),
         })
     }
 
@@ -2920,6 +3226,11 @@ impl<M: TextModel> CausalLmRunner<M> {
             self.model
                 .embed_input_ids(forward, ids, hidden)
                 .map_err(Error::from)?;
+            // An image block's hidden rows are its features, written over the placeholder rows'
+            // embeddings on this stream; a recording launches nothing.
+            if !forward.is_recording() {
+                self.write_image_rows(hidden)?;
+            }
             self.model
                 .forward(forward, &batch, cache, hidden)
                 .map_err(Error::from)?;

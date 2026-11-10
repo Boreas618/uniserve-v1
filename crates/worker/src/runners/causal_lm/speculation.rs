@@ -750,7 +750,9 @@ impl<M: TextModel> CausalLmRunner<M> {
         Speculation::write_i32(&mut spec.state_offsets, encoded, &state_offsets)?;
         Speculation::write_i32(&mut spec.state_lens, encoded, &state_lens)?;
         Speculation::write_i32(&mut spec.state_slots, encoded, &state_slots)?;
-        Ok(())
+        // A prompt's image rows rotate by their multi-axis coordinates and are written with their
+        // features, as in a replay.
+        self.stage_image_rows(&rows.positions[..tokens])
     }
 
     /// The target forward over the written columns: the embedding and the model, into a hidden
@@ -803,7 +805,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             num_tokens: plan.tokens as u32,
             max_kv_len: self.max_kv_len,
             draft_lens: None,
-            rope_positions: None,
+            rope_positions: self.rope_view(plan.tokens as u32),
         };
         let state_view = StateRows {
             query_offsets: spec.state_offsets.extent(0..state_rows + 1),
@@ -829,6 +831,9 @@ impl<M: TextModel> CausalLmRunner<M> {
                 self.model
                     .embed_input_ids(&forward, ids, hidden)
                     .map_err(Error::from)?;
+                if !forward.is_recording() {
+                    self.write_image_rows(hidden)?;
+                }
                 self.model
                     .forward(&forward, &batch, cache, hidden)
                     .map_err(Error::from)

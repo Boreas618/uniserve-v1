@@ -30,4 +30,5 @@ pub mod products;
 pub mod resident;
 pub mod sampling;
 pub mod state;
+pub mod vision;
 pub mod warm;

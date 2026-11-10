@@ -65,10 +65,13 @@ pub struct MemoryRequest {
     /// Device bytes the rank's expert transport takes at its first capture,
     /// after the cache is fitted, or zero for a rank that exchanges no experts.
     pub transport_bytes: u64,
-    /// Device bytes of the request slots' recurrent-state banks, for a model
-    /// that keeps a recurrent state per slot (`runners::state::bank_bytes`),
-    /// or zero: fixed storage the cache is fitted beside.
-    pub state_bytes: u64,
+    /// Device bytes the rank's runner carves from the resident pool beside
+    /// the cache: the request slots' recurrent-state banks of a model that
+    /// keeps a recurrent state per slot (`runners::state::bank_bytes`) and the
+    /// feature slots of a model that takes images
+    /// (`runners::vision::feature_bytes`), or zero: fixed storage the cache is
+    /// fitted beside.
+    pub carved_bytes: u64,
 }
 
 /// Model-independent values of the report.
@@ -406,7 +409,7 @@ fn fit(
         memory.info.max_unresolved_calls as usize,
         0,
     )?;
-    *memory.fixed_device_bytes.entry(request.device).or_default() += fixed + request.state_bytes;
+    *memory.fixed_device_bytes.entry(request.device).or_default() += fixed + request.carved_bytes;
     // The transport is created at the first capture, when a program exists, so the cache is
     // fitted around what it will take.
     memory.fit_cache(
@@ -664,7 +667,7 @@ mod tests {
             cache,
             segments: None,
             transport_bytes: 0,
-            state_bytes: 0,
+            carved_bytes: 0,
         }
     }
 

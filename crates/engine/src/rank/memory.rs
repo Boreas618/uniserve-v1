@@ -218,6 +218,11 @@ impl ModelRunner {
                 let state_bytes = state.as_ref().map_or(0, |state| {
                     worker::runners::state::bank_bytes(state, slots, trail)
                 });
+                // A model that takes images keeps its feature slots beside the banks.
+                let feature_bytes = image_features(model.as_ref())
+                    .map_or(0, |(row_bytes, rows)| {
+                        worker::runners::vision::feature_bytes(rows, row_bytes)
+                    });
                 let request = worker::capacity::MemoryRequest {
                     device: worker::config::Device::Cuda(device),
                     epoch: self.cache_epoch.unwrap_or(self.launch.epoch),
@@ -227,9 +232,10 @@ impl ModelRunner {
                     cache: Some(Arc::new(cache)),
                     segments: self.adopted_cache.clone(),
                     transport_bytes: self.transport_bytes(device, model.as_ref())?,
-                    state_bytes,
+                    carved_bytes: state_bytes + feature_bytes,
                 };
-                (request, rank_report(device, host, drafts > 0)?)
+                let images = image_features(model.as_ref()).is_some();
+                (request, rank_report(device, host, drafts > 0, images)?)
             }
             Loaded::Video(pipeline) => {
                 // No cache: a video rank addresses no paged request.
@@ -242,7 +248,7 @@ impl ModelRunner {
                     cache: None,
                     segments: None,
                     transport_bytes: 0,
-                    state_bytes: 0,
+                    carved_bytes: 0,
                 };
                 let longest = pipeline.timeline(self.engine_config().video.max_seconds)?;
                 let states = proto::tensor::DType::from(self.engine_config().model.dtype);
@@ -268,7 +274,7 @@ impl ModelRunner {
         let resident = match (&planned.cache, planned.info.prefix_cache.as_ref()) {
             // The recurrent state's banks are carved from the same pool, beside the block tables.
             (Some(cache), Some(info)) => {
-                u64::from(info.num_units) * cache.unit_bytes + request.state_bytes
+                u64::from(info.num_units) * cache.unit_bytes + request.carved_bytes
             }
             // A media rank keeps no cache, and its resident pool holds the tables its model
             // declares per layout. The reservation is addresses and not storage: a table books the
@@ -305,6 +311,23 @@ impl ModelRunner {
         // rank rather than a second one derived here. A media rank adds what its denoiser serves,
         // which the frontend plans a request against and no capacity figure implies.
         let mut info = planned.info.clone();
+        // A rank that takes images states its encodings: the feature row an image block's
+        // encoding writes, and the slots that hold them, each the largest image's.
+        if let Loaded::Text(model) = loaded
+            && let Some((row_bytes, rows)) = image_features(model.as_ref())
+        {
+            info.image_encoders.insert(
+                ipc::product::VISION_FEATURES.to_owned(),
+                ipc::ImageEncoderOutput {
+                    row_bytes,
+                    draws: false,
+                },
+            );
+            let entry = u64::from(rows) * row_bytes;
+            info.encoder_entry_bytes = entry;
+            info.encoder_cache_entries = worker::runners::vision::FEATURE_ENTRIES;
+            info.buffer_pool_bytes = entry * u64::from(worker::runners::vision::FEATURE_ENTRIES);
+        }
         if let Loaded::Video(pipeline) = loaded {
             let description = pipeline.description(&self.video_serving()?)?;
             info.video_denoiser = Some(ipc::VideoDenoiserInfo {
@@ -338,6 +361,14 @@ impl ModelRunner {
         };
         serving + 1
     }
+}
+
+/// What a model's image input occupies on its rank: the bytes of one feature row and the rows of
+/// the largest image's encoding; `None` for a model without a vision tower.
+pub(super) fn image_features(model: &dyn nn::family::TextModel) -> Option<(u64, u32)> {
+    let vision = model.vision()?;
+    let row_bytes = u64::from(model.hidden()) * model.dtype().bytes()?;
+    Some((row_bytes, vision.max_image_rows()))
 }
 
 /// The element type the cache pool stores, from the deployment when it states one.
