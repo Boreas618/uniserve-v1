@@ -29,6 +29,7 @@ members = [
     "crates/service",
     "crates/storage",
     "crates/storage-server",
+    "crates/testkit",
 ]
 
 [package]
@@ -96,6 +97,7 @@ processing = { path = "crates/processing" }
 program-server = { path = "crates/program-server" }
 proto = { path = "crates/proto" }
 scheduling = { path = "crates/scheduling" }
+testkit = { path = "crates/testkit" }
 scheduling-guest = { path = "crates/scheduling/guest" }
 scheduling-policy-fcfs = { path = "crates/scheduling/policies/fcfs" }
 scheduling-policy-priority = { path = "crates/scheduling/policies/priority" }

@@ -1430,7 +1430,7 @@ mod tests {
 
     use super::*;
 
-    use crate::testing::{Toy, fitting_limits, toy_module};
+    use crate::toy::{Toy, fitting_limits, toy_module};
 
     /// A `PolicySource` of one toy module.
     fn source(toy: &Toy) -> PolicyBytes {

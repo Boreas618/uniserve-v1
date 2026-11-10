@@ -19,9 +19,6 @@ serde_json.workspace = true
 storage.workspace = true
 tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
-# A test-only policy module is written as WebAssembly text, so the `testing`
-# feature states it as text instead of shipping a compiled policy package.
-wat = { version = "1", optional = true }
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
@@ -30,13 +27,17 @@ uuid.workspace = true
 [features]
 # Exposes the GPU-free simulated worker to control-plane tests and examples.
 # It is never part of a serving build.
-testing = ["dep:png", "dep:tempfile", "dep:wat"]
+testing = ["dep:png", "dep:tempfile"]
 
 [dev-dependencies]
 service.workspace = true
 storage-server.workspace = true
 base64.workspace = true
 scheduler = { path = ".", features = ["testing"] }
+# The one test double at the worker's batch interface and the packaged policy.
+testkit.workspace = true
+# The policy switch's unit tests state their modules as WebAssembly text.
+wat = "1"
 libc.workspace = true
 # Tests state video requests as the frontend plans them.
 png.workspace = true

@@ -4,11 +4,11 @@
 //! starts beside the running epoch under the same claim, is promoted with the
 //! running epoch's prefix cache index once it parks, commits once the running
 //! epoch closed, and continues a request the running one generated part of.
-//! Here both epochs are handles over `support::Serving`, which completes every
+//! Here both epochs are handles over `testkit::FakeBatches`, which completes every
 //! batch in process, and the commands are the launched path's own: `describe_cache`,
 //! `park`, `promote`, `commit`.
 //!
-//! The pool the case uses samples by cache extent (`Serving::by_extent`), so a
+//! The pool the case uses samples by cache extent (`testkit::Tokens::Extent`), so a
 //! token is a function of how much of the request the mechanism states as
 //! computed: the continuation samples what the uninterrupted request sampled
 //! next, which is the property the launched case asserts.
@@ -22,7 +22,8 @@ use scheduler::{
     BatchCapacity, Event, GenerationConstraint, GenerationRequest, SchedulerHandle, Stage,
 };
 
-use crate::support::{self, Serving};
+use crate::support;
+use testkit::FakeBatches;
 
 /// How long a command answer may take.
 /// How long a command answer may take.
@@ -75,7 +76,7 @@ fn request(id: u64, length: u32, first: u32, generated: Vec<u32>) -> GenerationR
 }
 
 /// Instantiates the epoch's first policy for `pool` and switches it in.
-fn install(handle: &SchedulerHandle, pool: &Serving) {
+fn install(handle: &SchedulerHandle, pool: &FakeBatches) {
     let rank = pool
         .inventory()
         .first()
@@ -141,7 +142,7 @@ fn terminal(events: &mut scheduler::EventRx) -> Event {
 #[test]
 fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
     // The reference: the same request, generated without interruption.
-    let reference_pool = Arc::new(Serving::by_extent(vec![support::pool("model")]));
+    let reference_pool = Arc::new(support::by_extent(vec![support::pool("model")]));
     let (mut reference_config, reference_limits) = support::config(&reference_pool, "epochs");
     reference_config.epoch = 1;
     let reference = SchedulerHandle::over_batches(
@@ -185,7 +186,7 @@ fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
     reference.shutdown();
 
     // The running epoch generates the first part.
-    let running_pool = Arc::new(Serving::by_extent(vec![support::pool("model")]));
+    let running_pool = Arc::new(support::by_extent(vec![support::pool("model")]));
     let (mut running_config, running_limits) = support::config(&running_pool, "epochs");
     running_config.epoch = 1;
     let running = SchedulerHandle::over_batches(
@@ -208,7 +209,7 @@ fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
     // Its successor starts beside it.
     answer("the running epoch's cache", running.describe_cache())
         .expect("the running epoch states its cache");
-    let successor_pool = Arc::new(Serving::by_extent(vec![support::pool("model")]));
+    let successor_pool = Arc::new(support::by_extent(vec![support::pool("model")]));
     let (mut successor_config, successor_limits) = support::config(&successor_pool, "epochs");
     successor_config.epoch = 2;
     let successor = SchedulerHandle::over_batches(

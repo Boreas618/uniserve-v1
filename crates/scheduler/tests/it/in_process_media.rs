@@ -3,7 +3,7 @@
 //! The launched case starts a text deployment and submits video requests it
 //! never declared support for. Each is rejected through its own event stream,
 //! and the engine goes on serving the text it does support. Here the deployment
-//! is a handle over `support::Serving` whose inventory states prefill and
+//! is a handle over `testkit::FakeBatches` whose inventory states prefill and
 //! decode only, so the refusal is the mechanism's own and no process exists to
 //! fail first.
 
@@ -17,13 +17,14 @@ use scheduler::{
     BatchCapacity, Event, GenerationConstraint, GenerationRequest, SchedulerHandle, Stage,
 };
 
-use crate::support::{self, Serving};
+use crate::support;
+use testkit::FakeBatches;
 
 /// How long a command answer may take.
 const ANSWER: Duration = Duration::from_secs(60);
 
 /// Instantiates the epoch's first policy for `pool` and switches it in.
-fn install(handle: &SchedulerHandle, pool: &Serving) {
+fn install(handle: &SchedulerHandle, pool: &FakeBatches) {
     let rank = pool
         .inventory()
         .first()
@@ -137,7 +138,7 @@ fn next(events: &mut scheduler::EventRx, what: &str) -> Event {
 /// reason to stop a text deployment.
 #[test]
 fn unsupported_media_is_rejected_without_stopping_the_engine() {
-    let pool = Arc::new(Serving::new(vec![support::pool("model")]));
+    let pool = Arc::new(support::positional(vec![support::pool("model")]));
     // The configuration the green text case uses: a batch bound is not part
     // of what this case asserts, and a construct that differs from the one
     // known to serve text would make a refusal unattributable.

@@ -99,7 +99,7 @@ pub(crate) fn sim_core(args: proto::config::EngineArgs, worker: SimEngine) -> Sc
 /// the ceilings the mechanism checks them against, so the precopy is answered
 /// with success rather than a refusal that would hide behind a fixture.
 ///
-/// Requires `SCHED_POLICY_WASM`; see [`scheduler::packaged_policy`], whose panic
+/// Requires `SCHED_POLICY_WASM`; see [`testkit::packaged_policy`], whose panic
 /// states the command that builds the module.
 pub(crate) fn policy_on(core: &SchedulerHandle) {
     let capacity = scheduler::BatchCapacity::of(core.info());
@@ -137,7 +137,7 @@ pub(crate) const POLICY_ANSWER: std::time::Duration = std::time::Duration::from_
 /// fixture looks like a deadlock in the daemon.
 pub(crate) const POLICY_BUILD: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// [`scheduler::packaged_policy`] under a bound, so a stalled build names itself.
+/// [`testkit::packaged_policy`] under a bound, so a stalled build names itself.
 ///
 /// The build is blocking and its thread cannot be cancelled; the thread is left
 /// to finish rather than joined, which is what a test fixture can do and a
@@ -147,7 +147,7 @@ pub(crate) fn packaged_policy(
 ) -> (scheduler::PolicyProgram, Vec<u8>) {
     let (answered, answer) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = answered.send(scheduler::packaged_policy(capacity));
+        let _ = answered.send(testkit::packaged_policy(capacity));
     });
     answer.recv_timeout(POLICY_BUILD).unwrap_or_else(|_| {
         panic!(

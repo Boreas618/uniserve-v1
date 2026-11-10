@@ -25,21 +25,17 @@
 //! makes those proportional to state changes, and the events an epoch emits are
 //! asserted where they come from, request by request.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ipc::execution::Outcome;
-use ipc::execution::{
-    Batch, BatchOutput, Batches, CallOutput, Inventory, PoolLayout, RowState, Submission,
-    SubmissionId,
-};
-use ipc::{ImageParams, MainProcessEndpoint, MainProcessInfo, SamplingParams, TimingCounters};
-use proto::config::BlockConfig;
+use ipc::execution::Batches;
+use ipc::{ImageParams, SamplingParams};
 use scheduler::{
     BatchCapacity, Event, GenerationConstraint, GenerationRequest, Parameters, PolicyProgram,
     PolicySource, Progress, SchedulerConfig, SchedulerHandle, Stage,
 };
 use scheduling::Call;
+use testkit::{Extent, FakeBatches, Tokens};
 
 /// How long a command answer may take: a precopy loads and instantiates a
 /// module on its own thread.
@@ -47,9 +43,6 @@ const ANSWER: Duration = Duration::from_secs(30);
 
 /// How long an epoch may take to reach the step the test asks for.
 const STEPS: Duration = Duration::from_secs(20);
-
-/// The token this pool samples for the `index`th call of every batch.
-const SAMPLED: u32 = 1000;
 
 /// Blocks until a command answers, and answers its result.
 fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result<T, String> {
@@ -59,126 +52,17 @@ fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result
     }
 }
 
-/// One rank of a text pool: prefill and decode, eight request rows, and the
-/// batch bounds the launch stated.
-fn rank(host: &str) -> MainProcessInfo {
-    MainProcessInfo {
-        endpoint: MainProcessEndpoint {
-            host: host.to_owned(),
-            address_space: format!("{host}-space"),
-            incarnation: format!("{host}-rank"),
-        },
-        supported_calls: vec![
-            ipc::CallKind::Forward(ipc::ForwardMode::Prefill),
-            ipc::CallKind::Forward(ipc::ForwardMode::Decode),
-        ],
-        request_slots: 8,
-        max_batch_calls: 16,
-        max_batch_tokens: 512,
-        // A text pool serves token generation, so it advertises the paged KV
-        // pool every such worker has (`MainProcessInfo::default`): a worker with no
-        // prefix cache is refused a token request at submission, which is the
-        // rule for a media-only rank and not for this one.
-        buffer_pool_bytes: 1 << 20,
-        ..MainProcessInfo::default()
-    }
-}
-
-/// A text pool of one rank named `model`.
-fn pool() -> Inventory {
-    Inventory {
-        group: "model".to_owned(),
-        ranks: vec![rank("gpu-a")],
-        layout: PoolLayout {
-            queue_depth: 1,
-            ranks: 1,
-            components: std::collections::BTreeMap::from([(
-                proto::config::DEFAULT_BLOCK.to_owned(),
-                BlockConfig {
-                    ranks: vec![0],
-                    tensor_parallel_size: 1,
-                    pipeline_parallel_size: 1,
-                    sequence_parallel: Default::default(),
-                    units_per_rank: 1,
-                    weights: Default::default(),
-                    distribution: None,
-                },
-            )]),
-        },
-        max_model_len: 4096,
-    }
-}
-
-/// A pool that serves every batch with the values the mechanism reads back.
-struct Serving {
-    inventory: Vec<Inventory>,
-    next: Mutex<u64>,
-}
-
-impl Serving {
-    fn new(inventory: Vec<Inventory>) -> Self {
-        Self {
-            inventory,
-            next: Mutex::new(1),
-        }
-    }
-
-    fn serve(&self, batch: Batch) -> Submission {
-        let calls = batch
-            .calls
-            .iter()
-            .enumerate()
-            .map(|(index, call)| {
-                let seen = batch
-                    .columns
-                    .rows
-                    .seq_lens
-                    .get(index)
-                    .copied()
-                    .unwrap_or(0)
-                    .max(0) as u32;
-                CallOutput::completed(
-                    *call,
-                    vec![SAMPLED + index as u32],
-                    RowState {
-                        step_index: seen + 1,
-                        cache_computed_len: seen + 1,
-                        cache_visible_len: seen + 1,
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut next = self.next.lock().expect("the pool's submissions");
-        let submission = Submission::completed(
-            SubmissionId(*next),
-            Outcome::Success(BatchOutput {
-                calls,
-                timing: TimingCounters::default(),
-                forward_stats: None,
-            }),
-        );
-        *next += 1;
-        submission
-    }
-}
-
-impl Batches for Serving {
-    fn submit(&self, batch: Batch) -> Result<Submission, Box<ipc::execution::Fault>> {
-        Ok(self.serve(batch))
-    }
-
-    fn shadow(&self, batch: Batch) -> Result<Submission, Box<ipc::execution::Fault>> {
-        Ok(self.serve(batch))
-    }
-
-    fn inventory(&self) -> &[Inventory] {
-        &self.inventory
-    }
+/// A pool of one text rank that completes every batch at once, sampling `testkit::SAMPLED` plus each
+/// call's place in its batch and standing one token past the extent its row states.
+fn serving() -> FakeBatches {
+    FakeBatches::new(vec![testkit::pool("model")])
+        .with_tokens(Tokens::Positional)
+        .with_extent(Extent::OnePast)
 }
 
 /// The program the epoch serves under, its arguments the capacity this pool was
 /// built for.
-fn program(pool: &Serving) -> PolicyProgram {
+fn program(pool: &FakeBatches) -> PolicyProgram {
     let rank = pool
         .inventory()
         .first()
@@ -229,7 +113,7 @@ fn text_request(id: u64, prompt: usize, max_tokens: usize) -> GenerationRequest 
 /// The epoch's policy: prepared, then switched in on the handle's own command
 /// surface. Both answers are checked, so a trial that broke the discipline would
 /// fail the install rather than the test's first assertion.
-fn install(handle: &SchedulerHandle, serving: &Serving) {
+fn install(handle: &SchedulerHandle, serving: &FakeBatches) {
     let source: Arc<dyn PolicySource + Send + Sync> =
         Arc::new(scheduler::PolicyBytes::new(crate::support::policy_module()));
     answer(handle.precopy_policy(program(serving), source)).expect("the policy is precopied");
@@ -253,9 +137,9 @@ fn reached(handle: &SchedulerHandle, steps: u64) -> Progress {
 
 #[test]
 fn a_step_asks_the_policy_to_observe_and_dispatch_once_each() {
-    let serving = Arc::new(Serving::new(vec![pool()]));
+    let serving = Arc::new(serving());
     let batches = Arc::clone(&serving) as Arc<dyn Batches>;
-    let args = scheduler::sim_args("call-counts");
+    let args = testkit::args("call-counts");
     let limits = SchedulerConfig {
         max_running_requests: 4,
         ..SchedulerConfig::default()

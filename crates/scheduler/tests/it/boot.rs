@@ -12,20 +12,16 @@
 //! and answers its calls. What the boot derives — the group, the budgets, the
 //! cache geometry, the tokenizer's bounds — is the code under test.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ipc::execution::Outcome;
-use ipc::execution::{
-    Batch, BatchOutput, Batches, CallOutput, Inventory, PoolLayout, RowState, Submission,
-    SubmissionId,
-};
-use ipc::{ImageParams, MainProcessEndpoint, MainProcessInfo, SamplingParams, TimingCounters};
-use proto::config::BlockConfig;
+use ipc::execution::Batches;
+use ipc::{ImageParams, SamplingParams};
 use scheduler::{
     BatchCapacity, Event, GenerationConstraint, GenerationRequest, SchedulerConfig,
     SchedulerHandle, Stage,
 };
+use testkit::{Extent, FakeBatches, SAMPLED, Tokens};
 
 /// How long a command answer may take.
 ///
@@ -39,9 +35,6 @@ const ANSWER: Duration = Duration::from_secs(60);
 /// How long a request may take to emit its first token.
 const FIRST_TOKEN: Duration = Duration::from_secs(20);
 
-/// The token this pool samples for the `index`th call of every batch.
-const SAMPLED: u32 = 1000;
-
 /// Blocks until a command answers, and answers its result.
 fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result<T, String> {
     match receiver.recv_timeout(ANSWER) {
@@ -50,60 +43,10 @@ fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result
     }
 }
 
-/// One rank of a text pool: prefill and decode, eight request rows, and the
-/// batch bounds the launch stated.
-fn rank(host: &str) -> MainProcessInfo {
-    MainProcessInfo {
-        endpoint: MainProcessEndpoint {
-            host: host.to_owned(),
-            address_space: format!("{host}-space"),
-            incarnation: format!("{host}-rank"),
-        },
-        supported_calls: vec![
-            ipc::CallKind::Forward(ipc::ForwardMode::Prefill),
-            ipc::CallKind::Forward(ipc::ForwardMode::Decode),
-        ],
-        request_slots: 8,
-        max_batch_calls: 16,
-        max_batch_tokens: 512,
-        // A text pool serves token generation, so it advertises the paged KV
-        // pool every such worker has (`MainProcessInfo::default`): a worker with no
-        // prefix cache is refused a token request at submission, which is the
-        // rule for a media-only rank and not for this one.
-        buffer_pool_bytes: 1 << 20,
-        ..MainProcessInfo::default()
-    }
-}
-
-/// A text pool of one rank named `model`: what the worker reports of itself.
-fn pool() -> Inventory {
-    Inventory {
-        group: "model".to_owned(),
-        ranks: vec![rank("gpu-a")],
-        layout: PoolLayout {
-            queue_depth: 1,
-            ranks: 1,
-            components: std::collections::BTreeMap::from([(
-                proto::config::DEFAULT_BLOCK.to_owned(),
-                BlockConfig {
-                    ranks: vec![0],
-                    tensor_parallel_size: 1,
-                    pipeline_parallel_size: 1,
-                    sequence_parallel: Default::default(),
-                    units_per_rank: 1,
-                    weights: Default::default(),
-                    distribution: None,
-                },
-            )]),
-        },
-        max_model_len: 4096,
-    }
-}
-
 /// The arguments one main process starts its scheduler with for a text deployment of one rank,
 /// and the mechanism's limits of its pool: a tokenizer whose end of text is the simulation's.
 fn launch() -> (proto::config::EngineArgs, SchedulerConfig) {
-    let mut args = scheduler::sim_args("boot-model");
+    let mut args = testkit::args("boot-model");
     args.engine_config.max_running_requests = std::num::NonZeroUsize::new(4).expect("positive");
     // The budgets the pool below is built for, stated rather than left to a default: a plan may
     // not exceed what the epoch was built for, so a budget tighter than the pool's would refuse
@@ -137,85 +80,18 @@ fn text_request(id: u64, prompt: usize, max_tokens: usize) -> GenerationRequest 
     }
 }
 
-/// A pool that serves every batch with the values the mechanism reads back.
-struct Serving {
-    inventory: Vec<Inventory>,
-    /// The batches the mechanism handed over, so a test can see the boot got as
-    /// far as executing work.
-    submitted: Mutex<usize>,
-    next: Mutex<u64>,
-}
-
-impl Serving {
-    fn new(inventory: Vec<Inventory>) -> Self {
-        Self {
-            inventory,
-            submitted: Mutex::new(0),
-            next: Mutex::new(1),
-        }
-    }
-
-    /// The batch's calls, each answered as a completed call that sampled
-    /// [`SAMPLED`] and stands one token past the cache extent the mechanism
-    /// wrote into the batch's own rows.
-    fn serve(&self, batch: Batch) -> Submission {
-        let calls = batch
-            .calls
-            .iter()
-            .enumerate()
-            .map(|(index, call)| {
-                let seen = batch
-                    .columns
-                    .rows
-                    .seq_lens
-                    .get(index)
-                    .copied()
-                    .unwrap_or(0)
-                    .max(0) as u32;
-                CallOutput::completed(
-                    *call,
-                    vec![SAMPLED + index as u32],
-                    RowState {
-                        step_index: seen + 1,
-                        cache_computed_len: seen + 1,
-                        cache_visible_len: seen + 1,
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut next = self.next.lock().expect("the pool's submissions");
-        let submission = Submission::completed(
-            SubmissionId(*next),
-            Outcome::Success(BatchOutput {
-                calls,
-                timing: TimingCounters::default(),
-                forward_stats: None,
-            }),
-        );
-        *next += 1;
-        submission
-    }
-}
-
-impl Batches for Serving {
-    fn submit(&self, batch: Batch) -> Result<Submission, Box<ipc::execution::Fault>> {
-        *self.submitted.lock().expect("the pool's batches") += 1;
-        Ok(self.serve(batch))
-    }
-
-    fn shadow(&self, batch: Batch) -> Result<Submission, Box<ipc::execution::Fault>> {
-        Ok(self.serve(batch))
-    }
-
-    fn inventory(&self) -> &[Inventory] {
-        &self.inventory
-    }
+/// A pool of one text rank that completes every batch at once, sampling [`SAMPLED`] plus each
+/// call's place in its batch and standing one token past the extent its row states.
+fn serving() -> FakeBatches {
+    FakeBatches::new(vec![testkit::pool("model")])
+        .with_tokens(Tokens::Positional)
+        .with_extent(Extent::OnePast)
 }
 
 /// The `fcfs` program, instantiated for the capacity this pool was built for:
 /// a policy declares its own limits and the mechanism refuses a declaration
 /// above the ceilings the ranks were started for.
-fn policy_program(pool: &Serving) -> scheduler::PolicyProgram {
+fn policy_program(pool: &FakeBatches) -> scheduler::PolicyProgram {
     let rank = pool
         .inventory()
         .first()
@@ -240,7 +116,7 @@ fn policy_program(pool: &Serving) -> scheduler::PolicyProgram {
 
 /// The epoch's first policy: prepared, then switched in on the handle's own
 /// command surface, which the launched path's is.
-fn install(handle: &SchedulerHandle, pool: &Serving) {
+fn install(handle: &SchedulerHandle, pool: &FakeBatches) {
     let source: Arc<dyn scheduler::PolicySource + Send + Sync> =
         Arc::new(scheduler::PolicyBytes::new(crate::support::policy_module()));
     answer(handle.precopy_policy(policy_program(pool), source)).expect("the policy is precopied");
@@ -249,7 +125,7 @@ fn install(handle: &SchedulerHandle, pool: &Serving) {
 
 #[test]
 fn the_facts_boot_a_main_process_that_serves_a_request() {
-    let serving = Arc::new(Serving::new(vec![pool()]));
+    let serving = Arc::new(serving());
     let batches = Arc::clone(&serving) as Arc<dyn Batches>;
     // The boot's whole shape: the facts of a launch file, the worker's batch
     // path, one handle. Nothing is launched: the pool is the rank.
@@ -294,7 +170,7 @@ fn the_facts_boot_a_main_process_that_serves_a_request() {
         "the token is the one this pool sampled, not an invented one"
     );
     assert!(
-        *serving.submitted.lock().expect("the pool's batches") > 0,
+        !serving.submitted().is_empty(),
         "the worker was handed the work the facts' budgets admit"
     );
 }

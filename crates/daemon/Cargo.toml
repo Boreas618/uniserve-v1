@@ -49,6 +49,8 @@ uuid.workspace = true
 # The application crate's test fixtures, such as the byte tokenizer.
 frontend = { workspace = true, features = ["testing"] }
 scheduler = { workspace = true, features = ["testing"] }
+# The packaged policy a test epoch installs.
+testkit.workspace = true
 # Tests drive the request interface with in-process schedulers and build
 # their worker values.
 ipc.workspace = true

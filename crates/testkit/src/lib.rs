@@ -1,0 +1,21 @@
+//! Test support for the scheduler and its callers.
+//!
+//! A test of the mechanism runs the production scheduler over the production submission door
+//! (`SchedulerHandle::over_batches`) and replaces only what lies beyond it: the worker. This crate
+//! holds the one test double at that boundary, [`FakeBatches`], an implementation of
+//! [`ipc::execution::Batches`] that answers each batch from the columns the mechanism wrote, so
+//! every completion a test observes travels the serving completion path.
+//!
+//! - [`batches`]: the fake worker and its answer rules.
+//! - [`pools`]: the inventories a fake states, and the limits and arguments a handle over one is
+//!   built with.
+//! - [`policy`]: the `fcfs` module this tree builds, and the program a test epoch installs it
+//!   under.
+
+pub mod batches;
+pub mod policy;
+pub mod pools;
+
+pub use batches::{Answer, Extent, FakeBatches, SAMPLED, Tokens, draw_token};
+pub use policy::{packaged_module, packaged_policy, packaged_program};
+pub use pools::{args, limits, pool, rank};

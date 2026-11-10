@@ -89,10 +89,6 @@ pub use crate::kv_cache::{HostCacheSize, IndexedPage, prefix_seeds};
 #[cfg(feature = "testing")]
 pub use crate::service::{EpochPolicy, serve_requests};
 pub use crate::submission::Submissions;
-#[cfg(feature = "testing")]
-pub use crate::testing::packaged_module;
-#[cfg(feature = "testing")]
-pub use crate::testing::packaged_policy;
 // The simulated engine is test support: `mod sim` is built only with the
 // `testing` feature, so its surface is exported only with it. A production
 // build that exported these would not compile - the module they come from is
@@ -180,10 +176,9 @@ mod residents;
 mod run;
 mod speculation;
 pub(crate) mod submission;
-/// Policy modules as WebAssembly text, and the quiet one a caller drives the
-/// mechanism with (`testing` feature; never part of a serving build).
-#[cfg(feature = "testing")]
-pub(crate) mod testing;
+/// Policy modules as WebAssembly text for the policy switch's unit tests.
+#[cfg(test)]
+mod toy;
 
 /// The mechanism's door to a worker a test supplies.
 #[cfg(feature = "testing")]

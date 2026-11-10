@@ -4,11 +4,31 @@
 //! these tests have no model, so a simulated worker's limits follow from the
 //! call kinds it serves.
 
-pub(crate) mod serving;
 pub(crate) mod storage;
 pub(crate) mod video;
 
-pub(crate) use serving::{SAMPLED, Serving, config, pool};
+pub(crate) use testkit::{SAMPLED, pool};
+
+use proto::config::EngineArgs;
+use testkit::{FakeBatches, Tokens};
+
+/// A fake worker over `inventory` that samples [`SAMPLED`] plus each call's place in its batch:
+/// every batch looks alike, so a case reads the mechanism's choices from the batch, not the token.
+pub(crate) fn positional(inventory: Vec<ipc::execution::Inventory>) -> FakeBatches {
+    FakeBatches::new(inventory).with_tokens(Tokens::Positional)
+}
+
+/// A fake worker over `inventory` whose sampled token follows each call's cache extent: the same
+/// request continued from a successor samples what it would have sampled uninterrupted.
+pub(crate) fn by_extent(inventory: Vec<ipc::execution::Inventory>) -> FakeBatches {
+    FakeBatches::new(inventory).with_tokens(Tokens::Extent)
+}
+
+/// The arguments and limits of a handle over `pool` for a deployment named `name`: the
+/// simulation's launch facts, with as many running requests as the pool holds rows.
+pub(crate) fn config(pool: &FakeBatches, name: &str) -> (EngineArgs, SchedulerConfig) {
+    (testkit::args(name), testkit::limits(pool))
+}
 
 /// Waits for `want` generated tokens, or for the request's terminal event.
 ///
@@ -129,10 +149,10 @@ pub(crate) fn scheduler_with_stating(
 /// admission, no batch — so an epoch that submits a request must be given one.
 /// The module is the `fcfs` program this tree builds for
 /// `wasm32-unknown-unknown`, the one that reproduces the rules the tests were
-/// written against: `scheduler::packaged_module` builds it on first use, and a
+/// written against: `testkit::packaged_module` builds it on first use, and a
 /// module named by `SCHED_POLICY_WASM` is read instead.
 pub(crate) fn policy_module() -> Vec<u8> {
-    scheduler::packaged_module()
+    testkit::packaged_module()
 }
 
 /// Installs `fcfs` with the ceilings an epoch advertises and the parameters the

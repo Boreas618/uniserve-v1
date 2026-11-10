@@ -76,7 +76,7 @@ fn text_request(id: u64, prompt: usize, max_tokens: usize) -> GenerationRequest 
 /// The `fcfs` program, instantiated for the capacity this pool was built for:
 /// a policy declares its own limits and the mechanism refuses a declaration
 /// above the ceilings the ranks were started for.
-fn policy_program(pool: &crate::support::Serving) -> scheduler::PolicyProgram {
+fn policy_program(pool: &testkit::FakeBatches) -> scheduler::PolicyProgram {
     // A pool's capacity is the rank's own statement: what the launch built it
     // for, which the policy's declaration must not exceed.
     let rank = pool
@@ -103,7 +103,7 @@ fn policy_program(pool: &crate::support::Serving) -> scheduler::PolicyProgram {
 
 /// The epoch's first policy: prepared, then switched in on the handle's own
 /// command surface, which is the launched path's.
-fn install(handle: &SchedulerHandle, pool: &crate::support::Serving) {
+fn install(handle: &SchedulerHandle, pool: &testkit::FakeBatches) {
     let source: Arc<dyn scheduler::PolicySource + Send + Sync> =
         Arc::new(scheduler::PolicyBytes::new(crate::support::policy_module()));
     answer(handle.precopy_policy(policy_program(pool), source)).expect("the policy is precopied");
@@ -112,13 +112,13 @@ fn install(handle: &SchedulerHandle, pool: &crate::support::Serving) {
 
 #[test]
 fn a_request_is_served_through_the_workers_own_batch_path() {
-    let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool(
+    let serving = Arc::new(crate::support::positional(vec![crate::support::pool(
         "model",
     )]));
     let batches = Arc::clone(&serving) as Arc<dyn Batches>;
     let handle = SchedulerHandle::over_batches(
-        &crate::support::serving::args("in-process-completion"),
-        crate::support::serving::limits(&serving),
+        &testkit::args("in-process-completion"),
+        testkit::limits(&*serving),
         batches,
     )
     .expect("the pool serves");
@@ -203,12 +203,12 @@ fn a_request_is_served_through_the_workers_own_batch_path() {
 /// epoch that queues more than it can run at once; a stop serves them in turn.
 #[test]
 fn a_request_that_does_not_fit_a_slot_waits_for_one() {
-    let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool(
+    let serving = Arc::new(crate::support::positional(vec![crate::support::pool(
         "model",
     )]));
     let batches = Arc::clone(&serving) as Arc<dyn Batches>;
-    let args = crate::support::serving::args("in-process-completion");
-    let mut limits = crate::support::serving::limits(&serving);
+    let args = testkit::args("in-process-completion");
+    let mut limits = testkit::limits(&*serving);
     limits.max_running_requests = 1;
     let handle = SchedulerHandle::over_batches(&args, limits, batches).expect("the pool serves");
     install(&handle, &serving);
@@ -254,13 +254,13 @@ fn a_request_that_does_not_fit_a_slot_waits_for_one() {
 /// will send.
 #[test]
 fn a_policy_stage_applies_after_a_request_ended() {
-    let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool(
+    let serving = Arc::new(crate::support::positional(vec![crate::support::pool(
         "model",
     )]));
     let batches = Arc::clone(&serving) as Arc<dyn Batches>;
     let handle = SchedulerHandle::over_batches(
-        &crate::support::serving::args("in-process-completion"),
-        crate::support::serving::limits(&serving),
+        &testkit::args("in-process-completion"),
+        testkit::limits(&*serving),
         batches,
     )
     .expect("the pool serves");
@@ -305,13 +305,13 @@ fn a_policy_stage_applies_after_a_request_ended() {
 /// a batch handed to the worker with no other help.
 #[test]
 fn an_admitted_request_is_prefilled_on_the_next_step() {
-    let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool(
+    let serving = Arc::new(crate::support::positional(vec![crate::support::pool(
         "model",
     )]));
     let batches = Arc::clone(&serving) as Arc<dyn Batches>;
     let handle = SchedulerHandle::over_batches(
-        &crate::support::serving::args("in-process-completion"),
-        crate::support::serving::limits(&serving),
+        &testkit::args("in-process-completion"),
+        testkit::limits(&*serving),
         batches,
     )
     .expect("the pool serves");

@@ -1,0 +1,20 @@
+[package]
+name = "testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Test support shared by the scheduler's and the daemon's tests: the one test
+# double at the worker's batch interface (`ipc::execution::Batches`), the
+# pools it states, and the policy module a test epoch installs. Never a
+# dependency of a serving build.
+[dependencies]
+ipc.workspace = true
+proto.workspace = true
+# `sim_args`, the simulation's launch arguments, is built with the scheduler's
+# `testing` feature until the simulated worker is gone.
+scheduler = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

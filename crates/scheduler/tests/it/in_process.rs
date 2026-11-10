@@ -7,12 +7,13 @@
 //! the launched path's, and a pool whose facts are absent is refused rather than
 //! guessed.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use ipc::execution::{Batch, Batches, Inventory, Submission};
+use ipc::execution::{Batches, Inventory};
 use proto::config::EngineArgs;
 use scheduler::{SchedulerConfig, SchedulerHandle};
+use testkit::FakeBatches;
 
 /// How long a command answer may take.
 ///
@@ -31,42 +32,11 @@ fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result
     }
 }
 
-/// A pool that serves nothing and states what it is.
-struct Pool {
-    inventory: Vec<Inventory>,
-    /// The batches the mechanism handed it, so a test can see none was needed.
-    submitted: Mutex<Vec<Batch>>,
-}
-
-impl Pool {
-    fn new(inventory: Vec<Inventory>) -> Self {
-        Self {
-            inventory,
-            submitted: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-impl Batches for Pool {
-    fn submit(&self, batch: Batch) -> Result<Submission, Box<ipc::execution::Fault>> {
-        self.submitted
-            .lock()
-            .expect("the pool's batches")
-            .push(batch);
-        Err("this test's pool serves no batch".into())
-    }
-
-    fn shadow(&self, batch: Batch) -> Result<Submission, Box<ipc::execution::Fault>> {
-        self.submitted
-            .lock()
-            .expect("the pool's batches")
-            .push(batch);
-        Err("this test's pool runs no shadow batch".into())
-    }
-
-    fn inventory(&self) -> &[Inventory] {
-        &self.inventory
-    }
+/// A pool that states what it is and refuses every batch: these cases need none served.
+fn pool(inventory: Vec<Inventory>) -> FakeBatches {
+    let pool = FakeBatches::new(inventory);
+    pool.refuse(Some("this test's pool serves no batch"));
+    pool
 }
 
 /// The arguments a main process holds, with the simulation's facts since these tests run no
@@ -76,12 +46,12 @@ fn config() -> (EngineArgs, SchedulerConfig) {
         max_running_requests: 4,
         ..SchedulerConfig::default()
     };
-    (scheduler::sim_args("in-process"), limits)
+    (testkit::args("in-process"), limits)
 }
 
 #[test]
 fn a_pool_the_process_did_not_launch_serves_the_launched_paths_commands() {
-    let batch_sink = Arc::new(Pool::new(vec![crate::support::pool("model")]));
+    let batch_sink = Arc::new(pool(vec![crate::support::pool("model")]));
     let batches = Arc::clone(&batch_sink) as Arc<dyn Batches>;
     let handle = {
         let (args, limits) = config();
@@ -104,11 +74,7 @@ fn a_pool_the_process_did_not_launch_serves_the_launched_paths_commands() {
 
     // A scheduler with no policy forms no batch: the pool was asked for none.
     assert!(
-        batch_sink
-            .submitted
-            .lock()
-            .expect("the pool's batches")
-            .is_empty(),
+        batch_sink.submitted().is_empty(),
         "no batch reached the worker before a policy serves"
     );
     handle.shutdown();
@@ -118,7 +84,7 @@ fn a_pool_the_process_did_not_launch_serves_the_launched_paths_commands() {
 fn a_launch_of_ranks_the_worker_does_not_serve_is_refused() {
     let (mut args, limits) = config();
     args.world_size = 2;
-    let batches: Arc<dyn Batches> = Arc::new(Pool::new(vec![crate::support::pool("model")]));
+    let batches: Arc<dyn Batches> = Arc::new(pool(vec![crate::support::pool("model")]));
     let refused = SchedulerHandle::over_batches(&args, limits, batches)
         .err()
         .expect("the launch and the worker state one pool");
@@ -133,7 +99,7 @@ fn a_pool_that_states_no_ranks_is_refused_by_name() {
         ranks: Vec::new(),
         ..crate::support::pool("model")
     };
-    let batches: Arc<dyn Batches> = Arc::new(Pool::new(vec![empty]));
+    let batches: Arc<dyn Batches> = Arc::new(pool(vec![empty]));
     let refused = {
         let (args, limits) = config();
         SchedulerHandle::over_batches(&args, limits, batches)
@@ -146,7 +112,7 @@ fn a_pool_that_states_no_ranks_is_refused_by_name() {
 
 #[test]
 fn an_worker_that_states_no_pool_is_refused_rather_than_guessed() {
-    let batches: Arc<dyn Batches> = Arc::new(Pool::new(Vec::new()));
+    let batches: Arc<dyn Batches> = Arc::new(pool(Vec::new()));
     let refused = {
         let (args, limits) = config();
         SchedulerHandle::over_batches(&args, limits, batches)
