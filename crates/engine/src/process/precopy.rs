@@ -4,15 +4,14 @@
 //! operator's program changed. Each stage is polled by the serve loop and advanced at most once
 //! per pass ([`PrecopyStage`]); a failure discards the generation and serving goes on.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
 use ipc::{ProgramStatus, UpdateFailure};
 use ops::{Generation, KernelEntry};
+use program_server::Program;
 use program_server::program::Programs;
-use program_server::{Program, ProgramSlot};
 use worker::batch::Submission;
 use worker::completion::Outcome;
 use worker::device::Worker;
@@ -20,19 +19,16 @@ use worker::host::HostTask;
 
 use super::MainProcess;
 use super::device_command;
-use super::installs::Advance;
 use super::policy::{TOKEN_LIMIT, limit_refusal};
-use crate::programs::modules::{ListStore, ModuleAnswer, ModuleWork, UnavailableCell};
-use crate::programs::select::{
-    Candidates, Routes, changed_operators, descriptor_keys, updated_programs,
-};
+use crate::programs::modules::{ModuleAnswer, ModuleWork};
+use crate::programs::select::{Routes, changed_operators, replaced_operators};
 
 /// The operator and descriptor key a failed walk named, when that is what failed.
 ///
-/// A generation holds every kernel its buckets launch, and the epoch's first generation installs
-/// the keys the devices' recorded walks reported (`worker::runners::recording`). A walk that still
-/// finds one missing names it here: a key the recording missed, which the precopy installs and
-/// reports as the recording's defect.
+/// A generation holds every kernel its buckets launch: the precopy installs every key the devices'
+/// recorded walks reported (`worker::runners::recording`) in one admission. A walk that still finds
+/// one missing names it here, and the precopy refuses with it: a key the recording missed is the
+/// recording's defect, never a key to learn and install on another attempt.
 fn missing_kernel(submissions: &[Submission]) -> Option<(String, String)> {
     /// The kernel an error names as missing, whether it reached the worker as an operator's
     /// error or wrapped in the model layer's: a capture reports it through
@@ -122,38 +118,19 @@ pub(super) struct Precopy {
     changed: Vec<String>,
     /// The policy program the update installs.
     policy: Program,
-    /// The kernel programs the update installs, by slot: kept so the installs can be admitted again
-    /// with a key a walk found missing, or with the operator's next candidate program.
-    pub(super) programs: Programs,
-    /// Every program this host may fill an operator with, when this generation's programs came from
-    /// the store's listing rather than from the daemon. Empty when the daemon named them: a named
-    /// program is the deployment's choice and the walk does not second-guess it.
-    pub(super) candidates: Candidates,
-    /// The epoch's whole set of programs as the daemon named it: the deployment's choice, which the
-    /// store's coverage never replaces.
-    pub(super) named: Programs,
-    /// The keys of each slot the Program Server's coverage filled (`MainProcess::supply`).
-    pub(super) routes: Routes,
-    /// The candidates this generation has already asked for. Each is tried once, and none again.
-    pub(super) tried: std::collections::BTreeSet<(String, u32)>,
-    /// The backends tried for each operator, so a refusal names every one of them.
-    pub(super) backends: BTreeMap<String, Vec<String>>,
-    /// The refusal the generation's installs met, shared with the device loads that found it.
-    pub(super) unavailable: UnavailableCell,
+    /// The programs the deployment names, by slot: the backends the selection prefers.
+    named: Programs,
+    /// The kernel programs the update installs, by slot: every slot of each operator whose selected
+    /// programs differ from what serves, which on the epoch's first generation is every operator.
+    programs: Programs,
+    /// The keys the Program Server selected each installed slot's package for.
+    routes: Routes,
     /// The stage the precopy is in, since when, and whether the wait has already been reported:
     /// every stage of the precopy is a poll, so a stage that never advances is a run that hangs
     /// without a line unless the process says which step it is standing on.
     stage_name: &'static str,
     since: Instant,
     warned: bool,
-    /// The descriptor keys this generation must hold beyond what a serving generation states, by
-    /// operator. The epoch's first generation has no serving generation to take them from: it holds
-    /// the keys every local device's recorded walk reported, and a key a walk later finds missing
-    /// joins them.
-    pub(super) required: BTreeMap<String, BTreeSet<String>>,
-    /// Whether every scheduler has already been asked for the candidate policy: the discovery loop
-    /// re-enters the stages, and the policy is prepared once.
-    policy_requested: bool,
     /// The generation built for each device, in `workers` order.
     next: Vec<Arc<Generation>>,
     /// The answers of every scheduler that is preparing the update's policy program. The build runs
@@ -177,8 +154,9 @@ enum PrecopyStage {
 
 /// The module-load lane's two steps, in the order the update needs them.
 enum ModuleLane {
-    /// The store's listing, alone on the lane: the installs are derived from it.
-    Listing(Arc<HostTask<ModuleWork>>),
+    /// The Program Server's selection of the generation's programs, alone on the lane: the
+    /// installs are derived from it.
+    Selection(Arc<HostTask<ModuleWork>>),
     /// One install per device for the generation the listing resolved.
     Installs(Vec<Arc<HostTask<ModuleWork>>>),
 }
@@ -258,9 +236,9 @@ fn pending_work(
     policies: &[crossbeam_channel::Receiver<std::result::Result<(), String>>],
 ) -> String {
     match stage {
-        PrecopyStage::Modules(ModuleLane::Listing(task)) => match task.outcome() {
-            None => "the Program Server's store listing".to_owned(),
-            Some(_) => "the store's listing (answered)".to_owned(),
+        PrecopyStage::Modules(ModuleLane::Selection(task)) => match task.outcome() {
+            None => "the Program Server's selection of the generation's programs".to_owned(),
+            Some(_) => "the Program Server's selection (answered)".to_owned(),
         },
         PrecopyStage::Modules(ModuleLane::Installs(tasks)) => {
             let answered = tasks.iter().filter(|task| task.outcome().is_some()).count();
@@ -295,9 +273,17 @@ fn unfinished(submissions: &[Submission], what: &str) -> Option<StageFailure> {
 }
 
 impl MainProcess {
-    /// The precopy, first half: states the new generation to the Program Server
-    /// and admits the lane's work - the store's listing, then one install per
-    /// device - whose builds run while serving goes on.
+    /// The precopy, first half: admits the Program Server's selection of the new generation's
+    /// programs on the module lane; the installs follow from its answer, and their builds run while
+    /// serving goes on.
+    ///
+    /// The epoch's first generation and an update go the same way. Every key this node's devices
+    /// launch is asked of the Program Server once, with the backends `programs` names, and the
+    /// server selects the package of each key (`ProgramServer::cover`). The first generation
+    /// installs every selected slot in one admission; an update installs only the operators whose
+    /// selection differs from what serves - a newly installed revision of an operator the
+    /// deployment names nothing for is such a difference - and a kernel that stays keeps its `Arc`,
+    /// so its buckets and its graphs stay too.
     pub(super) fn start_precopy(
         &mut self,
         generation: u64,
@@ -319,128 +305,38 @@ impl MainProcess {
             return Ok(());
         }
 
-        // A `Precopy` that names no kernel program is the startup switch: the daemon states the
-        // scheduling policy alone, because on a host that runs the worker path there is no kernel
-        // package to prepare (`crates/daemon/src/leader.rs`, `install_programs`). This process
-        // installs what it can actually launch, so the store's listing is read first, on the module
-        // lane, rather than capturing an empty generation.
-        //
-        // A policy-only *update* also names no kernel, and resolving there would be wrong twice
-        // over: every operator would be re-installed as a new generation, so every kernel's `Arc`
-        // would differ from the serving one and every captured bucket would be rebound or
-        // recaptured for a change no program made. The two states are told apart by what this
-        // process already serves - a startup has no kernel at all, an update has all of them.
-        //
-        // Each precopy reads the store at most once, and never one precopy's answer in another's
-        // place: a package built between two updates is a program the second one may install.
-        //
-        // The first generation's read is the lane's. An update's - the keys a package declares, the
-        // candidates an operator has - is still made here, on the control thread, by whichever step
-        // asks for it first; it is the same call the startup switch no longer makes, and the step
-        // that would carry it to the lane is the candidate walk, not this one.
-        self.store = None;
-        let never_installed = self
-            .generations
-            .iter()
-            .all(|generation| generation.is_empty());
-        // The programs the deployment chose, out of which an update installs only what changed.
-        let named = programs.clone();
-        // An update names the epoch's whole set, and only what differs from what serves is
-        // installed: a kernel that stays keeps its `Arc`, so its buckets and its graphs stay too.
-        let updated;
-        let programs = if never_installed {
-            programs
-        } else {
-            updated = updated_programs(programs, &self.serving_programs);
-            &updated
+        let keys = self.generation_keys();
+        tracing::info!(
+            generation,
+            named = programs.len(),
+            operators = keys.len(),
+            keys = keys
+                .values()
+                .map(std::collections::BTreeSet::len)
+                .sum::<usize>(),
+            devices = self.workers.len(),
+            "asking the Program Server to select this generation's programs"
+        );
+        let task = match self.admit_selection(programs, keys) {
+            Ok(task) => task,
+            Err(failure) => return self.abandon_precopy(generation, failure, reply),
         };
-        let mut precopy = Precopy {
+        self.precopy = Some(Precopy {
             generation,
             reply,
             changed: Vec::new(),
             policy: policy.clone(),
-            programs: programs.clone(),
-            named,
+            named: programs.clone(),
+            programs: Programs::new(),
             routes: Routes::new(),
-            candidates: Candidates::new(),
-            tried: std::collections::BTreeSet::new(),
-            backends: BTreeMap::new(),
-            unavailable: UnavailableCell::default(),
             stage_name: "modules",
             since: Instant::now(),
             warned: false,
-            // The first generation installs what the devices' forwards launch, as their recorded
-            // walks state it; an update installs the keys the serving generation holds.
-            required: if never_installed {
-                self.recorded_keys()
-            } else {
-                BTreeMap::new()
-            },
-            policy_requested: false,
             next: Vec::new(),
             policies: Vec::new(),
-            stage: PrecopyStage::Done,
-        };
-
-        if never_installed {
-            // The store's listing is the lane's first work and the one call that leaves this
-            // process before a module does: it is admitted where a build is admitted, so a store
-            // that never answers costs the lane's capacity and not the control thread.
-            let list = ListStore {
-                programs: Arc::clone(&self.programs),
-            };
-            match self.modules.admit(ModuleWork::List(list)) {
-                Ok(task) => {
-                    precopy.stage = PrecopyStage::Modules(ModuleLane::Listing(task));
-                    self.precopy = Some(precopy);
-                    return Ok(());
-                }
-                Err(error) => {
-                    return self.abandon_precopy(
-                        generation,
-                        UpdateFailure::Precopy {
-                            reason: format!("admitting the store's listing: {error}"),
-                        },
-                        reply,
-                    );
-                }
-            }
-        }
-
-        tracing::info!(
-            generation,
-            operators = programs.len(),
-            candidates = precopy
-                .candidates
-                .values()
-                .filter(|ordered| ordered.len() > 1)
-                .count(),
-            devices = self.workers.len(),
-            "this process is installing the generation the daemon named"
-        );
-        let (tasks, unavailable) =
-            match self.admit_installs(programs, &precopy.required, &precopy.routes) {
-                Ok(admitted) => admitted,
-                Err(failure) => return self.abandon_precopy(generation, failure, reply),
-            };
-        precopy.unavailable = unavailable;
-        precopy.stage = PrecopyStage::Modules(ModuleLane::Installs(tasks));
-        self.precopy = Some(precopy);
+            stage: PrecopyStage::Modules(ModuleLane::Selection(task)),
+        });
         Ok(())
-    }
-
-    /// Every program this node's devices launch, by operator and descriptor key: the union of the
-    /// local workers' recorded walks.
-    fn recorded_keys(&self) -> BTreeMap<String, BTreeSet<String>> {
-        let mut keys: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for worker in &self.workers {
-            for (operator, recorded) in worker.recorded() {
-                keys.entry(operator.clone())
-                    .or_default()
-                    .extend(recorded.iter().cloned());
-            }
-        }
-        keys
     }
 
     /// The operators this node's devices could not compare, each with its reason, in device order
@@ -501,7 +397,9 @@ impl MainProcess {
         let stage = std::mem::replace(&mut precopy.stage, PrecopyStage::Done);
 
         match stage {
-            PrecopyStage::Modules(ModuleLane::Listing(task)) => self.advance_listing(precopy, task),
+            PrecopyStage::Modules(ModuleLane::Selection(task)) => {
+                self.advance_selection(precopy, task)
+            }
             PrecopyStage::Modules(ModuleLane::Installs(tasks)) => {
                 self.advance_installs(precopy, tasks)
             }
@@ -513,119 +411,88 @@ impl MainProcess {
         }
     }
 
-    /// The store's listing stage: once the Program Server has said what this host built, the
-    /// generation's set is resolved from it and one install per device is admitted behind it on
-    /// the module lane.
-    fn advance_listing(
+    /// The selection stage: once the Program Server has selected the package of every key, the
+    /// operators whose selection differs from what serves are installed, one install per device
+    /// admitted behind it on the module lane.
+    fn advance_selection(
         &mut self,
         mut precopy: Precopy,
         task: Arc<HostTask<ModuleWork>>,
     ) -> Result<()> {
         let generation = precopy.generation;
-        let answer = match task.outcome() {
-            // The store has not answered yet: the lane keeps the task and this pass ends
-            // with the precopy where it was, as every stage of the precopy does.
+        let refuse = |reason: String| UpdateFailure::Precopy { reason };
+        let selection = match task.outcome() {
+            // The server has not answered yet: the lane keeps the task and this pass ends with the
+            // precopy where it was, as every stage of the precopy does.
             None => {
-                precopy.stage = PrecopyStage::Modules(ModuleLane::Listing(task));
+                precopy.stage = PrecopyStage::Modules(ModuleLane::Selection(task));
                 self.precopy = Some(precopy);
                 return Ok(());
             }
             Some(Outcome::Success(answer)) => match &*answer {
-                ModuleAnswer::Listed(listing) => listing.clone(),
-                // This stage holds the listing alone; an install here is a fault in this
-                // process, and it is refused by name rather than read as a listing.
+                ModuleAnswer::Selected(selection) => selection.clone(),
+                // This stage holds the selection alone; an install here is a fault in this
+                // process, and it is refused by name rather than read as a selection.
                 ModuleAnswer::Installed(_) => {
-                    return self.abandon_precopy(
-                        generation,
-                        UpdateFailure::Precopy {
-                            reason: "the module lane answered the store's listing with a \
-                                     kernel load"
-                                .to_owned(),
-                        },
-                        precopy.reply,
+                    let failure = refuse(
+                        "the module lane answered the selection with a kernel load".to_owned(),
                     );
+                    return self.abandon_precopy(generation, failure, precopy.reply);
                 }
             },
-            // The listing's own refusal already names the read: it is the store's answer,
-            // not the store, that failed.
             Some(Outcome::Failed(error)) => {
-                return self.abandon_precopy(
-                    generation,
-                    UpdateFailure::Precopy {
-                        reason: format!("reading the Program Server's store: {error}"),
-                    },
-                    precopy.reply,
-                );
+                let failure = refuse(format!("selecting this generation's programs: {error}"));
+                return self.abandon_precopy(generation, failure, precopy.reply);
             }
             Some(Outcome::Cancelled) => {
-                return self.abandon_precopy(
-                    generation,
-                    UpdateFailure::Precopy {
-                        reason: "the store's listing was cancelled".to_owned(),
-                    },
-                    precopy.reply,
-                );
+                let failure = refuse("the selection was cancelled".to_owned());
+                return self.abandon_precopy(generation, failure, precopy.reply);
             }
         };
 
-        // The store has said what it holds: the first generation's set is resolved from it
-        // and the installs are admitted on this same lane, behind the listing.
-        self.store = Some(answer);
-        let named = precopy.programs.clone();
-        let (resolved, candidates) = match self.first_generation(&named) {
-            Ok(resolved) => resolved,
-            Err(failure) => {
-                return self.abandon_precopy(generation, failure, precopy.reply);
-            }
-        };
-        precopy.programs = resolved;
-        precopy.candidates = candidates;
-        // Every recorded operator the daemon does not name is filled by the packages that cover its
-        // keys, so one admission prepares every recorded key and no package is asked for a key it
-        // cannot build.
-        let recorded: Vec<String> = precopy.required.keys().cloned().collect();
-        for operator in recorded {
-            if let Err(failure) = self.supply(&mut precopy, &operator) {
-                return self.abandon_precopy(generation, failure, precopy.reply);
-            }
-        }
-        if precopy.programs.is_empty() {
-            let failure = UpdateFailure::Precopy {
-                reason:
-                    "the precopy named no kernel program, this host's store has built none and \
-                         the devices' recorded walks launch none, so there is nothing to install"
-                        .to_owned(),
-            };
+        let never_installed = self
+            .generations
+            .iter()
+            .all(|generation| generation.is_empty());
+        if never_installed && selection.programs.is_empty() {
+            let failure = refuse(
+                "the devices' recorded walks launch no kernel, so this generation has nothing to \
+                 install"
+                    .to_owned(),
+            );
             return self.abandon_precopy(generation, failure, precopy.reply);
         }
+        let replaced = replaced_operators(&selection.programs, &self.serving_programs);
+        precopy.programs = selection
+            .programs
+            .into_iter()
+            .filter(|(slot, _)| replaced.contains(&slot.op))
+            .collect();
+        precopy.routes = selection
+            .routes
+            .into_iter()
+            .filter(|(slot, _)| replaced.contains(&slot.op))
+            .collect();
         tracing::info!(
             generation,
-            operators = precopy.programs.len(),
-            candidates = precopy
-                .candidates
-                .values()
-                .filter(|ordered| ordered.len() > 1)
-                .count(),
-            recorded = precopy.required.values().map(BTreeSet::len).sum::<usize>(),
+            named = precopy.named.len(),
+            installed = precopy.programs.len(),
+            operators = replaced.len(),
+            keys = precopy.routes.values().map(Vec::len).sum::<usize>(),
             devices = self.workers.len(),
-            "this process is installing the generation the daemon named, with every key its \
-             devices' recorded walks launch"
+            "this process is installing the operators whose selected programs differ from what \
+             serves, with every key its devices launch"
         );
-        let (tasks, unavailable) =
-            match self.admit_installs(&precopy.programs, &precopy.required, &precopy.routes) {
-                Ok(admitted) => admitted,
-                Err(failure) => {
-                    return self.abandon_precopy(generation, failure, precopy.reply);
-                }
-            };
-        precopy.unavailable = unavailable;
+        let tasks = match self.admit_installs(&precopy.programs, &precopy.routes) {
+            Ok(tasks) => tasks,
+            Err(failure) => return self.abandon_precopy(generation, failure, precopy.reply),
+        };
         precopy.stage = PrecopyStage::Modules(ModuleLane::Installs(tasks));
         self.precopy = Some(precopy);
         Ok(())
     }
 
-    /// The install stage: every device's kernels loaded build the next generations; a program the
-    /// store refused for a shape of this generation moves the walk to the operator's next candidate.
+    /// The install stage: every device's kernels loaded build the next generations.
     fn advance_installs(
         &mut self,
         mut precopy: Precopy,
@@ -644,13 +511,13 @@ impl MainProcess {
                 }
                 Some(Outcome::Success(answer)) => match &*answer {
                     ModuleAnswer::Installed(entries) => loaded.push(entries.clone()),
-                    // This stage holds installs; the listing has its own arm above.
-                    ModuleAnswer::Listed(_) => {
+                    // This stage holds installs; the selection has its own stage.
+                    ModuleAnswer::Selected(_) => {
                         return self.abandon_precopy(
                             generation,
                             UpdateFailure::Precopy {
                                 reason: "the module lane answered a kernel load with the \
-                                         store's listing"
+                                         selection"
                                     .to_owned(),
                             },
                             precopy.reply,
@@ -658,31 +525,6 @@ impl MainProcess {
                     }
                 },
                 Some(Outcome::Failed(error)) => {
-                    // A program the store refused for a shape of this generation is not
-                    // yet a failed generation: the operator may have another program this
-                    // host built, and the walk tries each once before it gives up.
-                    let refused = precopy
-                        .unavailable
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone();
-                    if let Some(refused) = refused {
-                        match self.advance_candidate(&mut precopy, &refused) {
-                            Advance::Retry(fresh) => {
-                                precopy.stage = PrecopyStage::Modules(ModuleLane::Installs(fresh));
-                                self.precopy = Some(precopy);
-                                return Ok(());
-                            }
-                            Advance::Exhausted(reason) | Advance::Failed(reason) => {
-                                return self.abandon_precopy(
-                                    generation,
-                                    UpdateFailure::Precopy { reason },
-                                    precopy.reply,
-                                );
-                            }
-                            Advance::Named => {}
-                        }
-                    }
                     return self.abandon_precopy(
                         generation,
                         UpdateFailure::Precopy {
@@ -779,156 +621,20 @@ impl MainProcess {
                 Ok(())
             }
             // A walk that found a kernel missing names the operator and key it needed: a key the
-            // devices' recorded walks missed, which is installed and retried.
-            Some(StageFailure::Failed(reason)) => self.missed_kernel(precopy, &submissions, reason),
+            // devices' recorded walks missed, which no second attempt is made to learn.
+            Some(StageFailure::Failed(reason)) => {
+                let reason = match missing_kernel(&submissions) {
+                    Some((operator, key)) => format!(
+                        "a device's walk launches {operator} under {key}, which its recorded walk \
+                         did not report, so this generation holds no kernel for it - the recording \
+                         is the defect ({reason})"
+                    ),
+                    None => reason,
+                };
+                self.abandon_precopy(generation, UpdateFailure::Precopy { reason }, precopy.reply)
+            }
             None => self.start_shadow(precopy),
         }
-    }
-
-    /// A device preparation that failed: when its walk named a kernel the generation lacks, the
-    /// generation requires the operator's descriptor key (routed, for an operator the deployment
-    /// does not name, to the package that covers it) and its installs are admitted again; any other
-    /// failure abandons the precopy with `reason`.
-    ///
-    /// The devices' recorded walks state every key their forwards launch, so a key found missing
-    /// here is one the recording missed: a defect of the walk, reported at WARN with the key, and
-    /// installed so the generation still completes.
-    fn missed_kernel(
-        &mut self,
-        mut precopy: Precopy,
-        submissions: &[Submission],
-        reason: String,
-    ) -> Result<()> {
-        let generation = precopy.generation;
-        let Some((operator, key)) = missing_kernel(submissions) else {
-            return self.abandon_precopy(
-                generation,
-                UpdateFailure::Precopy { reason },
-                precopy.reply,
-            );
-        };
-        if precopy
-            .required
-            .get(&operator)
-            .is_some_and(|keys| keys.contains(&key))
-        {
-            // The walk named a key this generation already installed, so no
-            // further attempt can succeed: the loop stops with both names
-            // rather than retrying a key it holds.
-            let cause = if precopy.programs.is_empty() {
-                " - and the daemon named no kernel program for this \
-                 generation, so there is nothing to install it from (the \
-                 startup switch states the scheduling policy alone)"
-            } else {
-                ""
-            };
-            return self.abandon_precopy(
-                generation,
-                UpdateFailure::Precopy {
-                    reason: format!(
-                        "{operator} still has no kernel under {key} after it \
-                         was installed: the walk and the install disagree{cause}"
-                    ),
-                },
-                precopy.reply,
-            );
-        }
-        tracing::warn!(
-            %operator,
-            %key,
-            generation,
-            "the recorded walk missed a descriptor key a device's walk launches: the key is \
-             installed and the preparation retried, and the recording is the defect to fix"
-        );
-        precopy
-            .required
-            .entry(operator.clone())
-            .or_default()
-            .insert(key);
-        // The operator's keys are routed again with the missed one among them: it may belong to a
-        // package the operator's other keys did not need.
-        if let Err(failure) = self.supply(&mut precopy, &operator) {
-            return self.abandon_precopy(generation, failure, precopy.reply);
-        }
-        let tasks = match self.admit_installs(&precopy.programs, &precopy.required, &precopy.routes)
-        {
-            Ok((tasks, unavailable)) => {
-                precopy.unavailable = unavailable;
-                tasks
-            }
-            Err(failure) => {
-                return self.abandon_precopy(generation, failure, precopy.reply);
-            }
-        };
-        precopy.stage = PrecopyStage::Modules(ModuleLane::Installs(tasks));
-        self.precopy = Some(precopy);
-        Ok(())
-    }
-
-    /// Fills `operator`'s slots in `precopy` from the packages that cover its keys, unless the
-    /// deployment named its program.
-    ///
-    /// A deployment names the implementations it pins and says nothing about the rest. For the rest,
-    /// the keys the generation needs - the devices' recorded ones and those a serving generation
-    /// launches - are routed by the Program Server to the installed package whose manifest covers
-    /// each (`MainProcess::cover_keys`), replacing whatever slots the operator held: one package fills
-    /// the operator's single slot, several each fill a slot of their own keys. A key no installed
-    /// package covers stops the generation with a sentence naming the operator and the key.
-    ///
-    /// A named operator an update left out of its installs - its program did not change - is given
-    /// its named programs back, so a key the walk found missing is built by the deployment's choice.
-    fn supply(
-        &mut self,
-        precopy: &mut Precopy,
-        operator: &str,
-    ) -> std::result::Result<(), UpdateFailure> {
-        let named: Vec<(ProgramSlot, Program)> = precopy
-            .named
-            .iter()
-            .filter(|(slot, _)| slot.op == operator)
-            .map(|(slot, program)| (slot.clone(), program.clone()))
-            .collect();
-        if !named.is_empty() {
-            if !precopy.programs.keys().any(|slot| slot.op == operator) {
-                precopy.programs.extend(named);
-            }
-            return Ok(());
-        }
-        let Some(name) = ops::operator_name(operator) else {
-            return Err(UpdateFailure::Precopy {
-                reason: format!("operator {operator} has no implementation in this build"),
-            });
-        };
-        let mut keys: BTreeSet<String> =
-            precopy.required.get(operator).cloned().unwrap_or_default();
-        keys.extend(descriptor_keys(&self.generations[0], name));
-        if keys.is_empty() {
-            return Ok(());
-        }
-        let (slots, routes) = self
-            .cover_keys(operator, keys.into_iter().collect())
-            .map_err(|reason| UpdateFailure::Precopy { reason })?;
-
-        // The coverage decides the operator's whole slot set: a slot the store's built set gave it
-        // is replaced, and the candidate walk has nothing left to move along.
-        precopy.programs.retain(|slot, _| slot.op != operator);
-        precopy.routes.retain(|slot, _| slot.op != operator);
-        precopy.candidates.remove(operator);
-        for (slot, program) in slots {
-            tracing::info!(
-                %operator,
-                backend = %program.backend,
-                revision = program.revision,
-                phase = ?slot.phase,
-                keys = routes.get(&slot).map_or(0, Vec::len),
-                generation = precopy.generation,
-                "the deployment does not name this operator: the package that covers its keys \
-                 fills it"
-            );
-            precopy.programs.insert(slot, program);
-        }
-        precopy.routes.extend(routes);
-        Ok(())
     }
 
     /// The prepared generation is complete on every device: the shadow step is asked of every
@@ -1024,8 +730,19 @@ impl MainProcess {
         // and 3). They wait here, so a descriptor lookup still reads the serving generation and a
         // revert has nothing to undo.
         self.prepared = std::mem::take(&mut precopy.next);
-        // What serves after the switchover: what serves now, with what this precopy installed.
-        self.prepared_programs = self.serving_programs.clone();
+        // What serves after the switchover: what serves now, with every operator this precopy
+        // installed replaced whole - its slots may divide it differently than the serving ones.
+        let replaced: std::collections::BTreeSet<&str> = precopy
+            .programs
+            .keys()
+            .map(|slot| slot.op.as_str())
+            .collect();
+        self.prepared_programs = self
+            .serving_programs
+            .iter()
+            .filter(|(slot, _)| !replaced.contains(slot.op.as_str()))
+            .map(|(slot, program)| (slot.clone(), program.clone()))
+            .collect();
         self.prepared_programs.extend(precopy.programs.clone());
         if let Err(error) = self.update.precopied(generation) {
             // The generation this precopy built is not the one the machine waits for - a revert or a
@@ -1078,25 +795,16 @@ impl MainProcess {
         // The candidate policy is instantiated on the current snapshot, and
         // every decision it would make is dry-run against the hard constraints
         // before anything switches.
-        //
-        // Once per precopy, not once per install: the descriptor discovery loop comes back through
-        // here with a larger key set, and a policy build on each pass would certify the same
-        // program again on the scheduler's blocking thread, minutes at a time, while the update
-        // waits for a generation that only needs another kernel.
-        let policies = if precopy.policy_requested {
-            Vec::new()
-        } else {
-            match self.request_policy(&precopy.policy) {
-                Ok(policies) => policies,
-                Err(error) => {
-                    return self.abandon_precopy(
-                        generation,
-                        UpdateFailure::Policy {
-                            error: format!("{error:#}"),
-                        },
-                        precopy.reply,
-                    );
-                }
+        let policies = match self.request_policy(&precopy.policy) {
+            Ok(policies) => policies,
+            Err(error) => {
+                return self.abandon_precopy(
+                    generation,
+                    UpdateFailure::Policy {
+                        error: format!("{error:#}"),
+                    },
+                    precopy.reply,
+                );
             }
         };
 
@@ -1107,10 +815,7 @@ impl MainProcess {
         }
         let mut precopy = precopy;
         precopy.next = next;
-        if !policies.is_empty() {
-            precopy.policies = policies;
-            precopy.policy_requested = true;
-        }
+        precopy.policies = policies;
         precopy.stage = PrecopyStage::Workers(submissions);
         self.precopy = Some(precopy);
         Ok(())

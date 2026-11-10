@@ -179,12 +179,8 @@ pub(crate) struct MainProcess {
     /// hold one beside the control thread without a lock.
     storage: Vec<Arc<Retained>>,
     blocking: ThreadPool,
-    /// The blocking lane the store's listing and the module loads run on.
+    /// The blocking lane the Program Server's selection and the module loads run on.
     modules: Lane<ModuleWork>,
-    /// The store's listing read for the precopy in flight. The lane reads it once and
-    /// every later reader of that precopy - the keys a package declares, the candidates an operator
-    /// has - answers from here, so the unbounded call is made where the lane is and never twice.
-    store: Option<program_server::Listing>,
     /// The program-layer update's phases and bookkeeping.
     update: HotUpdate,
     /// The stall and sticky-error rules of the control thread.

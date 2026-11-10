@@ -261,7 +261,7 @@ fn prepare_builds_a_scheduling_policy_once_for_wasm32() {
             },
         }],
         descriptors: vec![Descriptors {
-            op: "scheduling".into(),
+            slot: program_server::ProgramSlot::all("scheduling"),
             keys: vec!["default".into()],
         }],
     };
@@ -410,7 +410,7 @@ fn prepare_selects_the_latest_revision_of_a_backend() {
         // The package covers `dtype_bf16` only: asking for another value
         // names the descriptor and the program that fails to cover it.
         descriptors: vec![Descriptors {
-            op: "rms_norm".into(),
+            slot: program_server::ProgramSlot::all("rms_norm"),
             keys: vec!["dtype_fp32".into()],
         }],
     };
@@ -444,7 +444,7 @@ fn prepare_refuses_descriptors_of_an_operator_no_program_fills() {
             },
         }],
         descriptors: vec![Descriptors {
-            op: "paged_attention".into(),
+            slot: program_server::ProgramSlot::all("paged_attention"),
             keys: vec!["dtype_bf16".into()],
         }],
     };

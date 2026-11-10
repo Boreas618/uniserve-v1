@@ -116,7 +116,7 @@ fn witness(
             },
         }],
         descriptors: vec![Descriptors {
-            op: op.to_owned(),
+            slot: program_server::ProgramSlot::all(op),
             keys: vec![key.to_owned()],
         }],
     };
@@ -240,7 +240,7 @@ fn a_vendor_cubin_is_installed_stored_and_resolved_as_it_is() {
             },
         }],
         descriptors: vec![Descriptors {
-            op: "paged_attention".into(),
+            slot: program_server::ProgramSlot::all("paged_attention"),
             keys: vec![key.to_owned()],
         }],
     };

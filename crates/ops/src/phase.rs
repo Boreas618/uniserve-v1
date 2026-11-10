@@ -41,6 +41,16 @@ impl PhaseKind {
             Self::Denoise => "denoise",
         }
     }
+
+    /// The phase a descriptor key states, when its operator's descriptor holds one.
+    ///
+    /// An operator split by phase writes the phase as its key's first field (`phase_decode_...`,
+    /// [`crate::attention`]); a key of an operator without one states no phase and answers `None`.
+    pub fn of_key(key: &str) -> Option<Self> {
+        let rest = key.strip_prefix("phase_")?;
+        let name = rest.split('_').next()?;
+        Self::ALL.into_iter().find(|phase| phase.as_str() == name)
+    }
 }
 
 impl fmt::Display for PhaseKind {
@@ -60,5 +70,16 @@ mod tests {
         let mut printed: Vec<String> = PhaseKind::ALL.iter().map(ToString::to_string).collect();
         printed.dedup();
         assert_eq!(printed.len(), PhaseKind::ALL.len());
+    }
+
+    #[test]
+    fn a_key_states_its_phase_as_its_first_field() {
+        assert_eq!(
+            PhaseKind::of_key("phase_decode_dtype_bf16"),
+            Some(PhaseKind::Decode)
+        );
+        assert_eq!(PhaseKind::of_key("phase_prefill"), Some(PhaseKind::Prefill));
+        assert_eq!(PhaseKind::of_key("dtype_bf16_phase_decode"), None);
+        assert_eq!(PhaseKind::of_key("phase_sideways_dtype_bf16"), None);
     }
 }

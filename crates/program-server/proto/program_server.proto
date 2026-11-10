@@ -80,13 +80,20 @@ message ProgramRequest {
     Backend backend = 3;
     ProgramRef program = 4;
   }
+  // The backend whose part of the operator's descriptors the slot holds, when
+  // several packages divide them; empty when the slot holds them all.
+  string part = 5;
 }
 
-// The descriptors one operator's program must cover (design section 4.2).
+// The descriptors one slot's program must cover (design section 4.2): the
+// slot is the operator, its phase and its part, exactly as the program
+// request that fills it names them.
 message Descriptors {
   string op = 1;
   // Descriptor keys, in the canonical form the operator's `Display` gives.
   repeated string keys = 2;
+  ProgramPhase phase = 3;
+  string part = 4;
 }
 
 // Ask the server to select the programs of a set of operators and to build
@@ -106,6 +113,7 @@ message Chosen {
   string op = 1;
   ProgramPhase phase = 2;
   ProgramRef program = 3;
+  string part = 4;
 }
 
 // Ask for one module (design sections 5.3 and 6.3): the module of the
@@ -120,18 +128,31 @@ message Resolve {
 // List the installed packages, their revisions and their modules.
 message List {}
 
-// Ask which installed package covers each of an operator's descriptor keys:
-// for every key, the latest revision of a backend whose manifest covers the
-// key and builds for every target. Among several such packages the server
-// prefers one whose module of the key is already committed for every target,
-// then the highest revision, then the backend whose name sorts first. The
-// server answers with `Coverage`; nothing is built.
+// Ask which installed package is selected for each of an operator's
+// descriptor keys (design section 6.3). The candidates are each backend's
+// latest installed revision that builds for every target, or the revision a
+// named backend states; a key goes to the first candidate whose manifest
+// covers it, in this order: the backend the deployment names for the key's
+// phase, then the manifest's `priority`, highest first, then the backend whose
+// name sorts first. The server answers with `Coverage`; nothing is built.
 message Cover {
   string op = 1;
   // The targets the keys' modules are built for, such as `sm_100a`.
   repeated string targets = 2;
   // Descriptor keys, in the canonical form the operator's `Display` gives.
   repeated string keys = 3;
+  // The backends the deployment names for the operator; none leaves the
+  // selection to the manifests' priorities.
+  repeated Named named = 4;
+}
+
+// A backend a deployment names for an operator, in every phase (`ALL`) or in
+// one: it is preferred for the keys of that phase whenever it covers them.
+message Named {
+  ProgramPhase phase = 1;
+  string backend = 2;
+  // The revision to use; zero names the backend's latest installed revision.
+  uint32 revision = 3;
 }
 
 // The form of a compiled module (design section 5.3).
@@ -228,7 +249,7 @@ message Covered {
 
 // The answer to `Cover`: every requested key appears exactly once, either in
 // the package chosen for it or in `uncovered`. Packages are listed in the
-// server's preference order.
+// server's selection order.
 message Coverage {
   repeated Covered covered = 1;
   // The keys no installed package of the operator covers for the targets.

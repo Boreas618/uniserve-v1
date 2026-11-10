@@ -1,5 +1,5 @@
-//! `cover` (design section 6.3): which installed package builds each of an
-//! operator's descriptor keys. Every fixture package declares its own
+//! `cover` (design section 6.3): which installed package is selected for each
+//! of an operator's descriptor keys. Every fixture package declares its own
 //! descriptors in `[kernel.descriptors]`, so the answer is read from the
 //! manifests alone and nothing is compiled.
 
@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use program_server::PhaseKind;
 use program_server::builder::Limits;
-use program_server::protocol::{Client, CoverRequest, Coverage, Covered, Package};
+use program_server::protocol::{Client, CoverRequest, Coverage, Covered, Named, Package};
 use program_server::server::{ProgramServer, ServerConfig};
-use program_server::store::{ModulePath, Root, Store};
+use program_server::store::Root;
 use program_server::target::{Device, Target};
 use program_server::toolchain::ToolchainConfig;
 
@@ -53,6 +54,15 @@ descriptors = {{ dimensions = {{ dtype = [{}], head_dim = ["128"] }} }}
     )
 }
 
+/// `manifest` with the package's `priority` stated.
+fn prioritized(manifest: &str, priority: u32) -> String {
+    manifest.replacen(
+        "\n[toolchain]",
+        &format!("priority = {priority}\n\n[toolchain]"),
+        1,
+    )
+}
+
 /// Writes the package `manifest` into `directory`.
 fn write_package(directory: &Path, manifest: &str) {
     std::fs::create_dir_all(directory.join("src")).unwrap();
@@ -70,18 +80,6 @@ fn installed(configuration: &ServerConfig, backend: &str, revision: u32, manifes
         .join(backend)
         .join(revision.to_string());
     write_package(&directory, manifest);
-}
-
-/// Commits a module of `backend`'s `revision` for `key` on `sm_100a`, as a
-/// build ahead of this server would have left it.
-fn committed(configuration: &ServerConfig, backend: &str, revision: u32, key: &str) {
-    let store = Store::open(configuration.store_roots.clone()).unwrap();
-    let workspace = tempfile::tempdir().unwrap();
-    std::fs::write(workspace.path().join("module.cubin"), b"cubin").unwrap();
-    let path = ModulePath::new(OP, backend, revision, "sm_100a", key).unwrap();
-    store
-        .publish(&path, workspace.path(), &["module.cubin".to_owned()])
-        .unwrap();
 }
 
 /// A server configuration over a fresh package root and module store, for a
@@ -116,6 +114,16 @@ fn request(keys: &[&str]) -> CoverRequest {
         op: OP.to_owned(),
         targets: vec![Target::new("sm_100a")],
         keys: keys.iter().map(|key| (*key).to_owned()).collect(),
+        named: Vec::new(),
+    }
+}
+
+/// `backend` named for `phase`, at its latest revision.
+fn named(phase: Option<PhaseKind>, backend: &str) -> Named {
+    Named {
+        phase,
+        backend: backend.to_owned(),
+        revision: None,
     }
 }
 
@@ -171,7 +179,7 @@ fn each_key_goes_to_the_package_that_declares_it_over_the_socket() {
     client.install(&fa4).unwrap();
 
     let coverage = client.cover(&request(&[BF16, F32, F16, BF16])).unwrap();
-    // `f32` sorts before `fa4` at the same revision, so it is listed first.
+    // `f32` sorts before `fa4` at the same priority, so it is listed first.
     assert_eq!(
         coverage,
         Coverage {
@@ -181,53 +189,57 @@ fn each_key_goes_to_the_package_that_declares_it_over_the_socket() {
     );
 }
 
-/// A key two packages declare goes to the highest revision, and among equal
-/// revisions to the backend whose name sorts first.
+/// A key several packages declare goes to the one of highest priority, and
+/// among equal priorities to the backend whose name sorts first: a later
+/// revision of another backend does not outrank them.
 #[test]
-fn a_key_several_packages_cover_goes_to_the_preferred_one() {
+fn a_key_several_packages_cover_goes_to_the_highest_priority() {
     let temporary = tempfile::tempdir().unwrap();
     let configuration = config(temporary.path());
     installed(
         &configuration,
         "beta",
         1,
-        &manifest("beta", &["bf16", "f16"], "sm_100a"),
+        &prioritized(&manifest("beta", &["bf16", "f16"], "sm_100a"), 2),
     );
     installed(
         &configuration,
         "alpha",
         1,
-        &manifest("alpha", &["bf16"], "sm_100a"),
+        &manifest("alpha", &["bf16", "f32"], "sm_100a"),
     );
     installed(
         &configuration,
         "gamma",
-        2,
-        &manifest("gamma", &["f16"], "sm_100a"),
+        3,
+        &manifest("gamma", &["f32"], "sm_100a"),
     );
     let server = ProgramServer::open(&configuration).unwrap();
 
-    let coverage = server.cover(&request(&[BF16, F16])).unwrap();
+    let coverage = server.cover(&request(&[BF16, F16, F32])).unwrap();
     assert_eq!(
         coverage,
         Coverage {
-            covered: vec![covered("gamma", 2, &[F16]), covered("alpha", 1, &[BF16])],
+            covered: vec![
+                covered("beta", 1, &[BF16, F16]),
+                covered("alpha", 1, &[F32]),
+            ],
             uncovered: Vec::new(),
         }
     );
 }
 
-/// A package whose module of a key is already committed keeps that key
-/// before a preferred package that would have to build it.
+/// A named backend takes every key it covers before any priority, and a key it
+/// does not cover goes on to the packages that do.
 #[test]
-fn a_key_stays_with_the_package_that_built_it() {
+fn a_named_backend_takes_the_keys_it_covers() {
     let temporary = tempfile::tempdir().unwrap();
     let configuration = config(temporary.path());
     installed(
         &configuration,
         "alpha",
         1,
-        &manifest("alpha", &["bf16"], "sm_100a"),
+        &prioritized(&manifest("alpha", &["bf16", "f32"], "sm_100a"), 5),
     );
     installed(
         &configuration,
@@ -235,11 +247,44 @@ fn a_key_stays_with_the_package_that_built_it() {
         1,
         &manifest("beta", &["bf16"], "sm_100a"),
     );
-    committed(&configuration, "beta", 1, BF16);
     let server = ProgramServer::open(&configuration).unwrap();
 
-    let coverage = server.cover(&request(&[BF16])).unwrap();
-    assert_eq!(coverage.covered, vec![covered("beta", 1, &[BF16])]);
+    let mut asked = request(&[BF16, F32]);
+    asked.named = vec![named(None, "beta")];
+    let coverage = server.cover(&asked).unwrap();
+    assert_eq!(
+        coverage.covered,
+        vec![covered("alpha", 1, &[F32]), covered("beta", 1, &[BF16])]
+    );
+}
+
+/// A backend named for one phase is preferred for that phase's keys alone.
+#[test]
+fn a_backend_named_for_a_phase_takes_that_phase() {
+    let temporary = tempfile::tempdir().unwrap();
+    let configuration = config(temporary.path());
+    let phased = |backend: &str| {
+        manifest(backend, &["bf16"], "sm_100a").replace(
+            "descriptors = { dimensions = { dtype",
+            "descriptors = { dimensions = { phase = [\"prefill\", \"decode\"], dtype",
+        )
+    };
+    installed(&configuration, "alpha", 1, &phased("alpha"));
+    installed(&configuration, "beta", 1, &phased("beta"));
+    let server = ProgramServer::open(&configuration).unwrap();
+
+    let prefill = "phase_prefill_dtype_bf16_head_dim_128";
+    let decode = "phase_decode_dtype_bf16_head_dim_128";
+    let mut asked = request(&[prefill, decode]);
+    asked.named = vec![named(Some(PhaseKind::Decode), "beta")];
+    let coverage = server.cover(&asked).unwrap();
+    assert_eq!(
+        coverage.covered,
+        vec![
+            covered("alpha", 1, &[prefill]),
+            covered("beta", 1, &[decode])
+        ]
+    );
 }
 
 /// Only a backend's latest revision answers, as `prepare` selects it: a key

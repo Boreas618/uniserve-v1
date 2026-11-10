@@ -154,6 +154,7 @@ fn prepare_reports_each_build_and_answers_the_selected_programs() {
                                 revision: 2,
                                 arguments: "".into(),
                             }),
+                            part: String::new(),
                         }],
                     })),
                 },
@@ -172,7 +173,7 @@ fn prepare_reports_each_build_and_answers_the_selected_programs() {
             },
         }],
         descriptors: vec![Descriptors {
-            op: "rms_norm".into(),
+            slot: program_server::ProgramSlot::all("rms_norm"),
             keys: vec!["dtype_bf16".into()],
         }],
     };
@@ -296,6 +297,7 @@ fn the_four_phases_of_a_program_slot_travel_whole() {
                                     revision: 1,
                                     arguments: String::new(),
                                 }),
+                                part: program.part.clone(),
                             })
                             .collect(),
                     })),
@@ -328,7 +330,7 @@ fn the_four_phases_of_a_program_slot_travel_whole() {
             })
             .collect(),
         descriptors: vec![Descriptors {
-            op: "attention".into(),
+            slot: ProgramSlot::phase("attention", PhaseKind::Prefill),
             keys: vec!["phase_prefill".into()],
         }],
     };

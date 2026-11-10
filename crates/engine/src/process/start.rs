@@ -335,7 +335,6 @@ impl MainProcess {
             storage: clients,
             blocking,
             modules,
-            store: None,
             update,
             watchdog,
             programs,

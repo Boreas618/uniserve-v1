@@ -1,46 +1,83 @@
-//! The module-load lane's work: the store's listing and one device's installs, and the loading of
-//! each resolved module into the device's context as a kernel, a cubin or a native library chosen
-//! by the entry it defines.
+//! The module-load lane's work: the Program Server's selection of a generation's programs and one
+//! device's installs, and the loading of each resolved module into the device's context as a
+//! kernel, a cubin or a native library chosen by the entry it defines.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use ops::KernelEntry;
-use program_server::{Client, PrepareRequest, Target};
+use program_server::program::Programs;
+use program_server::{Client, CoverRequest, PrepareRequest, Target};
 use worker::completion::Outcome;
 use worker::host::HostAction;
 
-/// The first refusal the installs of one generation met, shared by the precopy and every device's
-/// load so the walk can answer it with the operator's next candidate program.
-pub(crate) type UnavailableCell = Arc<Mutex<Option<Unavailable>>>;
+use crate::programs::select::{Routes, named_backends, selected_slots};
 
-/// The store's listing, on the module-load lane.
+/// The Program Server's selection of a generation's programs, on the module-load lane.
 ///
-/// This is the one call that leaves this process before a generation is prepared, and the one
-/// with no deadline of its own: the client's connect and its reply read are unbounded, so a store
-/// that never answers holds whoever asked. On the lane that cost is a build slot. On the control
-/// thread it would be the thread itself - the one that answers the daemon, the requests, the
-/// metrics and the watchdog, whose silence reads exactly like a stalled device.
-pub(crate) struct ListStore {
+/// Every operator the generation launches is asked once, with every descriptor key it launches and
+/// the backends the deployment names for it; the server answers the package of each key
+/// (`ProgramServer::cover`), and the answer is the generation's slots and the keys each slot's
+/// package builds. The call has no deadline of its own, so it runs where a build runs: on the lane,
+/// a store that never answers costs a build slot and not the control thread that answers the
+/// daemon, the requests and the watchdog.
+pub(crate) struct Select {
     pub(crate) programs: Arc<Mutex<Client>>,
+    pub(crate) targets: Vec<Target>,
+    /// The programs the deployment names, by slot.
+    pub(crate) named: Programs,
+    /// Every descriptor key the generation launches, by operator.
+    pub(crate) keys: BTreeMap<String, BTreeSet<String>>,
 }
 
-impl HostAction for ListStore {
-    type Output = program_server::Listing;
+/// What a selection answered: the generation's programs by slot, and the keys of each slot.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Selection {
+    pub(crate) programs: Programs,
+    pub(crate) routes: Routes,
+}
+
+impl HostAction for Select {
+    type Output = Selection;
 
     fn run(&self) -> worker::Result<Self::Output> {
-        tracing::info!("asking the Program Server for its installed programs");
         let mut client = self
             .programs
             .lock()
             .map_err(|_| worker::Error::State("the Program Server client was poisoned"))?;
-        let listing = client.list().map_err(|error| {
-            worker::Error::Invalid(format!("reading the Program Server's store: {error}"))
-        })?;
-        tracing::info!(
-            packages = listing.packages.len(),
-            "the Program Server's listing answered"
-        );
-        Ok(listing)
+        let mut selection = Selection::default();
+        for (op, keys) in &self.keys {
+            if keys.is_empty() {
+                continue;
+            }
+            let request = CoverRequest {
+                op: op.clone(),
+                targets: self.targets.clone(),
+                keys: keys.iter().cloned().collect(),
+                named: named_backends(op, &self.named),
+            };
+            let coverage = client.cover(&request).map_err(|error| {
+                worker::Error::Invalid(format!(
+                    "asking the Program Server to select {op}'s programs: {error}"
+                ))
+            })?;
+            let (slots, routes) =
+                selected_slots(op, &coverage, &self.named).map_err(worker::Error::Invalid)?;
+            for (slot, program) in &slots {
+                tracing::info!(
+                    %op,
+                    backend = %program.backend,
+                    revision = program.revision,
+                    part = slot.part.as_deref().unwrap_or(""),
+                    keys = routes.get(slot).map_or(0, Vec::len),
+                    named = !request.named.is_empty(),
+                    "the Program Server selected a package for this operator's keys"
+                );
+            }
+            selection.programs.extend(slots);
+            selection.routes.extend(routes);
+        }
+        Ok(selection)
     }
 
     /// Nothing to give back: the client this action borrows belongs to the process, and its reply
@@ -56,12 +93,11 @@ impl HostAction for ListStore {
 
 /// One piece of the module-load lane's work.
 ///
-/// The lane has two tenants and one order: the store's listing, which says what this host has
-/// built, and the installs that follow from it. Keeping them in one lane keeps that order where
-/// it belongs - nothing is installed before the store has said what it holds - and keeps both off
-/// the control thread.
+/// The lane has two tenants and one order: the selection, which says which package builds each
+/// key, and the installs that follow from it. Keeping them in one lane keeps that order where it
+/// belongs and keeps both off the control thread.
 pub(crate) enum ModuleWork {
-    List(ListStore),
+    Select(Select),
     Install(Install),
 }
 
@@ -70,21 +106,21 @@ impl HostAction for ModuleWork {
 
     fn run(&self) -> worker::Result<Self::Output> {
         match self {
-            Self::List(list) => list.run().map(ModuleAnswer::Listed),
+            Self::Select(select) => select.run().map(ModuleAnswer::Selected),
             Self::Install(install) => install.run().map(ModuleAnswer::Installed),
         }
     }
 
     fn release(&self) -> worker::Result<()> {
         match self {
-            Self::List(list) => list.release(),
+            Self::Select(select) => select.release(),
             Self::Install(install) => install.release(),
         }
     }
 
     fn input_outcome(&self) -> Outcome {
         match self {
-            Self::List(list) => list.input_outcome(),
+            Self::Select(select) => select.input_outcome(),
             Self::Install(install) => install.input_outcome(),
         }
     }
@@ -92,8 +128,8 @@ impl HostAction for ModuleWork {
 
 /// What one piece of the module lane's work answered.
 pub(crate) enum ModuleAnswer {
-    /// The store's catalog: every package this host has built, with its modules.
-    Listed(program_server::Listing),
+    /// The generation's programs, as the Program Server selected them.
+    Selected(Selection),
     /// One device's kernels for the generation being prepared.
     Installed(Vec<KernelEntry>),
 }
@@ -109,73 +145,10 @@ pub(crate) struct Install {
     pub(crate) programs: Arc<Mutex<Client>>,
     pub(crate) device: platform::Device,
     pub(crate) target: Target,
-    /// One request per package the generation's programs come from: the Program Server names one
-    /// program per operator in a request, and an operator two packages split is asked of each in
-    /// its own request, with only the keys that package built.
-    pub(crate) requests: Vec<PrepareRequest>,
-    /// The Program Server's own refusal, when it named a program that cannot serve a shape of this
-    /// generation. The task fails with a message either way; this keeps the structured cause so the
-    /// walk can ask the operator's next candidate program instead of giving up on the generation.
-    pub(crate) unavailable: UnavailableCell,
-}
-
-/// A program that cannot serve a shape of this generation: the two refusals that mean "the walk may
-/// try the operator's next candidate program" rather than "this generation cannot be built".
-#[derive(Clone, Debug)]
-pub(crate) enum Unavailable {
-    /// The program is installed, and no module of it covers this descriptor key.
-    Descriptor {
-        op: String,
-        backend: String,
-        descriptor: String,
-    },
-    /// No revision of the backend is installed for the operator.
-    Installed { op: String, backend: String },
-}
-
-impl Unavailable {
-    /// Reads a Program Server refusal, when it is one of the two the walk can answer.
-    fn of(error: &program_server::Error) -> Option<Self> {
-        match error {
-            program_server::Error::UnsupportedDescriptor {
-                op,
-                backend,
-                descriptor,
-                ..
-            } => Some(Self::Descriptor {
-                op: op.clone(),
-                backend: backend.clone(),
-                descriptor: descriptor.clone(),
-            }),
-            program_server::Error::NotInstalled { op, backend } => Some(Self::Installed {
-                op: op.clone(),
-                backend: backend.clone(),
-            }),
-            _ => None,
-        }
-    }
-
-    /// The operator whose program cannot serve the shape.
-    pub(crate) fn op(&self) -> &str {
-        match self {
-            Self::Descriptor { op, .. } | Self::Installed { op, .. } => op,
-        }
-    }
-
-    /// The backend the refusal names.
-    pub(crate) fn backend(&self) -> &str {
-        match self {
-            Self::Descriptor { backend, .. } | Self::Installed { backend, .. } => backend,
-        }
-    }
-
-    /// The descriptor the program could not serve, when the refusal named one.
-    pub(crate) fn descriptor(&self) -> Option<&str> {
-        match self {
-            Self::Descriptor { descriptor, .. } => Some(descriptor),
-            Self::Installed { .. } => None,
-        }
-    }
+    /// The generation's one admission: every slot's program with exactly the keys selected for
+    /// it, so the Program Server prepares the whole generation at once and no package is asked
+    /// for another slot's keys.
+    pub(crate) request: PrepareRequest,
 }
 
 /// One module the Program Server resolved, held open while its kernel loads.
@@ -557,72 +530,48 @@ fn resolved(module: program_server::Module) -> worker::Result<Resolved> {
     }
 }
 
-impl Install {
-    /// Keeps the first structured refusal this device's load met.
-    fn note(&self, error: &program_server::Error) {
-        if let Some(unavailable) = Unavailable::of(error) {
-            let mut held = self
-                .unavailable
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if held.is_none() {
-                *held = Some(unavailable);
-            }
-        }
-    }
+impl HostAction for Install {
+    type Output = Vec<KernelEntry>;
 
-    /// One package's worth of the generation: its programs prepared, each key resolved for this
-    /// node's target, and each module loaded into this device's context as a kernel.
-    ///
-    /// Answers the entries this device installed for that package, and how many of them were
-    /// copied out of the store rather than loaded where they lie.
-    fn install_group(
-        &self,
-        client: &mut Client,
-        request: &PrepareRequest,
-    ) -> worker::Result<PackageInstall> {
+    /// This device's half of the precopy: the generation's programs prepared in one request, each
+    /// slot's keys resolved for this node's target, and each module loaded into this device's
+    /// context as a kernel. A generation that changes no kernel program asks nothing.
+    fn run(&self) -> worker::Result<Self::Output> {
+        let request = &self.request;
+        if request.programs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut client = self
+            .programs
+            .lock()
+            .map_err(|_| worker::Error::State("the Program Server client was poisoned"))?;
         // The one call that leaves this process while a generation is prepared: a run that hangs
         // before it reaches the Program Server and one that hangs inside it look the same from the
-        // daemon, so both sides state it.
-        // The packages are named, not counted: an operator the store splits across two backends is
-        // asked in two requests, and a log that says only `programs=1` twice leaves the reader to
-        // guess which package carries which phase's keys.
+        // daemon, so both sides state it, naming every slot's package and key count.
         let asking: Vec<String> = request
             .descriptors
             .iter()
             .map(|descriptors| {
-                // One request may carry several of one package's operators, and a split operator's
-                // slot states the phase its keys belong to - so both come from the entry whose
-                // operator these descriptors are for.
-                let entry = request
+                let program = request
                     .programs
                     .iter()
-                    .find(|entry| entry.slot.op == descriptors.op);
-                let phase = entry
-                    .and_then(|entry| entry.slot.phase)
-                    .map(|phase| format!(" phase={}", phase.as_str()))
+                    .find(|entry| entry.slot == descriptors.slot)
+                    .and_then(|entry| match &entry.selector {
+                        program_server::Selector::Fixed(program) => {
+                            Some(format!("{}@{}", program.backend, program.revision))
+                        }
+                        program_server::Selector::Latest { .. } => None,
+                    })
                     .unwrap_or_default();
-                match entry.map(|entry| &entry.selector) {
-                    Some(program_server::Selector::Fixed(program)) => format!(
-                        "{}/{}@{}{} keys={}",
-                        descriptors.op,
-                        program.backend,
-                        program.revision,
-                        phase,
-                        descriptors.keys.len()
-                    ),
-                    _ => format!(
-                        "{}{} keys={}",
-                        descriptors.op,
-                        phase,
-                        descriptors.keys.len()
-                    ),
-                }
+                format!(
+                    "{}/{program} keys={}",
+                    descriptors.slot.op,
+                    descriptors.keys.len()
+                )
             })
             .collect();
         tracing::info!(
             programs = request.programs.len(),
-            descriptors = request.descriptors.len(),
             packages = ?asking,
             target = %self.target,
             "asking the Program Server to prepare this generation's modules"
@@ -636,13 +585,11 @@ impl Install {
                 );
             })
             .map_err(|error| {
-                self.note(&error);
                 worker::Error::Invalid(format!("building the new generation: {}", causes(&error)))
             })?;
 
         let mut entries = Vec::new();
         let mut copies = 0_usize;
-        let mut asked: Vec<(String, usize)> = Vec::with_capacity(prepared.programs.len());
         for chosen in &prepared.programs {
             let operator = ops::operator_name(&chosen.slot.op).ok_or_else(|| {
                 worker::Error::Invalid(format!(
@@ -650,23 +597,19 @@ impl Install {
                     chosen.slot.op
                 ))
             })?;
-            let keys: Vec<String> = request
+            // A slot's program is resolved for the keys selected for that slot alone.
+            let keys = request
                 .descriptors
                 .iter()
-                .filter(|descriptor| descriptor.op == chosen.slot.op)
-                .flat_map(|descriptor| descriptor.keys.iter().cloned())
-                .collect();
-            asked.push((
-                format!("{}/{}", chosen.slot.op, chosen.program.backend),
-                keys.len(),
-            ));
+                .filter(|descriptor| descriptor.slot == chosen.slot)
+                .flat_map(|descriptor| descriptor.keys.iter());
             for key in keys {
                 let module = client
                     .resolve(
                         &chosen.slot.op,
                         &chosen.program,
                         &self.target,
-                        &key,
+                        key,
                         &mut |progress| {
                             tracing::debug!(
                                 path = %progress.path,
@@ -676,7 +619,6 @@ impl Install {
                         },
                     )
                     .map_err(|error| {
-                        self.note(&error);
                         tracing::warn!(
                             op = %chosen.slot.op,
                             key = %key,
@@ -693,7 +635,7 @@ impl Install {
                 if module.copied() {
                     copies += 1;
                 }
-                let entry = match ops::install(&self.device, operator, &key, module.as_ops()?) {
+                let entry = match ops::install(&self.device, operator, key, module.as_ops()?) {
                     Ok(entry) => entry,
                     Err(error) => {
                         // The refusal that travels is one line; this is the whole value, so a
@@ -717,113 +659,9 @@ impl Install {
                 }
             }
         }
-        // A package that installed nothing is not yet a failed generation: another package of the
-        // same generation may have installed every kernel this device needs, and a program this
-        // store has built no module of is the walk's business - it names the key it was expected to
-        // serve, one capture at a time. The generation-wide refusal is `run`'s, where the answer of
-        // every package is known.
-        if !prepared.programs.is_empty() {
-            if entries.is_empty() {
-                let asked_here = asked
-                    .iter()
-                    .map(|(program, keys)| format!("{program} with {keys} key(s)"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                tracing::warn!(
-                    target = %self.target,
-                    asked = %asked_here,
-                    "the Program Server prepared this package's programs and this device installed \
-                     no module of any of them"
-                );
-            }
-            tracing::info!(
-                modules = entries.len(),
-                copies,
-                target = %self.target,
-                "this package's modules are installed for the new generation"
-            );
-        }
-        Ok(PackageInstall {
-            entries,
-            copies,
-            prepared: asked,
-        })
-    }
-}
-
-/// What one package's request answered for this device, before the generation's kernels are gathered.
-struct PackageInstall {
-    /// The kernels this package installed into this device's context.
-    entries: Vec<KernelEntry>,
-    /// How many of them were copied out of the store rather than loaded where they lie.
-    copies: usize,
-    /// Each program the store selected for this package's request, and how many keys it was given.
-    /// Read by the generation-wide refusal, which needs the key counts to say which of the two
-    /// causes it met: a program given no key was never asked for a module, and one given keys whose
-    /// build answered nothing is the store's own refusal.
-    prepared: Vec<(String, usize)>,
-}
-
-impl HostAction for Install {
-    type Output = Vec<KernelEntry>;
-
-    /// Every package's half of the precopy for this device, as one answer.
-    ///
-    /// The lane is admitted one task per device, so the packages are asked one after another under
-    /// one lock of the client: each is its own request, and the entries of all of them are this
-    /// device's kernels for the generation.
-    fn run(&self) -> worker::Result<Self::Output> {
-        let mut client = self
-            .programs
-            .lock()
-            .map_err(|_| worker::Error::State("the Program Server client was poisoned"))?;
-        let mut entries = Vec::new();
-        let mut copies = 0_usize;
-        let mut prepared: Vec<(String, usize)> = Vec::new();
-        for request in &self.requests {
-            let mut package = self.install_group(&mut client, request)?;
-            entries.append(&mut package.entries);
-            copies += package.copies;
-            prepared.append(&mut package.prepared);
-        }
-        // A generation whose every package prepared its programs and installed no module of any of
-        // them is a failure of the store's build, not a generation with fewer kernels: the walk
-        // would find every operator missing and the update would stand in its device stage until a
-        // bound ended it. One package with nothing is not this: the generation's other packages are
-        // asked in their own requests, and a package this store has built nothing for leaves its
-        // key to the walk, which names it.
-        if entries.is_empty() && !prepared.is_empty() {
-            let asked = prepared
-                .iter()
-                .map(|(program, keys)| format!("{program} with {keys} key(s)"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            tracing::warn!(
-                target = %self.target,
-                packages = self.requests.len(),
-                "the Program Server prepared this generation's programs and this device installed \
-                 no module of any of them"
-            );
-            return Err(worker::Error::Invalid(format!(
-                "the Program Server prepared {} program(s) for target {} and this device installed \
-                 no module of any of them ({asked}): a program given no key was never asked for a \
-                 module, and one given keys built nothing",
-                prepared.len(),
-                self.target
-            )));
-        }
-        // A generation's kernels are named once each: two packages of one operator cover disjoint
-        // phases, and the same key twice would be the same kernel installed twice.
-        entries.sort_by(|left, right| {
-            (left.operator, &left.descriptor).cmp(&(right.operator, &right.descriptor))
-        });
-        entries.dedup_by(|left, right| {
-            left.operator == right.operator && left.descriptor == right.descriptor
-        });
         tracing::info!(
             modules = entries.len(),
             copies,
-            packages = self.requests.len(),
             target = %self.target,
             "this device's modules are installed for the new generation"
         );

@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use crate::builder::{Build, BuildState, Builder, Limits, Urgency};
 use crate::manifest::Manifest;
-use crate::program::{Program, ProgramSlot};
+use crate::program::Program;
 use crate::protocol::{
     self, Chosen, Connection, Descriptors, Module, ModuleFile, PrepareRequest, Progress, Selector,
     wire,
@@ -276,12 +276,9 @@ impl ProgramServer {
                         .into_iter()
                         .map(|chosen| wire::Chosen {
                             op: chosen.slot.op.clone(),
-                            phase: chosen
-                                .slot
-                                .phase
-                                .map_or(wire::ProgramPhase::All, wire::ProgramPhase::from)
-                                as i32,
+                            phase: protocol::phase_to_wire(chosen.slot.phase),
                             program: Some((&chosen.program).into()),
+                            part: chosen.slot.part.clone().unwrap_or_default(),
                         })
                         .collect(),
                 };
@@ -334,10 +331,21 @@ impl ProgramServer {
                 )
             }
             wire::request::Request::Cover(cover) => {
+                let mut named = Vec::with_capacity(cover.named.len());
+                for entry in cover.named {
+                    named.push(protocol::Named {
+                        phase: wire::ProgramPhase::try_from(entry.phase)
+                            .map_err(|_| Error::Protocol("unknown program phase".into()))?
+                            .try_into()?,
+                        backend: entry.backend,
+                        revision: (entry.revision != 0).then_some(entry.revision),
+                    });
+                }
                 let coverage = self.cover(&protocol::CoverRequest {
                     op: cover.op,
                     targets: cover.targets.into_iter().map(Target::new).collect(),
                     keys: cover.keys,
+                    named,
                 })?;
                 let coverage = wire::Coverage {
                     covered: coverage
@@ -592,14 +600,14 @@ impl ProgramServer {
             });
         }
 
-        // Asking for the descriptors of an operator no program fills would
+        // Asking for the descriptors of a slot no program fills would
         // silently leave the epoch without its modules; it is the request's
         // inconsistency, not a missing build.
         for descriptors in &request.descriptors {
-            if !chosen.iter().any(|chosen| chosen.slot.op == descriptors.op) {
+            if !chosen.iter().any(|chosen| chosen.slot == descriptors.slot) {
                 return Err(Error::Protocol(format!(
-                    "prepare asks for the descriptors of {} and no program fills it",
-                    descriptors.op
+                    "prepare asks for the descriptors of {:?} and no program fills that slot",
+                    descriptors.slot
                 )));
             }
         }
@@ -608,11 +616,14 @@ impl ProgramServer {
         let mut failures: Vec<Error> = Vec::new();
         for chosen in &chosen {
             let package = self.package(&chosen.slot.op, &chosen.program)?;
+            // A slot's program builds the keys named for that slot alone: two
+            // slots of one operator, one per phase or per part, hold disjoint
+            // keys, and a package is never asked for another slot's.
             let mut keys = Vec::new();
             for descriptors in request
                 .descriptors
                 .iter()
-                .filter(|descriptors| descriptors.op == chosen.slot.op)
+                .filter(|descriptors| descriptors.slot == chosen.slot)
             {
                 for key in &descriptors.keys {
                     if !keys.contains(key) {
@@ -853,21 +864,25 @@ impl ProgramServer {
         })
     }
 
-    /// Answers which installed package covers each of an operator's descriptor
-    /// keys, so a caller asks every package only for keys it can build.
+    /// Selects the installed package of each of an operator's descriptor keys:
+    /// the one rule by which a key's program is chosen (design section 6.3).
     ///
-    /// A package is a candidate when it is its backend's latest installed
-    /// revision of the operator - the revision `prepare` selects for a backend -
-    /// and builds for every requested target. A key goes to a candidate whose
-    /// manifest covers it, preferring one whose module of the key is already
-    /// committed for every target (a store built ahead keeps serving the
-    /// modules it holds), then by [`preference`](crate::program::preference).
-    /// A key no candidate covers is answered in `uncovered`. Nothing is built.
+    /// The candidates are each backend's latest installed revision of the
+    /// operator - or the revision a named backend states - that builds for
+    /// every requested target. A key goes to the first candidate whose manifest
+    /// covers it, in the selection order: a backend the request names for the
+    /// key's phase ([`ops::PhaseKind::of_key`]) first, then the manifest's
+    /// `priority`, highest first, then the backend whose name sorts first. A
+    /// named backend that does not cover a key leaves it to the next candidate,
+    /// so a deployment that names its attention backend still serves the keys
+    /// only another package declares. A key no candidate covers is answered in
+    /// `uncovered`. Nothing is built, and the answer does not depend on what
+    /// the store has built: every host selects alike.
     ///
     /// # Errors
     ///
-    /// Fails when the request names no target, or names a key that cannot be
-    /// a module path.
+    /// Fails when the request names no target, or names a revision of a backend
+    /// that is not installed.
     pub fn cover(&self, request: &protocol::CoverRequest) -> Result<protocol::Coverage> {
         if request.targets.is_empty() {
             return Err(Error::Protocol(format!(
@@ -880,21 +895,40 @@ impl ProgramServer {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        // Each backend's latest revision of the operator, kept when it builds
-        // for every requested target, in the store's preference order.
-        let mut latest: BTreeMap<&str, (u32, &Arc<Package>)> = BTreeMap::new();
+        // Each backend's revision: the one a named backend states, else the
+        // latest installed.
+        let mut revisions: BTreeMap<&str, (u32, &Arc<Package>)> = BTreeMap::new();
         for ((op, backend, revision), package) in packages.iter() {
             if *op != request.op {
                 continue;
             }
-            let held = latest
+            let stated = request
+                .named
+                .iter()
+                .find(|named| named.backend == *backend)
+                .and_then(|named| named.revision);
+            if stated.is_some_and(|stated| stated != *revision) {
+                continue;
+            }
+            let held = revisions
                 .entry(backend.as_str())
                 .or_insert((*revision, package));
             if *revision > held.0 {
                 *held = (*revision, package);
             }
         }
-        let mut candidates: Vec<(&str, u32, &Arc<Package>)> = latest
+        for named in &request.named {
+            if let Some(revision) = named.revision
+                && !revisions.contains_key(named.backend.as_str())
+            {
+                return Err(Error::UnknownRevision {
+                    op: request.op.clone(),
+                    backend: named.backend.clone(),
+                    revision,
+                });
+            }
+        }
+        let mut candidates: Vec<(&str, u32, &Arc<Package>)> = revisions
             .into_iter()
             .filter(|(_, (_, package))| {
                 request
@@ -905,12 +939,15 @@ impl ProgramServer {
             .map(|(backend, (revision, package))| (backend, revision, package))
             .collect();
         candidates.sort_by(|left, right| {
-            crate::program::preference((left.0, left.1), (right.0, right.1))
+            right
+                .2
+                .manifest
+                .priority
+                .cmp(&left.2.manifest.priority)
+                .then_with(|| left.0.cmp(right.0))
         });
 
-        // The keys chosen for each candidate, index for index: a key joins the
-        // first covering candidate that holds its modules, or else the first
-        // covering one.
+        // The keys selected for each candidate, index for index.
         let mut chosen: Vec<Vec<String>> = vec![Vec::new(); candidates.len()];
         let mut uncovered: Vec<String> = Vec::new();
         let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
@@ -918,30 +955,18 @@ impl ProgramServer {
             if !seen.insert(key.as_str()) {
                 continue;
             }
-            let mut first: Option<usize> = None;
-            let mut built: Option<usize> = None;
-            for (index, (backend, revision, package)) in candidates.iter().enumerate() {
-                if !package.manifest.covers(key) {
-                    continue;
-                }
-                first = first.or(Some(index));
-                let mut committed = true;
-                for target in &request.targets {
-                    let path = ModulePath::new(
-                        request.op.clone(),
-                        *backend,
-                        *revision,
-                        target.to_string(),
-                        key.clone(),
-                    )?;
-                    committed &= self.store.contains(&path);
-                }
-                if committed {
-                    built = Some(index);
-                    break;
-                }
-            }
-            match built.or(first) {
+            let phase = ops::PhaseKind::of_key(key);
+            let named = |backend: &str| {
+                request.named.iter().any(|named| {
+                    named.backend == backend && (named.phase.is_none() || named.phase == phase)
+                })
+            };
+            let covering = |index: &usize| candidates[*index].2.manifest.covers(key);
+            let selected = (0..candidates.len())
+                .filter(|index| named(candidates[*index].0))
+                .find(covering)
+                .or_else(|| (0..candidates.len()).find(covering));
+            match selected {
                 Some(index) => chosen[index].push(key.clone()),
                 None => uncovered.push(key.clone()),
             }
@@ -1594,14 +1619,7 @@ fn same_tree(left: &Path, right: &Path) -> Result<bool> {
 fn prepare_request(message: wire::Prepare) -> Result<PrepareRequest> {
     let mut programs = Vec::with_capacity(message.programs.len());
     for program in message.programs {
-        let slot = ProgramSlot {
-            op: program.op,
-            phase: Option::<crate::program::PhaseKind>::try_from(
-                wire::ProgramPhase::try_from(program.phase)
-                    .map_err(|_| Error::Protocol("unknown program phase".into()))?,
-            )?,
-            part: None,
-        };
+        let slot = protocol::slot_of(program.op, program.phase, program.part)?;
         let selector = match program.selector {
             Some(wire::program_request::Selector::Backend(backend)) => Selector::Latest {
                 backend: backend.backend,
@@ -1618,14 +1636,13 @@ fn prepare_request(message: wire::Prepare) -> Result<PrepareRequest> {
         };
         programs.push(crate::protocol::ProgramRequest { slot, selector });
     }
-    let descriptors = message
-        .descriptors
-        .into_iter()
-        .map(|descriptors| Descriptors {
-            op: descriptors.op,
-            keys: descriptors.keys,
-        })
-        .collect();
+    let mut descriptors = Vec::with_capacity(message.descriptors.len());
+    for entry in message.descriptors {
+        descriptors.push(Descriptors {
+            slot: protocol::slot_of(entry.op, entry.phase, entry.part)?,
+            keys: entry.keys,
+        });
+    }
     Ok(PrepareRequest {
         targets: message.targets.into_iter().map(Target::new).collect(),
         programs,

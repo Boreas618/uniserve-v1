@@ -50,10 +50,10 @@ pub mod toolchain;
 
 pub use builder::{BuildState, Limits, Urgency};
 pub use manifest::{Manifest, ManifestError, ModuleForm, SourceKind, TargetKind, ToolchainKind};
-pub use program::{PhaseKind, Program, ProgramSlot, preference};
+pub use program::{PhaseKind, Program, ProgramSlot};
 pub use protocol::{
-    Client, CoverRequest, Coverage, Covered, Descriptors, Module, ModuleFile, PrepareRequest,
-    Prepared, ProgramRequest, Progress, Selector,
+    Client, CoverRequest, Coverage, Covered, Descriptors, Module, ModuleFile, Named,
+    PrepareRequest, Prepared, ProgramRequest, Progress, Selector,
 };
 pub use server::{Installed, Listing, ProgramServer, ServerConfig};
 pub use store::{ModulePath, Root, Store};

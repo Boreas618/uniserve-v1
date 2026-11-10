@@ -63,10 +63,11 @@ pub struct Installed {
     pub package: Package,
 }
 
-/// The descriptors one operator's program must cover.
+/// The descriptors one slot's program must cover: `prepare` hands the program
+/// that fills `slot` exactly these keys, and no slot another's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Descriptors {
-    pub op: String,
+    pub slot: ProgramSlot,
     /// Descriptor keys, in the canonical form the operator's `Display` gives.
     pub keys: Vec<String>,
 }
@@ -174,14 +175,29 @@ pub struct Listing {
     pub packages: Vec<ListedPackage>,
 }
 
-/// What `cover` asks: which installed package covers each of an operator's
-/// descriptor keys when its modules are built for `targets`.
+/// What `cover` asks: which installed package the Program Server selects for
+/// each of an operator's descriptor keys when its modules are built for
+/// `targets`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoverRequest {
     pub op: String,
     pub targets: Vec<Target>,
     /// Descriptor keys, in the canonical form the operator's `Display` gives.
     pub keys: Vec<String>,
+    /// The backends the deployment names for the operator, preferred for the
+    /// keys of their phase; empty leaves every key to the manifests'
+    /// priorities.
+    pub named: Vec<Named>,
+}
+
+/// A backend a deployment names for an operator: preferred over every other
+/// package for the keys of `phase` (every key when `None`) that it covers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Named {
+    pub phase: Option<PhaseKind>,
+    pub backend: String,
+    /// The revision to use; `None` is the backend's latest installed one.
+    pub revision: Option<u32>,
 }
 
 /// The keys of a `cover` one package was chosen for.
@@ -192,7 +208,7 @@ pub struct Covered {
 }
 
 /// The answer to `cover`: each requested key once, either under the package
-/// chosen for it or in `uncovered`. `covered` is in the server's preference
+/// selected for it or in `uncovered`. `covered` is in the server's selection
 /// order, and each package's keys in the order the request named them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Coverage {
@@ -230,6 +246,23 @@ fn arguments(text: &str) -> Result<toml::Table> {
     }
     toml::from_str(text)
         .map_err(|error| Error::Protocol(format!("a program's arguments are not TOML: {error}")))
+}
+
+/// A slot's phase as the wire states it: `ALL` for a slot of every phase.
+pub(crate) fn phase_to_wire(phase: Option<PhaseKind>) -> i32 {
+    phase.map_or(wire::ProgramPhase::All, wire::ProgramPhase::from) as i32
+}
+
+/// The slot an operator, a wire phase and a wire part name: an empty part is
+/// a slot that holds the operator's every descriptor.
+pub(crate) fn slot_of(op: String, phase: i32, part: String) -> Result<ProgramSlot> {
+    Ok(ProgramSlot {
+        op,
+        phase: wire::ProgramPhase::try_from(phase)
+            .map_err(|_| Error::Protocol("unknown program phase".into()))?
+            .try_into()?,
+        part: (!part.is_empty()).then_some(part),
+    })
 }
 
 impl From<PhaseKind> for wire::ProgramPhase {
@@ -339,20 +372,19 @@ fn prepare_message(request: &PrepareRequest) -> Result<wire::Prepare> {
         };
         programs.push(wire::ProgramRequest {
             op: entry.slot.op.clone(),
-            phase: entry
-                .slot
-                .phase
-                .map_or(wire::ProgramPhase::All, wire::ProgramPhase::from)
-                as i32,
+            phase: phase_to_wire(entry.slot.phase),
             selector: Some(selector),
+            part: entry.slot.part.clone().unwrap_or_default(),
         });
     }
     let descriptors = request
         .descriptors
         .iter()
         .map(|descriptors| wire::Descriptors {
-            op: descriptors.op.clone(),
+            op: descriptors.slot.op.clone(),
             keys: descriptors.keys.clone(),
+            phase: phase_to_wire(descriptors.slot.phase),
+            part: descriptors.slot.part.clone().unwrap_or_default(),
         })
         .collect();
     Ok(wire::Prepare {
@@ -639,13 +671,7 @@ impl Client {
                 wire::server_message::Message::Prepared(prepared) => {
                     let mut chosen = Vec::with_capacity(prepared.programs.len());
                     for program in prepared.programs {
-                        let slot = ProgramSlot {
-                            op: program.op,
-                            phase: wire::ProgramPhase::try_from(program.phase)
-                                .map_err(|_| Error::Protocol("unknown phase".into()))?
-                                .try_into()?,
-                            part: None,
-                        };
+                        let slot = slot_of(program.op, program.phase, program.part)?;
                         let program = program.program.ok_or_else(|| {
                             Error::Protocol("a chosen program carries no program".into())
                         })?;
@@ -792,6 +818,15 @@ impl Client {
                     op: request.op.clone(),
                     targets: request.targets.iter().map(Target::to_string).collect(),
                     keys: request.keys.clone(),
+                    named: request
+                        .named
+                        .iter()
+                        .map(|named| wire::Named {
+                            phase: phase_to_wire(named.phase),
+                            backend: named.backend.clone(),
+                            revision: named.revision.unwrap_or(0),
+                        })
+                        .collect(),
                 })),
             },
             &[],

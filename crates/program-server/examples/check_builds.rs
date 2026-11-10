@@ -526,7 +526,7 @@ fn witness(
             },
         }],
         descriptors: vec![Descriptors {
-            op: op.to_owned(),
+            slot: program_server::ProgramSlot::all(op),
             keys: vec![key.to_owned()],
         }],
     };
@@ -604,7 +604,7 @@ fn prepare_outcome(
                     },
                 }],
                 descriptors: vec![Descriptors {
-                    op: op.to_owned(),
+                    slot: program_server::ProgramSlot::all(op),
                     keys: vec![key.to_owned()],
                 }],
             };
@@ -939,7 +939,7 @@ fn a_package_compiles_from_the_copy_its_install_kept(args: &Args) -> Outcome {
             },
         }],
         descriptors: vec![Descriptors {
-            op: "moe_sort".to_owned(),
+            slot: program_server::ProgramSlot::all("moe_sort"),
             keys: vec![key],
         }],
     };

@@ -86,14 +86,3 @@ impl ProgramSlot {
 
 /// The programs an epoch fills its operators with, by slot.
 pub type Programs = BTreeMap<ProgramSlot, Program>;
-
-/// The order one operator's installed packages are preferred in, as `(backend, revision)`: the
-/// highest revision first, then the backend whose name sorts first.
-///
-/// It is the one rule every reader of the store chooses by when nothing else decides - the Program
-/// Server's `cover` among the packages that cover a key, and the main process among the candidate
-/// programs of an operator - so two readers, and two runs, choose alike. `Less` means `left` is
-/// preferred.
-pub fn preference(left: (&str, u32), right: (&str, u32)) -> std::cmp::Ordering {
-    right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0))
-}

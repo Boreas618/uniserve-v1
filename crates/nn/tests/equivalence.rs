@@ -527,7 +527,7 @@ mod device {
                 descriptors: missing
                     .iter()
                     .map(|(operator, keys)| Descriptors {
-                        op: (*operator).to_owned(),
+                        slot: ProgramSlot::all(*operator),
                         keys: keys.iter().cloned().collect(),
                     })
                     .collect(),

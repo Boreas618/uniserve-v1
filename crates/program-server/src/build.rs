@@ -255,7 +255,7 @@ fn build_keys(
                     },
                 }],
                 descriptors: vec![Descriptors {
-                    op: op.to_owned(),
+                    slot: ProgramSlot::all(op),
                     keys: covered.clone(),
                 }],
             };

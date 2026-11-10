@@ -571,6 +571,12 @@ pub struct Manifest {
     pub op: String,
     /// The backend's name, which the configuration field selects.
     pub backend: String,
+    /// The package's place among its operator's backends: of the packages
+    /// that cover a descriptor key, the Program Server selects the one with
+    /// the highest priority, after the backend a deployment names (design
+    /// section 6.3). Packages of equal priority are ordered by backend name.
+    #[serde(default)]
+    pub priority: u32,
     /// The toolchain and external packages the sources need.
     pub toolchain: ToolchainDeps,
     /// What the package compiles to.
