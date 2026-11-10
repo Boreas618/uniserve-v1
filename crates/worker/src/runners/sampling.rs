@@ -1114,7 +1114,8 @@ impl Adjustments {
 pub(crate) struct Sampling {
     pub(crate) sampler: Sampler,
     /// `[slots, vocabulary]` i32 counts of the tokens each slot has already seen, which the
-    /// penalties subtract; zeroed once when the runner binds and advanced by `ops::commit`.
+    /// penalties subtract; zeroed once when the runner binds, started for each request that takes
+    /// a slot ([`Self::start_counts`]) and advanced by `ops::commit`.
     pub(crate) counts: TensorView,
     pub(crate) _counts: platform::DeviceAllocation,
     /// `[slots, vocabulary]` f32 each slot's bias row: the logit bias of its request's biased
@@ -1128,8 +1129,27 @@ pub(crate) struct Sampling {
     /// later request after the slot's previous request finished and its batches completed (or
     /// repeats the same request's identical row), so no copy in flight reads a row while it changes.
     mirror: platform::PinnedBuffer,
+    /// The two halves a fresh slot's seeded count row is built in, taken by the batches in turn
+    /// and grown to the most rows one batch has seeded ([`Self::start_counts`]).
+    seeds: [Option<platform::PinnedBuffer>; 2],
+    /// The half of `seeds` the next batch writes.
+    seed_turn: usize,
+    device: DeviceId,
     vocabulary: u32,
     slots: u32,
+}
+
+/// Writes into `row`, one slot's `[vocabulary]` i32 penalty counts, one count per occurrence of
+/// each token of `history`: the counts the commits of those tokens leave on a slot that held the
+/// request from its first token (`ops::commit` adds one per committed token). A token outside the
+/// vocabulary counts nothing, as the commit counts nothing for one.
+pub(crate) fn seed_row(row: &mut [i32], history: &[u32]) {
+    row.fill(0);
+    for &token in history {
+        if let Some(count) = row.get_mut(token as usize) {
+            *count += 1;
+        }
+    }
 }
 
 impl Sampling {
@@ -1196,29 +1216,93 @@ impl Sampling {
             bias,
             _bias: bias_allocation,
             mirror,
+            seeds: [None, None],
+            seed_turn: 0,
+            device,
             vocabulary,
             slots,
         })
     }
 
-    /// Clears the penalty counts of each of `slots`, on `stream`, before the step that reads them:
-    /// a request that takes a slot counts only its own tokens. One device memset per slot, ordered
-    /// after the previous request's last commit on the same stream.
-    pub(crate) fn clear_counts(&self, slots: &[u32], stream: &platform::Stream) -> Result<()> {
+    /// Starts the penalty counts of each fresh slot on `stream`, before the step that reads them:
+    /// a request that takes a slot counts its own tokens and none of the slot's previous request.
+    ///
+    /// A slot whose request generated nothing yet (or counts nothing) is cleared by one device
+    /// memset. A slot whose request already generated tokens elsewhere - on its prefill group
+    /// before a hand-off, or before a migration or a preemption admitted it again - starts at
+    /// those tokens' counts instead: the row is built in this batch's half of the seed staging
+    /// and copied over the slot's row. Both are stream-ordered after the previous request's last
+    /// commit, so nothing on the host waits for the device.
+    pub(crate) fn start_counts(
+        &mut self,
+        fresh: &[ipc::execution::FreshSlot],
+        stream: &platform::Stream,
+    ) -> Result<()> {
         let width = self.vocabulary as usize;
-        for &slot in slots {
-            if slot >= self.slots {
-                return Err(Error::Invalid(format!(
-                    "a fresh slot {slot} of a count table of {} slots",
-                    self.slots
-                )));
+        let row_bytes = width * std::mem::size_of::<i32>();
+        if let Some(fresh) = fresh.iter().find(|fresh| fresh.slot >= self.slots) {
+            return Err(Error::Invalid(format!(
+                "a fresh slot {} of a count table of {} slots",
+                fresh.slot, self.slots
+            )));
+        }
+        let seeded = fresh
+            .iter()
+            .filter(|fresh| !fresh.history.is_empty())
+            .count();
+        // The batches take the two halves in turn: the half this batch writes was last read by the
+        // copies of the batch before the previous one, which completed before this batch was
+        // staged, as the runner's columns' halves do.
+        let turn = self.seed_turn;
+        self.seed_turn = 1 - turn;
+        if seeded * row_bytes
+            > self.seeds[turn]
+                .as_ref()
+                .map_or(0, platform::PinnedBuffer::len)
+        {
+            // A hand-off or a resumed request is rare, so the staging grows to the most rows a
+            // batch has seeded rather than being reserved for every slot at bind.
+            self.seeds[turn] = Some(platform::PinnedBuffer::new(
+                self.device,
+                seeded * row_bytes,
+            )?);
+        }
+        let mut row_index = 0;
+        for fresh in fresh {
+            let offset = (fresh.slot as usize * row_bytes) as u64;
+            let destination = self.counts.ptr.address() + offset;
+            if fresh.history.is_empty() {
+                // SAFETY: the range is slot `slot`'s own `vocabulary` i32 of the count table, and
+                // the table outlives the stream's work on it (the runner owns both).
+                unsafe {
+                    platform::memset_d32(destination, 0, width, stream)?;
+                }
+                continue;
             }
-            let offset = (slot as usize * width * std::mem::size_of::<i32>()) as u64;
-            // SAFETY: the range is slot `slot`'s own `vocabulary` i32 of the count table, and the
-            // table outlives the stream's work on it (the runner owns both).
+            let staging = self.seeds[turn]
+                .as_ref()
+                .ok_or(Error::State("a seeded slot has no staging"))?;
+            // SAFETY: the staging holds `seeded` rows of `vocabulary` i32 and `row_index` is below
+            // `seeded`; no copy in flight reads this batch's half (the turn's invariant above).
+            let row = unsafe {
+                std::slice::from_raw_parts_mut(
+                    staging.as_ptr().cast::<i32>().add(row_index * width),
+                    width,
+                )
+            };
+            seed_row(row, &fresh.history);
+            // SAFETY: the source is the staging's row just written and the destination the slot's
+            // row of the count table, both `vocabulary` i32; the staging row stays as written until
+            // the copy has run (the turn's invariant).
             unsafe {
-                platform::memset_d32(self.counts.ptr.address() + offset, 0, width, stream)?;
+                platform::memcpy_async(
+                    destination,
+                    staging.address() + (row_index * row_bytes) as u64,
+                    row_bytes,
+                    stream,
+                )?;
             }
+            row_index += 1;
         }
         Ok(())
     }
@@ -1483,6 +1567,18 @@ mod tests {
         assert_eq!(adjustments.rows(4), &[0, -1, 0, -1, 0, -1, 0, -1]);
         // A bucket wider than the reservation is refused.
         assert!(adjustments.stage(&batch, 3, 5).is_err());
+    }
+
+    /// A fresh slot's seeded counts are its request's history as the commits count it: one per
+    /// occurrence, nothing for a token outside the vocabulary, and nothing left of the row's
+    /// previous request.
+    #[test]
+    fn a_seeded_count_row_counts_each_occurrence_of_its_history() {
+        let mut row = vec![5_i32; 8];
+        seed_row(&mut row, &[3, 1, 3, 9, 3]);
+        assert_eq!(row, vec![0, 1, 0, 3, 0, 0, 0, 0]);
+        seed_row(&mut row, &[]);
+        assert_eq!(row, vec![0; 8]);
     }
 
     /// A greedy step reads no draws, so the state a greedy caller must supply is exactly the state a

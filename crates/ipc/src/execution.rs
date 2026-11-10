@@ -786,11 +786,28 @@ pub struct BatchColumns {
     /// The logit adjustments the sampler applies before penalties, temperature and filtering:
     /// the slots' logit bias and allowed sets, and each row's banned tokens.
     pub adjustments: LogitAdjustments,
-    /// The request slots this batch starts a request's sampling state on, strictly increasing:
-    /// the batch carrying a request's first token call on a worker names its slot, and the worker
-    /// clears the slot's penalty counts before the batch samples, so a request's penalties count
-    /// its own tokens and never those of the slot's previous request.
-    pub fresh_slots: Vec<u32>,
+    /// The request slots this batch starts a request's sampling state on, strictly increasing by
+    /// slot: the batch carrying a request's first token call on a worker names its slot, and the
+    /// worker sets the slot's penalty counts to the request's own history before the batch
+    /// samples ([`FreshSlot`]), so a request's penalties count its own tokens - wherever it
+    /// generated them - and never those of the slot's previous request.
+    pub fresh_slots: Vec<FreshSlot>,
+}
+
+/// One request slot a batch starts a request's sampling state on.
+///
+/// A request does not always start on a worker with nothing generated: a request handed from its
+/// prefill group to a decode group generated its first token on the prefill group, and a migrated
+/// or preempted request generated its tokens before it was admitted again. Its penalties count
+/// those tokens all the same, so the slot's counts start at the request's history rather than at
+/// zero: one count per occurrence of each token in `history`.
+#[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshSlot {
+    /// The request slot whose penalty counts start.
+    pub slot: u32,
+    /// The tokens the request generated before this batch, which its penalties count: empty for a
+    /// request that generated none, or whose penalties count nothing.
+    pub history: Vec<u32>,
 }
 
 /// One vision encoding of a batch: the image a call reads and the feature product it writes.
@@ -1225,7 +1242,11 @@ impl BatchColumns {
                 )));
             }
         }
-        if !increasing(&self.fresh_slots) {
+        if !self
+            .fresh_slots
+            .windows(2)
+            .all(|pair| pair[0].slot < pair[1].slot)
+        {
             return Err(ValidationError::message(
                 "the batch's fresh slots are not strictly increasing",
             ));

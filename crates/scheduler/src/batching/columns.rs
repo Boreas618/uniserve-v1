@@ -71,7 +71,7 @@
 use std::ops::Range;
 
 use ipc::execution::{
-    BatchColumns, BatchRow, BatchRows, LogitAdjustments, RowKind, SlotBias, StateCopy,
+    BatchColumns, BatchRow, BatchRows, FreshSlot, LogitAdjustments, RowKind, SlotBias, StateCopy,
     StateDirection,
 };
 use ipc::{Call, CallKind, ForwardMode};
@@ -271,11 +271,14 @@ const TEMPERATURE_COLUMN: usize = proto::program::sampler::TEMPERATURE as usize;
 /// start when it resumes from a cached prefix. A call that resumes past position
 /// zero with no checkpoint there is a planning fault.
 ///
-/// `fresh[i]` is whether call `i`'s request slot does not yet hold the
-/// request's sampling state on its worker: the batch names the slot among its
-/// `fresh_slots`, whose penalty counts the worker clears, and a request that
-/// adjusts its logits ([`adjusts_logits`]) installs its bias row, which every
-/// row of it reads afterwards. An empty `fresh` starts nothing. A call whose
+/// `fresh[i]` is, when call `i`'s request slot does not yet hold the
+/// request's sampling state on its worker, the tokens the request generated
+/// before the call: the batch names the slot among its `fresh_slots`, whose
+/// penalty counts the worker starts at those tokens when the request's
+/// penalties count any ([`uses_penalties`]) and at zero otherwise, and a
+/// request that adjusts its logits ([`adjusts_logits`]) installs its bias row,
+/// which every row of it reads afterwards. `None` is a resident slot, and an
+/// empty `fresh` starts nothing. A call whose
 /// `SamplingState` states a per-step allowed set is refused: the worker keeps an
 /// allowed set only as the request's own slot row.
 #[allow(
@@ -293,7 +296,7 @@ pub(crate) fn columns(
     max_kv_len: u32,
     state: Option<StatePages>,
     resident: &[bool],
-    fresh: &[bool],
+    fresh: &[Option<&[u32]>],
 ) -> Option<BatchColumns> {
     if requests.len() != inputs.len()
         || requests.len() != sampling.len()
@@ -317,7 +320,7 @@ pub(crate) fn columns(
     let mut parameters: Vec<f32> = Vec::new();
     let mut draw_addresses: Vec<ipc::philox::DrawAddress> = Vec::new();
     let mut installs: Vec<SlotBias> = Vec::new();
-    let mut fresh_slots: Vec<u32> = Vec::new();
+    let mut fresh_slots: Vec<FreshSlot> = Vec::new();
     let mut biased: Vec<bool> = Vec::new();
     let mut banned: Vec<Vec<u32>> = Vec::new();
     let drafts: Vec<ipc::DraftWork> = requests.iter().map(|(call, _)| call.draft).collect();
@@ -428,8 +431,18 @@ pub(crate) fn columns(
         // (`Scheduler::build_token_masks`), the same for every row of the call: a verification's
         // drafts are capped where they would sample under different bans (`verify_drafts`).
         let adjusts = adjusts_logits(sampling);
-        if fresh.get(index).copied().unwrap_or(false) {
-            fresh_slots.push(request);
+        if let Some(history) = fresh.get(index).copied().flatten() {
+            // The counts are what the request's commits would have left on a slot it held from
+            // its first token: they count only when its penalties do (the commit table's
+            // `PENALTIES` column), so a request whose penalties count nothing starts at zero.
+            fresh_slots.push(FreshSlot {
+                slot: request,
+                history: if uses_penalties(sampling) {
+                    history.to_vec()
+                } else {
+                    Vec::new()
+                },
+            });
             if adjusts {
                 installs.push(slot_bias(request, sampling));
             }
@@ -617,8 +630,9 @@ pub(crate) fn columns(
             },
         },
         fresh_slots: {
-            fresh_slots.sort_unstable();
-            fresh_slots.dedup();
+            // A batch carries one call per request, so a slot is named once.
+            fresh_slots.sort_unstable_by_key(|fresh| fresh.slot);
+            fresh_slots.dedup_by_key(|fresh| fresh.slot);
             fresh_slots
         },
     })
@@ -1003,6 +1017,61 @@ mod tests {
         );
     }
 
+    /// A request that starts on a slot with tokens already generated - handed over from its
+    /// prefill group, migrated, or admitted again - starts its slot's penalty counts at them, so its
+    /// penalties count what a slot it held from its first token would; a request whose penalties
+    /// count nothing starts at zero, as one that generated nothing does.
+    #[test]
+    fn a_fresh_slot_counts_the_tokens_its_request_generated_elsewhere() {
+        let mut first = call(decode(), 12, &[1]);
+        first.coordinates.cache_visible_len = 12;
+        let mut second = call(decode(), 12, &[1]);
+        second.coordinates.cache_visible_len = 12;
+        let requests = vec![
+            (first, dispatch(4, &[1], &[true])),
+            (second, dispatch(3, &[1], &[true])),
+        ];
+        let calls: Vec<(&Call, &CallLayout)> =
+            requests.iter().map(|(call, rows)| (call, rows)).collect();
+        let penalised = sampling();
+        let neutral = SamplingParams {
+            repetition_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            ..sampling()
+        };
+        let columns = super::columns(
+            &calls,
+            &tables_of(&requests),
+            &[vec![42], vec![43]],
+            &[&penalised, &neutral],
+            &[2, 2],
+            BLOCK_SIZE,
+            2048,
+            None,
+            &[],
+            &[Some(&[42, 7, 42]), Some(&[43, 9])],
+        )
+        .expect("a decode batch");
+        assert_eq!(
+            columns.fresh_slots,
+            vec![
+                FreshSlot {
+                    slot: 3,
+                    history: Vec::new(),
+                },
+                FreshSlot {
+                    slot: 4,
+                    history: vec![42, 7, 42],
+                },
+            ],
+            "slots in increasing order, each counting its own request's history"
+        );
+        columns
+            .check(&batch_shape(&columns))
+            .expect("the fresh slots are one per slot and increasing");
+    }
+
     /// A request with a logit bias or an allowed set installs its slot's bias row with the call
     /// that is not yet resident, flags every row of it, and bans its call's suppressed tokens; a
     /// request with neither, beside it, states nothing, and a batch of such requests alone states
@@ -1030,7 +1099,7 @@ mod tests {
         let plain = sampling();
         let calls: Vec<(&Call, &CallLayout)> =
             requests.iter().map(|(call, rows)| (call, rows)).collect();
-        let fill = |fresh: &[bool], sampling: [&SamplingParams; 2]| {
+        let fill = |fresh: &[Option<&[u32]>], sampling: [&SamplingParams; 2]| {
             super::columns(
                 &calls,
                 &tables_of(&requests),
@@ -1046,7 +1115,7 @@ mod tests {
             .expect("a decode batch")
         };
 
-        let columns = fill(&[true, true], [&restricted, &plain]);
+        let columns = fill(&[Some(&[]), Some(&[])], [&restricted, &plain]);
         let adjustments = &columns.adjustments;
         assert_eq!(
             adjustments.installs,
@@ -1061,13 +1130,20 @@ mod tests {
         assert_eq!(adjustments.banned, vec![vec![2, 9], Vec::new()]);
         // Both requests start their sampling state on their slots: the worker clears the counts
         // of each, whether or not it adjusts its logits.
-        assert_eq!(columns.fresh_slots, vec![3, 4]);
+        assert_eq!(
+            columns
+                .fresh_slots
+                .iter()
+                .map(|fresh| fresh.slot)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
         columns
             .check(&batch_shape(&columns))
             .expect("the adjustments are canonical and one per row");
 
         // Once the row is resident the request still reads it, and installs nothing.
-        let resident = fill(&[false, false], [&restricted, &plain]);
+        let resident = fill(&[None, None], [&restricted, &plain]);
         assert!(resident.adjustments.installs.is_empty());
         assert!(
             resident.fresh_slots.is_empty(),
@@ -1115,7 +1191,7 @@ mod tests {
             2048,
             None,
             &[],
-            &[true, true],
+            &[Some(&[]), Some(&[])],
         )
         .expect("a decode batch");
         assert!(none.adjustments.is_empty());

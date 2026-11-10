@@ -720,7 +720,11 @@ impl Scheduler {
             };
             inputs.push(tokens);
             resident.push(state.state_resident);
-            fresh.push(!state.sampling_resident);
+            // A slot that does not hold the request's sampling state starts it at the tokens the
+            // request accepted so far: a decode group's first batch after a hand-off, and a
+            // migrated or preempted request's first batch after its admission, continue penalty
+            // counts the request began elsewhere.
+            fresh.push((!state.sampling_resident).then_some(state.generated_token_ids.as_slice()));
             sampling.push(&state.req.sampling);
             draws.push(state.sampling_position);
             // The layout addresses the request's current cache tables. A call

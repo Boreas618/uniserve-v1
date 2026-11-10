@@ -74,8 +74,8 @@ pub struct Staging {
     draws: Vec<ipc::philox::DrawAddress>,
     /// The batch's logit adjustments, encoded as the sampler reads them.
     adjustments: Adjustments,
-    /// The request slots whose penalty counts the batch clears before it samples.
-    fresh_slots: Vec<u32>,
+    /// The request slots whose penalty counts the batch starts before it samples.
+    fresh_slots: Vec<ipc::execution::FreshSlot>,
     commit: Vec<i64>,
     page_size: u32,
     max_kv_len: u32,
@@ -396,7 +396,7 @@ impl Staging {
     }
 
     /// The request slots the staged batch starts a request's sampling state on.
-    pub fn fresh_slots(&self) -> &[u32] {
+    pub fn fresh_slots(&self) -> &[ipc::execution::FreshSlot] {
         &self.fresh_slots
     }
 
@@ -2709,9 +2709,10 @@ impl<M: TextModel> CausalLmRunner<M> {
     }
 
     /// Starts the staged batch's requests' sampling state on their slots, on `stream`, before the
-    /// step that samples them: a fresh slot's penalty counts are cleared - the slot's previous
-    /// request committed its own tokens there - and the batch's bias rows are installed. Both are
-    /// stream-ordered device writes, so nothing waits for them.
+    /// step that samples them: a fresh slot's penalty counts start at its request's own history -
+    /// the slot's previous request committed its own tokens there, and the request may have
+    /// generated tokens on another group or before it was admitted again - and the batch's bias
+    /// rows are installed. Both are stream-ordered device writes, so nothing waits for them.
     fn start_slots(&mut self, stream: &platform::Stream) -> Result<()> {
         let fresh = self.staging.fresh_slots();
         let installs = self.staging.adjustments().installs();
@@ -2721,7 +2722,7 @@ impl<M: TextModel> CausalLmRunner<M> {
         let sampling = self.sampling.as_mut().ok_or(Error::State(
             "a batch starts sampling state in a runner that samples nothing",
         ))?;
-        sampling.clear_counts(fresh, stream)?;
+        sampling.start_counts(fresh, stream)?;
         sampling.install(installs, stream)
     }
 
