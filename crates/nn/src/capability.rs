@@ -164,7 +164,8 @@ pub struct KvPlanes {
     /// `[pages, 1, 1, 1]` **u8**, one flag per page of `key`.
     ///
     /// One byte, not four: the plane is the layout and the Storage Server carries one
-    /// byte per page, so the cache write refuses anything but `DType::U8`. An `i32` view of this plane writes four bytes where one
+    /// byte per page, so `cache_copy_region` refuses anything but `DType::U8`
+    /// (`prefix_cache.rs`). An `i32` view of this plane writes four bytes where one
     /// belongs and clobbers three neighbouring pages' flags with zeros.
     pub key_initialized: TensorView,
     /// `[pages, 1, 1, 1]` **u8**, one flag per page of `value`; one byte for the same reason.

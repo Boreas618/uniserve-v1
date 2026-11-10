@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! routes(router scores)                    → topk_softmax      ids, weights
+//! map logical experts to this rank's       → expert_gather
 //! group routes by expert for the GEMMs     → moe_sort          tile and permutation maps
 //! FC1: act(gate)·up of every route         → gather_gemm
 //! FC2: every route's expert product        → route_gemm
@@ -33,7 +34,7 @@ pub mod sort;
 pub use combine::{MoeUnpermute, UnpermuteArgs};
 pub use exchange::{ExchangeArgs, ExchangeTransport, ExpertExchange};
 pub use grouped::{GatherGemm, GatherGemmArgs, RouteGemm, RouteGemmArgs};
-pub use routing::{TopkArgs, TopkSoftmax};
+pub use routing::{ExpertGather, GatherArgs, TopkArgs, TopkSoftmax};
 pub use sort::{MoeSort, SortArgs};
 
 /// The most tiles `skip` routes over `local_experts` can produce at `tile` rows per tile.

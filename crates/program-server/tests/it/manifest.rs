@@ -92,12 +92,12 @@ fn a_package_covers_a_descriptor_by_its_enumerated_values() {
     assert!(!descriptors.covers("nonsense"));
 }
 
-/// The manifest of a Triton `kv_write` package whose `descriptors`
+/// The manifest of a Triton `cache_block_scatter` package whose `descriptors`
 /// line is `descriptors`: width-generic dimensions declared by constraint.
 fn generic(descriptors: &str) -> String {
     format!(
         r#"
-op = "kv_write"
+op = "cache_block_scatter"
 backend = "triton"
 
 [toolchain]
@@ -624,7 +624,7 @@ fn a_package_may_declare_one_descriptor_table() {
     std::fs::write(package.join("metadata.json"), METADATA).unwrap();
     std::fs::write(
         package.join("package.toml"),
-        r#"op = "channel_affine"
+        r#"op = "bias_add"
 backend = "triton"
 
 [toolchain]

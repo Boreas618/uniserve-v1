@@ -1,0 +1,39 @@
+# The cache_block_scatter operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# A state bank's field is block-major with arbitrary strides; one program walks
+# one 1024-element tile of one flattened block, so the copy's extent comes from
+# the grid and the bank's block count from the descriptor's shape.
+
+op = "cache_block_scatter"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/cache_block_scatter.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_u8_shape_2048x64x1x128_strides_8192x128x128x1_index_stride_1_width_8192_block_1024`.
+[kernel.descriptors]
+# The shape, the strides, the index stride and the block width are compile-time
+# values the program unrolls its address arithmetic over, and it compiles for any
+# of them: a shape and its strides are extent tuples of one rank (`build.py`
+# refuses two ranks), a stride may be zero, and the tile is a `tl.arange` extent.
+dimensions = { dtype = ["u8", "bf16"], shape = { separator = "x" }, strides = { min = 0, separator = "x" }, index_stride = { min = 1 }, width = { min = 1 }, block = { power_of_two = true } }
+
+[parameters]

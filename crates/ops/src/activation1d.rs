@@ -122,8 +122,9 @@ impl fmt::Display for Descriptor {
 ///
 /// The pads are `kernel - 1` in total (`kernel/2 - 1` and `kernel/2`), so the span is
 /// `width + kernel - 1` and the length is `floor((width - 1)/ratio) + 1`. Passing the padded span
-/// here would add the pads twice and shift the length by `kernel`; a 4-sample signal with pads 5 and
-/// 6 is a span of 15 and yields 2.
+/// here would add the pads twice, which is exactly the off-by-`kernel` the caller's run caught; the
+/// two ops agree when both take the unpadded width (`audio_resample`'s 4-sample signal with pads 5
+/// and 6 is a span of 15 and yields 2 here too).
 pub fn lowpass_length(width: u64, kernel: u64, ratio: u64) -> Result<u64> {
     let padded = width + kernel - 1;
     if padded < kernel {
@@ -325,8 +326,8 @@ mod tests {
             assert_eq!(descriptor().output(length).unwrap(), length);
         }
         // A span the ratio does not divide still floors, and the boundary is the filter's length:
-        // the argument is the *unpadded* width and the pads are derived inside; a 4-sample signal's
-        // pads make a span of 15.
+        // the argument is the *unpadded* width and the pads are derived inside, so the two ops agree
+        // -- `audio_resample`'s case is a 4-sample signal whose pads make a span of 15.
         assert_eq!(lowpass_length(4, 12, 2).unwrap(), 2);
         assert_eq!(lowpass_length(200, 12, 2).unwrap(), 100);
         assert_eq!(lowpass_length(1, 12, 2).unwrap(), 1);

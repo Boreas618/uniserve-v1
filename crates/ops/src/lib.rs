@@ -81,6 +81,9 @@ pub mod activation;
 pub mod activation1d;
 pub mod adaptive_pool;
 pub mod attention;
+pub mod audio_resample;
+pub mod bias;
+pub mod block_copy;
 // Test-only: the package headers' mirrors checked against the layouts this crate passes.
 #[cfg(test)]
 pub mod call_layout_check;
@@ -113,12 +116,14 @@ pub mod phase;
 pub mod platform;
 pub mod position;
 pub mod posterior;
+pub mod prefix_cache;
 pub mod residual;
 pub mod rgb;
 pub mod rope;
 pub mod rows;
 pub mod sampler;
 pub mod snake;
+pub mod snake_beta;
 pub mod tensor;
 pub mod tile_stitch;
 pub mod tolerance;

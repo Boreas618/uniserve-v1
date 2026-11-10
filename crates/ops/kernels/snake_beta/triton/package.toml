@@ -1,0 +1,35 @@
+# The snake operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# The key is the one `Descriptor`'s `Display` prints, e.g.
+# `dtype_bf16_channels_512_block_1024_pdl_false`. The channel count is the parameter
+# count, so a second channel layout is a second module.
+
+op = "snake_beta"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/snake_beta.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], channels = ["8", "16", "32", "64", "128", "256", "512", "1024", "2048"], block = ["256", "512", "1024", "2048", "4096"], pdl = ["true", "false"] }
+
+[parameters]

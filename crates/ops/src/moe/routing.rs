@@ -21,6 +21,19 @@
 //! FP32 accumulation and output; the expert ids are exact — the descending-then-ascending order is
 //! part of the contract, not an implementation detail, so two correct implementations name the same
 //! experts in the same slots.
+//!
+//! # `expert_gather`
+//!
+//! `out[i] = map[ids[i]]` for every flattened `(token, route)` entry: the expert-parallel rank's
+//! logical ids become indices into the physical expert weights. It moves integers, so two
+//! implementations agree bit for bit.
+//!
+//! Every entry of `ids` must be a logical expert id in `[0, experts)`: the program indexes `map`
+//! with it directly and reads nothing that would say otherwise, so an id outside that range reads
+//! memory beside the map and hands the route whichever expert id that memory holds. The invariant
+//! belongs to the routing that wrote the ids — `topk_softmax` writes `top` ids of a row it reasoned
+//! about — and the consumer bounds its own side: `moe_sort` drops a physical id outside its local
+//! range (`local_expert_of`), so a wrong id costs a stray read and not a corrupted permutation.
 
 use std::fmt;
 
@@ -264,6 +277,104 @@ impl Op for TopkSoftmax {
             rounding.atol,
             (f64::from(rounding.rtol) + 4.0 * accumulate.unit_roundoff()) as f32,
         )
+    }
+}
+
+/// The arguments of one expert-map call.
+#[derive(Clone, Copy)]
+pub struct GatherArgs {
+    /// `[tokens, top]` i32 logical expert ids.
+    pub ids: TensorView,
+    /// `[experts]` i32 physical expert index of each logical one.
+    pub map: TensorView,
+    /// `[tokens, top]` i32 physical expert ids, written.
+    pub out: TensorView,
+}
+
+/// What one compilation of `expert_gather` covers.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct GatherDescriptor {
+    /// Experts in the router's vocabulary: the length of the map.
+    pub experts: u32,
+    /// Routes per token: the entries of a row.
+    pub top: u32,
+}
+
+impl fmt::Display for GatherDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Key::new()
+            .field("experts", self.experts)
+            .field("top", self.top)
+            .finish(formatter)
+    }
+}
+
+/// The logical-to-physical expert map of an expert-parallel layout.
+pub struct ExpertGather;
+
+impl Op for ExpertGather {
+    const NAME: &'static str = "expert_gather";
+
+    /// What one compilation covers: the expert vocabulary and the top-k it maps.
+    type Descriptor = GatherDescriptor;
+
+    type Args<'a> = GatherArgs;
+
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
+        let experts = u64::from(descriptor.experts);
+        let top = u64::from(descriptor.top);
+        let tokens = args.ids.rows();
+
+        args.ids
+            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
+        args.out
+            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
+        args.map.require_shape(Self::NAME, Shape::new(&[experts]))?;
+        for view in [&args.ids, &args.out, &args.map] {
+            if view.dtype != DType::I32 {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!("expected i32 entries, found {}", view.dtype),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let _ = descriptor;
+        let threads = u64::from(cubin_metadata(kernel, Self::NAME, 1)?.threads());
+        let grid = LaunchGrid::covering(args.ids.numel(), threads)?;
+        let mut arguments = Arguments::new();
+        arguments
+            .view(args.ids)
+            .view(args.map)
+            .view(args.out)
+            .i64(to_i64(Self::NAME, args.ids.numel())?);
+        kernel.launch(grid, &mut arguments, stream)
+    }
+
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+        let _ = stream;
+        GatherArgs {
+            out: twins.shadow_of(args.out),
+            ..args
+        }
+    }
+
+    /// Exact: the gather moves rows of an already-computed activation and rounds nothing.
+    ///
+    /// It reads the routing's `[tokens, top]` ids and writes `top` rows per token — an index
+    /// arithmetic, not a sum, so two implementations agree bit for bit. The rounding this operator
+    /// sits between belongs to `route_gemm` (before it) and `moe_unpermute` (after it), each of which
+    /// states its own reduction length.
+    fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
+        Tolerance::exact()
     }
 }
 
