@@ -34,8 +34,11 @@ pub struct ConversionRequest {
 /// One program serves one import workspace: it is built once with the
 /// workspace's scratch, its stream and the pool's fields, and launched per
 /// span afterwards. A launch enqueues its kernels on the stream it is given;
-/// the caller has already ordered the span's reads before it.
-pub trait PageConversion: Send + Sync {
+/// the caller has already ordered the span's reads before it. The kernels it
+/// launches are the library's `page_conversion` operator
+/// (`ops::prefix_cache::PageConversion`); this trait is the worker's handle on
+/// the bound program, named for the import it serves.
+pub trait ImportConversion: Send + Sync {
     /// Decode `request`'s span and encode it into the destination units.
     fn convert(&self, stream: Option<&Stream>, request: &ConversionRequest) -> Result<()>;
 }
@@ -49,7 +52,7 @@ pub trait PageConversion: Send + Sync {
 /// writing nothing.
 pub struct Unimported;
 
-impl PageConversion for Unimported {
+impl ImportConversion for Unimported {
     fn convert(&self, _stream: Option<&Stream>, request: &ConversionRequest) -> Result<()> {
         Err(crate::Error::Unsupported(format!(
             "this rank imports no cache, so group {} has nothing to convert",

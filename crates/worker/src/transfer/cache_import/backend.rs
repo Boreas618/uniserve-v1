@@ -22,7 +22,7 @@ use crate::memory::allocation::Backing;
 use crate::memory::allocation::ElementType;
 use crate::memory::allocation::StorageView;
 use crate::memory::prefix_cache::conversion::{
-    ConversionRequest, ConversionScratch, PageConversion,
+    ConversionRequest, ConversionScratch, ImportConversion,
 };
 use crate::memory::{CachePlanes, GroupTable, UnitColumn};
 use crate::transfer::fetch;
@@ -39,7 +39,7 @@ pub(crate) struct ImportWorkspace {
     elements: u64,
     units: UnitColumn,
     /// The program that converts a span the transports could not copy.
-    conversion: Arc<dyn PageConversion>,
+    conversion: Arc<dyn ImportConversion>,
 }
 
 impl ImportWorkspace {
@@ -55,7 +55,7 @@ impl ImportWorkspace {
     /// converts the spans the transports cannot copy.
     pub(crate) fn bind(
         planes: &Arc<CachePlanes>,
-        conversion: Arc<dyn PageConversion>,
+        conversion: Arc<dyn ImportConversion>,
     ) -> Result<Self> {
         let (elements, scales) = planes.plan().page_extents();
         let bytes = Self::scratch_bytes(elements, scales);

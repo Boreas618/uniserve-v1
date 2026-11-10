@@ -154,7 +154,7 @@ impl PrefixCache {
         device: Option<DeviceId>,
         stream: Option<&Stream>,
         storage: &mut dyn ExclusiveStorage,
-        conversion: Arc<dyn conversion::PageConversion>,
+        conversion: Arc<dyn conversion::ImportConversion>,
     ) -> Result<Self> {
         let shapes = plan.group_shapes()?;
         let planes = Arc::new(CachePlanes::allocate(

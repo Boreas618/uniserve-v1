@@ -66,7 +66,7 @@ pub struct OpenMemory<'a> {
     /// worker thread exists, and a stream accepts work without one.
     pub stream: Option<&'a Stream>,
     /// The conversion program the import path launches.
-    pub conversion: Arc<dyn prefix_cache::conversion::PageConversion>,
+    pub conversion: Arc<dyn prefix_cache::conversion::ImportConversion>,
     /// The device's pools, which a paired forward's scratch page set is taken
     /// from.
     pub pools: Arc<Mutex<crate::arena::Pools>>,
