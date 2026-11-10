@@ -47,9 +47,9 @@ use crate::engine::control::EngineControl;
 use crate::http::admin::{Admin, HandedAdmin};
 use crate::http::listener::{HandedListener, Listener};
 use crate::leader::{Leader, stats_sink};
-use crate::openai::video_jobs::{VideoJob, VideoJobs};
 use crate::options::Stated;
 use crate::supervision::{Daemon, HandedService};
+use frontend::openai::video_jobs::{VideoJob, VideoJobs};
 
 pub(crate) mod requests;
 pub(crate) mod streams;
@@ -573,7 +573,7 @@ fn spawn(executable: &std::path::Path, socket: UnixStream) -> anyhow::Result<u32
 /// change is one `Job` message, with the artifact's descriptor once the job
 /// completed. A change that cannot be sent is logged: the successor holds
 /// the job's last record it received.
-fn job_relay(writer: requests::Writer) -> crate::openai::video_jobs::Relay {
+fn job_relay(writer: requests::Writer) -> frontend::openai::video_jobs::Relay {
     Box::new(move |record, media| {
         let mut channel = crate::leader::locked(&writer);
         let artifact = media.map(|media| (media.len() as u64, artifact_descriptor(media)));
@@ -605,7 +605,7 @@ fn job_relay(writer: requests::Writer) -> crate::openai::video_jobs::Relay {
 /// A descriptor of shared memory holding `media`'s bytes: the artifact's own
 /// when it has one, else a new one they are copied into.
 fn artifact_descriptor(
-    media: &Arc<crate::openai::video_jobs::RetainedMedia>,
+    media: &Arc<frontend::openai::video_jobs::RetainedMedia>,
 ) -> anyhow::Result<OwnedFd> {
     if let Some(descriptor) = media.descriptor() {
         return Ok(descriptor.try_clone_to_owned()?);

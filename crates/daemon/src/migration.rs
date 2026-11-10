@@ -144,16 +144,9 @@ impl Migrator {
     }
 }
 
-/// What one step of a request's events resolved to.
-pub(crate) enum Step {
-    /// The next event; its tokens are already kept as the request's facts.
-    Event(Event),
-    /// The request's engine is handing the request over: the consumer
-    /// migrates ([`RequestEvents::migrate_pending`]) before the next step.
-    Migrate,
-    /// The request ended.
-    Ended,
-}
+/// What one step of a request's events resolved to; an event's tokens are
+/// already kept as the request's facts.
+pub(crate) use frontend::events::Next as Step;
 
 /// A request a migration submits again, as last submitted.
 #[derive(Clone)]
@@ -723,6 +716,52 @@ impl Drop for RequestEvents {
         if let Some(on_finish) = self.on_finish.take() {
             on_finish();
         }
+    }
+}
+
+impl frontend::events::Events for RequestEvents {
+    fn poll_step(&mut self, cx: &mut Context<'_>) -> Poll<Step> {
+        RequestEvents::poll_step(self, cx)
+    }
+
+    fn recv(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Event>> + Send + '_>> {
+        Box::pin(RequestEvents::recv(self))
+    }
+
+    fn migrate_pending(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Event>> + Send + '_>> {
+        Box::pin(RequestEvents::migrate_pending(self))
+    }
+
+    fn acknowledge_consumed_prefix(&mut self) {
+        RequestEvents::acknowledge_consumed_prefix(self);
+    }
+
+    fn stop_at_consumed_prefix(&mut self) {
+        self.cancel_at_consumed_prefix(StreamCancelCause::StopStringMatched);
+    }
+
+    fn cancel(&mut self) {
+        RequestEvents::cancel(self);
+    }
+
+    fn hand_over(&mut self) {
+        RequestEvents::hand_over(self);
+    }
+
+    fn engine_request_id(&self) -> Option<RequestId> {
+        RequestEvents::engine_request_id(self)
+    }
+
+    fn progress(&self) -> (u64, u64) {
+        RequestEvents::progress(self)
+    }
+
+    fn submitted(&self) -> Option<Vec<u8>> {
+        RequestEvents::submitted(self)
     }
 }
 

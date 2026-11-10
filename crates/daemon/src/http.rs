@@ -3,7 +3,7 @@
 //! [`serve`] starts this node's daemon and, on the leader, the [`Leader`],
 //! binds the configured TCP or Unix-domain listener, and serves the router
 //! of the tasks the engine serves until shutdown. Each API module builds its own routes over the engine
-//! (`crate::openai`); this module registers them by task, as vLLM registers
+//! (`frontend::openai`); this module registers them by task, as vLLM registers
 //! its routers by `supported_tasks`, and wraps them in the middleware of
 //! `middleware`.
 
@@ -13,6 +13,7 @@ pub(crate) mod handoff;
 pub(crate) mod listener;
 mod middleware;
 mod node;
+mod served;
 pub(crate) mod stream;
 
 pub use node::node;
@@ -40,9 +41,9 @@ use tracing::{info, warn};
 use crate::http::listener::Listener;
 use crate::http::middleware::ConcurrencyLimit;
 use crate::leader::{Leader, Task};
-use crate::openai::video_jobs::VideoJobs;
-use crate::openai::{self, ApiError, chat_completions, videos};
 use crate::options::{MediaConfig, ServerArgs, ServerConfig, Stated};
+use frontend::openai::video_jobs::VideoJobs;
+use frontend::openai::{self, ApiError, chat_completions, videos};
 
 /// HTTP body limit of every route but the video submission routes, in bytes.
 pub(crate) const BODY_LIMIT: usize = 64 << 20;
@@ -488,26 +489,23 @@ pub(crate) fn router(
         None => router,
     };
 
+    let served = served::Served::shared(Arc::clone(&engine), Arc::clone(&handoff));
     let mut generation = Router::new();
-    let mut api = openai::models_router(Arc::clone(&engine));
+    let mut api = openai::models_router(Arc::clone(&served));
     for task in engine.supported_tasks() {
         match task {
             Task::Generate => {
-                generation = generation.merge(chat_completions::router(
-                    Arc::clone(&engine),
-                    Arc::clone(&handoff),
-                ));
+                generation = generation.merge(chat_completions::router(Arc::clone(&served)));
             }
             Task::VideoGeneration => {
                 generation = generation.merge(videos::generation_router(
-                    Arc::clone(&engine),
+                    Arc::clone(&served),
                     video_body_limit,
                 ));
                 api = api.merge(videos::job_router(
-                    Arc::clone(&engine),
+                    Arc::clone(&served),
                     Arc::clone(&jobs),
                     video_body_limit,
-                    Arc::clone(&handoff),
                 ));
             }
         }
@@ -1178,5 +1176,89 @@ mod tests {
             .unwrap();
         assert!(cancelled.elapsed() >= budget);
         engine.shutdown().await.unwrap();
+    }
+
+    /// The video routes' fixture: a router over the test video family.
+    fn video_router() -> Router {
+        router(sim_engine(crate::test_support::VIDEO))
+    }
+
+    /// A five-second video request of the served model.
+    fn video_request() -> serde_json::Value {
+        serde_json::json!({
+            "model": crate::test_support::SERVED_MODEL,
+            "prompt": "A river",
+            "size": "64x64",
+            "seconds": 5,
+        })
+    }
+
+    /// An engine rejection reaches an asynchronous job with the error code the
+    /// synchronous route answers the same rejection with.
+    #[tokio::test]
+    async fn a_rejected_job_reports_the_synchronous_error_code() {
+        let router = video_router();
+
+        // The simulator has no video media components, so the engine rejects
+        // the request as invalid on both routes.
+        let (sync_status, _, sync_body) =
+            send(&router, post_json("/v1/videos/sync", &video_request())).await;
+        assert_eq!(sync_status, StatusCode::BAD_REQUEST);
+
+        let (status, _, job) = send(&router, post_json("/v1/videos", &video_request())).await;
+        assert_eq!(status, StatusCode::OK);
+        let uri = format!("/v1/videos/{}", job["id"].as_str().unwrap());
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let request = axum::extract::Request::builder()
+                    .uri(&uri)
+                    .body(Body::empty())
+                    .unwrap();
+                let (_, _, job) = send(&router, request).await;
+                if job["status"] == "failed" {
+                    return job;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(failed["error"]["code"], sync_body["error"]["code"]);
+    }
+
+    /// Both submission routes refuse a model the server does not serve.
+    #[tokio::test]
+    async fn the_video_routes_refuse_another_model() {
+        let router = video_router();
+        let mut request = video_request();
+        request["model"] = serde_json::json!("another-model");
+        for path in ["/v1/videos/sync", "/v1/videos"] {
+            let (status, _, body) = send(&router, post_json(path, &request)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(body["error"]["code"], "model_not_found", "{path}");
+        }
+    }
+
+    /// The capabilities state the model's own part beside the request fields every video model
+    /// takes.
+    #[tokio::test]
+    async fn capabilities_state_the_models_part() {
+        let router = video_router();
+        let request = axum::extract::Request::builder()
+            .uri("/v1/capabilities")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = send(&router, request).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["video"]["model"]["sizes"],
+            serde_json::json!(["64x64"])
+        );
+        assert_eq!(
+            body["video"]["request_fields"],
+            serde_json::json!(frontend::input::video::REQUEST_FIELDS)
+        );
     }
 }

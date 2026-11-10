@@ -103,13 +103,7 @@ pub enum EngineState {
     Closed,
 }
 
-/// Why a request could not be submitted.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum SubmitError {
-    /// The engine serves no requests.
-    #[error("the engine is unavailable: {0}")]
-    Unavailable(String),
-}
+pub use frontend::input::SubmitError;
 
 /// Receives each scheduler's statistics: the scheduler's index and its
 /// snapshot of the last interval.

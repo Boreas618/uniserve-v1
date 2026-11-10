@@ -174,7 +174,7 @@ pub(crate) async fn adopt(
             // One document, so a body that ends before producing one is a
             // failure rather than an empty success.
             Opened::Ended => {
-                let error = crate::openai::error::ApiError::server_error(
+                let error = frontend::openai::error::ApiError::server_error(
                     "the response ended before it wrote its document".to_owned(),
                 );
                 let document = Connection::failure_document(&error);
@@ -614,7 +614,7 @@ impl Connection {
                         request = %handed.request_id,
                         "a response's document opened with an empty frame, which a client reads as an empty success"
                     );
-                    let error = crate::openai::error::ApiError::server_error(
+                    let error = frontend::openai::error::ApiError::server_error(
                         "the response's document was empty".to_owned(),
                     );
                     let document = Self::failure_document(&error);
@@ -627,7 +627,7 @@ impl Connection {
                 // One document, so a body that ends before producing one is a
                 // failure rather than an empty response.
                 Some(Opened::Ended) => {
-                    let error = crate::openai::error::ApiError::server_error(
+                    let error = frontend::openai::error::ApiError::server_error(
                         "the response ended before it wrote its document".to_owned(),
                     );
                     let document = Self::failure_document(&error);
@@ -696,7 +696,7 @@ impl Connection {
 
     /// The document a failure answers with when the body produced none: the
     /// error's own JSON, which is what a sink's `failed` writes for it.
-    fn failure_document(error: &crate::openai::error::ApiError) -> Bytes {
+    fn failure_document(error: &frontend::openai::error::ApiError) -> Bytes {
         serde_json::to_vec(&error.to_error_response())
             .map(Bytes::from)
             .unwrap_or_default()
@@ -706,7 +706,7 @@ impl Connection {
     /// is the failure's, and the body is the sink's document for it.
     async fn write_failure(
         &mut self,
-        error: crate::openai::error::ApiError,
+        error: frontend::openai::error::ApiError,
         frames: Vec<Bytes>,
         closing: bool,
     ) -> anyhow::Result<Outcome> {
@@ -2629,7 +2629,7 @@ mod tests {
             br#"{"error":{"message":"the engine failed","type":"server_error"}}"#,
         );
         let mut client = serve_document(Some(Step::Failed {
-            error: crate::openai::error::ApiError::server_error("the engine failed".to_owned()),
+            error: frontend::openai::error::ApiError::server_error("the engine failed".to_owned()),
             frames: vec![Bytes::clone(&document)],
         }));
         client
@@ -2728,7 +2728,7 @@ mod tests {
         let body = ResponseStream::start_held(
             Box::new(DocumentSession {
                 step: Some(Step::Failed {
-                    error: crate::openai::error::ApiError::server_error(
+                    error: frontend::openai::error::ApiError::server_error(
                         "the engine failed".to_owned(),
                     ),
                     frames: vec![Bytes::clone(&document)],

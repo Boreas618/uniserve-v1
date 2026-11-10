@@ -4,23 +4,21 @@
 //! Every node runs one daemon; the leader is the node the deployment is
 //! started on (node rank 0). Every daemon supervises the processes of its
 //! node and holds its node's claim at the Storage Server (`supervision`).
-//! The leader also serves the deployment's model. Its modules are layered,
-//! each using only those below it:
+//! The leader also serves the deployment's model: the OpenAI-compatible API,
+//! input processing and output processing are `crates/frontend`'s, and the
+//! daemon supplies them the served model's engines and its own HTTP
+//! connections. Its modules are layered, each using only those below it:
 //!
-//! - `http`: the HTTP server, its router, middleware and listener;
-//! - `openai`: the OpenAI-compatible API's wire schemas and route handlers;
+//! - `http`: the HTTP server, its router, middleware and listener, and the
+//!   connection that writes every response body (`frontend::body`);
 //! - [`Leader`]: the served model, which carries every request through its
-//!   input processing, the engine process and its output processing;
-//! - `input`: input processing (chat templates, tokenization, multimodal
-//!   inputs, each model family's request lowering) into engine requests;
-//! - `output`: output processing (detokenization, stop strings, reasoning
-//!   and tool parsing) of engine events into public events;
+//!   input processing (`frontend::input`), the engine process and its output
+//!   processing (`frontend::output`);
 //! - `migration`: moving token requests between engines with the tokens
-//!   they generated, behind one stream of events per request;
+//!   they generated, behind one stream of events per request
+//!   (`frontend::events::Events`);
 //! - `engine`: starting the engine process and the client of the request
 //!   interface it serves;
-//! - `model`: the served checkpoint: its files, configuration and family
-//!   profile; `tokenizer`: its tokenizer;
 //! - `options`: the serving option tree (`options::ServerArgs`);
 //! - `metrics`: the Prometheus registry the daemon exports;
 //! - `restart`: the hot restart that hands a deployment to a successor
@@ -32,15 +30,11 @@ pub mod engine;
 pub mod epoch;
 pub mod experts;
 pub mod http;
-pub mod input;
 mod interference;
 mod leader;
 pub mod metrics;
 pub mod migration;
-pub mod model;
-pub mod openai;
 pub mod options;
-pub mod output;
 pub mod profiling;
 pub mod programs;
 pub mod restart;
@@ -56,10 +50,6 @@ pub mod observe;
     reason = "the switch lands before the update layer that drives it"
 )]
 pub(crate) mod updates;
-
-// The application layer's lowest modules are `crates/frontend`'s while the
-// application still serves inside the daemon (delivery item 2, stage A).
-pub use frontend::tokenizer;
 
 pub use crate::http::{node, serve};
 pub use crate::leader::{Leader, Task};

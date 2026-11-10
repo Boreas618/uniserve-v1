@@ -24,7 +24,7 @@ use crate::metrics::{
 use futures::{Stream, StreamExt as _};
 use tracing::info;
 
-use crate::output::{RequestOutput, RequestOutputStream, RequestUsage};
+use frontend::output::{RequestOutput, RequestOutputStream, RequestUsage};
 use proto::report::SchedulerStats;
 
 /// Records the scheduler-stats-backed metrics for one engine at one point in
@@ -547,7 +547,7 @@ impl RequestOutcome {
 }
 
 impl Stream for RequestStats {
-    type Item = Result<RequestOutput, crate::output::OutputError>;
+    type Item = Result<RequestOutput, frontend::output::OutputError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let next = ready!(self.inner.poll_next_unpin(cx));
@@ -623,6 +623,24 @@ fn record_usage(metrics: &RequestMetrics, labels: &EngineLabels, usage: &Request
 /// Converts a microsecond duration to the seconds the histograms observe.
 fn seconds(microseconds: u64) -> f64 {
     microseconds as f64 / 1_000_000.0
+}
+
+impl frontend::events::Outcome for RequestOutcome {
+    fn started(&self) -> Instant {
+        RequestOutcome::started(self)
+    }
+
+    fn engine(&self) -> u32 {
+        RequestOutcome::engine(self)
+    }
+
+    fn observe(&mut self, output: &RequestOutput) {
+        RequestOutcome::observe(self, output);
+    }
+
+    fn abandoned(&mut self) {
+        RequestOutcome::abandoned(self);
+    }
 }
 
 #[cfg(test)]

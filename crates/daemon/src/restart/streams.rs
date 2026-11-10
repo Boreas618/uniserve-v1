@@ -58,7 +58,7 @@ use tracing::{info, warn};
 use crate::http::handoff::{Decision, FrozenStream};
 use crate::http::stream::ResponseStream;
 use crate::leader::Leader;
-use crate::openai::video_jobs::VideoJobs;
+use frontend::openai::video_jobs::VideoJobs;
 
 /// One response the predecessor froze, as it travels to the successor.
 ///
@@ -367,17 +367,17 @@ fn take_over(
                 &chat.engine_request_id,
                 chat.consumed_events,
             )?;
-            let started = crate::output::run::started_instant(
+            let started = frontend::output::run::started_instant(
                 chat.lowering
                     .as_ref()
                     .map_or(0, |lowering| lowering.started_unix_us),
             );
             let outcome = leader.request_outcome(&state.request_id, chat.engine_replica, started);
-            let run = crate::output::run::GenerationRun::resume_stream(
+            let run = frontend::output::run::GenerationRun::resume_stream(
                 &chat,
                 leader.tokenizer(),
-                events,
-                outcome,
+                Box::new(events),
+                Box::new(outcome),
             )?;
             // Server-sent events: the body keeps its connection alive while
             // it waits for the engine.
@@ -389,17 +389,17 @@ fn take_over(
                 &chat.engine_request_id,
                 chat.consumed_events,
             )?;
-            let started = crate::output::run::started_instant(
+            let started = frontend::output::run::started_instant(
                 chat.lowering
                     .as_ref()
                     .map_or(0, |lowering| lowering.started_unix_us),
             );
             let outcome = leader.request_outcome(&state.request_id, chat.engine_replica, started);
-            let run = crate::output::run::GenerationRun::resume_collection(
+            let run = frontend::output::run::GenerationRun::resume_collection(
                 &chat,
                 leader.tokenizer(),
-                events,
-                outcome,
+                Box::new(events),
+                Box::new(outcome),
             )?;
             // One JSON body: no server-sent events, so no keep-alive comment.
             ResponseStream::start(Box::new(run), false)
@@ -414,7 +414,7 @@ fn take_over(
                     content.job_id
                 )
             })?;
-            let run = crate::output::run::VideoContentRun::new(
+            let run = frontend::output::run::VideoContentRun::new(
                 content.job_id.clone(),
                 content.content_type.clone(),
                 media,

@@ -249,8 +249,8 @@ crates/scheduling/      the scheduling interface: events, decisions, the WASM po
 crates/media/           H.264/AAC encoding, MP4 muxing, condition media decoding and host resamplers (libav* FFI)
 crates/scheduler/       the main process's mechanism: schedulers, KV cache allocation, executor groups, process launch through the daemons, the request interface's service
 crates/worker/          the executors and the numerics they issue: runners, graphs, arenas, the memory owners, capacity, transfers, the program-layer update
-crates/daemon/          a node's daemon: process supervision, the node's Storage Server claim, the process interface's service; on the leader the HTTP/OpenAI API, input and output processing, metrics and the engine's client
-crates/frontend/        the application's view of the served checkpoint: its tokenizer and incremental decoding, files, configuration and family profile
+crates/daemon/          a node's daemon: process supervision, the node's Storage Server claim, the process interface's service; on the leader the HTTP server and its connections, metrics, the served model's facade (`frontend::openai::Server`) and the engine's client
+crates/frontend/        the application layer: the OpenAI-compatible API, input processing and output processing, over the served checkpoint's tokenizer, files, configuration and family profile
 crates/service/         host services: the per-user socket, its owner lock, a detached start and the start of an absent service
 crates/program-server/  the Program Server: protocol and client, the package manifest format, storage, the compile queue
 crates/nixl/            NIXL agents with the UCX backend: storage registration, agent metadata exchange and READs between hosts, through NIXL's C API library loaded at run time

@@ -22,23 +22,22 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 
 use crate::engine::client::{EngineClient, EngineInfo};
-use crate::input::chat::HfChatRenderer;
-use crate::input::media::MediaConnector;
-use crate::input::video::VideoService;
-use crate::input::{InputProcessor, RequestRenderer};
 use crate::leader::Leader;
-use crate::model::{ModelConfig, SamplingDefaults};
-use crate::openai::video_jobs::VideoJobs;
 use crate::options::ChatTemplateContentFormat;
 use crate::options::{ImageFetchConfig, LoggingConfig, ServerArgs, ServerConfig, VideoJobConfig};
-use crate::tokenizer::DynTokenizer;
+use frontend::input::chat::HfChatRenderer;
+use frontend::input::media::MediaConnector;
+use frontend::input::{InputProcessor, RequestRenderer};
+use frontend::model::{ModelConfig, SamplingDefaults};
+use frontend::openai::video_jobs::VideoJobs;
+use frontend::tokenizer::DynTokenizer;
 
 /// Served model name the simulated engines answer to.
 pub(crate) const SERVED_MODEL: &str = "sim-model";
 
 /// The application crate's byte tokenizer, which the serving tests decode
 /// with (see `frontend::test_support::configured_tokenizer`).
-pub(crate) use frontend::test_support::{configured_tokenizer, load_tokenizer};
+pub(crate) use frontend::test_support::{CHAT, VIDEO, configured_tokenizer, test_video_service};
 
 /// The server's router over `engine` under the default server options.
 pub(crate) fn router(engine: impl Into<Arc<Leader>>) -> Router {
@@ -227,141 +226,6 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
         None,
     )
     .expect("a client")
-}
-
-/// A chat family whose outputs are parsed in the Qwen3 formats.
-pub(crate) const CHAT: processing::Family = processing::Family {
-    id: "chat",
-    model_types: &["chat"],
-    classes: &[],
-    serving: processing::Serving::Chat(processing::ChatProfile {
-        reasoning: Some(processing::ReasoningFormat::Qwen3),
-        tool_calls: Some(processing::ToolCallFormat::Qwen3),
-    }),
-};
-
-/// A video family whose processor is [`TestProcessor`].
-pub(crate) const VIDEO: processing::Family = processing::Family {
-    id: "video",
-    model_types: &[],
-    classes: &["TestVideoPipeline"],
-    serving: processing::Serving::Video(&TestVideo),
-};
-
-/// The video family [`VIDEO`] serves.
-struct TestVideo;
-
-impl processing::VideoFamily for TestVideo {
-    fn default_prompt_tokens(&self) -> u32 {
-        4096
-    }
-
-    fn processor_files(&self) -> &'static [(&'static str, &'static str)] {
-        &[]
-    }
-
-    fn bind(
-        &self,
-        _: processing::VideoBinding<'_>,
-    ) -> Result<Box<dyn processing::VideoProcessor>, String> {
-        Ok(Box::new(TestProcessor))
-    }
-}
-
-/// A video model of one rule and plain plans, for the daemon's own behavior: a request shorter
-/// than a second is refused before its media is fetched, and every image reference is one
-/// condition whose rows are its height.
-pub(crate) struct TestProcessor;
-
-impl processing::VideoProcessor for TestProcessor {
-    fn capabilities(&self) -> serde_json::Value {
-        serde_json::json!({"sizes": ["64x64"]})
-    }
-
-    fn denoise_steps(&self) -> u32 {
-        4
-    }
-
-    fn check(&self, request: &processing::VideoSpec) -> Result<(), processing::InputError> {
-        match request.length {
-            Some(processing::Length::Seconds(seconds)) if seconds < 1.0 => Err(
-                processing::InputError::invalid("seconds", "a video lasts at least a second"),
-            ),
-            _ => Ok(()),
-        }
-    }
-
-    fn plan(
-        &self,
-        request: &processing::VideoSpec,
-        media: &[processing::MediaMetadata],
-        vocabulary: &dyn processing::Vocabulary,
-    ) -> Result<processing::VideoPlan, processing::InputError> {
-        use proto::video::{Canvas, ConditionMedia, ConditionRole, ImageFit};
-
-        let conditions = request
-            .references
-            .iter()
-            .zip(media)
-            .map(|(reference, media)| {
-                let processing::MediaMetadata::Image(image) = media else {
-                    return Err(processing::InputError::Internal(
-                        "the test processor plans images".to_owned(),
-                    ));
-                };
-                let canvas = Canvas {
-                    width: image.width,
-                    height: image.height,
-                };
-                Ok(processing::ConditionPlan {
-                    role: match reference.frame_index {
-                        Some(0) => ConditionRole::FirstFrame,
-                        Some(_) => ConditionRole::LastFrame,
-                        None => ConditionRole::Reference,
-                    },
-                    media: ConditionMedia::Image(ImageFit {
-                        resized: canvas,
-                        left: 0,
-                        top: 0,
-                        size: canvas,
-                    }),
-                    vision: None,
-                    latent_units: vec![image.height],
-                    audio_rows: 0,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let prompt_token_ids = vocabulary
-            .encode(&request.prompt)
-            .map_err(|error| processing::InputError::Internal(error.to_string()))?;
-        Ok(processing::VideoPlan {
-            size: request.size.unwrap_or(Canvas {
-                width: 64,
-                height: 64,
-            }),
-            num_frames: 22,
-            fps: 24,
-            seed: request.seed.unwrap_or(42),
-            prompt_token_ids,
-            vision_spans: Vec::new(),
-            condition_rows: conditions
-                .iter()
-                .flat_map(|condition| condition.latent_units.iter())
-                .sum(),
-            conditions,
-            video_units: 2,
-        })
-    }
-}
-
-/// The video service of [`TestProcessor`] under the default media policy.
-pub(crate) fn test_video_service() -> VideoService {
-    VideoService::new(
-        Box::new(TestProcessor),
-        &crate::options::MediaConfig::default(),
-        configured_tokenizer(),
-    )
-    .unwrap()
 }
 
 /// The simulated model's facts.

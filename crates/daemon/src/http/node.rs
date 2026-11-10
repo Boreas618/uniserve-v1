@@ -31,10 +31,10 @@ use super::admin::Admin;
 use super::listener::Listener;
 use super::{middleware, retire_deployment, router, video_body_limit};
 use crate::leader::Leader;
-use crate::openai::ApiError;
-use crate::openai::video_jobs::VideoJobs;
 use crate::options::{AdminConfig, ServerArgs, ServerConfig, resolve_text};
 use crate::supervision::Daemon;
+use frontend::openai::ApiError;
+use frontend::openai::video_jobs::VideoJobs;
 
 /// How often a deployment that is brought down checks for requests in
 /// flight.

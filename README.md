@@ -203,8 +203,8 @@ crates/models/          The concrete models, each a crate that implements both c
   minimax-h3/           MiniMax-H3 and FastH3: checkpoint configuration, mathematical partition, components and request processing (`src/processing/`)
 crates/worker/          The executors: the one thread per device that issues its work, with the runners, graphs and memory owners
 crates/scheduler/       The main process's mechanism: schedulers, KV allocation, executor groups and the request interface's service
-crates/daemon/          The node's daemon: process supervision and the Storage Server claim; on the leader, serving options, input and output processing, the HTTP API, metrics and the engine's client
-crates/frontend/        The application's view of the served checkpoint: its tokenizer, files, configuration and family profile
+crates/daemon/          The node's daemon: process supervision and the Storage Server claim; on the leader, serving options, the HTTP server and its connections, metrics, the served model's facade and the engine's client
+crates/frontend/        The application layer: the OpenAI-compatible API, input processing (templates, tokenization, media) and output processing (detokenization, parsers, response bodies), over the served checkpoint's tokenizer, files and family profile
 crates/service/         Host services: the per-user socket, its owner lock, a detached start and the start of an absent service
 crates/media/           H.264/AAC output encoding and MP4 muxing, conditional media reading and host resamplers
 crates/program-server/  The Program Server: compiles programs, keeps them and hands them out; one host service per host and user

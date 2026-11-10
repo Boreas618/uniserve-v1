@@ -26,8 +26,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::epoch::Phase;
 use crate::leader::{Leader, LeaderStatus, UpdateError};
-use crate::openai::ApiError;
 use crate::updates::change::{Applied, ApplyRequest, InFlight};
+use frontend::openai::ApiError;
 
 /// Events the log keeps; older ones leave it.
 const EVENT_CAPACITY: usize = 1024;
@@ -381,7 +381,7 @@ impl Admin {
 pub(crate) struct AdminState {
     pub leader: Arc<Leader>,
     pub admin: Arc<Admin>,
-    pub jobs: Arc<crate::openai::video_jobs::VideoJobs>,
+    pub jobs: Arc<frontend::openai::video_jobs::VideoJobs>,
     /// What restarts the daemon in place; `None` where it cannot.
     pub restarter: Option<Arc<crate::restart::Restarter>>,
 }

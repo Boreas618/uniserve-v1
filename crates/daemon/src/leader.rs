@@ -15,15 +15,15 @@
 //!    it when it migrates;
 //! 3. the events are assembled into public [`RequestOutput`] events: a
 //!    token request's by the body that writes its response
-//!    (`output::run::GenerationRun`, from [`Leader::generate_handed`]'s
+//!    (`output::run::GenerationRun`, from [`Leader::generate`]'s
 //!    parts), a media request's by [`output::media_output`] wrapped in
 //!    `RequestStats`; either records the request's metrics once.
 //!
 //! Dropping a request's `RequestEvents` cancels the request in the engine
 //! that serves it; that is the only cancellation path.
 //!
-//! [`RequestOutput`]: crate::output::RequestOutput
-//! [`output::media_output`]: crate::output::media_output
+//! [`RequestOutput`]: frontend::output::RequestOutput
+//! [`output::media_output`]: frontend::output::media_output
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -41,29 +41,18 @@ use tracing::{info, warn};
 use crate::engine::client::{EngineClient, EngineState, StatsSink, SubmitError};
 use crate::engine::control::EngineControl;
 use crate::engine::hold::{HoldState, RequestHold};
-use crate::input::media::MediaConnector;
-use crate::input::processor::LoadModel as _;
-use crate::input::video::{ProcessedVideo, VideoGenerationRequest, VideoService};
-use crate::input::{
-    GenerateRequest, InputProcessor, LoadedModel, LoadedRenderer, Prompt, RequestRenderer,
-    ServeError, TokenizeError,
-};
 use crate::metrics::log_stats::StatsLogger;
 use crate::metrics::stats::{self as metrics, RequestStats};
 use crate::migration::{Migrator, RequestEvents};
-use crate::model::ModelConfig;
 use crate::options::{ReasoningParser, ServerArgs, Stated};
-use crate::output::RequestOutputStream;
-
-/// What one submitted generation request's body is built from: its engine
-/// events, the parameters of its output pipeline, how long it took to reach
-/// the engine in microseconds, and the recorder of its statistics.
-pub(crate) type Handed = (
-    RequestEvents,
-    crate::output::OutputParams,
-    u64,
-    crate::metrics::stats::RequestOutcome,
-);
+use frontend::input::media::MediaConnector;
+use frontend::input::video::{ProcessedVideo, VideoGenerationRequest, VideoService};
+use frontend::input::{
+    GenerateRequest, InputProcessor, LoadedModel, LoadedRenderer, Prompt, RequestRenderer,
+    ServeError, TokenizeError,
+};
+use frontend::model::ModelConfig;
+use frontend::output::RequestOutputStream;
 
 /// How long the epoch's Program Servers may take to select its programs.
 ///
@@ -251,7 +240,7 @@ pub(crate) fn replica_configs(
 pub(crate) struct Prepared {
     catalogue: processing::Catalogue,
     model_config: ModelConfig,
-    tokenizer: crate::tokenizer::DynTokenizer,
+    tokenizer: frontend::tokenizer::DynTokenizer,
     renderer: LoadedRenderer,
     /// The deployment's engine configuration, with the facts the model's files determine.
     pub(crate) engine: proto::config::EngineConfig,
@@ -408,10 +397,10 @@ impl Leader {
 
     /// The LoRA adapter named `name` the workers hold, which a request
     /// naming it as its model computes with.
-    pub fn adapter(&self, name: &str) -> Option<crate::input::AdapterSelection> {
+    pub fn adapter(&self, name: &str) -> Option<frontend::input::AdapterSelection> {
         locked(&self.replicas.adapters)
             .get(name)
-            .map(|adapter| crate::input::AdapterSelection {
+            .map(|adapter| frontend::input::AdapterSelection {
                 slot: adapter.slot,
                 identity: adapter.identity.clone(),
             })
@@ -895,9 +884,14 @@ impl Leader {
             config: model_config,
             tokenizer,
             renderer,
-        } = ModelConfig::load(config, catalogue)
-            .await
-            .with_context(|| format!("failed to resolve model assets for `{}`", config.model()))?;
+        } = ModelConfig::load(
+            config.model(),
+            config.max_model_len,
+            &config.chat_config,
+            catalogue,
+        )
+        .await
+        .with_context(|| format!("failed to resolve model assets for `{}`", config.model()))?;
         // Options of another model family than the served one are refused
         // rather than ignored.
         stated.refuse_foreign_options(&model_config.family)?;
@@ -1189,10 +1183,10 @@ impl Leader {
     ///
     /// Fails when an image cannot be fetched, preprocessing refuses the
     /// request, or no scheduler accepts it.
-    pub(crate) async fn generate_handed(
+    pub(crate) async fn generate(
         &self,
         request: GenerateRequest,
-    ) -> Result<Handed, ServeError> {
+    ) -> Result<frontend::openai::Generation, ServeError> {
         let started = Instant::now();
         let request_id = request.request_id.clone();
         let image_urls = match &request.prompt {
@@ -1220,12 +1214,17 @@ impl Leader {
         };
         let log = self.log_requests.then_some(request_id);
         let outcome = crate::metrics::stats::RequestOutcome::new(labels, started, log);
-        Ok((events, output, compile_us, outcome))
+        Ok(frontend::openai::Generation {
+            events: Box::new(events),
+            output,
+            compile_us,
+            outcome: Box::new(outcome),
+        })
     }
 
     /// The model's tokenizer, which a successor builds a handed-over body's
     /// decoder from.
-    pub(crate) fn tokenizer(&self) -> crate::tokenizer::DynTokenizer {
+    pub(crate) fn tokenizer(&self) -> frontend::tokenizer::DynTokenizer {
         self.processor.tokenizer()
     }
 
@@ -1307,12 +1306,12 @@ impl Leader {
             .await?;
         let prompt_tokens = request.prompt_token_ids.len();
         let (events, core) = self.submit(Request::Diffusion(request)).await?;
-        let output = crate::output::media_output(
+        let output = frontend::output::media_output(
             request_id.clone(),
             started,
             elapsed_us(started),
             prompt_tokens,
-            events,
+            Box::new(events),
         );
         // The workers read the condition media while the request runs, which
         // ends with its event stream.
@@ -1932,7 +1931,7 @@ pub(crate) fn configurable(
 /// it does for the served model at `served`: the same tokenizer, tokenizer
 /// settings, generation defaults and chat template, byte for byte.
 pub(crate) async fn same_processing(served: &str, path: &str) -> Result<(), String> {
-    use crate::model::assets::model_files::ResolvedModelFiles;
+    use frontend::model::assets::model_files::ResolvedModelFiles;
     // A diffusers checkpoint keeps what processes a request in directories of its own, and states
     // no tokenizer at its root for the model's files to resolve.
     if std::path::Path::new(served).join(MODULAR_INDEX).is_file() {

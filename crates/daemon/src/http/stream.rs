@@ -35,9 +35,7 @@
 //! deployment over does not wait for a response to end (design §7.5.1). Every
 //! route the daemon serves declares such a state, so no kind is exempt.
 
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::Poll;
 
 use std::sync::Arc;
 
@@ -45,7 +43,7 @@ use axum::response::Response;
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
-use proto::handoff;
+pub(crate) use frontend::body::{Application, Session, Step};
 
 use crate::http::handoff::Registration;
 
@@ -63,85 +61,6 @@ const KEEP_ALIVE_COMMENT: &[u8] = b":\n\n";
 /// flushes, and it bounds what a freeze has to drain before the socket is
 /// stopped.
 const AHEAD: usize = 1;
-
-/// One step of a response's driver.
-pub(crate) enum Step {
-    /// The frames the last engine event produced.
-    Frames(Vec<Bytes>),
-    /// The request's engine stream reported a migration that the driver
-    /// performs before the next step.
-    Migrate,
-    /// The response ended; no later frame follows.
-    Ended,
-    /// The response failed before anything was written: the connection answers
-    /// it with `error`'s status and `frames`, which are the sink's own shape of
-    /// the failure. Only a response whose head is held reports this — a
-    /// response whose head is written reports its failure as frames inside the
-    /// stream, where the status is already stated.
-    Failed {
-        error: crate::openai::error::ApiError,
-        frames: Vec<Bytes>,
-    },
-}
-
-/// A response body produced from one request's engine events, freezable at an
-/// event boundary.
-pub(crate) trait Session: Send + 'static {
-    /// Advances to the next boundary.
-    ///
-    /// Returns the frames one engine event produced, that the request
-    /// migrated, or that the response ended. Returns `Pending` while it waits
-    /// for the engine, having registered `cx`'s waker.
-    fn poll_step(&mut self, cx: &mut Context<'_>) -> Poll<Step>;
-
-    /// Performs the migration `poll_step` reported.
-    ///
-    /// The driver never cancels this future: a paused handoff waits until the
-    /// request's engine stream is whole again.
-    fn migrate(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
-
-    /// Freezes at the boundary just reached and reports the state a successor
-    /// continues from; `None` when this response cannot be handed over, for
-    /// example because its request cannot migrate.
-    fn freeze(&mut self) -> Option<Application>;
-
-    /// Ends the response because the client is gone or it failed: cancel the
-    /// request on the engine.
-    fn abort(&mut self);
-
-    /// Ends this process's part in the response because a successor took it
-    /// over (design §7.5.1): stop reading the request's engine events and
-    /// give the stream up, so the engine's next consumer takes it over where
-    /// this one stopped. Never cancels the request.
-    fn detach(&mut self);
-}
-
-/// The application state of one frozen response, as the `application` of
-/// `handoff.Stream`.
-pub(crate) enum Application {
-    /// A chat completion streamed as server-sent events.
-    ChatStream(handoff::ChatStream),
-    /// A chat completion answered as one JSON body.
-    ChatResponse(handoff::ChatResponse),
-    /// A video artifact streamed from a job's retained media.
-    VideoContent(handoff::VideoContent),
-}
-
-impl Application {
-    /// The application state as the `application` of `handoff.Stream`.
-    pub(crate) fn into_stream(self, http: handoff::Http, request_id: String) -> handoff::Stream {
-        let application = match self {
-            Self::ChatStream(chat) => handoff::stream::Application::ChatStream(chat),
-            Self::ChatResponse(chat) => handoff::stream::Application::ChatResponse(chat),
-            Self::VideoContent(video) => handoff::stream::Application::VideoContent(video),
-        };
-        handoff::Stream {
-            http: Some(http),
-            request_id,
-            application: Some(application),
-        }
-    }
-}
 
 /// A message from the connection to its response's driver.
 enum Control {
@@ -182,7 +101,7 @@ enum Produced {
     /// The response failed before its head was written: the connection states
     /// the failure in the head it has not sent yet.
     Failed {
-        error: crate::openai::error::ApiError,
+        error: frontend::openai::error::ApiError,
         frames: Vec<Bytes>,
     },
 }
@@ -193,7 +112,7 @@ pub(crate) enum Opened {
     /// The body's first frame.
     Frame(Bytes),
     /// The body failed before producing anything: the head states the outcome.
-    Failed(crate::openai::error::ApiError, Vec<Bytes>),
+    Failed(frontend::openai::error::ApiError, Vec<Bytes>),
     /// The body ended without producing anything.
     Ended,
 }
