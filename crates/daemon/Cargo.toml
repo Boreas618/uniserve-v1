@@ -17,8 +17,6 @@ base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
 platform.workspace = true
-# The rank layout a spec states, which the leader and an update read.
-scheduler.workspace = true
 fastokens.workspace = true
 fnv.workspace = true
 frontend.workspace = true

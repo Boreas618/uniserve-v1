@@ -51,7 +51,6 @@ pub mod nccl;
 mod nvml;
 mod pool;
 pub mod reclaim;
-pub mod shm;
 mod stream;
 mod tensormap;
 mod vmm;

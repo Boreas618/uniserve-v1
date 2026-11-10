@@ -206,14 +206,14 @@ pub(crate) fn replica_configs(
         .transfer
         .as_deref()
         .unwrap_or_default()
-        .parse::<scheduler::ConnectorConfig>()
+        .parse::<proto::config::connector::ConnectorConfig>()
         .context("invalid `device_config.transfer`")?;
     groups
         .chunks(groups.len() / count)
         .map(|groups| {
             let contains =
                 |id: &proto::config::WorkerGroupId| groups.iter().any(|group| &group.id == id);
-            let mut local = scheduler::ConnectorConfig::default();
+            let mut local = proto::config::connector::ConnectorConfig::default();
             for edge in &transfers.edges {
                 let source = contains(&edge.source_worker);
                 let destination = contains(&edge.destination_worker);

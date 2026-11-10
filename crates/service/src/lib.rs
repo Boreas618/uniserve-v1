@@ -14,6 +14,12 @@
 //! never ends the service. A server logs to standard error at the level of
 //! `UNISERVE_<NAME>_LOG` ([`init_logging`]) and stops on SIGTERM or SIGINT
 //! ([`stop_signals`]).
+//!
+//! [`shm`] removes the shared memory a process of the host's libraries leaves
+//! behind when it ends without closing them, which the process that reaps it
+//! clears.
+
+pub mod shm;
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _, Write as _};

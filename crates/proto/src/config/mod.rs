@@ -6,6 +6,7 @@
 //! section knows fails the parse instead of being ignored.
 
 pub mod block;
+pub mod connector;
 pub mod values;
 pub mod worker_group;
 
