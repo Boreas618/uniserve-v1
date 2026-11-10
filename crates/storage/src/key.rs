@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn a_page_key_names_its_whole_prefix() {
-        let seed = page_seed("model|page-layout:1");
+        let seed = page_seed("model|page-content:1");
         let first = chain(&seed, None, &[&[1, 2], &[3, 4]]);
         // The same prefix is the same key, page by page.
         assert_eq!(first, chain(&seed, None, &[&[1, 2], &[3, 4]]));
@@ -238,9 +238,9 @@ mod tests {
     #[test]
     fn a_seed_and_an_isolation_key_part_the_pages() {
         let pages: &[&[u32]] = &[&[1, 2]];
-        let seed = page_seed("model|page-layout:1");
+        let seed = page_seed("model|page-content:1");
         let keys = chain(&seed, None, pages);
-        assert_ne!(keys, chain(&page_seed("model|page-layout:2"), None, pages));
+        assert_ne!(keys, chain(&page_seed("model|page-content:2"), None, pages));
         assert_ne!(keys, chain(&seed, Some(7), pages));
         assert_ne!(chain(&seed, Some(7), pages), chain(&seed, Some(8), pages));
         // A consumer without a model keys its pages by their tokens alone.

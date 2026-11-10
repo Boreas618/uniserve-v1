@@ -19,9 +19,11 @@
 //! their own, so a long transfer never delays an admission's lookup. The
 //! connector never removes objects: Mooncake's master evicts them.
 //!
-//! A page's object key is `uniserve_{hex(page key)}_{kv head
-//! offset}-{kv head count}`, one object per page per rank. It names no
-//! deployment or host, so identical content is shared across both.
+//! A page's object key is `uniserve_{hex(page key)}_{hex(pool
+//! layout)}_{kv head offset}-{kv head count}`, one object per page per rank
+//! and representation: a page key names the logical content, which two
+//! cache dtypes store differently. It names no deployment or host, so
+//! identical content is shared across both.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -72,8 +74,9 @@ impl Mapped {
     /// The object key of `key`'s page in this pool.
     fn object(&self, key: &Key) -> String {
         format!(
-            "uniserve_{}_{}-{}",
+            "uniserve_{}_{}_{}-{}",
             key.hex(),
+            self.shape.layout.hex(),
             self.shape.kv_head_offset,
             self.shape.kv_head_count
         )

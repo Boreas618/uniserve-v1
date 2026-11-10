@@ -124,17 +124,47 @@ fn layout(plan: &CachePlan, group: usize) -> [u8; 32] {
     digest.finish()
 }
 
+/// The digest of the logical content of `group`'s pages: the page encoding
+/// and the group's shape and logical layers, without its representation
+/// (the cache dtype, its quantization and the planes' packing), which
+/// [`layout`] adds. Pages of one prompt computed by one model in two
+/// representations hold the same logical content.
+fn content(plan: &CachePlan, group: usize) -> [u8; 32] {
+    let entry = &plan.groups[group];
+    let mut digest = ::storage::key::Digest::new(b"uniserve-page-content-layout");
+    digest.number(u64::from(PAGE_ENCODING));
+    digest.number(u64::from(entry.window().unwrap_or(0)));
+    digest.number(u64::from(entry.block_size));
+    let layers: Vec<u64> = entry
+        .layer_ids
+        .iter()
+        .map(|&layer| u64::from(layer))
+        .collect();
+    digest.numbers(&layers);
+    digest.number(u64::from(entry.total_kv_heads));
+    digest.number(u64::from(entry.head_dim));
+    if entry.state() {
+        digest.text("state");
+        digest.number(u64::from(entry.units_per_page));
+    }
+    digest.finish()
+}
+
 /// The page identity of each of `plan`'s groups for a model whose weights
 /// are `fingerprint` (`PrefixCacheInfo::identities`): the weights and the
-/// group's page layout, as `|`-separated components. The engine seeds the
-/// group's page keys at every cache level from it (`storage::key::page_seed`),
-/// so a page computed by other weights or laid out otherwise is another
-/// page on the device, in the host page pools and in the KV storage.
+/// group's logical page content, as `|`-separated components. The engine
+/// seeds the group's page keys at every cache level from it
+/// (`storage::key::page_seed`), so a page computed by other weights or of
+/// another shape is another page on the device, in the host page pools and
+/// in the KV storage. The representation is not part of it: the same page
+/// in another cache dtype has the same key, and the pools and KV storage
+/// objects of each representation stay apart by their layout
+/// (`PageShape::layout`, [`layout`]).
 pub fn page_identities(plan: &CachePlan, fingerprint: &str) -> Vec<String> {
     (0..plan.groups.len())
         .map(|group| {
-            let layout = ::storage::Key(layout(plan, group)).hex();
-            format!("{fingerprint}|page-layout:{layout}")
+            let content = ::storage::Key(content(plan, group)).hex();
+            format!("{fingerprint}|page-content:{content}")
         })
         .collect()
 }
