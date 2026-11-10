@@ -48,8 +48,8 @@ use crate::options::{ReasoningParser, ServerArgs, Stated};
 use frontend::input::media::MediaConnector;
 use frontend::input::video::{ProcessedVideo, VideoGenerationRequest, VideoService};
 use frontend::input::{
-    GenerateRequest, InputProcessor, LoadedModel, LoadedRenderer, Prompt, RequestRenderer,
-    ServeError, TokenizeError,
+    GenerateRequest, InputProcessor, LoadedModel, LoadedRenderer, RequestRenderer, ServeError,
+    TokenizeError,
 };
 use frontend::model::ModelConfig;
 use frontend::output::RequestOutputStream;
@@ -1176,9 +1176,10 @@ impl Leader {
     ) -> Result<frontend::openai::Generation, ServeError> {
         let started = Instant::now();
         let request_id = request.request_id.clone();
-        let image_urls = match &request.prompt {
-            Prompt::Chat(chat) if self.processor.supports_image_input() => chat.image_urls(),
-            _ => Vec::new(),
+        let image_urls = if self.processor.supports_image_input() {
+            request.prompt.image_urls()
+        } else {
+            Vec::new()
         };
         let images = self
             .images

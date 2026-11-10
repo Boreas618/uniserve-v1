@@ -1,7 +1,7 @@
 //! The serving layer's request vocabulary.
 //!
 //! A [`GenerateRequest`] is one generation request before tokenization: its
-//! [`Prompt`], what it generates, the engine's sampling parameters (lowered
+//! chat conversation, what it generates, the engine's sampling parameters (lowered
 //! once from the wire request, the model's defaults applied), its length and
 //! stop controls, and its scheduling and cache controls. The API routes lower
 //! their wire requests into it; `InputProcessor::preprocess` splits it into
@@ -14,27 +14,13 @@ use proto::request::SamplingParams;
 use crate::input::chat::ChatRequest;
 use crate::output::text::TextDecodeOptions;
 
-/// The prompt of a generation request.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Prompt {
-    /// The text prompt of an image-generation request.
-    Text {
-        /// The prompt.
-        prompt: String,
-        /// The prompt classifier-free guidance steers the image away from.
-        negative_prompt: Option<String>,
-    },
-    /// A chat conversation; its input images are `image_url` parts.
-    Chat(ChatRequest),
-}
-
 /// One generation request before tokenization.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerateRequest {
     /// Names the request in its errors and logs.
     pub request_id: String,
-    /// The prompt.
-    pub prompt: Prompt,
+    /// The chat conversation; its input images are `image_url` parts.
+    pub prompt: ChatRequest,
     /// Whether the request asks for image output, which no served model
     /// generates: feature validation refuses it.
     pub image_output: bool,

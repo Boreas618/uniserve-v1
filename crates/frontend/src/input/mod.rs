@@ -19,7 +19,7 @@ pub use error::{ServeError, SubmitError, TokenizeError};
 pub use media::ImageInput;
 pub use processor::{InputProcessor, ModelResolutionError, RequestRenderer};
 pub use processor::{LoadedModel, LoadedRenderer};
-pub use request::{AdapterSelection, GenerateRequest, Prompt};
+pub use request::{AdapterSelection, GenerateRequest};
 
 /// Result type returned by serving-runtime calls.
 pub type Result<T> = std::result::Result<T, ServeError>;

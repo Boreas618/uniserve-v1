@@ -25,7 +25,7 @@ use proto::request::{RequestId, SamplingParams as EngineSamplingParams};
 use thiserror::Error;
 
 use crate::input::chat::{ChatRequest, HfChatRenderer};
-use crate::input::request::{GenerateRequest, Prompt};
+use crate::input::request::GenerateRequest;
 use crate::input::sampling::resolve_max_tokens;
 use crate::input::video::VideoService;
 use crate::input::{Result, ServeError};
@@ -329,7 +329,7 @@ impl InputProcessor {
     fn validate_generation_features(
         &self,
         request_id: &str,
-        prompt: &Prompt,
+        prompt: &ChatRequest,
         has_input_image: bool,
         image_output: bool,
     ) -> Result<()> {
@@ -346,14 +346,11 @@ impl InputProcessor {
         if image_output {
             return Err(reject("image_output"));
         }
-        if let Prompt::Chat(chat) = prompt {
-            let uses_tools = chat.uses_tools();
-            if uses_tools && !self.supports_tool_calling() {
-                return Err(reject("tool_calling"));
-            }
-            if chat.chat_options.reasoning_effort.is_some() && !self.supports_reasoning() {
-                return Err(reject("reasoning"));
-            }
+        if prompt.uses_tools() && !self.supports_tool_calling() {
+            return Err(reject("tool_calling"));
+        }
+        if prompt.chat_options.reasoning_effort.is_some() && !self.supports_reasoning() {
+            return Err(reject("reasoning"));
         }
         self.limits
             .covers(GenerationFeatures::UNDERSTANDING)
@@ -388,8 +385,7 @@ impl InputProcessor {
             cache_salt,
             adapter,
         } = request;
-        let has_input_image =
-            !images.is_empty() || matches!(&prompt, Prompt::Chat(chat) if chat.has_multimodal());
+        let has_input_image = !images.is_empty() || prompt.has_multimodal();
         self.validate_generation_features(&request_id, &prompt, has_input_image, image_output)?;
         let mut generation = GenerationRequest {
             // The daemon's submission stamps the engine's identifier for the request.
@@ -417,8 +413,7 @@ impl InputProcessor {
         // No partially prepared request is exposed to the submission boundary.
         // The closure gathers every `TokenizeError` so it maps once to `ServeError::Tokenize`.
         let processor = (|| -> std::result::Result<_, crate::input::TokenizeError> {
-            let processor =
-                self.preprocess_chat_input(chat_only(prompt), max_tokens, &mut generation)?;
+            let processor = self.preprocess_chat_input(prompt, max_tokens, &mut generation)?;
             generation.validate()?;
             Ok(processor)
         })()
@@ -437,19 +432,6 @@ impl InputProcessor {
             processor,
         };
         Ok((generation, output))
-    }
-}
-
-/// Returns the chat conversation of a prompt for a model that serves chat only.
-///
-/// Only an image-generation request sends a text prompt, and feature validation
-/// refuses it for a model without image output.
-fn chat_only(prompt: Prompt) -> ChatRequest {
-    match prompt {
-        Prompt::Chat(chat) => chat,
-        Prompt::Text { .. } => {
-            unreachable!("a text prompt is image generation, refused above for a chat-only model")
-        }
     }
 }
 

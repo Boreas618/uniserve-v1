@@ -35,7 +35,7 @@ use tracing::{debug, error};
 use tracing_futures::Instrument as _;
 
 use crate::input::chat::{ChatRequest, ChatToolChoice};
-use crate::input::{GenerateRequest, InputProcessor, Prompt, ServeError};
+use crate::input::{GenerateRequest, InputProcessor, ServeError};
 use crate::openai::RequestId;
 use crate::openai::error::{bail_invalid_request, bail_server_error, server_error};
 use crate::openai::{
@@ -1327,7 +1327,7 @@ pub fn lower_chat_request(
 
     let lowered = GenerateRequest {
         request_id,
-        prompt: Prompt::Chat(ChatRequest {
+        prompt: ChatRequest {
             messages: request.messages,
             tools: convert_tools(request.tools),
             // An absent choice lets the model decide, as OpenAI's default does.
@@ -1337,7 +1337,7 @@ pub fn lower_chat_request(
                 template_kwargs,
                 ..Default::default()
             },
-        }),
+        },
         image_output: request.modalities.contains(&ChatModality::Image),
         sampling,
         max_tokens: request.max_completion_tokens,
