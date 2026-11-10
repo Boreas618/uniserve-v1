@@ -1,9 +1,9 @@
 //! Incremental conversion from engine events to decoded text events.
 //!
-//! [`decoded_text_event_stream`] consumes one generation request's `RequestEvents`,
+//! [`DecodeStream`] consumes one generation request's `RequestEvents`,
 //! checks the engine event protocol, detokenizes generated tokens with the
 //! tokenizer's `IncrementalDecoder`, decodes requested logprobs, matches stop
-//! strings, and passes image events through in order. `output::assembly`
+//! strings, and passes image events through in order. `output::run`
 //! feeds its output to the request's chat output processor.
 //!
 //! The decoder also reports its stop-string decisions to the engine: it
@@ -14,7 +14,6 @@
 use std::sync::Arc;
 
 use crate::migration::RequestEvents;
-use asynk_strim_attr::{TryYielder, try_stream};
 use proto::request::{Event, PositionLogprobs, RejectionKind};
 use serde::{Deserialize, Serialize};
 use tracing::{Level, debug, trace};
@@ -173,28 +172,15 @@ pub(crate) struct DecodeStream {
     output_tokens: usize,
 }
 
-/// The decoded events one engine event produced, and whether it ended the
-/// stream.
+/// The decoded events one engine event produced.
 pub(crate) struct Decoded {
-    /// The events, in order.
+    /// The events, in order; a terminal event is the last.
     pub(crate) events: Vec<DecodedTextEvent>,
-    /// Whether the stream ended: no later event reaches this decoder.
-    pub(crate) ended: bool,
 }
 
 impl Decoded {
     fn new(events: Vec<DecodedTextEvent>) -> Self {
-        Self {
-            events,
-            ended: false,
-        }
-    }
-
-    fn ended(events: Vec<DecodedTextEvent>) -> Self {
-        Self {
-            events,
-            ended: true,
-        }
+        Self { events }
     }
 }
 
@@ -285,7 +271,9 @@ impl DecodeStream {
     ///
     /// # Errors
     ///
-    /// Fails as [`decoded_text_event_stream`] documents.
+    /// Fails with [`Error::MalformedOutput`] when engine events violate the
+    /// protocol of [`DecodedTextEvent`], and with a tokenizer error when
+    /// decoding fails.
     pub(crate) fn push(
         &mut self,
         event: Event,
@@ -340,7 +328,7 @@ impl DecodeStream {
                     raw_stream,
                     &mut events,
                 )? {
-                    return Ok(Decoded::ended(events));
+                    return Ok(Decoded::new(events));
                 }
             }
             // Tokens committed together, such as a block-diffusion canvas,
@@ -364,7 +352,7 @@ impl DecodeStream {
                     raw_stream,
                     &mut events,
                 )? {
-                    return Ok(Decoded::ended(events));
+                    return Ok(Decoded::new(events));
                 }
             }
             Event::TokenLogprobs { id, candidates } => {
@@ -392,7 +380,7 @@ impl DecodeStream {
                     raw_stream,
                     &mut events,
                 )? {
-                    return Ok(Decoded::ended(events));
+                    return Ok(Decoded::new(events));
                 }
             }
             Event::ImageBegin { .. } => {
@@ -446,7 +434,7 @@ impl DecodeStream {
                     events.push(DecodedTextEvent::Failed {
                         message: "engine execution failed".to_owned(),
                     });
-                    return Ok(Decoded::ended(events));
+                    return Ok(Decoded::new(events));
                 };
 
                 // Release the decoder's holdback untruncated: a stop-string
@@ -472,15 +460,15 @@ impl DecodeStream {
                     output_tokens: completion_tokens,
                     images,
                 }));
-                return Ok(Decoded::ended(events));
+                return Ok(Decoded::new(events));
             }
             Event::Rejected { kind, message } => {
                 events.push(DecodedTextEvent::Rejected { kind, message });
-                return Ok(Decoded::ended(events));
+                return Ok(Decoded::new(events));
             }
             Event::Error { message } | Event::ArtifactUnavailable { message } => {
                 events.push(DecodedTextEvent::Failed { message });
-                return Ok(Decoded::ended(events));
+                return Ok(Decoded::new(events));
             }
             // A request's events migrate with it (`crate::migration`), which
             // carries a migratable end over to the next engine and keeps the
@@ -738,55 +726,6 @@ fn decode_one_token(
         String::new()
     };
     Ok(ArDecode { delta, stop })
-}
-
-/// Decodes one generation request's engine events into decoded text events.
-///
-/// On success the stream follows the protocol of [`DecodedTextEvent`]. When
-/// `generated_logprobs_requested` is set, every `TextToken` must be followed
-/// by a `TokenLogprobs` event for the same token whose first candidate is
-/// that token. An engine error finish fails the request like an engine error
-/// event.
-///
-/// # Errors
-///
-/// Fails with [`Error::EmptyPromptTokenIds`] for an empty prompt,
-/// [`Error::MalformedOutput`] when engine events violate the protocol,
-/// [`Error::StreamClosedBeforeTerminalOutput`] when the channel closes
-/// without a terminal event, and a tokenizer error when decoding fails.
-#[try_stream]
-pub async fn decoded_text_event_stream(
-    request_id: String,
-    tokenizer: DynTokenizer,
-    prompt_token_ids: Vec<u32>,
-    prompt_logprobs_requested: bool,
-    generated_logprobs_requested: bool,
-    mut raw_stream: RequestEvents,
-    decode_options: TextDecodeOptions,
-    mut y: TryYielder<DecodedTextEvent, Error>,
-) -> crate::output::text::Result<()> {
-    let request = request_id.clone();
-    let mut stream = DecodeStream::new(
-        request_id,
-        tokenizer,
-        prompt_token_ids,
-        prompt_logprobs_requested,
-        generated_logprobs_requested,
-        decode_options,
-    )?;
-    while let Some(event) = raw_stream.recv().await {
-        let decoded = stream.push(event, &mut raw_stream)?;
-        for event in decoded.events {
-            y.yield_ok(event).await;
-        }
-        if decoded.ended {
-            return Ok(());
-        }
-    }
-
-    Err(Error::StreamClosedBeforeTerminalOutput {
-        request_id: request,
-    })
 }
 
 /// Returns the suffix byte count retained to detect cross-chunk stop strings.

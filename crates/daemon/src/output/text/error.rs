@@ -1,6 +1,6 @@
 //! Text tokenization, decoding, and stream errors.
 //!
-//! `decoded_text_event_stream` reports engine-protocol violations as
+//! The incremental decoder (`DecodeStream`) reports engine-protocol violations as
 //! [`Error::MalformedOutput`]; an engine rejection or failure is a terminal
 //! event of its stream, not an error.
 
@@ -29,12 +29,6 @@ pub enum Error {
         max_model_len: u32,
         /// Tokenized prompt length.
         prompt_len: u32,
-    },
-    /// The engine stream closes without terminal output.
-    #[error("text request stream `{request_id}` closed before terminal output")]
-    StreamClosedBeforeTerminalOutput {
-        /// Identifier of the incomplete request.
-        request_id: String,
     },
     /// An engine event cannot be represented as valid decoded text output.
     #[error("text request `{request_id}` received malformed output: {message}")]

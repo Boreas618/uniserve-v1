@@ -1,14 +1,14 @@
 //! A streamed chat completion driven one engine event at a time, so that a
 //! hot restart can take it over.
 //!
-//! [`generation_output`](super::assembly::generation_output) pulls the same
-//! pipeline through one `try_stream`; a handed-over response cannot be a
-//! generator, because a restart boundary is a place to stop: between two
-//! engine events, with every frame of the events consumed so far produced.
-//! [`GenerationRun`] therefore pushes the pipeline: it takes one event from
-//! the request's engine stream, decodes it, runs it through the output
-//! processors and the block assembly, turns the resulting outputs into
-//! server-sent event frames, and returns.
+//! A handed-over response cannot be a generator, because a restart boundary
+//! is a place to stop: between two engine events, with every frame of the
+//! events consumed so far produced. [`GenerationRun`] therefore pushes the
+//! pipeline: it takes one event from the request's engine stream, decodes
+//! it, runs it through the output processors and the block assembly, turns
+//! the resulting outputs into its sink's frames (server-sent events, or one
+//! JSON document), and returns. It is the one output pipeline of a token
+//! request, streamed or not.
 //!
 //! Its state is the whole of what a successor goes on writing from: the
 //! incremental decoder, the parsers, the assembled blocks, the stream clock,
@@ -384,12 +384,14 @@ impl<S: ResponseSink> GenerationRun<S> {
         })
     }
 
-    /// The frames of one engine event's outputs.
+    /// The step one engine event's outputs produce: their frames, which are
+    /// none while the sink waits for more.
     ///
-    /// An output the response fails on ends it: the error event and the
-    /// terminal `[DONE]` follow the frames produced before it, as the `Sse`
-    /// path wrote them.
-    fn push(&mut self, event: proto::request::Event) -> Result<Vec<Bytes>, OutputError> {
+    /// An output the response fails on ends it in the sink's own shape
+    /// ([`Self::failed`]): for a stream, the error event and the terminal
+    /// `[DONE]` after the frames produced before it; for one document, the
+    /// failure's status and error document.
+    fn push(&mut self, event: proto::request::Event) -> Result<Step, OutputError> {
         let decoded = self
             .decode
             .push(event, &mut self.events)
@@ -403,20 +405,25 @@ impl<S: ResponseSink> GenerationRun<S> {
                 match self.frames(output) {
                     Ok(output_frames) => frames.extend(output_frames),
                     Err(error) => {
-                        frames.push(error_frame(&error));
-                        frames.push(done_frame());
                         self.ended = true;
-                        return Ok(frames);
+                        return Ok(match self.failed(error) {
+                            Step::Frames(failure) => {
+                                frames.extend(failure);
+                                Step::Frames(frames)
+                            }
+                            failed => failed,
+                        });
                     }
                 }
             }
         }
-        Ok(frames)
+        Ok(Step::Frames(frames))
     }
 
-    /// The outputs one decoded text event produces, as
-    /// [`generation_output`](super::assembly::generation_output) produces
-    /// them.
+    /// The public outputs one decoded text event produces: the prompt and
+    /// scheduling facts first, then each update's content-block, tool-call
+    /// and image events followed by its `TokenDelta`, then the terminal
+    /// event.
     fn outputs(&mut self, event: DecodedTextEvent) -> Result<Vec<RequestOutput>, OutputError> {
         let failed = |source: crate::output::chat::Error| OutputError {
             request_id: self.request_id.clone(),
@@ -716,8 +723,8 @@ impl<S: ResponseSink> Session for GenerationRun<S> {
                     )));
                 }
                 Poll::Ready(EventStep::Event(event)) => match self.push(event) {
-                    Ok(frames) if frames.is_empty() => continue,
-                    Ok(frames) => return Poll::Ready(Step::Frames(frames)),
+                    Ok(Step::Frames(frames)) if frames.is_empty() => continue,
+                    Ok(step) => return Poll::Ready(step),
                     Err(error) => {
                         error!(error = %error.as_report(), "a handed-over response failed");
                         return Poll::Ready(
@@ -951,7 +958,282 @@ impl<M: AsRef<[u8]> + Send + Sync + 'static> Session for VideoContentRun<M> {
 mod tests {
     use std::task::Context;
 
+    use proto::request::{Event, TokenLogprob};
+    use serde_json::Value;
+
     use super::*;
+    use crate::metrics::EngineLabels;
+    use crate::migration::RequestEvents;
+
+    /// Drives a body to its end as its connection does and answers what it
+    /// wrote, with the failure a held head states.
+    async fn answered(run: &mut impl Session) -> (Vec<u8>, Option<ApiError>) {
+        let mut bytes = Vec::new();
+        loop {
+            match std::future::poll_fn(|cx| run.poll_step(cx)).await {
+                Step::Frames(frames) => frames
+                    .iter()
+                    .for_each(|frame| bytes.extend_from_slice(frame)),
+                Step::Migrate => run.migrate().await,
+                Step::Ended => return (bytes, None),
+                Step::Failed { error, frames } => return (frames.concat(), Some(error)),
+            }
+        }
+    }
+
+    /// The response options of a request that asks for `logprobs`.
+    fn context(logprobs: bool) -> ChatResponseContext {
+        ChatResponseContext {
+            request_id: "request".to_owned(),
+            response_model: "model".to_owned(),
+            include_usage: false,
+            requested_logprobs: logprobs,
+            include_prompt_logprobs: false,
+            include_reasoning: true,
+            return_token_ids: false,
+            return_tokens_as_token_ids: false,
+        }
+    }
+
+    /// The body of a request whose prompt is `p`, decoded and parsed as
+    /// `processor` does, over the engine events `events`, written by `sink`.
+    fn run<S: ResponseSink>(
+        processor: ChatOutputProcessor,
+        decode: TextDecodeOptions,
+        logprobs: bool,
+        events: RequestEvents,
+        sink: S,
+    ) -> GenerationRun<S> {
+        let parser = *processor.parser();
+        let outcome = RequestOutcome::new(
+            EngineLabels {
+                model_name: "output-run-model".to_owned(),
+                engine: 0,
+            },
+            Instant::now(),
+            None,
+        );
+        let inputs = ChatOutputInputs {
+            tokenizer: crate::test_support::configured_tokenizer(),
+            prompt_token_ids: vec![u32::from(b'p')],
+            decode,
+            prompt_logprobs: false,
+            logprobs,
+            processor,
+            parser,
+            context: context(logprobs),
+        };
+        GenerationRun::new("request".to_owned(), 7, inputs, events, outcome, sink).unwrap()
+    }
+
+    /// The one JSON document a non-streamed request over `events` answers
+    /// with, or the failure its held head states.
+    async fn document(
+        processor: ChatOutputProcessor,
+        decode: TextDecodeOptions,
+        logprobs: bool,
+        events: RequestEvents,
+    ) -> Result<Value, ApiError> {
+        let sink = ChatBodySink::new(&context(logprobs), 0);
+        let mut body = run(processor, decode, logprobs, events, sink);
+        match answered(&mut body).await {
+            (bytes, None) => Ok(serde_json::from_slice(&bytes).unwrap()),
+            (_, Some(error)) => Err(error),
+        }
+    }
+
+    /// An engine stream of `events` after the request's scheduling.
+    fn engine_events(events: impl IntoIterator<Item = Event>) -> RequestEvents {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(Event::Scheduled {
+            queued_at: 1.0,
+            scheduled_at: 2.0,
+        })
+        .unwrap();
+        for event in events {
+            tx.send(event).unwrap();
+        }
+        RequestEvents::detached(rx)
+    }
+
+    fn text_token(byte: u8) -> Event {
+        Event::TextToken {
+            id: u32::from(byte),
+            logprob: None,
+        }
+    }
+
+    fn finished(reason: proto::request::FinishReason, completion_tokens: usize) -> Event {
+        Event::Finished {
+            reason,
+            stop_reason: None,
+            prompt_tokens: 1,
+            completion_tokens,
+            images: 0,
+        }
+    }
+
+    /// The text of a document's message, empty when it has none.
+    fn content(document: &Value) -> &str {
+        document["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+    }
+
+    /// A generated token's logprob reaches the document beside its text, and
+    /// a request cut at its token limit finishes with `length`.
+    #[tokio::test]
+    async fn a_document_carries_each_tokens_logprob() {
+        let events = engine_events([
+            text_token(b'a'),
+            Event::TokenLogprobs {
+                id: u32::from(b'a'),
+                candidates: vec![TokenLogprob {
+                    token_id: u32::from(b'a'),
+                    logprob: -0.25,
+                    rank: 3,
+                }],
+            },
+            finished(proto::request::FinishReason::MaxTokens, 1),
+        ]);
+        let document = document(
+            ChatOutputProcessor::default(),
+            TextDecodeOptions::default(),
+            true,
+            events,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(content(&document), "a");
+        let token = &document["choices"][0]["logprobs"]["content"][0];
+        assert_eq!(token["token"], "a");
+        assert_eq!(token["logprob"], -0.25);
+        assert_eq!(document["choices"][0]["finish_reason"], "length");
+        assert_eq!(document["usage"]["completion_tokens"], 1);
+    }
+
+    /// A request that finishes without publishing a text token (the engine
+    /// withholds an EOS or excluded stop token) answers no text: the prompt
+    /// seeds decoding only.
+    #[tokio::test]
+    async fn a_request_without_generated_tokens_has_no_text() {
+        let events = engine_events([finished(proto::request::FinishReason::Eos, 1)]);
+        let document = document(
+            ChatOutputProcessor::default(),
+            TextDecodeOptions::default(),
+            false,
+            events,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(content(&document), "");
+        assert_eq!(document["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// An engine failure of a running request (`Error`, or
+    /// `ArtifactUnavailable` when its output cannot be delivered) answers a
+    /// server error, in the head of a document and as the error event of a
+    /// stream.
+    #[tokio::test]
+    async fn an_engine_failure_is_a_server_error() {
+        let failures = || {
+            [
+                Event::Error {
+                    message: "worker call failed".to_string(),
+                },
+                Event::ArtifactUnavailable {
+                    message: "worker call failed".to_string(),
+                },
+            ]
+        };
+        for failure in failures() {
+            let error = document(
+                ChatOutputProcessor::default(),
+                TextDecodeOptions::default(),
+                false,
+                engine_events([text_token(b'a'), failure]),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.status_code(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
+        for failure in failures() {
+            let sink = ChatStreamEmitter::new(&context(false), 0);
+            let mut body = run(
+                ChatOutputProcessor::default(),
+                TextDecodeOptions::default(),
+                false,
+                engine_events([text_token(b'a'), failure]),
+                sink,
+            );
+            let (bytes, failed) = answered(&mut body).await;
+            assert!(failed.is_none());
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(
+                text.contains(r#""type":"server_error""#) && text.ends_with("data: [DONE]\n\n"),
+                "{text}"
+            );
+        }
+    }
+
+    /// An engine rejection of a non-streamed request is the status of its
+    /// document: its head waits for the outcome.
+    #[tokio::test]
+    async fn a_rejected_document_states_its_rejection_in_the_head() {
+        let events = engine_events([Event::Rejected {
+            kind: proto::request::RejectionKind::Invalid,
+            message: "the prompt does not fit".to_owned(),
+        }]);
+        let error = document(
+            ChatOutputProcessor::default(),
+            TextDecodeOptions::default(),
+            false,
+            events,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// Tokens committed together are decoded as one block, and a stop string
+    /// inside a block ends the output at the match with the tokens through
+    /// the one that completed it.
+    #[tokio::test]
+    async fn a_stop_string_inside_a_committed_block_ends_the_output() {
+        let block = |text: &str| Event::TextTokens {
+            ids: text.bytes().map(u32::from).collect(),
+        };
+        let decode = TextDecodeOptions {
+            stop_strings: Some(vec!["END".to_string()]),
+            ..TextDecodeOptions::default()
+        };
+        let processor =
+            ChatOutputProcessor::qwen3(None, crate::test_support::configured_tokenizer(), true)
+                .unwrap();
+        let document = document(
+            processor,
+            decode,
+            false,
+            engine_events([
+                block("first block, "),
+                block("second one. END and more"),
+                block("never decoded"),
+            ]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(content(&document), "first block, second one. ");
+        assert_eq!(document["choices"][0]["finish_reason"], "stop");
+        assert_eq!(document["choices"][0]["stop_reason"], "END");
+        // The first block and the second through the `D` that completes `END`.
+        assert_eq!(document["usage"]["completion_tokens"], 28);
+    }
 
     /// Polls a body to its end and answers the bytes it wrote.
     fn written(run: &mut impl Session) -> Vec<u8> {

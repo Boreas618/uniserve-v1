@@ -1,13 +1,11 @@
 //! Text decoding of a request's engine events.
 //!
 //! `decoded` turns one request's engine events into [`DecodedTextEvent`]s,
-//! which `output::assembly` consumes; `logprobs` converts engine token-ID
+//! which `output::run` consumes; `logprobs` converts engine token-ID
 //! candidates into decoded strings.
 
 pub(crate) use decoded::DecodeStream;
-pub use decoded::{
-    DecodedTextEvent, Finished, ImageEvent, TextDecodeOptions, decoded_text_event_stream,
-};
+pub use decoded::{DecodedTextEvent, Finished, ImageEvent, TextDecodeOptions};
 pub use error::{Error, Result};
 pub use logprobs::{
     DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs, DecodedTokenLogprob,

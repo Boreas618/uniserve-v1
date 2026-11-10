@@ -3,10 +3,11 @@
 //!
 //! The handler validates and lowers the body (the schema's `validator` rules
 //! in `ValidatedJson`, then [`lower_chat_request`]), capturing the response
-//! options ([`ChatResponseContext`]), and runs the request through
-//! `Leader::generate`. Both response paths consume the `RequestOutput`
-//! stream it returns: [`collect_chat_completion`] folds it into one
-//! `ChatCompletionResponse`; [`chat_completion_chunk_stream`] maps it to
+//! options ([`ChatResponseContext`]), submits the request
+//! (`Leader::generate_handed`) and answers with the body
+//! `output::run::GenerationRun` drives one engine event at a time. Its sink
+//! turns each `RequestOutput`: [`ChatCollector`] folds them into one
+//! `ChatCompletionResponse`; [`ChatStreamEmitter`] maps them to
 //! `ChatCompletionStreamResponse` chunks.
 //!
 //! One decoded update from the engine becomes several events: semantic events
@@ -20,7 +21,6 @@ use std::collections::HashMap;
 use std::result::Result;
 use std::sync::Arc;
 
-use asynk_strim_attr::{TryYielder, try_stream};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -28,12 +28,10 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Extension, Router};
-use futures::{Stream, StreamExt as _, pin_mut};
 use itertools::Itertools as _;
 use proto::handoff;
 use proto::request::GenerationConstraint;
 use serde_json::Value;
-use thiserror_ext::AsReport as _;
 use tracing::{debug, error};
 use tracing_futures::Instrument as _;
 
@@ -109,140 +107,111 @@ async fn chat_completions(
 
     // One timestamp for the whole response, shared by every streamed chunk.
     let created = crate::openai::unix_time();
-
-    if stream {
-        let (events, output, compile_us, outcome) = match engine
-            .generate_handed(request)
-            .instrument(request_span.clone())
-            .await
-        {
-            Ok(parts) => parts,
-            Err(error) => return ApiError::from(error).into_response(),
-        };
-        let crate::output::OutputParams {
-            tokenizer,
-            prompt_token_ids,
-            decode,
-            prompt_logprobs,
-            logprobs,
-            processor,
-        } = output;
-        let request_id = response.request_id.clone();
-        let parser = *processor.parser();
-        let sink = crate::openai::chat_completions::ChatStreamEmitter::new(&response, created);
-        let inputs = crate::output::run::ChatOutputInputs {
-            tokenizer,
-            prompt_token_ids,
-            decode,
-            prompt_logprobs,
-            logprobs,
-            processor,
-            parser,
-            context: response,
-        };
-        let run = match crate::output::run::GenerationRun::new(
-            request_id.clone(),
-            compile_us,
-            inputs,
-            events,
-            outcome,
-            sink,
-        ) {
-            Ok(run) => run,
-            Err(error) => {
-                return ApiError::from(crate::output::OutputError {
-                    request_id,
-                    source: error.into(),
-                })
-                .into_response();
-            }
-        };
-        // The response registers before it writes a frame, so a hot restart
-        // pauses it at its next engine event boundary (design §7.5.1).
-        let registration = handoff.register();
-        let stream = crate::http::stream::ResponseStream::start(Box::new(run), true);
-        let Some(body) =
-            crate::http::stream::HandedBody::new(stream, Some(registration), request_id.clone())
-        else {
-            return ApiError::server_error("the response cannot be handed over".to_string())
-                .into_response();
-        };
-        let mut response = Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .header(header::CONNECTION, "keep-alive")
-            .body(Body::empty())
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
-        crate::http::stream::attach(&mut response, body);
-        response
+    let handed = match engine
+        .generate_handed(request)
+        .instrument(request_span.clone())
+        .await
+    {
+        Ok(handed) => handed,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+    let request_id = response.request_id.clone();
+    // A streamed response writes its head at once and answers as server-sent
+    // events; a response answered as one document holds its head until the
+    // document exists, so its status is the outcome.
+    let (session, content_type, held): (Box<dyn crate::http::stream::Session>, _, _) = if stream {
+        let sink = ChatStreamEmitter::new(&response, created);
+        match chat_body(handed, response, sink) {
+            Ok(run) => (Box::new(run), "text/event-stream", false),
+            Err(error) => return error.into_response(),
+        }
     } else {
-        let (events, output, compile_us, outcome) = match engine
-            .generate_handed(request)
-            .instrument(request_span.clone())
-            .await
-        {
-            Ok(parts) => parts,
-            Err(error) => return ApiError::from(error).into_response(),
-        };
-        let crate::output::OutputParams {
-            tokenizer,
-            prompt_token_ids,
-            decode,
-            prompt_logprobs,
-            logprobs,
-            processor,
-        } = output;
-        let request_id = response.request_id.clone();
-        let parser = *processor.parser();
         let sink = crate::output::run::ChatBodySink::new(&response, created);
-        let inputs = crate::output::run::ChatOutputInputs {
-            tokenizer,
-            prompt_token_ids,
-            decode,
-            prompt_logprobs,
-            logprobs,
-            processor,
-            parser,
-            context: response,
-        };
-        let run = match crate::output::run::GenerationRun::new(
-            request_id.clone(),
-            compile_us,
-            inputs,
-            events,
-            outcome,
-            sink,
-        ) {
-            Ok(run) => run,
-            Err(error) => {
-                return ApiError::from(crate::output::OutputError {
-                    request_id,
-                    source: error.into(),
-                })
-                .into_response();
-            }
-        };
-        // The response registers before its body computes, so a hot restart
-        // pauses it at its next engine event boundary and the successor
-        // collects the rest (design §7.5.1).
-        let registration = handoff.register();
-        // The head waits for the document: one status, which is the outcome.
-        let stream = crate::http::stream::ResponseStream::start_held(Box::new(run), false);
-        let Some(body) =
-            crate::http::stream::HandedBody::new(stream, Some(registration), request_id.clone())
-        else {
-            return ApiError::server_error("the response cannot be handed over".to_string())
-                .into_response();
-        };
-        let mut response = Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::empty())
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
-        crate::http::stream::attach(&mut response, body);
-        response
+        match chat_body(handed, response, sink) {
+            Ok(run) => (Box::new(run), "application/json", true),
+            Err(error) => return error.into_response(),
+        }
+    };
+
+    // The response registers before it writes a frame, so a hot restart
+    // pauses it at its next engine event boundary (design §7.5.1).
+    let registration = handoff.register();
+    let stream = if held {
+        crate::http::stream::ResponseStream::start_held(session, false)
+    } else {
+        crate::http::stream::ResponseStream::start(session, true)
+    };
+    let Some(body) =
+        crate::http::stream::HandedBody::new(stream, Some(registration), request_id.clone())
+    else {
+        return ApiError::server_error("the response cannot be handed over".to_string())
+            .into_response();
+    };
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type);
+    if !held {
+        builder = builder
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive");
     }
+    let mut response = builder
+        .body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    crate::http::stream::attach(&mut response, body);
+    response
+}
+
+/// The body of one submitted chat request, whose outputs `sink` turns into
+/// the frames the response writes.
+///
+/// `handed` is what `Leader::generate_handed` returned for the request and
+/// `context` the response options its lowering captured.
+///
+/// # Errors
+///
+/// Fails when the request's output pipeline cannot be built, for example
+/// because its prompt is empty.
+pub(crate) fn chat_body<S: crate::output::run::ResponseSink>(
+    handed: crate::leader::Handed,
+    context: ChatResponseContext,
+    sink: S,
+) -> Result<crate::output::run::GenerationRun<S>, ApiError> {
+    let (events, output, compile_us, outcome) = handed;
+    let crate::output::OutputParams {
+        tokenizer,
+        prompt_token_ids,
+        decode,
+        prompt_logprobs,
+        logprobs,
+        processor,
+    } = output;
+    let request_id = context.request_id.clone();
+    let parser = *processor.parser();
+    let inputs = crate::output::run::ChatOutputInputs {
+        tokenizer,
+        prompt_token_ids,
+        decode,
+        prompt_logprobs,
+        logprobs,
+        processor,
+        parser,
+        context,
+    };
+    crate::output::run::GenerationRun::new(
+        request_id.clone(),
+        compile_us,
+        inputs,
+        events,
+        outcome,
+        sink,
+    )
+    .map_err(|error| {
+        ApiError::from(crate::output::OutputError {
+            request_id,
+            source: error.into(),
+        })
+    })
 }
 
 /// Validates the rules of a chat request that depend on the served model.
@@ -284,8 +253,8 @@ pub fn validate_request_compat(
 /// The response options of one chat request, captured when the request is
 /// lowered.
 ///
-/// The handler passes it to [`collect_chat_completion`] or
-/// [`chat_completion_chunk_stream`].
+/// The handler passes it to the response's sink ([`ChatCollector`] through
+/// `output::run::ChatBodySink`, or [`ChatStreamEmitter`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatResponseContext {
     /// OpenAI-compatible response identifier.
@@ -333,31 +302,6 @@ impl ChatResponseContext {
             return_tokens_as_token_ids: request.return_tokens_as_token_ids.unwrap_or(false),
         }
     }
-}
-
-/// Collects a chat event stream into one non-streaming response.
-///
-/// `context` holds the response options the request chose; `created` is the
-/// response timestamp in UNIX seconds.
-///
-/// When reasoning is present but `include_reasoning` is false, the response
-/// omits output logprobs and token IDs as well as the reasoning text, because
-/// that metadata covers every generated token, reasoning tokens included.
-///
-/// # Errors
-///
-/// Returns `ApiError::rejected` for a `Rejected` event and a server error
-/// when the stream yields an error or a `Failed` event, closes without a
-/// terminal event, lacks output logprobs the response must include or prompt
-/// logprobs the request asked for, or fails to convert output logprobs.
-pub async fn collect_chat_completion(
-    stream: impl Stream<Item = Result<RequestOutput, crate::output::OutputError>> + Send,
-    context: ChatResponseContext,
-    created: u64,
-) -> Result<ChatCompletionResponse, ApiError> {
-    // Usage is part of every non-streaming response.
-    let collected = collect_chat_events(stream).await?;
-    chat_response(collected, &context, created)
 }
 
 /// The non-streaming response of one collected request.
@@ -467,7 +411,7 @@ pub(crate) fn chat_response(
     })
 }
 
-/// Everything `collect_chat_events` accumulates from one request's stream.
+/// Everything a [`ChatCollector`] accumulates from one request's outputs.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CollectedChatOutput {
     message: AssistantMessage,
@@ -794,29 +738,6 @@ fn decoded_prompt_logprobs(state: &handoff::DecodedPromptLogprobs) -> DecodedPro
     }
 }
 
-/// Collects semantic serving events into one non-streaming chat response payload.
-///
-/// The closed content blocks and tool calls carry the complete message, so
-/// the deltas inside them are skipped.
-async fn collect_chat_events(
-    stream: impl Stream<Item = Result<RequestOutput, crate::output::OutputError>> + Send,
-) -> Result<CollectedChatOutput, ApiError> {
-    pin_mut!(stream);
-    let mut collector = ChatCollector::new();
-    while let Some(next) = stream.next().await {
-        match next {
-            Ok(output) => collector.push(&output)?,
-            Err(error) => {
-                return Err(server_error!(
-                    "chat completion stream failed: {}",
-                    error.to_report_string()
-                ));
-            }
-        }
-    }
-    collector.collected()
-}
-
 /// The OpenAI chunks of one streamed chat completion: converts one serving
 /// event stream into OpenAI chat-completion chunks.
 ///
@@ -1109,7 +1030,7 @@ impl ChatStreamEmitter {
                 return Err(ApiError::rejected(*kind, message.clone()));
             }
             RequestOutput::Failed { message } => {
-                // As in `collect_chat_completion`, the failure detail is
+                // As in the collected response, the failure detail is
                 // logged but not returned to the client.
                 error!(%message, "chat completion failed");
                 bail_server_error!("Internal server error");
@@ -1172,40 +1093,6 @@ impl ChatStreamEmitter {
                 || pending.token_ids.is_some()
         })
     }
-}
-
-/// Builds the chunk stream of one streamed chat completion.
-///
-/// # Errors
-///
-/// Fails as the response does: a rejected or failed request, or logprobs that
-/// cannot be converted.
-#[try_stream]
-pub async fn chat_completion_chunk_stream(
-    stream: impl Stream<Item = Result<RequestOutput, crate::output::OutputError>> + Send,
-    context: ChatResponseContext,
-    created: u64,
-    mut y: TryYielder<ChatCompletionStreamResponse, ApiError>,
-) -> Result<(), ApiError> {
-    let mut emitter = ChatStreamEmitter::new(&context, created);
-    pin_mut!(stream);
-    while let Some(next) = stream.next().await {
-        match next {
-            Ok(output) => {
-                for chunk in emitter.push(&output)? {
-                    y.yield_ok(chunk).await;
-                }
-            }
-            Err(error) => {
-                error!(
-                    error = %error.as_report(),
-                    "chat stream failed"
-                );
-                bail_server_error!("{}", error.to_report_string());
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Builds a streaming usage chunk.
@@ -1886,13 +1773,10 @@ fn clamp_logprob(logprob: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use futures::{StreamExt as _, stream};
-
     use super::super::protocol::ChatCompletionStreamResponse;
     use super::ChatCollector;
     use super::ChatResponseContext;
     use super::ChatStreamEmitter;
-    use super::chat_completion_chunk_stream;
     use super::chat_response;
     use crate::output::chat::{AssistantBlockKind, AssistantContentBlock};
     use crate::output::text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
@@ -1970,14 +1854,16 @@ mod tests {
             return_token_ids: true,
             return_tokens_as_token_ids: false,
         };
-        let chunks = chat_completion_chunk_stream(stream::iter(thinking_response()), context, 0)
-            .collect::<Vec<_>>()
-            .await;
+        let mut emitter = ChatStreamEmitter::new(&context, 0);
+        let chunks: Vec<ChatCompletionStreamResponse> = thinking_response()
+            .into_iter()
+            .flat_map(|output| emitter.push(&output.unwrap()).unwrap())
+            .collect();
 
         let mut token_ids = Vec::new();
         let mut logprob_positions = 0;
         for chunk in chunks {
-            for choice in chunk.unwrap().choices {
+            for choice in chunk.choices {
                 token_ids.extend(choice.token_ids.unwrap_or_default());
                 logprob_positions += choice
                     .logprobs

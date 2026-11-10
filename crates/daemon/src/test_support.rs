@@ -41,16 +41,16 @@ pub(crate) const SERVED_MODEL: &str = "sim-model";
 pub(crate) use frontend::test_support::{configured_tokenizer, load_tokenizer};
 
 /// The server's router over `engine` under the default server options.
-pub(crate) fn router(engine: Leader) -> Router {
+pub(crate) fn router(engine: impl Into<Arc<Leader>>) -> Router {
     router_with(engine, &ServerConfig::default())
 }
 
 /// The daemon's router over `engine` under `server`, with the HTTP body limit
 /// for the video submission routes and default video job options.
-pub(crate) fn router_with(engine: Leader, server: &ServerConfig) -> Router {
+pub(crate) fn router_with(engine: impl Into<Arc<Leader>>, server: &ServerConfig) -> Router {
     let jobs = VideoJobs::new(VideoJobConfig::default(), CancellationToken::new());
     crate::http::router(
-        Arc::new(engine),
+        engine.into(),
         Arc::new(jobs),
         server,
         crate::http::BODY_LIMIT,
@@ -489,6 +489,27 @@ pub(crate) async fn send(
         serde_json::from_slice(&bytes).unwrap()
     };
     (parts.status, parts.headers, json)
+}
+
+/// Sends `request`, whose response is a streamed body, through `router` and
+/// returns the body's frames as the connection reads them; dropping the
+/// handle is the client going away.
+pub(crate) async fn send_streamed(
+    router: &Router,
+    request: Request<Body>,
+) -> crate::http::stream::ResponseStream {
+    let waited = format!("{} {}", request.method(), request.uri());
+    let response = match tokio::time::timeout(STALL, router.clone().oneshot(request)).await {
+        Ok(response) => response.unwrap(),
+        Err(_) => panic!("{waited} answered nothing within {} s", STALL.as_secs()),
+    };
+    assert_eq!(response.status(), StatusCode::OK, "{waited}");
+    response
+        .extensions()
+        .get::<crate::http::stream::HandedBody>()
+        .and_then(crate::http::stream::HandedBody::take)
+        .unwrap_or_else(|| panic!("{waited} answered no streamed body"))
+        .stream
 }
 
 /// Builds a JSON `POST` request to `path`.

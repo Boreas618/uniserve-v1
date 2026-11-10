@@ -13,15 +13,16 @@
 //!    to the engine process, which routes it to one of its schedulers and
 //!    returns its events ([`RequestEvents`]), across the engines that serve
 //!    it when it migrates;
-//! 3. the events are assembled into public [`RequestOutput`] events
-//!    ([`output::generation_output`], [`output::media_output`]) and wrapped
-//!    in [`RequestStats`], which records the request's metrics once.
+//! 3. the events are assembled into public [`RequestOutput`] events: a
+//!    token request's by the body that writes its response
+//!    (`output::run::GenerationRun`, from [`Leader::generate_handed`]'s
+//!    parts), a media request's by [`output::media_output`] wrapped in
+//!    `RequestStats`; either records the request's metrics once.
 //!
-//! Dropping the returned stream drops its `RequestEvents`, which cancels the
-//! request in the engine that serves it; that is the only cancellation path.
+//! Dropping a request's `RequestEvents` cancels the request in the engine
+//! that serves it; that is the only cancellation path.
 //!
 //! [`RequestOutput`]: crate::output::RequestOutput
-//! [`output::generation_output`]: crate::output::generation_output
 //! [`output::media_output`]: crate::output::media_output
 
 use std::collections::BTreeMap;
@@ -53,6 +54,16 @@ use crate::migration::{Migrator, RequestEvents};
 use crate::model::ModelConfig;
 use crate::options::{ReasoningParser, ServerArgs, Stated};
 use crate::output::RequestOutputStream;
+
+/// What one submitted generation request's body is built from: its engine
+/// events, the parameters of its output pipeline, how long it took to reach
+/// the engine in microseconds, and the recorder of its statistics.
+pub(crate) type Handed = (
+    RequestEvents,
+    crate::output::OutputParams,
+    u64,
+    crate::metrics::stats::RequestOutcome,
+);
 
 /// How long the epoch's Program Servers may take to select its programs.
 ///
@@ -1161,55 +1172,6 @@ impl Leader {
             .any(|replica| replica.hold.is_serving())
     }
 
-    /// Fetches the input images of a generation request, renders and
-    /// tokenizes it, and streams its output.
-    ///
-    /// A chat prompt's `image_url` parts are fetched only for a model that
-    /// accepts image input; for any other model, preprocessing rejects them
-    /// without network access.
-    ///
-    /// # Errors
-    ///
-    /// Fails when an image cannot be fetched, preprocessing refuses the
-    /// request, or no scheduler accepts it.
-    pub async fn generate(
-        &self,
-        request: GenerateRequest,
-    ) -> Result<RequestOutputStream, ServeError> {
-        // Compilation, and with it the request's latency, is measured from
-        // here, so image fetching and time queued for the blocking pool
-        // count toward it.
-        let started = Instant::now();
-        let request_id = request.request_id.clone();
-        let image_urls = match &request.prompt {
-            Prompt::Chat(chat) if self.processor.supports_image_input() => chat.image_urls(),
-            _ => Vec::new(),
-        };
-        let images = self
-            .images
-            .fetch_images(image_urls)
-            .await
-            .map_err(|error| ServeError::ImageInput {
-                request_id: request_id.clone(),
-                index: error.index,
-                source: error.source,
-            })?;
-        let processor = Arc::clone(&self.processor);
-        let (request, output) =
-            preprocess(&request_id, move || processor.preprocess(request, images)).await?;
-
-        let compile_us = elapsed_us(started);
-        let (events, core) = self.submit(request.into()).await?;
-        let output = crate::output::generation_output(
-            request_id.clone(),
-            started,
-            compile_us,
-            output,
-            events,
-        );
-        Ok(self.stats(request_id, started, core, output))
-    }
-
     /// Submits one generation request and returns what its handoffable body
     /// is built from: the request's engine events, the pipeline that produces
     /// its output, how long it took to reach the engine, and the recorder of
@@ -1219,21 +1181,18 @@ impl Leader {
     /// (`output::run::GenerationRun`), so the response can stop at an engine
     /// event boundary and go on in a successor.
     ///
+    /// A chat prompt's `image_url` parts are fetched only for a model that
+    /// accepts image input; for any other model, preprocessing rejects them
+    /// without network access.
+    ///
     /// # Errors
     ///
-    /// Fails as [`Self::generate`] does.
+    /// Fails when an image cannot be fetched, preprocessing refuses the
+    /// request, or no scheduler accepts it.
     pub(crate) async fn generate_handed(
         &self,
         request: GenerateRequest,
-    ) -> Result<
-        (
-            RequestEvents,
-            crate::output::OutputParams,
-            u64,
-            crate::metrics::stats::RequestOutcome,
-        ),
-        ServeError,
-    > {
+    ) -> Result<Handed, ServeError> {
         let started = Instant::now();
         let request_id = request.request_id.clone();
         let image_urls = match &request.prompt {
@@ -3539,7 +3498,6 @@ mod tests {
     use std::time::Duration;
 
     use crate::metrics::METRICS;
-    use futures::{StreamExt as _, poll};
     use proto::request::{
         Event, GenerationConstraint, GenerationRequest, ImageGenerationConfig, Request,
     };
@@ -3547,15 +3505,9 @@ mod tests {
     use scheduler::{SchedulerHandle, SimEngine, SimWorker, Worker};
 
     use super::{EngineState, Leader, keeps_standby};
-    use crate::input::GenerateRequest;
-    use crate::openai::ChatCompletionRequest;
-    use crate::openai::chat_completions::{
-        ChatResponseContext, collect_chat_completion, lower_chat_request,
-    };
-    use crate::output::{FinishReason, RequestOutput};
     use crate::test_support::{
-        SERVED_MODEL, configured_tokenizer, leader_over, sim_client, sim_core, sim_engine_over,
-        sim_model,
+        SERVED_MODEL, STALL, configured_tokenizer, leader_over, post_json, router, send,
+        send_streamed, sim_client, sim_core, sim_engine_over, sim_model,
     };
 
     /// A Qwen3 engine over one scheduler, named `engine_model`, that drives
@@ -3568,38 +3520,39 @@ mod tests {
         sim_engine_over(crate::test_support::CHAT, vec![core])
     }
 
-    /// `request` as the chat route lowers it for the served model.
-    fn lowered(id: &str, request: ChatCompletionRequest) -> GenerateRequest {
-        lower_chat_request(id.to_owned(), SERVED_MODEL, request)
-            .unwrap()
-            .0
-    }
-
     /// Greedy chat request of at most `max_completion_tokens` tokens that may
-    /// sample only `a`, stopping on each of `stop`.
-    fn chat_request(max_completion_tokens: u32, stop: &[&str]) -> ChatCompletionRequest {
-        serde_json::from_value(serde_json::json!({
+    /// sample only `a`, stopping on each of `stop`, streamed when `stream`.
+    fn chat_request(max_completion_tokens: u32, stop: &[&str], stream: bool) -> serde_json::Value {
+        serde_json::json!({
             "model": SERVED_MODEL,
             "messages": [{"role": "user", "content": "prompt"}],
             "max_completion_tokens": max_completion_tokens,
             "temperature": 0.0,
             "allowed_token_ids": [u32::from(b'a')],
             "stop": stop,
-        }))
-        .unwrap()
+            "stream": stream,
+        })
     }
 
-    /// Reads `stream` to its end and returns its terminal reason and usage.
-    async fn finish(
-        mut stream: crate::output::RequestOutputStream,
-    ) -> (FinishReason, crate::output::RequestUsage) {
-        let mut finished = None;
-        while let Some(event) = stream.next().await {
-            if let RequestOutput::Finished { reason, usage } = event.unwrap() {
-                finished = Some((reason, usage));
-            }
+    /// Answers `body` through the chat route of `engine`'s router.
+    async fn chat(
+        router: &axum::Router,
+        body: &serde_json::Value,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let (status, _, document) = send(router, post_json("/v1/chat/completions", body)).await;
+        (status, document)
+    }
+
+    /// Waits until the rendered process-wide metrics hold `line`.
+    async fn metrics_reach(line: &str) {
+        let deadline = tokio::time::Instant::now() + STALL;
+        while !rendered_metrics_hold(line) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the metrics never held `{line}`"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        finished.expect("the request finishes")
     }
 
     /// Returns whether the rendered process-wide metrics hold `line`.
@@ -3844,40 +3797,26 @@ mod tests {
     }
 
     /// A chat prompt that exceeds the total capacity of a two-unit prefix
-    /// cache is returned as a stream and then rejected by engine admission.
-    /// Collecting the completion must report that rejection as HTTP 400.
+    /// cache is submitted and then rejected by engine admission. The
+    /// non-streamed response holds its head for the outcome, so it answers
+    /// that rejection as HTTP 400.
     #[tokio::test]
     async fn chat_admission_rejection_remains_a_bad_request() {
         let mut worker = SimEngine::new();
         // Unit zero is the sentinel: two allocatable 64-token pages remain.
         worker.set_num_units(3);
-        let engine = qwen3_engine(worker, SERVED_MODEL);
-        let request = serde_json::from_value(serde_json::json!({
+        let engine = Arc::new(qwen3_engine(worker, SERVED_MODEL));
+        let router = router(Arc::clone(&engine));
+        let request = serde_json::json!({
             "model": SERVED_MODEL,
             "messages": [{"role": "user", "content": "a".repeat(1024)}],
             "max_completion_tokens": 8
-        }))
-        .unwrap();
+        });
 
-        let stream = engine
-            .generate(lowered("rejected-chat", request))
-            .await
-            .unwrap();
-        let context = ChatResponseContext {
-            request_id: "rejected-chat".to_string(),
-            response_model: SERVED_MODEL.to_string(),
-            include_usage: false,
-            requested_logprobs: false,
-            include_prompt_logprobs: false,
-            include_reasoning: false,
-            return_token_ids: false,
-            return_tokens_as_token_ids: false,
-        };
-        let error = collect_chat_completion(stream, context, 0)
-            .await
-            .unwrap_err();
+        let (status, document) = chat(&router, &request).await;
 
-        assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{document}");
+        assert_eq!(document["error"]["type"], "invalid_request_error");
         engine.shutdown().await.unwrap();
     }
 
@@ -3891,7 +3830,9 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let engine = qwen3_engine(SimEngine::new(), SERVED_MODEL);
+            let engine_model = "preprocessing-latency-model";
+            let engine = Arc::new(qwen3_engine(SimEngine::new(), engine_model));
+            let router = router(Arc::clone(&engine));
 
             // Hold the only blocking thread so preprocessing waits in the
             // queue for a measurable interval before it runs.
@@ -3903,18 +3844,26 @@ mod tests {
             });
             ready_rx.await.unwrap();
             let wait = Duration::from_millis(25);
-            let mut pending = Box::pin(engine.generate(lowered("timed", chat_request(8, &["aa"]))));
-            assert!(poll!(pending.as_mut()).is_pending());
+            let pending = tokio::spawn({
+                let router = router.clone();
+                async move { chat(&router, &chat_request(8, &["aa"], false)).await }
+            });
             tokio::time::sleep(wait).await;
             release_tx.send(()).unwrap();
             occupied.await.unwrap();
 
-            let (_, usage) = finish(pending.await.unwrap()).await;
-            assert!(
-                usage.timings.total_us >= wait.as_micros() as u64,
-                "{:?}",
-                usage.timings
-            );
+            let (status, document) = pending.await.unwrap();
+            assert_eq!(status, axum::http::StatusCode::OK, "{document}");
+            let labels = format!("model_name=\"{engine_model}\",engine=\"0\"");
+            let series = format!("uniserve:e2e_request_latency_seconds_sum{{{labels}}} ");
+            let rendered = METRICS.render().unwrap();
+            let seconds: f64 = rendered
+                .lines()
+                .find_map(|line| line.strip_prefix(&series))
+                .unwrap_or_else(|| panic!("no `{series}` in:\n{rendered}"))
+                .parse()
+                .unwrap();
+            assert!(seconds >= wait.as_secs_f64(), "{seconds} s");
             engine.shutdown().await.unwrap();
         });
     }
@@ -3926,23 +3875,19 @@ mod tests {
     #[tokio::test]
     async fn completed_request_is_recorded_in_request_metrics() {
         let engine_model = "request-metrics-model";
-        let engine = qwen3_engine(SimEngine::new(), engine_model);
+        let engine = Arc::new(qwen3_engine(SimEngine::new(), engine_model));
+        let router = router(Arc::clone(&engine));
 
-        let stream = engine
-            .generate(lowered("metrics", chat_request(3, &[])))
-            .await
-            .unwrap();
-        let (reason, usage) = finish(stream).await;
-        assert_eq!(reason, FinishReason::Length);
-        assert_eq!(usage.output_tokens, 3);
+        let (status, document) = chat(&router, &chat_request(3, &[], false)).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{document}");
+        assert_eq!(document["choices"][0]["finish_reason"], "length");
+        assert_eq!(document["usage"]["completion_tokens"], 3);
+        let prompt_tokens = &document["usage"]["prompt_tokens"];
 
         let labels = format!("model_name=\"{engine_model}\",engine=\"0\"");
         for expected in [
             format!("uniserve:request_success_total{{{labels},finished_reason=\"length\"}} 1"),
-            format!(
-                "uniserve:prompt_tokens_total{{{labels}}} {}",
-                usage.prompt_tokens
-            ),
+            format!("uniserve:prompt_tokens_total{{{labels}}} {prompt_tokens}"),
             format!("uniserve:generation_tokens_total{{{labels}}} 3"),
             format!("uniserve:request_prompt_tokens_count{{{labels}}} 1"),
             format!("uniserve:request_generation_tokens_count{{{labels}}} 1"),
@@ -3963,18 +3908,16 @@ mod tests {
         let cores = (0..2)
             .map(|_| sim_core(scheduler::sim_args(engine_model), SimEngine::new()))
             .collect();
-        let engine = sim_engine_over(crate::test_support::CHAT, cores);
+        let engine = Arc::new(sim_engine_over(crate::test_support::CHAT, cores));
+        let router = router(Arc::clone(&engine));
 
-        // Both requests are submitted before either stream is read, so the
-        // first is still in flight when the second is routed.
-        let mut streams = Vec::new();
-        for id in ["core-a", "core-b"] {
-            let request = lowered(id, chat_request(3, &[]));
-            streams.push(engine.generate(request).await.unwrap());
-        }
-        for stream in streams {
-            assert_eq!(finish(stream).await.0, FinishReason::Length);
-        }
+        // Both requests are in flight together, so the second is routed
+        // while the first is still served.
+        let request = chat_request(3, &[], false);
+        let ((first, _), (second, _)) =
+            futures::join!(chat(&router, &request), chat(&router, &request));
+        assert_eq!(first, axum::http::StatusCode::OK);
+        assert_eq!(second, axum::http::StatusCode::OK);
 
         for core in 0..2 {
             let expected = format!(
@@ -3994,18 +3937,24 @@ mod tests {
         let engine_model = "disconnect-metrics-model";
         let mut worker = SimEngine::new();
         worker.set_text_len(1_000_000);
-        let engine = qwen3_engine(worker, engine_model);
+        let engine = Arc::new(qwen3_engine(worker, engine_model));
+        let router = router(Arc::clone(&engine));
 
-        let mut stream = engine
-            .generate(lowered("disconnect", chat_request(1_000, &[])))
-            .await
-            .unwrap();
+        let mut stream = send_streamed(
+            &router,
+            post_json("/v1/chat/completions", &chat_request(1_000, &[], true)),
+        )
+        .await;
         loop {
-            match stream.next().await.unwrap().unwrap() {
-                RequestOutput::TextDelta { text } if !text.is_empty() => break,
-                _ => {}
+            let frame = tokio::time::timeout(STALL, stream.next_frame())
+                .await
+                .expect("the stream writes")
+                .expect("the stream goes on");
+            if std::str::from_utf8(&frame).is_ok_and(|frame| frame.contains(r#""content":"a"#)) {
+                break;
             }
         }
+        // The connection is gone: the body's frames have no reader.
         drop(stream);
 
         let labels = format!("model_name=\"{engine_model}\",engine=\"0\"");
@@ -4013,7 +3962,7 @@ mod tests {
             format!("uniserve:request_success_total{{{labels},finished_reason=\"abort\"}} 1"),
             format!("uniserve:e2e_request_latency_seconds_count{{{labels}}} 1"),
         ] {
-            assert!(rendered_metrics_hold(&expected), "missing `{expected}`");
+            metrics_reach(&expected).await;
         }
         let rendered = METRICS.render().unwrap();
         for family in [
