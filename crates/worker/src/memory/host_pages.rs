@@ -44,7 +44,8 @@ pub(crate) struct HostPages {
     pool: u64,
     storage: Arc<Storage>,
     slots: u64,
-    page_bytes: u64,
+    /// The shape of the pool's pages, with the page bytes the server holds them at.
+    shape: PageShape,
 }
 
 impl HostPages {
@@ -102,7 +103,10 @@ impl HostPages {
             pool,
             storage,
             slots,
-            page_bytes,
+            shape: PageShape {
+                page_bytes,
+                ..shape
+            },
         })
     }
 
@@ -113,7 +117,12 @@ impl HostPages {
 
     /// The bytes of one page.
     pub(crate) fn page_bytes(&self) -> u64 {
-        self.page_bytes
+        self.shape.page_bytes
+    }
+
+    /// The shape of the pool's pages: its layout, the kv heads a page holds and its bytes.
+    pub(crate) fn shape(&self) -> PageShape {
+        self.shape
     }
 
     /// The host address of host page `page`.
@@ -128,7 +137,7 @@ impl HostPages {
                 self.pool, self.slots
             )));
         }
-        Ok(self.storage.address() + page * self.page_bytes)
+        Ok(self.storage.address() + page * self.shape.page_bytes)
     }
 
     /// The `uint8 [page_bytes]` view of host page `page`.
@@ -140,9 +149,9 @@ impl HostPages {
         self.address(page)?;
         StorageView::contiguous(
             Arc::clone(&self.storage) as Arc<dyn Backing>,
-            (page * self.page_bytes) as usize,
+            (page * self.shape.page_bytes) as usize,
             ElementType::U8,
-            &[self.page_bytes as i64],
+            &[self.shape.page_bytes as i64],
         )
     }
 }

@@ -162,6 +162,15 @@ pub struct KvCacheConfig {
     /// keeps per request slot (a recurrent state); the engine's default
     /// when unset.
     pub state_interval: Option<NonZeroU32>,
+    /// The Storage Server endpoints (`host:port`) of other hosts serving the
+    /// same model under the same served name, whose published host KV cache
+    /// pages admission reads when they deepen a prompt's hit: the pages are
+    /// pinned there by key, read into this host's pools by its Transfer
+    /// Server and loaded like host pages. The endpoints are unauthenticated;
+    /// the hosts rely on the isolation of their network. Applies with
+    /// `host_tier`; none when empty.
+    #[serde(deserialize_with = "values::list::deserialize")]
+    pub peers: Vec<String>,
 }
 
 impl Default for KvCacheConfig {
@@ -177,6 +186,7 @@ impl Default for KvCacheConfig {
             mooncake: None,
             boundary_interval: None,
             state_interval: None,
+            peers: Vec::new(),
         }
     }
 }

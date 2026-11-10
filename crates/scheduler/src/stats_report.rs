@@ -42,6 +42,7 @@ pub struct SchedulerStatsReporter {
     last_prefix_queries: u64,
     last_prefix_hit_tokens: u64,
     last_prefix_host_hit_tokens: u64,
+    last_prefix_peer_hit_tokens: u64,
     last_queue_wait_count: u64,
     last_queue_wait_us_total: u64,
     last_worker_forward_stats: ForwardStats,
@@ -80,6 +81,10 @@ impl SchedulerStatsReporter {
         let delta_host_hit_tokens =
             prefix_host_hit_tokens.saturating_sub(self.last_prefix_host_hit_tokens);
         self.last_prefix_host_hit_tokens = prefix_host_hit_tokens;
+        let prefix_peer_hit_tokens = stats.prefix.peer_hit_tokens.load(Ordering::Relaxed);
+        let delta_peer_hit_tokens =
+            prefix_peer_hit_tokens.saturating_sub(self.last_prefix_peer_hit_tokens);
+        self.last_prefix_peer_hit_tokens = prefix_peer_hit_tokens;
 
         let queue_wait_count = stats.timing.queue_wait_count.load(Ordering::Relaxed);
         let queue_wait_us_total = stats.timing.queue_wait_us_total.load(Ordering::Relaxed);
@@ -134,6 +139,7 @@ impl SchedulerStatsReporter {
                     hits: delta_hit_tokens,
                 },
                 host_hits: delta_host_hit_tokens,
+                peer_hits: delta_peer_hit_tokens,
                 preempted_requests: 0,
                 ..Default::default()
             },

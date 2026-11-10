@@ -62,6 +62,8 @@ pub struct PrefixStats {
     pub hit_tokens: AtomicU64,
     /// The part of `hit_tokens` loaded from the host KV cache.
     pub host_hit_tokens: AtomicU64,
+    /// The part of `host_hit_tokens` read from peer hosts' pools first.
+    pub peer_hit_tokens: AtomicU64,
 }
 
 /// Encoder-output (multimodal) cache counters.

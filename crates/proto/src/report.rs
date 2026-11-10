@@ -41,6 +41,9 @@ pub struct PrefixCacheStats {
     /// The part of `base.hits` loaded from the host KV cache, in tokens.
     #[serde(default)]
     pub host_hits: u64,
+    /// The part of `host_hits` read from peer hosts' pools first, in tokens.
+    #[serde(default)]
+    pub peer_hits: u64,
     /// The number of requests preempted before this stats update.
     pub preempted_requests: u64,
     /// The `queries` number for preempted requests.

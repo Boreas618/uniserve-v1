@@ -19,12 +19,15 @@
 //! `cargo test -p storage-server --test it remote -- --ignored`.
 
 use std::os::fd::AsFd;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use ::storage::protocol::{Priority, Reply, Request, TransferEnd};
-use ::storage::{Access, Client, Role, TensorRecord};
+use ::storage::protocol::{PageShape, PageSlot, Priority, Region, Reply, Request, TransferEnd};
+use ::storage::{Access, Client, Key, Role, TensorRecord};
 
-use crate::server::{FORKING, Running, head, host, key, memfd, scope, tensor, worker};
+use crate::server::{
+    FORKING, Running, engine_head, epoch_worker, head, host, key, memfd, scope, tensor, worker,
+};
 use crate::transfer::{
     Gpus, end_of, read, remote_region, serving, span, tensor_region, transfer_pid, transfer_server,
 };
@@ -205,6 +208,170 @@ fn a_process_of_another_host_reads_a_small_read_only_tensor_of_bytes() {
     ] {
         let error = peer.read(deployment.into(), key).unwrap_err().to_string();
         assert!(error.contains(reason), "{error}");
+    }
+}
+
+/// A page pool of `slots` pages of `page_bytes` bytes of layout 3 that
+/// `worker` maps, with its storage.
+fn page_pool(worker: &mut Client, page_bytes: u64, slots: u64) -> (u64, std::fs::File) {
+    let shape = PageShape {
+        layout: key(3),
+        kv_head_offset: 0,
+        kv_head_count: 2,
+        page_bytes,
+    };
+    let answer = worker
+        .call(
+            &Request::PagePool {
+                shape,
+                numa_node: None,
+                bytes: Some(slots * page_bytes),
+            },
+            &[],
+        )
+        .unwrap();
+    let Reply::PagePool { pool, .. } = answer.reply else {
+        panic!("the page pool was refused: {:?}", answer.reply);
+    };
+    let storage = answer
+        .descriptors
+        .into_iter()
+        .next()
+        .expect("the pool's storage");
+    (pool, std::fs::File::from(storage))
+}
+
+/// Reserve slots for `keys` in `pool` for `writer` (`None`: the head's own
+/// transfer tasks), every key a slot.
+fn reserve(
+    head: &mut Client,
+    pool: u64,
+    writer: Option<::storage::Scope>,
+    keys: &[Key],
+) -> Vec<u64> {
+    let Reply::Reserved { slots } = head
+        .call(
+            &Request::Reserve {
+                pool,
+                writer,
+                keys: keys.to_vec(),
+                window: None,
+            },
+            &[],
+        )
+        .unwrap()
+        .reply
+    else {
+        panic!("the reservation was refused");
+    };
+    slots
+        .into_iter()
+        .map(|slot| match slot {
+            PageSlot::Reserved { slot } => slot,
+            other => panic!("a key was given no slot: {other:?}"),
+        })
+        .collect()
+}
+
+/// The peer read of host pages: a scheduler of another host pins the
+/// published pages of this host's pool by key, reserves slots for them in
+/// its own host's pool, and its host's Transfer Server READs the pinned
+/// slots into them through NIXL; the committed copies hold the same bytes.
+#[test]
+#[ignore = "requires an RDMA adapter and NIXL"]
+fn a_peer_reads_published_pages_into_its_own_pool() {
+    const PAGE: u64 = 64 << 10;
+    let source_host = rdma_host();
+    let destination_host = rdma_host();
+    let keys = [key(11), key(12), key(13)];
+
+    // The source host serves epoch 1, published, whose pages a worker wrote.
+    let mut source_daemon = head(&source_host.socket);
+    let claim = source_daemon
+        .claim(1, vec![scope("text", 0)], Vec::new())
+        .unwrap();
+    source_daemon.publish_epochs(vec![1]).unwrap();
+    let mut source_worker = epoch_worker(&source_host.socket, scope("text", 0), 1, claim);
+    let (source_pool, source_storage) = page_pool(&mut source_worker, PAGE, 8);
+    let mut source_head = engine_head(&source_host.socket, 1);
+    let written = reserve(&mut source_head, source_pool, Some(scope("text", 0)), &keys);
+    let pages: Vec<Vec<u8>> = (0..keys.len())
+        .map(|page| sequence(PAGE as usize, 31 * page as u64 + 1))
+        .collect();
+    for (slot, bytes) in written.iter().zip(&pages) {
+        source_storage.write_all_at(bytes, slot * PAGE).unwrap();
+    }
+    source_head
+        .call(
+            &Request::Commit {
+                pool: source_pool,
+                keys: keys.to_vec(),
+            },
+            &[],
+        )
+        .unwrap();
+
+    // The destination host's scheduler pins them at the source as a peer.
+    let source = endpoint(&source_host.socket);
+    let mut peer = Client::connect_peer(&source, std::time::Duration::from_secs(30)).unwrap();
+    let pinned = peer
+        .peer_pin("model".into(), vec![key(3)], keys.to_vec())
+        .unwrap();
+    assert_eq!(pinned.len(), 1);
+    let sources: Vec<u64> = pinned[0].slots.iter().map(|slot| slot.unwrap()).collect();
+
+    // Its own pool reserves slots its head's task writes, and the task
+    // READs every page whole from its peer slot.
+    let mut destination_daemon = head(&destination_host.socket);
+    let claim = destination_daemon
+        .claim(1, vec![scope("text", 0)], Vec::new())
+        .unwrap();
+    destination_daemon.publish_epochs(vec![1]).unwrap();
+    let mut destination_worker = epoch_worker(&destination_host.socket, scope("text", 0), 1, claim);
+    let (destination_pool, destination_storage) = page_pool(&mut destination_worker, PAGE, 8);
+    let mut destination_head = engine_head(&destination_host.socket, 1);
+    let reserved = reserve(&mut destination_head, destination_pool, None, &keys);
+    let spans = sources
+        .iter()
+        .zip(&reserved)
+        .map(|(source_slot, slot)| {
+            span(
+                remote_region(
+                    &source,
+                    Region::Pool {
+                        pool: pinned[0].pool,
+                    },
+                ),
+                source_slot * PAGE,
+                Region::Pool {
+                    pool: destination_pool,
+                },
+                slot * PAGE,
+                PAGE,
+            )
+        })
+        .collect();
+    let task = destination_head
+        .transfer(spans, Priority::Request, 0)
+        .unwrap();
+    assert_eq!(
+        end_of(&mut destination_head, task),
+        (3 * PAGE, TransferEnd::Complete)
+    );
+    destination_head
+        .call(
+            &Request::Commit {
+                pool: destination_pool,
+                keys: keys.to_vec(),
+            },
+            &[],
+        )
+        .unwrap();
+    peer.peer_unpin(pinned[0].pool, keys.to_vec()).unwrap();
+
+    for (slot, expected) in reserved.iter().zip(&pages) {
+        let copied = read(&destination_storage, slot * PAGE, PAGE as usize);
+        assert_eq!(first_difference(&copied, expected), None, "a page differs");
     }
 }
 

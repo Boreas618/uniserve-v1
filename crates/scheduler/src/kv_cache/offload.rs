@@ -26,6 +26,24 @@
 //!   loads the pages into those units (`Batch::page_loads`) and computes
 //!   from the boundary, and the pins end once that call's result is
 //!   accepted. Pages that did not arrive in time are computed.
+//! - **Peer loads.** A deployment may name the Storage Servers of other
+//!   hosts that serve the same model under the same name
+//!   (`kv_cache_config.peers`). When neither the pools nor the KV storage
+//!   would deepen the hit by [`PREFETCH_MIN_TOKENS`], admission asks every
+//!   peer for the keys at once: it pins, by key, the published pages of the
+//!   peer's pools whose page shape (layout and kv head slice) equals a
+//!   rank's pool's (`Request::PeerPin`). When the pages the peers hold would
+//!   deepen the hit by at least [`PREFETCH_MIN_TOKENS`], it reserves slots
+//!   for them in each rank's own pool, with the head as the writer, and has
+//!   the rank's host's Transfer Server READ them from the peer's slots
+//!   (`crate::host_pages::PoolRead`) at `Priority::Request`. A task that
+//!   ends complete commits its slots under the engine's epoch and unpins at
+//!   the peer; a task that fails or is cancelled aborts them. Admission
+//!   waits for the reads at most [`prefetch_wait`], then pins the pages that
+//!   arrived as ordinary host pages, loads them as above, and computes the
+//!   rest; a read past the wait is cancelled. A peer that cannot be reached
+//!   or answers with an error is skipped for that admission. A failure never
+//!   fails the request.
 //! - **Offloads.** Once a prompt page is published in L1, a slot is reserved
 //!   for it in every rank's pool, while the scheduler holds a reference to
 //!   its units. Full attention offloads every published page. A sliding
@@ -88,12 +106,15 @@ use std::time::{Duration, Instant};
 
 use ipc::{PageCopy, PrefixCacheInfo};
 use ipc::{RequestId, UnitId};
-use storage::protocol::{Event, PageAnchor, PageLevel, PageSlot, PageWindow, Reply, Request};
+use storage::protocol::{
+    Event, PageAnchor, PageLevel, PageShape, PageSlot, PageWindow, PeerPool, Reply, Request,
+    TransferEnd,
+};
 use storage::{Key, Scope};
 
 use super::manager::{self, AttentionManager};
 use super::{GroupShape, PageRef};
-use crate::host_pages::Servers;
+use crate::host_pages::{PageRead, PoolRead, Servers};
 use crate::worker::WorkerGroupId;
 
 /// The fewest tokens an L3 hit must add to the pools' hit to be prefetched:
@@ -225,6 +246,9 @@ struct RankPool {
     client: usize,
     scope: Scope,
     pool: u64,
+    /// The shape of the pool's pages, which a peer pool must have for its
+    /// pages to be read into this one.
+    shape: PageShape,
 }
 
 /// The page pools of one cache group of a worker group, one per rank.
@@ -293,6 +317,28 @@ enum Purpose {
     Orphan { pool: RankPool, keys: Vec<Key> },
     /// The reservation of offload `offload` in `rank`'s pool.
     Reserve { offload: u64, rank: usize },
+    /// The pins of `request`'s keys of `group` at the peer `peer` (an index
+    /// of `KvOffloadManager::peers`).
+    PeerPin {
+        request: RequestId,
+        group: usize,
+        peer: usize,
+    },
+    /// Pins of `keys` at a peer, on connection `client`, for a request that
+    /// no longer wants them: every page they pinned is unpinned when the
+    /// answer arrives.
+    PeerOrphan { client: usize, keys: Vec<Key> },
+    /// The reservation of slots in `pool`, a rank's pool of one of
+    /// `request`'s cache groups, for the pages of `keys`, read from
+    /// `sources`.
+    PeerReserve {
+        request: RequestId,
+        pool: RankPool,
+        keys: Vec<Key>,
+        sources: Vec<RemoteSlot>,
+    },
+    /// The transfer task of peer read `read` (`KvOffloadManager::reads`).
+    PeerRead { read: u64 },
     /// A request whose answer changes nothing here: commit, abort, unpin,
     /// prefetch.
     Settle,
@@ -310,6 +356,15 @@ enum Stage {
         arrived: usize,
         expected: usize,
     },
+    /// The peers are asked for the pages the pools and the KV storage do
+    /// not deepen the hit with.
+    PeerPinning,
+    /// Slots for the pages the peers hold are being reserved; `awaiting`
+    /// reservations have not answered.
+    PeerReserving { awaiting: usize },
+    /// The rank's Transfer Servers read the peers' pages; admission waits
+    /// for them until `deadline`.
+    Reading { deadline: Instant },
     /// The prefetched pages are being pinned; `awaiting` pins have not
     /// answered.
     Repinning { awaiting: usize },
@@ -332,24 +387,96 @@ struct GroupPins {
     /// The positions of the keys being prefetched, pinned again once they
     /// arrive.
     fetching: Vec<usize>,
+    /// Each peer's answer to the pins of the keys there, once answered: the
+    /// pools that hold some of them. Empty until the peers are asked, and
+    /// emptied once the pins pass to the reads.
+    peers: Vec<Option<Vec<PeerPool>>>,
+    /// For each rank, where a peer holds each key in a pool of the rank's
+    /// page shape; empty until the peers answered.
+    remote: Vec<Vec<Option<RemoteSlot>>>,
+}
+
+/// Which pages a boundary counts as present on a rank.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// The pages pinned in the rank's pool.
+    Pinned,
+    /// Those, and the pages the lookup found in the pool or the KV storage.
+    Stored,
+    /// The pinned pages, and the pages a peer holds in a pool of the
+    /// rank's page shape.
+    Peers,
+}
+
+/// A page a peer holds: the peer (an index of `KvOffloadManager::peers`),
+/// its pool and the slot it pinned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RemoteSlot {
+    peer: usize,
+    pool: u64,
+    slot: u64,
 }
 
 impl GroupPins {
-    /// Whether every rank holds the page at `position` of the keys: pinned
-    /// in its pool, or, when `stored` counts, in the pool or the KV storage
-    /// at the lookup.
-    fn present(&self, position: usize, stored: bool) -> bool {
-        self.slots.iter().zip(&self.levels).all(|(slots, levels)| {
-            let pinned = slots
-                .as_ref()
-                .and_then(|slots| slots.get(position))
-                .is_some_and(Option::is_some);
-            let found = levels
-                .as_ref()
-                .and_then(|levels| levels.get(position))
-                .is_some_and(|level| *level != PageLevel::Absent);
-            pinned || (stored && found)
-        })
+    /// Whether every rank holds the page at `position` of the keys as far
+    /// as `reach` counts.
+    fn present(&self, position: usize, reach: Reach) -> bool {
+        self.slots
+            .iter()
+            .zip(&self.levels)
+            .enumerate()
+            .all(|(rank, (slots, levels))| {
+                let pinned = slots
+                    .as_ref()
+                    .and_then(|slots| slots.get(position))
+                    .is_some_and(Option::is_some);
+                let found = || {
+                    levels
+                        .as_ref()
+                        .and_then(|levels| levels.get(position))
+                        .is_some_and(|level| *level != PageLevel::Absent)
+                };
+                let remote = || {
+                    self.remote
+                        .get(rank)
+                        .and_then(|remote| remote.get(position))
+                        .is_some_and(Option::is_some)
+                };
+                pinned
+                    || match reach {
+                        Reach::Pinned => false,
+                        Reach::Stored => found(),
+                        Reach::Peers => remote(),
+                    }
+            })
+    }
+
+    /// Where a peer holds each key in a pool of each rank's page shape, the
+    /// first peer in configuration order that does.
+    fn locate(&mut self, shapes: &[PageShape]) {
+        self.remote = shapes
+            .iter()
+            .map(|shape| {
+                (0..self.keys.len())
+                    .map(|position| {
+                        self.peers.iter().enumerate().find_map(|(peer, pools)| {
+                            pools
+                                .iter()
+                                .flatten()
+                                .filter(|pool| pool.shape == *shape)
+                                .find_map(|pool| {
+                                    let slot = (*pool.slots.get(position)?)?;
+                                    Some(RemoteSlot {
+                                        peer,
+                                        pool: pool.pool,
+                                        slot,
+                                    })
+                                })
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
     }
 
     fn answered(&self) -> bool {
@@ -366,6 +493,25 @@ struct Pins {
     limit: usize,
     groups: Vec<GroupPins>,
     stage: Stage,
+    /// The connection to each configured peer for this admission, once the
+    /// peers are asked; `None` for a peer that could not be reached.
+    peers: Vec<Option<usize>>,
+    /// The boundary the pools held when the peers were asked.
+    local: Option<usize>,
+    /// The peer reads submitted for the admission, those that ended, and
+    /// those that ended complete.
+    reads: usize,
+    reads_ended: usize,
+    reads_complete: usize,
+}
+
+/// One peer read in flight: what it reads, the request whose admission
+/// waits for it (`None` once that admission moved on), and its task once
+/// the local server answered.
+struct Read {
+    request: Option<RequestId>,
+    read: PoolRead,
+    task: Option<u64>,
 }
 
 /// The pages of one cache group a hit loads.
@@ -474,6 +620,17 @@ pub(crate) struct KvOffloadManager {
     /// from `retry_at` on.
     deferred: Vec<Deferred>,
     retry_at: Instant,
+    /// The Storage Server endpoints of other hosts whose published pages
+    /// admission reads (`kv_cache_config.peers`).
+    peers: Vec<String>,
+    /// Peer reads in flight, by number, and their tasks by connection and
+    /// task.
+    reads: HashMap<u64, Read>,
+    next_read: u64,
+    tasks: HashMap<(usize, u64), u64>,
+    /// The tokens each admitted request's hit read from peers, until the
+    /// admission takes them ([`KvOffloadManager::take_peer_tokens`]).
+    peer_tokens: HashMap<RequestId, usize>,
 }
 
 impl KvOffloadManager {
@@ -503,7 +660,23 @@ impl KvOffloadManager {
             kv_storage,
             deferred: Vec::new(),
             retry_at: Instant::now(),
+            peers: Vec::new(),
+            reads: HashMap::new(),
+            next_read: 1,
+            tasks: HashMap::new(),
+            peer_tokens: HashMap::new(),
         })
+    }
+
+    /// Read the published pages of the Storage Servers at `peers`, other
+    /// hosts' endpoints, at admission ("Peer loads" in the module).
+    pub(crate) fn set_peers(&mut self, peers: Vec<String>) {
+        self.peers = peers;
+    }
+
+    /// The tokens `request`'s admitted hit read from peers, once.
+    pub(crate) fn take_peer_tokens(&mut self, request: RequestId) -> usize {
+        self.peer_tokens.remove(&request).unwrap_or(0)
     }
 
     /// The token count every rank of the epoch holds in the host KV cache
@@ -593,6 +766,7 @@ impl KvOffloadManager {
                         rank: rank as u32,
                     },
                     pool: pool.pool,
+                    shape: pool.shape,
                 });
             }
         }
@@ -722,6 +896,8 @@ impl KvOffloadManager {
                 slots: vec![None; ranks],
                 levels: vec![if look_up { None } else { Some(Vec::new()) }; ranks],
                 fetching: Vec::new(),
+                peers: Vec::new(),
+                remote: Vec::new(),
             };
             for (rank, pool) in group.ranks.iter().enumerate() {
                 if wanted.is_empty() {
@@ -772,15 +948,19 @@ impl KvOffloadManager {
                 limit,
                 groups,
                 stage: Stage::Pinning,
+                peers: Vec::new(),
+                local: None,
+                reads: 0,
+                reads_ended: 0,
+                reads_complete: 0,
             },
         );
         self.advance(request)
     }
 
     /// The deepest boundary of `pins` every manager of `pools` accepts, with
-    /// the pages each rank pinned, and, when `stored` counts, the pages each
-    /// rank's lookup found in its pool or the KV storage.
-    fn boundary(pools: &GroupCachePools, pins: &Pins, stored: bool) -> usize {
+    /// the pages each rank holds as far as `reach` counts.
+    fn boundary(pools: &GroupCachePools, pins: &Pins, reach: Reach) -> usize {
         let misses: Vec<Vec<usize>> = pools
             .groups
             .iter()
@@ -789,7 +969,7 @@ impl KvOffloadManager {
             .map(|(group, pins_of)| {
                 let pages = pins.limit / group.manager.block_size();
                 manager::misses((0..pages).map(|page| {
-                    page < pins_of.first || pins_of.present(page - pins_of.first, stored)
+                    page < pins_of.first || pins_of.present(page - pins_of.first, reach)
                 }))
             })
             .collect();
@@ -803,22 +983,58 @@ impl KvOffloadManager {
         let pins = self.pins.get(&request)?;
         let pools = self.workers.get(&pins.worker)?.clone();
         match pins.stage {
-            Stage::Settled => Some(Self::boundary(&pools, pins, false)),
+            Stage::Settled => Some(Self::boundary(&pools, pins, Reach::Pinned)),
             Stage::Repinning { awaiting } => {
                 if awaiting > 0 {
                     return None;
                 }
                 let pins = self.pins.get_mut(&request)?;
                 pins.stage = Stage::Settled;
-                Some(Self::boundary(&pools, pins, false))
+                Some(Self::boundary(&pools, pins, Reach::Pinned))
+            }
+            Stage::PeerPinning => {
+                let answered = pins
+                    .groups
+                    .iter()
+                    .all(|group| group.peers.iter().all(Option::is_some));
+                if !answered {
+                    return None;
+                }
+                self.read_peers(request, &pools)
+            }
+            Stage::PeerReserving { awaiting } => {
+                if awaiting > 0 {
+                    return None;
+                }
+                let pinned = Self::boundary(&pools, pins, Reach::Pinned);
+                let peers = Self::boundary(&pools, pins, Reach::Peers);
+                let pins = self.pins.get_mut(&request)?;
+                pins.stage = Stage::Reading {
+                    deadline: Instant::now() + prefetch_wait(peers.saturating_sub(pinned)),
+                };
+                self.advance(request)
+            }
+            Stage::Reading { deadline } => {
+                if pins.reads_ended < pins.reads && Instant::now() < deadline {
+                    return None;
+                }
+                // Reads past the wait are cancelled: their slots are aborted
+                // when their tasks end, and their pages are computed.
+                self.detach_reads(request);
+                self.repin(request, &pools)
             }
             Stage::Pinning => {
                 if !pins.groups.iter().all(GroupPins::answered) {
                     return None;
                 }
-                let pinned = Self::boundary(&pools, pins, false);
-                let stored = Self::boundary(&pools, pins, true);
+                let pinned = Self::boundary(&pools, pins, Reach::Pinned);
+                let stored = Self::boundary(&pools, pins, Reach::Stored);
                 if stored <= pinned || stored - pinned < PREFETCH_MIN_TOKENS {
+                    if pins.limit.saturating_sub(pinned) >= PREFETCH_MIN_TOKENS
+                        && self.ask_peers(request, &pools, pinned)
+                    {
+                        return None;
+                    }
                     let pins = self.pins.get_mut(&request)?;
                     pins.stage = Stage::Settled;
                     return Some(pinned);
@@ -898,52 +1114,397 @@ impl KvOffloadManager {
                 // Pin what arrived; pages still in flight are computed, and
                 // stay in the pools for later requests.
                 self.fetches.retain(|_, waiting| *waiting != request);
-                let mut repins = Vec::new();
-                for (index, (group, pins_of)) in pools.groups.iter().zip(&pins.groups).enumerate() {
-                    for (rank, pool) in group.ranks.iter().enumerate() {
-                        let Some(slots) = pins_of.slots[rank].as_ref() else {
-                            continue;
-                        };
-                        let positions: Vec<usize> = pins_of
-                            .fetching
-                            .iter()
+                self.repin(request, &pools)
+            }
+        }
+    }
+
+    /// Pin `request`'s pages that were fetched or read into the pools since
+    /// its pins were answered, then settle its hit.
+    fn repin(&mut self, request: RequestId, pools: &GroupCachePools) -> Option<usize> {
+        let pins = self.pins.get(&request)?;
+        let mut repins = Vec::new();
+        for (index, (group, pins_of)) in pools.groups.iter().zip(&pins.groups).enumerate() {
+            for (rank, pool) in group.ranks.iter().enumerate() {
+                let Some(slots) = pins_of.slots[rank].as_ref() else {
+                    continue;
+                };
+                let positions: Vec<usize> = pins_of
+                    .fetching
+                    .iter()
+                    .copied()
+                    .filter(|&position| slots.get(position).is_some_and(Option::is_none))
+                    .collect();
+                if !positions.is_empty() {
+                    let keys = positions
+                        .iter()
+                        .map(|&position| pins_of.keys[position])
+                        .collect();
+                    repins.push((index, rank, pool.clone(), keys, positions));
+                }
+            }
+        }
+        let mut awaiting = 0;
+        for (group, rank, pool, keys, positions) in repins {
+            if self.servers.pin(
+                pool.client,
+                pool.pool,
+                &pool.scope,
+                keys,
+                Purpose::Repin {
+                    request,
+                    group,
+                    rank,
+                    positions,
+                },
+            ) {
+                awaiting += 1;
+            }
+        }
+        let pins = self.pins.get_mut(&request)?;
+        if awaiting == 0 {
+            pins.stage = Stage::Settled;
+            return Some(Self::boundary(pools, pins, Reach::Pinned));
+        }
+        pins.stage = Stage::Repinning { awaiting };
+        None
+    }
+
+    /// Ask every configured peer for `request`'s keys after the boundary
+    /// `pinned` the pools hold, in the pools of its ranks' page shapes.
+    /// Returns whether a peer was asked.
+    fn ask_peers(&mut self, request: RequestId, pools: &GroupCachePools, pinned: usize) -> bool {
+        if self.peers.is_empty() {
+            return false;
+        }
+        let endpoints = self.peers.clone();
+        let clients: Vec<Option<usize>> = endpoints
+            .iter()
+            .map(|endpoint| self.servers.peer(endpoint))
+            .collect();
+        if clients.iter().all(Option::is_none) {
+            return false;
+        }
+        let Some(pins) = self.pins.get(&request) else {
+            return false;
+        };
+        let mut asks = Vec::new();
+        for (index, (group, pins_of)) in pools.groups.iter().zip(&pins.groups).enumerate() {
+            let mut layouts: Vec<Key> = group.ranks.iter().map(|rank| rank.shape.layout).collect();
+            layouts.sort_unstable_by_key(|layout| layout.0);
+            layouts.dedup();
+            asks.push((index, layouts, pins_of.keys.clone()));
+        }
+        let mut answered: Vec<Vec<Option<Vec<PeerPool>>>> =
+            vec![vec![Some(Vec::new()); clients.len()]; asks.len()];
+        for (group, layouts, keys) in asks {
+            for (peer, client) in clients.iter().enumerate() {
+                let Some(client) = *client else {
+                    continue;
+                };
+                if keys.is_empty() {
+                    continue;
+                }
+                let purpose = Purpose::PeerPin {
+                    request,
+                    group,
+                    peer,
+                };
+                if self
+                    .servers
+                    .peer_pin(client, layouts.clone(), keys.clone(), purpose)
+                {
+                    answered[group][peer] = None;
+                }
+            }
+        }
+        let Some(pins) = self.pins.get_mut(&request) else {
+            return false;
+        };
+        for (pins_of, peers) in pins.groups.iter_mut().zip(answered) {
+            pins_of.peers = peers;
+        }
+        pins.peers = clients;
+        pins.local = Some(pinned);
+        pins.stage = Stage::PeerPinning;
+        true
+    }
+
+    /// The peers answered `request`'s pins: when the pages they hold deepen
+    /// the hit by at least [`PREFETCH_MIN_TOKENS`], reserve slots for the
+    /// pages the deeper boundary needs in each rank's pool; unpin at the
+    /// peers every page that is not read.
+    fn read_peers(&mut self, request: RequestId, pools: &GroupCachePools) -> Option<usize> {
+        let pins = self.pins.get_mut(&request)?;
+        for (group, pins_of) in pools.groups.iter().zip(pins.groups.iter_mut()) {
+            let shapes: Vec<PageShape> = group.ranks.iter().map(|rank| rank.shape).collect();
+            pins_of.locate(&shapes);
+        }
+        let pinned = Self::boundary(pools, pins, Reach::Pinned);
+        let peers = Self::boundary(pools, pins, Reach::Peers);
+        let deepens = peers > pinned && peers - pinned >= PREFETCH_MIN_TOKENS;
+
+        // The pages each rank reads: those the deeper boundary needs that its
+        // pool did not pin and a peer holds.
+        let mut reserves = Vec::new();
+        let mut used: Vec<(usize, u64, Key)> = Vec::new();
+        if deepens {
+            for (index, (group, pins_of)) in pools.groups.iter().zip(&pins.groups).enumerate() {
+                let needed = group.manager.needed_pages(peers);
+                let positions: Vec<usize> = (needed.start.max(pins_of.first)
+                    ..needed.end.max(pins_of.first))
+                    .map(|page| page - pins_of.first)
+                    .collect();
+                for (rank, pool) in group.ranks.iter().enumerate() {
+                    let slots = pins_of.slots[rank].as_deref().unwrap_or_default();
+                    let mut read = Vec::new();
+                    let mut sources = Vec::new();
+                    for &position in &positions {
+                        let pinned = slots.get(position).is_some_and(Option::is_some);
+                        let source = pins_of
+                            .remote
+                            .get(rank)
+                            .and_then(|remote| remote.get(position))
                             .copied()
-                            .filter(|&position| slots.get(position).is_some_and(Option::is_none))
+                            .flatten();
+                        if let (false, Some(source)) = (pinned, source) {
+                            read.push(position);
+                            sources.push(source);
+                            used.push((source.peer, source.pool, pins_of.keys[position]));
+                        }
+                    }
+                    if !read.is_empty() {
+                        let keys: Vec<Key> = read
+                            .iter()
+                            .map(|&position| pins_of.keys[position])
                             .collect();
-                        if !positions.is_empty() {
-                            let keys = positions
-                                .iter()
-                                .map(|&position| pins_of.keys[position])
-                                .collect();
-                            repins.push((index, rank, pool.clone(), keys, positions));
+                        reserves.push((pool.clone(), keys, index, read, sources));
+                    }
+                }
+            }
+        }
+
+        // Every pin at a peer that no read takes ends now.
+        let mut unpins: HashMap<(usize, u64), Vec<Key>> = HashMap::new();
+        for pins_of in &mut pins.groups {
+            for (peer, pools_of) in std::mem::take(&mut pins_of.peers).into_iter().enumerate() {
+                for pool in pools_of.into_iter().flatten() {
+                    for (key, slot) in pins_of.keys.iter().zip(&pool.slots) {
+                        let read = used.iter().any(|(at, from, used)| {
+                            *at == peer && *from == pool.pool && used == key
+                        });
+                        if slot.is_some() && !read {
+                            unpins.entry((peer, pool.pool)).or_default().push(*key);
                         }
                     }
                 }
-                let mut awaiting = 0;
-                for (group, rank, pool, keys, positions) in repins {
-                    if self.servers.pin(
-                        pool.client,
-                        pool.pool,
-                        &pool.scope,
-                        keys,
-                        Purpose::Repin {
-                            request,
-                            group,
-                            rank,
-                            positions,
-                        },
-                    ) {
-                        awaiting += 1;
-                    }
-                }
-                let pins = self.pins.get_mut(&request)?;
-                if awaiting == 0 {
-                    pins.stage = Stage::Settled;
-                    return Some(Self::boundary(&pools, pins, false));
-                }
-                pins.stage = Stage::Repinning { awaiting };
-                None
             }
+        }
+        for ((peer, pool), keys) in unpins {
+            if let Some(client) = self.peer_client(peer) {
+                self.servers.peer_unpin(client, pool, keys, Purpose::Settle);
+            }
+        }
+
+        let mut awaiting = 0;
+        let mut fetching: Vec<Vec<usize>> = vec![Vec::new(); pools.groups.len()];
+        for (pool, keys, group, positions, sources) in reserves {
+            fetching[group].extend(positions.iter().copied());
+            let purpose = Purpose::PeerReserve {
+                request,
+                pool: pool.clone(),
+                keys: keys.clone(),
+                sources: sources.clone(),
+            };
+            if self
+                .servers
+                .reserve_read(pool.client, pool.pool, keys.clone(), purpose)
+            {
+                awaiting += 1;
+            } else {
+                self.unpin_sources(&keys, &sources);
+            }
+        }
+        let pins = self.pins.get_mut(&request)?;
+        if awaiting == 0 {
+            pins.stage = Stage::Settled;
+            return Some(pinned);
+        }
+        for (pins_of, mut positions) in pins.groups.iter_mut().zip(fetching) {
+            positions.sort_unstable();
+            positions.dedup();
+            pins_of.fetching = positions;
+        }
+        pins.stage = Stage::PeerReserving { awaiting };
+        None
+    }
+
+    /// The connection to configured peer `peer`, which holds the pins taken
+    /// there; a peer connected again holds none, and its unpins are skipped.
+    fn peer_client(&mut self, peer: usize) -> Option<usize> {
+        let endpoint = self.peers.get(peer)?.clone();
+        self.servers.peer(&endpoint)
+    }
+
+    /// End the pins at the peers of `keys`, held at `sources`.
+    fn unpin_sources(&mut self, keys: &[Key], sources: &[RemoteSlot]) {
+        let mut unpins: BTreeMap<(usize, u64), Vec<Key>> = BTreeMap::new();
+        for (key, source) in keys.iter().zip(sources) {
+            unpins
+                .entry((source.peer, source.pool))
+                .or_default()
+                .push(*key);
+        }
+        for ((peer, pool), keys) in unpins {
+            if let Some(client) = self.peer_client(peer) {
+                self.servers.peer_unpin(client, pool, keys, Purpose::Settle);
+            }
+        }
+    }
+
+    /// `pool` answered the reservation of `request`'s peer pages `keys`
+    /// with `slots`: read the reserved ones from their `sources`, one task
+    /// per peer pool, and unpin at the peers those it gave no slot. When the
+    /// admission left meanwhile, the reserved slots are aborted and the peer
+    /// pins end.
+    fn peer_reserved(
+        &mut self,
+        request: RequestId,
+        pool: &RankPool,
+        keys: &[Key],
+        sources: &[RemoteSlot],
+        slots: &[PageSlot],
+    ) {
+        let admitting = self
+            .pins
+            .get(&request)
+            .is_some_and(|pins| matches!(pins.stage, Stage::PeerReserving { .. }));
+        if !admitting {
+            let reserved: Vec<Key> = keys
+                .iter()
+                .zip(slots)
+                .filter(|(_, slot)| matches!(slot, PageSlot::Reserved { .. }))
+                .map(|(key, _)| *key)
+                .collect();
+            self.servers
+                .settle(pool.client, pool.pool, reserved, false, Purpose::Settle);
+            self.unpin_sources(keys, sources);
+            return;
+        }
+        let mut reads: BTreeMap<(usize, u64), Vec<PageRead>> = BTreeMap::new();
+        let mut unread = Vec::new();
+        for (index, (key, source)) in keys.iter().zip(sources).enumerate() {
+            match slots.get(index) {
+                Some(PageSlot::Reserved { slot }) => {
+                    reads
+                        .entry((source.peer, source.pool))
+                        .or_default()
+                        .push(PageRead {
+                            key: *key,
+                            source: source.slot,
+                            destination: *slot,
+                        });
+                }
+                // A page committed meanwhile is pinned with the others; a
+                // pool without a slot computes it.
+                _ => unread.push((*key, *source)),
+            }
+        }
+        let (unread_keys, unread_sources): (Vec<Key>, Vec<RemoteSlot>) = unread.into_iter().unzip();
+        self.unpin_sources(&unread_keys, &unread_sources);
+        let mut submitted = 0;
+        for ((peer, peer_pool), pages) in reads {
+            let (Some(client), Some(endpoint)) = (self.peer_client(peer), self.peers.get(peer))
+            else {
+                let keys: Vec<Key> = pages.iter().map(|page| page.key).collect();
+                self.servers
+                    .settle(pool.client, pool.pool, keys, false, Purpose::Settle);
+                continue;
+            };
+            let read = PoolRead {
+                client: pool.client,
+                pool: pool.pool,
+                peer: client,
+                endpoint: endpoint.clone(),
+                peer_pool,
+                shape: pool.shape,
+                pages,
+            };
+            let number = self.next_read;
+            self.next_read += 1;
+            if self
+                .servers
+                .read_pages(&read, Purpose::PeerRead { read: number })
+            {
+                self.reads.insert(
+                    number,
+                    Read {
+                        request: Some(request),
+                        read,
+                        task: None,
+                    },
+                );
+                submitted += 1;
+            } else {
+                self.servers.settle_read(&read, false, || Purpose::Settle);
+            }
+        }
+        if let Some(pins) = self.pins.get_mut(&request) {
+            pins.reads += submitted;
+            if let Stage::PeerReserving { awaiting } = &mut pins.stage {
+                *awaiting = awaiting.saturating_sub(1);
+            }
+        }
+    }
+
+    /// The reads `request`'s admission submitted no longer hold it: those
+    /// still running are cancelled, and every one settles when its task
+    /// ends.
+    fn detach_reads(&mut self, request: RequestId) {
+        let mut cancels = Vec::new();
+        for read in self.reads.values_mut() {
+            if read.request == Some(request) {
+                read.request = None;
+                if let Some(task) = read.task {
+                    cancels.push((read.read.client, task));
+                }
+            }
+        }
+        for (client, task) in cancels {
+            self.servers.cancel_read(client, task, Purpose::Settle);
+        }
+    }
+
+    /// Peer read `number`'s task ended as `end`: settle its slots and pins,
+    /// and count it for the admission that waits for it.
+    fn read_ended(&mut self, number: u64, complete: bool) {
+        let Some(read) = self.reads.remove(&number) else {
+            return;
+        };
+        if let Some(task) = read.task {
+            self.tasks.remove(&(read.read.client, task));
+        }
+        self.servers
+            .settle_read(&read.read, complete, || Purpose::Settle);
+        if complete {
+            tracing::debug!(
+                pages = read.read.pages.len(),
+                bytes = read.read.bytes(),
+                endpoint = read.read.endpoint,
+                "read host KV cache pages from a peer"
+            );
+        } else {
+            tracing::warn!(
+                pages = read.read.pages.len(),
+                endpoint = read.read.endpoint,
+                "a peer read of host KV cache pages did not complete: its pages are computed"
+            );
+        }
+        if let Some(request) = read.request
+            && let Some(pins) = self.pins.get_mut(&request)
+        {
+            pins.reads_ended += 1;
+            pins.reads_complete += usize::from(complete);
         }
     }
 
@@ -956,7 +1517,15 @@ impl KvOffloadManager {
         let pins = self.pins.remove(&request)?;
         self.fetches.retain(|_, waiting| *waiting != request);
         let pools = self.workers.get(&pins.worker)?.clone();
-        let boundary = Self::boundary(&pools, &pins, false);
+        let boundary = Self::boundary(&pools, &pins, Reach::Pinned);
+        if pins.reads_complete > 0
+            && let Some(local) = pins.local
+        {
+            let read = boundary.saturating_sub(local.max(pins.device));
+            if read > 0 {
+                self.peer_tokens.insert(request, read);
+            }
+        }
         let mut groups = Vec::with_capacity(pools.groups.len());
         for (group, pins_of) in pools.groups.iter().zip(&pins.groups) {
             // A full-attention group loads its pages from the device match
@@ -967,7 +1536,7 @@ impl KvOffloadManager {
             if group.draft {
                 let held = (0..loaded.end - loaded.start)
                     .take_while(|&offset| {
-                        pins_of.present(loaded.start - pins_of.first + offset, false)
+                        pins_of.present(loaded.start - pins_of.first + offset, Reach::Pinned)
                     })
                     .count();
                 loaded.end = loaded.start + held;
@@ -1054,6 +1623,19 @@ impl KvOffloadManager {
                     *purpose = Purpose::Settle;
                     None
                 }
+                Purpose::PeerPin {
+                    request: pinned,
+                    group,
+                    peer,
+                } if *pinned == request => {
+                    if let Some(Some(client)) = pins.peers.get(*peer) {
+                        *purpose = Purpose::PeerOrphan {
+                            client: *client,
+                            keys: pins.groups[*group].keys.clone(),
+                        };
+                    }
+                    None
+                }
                 _ => None,
             };
             if let Some((group, rank, keys)) = orphan
@@ -1075,7 +1657,19 @@ impl KvOffloadManager {
                     self.unpin(pool, pinned);
                 }
             }
+            // Pins the peers answered and no read took yet end too.
+            for (peer, pools_of) in pins_of.peers.iter().enumerate() {
+                let Some(Some(client)) = pins.peers.get(peer) else {
+                    continue;
+                };
+                for pool in pools_of.iter().flatten() {
+                    let keys = Self::pinned(&pins_of.keys, Some(&pool.slots));
+                    self.servers
+                        .peer_unpin(*client, pool.pool, keys, Purpose::Settle);
+                }
+            }
         }
+        self.detach_reads(request);
     }
 
     /// The keys whose pages `slots`, a pin's answer for `keys`, pinned.
@@ -1196,7 +1790,8 @@ impl KvOffloadManager {
             || self
                 .pins
                 .values()
-                .any(|pins| matches!(pins.stage, Stage::Fetching { .. }))
+                .any(|pins| matches!(pins.stage, Stage::Fetching { .. } | Stage::Reading { .. }))
+            || !self.reads.is_empty()
     }
 
     /// Offload published pages of `worker`'s cache group `group` to the host
@@ -1367,7 +1962,14 @@ impl KvOffloadManager {
     pub(crate) fn poll(&mut self) -> bool {
         let mut admissions = false;
         let (events, answers) = self.servers.take();
-        for event in events {
+        for (client, event) in events {
+            if let Event::Transferred { task, end, .. } = event {
+                if let Some(read) = self.tasks.get(&(client, task)).copied() {
+                    self.read_ended(read, matches!(end, TransferEnd::Complete));
+                    admissions = true;
+                }
+                continue;
+            }
             let Event::Prefetched { tag, .. } = event else {
                 continue;
             };
@@ -1384,8 +1986,11 @@ impl KvOffloadManager {
             }
         }
         // A prefetch past its deadline lets its admission move on.
-        admissions |= self.pins.values().any(|pins| {
-            matches!(pins.stage, Stage::Fetching { deadline, .. } if Instant::now() >= deadline)
+        admissions |= self.pins.values().any(|pins| match pins.stage {
+            Stage::Fetching { deadline, .. } | Stage::Reading { deadline } => {
+                Instant::now() >= deadline
+            }
+            _ => false,
         });
         for (purpose, reply) in answers {
             match (purpose, reply) {
@@ -1477,6 +2082,78 @@ impl KvOffloadManager {
                     };
                     self.reserved(offload, rank, &slots);
                 }
+                (
+                    Purpose::PeerPin {
+                        request,
+                        group,
+                        peer,
+                    },
+                    reply,
+                ) => {
+                    let pools = match reply {
+                        Reply::PeerPinned { pools } => pools,
+                        other => {
+                            tracing::warn!(?other, "a peer's host KV cache pin failed");
+                            Vec::new()
+                        }
+                    };
+                    // A pin purpose names a live admission in its peer stage:
+                    // `release` turns the pins of one that left into orphans.
+                    if let Some(pins) = self.pins.get_mut(&request)
+                        && let Some(entry) = pins.groups[group].peers.get_mut(peer)
+                    {
+                        *entry = Some(pools);
+                        admissions = true;
+                    }
+                }
+                (Purpose::PeerOrphan { client, keys }, Reply::PeerPinned { pools }) => {
+                    for pool in pools {
+                        let pinned = Self::pinned(&keys, Some(&pool.slots));
+                        self.servers
+                            .peer_unpin(client, pool.pool, pinned, Purpose::Settle);
+                    }
+                }
+                (Purpose::PeerOrphan { .. }, _) => {}
+                (
+                    Purpose::PeerReserve {
+                        request,
+                        pool,
+                        keys,
+                        sources,
+                        ..
+                    },
+                    reply,
+                ) => {
+                    let slots = match reply {
+                        Reply::Reserved { slots } => slots,
+                        other => {
+                            tracing::warn!(
+                                ?other,
+                                "a host KV cache reservation for a peer read failed"
+                            );
+                            Vec::new()
+                        }
+                    };
+                    self.peer_reserved(request, &pool, &keys, &sources, &slots);
+                    admissions = true;
+                }
+                (Purpose::PeerRead { read }, reply) => match reply {
+                    Reply::Transferring { task } => {
+                        if let Some(entry) = self.reads.get_mut(&read) {
+                            entry.task = Some(task);
+                            let client = entry.read.client;
+                            self.tasks.insert((client, task), read);
+                            if entry.request.is_none() {
+                                self.servers.cancel_read(client, task, Purpose::Settle);
+                            }
+                        }
+                    }
+                    other => {
+                        tracing::warn!(?other, "a peer read of host KV cache pages was refused");
+                        self.read_ended(read, false);
+                        admissions = true;
+                    }
+                },
                 (Purpose::Settle, Reply::Error { kind, message }) => {
                     tracing::warn!(?kind, message, "a host KV cache request failed");
                 }
@@ -1665,10 +2342,12 @@ mod tests {
     use super::*;
     use crate::kv_cache::BlockPool;
 
-    /// A Storage Server on a socket of its own, with pools of 64 pages of
-    /// 16 bytes, stopped when dropped.
+    /// A Storage Server on a socket of its own and a TCP endpoint other
+    /// hosts reach it at, with pools of 64 pages of 16 bytes, stopped when
+    /// dropped.
     struct Running {
         socket: std::path::PathBuf,
+        tcp: String,
         stop: Arc<AtomicBool>,
         wake: OwnedFd,
         thread: Option<std::thread::JoinHandle<()>>,
@@ -1695,15 +2374,19 @@ mod tests {
                 unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
             let stop = Arc::new(AtomicBool::new(false));
             let stopped = Arc::clone(&stop);
+            let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = tcp.local_addr().unwrap().to_string();
             let thread = std::thread::spawn(move || {
                 let _lock = lock;
                 let mut server = Server::new(listener, 64 * 16, host_reserve, None, None).unwrap();
+                server.listen_tcp(tcp).unwrap();
                 server
                     .run(reader.as_fd(), &|| stopped.load(Ordering::Acquire))
                     .unwrap();
             });
             Self {
                 socket,
+                tcp: address,
                 stop,
                 wake: writer,
                 thread: Some(thread),
@@ -1826,9 +2509,15 @@ mod tests {
             groups,
             page_pools: pools
                 .iter()
-                .map(|pool| HostPoolInfo {
+                .zip(contents)
+                .map(|(pool, content)| HostPoolInfo {
                     pool: *pool,
-                    page_bytes: 0,
+                    shape: PageShape {
+                        layout: Key([*content; 32]),
+                        kv_head_offset: 0,
+                        kv_head_count: 8,
+                        page_bytes: 16,
+                    },
                     endpoint: None,
                 })
                 .collect(),
@@ -1976,6 +2665,123 @@ mod tests {
 
         stop.store(true, Ordering::Release);
         mooncake.join().unwrap();
+    }
+
+    /// The pool `pool` as the server on `socket` lists it.
+    fn listed(socket: &std::path::Path, pool: u64) -> storage::protocol::ListedPool {
+        let mut operator = Client::connect(socket, Role::Operator).unwrap();
+        operator
+            .list()
+            .unwrap()
+            .page_pools
+            .into_iter()
+            .find(|listed| listed.pool == pool)
+            .expect("the pool is listed")
+    }
+
+    /// A peer host's pages that its own host's Transfer Server cannot read
+    /// are computed: admission answers the device match, and the pins at
+    /// the peer and the slots reserved for the reads end.
+    #[test]
+    fn a_peer_hit_that_cannot_be_read_is_computed_and_its_pins_end() {
+        let peer = Running::start();
+        let local = Running::start();
+        let scope = Scope {
+            deployment: "model".into(),
+            group: "text".into(),
+            rank: 0,
+        };
+
+        // The peer host serves the deployment's published epoch 1, whose
+        // pool holds the prompt's eight pages.
+        let mut daemon = Client::connect(
+            &peer.socket,
+            Role::Head {
+                deployment: "model".into(),
+                epoch: 1,
+            },
+        )
+        .unwrap();
+        let claim = daemon.claim(1, vec![scope.clone()], Vec::new()).unwrap();
+        daemon.publish_epochs(vec![1]).unwrap();
+        let mut peer_worker = Client::connect(
+            &peer.socket,
+            Role::Worker {
+                scope: scope.clone(),
+                generation: 1,
+                claim,
+                epoch: 1,
+            },
+        )
+        .unwrap();
+        let shape = PageShape {
+            layout: Key([3; 32]),
+            kv_head_offset: 0,
+            kv_head_count: 8,
+            page_bytes: 16,
+        };
+        let request = Request::PagePool {
+            shape,
+            numa_node: None,
+            bytes: None,
+        };
+        let Reply::PagePool {
+            pool: peer_pool, ..
+        } = peer_worker.call(&request, &[]).unwrap().reply
+        else {
+            panic!("the page pool was refused");
+        };
+        let (_worker, pools) = worker_pools(&local, &[3]);
+        let cache = report(vec![cache_group(None)], &pools, &[3]);
+        let prompt: Vec<u32> = (0..8 * 64 + 1).collect();
+        let keys = page_keys(&cache, &prompt[..512]);
+        let reserve = Request::Reserve {
+            pool: peer_pool,
+            writer: Some(scope),
+            keys: keys[0].clone(),
+            window: None,
+        };
+        daemon.call(&reserve, &[]).unwrap();
+        let commit = Request::Commit {
+            pool: peer_pool,
+            keys: keys[0].clone(),
+        };
+        daemon.call(&commit, &[]).unwrap();
+
+        // This host's pool of the same shape holds nothing, and its server
+        // runs no Transfer Server to read the peer's pages with.
+        let mut kv_offload =
+            KvOffloadManager::connect(&local.socket, "model", 0, DEFAULT_BOUNDARY_INTERVAL, false)
+                .unwrap();
+        kv_offload.set_peers(vec![peer.tcp.clone()]);
+        let text = WorkerGroupId("text".into());
+        assert!(kv_offload.add_worker(
+            &text,
+            &[RankCache {
+                local: true,
+                cache: &cache,
+            }]
+        ));
+        let mut boundary = None;
+        poll_until(&mut kv_offload, |kv_offload| {
+            boundary = kv_offload.admission(RequestId(1), &text, &keys, 0, 512, 0);
+            boundary.is_some()
+        });
+        assert_eq!(
+            boundary,
+            Some(0),
+            "an unread peer page was counted as a hit"
+        );
+        assert_eq!(kv_offload.admit(RequestId(1)), None);
+        assert_eq!(kv_offload.take_peer_tokens(RequestId(1)), 0);
+
+        // The peer's pages were pinned and are released; the slots reserved
+        // for them are aborted.
+        poll_until(&mut kv_offload, |_| {
+            listed(&peer.socket, peer_pool).pinned == 0
+                && listed(&local.socket, pools[0]).reserved == 0
+        });
+        assert_eq!(listed(&peer.socket, peer_pool).ready, 8);
     }
 
     /// A hybrid worker's hit ends at the deepest boundary whose sliding

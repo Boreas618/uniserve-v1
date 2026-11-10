@@ -126,8 +126,10 @@ pub struct CacheTable {
 pub struct HostPoolInfo {
     /// The pool's identity at the rank's host's Storage Server.
     pub pool: u64,
-    /// The bytes of one pool page.
-    pub page_bytes: u64,
+    /// The shape of the pool's pages: their layout digest, the kv heads a page holds (a rank's
+    /// head slice) and the bytes of one page. Another host's pool of the same layout holds the
+    /// same pages under the same keys.
+    pub shape: storage::protocol::PageShape,
     /// Where an engine on another host reaches the pool's Storage Server
     /// (`StorageLaunch::tcp`).
     pub endpoint: Option<String>,

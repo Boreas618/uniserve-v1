@@ -98,7 +98,7 @@ impl EncoderHostPool {
         let info = EncoderPoolInfo {
             pages: HostPoolInfo {
                 pool: pages.pool(),
-                page_bytes: pages.page_bytes(),
+                shape: pages.shape(),
                 endpoint: endpoint.map(str::to_owned),
             },
             identities,

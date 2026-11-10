@@ -376,6 +376,7 @@ impl SchedulerHandle {
                         }),
                     host_cache(kv_cache)?,
                     kv_cache.mooncake.is_some(),
+                    kv_cache.peers.clone(),
                 )
                 .context("sizing the epoch's host KV cache")?;
         }

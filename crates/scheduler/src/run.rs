@@ -376,13 +376,19 @@ impl Scheduler {
     /// KV cache holds one token count on every rank, of `size`
     /// (`crate::kv_cache::HostCacheDemand`): its device tokens times the
     /// ratio, or what the stated bytes of each host hold, which every rank
-    /// maps its pools at (`uniserve.host_cache`). A failure to reach this
-    /// host's server leaves the host KV cache off.
+    /// maps its pools at (`uniserve.host_cache`). Admission reads the
+    /// published pages of the Storage Servers at `peers`, other hosts'
+    /// endpoints (`kv_cache_config.peers`). A failure to reach this host's
+    /// server leaves the host KV cache off.
     ///
     /// # Errors
     ///
     /// Fails when another host's server cannot size the cache, or a rank
     /// cannot map its pools.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the deployment, its epoch and host, and the host KV cache's settings"
+    )]
     pub fn enable_kv_offload(
         &mut self,
         deployment: &str,
@@ -391,6 +397,7 @@ impl Scheduler {
         boundary_interval: usize,
         size: crate::kv_cache::HostCacheSize,
         kv_storage: bool,
+        peers: Vec<String>,
     ) -> anyhow::Result<()> {
         let socket = storage::default_socket();
         let mut kv_offload = match crate::kv_cache::KvOffloadManager::connect(
@@ -406,6 +413,7 @@ impl Scheduler {
                 return Ok(());
             }
         };
+        kv_offload.set_peers(peers);
         let mut rank_caches = self.worker.info().rank_caches.clone();
         let Some(demand) = crate::kv_cache::HostCacheDemand::of(&rank_caches, size.ratio) else {
             return Ok(());

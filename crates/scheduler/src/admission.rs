@@ -1599,6 +1599,14 @@ impl Scheduler {
             .prefix
             .host_hit_tokens
             .fetch_add(loaded, Ordering::Relaxed);
+        let peer = self
+            .kv_offload
+            .as_mut()
+            .map_or(0, |kv_offload| kv_offload.take_peer_tokens(id));
+        self.stats
+            .prefix
+            .peer_hit_tokens
+            .fetch_add(peer as u64, Ordering::Relaxed);
     }
 }
 

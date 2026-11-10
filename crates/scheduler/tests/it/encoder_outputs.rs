@@ -34,7 +34,12 @@ fn mapping(mut pools: Vec<Inventory>, pool: u64, identities: &[(&str, &str)]) ->
         rank.encoder_pool = Some(Box::new(EncoderPoolInfo {
             pages: ipc::HostPoolInfo {
                 pool,
-                page_bytes: PAGE_BYTES,
+                shape: storage::protocol::PageShape {
+                    layout: storage::Key([8; 32]),
+                    kv_head_offset: 0,
+                    kv_head_count: 0,
+                    page_bytes: PAGE_BYTES,
+                },
                 endpoint: None,
             },
             identities: identities

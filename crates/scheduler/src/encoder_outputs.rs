@@ -201,7 +201,7 @@ impl EncoderStore {
         if ranks
             .iter()
             .any(|(_, report)| report.pool.pages != first.pool.pages || report.local != first.local)
-            || first.pool.pages.page_bytes == 0
+            || first.pool.pages.shape.page_bytes == 0
         {
             return false;
         }
@@ -238,7 +238,7 @@ impl EncoderStore {
                 worker: worker.clone(),
                 client,
                 pool: first.pool.pages.pool,
-                page_bytes: first.pool.pages.page_bytes,
+                page_bytes: first.pool.pages.shape.page_bytes,
                 scope: Scope {
                     deployment: self.servers.deployment().to_owned(),
                     group: worker.0.clone(),
