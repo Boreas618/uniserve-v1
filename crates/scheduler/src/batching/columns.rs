@@ -14,7 +14,7 @@
 //! - **positions**: each call's query tokens start at its own logical position;
 //! - **slot_mapping**: one absolute slot per token through the call's block
 //!   table, `-1` where the call's row writes no cache page — the mechanism's
-//!   decision, taken from `ipc::ForwardBatch::write_cache`, never a clamp;
+//!   decision, taken from each [`Row::writes`], never a clamp;
 //! - **seq_lens**: each row's attention length;
 //! - **query_offsets**: the packed token range of every row;
 //! - **logits_rows**: the rows whose logits are wanted (a prefill's last row, a
@@ -69,7 +69,62 @@ use proto::program::commit;
 use proto::request::SamplingParams;
 
 use super::slots;
-use crate::worker::RequestDispatch;
+
+/// One row a token call evaluates, as its planner states it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Row {
+    /// The row's total attention length: cached prefix plus its own query.
+    pub seq_len: u32,
+    /// Query tokens the row evaluates.
+    pub query_len: u32,
+    /// Whether the row's query persists in the prefix cache after its
+    /// visible prefix.
+    pub writes: bool,
+}
+
+/// What one call states to the device worker: the rows it evaluates, all in
+/// its request's slot, and the cache tables, fresh units and host page loads
+/// its forward reads through.
+///
+/// The call planner states this once per call, and the batch's device layout
+/// (`ExecutionBatch::device`) is written from it; nothing else carries a
+/// call's rows or tables. A call that evaluates no token rows (a media or
+/// transfer call) states no rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CallLayout {
+    /// The request slot every row belongs to.
+    pub slot: u32,
+    /// The rows, in the order the call evaluates them.
+    pub rows: Vec<Row>,
+    /// The cache tables the call addresses, which the worker installs before
+    /// the forward: the request's whole current tables, not a delta.
+    pub block_tables: Vec<ipc::BlockTable>,
+    /// Units the call acquired since its request's last declaration, which
+    /// the worker resets before the forward writes them.
+    pub cache_units: Vec<ipc::CacheUnitAllocation>,
+    /// Pages of the host KV cache the call's new units are filled with before
+    /// its forward, on every rank of its worker group.
+    pub page_loads: Vec<ipc::PageCopy>,
+}
+
+impl CallLayout {
+    /// The layout of a call of request slot `slot`, with nothing stated yet.
+    pub(crate) fn of(slot: u32) -> Self {
+        Self {
+            slot,
+            ..Self::default()
+        }
+    }
+
+    /// Appends one row.
+    pub(crate) fn push(&mut self, seq_len: u32, query_len: u32, writes: bool) {
+        self.rows.push(Row {
+            seq_len,
+            query_len,
+            writes,
+        });
+    }
+}
 
 /// The kind of row a call occupies in a token batch, or `None` for a call a
 /// token batch does not carry.
@@ -186,7 +241,7 @@ const TEMPERATURE_COLUMN: usize = proto::program::sampler::TEMPERATURE as usize;
               geometry"
 )]
 pub(crate) fn columns(
-    requests: &[(Call, RequestDispatch)],
+    requests: &[(&Call, &CallLayout)],
     tables: &[Vec<crate::IpcBlockTable>],
     inputs: &[Vec<i32>],
     sampling: &[&SamplingParams],
@@ -216,30 +271,20 @@ pub(crate) fn columns(
     let mut input_ids: Vec<i32> = Vec::new();
     let mut parameters: Vec<f32> = Vec::new();
     let mut draw_addresses: Vec<ipc::philox::DrawAddress> = Vec::new();
-    for (index, (call, dispatch)) in requests.iter().enumerate() {
+    for (index, (call, call_rows)) in requests.iter().enumerate() {
         let inputs = inputs.get(index)?;
         let sampling = *sampling.get(index)?;
-        let forward = &dispatch.forward;
         let kind = row_kind(call.kind)?;
-        // Every row of one call belongs to the call's request: the dispatch
-        // group a call by request, so rows of two requests in one call is a
-        // fault of the assembly, not something to split here.
-        let request = *forward.request_pool_indices.first()?;
-        if forward.request_pool_indices.len() != forward.query_lens.len()
-            || forward.seq_lens.len() != forward.query_lens.len()
-            || forward.write_cache.len() != forward.query_lens.len()
-            || forward
-                .request_pool_indices
-                .iter()
-                .any(|index| *index != request)
-        {
+        // Every row of one call belongs to the call's request slot.
+        let request = call_rows.slot;
+        if call_rows.rows.is_empty() {
             return None;
         }
-        let rows_of_call = u32::try_from(forward.query_lens.len()).ok()?;
-        let tokens_of_call = forward
-            .query_lens
+        let rows_of_call = u32::try_from(call_rows.rows.len()).ok()?;
+        let tokens_of_call = call_rows
+            .rows
             .iter()
-            .try_fold(0u32, |total, length| total.checked_add(*length))?;
+            .try_fold(0u32, |total, row| total.checked_add(row.query_len))?;
         if usize::try_from(tokens_of_call).ok()? != inputs.len() {
             return None;
         }
@@ -250,11 +295,10 @@ pub(crate) fn columns(
 
         // One `-1` per token whose row writes no cache page: the write decision
         // is per row, so it expands over the row's tokens here and nowhere else.
-        let writes: Vec<bool> = forward
-            .write_cache
+        let writes: Vec<bool> = call_rows
+            .rows
             .iter()
-            .zip(&forward.query_lens)
-            .flat_map(|(writes, length)| std::iter::repeat_n(*writes, *length as usize))
+            .flat_map(|row| std::iter::repeat_n(row.writes, row.query_len as usize))
             .collect();
         // The tables this call addresses, which the caller states for every
         // call: a call declares a table on the wire only when it changed
@@ -276,18 +320,18 @@ pub(crate) fn columns(
         );
         rows.slot_mapping.extend(mapped?);
 
-        for seq_len in &forward.seq_lens {
-            rows.seq_lens.push(i32::try_from(*seq_len).ok()?);
+        for row in &call_rows.rows {
+            rows.seq_lens.push(i32::try_from(row.seq_len).ok()?);
+            queries.push(row.query_len);
         }
         if let Some(state) = state {
             let table = tables
                 .get(index)?
                 .iter()
                 .find(|table| table.group_id == state.group_id)?;
-            for (row, (seq_len, query)) in
-                forward.seq_lens.iter().zip(&forward.query_lens).enumerate()
-            {
-                let start = seq_len.checked_sub(*query)?;
+            for (row, layout) in call_rows.rows.iter().enumerate() {
+                let seq_len = layout.seq_len;
+                let start = seq_len.checked_sub(layout.query_len)?;
                 // The first row of a request's first call on its slot continues from the
                 // checkpoint its reused prefix ends at; a row from position zero starts from a zero
                 // state the kernels write themselves.
@@ -313,15 +357,8 @@ pub(crate) fn columns(
                 }
             }
         }
-        queries.extend_from_slice(&forward.query_lens);
-        slots.extend(
-            forward
-                .request_pool_indices
-                .iter()
-                .map(|slot| i32::try_from(*slot))
-                .collect::<Result<Vec<_>, _>>()
-                .ok()?,
-        );
+        let slot = i32::try_from(request).ok()?;
+        slots.extend(std::iter::repeat_n(slot, call_rows.rows.len()));
         input_ids.extend_from_slice(inputs);
         // One parameter row per row of the call, the same values: the
         // request's sampling parameters apply to every row it samples.
@@ -340,8 +377,8 @@ pub(crate) fn columns(
             call.request_key.request_epoch,
         );
         let mut end = u64::from(first);
-        for length in &forward.query_lens {
-            end = end.checked_add(u64::from(*length))?;
+        for row in &call_rows.rows {
+            end = end.checked_add(u64::from(row.query_len))?;
             draw_addresses.push(ipc::philox::DrawAddress { key, position: end });
         }
 
@@ -361,7 +398,7 @@ pub(crate) fn columns(
         // slot's device state. A row names its slot, its mode, the task whose
         // sampled token it installs, the host length and positions an explicit
         // or a verification row writes, and whether its token counts penalties.
-        let query = *forward.query_lens.last()?;
+        let query = call_rows.rows.last()?.query_len;
         // A call samples when it declares a sampled-token output: a decode and
         // a verification always do, and a prompt chunk does only when it is the
         // chunk that ends the prompt. `consumer_slots` is the worker's, filled
@@ -385,12 +422,11 @@ pub(crate) fn columns(
         let committed = match kind {
             RowKind::Decode => 1,
             RowKind::Verify => 0,
-            RowKind::Prefill => forward
-                .query_lens
+            RowKind::Prefill => call_rows
+                .rows
                 .iter()
-                .zip(&forward.write_cache)
-                .filter(|(_, writes)| **writes)
-                .try_fold(0u32, |total, (length, _)| total.checked_add(*length))?,
+                .filter(|row| row.writes)
+                .try_fold(0u32, |total, row| total.checked_add(row.query_len))?,
         };
         let visible = call.coordinates.cache_visible_len;
         let length = visible.checked_add(committed)?;
@@ -538,23 +574,38 @@ pub(crate) fn batch_shape(columns: &BatchColumns) -> ipc::execution::Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::WorkerGroupId;
 
     /// Four tokens per page.
     const BLOCK_SIZE: u32 = 4;
 
     /// A table covering pages 2..5 (positions 8..20) whose units are 7, 9 and
     /// 10.
-    /// The tables each call addresses, as the mechanism states them for the
-    /// layout: the dispatch's own declaration, which is the whole table in a
-    /// fixture.
-    fn tables_of(
-        requests: &[(Call, crate::worker::RequestDispatch)],
-    ) -> Vec<Vec<crate::IpcBlockTable>> {
-        requests
-            .iter()
-            .map(|(_, dispatch)| dispatch.block_tables.clone())
-            .collect()
+    /// The tables each call addresses: the whole table of the fixture.
+    fn tables_of(requests: &[(Call, CallLayout)]) -> Vec<Vec<crate::IpcBlockTable>> {
+        requests.iter().map(|_| vec![table()]).collect()
+    }
+
+    /// The batch columns of `requests`, as the assembly fills them.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the arguments of the function under test"
+    )]
+    fn columns(
+        requests: &[(Call, CallLayout)],
+        tables: &[Vec<crate::IpcBlockTable>],
+        inputs: &[Vec<i32>],
+        sampling: &[&SamplingParams],
+        draws: &[u32],
+        block_size: u32,
+        max_kv_len: u32,
+        state: Option<StatePages>,
+        resident: &[bool],
+    ) -> Option<BatchColumns> {
+        let requests: Vec<(&Call, &CallLayout)> =
+            requests.iter().map(|(call, rows)| (call, rows)).collect();
+        super::columns(
+            &requests, tables, inputs, sampling, draws, block_size, max_kv_len, state, resident,
+        )
     }
 
     fn table() -> ipc::BlockTable {
@@ -591,29 +642,18 @@ mod tests {
         call
     }
 
-    /// The dispatch of a call whose rows are `query_lens`, all in request slot
+    /// The rows of a call whose queries are `query_lens`, all in request slot
     /// `slot`, writing the cache where `writes` says.
-    fn dispatch(slot: u32, query_lens: &[u32], writes: &[bool]) -> RequestDispatch {
-        let mut forward = ipc::ForwardBatch::default();
-        // `ForwardBatch::seq_lens` is a row's total attention length, cached
-        // prefix plus its own query, which is what the assembly states.
+    fn dispatch(slot: u32, query_lens: &[u32], writes: &[bool]) -> CallLayout {
+        // A row's attention length is its total, cached prefix plus its own
+        // query, which is what the assembly states.
+        let mut rows = CallLayout::of(slot);
         let mut prefix = 8;
         for (length, write) in query_lens.iter().zip(writes) {
-            forward.push(0, slot, prefix + length, *length, *write);
+            rows.push(prefix + length, *length, *write);
             prefix += length;
         }
-        RequestDispatch {
-            worker: WorkerGroupId("w".to_owned()),
-            request_pool_idx: Some(slot),
-            block_tables: vec![table()],
-            new_cache_units: Vec::new(),
-            forward,
-            latent: None,
-            decode: None,
-            buffers: Vec::new(),
-            page_loads: Vec::new(),
-            readers: None,
-        }
+        rows
     }
 
     /// A request's sampling parameters, distinguishable per field so a column
@@ -743,7 +783,7 @@ mod tests {
         // model reads this column verbatim into its factor tables, so a row index here would put
         // every decode at RoPE angle zero and produce plausible, wrong logits.
         assert_eq!(columns.rows.positions, vec![12]);
-        // The row's attention length is the dispatch's `ForwardBatch::seq_lens` - cached prefix plus
+        // The row's attention length is the planner's `Row::seq_len` - cached prefix plus
         // this row's queries - and not the call's position: this fixture states a prefix of 8 for a
         // call at position 12, so the column carries 9. The two are separate inputs on purpose (a
         // retained cache can be shorter than the sequence), and a live decode states them equal.
@@ -1457,27 +1497,6 @@ mod tests {
                 &requests,
                 &tables_of(&requests),
                 &[vec![1]],
-                &[&sampling()],
-                &[0],
-                BLOCK_SIZE,
-                64,
-                None,
-                &[],
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn rows_of_two_requests_in_one_call_are_a_fault() {
-        let mut dispatch = dispatch(1, &[2], &[true]);
-        dispatch.forward.push(0, 2, 4, 1, true);
-        let requests = vec![(call(prefill(), 8, &[2]), dispatch)];
-        assert!(
-            columns(
-                &requests,
-                &tables_of(&requests),
-                &[vec![1, 2]],
                 &[&sampling()],
                 &[0],
                 BLOCK_SIZE,

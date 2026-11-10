@@ -28,6 +28,7 @@ impl Scheduler {
         admitted: bool,
         planned_us: u64,
         batch: &mut ExecutionBatch,
+        layouts: &mut Vec<columns::CallLayout>,
     ) -> Option<()> {
         let request_id = call.request_key.request_id;
 
@@ -201,10 +202,10 @@ impl Scheduler {
             Vec::new()
         };
 
-        let mut call_block_tables = Vec::new();
-        let mut call_new_cache_units = Vec::new();
-        let mut call_page_loads = Vec::new();
-        let mut call_forward = ForwardBatch::default();
+        // What the call states to the device: its rows, the tables it reads
+        // through, its fresh units and host page loads. The batch's device
+        // layout is written from this, once (`attach_columns`).
+        let mut layout = columns::CallLayout::default();
         if let Some(lengths) = cache_lengths {
             // Registration above found the request running, and a running
             // token request always has its cache tables.
@@ -220,6 +221,7 @@ impl Scheduler {
                 self.invariant_broken("a registered token request is admitted with a prefix cache");
                 return None;
             };
+            layout = columns::CallLayout::of(request_pool_idx);
 
             // A table is declared when its held page interval changed since
             // its last declaration (growth, or window retirement in a
@@ -253,7 +255,7 @@ impl Scheduler {
                     .map(|serial| table.fresh_units(serial))
                     .unwrap_or_default();
                 if table.changed_since_sent() || !fresh.is_empty() {
-                    call_block_tables.push(IpcBlockTable {
+                    layout.block_tables.push(IpcBlockTable {
                         request_pool_idx,
                         group_id: table.group_id() as u32,
                         start_page: u32::try_from(table.start_page()).unwrap_or(u32::MAX),
@@ -264,7 +266,7 @@ impl Scheduler {
                     table.mark_sent();
                 }
                 if !fresh.is_empty() {
-                    call_new_cache_units.push(CacheUnitAllocation {
+                    layout.cache_units.push(CacheUnitAllocation {
                         request_pool_idx,
                         group_id: table.group_id() as u32,
                         unit_ids: fresh,
@@ -277,7 +279,7 @@ impl Scheduler {
             // forward.
             if admitted && let Some(kv_offload) = self.kv_offload.as_mut() {
                 let tables = &allocation.tables;
-                call_page_loads = kv_offload.loads(request_id, |group, page| {
+                layout.page_loads = kv_offload.loads(request_id, |group, page| {
                     tables
                         .get(group)
                         .and_then(|table| table.page(page))
@@ -294,14 +296,12 @@ impl Scheduler {
                 let mut end = lengths.visible;
                 for &segment in &context_segments {
                     end += segment;
-                    call_forward.push(0, request_pool_idx, end, segment, true);
+                    layout.push(end, segment, true);
                 }
             } else if lengths.input > 0 {
                 // A draft refill writes no cache of the target: its
                 // tokens' K/V are the request's already.
-                call_forward.push(
-                    0,
-                    request_pool_idx,
+                layout.push(
                     lengths.visible + lengths.input,
                     lengths.input,
                     call.draft.refill.is_none(),
@@ -310,13 +310,7 @@ impl Scheduler {
             // One read-only row per canvas: it attends to the visible prefix
             // and its own canvas, and persists nothing.
             for canvas in &canvas_lengths {
-                call_forward.push(
-                    0,
-                    request_pool_idx,
-                    lengths.visible + canvas,
-                    *canvas,
-                    false,
-                );
+                layout.push(lengths.visible + canvas, *canvas, false);
             }
         }
 
@@ -379,51 +373,21 @@ impl Scheduler {
             });
         }
 
-        // A denoising call adds one query row per guidance branch; its query
-        // is the latent grid plus the commit marker tokens and writes nothing to the prefix cache.
-        // Branch 0 attends to the request's own conditioning prefix cache. Every other
-        // branch attends to the guidance prefix (the negative-prompt prefix cache in its own
-        // request row) when the request holds one, and to the request's own
-        // prefix cache otherwise. Until a denoising call completes successfully and
-        // finalizes the prefix, the call also prefills a non-empty negative
-        // prompt into it; the prefix's tables are resent until then and
-        // whenever the prefix has gained pages.
+        // A denoising call carries its guidance prefixes' tables and fresh
+        // units, resent until a denoising call completes and finalizes them
+        // and whenever a prefix has gained pages. Its guidance branches are
+        // the denoiser's own evaluation, not token rows of the device layout.
         if call.kind == CallKind::Media(MediaCall::Denoising) {
-            let Some(CacheLengths {
-                visible: conditioning_tokens,
-                ..
-            }) = cache_lengths
-            else {
-                self.invariant_broken("denoising declares its conditioning cache range");
-                return None;
-            };
-            let query_len = u32::try_from(
-                self.running
-                    .get(&request_id)
-                    .map(|state| self.num_vae(&state.req.image))
-                    .unwrap_or_default()
-                    .saturating_add(u64::from(self.generation_limits.commit_marker_tokens)),
-            )
-            .unwrap_or(u32::MAX);
             let Some(state) = self.running.get_mut(&request_id) else {
                 self.fatal = true;
                 return None;
             };
-            let Some(main_slot) = state.request_pool_idx() else {
-                self.invariant_broken("a denoising request is admitted");
-                return None;
-            };
-            // Each guidance prefix carries its tables and fresh units, and is
-            // prefilled until a denoising call completes; then one row per
-            // branch, in evaluation order, reads the prefix it attends to.
-            let mut text_row = None;
-            let mut image_row = None;
             if let Some(state) = state.guidance_prefix.as_mut() {
                 let finalized = state.diffusion_finalized;
                 for prefix in &mut state.prefixes {
                     if !finalized || !prefix.new_units.is_empty() {
                         for table in prefix.block_tables() {
-                            call_block_tables.push(IpcBlockTable {
+                            layout.block_tables.push(IpcBlockTable {
                                 request_pool_idx: prefix.request_pool_idx(),
                                 group_id: table.group_id() as u32,
                                 start_page: u32::try_from(table.start_page()).unwrap_or(u32::MAX),
@@ -435,7 +399,7 @@ impl Scheduler {
                     }
                     for (group_id, units) in std::mem::take(&mut prefix.new_units) {
                         if !units.is_empty() {
-                            call_new_cache_units.push(CacheUnitAllocation {
+                            layout.cache_units.push(CacheUnitAllocation {
                                 request_pool_idx: prefix.request_pool_idx(),
                                 group_id,
                                 unit_ids: units,
@@ -443,32 +407,7 @@ impl Scheduler {
                             });
                         }
                     }
-                    if prefix.tokens > 0 && !finalized {
-                        call_forward.push(
-                            0,
-                            prefix.request_pool_idx(),
-                            prefix.tokens,
-                            prefix.tokens,
-                            true,
-                        );
-                    }
                 }
-                text_row = state.row(state.text);
-                image_row = state.row(state.image);
-            }
-            // The conditioned branch reads the request's own context; a
-            // branch without a prefix of its own (an image-unconditional
-            // branch the worker states none for) reads it too.
-            let own = (main_slot, conditioning_tokens);
-            let mut rows = vec![own];
-            if state.req.image.guides_text() {
-                rows.push(text_row.unwrap_or(own));
-            }
-            if state.req.image.guides_image() {
-                rows.push(image_row.unwrap_or(own));
-            }
-            for (request_pool_index, seq_len) in rows {
-                call_forward.push(0, request_pool_index, seq_len + query_len, query_len, false);
             }
         }
 
@@ -548,16 +487,13 @@ impl Scheduler {
             RequestDispatch {
                 worker,
                 request_pool_idx: None,
-                block_tables: call_block_tables,
-                new_cache_units: call_new_cache_units,
-                forward: call_forward,
                 latent,
                 decode: None,
                 buffers,
                 readers: Default::default(),
-                page_loads: call_page_loads,
             },
         ));
+        layouts.push(layout);
         // The resolved token product serves only the first call after its
         // resolution; later calls chain from the in-flight one.
         if let Some(st) = self.running.get_mut(&request_id) {

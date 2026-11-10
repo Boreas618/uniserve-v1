@@ -1157,17 +1157,16 @@ impl Scheduler {
             .as_ref()
             .filter(|_| state.req.image.guides_image());
         let mut lengths = Vec::new();
-        let text_index = text.map(|tokens| {
+        if let Some(tokens) = text {
             lengths.push(tokens.len() as u32);
-            lengths.len() - 1
-        });
-        let image_index = image.map(|tokens| match (text, text_index) {
-            (Some(text), Some(index)) if text == tokens => index,
-            _ => {
-                lengths.push(tokens.len() as u32);
-                lengths.len() - 1
-            }
-        });
+        }
+        // An image-unconditional branch whose prefix is the text branch's
+        // shares it.
+        if let Some(tokens) = image
+            && text != Some(tokens)
+        {
+            lengths.push(tokens.len() as u32);
+        }
         if lengths.is_empty() {
             return true;
         }
@@ -1192,8 +1191,6 @@ impl Scheduler {
         };
         state.guidance_prefix = Some(GuidancePrefixState {
             prefixes,
-            text: text_index,
-            image: image_index,
             diffusion_finalized: false,
         });
         true
@@ -1225,7 +1222,6 @@ impl Scheduler {
                 buffers: HashMap::new(),
             },
             new_units,
-            tokens,
         })
     }
 

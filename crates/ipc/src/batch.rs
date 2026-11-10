@@ -1,7 +1,6 @@
 //! What the scheduler allocates for a call: the cache page tables of its
 //! request ([`BlockTable`], with the units newly acquired for them in
-//! [`CacheUnitAllocation`]), its forward rows ([`ForwardBatch`]), latent
-//! trajectories ([`LatentParams`]), decode cursors ([`DecodeRange`]),
+//! [`CacheUnitAllocation`]), latent trajectories ([`LatentParams`]), decode cursors ([`DecodeRange`]),
 //! persistent buffer spans ([`BufferAllocation`]) and the host cache copies
 //! ([`PageCopy`], [`LatentOffload`]).
 //!
@@ -236,73 +235,6 @@ impl CacheUnitAllocation {
                     && destinations.insert(*destination)
             }),
             "cache-unit copies require distinct new destinations and immutable sources"
-        );
-        Ok(())
-    }
-}
-
-/// Aligned columns defining the model's forward rows, independent of wire framing.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForwardBatch {
-    /// Physical call index for each row; logical call IDs remain unchanged.
-    pub call_indices: Vec<u32>,
-    /// Scheduler-owned request slots, including alternative CFG prefixes.
-    pub request_pool_indices: Vec<u32>,
-    /// Total attention lengths (cached prefix plus query), not allocated capacities.
-    pub seq_lens: Vec<u32>,
-    /// Query tokens evaluated by each row.
-    pub query_lens: Vec<u32>,
-    /// Whether the query interval persists in the prefix cache after its visible prefix.
-    pub write_cache: Vec<bool>,
-}
-
-impl ForwardBatch {
-    /// Append one model row to every column in the same order.
-    pub fn push(
-        &mut self,
-        call_index: u32,
-        request_pool_index: u32,
-        seq_len: u32,
-        query_len: u32,
-        write_cache: bool,
-    ) {
-        self.call_indices.push(call_index);
-        self.request_pool_indices.push(request_pool_index);
-        self.seq_lens.push(seq_len);
-        self.query_lens.push(query_len);
-        self.write_cache.push(write_cache);
-    }
-
-    /// Validate column alignment and numerical ranges before indexing model inputs.
-    pub fn validate(&self, call_count: usize) -> ValidationResult<()> {
-        let rows = self.call_indices.len();
-        ensure_valid!(
-            self.request_pool_indices.len() == rows
-                && self.seq_lens.len() == rows
-                && self.query_lens.len() == rows
-                && self.write_cache.len() == rows,
-            "forward input columns have different lengths"
-        );
-        ensure_valid!(
-            self.call_indices
-                .iter()
-                .all(|index| (*index as usize) < call_count),
-            "forward call index is outside its batch"
-        );
-        ensure_valid!(
-            self.request_pool_indices.iter().all(|slot| *slot > 0),
-            "forward input carries the reserved request slot"
-        );
-        ensure_valid!(
-            self.query_lens.iter().all(|length| *length > 0),
-            "forward query length must be positive"
-        );
-        ensure_valid!(
-            self.seq_lens
-                .iter()
-                .zip(&self.query_lens)
-                .all(|(total, query)| total >= query),
-            "forward sequence length is shorter than its query"
         );
         Ok(())
     }

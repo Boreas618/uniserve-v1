@@ -21,9 +21,7 @@ use crate::worker::ExecutionBatch;
 use crate::worker::Worker;
 use crate::worker::{WorkerError, WorkerInfo, WorkerSubmitError};
 use ipc::BatchCommand;
-use ipc::execution::{
-    Batch as DeviceBatch, BatchId as DeviceBatchId, Batches, CallId as DeviceCallId, Submission,
-};
+use ipc::execution::{Batch as DeviceBatch, Batches, Submission};
 use ipc::execution::{EpochOperation, Outcome};
 
 /// What dispatch and the views ask of the epoch: the pools it serves, and
@@ -829,16 +827,17 @@ impl InProcess {
     /// The batch as the worker reads it, with the mechanism's names for its
     /// calls.
     ///
-    /// The refusals are the mechanism's, stated here because this is where the
-    /// batch crosses into the worker's layout: a batch the mechanism could
-    /// not state the columns of, a batch of media or denoise calls (2.4 serves
-    /// no media in process yet), and a batch whose call kinds name no device
-    /// phase are refused rather than served on invented values. The shape is
-    /// the assembly's, not this seam's (`batching::columns::batch_shape`), and
-    /// it is checked against the columns before the batch leaves.
+    /// The batch was laid out once when the mechanism assembled it
+    /// (`ExecutionBatch::device`); this seam stamps the step's generation and
+    /// checks the layout against the calls before it leaves. The refusals are
+    /// the mechanism's, stated here because this is where the batch crosses
+    /// into the worker: a batch the mechanism could not lay out, a token
+    /// batch carrying a media call or a media batch a token call, a batch
+    /// whose calls name no device phase or several, and columns that do not
+    /// fit their shape are refused rather than served on invented values.
     ///
-    /// The batch's lifecycle commands do not travel: `::worker::Batch` has no
-    /// field for them, because the resources such a command retires —
+    /// The batch's lifecycle commands do not travel: `ipc::execution::Batch`
+    /// has no field for them, because the resources such a command retires —
     /// a request's row, its buffers, its pages — belong to this process's
     /// worker once it holds the columns. A batch that completes reports no
     /// command as failed, which the mechanism reads as its commands having
@@ -859,102 +858,11 @@ impl InProcess {
         batch: &ExecutionBatch,
         generation: u64,
     ) -> anyhow::Result<(DeviceBatch, Vec<(ipc::RequestKey, ipc::CallId)>)> {
-        // One batch is one computation: a token batch is the typed columns the mechanism wrote,
-        // and a media batch is the computation its kernels were captured for beside the request's
-        // own stated parameters. A batch that states both would be served twice over, and one that
-        // states neither cannot be served at all.
-        if let Some(media) = batch.media.clone() {
-            // A text encoding is the one media computation that reads token columns: its prompt.
-            anyhow::ensure!(
-                batch.columns.is_none() || media.computation.call == ipc::MediaCall::TextEncoding,
-                "batch {} states token columns and media columns: one batch is one computation",
-                batch.id
-            );
-            media
-                .check()
-                .map_err(|error| anyhow::anyhow!("batch {}: {error}", batch.id))?;
-            let mut calls = Vec::with_capacity(batch.requests.len());
-            let mut kind = None;
-            for (call, _) in &batch.requests {
-                anyhow::ensure!(
-                    matches!(call.kind, ipc::CallKind::Media(_)),
-                    "batch {} states media columns and carries a call no media phase serves: {:?}",
-                    batch.id,
-                    call.kind
-                );
-                let phase = wire_phase(call.kind).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "batch {} carries a call kind no device phase serves: {:?}",
-                        batch.id,
-                        call.kind
-                    )
-                })?;
-                anyhow::ensure!(
-                    kind.is_none_or(|served| served == phase),
-                    "batch {} mixes phases: one batch serves one phase",
-                    batch.id
-                );
-                kind = Some(phase);
-                calls.push((call.request_key, call.call_id));
-            }
-            let phase =
-                kind.ok_or_else(|| anyhow::anyhow!("batch {} carries no call to serve", batch.id))?;
-            let computation = media.computation;
-            let variant = computation.variant().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "batch {} states a {:?} computation no variant serves",
-                    batch.id,
-                    computation.call
-                )
-            })?;
-            let device = DeviceBatch {
-                id: DeviceBatchId(batch.id),
-                phase,
-                calls: (0..calls.len() as u64).map(DeviceCallId).collect(),
-                shape: ipc::execution::Shape {
-                    rows: computation.rows,
-                    tokens: computation.tokens,
-                    variant,
-                },
-                // A text encoding reads its prompt as token columns. Every other media computation
-                // reads none, so its batch carries none: the fields its kernels read are the
-                // model's own, staged inside the runner.
-                columns: batch.columns.clone().unwrap_or_default(),
-                generation,
-                cache_units: Vec::new(),
-                block_tables: Vec::new(),
-                page_loads: Vec::new(),
-                page_offloads: Vec::new(),
-                // A resumed request's latent preparation opens at the stored trajectory its restore
-                // pinned, which the denoiser copies in before the call completes.
-                latent_restores: batch
-                    .requests
-                    .iter()
-                    .filter_map(|(call, _)| {
-                        call.latent_restore
-                            .clone()
-                            .map(|restore| (call.request_key, restore))
-                    })
-                    .collect(),
-                // An encoder call's output in the host encoder pool: read from it, or written to it.
-                host_outputs: batch
-                    .requests
-                    .iter()
-                    .filter_map(|(call, _)| {
-                        call.host_output
-                            .clone()
-                            .map(|output| (call.request_key, output))
-                    })
-                    .collect(),
-                media: Some(media),
-            };
-            return Ok((device, calls));
-        }
-        let columns = batch.columns.clone().ok_or_else(|| {
-            // A media batch that arrives without its own columns is a different fact from a token
-            // batch without a layout: the mechanism states a media computation's per-request buffers
-            // only for the families it has a record for, so the refusal names the family rather than
-            // the token layout that batch never had.
+        let device = batch.device.as_ref().ok_or_else(|| {
+            // A media batch that arrives without its layout is a different fact from a token
+            // batch without one: the mechanism states a media computation's per-request buffers
+            // only for the computations a device serves, so the refusal names the computation
+            // rather than the token layout that batch never had.
             match batch.requests.first().map(|(call, _)| call.kind) {
                 Some(ipc::CallKind::Media(call)) => anyhow::anyhow!(
                     "batch {} states no media columns: the mechanism stages no per-request buffers \
@@ -969,12 +877,22 @@ impl InProcess {
                 ),
             }
         })?;
+        // One batch is one computation: a token batch is the typed columns the mechanism wrote,
+        // and a media batch is the computation its kernels were captured for beside the request's
+        // own stated parameters.
+        let media = device.media.is_some();
         let mut calls = Vec::with_capacity(batch.requests.len());
-        let mut kind = None;
         for (call, _) in &batch.requests {
+            let media_call = matches!(call.kind, ipc::CallKind::Media(_));
             anyhow::ensure!(
-                !matches!(call.kind, ipc::CallKind::Media(_)),
+                !media_call || media,
                 "in-process execution serves no media call from a token batch (batch {}): {:?}",
+                batch.id,
+                call.kind
+            );
+            anyhow::ensure!(
+                media_call || !media,
+                "batch {} states media columns and carries a call no media phase serves: {:?}",
                 batch.id,
                 call.kind
             );
@@ -986,61 +904,36 @@ impl InProcess {
                 )
             })?;
             anyhow::ensure!(
-                kind.is_none_or(|served| served == phase),
+                phase == device.phase,
                 "batch {} mixes phases: one batch serves one phase",
                 batch.id
             );
-            kind = Some(phase);
             calls.push((call.request_key, call.call_id));
         }
-        let phase =
-            kind.ok_or_else(|| anyhow::anyhow!("batch {} carries no call to serve", batch.id))?;
-        let shape = crate::batching::columns::batch_shape(&columns);
-        columns
-            .check(&shape)
-            .map_err(|error| anyhow::anyhow!("batch {}: {error}", batch.id))?;
-        let device = DeviceBatch {
-            id: DeviceBatchId(batch.id),
-            phase,
-            calls: (0..calls.len() as u64).map(DeviceCallId).collect(),
-            shape,
-            columns,
-            generation,
-            // What the mechanism allocated for every call's pages: the units each takes, which the
-            // runner resets before the forward writes them, and the copies a continuation's partial
-            // last page needs from the page its predecessor published. A batch without them reads
-            // that page from whatever its new unit held before.
-            cache_units: batch
-                .requests
-                .iter()
-                .flat_map(|(_, dispatch)| dispatch.new_cache_units.iter().cloned())
-                .collect(),
-            // Every call's tables, flattened: the worker installs these into the cache's pooled
-            // table before the replay, because the gather reads row `slot` of that table and a row
-            // nobody wrote gathers another request's pages.
-            block_tables: batch
-                .requests
-                .iter()
-                .flat_map(|(_, dispatch)| dispatch.block_tables.iter().cloned())
-                .collect(),
-            // The host KV cache's copies, which the runner issues on its copy stream: what the
-            // batch's new units load before the forward, and what it publishes beside it.
-            page_loads: batch
-                .requests
-                .iter()
-                .flat_map(|(_, dispatch)| dispatch.page_loads.iter().cloned())
-                .collect(),
-            page_offloads: batch
-                .page_offloads
-                .as_ref()
-                .map(|offloads| offloads.pages.clone())
-                .unwrap_or_default(),
-            latent_restores: Vec::new(),
-            host_outputs: Vec::new(),
-            // A token forward carries no media columns: the media arm above is where a media
-            // batch's are passed through, and this arm refuses a media call by name.
-            media: None,
-        };
+        anyhow::ensure!(
+            !calls.is_empty(),
+            "batch {} carries no call to serve",
+            batch.id
+        );
+        if let Some(media) = &device.media {
+            // A text encoding is the one media computation that reads token columns: its prompt.
+            anyhow::ensure!(
+                device.columns == ipc::execution::BatchColumns::default()
+                    || media.computation.call == ipc::MediaCall::TextEncoding,
+                "batch {} states token columns and media columns: one batch is one computation",
+                batch.id
+            );
+            media
+                .check()
+                .map_err(|error| anyhow::anyhow!("batch {}: {error}", batch.id))?;
+        } else {
+            device
+                .columns
+                .check(&device.shape)
+                .map_err(|error| anyhow::anyhow!("batch {}: {error}", batch.id))?;
+        }
+        let mut device = device.clone();
+        device.generation = generation;
         Ok((device, calls))
     }
 }
@@ -1201,13 +1094,9 @@ mod tests {
             crate::worker::RequestDispatch {
                 worker: WorkerGroupId("gpu".to_owned()),
                 request_pool_idx: None,
-                block_tables: Vec::new(),
-                new_cache_units: Vec::new(),
-                forward: Default::default(),
                 latent: None,
                 decode: None,
                 buffers: Vec::new(),
-                page_loads: Vec::new(),
                 readers: None,
             },
         )
@@ -1231,8 +1120,35 @@ mod tests {
             Vec::new(),
         );
         let staged = vec![staged(); rows as usize];
-        batch.media = Some(MediaColumns::staged(computation, &staged));
+        with_media(&mut batch, MediaColumns::staged(computation, &staged));
         batch
+    }
+
+    /// Lays `batch` out as a media computation over `media`, as `attach_media` does.
+    fn with_media(batch: &mut ExecutionBatch, media: MediaColumns) {
+        let phase = wire_phase(batch.requests[0].0.kind).expect("a media call has a phase");
+        let computation = media.computation;
+        batch.device = Some(DeviceBatch {
+            id: ipc::execution::BatchId(batch.id),
+            phase,
+            calls: (0..batch.requests.len() as u64)
+                .map(ipc::execution::CallId)
+                .collect(),
+            shape: ipc::execution::Shape {
+                rows: computation.rows,
+                tokens: computation.tokens,
+                variant: computation.variant().expect("a served computation"),
+            },
+            columns: ipc::execution::BatchColumns::default(),
+            generation: 0,
+            cache_units: Vec::new(),
+            block_tables: Vec::new(),
+            page_loads: Vec::new(),
+            page_offloads: Vec::new(),
+            latent_restores: Vec::new(),
+            host_outputs: Vec::new(),
+            media: Some(media),
+        });
     }
 
     /// The phase a call kind is served at, as the mechanism's one translation states it.
@@ -1349,11 +1265,16 @@ mod tests {
         let pool = submissions.info().workers[0].0.clone();
         let decode = |id: u64, unit: u32| {
             let mut batch = media_batch(id, MediaCall::VideoDecoding, 1);
-            let computation = batch.media.as_ref().expect("a media batch").computation;
-            batch.media = Some(MediaColumns::staged(
-                computation,
-                &[StagedRequest { unit, ..staged() }],
-            ));
+            let computation = batch
+                .device
+                .as_ref()
+                .and_then(|device| device.media.as_ref())
+                .expect("a media batch")
+                .computation;
+            with_media(
+                &mut batch,
+                MediaColumns::staged(computation, &[StagedRequest { unit, ..staged() }]),
+            );
             batch
         };
 
@@ -1448,7 +1369,10 @@ mod tests {
         let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
 
         let mut both = media_batch(6, MediaCall::Denoising, 1);
-        both.columns = Some(ipc::execution::BatchColumns::default());
+        both.device.as_mut().expect("a laid-out batch").columns = ipc::execution::BatchColumns {
+            input_ids: vec![1],
+            ..ipc::execution::BatchColumns::default()
+        };
         let refusal = format!(
             "{}",
             submissions

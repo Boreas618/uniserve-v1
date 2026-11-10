@@ -1,14 +1,16 @@
 //! Logical submissions.
 //!
 //! The scheduler builds an [`ExecutionBatch`] of calls, each paired with the
-//! [`RequestDispatch`] it chose, plus lifecycle commands, and hands it to
-//! `Submissions`, which describes it to the device worker or gives it to the
-//! simulated one.
+//! [`RequestDispatch`] it chose, plus lifecycle commands, and lays it out once
+//! as the `ipc::execution::Batch` the device worker reads
+//! ([`ExecutionBatch::device`]). `Submissions` hands that batch to the device
+//! worker, stamped with the step's generation, or gives the whole record to
+//! the simulated one.
 
 use super::WorkerGroupId;
 use ipc::{
-    BatchCommand, BlockTable, BufferAllocation, CacheUnitAllocation, Call, DecodeRange,
-    ForwardBatch, LatentParams, NewRequest, RequestKey, TensorExport,
+    BatchCommand, BufferAllocation, Call, DecodeRange, LatentParams, NewRequest, RequestKey,
+    TensorExport,
 };
 use std::collections::BTreeMap;
 
@@ -43,8 +45,11 @@ impl RankBuffer {
 
 /// Physical dispatch selected by the scheduler for a call.
 ///
-/// The call itself is the shared IPC `Call`. These fields describe
-/// its worker and allocations, which are gathered into physical batch arrays.
+/// The call itself is the shared IPC `Call`. These fields describe its worker
+/// and the allocations the mechanism retires with it. What the call states to
+/// the device — its rows, cache tables, fresh units and page loads — is not
+/// here: it is written once into the batch's device layout
+/// ([`ExecutionBatch::device`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RequestDispatch {
     /// Worker routing stays outside the call sent across IPC.
@@ -53,21 +58,12 @@ pub struct RequestDispatch {
     /// space. Unset dispatches retain the admission's canonical row;
     /// The worker applies the override to the request's `Start`.
     pub request_pool_idx: Option<u32>,
-    /// Cache tables and newly acquired units used by this call.
-    pub block_tables: Vec<BlockTable>,
-    pub new_cache_units: Vec<CacheUnitAllocation>,
-    /// Rows use a local call index: `ExecutionBatch::validate` requires every
-    /// row's index to be zero.
-    pub forward: ForwardBatch,
     pub latent: Option<LatentParams>,
     pub decode: Option<DecodeRange>,
     /// Persistent spans for the call's buffer inputs and outputs, on each
     /// rank of the worker that backs them. Request retirement retains every
     /// physical reader and writer allocation.
     pub buffers: Vec<RankBuffer>,
-    /// Pages of the host KV cache the call's new units are filled with
-    /// before its forward, on every rank of its worker group.
-    pub page_loads: Vec<ipc::PageCopy>,
     /// For a video request's call, the worker routed to each component that
     /// reads its products, keyed by component name, as the request's graph
     /// connects its calls; empty for a call whose products leave the graph.
@@ -94,32 +90,24 @@ pub struct ExecutionBatch {
     pub cache_inputs: Vec<ipc::CacheTransfer>,
     /// Published pages the batch writes to the host KV cache.
     pub page_offloads: Option<PageOffloads>,
-    /// The batch's columns in the layout the kernels read, filled when the
-    /// mechanism assembles the batch (design §4.3, `worker::BatchColumns`).
+    /// The batch as the device worker reads it, laid out once when the
+    /// mechanism assembles the batch: its phase, shape and host columns (a
+    /// token batch's typed columns, or a media computation's
+    /// `MediaColumns`), every call's cache tables, fresh units and page
+    /// loads, and the batch's page offloads.
     ///
-    /// The batch carries them so that a submission hands the worker one value
-    /// and nothing re-derives the layout from the calls. `None` means the
-    /// mechanism could not state them — a batch no worker may serve, as
-    /// opposed to one served on invented values.
-    pub columns: Option<ipc::execution::BatchColumns>,
-    /// A media computation's own columns, and `None` for every token batch (2.4).
-    ///
-    /// One batch is one computation: a media batch states the computation its kernels were
-    /// captured for and, per request, the buffers the model's family prepared, and it carries
-    /// no token column. The two fields are therefore never both `Some`.
-    ///
-    /// The mechanism is the one that fills this, and it fills it only with facts it owns: the
-    /// computation comes from the plan the scheduler selected the call in, the extent from the
-    /// bucket the worker states it would serve that computation in, and the buffers from the
-    /// request's own stated parameters. A media batch whose inputs the mechanism cannot state is
-    /// left without columns and is refused at submission by name, never served on invented bytes.
-    pub media: Option<ipc::execution::MediaColumns>,
+    /// Its `calls` number this record's `requests` by index, and its
+    /// `generation` is stamped at submission, since the step reads it then.
+    /// `None` means the mechanism could not state the layout — a batch no
+    /// worker may serve, refused at submission by name rather than served on
+    /// invented values.
+    pub device: Option<ipc::execution::Batch>,
 }
 
 /// Batches compare by what the mechanism decided: their identity, their
-/// calls and their commands. The columns are that decision's projection into
-/// the worker's layout (equal calls project equally, and a batch with none
-/// is the unservable one), so equality states only whether both carry them.
+/// calls and their commands. The device layout is that decision's projection
+/// into the worker's layout (equal calls project equally, and a batch with
+/// none is the unservable one), so equality states only whether both carry it.
 impl PartialEq for ExecutionBatch {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
@@ -128,8 +116,7 @@ impl PartialEq for ExecutionBatch {
             && self.input_transfers == other.input_transfers
             && self.cache_inputs == other.cache_inputs
             && self.page_offloads == other.page_offloads
-            && self.columns.is_some() == other.columns.is_some()
-            && self.media.is_some() == other.media.is_some()
+            && self.device.is_some() == other.device.is_some()
     }
 }
 
@@ -160,8 +147,22 @@ impl ExecutionBatch {
             input_transfers,
             cache_inputs: Vec::new(),
             page_offloads: None,
-            columns: None,
-            media: None,
+            device: None,
+        }
+    }
+
+    /// The captured shape of the batch's token columns, which a shadow pass
+    /// compares by: a token batch's own shape, and a text encoding's prompt
+    /// columns'. `None` for a batch with no layout and for a media
+    /// computation that reads no token column.
+    pub(crate) fn token_shape(&self) -> Option<ipc::execution::Shape> {
+        let device = self.device.as_ref()?;
+        match &device.media {
+            None => Some(device.shape),
+            Some(media) if media.computation.call == ipc::MediaCall::TextEncoding => {
+                Some(crate::batching::columns::batch_shape(&device.columns))
+            }
+            Some(_) => None,
         }
     }
 
@@ -244,9 +245,6 @@ impl ExecutionBatch {
                 "logical batch repeats a call identity"
             );
 
-            // A dispatch describes one call, so its forward rows may only
-            // name local call index zero.
-            dispatch.forward.validate(1)?;
             if let Some(latent) = &dispatch.latent {
                 anyhow::ensure!(
                     (latent.request_key, latent.call_id) == (call.request_key, call.call_id),

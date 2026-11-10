@@ -2811,7 +2811,7 @@ impl SimEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ipc::{Bounds, CallId, ForwardBatch, GenerationParams, RequestKey, ShapeBound, TensorRef};
+    use ipc::{Bounds, CallId, GenerationParams, RequestKey, ShapeBound, TensorRef};
     use proto::tensor::DType;
 
     /// The pool states the longest sequence it serves, and `SimWorker`
@@ -2924,14 +2924,10 @@ mod tests {
                 crate::worker::RequestDispatch {
                     worker: WorkerGroupId("sim".into()),
                     request_pool_idx: None,
-                    block_tables: Vec::new(),
-                    new_cache_units: Vec::new(),
-                    forward: ForwardBatch::default(),
                     latent: None,
                     decode: None,
                     buffers: Vec::new(),
                     readers: Default::default(),
-                    page_loads: Vec::new(),
                 },
             )],
             vec![ipc::BatchCommand::Start {

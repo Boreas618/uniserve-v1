@@ -220,9 +220,8 @@ use ipc::UnitId;
 use ipc::execution::EpochOperation;
 use ipc::{
     BatchCommand, BlockTable as IpcBlockTable, BufferAllocation, BufferId, CacheUnitAllocation,
-    Call, CallId, CallKind, CallStatus, DecodeRange, DimBound, ForwardBatch, ForwardStats,
-    GenerationParams, MainProcessInfo, NewRequest, RequestKey, SamplingState, ShapeBound,
-    TensorRef, TimingCounters,
+    Call, CallId, CallKind, CallStatus, DecodeRange, DimBound, ForwardStats, GenerationParams,
+    MainProcessInfo, NewRequest, RequestKey, SamplingState, ShapeBound, TensorRef, TimingCounters,
 };
 use ipc::{SharedMedia, TokenLogprob};
 use proto::request::MigrationCause;
@@ -352,9 +351,6 @@ struct GuidancePrefix {
     /// Units per cache group, as `(group_id, unit_ids)`, not yet declared to the
     /// worker; the next denoising call drains them as fresh-unit allocations.
     new_units: Vec<(u32, Vec<UnitId>)>,
-    /// Tokens the prefix holds, which the denoising calls prefill until one
-    /// completes.
-    tokens: u32,
 }
 
 impl GuidancePrefix {
@@ -380,12 +376,6 @@ impl GuidancePrefix {
 /// the last denoising step or the request finishes.
 struct GuidancePrefixState {
     prefixes: Vec<GuidancePrefix>,
-    /// Index in `prefixes` of the text-unconditional branch's prefix, when
-    /// text guidance is active.
-    text: Option<usize>,
-    /// Index in `prefixes` of the image-unconditional branch's prefix, when
-    /// image guidance is active and the branch has a prefix of its own.
-    image: Option<usize>,
     /// Set by the first successful denoising completion. Until then every
     /// denoising call carries the prefixes' block tables and prefills each
     /// prefix that holds tokens.
@@ -393,12 +383,6 @@ struct GuidancePrefixState {
 }
 
 impl GuidancePrefixState {
-    /// The request-pool row and token count of prefix `index`.
-    fn row(&self, index: Option<usize>) -> Option<(u32, u32)> {
-        let prefix = &self.prefixes[index?];
-        Some((prefix.request_pool_idx(), prefix.tokens))
-    }
-
     /// Every allocation the prefixes hold.
     fn into_allocations(self) -> impl Iterator<Item = RequestAllocations> {
         self.prefixes.into_iter().map(|prefix| prefix.allocations)

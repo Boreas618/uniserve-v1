@@ -213,18 +213,27 @@ fn assert_generated(events: &[Event], request: &GenerationRequest) {
 }
 
 /// The calls of one request in submission order.
-fn calls_of(batches: &[ExecutionBatch], request: u64) -> Vec<(Call, ipc::ForwardBatch)> {
+fn calls_of(batches: &[ExecutionBatch], request: u64) -> Vec<(Call, crate::support::CallRows)> {
     batches
         .iter()
-        .flat_map(|batch| &batch.requests)
+        .flat_map(|batch| {
+            batch
+                .requests
+                .iter()
+                .enumerate()
+                .map(move |(index, (call, _))| (call, crate::support::rows_of(batch, index)))
+        })
         .filter(|(call, _)| call.request_key.request_id == RequestId(request))
-        .map(|(call, dispatch)| (call.clone(), dispatch.forward.clone()))
+        .map(|(call, rows)| (call.clone(), rows))
         .collect()
 }
 
 /// The context prefills of one request, with their forward rows, in
 /// submission order.
-fn context_prefills(batches: &[ExecutionBatch], request: u64) -> Vec<(Call, ipc::ForwardBatch)> {
+fn context_prefills(
+    batches: &[ExecutionBatch],
+    request: u64,
+) -> Vec<(Call, crate::support::CallRows)> {
     calls_of(batches, request)
         .into_iter()
         .filter(|(call, _)| call.kind == CallKind::Forward(ForwardMode::Prefill))
@@ -392,8 +401,9 @@ fn image_contexts_respect_the_workers_staged_row_capacity() {
         let rows: usize = batch
             .requests
             .iter()
-            .filter(|(call, _)| call.kind == CallKind::Forward(ForwardMode::Prefill))
-            .map(|(_, dispatch)| dispatch.forward.query_lens.len())
+            .enumerate()
+            .filter(|(_, (call, _))| call.kind == CallKind::Forward(ForwardMode::Prefill))
+            .map(|(index, _)| crate::support::rows_of(batch, index).query_lens.len())
             .sum();
         assert!(rows <= 3, "prefill batch has {rows} numerical rows");
     }

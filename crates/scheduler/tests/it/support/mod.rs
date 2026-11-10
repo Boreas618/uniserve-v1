@@ -239,3 +239,42 @@ pub(crate) fn scheduler_with_depth(
         },
     )
 }
+
+/// One call's rows as a batch's device layout states them, column by column.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CallRows {
+    pub(crate) request_pool_indices: Vec<u32>,
+    pub(crate) seq_lens: Vec<u32>,
+    pub(crate) query_lens: Vec<u32>,
+    pub(crate) write_cache: Vec<bool>,
+}
+
+/// The rows the call at `index` of `batch` evaluates, read back from the
+/// batch's device layout: per row its request slot, attention length, query
+/// length and whether it writes the cache. Empty for a call of a batch the
+/// mechanism laid out no token columns for (a media or canvas call).
+pub(crate) fn rows_of(batch: &scheduler::ExecutionBatch, index: usize) -> CallRows {
+    let mut forward = CallRows::default();
+    let Some(device) = batch
+        .device
+        .as_ref()
+        .filter(|device| device.media.is_none())
+    else {
+        return forward;
+    };
+    let rows = &device.columns.rows;
+    let Some(call) = rows.calls.get(index) else {
+        return forward;
+    };
+    for row in call.rows.clone() {
+        let row = row as usize;
+        let start = rows.query_offsets[row];
+        let end = rows.query_offsets[row + 1];
+        let writes = rows.slot_mapping[start as usize] >= 0;
+        forward.request_pool_indices.push(call.request);
+        forward.seq_lens.push(rows.seq_lens[row] as u32);
+        forward.query_lens.push((end - start) as u32);
+        forward.write_cache.push(writes);
+    }
+    forward
+}

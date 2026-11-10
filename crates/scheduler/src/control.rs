@@ -469,10 +469,7 @@ impl Scheduler {
     /// submits, since it names the kernels the shadow pass compares against.
     pub(super) fn shadow_generation(&self, batch: &ExecutionBatch) -> Option<u64> {
         let pass = self.shadow_pass.as_ref()?;
-        let shape = batch
-            .columns
-            .as_ref()
-            .map(crate::batching::columns::batch_shape);
+        let shape = batch.token_shape();
         // A media batch states no token shape: its computation is compared once.
         let compared = match &shape {
             Some(shape) => pass.shapes.contains(shape),

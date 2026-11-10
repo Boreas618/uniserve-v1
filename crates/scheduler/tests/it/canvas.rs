@@ -18,7 +18,7 @@ use crate::support;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ipc::{Call, CallKind, ForwardBatch, ForwardMode};
+use ipc::{Call, CallKind, ForwardMode};
 use ipc::{CanvasSampling, ImageParams, RequestId, SamplingParams};
 use scheduler::{
     BatchEvent, CommandSender, EventRx, ExecutionBatch, SchedulerConfig, SimEngine, SimWorker,
@@ -199,12 +199,18 @@ fn finish_of(events: &[Event]) -> (FinishReason, usize) {
 }
 
 /// The calls of one request in submission order.
-fn calls_of(batches: &[ExecutionBatch], request: u64) -> Vec<(Call, ForwardBatch)> {
+fn calls_of(batches: &[ExecutionBatch], request: u64) -> Vec<(Call, crate::support::CallRows)> {
     batches
         .iter()
-        .flat_map(|batch| &batch.requests)
+        .flat_map(|batch| {
+            batch
+                .requests
+                .iter()
+                .enumerate()
+                .map(move |(index, (call, _))| (call, crate::support::rows_of(batch, index)))
+        })
         .filter(|(call, _)| call.request_key.request_id == RequestId(request))
-        .map(|(call, dispatch)| (call.clone(), dispatch.forward.clone()))
+        .map(|(call, rows)| (call.clone(), rows))
         .collect()
 }
 

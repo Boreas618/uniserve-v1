@@ -252,7 +252,12 @@ impl Scheduler {
         // the worker's phase column names it exactly. The plan's order is the
         // order the first call of each pair was selected in.
         let mut kind_order: Vec<(PhaseId, String)> = Vec::new();
-        let mut kind_batches: HashMap<(PhaseId, String), ExecutionBatch> = HashMap::new();
+        // Each batch beside its calls' device layouts, index for index with
+        // its requests, which `attach_columns` writes the device batch from.
+        let mut kind_batches: HashMap<
+            (PhaseId, String),
+            (ExecutionBatch, Vec<columns::CallLayout>),
+        > = HashMap::new();
         let submit_at = Instant::now();
         // The per-step token budget is the binding limit; individual prefill
         // chunks are clipped to its remaining capacity.
@@ -371,12 +376,15 @@ impl Scheduler {
                     continue;
                 };
                 let key = (phase, component);
-                let batch = kind_batches.entry(key.clone()).or_insert_with(|| {
+                let (batch, layouts) = kind_batches.entry(key.clone()).or_insert_with(|| {
                     kind_order.push(key);
-                    ExecutionBatch::new(
-                        self.inflight.next_batch_id(),
-                        Vec::new(),
-                        Vec::new(),
+                    (
+                        ExecutionBatch::new(
+                            self.inflight.next_batch_id(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                        ),
                         Vec::new(),
                     )
                 });
@@ -391,7 +399,12 @@ impl Scheduler {
                     &mut admissions,
                 );
                 match planned {
-                    Ok(planned) => batch.requests.push(planned),
+                    Ok(planned) => {
+                        // A media call states no token rows: its batch's device layout is the
+                        // computation's own (`attach_media`).
+                        batch.requests.push(planned);
+                        layouts.push(columns::CallLayout::default());
+                    }
                     Err(invariant) => {
                         self.invariant_broken(invariant);
                         return Vec::new();
@@ -492,12 +505,15 @@ impl Scheduler {
                 // Identify the call by its batch and row, and stamp the
                 // coordinates projected through the request's in-flight calls.
                 let key = (phase, call.component.clone());
-                let batch = kind_batches.entry(key.clone()).or_insert_with(|| {
+                let (batch, layouts) = kind_batches.entry(key.clone()).or_insert_with(|| {
                     kind_order.push(key);
-                    ExecutionBatch::new(
-                        self.inflight.next_batch_id(),
-                        Vec::new(),
-                        Vec::new(),
+                    (
+                        ExecutionBatch::new(
+                            self.inflight.next_batch_id(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                        ),
                         Vec::new(),
                     )
                 });
@@ -578,6 +594,7 @@ impl Scheduler {
                     admitted,
                     planned_us,
                     batch,
+                    layouts,
                 );
                 if prepared.is_none() {
                     // Most preparation failures latch engine-fatal first.
@@ -594,6 +611,7 @@ impl Scheduler {
                 .iter()
                 .find(|key| {
                     kind_batches[*key]
+                        .0
                         .requests
                         .iter()
                         .any(|(call, _)| call.request_key == request.request_key)
@@ -603,7 +621,7 @@ impl Scheduler {
                 self.invariant_broken("an admitted media request has a selected call");
                 return Vec::new();
             };
-            if let Some(batch) = kind_batches.get_mut(&owner) {
+            if let Some((batch, _)) = kind_batches.get_mut(&owner) {
                 batch.commands.push(BatchCommand::Start {
                     request: Box::new(request),
                 });
@@ -612,7 +630,7 @@ impl Scheduler {
         kind_order.retain(|kind| {
             kind_batches
                 .get(kind)
-                .is_some_and(|batch| !batch.requests.is_empty())
+                .is_some_and(|(batch, _)| !batch.requests.is_empty())
         });
         let Some(last) = kind_order.last().cloned() else {
             return Vec::new();
@@ -634,7 +652,7 @@ impl Scheduler {
         let commands = if prompt_only {
             let requests = kind_order
                 .iter()
-                .flat_map(|kind| kind_batches[kind].requests.iter())
+                .flat_map(|kind| kind_batches[kind].0.requests.iter())
                 .map(|(call, _)| call.request_key.request_id)
                 .collect::<HashSet<_>>();
             self.take_commands(|command| {
@@ -646,7 +664,7 @@ impl Scheduler {
         };
         let mut batches = Vec::with_capacity(kind_order.len());
         for kind in kind_order {
-            let Some(mut batch) = kind_batches.remove(&kind) else {
+            let Some((mut batch, layouts)) = kind_batches.remove(&kind) else {
                 self.invariant_broken("every selected phase and component has its batch");
                 return Vec::new();
             };
@@ -660,7 +678,7 @@ impl Scheduler {
             if media_batch(&batch) {
                 self.attach_media(&mut batch);
             } else {
-                self.attach_columns(&mut batch);
+                self.attach_columns(&mut batch, layouts);
                 self.note_state_resident(&batch);
             }
             batches.push(batch);
@@ -680,7 +698,7 @@ impl Scheduler {
     /// unusable page shape, a worker group the mechanism has no info for, or
     /// a call whose request state is gone. Such a batch is not servable, which
     /// is what its `None` says; it is never filled with plausible values.
-    fn attach_columns(&self, batch: &mut ExecutionBatch) {
+    fn attach_columns(&self, batch: &mut ExecutionBatch, mut layouts: Vec<columns::CallLayout>) {
         // A batch that leaves without columns is dropped: the calls it names are
         // never submitted and the step serves nothing. Nothing downstream can
         // tell that from a step the policy planned empty, so each refusal names
@@ -725,6 +743,10 @@ impl Scheduler {
             );
             return;
         }
+        if layouts.len() != batch.requests.len() {
+            tracing::debug!("a batch is dropped: its calls and their layouts disagree");
+            return;
+        }
         // A model that keeps a recurrent state per request slot has a state group, whose pages the
         // columns name the checkpoints and restores of.
         let state_pages = cache
@@ -745,11 +767,11 @@ impl Scheduler {
         let mut sampling = Vec::with_capacity(batch.requests.len());
         let mut draws = Vec::with_capacity(batch.requests.len());
         let mut tables = Vec::with_capacity(batch.requests.len());
-        // Mutable, because the resolved table is written back to the dispatch: the worker
+        // Mutable, because the resolved table is written back to the layout: the worker
         // installs the table the batch states, so a batch that stated only the wire's delta left a
         // decode's row uninstalled and its gather read whatever the slot held before. One value,
         // one statement - the table this batch addresses.
-        for (call, placed) in &mut batch.requests {
+        for ((call, _), placed) in batch.requests.iter().zip(&mut layouts) {
             let Some(state) = self.running.get(&call.request_key.request_id) else {
                 tracing::debug!(
                     "a batch is dropped: {:?} names a request this scheduler is not running",
@@ -760,11 +782,9 @@ impl Scheduler {
             // A decode's rows embed the token the request's own state continues
             // from; every other token call states its tokens itself.
             let tokens: Vec<i32> = match call.kind {
-                ipc::CallKind::Forward(ipc::ForwardMode::Decode) => {
-                    (0..placed.forward.query_lens.len())
-                        .map(|_| i32::try_from(state.next_token).unwrap_or(-1))
-                        .collect()
-                }
+                ipc::CallKind::Forward(ipc::ForwardMode::Decode) => (0..placed.rows.len())
+                    .map(|_| i32::try_from(state.next_token).unwrap_or(-1))
+                    .collect(),
                 _ => call
                     .input_token_ids
                     .iter()
@@ -817,14 +837,20 @@ impl Scheduler {
             } else {
                 declared
             };
-            // The dispatch now states the table this batch addresses, so the worker installs it
+            // The layout now states the table this batch addresses, so the worker installs it
             // and the columns address it: a decode that declared nothing no longer travels with an
             // empty statement while its rows read the request's pages.
             placed.block_tables = resolved.clone();
             tables.push(resolved);
         }
-        batch.columns = columns::columns(
-            &batch.requests,
+        let calls: Vec<(&Call, &columns::CallLayout)> = batch
+            .requests
+            .iter()
+            .map(|(call, _)| call)
+            .zip(&layouts)
+            .collect();
+        let filled = columns::columns(
+            &calls,
             &tables,
             &inputs,
             &sampling,
@@ -835,7 +861,7 @@ impl Scheduler {
             &resident,
         );
 
-        if batch.columns.is_none() {
+        let Some(filled) = filled else {
             let tokens = batch
                 .requests
                 .iter()
@@ -846,14 +872,57 @@ impl Scheduler {
                 batch.requests.len(),
                 block_size,
             );
+            return;
+        };
+        let Some(phase) = batch
+            .requests
+            .first()
+            .and_then(|(call, _)| super::submission::wire_phase(call.kind))
+        else {
+            tracing::debug!("a batch is dropped: its first call names no device phase");
+            return;
+        };
+        let shape = columns::batch_shape(&filled);
+        // The batch as the worker reads it, written once: every call's tables, fresh units and
+        // host page loads beside the columns, and the pages the batch publishes to the host KV
+        // cache (`finish_generation_batch` attached them).
+        let mut cache_units = Vec::new();
+        let mut block_tables = Vec::new();
+        let mut page_loads = Vec::new();
+        for layout in layouts {
+            cache_units.extend(layout.cache_units);
+            block_tables.extend(layout.block_tables);
+            page_loads.extend(layout.page_loads);
         }
+        batch.device = Some(ipc::execution::Batch {
+            id: ipc::execution::BatchId(batch.id),
+            phase,
+            calls: (0..batch.requests.len() as u64)
+                .map(ipc::execution::CallId)
+                .collect(),
+            shape,
+            columns: filled,
+            // Stamped at submission: the step reads its generation then.
+            generation: 0,
+            cache_units,
+            block_tables,
+            page_loads,
+            page_offloads: batch
+                .page_offloads
+                .as_ref()
+                .map(|offloads| offloads.pages.clone())
+                .unwrap_or_default(),
+            latent_restores: Vec::new(),
+            host_outputs: Vec::new(),
+            media: None,
+        });
     }
 
     /// Marks every request a token batch carries as holding its recurrent state in its slot: the
     /// batch's first call of a request restored it there (or started it from zero), so its later
     /// calls continue from the slot's banks and restore nothing.
     fn note_state_resident(&mut self, batch: &ExecutionBatch) {
-        if batch.columns.is_none() {
+        if batch.device.is_none() {
             return;
         }
         for (call, _) in &batch.requests {
@@ -982,8 +1051,57 @@ impl Scheduler {
                 unit: placed.decode.as_ref().map_or(0, |range| range.cursor),
             });
         }
-        batch.media = Some(ipc::execution::MediaColumns::staged(stated, &requests));
-        batch.columns = prompts;
+        let Some(variant) = stated.variant() else {
+            tracing::debug!(
+                "a media batch is dropped: no variant serves a {:?} computation",
+                media_call
+            );
+            return;
+        };
+        batch.device = Some(ipc::execution::Batch {
+            id: ipc::execution::BatchId(batch.id),
+            phase,
+            calls: (0..batch.requests.len() as u64)
+                .map(ipc::execution::CallId)
+                .collect(),
+            shape: ipc::execution::Shape {
+                rows: stated.rows,
+                tokens: stated.tokens,
+                variant,
+            },
+            // A text encoding reads its prompt as token columns. Every other media computation
+            // reads none, so its batch carries none: the fields its kernels read are the model's
+            // own, staged inside the runner.
+            columns: prompts.unwrap_or_default(),
+            // Stamped at submission: the step reads its generation then.
+            generation: 0,
+            cache_units: Vec::new(),
+            block_tables: Vec::new(),
+            page_loads: Vec::new(),
+            page_offloads: Vec::new(),
+            // A resumed request's latent preparation opens at the stored trajectory its restore
+            // pinned, which the denoiser copies in before the call completes.
+            latent_restores: batch
+                .requests
+                .iter()
+                .filter_map(|(call, _)| {
+                    call.latent_restore
+                        .clone()
+                        .map(|restore| (call.request_key, restore))
+                })
+                .collect(),
+            // An encoder call's output in the host encoder pool: read from it, or written to it.
+            host_outputs: batch
+                .requests
+                .iter()
+                .filter_map(|(call, _)| {
+                    call.host_output
+                        .clone()
+                        .map(|output| (call.request_key, output))
+                })
+                .collect(),
+            media: Some(ipc::execution::MediaColumns::staged(stated, &requests)),
+        });
     }
 
     /// The step a request's call covers: the steps its trajectory has completed and the denoising

@@ -1270,14 +1270,10 @@ impl Scheduler {
         let dispatch = RequestDispatch {
             worker,
             request_pool_idx: Some(request_pool_idx),
-            block_tables: Vec::new(),
-            new_cache_units: Vec::new(),
-            forward: ipc::ForwardBatch::default(),
             latent: None,
             decode,
             buffers,
             readers: Some(readers),
-            page_loads: Vec::new(),
         };
         self.register_inflight(
             call.clone(),

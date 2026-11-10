@@ -142,10 +142,7 @@ impl Scheduler {
                     // as the serving submit does. A refused pass is answered at
                     // once, because waiting will not shadow it.
                     if let (Some(generation), Some(shadow_batch)) = (shadow, shadow_batch) {
-                        let shape = shadow_batch
-                            .columns
-                            .as_ref()
-                            .map(crate::batching::columns::batch_shape);
+                        let shape = shadow_batch.token_shape();
                         match self.worker.shadow(shadow_batch, generation) {
                             Ok(()) => self.note_shadowed(shape),
                             Err(WorkerSubmitError::Failed(error)) => {
