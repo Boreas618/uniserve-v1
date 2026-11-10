@@ -26,6 +26,7 @@ These name the checkpoints and inputs of the host. Set the ones the host has; th
 | `UNISERVE_QWEN3_UPDATED_MODEL` | Another directory with the same checkpoint files and other weight values, such as a copy whose shards are renormalized, for weight updates | `test_epoch_changes_http.py`, `test_live_updates_http.py` |
 | `UNISERVE_H3_MODEL` | A FastH3 checkpoint directory (`FastVideo/FastVideo-FastH3-8-Step-V2`; the [FastH3 guide](minimax_h3/minimax_h3.md) lists the supported ones) | the FastH3 modules |
 | `UNISERVE_MINIMAX_H3_MODEL` | The MiniMax-H3 diffusers root | `test_minimax_h3_http.py`, `test_minimax_h3_conditions_http.py` |
+| `UNISERVE_FASTH3_ADAPTER` | A FastH3 Preview v1 adapter directory (`vsa-datafree` or `dense-datafree` of `FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA`), served over `UNISERVE_MINIMAX_H3_MODEL` | `test_minimax_h3_http.py` |
 | `UNISERVE_MINIMAX_H3_OMNIREF` | A FastH3 OmniRef export (`FastVideo/FastVideo-FastH3-Omni-8-Step-V1`), whose omitted components are read from the Hugging Face cache (`HF_HOME`) at the base revision it pins | `test_minimax_h3_conditions_http.py` |
 | `UNISERVE_MINIMAX_H3_INPUTS` | The protocol inputs directory holding `media/`, the reference files of `uniserve_eval/workloads/minimax_h3` ([MiniMax-H3 workloads](minimax_h3/evaluation.md)) | `test_minimax_h3_conditions_http.py` |
 | `UNISERVE_MOONCAKE_MASTER`, `MOONCAKE_STORE_LIBRARY` | A running Mooncake master (`host:port`) and the `libmooncake_store.so` its clients load | the Mooncake cases of `test_epoch_changes_http.py` |

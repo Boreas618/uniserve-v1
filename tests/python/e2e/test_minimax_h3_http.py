@@ -1,11 +1,12 @@
-"""The MiniMax-H3 base checkpoint serves text-to-video at every 768p size.
+"""MiniMax-H3 serves text-to-video, and so does a FastH3 adapter fused over it.
 
 Serves the diffusers root's ``transformer`` on the published Ulysses-4
 deployment, serving the 768p size of every aspect ratio the model names, and
 requests one 124-frame ``t2va`` video at each. Every response is a complete
 MP4 at the requested size whose headers report the generated shape; the
 capabilities report the handshake's schedule, and a body naming a task is
-refused.
+refused. With ``--lora-path`` naming a FastH3 adapter, the same root serves the
+student's schedule, and a fixed-seed request answers the same video twice.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    FASTH3_ADAPTER,
     MINIMAX_H3_CHECKPOINT,
     find_free_port,
     host_asset,
@@ -151,3 +153,83 @@ def test_base_text_to_video_at_every_768p_size(tmp_path: Path) -> None:
             assert stages["denoising"] > stages["decoding"] > 0
             inference = float(response.headers["x-inference-time-s"])
             assert abs(sum(stages.values()) - inference) <= 0.01, size
+
+
+def test_a_fasth3_adapter_over_the_base_release_serves_its_student(
+    tmp_path: Path,
+) -> None:
+    model = str(host_asset("UNISERVE_MINIMAX_H3_MODEL", MINIMAX_H3_CHECKPOINT))
+    adapter = str(host_asset("UNISERVE_FASTH3_ADAPTER", FASTH3_ADAPTER))
+    deployment = (
+        Path(__file__).resolve().parents[3]
+        / "configs"
+        / "minimax_h3"
+        / "ulysses4.toml"
+    )
+    port = find_free_port()
+    base = f"http://127.0.0.1:{port}"
+    command = [
+        str(require_uniserve_binary()),
+        "serve",
+        model,
+        "--lora-path",
+        adapter,
+        "--worker-groups",
+        str(deployment),
+        "--worker-executable",
+        str(worker_executable()),
+        "--served-model-name",
+        "FastH3",
+        "--port",
+        str(port),
+        "--set",
+        "video_config.sizes=1344x768",
+        "--set",
+        "video_config.max_seconds=5",
+        "--max-model-len",
+        "1024",
+        "--set",
+        "video_config.text_capacities=1024",
+    ]
+    prompt = (
+        "A red fox trots across a snowy meadow at sunrise, its breath "
+        "steaming, while birds call from the pines."
+    )
+    with (
+        server_process(command, base, tmp_path / "server.log", timeout_s=3600),
+        httpx.Client(base_url=base, timeout=1800) as client,
+    ):
+        video = client.get("/v1/capabilities").json()["video"]["model"]
+        # The student is distilled from the base partition, which serves
+        # text-to-video and keyframes, on four DMD rungs at the base shifts.
+        assert video["tasks"] == ["t2va", "fl2va"]
+        assert video["num_inference_steps"] == 4
+        assert video["schedule"] == {
+            "flow_shift": 12.0,
+            "audio_flow_shift": 3.0,
+        }
+
+        # 107 frames are 4.46 seconds at 24 fps, inside the five seconds the
+        # deployment prepares.
+        answers = []
+        for attempt in range(2):
+            response = client.post(
+                "/v1/videos/sync",
+                json=t2va_request("FastH3", prompt, 107, 42, size="1344x768"),
+            )
+            assert response.status_code == 200, (attempt, response.text)
+            media = inspect_video_bytes(
+                response.content,
+                declared_mime=response.headers["content-type"],
+            )
+            (tmp_path / f"fasth3-{attempt}.mp4").write_bytes(response.content)
+            assert (media.width, media.height, media.frame_count) == (
+                1344,
+                768,
+                107,
+            )
+            assert media.video_variance > 0 and media.audio_rms > 0
+            answers.append(response.content)
+        # The fused weights are the deployment's for every request: a
+        # fixed-seed request is answered with the same video again.
+        assert answers[0] == answers[1]

@@ -52,6 +52,12 @@ H3_CHECKPOINT = (
 #: What ``UNISERVE_MINIMAX_H3_MODEL`` names.
 MINIMAX_H3_CHECKPOINT = "the MiniMax-H3 diffusers root"
 
+#: What ``UNISERVE_FASTH3_ADAPTER`` names.
+FASTH3_ADAPTER = (
+    "a FastH3 Preview v1 adapter (FastVideo-FastH3-4-step-Preview-v1-LoRA's "
+    "vsa-datafree or dense-datafree directory)"
+)
+
 # Options every test server adds to its own, as `PATH=VALUE` assignments
 # separated by whitespace (``UNISERVE_E2E_SET``), and the factor every wait
 # of a test is stretched by (``UNISERVE_E2E_TIME_SCALE``): a run whose
