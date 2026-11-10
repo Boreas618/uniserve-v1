@@ -963,27 +963,20 @@ impl Sampling {
                 Error::Invalid("the sampler's count table is larger than memory".into())
             })?,
         )?;
-        // The table starts at zero: a slot has seen no token before its first call. Zeroing is a
-        // bind-time copy, not a step's, so a chunked upload from pinned memory is enough.
-        let chunk = 1 << 22;
-        let staging = platform::PinnedBuffer::new(device, chunk)?;
-        // SAFETY: the staging buffer is this allocation's own pinned memory, wholly writable.
-        let zeros = unsafe { staging.as_slice() };
-        let mut written = 0u64;
-        while written < bytes {
-            let step = (bytes - written).min(chunk as u64);
-            // SAFETY: source and destination are the pinned chunk and the count table's range, of
-            // the same length, and the copy is stream-ordered before the first sample.
-            unsafe {
-                platform::memcpy_async(
-                    allocation.address() + written,
-                    staging.address(),
-                    step as usize,
-                    stream,
-                )?;
-            }
-            written += step;
-            let _ = zeros;
+        // The table starts at zero: a slot has seen no token before its first call. A fresh device
+        // allocation holds whatever its pages held last, so the zeros are written by the device,
+        // stream-ordered before the first sample reads a count.
+        // SAFETY: the range is this allocation's own `slots × vocabulary` i32 words, and the
+        // allocation outlives the stream's work on it (the runner owns both).
+        unsafe {
+            platform::memset_d32(
+                allocation.address(),
+                0,
+                usize::try_from(bytes / 4).map_err(|_| {
+                    Error::Invalid("the sampler's count table is larger than memory".into())
+                })?,
+                stream,
+            )?;
         }
         stream.synchronize()?;
         let counts = TensorView::new(
