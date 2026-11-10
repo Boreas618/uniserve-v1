@@ -207,3 +207,55 @@ fn a_released_hybrid_checkpoint_loads_and_composes_both_phases() {
         println!("{operator} {key}");
     }
 }
+
+/// The calibrated mixed-precision export loads its attention and delta-network projections as
+/// per-tensor FP8 products and its experts, shared experts and head as the dense matrices their
+/// weight-only NVFP4 fields state, and serves both phases with no encoded-activation program.
+#[test]
+#[ignore = "requires UNISERVE_QWEN36_NVFP4_MODEL naming a Qwen3.6-35B-A3B-NVFP4 checkpoint"]
+fn a_mixed_precision_hybrid_checkpoint_loads_fp8_and_weight_only_nvfp4() {
+    let Model::Text(family) = qwen3::family::HYBRID_FAMILY.model else {
+        panic!("Qwen3.5-MoE is a text family");
+    };
+    let root = std::env::var_os("UNISERVE_QWEN36_NVFP4_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("UNISERVE_QWEN36_NVFP4_MODEL names the NVFP4 checkpoint"));
+    let checkpoint = Checkpoint::open(&root).unwrap_or_else(|error| panic!("the shards: {error}"));
+    let opened = family
+        .open(&checkpoint)
+        .unwrap_or_else(|error| panic!("the configuration: {error}"));
+    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let model = opened
+        .load(
+            &checkpoint,
+            &mut loader,
+            &TextPlacement {
+                tensor: Split::WHOLE,
+                experts: Split::WHOLE,
+            },
+            &nn::family::ExpertOrder::new(),
+        )
+        .unwrap_or_else(|error| panic!("the meta load: {error}"));
+    // The experts are dense once decoded: no step encodes activations for them.
+    let experts = model.experts().unwrap_or_else(|| panic!("routed experts"));
+    assert!(!experts.encoded);
+
+    let mut launches = recorded_forward(&*model, PhaseKind::Prefill, 2, 200);
+    launches.extend(recorded_forward(&*model, PhaseKind::Decode, 4, 4));
+    let named: BTreeSet<&str> = launches
+        .iter()
+        .map(|(operator, _)| operator.as_str())
+        .collect();
+    assert!(named.contains("fp8_gemm"), "{named:?}");
+    for encoded in [
+        "nvfp4_quantize",
+        "nvfp4_gemm",
+        "gather_gemm_nvfp4",
+        "route_gemm_nvfp4",
+    ] {
+        assert!(!named.contains(encoded), "{encoded} runs: {named:?}");
+    }
+    for (operator, key) in &launches {
+        println!("{operator} {key}");
+    }
+}
