@@ -261,7 +261,7 @@ The request fields are the same for every video model; any other field is refuse
 | `input_references` | `ref2va` takes up to the references the served checkpoint declares, which `/v1/capabilities` reports (9 images, 3 videos and 3 audio tracks, 12 in total, for MiniMax-H3 and OmniRef). A video reference contributes its soundtrack when it has one. `start_time_seconds` applies to video references. |
 | `size` | One of the deployment's `video_config.sizes`. Without it, an `fl2va` request's canvas follows its first keyframe by the canvas rule (a 768-pixel short edge, an area of at most 768 × 1344 pixels, sides multiples of 32), and must be a served size; every other request takes the first served size's short edge at 16:9. |
 | `seconds` | 4 to `video_config.max_seconds`. A video has `seconds × 24` frames, rounded half to even and extended to the next count of the frame rule, 17n + 5: 4 seconds give 107 frames, 5 give 124, 8 give 192 and 15 give 362. A `ref2va` request whose references carry exactly one soundtrack may omit it and lasts as long as that soundtrack after its start. |
-| `num_frames` | Must already be a count of the frame rule within the duration range, such as 107 or 124. |
+| `num_frames` | Must already be a count of the frame rule, from the count 4 seconds generate to the count `video_config.max_seconds` generates: 107 to 124 frames for a 5-second deployment, although 124 frames last 5.17 seconds. |
 | `fps` | 24 when stated. |
 | `num_inference_steps` | When stated, the schedule's denoiser evaluations, which the served checkpoint fixes and `/v1/capabilities` reports. |
 | `seed` | 42 when not stated. |

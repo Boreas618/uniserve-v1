@@ -977,16 +977,40 @@ fn check_served(size: Canvas, limits: &PlanLimits) -> Result<(), InputError> {
     ))
 }
 
-/// The duration a request states, in seconds: a stated frame count, which
-/// must be one of the frame rule, lasts its frames at the output frame rate.
+/// The length a request states, as its duration in seconds and its frame
+/// count; `None` when it states none.
+///
+/// A duration is aligned up to the frame rule ([`video_frame_count`]) and
+/// must lie in `[MIN_SECONDS, max_video_seconds]`. A frame count must be one
+/// of the frame rule and lie between the counts those two durations align
+/// to: the frame counts the deployment prepares layouts for, so a 5-second
+/// deployment at 24 fps serves the 124 frames its own 5 seconds generate,
+/// although 124 frames last 5.17 seconds. It lasts its frames at the output
+/// frame rate.
 ///
 /// # Errors
 ///
-/// Refuses `num_frames` when it is not a frame count of the denoiser's rule.
-fn stated_seconds(request: &VideoSpec, limits: &PlanLimits) -> Result<Option<f64>, InputError> {
+/// Refuses `seconds` or `num_frames`, whichever the request states, when it
+/// lies outside the served range or is no frame count of the rule.
+fn stated_length(
+    request: &VideoSpec,
+    limits: &PlanLimits,
+) -> Result<Option<(f64, u32)>, InputError> {
+    let aligned = |seconds| {
+        video_frame_count(
+            seconds,
+            limits.max_video_seconds,
+            limits.frame_rate,
+            &limits.frames,
+        )
+    };
     Ok(match request.length {
         None => None,
-        Some(Length::Seconds(seconds)) => Some(seconds),
+        Some(Length::Seconds(seconds)) => {
+            let frames = aligned(seconds)
+                .map_err(|error| InputError::invalid("seconds", error.to_string()))?;
+            Some((seconds, frames))
+        }
         Some(Length::Frames(frames)) => {
             let rule = limits.frames;
             if !rule.is_legal(frames) {
@@ -999,7 +1023,20 @@ fn stated_seconds(request: &VideoSpec, limits: &PlanLimits) -> Result<Option<f64
                     ),
                 ));
             }
-            Some(f64::from(frames) / f64::from(limits.frame_rate))
+            let served =
+                |seconds| aligned(seconds).map_err(|error| InputError::Internal(error.to_string()));
+            let (fewest, most) = (served(MIN_SECONDS)?, served(limits.max_video_seconds)?);
+            if !(fewest..=most).contains(&frames) {
+                return Err(InputError::invalid(
+                    "num_frames",
+                    format!(
+                        "must lie between {fewest} and {most} frames, the frame counts of \
+                         {MIN_SECONDS} to {} seconds at {} fps, got {frames}",
+                        limits.max_video_seconds, limits.frame_rate
+                    ),
+                ));
+            }
+            Some((f64::from(frames) / f64::from(limits.frame_rate), frames))
         }
     })
 }
@@ -1033,16 +1070,8 @@ pub fn check_request(request: &VideoSpec, limits: &PlanLimits) -> Result<(), Inp
     check_references(task, &request.references, &limits.reference_limits)?;
 
     let length = length_param(request);
-    match stated_seconds(request, limits)? {
-        Some(seconds) => {
-            video_frame_count(
-                seconds,
-                limits.max_video_seconds,
-                limits.frame_rate,
-                &limits.frames,
-            )
-            .map_err(|error| InputError::invalid(length, error.to_string()))?;
-        }
+    match stated_length(request, limits)? {
+        Some(_) => {}
         None => {
             let may_follow_audio = task == VideoTask::ReferenceToVideoAudio
                 && request
@@ -1174,15 +1203,8 @@ fn resolve_frames(
     limits: &PlanLimits,
 ) -> Result<(f64, u32), InputError> {
     let length = length_param(request);
-    if let Some(seconds) = stated_seconds(request, limits)? {
-        return video_frame_count(
-            seconds,
-            limits.max_video_seconds,
-            limits.frame_rate,
-            &limits.frames,
-        )
-        .map(|frames| (seconds, frames))
-        .map_err(|error| InputError::invalid(length, error.to_string()));
+    if let Some(stated) = stated_length(request, limits)? {
+        return Ok(stated);
     }
     let [(index, track, start_seconds)] = soundtracks else {
         return Err(InputError::invalid(
@@ -2434,6 +2456,39 @@ pub(super) mod tests {
         // A 4:3 keyframe sets 1024x768, which the deployment does not serve.
         let error = plan_request(&request, &keyframe(1024, 768), &vision, &limits).unwrap_err();
         assert_eq!(param(error), "size");
+    }
+
+    /// A stated frame count is served when the deployment's own durations
+    /// generate it: a 5-second deployment at 24 fps serves the 124 frames 5
+    /// seconds align to, though they last 5.17 seconds, and no longer count.
+    #[test]
+    fn a_frame_count_of_the_served_durations_is_served() {
+        let fixture = fixture();
+        let vision = vision(&fixture);
+        let limits = PlanLimits {
+            max_video_seconds: 5.0,
+            ..limits()
+        };
+        let frames = |count| VideoSpec {
+            length: Some(Length::Frames(count)),
+            ..text(None, 5.0)
+        };
+
+        let plan = plan_request(&frames(124), &[], &vision, &limits).unwrap();
+        assert_eq!(plan.num_frames, 124);
+        assert_eq!(
+            plan.num_frames,
+            plan_request(&text(None, 5.0), &[], &vision, &limits)
+                .unwrap()
+                .num_frames,
+            "a frame count and the duration that generates it plan alike"
+        );
+        // The fewest frames 4 seconds generate, and none fewer or more.
+        assert!(check_request(&frames(107), &limits).is_ok());
+        for count in [90, 141] {
+            let error = check_request(&frames(count), &limits).unwrap_err();
+            assert_eq!(param(error), "num_frames", "{count}");
+        }
     }
 
     /// The served maximum duration narrows the model's own range.
