@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result, bail};
 use ops::DType;
 use platform::DeviceId;
-use worker::capacity::{graph_storage_budget_bytes, graph_storage_bytes, quota};
+use worker::capacity::{graph_scratch_bytes, graph_storage_bytes, quota};
 use worker::device::GraphStorage;
 use worker::memory::Memory;
 
@@ -61,7 +61,7 @@ impl ModelRunner {
         // The shadow region an update's shadow step runs a replaced operator in, plus the state
         // group's snapshot copies units through: one scratch pool, sized once, never allocated per
         // step or per batch.
-        let shadow = graph_storage_budget_bytes(i64::try_from(total)?) / 8;
+        let shadow = graph_scratch_bytes(i64::try_from(total)?);
         let scratch = shadow.checked_add(snapshot).with_context(|| {
             format!(
                 "device {} reserves a {shadow}-byte shadow region and a {snapshot}-byte state snapshot, more than one scratch pool holds",
