@@ -32,23 +32,6 @@ use crate::batch::{
     RowKind, RowState,
 };
 use crate::plan::{Bucket, Buckets, Shape};
-/// `rows` uniform draws in `[0, 1)`, from the runner's generator into its own buffer.
-///
-/// The generator is the runner's (sampling state is the worker's, 4.5) and a seeded one is what
-/// makes a replay reproduce its tokens; the buffer is the runner's too, so a step allocates
-/// nothing.
-fn draw_uniforms(seed: &std::cell::Cell<u64>, draws: &mut Vec<f32>, rows: usize) {
-    draws.clear();
-    let mut state = seed.get();
-    while draws.len() < rows {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        // The top 24 bits are a value in [0, 1) that cannot round up to one in f32.
-        draws.push(((state >> 40) as f32) / ((1u64 << 24) as f32));
-    }
-    seed.set(state);
-}
 
 #[cfg(test)]
 use crate::plan::Variant;
@@ -74,6 +57,8 @@ pub struct Staging {
     input_ids: Vec<i32>,
     slots: Vec<i32>,
     parameters: Vec<f32>,
+    /// `[rows]` each row's draw address; a padded row's is the default, and its draw is discarded.
+    draws: Vec<ipc::philox::DrawAddress>,
     commit: Vec<i64>,
     page_size: u32,
     max_kv_len: u32,
@@ -107,6 +92,7 @@ impl Staging {
         self.slots = vec![0; largest.rows as usize];
         self.parameters =
             vec![0.0; largest.rows as usize * ops::sampler::PARAMETER_COLUMNS as usize];
+        self.draws = vec![ipc::philox::DrawAddress::default(); largest.rows as usize];
         // The commit table's height is ops' business; `reserve` leaves it empty and `stage` sizes
         // it to whatever the mechanism wrote, which `check` has already validated.
         self.commit = Vec::new();
@@ -190,8 +176,16 @@ impl Staging {
         let parameters = ops::sampler::PARAMETER_COLUMNS as usize;
         self.parameters[..rows * parameters]
             .copy_from_slice(&columns.parameters[..rows * parameters]);
+        if columns.draws.len() != rows {
+            return Err(Error::Invalid(format!(
+                "the batch states {} draw addresses for its {rows} rows",
+                columns.draws.len()
+            )));
+        }
+        self.draws[..rows].copy_from_slice(&columns.draws);
         for index in rows..bucket_rows {
             self.slots[index] = -1;
+            self.draws[index] = ipc::philox::DrawAddress::default();
             for column in 0..parameters {
                 self.parameters[index * parameters + column] = 0.0;
             }
@@ -321,6 +315,11 @@ impl Staging {
     pub fn parameters(&self, rows: usize) -> &[f32] {
         let parameters = ops::sampler::PARAMETER_COLUMNS as usize;
         &self.parameters[..rows * parameters]
+    }
+
+    /// The staged rows' draw addresses.
+    pub fn draws(&self, rows: usize) -> &[ipc::philox::DrawAddress] {
+        &self.draws[..rows]
     }
 
     /// `ops::commit`'s column table of the staged rows.
@@ -1269,8 +1268,6 @@ pub struct CausalLmRunner<M: TextModel> {
     draws: Vec<f32>,
     /// Where the batch's KV views come from: the resident cache, and a paired forward's scratch.
     kv: Box<dyn KvProvider>,
-    /// The sampling step's uniform generator, seeded by the engine so a run reproduces.
-    seed: std::cell::Cell<u64>,
     /// Whether this runner has served a batch. A bucket captured before that may be warmed by an
     /// eager walk; one captured afterwards may not, because the walk would run a forward over an
     /// arena a serving bucket owns.
@@ -1390,11 +1387,6 @@ impl<M: TextModel> CausalLmRunner<M> {
     /// attention descriptor's static key bound. It captures nothing here: the device worker's
     /// warmup captures every bucket after the runner is bound, largest first, so the pools' plans
     /// exist before serving starts.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the binding, the model, its generation and buckets, its cache, the deployment's \
-                  two bounds and the sampler's seed are independent inputs"
-    )]
     pub fn new(
         binding: Binding,
         model: M,
@@ -1403,7 +1395,6 @@ impl<M: TextModel> CausalLmRunner<M> {
         kv: Box<dyn KvProvider>,
         slots: u32,
         max_kv_len: u32,
-        seed: u64,
     ) -> Result<Self> {
         let Binding {
             id,
@@ -1484,7 +1475,6 @@ impl<M: TextModel> CausalLmRunner<M> {
             indices: Vec::new(),
             draws: Vec::new(),
             kv,
-            seed: std::cell::Cell::new(seed | 1),
         })
     }
 
@@ -2763,7 +2753,17 @@ impl<M: TextModel> CausalLmRunner<M> {
         encode_i32(&mut self.encoded, self.staging.slots(rows));
         self.columns.slots.write(&self.encoded)?;
 
-        draw_uniforms(&self.seed, &mut self.draws, rows);
+        // Each row's uniform is a function of its request's stream and the position it samples
+        // (`ipc::philox`), never of a generator this runner advances: a step replayed, restored or
+        // served on another engine draws the same number, and the ranks of a tensor group, which
+        // stage the same batch, draw the same token from the same gathered logits.
+        self.draws.clear();
+        self.draws.extend(
+            self.staging
+                .draws(rows)
+                .iter()
+                .map(|address| address.uniform()),
+        );
         encode_f32(&mut self.encoded, &self.draws);
         self.columns.draws.write(&self.encoded)?;
 
@@ -3268,6 +3268,8 @@ impl<M: TextModel> CausalLmRunner<M> {
             // discarded. A greedy bucket's pose is not read through this path at all: the launch
             // sequence follows the bucket's variant.
             parameters: warm_parameters(rows),
+            // The pose's token is discarded, so any address serves; one per row, as the batch states.
+            draws: vec![ipc::philox::DrawAddress::default(); rows],
             // An inert table, not an empty one, with one row per call: a row whose slot and task
             // are `-1` commits nothing, and the launch is still recorded, so a serving replay of
             // this bucket runs the operator over the bucket's rows and advances nothing.
@@ -3871,6 +3873,7 @@ mod tests {
             input_ids: vec![7, 8],
             slots: vec![0, 1],
             parameters: vec![0.0; 2 * ops::sampler::PARAMETER_COLUMNS as usize],
+            draws: vec![ipc::philox::DrawAddress::default(); 2],
             commit: committed(&[0, 1]),
             page_size: 16,
             max_kv_len: 4096,
@@ -3895,6 +3898,7 @@ mod tests {
             input_ids: vec![1, 2, 3],
             slots: vec![0],
             parameters: vec![0.0; ops::sampler::PARAMETER_COLUMNS as usize],
+            draws: vec![ipc::philox::DrawAddress::default()],
             commit: committed(&[0]),
             page_size: 16,
             max_kv_len: 4096,
@@ -4023,6 +4027,7 @@ mod tests {
             input_ids: (0..tokens).map(|token| token + 1).collect(),
             slots: vec![0],
             parameters: vec![0.0; ops::sampler::PARAMETER_COLUMNS as usize],
+            draws: vec![ipc::philox::DrawAddress::default()],
             commit: committed(&[0]),
             page_size: 16,
             max_kv_len: 4096,

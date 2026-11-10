@@ -22,6 +22,10 @@
 //! - **slots**: the sampler's per-slot state row;
 //! - **parameters**: the sampler's columns of every row, in the order
 //!   `ops::sampler` names ([`sampler_parameters`]);
+//! - **draws**: where each row's random draw lies, `ipc::philox::DrawAddress`:
+//!   the request's Philox stream (its seed, or its lineage when it has none)
+//!   and the logical position of the token the row samples, one past the row's
+//!   last query token;
 //! - **input_ids**: the tokens each call's rows embed, which the caller states
 //!   because a decode's token comes from the mechanism's request state and not
 //!   from the call;
@@ -159,6 +163,7 @@ pub(crate) fn columns(
     let mut spans: Vec<Range<u32>> = Vec::with_capacity(requests.len());
     let mut input_ids: Vec<i32> = Vec::new();
     let mut parameters: Vec<f32> = Vec::new();
+    let mut draw_addresses: Vec<ipc::philox::DrawAddress> = Vec::new();
     for (index, (call, dispatch)) in requests.iter().enumerate() {
         let inputs = inputs.get(index)?;
         let sampling = *sampling.get(index)?;
@@ -237,6 +242,21 @@ pub(crate) fn columns(
         let row = sampler_parameters(sampling);
         for _ in 0..rows_of_call {
             parameters.extend_from_slice(&row);
+        }
+        // Each row draws at the logical position of the token it samples: one past its last
+        // query token, so a decode at position `p` samples position `p + 1` and a prompt's last
+        // chunk the position after the prompt. A migrated request continues at the position it
+        // had reached under the seed the migrator gave it, so it draws the same values there.
+        let key = ipc::philox::request_sampling_key(
+            sampling.seed,
+            call.request_key.engine_id,
+            call.request_key.request_id.0,
+            call.request_key.request_epoch,
+        );
+        let mut end = u64::from(first);
+        for length in &forward.query_lens {
+            end = end.checked_add(u64::from(*length))?;
+            draw_addresses.push(ipc::philox::DrawAddress { key, position: end });
         }
 
         let start = spans.last().map_or(0, |span| span.end);
@@ -356,6 +376,7 @@ pub(crate) fn columns(
         input_ids,
         slots,
         parameters,
+        draws: draw_addresses,
         commit,
         page_size: block_size,
         max_kv_len,
@@ -595,6 +616,45 @@ mod tests {
             1,
             "every penalty of this request is set"
         );
+    }
+
+    /// A seeded request's draw is addressed by its seed and the position of the token it samples:
+    /// the same request under another identity, in another batch, draws the same value, and the
+    /// next position draws another.
+    #[test]
+    fn a_seeded_row_draws_at_its_seed_and_sampled_position() {
+        let seeded = SamplingParams {
+            seed: Some(7),
+            ..sampling()
+        };
+        let batch = |request: u64, position: u32| {
+            let mut decode_call = call(decode(), position, &[1]);
+            decode_call.request_key = ipc::RequestKey::new(1, ipc::RequestId(request), 1);
+            decode_call.coordinates.cache_visible_len = position;
+            let requests = vec![(decode_call, dispatch(3, &[1], &[true]))];
+            columns(
+                &requests,
+                &tables_of(&requests),
+                &[vec![42]],
+                &[&seeded],
+                &[5],
+                BLOCK_SIZE,
+                2048,
+            )
+            .expect("a decode batch")
+            .draws
+        };
+
+        let draws = batch(1, 12);
+        assert_eq!(draws.len(), 1, "one draw per row");
+        // The decode of the token at position 12 samples position 13.
+        assert_eq!(draws[0].position, 13);
+        assert_eq!(
+            draws[0].key,
+            ipc::philox::request_sampling_key(Some(7), 0, 0, 0)
+        );
+        assert_eq!(batch(9, 12)[0].uniform(), draws[0].uniform());
+        assert_ne!(batch(1, 13)[0].uniform(), draws[0].uniform());
     }
 
     #[test]

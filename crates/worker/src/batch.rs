@@ -325,6 +325,11 @@ pub struct BatchColumns {
     pub slots: Vec<i32>,
     /// `rows x ops::sampler::PARAMETER_COLUMNS` f32 request parameters, row-major.
     pub parameters: Vec<f32>,
+    /// `[rows]` where each row's draw lies: its request's Philox stream and the logical position
+    /// of the token it samples (`ipc::philox`). The runner turns each into the row's uniform before
+    /// the replay, so a sampled token depends on its request's seed and position alone. A greedy
+    /// row and a row that samples nothing carry one too; its draw is never read.
+    pub draws: Vec<ipc::philox::DrawAddress>,
     /// `ops::commit`'s column table, column-major `[columns][rows]` i64; a negative commit slot
     /// belongs to a padded row and keeps its token state.
     pub commit: Vec<i64>,
@@ -601,8 +606,8 @@ impl BatchColumns {
     /// batch fails before a launch rather than after one.
     pub fn check(&self, shape: &Shape) -> Result<()> {
         let tokens = self.rows.tokens();
-        // Two counts, and a column belongs to one of them: `slots`, `parameters`, `seq_lens` and
-        // `logits_rows` are per **row** (a verify or branch call carries several rows for one call),
+        // Two counts, and a column belongs to one of them: `slots`, `parameters`, `draws`,
+        // `seq_lens` and `logits_rows` are per **row** (a verify or branch call carries several rows for one call),
         // while the commit table states one row per **call** (`crates/scheduler`'s `columns.rs`).
         // Sizing one against the other refuses a valid multi-row call and lets a wrong commit table
         // through.
@@ -617,6 +622,7 @@ impl BatchColumns {
             ("logits_rows", self.rows.logits_rows.len(), rows),
             ("slots", self.slots.len(), rows),
             ("parameters", self.parameters.len(), rows * parameters),
+            ("draws", self.draws.len(), rows),
             (
                 "commit",
                 self.commit.len(),

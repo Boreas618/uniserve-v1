@@ -1516,7 +1516,7 @@ impl SimEngine {
                         request_id.0,
                         call.request_key.request_epoch,
                     );
-                    philox::sampling_uniform(key, position, 0, 0)
+                    philox::DrawAddress { key, position }.uniform()
                 } else {
                     0.0
                 };

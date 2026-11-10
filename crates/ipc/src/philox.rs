@@ -5,9 +5,15 @@
 //! uniforms. This addressing makes a draw independent of batching, execution
 //! depth, completion order, and replay.
 //!
-//! The engine simulator draws through this module; the rank's token sampler
-//! (`uniserve.worker.text.philox`) draws bit-identical values for the same
-//! coordinates.
+//! This module is the one implementation of a token draw: the causal-LM
+//! runner (`worker::runners::causal_lm`) computes each sampled row's uniform
+//! from the row's [`DrawAddress`], which the scheduler writes into the batch,
+//! and the engine simulator draws the same values for the same coordinates.
+//! The scheme is sglang's seeded sampling (`multinomial_with_seed`: a hash of
+//! the request seed and the sampled token's position) with Philox as the hash,
+//! so a sampled token is a function of its request's seed, its position and its
+//! distribution, and never of the batch it ran in, the engine that ran it or
+//! how many tokens other requests drew before it.
 //!
 //! Layout:
 //!
@@ -18,7 +24,11 @@
 //!   one, so a seeded request draws the same values whenever it is sent,
 //!   and its lineage when it has none;
 //! - counter = `[semantic_token_index low, semantic_token_index high,
-//!   processor_stage, draw_index]`;
+//!   processor_stage, draw_index]`, where the token index is the sampled
+//!   token's logical position in the request's sequence (the position its
+//!   token takes: prompt and generated tokens before it), which a migration
+//!   keeps, and the stage and draw index are zero for the one draw of target
+//!   sampling;
 //! - uniform = `(word0 >> 8) * 2^-24`, a 24-bit dyadic value in `[0, 1)`.
 
 const PHILOX_M0: u32 = 0xD251_1F53;
@@ -97,6 +107,29 @@ pub fn request_sampling_key(
     match seed {
         Some(seed) => sampling_key(seed, 0, 0, 0),
         None => sampling_key(0, engine_id, request_id, request_epoch),
+    }
+}
+
+/// Where one sampled row's draw lies: its request's stream and the logical
+/// position of the token it samples.
+///
+/// The scheduler writes one per sampling row (`worker::batch::BatchColumns::draws`)
+/// and the causal-LM runner turns it into the row's uniform with
+/// [`DrawAddress::uniform`] before the replay, so every rank of a tensor group,
+/// which reads the same batch, draws the same token.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct DrawAddress {
+    /// The request's stream, [`request_sampling_key`].
+    pub key: u64,
+    /// The logical position of the token the row samples.
+    pub position: u64,
+}
+
+impl DrawAddress {
+    /// The row's uniform draw in `[0, 1)`: target sampling's draw at the
+    /// address, stage and draw index zero.
+    pub fn uniform(self) -> f32 {
+        sampling_uniform(self.key, self.position, 0, 0)
     }
 }
 

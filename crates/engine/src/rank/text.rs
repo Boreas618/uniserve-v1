@@ -96,9 +96,6 @@ impl ModelRunner {
                     // The attention descriptor's static key bound: the deployment's longest
                     // sequence, which the resident cache's block-table rows were sized for.
                     self.engine_config().model.max_model_len,
-                    // A seed that changes with the process, so two runs of one deployment are not
-                    // the same run.
-                    seed(),
                 )?;
                 let runner = match member {
                     Some(member) => runner.in_union(member),
@@ -113,19 +110,4 @@ impl ModelRunner {
         }
         Ok(runners)
     }
-}
-
-/// A seed for the runner's draws: the process's clock, so two runs differ.
-///
-/// One value for the whole process: the ranks of a tensor group each sample from the same gathered
-/// logits, and a rank that drew another token would feed its next step another input than its
-/// peers, whose sums it then joins.
-pub(super) fn seed() -> u64 {
-    static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *SEED.get_or_init(|| {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos() as u64);
-        (nanos ^ u64::from(std::process::id())) | 1
-    })
 }
