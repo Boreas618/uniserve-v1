@@ -224,7 +224,7 @@ impl Scheduler {
             worker: submissions,
             inflight: inflight::Inflight::new(),
             dispatch: dispatch::Dispatch::default(),
-            storage: reservation::Storage {
+            storage: allocation::requests::Storage {
                 cache,
                 encoder_cache: crate::kv_cache::EncoderCacheManager::new(
                     generation_limits.encoder_cache_entries as usize,

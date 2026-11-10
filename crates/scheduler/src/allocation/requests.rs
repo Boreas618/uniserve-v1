@@ -9,35 +9,35 @@
 //! acknowledged, so storage is reused only after the workers' physical readers
 //! have finished.
 
-use super::*;
+use crate::*;
 use ipc::BufferId;
 
 /// Logical storage reservations and retained exports owned by the engine.
-pub(super) struct Storage {
+pub(crate) struct Storage {
     /// Text cache pages and prefix cache; `None` when the runtime has no prefix cache.
-    pub(super) cache: Option<PrefixCacheManager>,
-    pub(super) encoder_cache: crate::kv_cache::EncoderCacheManager,
+    pub(crate) cache: Option<PrefixCacheManager>,
+    pub(crate) encoder_cache: crate::kv_cache::EncoderCacheManager,
     /// Encoder-cache entries promised to admitted requests. `admit` checks it
     /// against `EncoderCacheManager::budget` only for requests that reserve
     /// their worst case.
-    pub(super) reserved_encoder_entries: usize,
+    pub(crate) reserved_encoder_entries: usize,
     /// Request-state rows of token requests and their guidance prefixes, sized by
     /// the runtime's `request_slots`.
-    pub(super) request_pool: RequestPool,
-    pub(super) latent_pool: LatentPool,
+    pub(crate) request_pool: RequestPool,
+    pub(crate) latent_pool: LatentPool,
     /// Byte spans of persistent products in the runtime's buffer pool.
-    pub(super) buffer_pool: BufferPool,
+    pub(crate) buffer_pool: BufferPool,
     /// Per-worker row address spaces and per-rank buffer address spaces of
     /// the media workers.
-    pub(super) media_storage: HashMap<crate::WorkerGroupId, MediaStorage>,
+    pub(crate) media_storage: HashMap<crate::WorkerGroupId, MediaStorage>,
     /// Spans whose ownership moved from their producing request to
     /// encoder-cache retention, keyed by the cached product's buffer.
-    pub(super) encoder_buffers: HashMap<ipc::BufferId, BufferSpan>,
+    pub(crate) encoder_buffers: HashMap<ipc::BufferId, BufferSpan>,
     /// Spans that left encoder-cache retention (or failed to enter it) and
     /// whose `Free` command is queued or in flight; the span returns to
     /// `buffer_pool` when `Scheduler::acknowledge_commands` sees that `Free`.
     /// A request-owned span stays with its request until then instead.
-    pub(super) pending_buffer_frees: HashMap<BufferId, BufferSpan>,
+    pub(crate) pending_buffer_frees: HashMap<BufferId, BufferSpan>,
 }
 
 /// A media allocation named a worker the scheduler holds no media storage for.
@@ -45,7 +45,7 @@ pub(super) struct Storage {
 /// Media storage exists for every loaded worker that serves a media call and
 /// every media allocation is taken from it, so this reports a scheduler defect.
 #[derive(Debug)]
-pub(super) struct UnknownMediaGroup(pub(super) crate::WorkerGroupId);
+pub(crate) struct UnknownMediaGroup(pub(crate) crate::WorkerGroupId);
 
 impl std::fmt::Display for UnknownMediaGroup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -58,7 +58,7 @@ impl std::fmt::Display for UnknownMediaGroup {
 }
 
 impl Storage {
-    pub(super) fn free_media_request(
+    pub(crate) fn free_media_request(
         &mut self,
         worker: &crate::WorkerGroupId,
         allocation: RequestSlot,
@@ -72,7 +72,7 @@ impl Storage {
     }
 
     /// Returns `allocation` to the buffer pool of `rank` of `worker`.
-    pub(super) fn free_media_buffer(
+    pub(crate) fn free_media_buffer(
         &mut self,
         worker: &crate::WorkerGroupId,
         rank: u32,
@@ -88,27 +88,27 @@ impl Storage {
 
     /// Returns the text prefix cache, which exists when the worker serves token
     /// generation; token requests are rejected at submission without it.
-    pub(super) fn cache(&self) -> Option<&PrefixCacheManager> {
+    pub(crate) fn cache(&self) -> Option<&PrefixCacheManager> {
         self.cache.as_ref()
     }
 
     /// Revokes the prefix identity of every cached page (`BlockPool::flush`);
     /// returns how many pages it revoked.
-    pub(super) fn flush_prefix_cache(&self) -> usize {
+    pub(crate) fn flush_prefix_cache(&self) -> usize {
         self.cache
             .as_ref()
             .map_or(0, |cache| cache.block_pool.flush())
     }
 
     /// Returns the queued cache units, including cached ones allocation evicts.
-    pub(super) fn free_units(&self) -> usize {
+    pub(crate) fn free_units(&self) -> usize {
         self.cache
             .as_ref()
             .map_or(0, |cache| cache.block_pool.free_units())
     }
 
     /// Returns the cache units the scheduler may allocate.
-    pub(super) fn usable_units(&self) -> usize {
+    pub(crate) fn usable_units(&self) -> usize {
         self.cache
             .as_ref()
             .map_or(0, PrefixCacheManager::usable_units)
@@ -117,7 +117,7 @@ impl Storage {
     /// Returns the cache units the scheduler may allocate once none is
     /// withdrawn: a request that needs more is refused, and one that needs
     /// fewer waits while the cache is shrunk.
-    pub(super) fn capacity_units(&self) -> usize {
+    pub(crate) fn capacity_units(&self) -> usize {
         self.cache
             .as_ref()
             .map_or(0, PrefixCacheManager::capacity_units)
@@ -127,7 +127,7 @@ impl Storage {
     ///
     /// Hands `allocation` back, retaining nothing, when it is not owned by the
     /// buffer's producing request or the buffer is already retained.
-    pub(super) fn retain_encoder_buffer(
+    pub(crate) fn retain_encoder_buffer(
         &mut self,
         buffer: BufferId,
         allocation: BufferSpan,
@@ -139,7 +139,7 @@ impl Storage {
         Ok(())
     }
 
-    pub(super) fn take_encoder_buffer(&mut self, buffer: BufferId) -> Option<BufferSpan> {
+    pub(crate) fn take_encoder_buffer(&mut self, buffer: BufferId) -> Option<BufferSpan> {
         self.encoder_buffers.remove(&buffer)
     }
 
@@ -148,7 +148,7 @@ impl Storage {
     /// The `Finish` command for `request` lists them so its workers keep them
     /// readable until their own `Free`. The list is sorted by producer call,
     /// output index, and generation.
-    pub(super) fn retained_buffers(&self, request: RequestKey) -> Vec<BufferId> {
+    pub(crate) fn retained_buffers(&self, request: RequestKey) -> Vec<BufferId> {
         let mut buffers: Vec<_> = self
             .encoder_buffers
             .keys()
@@ -170,45 +170,45 @@ impl Storage {
 ///
 /// `Scheduler::acknowledge_commands` releases the record when a `Finish`
 /// acknowledgement names the same `request_key`.
-pub(super) struct RetiringRequest {
-    pub(super) request_key: RequestKey,
+pub(crate) struct RetiringRequest {
+    pub(crate) request_key: RequestKey,
     /// The token request's own allocations and those of its guidance prefix;
     /// empty for a media request.
-    pub(super) allocations: Vec<RequestAllocations>,
-    pub(super) media_allocations: Option<MediaAllocations>,
+    pub(crate) allocations: Vec<RequestAllocations>,
+    pub(crate) media_allocations: Option<MediaAllocations>,
     /// Persistent product spans still held by the request. An earlier `Free`
     /// acknowledgement may release one of them before the `Finish` does.
-    pub(super) buffers: HashMap<BufferId, BufferSpan>,
+    pub(crate) buffers: HashMap<BufferId, BufferSpan>,
 }
 
 /// Storage one token request, or its guidance prefix, holds in the runtime's
 /// shared pools.
-pub(super) struct RequestAllocations {
-    pub(super) request_slot: RequestSlot,
+pub(crate) struct RequestAllocations {
+    pub(crate) request_slot: RequestSlot,
     /// One block table per cache group.
-    pub(super) prefix_cache: CacheAllocation,
+    pub(crate) prefix_cache: CacheAllocation,
     /// Latent pages of the current image trajectory, reserved by its latent
     /// preparation or denoising call on a worker that tracks image latents
     /// and released when its image decoding completes or with the request's
     /// other allocations.
-    pub(super) latent: Option<LatentPages>,
+    pub(crate) latent: Option<LatentPages>,
     /// Persistent product spans keyed by the product's buffer identity.
-    pub(super) buffers: HashMap<BufferId, BufferSpan>,
+    pub(crate) buffers: HashMap<BufferId, BufferSpan>,
 }
 
 impl RequestAllocations {
     /// Returns the request row, sent to workers as `request_pool_idx`.
-    pub(super) fn request_slot(&self) -> u32 {
+    pub(crate) fn request_slot(&self) -> u32 {
         self.request_slot.index()
     }
 
     /// Returns shared access to the request block tables.
-    pub(super) fn block_tables(&self) -> &[BlockTable] {
+    pub(crate) fn block_tables(&self) -> &[BlockTable] {
         &self.prefix_cache.tables
     }
 
     /// Takes ownership of the request buffer allocation.
-    pub(super) fn take_buffer(&mut self, id: BufferId) -> Option<BufferSpan> {
+    pub(crate) fn take_buffer(&mut self, id: BufferId) -> Option<BufferSpan> {
         self.buffers.remove(&id)
     }
 
@@ -216,7 +216,7 @@ impl RequestAllocations {
     ///
     /// Cache units need no explicit release: each page in `prefix_cache` is a counted
     /// reference, dropped with `self`.
-    pub(super) fn free(self, storage: &mut Storage) {
+    pub(crate) fn free(self, storage: &mut Storage) {
         for buffer in self.buffers.into_values() {
             storage.buffer_pool.free(buffer);
         }
@@ -229,21 +229,21 @@ impl RequestAllocations {
 
 /// Storage one media request reserves at admission in the per-worker address
 /// spaces of `Storage::media_storage`.
-pub(super) struct MediaAllocations {
+pub(crate) struct MediaAllocations {
     /// Declared results keyed by component name and output index.
-    pub(super) tensors: HashMap<(String, u32), MediaTensorAllocation>,
+    pub(crate) tensors: HashMap<(String, u32), MediaTensorAllocation>,
     /// The request's row on each worker of its route.
-    pub(super) request_slots: HashMap<crate::WorkerGroupId, RequestSlot>,
+    pub(crate) request_slots: HashMap<crate::WorkerGroupId, RequestSlot>,
 }
 
 /// A request reserves each declared result in the buffer pool of every rank
 /// that backs it, on every worker of its route. Video ranges occupy disjoint
 /// slices of the temporal result, independent of decoder Worker width.
-pub(super) struct MediaTensorAllocation {
+pub(crate) struct MediaTensorAllocation {
     /// The span on each backing rank, keyed by worker and rank.
-    pub(super) allocations: HashMap<(crate::WorkerGroupId, u32), BufferSpan>,
-    pub(super) dtype: DType,
-    pub(super) shape_bound: ShapeBound,
+    pub(crate) allocations: HashMap<(crate::WorkerGroupId, u32), BufferSpan>,
+    pub(crate) dtype: DType,
+    pub(crate) shape_bound: ShapeBound,
 }
 
 /// Independent scheduler address spaces for one physical media group.
@@ -254,10 +254,10 @@ pub(super) struct MediaTensorAllocation {
 /// buffer pool, holding only the results of the components it executes and of
 /// the components that read them, so the pool the engine allocates from is
 /// the pool the rank backs.
-pub(super) struct MediaStorage {
-    pub(super) requests: RequestPool,
+pub(crate) struct MediaStorage {
+    pub(crate) requests: RequestPool,
     /// The buffer address space of each rank, in rank order.
-    pub(super) buffers: Vec<BufferPool>,
+    pub(crate) buffers: Vec<BufferPool>,
     /// The ranks that back the declared results of each component.
     holders: HashMap<String, Vec<u32>>,
 }
@@ -272,7 +272,7 @@ impl MediaStorage {
     /// deployment's `routing`; the worker sizes each rank's pool by the same
     /// rule. A group placed with no components backs every result on every
     /// rank.
-    pub(super) fn new(
+    pub(crate) fn new(
         request_slots: usize,
         rank_bytes: &[u64],
         components: &BTreeMap<String, proto::config::BlockConfig>,
@@ -325,7 +325,7 @@ impl MediaStorage {
 
     /// The ranks that back the declared results of `component`, in rank
     /// order; none for a component no route or dispatch names.
-    pub(super) fn holders(&self, component: &str) -> &[u32] {
+    pub(crate) fn holders(&self, component: &str) -> &[u32] {
         self.holders.get(component).map_or(&[], Vec::as_slice)
     }
 }
@@ -338,7 +338,7 @@ impl MediaTensorAllocation {
     /// it, where one unit is the product's bytes divided by its static leading
     /// dimension. With `start_unit` zero, or a leading dimension that is not
     /// static, the product binds at the start of the reservation.
-    pub(super) fn bind(
+    pub(crate) fn bind(
         &self,
         product: &TensorRef,
         start_unit: u32,
@@ -376,7 +376,7 @@ impl MediaAllocations {
     /// `Finish` that closes it has been submitted; a tensor is a span the
     /// worker writes and reads until it has seen that `Finish`, so it stays in
     /// the record until the acknowledgement releases it.
-    pub(super) fn close_rows(&mut self, storage: &mut Storage) -> Result<(), UnknownMediaGroup> {
+    pub(crate) fn close_rows(&mut self, storage: &mut Storage) -> Result<(), UnknownMediaGroup> {
         let mut released = Ok(());
         for (worker, allocation) in std::mem::take(&mut self.request_slots) {
             released = released.and(storage.free_media_request(&worker, allocation));
@@ -385,7 +385,7 @@ impl MediaAllocations {
     }
 
     /// Returns the request row assigned in one physical worker address space.
-    pub(super) fn request_slot(&self, worker: &crate::WorkerGroupId) -> u32 {
+    pub(crate) fn request_slot(&self, worker: &crate::WorkerGroupId) -> u32 {
         self.request_slots[worker].index()
     }
 
@@ -393,7 +393,7 @@ impl MediaAllocations {
     ///
     /// Every allocation on a worker with media storage is released even when
     /// another names an unknown worker; the first unknown worker is reported.
-    pub(super) fn free(self, storage: &mut Storage) -> Result<(), UnknownMediaGroup> {
+    pub(crate) fn free(self, storage: &mut Storage) -> Result<(), UnknownMediaGroup> {
         let mut released = Ok(());
         for tensor in self.tensors.into_values() {
             for ((worker, rank), allocation) in tensor.allocations {

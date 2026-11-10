@@ -41,10 +41,10 @@
 //!    its facts (`generation::continuation`). Either computes what it
 //!    computed before.
 
-use super::*;
 use crate::WorkerGroupId;
 use crate::completion::CallCompletion;
 use crate::trajectories::{Offloaded, Restored, image_trajectory};
+use crate::*;
 
 /// What [`Scheduler::store_preempted`] reads of a preempted request.
 struct Preempted {
@@ -77,7 +77,7 @@ impl Scheduler {
     /// picks and that has a denoising step left to schedule, at its next
     /// step boundary; queued video requests leave at once with the steps
     /// they name.
-    pub(super) fn preempt_media(
+    pub(crate) fn preempt_media(
         &mut self,
         cause: MigrationCause,
         select: impl Fn(RequestId) -> bool,
@@ -195,7 +195,7 @@ impl Scheduler {
     /// Ends preempted video request `id`, whose calls completed: its
     /// trajectory is stored when it reached a step worth storing, and it
     /// leaves once the store answered. Returns whether it left.
-    pub(super) fn retire_preempted(&mut self, id: RequestId, cause: MigrationCause) -> bool {
+    pub(crate) fn retire_preempted(&mut self, id: RequestId, cause: MigrationCause) -> bool {
         let Some(state) = self.media_state(id) else {
             return true;
         };
@@ -231,7 +231,7 @@ impl Scheduler {
     /// a step worth storing, keyed by the request's trajectory identity and
     /// the image's index ([`image_trajectory`]), and the request leaves as
     /// migratable once the store answered, naming the steps stored.
-    pub(super) fn retire_preempted_token(&mut self, id: RequestId, cause: MigrationCause) {
+    pub(crate) fn retire_preempted_token(&mut self, id: RequestId, cause: MigrationCause) {
         let Some(state) = self.running.get(&id) else {
             return;
         };
@@ -281,7 +281,7 @@ impl Scheduler {
     /// restored (or zero) and states how the denoising ranks hold it; a
     /// denoising step advances it, and the client reads the steps it
     /// completed.
-    pub(super) fn accept_preempted_trajectory(
+    pub(crate) fn accept_preempted_trajectory(
         &mut self,
         id: RequestId,
         call: &Call,
@@ -326,7 +326,7 @@ impl Scheduler {
     /// resolves, and the copies of a preempted request's trajectory leave
     /// in a batch of latent offloads alone to its denoiser's worker group.
     /// Returns whether anything moved on.
-    pub(super) fn poll_trajectories(&mut self) -> bool {
+    pub(crate) fn poll_trajectories(&mut self) -> bool {
         let Some(store) = self.trajectories.as_mut() else {
             return false;
         };
@@ -428,7 +428,7 @@ impl Scheduler {
     /// its latent preparation then waits for; a request that names no
     /// stored steps, or whose denoiser the host latent pools do not serve,
     /// starts from noise.
-    pub(super) fn start_restore(&mut self, id: RequestId) -> Restoring {
+    pub(crate) fn start_restore(&mut self, id: RequestId) -> Restoring {
         let Some(state) = self.media_state(id) else {
             return Restoring::Ready(None);
         };
@@ -466,7 +466,7 @@ impl Scheduler {
     /// steps of its trajectory (`GenerationRequest::trajectory`), keyed by
     /// the image's index ([`image_trajectory`]). A replica that has no room
     /// for the call yet is chosen at a later step.
-    pub(super) fn image_restore(&mut self, id: RequestId) -> Option<Option<ipc::LatentRestore>> {
+    pub(crate) fn image_restore(&mut self, id: RequestId) -> Option<Option<ipc::LatentRestore>> {
         let state = self.running.get(&id)?;
         match &state.host_trajectory.restoring {
             Restoring::Due => {}
@@ -505,7 +505,7 @@ impl Scheduler {
 
     /// Ends the restore of request `id`, whose latent preparation resolved
     /// or which left: the pages it pinned are released.
-    pub(super) fn end_restore(&mut self, id: RequestId) {
+    pub(crate) fn end_restore(&mut self, id: RequestId) {
         if let Some(store) = self.trajectories.as_mut() {
             store.release(id);
         }
@@ -514,7 +514,7 @@ impl Scheduler {
     /// Ends the restore of token request `id`'s image, whose latent
     /// preparation completed, as `end_restore` does: the request's later
     /// images start from noise.
-    pub(super) fn end_image_restore(&mut self, id: RequestId) {
+    pub(crate) fn end_image_restore(&mut self, id: RequestId) {
         self.end_restore(id);
         if let Some(state) = self.running.get_mut(&id) {
             state.host_trajectory.restoring = Restoring::Planned;
@@ -523,7 +523,7 @@ impl Scheduler {
 
     /// The batch `batch` carrying latent offloads completed: they are
     /// committed when it `succeeded`, and aborted otherwise.
-    pub(super) fn trajectory_batch_completed(&mut self, batch: u64, succeeded: bool) {
+    pub(crate) fn trajectory_batch_completed(&mut self, batch: u64, succeeded: bool) {
         if let Some(store) = self.trajectories.as_mut() {
             store.completed(batch, succeeded);
         }

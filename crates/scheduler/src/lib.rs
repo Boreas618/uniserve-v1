@@ -175,7 +175,6 @@ mod mechanism;
 pub(crate) mod output;
 mod policy;
 mod preemption;
-mod reservation;
 mod run;
 mod speculation;
 pub(crate) mod submission;
@@ -231,15 +230,15 @@ use proto::request::MigrationCause;
 use proto::tensor::DType;
 
 use crate::image_artifact::png_artifact_info;
+use allocation::requests::{
+    MediaAllocations, MediaStorage, MediaTensorAllocation, RequestAllocations, RetiringRequest,
+    UnknownMediaGroup,
+};
 use denoising::{Denoising, LatentDispatch};
 use generation::RequestState;
 use graph::{VideoGraph, product};
 use inflight::{InflightCall, InflightInput, PendingCompletion, PendingFinish};
 use output::RequestOutput;
-use reservation::{
-    MediaAllocations, MediaStorage, MediaTensorAllocation, RequestAllocations, RetiringRequest,
-    UnknownMediaGroup,
-};
 
 /// The kind of pass a call kind is batched in (see `batch_kind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -559,7 +558,7 @@ pub struct Scheduler {
     worker: submission::Submissions,
     inflight: inflight::Inflight,
     /// Resident resource ownership and reservation accounting.
-    storage: reservation::Storage,
+    storage: allocation::requests::Storage,
     dispatch: dispatch::Dispatch,
     /// Aggregate capacity view of the loaded workers.
     info: MainProcessInfo,

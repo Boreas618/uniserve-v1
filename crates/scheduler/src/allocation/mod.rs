@@ -14,10 +14,14 @@
 //! consumes; the value does not record which pool issued it, so the caller
 //! returns it to the right one. `CacheAllocation` has no `free`: its units return
 //! to the `BlockPool` when its tables drop.
+//!
+//! [`requests`] holds what a request owns of these pools from its admission
+//! to its retirement, and `Storage`, the scheduler's aggregate of every pool.
 
 use ipc::{MainProcessInfo, RequestKey};
 
 mod bytes;
+pub(crate) mod requests;
 pub(crate) use bytes::ByteAllocator;
 
 pub(crate) use crate::kv_cache::CacheAllocation;
