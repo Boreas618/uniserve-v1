@@ -9,8 +9,8 @@ differs between them — and `columns` is the row width the program addresses wi
 `block` and the PDL flag also travel at launch, so one module serves every row count.
 """
 
-import _compile
 import rows as kernels
+from uniserve_program_server import triton as driver
 
 #: The element types the rows are stored in.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
@@ -51,4 +51,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

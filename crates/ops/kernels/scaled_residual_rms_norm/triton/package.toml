@@ -24,7 +24,7 @@ metadata = "metadata.json"
 
 [source]
 kind = "triton"
-files = ["src/scaled_residual_rms_norm.py", "src/build.py", "src/_compile.py"]
+files = ["src/scaled_residual_rms_norm.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]

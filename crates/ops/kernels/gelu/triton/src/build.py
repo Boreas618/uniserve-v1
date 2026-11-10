@@ -3,15 +3,15 @@
 ``spec`` states what this package's kernel needs for one descriptor: the kernel function, its
 argument signature in the order the operator launches them, the compile-time values the descriptor
 dimensions give, and the compilation options. The Program Server's Triton source drives
-``_compile`` with it.
+``uniserve_program_server.triton`` with it.
 
 The approximation is compiled in: the reference selects a formula, and the two are separate programs.
 ``pdl`` is a flag the launch repeats as a word the kernel does not read; the module's own
 `launch_pdl` option is what issues the dependent launch, and only a Blackwell target has it.
 """
 
-import _compile
 import gelu as kernels
+from uniserve_program_server import triton as driver
 
 #: The dtypes a row may have, in the descriptor's vocabulary.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32", "f8e4m3": "fp8e4nv"}
@@ -25,7 +25,7 @@ def warps_of(block):
 def spec(fields, parameters, target):
     """The compilation of one gelu descriptor."""
     block = int(fields["block"])
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     return {
         "kernel": kernels._gelu_kernel,
         "signature": {
@@ -48,4 +48,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

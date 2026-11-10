@@ -10,8 +10,8 @@ runtime value.
 
 import struct
 
-import _compile
 import qk_norm_rope as kernels
+from uniserve_program_server import triton as driver
 
 #: Element types of the queries, keys and their normalized outputs.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
@@ -71,7 +71,7 @@ def spec(fields, parameters, target):
         raise SystemExit(f"a rotation of {rotated} channels of a {head_dim} channel head")
     # The turned pairs in tiles of a power of two: 96 channels turn 48 pairs.
     pair_lanes = 1 << (rotated // 2 - 1).bit_length()
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     if fields.get("strided") == "true":
         return strided_spec(fields, head_dim, rotated, pdl)
 
@@ -140,4 +140,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

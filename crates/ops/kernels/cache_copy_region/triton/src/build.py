@@ -10,8 +10,8 @@ addressing is built from them. The span is not: the token count, the page offset
 the field's units per column are launch words.
 """
 
-import _compile
 import cache_copy_region as kernels
+from uniserve_program_server import triton as driver
 
 #: Triton's element type for each stored type the operator accepts, and its byte width. An FP8 pool
 #: is addressed as bytes: Triton's signature table has no pointer to a float8, so the kernel bitcasts
@@ -49,7 +49,7 @@ def spec(fields, parameters, target):
     row_pow2 = 1
     while row_pow2 < row_size:
         row_pow2 *= 2
-    pdl = _compile.capability(target) >= 100
+    pdl = driver.capability(target) >= 100
     return {
         "kernel": kernels._cache_copy_region_kernel,
         "signature": {
@@ -88,4 +88,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

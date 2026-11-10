@@ -5,8 +5,8 @@ first id and row count, the tokens one program copies and the dependent-launch
 flag. The token count stays a runtime value.
 """
 
-import _compile
 import embedding as kernels
+from uniserve_program_server import triton as driver
 
 #: The vocabulary weight's dtype, and the output row's.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
@@ -18,7 +18,7 @@ IDS = {"i32": "i32", "i64": "i64"}
 def spec(fields, parameters, target):
     """The compilation of one embedding descriptor."""
     dtype = "*" + DTYPES[fields["dtype"]]
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     tile = int(parameters["tile"])
     return {
         "kernel": kernels._embedding_kernel,
@@ -44,4 +44,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

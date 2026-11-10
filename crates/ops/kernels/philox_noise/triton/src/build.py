@@ -3,7 +3,7 @@
 ``spec`` states what this package's kernel needs for one descriptor: the kernel function, its
 argument signature in the order the operator launches them, the compile-time values the descriptor
 dimensions give, and the compilation options. The Program Server's Triton source drives
-``_compile`` with it.
+``uniserve_program_server.triton`` with it.
 
 The draw's kind is baked in: a normal draw takes one counter per element pair and stores two values,
 a uniform draw takes one counter per element, so the two read different words from the same counter
@@ -12,8 +12,8 @@ for the whole flattened buffer, which addresses the same draw differently and is
 The row count, the element count, the stage, the draw index and the scalar key are launch words.
 """
 
-import _compile
 import philox_noise as kernels
+from uniserve_program_server import triton as driver
 
 #: The dtypes the drawn noise may have: the draw is computed in FP32 and stored.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
@@ -54,4 +54,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

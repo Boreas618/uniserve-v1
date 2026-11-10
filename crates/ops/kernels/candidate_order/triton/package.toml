@@ -22,7 +22,7 @@ metadata = "metadata.json"
 
 [source]
 kind = "triton"
-files = ["src/candidate_order.py", "src/build.py", "src/_compile.py"]
+files = ["src/candidate_order.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]

@@ -29,6 +29,11 @@ REPOSITORY = pathlib.Path(__file__).resolve().parents[1]
 OPS = REPOSITORY / 'crates/ops/src'
 KERNELS = REPOSITORY / 'crates/ops/kernels'
 
+# A package's `build.py` imports its compile driver from the Program Server's Python package, so
+# the package's source is importable from this tree whichever interpreter runs the tool.
+sys.path.insert(0, str(REPOSITORY / 'crates/program-server/python/src'))
+from uniserve_program_server import package as program_package  # noqa: E402
+
 
 def packs_pdl(operator):
     for path in OPS.rglob('*.rs'):
@@ -73,15 +78,13 @@ def declares_pdl(operator, key):
                 tables.append(table.get('dimensions', {}))
         sys.path.insert(0, str(source))
         try:
-            sys.modules.pop('_compile', None)
             spec = importlib.util.spec_from_file_location('b', source / 'build.py')
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
-            import _compile
             placed = False
             for dimensions in tables:
                 try:
-                    fields = _compile.parse_key(key, dimensions)
+                    fields = program_package.read_key(key, dimensions)
                 # A package's key reader ends a key it cannot place with `SystemExit`, which is
                 # not an `Exception`: without the wider catch the checker stops at the first
                 # table that does not fit and never reaches the one that does.

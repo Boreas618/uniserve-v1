@@ -4,8 +4,8 @@ A descriptor is the hidden state's dtype, its width, the program's block and the
 dependent-launch flag. The row count stays a runtime value.
 """
 
-import _compile
 import logits_gather as kernels
+from uniserve_program_server import triton as driver
 
 #: The hidden state's dtype, and the gathered row's.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32", "i32": "i32"}
@@ -14,7 +14,7 @@ DTYPES = {"bf16": "bf16", "f16": "fp16", "fp16": "fp16", "fp32": "fp32", "f32": 
 def spec(fields, parameters, target):
     """The compilation of one logits_gather descriptor."""
     dtype = "*" + DTYPES[fields["dtype"]]
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     return {
         "kernel": kernels._logits_gather_kernel,
         "signature": {
@@ -31,4 +31,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

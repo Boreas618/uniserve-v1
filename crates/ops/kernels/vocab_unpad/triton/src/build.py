@@ -5,8 +5,8 @@ program's block and the dependent-launch flag. The row count stays a runtime
 value.
 """
 
-import _compile
 import vocab_unpad as kernels
+from uniserve_program_server import triton as driver
 
 #: The gathered logits' dtype.
 DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
@@ -18,7 +18,7 @@ def spec(fields, parameters, target):
     # The output's element type is its own field: the head's product is in the model's dtype and the
     # sampler's candidate buffer is FP32, so this program is one of the places the two meet.
     output = "*" + DTYPES[fields["output"]]
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     return {
         "kernel": kernels._vocab_unpad_kernel,
         "signature": {
@@ -36,4 +36,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

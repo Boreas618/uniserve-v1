@@ -32,7 +32,7 @@ metadata = "metadata.json"
 
 [source]
 kind = "triton"
-files = ["src/rgb_bytes.py", "src/build.py", "src/_compile.py"]
+files = ["src/rgb_bytes.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]

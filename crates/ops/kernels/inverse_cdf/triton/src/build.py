@@ -6,8 +6,8 @@ width are runtime values: the program loops over the row's tiles, so no block co
 the whole row.
 """
 
-import _compile
 import inverse_cdf as kernels
+from uniserve_program_server import triton as driver
 
 #: Candidate id dtypes.
 IDS = {"i32": "i32", "i64": "i64"}
@@ -20,7 +20,7 @@ def spec(fields, parameters, target):
     """The compilation of one inverse_cdf descriptor."""
     width = int(fields["width"])
     tile = int(fields["tile"])
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     return {
         "kernel": kernels._inverse_cdf_kernel,
         "signature": {
@@ -38,4 +38,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

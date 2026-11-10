@@ -7,10 +7,9 @@ token count is a runtime word; the rotation's width is a field only when it is
 narrower than the head.
 """
 
-import triton
-
-import _compile
 import rope_apply as kernels
+import triton
+from uniserve_program_server import triton as driver
 
 #: The element types the operator's values and outputs take.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
@@ -27,7 +26,7 @@ def spec(fields, parameters, target):
     if heads > block:
         raise SystemExit(f"{heads} heads do not fit a {block} lane head tile")
     pairs = rotated // 2
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     narrowed = rotated != head_dim
     signature = {
         "x": "*" + DTYPES[fields["dtype"]],
@@ -61,4 +60,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

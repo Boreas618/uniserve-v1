@@ -10,8 +10,8 @@ and releases around its grid. Neither extent is: the frame count varies per requ
 while the arithmetic does not.
 """
 
-import _compile
 import transpose as kernels
+from uniserve_program_server import triton as driver
 
 #: Triton's element type for each element type the operator accepts.
 POINTERS = {"f16": "*fp16", "bf16": "*bf16", "f32": "*fp32"}
@@ -44,4 +44,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

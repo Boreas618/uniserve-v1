@@ -39,7 +39,21 @@ The Program Server runs `<interpreter> <package>/<source.script>` with the packa
 | `UNISERVE_OUT` | the build's output directory; the script writes `module.cubin` and its metadata JSON there, or `module.so` for a native module |
 | `MAX_JOBS` | the compile queue's limit on parallel compilers |
 
-The script reads the descriptor's parameter values out of its own manifest, so the keys a package accepts are exactly the descriptor range its `[kernel.descriptors]` declares: a dimension's enumerated values, or, for a dimension declared by a constraint table (`{ multiple = 16 }`, `{ power_of_two = true }`, `{ separator = "x" }`, `{ bits = 32 }`; the grammar is `Dimension` in `crates/program-server/src/manifest.rs`), the text up to the next `_` when it meets the constraint.
+The script reads the descriptor's parameter values out of its own manifest through `uniserve_program_server.package.fields`, so the keys a package accepts are exactly the descriptor range its `[kernel.descriptors]` declares: a dimension's enumerated values, or, for a dimension declared by a constraint table (`{ multiple = 16 }`, `{ power_of_two = true }`, `{ separator = "x" }`, `{ bits = 32 }`; the grammar is `Dimension` in `crates/program-server/src/manifest.rs`), the text up to the next `_` when it meets the constraint. A manifest with several `[[kernel.descriptors]]` shapes is read against each in turn.
+
+A Triton or CuTe DSL package's script states only what one descriptor of its kernel needs, `spec(fields, parameters, target)`, and hands it to the shared driver:
+
+```python
+from uniserve_program_server import triton as driver   # or cute_dsl
+
+def spec(fields, parameters, target):
+    return {"kernel": ..., "signature": {...}, "constexprs": {...}, "options": {...}}
+
+if __name__ == "__main__":
+    driver.main(spec)
+```
+
+`uniserve_program_server.triton` compiles the spec with `triton.compile` on an explicit target and writes `module.cubin` and `metadata.json` with the launch signature; `uniserve_program_server.cute_dsl` compiles it with `cute.compile`, exports the host launcher and links it with the package's `src/entry.cpp` into `module.so`. Both need no GPU. The drivers belong to this environment, not to a package's revision: like the compilers this lock fixes, a change to them is a change of the environment.
 
 ## Pinned third-party sources
 

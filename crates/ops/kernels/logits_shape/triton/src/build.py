@@ -6,8 +6,8 @@ the row is divided by its temperature and the dependent-launch flag. The row
 count stays a runtime value.
 """
 
-import _compile
 import logits_shape as kernels
+from uniserve_program_server import triton as driver
 
 #: The input logits' dtype; the shaped logits are FP32 in every case.
 DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
@@ -20,7 +20,7 @@ def spec(fields, parameters, target):
     """The compilation of one logits_shape descriptor."""
     block = int(fields["block"])
     extras = int(fields["extras"])
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     return {
         "kernel": kernels._logits_shape_kernel,
         "signature": {
@@ -51,4 +51,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

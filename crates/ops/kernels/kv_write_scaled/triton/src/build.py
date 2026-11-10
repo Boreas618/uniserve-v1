@@ -6,8 +6,8 @@ covers, and the dependent-launch flag. The token count and the page count stay
 runtime values: the grid is the pages the cache has.
 """
 
-import _compile
 import kv_write_scaled as kernels
+from uniserve_program_server import triton as driver
 
 #: Element types the source may have. The cache is E4M3 in every descriptor, which
 #: is what this operator is for; a full-precision cache is `kv_write`.
@@ -23,7 +23,7 @@ def spec(fields, parameters, target):
             "the rows are divided in f32, and a narrower scale would round the page twice"
         )
     pointer = "*" + DTYPES[dtype]
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     return {
         "kernel": kernels._kv_write_scaled_kernel,
         "signature": {
@@ -46,4 +46,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

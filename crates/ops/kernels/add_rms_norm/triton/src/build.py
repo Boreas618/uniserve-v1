@@ -4,8 +4,8 @@
 ``rms_norm``'s build script for the shape of that statement.
 """
 
-import _compile
 import add_rms_norm as kernels
+from uniserve_program_server import triton as driver
 
 #: The floating dtypes an activation row, its residual and its outputs may have.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
@@ -20,7 +20,7 @@ def spec(fields, parameters, target):
     """The compilation of one add_rms_norm descriptor."""
     tile = int(fields["tile"])
     dtype = "*" + DTYPES[fields["dtype"]]
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     return {
         # Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds.
         "aligned": ["x_ptr", "r_ptr", "w_ptr", "y_ptr", "c_ptr"] + (["columns"] if int(fields["columns"]) % 16 == 0 else []),
@@ -43,4 +43,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

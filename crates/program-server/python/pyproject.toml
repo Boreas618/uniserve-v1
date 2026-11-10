@@ -47,10 +47,11 @@ module-root = "src"
 
 [tool.uv]
 # The environment holds the compilers and the packages a kernel program imports,
-# and one package of our own: `uniserve_program_server`, what the compile drivers
-# share — the pinned third-party sources (`fetch`, with its manifests under
-# `pins/`) and the trtllm-gen build. The compile drivers themselves are the kernel
-# packages' own `src/build.py`
-# (design 5.2: a revision fixes the rule that picks its kernel), which this
-# environment's interpreter runs.
+# and one package of our own: `uniserve_program_server`, what the packages'
+# compile scripts share — the Triton and CuTe DSL compile drivers, the key
+# reader, the pinned third-party sources (`fetch`, with its manifests under
+# `pins/`) and the trtllm-gen build. Each kernel package's own `src/build.py`
+# states what is particular to it (design 5.2: a revision fixes the rule that
+# picks its kernel) and calls those drivers; this environment's interpreter
+# runs it.
 package = true

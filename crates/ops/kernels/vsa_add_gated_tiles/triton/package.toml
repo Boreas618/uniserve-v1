@@ -23,7 +23,7 @@ metadata = "metadata.json"
 
 [source]
 kind = "triton"
-files = ["src/vsa_add_gated_tiles.py", "src/build.py", "src/_compile.py"]
+files = ["src/vsa_add_gated_tiles.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]

@@ -5,8 +5,8 @@ the dependent-launch flag. The output is FP32 in every case; the row count comes
 from the grid.
 """
 
-import _compile
 import log_softmax as kernels
+from uniserve_program_server import triton as driver
 
 #: The largest column tile a program holds in registers in one step.
 LANES = 4096
@@ -17,7 +17,7 @@ DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
 
 def spec(fields, parameters, target):
     """The compilation of one log_softmax descriptor."""
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     tile = int(fields["tile"])
     return {
         "kernel": kernels._log_softmax_kernel,
@@ -35,4 +35,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

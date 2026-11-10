@@ -27,7 +27,7 @@ metadata = "metadata.json"
 
 [source]
 kind = "triton"
-files = ["src/gated_residual.py", "src/build.py", "src/_compile.py"]
+files = ["src/gated_residual.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]

@@ -4,8 +4,8 @@ A descriptor is the candidates' dtype, the row width, the emitted id dtype and
 the dependent-launch flag. The row count comes from the grid.
 """
 
-import _compile
 import argmax as kernels
+from uniserve_program_server import triton as driver
 
 #: The candidates' dtype.
 DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
@@ -16,7 +16,7 @@ IDS = {"i32": "i32", "i64": "i64"}
 
 def spec(fields, parameters, target):
     """The compilation of one argmax descriptor."""
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     return {
         "kernel": kernels._argmax_kernel,
         "signature": {
@@ -37,4 +37,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

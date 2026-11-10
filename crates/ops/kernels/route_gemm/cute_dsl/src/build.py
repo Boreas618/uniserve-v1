@@ -9,10 +9,9 @@ the MMA tile and the cluster, which is what the operator's key carries.
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import make_ptr
-
-import _compile
 import route_gemm as kernels
+from cutlass.cute.runtime import make_ptr
+from uniserve_program_server import cute_dsl as driver
 
 #: The element types the kernel serves, by the operator's name.
 DTYPES = {"bf16": cutlass.BFloat16}
@@ -75,4 +74,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

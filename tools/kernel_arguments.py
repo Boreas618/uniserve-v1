@@ -42,10 +42,14 @@ import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-#: The compile driver every package imports; a key is parsed by the package's own copy.
-_COMPILE = "_compile"
 KERNELS = ROOT / "crates/ops/kernels"
 OPS = ROOT / "crates/ops/src"
+
+# A package's `build.py` imports its compile driver from the Program Server's Python package
+# (`uniserve_program_server.triton`), so that package is importable from this tree whichever
+# interpreter runs the tool.
+sys.path.insert(0, str(ROOT / "crates/program-server/python/src"))
+from uniserve_program_server import package as program_package  # noqa: E402
 
 #: The `Arguments` methods that pack one launch word. `flag` is a word like any other: Triton's
 #: `pdl` is a kernel parameter the entry reads, not a launch attribute.
@@ -80,17 +84,15 @@ def load_spec(build: pathlib.Path):
     """The package's `spec` function, imported under a name of its own.
 
     Each package's `src` is put first on the path for the import, because `build.py` imports its
-    kernel module and `_compile` by bare name. The module is loaded fresh per package so two
-    packages never share one `kernels` module.
+    kernel module by bare name. The module is loaded fresh per package so two packages never share
+    one `kernels` module.
     """
     source = build.parent
     sys.path.insert(0, str(source))
     try:
-        # `build.py` imports `_compile` and its kernel module by bare name, so `sys.modules` would
-        # hand every package after the first the first package's copy. The copies differ between
-        # operators - one carries `parse_key` and no `descriptor_fields`, another the reverse - so a
-        # shared one refuses keys its own operator declares. Everything imported from a package's
-        # source is dropped, which is what a fresh process per package would do.
+        # `build.py` imports its kernel module by bare name, so `sys.modules` would hand every
+        # package after the first the first package's module of that name. Everything imported from
+        # a package's source is dropped, which is what a fresh process per package would do.
         for cached, module in list(sys.modules.items()):
             origin = getattr(module, "__file__", None)
             if origin and str(KERNELS) in origin:
@@ -107,17 +109,6 @@ def load_spec(build: pathlib.Path):
                 found.loader.exec_module(module)
         except BaseException as error:  # noqa: BLE001 - an unimportable package is a gap
             raise RuntimeError(f"{type(error).__name__}: {error}") from None
-        # The purge above is the repair; this is the statement that it held. A package that bound
-        # another package's `_compile` would compare a key against a parser its own operator never
-        # used, and the symptom is a refusal, not a wrong number - so the invariant is checked where
-        # the binding happens rather than trusted to the purge being repeated correctly.
-        bound = sys.modules.get(_COMPILE)
-        origin = getattr(bound, "__file__", None)
-        if origin and source not in pathlib.Path(origin).parents:
-            raise RuntimeError(
-                f"{build} bound `_compile` from {origin}, which is not this package's; two "
-                f"packages in one process share a bare module name unless each is loaded fresh"
-            )
         return module.spec
     finally:
         sys.path.remove(str(source))
@@ -324,7 +315,7 @@ def report(op: str, verbose: bool) -> tuple[list[str], list[str]]:
                 order = list(signature)
                 # Two packages state their compile-time values two ways: marked `"constexpr"` inside
                 # the signature, or listed in a separate `constexprs` table. Both are the same
-                # statement and `_compile` hands Triton both, so they are read together.
+                # statement and the Triton driver hands Triton both, so they are read together.
                 marked = [
                     name
                     for name, kind in signature.items()
@@ -847,25 +838,15 @@ def sweep(
             continue
         try:
             spec = load_spec(build)
-            manifest = tomllib.loads((package / "package.toml").read_text())
-            compile_mod = spec.__globals__[_COMPILE]
         except Exception as error:  # noqa: BLE001
             gaps.append(
                 f"{op}/{backend}: the package could not be read ({error})"
             )
             continue
-        declared = manifest["kernel"]["descriptors"]
-        declared = declared if isinstance(declared, list) else [declared]
-        fields = None
-        for shape in declared:
-            try:
-                fields = compile_mod.parse_key(
-                    descriptor, shape.get("dimensions", {})
-                )
-                break
-            except BaseException:  # noqa: BLE001 - a shape that does not parse this key
-                continue
-        if fields is None:
+        try:
+            # The key is read as the package's build reads it, by the shared driver's parser.
+            fields = program_package.fields(package, descriptor)
+        except SystemExit:
             gaps.append(
                 f"{op}/{backend} {descriptor}: no declared shape parses this key"
             )

@@ -22,7 +22,7 @@ packages = []
 
 [source]
 kind = "triton"
-files = ["src/rms_norm.py", "src/build.py", "src/_compile.py"]
+files = ["src/rms_norm.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]

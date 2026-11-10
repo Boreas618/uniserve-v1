@@ -3,7 +3,7 @@
 ``spec`` states what this package's kernel needs for one descriptor: the kernel function, its
 argument signature in the order the operator launches them, the compile-time values the descriptor
 dimensions give, and the compilation options. The Program Server's Triton source drives
-``_compile`` with it.
+``uniserve_program_server.triton`` with it.
 
 Nothing of a raster's geometry is baked in: the channels, the frames, the canvas and the block all
 travel as the words ``spec`` lists after the two views, so one module serves every request. What is
@@ -11,8 +11,8 @@ compiled is the element type — it is the pointer type — and programmatic dep
 a module option, so a descriptor that asks for it compiles one that declares it in its metadata.
 """
 
-import _compile
 import patch as kernels
+from uniserve_program_server import triton as driver
 
 #: The element types the latent and the rows may have; the move is exact in each of them.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
@@ -53,4 +53,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

@@ -4,8 +4,8 @@ A descriptor is the row width, the token id dtype and the dependent-launch flag.
 The row count stays a runtime value.
 """
 
-import _compile
 import logprob_gather as kernels
+from uniserve_program_server import triton as driver
 
 #: Token id dtypes: a sampler writes int32 or int64 tokens.
 IDS = {"i32": "i32", "i64": "i64"}
@@ -13,7 +13,7 @@ IDS = {"i32": "i32", "i64": "i64"}
 
 def spec(fields, parameters, target):
     """The compilation of one logprob_gather descriptor."""
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     return {
         "kernel": kernels._logprob_gather_kernel,
         "signature": {
@@ -29,4 +29,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

@@ -3,14 +3,14 @@
 ``spec`` states what this package's kernel needs for one descriptor: the kernel function, its
 argument signature in the order the operator launches them, the compile-time values the descriptor
 dimensions give, and the compilation options. The Program Server's Triton source drives
-``_compile`` with it.
+``uniserve_program_server.triton`` with it.
 
 The row width, the lane tile that covers it and whether the module issues the dependent launch are
 baked in; the row count, the width and the flag stay launch words.
 """
 
-import _compile
 import softmax as kernels
+from uniserve_program_server import triton as driver
 
 #: The dtypes a row and its output may have.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
@@ -25,7 +25,7 @@ def spec(fields, parameters, target):
     """The compilation of one softmax descriptor."""
     tile = int(fields["tile"])
     dtype = "*" + DTYPES[fields["dtype"]]
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     return {
         "kernel": kernels._softmax_kernel,
         "signature": {
@@ -42,4 +42,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

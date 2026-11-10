@@ -29,7 +29,7 @@ metadata = "metadata.json"
 
 [source]
 kind = "triton"
-files = ["src/transpose.py", "src/build.py", "src/_compile.py"]
+files = ["src/transpose.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]

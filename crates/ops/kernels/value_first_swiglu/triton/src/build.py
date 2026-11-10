@@ -3,7 +3,7 @@
 ``spec`` states what this package's kernel needs for one descriptor: the kernel function, its
 argument signature in the order the operator launches them, the compile-time values the descriptor
 dimensions give, and the compilation options. The Program Server's Triton source drives
-``_compile`` with it.
+``uniserve_program_server.triton`` with it.
 
 The output row width, the tile one program walks and the two flags are baked in — the packed input
 row is ``width`` elements past the value half, and the magnitude buffer's length is the program
@@ -11,8 +11,8 @@ count the launch derives from the same tile. The element count and the packed ro
 launch words, and the kernel indexes in int64 either way.
 """
 
-import _compile
 import value_first_swiglu as kernels
+from uniserve_program_server import triton as driver
 
 #: The floating dtypes the packed input, the bias and the output may have, as Triton spells them in
 #: an argument signature.
@@ -56,4 +56,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

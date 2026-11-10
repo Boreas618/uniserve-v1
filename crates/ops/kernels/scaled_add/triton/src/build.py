@@ -3,15 +3,15 @@
 ``spec`` states what this package's kernel needs for one descriptor: the kernel function, its
 argument signature in the order the operator launches them, the compile-time values the descriptor
 dimensions give, and the compilation options. The Program Server's Triton source drives
-``_compile`` with it.
+``uniserve_program_server.triton`` with it.
 
 The two element types are separate pointer arguments, so a descriptor whose target is BF16 and
 whose source is FP32 compiles a kernel taking two different dtypes — which is the operator's point.
 The coefficients are launch scalars and the element count is a launch word.
 """
 
-import _compile
 import scaled_add as kernels
+from uniserve_program_server import triton as driver
 
 #: The element types either operand may have; the arithmetic is FP32 in each.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
@@ -41,4 +41,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

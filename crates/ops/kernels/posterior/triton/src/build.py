@@ -10,8 +10,8 @@ physical layouts a request can have. The element type is always f32 and is not i
 throughout and the FP16 round trip is inside the kernel.
 """
 
-import _compile
 import posterior as kernels
+from uniserve_program_server import triton as driver
 
 #: Triton's element type for the one element type this operator computes in.
 POINTER = "*fp32"
@@ -25,7 +25,7 @@ def warps_of(block):
 def spec(fields, parameters, target):
     """The compilation of one posterior descriptor."""
     block = int(fields["block"])
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     return {
         "kernel": kernels._posterior_kernel,
         "signature": {
@@ -53,4 +53,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

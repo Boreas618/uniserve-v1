@@ -5,8 +5,8 @@ count nor the candidate count is a descriptor value: the grid names the rows, an
 width to the program, which walks the row in tiles of the package's block.
 """
 
-import _compile
 import candidate_order as kernels
+from uniserve_program_server import triton as driver
 
 #: The candidate value: probabilities or shaped logits, permuted unchanged.
 VALUES = {"f32": "fp32"}
@@ -18,7 +18,7 @@ IDS = {"i32": "i32", "i64": "i64"}
 def spec(fields, parameters, target):
     """The compilation of one candidate_order descriptor."""
     block = int(parameters["block"])
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     ids = "*" + IDS[fields["ids"]]
     return {
         "kernel": kernels._candidate_order_kernel,
@@ -39,4 +39,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

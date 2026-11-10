@@ -3,7 +3,7 @@
 ``spec`` states what this package's kernel needs for one descriptor: the kernel function, its
 argument signature in the order the operator launches them, the compile-time values the descriptor
 dimensions give, and the compilation options. The Program Server's Triton source drives
-``_compile`` with it.
+``uniserve_program_server.triton`` with it.
 
 Everything the descriptor names is compiled in: the three row and head stride pairs, the row strides
 the embedded stepwise routine reads, the head count, the width, the rotated feature count, the
@@ -14,8 +14,8 @@ module compiles with `num_warps = 2` and `enable_fp_fusion = false`, as the oper
 
 import struct
 
-import _compile
 import vsa_prepare_tiles as kernels
+from uniserve_program_server import triton as driver
 
 #: The floating dtypes a row may have, in the descriptor's vocabulary.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
@@ -92,4 +92,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

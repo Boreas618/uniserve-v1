@@ -15,8 +15,7 @@ import cutlass
 import cutlass.cute as cute
 import nvfp4_gemm as kernels
 from cutlass.cute.runtime import make_ptr
-
-import _compile
+from uniserve_program_server import cute_dsl as driver
 
 #: The product's element types, by the operator's name.
 OUTPUTS = {"bf16": cutlass.BFloat16, "f16": cutlass.Float16}
@@ -89,4 +88,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

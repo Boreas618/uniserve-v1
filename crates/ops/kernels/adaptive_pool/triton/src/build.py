@@ -11,8 +11,8 @@ the head axis is unrolled — while the row count is a launch value, so one modu
 serves every frame count.
 """
 
-import _compile
 import adaptive_pool as kernels
+from uniserve_program_server import triton as driver
 
 #: Triton's element type for each element type the operator accepts, as the
 #: signature spells a pointer to it.
@@ -34,7 +34,7 @@ def spec(fields, parameters, target):
     heads = int(fields["heads"])
     width = int(fields["width"])
     output = int(fields["output"])
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     return {
         "kernel": kernels._adaptive_pool_kernel,
         "signature": {
@@ -69,4 +69,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

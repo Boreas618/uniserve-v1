@@ -22,7 +22,7 @@ metadata = "metadata.json"
 
 [source]
 kind = "triton"
-files = ["src/position_interpolate.py", "src/build.py", "src/_compile.py"]
+files = ["src/position_interpolate.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]

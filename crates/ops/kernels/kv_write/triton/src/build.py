@@ -9,8 +9,8 @@ declares: an FP8 page is written through one scale per page, and the operator's
 arguments carry no scale tensors, so an FP8 cache has no correct write here yet.
 """
 
-import _compile
 import kv_write as kernels
+from uniserve_program_server import triton as driver
 
 #: Element types the keys, the values and the cache share here.
 DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
@@ -25,7 +25,7 @@ def spec(fields, parameters, target):
             "which the operator's arguments do not carry"
         )
     pointer = "*" + DTYPES[dtype]
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     return {
         "kernel": kernels._kv_write_kernel,
         "signature": {
@@ -50,4 +50,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

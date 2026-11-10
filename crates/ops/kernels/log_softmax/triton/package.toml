@@ -20,7 +20,7 @@ metadata = "metadata.json"
 
 [source]
 kind = "triton"
-files = ["src/log_softmax.py", "src/build.py", "src/_compile.py"]
+files = ["src/log_softmax.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]

@@ -6,9 +6,9 @@ covers. The step's row count is a runtime word and the grid is one program, so
 one module serves every step of that shape.
 """
 
-import _compile
 import slot_commit as kernels
 import triton.language as tl
+from uniserve_program_server import triton as driver
 
 #: The element types a descriptor may name, as Triton spells them.
 DTYPES = {
@@ -82,4 +82,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

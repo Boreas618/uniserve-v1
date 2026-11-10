@@ -20,7 +20,7 @@ metadata = "metadata.json"
 
 [source]
 kind = "triton"
-files = ["src/slot_commit.py", "src/build.py", "src/_compile.py"]
+files = ["src/slot_commit.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]

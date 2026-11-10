@@ -10,8 +10,8 @@ the raster is: the frame count, the sides and the strides are launch values, so 
 module serves every clip. The output is always ``u8`` and is never in the key.
 """
 
-import _compile
 import rgb_bytes as kernels
+from uniserve_program_server import triton as driver
 
 #: Triton's element type for each element type the operator accepts, as the
 #: signature spells a pointer to it.
@@ -26,7 +26,7 @@ def warps_of(block):
 def spec(fields, parameters, target):
     """The compilation of one rgb_bytes descriptor."""
     block = int(fields["block"])
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     return {
         "kernel": kernels._rgb_bytes_kernel,
         "signature": {
@@ -59,4 +59,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

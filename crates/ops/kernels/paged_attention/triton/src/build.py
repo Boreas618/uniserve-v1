@@ -10,8 +10,8 @@ back: both are compiled, because a program that read a scale it was not given, o
 if it were dense, would be right only by accident.
 """
 
-import _compile
 import paged_attention as kernels
+from uniserve_program_server import triton as driver
 
 #: The element types a cache plane may have, as Triton spells them.
 PLANES = {"bf16": "bf16", "f16": "fp16", "f8e4m3": "fp8e4nv"}
@@ -118,4 +118,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

@@ -9,8 +9,8 @@ whether the axes interleave. The token count is a runtime word.
 
 import struct
 
-import _compile
 import rotary_factors as kernels
+from uniserve_program_server import triton as driver
 
 #: Element types of the factor tables and of the positions.
 DTYPES = {"f32": "fp32", "bf16": "bf16", "f16": "fp16"}
@@ -42,7 +42,7 @@ def spec(fields, parameters, target):
     interleaved = fields.get("interleaved") == "true"
     if interleaved and axes < 2:
         raise SystemExit("an interleaved rotation needs at least two axes")
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
 
     # Each axis owns `width / 2` frequencies, so the sections must cover the
     # row for a call to be launchable; the operator refuses a call whose
@@ -101,4 +101,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

@@ -54,15 +54,48 @@ def manifest(package: pathlib.Path) -> dict:
 def fields(package: pathlib.Path, key: str) -> dict[str, str]:
     """A descriptor key read into ``{dimension: value}``.
 
-    The dimensions are the manifest's ``[kernel.descriptors]``.
+    The dimensions are the manifest's ``[kernel.descriptors]``: one table, or
+    several ``[[kernel.descriptors]]`` shapes when an operator prints some
+    fields only for the variant that has them (a narrowed rotation names its
+    width, a sectioned one its axes). The key is read against each shape in
+    turn and the first that reads it whole answers.
+
     A key is ``field_value`` pairs joined with ``_``, in whatever order the
     operator prints them. Names and declared values may contain ``_``, so a
     field is the longest declared name the rest starts with and a value the
     longest declared value that follows it whole, or, for a dimension declared
     by a constraint table, the text up to the next ``_`` when it meets the
-    constraint. A key that leaves a declared dimension out is refused.
+    constraint.
+
+    A declared dimension the key leaves out is not refused here, which is the
+    rule the Program Server's coverage (``Descriptors::covers``) applies: the
+    package's compilation answers for a field it needs and the key lacks.
     """
-    dimensions = manifest(package)["kernel"]["descriptors"]["dimensions"]
+    declared = manifest(package)["kernel"]["descriptors"]
+    shapes = declared if isinstance(declared, list) else [declared]
+    refusals = []
+    for shape in shapes:
+        dimensions = shape.get("dimensions") or {}
+        if not dimensions:
+            continue
+        try:
+            return read_key(key, dimensions)
+        except DescriptorKeyError as refusal:
+            refusals.append(str(refusal))
+    raise SystemExit(
+        f"{key}: no declared descriptor shape reads it: " + "; ".join(refusals)
+    )
+
+
+class DescriptorKeyError(ValueError):
+    """A key one descriptor shape does not read."""
+
+
+def read_key(key: str, dimensions: dict) -> dict[str, str]:
+    """``key`` read against one shape's ``dimensions``.
+
+    Raises :class:`DescriptorKeyError` when the shape does not read it.
+    """
     names = sorted(dimensions, key=len, reverse=True)
     found: dict[str, str] = {}
     remaining = key
@@ -71,16 +104,15 @@ def fields(package: pathlib.Path, key: str) -> dict[str, str]:
             (one for one in names if remaining.startswith(one + "_")), None
         )
         if name is None:
-            raise SystemExit(f"{key}: no dimension starts {remaining!r}")
+            raise DescriptorKeyError(
+                f"no dimension among {names} starts {remaining!r}"
+            )
         rest = remaining[len(name) + 1 :]
         value = declared_value(dimensions[name], rest)
         if value is None:
-            raise SystemExit(f"{key}: {name} admits no value at {rest!r}")
+            raise DescriptorKeyError(f"{name} admits no value at {rest!r}")
         found[name] = value
         remaining = rest[len(value) :].removeprefix("_")
-    missing = sorted(set(dimensions) - set(found))
-    if missing:
-        raise SystemExit(f"{key}: the descriptor names no {missing}")
     return found
 
 

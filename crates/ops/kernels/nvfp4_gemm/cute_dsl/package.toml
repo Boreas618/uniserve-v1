@@ -22,7 +22,7 @@ entries = { launch = "uniserve_nvfp4_gemm" }
 
 [source]
 kind = "cute_dsl"
-files = ["src/nvfp4_gemm.py", "src/build.py", "src/_compile.py", "src/entry.cpp", "src/entry.h"]
+files = ["src/nvfp4_gemm.py", "src/build.py", "src/entry.cpp", "src/entry.h"]
 script = "src/build.py"
 
 [kernel]

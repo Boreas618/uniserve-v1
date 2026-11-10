@@ -47,6 +47,11 @@ REPOSITORY = pathlib.Path(__file__).resolve().parents[1]
 OPS = REPOSITORY / "crates/ops/src"
 KERNELS = REPOSITORY / "crates/ops/kernels"
 
+# A package's `build.py` imports its compile driver from the Program Server's Python package, so
+# the package's source is importable from this tree whichever interpreter runs the tool.
+sys.path.insert(0, str(REPOSITORY / "crates/program-server/python/src"))
+from uniserve_program_server import package as program_package  # noqa: E402
+
 #: The parameters the compiler's launcher appends to every Triton kernel.
 IMPLICIT = 2
 
@@ -182,13 +187,10 @@ def module_parameters(operator, key):
             dimensions = tables[0].get("dimensions") or {}
         sys.path.insert(0, str(source))
         try:
-            sys.modules.pop("_compile", None)
             spec_module = importlib.util.spec_from_file_location("build", source / "build.py")
             module = importlib.util.module_from_spec(spec_module)
             spec_module.loader.exec_module(module)
-            import _compile
-
-            fields = _compile.parse_key(key, dimensions)
+            fields = program_package.read_key(key, dimensions)
             described = module.spec(fields, manifest.get("parameters", {}), "sm_100a")
             import triton
             from triton.backends.compiler import GPUTarget
@@ -210,8 +212,8 @@ def module_parameters(operator, key):
                 if line.strip().startswith(".param")
             )
             return parameters, declared
-        except SystemExit as error:
-            # The package's own key reader refused the key: the row is not covered by that package, so
+        except (SystemExit, program_package.DescriptorKeyError) as error:
+            # The key reader refused the key: the row is not covered by that package, so
             # there is no module to compare against.
             return f"not covered: {error}", None
         except KeyError:

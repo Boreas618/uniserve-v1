@@ -4,8 +4,8 @@ The element type, the channels, the patch and the block are the key's; the raste
 strides and the grid's numbers are the launch's words, and the grid itself arrives as two tables.
 """
 
-import _compile
 import tile_stitch as kernels
+from uniserve_program_server import triton as driver
 
 #: The element types a decoded tile is stored in.
 DTYPES = {"f16": "fp16", "bf16": "bf16", "f32": "fp32"}
@@ -46,4 +46,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

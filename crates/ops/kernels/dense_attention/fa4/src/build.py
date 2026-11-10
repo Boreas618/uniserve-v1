@@ -7,8 +7,7 @@ vendor's configuration is chosen for.
 """
 
 import fa4
-
-import _compile
+from uniserve_program_server import cute_dsl as driver
 
 
 def spec(fields, parameters, target):
@@ -24,4 +23,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

@@ -6,10 +6,9 @@ row count is the grid -- one program per row -- so one module serves every row
 count.
 """
 
-import triton
-
-import _compile
 import nvfp4_quantize as kernels
+import triton
+from uniserve_program_server import triton as driver
 
 #: The element types the operator encodes, as Triton spells them.
 DTYPES = {"bf16": "*bf16", "f16": "*fp16"}
@@ -39,7 +38,7 @@ def spec(fields, parameters, target):
         if swizzled
         else scale_columns
     )
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     return {
         "kernel": kernels._nvfp4_quantize_kernel,
         "signature": {
@@ -74,4 +73,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

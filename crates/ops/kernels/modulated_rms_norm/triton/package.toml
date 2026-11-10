@@ -33,7 +33,7 @@ metadata = "metadata.json"
 
 [source]
 kind = "triton"
-files = ["src/modulated_rms_norm.py", "src/build.py", "src/_compile.py"]
+files = ["src/modulated_rms_norm.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]

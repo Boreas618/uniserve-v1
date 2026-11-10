@@ -6,8 +6,8 @@ copy and the bank's block count are runtime words — the index vector's length
 and the field's shape — so one module serves every copy of that geometry.
 """
 
-import _compile
 import cache_block_snapshot as kernels
+from uniserve_program_server import triton as driver
 
 #: The storage's element type, as Triton spells it.
 DTYPES = {"u8": "u8", "bf16": "bf16", "f16": "fp16", "fp32": "fp32", "i32": "i32"}
@@ -51,4 +51,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

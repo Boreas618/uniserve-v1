@@ -3,7 +3,7 @@
 ``spec`` states what this package's kernel needs for one descriptor: the kernel function, its
 argument signature in the order the operator launches them, the compile-time values the descriptor
 dimensions give, and the compilation options. The Program Server's Triton source drives
-``_compile`` with it.
+``uniserve_program_server.triton`` with it.
 
 The element count one launch walks, the gate and value row strides, the row width, the activation,
 the 64-bit addressing and the two flags are all in the key, because each one changes what the module
@@ -11,8 +11,8 @@ computes: the strides and the element count are launch words whose addressing wi
 in.
 """
 
-import _compile
 import act_and_mul as kernels
+from uniserve_program_server import triton as driver
 
 #: The floating dtypes the gates, the values and the output may have, as Triton spells them in an
 #: argument signature.
@@ -25,7 +25,7 @@ def spec(fields, parameters, target):
     wide = fields["wide"] == "true"
     # The descriptor's flag decides whether the module issues the dependent launch; a target older
     # than sm_100 cannot, so the module is compiled without it there.
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     return {
         # Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds.
         "aligned": ["gate_ptr", "value_ptr", "out_ptr", "elements", "gate_row_stride", "value_row_stride"],
@@ -61,4 +61,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

@@ -10,8 +10,8 @@ from it. `extent`, the four extents and the destination's three strides are the 
 which is why the fixture's two extent axes are two cells rather than one program that branches.
 """
 
-import _compile
 import cross_fade as kernels
+from uniserve_program_server import triton as driver
 
 #: The element types a decoded tile is stored in.
 DTYPES = {"f16": "fp16", "bf16": "bf16", "f32": "fp32"}
@@ -61,4 +61,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

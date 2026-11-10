@@ -10,8 +10,8 @@ scores' layout and the tolerance's reduction length are the operator's, not this
 There is no element-type dimension: both operands are FP32, the type `vsa_prepare_tiles` pools in.
 """
 
-import _compile
 import vsa_scores as kernels
+from uniserve_program_server import triton as driver
 
 #: The pooled rows are FP32 by construction — `vsa_prepare_tiles` pools each tile's per-head means
 #: as the accumulation its pooling runs in — so the operand type is the operator's, not a
@@ -57,4 +57,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

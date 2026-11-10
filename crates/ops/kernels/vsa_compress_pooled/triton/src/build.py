@@ -13,8 +13,8 @@ operator's, not this package's choice. `dtype` is the row type the store narrows
 are FP32 by construction and are not a dimension.
 """
 
-import _compile
 import vsa_compress_pooled as kernels
+from uniserve_program_server import triton as driver
 
 #: The two operands and the tile sizes are FP32/I32 by construction — the pooling and the
 #: reference's softmax run in FP32 — so only the compressed rows carry a descriptor type.
@@ -62,4 +62,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

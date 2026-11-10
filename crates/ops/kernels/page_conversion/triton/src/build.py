@@ -7,9 +7,9 @@ The span's extent, the source's page size and scale group, and the number of
 pages are runtime words, so one module serves every span of that geometry.
 """
 
-import _compile
 import page_conversion as kernels
 import triton.language as tl
+from uniserve_program_server import triton as driver
 
 #: The stored element type: what the raw areas hold.
 SOURCES = {
@@ -70,4 +70,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

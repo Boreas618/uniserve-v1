@@ -5,8 +5,8 @@ and the dependent-launch flag. The row count and the width are runtime values: t
 program loops over the row's tiles, so no block covers the whole row.
 """
 
-import _compile
 import filter_candidates as kernels
+from uniserve_program_server import triton as driver
 
 #: The candidate id dtype: read by the operators after this one.
 IDS = {"i32": "i32", "i64": "i64"}
@@ -15,7 +15,7 @@ IDS = {"i32": "i32", "i64": "i64"}
 def spec(fields, parameters, target):
     """The compilation of one filter_candidates descriptor."""
     tile = int(fields["tile"])
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     return {
         "kernel": kernels._filter_candidates_kernel,
         "signature": {
@@ -33,4 +33,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

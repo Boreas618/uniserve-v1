@@ -8,8 +8,8 @@ kept pairs with radix passes over the scratch, so no buffer or network of the ke
 count is compiled in.
 """
 
-import _compile
 import top_k as kernels
+from uniserve_program_server import triton as driver
 
 #: The logits' dtype.
 DTYPES = {"bf16": "bf16", "fp16": "fp16", "f32": "fp32", "fp32": "fp32"}
@@ -34,7 +34,7 @@ def spec(fields, parameters, target):
         raise SystemExit(
             f"a tile of {tile} is past the {MAX_TILE} lanes one pass holds at the event's warp count"
         )
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     return {
         "kernel": kernels._top_k_kernel,
         "signature": {
@@ -53,4 +53,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)

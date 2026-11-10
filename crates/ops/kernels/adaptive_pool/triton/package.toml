@@ -30,7 +30,7 @@ metadata = "metadata.json"
 
 [source]
 kind = "triton"
-files = ["src/adaptive_pool.py", "src/build.py", "src/_compile.py"]
+files = ["src/adaptive_pool.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]

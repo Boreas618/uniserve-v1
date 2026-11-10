@@ -3,7 +3,7 @@
 ``spec`` states what this package's kernel needs for one descriptor: the kernel
 function, its argument signature in the order the operator launches them, the
 compile-time values the descriptor dimensions give, and the compilation options.
-The Program Server's Triton source drives ``_compile`` with it.
+The Program Server's Triton source drives ``uniserve_program_server.triton`` with it.
 
 Two things are compiled in. ``BLOCK``, the samples one program converts, so the
 grid a launch computes and the module agree. And ``PDL``: a module compiled for
@@ -15,8 +15,8 @@ the arithmetic does not, so the count is a word and one module serves every clip
 The output is always i16 and is never in the key.
 """
 
-import _compile
 import pcm_interleave as kernels
+from uniserve_program_server import triton as driver
 
 
 def warps_of(block):
@@ -27,7 +27,7 @@ def warps_of(block):
 def spec(fields, parameters, target):
     """The compilation of one pcm_interleave descriptor."""
     block = int(fields["block"])
-    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     return {
         "kernel": kernels._pcm_interleave_kernel,
         "signature": {
@@ -46,4 +46,4 @@ def spec(fields, parameters, target):
 
 
 if __name__ == "__main__":
-    _compile.main(spec)
+    driver.main(spec)
