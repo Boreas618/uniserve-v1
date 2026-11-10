@@ -1,5 +1,10 @@
-//! Sampling: the request's penalties, its candidate filtering, its draw, and the log-probabilities
-//! it reports.
+//! Sampling: the request's penalties, its candidate filtering, its draw, the log-probabilities it
+//! reports, and the slot state a step reads and advances.
+//!
+//! The module is the worker's one owner of sampling: the [`Sampler`] layer, the per-slot penalty
+//! count table it reads ([`Sampling`]), and the commit table ([`CommitColumns`], `ops::commit`)
+//! that installs each row's token into its slot after the draw. The causal-LM runner composes them
+//! inside a bucket's captured graph.
 //!
 //! One sampling step is a fixed sequence of operator launches over one row per active request:
 //!
@@ -77,6 +82,10 @@ use ops::{DType, Shape, TensorView};
 use nn::layers::launch;
 use nn::{Arena, Forward};
 
+use platform::DeviceId;
+
+use crate::plan::Buckets;
+use crate::runners::columns::{Column, encode_i32};
 use crate::{Error, Result};
 
 /// A view or a construction argument the sampling step cannot take, named by its owner.
@@ -660,6 +669,378 @@ impl Sampler {
         self.report(f, logits, shaped, samples)?;
 
         Ok(())
+    }
+}
+
+/// The commit table of a warm pose: `COMMIT_FIELDS` columns of `rows` i64 values, every row's slot
+/// and task `-1` and every other field zero.
+///
+/// The kernel treats a row with a negative slot as having no destination (no store of any kind) and
+/// a row with a negative task as having sampled nothing, so this table commits nothing while the
+/// launch that reads it is still recorded in the bucket's graph - which is what makes the graph a
+/// warmup captures the graph a serving batch replays.
+pub(crate) fn inert_commit(rows: usize) -> Vec<i64> {
+    let mut table = vec![0_i64; ops::commit::COMMIT_FIELDS * rows];
+    for row in 0..rows {
+        table[ops::commit::column::SLOT * rows + row] = -1;
+        table[ops::commit::column::TASK * rows + row] = -1;
+    }
+    table
+}
+
+/// The descriptor a plain decode step's commit uses, from the table's capacity and the vocabulary.
+///
+/// `ops::commit` checks the table's leading stride against `stride`, every operand's type against
+/// `index`, and the block against `count`; the arithmetic is here, once, so a host test can state it
+/// without a device and the runner cannot drift from it.
+pub(crate) fn commit_descriptor(
+    capacity: u64,
+    block: u32,
+    vocabulary: u32,
+) -> ops::commit::CommitDescriptor {
+    ops::commit::CommitDescriptor {
+        // The table and the sampled ids are i32 end to end: `Sampler` emits i32 tokens, and the
+        // operator checks `tokens` against `index`.
+        index: DType::I32,
+        verified: DType::I32,
+        penalties: DType::I32,
+        // The table is `[COMMIT_FIELDS, capacity]` and a column is contiguous.
+        stride: capacity,
+        // One next-input token per slot, in a `[slots, 1]` matrix.
+        future_stride: 1,
+        vocab: vocabulary,
+        block,
+    }
+}
+
+/// Every `slot_commit` descriptor a runner of `buckets` can launch, one per distinct block.
+///
+/// The commit is a runner-owned operator: no model calls it, so the epoch's program set does not
+/// contain it unless the runner asks. Its descriptor carries the vocabulary and the launch block
+/// (the smallest power of two covering the bucket's rows) while the table's capacity is the largest
+/// bucket's rows for every bucket, so the keys a deployment needs are one per power of two its
+/// buckets reach - eight for the default catalog.
+pub fn commit_descriptors(
+    buckets: &Buckets,
+    vocabulary: u32,
+) -> Vec<ops::commit::CommitDescriptor> {
+    let capacity = buckets
+        .iter()
+        .map(|bucket| u64::from(bucket.rows))
+        .max()
+        .unwrap_or(1);
+    let mut blocks: Vec<u32> = buckets
+        .iter()
+        .map(|bucket| commit_block(bucket.rows))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    blocks
+        .into_iter()
+        .map(|block| commit_descriptor(capacity, block, vocabulary))
+        .collect()
+}
+
+/// The commit table the device reads, from the mechanism's `[COMMIT_FIELDS, rows]` i64 table.
+///
+/// The device table is `[COMMIT_FIELDS, capacity]` i32: the staged rows fill its first `rows`
+/// columns, and the rest keep whatever the previous batch left there behind `dim(1) >= count`.
+pub(crate) fn commit_table(commit: &[i64], rows: usize, capacity: usize) -> Result<Vec<i32>> {
+    let fields = ops::commit::COMMIT_FIELDS;
+    if commit.len() != fields * rows {
+        return Err(Error::Invariant(format!(
+            "the commit table holds {} values, {fields} fields of {rows} rows",
+            commit.len()
+        )));
+    }
+    let mut table = vec![0_i32; fields * capacity];
+    // Rows past the batch's own are **inert**, not zero: a zero slot is slot 0, a real destination,
+    // so a launch that ever ran over the whole capacity would commit thirteen phantom tokens into
+    // the first slot the deployment serves. The staged table already pads its own rows with the
+    // operator's sentinels; this makes the tail inert as well, so the invariant survives whatever
+    // `count` a future launch passes (`ops::commit`'s two sentinels).
+    for row in rows.min(capacity)..capacity {
+        table[ops::commit::column::SLOT * capacity + row] = -1;
+        table[ops::commit::column::TASK * capacity + row] = -1;
+    }
+    for field in 0..fields {
+        for row in 0..rows.min(capacity) {
+            let value = commit[field * rows + row];
+            table[field * capacity + row] = i32::try_from(value).map_err(|_| {
+                Error::Invalid(format!("a commit column value {value} does not fit i32"))
+            })?;
+        }
+    }
+    Ok(table)
+}
+
+/// The block a commit launch needs for `rows` rows: the smallest power of two that covers them.
+pub(crate) fn commit_block(rows: u32) -> u32 {
+    rows.max(1).next_power_of_two()
+}
+
+/// The token-state commit's operands (`ops::commit`), bound once and rewritten per batch.
+///
+/// A batch's sampled tokens must advance its slots' state - the histories the repetition,
+/// frequency and presence penalties subtract, and the positions a verify row carries. Without the
+/// launch a slot's state never moves, so the second decode step is computed against an empty
+/// history. It runs once per batch, after the sampler and before the read-back, inside the bucket's
+/// capture, so a replay advances the state exactly once.
+///
+/// Every operand is allocated when the runner binds and only the table's contents change per
+/// batch: the warm pose writes it with every row's slot and task `-1`, which the kernel treats as
+/// inert on every store, so the graph recorded at warmup is the graph a serving batch replays.
+pub(crate) struct CommitColumns {
+    /// `[COMMIT_FIELDS, capacity]` i32, column-major: the table the mechanism's rows fill.
+    pub(crate) table: Column,
+    /// `[rows]` i32 whether a row's token is valid, and whether its slot is active.
+    pub(crate) valid: Column,
+    pub(crate) active: Column,
+    /// `[rows]` u8 continuation flags and `[rows]` i32 accepted points, one per sampled task: a plain
+    /// decode's rows use neither, and the commit reads them at the row's task all the same.
+    pub(crate) continuation: Column,
+    pub(crate) points: Column,
+    /// `[slots]` the per-slot next-input predicate, logical position, sampling position and
+    /// verification length. A decode row advances the two positions by one.
+    pub(crate) predicates: Column,
+    pub(crate) logical: Column,
+    pub(crate) sampling: Column,
+    pub(crate) verified: Column,
+    /// `[slots]` i32 one next-input token per slot: a decode without speculation drafts none.
+    pub(crate) future: Column,
+    /// The table's leading stride, which the descriptor states.
+    pub(crate) capacity: u64,
+    /// The launch's block, which must cover every row of the largest bucket.
+    pub(crate) block: u32,
+    /// The slots the per-slot state columns address.
+    pub(crate) slots: u32,
+    /// `[slots]` i32 the per-slot trajectory positions, read back after a replay: the commit kernel
+    /// advances them, so only the device knows where a call's slot stands. Two, because a replay's
+    /// positions are read while the next replay's copy is on its way.
+    pub(crate) readback: [platform::PinnedBuffer; 2],
+}
+
+impl CommitColumns {
+    /// The commit operands of a runner whose largest bucket has `rows` rows over `slots` slots.
+    pub(crate) fn new(device: DeviceId, rows: u32, slots: u32) -> Result<Self> {
+        let capacity = u64::from(rows.max(1));
+        let mut columns = Self {
+            table: Column::new(
+                device,
+                DType::I32,
+                u64::from(ops::commit::COMMIT_FIELDS as u32) * capacity,
+            )?,
+            valid: Column::new(device, DType::I32, capacity)?,
+            active: Column::new(device, DType::I32, capacity)?,
+            continuation: Column::new(device, DType::U8, capacity)?,
+            points: Column::new(device, DType::I32, capacity)?,
+            predicates: Column::new(device, DType::U8, u64::from(slots.max(1)))?,
+            logical: Column::new(device, DType::I32, u64::from(slots.max(1)))?,
+            sampling: Column::new(device, DType::I32, u64::from(slots.max(1)))?,
+            verified: Column::new(device, DType::I32, u64::from(slots.max(1)))?,
+            future: Column::new(device, DType::I32, u64::from(slots.max(1)))?,
+            capacity,
+            block: commit_block(rows),
+            slots: slots.max(1),
+            readback: [
+                platform::PinnedBuffer::new(
+                    device,
+                    2 * slots.max(1) as usize * std::mem::size_of::<i32>(),
+                )?,
+                platform::PinnedBuffer::new(
+                    device,
+                    2 * slots.max(1) as usize * std::mem::size_of::<i32>(),
+                )?,
+            ],
+        };
+        // The roles a decode step leaves inert hold their starting values; only `table` is written
+        // again per batch.
+        let mut encoded = Vec::new();
+        let ones = vec![1_i32; capacity as usize];
+        encode_i32(&mut encoded, &ones);
+        columns.valid.write(&encoded)?;
+        columns.active.write(&encoded)?;
+        let zeros = vec![0_i32; slots.max(1) as usize];
+        encode_i32(&mut encoded, &zeros);
+        for column in [
+            &mut columns.logical,
+            &mut columns.sampling,
+            &mut columns.verified,
+            &mut columns.future,
+        ] {
+            column.write(&encoded)?;
+        }
+        let zeros_i32 = vec![0_i32; capacity as usize];
+        encode_i32(&mut encoded, &zeros_i32);
+        columns.points.write(&encoded)?;
+        let zeros_u8 = vec![0_u8; capacity as usize];
+        columns.continuation.write(&zeros_u8)?;
+        let zeros_u8 = vec![0_u8; slots.max(1) as usize];
+        columns.predicates.write(&zeros_u8)?;
+        Ok(columns)
+    }
+
+    /// The slots the per-slot state columns address.
+    pub(crate) fn slots(&self) -> usize {
+        self.slots as usize
+    }
+
+    /// States slot `slot`'s next input, for a token the host chose after the graph drew another.
+    pub(crate) fn set_next_input(
+        &self,
+        slot: usize,
+        token: i32,
+        stream: &platform::Stream,
+    ) -> Result<()> {
+        let offset = (slot * std::mem::size_of::<i32>()) as u64;
+        // SAFETY: the column holds one i32 per slot and the caller's slot is inside it; no launch
+        // that reads the column is in flight, and the wait below ends the copy's use of the source.
+        unsafe {
+            *self.future.host.as_ptr().cast::<i32>().add(slot) = token;
+            platform::memcpy_async(
+                self.future.device.ptr.address() + offset,
+                self.future.host.address() + offset,
+                std::mem::size_of::<i32>(),
+                stream,
+            )?;
+        }
+        stream.synchronize()?;
+        Ok(())
+    }
+
+    /// Moves the columns the host rewrites or reads to device storage. The others hold values no
+    /// step changes, or values only the kernel touches, and stay where they are.
+    pub(crate) fn place(
+        &mut self,
+        device: DeviceId,
+        pools: &mut crate::arena::Pools,
+        stream: &platform::Stream,
+    ) -> Result<()> {
+        for column in [
+            &mut self.table,
+            &mut self.logical,
+            &mut self.sampling,
+            &mut self.future,
+        ] {
+            column.place(device, pools, stream)?;
+        }
+        Ok(())
+    }
+
+    /// The device address of the per-slot trajectory positions.
+    pub(crate) fn sampling_ptr(&self) -> ops::DevicePtr {
+        self.sampling.device.ptr
+    }
+
+    /// The device address of the per-slot logical positions: the cache extent execution
+    /// initialized.
+    pub(crate) fn logical_ptr(&self) -> ops::DevicePtr {
+        self.logical.device.ptr
+    }
+
+    /// The bytes one readback buffer holds, which bounds what one copy may read.
+    pub(crate) fn readback_len(&self) -> usize {
+        self.readback[0].len()
+    }
+
+    /// The host address a readback copies the trajectory positions into.
+    pub(crate) fn readback_address(&self, turn: usize) -> u64 {
+        self.readback[turn].address()
+    }
+
+    /// The host side of the readback, as the positions the copy filled.
+    pub(crate) fn readback_ptr(&self, turn: usize) -> *const u8 {
+        self.readback[turn].as_ptr()
+    }
+
+    /// Writes the staged commit table - `[COMMIT_FIELDS, rows]` i64, column-major - as the i32 table
+    /// the descriptor asks for, then hands every operand to the device.
+    pub(crate) fn stage(
+        &mut self,
+        commit: &[i64],
+        staged_rows: usize,
+        capacity: usize,
+    ) -> Result<()> {
+        if commit.is_empty() {
+            return Ok(());
+        }
+        let table = commit_table(commit, staged_rows, capacity)?;
+        let mut encoded = Vec::new();
+        encode_i32(&mut encoded, &table);
+        self.table.write(&encoded)?;
+        Ok(())
+    }
+
+    /// The `[COMMIT_FIELDS, capacity]` i32 view the kernel reads.
+    pub(crate) fn table_view(&self) -> TensorView {
+        TensorView::with_strides(
+            self.table.device.ptr,
+            DType::I32,
+            ops::Shape::new(&[ops::commit::COMMIT_FIELDS as u64, self.capacity]),
+            ops::Strides::new(&[self.capacity, 1]),
+        )
+    }
+
+    /// Copies the one operand a batch rewrites into its device buffer.
+    pub(crate) fn upload(&mut self, stream: &platform::Stream) -> Result<()> {
+        self.table.push(stream)
+    }
+}
+
+/// The sampling step's own device state: the slot histories its penalties read.
+pub(crate) struct Sampling {
+    pub(crate) sampler: Sampler,
+    /// `[slots, vocabulary]` i32 counts of the tokens each slot has already seen, which the
+    /// penalties subtract; zeroed once when the runner binds and advanced by `ops::commit`.
+    pub(crate) counts: TensorView,
+    pub(crate) _counts: platform::DeviceAllocation,
+}
+
+impl Sampling {
+    /// The sampler and its zeroed count table for `slots` request slots over `vocabulary` tokens.
+    ///
+    /// A request may ask for any top-k it likes, so the candidate width is the vocabulary: a
+    /// narrower buffer would silently sample a different set.
+    pub(crate) fn new(
+        device: DeviceId,
+        stream: &platform::Stream,
+        vocabulary: u32,
+        slots: u32,
+    ) -> Result<Self> {
+        let sampler = Sampler::new(vocabulary, slots, vocabulary, 0)?;
+        let bytes = u64::from(slots) * u64::from(vocabulary) * 4;
+        let allocation = platform::DeviceAllocation::linear(
+            device,
+            usize::try_from(bytes).map_err(|_| {
+                Error::Invalid("the sampler's count table is larger than memory".into())
+            })?,
+        )?;
+        // The table starts at zero: a slot has seen no token before its first call. A fresh device
+        // allocation holds whatever its pages held last, so the zeros are written by the device,
+        // stream-ordered before the first sample reads a count.
+        // SAFETY: the range is this allocation's own `slots × vocabulary` i32 words, and the
+        // allocation outlives the stream's work on it (the runner owns both).
+        unsafe {
+            platform::memset_d32(
+                allocation.address(),
+                0,
+                usize::try_from(bytes / 4).map_err(|_| {
+                    Error::Invalid("the sampler's count table is larger than memory".into())
+                })?,
+                stream,
+            )?;
+        }
+        stream.synchronize()?;
+        let counts = TensorView::new(
+            ops::DevicePtr::new(allocation.address()),
+            DType::I32,
+            ops::Shape::new(&[u64::from(slots), u64::from(vocabulary)]),
+        );
+        Ok(Self {
+            sampler,
+            counts,
+            _counts: allocation,
+        })
     }
 }
 

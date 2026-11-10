@@ -28,5 +28,5 @@ pub use causal_lm::CausalLmRunner;
 pub use decoder::DecoderRunner;
 pub mod products;
 pub mod resident;
-pub mod sampler;
+pub mod sampling;
 pub mod warm;
