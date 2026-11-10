@@ -1,6 +1,7 @@
 """The GEMM and NVFP4 quantization packages against their references.
 
-The NVFP4 checks have a host half that needs no module and no device. Every
+The NVFP4 checks have a host half that needs no module and no device. The FP8
+product is a Triton program, launched from its source on a device. Every other
 GEMM is a native module, checked with a built one
 (``UNISERVE_KERNEL_MODULES``) on a device.
 """
@@ -45,3 +46,9 @@ def test_the_nvfp4_quantization_feeds_the_nvfp4_gemm():
         "--gemm",
         module("nvfp4_gemm", "cute_dsl"),
     )
+
+
+@pytest.mark.gpu
+def test_the_fp8_gemm_matches_its_reference_on_the_device():
+    """The interpreter does not store E4M3 as a device does, so the product is checked here."""
+    on_device(FAMILY / "fp8_gemm_check.py")

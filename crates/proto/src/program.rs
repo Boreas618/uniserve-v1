@@ -200,6 +200,7 @@ pub mod operator {
     pub const MOE_SORT: &str = "moe_sort";
     pub const NVFP4_QUANTIZE: &str = "nvfp4_quantize";
     pub const NVFP4_GEMM: &str = "nvfp4_gemm";
+    pub const FP8_GEMM: &str = "fp8_gemm";
     pub const SNAKE: &str = "snake";
     pub const CHANNEL_AFFINE: &str = "channel_affine";
     pub const GELU: &str = "gelu";
@@ -290,6 +291,7 @@ pub mod operator {
         MOE_SORT,
         NVFP4_QUANTIZE,
         NVFP4_GEMM,
+        FP8_GEMM,
         SNAKE,
         CHANNEL_AFFINE,
         GELU,

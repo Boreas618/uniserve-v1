@@ -96,6 +96,7 @@ pub mod descriptor;
 pub mod embedding;
 pub mod error;
 pub mod fp4;
+pub mod fp8;
 pub mod frame;
 pub mod gelu;
 pub mod gemm;

@@ -1,0 +1,40 @@
+# The fp8_gemm operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# One program computes one output tile of a per-tensor FP8 product: the 16-bit
+# activation tile is encoded to E4M3 by its static scale as it is loaded, the
+# E4M3 product accumulates in FP32, and the accumulator is dequantized by
+# `input_scale · weight_scale` before the one rounding into the output. The
+# extents, the activation's row stride and both scales are launch words.
+
+op = "fp8_gemm"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/fp8_gemm.py", "src/build.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_bf16_block_m_64_block_n_128_block_k_128_bias_false`.
+[kernel.descriptors]
+# The three tile extents are `tl.arange` extents and `tl.dot` operands, so
+# powers of two of at least sixteen.
+dimensions = { dtype = ["bf16", "f16"], block_m = { power_of_two = true, min = 16 }, block_n = { power_of_two = true, min = 16 }, block_k = { power_of_two = true, min = 32 }, bias = ["false", "true"] }
+
+[parameters]
