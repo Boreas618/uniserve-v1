@@ -23,7 +23,7 @@ use crate::runner::RunnerId;
 ///
 /// The graphs, their capture order and their lifetimes are all keyed by these three numbers, so they
 /// live beside them rather than in each runner.
-pub(crate) struct Lifecycle {
+pub struct Lifecycle {
     /// The runner this lifecycle belongs to, which every job it builds names.
     pub(crate) id: RunnerId,
     /// The graphs captured for every generation this runner prepared.
@@ -79,6 +79,23 @@ impl Lifecycle {
     /// Hands the lifecycle the device's pools, once the device has opened them.
     pub(crate) fn attach_pools(&mut self, pools: Arc<std::sync::Mutex<Pools>>) {
         self.pools = Some(pools);
+    }
+
+    /// The captures a warmup runs: every bucket of `order` the serving generation has no graph
+    /// of, in that order (largest first, so the smaller captures reuse the larger ones' pool
+    /// blocks). A runner whose buckets are all captured gets no job.
+    pub(crate) fn warmup(&self, order: impl IntoIterator<Item = Bucket>) -> Jobs {
+        let generation = self.generation.number();
+        Jobs::new(
+            order
+                .into_iter()
+                .filter(|bucket| self.graphs.captured_for(*bucket, generation).is_none())
+                .map(|bucket| Job::Capture {
+                    runner: self.id,
+                    bucket,
+                    generation,
+                }),
+        )
     }
 
     /// The pool stream this runner's graphs are planned and replayed on.

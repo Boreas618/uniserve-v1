@@ -1281,6 +1281,10 @@ impl<M: Decoder + Send + Sync + ?Sized> Runner for DecoderRunner<M> {
     /// and never from how many requests it happens to carry: a decode graph is captured for one
     /// canvas, and a clip of another canvas must hear that it has no bucket rather than be served by
     /// a graph whose constants belong to a different raster.
+    fn lifecycle_mut(&mut self) -> Option<&mut Lifecycle> {
+        Some(&mut self.lifecycle)
+    }
+
     fn submit(&mut self, batch: Batch) -> Result<Jobs> {
         let media = media_of(&batch)?.clone();
         media.check()?;
@@ -1320,47 +1324,11 @@ impl<M: Decoder + Send + Sync + ?Sized> Runner for DecoderRunner<M> {
         None
     }
 
-    fn warmup(&mut self) -> Result<Jobs> {
-        let generation = self.lifecycle.generation.number();
-        let mut jobs = Vec::new();
-        for bucket in self.capture_order() {
-            if self
-                .lifecycle
-                .graphs
-                .captured_for(bucket, generation)
-                .is_none()
-            {
-                jobs.push(Job::Capture {
-                    runner: self.id,
-                    bucket,
-                    generation,
-                });
-            }
-        }
-        Ok(Jobs::new(jobs))
-    }
-
-    fn precopy(&mut self, next: &Arc<ops::Generation>) -> Result<Jobs> {
-        self.lifecycle.precopy(next)
-    }
-
-    fn switchover(&mut self, generation: u64) -> Result<()> {
-        self.lifecycle.switchover(generation)
-    }
-
-    fn revert(&mut self, generation: u64) {
-        self.lifecycle.revert(generation);
-    }
-
     fn purge(&mut self, generation: u64) {
         self.lifecycle.purge(generation);
         // A generation's tables are charged to resident and retire with it, the same rule as its
         // weights, so the release is here beside the graphs rather than on a second path (4.3).
         self.tables.release(generation);
-    }
-
-    fn discard(&mut self, generation: u64) -> Result<()> {
-        self.lifecycle.discard(generation)
     }
 
     fn attach_products(&mut self, products: Arc<dyn Products>) {

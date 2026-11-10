@@ -817,6 +817,10 @@ impl<M: Encoder + Send + Sync + ?Sized> Runner for EncoderRunner<M> {
     /// happens to carry: a media graph is captured for one extent, and a batch that a smaller bucket
     /// could hold is still served by the bucket its computation names, because the alternative is a
     /// graph whose capture assumed another canvas.
+    fn lifecycle_mut(&mut self) -> Option<&mut Lifecycle> {
+        Some(&mut self.lifecycle)
+    }
+
     fn submit(&mut self, batch: Batch) -> Result<Jobs> {
         let media = batch.media.clone().ok_or_else(|| {
             Error::Invalid(
@@ -861,47 +865,11 @@ impl<M: Encoder + Send + Sync + ?Sized> Runner for EncoderRunner<M> {
         None
     }
 
-    fn warmup(&mut self) -> Result<Jobs> {
-        let generation = self.lifecycle.generation.number();
-        let mut jobs = Vec::new();
-        for bucket in self.capture_order() {
-            if self
-                .lifecycle
-                .graphs
-                .captured_for(bucket, generation)
-                .is_none()
-            {
-                jobs.push(Job::Capture {
-                    runner: self.id,
-                    bucket,
-                    generation,
-                });
-            }
-        }
-        Ok(Jobs::new(jobs))
-    }
-
-    fn precopy(&mut self, next: &Arc<ops::Generation>) -> Result<Jobs> {
-        self.lifecycle.precopy(next)
-    }
-
-    fn switchover(&mut self, generation: u64) -> Result<()> {
-        self.lifecycle.switchover(generation)
-    }
-
-    fn revert(&mut self, generation: u64) {
-        self.lifecycle.revert(generation);
-    }
-
     fn purge(&mut self, generation: u64) {
         self.lifecycle.purge(generation);
         // A generation's tables are charged to resident and retire with it, the same rule as its
         // weights, so the release is here beside the graphs rather than on a second path (4.3).
         self.tables.release(generation);
-    }
-
-    fn discard(&mut self, generation: u64) -> Result<()> {
-        self.lifecycle.discard(generation)
     }
 
     fn attach_products(&mut self, products: Arc<dyn Products>) {

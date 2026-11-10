@@ -141,7 +141,20 @@ pub trait Runner: Send {
     /// The returned jobs are the captures, each performed by this runner when the device worker
     /// reaches it, so a warmup interleaves with anything else the device is doing. A runner whose
     /// buckets are all captured returns no job.
-    fn warmup(&mut self) -> Result<Jobs>;
+    fn warmup(&mut self) -> Result<Jobs> {
+        let order = self.capture_plan();
+        Ok(self
+            .lifecycle_mut()
+            .map(|lifecycle| lifecycle.warmup(order))
+            .unwrap_or_default())
+    }
+
+    /// The lifecycle that holds this runner's graphs, generations and pools, for a runner that
+    /// captures any; the generation methods of this trait forward to it by default, so a runner
+    /// with no graph (a host stage) states nothing and a runner with one states this alone.
+    fn lifecycle_mut(&mut self) -> Option<&mut crate::runners::lifecycle::Lifecycle> {
+        None
+    }
 
     /// Prepares the next generation (7.3): rebind the buckets whose program change leaves the
     /// launch structure intact, recapture those whose structure changes, and return the jobs the
@@ -152,7 +165,12 @@ pub trait Runner: Send {
     ///
     /// Precopy leaves the current generation serving. The runner holds both generations until
     /// `purge` releases the old one.
-    fn precopy(&mut self, next: &Arc<Generation>) -> Result<Jobs>;
+    fn precopy(&mut self, next: &Arc<Generation>) -> Result<Jobs> {
+        match self.lifecycle_mut() {
+            Some(lifecycle) => lifecycle.precopy(next),
+            None => Ok(Jobs::default()),
+        }
+    }
 
     /// Switches to `generation` at a batch boundary: from the next batch on, `submit` serves with
     /// its kernels and graphs. The runner keeps the previous generation for a revert (7.3).
@@ -162,7 +180,12 @@ pub trait Runner: Send {
     /// switch to is the two disagreeing about what was prepared - and the alternative, taking the
     /// generation's number with no kernels and no graphs behind it, would serve an empty
     /// generation that answers every later batch with "no graph for this bucket".
-    fn switchover(&mut self, generation: u64) -> Result<()>;
+    fn switchover(&mut self, generation: u64) -> Result<()> {
+        match self.lifecycle_mut() {
+            Some(lifecycle) => lifecycle.switchover(generation),
+            None => Ok(()),
+        }
+    }
 
     /// Reverts a generation (7.3 step 4).
     ///
@@ -173,11 +196,19 @@ pub trait Runner: Send {
     ///
     /// Design 4.5's method list does not name it and a failed precopy cannot do without it, so it
     /// is a filled silence beside `serve` and `warmup`.
-    fn revert(&mut self, generation: u64);
+    fn revert(&mut self, generation: u64) {
+        if let Some(lifecycle) = self.lifecycle_mut() {
+            lifecycle.revert(generation);
+        }
+    }
 
     /// Releases everything that references a generation older than `generation` (7.3): the graphs
     /// and the kernels they held. It runs after the last batch of the old generation completed.
-    fn purge(&mut self, generation: u64);
+    fn purge(&mut self, generation: u64) {
+        if let Some(lifecycle) = self.lifecycle_mut() {
+            lifecycle.purge(generation);
+        }
+    }
 
     /// Releases everything that references `generation`, which was prepared and never served
     /// (7.3 step 2): its graphs, the kernels they held, and its arena regions where nothing else
@@ -188,7 +219,12 @@ pub trait Runner: Send {
     /// Abandons a prepared generation: its graphs go, then the arena regions no live generation
     /// holds. A generation this runner serves - the serving one or probation's old one - is refused
     /// by name: discarding it would take away the graphs that answer batches.
-    fn discard(&mut self, generation: u64) -> Result<()>;
+    fn discard(&mut self, generation: u64) -> Result<()> {
+        match self.lifecycle_mut() {
+            Some(lifecycle) => lifecycle.discard(generation),
+            None => Ok(()),
+        }
+    }
 
     /// Walks every bucket this runner captures, and every forward it launches eagerly while it warms
     /// and serves, on a recording forward over a counting arena
@@ -210,7 +246,9 @@ pub trait Runner: Send {
     /// (4.1): two runners each reserving their own range would double-book the device's graph
     /// storage. The device worker calls this when it starts.
     fn attach_pools(&mut self, pools: std::sync::Arc<std::sync::Mutex<crate::arena::Pools>>) {
-        let _ = pools;
+        if let Some(lifecycle) = self.lifecycle_mut() {
+            lifecycle.attach_pools(pools);
+        }
     }
 
     /// Gives the runner the shadow harness of its device (7.3): the paired forward needs an

@@ -1326,34 +1326,6 @@ impl Runner for MediaStage {
     fn attach_products(&mut self, products: Arc<dyn Products>) {
         self.products = Some(products);
     }
-
-    /// Nothing to capture: this runner owns no graph. The three calls a media request ends with
-    /// are host work, so a generation changes under them without changing anything here - the
-    /// encoder and the muxer belong to the deployment, not to a program generation.
-    fn warmup(&mut self) -> Result<Jobs> {
-        Ok(Jobs::default())
-    }
-
-    /// Nothing to prepare, for the same reason: no graph of this runner reads a program.
-    fn precopy(&mut self, _next: &Arc<ops::Generation>) -> Result<Jobs> {
-        Ok(Jobs::default())
-    }
-
-    /// Nothing to switch: the host work reads no kernel, so a generation boundary is empty here.
-    fn switchover(&mut self, _generation: u64) -> Result<()> {
-        Ok(())
-    }
-
-    /// Nothing to revert, for the same reason.
-    fn revert(&mut self, _generation: u64) {}
-
-    /// Nothing to release: this runner holds no graph that references a generation.
-    fn purge(&mut self, _generation: u64) {}
-
-    /// Nothing to discard, for the same reason.
-    fn discard(&mut self, _generation: u64) -> Result<()> {
-        Ok(())
-    }
 }
 
 #[cfg(test)]

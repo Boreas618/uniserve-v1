@@ -1805,6 +1805,10 @@ impl<M: Denoiser + Send + Sync + ?Sized> Runner for DenoiserRunner<M> {
     /// The bucket is chosen from the computation the batch states - the layout is the extent - and
     /// never from how many requests it happens to carry: a graph is captured for one layout, and a
     /// batch of another canvas must not be served by it.
+    fn lifecycle_mut(&mut self) -> Option<&mut Lifecycle> {
+        Some(&mut self.lifecycle)
+    }
+
     fn submit(&mut self, batch: Batch) -> Result<Jobs> {
         let media = batch.media.clone().ok_or_else(|| {
             Error::Invalid(
@@ -1930,47 +1934,11 @@ impl<M: Denoiser + Send + Sync + ?Sized> Runner for DenoiserRunner<M> {
         None
     }
 
-    fn warmup(&mut self) -> Result<Jobs> {
-        let generation = self.lifecycle.generation.number();
-        let mut jobs = Vec::new();
-        for bucket in self.capture_order() {
-            if self
-                .lifecycle
-                .graphs
-                .captured_for(bucket, generation)
-                .is_none()
-            {
-                jobs.push(Job::Capture {
-                    runner: self.id,
-                    bucket,
-                    generation,
-                });
-            }
-        }
-        Ok(Jobs::new(jobs))
-    }
-
-    fn precopy(&mut self, next: &Arc<ops::Generation>) -> Result<Jobs> {
-        self.lifecycle.precopy(next)
-    }
-
-    fn switchover(&mut self, generation: u64) -> Result<()> {
-        self.lifecycle.switchover(generation)
-    }
-
-    fn revert(&mut self, generation: u64) {
-        self.lifecycle.revert(generation);
-    }
-
     fn purge(&mut self, generation: u64) {
         self.lifecycle.purge(generation);
         // A generation's tables are charged to resident and retire with it, the same rule as its
         // weights, so the release is here beside the graphs rather than on a second path (4.3).
         self.tables.release(generation);
-    }
-
-    fn discard(&mut self, generation: u64) -> Result<()> {
-        self.lifecycle.discard(generation)
     }
 
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {

@@ -26,7 +26,6 @@ use nn::capability::{DecodedMedia, Decoder, LatentShape, Layout};
 use ops::{DType, Shape, TensorView};
 use platform::DeviceId;
 
-use crate::arena::Pools;
 use crate::batch::{Batch, BatchOutput, CallId, Job, Jobs, answered};
 use crate::plan::{Bucket, Buckets, Extent, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
@@ -364,6 +363,10 @@ impl<M: Decoder + Send + Sync + ?Sized> Runner for AudioDecoderRunner<M> {
     }
 
     /// Serves one track: choose its bucket, stage its latents, and return the replay.
+    fn lifecycle_mut(&mut self) -> Option<&mut Lifecycle> {
+        Some(&mut self.lifecycle)
+    }
+
     fn submit(&mut self, batch: Batch) -> Result<Jobs> {
         let media = media_of(&batch)?.clone();
         media.check()?;
@@ -403,46 +406,6 @@ impl<M: Decoder + Send + Sync + ?Sized> Runner for AudioDecoderRunner<M> {
         None
     }
 
-    fn warmup(&mut self) -> Result<Jobs> {
-        let generation = self.lifecycle.generation.number();
-        let mut jobs = Vec::new();
-        for bucket in self.capture_order() {
-            if self
-                .lifecycle
-                .graphs
-                .captured_for(bucket, generation)
-                .is_none()
-            {
-                jobs.push(Job::Capture {
-                    runner: self.id,
-                    bucket,
-                    generation,
-                });
-            }
-        }
-        Ok(Jobs::new(jobs))
-    }
-
-    fn precopy(&mut self, next: &Arc<ops::Generation>) -> Result<Jobs> {
-        self.lifecycle.precopy(next)
-    }
-
-    fn switchover(&mut self, generation: u64) -> Result<()> {
-        self.lifecycle.switchover(generation)
-    }
-
-    fn revert(&mut self, generation: u64) {
-        self.lifecycle.revert(generation);
-    }
-
-    fn purge(&mut self, generation: u64) {
-        self.lifecycle.purge(generation);
-    }
-
-    fn discard(&mut self, generation: u64) -> Result<()> {
-        self.lifecycle.discard(generation)
-    }
-
     fn attach_products(&mut self, products: Arc<dyn Products>) {
         self.products = Some(products);
     }
@@ -456,10 +419,6 @@ impl<M: Decoder + Send + Sync + ?Sized> Runner for AudioDecoderRunner<M> {
             })?;
         }
         Ok(footprint)
-    }
-
-    fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
-        self.lifecycle.attach_pools(pools);
     }
 
     fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {

@@ -1415,26 +1415,8 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
         self.buckets.capture_order().copied().collect()
     }
 
-    fn warmup(&mut self) -> Result<Jobs> {
-        let generation = self.lifecycle.generation.number();
-        let mut jobs = Vec::new();
-        // Largest first, so the smaller captures reuse the larger ones' pool blocks
-        // (`specs/replaceable-processes.md` 9.3).
-        for bucket in self.buckets.capture_order().copied().collect::<Vec<_>>() {
-            if self
-                .lifecycle
-                .graphs
-                .captured_for(bucket, generation)
-                .is_none()
-            {
-                jobs.push(Job::Capture {
-                    runner: self.id,
-                    bucket,
-                    generation,
-                });
-            }
-        }
-        Ok(Jobs::new(jobs))
+    fn lifecycle_mut(&mut self) -> Option<&mut Lifecycle> {
+        Some(&mut self.lifecycle)
     }
 
     fn precopy(&mut self, next: &Arc<Generation>) -> Result<Jobs> {
@@ -1442,22 +1424,6 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
         // compares is never reported from the one before it.
         self.clear_uncompared();
         self.lifecycle.precopy(next)
-    }
-
-    fn switchover(&mut self, generation: u64) -> Result<()> {
-        self.lifecycle.switchover(generation)
-    }
-
-    fn revert(&mut self, generation: u64) {
-        self.lifecycle.revert(generation)
-    }
-
-    fn discard(&mut self, generation: u64) -> Result<()> {
-        self.lifecycle.discard(generation)
-    }
-
-    fn purge(&mut self, generation: u64) {
-        self.lifecycle.purge(generation)
     }
 
     fn attach_pools(&mut self, pools: Arc<std::sync::Mutex<Pools>>) {
