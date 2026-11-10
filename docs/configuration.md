@@ -129,7 +129,7 @@ Three backend-name fields the split names already exist in the code and are read
 | `uds` | Unset | Unix domain socket the application server listens on instead of TCP; a stale socket file is replaced and the socket file is removed at shutdown |
 | `api_key` | Unset | Bearer token every route but `/health` and `/metrics` requires; `UNISERVE_API_KEY` supplies it when unset or blank. Never printed |
 | `request_timeout` | Unset | Time until a response head is sent, answered with 504 when it expires; streamed bodies are not bounded |
-| `max_concurrent_requests` | Unset | In-flight chat, image generation, System One and synchronous video requests above which requests are shed with 503 |
+| `max_concurrent_requests` | Unset | In-flight chat, image generation and synchronous video requests above which requests are shed with 503 |
 | `shutdown_timeout` | `"30s"` | Longest drain of in-flight requests at shutdown; `0` stops at once |
 | `request_id_headers` | `false` | Add an `X-Request-Id` response header with the ID the request ran under |
 
