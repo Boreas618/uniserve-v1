@@ -17,7 +17,7 @@
 //! buckets a changed operator uses, and switchover and purge are submissions of their own so they
 //! land on a batch boundary (7.3).
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ipc::{CallStatus, ErrorCode, MainProcessInfo, PhaseId, TimingCounters};
@@ -1320,21 +1320,18 @@ pub struct Submission {
 }
 
 pub(crate) struct SubmissionState {
-    outcome: Mutex<Option<Outcome<BatchOutput>>>,
+    /// The submission's own outcome, which `Completion` records once and waits on.
+    completion: crate::completion::Completion<std::convert::Infallible, BatchOutput>,
     /// What the submission was doing when it failed, written where the failure happened: the
     /// caller cannot know it, and an error alone does not say which bucket or operator broke.
     failure: Mutex<Option<String>>,
-    ready: Condvar,
 }
 
 impl Submission {
     /// A submission that has already completed with `outcome`.
     pub fn completed(id: SubmissionId, outcome: Outcome<BatchOutput>) -> Self {
-        let state = Arc::new(SubmissionState {
-            outcome: Mutex::new(Some(outcome)),
-            failure: Mutex::new(None),
-            ready: Condvar::new(),
-        });
+        let state = Arc::new(SubmissionState::default());
+        state.completion.settle(outcome);
         Self {
             id,
             state,
@@ -1355,11 +1352,7 @@ impl Submission {
 
     /// A submission waiting for its jobs' completion, with the state the queue completes.
     pub(crate) fn pending(id: SubmissionId) -> (Self, Arc<SubmissionState>) {
-        let state = Arc::new(SubmissionState {
-            outcome: Mutex::new(None),
-            failure: Mutex::new(None),
-            ready: Condvar::new(),
-        });
+        let state = Arc::new(SubmissionState::default());
         (
             Self {
                 id,
@@ -1398,19 +1391,7 @@ impl Submission {
 
     /// Waits until this rank's part completed and answers its outcome.
     fn wait_own(&self) -> Outcome<BatchOutput> {
-        let mut outcome = lock(&self.state.outcome);
-        while outcome.is_none() {
-            outcome = match self.state.ready.wait(outcome) {
-                Ok(guard) => guard,
-                // A panicking waiter does not make the submission incomplete.
-                Err(poisoned) => poisoned.into_inner(),
-            };
-        }
-        outcome
-            .clone()
-            .unwrap_or(Outcome::Failed(Arc::new(Error::State(
-                "a submission completed without an outcome",
-            ))))
+        self.state.completion.wait()
     }
 
     /// Waits at most `timeout` for the submission's completion.
@@ -1426,23 +1407,14 @@ impl Submission {
 
     /// Waits until `deadline` for this rank's part.
     fn wait_own_until(&self, deadline: Instant) -> Option<Outcome<BatchOutput>> {
-        let mut outcome = lock(&self.state.outcome);
-        while outcome.is_none() {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return None;
-            }
-            outcome = match self.state.ready.wait_timeout(outcome, left) {
-                Ok((guard, _)) => guard,
-                Err(poisoned) => poisoned.into_inner().0,
-            };
-        }
-        outcome.clone()
+        self.state
+            .completion
+            .wait_timeout(deadline.saturating_duration_since(Instant::now()))
     }
 
     /// The submission's outcome, when it completed.
     pub fn outcome(&self) -> Option<Outcome<BatchOutput>> {
-        let own = lock(&self.state.outcome).clone()?;
+        let own = self.state.completion.outcome()?;
         let mut peers = Vec::with_capacity(self.peers.len());
         for peer in &self.peers {
             peers.push(peer.outcome()?);
@@ -1472,12 +1444,8 @@ impl SubmissionState {
 
     /// Completes the submission with `outcome`; the first completion wins.
     pub(crate) fn finish(self: Arc<Self>, outcome: Outcome<BatchOutput>) {
-        let mut slot = lock(&self.outcome);
-        if slot.is_none() {
-            *slot = Some(outcome);
-        }
-        drop(slot);
-        self.ready.notify_all();
+        // The first outcome stands; a later one (a cancel racing a completion) is dropped.
+        self.completion.settle(outcome);
     }
 }
 
@@ -1488,6 +1456,15 @@ impl std::fmt::Debug for Submission {
             .field("id", &self.id)
             .field("completed", &self.outcome().is_some())
             .finish()
+    }
+}
+
+impl Default for SubmissionState {
+    fn default() -> Self {
+        Self {
+            completion: crate::completion::Completion::default(),
+            failure: Mutex::new(None),
+        }
     }
 }
 

@@ -120,19 +120,27 @@ impl<C, T: Clone> Completion<C, T> {
     }
 
     pub(crate) fn complete(&self, result: Result<T>) -> Result<Vec<C>> {
-        let mut state = self.state();
-        if state.outcome.is_some() {
-            return Err(Error::State("operation has already completed"));
-        }
-
-        state.outcome = Some(match result {
+        let outcome = match result {
             Ok(value) => Outcome::Success(value),
             Err(error) => Outcome::Failed(Arc::new(error)),
-        });
+        };
+        self.settle(outcome)
+            .ok_or(Error::State("operation has already completed"))
+    }
+
+    /// Records `outcome` when the operation has none yet, wakes every waiter, and answers the
+    /// callbacks to run; `None` when an outcome was already recorded, which this one does not
+    /// replace.
+    pub(crate) fn settle(&self, outcome: Outcome<T>) -> Option<Vec<C>> {
+        let mut state = self.state();
+        if state.outcome.is_some() {
+            return None;
+        }
+        state.outcome = Some(outcome);
         let callbacks = std::mem::take(&mut state.callbacks);
         drop(state);
         self.ready.notify_all();
-        Ok(callbacks)
+        Some(callbacks)
     }
 
     /// Cancel an unresolved completion. This does not stop its producer.
