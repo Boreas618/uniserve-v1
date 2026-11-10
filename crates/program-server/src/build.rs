@@ -17,11 +17,12 @@
 //! <store>/modules    the committed modules (`--store-root`)
 //! ```
 //!
-//! Building into an existing store extends it. A package whose files are
+//! Building into an existing store extends it. A package whose build inputs
+//! (its files, and the toolchain with its compile driver and pins) are
 //! unchanged since its latest installed revision keeps that revision
-//! ([`ProgramServer::installed`]), so modules built earlier stay under the
-//! revision the store serves, and only a changed package is installed as a
-//! new revision.
+//! ([`ProgramServer::installed`]), so modules built earlier stay the ones the
+//! store serves, and only a package of changed inputs is installed as a new
+//! revision, whose modules are built again.
 //!
 //! The builds are real: nvcc, Triton, CuTe DSL and wasm run with the host's
 //! toolchains, so a build of a deployment takes minutes. The server is driven

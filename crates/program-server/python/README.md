@@ -53,7 +53,7 @@ if __name__ == "__main__":
     driver.main(spec)
 ```
 
-`uniserve_program_server.triton` compiles the spec with `triton.compile` on an explicit target and writes `module.cubin` and `metadata.json` with the launch signature; `uniserve_program_server.cute_dsl` compiles it with `cute.compile`, exports the host launcher and links it with the package's `src/entry.cpp` into `module.so`. Both need no GPU. The drivers belong to this environment, not to a package's revision: like the compilers this lock fixes, a change to them is a change of the environment.
+`uniserve_program_server.triton` compiles the spec with `triton.compile` on an explicit target and writes `module.cubin` and `metadata.json` with the launch signature; `uniserve_program_server.cute_dsl` compiles it with `cute.compile`, exports the host launcher and links it with the package's `src/entry.cpp` into `module.so`. Both need no GPU. The drivers belong to this environment, not to a package's revision: like the compilers this lock fixes, a change to them is a change of the environment. Every file of `uniserve_program_server` (drivers, fetcher, pins) is an input of every module a package's compile script builds: an installation records its digest, a module is stored under it, and a server whose driver differs from a revision's record refuses to build that revision until the package is installed again.
 
 ## Pinned third-party sources
 

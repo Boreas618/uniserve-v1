@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use program_server::Error;
 use program_server::builder::{BuildState, Limits};
+use program_server::inputs::Inputs;
 use program_server::protocol::{Descriptors, PrepareRequest, ProgramRequest, Selector};
 use program_server::server::{ProgramServer, ServerConfig};
 use program_server::store::{ModulePath, Root};
@@ -82,6 +83,15 @@ fn installed(package_root: &Path, revision: u32) {
         .join("triton")
         .join(revision.to_string());
     package(&directory);
+    record(&directory);
+}
+
+/// Records the build inputs of the revision laid out in `directory`, as its
+/// installation would have, and answers their digest.
+fn record(directory: &Path) -> String {
+    let inputs = Inputs::of(directory, "triton 3.7.1".to_owned()).unwrap();
+    inputs.write(directory).unwrap();
+    inputs.digest()
 }
 
 #[test]
@@ -122,6 +132,24 @@ fn an_installation_numbers_the_next_revision_of_its_operator_and_backend() {
         assert!(directory.join("src/rms.py").is_file());
     }
     assert_eq!(server.list().unwrap().packages.len(), 2);
+}
+
+/// A revision whose installation recorded no build inputs is not served, because modules found
+/// under its number may have been built from other inputs; its number stays taken, so the next
+/// installation is numbered after it.
+#[test]
+fn a_revision_without_a_record_of_its_inputs_is_not_served_and_keeps_its_number() {
+    let temporary = tempfile::tempdir().unwrap();
+    let configuration = config(temporary.path(), None);
+    package(&configuration.package_root.join("rms_norm/triton/1"));
+
+    let server = ProgramServer::open(&configuration).unwrap();
+    assert!(server.list().unwrap().packages.is_empty());
+    let installed = server
+        .install(&package(&temporary.path().join("again")))
+        .unwrap();
+    assert_eq!(installed.package.revision, 2);
+    assert_eq!(server.list().unwrap().packages.len(), 1);
 }
 
 /// A source the tree shares between packages through a symbolic link is installed as the bytes it
@@ -235,9 +263,10 @@ fn a_policy_module_is_listed_as_the_wasm_module_it_is() {
     std::fs::create_dir_all(package_root.join("src")).unwrap();
     std::fs::write(package_root.join("package.toml"), POLICY).unwrap();
     std::fs::write(package_root.join("src/lib.rs"), b"// the policy\n").unwrap();
+    let inputs = record(&package_root);
     let module = configuration.store_roots[0]
         .path
-        .join("scheduling/fcfs/1/wasm32/default");
+        .join(format!("scheduling/fcfs/1/{inputs}/wasm32/default"));
     std::fs::create_dir_all(&module).unwrap();
     std::fs::write(module.join("module.wasm"), b"a precompiled module").unwrap();
     std::fs::write(module.join(".committed"), b"").unwrap();
@@ -268,9 +297,10 @@ fn prepare_builds_a_scheduling_policy_once_for_wasm32() {
     std::fs::create_dir_all(package_root.join("src")).unwrap();
     std::fs::write(package_root.join("package.toml"), POLICY).unwrap();
     std::fs::write(package_root.join("src/lib.rs"), b"// the policy\n").unwrap();
+    let inputs = record(&package_root);
     let module = configuration.store_roots[0]
         .path
-        .join("scheduling/fcfs/1/wasm32/default");
+        .join(format!("scheduling/fcfs/1/{inputs}/wasm32/default"));
     std::fs::create_dir_all(&module).unwrap();
     std::fs::write(module.join("module.wasm"), b"a precompiled module").unwrap();
     std::fs::write(module.join(".committed"), b"").unwrap();
@@ -301,7 +331,7 @@ fn prepare_builds_a_scheduling_policy_once_for_wasm32() {
     assert_eq!(progress.len(), 1);
     assert_eq!(
         progress[0].path,
-        ModulePath::new("scheduling", "fcfs", 1, "wasm32", "default").unwrap()
+        ModulePath::new("scheduling", "fcfs", 1, inputs, "wasm32", "default").unwrap()
     );
     assert_eq!(progress[0].state, BuildState::Committed);
 }
@@ -318,9 +348,10 @@ fn a_policy_module_resolves_for_wasm32_only() {
     std::fs::create_dir_all(package_root.join("src")).unwrap();
     std::fs::write(package_root.join("package.toml"), POLICY).unwrap();
     std::fs::write(package_root.join("src/lib.rs"), b"// the policy\n").unwrap();
+    let inputs = record(&package_root);
     let module = configuration.store_roots[0]
         .path
-        .join("scheduling/fcfs/1/wasm32/default");
+        .join(format!("scheduling/fcfs/1/{inputs}/wasm32/default"));
     std::fs::create_dir_all(&module).unwrap();
     std::fs::write(module.join("module.wasm"), b"a precompiled module").unwrap();
     std::fs::write(module.join(".committed"), b"").unwrap();

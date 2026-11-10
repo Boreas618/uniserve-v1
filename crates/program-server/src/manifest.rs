@@ -19,7 +19,9 @@
 //!
 //! A revision fixes all of these (design section 5.1): any change to the
 //! sources, the tuning data or a toolchain version is a new installation and
-//! a new revision, and an installed revision is never overwritten.
+//! a new revision, and an installed revision is never overwritten. The
+//! revision records them, with the compile driver they are built through, as
+//! its build inputs ([`crate::inputs`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

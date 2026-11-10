@@ -206,6 +206,10 @@ fn a_prepare_waits_through_a_server_restart_and_answers_from_the_new_one() {
     let source = package(&temporary.path().join("package"));
     let installed = configuration.package_root.join("rms_norm/triton/1");
     copy_tree(&source, &installed);
+    program_server::inputs::Inputs::of(&installed, "triton 3.7.1".to_owned())
+        .unwrap()
+        .write(&installed)
+        .unwrap();
 
     let restart = {
         let socket_directory = temporary.path().to_path_buf();

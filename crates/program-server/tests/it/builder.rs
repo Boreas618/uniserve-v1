@@ -12,7 +12,15 @@ fn limits(max_jobs: usize, host_reserve: u64) -> Limits {
 }
 
 fn path(key: &str) -> ModulePath {
-    ModulePath::new("rms_norm", "triton", 1, "sm_100a", key).unwrap()
+    ModulePath::new(
+        "rms_norm",
+        "triton",
+        1,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "sm_100a",
+        key,
+    )
+    .unwrap()
 }
 
 #[test]

@@ -136,6 +136,7 @@ fn prepare_reports_each_build_and_answers_the_selected_programs() {
                 descriptor: "dtype_bf16".into(),
                 state: state as i32,
                 detail: detail.into(),
+                inputs: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             })),
         };
         connection
@@ -186,7 +187,15 @@ fn prepare_reports_each_build_and_answers_the_selected_programs() {
     assert_eq!(seen.len(), 1);
     assert_eq!(
         seen[0].path,
-        ModulePath::new("rms_norm", "triton", 2, "sm_100a", "dtype_bf16").unwrap()
+        ModulePath::new(
+            "rms_norm",
+            "triton",
+            2,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "sm_100a",
+            "dtype_bf16"
+        )
+        .unwrap()
     );
     assert_eq!(prepared.programs.len(), 1);
     assert_eq!(prepared.programs[0].slot, ProgramSlot::all("rms_norm"));

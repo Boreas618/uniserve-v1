@@ -192,6 +192,8 @@ message Progress {
   BuildState state = 6;
   // On a failure, the build's log.
   string detail = 7;
+  // The digest of the revision's build inputs, which names the module in the store.
+  string inputs = 8;
 }
 
 // One file of a module, passed as a descriptor attached to this frame.

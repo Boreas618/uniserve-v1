@@ -1,16 +1,20 @@
 //! The module store (design section 5.3).
 //!
-//! A module is stored under a path made only of names: the operator, the
-//! backend, the revision, the target and the descriptor key,
+//! A module is stored under a path made of names and one digest: the
+//! operator, the backend, the revision, the digest of its build inputs, the
+//! target and the descriptor key,
 //!
 //! ```text
-//! <op>/<backend>/<revision>/<target>/<descriptor key>/
+//! <op>/<backend>/<revision>/<inputs>/<target>/<descriptor key>/
 //! ```
 //!
-//! and a revision already fixes the sources, tuning data and toolchain the
-//! module was built from (design sections 5.1 and 5.2). The same path is
-//! therefore always the same module, wherever it was built, and nothing needs
-//! a content digest.
+//! The inputs digest ([`crate::inputs::Inputs::digest`]) names everything that
+//! determines the module's bytes beside the target and the key: the package's
+//! files, the toolchain's version and the shared compile driver with its pins.
+//! A revision number alone does not: two package roots number their own
+//! installations, and a driver, a pin or a toolchain changes without one. The
+//! same path is therefore always the same module, wherever it was built, and a
+//! module built from other inputs is never found, so it is built again.
 //!
 //! Roots: the first root is writable and holds the modules this host built;
 //! the others are shared, read-only roots that other hosts mount, so a module
@@ -38,10 +42,10 @@ static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 /// The longest a module path's last segment may be, in bytes.
 ///
 /// A descriptor key is the last segment of a module's path (design section 5.3: every module sits
-/// under `<operator>/<backend>/<revision>/<target>/<descriptor key>`), so a key must be one file
-/// name, and this is the filesystem's own cap rather than a policy: a longer name has no directory
-/// to live in, whatever the store would like. Publishing stages under a name of its own, short and
-/// independent of the key, so the key's length is the only thing measured here.
+/// under `<operator>/<backend>/<revision>/<inputs>/<target>/<descriptor key>`), so a key must be
+/// one file name, and this is the filesystem's own cap rather than a policy: a longer name has no
+/// directory to live in, whatever the store would like. Publishing stages under a name of its own,
+/// short and independent of the key, so the key's length is the only thing measured here.
 ///
 /// A key that reaches this bound is a design smell even when it fits: it usually names values that
 /// are launch arguments rather than properties of the problem — a stride the caller varies, a
@@ -55,6 +59,8 @@ pub struct ModulePath {
     pub op: String,
     pub backend: String,
     pub revision: u32,
+    /// The digest of the revision's build inputs ([`crate::inputs`]), in hex.
+    pub inputs: String,
     pub target: String,
     pub descriptor: String,
 }
@@ -66,6 +72,7 @@ impl ModulePath {
         op: impl Into<String>,
         backend: impl Into<String>,
         revision: u32,
+        inputs: impl Into<String>,
         target: impl Into<String>,
         descriptor: impl Into<String>,
     ) -> Result<Self> {
@@ -73,12 +80,14 @@ impl ModulePath {
             op: op.into(),
             backend: backend.into(),
             revision,
+            inputs: inputs.into(),
             target: target.into(),
             descriptor: descriptor.into(),
         };
         for (name, value) in [
             ("operator", &path.op),
             ("backend", &path.backend),
+            ("inputs digest", &path.inputs),
             ("target", &path.target),
             ("descriptor", &path.descriptor),
         ] {
@@ -103,11 +112,13 @@ impl ModulePath {
         Ok(path)
     }
 
-    /// The path relative to a store root: `<op>/<backend>/<revision>/<target>/<descriptor key>`.
+    /// The path relative to a store root:
+    /// `<op>/<backend>/<revision>/<inputs>/<target>/<descriptor key>`.
     pub fn relative(&self) -> PathBuf {
         PathBuf::from(&self.op)
             .join(&self.backend)
             .join(self.revision.to_string())
+            .join(&self.inputs)
             .join(&self.target)
             .join(&self.descriptor)
     }
@@ -117,8 +128,8 @@ impl std::fmt::Display for ModulePath {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "{}/{}/{}/{}/{}",
-            self.op, self.backend, self.revision, self.target, self.descriptor
+            "{}/{}/{}/{}/{}/{}",
+            self.op, self.backend, self.revision, self.inputs, self.target, self.descriptor
         )
     }
 }
@@ -246,7 +257,7 @@ impl Store {
         sync_directory(&staged)?;
         if destination.exists() {
             if destination.join(COMMITTED).is_file() {
-                // A revision fixes a module's content, so a committed module
+                // A path fixes a module's content, so a committed module
                 // is never replaced (design section 5.3).
                 std::fs::remove_dir_all(&staged)?;
                 return Err(Error::Io(io::Error::new(
@@ -285,18 +296,21 @@ impl Store {
                         else {
                             continue;
                         };
-                        for target in directories(&revision_path(revision, &backend))? {
-                            for descriptor in directories(&target)? {
-                                if !descriptor.join(COMMITTED).is_file() {
-                                    continue;
+                        for inputs in directories(&revision_path(revision, &backend))? {
+                            for target in directories(&inputs)? {
+                                for descriptor in directories(&target)? {
+                                    if !descriptor.join(COMMITTED).is_file() {
+                                        continue;
+                                    }
+                                    modules.push(ModulePath {
+                                        op: file_name(&op),
+                                        backend: file_name(&backend),
+                                        revision,
+                                        inputs: file_name(&inputs),
+                                        target: file_name(&target),
+                                        descriptor: file_name(&descriptor),
+                                    });
                                 }
-                                modules.push(ModulePath {
-                                    op: file_name(&op),
-                                    backend: file_name(&backend),
-                                    revision,
-                                    target: file_name(&target),
-                                    descriptor: file_name(&descriptor),
-                                });
                             }
                         }
                     }

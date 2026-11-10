@@ -33,6 +33,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
 use crate::builder::{Build, BuildState, Builder, Limits, Urgency};
+use crate::inputs::{BYTECODE_CACHE, Inputs};
 use crate::manifest::Manifest;
 use crate::protocol::{
     self, Chosen, Connection, Descriptors, Module, ModuleFile, PrepareRequest, Progress, Selector,
@@ -59,6 +60,9 @@ pub struct Package {
     /// server's package root.
     pub root: PathBuf,
     pub source: Box<dyn Source>,
+    /// What the revision's modules are built from, as its installation
+    /// recorded it; its digest is in every module path of the revision.
+    pub inputs: Inputs,
 }
 
 impl Package {
@@ -408,7 +412,13 @@ impl ProgramServer {
     /// names the upstream. A revision fixes the package's sources, tuning data
     /// and toolchain versions, so an installed revision is never overwritten:
     /// each installation of the same operator and backend is the next
-    /// revision (design section 5.1).
+    /// revision (design section 5.1), numbered after every revision directory
+    /// the package root holds.
+    ///
+    /// The revision records its build inputs ([`Inputs`]): the digest of the
+    /// package's files and this host's identity of the toolchain that builds
+    /// them. A host without that toolchain records why it has none, and no host
+    /// builds the revision until it is installed where the toolchain is.
     pub fn install(&self, directory: &Path) -> Result<protocol::Installed> {
         if let Some(upstream) = &self.upstream {
             return Err(Error::Refused {
@@ -428,10 +438,18 @@ impl ProgramServer {
             .packages
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A revision directory the server does not serve (one installed with
+        // no record of its inputs) still holds its number.
+        let on_disk = directories(&self.package_root.join(&manifest.op).join(&manifest.backend))
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|revision| revision.file_name()?.to_str()?.parse::<u32>().ok())
+            .max();
         let revision = packages
             .keys()
             .filter(|(op, backend, _)| op == &manifest.op && backend == &manifest.backend)
             .map(|(_, _, revision)| *revision)
+            .chain(on_disk)
             .max()
             .unwrap_or(0)
             .checked_add(1)
@@ -445,7 +463,13 @@ impl ProgramServer {
             &manifest.backend,
             revision,
         );
-        install_package(directory, &root)?;
+        let kind = manifest.source(directory)?.toolchain();
+        let toolchain = self
+            .toolchains
+            .identity(kind)
+            .unwrap_or_else(|error| format!("{kind} unavailable: {error}"));
+        let inputs = Inputs::of(directory, toolchain)?;
+        install_package(directory, &root, &inputs)?;
         // The source compiles the installed copy, not the tree the install
         // named: a downstream server's package root is a read-only mount of the
         // upstream's, and the publisher's directory need not exist there.
@@ -454,6 +478,7 @@ impl ProgramServer {
             manifest,
             root,
             source,
+            inputs,
         });
         // Design 6.2: a package is built when it is installed. Every other kind
         // builds per descriptor at `prepare`; a wasm policy is one module with
@@ -479,14 +504,15 @@ impl ProgramServer {
     }
 
     /// The latest installed revision of the package in `directory` when that
-    /// revision was installed from the same files, and `None` otherwise.
+    /// revision was installed from the same build inputs, and `None` otherwise.
     ///
-    /// A revision fixes a package's sources (design section 5.1), and its
-    /// installed copy is the record of them: [`Self::install`] copies the
-    /// directory as it is, so the copy is compared with the directory file by
-    /// file and no separate digest is kept. Only the latest revision is
+    /// A revision fixes what its modules are built from (design section 5.1):
+    /// the package's files, and the toolchain with its compile driver and pins.
+    /// Its record of them ([`Inputs`]) is compared with the directory's files
+    /// and this host's toolchain as they are now, so a changed kernel source,
+    /// driver, pin or toolchain is a new revision. Only the latest revision is
     /// compared, because it is the one `prepare` selects by backend: modules
-    /// built under an older revision with the same files are not the ones a
+    /// built under an older revision with the same inputs are not the ones a
     /// later `prepare` would reach.
     ///
     /// A scheduling policy never matches: its build reads the publisher's
@@ -516,9 +542,13 @@ impl ProgramServer {
         let Some((revision, package)) = latest else {
             return Ok(None);
         };
-        if package.toolchain() == crate::manifest::ToolchainKind::Wasm
-            || !same_tree(directory, &package.root)?
-        {
+        if package.toolchain() == crate::manifest::ToolchainKind::Wasm {
+            return Ok(None);
+        }
+        let Ok(toolchain) = self.toolchains.identity(package.toolchain()) else {
+            return Ok(None);
+        };
+        if Inputs::of(directory, toolchain)? != package.inputs {
             return Ok(None);
         }
         Ok(Some(protocol::Installed {
@@ -650,6 +680,7 @@ impl ProgramServer {
                         chosen.slot.op.clone(),
                         chosen.program.backend.clone(),
                         chosen.program.revision,
+                        package.inputs.digest(),
                         target.to_string(),
                         key.clone(),
                     )?;
@@ -767,6 +798,7 @@ impl ProgramServer {
             op,
             program.backend.clone(),
             program.revision,
+            package.inputs.digest(),
             target.to_string(),
             descriptor,
         )?;
@@ -848,16 +880,19 @@ impl ProgramServer {
             })
             .collect();
         for path in self.store.list()? {
-            let Some(entry) =
-                listed.get_mut(&(path.op.clone(), path.backend.clone(), path.revision))
+            let key = (path.op.clone(), path.backend.clone(), path.revision);
+            // A module under the revision's number and other inputs was built
+            // by another installation, and is not this revision's.
+            let Some(package) = packages
+                .get(&key)
+                .filter(|package| package.inputs.digest() == path.inputs)
             else {
                 continue;
             };
-            let form = packages
-                .get(&(path.op.clone(), path.backend.clone(), path.revision))
-                .map_or(crate::manifest::ModuleForm::Cubin, |package| {
-                    package.manifest.module.form
-                });
+            let form = package.manifest.module.form;
+            let Some(entry) = listed.get_mut(&key) else {
+                continue;
+            };
             entry.modules.push(protocol::ListedModule {
                 target: Target::new(path.target),
                 descriptor: path.descriptor,
@@ -1346,6 +1381,23 @@ impl Queue {
             Some(built) => built,
             None => {
                 let toolchain = self.toolchains.get(kind)?;
+                // A module is stored under the inputs its revision recorded, so
+                // only the toolchain and compile driver the revision was
+                // installed with may build it.
+                let identity = self.toolchains.identity(kind)?;
+                if identity != package.inputs.toolchain {
+                    return Err(Error::Toolchain {
+                        kind,
+                        message: format!(
+                            "the package {} {} revision {} was installed for {} and this host \
+                             builds with {identity}: install the package again",
+                            package.manifest.op,
+                            package.manifest.backend,
+                            job.path.revision,
+                            package.inputs.toolchain,
+                        ),
+                    });
+                }
                 // A package that compiles nothing has no compiler version to
                 // match, and a package that declares no version is built by
                 // whatever this host has: both leave `[toolchain] version`
@@ -1435,6 +1487,7 @@ impl<'a> Replies<'a> {
                 op: progress.path.op.clone(),
                 backend: progress.path.backend.clone(),
                 revision: progress.path.revision,
+                inputs: progress.path.inputs.clone(),
                 target: progress.path.target.clone(),
                 descriptor: progress.path.descriptor.clone(),
                 state: wire::BuildState::from(&progress.state) as i32,
@@ -1500,6 +1553,17 @@ fn load_packages(root: &Path) -> Result<BTreeMap<(String, String, u32), Arc<Pack
                         ))),
                     });
                 }
+                // A revision installed with no record of its inputs cannot name
+                // the modules it would build, and modules found under its number
+                // may come from other inputs: it is not served, and its package
+                // is installed again.
+                let Some(inputs) = Inputs::read(&revision)? else {
+                    tracing::warn!(
+                        "{} records no build inputs and is not served: install the package again",
+                        revision.display()
+                    );
+                    continue;
+                };
                 let source = manifest.source(&revision)?;
                 packages.insert(
                     (op_name.clone(), backend_name.clone(), number),
@@ -1507,6 +1571,7 @@ fn load_packages(root: &Path) -> Result<BTreeMap<(String, String, u32), Arc<Pack
                         manifest,
                         root: revision.clone(),
                         source,
+                        inputs,
                     }),
                 );
             }
@@ -1515,9 +1580,10 @@ fn load_packages(root: &Path) -> Result<BTreeMap<(String, String, u32), Arc<Pack
     Ok(packages)
 }
 
-/// Copies a package into its revision's directory, atomically: a crash leaves
-/// no directory a later scan would mistake for an installed revision.
-fn install_package(directory: &Path, destination: &Path) -> Result<()> {
+/// Copies a package into its revision's directory with the record of its
+/// build inputs, atomically: a crash leaves no directory a later scan would
+/// mistake for an installed revision, and no revision without its record.
+fn install_package(directory: &Path, destination: &Path, inputs: &Inputs) -> Result<()> {
     let parent = destination.parent().ok_or_else(|| {
         Error::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1538,6 +1604,7 @@ fn install_package(directory: &Path, destination: &Path) -> Result<()> {
     }
     fs::create_dir_all(&staged)?;
     copy_tree(directory, &staged)?;
+    inputs.write(&staged)?;
     if let Ok(handle) = fs::File::open(&staged) {
         handle.sync_all()?;
     }
@@ -1547,14 +1614,6 @@ fn install_package(directory: &Path, destination: &Path) -> Result<()> {
     }
     Ok(())
 }
-
-/// The directory Python writes a module's bytecode into beside its source.
-///
-/// Bytecode is derived from the sources and regenerated by the interpreter, so
-/// it is no part of a revision: an install does not copy it, and a comparison
-/// with an installed copy ignores it on both sides, because a Python build runs
-/// in the installed copy and leaves its own bytecode there.
-const BYTECODE_CACHE: &str = "__pycache__";
 
 /// Copies a directory tree, keeping relative paths and file modes, without
 /// Python bytecode ([`BYTECODE_CACHE`]).
@@ -1580,49 +1639,6 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Whether two directory trees hold the same entries: the same names and the
-/// same bytes in every file, a symbolic link read as what it names, as
-/// [`copy_tree`] reproduces them. Python bytecode is not compared
-/// ([`BYTECODE_CACHE`]).
-fn same_tree(left: &Path, right: &Path) -> Result<bool> {
-    let entries = |path: &Path| -> Result<BTreeMap<std::ffi::OsString, fs::FileType>> {
-        let mut entries = BTreeMap::new();
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            if entry.file_name() == BYTECODE_CACHE {
-                continue;
-            }
-            entries.insert(entry.file_name(), fs::metadata(entry.path())?.file_type());
-        }
-        Ok(entries)
-    };
-    let (ours, theirs) = (entries(left)?, entries(right)?);
-    if ours.len() != theirs.len() {
-        return Ok(false);
-    }
-
-    for (name, kind) in &ours {
-        let Some(other) = theirs.get(name) else {
-            return Ok(false);
-        };
-        let (from, to) = (left.join(name), right.join(name));
-        let same = if kind.is_dir() && other.is_dir() {
-            same_tree(&from, &to)?
-        } else if kind.is_file() && other.is_file() {
-            // Sizes first: a changed source usually changes its length, and
-            // the comparison then reads neither file.
-            fs::metadata(&from)?.len() == fs::metadata(&to)?.len()
-                && fs::read(&from)? == fs::read(&to)?
-        } else {
-            false
-        };
-        if !same {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 /// The descriptors a `prepare` asks for, as the server's request.

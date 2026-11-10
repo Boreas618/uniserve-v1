@@ -21,8 +21,11 @@
 //!   `resolve`, `list` (section 6.3) and `cover`, which answers the package
 //!   whose manifest covers each of an operator's descriptor keys.
 //! - [`store`]: the module store of section 5.3, whose paths are made of the
-//!   operator's and backend's names, the revision, the target and the
-//!   descriptor key, and whose every directory ends in a `.committed` mark.
+//!   operator's and backend's names, the revision, the digest of its build
+//!   inputs, the target and the descriptor key, and whose every directory ends
+//!   in a `.committed` mark.
+//! - [`inputs`]: what a module is built from (the package's files, the
+//!   toolchain, the compile driver and its pins) and the digest that names it.
 //! - [`build`]: `uniserve program-server build`, which fills a store from
 //!   descriptor key lists.
 //! - [`builder`]: the compile queue of section 6.2, with its urgencies, its
@@ -40,6 +43,7 @@
 pub mod build;
 pub mod builder;
 pub mod command;
+pub mod inputs;
 pub mod manifest;
 pub mod protocol;
 pub mod server;

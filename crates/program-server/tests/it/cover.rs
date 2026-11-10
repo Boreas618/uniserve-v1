@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use program_server::builder::Limits;
+use program_server::inputs::Inputs;
 use program_server::protocol::{Client, CoverRequest, Coverage, Covered, Named, Package};
 use program_server::server::{ProgramServer, ServerConfig};
 use program_server::store::Root;
@@ -80,6 +81,10 @@ fn installed(configuration: &ServerConfig, backend: &str, revision: u32, manifes
         .join(backend)
         .join(revision.to_string());
     write_package(&directory, manifest);
+    Inputs::of(&directory, "triton 3.7.1".to_owned())
+        .unwrap()
+        .write(&directory)
+        .unwrap();
 }
 
 /// A server configuration over a fresh package root and module store, for a

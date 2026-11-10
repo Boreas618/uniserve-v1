@@ -178,6 +178,11 @@ pub struct Toolchains {
     /// name (PEP 503), with their versions: what a package's `[toolchain] packages` is compared
     /// with before it is built.
     distributions: Discovered<BTreeMap<String, String>>,
+    /// The directory of the compile driver package (`uniserve_program_server`) the Python
+    /// environment imports: the Triton and CuTe DSL drivers, the fetcher and its pins, which every
+    /// package's compile script runs through. Its files are an input of every module a script
+    /// builds ([`Self::identity`]).
+    driver: Discovered<PathBuf>,
 }
 
 /// A toolchain the host may not have.
@@ -197,7 +202,35 @@ impl Toolchains {
             cute_dsl: CuteDsl::discover(config, interpreter),
             wasm: Wasm::discover(config, interpreter),
             distributions: named_interpreter(interpreter).and_then(python_distributions),
+            driver: named_interpreter(interpreter).and_then(driver_directory),
         })
+    }
+
+    /// What builds a package of toolchain `kind` on this host, as one line: the toolchain's kind
+    /// and version and, for a toolchain that runs a package's Python compile script, the digest of
+    /// the compile driver's files, read now. Two hosts, or one host before and after an upgrade or
+    /// an edit of the driver or of a pin, answer the same line only when they build the same bytes
+    /// from the same package (`crate::inputs`).
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::Toolchain`] when the host has no toolchain of that kind, or its
+    /// compile driver cannot be found or read.
+    pub fn identity(&self, kind: ToolchainKind) -> Result<String> {
+        if kind == ToolchainKind::None {
+            return Ok(kind.to_string());
+        }
+        let toolchain = self.get(kind)?;
+        let mut identity = format!("{kind} {}", toolchain.version());
+        if toolchain.script_interpreter().is_some() {
+            let driver = self.driver.as_ref().map_err(|reason| Error::Toolchain {
+                kind,
+                message: reason.clone(),
+            })?;
+            identity.push_str("; driver ");
+            identity.push_str(&crate::inputs::tree_digest(driver)?);
+        }
+        Ok(identity)
     }
 
     /// Refuses a build whose package imports a Python distribution this host's environment does
@@ -631,6 +664,34 @@ fn python_distributions(interpreter: &Path) -> Discovered<BTreeMap<String, Strin
         .collect())
 }
 
+/// The directory of the compile driver package the Python environment imports.
+fn driver_directory(interpreter: &Path) -> Discovered<PathBuf> {
+    if !interpreter.is_file() {
+        return Err(format!(
+            "no Python interpreter at {}: pass --python <the Program Server's interpreter>",
+            interpreter.display()
+        ));
+    }
+    let reported = Command::new(interpreter)
+        .args([
+            "-c",
+            "import pathlib, uniserve_program_server as d; \
+             print(pathlib.Path(d.__file__).resolve().parent)",
+        ])
+        .output()
+        .map_err(|error| format!("running {}: {error}", interpreter.display()))?;
+    if !reported.status.success() {
+        return Err(format!(
+            "{} cannot import the compile driver uniserve_program_server: {}",
+            interpreter.display(),
+            String::from_utf8_lossy(&reported.stderr).trim()
+        ));
+    }
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&reported.stdout).trim(),
+    ))
+}
+
 /// Asks the Python environment for the version of one of its distributions.
 fn python_version(interpreter: &Path, module: &str) -> Discovered<String> {
     if !interpreter.is_file() {
@@ -780,8 +841,11 @@ pub fn execute(job: &ToolJob, max_jobs: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolJob, disagreements, execute, normalized, parse_nvcc_version, resolve_in};
-    use crate::manifest::PythonPackage;
+    use super::{
+        ToolJob, ToolchainConfig, Toolchains, disagreements, execute, normalized,
+        parse_nvcc_version, resolve_in,
+    };
+    use crate::manifest::{PythonPackage, ToolchainKind};
     use std::collections::BTreeMap;
     use std::path::Path;
 
@@ -822,6 +886,50 @@ mod tests {
                 "flashinfer-python 0.6.18 (it has none)"
             ]
         );
+    }
+
+    /// A Python toolchain's identity names its compile driver's files as they are when it is
+    /// asked: an edited driver or pin is another identity, so its modules are other modules.
+    #[test]
+    fn a_python_toolchain_identity_follows_its_compile_driver() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let driver = temporary.path().join("uniserve_program_server");
+        std::fs::create_dir_all(driver.join("pins")).unwrap();
+        std::fs::write(driver.join("triton.py"), "# the driver\n").unwrap();
+        std::fs::write(driver.join("pins/artifact.sha256"), "ab  file\n").unwrap();
+        // The Python environment is outside the server: a script answers the questions discovery
+        // asks an interpreter (the driver's directory, a version, the distributions).
+        let python = temporary.path().join("python");
+        std::fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\ncase \"$2\" in\n  *uniserve_program_server*) echo {};;\n  \
+                 *distributions*) echo '{{}}';;\n  *) echo 3.7.1;;\nesac\n",
+                driver.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let toolchains = Toolchains::discover(&ToolchainConfig {
+            nvcc: None,
+            python: Some(python),
+            wasm: None,
+            cargo: None,
+            max_jobs: 1,
+        })
+        .unwrap();
+
+        let first = toolchains.identity(ToolchainKind::Triton).unwrap();
+        assert!(first.starts_with("triton 3.7.1; driver "), "{first}");
+        assert_eq!(toolchains.identity(ToolchainKind::Triton).unwrap(), first);
+        std::fs::write(driver.join("triton.py"), "# the driver, edited\n").unwrap();
+        let edited = toolchains.identity(ToolchainKind::Triton).unwrap();
+        assert_ne!(edited, first);
+        std::fs::write(driver.join("pins/artifact.sha256"), "cd  file\n").unwrap();
+        assert_ne!(toolchains.identity(ToolchainKind::Triton).unwrap(), edited);
+        assert_eq!(toolchains.identity(ToolchainKind::None).unwrap(), "none");
     }
 
     /// A build whose compiler is not where the host said names the program, its

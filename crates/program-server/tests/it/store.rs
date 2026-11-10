@@ -16,9 +16,20 @@ fn store(directory: &std::path::Path) -> Store {
     .unwrap()
 }
 
+/// The inputs digest the paths of these tests name.
+const INPUTS: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 /// A path of one module of `rms_norm`, backend `triton`, revision 3.
 fn path() -> ModulePath {
-    ModulePath::new("rms_norm", "triton", 3, "sm_100a", "dtype_bf16_hidden_2048").unwrap()
+    ModulePath::new(
+        "rms_norm",
+        "triton",
+        3,
+        INPUTS,
+        "sm_100a",
+        "dtype_bf16_hidden_2048",
+    )
+    .unwrap()
 }
 
 /// Writes a build's files into a fresh workspace directory and answers it.
@@ -154,8 +165,15 @@ fn list_names_every_committed_module_of_every_root_once() {
     let store = store(temporary.path());
     let workspace = workspace(temporary.path(), &[("module.cubin", b"bytes")]);
     let first = path();
-    let second =
-        ModulePath::new("rms_norm", "triton", 4, "sm_100a", "dtype_bf16_hidden_2048").unwrap();
+    let second = ModulePath::new(
+        "rms_norm",
+        "triton",
+        4,
+        INPUTS,
+        "sm_100a",
+        "dtype_bf16_hidden_2048",
+    )
+    .unwrap();
     for path in [&first, &second] {
         store
             .publish(path, &workspace, &["module.cubin".to_owned()])
@@ -169,11 +187,14 @@ fn list_names_every_committed_module_of_every_root_once() {
 #[test]
 fn a_module_path_is_made_of_names_that_cannot_leave_their_root() {
     for name in ["", ".", "..", "a/b", "../sibling"] {
-        let path = ModulePath::new("rms_norm", name, 1, "sm_100a", "dtype_bf16");
+        let path = ModulePath::new("rms_norm", name, 1, INPUTS, "sm_100a", "dtype_bf16");
         assert!(path.is_err(), "{name:?} is not one name");
     }
-    let path = ModulePath::new("rms_norm", "triton", 1, "sm_100a", "dtype_bf16").unwrap();
-    assert_eq!(path.to_string(), "rms_norm/triton/1/sm_100a/dtype_bf16");
+    let path = ModulePath::new("rms_norm", "triton", 1, INPUTS, "sm_100a", "dtype_bf16").unwrap();
+    assert_eq!(
+        path.to_string(),
+        format!("rms_norm/triton/1/{INPUTS}/sm_100a/dtype_bf16")
+    );
 }
 
 #[test]
@@ -219,8 +240,8 @@ fn a_store_with_two_writable_roots_is_refused() {
 
 /// A descriptor key names a module's last path segment, so it must be one file name.
 ///
-/// The design puts every module under `<operator>/<backend>/<revision>/<target>/<descriptor key>`,
-/// and a filesystem caps one file name at 255 bytes. A key longer than the store's own bound cannot
+/// The design puts every module under
+/// `<operator>/<backend>/<revision>/<inputs>/<target>/<descriptor key>`, and a filesystem caps one file name at 255 bytes. A key longer than the store's own bound cannot
 /// name a directory at all — the write fails with `File name too long` — so the store refuses it
 /// when the path is made, with a message that says both numbers, rather than failing later in a
 /// build whose log cannot explain it.
@@ -233,6 +254,7 @@ fn a_descriptor_key_too_long_to_name_a_directory_is_refused() {
             "attention_gather_rows",
             "triton",
             0,
+            INPUTS,
             "sm_100a",
             at_limit.clone()
         )
@@ -245,6 +267,7 @@ fn a_descriptor_key_too_long_to_name_a_directory_is_refused() {
         "attention_gather_rows",
         "triton",
         0,
+        INPUTS,
         "sm_100a",
         over.clone(),
     )

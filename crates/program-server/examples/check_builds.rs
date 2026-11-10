@@ -676,10 +676,12 @@ fn a_triton_package_builds_a_cubin_module_and_resolves_it(args: &Args) -> Outcom
         "the build failed: {}",
         witness.progress[0].detail
     );
+    // The path names the revision's build inputs, which this check does not restate.
     let path = ModulePath::new(
         &package.op,
         &package.backend,
         1,
+        witness.progress[0].path.inputs.clone(),
         "sm_100a",
         &package.descriptor,
     )

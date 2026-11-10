@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use program_server::Client;
 use program_server::builder::{BuildState, Limits};
+use program_server::inputs::Inputs;
 use program_server::manifest::ModuleForm;
 use program_server::protocol::{Descriptors, Module, PrepareRequest, ProgramRequest, Selector};
 use program_server::server::{ProgramServer, ServerConfig};
@@ -253,8 +254,12 @@ fn a_vendor_cubin_is_installed_stored_and_resolved_as_it_is() {
     assert_eq!(progress.len(), 1);
     assert_eq!(progress[0].state, BuildState::Committed);
 
+    let inputs = Inputs::read(&configuration.package_root.join("paged_attention/trtllm/1"))
+        .unwrap()
+        .expect("the installation recorded its build inputs")
+        .digest();
     let module = store
-        .join("paged_attention/trtllm/1")
+        .join(format!("paged_attention/trtllm/1/{inputs}"))
         .join(target.as_str())
         .join(key);
     assert_eq!(
@@ -624,10 +629,18 @@ fn revisions(store: &Path) -> Vec<String> {
     revisions
 }
 
-/// Whether a built store holds the committed module of `key` at `revision`.
+/// Whether a built store holds the committed module of `key` at `revision`, under the build
+/// inputs that revision records.
 fn committed(store: &Path, revision: u32, key: &str) -> bool {
+    let installed = store.join(format!("packages/paged_attention/trtllm/{revision}"));
+    let inputs = Inputs::read(&installed)
+        .unwrap()
+        .expect("an installed revision records its build inputs")
+        .digest();
     store
-        .join(format!("modules/paged_attention/trtllm/{revision}/sm_100a"))
+        .join(format!(
+            "modules/paged_attention/trtllm/{revision}/{inputs}/sm_100a"
+        ))
         .join(key)
         .join(".committed")
         .is_file()
@@ -672,6 +685,63 @@ fn a_build_into_an_existing_store_keeps_the_revision_of_an_unchanged_package() {
         "a changed package kept its revision"
     );
     assert!(committed(&store, 2, "dtype_bf16_page_64"));
+}
+
+/// A store's modules are found by what built them, not by a revision number alone: a package root
+/// installed again from other files numbers its revision 1 again, and the store answers the
+/// module of those files rather than the one the earlier revision 1 committed.
+#[test]
+fn a_revision_numbered_again_never_serves_the_module_of_other_files() {
+    let temporary = tempfile::tempdir().unwrap();
+    let tree = temporary.path().join("kernels");
+    let package = cubin_tree(&tree);
+    let store = temporary.path().join("store");
+    let key = "dtype_bf16_page_64";
+    build_store(temporary.path(), &tree, &store, &[key]).unwrap();
+
+    std::fs::remove_dir_all(store.join("packages")).unwrap();
+    let mut edited = cubin_bytes();
+    edited.extend_from_slice(b"edited");
+    std::fs::write(
+        package.join(format!("artifact/module_{key}.cubin")),
+        &edited,
+    )
+    .unwrap();
+    build_store(temporary.path(), &tree, &store, &[key]).unwrap();
+    assert_eq!(revisions(&store), ["1"]);
+
+    let mut serving = configuration(
+        temporary.path(),
+        ToolchainConfig {
+            nvcc: None,
+            python: None,
+            wasm: None,
+            cargo: None,
+            max_jobs: 1,
+        },
+    );
+    serving.package_root = store.join("packages");
+    serving.store_roots[0].path = store.join("modules");
+    let server = ProgramServer::open(&serving).unwrap();
+    let program = proto::program::Program {
+        backend: "trtllm".into(),
+        revision: 1,
+        arguments: toml::Table::new(),
+    };
+    let module = server
+        .resolve(
+            "paged_attention",
+            &program,
+            &Target::new("sm_100a"),
+            key,
+            &mut |_| {},
+        )
+        .unwrap();
+    assert_eq!(
+        file_of(&module, "module.cubin"),
+        edited,
+        "the store served the module of the earlier installation's files"
+    );
 }
 
 /// A build fails with the keys it could not build, and still builds the rest.

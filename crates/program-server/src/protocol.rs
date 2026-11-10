@@ -340,6 +340,7 @@ impl From<wire::Progress> for Progress {
                 op: progress.op,
                 backend: progress.backend,
                 revision: progress.revision,
+                inputs: progress.inputs,
                 target: progress.target,
                 descriptor: progress.descriptor,
             },
