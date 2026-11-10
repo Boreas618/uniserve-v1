@@ -207,6 +207,16 @@ impl Staging {
         let parameters = proto::program::sampler::PARAMETER_COLUMNS as usize;
         self.parameters[..rows * parameters]
             .copy_from_slice(&columns.parameters[..rows * parameters]);
+        // A greedy row keeps one candidate: its largest. A greedy bucket argmaxes and reads no
+        // width, and a drawing bucket that holds the row - a prompt ending beside a drawn one, a
+        // decode beside a drawn decode - then draws from that one candidate, which is the argmax
+        // of the row's shaped logits with ties to the lowest id (`top_k` orders ties by id), the
+        // token the greedy launch sequence chooses.
+        for row in self.parameters[..rows * parameters].chunks_exact_mut(parameters) {
+            if row[proto::program::sampler::TEMPERATURE as usize] == 0.0 {
+                row[proto::program::sampler::TOP_K as usize] = 1.0;
+            }
+        }
         if columns.draws.len() != rows {
             return Err(Error::Invalid(format!(
                 "the batch states {} draw addresses for its {rows} rows",
@@ -436,13 +446,6 @@ struct Columns {
     readback: [platform::PinnedBuffer; 2],
     /// `[rows]` f32 the raw log-probability of each sampled id, read back beside it.
     logprob_readback: [platform::PinnedBuffer; 2],
-    /// One row of logits, `[vocabulary]`, read back for a greedy request whose first token is taken
-    /// on the host (see `read_sampled`): a bucket is homogeneous in its sampling path, so a prefill
-    /// bucket that ends a greedy prompt cannot argmax in its graph - the graph draws. The raw row,
-    /// which the reported log-probability is computed over.
-    logits_row: platform::PinnedBuffer,
-    /// The same row shaped, `[vocabulary]` f32: the adjusted logits the token is the argmax of.
-    shaped_row: platform::PinnedBuffer,
 }
 
 /// The width of the per-token columns and of the per-row columns, over the buckets a runner serves.
@@ -535,8 +538,6 @@ impl Columns {
                 platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
                 platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
             ],
-            logits_row: platform::PinnedBuffer::new(device, (u64::from(vocabulary) * 4) as usize)?,
-            shaped_row: platform::PinnedBuffer::new(device, (u64::from(vocabulary) * 4) as usize)?,
         })
     }
 }
@@ -584,30 +585,8 @@ struct Sampled {
     tokens: TensorView,
     /// `[rows]` f32 each sampled id's log-probability under the raw logits.
     logprobs: TensorView,
-    /// `[rows, vocabulary]` the bucket's raw logits, kept for a bucket that may hold a greedy
-    /// request's prompt ending: its first token is the argmax of that row, which the captured graph
-    /// cannot produce because a bucket is homogeneous in its sampling path.
-    ///
-    /// `None` for a decode bucket, whose variant already states which path it takes.
-    logits: Option<TensorView>,
-    /// `[rows, vocabulary]` f32 the same rows shaped - adjusted, penalized and divided by one for a
-    /// greedy row - which the prompt ending's token is the argmax of. Present with `logits`.
-    shaped: Option<TensorView>,
 }
 
-/// The largest candidate of one row: a greedy request's token.
-///
-/// The first finite value wins ties (the lowest token id, which is what `torch.max` answers for a
-/// row of distinct logits and what keeps two runs alike for a tied one), and a row whose values are
-/// all non-finite answers candidate zero rather than an arbitrary index. This is the same rule the
-/// captured `argmax` operator applies on the device, and it is here in one place so the host path
-/// and its test cannot disagree about it.
-/// How many tokens a slot had committed **before** the step whose readback is `readback`.
-///
-/// The commit table answers the sampling position after the batch, and the batch commits the row's
-/// own token, so a row that ends a prompt answers 1 and a slot that already held four answers 5. The
-/// greedy host path is valid only for the first: it argmaxes the raw logits row, and the penalties a
-/// continuing slot carries are computed by the captured sampler and not by this path.
 /// The classes of the rows a batch carries, as a reader of a refusal needs them.
 ///
 /// A device's graph serves one class: a prefill evaluates a chunk of prompt tokens and a decode one
@@ -652,56 +631,6 @@ fn largest_grid(rows: u32, merge: u32, side: u32) -> [u32; 3] {
     [1, height * merge, width * merge]
 }
 
-fn committed_before(readback: i32) -> usize {
-    usize::try_from(readback).unwrap_or(0).saturating_sub(1)
-}
-
-/// How a prompt-ending row's first token is decided (4.4), from the batch's own staged figures.
-///
-/// A prefill bucket's job is the KV cache; the sampler is a decode operator, and the prompt ending
-/// is the one token a prefill can owe the mechanism. Three cases, and only the first needs the host:
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PromptToken {
-    /// The row ends no prompt: whatever the graph drew for it is discarded.
-    Discarded,
-    /// A greedy row that has committed nothing: the host takes the argmax of its own logits row,
-    /// which is the same token the captured sampler would take - every penalty is a no-op for a
-    /// slot with no history.
-    HostArgmax,
-    /// A sampled row: its first token is the graph's draw over its penalized logits, not an argmax.
-    Draw,
-}
-
-/// The decision for one row, and the refusal when the row cannot be decided here.
-///
-/// `readback` is the slot's sampling position **after** this batch, and this batch committed the
-/// row's own token, so the figure the decision needs is [`committed_before`] of it. A greedy row
-/// with earlier commits is refused by name: its token is the argmax of *penalized* logits, which
-/// only the captured sampler computes, and argmaxing the raw row would silently answer a different
-/// request's token.
-fn prompt_token(
-    samples_nothing: bool,
-    temperature: f32,
-    slot: i32,
-    readback: i32,
-) -> Result<PromptToken> {
-    if samples_nothing {
-        return Ok(PromptToken::Discarded);
-    }
-    if temperature != 0.0 {
-        return Ok(PromptToken::Draw);
-    }
-    let committed = committed_before(readback);
-    if committed > 0 {
-        return Err(Error::Invalid(format!(
-            "a greedy row of slot {slot} ends a prompt that already holds {committed} \
-             committed token(s): its token is the argmax of its penalized logits, which only \
-             the captured sampler computes"
-        )));
-    }
-    Ok(PromptToken::HostArgmax)
-}
-
 /// The bytes the trtllm-gen paged-attention program takes as its workspace: its `workspace_size`
 /// argument. A forward reserves them from its arena ([`KvView::workspace`]) and the model clears
 /// the decode's arrival counters at its head once per forward.
@@ -718,46 +647,6 @@ fn eager_replay() -> bool {
     *EAGER.get_or_init(|| {
         std::env::var_os("UNISERVE_EAGER_REPLAY").is_some_and(|value| !value.is_empty())
     })
-}
-
-/// The largest logit that is not `best`'s, which is the gap a first-token choice was made by.
-fn runner_up(values: &[f32], best: usize) -> f32 {
-    let mut second = f32::NEG_INFINITY;
-    for (index, value) in values.iter().enumerate() {
-        if index != best && value.is_finite() && *value > second {
-            second = *value;
-        }
-    }
-    values.get(best).copied().unwrap_or(f32::NAN) - second
-}
-
-/// The raw log-probability of `index` in a row of logits: `x[index] - logsumexp(x)`, accumulated
-/// in f64 so the host's answer for a greedy prompt ending is no coarser than the device's.
-fn log_softmax_at(values: &[f32], index: usize) -> f32 {
-    let max = values
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .fold(f32::NEG_INFINITY, f32::max);
-    if !max.is_finite() {
-        return f32::NAN;
-    }
-    let total: f64 = values
-        .iter()
-        .map(|value| f64::from(*value - max).exp())
-        .sum();
-    let chosen = values.get(index).copied().unwrap_or(f32::NAN);
-    (f64::from(chosen - max) - total.ln()) as f32
-}
-
-fn argmax(values: &[f32]) -> usize {
-    let mut best = 0_usize;
-    for (index, value) in values.iter().enumerate() {
-        if value.is_finite() && (*value > values[best] || !values[best].is_finite()) {
-            best = index;
-        }
-    }
-    best
 }
 
 /// The refusal a provider that cannot install a batch's block tables gives, over the tables alone.
@@ -1692,10 +1581,13 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
         self.staging
             .stage(&batch.columns, &batch.calls, &shape, bucket)
             .map_err(refused)?;
-        // A batch is homogeneous in its sampling path, and the check is about this batch's own
-        // rows: a warm pose has no request rows, so it is made here rather than in the capture.
-        refuse_mixed_sampling(bucket.variant, self.staging.parameters(shape.rows as usize))
-            .map_err(refused)?;
+        // A greedy bucket takes no drawn row, and the check is about this batch's own rows: a warm
+        // pose has no request rows, so it is made here rather than in the capture.
+        refuse_drawn_rows_in_greedy_bucket(
+            bucket.variant,
+            self.staging.parameters(shape.rows as usize),
+        )
+        .map_err(refused)?;
         // The batch's slot rows and page copies are the replay's first work, not this thread's:
         // both are operations on this runner's stream and only the device thread issues there
         // (2.4). A table installed from here races the previous batch's replay, and the pages this
@@ -1727,8 +1619,11 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
         let bucket = self.bucket_for(&shape)?;
         self.staging
             .stage(&batch.columns, &batch.calls, &shape, bucket)?;
-        // A shadow batch is a real batch: the same homogeneity rule applies to its rows.
-        refuse_mixed_sampling(bucket.variant, self.staging.parameters(shape.rows as usize))?;
+        // A shadow batch is a real batch: the same rule applies to its rows.
+        refuse_drawn_rows_in_greedy_bucket(
+            bucket.variant,
+            self.staging.parameters(shape.rows as usize),
+        )?;
         // The operators whose kernel differs between the serving generation and the one the batch
         // names are the ones the paired forwards compare (7.3 step 2).
         let next = self.lifecycle.generation_named(batch.generation)?;
@@ -2617,134 +2512,6 @@ impl<M: TextModel> CausalLmRunner<M> {
         Ok(None)
     }
 
-    /// Reads the step's device results back and states what each call did (4.4).
-    ///
-    /// Two columns come back after the replay's stream completed: the sampled token ids the
-    /// sampling step wrote (one `i32` per sampling row) and the commit table's per-slot trajectory
-    /// position, which the commit kernel advanced. `launched` is the instant the replay was issued,
-    /// so the device segment is measured from the launch to this wait and the host segment from
-    /// there to the output.
-    ///
-    /// Replaces a greedy row's drawn token with the argmax of its shaped row, taken on the host.
-    ///
-    /// A request whose temperature is zero asks for its largest candidate, and the captured graph of
-    /// a prefill bucket draws for every row of the bucket (a bucket is homogeneous in its sampling
-    /// path, and a greedy prefill variant would double the largest graphs' memory to decide one
-    /// token). The host has the logits and the shaped rows - the arena buffer is live until the next
-    /// `begin` - so the decision is made here, once per request, before the token leaves this
-    /// process. The token is the argmax of the **shaped** row, which the graph's shaper wrote with
-    /// the row's logit adjustments (its slot's bias row, its banned tokens) and divided by one, so
-    /// it is the token the greedy graph would choose; its reported log-probability is the raw row's,
-    /// as every path reports.
-    ///
-    /// The penalties are no-ops for a row whose slot has committed nothing *before this step*, which
-    /// is what a prompt ending is: a row whose slot already held committed tokens would need the
-    /// penalized logits, which the graph computes and this path does not, so it is **refused by
-    /// name** rather than argmaxed over the raw row. The readback states the position after this
-    /// batch's own token was committed, so the row's commit is subtracted before the test.
-    fn greedy_first_tokens(
-        &mut self,
-        logits: TensorView,
-        shaped: TensorView,
-        rows: usize,
-        sampling: &[i32],
-        turn: usize,
-    ) -> Result<()> {
-        if logits.dtype != DType::F32 {
-            return Err(Error::Invalid(format!(
-                "a greedy request's first token is argmaxed on the host, which reads f32 logits, \
-                 and this deployment's logits are {}",
-                logits.dtype
-            )));
-        }
-        let width = u64::from(self.model.vocabulary());
-        let row_bytes = (width * 4) as usize;
-        if row_bytes > self.columns.logits_row.len() || row_bytes > self.columns.shaped_row.len() {
-            return Err(Error::Invariant(
-                "the logits row buffers are narrower than the vocabulary".into(),
-            ));
-        }
-        let columns = proto::program::sampler::PARAMETER_COLUMNS as usize;
-        for row in 0..rows {
-            let slot = self.staging.slots(rows)[row];
-            let readback = usize::try_from(slot)
-                .ok()
-                .and_then(|slot| sampling.get(slot).copied())
-                .unwrap_or(0);
-            let decision = prompt_token(
-                self.staging.logits_rows()[row] < 0,
-                self.staging.parameters(rows)
-                    [row * columns + proto::program::sampler::TEMPERATURE as usize],
-                slot,
-                readback,
-            )?;
-            // A drawn row keeps the graph's token, and a row that ends no prompt keeps nothing: the
-            // host answers only the greedy prompt ending.
-            if decision != PromptToken::HostArgmax {
-                continue;
-            }
-            let offset = row as u64 * width * 4;
-            // SAFETY: the sources are the row's `width` f32 inside the logits and shaped tensors the
-            // graph wrote, the destinations are this runner's pinned row buffers of that length, and
-            // the stream has completed the launches that wrote them.
-            unsafe {
-                platform::memcpy_async(
-                    self.columns.logits_row.address(),
-                    logits.ptr.address() + offset,
-                    row_bytes,
-                    &self.stream,
-                )?;
-                platform::memcpy_async(
-                    self.columns.shaped_row.address(),
-                    shaped.ptr.address() + offset,
-                    row_bytes,
-                    &self.stream,
-                )?;
-            }
-            self.stream.synchronize()?;
-            // SAFETY: the copies above filled `width` f32 in each pinned row buffer.
-            let (row_logits, row_shaped) = unsafe {
-                (
-                    std::slice::from_raw_parts(
-                        self.columns.logits_row.as_ptr().cast::<f32>(),
-                        width as usize,
-                    ),
-                    std::slice::from_raw_parts(
-                        self.columns.shaped_row.as_ptr().cast::<f32>(),
-                        width as usize,
-                    ),
-                )
-            };
-            let best = argmax(row_shaped);
-            // The first token of a prompt is the one value a serving run and a reference stack must
-            // agree on before anything downstream means anything, and a wrong token and a right one
-            // read the same in a completion. The margin says which it is: a near-tie is numerics,
-            // a wide one is a defect. Only on the host's greedy path, which is one call per prompt.
-            tracing::debug!(
-                row,
-                token = best,
-                logit = row_shaped.get(best).copied().unwrap_or(f32::NAN),
-                runner_up = runner_up(row_shaped, best),
-                "the prompt's first token was argmaxed on the host"
-            );
-            // SAFETY: the readback buffer holds `rows` i32 and `row` is inside it.
-            unsafe {
-                *self.columns.readback[turn].as_ptr().cast::<i32>().add(row) = best as i32;
-                *self.columns.logprob_readback[turn]
-                    .as_ptr()
-                    .cast::<f32>()
-                    .add(row) = log_softmax_at(row_logits, best);
-            }
-            // The graph committed its own draw as this slot's next input, and the next decode
-            // embeds what the client was told.
-            if let Ok(slot) = usize::try_from(slot) {
-                self.commit
-                    .set_next_input(slot, best as i32, &self.stream)?;
-            }
-        }
-        Ok(())
-    }
-
     /// A bucket that samples nothing answers with an empty output: nothing was measured and no call
     /// produced a token.
     fn read_sampled(&mut self, bucket: Bucket, launched: Instant) -> Result<Flight> {
@@ -2819,7 +2586,7 @@ impl<M: TextModel> CausalLmRunner<M> {
 
     /// The answer of a replay whose copies have landed.
     fn finish(&mut self, flight: Flight) -> Result<BatchOutput> {
-        let Some(samples) = flight.sampled else {
+        if flight.sampled.is_none() {
             return Ok(BatchOutput::default());
         };
         let Flight {
@@ -2848,17 +2615,6 @@ impl<M: TextModel> CausalLmRunner<M> {
                 ),
             )
         };
-        // A greedy request's first token is the argmax of its prompt-ending row, taken here on the
-        // host: the bucket is homogeneous in its sampling path, so a prefill bucket's graph draws,
-        // and a draw cannot produce a greedy token (the candidates are in token-id order before the
-        // inverse CDF). Only a bucket that kept its logits view can answer this - a decode bucket's
-        // variant already states that it is greedy, and its graph argmaxes. The tokens are corrected
-        // in place, in the buffer the copy above filled, so a step allocates nothing (4.5).
-        if let (Some(logits), Some(shaped)) = (samples.logits, samples.shaped)
-            && !bucket.variant.is_decode()
-        {
-            self.greedy_first_tokens(logits, shaped, rows, sampling, turn)?;
-        }
         // A sampled id is an INDEX into the vocabulary, so it is below `vocabulary` by contract:
         // a kernel that answers the width instead of the last index is a defect and not a token,
         // and a token one past the vocabulary reaches the tokenizer as an out-of-range id. The
@@ -2884,8 +2640,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             logical,
             sampling,
         );
-        // SAFETY: the copy above filled `rows` f32 with the sampled ids' log-probabilities, and the
-        // host argmax rewrote the rows it decided.
+        // SAFETY: the copy above filled `rows` f32 with the sampled ids' log-probabilities.
         let logprobs = unsafe {
             std::slice::from_raw_parts(
                 self.columns.logprob_readback[turn].as_ptr().cast::<f32>(),
@@ -3487,28 +3242,19 @@ impl<M: TextModel> CausalLmRunner<M> {
         let samples = Samples::reserve(arena, DType::I32, rows, true)?;
         // A greedy bucket takes each row's largest candidate; every other sampling bucket draws one
         // from the row's distribution. The two are different launch sequences in the sampler layer
-        // (`Sampler::greedy` and `Sampler::forward`), and a draw cannot produce a greedy token: the
-        // candidates are ordered by token id before the inverse CDF, so a draw of zero selects the
-        // lowest id rather than the largest logit.
-        let shaped = if bucket.variant.greedy() {
+        // (`Sampler::greedy` and `Sampler::forward`). A greedy row in a drawing bucket draws from the
+        // one candidate its staged `top_k` keeps, which is its argmax (`Staging::stage`).
+        if bucket.variant.greedy() {
             sampling.sampler.greedy(forward, logits, &state, &samples)?;
-            None
         } else {
-            Some(sampling.sampler.forward(
+            sampling.sampler.forward(
                 forward,
                 logits,
                 &state,
                 self.columns.draws.shaped(&[rows]),
                 &samples,
-            )?)
-        };
-        // A bucket that draws may end a greedy request's prompt, whose first token is the argmax of
-        // the row - a decision the graph cannot make for one row of a bucket that draws. The view
-        // is kept (the arena's buffer is live until the next `begin`, and `read_sampled` runs before
-        // that); a greedy bucket's own launch already states every token it keeps.
-        let prompt_ending = bucket.variant == ipc::execution::Variant::PrefillOutput;
-        let logits = prompt_ending.then_some(logits);
-        let shaped = shaped.filter(|_| prompt_ending);
+            )?;
+        }
         // A recording's views address no memory, so only a launching walk names where a replay's
         // tokens land.
         if !forward.is_recording() {
@@ -3519,8 +3265,6 @@ impl<M: TextModel> CausalLmRunner<M> {
                     logprobs: samples.logprobabilities.ok_or(Error::State(
                         "a sampling bucket reserved no log-probabilities",
                     ))?,
-                    logits,
-                    shaped,
                 },
             );
         }
@@ -3845,42 +3589,34 @@ fn warm_parameters(rows: usize) -> Vec<f32> {
     parameters
 }
 
-/// Refuses a decode batch whose rows disagree with the bucket's sampling path.
+/// Refuses a greedy decode bucket a row that draws.
 ///
 /// A bucket's variant fixes the sampler launch sequence for every row: [`Variant::DecodeGreedy`]
-/// argmaxes each row's penalized logits and [`Variant::DecodeSampled`] draws one token per row from
-/// its distribution. Neither sequence can serve a row of the other class - a draw cannot produce a
-/// greedy token (the candidates are ordered by token id before the inverse CDF, so a draw selects an
-/// id, not the largest logit), and an argmax is not what a row that states a temperature asked for.
-///
-/// Which requests share a batch is the batcher's decision, so the composition is not the worker's
-/// to change: it states that the batch it was handed cannot be served, naming the row and the
-/// bucket, rather than serving a token the request did not ask for. Prefill buckets are exempt - a
-/// prompt-ending greedy row inside a drawing prefill bucket is ordinary, and its first token is the
-/// host argmax of the row's kept logits (`greedy_first_tokens`).
-fn refuse_mixed_sampling(variant: ipc::execution::Variant, parameters: &[f32]) -> Result<()> {
-    if !variant.is_decode() {
+/// argmaxes each row's shaped logits and [`Variant::DecodeSampled`] draws one token per row. A
+/// drawing bucket serves a greedy row as well - the row is staged with a top-k width of one, so its
+/// draw is its argmax (`Staging::stage`) - which is what lets the batcher put greedy and drawn rows
+/// in one batch. The converse is not so: an argmax is not what a row that states a temperature
+/// asked for, so a greedy bucket holding one is a batch it cannot serve, refused by the row and the
+/// bucket rather than served with a token the request did not ask for.
+fn refuse_drawn_rows_in_greedy_bucket(
+    variant: ipc::execution::Variant,
+    parameters: &[f32],
+) -> Result<()> {
+    if !variant.greedy() {
         return Ok(());
     }
     let columns = proto::program::sampler::PARAMETER_COLUMNS as usize;
     let temperature = proto::program::sampler::TEMPERATURE as usize;
     let rows = parameters.len() / columns;
     for (row, stated) in parameters.chunks_exact(columns).enumerate() {
-        let greedy_row = stated[temperature] == 0.0;
-        if greedy_row == variant.greedy() {
+        if stated[temperature] == 0.0 {
             continue;
         }
         return Err(Error::Invariant(format!(
-            "a batch is homogeneous in its sampling path: the {} bucket holds {rows} row(s) and row \
-             {row} states temperature {}, so its token is {} and this bucket has no launch sequence \
-             for it",
+            "the {} bucket holds {rows} row(s) and row {row} states temperature {}: its token is \
+             drawn from its distribution, and a greedy bucket only takes each row's argmax",
             variant.name(),
             stated[temperature],
-            if greedy_row {
-                "the argmax of its penalized logits"
-            } else {
-                "drawn from its distribution"
-            },
         )));
     }
     Ok(())
@@ -4022,100 +3758,42 @@ mod tests {
     /// The logit row width a staging is sized for; no case here bans a token.
     const VOCABULARY_UNDER_TEST: u32 = 1_024;
 
-    /// A decode batch is homogeneous in its sampling path: a row of the other class is refused by
-    /// name rather than served by a launch sequence that cannot produce its token. A prefill bucket
-    /// is exempt, because a prompt-ending greedy row is ordinary there.
+    /// A drawing bucket serves greedy rows beside drawn ones: the staging gives each greedy row a
+    /// top-k width of one, so its draw is its largest candidate, and leaves a drawn row's width as
+    /// the request stated it. A greedy bucket still refuses a drawn row, by the bucket and the row.
     #[test]
-    fn a_decode_bucket_refuses_a_row_of_the_other_sampling_class() {
+    fn a_drawing_bucket_serves_greedy_rows_as_their_largest_candidate() -> Result<()> {
         let columns = proto::program::sampler::PARAMETER_COLUMNS as usize;
         let temperature = proto::program::sampler::TEMPERATURE as usize;
-        // One row a stated temperature, the rest of its columns the reference values: 8 floats a row,
-        // as the worker writes them.
-        let rows = |stated: &[f32]| {
-            stated
-                .iter()
-                .flat_map(|stated| {
-                    let mut row = vec![1.0_f32; columns];
-                    row[temperature] = *stated;
-                    row
-                })
-                .collect::<Vec<f32>>()
-        };
-
-        assert!(
-            refuse_mixed_sampling(ipc::execution::Variant::DecodeGreedy, &rows(&[0.0, 0.0]))
-                .is_ok(),
-            "two greedy rows were refused by a greedy bucket"
-        );
-        assert!(
-            refuse_mixed_sampling(ipc::execution::Variant::DecodeSampled, &rows(&[0.7, 1.0]))
-                .is_ok(),
-            "two sampled rows were refused by a sampling bucket"
-        );
-        assert!(
-            refuse_mixed_sampling(ipc::execution::Variant::PrefillOutput, &rows(&[0.0, 0.7]))
-                .is_ok(),
-            "a prompt-ending greedy row was refused inside a drawing prefill bucket"
-        );
-
-        let error =
-            refuse_mixed_sampling(ipc::execution::Variant::DecodeSampled, &rows(&[0.7, 0.0]))
-                .expect_err("a greedy row was drawn from in a sampling bucket");
-        let text = error.to_string();
-        assert!(
-            text.contains("decode_sampled") && text.contains("row 1"),
-            "the refusal names neither the bucket nor the row: {text}"
-        );
-        assert!(
-            text.contains("temperature 0"),
-            "the refusal does not name the temperature the row stated: {text}"
-        );
-
-        let error = refuse_mixed_sampling(ipc::execution::Variant::DecodeGreedy, &rows(&[0.5]))
-            .expect_err("a sampled row was argmaxed in a greedy bucket");
-        assert!(
-            error.to_string().contains("decode_greedy"),
-            "the refusal does not name the bucket: {error}"
-        );
-    }
-
-    /// The homogeneity check reads the **batch's** rows, and the rows the bucket pads around them
-    /// are not rows of the batch: a padded row's parameters are zero, and zero reads as a greedy
-    /// row, so a check handed the bucket's rows would refuse a perfectly homogeneous sampled batch
-    /// for the rows nobody sent.
-    ///
-    /// This is the same boundary the capture's failure was on, with a boolean instead of a count:
-    /// the figure the check reads is the batch's, the figure the graph is built from is the bucket's.
-    #[test]
-    fn the_rows_a_bucket_pads_are_not_rows_of_the_batch() -> Result<()> {
-        let buckets = Buckets::new([
-            Bucket::decode(2, Variant::DecodeSampled),
-            Bucket::decode(4, Variant::DecodeSampled),
-        ]);
+        let top_k = proto::program::sampler::TOP_K as usize;
+        let buckets = Buckets::new([Bucket::decode(4, Variant::DecodeSampled)]);
         let mut staging = Staging::new();
         staging.reserve(&buckets, VOCABULARY_UNDER_TEST)?;
-        let bucket = Bucket::decode(4, Variant::DecodeSampled);
-        let mut columns = decode_columns();
-        let stated = proto::program::sampler::PARAMETER_COLUMNS as usize;
-        for row in 0..2 {
-            columns.parameters[row * stated + proto::program::sampler::TEMPERATURE as usize] = 0.7;
-        }
+        let mut batch = decode_columns();
+        batch.parameters[temperature] = 0.7;
+        batch.parameters[top_k] = 40.0;
+        batch.parameters[columns + temperature] = 0.0;
+        batch.parameters[columns + top_k] = 40.0;
         let shape = Shape::decode(2, Variant::DecodeSampled);
-        staging.stage(&columns, &[CallId(0), CallId(1)], &shape, bucket)?;
+        let bucket = Bucket::decode(4, Variant::DecodeSampled);
+        staging.stage(&batch, &[CallId(4), CallId(5)], &shape, bucket)?;
 
-        // The batch's own rows: both sampled, so the bucket takes them.
-        assert!(
-            refuse_mixed_sampling(bucket.variant, staging.parameters(shape.rows as usize)).is_ok(),
-            "a homogeneous sampled batch was refused for rows it did not send"
+        let staged = staging.parameters(2);
+        assert_eq!(staged[top_k], 40.0, "a drawn row keeps its width");
+        assert_eq!(
+            staged[columns + top_k],
+            1.0,
+            "a greedy row keeps one candidate"
         );
-        // The bucket's rows: the two the staging padded state temperature 0, so they read as greedy
-        // rows of a sampling bucket. That is what the capture used to be refused by.
-        let error = refuse_mixed_sampling(bucket.variant, staging.parameters(bucket.rows as usize))
-            .expect_err("a padded row read as a row of the batch");
+        refuse_drawn_rows_in_greedy_bucket(bucket.variant, staged)
+            .expect("a drawing bucket takes a greedy row");
+
+        let error = refuse_drawn_rows_in_greedy_bucket(Variant::DecodeGreedy, staged)
+            .expect_err("a greedy bucket argmaxed a drawn row");
         let text = error.to_string();
         assert!(
-            text.contains("row 2") && text.contains("temperature 0"),
-            "the refusal does not name the first padded row: {text}"
+            text.contains("decode_greedy") && text.contains("row 0"),
+            "the refusal names neither the bucket nor the row: {text}"
         );
         Ok(())
     }
@@ -4142,27 +3820,6 @@ mod tests {
             error.to_string().contains("never copied"),
             "the refusal does not say what would go wrong: {error}"
         );
-    }
-
-    /// The host argmax of a greedy row is the same rule the captured `argmax` operator applies: the
-    /// largest finite value, ties to the lowest index, and a row of non-finite values answering
-    /// candidate zero rather than an arbitrary index.
-    ///
-    /// The end-to-end proof - a greedy request whose prompt spans several prefill chunks taking the
-    /// argmax of that chunk's row - belongs to the caller's run, which must compare against a
-    /// recomputed argmax and not merely against a rerun of this code: a drawn token is just as
-    /// deterministic.
-    #[test]
-    fn the_host_argmax_is_the_largest_finite_candidate_and_ties_go_to_the_lowest() {
-        assert_eq!(argmax(&[1.0, 3.0, 2.0]), 1);
-        assert_eq!(argmax(&[3.0, 1.0, 1.0]), 0);
-        // Two equal maxima: the first wins, so two runs and two implementations agree.
-        assert_eq!(argmax(&[0.5, 2.0, 2.0]), 1);
-        // A non-finite value is never a candidate, at the head or in the middle.
-        assert_eq!(argmax(&[f32::NAN, 1.5, 1.0]), 1);
-        assert_eq!(argmax(&[1.0, f32::INFINITY, 2.0]), 2);
-        // Every value non-finite: answer zero rather than an index that came from nowhere.
-        assert_eq!(argmax(&[f32::NAN, f32::NAN]), 0);
     }
 
     /// A provider that holds no cache refuses a slot row by name, because the gather would otherwise
@@ -4753,16 +4410,6 @@ mod sampled_output_tests {
         assert!(output[1].tokens.is_empty() && output[1].token_logprobs.is_empty());
     }
 
-    /// The host's score of a greedy prompt ending is the raw row's log-softmax.
-    #[test]
-    fn the_host_logprob_is_the_rows_log_softmax() {
-        // exp(0) : exp(ln 3) is 1 : 3, so the second logit holds three quarters of the mass.
-        let row = [0.0, 3.0_f32.ln(), f32::NEG_INFINITY];
-        assert!((log_softmax_at(&row, 1) - 0.75_f32.ln()).abs() < 1e-6);
-        assert!((log_softmax_at(&row, 0) - 0.25_f32.ln()).abs() < 1e-6);
-        assert_eq!(log_softmax_at(&row, 2), f32::NEG_INFINITY);
-    }
-
     /// The step's output names every call of the batch, and each call's tokens are its own rows'
     /// samples in row order, whatever order the mechanism listed the calls in.
     #[test]
@@ -4932,9 +4579,7 @@ mod sampled_output_tests {
     }
 
     /// The warm pose of a sampled bucket states a draw the sampler can make: temperature 1, every
-    /// candidate kept. A zeroed pose asks the forward to divide by a zero temperature - and it is
-    /// the very input `refuse_mixed_sampling` refuses in a real batch, which is why a capture that
-    /// ran on it was a bucket the batch check would have rejected.
+    /// candidate kept, so the capture walks the whole candidate width a served draw may need.
     #[test]
     fn a_warm_pose_states_a_draw_a_sampled_bucket_can_make() {
         let columns = proto::program::sampler::PARAMETER_COLUMNS as usize;
@@ -4946,95 +4591,5 @@ mod sampled_output_tests {
             assert_eq!(row[proto::program::sampler::TOP_P as usize], 1.0);
             assert_eq!(row[proto::program::sampler::TOP_K as usize], 0.0);
         }
-        refuse_mixed_sampling(ipc::execution::Variant::DecodeSampled, &parameters)
-            .expect("the pose of a sampled bucket is not a greedy row");
-        assert!(
-            refuse_mixed_sampling(
-                ipc::execution::Variant::DecodeSampled,
-                &vec![0.0; 2 * columns]
-            )
-            .is_err(),
-            "the zeroed pose the capture used to state is not a draw"
-        );
-    }
-
-    /// A prompt ending's own token is one the batch committed, so the readback the greedy host path
-    /// reads answers 1 for it and not 0. Refusing on that raw figure refused every deployment's
-    /// first token (the run at `091731ffb`: `a greedy row of slot 1 ends a prompt that already holds 1
-    /// committed token(s)`), and a slot that really did hold tokens is still refused.
-    #[test]
-    fn a_prompt_ending_holds_no_committed_token_before_its_own() {
-        assert_eq!(committed_before(1), 0, "a prompt ending's own token only");
-        assert_eq!(committed_before(5), 4, "four tokens before this step's");
-        assert_eq!(committed_before(0), 0, "an unread slot has none");
-        assert_eq!(
-            committed_before(-1),
-            0,
-            "a readback that never ran has none"
-        );
-    }
-
-    /// **A greedy prompt ending is argmaxed on the host.** The row is greedy (temperature zero), it
-    /// ends a prompt (the readback states the position after its own commit, so one means none
-    /// before it), and its token is the argmax of its own logits row - the same token the captured
-    /// sampler would take, because every penalty is a no-op for a slot with no history.
-    ///
-    /// The device half - the copy of the row out of the arena and the readback the mechanism reads -
-    /// is the caller's run; what is stated here is the decision and the argmax it rests on.
-    #[test]
-    fn a_greedy_prompt_ending_is_argmaxed_on_the_host() {
-        assert_eq!(
-            prompt_token(false, 0.0, 3, 1).expect("a prompt ending that committed only its own"),
-            PromptToken::HostArgmax
-        );
-        // The token is the largest value of the row, and a tie is the lowest index.
-        assert_eq!(argmax(&[0.5, 9.0, 9.0, -3.0]), 1);
-        // A non-finite value is never the largest: the first finite value wins over a NaN before it,
-        // and a row with no finite value has no largest candidate to name.
-        assert_eq!(argmax(&[f32::NAN, 2.0, 1.5]), 1);
-        assert_eq!(argmax(&[f32::NAN, f32::NEG_INFINITY]), 0);
-        assert_eq!(argmax(&[f32::NAN, f32::NEG_INFINITY, f32::NAN]), 0);
-    }
-
-    /// **A sampled prompt ending is NOT argmaxed**: its first token is the graph's draw over the
-    /// penalized logits. The host leaves the drawn token alone, and the decision is taken before any
-    /// history is consulted - a sampled slot may hold as much history as it has decoded, because the
-    /// captured sampler is what applies the penalties.
-    #[test]
-    fn a_sampled_prompt_ending_is_drawn_and_not_argmaxed() {
-        for readback in [1, 9, -1] {
-            assert_eq!(
-                prompt_token(false, 0.7, 3, readback)
-                    .expect("a sampled row is decided by the draw"),
-                PromptToken::Draw,
-                "a sampled prompt ending was argmaxed on the host, which would answer the largest                  candidate instead of a token of its distribution"
-            );
-        }
-        // A row that ends no prompt is discarded whatever its temperature: the graph drew for it in
-        // a bucket that draws, and the draw belongs to no call.
-        for temperature in [0.0, 1.0] {
-            assert_eq!(
-                prompt_token(true, temperature, 3, 1).expect("a row that ends no prompt"),
-                PromptToken::Discarded
-            );
-        }
-    }
-
-    /// **A greedy row with a committed history is refused by name.** Its token is the argmax of the
-    /// *penalized* logits, which only the captured sampler computes; argmaxing the raw row would
-    /// answer a different request's token, so the row is refused with both figures rather than
-    /// served with the wrong one.
-    #[test]
-    fn a_greedy_row_with_a_committed_history_is_refused_by_name() {
-        let refusal = prompt_token(false, 0.0, 7, 5).expect_err("four tokens before this step's");
-        assert!(
-            matches!(refusal, Error::Invalid(_)),
-            "a row that cannot be decided here was not stated as a refusal: {refusal:?}"
-        );
-        let text = refusal.to_string();
-        assert!(
-            text.contains("slot 7") && text.contains("4 committed token"),
-            "the refusal names neither the slot nor the history it found: {text}"
-        );
     }
 }

@@ -1251,11 +1251,10 @@ impl BatchColumns {
 /// a batch of greedy prompt endings and a batch that ends no prompt both have no use for. So those
 /// two take the greedy tail, and only a batch with a drawing row pays for the draw.
 ///
-/// **One rule keeps the two paths of a prompt ending agreeing:** in such a batch, a draw is replaced on the
-/// host by the argmax of the row's own logits **only for a strictly greedy row whose slot held
-/// nothing before the step**. Every penalty is the identity over an empty history, so the draw and
-/// the argmax answer the same token there; a row with history is refused by name, because its token
-/// is the argmax of the *penalized* logits, which only the captured sampler computes.
+/// **A greedy row in a drawing bucket is served by the draw:** the worker stages it with a top-k
+/// width of one, so its candidate set is its largest shaped logit and its draw selects it, the
+/// token the greedy launch sequence would choose (ties to the lowest id on both paths). A batch may
+/// therefore mix greedy and drawn rows, prompt endings or decodes, and is served as a drawing one.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum Variant {
     /// Decode rows drawn from the slot state, sampled greedily.
@@ -1420,8 +1419,8 @@ impl Variant {
     /// rather than by drawing one (4.4's greedy path).
     ///
     /// A greedy request states temperature zero, whose shaping divides by one, so the row's largest
-    /// candidate *is* its token. No draw can produce it - the draw runs in token-id order - so the
-    /// two are separate launch sequences and a bucket is homogeneous in which one it takes. A
+    /// candidate *is* its token. A bucket of greedy rows takes the argmax launch sequence; one with
+    /// a drawn row draws, and serves its greedy rows as a draw over their one largest candidate. A
     /// prefill that ends no prompt keeps no token, so it takes the cheaper of the two.
     pub const fn greedy(self) -> bool {
         matches!(

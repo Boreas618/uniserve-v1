@@ -23,10 +23,8 @@
 //! The reported log-probabilities are the raw distribution's: `log_softmax` of the model's logits
 //! before the logit adjustments, penalties, temperature and filtering - vLLM's default
 //! (`logprobs_mode = raw_logprobs`), so a logit bias, an allowed set or a banned token changes which
-//! token is chosen and not the score reported for it. A draw writes them over the candidate
-//! ordering's counts once that ordering is done, so the shaped row survives the step for the host's
-//! greedy prompt ending (`Sampler::forward`); a greedy step writes them over its shaped row after
-//! its argmax.
+//! token is chosen and not the score reported for it. Both paths write them over the shaped row
+//! once the selection no longer reads it.
 //!
 //! ## Logit adjustments
 //!
@@ -58,13 +56,14 @@
 //!
 //! ## Greedy rows
 //!
-//! A row whose temperature is zero is **not** a draw: it is [`Sampler::greedy`]'s row. The shaper
-//! divides such a row by one rather than by zero (`ops::sampler`'s doc cites the rule), so the row's
-//! shaped logits keep the logits' order and its largest candidate is the temperature-zero token. The
-//! temperature of each row is a request parameter, so the worker knows which rows are greedy and
-//! routes them: `argmax` over the row's logits for those, this path's draw for the rest. No draw can
-//! replace that step, because the draw path's candidates are sorted by token id before the CDF, so
-//! a draw of zero selects the lowest token id rather than the largest logit.
+//! A row whose temperature is zero asks for its largest shaped logit. The shaper divides such a row
+//! by one rather than by zero (`ops::sampler`'s doc cites the rule), so the row's shaped logits keep
+//! the logits' order and its largest candidate is the temperature-zero token. A bucket of greedy
+//! rows takes [`Sampler::greedy`]'s launch sequence, an argmax. A greedy row in a drawing bucket -
+//! beside a drawn row in the same batch - is staged with a top-k width of one, so its candidate set
+//! is that one token and its draw, whatever the uniform, selects it: the candidates sorted by token
+//! id before the CDF are a set of one. The two paths agree on ties, because `top_k` orders equal
+//! scores by ascending id and `argmax` answers the lowest index.
 //!
 //! ## Rows that cannot be sampled
 //!
@@ -282,9 +281,9 @@ impl Sampler {
     /// token whatever order the top-k program kept the candidates in. Greedy rows do not go
     /// through this method at all — see [`Self::greedy`].
     ///
-    /// Answers the `[rows, vocabulary]` f32 shaped logits, which the step leaves intact in the
-    /// forward's arena: a greedy prompt ending served by a drawing bucket is the argmax of its
-    /// shaped row, which the host takes from there.
+    /// A greedy row (temperature zero) is shaped with a divisor of one and drawn from the
+    /// candidates its `top_k` keeps; the worker stages a width of one for it, so its draw is the
+    /// argmax of its shaped row and a drawing bucket serves greedy rows beside drawn ones.
     pub fn forward(
         &self,
         f: &Forward,
@@ -292,7 +291,7 @@ impl Sampler {
         state: &SamplerState,
         draws: TensorView,
         samples: &Samples,
-    ) -> Result<TensorView> {
+    ) -> Result<()> {
         let vocabulary = u64::from(self.vocabulary);
         let width = u64::from(self.width);
         let rows = self.check(logits, state, samples)?;
@@ -367,17 +366,11 @@ impl Sampler {
 
         f.operate::<InverseCdf>(&draw, args)?;
 
-        // 5. The reported log-probabilities. The ordering's counts are dead once the candidates
-        // are ordered, and they are as wide as a row of scores, so they hold the scores: the step
-        // reserves nothing more for them and the shaped row stays intact.
-        let scratch = TensorView::new(
-            candidates.counts.ptr,
-            DType::F32,
-            Shape::new(&[rows, vocabulary]),
-        );
-        self.report(f, logits, scratch, samples)?;
+        // 5. The reported log-probabilities. The shaped row is dead once the draw has read the
+        // candidates, so it holds the scores and the step reserves nothing more for them.
+        self.report(f, logits, candidates.shaped, samples)?;
 
-        Ok(candidates.shaped)
+        Ok(())
     }
 
     /// Adjust, penalize and temperature-scale `logits` into `out`, as both paths do.
@@ -703,8 +696,9 @@ impl Sampler {
     /// greedy request honours its logit bias, its allowed set and its banned tokens, as vLLM's
     /// greedy sampler does. It runs the same shaper as [`Self::forward`] and nothing
     /// else: no candidate set, no cutoffs, no draw. It is a separate launch sequence
-    /// rather than a branch inside `forward`, because the worker's buckets are homogeneous in the
-    /// path their rows take and a bucket's captured plan is one of the two.
+    /// rather than a branch inside `forward`, because a bucket's captured plan is one of the two:
+    /// a bucket whose rows are all greedy takes this one, and a bucket with a drawn row takes
+    /// `forward`, which serves its greedy rows as a draw over their one largest candidate.
     pub fn greedy(
         &self,
         f: &Forward,
@@ -946,29 +940,6 @@ impl CommitColumns {
     /// The slots the per-slot state columns address.
     pub(crate) fn slots(&self) -> usize {
         self.slots as usize
-    }
-
-    /// States slot `slot`'s next input, for a token the host chose after the graph drew another.
-    pub(crate) fn set_next_input(
-        &self,
-        slot: usize,
-        token: i32,
-        stream: &platform::Stream,
-    ) -> Result<()> {
-        let offset = (slot * std::mem::size_of::<i32>()) as u64;
-        // SAFETY: the column holds one i32 per slot and the caller's slot is inside it; no launch
-        // that reads the column is in flight, and the wait below ends the copy's use of the source.
-        unsafe {
-            *self.future.host.as_ptr().cast::<i32>().add(slot) = token;
-            platform::memcpy_async(
-                self.future.device.ptr.address() + offset,
-                self.future.host.address() + offset,
-                std::mem::size_of::<i32>(),
-                stream,
-            )?;
-        }
-        stream.synchronize()?;
-        Ok(())
     }
 
     /// Moves the columns the host rewrites or reads to device storage. The others hold values no

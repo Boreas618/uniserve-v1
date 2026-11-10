@@ -682,11 +682,9 @@ impl Context {
 /// - a prefill projects last hidden states exactly when a row's logits are
 ///   wanted, which `logits_rows` names with a row index or `-1`;
 /// - a decode is served greedily only when no row draws. `ops::sampler` divides
-///   a temperature-zero row by one and leaves its order, and **no draw path
-///   produces a greedy token** — `argmax` is a separate step of the sampler — so
-///   a greedy row served from the sampler graph would sample where its request
-///   asked for the largest candidate. One batch serves one variant, so a burst
-///   that mixes greedy and sampling rows is sampled.
+///   a temperature-zero row by one and leaves its order, so an all-greedy batch
+///   takes the cheaper argmax tail; a burst that mixes greedy and sampling rows is sampled, and the worker
+///   serves its greedy rows as a draw over their one largest candidate.
 ///
 /// A prefill's prompt endings choose the same way: a batch whose endings are all greedy takes no
 /// draw, because the draw is the expensive tail of the graph.
