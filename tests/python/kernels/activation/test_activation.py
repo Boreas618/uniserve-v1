@@ -33,4 +33,3 @@ def test_an_activation_matches_its_reference_on_the_interpreter(check):
 @pytest.mark.parametrize("op", ["swiglu", "value_first_swiglu"])
 def test_a_gated_activation_matches_its_reference_on_the_interpreter(op):
     interpreted(FAMILY / "swiglu_check.py", "--op", op)
-
