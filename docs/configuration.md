@@ -368,6 +368,8 @@ The workers' always-on profiling: the fence probes at the entry and exit of the 
 | `max_bytes` | `20000000` | Largest input image, fetched or `data:` |
 | `allow_private` | `false` | Allow image URLs resolving to loopback, private, link-local, unique-local or cloud metadata addresses |
 
+A chat family that takes images (Qwen3.6-35B-A3B, BF16 and NVFP4) serves `image_url` parts, URLs and `data:` URIs alike, when its checkpoint holds the vision tower and its processor files (`preprocessor_config.json`, `video_preprocessor_config.json`). Each image is sized by the processor's rule (`smart_resize` to whole 32-pixel merged tokens within the processor's pixel bounds, its EXIF orientation applied) and takes as many cache tokens as merged tokens, which count against `max_model_len` and, with the prompt, against `max_num_batched_tokens`. The rank holds eight images' features at once, each slot sized for the largest image the processor admits, so a request reads at most eight images. Every other family refuses an image part with `unsupported feature image_input`.
+
 ### `video_config`
 
 **Destination: build config.**
