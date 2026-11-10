@@ -135,14 +135,15 @@ pub async fn pipeline_tokenizer(
     let path = pipeline
         .component_file("tokenizer", "tokenizer.json")
         .await?;
-    let tokenizer = match pipeline
+    let config = match pipeline
         .component_file("tokenizer", "tokenizer_config.json")
         .await
     {
-        Ok(config) => HuggingFaceTokenizer::with_config(&path, &config)?,
-        Err(crate::model::assets::Error::MissingFile { .. }) => HuggingFaceTokenizer::new(&path)?,
+        Ok(config) => Some(config),
+        Err(crate::model::assets::Error::MissingFile { .. }) => None,
         Err(error) => return Err(error.into()),
     };
+    let tokenizer = HuggingFaceTokenizer::load(&path, config.as_deref())?;
     Ok(tokenizer)
 }
 
@@ -204,7 +205,10 @@ impl ModelConfig {
         }
 
         let files = ResolvedModelFiles::new(model).await?;
-        let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&files.tokenizer_path)?);
+        let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::load(
+            &files.tokenizer_path,
+            files.tokenizer_config_path.as_deref(),
+        )?);
         let model = Self::from_files(catalogue, &files, max_model_len, tokenizer.as_ref()).await?;
         // No served model's template renders image parts: the families whose
         // prompts carried images are not served by this daemon.
@@ -588,5 +592,69 @@ impl InputProcessor {
         let core = super::sampling::resolve_sampling(&self.tokenizer, defaults, sampling, seed)?;
 
         Ok((core, max_tokens, stop_token_ids))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokenizers::models::bpe::{BPE, Vocab};
+    use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
+
+    use super::*;
+
+    /// A chat checkpoint's tokenizer registers the tokens its
+    /// `tokenizer_config.json` declares and its `tokenizer.json` lacks, as
+    /// `transformers` loads it: a declared `<d>` encodes as one token.
+    #[tokio::test]
+    async fn a_chat_tokenizer_registers_the_tokens_its_configuration_declares() {
+        let directory = tempfile::tempdir().unwrap();
+        let vocab = ["<unk>", "a", "b", "<", ">", "d", "<|im_end|>"]
+            .into_iter()
+            .enumerate()
+            .map(|(id, token)| (token.to_owned(), id as u32))
+            .collect::<Vocab>();
+        let model = BPE::builder()
+            .vocab_and_merges(vocab, Vec::new())
+            .unk_token("<unk>".to_owned())
+            .build()
+            .unwrap();
+        let mut tokenizer = TokenizerBuilder::new(model);
+        tokenizer.add_special_tokens(&[AddedToken::from("<|im_end|>", true)]);
+        tokenizer
+            .save(directory.path().join("tokenizer.json"), false)
+            .unwrap();
+        std::fs::write(
+            directory.path().join("config.json"),
+            r#"{"model_type": "chat", "max_position_embeddings": 64}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("tokenizer_config.json"),
+            r#"{
+                "eos_token": "<|im_end|>",
+                "added_tokens_decoder": {
+                    "7": {"content": "<d>", "lstrip": false, "normalized": false,
+                          "rstrip": false, "single_word": false, "special": true}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let catalogue = processing::Catalogue::new([crate::test_support::CHAT]).unwrap();
+        let loaded = ModelConfig::load(
+            directory.path().to_str().unwrap(),
+            None,
+            &proto::config::ChatConfig::default(),
+            &catalogue,
+        )
+        .await
+        .unwrap();
+
+        let marker = loaded
+            .tokenizer
+            .token_to_id("<d>")
+            .expect("<d> is registered");
+        assert_eq!(marker, 7);
+        assert_eq!(loaded.tokenizer.encode("a<d>b", false).unwrap(), [1, 7, 2]);
     }
 }

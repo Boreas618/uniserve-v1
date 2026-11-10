@@ -127,8 +127,13 @@ fn try_resolved_model(
         chat_template_path: None,
         config_path: Some(config_path),
     };
-    let tokenizer: DynTokenizer =
-        Arc::new(HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap());
+    let tokenizer: DynTokenizer = Arc::new(
+        HuggingFaceTokenizer::load(
+            &files.tokenizer_path,
+            files.tokenizer_config_path.as_deref(),
+        )
+        .unwrap(),
+    );
     let renderer = HfChatRenderer::new(
         Some(CHAT_TEMPLATE.to_string()),
         HashMap::new(),

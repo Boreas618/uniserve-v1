@@ -1,9 +1,8 @@
 //! Tokenizer abstraction, Hugging Face implementation, and incremental decoding.
 //!
 //! `HuggingFaceTokenizer` loads a model's `tokenizer.json` through `fastokens`
-//! (with `HuggingFaceTokenizer::with_config`, as a diffusers pipeline's
-//! tokenizer component is loaded, also the special tokens its
-//! `tokenizer_config.json` declares) and serves both directions of the text
+//! with the tokens its `tokenizer_config.json` declares, as `transformers`
+//! loads a checkpoint (`HuggingFaceTokenizer::load`), and serves both directions of the text
 //! path: `input::processor`, `input::omni`, and the `model::omni` prompt
 //! builders encode prompts into token IDs (`input::sampling` also encodes
 //! bad words), and the output stages in `output::text` and

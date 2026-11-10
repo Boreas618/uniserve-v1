@@ -74,35 +74,29 @@ pub struct HuggingFaceTokenizer {
 }
 
 impl HuggingFaceTokenizer {
-    /// Loads tokenizer data and derives special-token lookup tables.
+    /// Loads a tokenizer the way `transformers` loads a checkpoint's
+    /// directory: the `tokenizer.json` at `path` plus the tokens the
+    /// `tokenizer_config.json` at `config`, when the checkpoint publishes one,
+    /// declares and the definition lacks.
     ///
-    /// Returns a tokenizer error when `fastokens` cannot load `path`.
-    pub fn new(path: &Path) -> Result<Self> {
-        info!(path = %path.display(), "loading configured Hugging Face tokenizer");
-        let tokenizer = FastokensTokenizer::from_file(path)
-            .map_err(|error| tokenizer_error!("failed to load tokenizer: {}", error.as_report()))?;
-        Ok(Self::from_fastokens(tokenizer))
-    }
-
-    /// Loads a tokenizer the way `transformers` loads its directory: the
-    /// `tokenizer.json` at `path` plus the tokens the `tokenizer_config.json`
-    /// at `config` declares and the definition lacks.
-    ///
-    /// A checkpoint may declare special tokens only in its configuration;
-    /// MiniMax-H3's `<d>` dialogue marker is one. `transformers` registers
-    /// them when it loads the tokenizer, so a prompt containing one encodes
-    /// it as a single token; `register_declared_tokens` states the rule.
+    /// A checkpoint may declare tokens only in its configuration
+    /// (`added_tokens_decoder`); MiniMax-H3's `<d>` dialogue marker is one.
+    /// `transformers` registers them when it loads the tokenizer, so a prompt
+    /// containing one encodes it as a single token; `register_declared_tokens`
+    /// states the rule.
     ///
     /// Returns a tokenizer error when either file cannot be read or parsed,
-    /// or when `fastokens` cannot build the extended definition.
-    pub fn with_config(path: &Path, config: &Path) -> Result<Self> {
+    /// or when `fastokens` cannot build the definition.
+    pub fn load(path: &Path, config: Option<&Path>) -> Result<Self> {
         info!(
             path = %path.display(),
-            config = %config.display(),
+            config = ?config.map(Path::display),
             "loading configured Hugging Face tokenizer"
         );
         let mut definition = read_json(path)?;
-        register_declared_tokens(&mut definition, &read_json(config)?)?;
+        if let Some(config) = config {
+            register_declared_tokens(&mut definition, &read_json(config)?)?;
+        }
         Self::from_json(definition)
     }
 
@@ -455,7 +449,8 @@ mod tests {
         let mut tokenizer = tiny_bpe_tokenizer();
         tokenizer.add_special_tokens(&[AddedToken::from("<|im_end|>", true)]);
         let (_directory, path) = save_tokenizer(&tokenizer);
-        let configured = HuggingFaceTokenizer::new(&path).expect("load configured tokenizer");
+        let configured =
+            HuggingFaceTokenizer::load(&path, None).expect("load configured tokenizer");
 
         // The tiny BPE tokenizer has no decoder, so this decodes through
         // `fastokens` rather than the byte-level fast path.
@@ -507,7 +502,8 @@ mod tests {
         let directory = tempdir().expect("create tokenizer directory");
         let path = directory.path().join("tokenizer.json");
         std::fs::write(&path, BYTE_LEVEL_TOKENIZER).expect("write tokenizer");
-        let configured = HuggingFaceTokenizer::new(&path).expect("load configured tokenizer");
+        let configured =
+            HuggingFaceTokenizer::load(&path, None).expect("load configured tokenizer");
         let value = serde_json::from_str(BYTE_LEVEL_TOKENIZER).expect("parse tokenizer");
         let provider = fastokens::Tokenizer::from_json(value).expect("load provider tokenizer");
         (directory, configured, provider)
@@ -579,7 +575,7 @@ mod tests {
         )
         .expect("write tokenizer config");
         let configured =
-            HuggingFaceTokenizer::with_config(&path, &config).expect("load configured tokenizer");
+            HuggingFaceTokenizer::load(&path, Some(&config)).expect("load configured tokenizer");
 
         for (token, id) in [("<|pad|>", 11), ("<d>", 12), ("</d>", 13), ("H", 1)] {
             assert_eq!(configured.token_to_id(token), Some(id), "{token}");

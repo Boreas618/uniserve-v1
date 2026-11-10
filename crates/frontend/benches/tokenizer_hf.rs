@@ -31,7 +31,7 @@ impl BenchFixture {
             .build()?
             .model(MODEL_ID.to_string())
             .get("tokenizer.json")?;
-        let tokenizer = HuggingFaceTokenizer::new(&path)?;
+        let tokenizer = HuggingFaceTokenizer::load(&path, None)?;
         let text = SAMPLE_TEXT.repeat(32);
         let token_ids = tokenizer.encode(&text, false)?;
         tokenizer.decode(&token_ids, false)?;

@@ -312,7 +312,11 @@ mod tests {
         crate::model::assets::Result<ModelConfig>,
     ) {
         let (directory, files) = configured_files(model_type);
-        let tokenizer = HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap();
+        let tokenizer = HuggingFaceTokenizer::load(
+            &files.tokenizer_path,
+            files.tokenizer_config_path.as_deref(),
+        )
+        .unwrap();
         let catalogue = Catalogue::new([CHAT, VIDEO]).unwrap();
         let config = ModelConfig::from_files(&catalogue, &files, None, &tokenizer).await;
         (directory, tokenizer, config)
