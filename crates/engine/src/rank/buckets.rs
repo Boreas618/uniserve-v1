@@ -153,9 +153,10 @@ pub(super) fn served_phases(buckets: &Buckets, verifies: bool) -> Vec<PhaseId> {
     let mut kinds: Vec<scheduler::PhaseKind> = buckets
         .iter()
         .map(|bucket| match bucket.variant {
-            Variant::PrefillWrite | Variant::PrefillOutput | Variant::PrefillGreedy => {
-                scheduler::PhaseKind::Prefill
-            }
+            Variant::PrefillWrite
+            | Variant::PrefillOutput
+            | Variant::PrefillGreedy
+            | Variant::PrefillScored => scheduler::PhaseKind::Prefill,
             Variant::DecodeGreedy | Variant::DecodeSampled => scheduler::PhaseKind::Decode,
             Variant::Encode => scheduler::PhaseKind::TextEncoding,
             Variant::Denoise => scheduler::PhaseKind::Denoise,

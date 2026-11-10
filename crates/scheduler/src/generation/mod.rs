@@ -389,22 +389,27 @@ pub(super) fn plan_prompt(
         .last()
         .is_some_and(|block| block.offset == end.saturating_sub(start))
         && end as usize == request.prompt_token_ids.len();
-    call.vision_inputs = blocks;
-    let ends_prompt = end as usize == request.prompt_token_ids.len();
-    if !samples || !ends_prompt || ends_with_block {
-        return finish_plan(request, call, 0);
-    }
-    call.token_output = Some(output_tensor(0, DType::I64));
-    call.sampling_state = sampling_state;
-    // Prompt position zero reports no logprob, so a chunk starting there
-    // covers one position fewer; `validate_generation_result` recovers the
-    // same offset from the call's coordinates.
-    let prompt_positions = if request.sampling.prompt_logprobs_requested() {
-        end.saturating_sub(start)
-            .saturating_sub(u32::from(start == 0))
+    // A text chunk of a request that asks for prompt logprobs scores the prompt token after each
+    // of its tokens: the next input token, and after its last the next chunk's first, so the
+    // prompt is scored at every position but its first. A chunk with image blocks scores
+    // nothing, as it extends no prompt (`is_prompt_extend`).
+    let prompt_positions = if request.sampling.prompt_logprobs_requested() && blocks.is_empty() {
+        let scores = ipc::PromptScores {
+            next: request.prompt_token_ids.get(end as usize).copied(),
+        };
+        let scored = scores.targets(&call.input_token_ids).count();
+        call.prompt_scores = Some(scores);
+        u32::try_from(scored).unwrap_or(u32::MAX)
     } else {
         0
     };
+    call.vision_inputs = blocks;
+    let ends_prompt = end as usize == request.prompt_token_ids.len();
+    if !samples || !ends_prompt || ends_with_block {
+        return finish_plan(request, call, prompt_positions);
+    }
+    call.token_output = Some(output_tensor(0, DType::I64));
+    call.sampling_state = sampling_state;
     finish_plan(request, call, prompt_positions)
 }
 
@@ -879,16 +884,15 @@ pub(crate) fn validate_generation_result(
         }
     }
 
-    // Prompt logprobs cover every input token of a prompt-extending prefill
-    // except prompt position zero, so a chunk starting there reports one
-    // position fewer; this reads only the call's stated coordinates, not
-    // request progress, which cancellation may have stopped.
-    let prompt_tokens = (is_prompt_extend(call) && request.sampling.prompt_logprobs_requested())
-        .then(|| {
-            &call.input_token_ids[usize::from(
-                call.coordinates.logical_position == 0 && !call.input_token_ids.is_empty(),
-            )..]
-        });
+    // A prefill that scores its prompt reports one position per prompt token
+    // after each of its input tokens (`ipc::PromptScores`): its own tokens but
+    // the first, then the next chunk's first. This reads only what the call
+    // states, not request progress, which cancellation may have stopped.
+    let prompt_tokens = call
+        .prompt_scores
+        .filter(|_| is_prompt_extend(call) && request.sampling.prompt_logprobs_requested())
+        .map(|scores| scores.targets(&call.input_token_ids).collect::<Vec<u32>>());
+    let prompt_tokens = prompt_tokens.as_deref();
     match (
         prompt_tokens,
         (!record.prompt_logprobs.is_empty()).then_some(record.prompt_logprobs.as_slice()),
@@ -1268,6 +1272,28 @@ mod tests {
             generated_token_ids: Vec::new(),
             adapter: 0,
         }
+    }
+
+    /// A request that asks for prompt logprobs scores its prompt at every position but its first,
+    /// however it is chunked: each chunk scores the token after each of its own, its last scoring
+    /// the next chunk's first, and the chunk that ends the prompt scores nothing after it. A request
+    /// that asks for none scores nothing.
+    #[test]
+    fn a_chunked_prompt_is_scored_at_every_position_but_its_first() {
+        let mut asking = request(10);
+        asking.sampling.return_prompt_logprobs = true;
+        let plan = |request: &GenerationRequest, start, end| {
+            plan_prompt(request, start, end, Vec::new(), 0, None, true).expect("a prompt range")
+        };
+        let scored = |call: &Call| {
+            call.prompt_scores
+                .map(|scores| scores.targets(&call.input_token_ids).collect::<Vec<_>>())
+        };
+        let first = plan(&asking, 0, 4);
+        let second = plan(&asking, 4, 10);
+        assert_eq!(scored(&first), Some(vec![1, 2, 3, 4]));
+        assert_eq!(scored(&second), Some(vec![5, 6, 7, 8, 9]));
+        assert_eq!(scored(&plan(&request(10), 0, 10)), None);
     }
 
     /// A prompt longer than one batch's budget is split, and only the chunk that ends it draws. The

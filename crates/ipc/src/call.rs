@@ -312,6 +312,30 @@ pub struct Call {
     /// encoder cache spared and whichever engine the request resumed on.
     /// Absent on every other call.
     pub latent_draw: Option<u32>,
+    /// What a prompt prefill scores, when its request asks for prompt logprobs: every input
+    /// token's logits score the token after it. Absent for every other call.
+    pub prompt_scores: Option<PromptScores>,
+}
+
+/// The prompt tokens a prefill scores (`Call::prompt_scores`): each input token's logits score
+/// the next input token, and the last input token's score `next`.
+///
+/// So a prompt is scored at every position but its first, however it is chunked: a chunk scores
+/// the token after each of its own, and the first token of the next chunk is scored by this
+/// chunk's last token, as vLLM's prompt logprobs are aligned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PromptScores {
+    /// The prompt token after the call's last input token; `None` when the call ends the prompt,
+    /// whose last token scores no prompt token.
+    pub next: Option<u32>,
+}
+
+impl PromptScores {
+    /// The prompt tokens a call of `inputs` scores, in input order: every input but the first,
+    /// then `next`.
+    pub fn targets<'a>(&self, inputs: &'a [u32]) -> impl Iterator<Item = u32> + 'a {
+        inputs.iter().skip(1).copied().chain(self.next)
+    }
 }
 
 /// Where an encoder call's output lies in the host encoder pool
@@ -419,6 +443,7 @@ impl Call {
             latent_restore: None,
             host_output: None,
             latent_draw: None,
+            prompt_scores: None,
         }
     }
 

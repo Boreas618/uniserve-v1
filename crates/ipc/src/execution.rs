@@ -791,6 +791,13 @@ pub struct BatchColumns {
     /// The logit adjustments the sampler applies before penalties, temperature and filtering:
     /// the slots' logit bias and allowed sets, and each row's banned tokens.
     pub adjustments: LogitAdjustments,
+    /// `[tokens]` the prompt token each token's logits score, `-1` for a token that scores none;
+    /// empty for a batch that scores no prompt token. A call that scores its prompt
+    /// ([`crate::Call::prompt_scores`]) names, for each of its tokens, the prompt token after it:
+    /// the next input token, and for its last the first prompt token after the call, so a prompt
+    /// is scored at every position but its first however it is chunked (vLLM's alignment). A
+    /// batch that names one is served by [`Variant::PrefillScored`].
+    pub targets: Vec<i32>,
     /// The request slots this batch starts a request's sampling state on, strictly increasing by
     /// slot: the batch carrying a request's first token call on a worker names its slot, and the
     /// worker sets the slot's penalty counts to the request's own history before the batch
@@ -1207,6 +1214,23 @@ impl BatchColumns {
         if self.page_size == 0 {
             return Err(ValidationError::message("the batch's page size is zero"));
         }
+        if !self.targets.is_empty() && self.targets.len() != tokens {
+            return Err(ValidationError::message(format!(
+                "targets has {} entries, the batch has {tokens} tokens",
+                self.targets.len()
+            )));
+        }
+        if self.targets.iter().any(|target| *target >= 0) != shape.variant.scores() {
+            return Err(ValidationError::message(format!(
+                "a {} batch {} prompt targets",
+                shape.variant,
+                if shape.variant.scores() {
+                    "names no"
+                } else {
+                    "names"
+                }
+            )));
+        }
         if !self.checkpoints.is_empty() && self.checkpoints.len() != rows {
             return Err(ValidationError::message(format!(
                 "checkpoints has {} entries, the batch has {rows} rows",
@@ -1278,6 +1302,7 @@ impl BatchColumns {
 /// | [`Variant::PrefillWrite`] | the KV cache | runs over every row, and every row's draw is discarded (`logits_rows` are all `-1`) |
 /// | [`Variant::PrefillOutput`] | the KV cache **and** every sampling row's logits | runs over every row of the bucket; a row that ends a prompt keeps its token |
 /// | [`Variant::PrefillGreedy`] | the same, for a batch whose prompt endings are all greedy | runs, greedily |
+/// | [`Variant::PrefillScored`] | the same, and the scores of every prompt token the batch's `targets` name | runs over every row, one draw per row |
 /// | [`Variant::DecodeGreedy`] | one token per row | runs, greedily |
 /// | [`Variant::DecodeSampled`] | one token per row | runs, one draw per row |
 ///
@@ -1304,6 +1329,15 @@ pub enum Variant {
     /// A [`Self::PrefillOutput`] whose rows that end a prompt are all greedy: each row's first
     /// token is the argmax of its shaped logits, and nothing is drawn.
     PrefillGreedy,
+    /// A [`Self::PrefillOutput`] that also scores prompt tokens (`prompt_logprobs`): every token
+    /// whose target the batch names ([`BatchColumns::targets`]) has its logits projected and its
+    /// target's log-probability, rank and candidates reported on the raw distribution.
+    ///
+    /// A variant of its own because the scoring projects every token of the bucket rather than
+    /// one per row, which a prefill that scores nothing does not pay for: a batch none of whose
+    /// requests asks for prompt logprobs is served by the other prefill variants, with their
+    /// launches. Its prompt endings are drawn, a greedy one as a draw over its largest candidate.
+    PrefillScored,
     /// One encode of prompt rows: the text model's and the vision tower's outputs, kept as the
     /// conditioning the denoiser reads.
     Encode,
@@ -1349,7 +1383,10 @@ impl Variant {
     pub const fn stage(self) -> &'static str {
         match self {
             Self::DecodeGreedy | Self::DecodeSampled => "decode",
-            Self::PrefillWrite | Self::PrefillOutput | Self::PrefillGreedy => "prefill",
+            Self::PrefillWrite
+            | Self::PrefillOutput
+            | Self::PrefillGreedy
+            | Self::PrefillScored => "prefill",
             Self::Encode => "text_encoding",
             Self::Denoise => "denoising",
             Self::Decode => "video_decoding",
@@ -1372,6 +1409,7 @@ impl Variant {
             Self::PrefillWrite => "prefill_write",
             Self::PrefillOutput => "prefill_output",
             Self::PrefillGreedy => "prefill_greedy",
+            Self::PrefillScored => "prefill_scored",
             Self::Encode => "encode",
             Self::Denoise => "denoise",
             Self::Decode => "decode",
@@ -1477,6 +1515,11 @@ impl Variant {
     /// host's argmax.
     pub const fn samples(self) -> bool {
         true
+    }
+
+    /// Whether a bucket of this variant scores the prompt tokens its batch's targets name.
+    pub const fn scores(self) -> bool {
+        matches!(self, Self::PrefillScored)
     }
 
     /// Whether a forward of this variant draws its inputs from the slot state one token per row.

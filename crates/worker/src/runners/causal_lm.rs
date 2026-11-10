@@ -62,6 +62,9 @@ use crate::{Error, Result};
 pub struct Staging {
     rows: BatchRows,
     input_ids: Vec<i32>,
+    /// `[tokens]` the prompt token each token's logits score, `-1` for one that scores none and
+    /// for padding (`BatchColumns::targets`).
+    targets: Vec<i32>,
     slots: Vec<i32>,
     /// `[rows]` each row's recurrent-state checkpoint, zero for padding and for a row that keeps
     /// none.
@@ -109,6 +112,7 @@ impl Staging {
             .copied()
             .ok_or_else(|| Error::Invalid("the runner has no bucket to serve".into()))?;
         self.input_ids = vec![0; largest.tokens as usize];
+        self.targets = vec![-1; largest.tokens as usize];
         self.slots = vec![0; largest.rows as usize];
         self.checkpoints = vec![0; largest.rows as usize];
         self.state_copies = Vec::new();
@@ -165,6 +169,11 @@ impl Staging {
         self.input_ids[..tokens].copy_from_slice(&columns.input_ids[..tokens]);
         for index in tokens..bucket_tokens {
             self.input_ids[index] = 0;
+        }
+        // A batch that scores nothing states no targets, and padding scores nothing.
+        self.targets[..bucket_tokens].fill(-1);
+        if !columns.targets.is_empty() {
+            self.targets[..tokens].copy_from_slice(&columns.targets[..tokens]);
         }
         self.rows.clear();
         self.rows
@@ -355,6 +364,11 @@ impl Staging {
         &self.input_ids[..tokens]
     }
 
+    /// The staged prompt targets, one per token.
+    pub fn targets(&self, tokens: usize) -> &[i32] {
+        &self.targets[..tokens]
+    }
+
     /// The staged sampler slot view.
     pub fn slots(&self, rows: usize) -> &[i32] {
         &self.slots[..rows]
@@ -433,6 +447,8 @@ struct Columns {
     positions: Column,
     /// `[tokens]` i32 the input ids, which the model embeds into the forward's hidden states.
     input_ids: Column,
+    /// `[tokens]` i32 the prompt token each token's logits score, which a scoring bucket reads.
+    targets: Column,
     slot_mapping: Column,
     /// `[tokens]` i32 the paired forward's cache slots: the same tokens, addressed in the scratch
     /// set's numbering, so a shadow walk writes no resident page (7.3).
@@ -462,6 +478,9 @@ struct Columns {
     /// `[rows, candidates]` f32 then `[rows, candidates]` i32: each row's most likely tokens, read
     /// back beside them, for a runner whose sampler reports candidates ([`CausalLmRunner::reporting`]).
     top_readback: Option<[platform::PinnedBuffer; 2]>,
+    /// `[tokens]` f32, `[tokens]` i32, then `[tokens, candidates]` f32 and i32: a scoring bucket's
+    /// prompt scores, read back beside its samples ([`Variant::PrefillScored`]).
+    prompt_readback: [platform::PinnedBuffer; 2],
 }
 
 /// The width of the per-token columns and of the per-row columns, over the buckets a runner serves.
@@ -504,10 +523,11 @@ impl Columns {
     }
 
     /// The columns every batch rewrites.
-    fn staged(&mut self) -> [&mut Column; 13] {
+    fn staged(&mut self) -> [&mut Column; 14] {
         [
             &mut self.positions,
             &mut self.input_ids,
+            &mut self.targets,
             &mut self.slot_mapping,
             &mut self.seq_lens,
             &mut self.query_offsets,
@@ -530,6 +550,7 @@ impl Columns {
         Ok(Self {
             positions: Column::new(device, DType::I32, tokens)?,
             input_ids: Column::new(device, DType::I32, tokens)?,
+            targets: Column::new(device, DType::I32, tokens)?,
             slot_mapping: Column::new(device, DType::I32, tokens)?,
             scratch_slots: Column::new(device, DType::I32, tokens)?,
             seq_lens: Column::new(device, DType::I32, rows)?,
@@ -559,13 +580,17 @@ impl Columns {
                 platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
             ],
             top_readback: None,
+            prompt_readback: [
+                platform::PinnedBuffer::new(device, (tokens * 8) as usize)?,
+                platform::PinnedBuffer::new(device, (tokens * 8) as usize)?,
+            ],
         })
     }
 
     /// Sizes the candidates' readback for `candidates` most likely tokens a row, over the widest
     /// row count `buckets` hold; none for a sampler that reports none.
     fn report(&mut self, device: DeviceId, buckets: &Buckets, candidates: u32) -> Result<()> {
-        let (_, rows) = column_extents(buckets)?;
+        let (tokens, rows) = column_extents(buckets)?;
         let bytes = usize::try_from(2 * rows * u64::from(candidates) * 4)
             .map_err(|_| Error::Invalid("a candidates readback larger than memory".into()))?;
         self.top_readback = match bytes {
@@ -575,6 +600,13 @@ impl Columns {
                 platform::PinnedBuffer::new(device, bytes)?,
             ]),
         };
+        // A scored token's log-probability and rank, then its candidates' values and ids.
+        let prompt = usize::try_from(tokens * (8 + 8 * u64::from(candidates)))
+            .map_err(|_| Error::Invalid("a prompt scores readback larger than memory".into()))?;
+        self.prompt_readback = [
+            platform::PinnedBuffer::new(device, prompt)?,
+            platform::PinnedBuffer::new(device, prompt)?,
+        ];
         Ok(())
     }
 }
@@ -591,6 +623,11 @@ fn largest_rows(buckets: &Buckets) -> Result<u32> {
 /// Elements one program of a step's gather copies.
 const GATHER_BLOCK: u32 = 1024;
 
+/// The tokens one chunk of a scoring bucket's prompt projection holds: its two `[rows, vocabulary]`
+/// f32 buffers are 39 MB each over a 151936-token vocabulary, and sixty-four rows keep the
+/// candidates' `top_k`, one program a row, over most of a device's multiprocessors.
+const SCORE_ROWS: u64 = 64;
+
 /// A replay on its way: what its answer reads once its copies land.
 struct Flight {
     bucket: Bucket,
@@ -602,6 +639,8 @@ struct Flight {
     turn: usize,
     slots: Vec<i32>,
     logits_rows: Vec<i32>,
+    /// `[tokens]` the prompt targets a scoring bucket scored, empty for any other.
+    targets: Vec<i32>,
     rows: BatchRows,
     calls: Vec<CallId>,
 }
@@ -622,6 +661,8 @@ struct Sampled {
     tokens: TensorView,
     /// Each sampled id's scores under the raw logits.
     scores: Scores,
+    /// `[tokens]` each token's prompt target's scores, in a bucket that scores its prompt.
+    prompt: Option<Scores>,
 }
 
 /// The classes of the rows a batch carries, as a reader of a refusal needs them.
@@ -2593,6 +2634,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             turn,
             slots: Vec::new(),
             logits_rows: Vec::new(),
+            targets: Vec::new(),
             rows: BatchRows::default(),
             calls: Vec::new(),
         };
@@ -2659,6 +2701,36 @@ impl<M: TextModel> CausalLmRunner<M> {
                     &self.stream,
                 )?;
             }
+            // A scoring bucket's prompt scores: log-probabilities, ranks, then the candidates'
+            // values and ids, each over the bucket's tokens and back to back.
+            if let Some(prompt) = samples.prompt {
+                let tokens = bucket.tokens as usize;
+                let width = prompt.candidates() as usize;
+                let word = std::mem::size_of::<i32>();
+                let readback = &self.columns.prompt_readback[turn];
+                if tokens * word * (2 + 2 * width) > readback.len() {
+                    return Err(Error::Invariant(
+                        "the prompt scores' readback buffer is smaller than the bucket".into(),
+                    ));
+                }
+                let mut offset = 0;
+                let mut copy = |source: TensorView, bytes: usize| -> Result<()> {
+                    platform::memcpy_async(
+                        readback.address() + offset as u64,
+                        source.ptr.address(),
+                        bytes,
+                        &self.stream,
+                    )?;
+                    offset += bytes;
+                    Ok(())
+                };
+                copy(prompt.logprobs, tokens * word)?;
+                copy(prompt.ranks, tokens * word)?;
+                if let Some(top) = prompt.top {
+                    copy(top.values, tokens * width * word)?;
+                    copy(top.ids, tokens * width * word)?;
+                }
+            }
             // The two per-slot lengths the completion reports: the logical position execution
             // initialized and the sampling position a successor may read.
             platform::memcpy_async(
@@ -2678,6 +2750,9 @@ impl<M: TextModel> CausalLmRunner<M> {
         // lands.
         flight.slots = self.staging.slots(rows).to_vec();
         flight.logits_rows = self.staging.logits_rows().to_vec();
+        if samples.prompt.is_some() {
+            flight.targets = self.staging.targets(bucket.tokens as usize).to_vec();
+        }
         flight.rows = self.staging.batch_rows().clone();
         flight.calls = self.staging.calls().to_vec();
         Ok(flight)
@@ -2745,7 +2820,8 @@ impl<M: TextModel> CausalLmRunner<M> {
             .map_or(0, |top| top.values.shape.last() as usize);
         // SAFETY: the copies above filled `rows` f32 with the sampled ids' log-probabilities and
         // `rows` i32 with their ranks, and, for a sampler that reports candidates, `rows · width`
-        // f32 then `rows · width` i32 with each row's most likely tokens.
+        // f32 then `rows · width` i32 with each row's most likely tokens; for a scoring bucket, the
+        // prompt readback with its tokens' scores in the same order.
         let samples = unsafe {
             let (values, candidates) = match (&self.columns.top_readback, width) {
                 (Some(readback), width) if width > 0 => {
@@ -2761,8 +2837,32 @@ impl<M: TextModel> CausalLmRunner<M> {
                 }
                 _ => (&[][..], &[][..]),
             };
+            let prompt = sampled.and_then(|sampled| sampled.prompt).map(|prompt| {
+                let tokens = flight.targets.len();
+                let width = prompt.candidates() as usize;
+                let base = self.columns.prompt_readback[turn].as_ptr();
+                let word = std::mem::size_of::<i32>();
+                PromptSamples {
+                    targets: &flight.targets,
+                    logprobs: std::slice::from_raw_parts(base.cast::<f32>(), tokens),
+                    ranks: std::slice::from_raw_parts(
+                        base.add(tokens * word).cast::<i32>(),
+                        tokens,
+                    ),
+                    values: std::slice::from_raw_parts(
+                        base.add(2 * tokens * word).cast::<f32>(),
+                        tokens * width,
+                    ),
+                    candidates: std::slice::from_raw_parts(
+                        base.add((2 + width) * tokens * word).cast::<i32>(),
+                        tokens * width,
+                    ),
+                    width,
+                }
+            });
             RowSamples {
                 ids,
+                prompt,
                 logprobs: std::slice::from_raw_parts(
                     self.columns.logprob_readback[turn].as_ptr().cast::<f32>(),
                     rows,
@@ -2864,6 +2964,8 @@ impl<M: TextModel> CausalLmRunner<M> {
         // before it may still be running, and the mechanism plans ahead of its results anyway.
         encode_i32(&mut self.encoded, self.staging.input_ids(tokens));
         self.columns.input_ids.write(&self.encoded)?;
+        encode_i32(&mut self.encoded, self.staging.targets(tokens));
+        self.columns.targets.write(&self.encoded)?;
         encode_i32(&mut self.encoded, &batch.slot_mapping[..tokens]);
         self.columns.slot_mapping.write(&self.encoded)?;
         encode_i32(&mut self.encoded, &batch.seq_lens[..rows]);
@@ -3394,6 +3496,7 @@ impl<M: TextModel> CausalLmRunner<M> {
                 &samples,
             )?;
         }
+        let prompt = self.score_prompt(forward, bucket, hidden)?;
         // A recording's views address no memory, so only a launching walk names where a replay's
         // tokens land.
         if !forward.is_recording() {
@@ -3404,11 +3507,69 @@ impl<M: TextModel> CausalLmRunner<M> {
                     scores: samples
                         .scores
                         .ok_or(Error::State("a sampling bucket reserved no scores"))?,
+                    prompt,
                 },
             );
         }
         self.commit_step(forward, bucket, &samples)?;
         Ok(())
+    }
+
+    /// Scores the prompt tokens a scoring bucket's targets name (`prompt_logprobs`), and answers
+    /// where the scores land; a bucket that scores nothing launches nothing.
+    ///
+    /// Every token of the bucket is projected: its hidden row's logits, their `log_softmax` (the
+    /// raw distribution), then its target's log-probability, rank and the row's candidates, as a
+    /// sampled token's are scored (`Sampler::score`). The projection walks the bucket in
+    /// [`SCORE_ROWS`]-row chunks through one pair of `[SCORE_ROWS, vocabulary]` f32 buffers, so the
+    /// working set does not grow with the bucket; a chunk is a fixed sequence of launches, and the
+    /// graph holds one per chunk. A token whose target is `-1` - padding, a row of a request that
+    /// asks for nothing, a prompt's last token - is projected all the same and reports rank `0`,
+    /// which the readback skips.
+    ///
+    /// The cost is the scoring's: one head projection, one log-softmax and one `top_k` per token,
+    /// which a decode or a prefill that scores nothing never pays (`Variant::PrefillScored`).
+    fn score_prompt(
+        &self,
+        forward: &Forward<'_>,
+        bucket: Bucket,
+        hidden: TensorView,
+    ) -> Result<Option<Scores>> {
+        if !bucket.variant.scores() {
+            return Ok(None);
+        }
+        let sampler = &self
+            .sampling
+            .as_ref()
+            .ok_or(Error::State("a scoring bucket has no sampler"))?
+            .sampler;
+        let arena = forward.arena();
+        let tokens = u64::from(bucket.tokens);
+        let vocabulary = u64::from(self.model.vocabulary());
+        let scores = Scores::reserve(arena, tokens, sampler.candidates())?;
+        let chunk = SCORE_ROWS.min(tokens);
+        let logits = arena.tensor(LOGITS_DTYPE, ops::Shape::new(&[chunk, vocabulary]))?;
+        let logprobs = arena.tensor(DType::F32, ops::Shape::new(&[chunk, vocabulary]))?;
+        let targets = self.columns.targets.shaped(&[tokens]);
+        let mut start = 0;
+        while start < tokens {
+            let count = chunk.min(tokens - start);
+            let rows = hidden.narrow(0, start, count).map_err(Error::from)?;
+            let logits = logits.narrow(0, 0, count).map_err(Error::from)?;
+            let logprobs = logprobs.narrow(0, 0, count).map_err(Error::from)?;
+            self.model
+                .compute_logits(forward, rows, logits)
+                .map_err(Error::from)?;
+            sampler.log_softmax(forward, logits, logprobs)?;
+            sampler.score(
+                forward,
+                logprobs,
+                targets.narrow(0, start, count).map_err(Error::from)?,
+                &scores.rows(start, count)?,
+            )?;
+            start += count;
+        }
+        Ok(Some(scores))
     }
 
     /// Launches the token-state commit of `bucket`'s rows: their sampled tokens advance their
@@ -3477,6 +3638,7 @@ impl<M: TextModel> CausalLmRunner<M> {
                 calls: warm_calls(bucket),
             },
             input_ids: vec![0; tokens],
+            targets: Vec::new(),
             slots: vec![0; rows],
             // A warm pose of a sampled bucket must state a valid *draw*: the sampler's forward
             // divides by the row's temperature, so a zeroed row asks it to divide by zero - and a
@@ -3638,6 +3800,22 @@ pub fn calls_output(
             entry.token_logprobs.push(scored);
         }
     }
+    // A scoring bucket's prompt scores belong to the call whose rows hold the scored tokens, in
+    // token order; a token whose target is `-1` scored nothing.
+    if let Some(prompt) = &samples.prompt {
+        for (call, entry) in rows.calls.iter().zip(output.iter_mut()) {
+            let offset = |row: u32| {
+                rows.query_offsets
+                    .get(row as usize)
+                    .map_or(0, |offset| (*offset).max(0) as usize)
+            };
+            for token in offset(call.rows.start)..offset(call.rows.end) {
+                if let Some(scored) = prompt.scored(token, samples.vocabulary) {
+                    entry.prompt_logprobs.push(scored);
+                }
+            }
+        }
+    }
     Ok(output)
 }
 
@@ -3658,6 +3836,41 @@ pub struct RowSamples<'a> {
     pub width: usize,
     /// The vocabulary a candidate id lies in.
     pub vocabulary: u32,
+    /// A scoring bucket's prompt scores, one per bucket token.
+    pub prompt: Option<PromptSamples<'a>>,
+}
+
+/// What a scoring bucket's readback holds per bucket token: the prompt token it scored and its
+/// scores.
+pub struct PromptSamples<'a> {
+    /// `[tokens]` the prompt token each token scored, `-1` for one that scored none.
+    pub targets: &'a [i32],
+    /// `[tokens]` each target's raw log-probability.
+    pub logprobs: &'a [f32],
+    /// `[tokens]` each target's rank.
+    pub ranks: &'a [i32],
+    /// `[tokens, width]` each token's most likely next tokens' log-probabilities, row-major.
+    pub values: &'a [f32],
+    /// `[tokens, width]` their ids.
+    pub candidates: &'a [i32],
+    /// The candidates a token reports.
+    pub width: usize,
+}
+
+impl PromptSamples<'_> {
+    /// Token `index`'s target and its scores ([`scored`]), when it scored one.
+    fn scored(&self, index: usize, vocabulary: u32) -> Option<Vec<ipc::TokenLogprob>> {
+        let target = u32::try_from(*self.targets.get(index)?).ok()?;
+        let span = index * self.width..(index + 1) * self.width;
+        Some(scored(
+            target,
+            *self.logprobs.get(index)?,
+            self.ranks.get(index).copied().unwrap_or(0).max(0) as u32,
+            self.values.get(span.clone()).unwrap_or_default(),
+            self.candidates.get(span).unwrap_or_default(),
+            vocabulary,
+        ))
+    }
 }
 
 impl RowSamples<'_> {
@@ -4060,6 +4273,7 @@ mod tests {
                 ],
             },
             input_ids: vec![7, 8],
+            targets: Vec::new(),
             slots: vec![0, 1],
             parameters: vec![0.0; 2 * proto::program::sampler::PARAMETER_COLUMNS as usize],
             draws: vec![ipc::philox::DrawAddress::default(); 2],
@@ -4091,6 +4305,7 @@ mod tests {
                 }],
             },
             input_ids: vec![1, 2, 3],
+            targets: Vec::new(),
             slots: vec![0],
             parameters: vec![0.0; proto::program::sampler::PARAMETER_COLUMNS as usize],
             draws: vec![ipc::philox::DrawAddress::default()],
@@ -4226,6 +4441,7 @@ mod tests {
                 }],
             },
             input_ids: (0..tokens).map(|token| token + 1).collect(),
+            targets: Vec::new(),
             slots: vec![0],
             parameters: vec![0.0; proto::program::sampler::PARAMETER_COLUMNS as usize],
             draws: vec![ipc::philox::DrawAddress::default()],
@@ -4580,6 +4796,7 @@ mod sampled_output_tests {
             candidates: &[],
             width: 0,
             vocabulary: 1_000,
+            prompt: None,
         }
     }
 
@@ -4596,6 +4813,7 @@ mod sampled_output_tests {
             candidates: &[7, 111, 3, 4],
             width: 2,
             vocabulary: 1_000,
+            prompt: None,
         };
         let output = calls_output(
             &samples,

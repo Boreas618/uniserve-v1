@@ -385,7 +385,9 @@ impl Buckets {
     /// count. A prefill bucket holds any batch of fewer rows, whose rows past its own are empty
     /// sequences, so its rows are the coarse [`prefill_row_buckets`] of the largest size: every
     /// decode size against every token size would be thousands of graphs that serve no batch
-    /// better.
+    /// better. A prefill that scores its prompt ([`Variant::PrefillScored`]) is captured at every
+    /// prefill size as well, so a request that asks for prompt logprobs is chunked and batched as
+    /// any other.
     pub fn causal_lm(rows: &[u32], tokens: &[u32], sampled: bool) -> Self {
         let mut buckets = Vec::new();
         for &rows in rows {
@@ -401,6 +403,7 @@ impl Buckets {
                     Variant::PrefillWrite,
                     Variant::PrefillOutput,
                     Variant::PrefillGreedy,
+                    Variant::PrefillScored,
                 ] {
                     buckets.push(Bucket::prefill(bucket, count.max(bucket), variant));
                 }
@@ -1254,8 +1257,8 @@ mod tests {
         let buckets = Buckets::for_batch(Some(&[1, 2, 4, 8]), Some(&[512]), 256, 40960, true)
             .expect("the deployment's sizes");
         // 4 sizes x (greedy + sampled) decode, and one row bucket x 1 token count x (write, drawn
-        // and greedy output) prefill: a prefill bucket holds any batch of fewer rows.
-        assert_eq!(buckets.len(), 11, "11 buckets, so 11 captures");
+        // output, greedy output and scored) prefill: a prefill bucket holds any batch of fewer rows.
+        assert_eq!(buckets.len(), 12, "12 buckets, so 12 captures");
 
         // With no configured size the catalogues are the plan, and every size they state is
         // captured with each computation it admits. The count is derived from them here rather than
@@ -1276,6 +1279,7 @@ mod tests {
                     Variant::PrefillWrite,
                     Variant::PrefillOutput,
                     Variant::PrefillGreedy,
+                    Variant::PrefillScored,
                 ] {
                     stated.insert(Bucket::prefill(row, count.max(row), variant));
                 }

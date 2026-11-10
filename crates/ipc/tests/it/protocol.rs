@@ -68,6 +68,7 @@ fn ar_decode_call() -> Call {
         latent_restore: None,
         host_output: None,
         latent_draw: (kind == CallKind::Media(MediaCall::LatentEncoding)).then_some(2),
+        prompt_scores: None,
     }
 }
 
@@ -348,6 +349,7 @@ fn token_batch() -> execution::Batch {
                 logits_rows: vec![0, 1],
             },
             input_ids: vec![17, 23],
+            targets: Vec::new(),
             slots: vec![1, 2],
             parameters: vec![0.5; 16],
             draws: vec![philox::DrawAddress::default(); 2],

@@ -1,12 +1,11 @@
 """Captured selections honour every sampling constraint.
 
 Qwen3 serves from CUDA graphs, prefilling a prompt of about a thousand tokens
-in chunks of 256 tokens. A forward's token selection, the logprobs it reports
-and the scores of its prompt are captured graphs whose inputs are tensors:
-token sets as bitmasks, each request's row of logit biases, its sampler and
-parameters, and each prompt row's position, target and place in its chunk's
-words; a continued chunk's first token is scored from the logits its request
-retained from the chunk before.
+in chunks of 256 tokens. A forward's token selection, the logprobs and top
+candidates it reports and the scores of its prompt are captured graphs whose
+inputs are tensors: token sets as bitmasks, each request's row of logit
+biases, its sampler and parameters, and each prompt token's target, the prompt
+token after it; a chunk's last token scores the next chunk's first.
 
 Constraints hold exactly under graphs: allowed tokens, a dominating logit
 bias, bad words of one token and of several, reported top logprobs that rank

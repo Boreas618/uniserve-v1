@@ -1650,23 +1650,21 @@ impl SimEngine {
                 let visual_state =
                     !call.vision_inputs.is_empty() || call.latent_feature_input.is_some();
                 let samples_token = call.token_output.is_some();
-                // A call that extends the prompt scores its tokens when the
-                // request asks, as a rank does: every token but the prompt's
-                // first, which no position predicts.
+                // A call that extends the prompt scores the prompt tokens its
+                // `prompt_scores` names when the request asks, as a rank
+                // does: the token after each of its input tokens.
                 let extends_prompt = work == CallKind::Forward(ForwardMode::Prefill)
                     && call.latent_feature_input.is_none()
                     && call.completion_output.is_none();
-                if extends_prompt
-                    && request
-                        .sampling()
-                        .is_some_and(SamplingParams::prompt_logprobs_requested)
-                {
-                    let scored = usize::from(call.coordinates.logical_position == 0);
-                    record.prompt_logprobs = call
-                        .input_token_ids
-                        .iter()
-                        .skip(scored)
-                        .map(|&token_id| {
+                if let Some(scores) = call.prompt_scores.filter(|_| {
+                    extends_prompt
+                        && request
+                            .sampling()
+                            .is_some_and(SamplingParams::prompt_logprobs_requested)
+                }) {
+                    record.prompt_logprobs = scores
+                        .targets(&call.input_token_ids)
+                        .map(|token_id| {
                             vec![TokenLogprob {
                                 token_id,
                                 logprob: sim_candidate_logprob(
@@ -2754,6 +2752,7 @@ mod tests {
             latent_restore: None,
             host_output: None,
             latent_draw: None,
+            prompt_scores: None,
         };
         ExecutionBatch::new(
             batch_id,

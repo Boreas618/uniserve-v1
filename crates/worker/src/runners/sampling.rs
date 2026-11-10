@@ -272,6 +272,23 @@ impl Scores {
     pub fn candidates(&self) -> u64 {
         self.top.map_or(0, |top| top.values.shape.last())
     }
+
+    /// The scores of rows `start..start + count`: the same buffers, narrowed to those rows.
+    pub fn rows(&self, start: u64, count: u64) -> Result<Self> {
+        let narrow = |view: TensorView| view.narrow(0, start, count).map_err(Error::from);
+        Ok(Self {
+            logprobs: narrow(self.logprobs)?,
+            ranks: narrow(self.ranks)?,
+            top: match self.top {
+                Some(top) => Some(TopLogprobs {
+                    values: narrow(top.values)?,
+                    ids: narrow(top.ids)?,
+                    workspace: narrow(top.workspace)?,
+                }),
+                None => None,
+            },
+        })
+    }
 }
 
 /// One scored token as the completion reports it: the token itself with its log-probability and

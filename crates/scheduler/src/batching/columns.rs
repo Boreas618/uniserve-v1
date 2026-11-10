@@ -26,6 +26,9 @@
 //!   the request's Philox stream (its seed, or its lineage when it has none)
 //!   and the logical position of the token the row samples, one past the row's
 //!   last query token;
+//! - **targets**: for a prefill that scores its prompt (`ipc::Call::prompt_scores`),
+//!   the prompt token each of its tokens' logits score, `-1` elsewhere, and no
+//!   column at all for a batch that scores nothing;
 //! - **input_ids**: the tokens each call's rows embed, which the caller states
 //!   because a decode's token comes from the mechanism's request state and not
 //!   from the call;
@@ -317,6 +320,7 @@ pub(crate) fn columns(
     let mut queries = Vec::new();
     let mut spans: Vec<Range<u32>> = Vec::with_capacity(requests.len());
     let mut input_ids: Vec<i32> = Vec::new();
+    let mut targets: Vec<i32> = Vec::new();
     let mut parameters: Vec<f32> = Vec::new();
     let mut draw_addresses: Vec<ipc::philox::DrawAddress> = Vec::new();
     let mut installs: Vec<SlotBias> = Vec::new();
@@ -420,6 +424,18 @@ pub(crate) fn columns(
         let slot = i32::try_from(request).ok()?;
         slots.extend(std::iter::repeat_n(slot, call_rows.rows.len()));
         input_ids.extend_from_slice(&context.ids);
+        // A scored text prefill's token at input `i` scores the prompt token after it; a call with
+        // image blocks scores nothing (`PromptScores`).
+        match call.prompt_scores {
+            Some(scores) if kind == RowKind::Prefill && call.vision_inputs.is_empty() => {
+                for target in scores.targets(&call.input_token_ids) {
+                    targets.push(i32::try_from(target).ok()?);
+                }
+                // The call's last token scores nothing when the call ends the prompt.
+                targets.resize(input_ids.len(), -1);
+            }
+            _ => targets.resize(input_ids.len(), -1),
+        }
         // One parameter row per row of the call, the same values: the
         // request's sampling parameters apply to every row it samples.
         let row = sampler_parameters(sampling);
@@ -594,6 +610,13 @@ pub(crate) fn columns(
     Some(BatchColumns {
         rows,
         input_ids,
+        // A batch that scores nothing states no column, as one that drafts nothing states no
+        // draft work.
+        targets: if targets.iter().any(|target| *target >= 0) {
+            targets
+        } else {
+            Vec::new()
+        },
         slots,
         parameters,
         draws: draw_addresses,
@@ -725,7 +748,10 @@ pub(crate) fn batch_shape(columns: &BatchColumns) -> ipc::execution::Shape {
         .calls
         .iter()
         .any(|call| matches!(call.kind, RowKind::Prefill));
-    let variant = if prefill {
+    let variant = if prefill && columns.targets.iter().any(|target| *target >= 0) {
+        // Scoring projects every token of the bucket, so only a batch that scores pays for it.
+        Variant::PrefillScored
+    } else if prefill {
         let mut endings = columns
             .parameters
             .as_chunks::<SAMPLER_PARAMETERS>()
@@ -1589,6 +1615,65 @@ mod tests {
         );
         assert_eq!(columns.input_ids, vec![11, 12, 13, 14, 21, 22]);
         assert_eq!(columns.slots, vec![1, 2]);
+    }
+
+    /// A prefill that scores its prompt names, for each of its tokens, the prompt token after it -
+    /// the next input token, then the next chunk's first, and nothing after the prompt's last - and
+    /// its batch is served by the scoring variant; a call beside it that scores nothing names none,
+    /// and a batch of such calls alone states no column and keeps its variant.
+    #[test]
+    fn a_scored_prefill_names_the_prompt_token_after_each_of_its_tokens() {
+        // The fixture's table holds positions 8..20, so the chunks lie there.
+        let mut chunk = call(prefill(), 8, &[3]);
+        chunk.token_output = None;
+        chunk.input_token_ids = vec![11, 12, 13];
+        chunk.prompt_scores = Some(ipc::PromptScores { next: Some(14) });
+        let mut last = call(prefill(), 11, &[2]);
+        last.input_token_ids = vec![14, 15];
+        last.prompt_scores = Some(ipc::PromptScores { next: None });
+        let plain = call(prefill(), 13, &[2]);
+        let requests = vec![
+            (chunk, dispatch(1, &[3], &[true])),
+            (last, dispatch(2, &[2], &[true])),
+            (plain, dispatch(3, &[2], &[true])),
+        ];
+        let filled = columns(
+            &requests,
+            &tables_of(&requests),
+            &[vec![11, 12, 13], vec![14, 15], vec![1, 1]],
+            &[&sampling(), &sampling(), &sampling()],
+            &[0, 0, 0],
+            BLOCK_SIZE,
+            2048,
+            None,
+            &[],
+        )
+        .expect("two scored chunks and a plain prefill");
+        assert_eq!(filled.targets, vec![12, 13, 14, 15, -1, -1, -1]);
+        let shape = batch_shape(&filled);
+        assert_eq!(shape.variant, ipc::execution::Variant::PrefillScored);
+        filled
+            .check(&shape)
+            .expect("a scored batch states its targets");
+
+        let quiet = vec![requests[2].clone()];
+        let unscored = columns(
+            &quiet,
+            &tables_of(&quiet),
+            &[vec![1, 1]],
+            &[&sampling()],
+            &[0],
+            BLOCK_SIZE,
+            2048,
+            None,
+            &[],
+        )
+        .expect("a plain prefill");
+        assert!(unscored.targets.is_empty());
+        assert_eq!(
+            batch_shape(&unscored).variant,
+            ipc::execution::Variant::PrefillOutput
+        );
     }
 
     #[test]
