@@ -14,8 +14,11 @@
 //!   (`ops::Twins`), the activations from the scratch arena, and the KV the paired forward writes
 //!   goes to scratch pages. Nothing a serving request reads is touched.
 //!
-//! The comparison copies each pair to host page-locked staging and compares there; it runs in
-//! precopy only, never on a serving path, so the copy cost is paid where it cannot delay a batch.
+//! The comparison copies each pair to host page-locked staging and compares there. It runs in
+//! precopy, between serving batches on the same stream, so issuing the copies and comparing them
+//! are two steps ([`Shadow::issue`], [`Shadow::finish`]): the executor thread does not wait for the
+//! stream when a paired forward is launched, and the runner compares one operator's pairs after it
+//! launched the next one's forward.
 //!
 //! ## Why a wrong kernel never passed probation
 //!
@@ -135,7 +138,26 @@ pub struct Summary {
 /// runner shadows, and reset for each paired forward; see `ops::Twins`.
 pub struct Shadow {
     twins: Twins,
+    device: DeviceId,
+    /// The host staging no comparison holds, which the next [`Shadow::issue`] copies into.
+    spare: Option<Staging>,
+}
+
+/// One paired forward's pairs on their way to the host: the copies are on the stream behind the
+/// forward, and [`Shadow::finish`] compares them once they have landed.
+///
+/// Issuing and finishing are two steps so that the executor thread does not wait for the stream
+/// the moment a paired forward is launched: the caller finishes a comparison when it next has to,
+/// by which time the copies have usually landed and the wait is a query.
+pub struct Issued {
     staging: Staging,
+    /// Per comparable pair: its element type, its element count, and its bytes' offset in the
+    /// staging buffers.
+    pairs: Vec<(DType, u64, usize, usize)>,
+    incomparable: Vec<String>,
+    tolerance: Tolerance,
+    /// Recorded behind the copies.
+    copied: platform::Event,
 }
 
 impl Shadow {
@@ -143,7 +165,8 @@ impl Shadow {
     pub fn new(device: DeviceId, twins: Twins) -> Result<Self> {
         Ok(Self {
             twins,
-            staging: Staging::new(device, 1 << 20)?,
+            device,
+            spare: Some(Staging::new(device, 1 << 20)?),
         })
     }
 
@@ -168,29 +191,29 @@ impl Shadow {
         self.twins.tolerance()
     }
 
-    /// Compares every pair of the paired forward on `stream` within `tolerance`.
+    /// Issues the host copies of every pair of the paired forward that ran on `stream`, to be
+    /// compared within `tolerance` by [`Shadow::finish`].
     ///
-    /// The stream is the one the paired forward ran on; the comparison waits for it, which is
-    /// correct in precopy and useless on a serving path.
-    pub fn compare(&mut self, stream: &Stream, tolerance: Tolerance) -> Result<Summary> {
+    /// The copies are stream-ordered behind the forward and nothing here waits for the stream. The
+    /// region is reset, so the next paired forward may carve its twins at once: its writes are
+    /// ordered behind these copies on the same stream.
+    pub fn issue(&mut self, stream: &Stream, tolerance: Tolerance) -> Result<Issued> {
         if let Some(error) = self.twins.failure() {
             return Err(Error::Invariant(format!(
                 "the shadow region could not hold the paired forward: {error}"
             )));
         }
-        let pairs = self.twins.pairs();
-        let mut summary = Summary {
-            pairs: pairs.len(),
-            elements: 0,
-            incomparable: Vec::new(),
-        };
-        for pair in pairs {
+        let mut pairs = Vec::new();
+        let mut views = Vec::new();
+        let mut incomparable = Vec::new();
+        let mut total = 0usize;
+        for pair in self.twins.pairs() {
             let bytes = pair.real.byte_len()?;
             if bytes != pair.shadow.byte_len()? {
                 // The two programs wrote outputs of different extents: they are not comparable, and
                 // an update is not refused for it - the pair is skipped and named, so the update's
                 // evidence states what it could not measure (7.3 step 2).
-                summary.incomparable.push(format!(
+                incomparable.push(format!(
                     "the twin and the real buffer have different sizes: the real output holds \
                      {bytes} bytes of {} and the twin {} of {}, so the two programs are not \
                      comparable",
@@ -198,23 +221,74 @@ impl Shadow {
                     pair.shadow.byte_len()?,
                     pair.shadow.dtype,
                 ));
-                summary.pairs -= 1;
                 continue;
             }
             let bytes = usize::try_from(bytes)
                 .map_err(|_| Error::Invariant("a twin buffer is larger than memory".into()))?;
-            self.staging.reserve(bytes)?;
-            self.staging.read(stream, &pair.real, &pair.shadow)?;
-            summary.elements += compare_buffers(
-                pair.real.dtype,
-                pair.real.numel(),
-                &self.staging.real()[..bytes],
-                &self.staging.shadow()[..bytes],
-                tolerance,
-            )?;
+            pairs.push((pair.real.dtype, pair.real.numel(), total, bytes));
+            views.push((pair.real, pair.shadow));
+            total = total
+                .checked_add(bytes)
+                .ok_or_else(|| Error::Invariant("the twin buffers overflow memory".into()))?;
         }
+        let mut staging = match self.spare.take() {
+            Some(staging) => staging,
+            None => Staging::new(self.device, total.max(1))?,
+        };
+        staging.reserve(total)?;
+        for ((real, shadow), (_, _, offset, bytes)) in views.iter().zip(&pairs) {
+            staging.copy(stream, *offset, *bytes, real, shadow)?;
+        }
+        let copied = platform::Event::new(platform::EventFlags::default());
+        copied.record(stream)?;
         self.twins.reset();
-        Ok(summary)
+        Ok(Issued {
+            staging,
+            pairs,
+            incomparable,
+            tolerance,
+            copied,
+        })
+    }
+
+    /// Waits for `issued`'s copies and compares its pairs, element by element.
+    ///
+    /// The wait is for the copies' event alone, not for whatever the stream ran after them.
+    pub fn finish(&mut self, issued: Issued) -> Result<Summary> {
+        let Issued {
+            staging,
+            pairs,
+            incomparable,
+            tolerance,
+            copied,
+        } = issued;
+        let compared = copied.synchronize().map_err(Error::from).and_then(|()| {
+            let mut elements = 0;
+            for (dtype, numel, offset, bytes) in &pairs {
+                elements += compare_buffers(
+                    *dtype,
+                    *numel,
+                    &staging.real()[*offset..*offset + *bytes],
+                    &staging.shadow()[*offset..*offset + *bytes],
+                    tolerance,
+                )?;
+            }
+            Ok(elements)
+        });
+        // The staging serves the next comparison whatever this one found.
+        self.spare = Some(staging);
+        Ok(Summary {
+            pairs: pairs.len(),
+            elements: compared?,
+            incomparable,
+        })
+    }
+
+    /// Compares every pair of the paired forward on `stream` within `tolerance`, waiting for it:
+    /// [`Shadow::issue`] and [`Shadow::finish`] in one call, for a caller off the serving path.
+    pub fn compare(&mut self, stream: &Stream, tolerance: Tolerance) -> Result<Summary> {
+        let issued = self.issue(stream, tolerance)?;
+        self.finish(issued)
     }
 }
 
@@ -355,7 +429,8 @@ fn missing(offset: usize, width: usize) -> Error {
     ))
 }
 
-/// Host staging for the comparison: two page-locked buffers, grown as pairs need.
+/// Host staging for the comparison: two page-locked buffers, grown as pairs need, holding every
+/// pair of one paired forward back to back.
 struct Staging {
     device: DeviceId,
     real: PinnedBuffer,
@@ -380,22 +455,38 @@ impl Staging {
         Ok(())
     }
 
-    /// Copies `real` and `shadow` to the host and waits for both copies.
-    fn read(&mut self, stream: &Stream, real: &TensorView, shadow: &TensorView) -> Result<()> {
-        let bytes = real.byte_len()? as usize;
-        // SAFETY: both host destinations are page-locked storage of `bytes`, and each device
-        // source view owns `bytes` of the paired forward's buffers, which the stream's work the
-        // caller waited for no longer touches.
+    /// Issues the copies of `real` and `shadow`, `bytes` each, to `offset` of the two buffers.
+    fn copy(
+        &mut self,
+        stream: &Stream,
+        offset: usize,
+        bytes: usize,
+        real: &TensorView,
+        shadow: &TensorView,
+    ) -> Result<()> {
+        // SAFETY: `reserve` sized both host buffers for every pair, so `offset..offset + bytes` is
+        // page-locked storage of this staging, which no other copy targets; each device source
+        // view owns `bytes` of the paired forward's buffers, and the copies are ordered behind the
+        // forward on its stream.
         unsafe {
-            platform::memcpy_async(self.real.address(), real.ptr.address(), bytes, stream)?;
-            platform::memcpy_async(self.shadow.address(), shadow.ptr.address(), bytes, stream)?;
+            platform::memcpy_async(
+                self.real.address() + offset as u64,
+                real.ptr.address(),
+                bytes,
+                stream,
+            )?;
+            platform::memcpy_async(
+                self.shadow.address() + offset as u64,
+                shadow.ptr.address(),
+                bytes,
+                stream,
+            )?;
         }
-        stream.synchronize()?;
         Ok(())
     }
 
     fn real(&self) -> &[u8] {
-        // SAFETY: the buffer is page-locked storage of `len` bytes written by the copy above.
+        // SAFETY: the buffer is page-locked storage of `len` bytes, read once its copies landed.
         unsafe { std::slice::from_raw_parts(self.real.as_ptr(), self.real.len()) }
     }
 

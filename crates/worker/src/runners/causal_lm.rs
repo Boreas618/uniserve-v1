@@ -795,6 +795,15 @@ struct Flight {
     calls: Vec<CallId>,
 }
 
+/// One paired forward whose pairs are on their way to the host, and what its comparison is about.
+struct PendingCompare {
+    issued: crate::shadow::Issued,
+    operator: &'static str,
+    key: String,
+    bucket: Bucket,
+    generation: u64,
+}
+
 /// Where one bucket's sampler wrote its ids: the first `rows` i32 of the plan's sampler block.
 #[derive(Clone, Copy)]
 struct Sampled {
@@ -1264,6 +1273,11 @@ pub struct CausalLmRunner<M: TextModel> {
     stream: platform::Stream,
     /// Where shadow execution's twins live, allocated at bind, before the first capture.
     shadow: Option<crate::shadow::Shadow>,
+    /// The last paired forward's comparison, issued and not yet read: it is compared when the next
+    /// paired forward has been launched, or when it was the last its shadow batch asked for.
+    pending_compare: Option<PendingCompare>,
+    /// The paired forwards the shadow batches asked for that have not run yet.
+    shadow_jobs_left: usize,
     /// How many request slots the deployment serves: the height of the sampler's penalty-count
     /// table and of the token-state commit's table.
     slots: u32,
@@ -1475,6 +1489,8 @@ impl<M: TextModel> CausalLmRunner<M> {
             device,
             stream,
             shadow: None,
+            pending_compare: None,
+            shadow_jobs_left: 0,
             slots,
             max_kv_len,
             columns,
@@ -1747,6 +1763,7 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
                 ));
             }
         }
+        self.shadow_jobs_left += jobs.len();
         Ok(Jobs::new(jobs))
     }
 
@@ -1964,27 +1981,9 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
                 if let Some(counters) = &self.counters {
                     counters.launches(nodes);
                 }
-                // The captured launch's token bound is the pose the bucket was captured with, which
-                // `stage_warm` states as the bucket's whole extent; the batch's span is its own. When
-                // they differ the kernel is told to run work this batch does not hold, and that is a
-                // fact about the two numbers, so it is stated on every batch: a bound taken from the
-                // wrong pose leaves no trace in any figure the batch computes for itself.
-                let live = self.staging.live_tokens();
-                if !bucket.variant.is_decode() && u64::from(bucket.tokens) > live {
-                    // The bound alone says the launch runs work this batch does not hold; what the
-                    // work *does* is decided by the columns those rows read, and the rows past the
-                    // live span are the ones no operator wrote. A slot there is either absent
-                    // (`-1`, which the cache write skips) or left from another batch, and a row
-                    // naming a slot this batch never allocated is a write outside its pages - which
-                    // the device reports as an illegal address two commands later.
-                    tracing::warn!(
-                        captured_tokens = bucket.tokens,
-                        live_tokens = live,
-                        beyond = %self.beyond_span(live, u64::from(bucket.tokens)),
-                        "a prefill bucket's captured launch states more tokens than this batch \
-                         holds: the bound was taken from the pose the bucket was captured with"
-                    );
-                }
+                // A prefill bucket's captured launches are bounded by the bucket's token count, not
+                // the batch's: the rows past the live span are the padding `Staging::stage` wrote, a
+                // slot of `-1` that the cache write skips, so they write no page.
                 self.served = true;
                 // The sampled tokens are read back behind the replay. A replay that overlaps the
                 // next one answers when it lands; any other waits here, and the wait covers the
@@ -2201,6 +2200,60 @@ impl<M: TextModel> CausalLmRunner<M> {
         bucket: Bucket,
         generation: u64,
     ) -> Result<()> {
+        let result = self.shadow_step(operator, key, bucket, generation);
+        // A failure ends the shadow batch: the device drops its remaining paired forwards, so none
+        // is still owed and no comparison is left to read.
+        if result.is_err() {
+            self.shadow_jobs_left = 0;
+            self.pending_compare = None;
+        }
+        result
+    }
+
+    /// One paired forward of a shadow batch, and the comparison of the one before it.
+    fn shadow_step(
+        &mut self,
+        operator: &'static str,
+        key: &str,
+        bucket: Bucket,
+        generation: u64,
+    ) -> Result<()> {
+        self.shadow_jobs_left = self.shadow_jobs_left.saturating_sub(1);
+        let issued = self.issue_shadow(operator, key, bucket, generation);
+        // The previous operator's copies were queued before this forward, so they have landed or
+        // are about to: comparing them now waits for no work this forward added. This operator's
+        // pairs are compared at the next paired forward, or now when none follows.
+        let previous = match issued {
+            Ok(Some(pending)) => self.pending_compare.replace(pending),
+            Ok(None) => self.pending_compare.take(),
+            Err(error) => {
+                if let Some(previous) = self.pending_compare.take() {
+                    self.finish_compare(previous)?;
+                }
+                return Err(error);
+            }
+        };
+        if let Some(previous) = previous {
+            self.finish_compare(previous)?;
+        }
+        if self.shadow_jobs_left == 0
+            && let Some(last) = self.pending_compare.take()
+        {
+            self.finish_compare(last)?;
+        }
+        Ok(())
+    }
+
+    /// Launches the paired forward of one changed operator and issues the copies of its pairs,
+    /// answering the comparison still to be read, or `None` when the bucket's batch could not be
+    /// paired (which the update's evidence then names).
+    fn issue_shadow(
+        &mut self,
+        operator: &'static str,
+        key: &str,
+        bucket: Bucket,
+        generation: u64,
+    ) -> Result<Option<PendingCompare>> {
         let next = self.lifecycle.generation_named(generation)?;
         let previous = if self.lifecycle.generation.number() == generation {
             self.lifecycle.previous.clone()
@@ -2233,42 +2286,63 @@ impl<M: TextModel> CausalLmRunner<M> {
                  and {} rows: {reason}",
                 bucket.tokens, bucket.rows
             ));
-            return Ok(());
+            return Ok(None);
         }
         // The operator's tolerance is the one its paired forward recorded: `Forward::operate`
         // calls `O::tolerance(descriptor)` when it shadows, and the harness compares with it.
-        let compared = walked.and_then(|_| {
+        let issued = walked.and_then(|_| {
             let tolerance = harness.tolerance().ok_or_else(|| {
                 Error::Invariant(format!(
                     "the paired forward of {operator} recorded no tolerance: was it shadowed?"
                 ))
             })?;
-            harness.compare(&stream, tolerance)
+            harness.issue(&stream, tolerance)
         });
         // The harness stays with the runner whatever the outcome: its failure is the precopy's,
         // which the calling device command reports.
         harness.reset();
         self.shadow = Some(harness);
+        Ok(Some(PendingCompare {
+            issued: issued?,
+            operator,
+            key: key.to_owned(),
+            bucket,
+            generation,
+        }))
+    }
+
+    /// Compares one paired forward's pairs, and names in the update's evidence what they could not
+    /// measure.
+    fn finish_compare(&mut self, pending: PendingCompare) -> Result<()> {
+        let PendingCompare {
+            issued,
+            operator,
+            key,
+            bucket,
+            generation,
+        } = pending;
+        let harness = self.shadow.as_mut().ok_or(Error::State(
+            "the runner has no shadow harness: it is allocated when the runner is bound",
+        ))?;
+        let summary = harness.finish(issued)?;
         // A pair the two programs could not be compared over, and a forward that carved no twin at
         // all, are both statements of what this update has no evidence for: the operator is named
         // in the update's answer rather than left to the log (7.3 step 2).
-        if let Ok(summary) = &compared {
-            for entry in &summary.incomparable {
-                self.note_uncompared(format!(
-                    "operator {operator} {key} of generation {generation} in the bucket of {} \
-                     tokens and {} rows: {entry}",
-                    bucket.tokens, bucket.rows
-                ));
-            }
-            if summary.pairs == 0 {
-                self.note_uncompared(format!(
-                    "operator {operator} of generation {generation} was shadowed in the bucket of \
-                     {} tokens and {} rows and its launch carved no twin, so nothing was compared",
-                    bucket.tokens, bucket.rows
-                ));
-            }
+        for entry in &summary.incomparable {
+            self.note_uncompared(format!(
+                "operator {operator} {key} of generation {generation} in the bucket of {} \
+                 tokens and {} rows: {entry}",
+                bucket.tokens, bucket.rows
+            ));
         }
-        compared.map(|_| ())
+        if summary.pairs == 0 {
+            self.note_uncompared(format!(
+                "operator {operator} of generation {generation} was shadowed in the bucket of \
+                 {} tokens and {} rows and its launch carved no twin, so nothing was compared",
+                bucket.tokens, bucket.rows
+            ));
+        }
+        Ok(())
     }
 
     /// Walks one bucket's forward with two kernels of `operator`: `previous`'s on the real outputs
@@ -2675,68 +2749,6 @@ impl<M: TextModel> CausalLmRunner<M> {
             self.kv
                 .issue_pages(&install.loads, &install.offloads, &self.stream)?;
         Ok(())
-    }
-
-    /// What the slot column holds for the rows a captured bound names beyond this batch's span.
-    ///
-    /// The cache write reads one slot per row of the launch's grid. Rows past the live span are rows
-    /// this batch never staged, so their slots are whatever the column last held: `-1` (which the
-    /// write skips), a slot of an earlier batch (a write into another request's pages), or a value
-    /// nothing ever wrote (a write into pages that do not exist, which is an illegal address on the
-    /// device). The three are indistinguishable from the bound alone, and only the third faults.
-    fn beyond_span(&self, live: u64, tokens: u64) -> String {
-        let first = usize::try_from(live).unwrap_or(0);
-        let count = usize::try_from(tokens.saturating_sub(live))
-            .unwrap_or(0)
-            .min(4096);
-        if count == 0 {
-            return "none".to_owned();
-        }
-        let address = self
-            .columns
-            .slot_mapping
-            .device
-            .ptr
-            .address()
-            .saturating_add((first as u64) * 4);
-        let Some(raw) = self.read_device(address, count * 4) else {
-            return "unreadable".to_owned();
-        };
-        let mut negative = 0_usize;
-        let mut largest = i64::MIN;
-        let mut first_few = String::new();
-        for (index, word) in raw.as_chunks::<4>().0.iter().enumerate() {
-            let slot = i32::from_ne_bytes(*word);
-            if slot < 0 {
-                negative += 1;
-            } else {
-                largest = largest.max(i64::from(slot));
-            }
-            if index < 4 {
-                first_few.push_str(&format!("{slot},"));
-            }
-        }
-        format!("rows={count} negative={negative} max={largest} first=[{first_few}]")
-    }
-
-    /// `bytes` of device memory at `address`, read on this runner's stream, or `None`.
-    ///
-    /// The copy is issued only from the device thread, and it synchronizes the stream before the
-    /// host reads the buffer.
-    fn read_device(&self, address: u64, bytes: usize) -> Option<Vec<u8>> {
-        if address == 0 || bytes == 0 {
-            return None;
-        }
-        let mut raw = vec![0_u8; bytes];
-        // SAFETY: the destination is this function's own buffer of `bytes`, and the source is an
-        // address the caller read out of a launch's own arguments.
-        let copied = unsafe {
-            platform::memcpy_async(raw.as_mut_ptr() as u64, address, bytes, &self.stream)
-        };
-        if copied.is_err() || self.stream.synchronize().is_err() {
-            return None;
-        }
-        Some(raw)
     }
 
     /// Uploads the staged batch into the device columns the captured graphs address.

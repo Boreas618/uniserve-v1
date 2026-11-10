@@ -168,6 +168,9 @@ pub struct EncoderRunner<M: Encoder + Send + Sync + ?Sized> {
     /// than a running sum, so the publish reads the same numbers the encode read: a call's span is
     /// its real tokens, and whatever the mechanism put before or after it is not this runner's.
     pending: Vec<(ipc::RequestKey, u32, u32)>,
+    /// The pinned tables of vision encodes the stream may still read, each with the event recorded
+    /// behind its encode: a buffer is freed once its event has completed, never by waiting for it.
+    vision_tables: std::sync::Mutex<Vec<(platform::Event, Vec<platform::PinnedBuffer>)>>,
     /// The vision blocks of the prompt staged last, when it carries any: the replay of that batch
     /// walks the encode instead of launching a graph.
     vision: Option<VisionPrompt>,
@@ -260,6 +263,7 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
             staged: None,
             products: None,
             pending: Vec::new(),
+            vision_tables: std::sync::Mutex::new(Vec::new()),
             vision: None,
             warm: vision,
             group: None,
@@ -631,7 +635,11 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
             group.as_deref(),
         );
         self.upload()?;
-        // The pinned tables stay alive until the encode that reads them in place has completed.
+        // The pinned tables stay alive until the encode that reads them in place has completed,
+        // which an event behind the encode states: earlier encodes' tables whose event completed
+        // are freed here, and the serving stream is never waited for.
+        let mut retained = crate::lock(&self.vision_tables);
+        retained.retain(|(read, _)| !matches!(read.query(), Ok(true)));
         let mut held = Vec::new();
         self.encode_images(
             &forward,
@@ -641,10 +649,9 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
             patches,
             |layout, tables| self.pinned_tables(layout, tables, &mut held),
         )?;
-        // The tables are this prompt's alone and the walk just queued reads them.
-        stream.synchronize()?;
-
-        drop(held);
+        let read = platform::Event::new(platform::EventFlags::default());
+        read.record(&stream)?;
+        retained.push((read, held));
         Ok(())
     }
 
