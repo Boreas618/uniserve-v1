@@ -173,6 +173,8 @@ impl Command {
 }
 
 struct Current {
+    /// The job in hand: a landing clears the watchdog's view only of its own job.
+    job: JobId,
     submission: Option<SubmissionId>,
     kind: JobKind,
     batch: Option<crate::batch::BatchId>,
@@ -322,6 +324,7 @@ impl JobQueue {
             }
             if let Some(entry) = state.pending.pop_front() {
                 state.current = Some(Current {
+                    job: entry.id,
                     submission: entry.submission_id,
                     kind: entry.kind,
                     batch: entry.batch,
@@ -352,6 +355,7 @@ impl JobQueue {
         }
         let entry = state.pending.pop_front()?;
         state.current = Some(Current {
+            job: entry.id,
             submission: entry.submission_id,
             kind: entry.kind,
             batch: entry.batch,
@@ -381,6 +385,7 @@ impl JobQueue {
         }
         let entry = state.pending.remove(index)?;
         state.current = Some(Current {
+            job: entry.id,
             submission: entry.submission_id,
             kind: entry.kind,
             batch: entry.batch,
@@ -405,12 +410,13 @@ impl JobQueue {
     ) {
         {
             // The command in hand may already be the next one: a replay lands while the replay
-            // launched behind it is the command the watchdog watches.
+            // launched behind it is the command the watchdog watches, so only the landing job's
+            // own record is cleared.
             let mut state = lock(&self.state);
             if state
                 .current
                 .as_ref()
-                .is_none_or(|current| current.batch == entry.batch)
+                .is_none_or(|current| current.job == entry.id)
             {
                 state.current = None;
             }
@@ -459,7 +465,7 @@ impl JobQueue {
             .map(|current| {
                 vec![crate::device::Watch {
                     submission: current.submission,
-                    job: JobId(0),
+                    job: current.job,
                     kind: current.kind,
                     batch: current.batch,
                     started: current.started,
@@ -629,6 +635,42 @@ mod tests {
 
         queue.complete(entry, Ok(crate::batch::BatchOutput::default()), None);
         assert!(matches!(submission.outcome(), Some(Outcome::Success(_))));
+        assert!(queue.in_flight().is_empty());
+    }
+
+    /// The watchdog reads the batch a job serves, and a replay landing while the next one is in
+    /// hand leaves the next one watched.
+    #[test]
+    fn the_watched_job_names_its_batch_until_it_lands() {
+        let (queue, _events) = queue();
+        let (first, _) = Submission::pending(crate::batch::SubmissionId(0));
+        let (second, _) = Submission::pending(crate::batch::SubmissionId(1));
+        let mut next = batch();
+        next.id = crate::batch::BatchId(2);
+        queue
+            .submit(
+                Command::Batch(batch()),
+                &first,
+                JobKind::Batch,
+                Some(crate::batch::BatchId(1)),
+            )
+            .expect("queued");
+        queue
+            .submit(
+                Command::Batch(next),
+                &second,
+                JobKind::Batch,
+                Some(crate::batch::BatchId(2)),
+            )
+            .expect("queued");
+
+        let landing = queue.next(Some(Duration::from_millis(10))).expect("first");
+        let in_hand = queue.next(Some(Duration::from_millis(10))).expect("second");
+        queue.complete(landing, Ok(crate::batch::BatchOutput::default()), None);
+        let watched = queue.in_flight();
+        assert_eq!(watched.len(), 1, "the second replay is still watched");
+        assert_eq!(watched[0].batch, Some(crate::batch::BatchId(2)));
+        queue.complete(in_hand, Ok(crate::batch::BatchOutput::default()), None);
         assert!(queue.in_flight().is_empty());
     }
 

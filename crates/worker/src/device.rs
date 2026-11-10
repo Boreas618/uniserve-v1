@@ -433,8 +433,14 @@ impl Worker {
     pub fn submit(&self, batch: Batch) -> Result<Submission> {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
-        self.queue
-            .submit(Command::Batch(batch), &submission, JobKind::Batch, None)?;
+        // The stall report names the batch its job belongs to (2.4).
+        let batch_id = batch.id;
+        self.queue.submit(
+            Command::Batch(batch),
+            &submission,
+            JobKind::Batch,
+            Some(batch_id),
+        )?;
         Ok(submission)
     }
 
@@ -443,8 +449,13 @@ impl Worker {
     pub fn shadow(&self, batch: Batch) -> Result<Submission> {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
-        self.queue
-            .submit(Command::Shadow(batch), &submission, JobKind::Shadow, None)?;
+        let batch_id = batch.id;
+        self.queue.submit(
+            Command::Shadow(batch),
+            &submission,
+            JobKind::Shadow,
+            Some(batch_id),
+        )?;
         Ok(submission)
     }
 
