@@ -404,75 +404,6 @@ fn column_extents(buckets: &Buckets) -> Result<(u64, u64)> {
 }
 
 impl Columns {
-    /// Every column's device address and byte length, named, so a dump can say what a copy writes.
-    ///
-    /// A column's device view names its **host** buffer (a pinned, host-mapped allocation), so the
-    /// two addresses a captured copy states are comparable against these.
-    fn named(&self) -> Vec<(&'static str, u64, usize)> {
-        vec![
-            (
-                "positions",
-                self.positions.device.ptr.address(),
-                self.positions.host.len(),
-            ),
-            (
-                "input_ids",
-                self.input_ids.device.ptr.address(),
-                self.input_ids.host.len(),
-            ),
-            (
-                "slot_mapping",
-                self.slot_mapping.device.ptr.address(),
-                self.slot_mapping.host.len(),
-            ),
-            (
-                "scratch_slots",
-                self.scratch_slots.device.ptr.address(),
-                self.scratch_slots.host.len(),
-            ),
-            (
-                "seq_lens",
-                self.seq_lens.device.ptr.address(),
-                self.seq_lens.host.len(),
-            ),
-            (
-                "query_offsets",
-                self.query_offsets.device.ptr.address(),
-                self.query_offsets.host.len(),
-            ),
-            (
-                "logits_rows",
-                self.logits_rows.device.ptr.address(),
-                self.logits_rows.host.len(),
-            ),
-            (
-                "indices",
-                self.indices.device.ptr.address(),
-                self.indices.host.len(),
-            ),
-            (
-                "parameters",
-                self.parameters.device.ptr.address(),
-                self.parameters.host.len(),
-            ),
-            (
-                "slots",
-                self.slots.device.ptr.address(),
-                self.slots.host.len(),
-            ),
-            (
-                "draws",
-                self.draws.device.ptr.address(),
-                self.draws.host.len(),
-            ),
-            (
-                "live_tokens",
-                self.live_tokens.device.ptr.address(),
-                self.live_tokens.host.len(),
-            ),
-        ]
-    }
-
     /// Moves every column a batch rewrites to device storage, so a batch can be staged behind a
     /// replay that still reads the batch before it.
     fn place(
@@ -971,18 +902,6 @@ fn prompt_token(
 /// the decode's arrival counters at its head once per forward.
 const ATTENTION_WORKSPACE_BYTES: u64 = 512 << 20;
 
-/// Whether this process was asked to state each batch's cache addresses (`UNISERVE_RUNNER_DUMP`).
-///
-/// Read once: a deployment either asks for the line or does not, and a step must not read the
-/// environment.
-fn runner_dump() -> bool {
-    static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DUMP.get_or_init(|| {
-        std::env::var_os("UNISERVE_RUNNER_DUMP").is_some_and(|value| !value.is_empty())
-    })
-}
-
-/// The largest logit that is not `best`'s, which is the gap a first-token choice was made by.
 /// Whether a replay walks its batch eagerly instead of launching the bucket's graph.
 ///
 /// A diagnosis of one question: is a wrong answer the batch the runner staged, or the graph it
@@ -996,251 +915,7 @@ fn eager_replay() -> bool {
     })
 }
 
-/// Whether a replay compares the graph it is about to launch with a fresh capture of the same walk.
-///
-/// A captured node keeps what the host computed when the capture ran - the kernel's arguments, the
-/// tensor maps built from the pose, every device pointer the walk derived from it - and the walk that
-/// serves a batch issues the same launches with the batch's own values. Comparing the two, node for
-/// node in capture order, names the first place the graph and the walk disagree, which is the
-/// difference between a replay that answers right and one that does not.
-/// Whether the first serving prefill is captured again with its own batch, beside the pose it was captured
-/// with, and the two launches compared byte for byte.
-///
-/// The pose capture and the serving batch issue the same launches with the same geometry and different
-/// values, and a replay that writes nothing is the difference between them. An eager launch is not recorded,
-/// so it has no node parameters to compare: only a *capture* of the real batch states the launch that batch
-/// would have had. This makes that capture once, on the runner's own stream, between steps - and it launches
-/// it once too, because the same graph writing attention's output is the other half of the answer.
-fn recapture_real() -> bool {
-    static RECAPTURE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *RECAPTURE.get_or_init(|| {
-        std::env::var_os("UNISERVE_RECAPTURE_REAL").is_some_and(|value| !value.is_empty())
-    })
-}
-
-/// The field a `KernelParams` byte offset belongs to, where the structure is known.
-fn field_at(at: usize) -> &'static str {
-    match at & !7 {
-        0 => "tmaQ",
-        128 => "tmaK",
-        256 => "tmaKsw",
-        384 => "tmaV",
-        512 => "tmaO",
-        896 => "grid.x",
-        900 => "grid.y",
-        904 => "grid.z",
-        912 => "ptrO",
-        936 => "cumSeqLensQ",
-        1000 => "counter",
-        1016 => "pageIdx",
-        1024 => "partialO",
-        1096 => "seqLensKv",
-        1112 => "stats",
-        1128 => "window",
-        1132 => "batch",
-        1136 => "chunked",
-        _ => "?",
-    }
-}
-
-fn graph_diff() -> bool {
-    static DIFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DIFF.get_or_init(|| {
-        std::env::var_os("UNISERVE_GRAPH_DIFF").is_some_and(|value| !value.is_empty())
-    })
-}
-
-/// Every kernel node of one walk's table, in capture order, with the operator it belongs to.
-fn kernel_nodes(nodes: &crate::captured::Nodes) -> Vec<(&'static str, &platform::GraphNode)> {
-    nodes
-        .iter()
-        .flat_map(|(operator, _, launch)| launch.iter().map(move |node| (*operator, &node.node)))
-        .collect()
-}
-
-/// What a serving graph's attention launches baked, beside what the batch it serves states.
-///
-/// A captured node keeps the host's values from capture time, and **the batch size is the one of them a
-/// batch can contradict**: the graph states `mBatchSize` from the pose it recorded, and a replay of that
-/// graph for a batch with another row count leaves the kernel working on rows the batch does not hold.
-/// The other four numbers are stated by geometry rather than by a pose - the longest query, the longest
-/// key, the CTA split and the pages per sequence - so they are printed beside the batch's figures rather
-/// than compared with them, and a reader sees whether the graph's own geometry is the one the deployment
-/// wants.
-///
-/// It reads and compares; it captures, launches and allocates nothing, because a diagnosis that disturbs
-/// the path it measures answers about itself.
-fn baked_difference(
-    captured: &crate::captured::Captured,
-    bucket: Bucket,
-    staging: &Staging,
-) -> String {
-    let graph = captured.template();
-    let nodes = kernel_nodes(captured.nodes());
-    let rows = i64::from(bucket.rows);
-    let live = staging.live_tokens();
-    let longest = staging
-        .batch_rows()
-        .seq_lens
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0)
-        .max(0);
-    let mut seen = 0usize;
-    let mut baked = None;
-    for (operator, node) in &nodes {
-        if *operator != "paged_attention" {
-            continue;
-        }
-        let Ok(params) = graph.kernel_node_params(node) else {
-            continue;
-        };
-        let Some(blob) = params.parameters.first() else {
-            continue;
-        };
-        // `fmha::KernelParams`' offsets.
-        let integer = |at: usize| -> i64 {
-            blob.get(at..at + 4)
-                .map(|bytes| i64::from(i32::from_ne_bytes(bytes.try_into().unwrap_or([0; 4]))))
-                .unwrap_or(0)
-        };
-        let numbers = (
-            integer(1132),
-            integer(1172),
-            integer(1176),
-            integer(1184),
-            integer(1188),
-        );
-        if baked.is_none() {
-            baked = Some(numbers);
-        }
-        seen += 1;
-    }
-    let Some((batch, max_q, max_kv, ctas_kv, pages)) = baked else {
-        return "no attention node in the graph".to_owned();
-    };
-    if batch != rows {
-        return format!(
-            " first=paged_attention batch baked={batch} this batch rows={rows} \
-             (live_tokens={live} longest_row_kv={longest})"
-        );
-    }
-    format!(
-        " attention={seen} batch={batch}={rows} baked[max_q={max_q} max_kv={max_kv} \
-         ctas_kv={ctas_kv} pages_per_seq={pages}] batch[live_tokens={live} \
-         longest_row_kv={longest}] all=same"
-    )
-}
-
-/// What depends on the first attention launches of a graph, by each dependent's kernel name.
-///
-/// A graph holds the edges the recording saw. Work an operator issued on another stream leaves none,
-/// and the graph then runs the consumer in whatever order the driver chooses - a projection reading
-/// its input before attention wrote it gives exactly a right layer and a wrong next one, with every
-/// scalar in the launch agreeing.
-fn attention_edges(captured: &crate::captured::Captured) -> String {
-    let graph = captured.template();
-    let nodes = kernel_nodes(captured.nodes());
-    let mut out = String::new();
-    let mut reported = 0usize;
-    for (ordinal, (operator, node)) in nodes.iter().enumerate() {
-        if *operator != "paged_attention" || reported >= 2 {
-            continue;
-        }
-        let dependents = match graph.dependents_with_edges(node) {
-            Ok(dependents) => dependents,
-            Err(error) => {
-                out.push_str(&format!(" attention{reported}=unreadable({error})"));
-                reported += 1;
-                continue;
-            }
-        };
-        let named: Vec<String> = dependents
-            .iter()
-            .map(|(dependent, edge)| {
-                let name = match graph.kernel_node_params(dependent) {
-                    Ok(params) => params
-                        .function
-                        .name()
-                        .unwrap_or_else(|error| format!("unnamed({error})")),
-                    Err(_) => "not-a-kernel".to_owned(),
-                };
-                // An edge that lets the consumer start early is a consumer that must wait for the
-                // producer's data itself; one recorded for a launch that never asked for it is the
-                // ordering defect, and it leaves every scalar in both launches agreeing.
-                if edge.is_programmatic() {
-                    format!("{name}@port{} PROGRAMMATIC", edge.port)
-                } else {
-                    name
-                }
-            })
-            .collect();
-        out.push_str(&format!(
-            " attention{reported}@{ordinal} depends_on_me={} [{}]",
-            named.len(),
-            named.join(",")
-        ));
-        reported += 1;
-    }
-    if reported == 0 {
-        return " no attention node in the graph".to_owned();
-    }
-    out
-}
-
-/// Every copy a captured graph replays, with the batch column it writes and what its source holds now.
-///
-/// A capture bakes both addresses of a copy. A copy whose source is a buffer the caller fills per
-/// batch replays the values that buffer held **when the recording happened**, and nothing in the
-/// graph's kernels, parameters or edges says so: the batch's own values never reach the destination.
-/// So this names the destination - a column by name, or an address outside every column - and reads
-/// the source as it stands now, which is what the replay is about to copy.
-fn copies_report(
-    captured: &crate::captured::Captured,
-    columns: &[(&'static str, u64, usize)],
-) -> String {
-    let copies = match captured.template().copies() {
-        Ok(copies) => copies,
-        Err(error) => return format!(" copies=unreadable({error})"),
-    };
-    if copies.is_empty() {
-        return " copies=0".to_owned();
-    }
-    let mut out = format!(" copies={}", copies.len());
-    for (index, copy) in copies.iter().enumerate() {
-        let source = copy.source.address().unwrap_or(0);
-        let destination = copy.destination.address().unwrap_or(0);
-        let named = columns
-            .iter()
-            .find(|(_, base, bytes)| {
-                let end = base.saturating_add(*bytes as u64);
-                destination >= *base && destination < end
-            })
-            .map(|(name, base, _)| format!("{name}+{}", destination.saturating_sub(*base)))
-            .unwrap_or_else(|| "no-column".to_owned());
-        // Four words of the source when it is host memory: enough to tell a batch's own values from
-        // a pose's zeros. Reading cannot change what the replay does.
-        let now = match copy.source {
-            platform::Space::Host(address) if address != 0 && copy.bytes >= 16 => {
-                // SAFETY: the driver stated this address as the source of a copy this graph holds,
-                // and reading it without writing it changes nothing the replay will do.
-                let words = unsafe { std::slice::from_raw_parts(address as *const u32, 4) };
-                format!(
-                    "{:08x},{:08x},{:08x},{:08x}",
-                    words[0], words[1], words[2], words[3]
-                )
-            }
-            _ => "n/a".to_owned(),
-        };
-        out.push_str(&format!(
-            " c{index}=[{source:#x}->{destination:#x} {named} {}B now={now}]",
-            copy.bytes
-        ));
-    }
-    out
-}
-
+/// The largest logit that is not `best`'s, which is the gap a first-token choice was made by.
 fn runner_up(values: &[f32], best: usize) -> f32 {
     let mut second = f32::NEG_INFINITY;
     for (index, value) in values.iter().enumerate() {
@@ -1358,39 +1033,6 @@ fn apply_cache_units_unavailable(units: &[ipc::CacheUnitAllocation]) -> Result<(
          cached prefix would read pages that were never copied"
             .into(),
     ))
-}
-
-/// Whether a block table view holds `bytes` readable bytes of page indices.
-///
-/// The table is read back from the column the kernel addresses, so a view that is not `i32` or is
-/// shorter than the read names no plan a launch could have. The copy is refused rather than
-/// clamped: a read past the column leaves the driver's error on the runner's stream, and a read of
-/// the wrong type prints numbers that are not page indices.
-fn table_readback_fits(view: &ops::TensorView, bytes: usize) -> bool {
-    view.dtype == ops::DType::I32 && view.byte_len().is_ok_and(|length| length >= bytes as u64)
-}
-
-/// The bytes a page readback covers, or the reason there is none.
-///
-/// A device copy that reads outside the allocation it describes is not a lost diagnostic: the
-/// driver's error sticks to the runner's stream and the next batch fails on it (2.4). So the range
-/// is computed and checked before anything is issued, and this function is the whole of that rule:
-/// the unit must be in the plane, and the plane must hold the bytes read.
-fn page_readback_range(
-    unit: i64,
-    units: i64,
-    plane_bytes: i64,
-    bytes: usize,
-) -> std::result::Result<u64, String> {
-    if plane_bytes < bytes as i64 {
-        return Err(format!(
-            "plane holds {plane_bytes} bytes, a read wants {bytes}"
-        ));
-    }
-    if unit < 0 || unit >= units {
-        return Err(format!("unit {unit} outside {units}"));
-    }
-    u64::try_from(unit * plane_bytes).map_err(|_| "offset".to_owned())
 }
 
 /// What the runner needs from the block's resident KV cache to build a batch's `nn::KvView`.
@@ -1629,28 +1271,6 @@ pub struct CausalLmRunner<M: TextModel> {
     kv: Box<dyn KvProvider>,
     /// The sampling step's uniform generator, seeded by the engine so a run reproduces.
     seed: std::cell::Cell<u64>,
-    /// The batch's cache rows and page copies, staged at submit and performed by the device
-    /// thread before the replay reads them (2.4).
-    ///
-    /// A table's installation is work on this runner's stream exactly as a column's upload is, and
-    /// only the device thread issues there. Installed from the submitting thread it races the
-    /// previous batch's replay, and the pages batch N+1 writes land in the row batch N is reading.
-    /// Submit therefore states which batch the rows belong to, and a replay of another batch
-    /// refuses rather than installing the wrong request's pages.
-    /// The page the dump digests: the first unit of the batch's own staged table, remembered here
-    /// because a batch that installs no new rows (a decode step on pages it already addresses) has
-    /// no staged table to read, and the pages a request reads do not move between its batches.
-    ///
-    /// Only a diagnosis reads this; it costs one `Option<u64>` and is filled where the install sees
-    /// the table, so no step pays for it.
-    cache_page: Option<u64>,
-    /// What the captured attention launch was given, read from the device after the replay and
-    /// printed on the device thread (`UNISERVE_RUNNER_DUMP`).
-    ///
-    /// The batch's own line states the host side; this states the *call*: the scalars a captured
-    /// launch carries and the pointers the kernel dereferences. A kernel handed a table of zeros or
-    /// a bound of one reads nothing, and no host-side figure says which.
-    pending_attention: Option<String>,
     /// Whether this runner has served a batch. A bucket captured before that may be warmed by an
     /// eager walk; one captured afterwards may not, because the walk would run a forward over an
     /// arena a serving bucket owns.
@@ -1659,15 +1279,17 @@ pub struct CausalLmRunner<M: TextModel> {
     /// launches and **not** inside a recording, where a synchronise is refused by the driver and a
     /// failed one can leave the recording in a state it never recovers from.
     capturing: bool,
+    /// The batch's cache rows and page copies, staged at submit and performed by the device
+    /// thread before the replay reads them (2.4).
+    ///
+    /// A table's installation is work on this runner's stream exactly as a column's upload is, and
+    /// only the device thread issues there. Installed from the submitting thread it races the
+    /// previous batch's replay, and the pages batch N+1 writes land in the row batch N is reading.
+    /// Submit therefore states which batch the rows belong to, and a replay of another batch
+    /// refuses rather than installing the wrong request's pages.
     pending_install: Option<PendingInstall>,
     /// The fence of the running batch's page offloads, until its output waits on it.
     offload_fence: Option<Arc<platform::Event>>,
-    /// What `UNISERVE_RUNNER_DUMP` wrote about the batch that is about to be replayed, and the page
-    /// its readback must name. Filled at submit, which sees the batch's own block tables, and read
-    /// by the device thread, which is the only thread that may issue to this runner's stream.
-    pending_dump: Option<(u32, String)>,
-    /// Whether a batch has been captured again beside the pose it serves (see `recapture_real`).
-    recaptured: bool,
     /// The replays launched and not yet answered, oldest first.
     flights: std::collections::VecDeque<Flight>,
     /// The readback buffers the next replay fills.
@@ -1676,13 +1298,6 @@ pub struct CausalLmRunner<M: TextModel> {
     placed: bool,
     /// The bucket the last warm walk made ready, without its expert step size.
     warmed: Option<Bucket>,
-    /// The last prefill batch's dump line and the page bytes it left behind, so a decode's line is
-    /// read beside the write that should have fed it.
-    last_prefill: Option<String>,
-    /// How long the last `cuGraphLaunch` took to return, which is the host's enqueue cost and not
-    /// the device's work: a replay that is slow in its enqueue is a graph the driver cannot hand
-    /// over quickly, and one that is slow after it is the kernels.
-    enqueue_ms: f64,
     /// This rank's member of the expert union, on a deployment whose experts are split.
     experts: Option<super::experts::Member>,
     /// The tensor group this rank's model is a member of: every forward issues the group's
@@ -1855,20 +1470,14 @@ impl<M: TextModel> CausalLmRunner<M> {
             commit: CommitColumns::new(device, commit_rows, slots)?,
             sampling,
             bucket_samples: std::cell::RefCell::new(HashMap::new()),
-            cache_page: None,
-            pending_attention: None,
             served: false,
             capturing: false,
             pending_install: None,
             offload_fence: None,
-            pending_dump: None,
-            recaptured: false,
             flights: std::collections::VecDeque::new(),
             turn: 0,
             placed: false,
             warmed: None,
-            last_prefill: None,
-            enqueue_ms: 0.0,
             experts: None,
             tensor: None,
             encoded: Vec::new(),
@@ -1963,11 +1572,11 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
     }
 
     /// A replay is launched behind the one before it, because the driver takes the device idle for
-    /// as long as a launch lasts when it waits for that replay to end. Every diagnosis reads a
-    /// replay's state as it ends, so those wait. A union's ranks enter its steps in order on each
-    /// device thread, so a step entered behind one in flight is the next step on every rank.
+    /// as long as a launch lasts when it waits for that replay to end. An eager replay launches no
+    /// graph, so it waits. A union's ranks enter its steps in order on each device thread, so a
+    /// step entered behind one in flight is the next step on every rank.
     fn overlaps_replays(&self) -> bool {
-        !runner_dump() && !eager_replay() && !recapture_real() && !graph_diff()
+        !eager_replay()
     }
 
     /// A batch that keeps its logits answers its greedy rows on the host, and the next step reads
@@ -1988,7 +1597,6 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
     }
 
     fn submit(&mut self, batch: Batch) -> Result<Jobs> {
-        let entered = std::time::Instant::now();
         let shape = batch.shape;
         // What a refusal is about, said before it happens: the classes the rows carry are the fact
         // no other owner of this batch can report, and a batch that mixes them is refused for them.
@@ -2024,15 +1632,6 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
             loads: batch.page_loads.clone(),
             offloads: batch.page_offloads.clone(),
         });
-        // What a batch says about where its tokens read and write their cache, when a deployment
-        // asks for it: the addresses a prefill wrote and a decode reads are compared from these
-        // numbers rather than guessed from a continuation's text.
-        if runner_dump() {
-            // The host figures are the submitting thread's; the page readback is the device
-            // thread's, because a copy issued from here would put a second thread on this
-            // runner's stream (2.4).
-            Self::dump_batch(self, bucket, &batch, &shape, entered.elapsed());
-        }
         // The columns are staged here, on the submitting thread; everything that touches the
         // device is the replay job, which this worker's device thread performs in `serve`: the
         // staged columns are uploaded, the bucket's graph is launched - the smallest captured
@@ -2277,44 +1876,12 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
                 // row `slot` of the cache's pooled table, so the row must state the request's own
                 // pages before the graph reads it, and the units must be this cache's before
                 // anything is copied into them.
-                // The page the batch's first row starts at, read from the staged table before the
-                // install consumes it: the dump digests the pages the replay has just written, and
-                // the row's own first page is where the prompt's first tokens live (4.5).
-                let first_page = self
-                    .pending_install
-                    .as_ref()
-                    .and_then(|install| install.tables.first())
-                    .and_then(|table| table.unit_ids.first())
-                    .map(|unit| u64::from(unit.0));
                 self.install_pending(*batch)?;
                 // Then the batch's columns are uploaded here, on the device thread, before the
                 // graph reads them: the scheduler hands over a `Batch` and the device thread
                 // stages and uploads it, so a replay that skipped the upload would serve the pose
                 // the bucket was captured with.
                 self.upload(*bucket)?;
-                // A draw that never ran and a draw that ran wrongly are the same reading afterwards,
-                // because the sampler's output lives in arena memory nothing has initialised. `-1` is
-                // outside every vocabulary and outside every sampled id, so filling the buffer with it
-                // before the launch makes "no draw" visible - and it is written under the dump only,
-                // which is a device fill on this thread's own stream and ordered before the replay.
-                if runner_dump() {
-                    let samples = self.bucket_samples.borrow().get(bucket).copied();
-                    if let Some(samples) = samples {
-                        // SAFETY: the buffer is the sampler's own `[rows]` i32 in this bucket's plan,
-                        // live for the whole epoch, and the fill is ordered before the launch that
-                        // would overwrite it.
-                        if let Err(error) = unsafe {
-                            platform::memset_d32(
-                                samples.tokens.ptr.address(),
-                                u32::MAX,
-                                bucket.rows as usize,
-                                &self.stream,
-                            )
-                        } {
-                            tracing::warn!(bucket = %bucket, %error, "the sampler's sentinel fill failed");
-                        }
-                    }
-                }
                 // Every rank of an expert union runs this step: the graph's dispatches wait on their
                 // devices for the peers', so the union is entered before the launch.
                 let mut expert_bucket = None;
@@ -2357,24 +1924,6 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
                 // change, so the newest generation that did prepare it is the same program: it
                 // serves the batch, and the switchover of an update that changed no kernel of this
                 // bucket's does not need a fresh executable per bucket.
-                // A diagnosis of the one difference an eager walk cannot state: the node table a *capture*
-                // of this batch would have. Once per process, on the first prefill this runner replays, and
-                // between the staging and the launch so the values it records are this batch's.
-                if recapture_real()
-                    && !self.recaptured
-                    && matches!(
-                        bucket.variant,
-                        crate::plan::Variant::PrefillWrite
-                            | crate::plan::Variant::PrefillOutput
-                            | crate::plan::Variant::PrefillGreedy
-                    )
-                    && self.staging.live_tokens() > 0
-                {
-                    self.recaptured = true;
-                    if let Err(error) = self.recapture_real(*bucket, *generation) {
-                        tracing::warn!(bucket = %bucket, %error, "the recapture of this batch failed");
-                    }
-                }
                 let (served, captured) = self
                     .lifecycle
                     .graphs
@@ -2393,35 +1942,6 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
                         "the bucket was prepared for an earlier generation; its programs did not change"
                     );
                 }
-                // A diagnosis of the one difference an eager walk cannot state: the node table a *capture*
-                // of this batch would have. Once per process, on the first prefill this runner replays, and
-                // between the staging and the launch so the values it records are this batch's.
-
-                // What the graph baked against what this batch states, node by node: a captured
-                // node keeps the host's values from capture time, and the numbers a pose decides -
-                // the batch size, the sum of the query lengths, the maximum key length, the CTA
-                // split - are the ones a graph and a batch can disagree about silently. This reads
-                // the graph's own parameters and the staged columns; it captures nothing, launches
-                // nothing and allocates nothing, because a diagnosis that disturbs the path it
-                // measures answers about itself.
-                if graph_diff() {
-                    tracing::warn!(
-                        bucket = %bucket,
-                        difference = %baked_difference(captured, *bucket, &self.staging),
-                        "the serving graph's baked numbers against the batch it is serving"
-                    );
-                    tracing::warn!(
-                        bucket = %bucket,
-                        edges = %attention_edges(captured),
-                        "what the graph's edges say waits for attention"
-                    );
-                    tracing::warn!(
-                        bucket = %bucket,
-                        copies = %copies_report(captured, &self.columns.named()),
-                        "every copy the graph replays, and what each source holds now"
-                    );
-                }
-                let enqueue = Instant::now();
                 let nodes = captured.kernel_nodes();
                 if !eager {
                     captured.launch(&stream)?;
@@ -2431,16 +1951,14 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
                 if let Some(fence) = self.offload_fence.take() {
                     stream.wait_event(&fence)?;
                 }
-                self.enqueue_ms = enqueue.elapsed().as_secs_f64() * 1e3;
                 if let Some(counters) = &self.counters {
                     counters.launches(nodes);
                 }
                 // The captured launch's token bound is the pose the bucket was captured with, which
                 // `stage_warm` states as the bucket's whole extent; the batch's span is its own. When
                 // they differ the kernel is told to run work this batch does not hold, and that is a
-                // fact about the two numbers, so it is stated on every batch rather than only under
-                // the dump: a bound taken from the wrong pose leaves no trace in any figure the batch
-                // computes for itself.
+                // fact about the two numbers, so it is stated on every batch: a bound taken from the
+                // wrong pose leaves no trace in any figure the batch computes for itself.
                 let live = self.staging.live_tokens();
                 if !bucket.variant.is_decode() && u64::from(bucket.tokens) > live {
                     // The bound alone says the launch runs work this batch does not hold; what the
@@ -2458,94 +1976,6 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
                     );
                 }
                 self.served = true;
-                if runner_dump() {
-                    let call = format!(
-                        "{}{}",
-                        self.dump_attention_call(captured, first_page.or(self.cache_page)),
-                        self.dump_layer_probes(captured)
-                    );
-                    self.pending_attention = Some(call);
-                }
-                if runner_dump() {
-                    // What a replay launches, by node kind, and how many launches the recording
-                    // saw. A forward of forty-eight layers holds hundreds of kernel nodes; a graph
-                    // that reports one node while the model has hundreds means the launches did not
-                    // land in the template - they ran during the capture - and a replay is then a
-                    // graph replaying work that is not the forward.
-                    let mut histogram: Vec<(String, u64)> = Vec::new();
-                    let mut launches = 0_u64;
-                    for (_, _, launch) in captured.nodes() {
-                        launches += 1;
-                        for walked in launch {
-                            let kind = walked
-                                .node
-                                .kind()
-                                .map(|kind| format!("{kind:?}"))
-                                .unwrap_or_else(|_| "unknown".to_owned());
-                            match histogram.iter_mut().find(|(name, _)| *name == kind) {
-                                Some((_, count)) => *count += 1,
-                                None => histogram.push((kind, 1)),
-                            }
-                        }
-                    }
-                    let kinds = histogram
-                        .iter()
-                        .map(|(name, count)| format!("{name}:{count}"))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    // The template's own node table, straight from the driver: what a replay
-                    // actually launches, which the recording's table can only claim.
-                    let (template_nodes, template_kinds) = match captured.template().nodes() {
-                        Ok(nodes) => {
-                            let mut counted: Vec<(String, u64)> = Vec::new();
-                            for node in &nodes {
-                                let kind = node
-                                    .kind()
-                                    .map(|kind| format!("{kind:?}"))
-                                    .unwrap_or_else(|_| "unknown".to_owned());
-                                match counted.iter_mut().find(|(name, _)| *name == kind) {
-                                    Some((_, count)) => *count += 1,
-                                    None => counted.push((kind, 1)),
-                                }
-                            }
-                            let spelled = counted
-                                .iter()
-                                .map(|(name, count)| format!("{name}:{count}"))
-                                .collect::<Vec<_>>()
-                                .join(",");
-                            (nodes.len(), spelled)
-                        }
-                        Err(error) => (0, format!("unreadable({error})")),
-                    };
-                    // Per operator, how many nodes the walk attributed to it: two buckets of one
-                    // model should name the same operators with the same counts, and a bucket
-                    // missing a few per layer names the operator that vanished.
-                    let mut per_op: Vec<(&'static str, u64)> = Vec::new();
-                    for (op, _, launch) in captured.nodes() {
-                        match per_op.iter_mut().find(|(name, _)| name == op) {
-                            Some((_, count)) => *count += launch.len() as u64,
-                            None => per_op.push((op, launch.len() as u64)),
-                        }
-                    }
-                    per_op.retain(|(_, count)| *count > 0);
-                    let ops = per_op
-                        .iter()
-                        .map(|(name, count)| format!("{name}:{count}"))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    tracing::info!(
-                        bucket = %bucket,
-                        ops = %ops,
-                        kernels = captured.kernel_nodes(),
-                        walks = launches,
-                        recorded_kinds = %kinds,
-                        template_nodes,
-                        template_kinds = %template_kinds,
-                        kernels_held = captured.kernels().len(),
-                        launch_ms = launched.elapsed().as_secs_f64() * 1e3,
-                        "a replay issued its graph"
-                    );
-                }
                 // The sampled tokens are read back behind the replay. A replay that overlaps the
                 // next one answers when it lands; any other waits here, and the wait covers the
                 // replay as well, which is why the launch's instant is what the device segment is
@@ -2707,10 +2137,6 @@ impl<M: TextModel> CausalLmRunner<M> {
             max_kv_len = self.max_kv_len,
             "a bucket's warm pose"
         );
-        if runner_dump() {
-            tracing::info!(bucket = %bucket, pose = %self.dump_kernel_arguments(bucket),
-                "a bucket's warm pose, as the columns and the page table hold it");
-        }
         self.walk(bucket, kernels)?;
         // The warm launches are real device work on the pool's stream; a capture begun over them is
         // legal and does not contain them, but nothing may plan a mapping while they are in flight.
@@ -2720,128 +2146,6 @@ impl<M: TextModel> CausalLmRunner<M> {
             warm_ms = began.elapsed().as_secs_f64() * 1e3,
             "a bucket's operators were warmed before its capture"
         );
-        Ok(())
-    }
-
-    /// Captures this bucket again with the batch it is serving, and compares that launch with the pose's.
-    ///
-    /// Run once, on the runner's own stream, between the staging of a batch and its replay. The walk inside
-    /// the recording is the same work the replay is about to do, so it changes nothing the batch observes:
-    /// the KV pages, the arena region and the page table all hold the same values the replay would write.
-    /// What it adds is a *node table* for the batch's real values, which no eager launch can have - and then
-    /// one launch of that graph, because a graph that writes attention's output is the other half of the
-    /// answer and the two halves are read in one run.
-    fn recapture_real(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
-        // The pose's own launch, read before the walk borrows this runner mutably.
-        let pose = {
-            let (_, captured) = self
-                .lifecycle
-                .graphs
-                .captured_for(bucket, generation)
-                .ok_or_else(|| {
-                    Error::Invariant(format!(
-                        "no graph of bucket {bucket} in generation {generation} to compare a \
-                         recapture with"
-                    ))
-                })?;
-            kernel_nodes(captured.nodes())
-                .into_iter()
-                .find(|(operator, _)| *operator == "paged_attention")
-                .map(|(_, node)| captured.template().kernel_node_params(node))
-                .ok_or_else(|| {
-                    Error::Invariant("the pose's graph holds no attention launch".into())
-                })??
-        };
-        let kernels = self.lifecycle.generation_named(generation)?;
-        let stream = self.stream.clone();
-        self.capturing = true;
-        let walked = walk_capture(&stream, || self.walk(bucket, &kernels));
-        self.capturing = false;
-        let walked = walked?;
-        // The same operator's launch in both graphs: the first attention node of each, in capture order.
-        let real = kernel_nodes(&walked.nodes)
-            .into_iter()
-            .find(|(operator, _)| *operator == "paged_attention")
-            .map(|(_, node)| walked.template.kernel_node_params(node));
-        let Some(real) = real else {
-            return Err(Error::Invariant(
-                "a recapture found no attention launch to compare".into(),
-            ));
-        };
-        let real = real?;
-        let pose_name = pose
-            .function
-            .name()
-            .unwrap_or_else(|error| format!("unnamed({error})"));
-        let real_name = real
-            .function
-            .name()
-            .unwrap_or_else(|error| format!("unnamed({error})"));
-        // Every 8-byte word of the parameter block the two launches disagree on. A pointer that moved is a
-        // buffer the batch's own walk chose; a scalar that moved is a value the pose decided and the batch
-        // did not, which is the class a graph bakes wrongly and no scalar check finds.
-        let mut differences = Vec::new();
-        if let (Some(pose_blob), Some(real_blob)) =
-            (pose.parameters.first(), real.parameters.first())
-        {
-            differences.push(format!(
-                "pose_bytes={} real_bytes={}",
-                pose_blob.len(),
-                real_blob.len()
-            ));
-            let words = pose_blob.len().min(real_blob.len()) / 8;
-            for word in 0..words {
-                let at = word * 8;
-                let left = u64::from_ne_bytes(pose_blob[at..at + 8].try_into().unwrap_or([0; 8]));
-                let right = u64::from_ne_bytes(real_blob[at..at + 8].try_into().unwrap_or([0; 8]));
-                if left != right {
-                    differences.push(format!(
-                        "{}(@{at}) pose={left:#x} real={right:#x}",
-                        field_at(at)
-                    ));
-                }
-            }
-        }
-        tracing::warn!(
-            bucket = %bucket,
-            pose_fn = %pose_name,
-            real_fn = %real_name,
-            pose_grid = ?pose.grid,
-            real_grid = ?real.grid,
-            pose_block = ?pose.block,
-            real_block = ?real.block,
-            differences = %differences.join(" "),
-            "a capture of this batch beside the capture of the pose it serves"
-        );
-        // Then one launch of the recapture's own graph: the same work, and the one reading that says whether
-        // a graph built from *these* values writes attention's output.
-        let executable = walked.template.instantiate()?;
-        executable.launch(&stream)?;
-        stream.synchronize()?;
-        let wrote = real
-            .parameters
-            .first()
-            .and_then(|blob| blob.get(912..920))
-            .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
-            .unwrap_or(0);
-        let live = usize::try_from(self.staging.live_tokens()).unwrap_or(0);
-        let hidden = usize::try_from(self.model.hidden()).unwrap_or(0);
-        let element = usize::try_from(self.model.dtype().bytes().unwrap_or(2).max(1)).unwrap_or(2);
-        let read = self.read_device(wrote, live.saturating_mul(hidden).saturating_mul(element));
-        match read {
-            Some(raw) if wrote != 0 => tracing::warn!(
-                bucket = %bucket,
-                out = %format!("{wrote:#x}"),
-                digest = %format!("{:016x}", platform::fnv1a(&raw)),
-                nz = raw.iter().filter(|byte| **byte != 0).count(),
-                "the recaptured graph, launched once, wrote attention's output"
-            ),
-            _ => tracing::warn!(
-                bucket = %bucket,
-                out = %format!("{wrote:#x}"),
-                "the recaptured graph, launched once, left attention's output unreadable or unwritten"
-            ),
-        }
         Ok(())
     }
 
@@ -3168,41 +2472,6 @@ impl<M: TextModel> CausalLmRunner<M> {
     /// A bucket that samples nothing answers with an empty output: nothing was measured and no call
     /// produced a token.
     fn read_sampled(&mut self, bucket: Bucket, launched: Instant) -> Result<Flight> {
-        // The dump's readback, on the thread that owns this runner's stream and after the launch
-        // that wrote the page: the batch's own line, the page's first bytes, and - when this batch
-        // is a decode - the prefill's line and bytes beside them, so one reading compares what was
-        // written with what is read.
-        if let Some((page, line)) = self.pending_dump.take() {
-            let bytes = self.dump_page_bytes(page);
-            let prefill = self
-                .last_prefill
-                .clone()
-                .unwrap_or_else(|| "none".to_owned());
-            let arguments = self.dump_kernel_arguments(bucket);
-            let call = self
-                .pending_attention
-                .take()
-                .unwrap_or_else(|| "none".to_owned());
-            tracing::info!(
-                %line,
-                %arguments,
-                %call,
-                page,
-                key_page = %bytes,
-                prefill = %prefill,
-                enqueue_ms = self.enqueue_ms,
-                replay_ms = launched.elapsed().as_secs_f64() * 1e3,
-                wait_ms = (launched.elapsed().as_secs_f64() * 1e3 - self.enqueue_ms).max(0.0),
-                "a batch states the cache addresses it read and wrote"
-            );
-            if !bucket.variant.is_decode() {
-                // The prefill's own arguments travel beside the decode's, so one run compares the
-                // two ends of one request's cache without a second launch.
-                self.last_prefill = Some(format!(
-                    "{line} page={page} key_page={bytes} arguments={arguments}"
-                ));
-            }
-        }
         let turn = self.turn;
         let sampled = self.bucket_samples.borrow().get(&bucket).copied();
         let mut flight = Flight {
@@ -3320,18 +2589,8 @@ impl<M: TextModel> CausalLmRunner<M> {
                     .map(|id| id >= self.model.vocabulary() as u64)
                     .unwrap_or(true)
         }) {
-            // `-1` is the sentinel the dump fills the sampler's buffer with, so it says which of the
-            // two things happened: no draw wrote this row, or a draw wrote a value outside the
-            // vocabulary. The two are indistinguishable from an id alone, and they are different
-            // defects.
-            let why = if ids[row] == -1 {
-                "the sampler wrote nothing for this row: its buffer still holds the sentinel the dump \
-                 fills before the replay"
-            } else {
-                "a draw produced a value outside the vocabulary"
-            };
             return Err(Error::Invariant(format!(
-                "row {row} sampled token {} outside the vocabulary of {}: {why}",
+                "row {row} sampled token {} outside the vocabulary of {}",
                 ids[row],
                 self.model.vocabulary()
             )));
@@ -3364,223 +2623,6 @@ impl<M: TextModel> CausalLmRunner<M> {
         })
     }
 
-    /// Uploads the staged batch into the device columns the captured graphs address.
-    ///
-    /// Every column is copied into a buffer allocated when the runner bound, sized for the largest
-    /// bucket, and the host-side encode indices and draw buffers are the runner's own: a step
-    /// writes fixed addresses and allocates nothing (4.5).
-    /// What a batch states about where its tokens read and write the cache, for `UNISERVE_RUNNER_DUMP`.
-    ///
-    /// A prefill writes the pages its slot mapping names and a decode reads them through its block
-    /// table. When a continuation ignores its context those two disagree, and the figures that tell
-    /// them apart are all on the host before the replay: the positions, the row lengths, the packed
-    /// token ranges, the pages each token's slot lands in, and the pages the table installs. The one
-    /// figure that is not host-side is the page's bytes, which the device thread reads back after
-    /// the launch (`read_sampled`) - the addressing can be right while the values are not.
-    ///
-    /// The line is a string and the readback a page number, because the two are written on
-    /// different threads: this runs at submit, on the scheduler's.
-    fn dump_batch(
-        &mut self,
-        bucket: Bucket,
-        batch: &Batch,
-        shape: &Shape,
-        submit_ms: std::time::Duration,
-    ) {
-        let rows = shape.rows as usize;
-        let tokens = usize::try_from(self.staging.live_tokens()).unwrap_or(0);
-        let page_of_slot = |slot: i32| -> Option<u32> {
-            let slot = u32::try_from(slot).ok()?;
-            (self.kv.page_size() > 0).then(|| slot / self.kv.page_size())
-        };
-        let spelled = |values: &[i32], count: usize| -> String {
-            let take = values.len().min(count);
-            let mut out = String::new();
-            for (index, value) in values[..take].iter().enumerate() {
-                if index > 0 {
-                    out.push(',');
-                }
-                out.push_str(&value.to_string());
-            }
-            out
-        };
-        // The pages the batch's own tokens write: a slot is flat over the plane's pages, so the
-        // page a token lands in is its slot divided by the page size - the write side of the pair a
-        // decode's table must agree with.
-        let mut written = String::new();
-        for (index, slot) in self.staging.batch_rows().slot_mapping[..tokens]
-            .iter()
-            .take(8)
-            .enumerate()
-        {
-            if index > 0 {
-                written.push(',');
-            }
-            match page_of_slot(*slot) {
-                Some(page) => written.push_str(&page.to_string()),
-                None => written.push('-'),
-            }
-        }
-        let (start_page, units, allocated) =
-            batch
-                .block_tables
-                .first()
-                .map_or((0, String::new(), 0), |table| {
-                    let take = table.unit_ids.len().min(8);
-                    let mut out = String::new();
-                    for (index, unit) in table.unit_ids[..take].iter().enumerate() {
-                        if index > 0 {
-                            out.push(',');
-                        }
-                        out.push_str(&unit.0.to_string());
-                    }
-                    (table.start_page, out, table.allocated_tokens)
-                });
-        // The indices the sampler will gather, computed the same way `upload` computes them, so a
-        // reading of the line does not have to derive them by hand.
-        let mut gather: Vec<i32> = Vec::new();
-        let _ = gather_indices(
-            &self.staging.batch_rows().logits_rows,
-            &self.staging.batch_rows().query_offsets,
-            tokens,
-            rows,
-            &mut gather,
-        );
-        let gather = spelled(&gather, rows);
-        let line = format!(
-            "bucket={bucket} variant={:?} rows={rows} tokens={tokens} gather={gather} \
-             ids={} positions={} seq_lens={} query_offsets={} logits_rows={} slots={} \
-             slot_pages={written} start_page={start_page} units={units} allocated_tokens={allocated}",
-            bucket.variant,
-            spelled(self.staging.input_ids(tokens.min(8)), 8),
-            spelled(&self.staging.batch_rows().positions, 8),
-            spelled(&self.staging.batch_rows().seq_lens, rows),
-            spelled(&self.staging.batch_rows().query_offsets, rows + 1),
-            spelled(&self.staging.batch_rows().logits_rows, rows),
-            spelled(self.staging.slots(rows), rows),
-        );
-        // The page the readback names: the first live row's first page, which is the page a decode
-        // must find the prefill's keys in.
-        let line = format!("{line} submit_ms={:.3}", submit_ms.as_secs_f64() * 1e3);
-        let page = self
-            .staging
-            .batch_rows()
-            .slot_mapping
-            .first()
-            .and_then(|slot| page_of_slot(*slot))
-            .unwrap_or(start_page);
-        self.pending_dump = Some((page, line));
-    }
-
-    /// The first bytes of one page of the cache's key plane, as a device read sees them.
-    ///
-    /// A page's address is the unit the block table names, inside the plane the first field's view
-    /// describes (`[columns, units, plane_bytes]`, so column zero's unit `u` begins at
-    /// `u * plane_bytes`). Reading the same page at a prefill and at the decode that must attend to
-    /// it answers whether the values a prefill wrote are the values a decode reads, which no
-    /// continuation's text can.
-    ///
-    /// The copy is issued on the batch's stream and waited for: this runs once per batch, only when
-    /// a deployment asked for the dump, and a dump that read memory a launch had not finished with
-    /// would be a guess.
-    fn dump_page_bytes(&self, unit: u32) -> String {
-        let Some(cache) = self.kv.cache() else {
-            return "no-cache".to_owned();
-        };
-        let planes = {
-            let cache = cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            cache.views()
-        };
-        let Ok(planes) = planes else {
-            return "no-views".to_owned();
-        };
-        let Some((_, view)) = planes.iter().find(|(name, _)| name == "key.values") else {
-            let mut names = String::new();
-            for (name, _) in &planes {
-                if !names.is_empty() {
-                    names.push(',');
-                }
-                names.push_str(name);
-            }
-            return format!("no-key-plane({names})");
-        };
-        let shape = view.shape().to_vec();
-        let (Some(&_columns), Some(&units), Some(&plane_bytes)) =
-            (shape.first(), shape.get(1), shape.get(2))
-        else {
-            return "odd-plane".to_owned();
-        };
-        const BYTES: usize = 16;
-        let offset = match page_readback_range(i64::from(unit), units, plane_bytes, BYTES) {
-            Ok(offset) => offset,
-            Err(reason) => return reason,
-        };
-        let mut host = [0_u8; BYTES];
-        // SAFETY: the source is this page's first `BYTES` bytes inside a plane whose extent the view
-        // above states, and the destination is this function's own host buffer of that length.
-        let copied = unsafe {
-            platform::memcpy_async(
-                host.as_mut_ptr() as u64,
-                view.address() + offset,
-                BYTES,
-                &self.stream,
-            )
-        };
-        if copied.is_err() || self.stream.synchronize().is_err() {
-            return "copy-failed".to_owned();
-        }
-        let mut out = String::new();
-        for byte in host {
-            out.push_str(&format!("{byte:02x}"));
-        }
-        // The page's `initialized` flag, as `kv_write` left it.
-        //
-        // It is a fact about the page, not a mask: the only reader of this plane in the tree is the
-        // FP8 scale update (`ops::kv`'s scale arguments), and the attention operator takes no
-        // pointer to it. A page a decode must not read is excluded by construction instead - the
-        // table names only the request's own pages, and the row's `seq_lens` bounds the read - so
-        // a zero flag beside a wrong token says the page was never written, not that it was
-        // masked.
-        match planes.iter().find(|(name, _)| name == "key.initialized") {
-            Some((_, flags)) => {
-                // The flag plane holds one byte per page, and the read is bounded by the plane's
-                // own extent for the reason every read here is.
-                let in_range = flags.dtype().to_ops() == Some(ops::DType::U8)
-                    && flags
-                        .shape()
-                        .first()
-                        .is_some_and(|&pages| pages > unit as i64)
-                    && flags
-                        .byte_len()
-                        .is_ok_and(|length| length as u64 > unit as u64);
-                if !in_range {
-                    out.push_str(" init=out-of-range");
-                    return out;
-                }
-                let mut flag = [0_u8; 1];
-                // SAFETY: the destination is this function's own one-byte host buffer and the
-                // source is the flag of a unit the view above states.
-                let copied = unsafe {
-                    platform::memcpy_async(
-                        flag.as_mut_ptr() as u64,
-                        flags.address() + unit as u64,
-                        1,
-                        &self.stream,
-                    )
-                };
-                if copied.is_ok() && self.stream.synchronize().is_ok() {
-                    out.push_str(&format!(" init={}", flag[0]));
-                } else {
-                    out.push_str(" init=unread");
-                }
-            }
-            None => out.push_str(" init=no-flags"),
-        }
-        out
-    }
-
     /// Installs the staged batch's cache rows and page copies on this runner's stream.
     ///
     /// A refusal is now the replay's, not submit's: the work itself is on the device's stream, and
@@ -3597,12 +2639,6 @@ impl<M: TextModel> CausalLmRunner<M> {
                 install.batch.0, batch.0
             )));
         }
-        self.cache_page = install
-            .tables
-            .first()
-            .and_then(|table| table.unit_ids.first())
-            .map(|unit| u64::from(unit.0))
-            .or(self.cache_page);
         self.kv
             .install_block_tables(&install.tables, &self.stream)?;
         self.kv.apply_cache_units(&install.units, &self.stream)?;
@@ -3610,496 +2646,6 @@ impl<M: TextModel> CausalLmRunner<M> {
             self.kv
                 .issue_pages(&install.loads, &install.offloads, &self.stream)?;
         Ok(())
-    }
-
-    /// What the captured attention launch is given: its grid, and the call its kernel dereferences.
-    ///
-    /// A paged attention kernel reads everything it knows from one argument: the call, a struct the
-    /// operator writes into the bucket's arena before the capture. Its scalars are the graph's
-    /// constants (a bound of one token or a table of zeros is invisible from the host side), and its
-    /// pointers are what make the launch read the vector this runner filled or another one
-    /// entirely. This reads the struct back from device memory and compares each pointer it holds
-    /// with the column this runner's batch wrote, so a launch reading somewhere else says so.
-    ///
-    /// It runs on the device thread, after the replay that wrote the pages, and every failure is
-    /// text: a diagnosis never fails the batch it describes.
-    fn dump_attention_call(
-        &self,
-        captured: &crate::captured::Captured,
-        first_page: Option<u64>,
-    ) -> String {
-        use ops::attention::PAGED_ATTENTION_CALL_LAYOUT as LAYOUT;
-        let Some((operator, key, launch)) = captured
-            .nodes()
-            .iter()
-            .find(|(operator, _, launch)| *operator == "paged_attention" && !launch.is_empty())
-        else {
-            return "no-attention-launch".to_owned();
-        };
-        let Some(first) = launch.first() else {
-            return "no-attention-node".to_owned();
-        };
-        let params = match captured.template().kernel_node_params(&first.node) {
-            Ok(params) => params,
-            Err(error) => return format!("params-refused({error})"),
-        };
-        // What the entry actually enqueued: a native package unpacks the call into the kernel's own
-        // arguments at capture time, so these blobs are the launch's whole input and every pointer
-        // among them was resolved then. Scanning them for this runner's own column addresses says
-        // whether the graph reads the vectors each batch uploads, or a copy taken from the warm
-        // pose at capture - the question no host-side figure answers, and one that needs no device
-        // read at all.
-        let known = [
-            ("seq_lens", self.columns.seq_lens.device.ptr.address()),
-            (
-                "cum_seq_lens_q",
-                self.columns.query_offsets.device.ptr.address(),
-            ),
-        ];
-        let mut shape = format!(
-            "attention {operator} {key} grid={:?} block={:?} shared={} params={}",
-            params.grid,
-            params.block,
-            params.shared_memory,
-            params.parameters.len()
-        );
-        // Each argument's own bytes, so a program order stated by another lane can be mapped onto
-        // what this launch carries without a second run: `p0=0x…` for a pointer-sized argument and
-        // `p3=512` for a scalar, which is the pair a slice's values are compared against.
-        let mut arguments = String::new();
-        for blob in &params.parameters {
-            let value = match blob.len() {
-                8 => u64::from_ne_bytes(blob[..8].try_into().unwrap_or([0; 8])),
-                4 => u64::from(u32::from_ne_bytes(blob[..4].try_into().unwrap_or([0; 4]))),
-                _ => 0,
-            };
-            arguments.push_str(&format!(" 0x{value:x}"));
-        }
-        shape.push_str(&format!(" args=[{}]", arguments.trim_start()));
-        for (index, blob) in params.parameters.iter().enumerate() {
-            shape.push_str(&format!(" p{index}({}B)", blob.len()));
-            for (name, address) in known {
-                let pattern = address.to_ne_bytes();
-                for at in 0..blob.len().saturating_sub(7) {
-                    if blob[at..at + 8] == pattern {
-                        shape.push_str(&format!(" {name}@{index}+{at}"));
-                    }
-                }
-            }
-        }
-        // A native package takes its parameters in one of two shapes, and only one of them is a
-        // pointer to the operator's call: the trtllm-gen entry passes `TllmGenFmhaRunnerParams` to
-        // the kernel by value, so the node's first argument **is** that struct. Decoding it names
-        // every bound the launch was given, which is what no host-side figure of the batch states.
-        let Some(bytes) = params.parameters.first() else {
-            return format!("{shape} no-parameters");
-        };
-        if bytes.len() != 8 {
-            // A native package does not hand the kernel a pointer to the operator's call: the
-            // trtllm-gen entry builds the kernel's own `KernelParams` and launches it by value, so
-            // the node's argument **is** that struct - 1344 bytes, its first 512 five TMA
-            // descriptors rather than addresses. Every scalar in it is what the replay uses, and
-            // its three grid extents name the launch this node holds.
-            return format!(
-                "{shape} {}{}",
-                self.decode_kernel_params(bytes),
-                self.dump_cache_digests(first_page)
-            );
-        }
-        let address = match bytes.as_slice() {
-            [a, b, c, d, e, f, g, h] => u64::from_ne_bytes([*a, *b, *c, *d, *e, *f, *g, *h]),
-            _ => return format!("{shape} odd-parameter"),
-        };
-        // The parameter a native package passes is not always a device address: a host entry may
-        // enqueue the launch itself and bake the scalars into the node, in which case this is the
-        // address of a host structure that no longer exists. A device copy from there would fault
-        // and the driver's error sticks to this stream, so the read happens only inside the arena
-        // the bucket owns - and "outside" is itself the answer.
-        if !self.in_arena(address, LAYOUT.size) {
-            return format!("{shape} call={address:#x} outside-arena");
-        }
-        let Some(call) = self.read_device(address, LAYOUT.size) else {
-            return format!("call-unreadable({address:#x})");
-        };
-        let word = |offset: usize| -> u64 {
-            let mut eight = [0_u8; 8];
-            eight.copy_from_slice(&call[offset..offset + 8]);
-            u64::from_ne_bytes(eight)
-        };
-        let signed = |offset: usize| -> i64 { word(offset) as i64 };
-        let mut out = format!(
-            "attention {operator} {key} grid={:?} block={:?} shared={} call={address:#x} \
-             phase={} batch={} tokens={} max_q_len={} max_kv_len={} num_pages={} page_size={} \
-             kv_stride_page={} kv_stride_tokens={} kv_stride_heads={}",
-            params.grid,
-            params.block,
-            params.shared_memory,
-            signed(LAYOUT.phase),
-            signed(LAYOUT.batch),
-            signed(LAYOUT.tokens),
-            signed(LAYOUT.max_q_len),
-            signed(LAYOUT.max_kv_len),
-            signed(LAYOUT.num_pages),
-            signed(LAYOUT.page_size),
-            signed(LAYOUT.kv_stride_page),
-            signed(LAYOUT.kv_stride_tokens),
-            signed(LAYOUT.kv_stride_heads),
-        );
-        // Every pointer the call holds, beside the address this runner's own column has: a launch
-        // that reads another vector is invisible in every host-side figure, and this is where it
-        // shows.
-        let mut verdicts = String::new();
-        for (name, offset, own) in [
-            (
-                "seq_lens",
-                LAYOUT.seq_lens,
-                self.columns.seq_lens.device.ptr.address(),
-            ),
-            (
-                "cum_seq_lens_q",
-                LAYOUT.cum_seq_lens_q,
-                self.columns.query_offsets.device.ptr.address(),
-            ),
-        ] {
-            let pointer = word(offset);
-            let agrees = if pointer == own { "own" } else { "OTHER" };
-            verdicts.push_str(&format!(" {name}={pointer:#x}({agrees})"));
-        }
-        // The attention's own output buffer: the address `o_proj` reads, and the first bytes it
-        // holds after the launch. An output of zeros is a row that attends to nothing, and every
-        // layer above it then computes from zeros without any error anywhere.
-        let out_pointer = word(LAYOUT.out);
-        let out_digest = match self.read_device(out_pointer, 64) {
-            Some(raw) => format!("{:016x}", platform::fnv1a(&raw)),
-            None => "unreadable".to_owned(),
-        };
-        out.push_str(&format!(" out={out_pointer:#x}/{out_digest}"));
-        out.push_str(&verdicts);
-        // The first entries of the two vectors the kernel reads, from the addresses the call names -
-        // not from the host's copy of the column, which would agree with itself either way.
-        for (name, offset, count) in [
-            ("seq_lens", LAYOUT.seq_lens, 8usize),
-            ("cum_seq_lens_q", LAYOUT.cum_seq_lens_q, 8),
-        ] {
-            let pointer = word(offset);
-            let own = match name {
-                "seq_lens" => self.columns.seq_lens.device.ptr.address(),
-                _ => self.columns.query_offsets.device.ptr.address(),
-            };
-            if pointer == 0 {
-                out.push_str(&format!(" {name}=[null]"));
-                continue;
-            }
-            if pointer != own {
-                // A vector this runner did not write: its contents are not ours to read, and a
-                // read out of range is a sticky device error.
-                out.push_str(&format!(" {name}=[foreign]"));
-                continue;
-            }
-            let Some(raw) = self.read_device(pointer, count * 4) else {
-                out.push_str(&format!(" {name}=unreadable"));
-                continue;
-            };
-            let values: Vec<i32> = raw
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|four| i32::from_ne_bytes(*four))
-                .collect();
-            out.push_str(&format!(" {name}={values:?}"));
-        }
-        // Per layer: where its keys and values are, and a digest of the page the table names. The
-        // slice prints the same digest for the same tokens, so a first layer that differs says the
-        // hidden state entering it differed, and a later one says that layer's attention or MoE.
-        let pages = {
-            let first = word(LAYOUT.page_table);
-            if first == 0 {
-                0
-            } else {
-                self.read_device(first, 4).map_or(0, |raw| {
-                    u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]])
-                }) as usize
-            }
-        };
-        for (layer, (_, _, launch)) in captured
-            .nodes()
-            .iter()
-            .filter(|(operator, _, _)| *operator == "paged_attention")
-            .enumerate()
-        {
-            let Some(node) = launch.first() else {
-                continue;
-            };
-            let Ok(params) = captured.template().kernel_node_params(&node.node) else {
-                continue;
-            };
-            let Some(bytes) = params.parameters.first() else {
-                continue;
-            };
-            let Some(call) = self.read_device(
-                u64::from_ne_bytes(bytes.as_slice().try_into().unwrap_or([0; 8])),
-                LAYOUT.size,
-            ) else {
-                continue;
-            };
-            let at = |offset: usize| -> u64 {
-                let mut eight = [0_u8; 8];
-                eight.copy_from_slice(&call[offset..offset + 8]);
-                u64::from_ne_bytes(eight)
-            };
-            let page_size = at(LAYOUT.page_size).max(1);
-            // Elements between two pages and between two tokens of one page, and the element's
-            // width: the digest covers one page's own bytes, so both halves of a comparison state
-            // the same quantity.
-            let page_elements = at(LAYOUT.kv_stride_page).max(1);
-            let token_elements = at(LAYOUT.kv_stride_tokens).max(1);
-            let element_bytes = ops::DType::from_i64(at(LAYOUT.dtype_key_value) as i64)
-                .and_then(ops::DType::bytes)
-                .unwrap_or(1)
-                .max(1);
-            let live = self.staging.live_tokens().max(1);
-            let held = page_size.min(live);
-            let mut digests = String::new();
-            for (plane, offset) in [("k", LAYOUT.key), ("v", LAYOUT.value)] {
-                let base = at(offset);
-                let pages_in_pool = at(LAYOUT.num_pages);
-                let bytes = (held * token_elements * element_bytes) as usize;
-                if base == 0 || pages as u64 >= pages_in_pool || bytes > (1 << 20) {
-                    digests.push_str(&format!(
-                        " {plane}={base:#x}/skipped(page {pages} of {pages_in_pool})"
-                    ));
-                    continue;
-                }
-                let start = base + pages as u64 * page_elements * element_bytes;
-                let digest = match self.read_device(start, bytes) {
-                    Some(raw) => format!("{:016x}", platform::fnv1a(&raw)),
-                    None => "unreadable".to_owned(),
-                };
-                digests.push_str(&format!(" {plane}={base:#x}/{digest}"));
-            }
-            out.push_str(&format!(" layer{layer}={digests}"));
-        }
-        // The same digests taken from the runner's own planes and the table it installed, so the
-        // comparison with a slice's line does not depend on what the launch kept: a package that
-        // unpacks the call into host memory holds no pointer here, and the pages are the runner's
-        // whatever the kernel was handed.
-        out.push_str(&self.dump_cache_digests(first_page));
-        out
-    }
-
-    /// The bounds and pointers the trtllm-gen FMHA launch was given, decoded from its argument.
-    ///
-    /// The entry hands the kernel `flashinfer::trtllm::fmha::KernelParams` **by value**, so the
-    /// node's argument blob is that struct: 1344 bytes whose first 896 are seven `CUtensorMap`
-    /// descriptors (Q, K, the sparse pool, V, O, and the two FP4 scale descriptors), followed by
-    /// the grid, the output pointer, the sequence and page vectors, and the launch's integers.
-    ///
-    /// **The offsets are the struct's own, and the run confirmed two of them independently:**
-    /// `cum_seq_lens_q` landed at 936 and `seq_lens` at 1096 in the blob the caller printed, which
-    /// is where `ptrCumSeqLensQ` and `ptrSeqLensKv` sit. The remaining fields follow that same
-    /// field order, so the numbers below are read at their declared positions rather than guessed.
-    ///
-    /// **Q, K and V are not plain pointers here.** They travel inside `tmaQ_`/`tmaK_`/`tmaV_`, and a
-    /// descriptor stores its base address encoded with swizzle and alignment bits - which is why a
-    /// scan of the blob finds the sequence vectors verbatim and no plane address at all. That
-    /// verdict compares the descriptor's first word with the plane under an alignment mask and says
-    /// `masked` when they agree only after it, `OTHER` when they do not.
-    fn decode_kernel_params(&self, bytes: &[u8]) -> String {
-        const SIZE: usize = 1344;
-        if bytes.len() < SIZE {
-            return format!(
-                "kparams blob={}B (not the {SIZE} of fmha::KernelParams)",
-                bytes.len()
-            );
-        }
-        let pointer = |at: usize| -> u64 {
-            u64::from_ne_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]))
-        };
-        let integer = |at: usize| -> i32 {
-            i32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap_or([0; 4]))
-        };
-        let verdict = |name: &str, at: u64, own: u64| -> String {
-            if at == 0 {
-                format!(" {name}=null")
-            } else if at == own {
-                format!(" {name}=own")
-            } else {
-                format!(" {name}=OTHER({at:#x})")
-            }
-        };
-        let mut out = format!(
-            "kparams blob={} grid=[{},{},{}] batch={} window={} chunked_log2={} \
-             out={:#x} cum_q={:#x} cum_kv={:#x} page_idx={:#x} seq_lens_kv={:#x} \
-             counter={:#x} partial_o={:#x} stats={:#x} tmaQ={:#x} tmaK={:#x} \
-             tmaKsw={:#x} tmaV={:#x} tmaO={:#x} {}",
-            bytes.len(),
-            integer(896),
-            integer(900),
-            integer(904),
-            integer(1132),
-            integer(1128),
-            integer(1136),
-            pointer(912),
-            pointer(936),
-            pointer(944),
-            pointer(1016),
-            pointer(1096),
-            pointer(1000),
-            pointer(1024),
-            pointer(1112),
-            pointer(0),
-            pointer(128),
-            pointer(256),
-            pointer(384),
-            pointer(512),
-            // The kernel may store O through its own tensor map rather than through `ptrO`, and the
-            // two are different statements of where attention's output is. If they differ, the
-            // tensor the projection reads was never written - which is what an all-zero attention
-            // output looks like from the projection's end.
-            if pointer(512) == pointer(912) {
-                "out_view=tmaO==ptrO".to_string()
-            } else {
-                format!(
-                    "out_view=DIFFERS tmaO={:#x} ptrO={:#x}",
-                    pointer(512),
-                    pointer(912)
-                )
-            }
-        );
-        // The launch's own lengths, at the offsets `KernelParams` declares them: `mMaxSeqLenQ` 1172,
-        // `mMaxSeqLenKv` 1176, the CTA bounds 1180 and 1184, `mMaxNumPagesPerSeqKv` 1188, and the
-        // head counts 1192 and 1196. The head counts are the cross-check - `mNumHeadsKv` must equal
-        // the KV plane's heads - so the block needs no device fact to be trusted.
-        out.push_str(&format!(
-            " max_q={} max_kv={} ctas_q={} ctas_kv={} pages_per_seq={} heads_kv={} heads_q={}",
-            integer(1172),
-            integer(1176),
-            integer(1180),
-            integer(1184),
-            integer(1188),
-            integer(1192),
-            integer(1196)
-        ));
-        // Past `mNumHeadsQPerKv` the struct holds a `cuda::fast_mod_div<int32_t>` whose width this
-        // host cannot read, so the tail is stated as a window rather than at offsets chosen by
-        // arithmetic: the pair `(mSumOfSeqLensQ, mSumOfSeqLensKv)` identifies itself, because the
-        // query lengths sum to the tokens the call was built for and the KV lengths do not.
-        let mut tail = String::new();
-        for at in (1256..1288).step_by(4) {
-            tail.push_str(&format!("{} ", integer(at)));
-        }
-        out.push_str(&format!(" tail@1256=[{tail}]"));
-        if let Ok(planes) = self.kv.planes(0)
-            && let Some(first) = planes.first()
-        {
-            out.push_str(&format!(
-                " plane_heads={} plane_pages={}",
-                first.key.shape.dim(2),
-                first.key.shape.dim(0)
-            ));
-        }
-        out.push_str(&verdict(
-            "cum_q",
-            pointer(936),
-            self.columns.query_offsets.device.ptr.address(),
-        ));
-        out.push_str(&verdict(
-            "seq_lens_kv",
-            pointer(1096),
-            self.columns.seq_lens.device.ptr.address(),
-        ));
-        match self.kv.planes(0) {
-            Ok(planes) => match planes.first() {
-                Some(first) => {
-                    let masked = |at: u64, own: u64| -> &'static str {
-                        if at & !0x3ff == own & !0x3ff {
-                            "masked"
-                        } else {
-                            "OTHER"
-                        }
-                    };
-                    out.push_str(&format!(
-                        " planes=layer0:{}/{}(K,V descriptor vs plane) layer0K={:#x} layer0V={:#x}",
-                        masked(pointer(128), first.key.ptr.address()),
-                        masked(pointer(384), first.value.ptr.address()),
-                        first.key.ptr.address(),
-                        first.value.ptr.address()
-                    ));
-                }
-                None => out.push_str(" planes=empty"),
-            },
-            Err(error) => out.push_str(&format!(" planes=refused({error})")),
-        }
-        out
-    }
-
-    /// One digest per layer of the keys and values the replay just wrote into the batch's pages.
-    ///
-    /// Each digest is `platform::fnv1a` over the bytes of the row's first page that hold this
-    /// batch's tokens, so between two runs over the same tokens the first layer whose numbers
-    /// differ is the layer where their arithmetic diverged. Unlike the call
-    /// readback this needs nothing from the launch - the planes are this runner's resident cache
-    /// and the page is the one it installed - so it is printed even when the launch's arguments are
-    /// not addresses this runner may read.
-    fn dump_cache_digests(&self, first_page: Option<u64>) -> String {
-        let Some(page) = first_page else {
-            return " cache=no-page".to_owned();
-        };
-        let planes = match self.kv.planes(0) {
-            Ok(planes) => planes,
-            Err(error) => return format!(" cache=refused({error})"),
-        };
-        let page_size = u64::from(self.kv.page_size()).max(1);
-        let element = self.kv.dtype().bytes().unwrap_or(1).max(1);
-        let live = self.staging.live_tokens().max(1);
-        let held = page_size.min(live);
-        let mut out = String::from(" cache:");
-        let first_elements = planes
-            .first()
-            .map(|plane| {
-                plane
-                    .key
-                    .shape
-                    .dim(2)
-                    .saturating_mul(plane.key.shape.dim(3))
-            })
-            .unwrap_or(0);
-        out.push_str(&format!(
-            "(page {page}, {held} token(s), {} bytes each)",
-            held.saturating_mul(first_elements).saturating_mul(element)
-        ));
-        for (layer, plane) in planes.iter().enumerate() {
-            let token_elements = plane
-                .key
-                .shape
-                .dim(2)
-                .saturating_mul(plane.key.shape.dim(3));
-            let page_elements = page_size.saturating_mul(token_elements);
-            let bytes =
-                usize::try_from(held.saturating_mul(token_elements).saturating_mul(element))
-                    .unwrap_or(0);
-            if bytes == 0 || token_elements == 0 {
-                continue;
-            }
-            // A page outside this layer's plane is stated and not read: a device copy from past an
-            // allocation leaves the driver's error stuck to the stream, and the next batch would
-            // fail on a diagnosis.
-            let pages = plane.key.shape.dim(0);
-            if page >= pages {
-                out.push_str(&format!(" layer{layer}=(page {page} of {pages})"));
-                continue;
-            }
-            out.push_str(&format!(" layer{layer}="));
-            for (name, view) in [("k", plane.key), ("v", plane.value)] {
-                let start =
-                    view.ptr.address() + page.saturating_mul(page_elements).saturating_mul(element);
-                match self.read_device(start, bytes) {
-                    Some(raw) => out.push_str(&format!("{name}={:016x} ", platform::fnv1a(&raw))),
-                    None => out.push_str(&format!("{name}=unreadable ")),
-                }
-            }
-        }
-        out
     }
 
     /// What the slot column holds for the rows a captured bound names beyond this batch's span.
@@ -4144,440 +2690,10 @@ impl<M: TextModel> CausalLmRunner<M> {
         format!("rows={count} negative={negative} max={largest} first=[{first_few}]")
     }
 
-    /// The tensors a captured graph writes, read back from the pointers its own launches name.
-    ///
-    /// Layer 0's keys and values are byte-identical to the slice's and layer 1's are not, so the
-    /// disagreement lies between layer 0's KV write and layer 1's projection: attention's output,
-    /// `o_proj`, the residual, the post-attention norm, the router, the experts, or the second
-    /// residual. Nothing on the host says what a kernel in the middle of a captured graph wrote -
-    /// its own arguments say where it wrote it. So this reads two sets of buffers:
-    ///
-    /// * every attention launch's output, at `KernelParams::ptrO` (offset 912 of the struct the node
-    ///   carries), stated with the launch's own grid so a decode launch and a prefill launch are
-    ///   told apart;
-    /// * for the first [`LAYER_PROBE_NODES`] launches, every 8-byte word of their arguments that
-    ///   lands inside the graph's arena, once per distinct address, labelled by the launch that
-    ///   names it first.
-    ///
-    /// Each digest covers the batch's own span - `live` rows of `hidden` elements at the forward's
-    /// element width - so a row here and a slice dump of the same tensor are comparable as bytes
-    /// rather than by name, and a tensor the two sides agree on shows up as one address whose digest
-    /// matches. It reads memory, so it runs only under the dump and only on the device thread, and
-    /// every failure becomes text.
-    fn dump_layer_probes(&self, captured: &crate::captured::Captured) -> String {
-        /// How far into the graph the pointer table reads: layer 0's segment, which is the stretch
-        /// between the KV write and layer 1's projection.
-        const LAYER_PROBE_NODES: usize = 64;
-
-        let live = usize::try_from(self.staging.live_tokens()).unwrap_or(0);
-        let hidden = usize::try_from(self.model.hidden()).unwrap_or(0);
-        let element = usize::try_from(self.model.dtype().bytes().unwrap_or(2).max(1)).unwrap_or(2);
-        let width = live.saturating_mul(hidden).saturating_mul(element);
-        if live == 0 || width == 0 {
-            return " probes=none".to_owned();
-        }
-        let (start, reserved) = match self.pool() {
-            Ok(mut pool) => match pool.base(self.stream_id()) {
-                Ok(base) => (base.address(), pool.reserved()),
-                Err(error) => return format!(" probes=no-arena({error})"),
-            },
-            Err(error) => return format!(" probes=no-pool({error})"),
-        };
-        let inside_bytes = |address: u64, bytes: usize| {
-            address >= start && (address - start).saturating_add(bytes as u64) <= reserved
-        };
-        let inside = |address: u64| inside_bytes(address, width);
-        let mut out = String::from(" probes:");
-        // Every extent an attention launch named as its output. If the layers share one, a digest read
-        // after the whole graph says nothing about what any single layer wrote: the last writer of
-        // that extent is the one being read, and the reading is the graph's rather than a layer's.
-        let mut attn_extents: Vec<u64> = Vec::new();
-
-        // The span the launch reads, as the columns hold it *now*: `cum_seq_lens_q` names where each
-        // row's queries start and end, and `seq_lens` how many keys that row may read. A bound baked
-        // at capture and a span uploaded per batch disagree exactly when these numbers and the
-        // launch's own `max_q`/`sum_q` disagree, and every row after the batch's own comes from that.
-        let spelled = |raw: &[u8]| {
-            let values: Vec<String> = raw
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|word| i32::from_ne_bytes(*word).to_string())
-                .collect();
-            if values.len() > 8 {
-                format!("{},+{}", values[..8].join(","), values.len() - 8)
-            } else {
-                values.join(",")
-            }
-        };
-        for (name, address, count) in [
-            (
-                "cum_q",
-                self.columns.query_offsets.device.ptr.address(),
-                live + 1,
-            ),
-            ("seq_lens", self.columns.seq_lens.device.ptr.address(), live),
-        ] {
-            let bytes = count.saturating_mul(4).min(4096);
-            match self.read_device(address, bytes) {
-                Some(raw) => out.push_str(&format!(" {name}[{}]", spelled(&raw))),
-                None => out.push_str(&format!(" {name}=unreadable")),
-            }
-        }
-
-        // Attention outputs, by layer: the one tensor this runner can name without a layout guess,
-        // because the node's own argument is the struct that holds the pointer.
-        let mut layer = 0_usize;
-        let mut layer0_out = 0_u64;
-        let mut dirty = Vec::new();
-        for (operator, _, launches) in captured.nodes() {
-            if *operator != "paged_attention" {
-                continue;
-            }
-            for launch in launches {
-                let params = captured.template().kernel_node_params(&launch.node).ok();
-                let address = params
-                    .as_ref()
-                    .and_then(|params| params.parameters.first())
-                    .and_then(|blob| blob.get(912..920))
-                    .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
-                    .unwrap_or(0);
-                let grid = params
-                    .as_ref()
-                    .map(|params| format!("{:?}", params.grid))
-                    .unwrap_or_else(|| "unknown".to_owned());
-                // A digest names a value; a byte count names its content. An output nobody wrote
-                // reads as all zeros, which is the same digest for every batch - and that is a
-                // different defect from an output written wrongly, so it is stated beside the digest.
-                let (named, written) = if address == 0 {
-                    ("null".to_owned(), String::new())
-                } else if !inside(address) {
-                    ("outside".to_owned(), String::new())
-                } else {
-                    match self.read_device(address, width) {
-                        Some(raw) => (
-                            format!("{:016x}", platform::fnv1a(&raw)),
-                            format!(" nz={}", raw.iter().filter(|byte| **byte != 0).count()),
-                        ),
-                        None => ("unreadable".to_owned(), String::new()),
-                    }
-                };
-                // The partial matrix and stats the multi-CTA split fills: the FMHA kernel writes
-                // these and a separate reduction turns them into the output, so nonzero partials
-                // beside a zero output is that reduction not having run.
-                let partial = params
-                    .as_ref()
-                    .and_then(|params| params.parameters.first())
-                    .and_then(|blob| blob.get(1024..1032))
-                    .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
-                    .unwrap_or(0);
-                let split = if partial != 0 && self.in_arena(partial, 4096) {
-                    self.read_device(partial, 4096)
-                        .map(|raw| {
-                            format!(" pnz={}", raw.iter().filter(|byte| **byte != 0).count())
-                        })
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                // The multi-CTA counter, read after the launch: a reduction that leaves it dirty
-                // hands the next launch a counter that never reaches its CTA bound, which is the
-                // shape of an illegal address on the *second* batch rather than the first.
-                let counter = params
-                    .as_ref()
-                    .and_then(|params| params.parameters.first())
-                    .and_then(|blob| blob.get(1000..1008))
-                    .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
-                    .unwrap_or(0);
-                let counter_value = if counter != 0 && self.in_arena(counter, 4) {
-                    self.read_device(counter, 4)
-                        .map(|raw| i32::from_ne_bytes(raw[..4].try_into().unwrap_or([0; 4])))
-                } else {
-                    None
-                };
-                let counted = match counter_value {
-                    Some(value) => format!(" cnt={value}"),
-                    None => String::new(),
-                };
-                if !attn_extents.contains(&address) {
-                    attn_extents.push(address);
-                }
-                if layer == 0 && address != 0 {
-                    layer0_out = address;
-                }
-                if let Some(value) = counter_value
-                    && value != 0
-                {
-                    dirty.push((layer, value));
-                }
-                // Where the launch's own tensor map says the output is. A kernel may store O through
-                // `tmaO_` rather than through `ptrO`, and the two are different statements of one
-                // address: a zero `ptrO` beside a nonzero map is attention writing a tensor the
-                // projection never reads, which is what an all-zero attention output looks like from
-                // the projection's end.
-                let tma_o = params
-                    .as_ref()
-                    .and_then(|params| params.parameters.first())
-                    .and_then(|blob| blob.get(512..520))
-                    .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
-                    .unwrap_or(0);
-                let mapped = if tma_o != 0 && tma_o != address && inside(tma_o) {
-                    match self.read_device(tma_o, width) {
-                        Some(raw) => format!(
-                            " map={:016x} mapnz={}",
-                            platform::fnv1a(&raw),
-                            raw.iter().filter(|byte| **byte != 0).count()
-                        ),
-                        None => " map=unreadable".to_owned(),
-                    }
-                } else if tma_o != 0 && tma_o != address {
-                    format!(" map={tma_o:#x}-outside")
-                } else {
-                    String::new()
-                };
-                // The launch's **input**, which nothing so far has read. Q travels inside
-                // `tmaQ_`'s first word, and that word encodes the base address with alignment and
-                // swizzle bits, so the raw word is tried first and then with its low bits cleared:
-                // whichever lands inside the arena is the buffer the kernel reads. An output nobody
-                // wrote has two causes and this separates them - an input that never arrived, or an
-                // input that did and a kernel that did not write.
-                let read = if layer < 2 {
-                    let tma_q = params
-                        .as_ref()
-                        .and_then(|params| params.parameters.first())
-                        .and_then(|blob| blob.get(0..8))
-                        .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
-                        .unwrap_or(0);
-                    let q_address = [tma_q, tma_q & !0x7F, tma_q & !0xF, tma_q & !0x3]
-                        .into_iter()
-                        .find(|candidate| *candidate != 0 && inside(*candidate))
-                        .unwrap_or(0);
-                    match self.read_device(q_address, width) {
-                        Some(raw) if q_address != 0 => format!(
-                            " q={:016x} qnz={}",
-                            platform::fnv1a(&raw),
-                            raw.iter().filter(|byte| **byte != 0).count()
-                        ),
-                        _ => format!(" q=nomap({tma_q:#x})"),
-                    }
-                } else {
-                    String::new()
-                };
-                // The node's own identity, so the capture's line and a serving line can be compared
-                // word for word: a replay that launches a *different* function, or the same function
-                // with different arguments buried where the pointer table does not reach, is visible
-                // as two digests that disagree - and nothing else in the dump compares them.
-                let launched = match params.as_ref() {
-                    Some(params) => {
-                        let name = params
-                            .function
-                            .name()
-                            .unwrap_or_else(|error| format!("unnamed({error})"));
-                        let blob = params
-                            .parameters
-                            .first()
-                            .map(|blob| platform::fnv1a(blob))
-                            .unwrap_or(0);
-                        format!(" fn={name} blob={blob:016x}")
-                    }
-                    None => " fn=unreadable".to_owned(),
-                };
-                out.push_str(&format!(
-                    " attn{layer}={named}{written}{split}@{grid}{counted}{mapped}{read}{launched}"
-                ));
-                if layer0_out != 0 && address == layer0_out && layer > 0 {
-                    out.push_str("(shared)");
-                }
-                layer += 1;
-            }
-        }
-
-        // Which layers left the multi-CTA counter dirty, and what the graph's kernels actually are.
-        // The counter is a semaphore the kernels reset, so a nonzero value after a launch is a
-        // protocol that did not complete - and the layers that share the value are the answer to
-        // "which batches", because every layer of one batch is launched by the same graph.
-        out.push_str(&format!(" cnt_dirty={}/{}", dirty.len(), layer));
-        if !dirty.is_empty() {
-            let named: Vec<String> = dirty
-                .iter()
-                .take(6)
-                .map(|(layer, value)| format!("L{layer}={value}"))
-                .collect();
-            out.push_str(&format!("[{}]", named.join(",")));
-        }
-        // An operator's name says what asked for a launch; the kernel's name says what ran. A
-        // protocol that is two launches shows as two names under one operator, and a launch filed
-        // under the wrong operator cannot hide.
-        let mut functions: Vec<(String, usize)> = Vec::new();
-        for (_, _, launches) in captured.nodes() {
-            for launch in launches {
-                let Ok(params) = captured.template().kernel_node_params(&launch.node) else {
-                    continue;
-                };
-                let name = params
-                    .function
-                    .name()
-                    .unwrap_or_else(|error| format!("unnamed({error})"));
-                match functions.iter_mut().find(|(known, _)| *known == name) {
-                    Some((_, count)) => *count += 1,
-                    None => functions.push((name, 1)),
-                }
-            }
-        }
-        out.push_str(&format!(" attn_extents={}", attn_extents.len()));
-        functions.sort_by_key(|function| std::cmp::Reverse(function.1));
-        // Every function of the graph, not the twelve most frequent: the question the histogram
-        // answers is which kernels are *absent* (a reduction node, a reduction's second launch), and
-        // a truncated list cannot answer it - a count of 1 at the end of the list is exactly what an
-        // absent kernel looks like from the top.
-        let spelled: Vec<String> = functions
-            .iter()
-            .map(|(name, count)| format!("{name}:{count}"))
-            .collect();
-        out.push_str(&format!(" functions=[{}]", spelled.join(",")));
-
-        // The projection out of the attention block: the slice's `attended` cut is the attention
-        // block's output *projected out and before the residual add*, so the tensor to compare
-        // against is not the one the FMHA kernel wrote but the one the gemm after it wrote. The gemm
-        // is named by its own call layout's `input` holding attention's output address, not by its
-        // position, so a graph that reorders its layers still pairs correctly.
-        if layer0_out != 0 {
-            use ops::gemm::GEMM_CALL_LAYOUT;
-            let word = |blob: &[u8], at: usize| -> u64 {
-                blob.get(at..at + 8)
-                    .map(|w| u64::from_ne_bytes(w.try_into().unwrap_or([0; 8])))
-                    .unwrap_or(0)
-            };
-            let projection = captured.nodes().iter().find_map(|(operator, _, launches)| {
-                if *operator != "gemm" {
-                    return None;
-                }
-                launches.iter().find_map(|launch| {
-                    let params = captured.template().kernel_node_params(&launch.node).ok()?;
-                    let blob = params.parameters.first()?;
-                    if word(blob, GEMM_CALL_LAYOUT.input) != layer0_out {
-                        return None;
-                    }
-                    Some(word(blob, GEMM_CALL_LAYOUT.out))
-                })
-            });
-            match projection {
-                Some(address) if inside(address) => match self.read_device(address, width) {
-                    Some(raw) => out.push_str(&format!(
-                        " proj0={:016x} from={:#x}",
-                        platform::fnv1a(&raw),
-                        layer0_out
-                    )),
-                    None => out.push_str(" proj0=unreadable"),
-                },
-                Some(_) => out.push_str(" proj0=outside"),
-                None => {
-                    // Say who does name it, so a deployment whose projection is not called `gemm`
-                    // states that instead of leaving the absence unexplained.
-                    let mut named = Vec::new();
-                    for (operator, _, launches) in captured.nodes() {
-                        if *operator == "paged_attention" || named.contains(operator) {
-                            continue;
-                        }
-                        let carries = launches.iter().any(|launch| {
-                            captured
-                                .template()
-                                .kernel_node_params(&launch.node)
-                                .ok()
-                                .map(|params| {
-                                    params.parameters.iter().any(|blob| {
-                                        blob.as_chunks::<8>()
-                                            .0
-                                            .iter()
-                                            .any(|word| u64::from_ne_bytes(*word) == layer0_out)
-                                    })
-                                })
-                                .unwrap_or(false)
-                        });
-                        if carries {
-                            named.push(*operator);
-                        }
-                    }
-                    out.push_str(&format!(" proj0=no-gemm; names={}", named.join(",")));
-                }
-            }
-        }
-
-        // Then every arena pointer the first launches name, once per address, with the launches that
-        // name it. A tensor's producer and its consumer both carry its address, so naming them
-        // answers the question no host figure can: does the operator after attention read the buffer
-        // attention wrote, or one the forward staged at capture?
-        let mut seen: Vec<(u64, Vec<(usize, String)>)> = Vec::new();
-        let mut index = 0_usize;
-        'nodes: for (operator, _, launches) in captured.nodes() {
-            for launch in launches {
-                if index >= LAYER_PROBE_NODES {
-                    break 'nodes;
-                }
-                index += 1;
-                let Ok(params) = captured.template().kernel_node_params(&launch.node) else {
-                    continue;
-                };
-                for blob in &params.parameters {
-                    for word in blob.as_chunks::<8>().0 {
-                        let address = u64::from_ne_bytes(*word);
-                        // Sixty-four bytes is the smallest span worth a digest: a sequence vector, a
-                        // counter and a page table all fit in it, and a digest of a shorter span
-                        // would name nothing.
-                        if !inside_bytes(address, 64) {
-                            continue;
-                        }
-                        let naming = (index, (*operator).to_owned());
-                        match seen.iter_mut().find(|(named, _)| *named == address) {
-                            Some((_, names)) if names.len() < 3 && !names.contains(&naming) => {
-                                names.push(naming);
-                            }
-                            Some(_) => {}
-                            None => seen.push((address, vec![naming])),
-                        }
-                    }
-                }
-            }
-        }
-        for (slot, (address, names)) in seen.iter().take(32).enumerate() {
-            let bytes = if inside(*address) { width } else { 64 };
-            let digest = match self.read_device(*address, bytes) {
-                Some(raw) => format!("{:016x}", platform::fnv1a(&raw)),
-                None => "unreadable".to_owned(),
-            };
-            let mut spelled = String::new();
-            for (node, operator) in names {
-                spelled.push_str(&format!(" n{node}{operator}"));
-            }
-            out.push_str(&format!(" p{slot}={digest}@{bytes}B{spelled}"));
-        }
-        if seen.len() > 32 {
-            out.push_str(&format!(" (+{} more)", seen.len() - 32));
-        }
-        out
-    }
-
-    /// Whether `[address, address + bytes)` lies inside the graph pool's arena.
-    ///
-    /// The only memory this runner may read back blindly is the arena its captured graphs address;
-    /// anything else is an address a launch named and a copy from it could fault, which the driver
-    /// leaves stuck to the stream for the next batch to fail on.
-    fn in_arena(&self, address: u64, bytes: usize) -> bool {
-        let Ok(mut pool) = self.pool() else {
-            return false;
-        };
-        let Ok(base) = pool.base(self.stream_id()) else {
-            return false;
-        };
-        let reserved = pool.reserved();
-        let start = base.address();
-        address >= start && (address - start).saturating_add(bytes as u64) <= reserved
-    }
-
     /// `bytes` of device memory at `address`, read on this runner's stream, or `None`.
     ///
-    /// The copy is issued only under the dump and only from the device thread, and it synchronizes
-    /// the stream before the host reads the buffer.
+    /// The copy is issued only from the device thread, and it synchronizes the stream before the
+    /// host reads the buffer.
     fn read_device(&self, address: u64, bytes: usize) -> Option<Vec<u8>> {
         if address == 0 || bytes == 0 {
             return None;
@@ -4594,124 +2710,11 @@ impl<M: TextModel> CausalLmRunner<M> {
         Some(raw)
     }
 
-    /// The cache description the attention kernel is handed, read from the device (2.4, 4.5).
+    /// Uploads the staged batch into the device columns the captured graphs address.
     ///
-    /// The batch's own line states what its rows *mean*; this states what the kernel is *given*,
-    /// and the two can disagree. The block table is read back from the column the launch points at
-    /// rather than from the batch's `unit_ids`, because a row's units are the engine's statement
-    /// and the column is what a kernel reads. The plane views are the ones `KvProvider::planes`
-    /// hands `nn`, so the shape and strides printed here are the numbers the attention `Call`
-    /// carries (`kv_stride_page`, `kv_stride_tokens`, `kv_stride_heads` are strides 0, 1 and 2).
-    ///
-    /// It reads memory, so it runs only under the dump and only on the device thread, and every
-    /// failure becomes text: a diagnosis never fails the batch it describes.
-    fn dump_kernel_arguments(&self, bucket: Bucket) -> String {
-        let rows = bucket.rows as usize;
-        let spelled = |view: &ops::TensorView| {
-            let mut shape = String::from("[");
-            for axis in 0..view.shape.rank() {
-                if axis > 0 {
-                    shape.push(',');
-                }
-                shape.push_str(&view.shape.dim(axis).to_string());
-            }
-            shape.push(']');
-            let mut strides = String::from("[");
-            for axis in 0..view.strides.rank() {
-                if axis > 0 {
-                    strides.push(',');
-                }
-                strides.push_str(&view.strides.get(axis).to_string());
-            }
-            strides.push(']');
-            format!(
-                "{:#x} {:?} shape={shape} strides={strides}",
-                view.ptr.address(),
-                view.dtype
-            )
-        };
-        if self.kv.groups() == 0 {
-            return "groups=0".to_owned();
-        }
-        let slots = self.staging.slots(rows).to_vec();
-        let seq_lens = self.staging.batch_rows().seq_lens[..rows].to_vec();
-        let live = seq_lens.iter().filter(|&&length| length > 0).count();
-        // The three statements of one partition, beside the rows they describe: a query count, the
-        // partition it makes, and the count the kernels bound by. A batch where they disagree is an
-        // operand mismatch, and it is the reading a one-row and a three-row pose of one bucket differ
-        // in - which is where a fault that appears above one row has to be.
-        let query_offsets = self.staging.batch_rows().query_offsets.to_vec();
-        let calls = self.staging.batch_rows().calls.len();
-        let mut out = format!(
-            "rows={rows} live_rows={live} seq_lens={seq_lens:?} query_offsets={query_offsets:?} \
-             live_tokens={} calls={calls} slots={slots:?} page_size={} max_kv_len={}",
-            self.staging.live_tokens(),
-            self.kv.page_size(),
-            self.max_kv_len,
-        );
-        // The page table's row, from the column the kernel addresses.
-        match self.kv.block_table_view(0, &slots) {
-            Ok(table) => {
-                let mut entries = [0_i32; 8];
-                let bytes = entries.len() * std::mem::size_of::<i32>();
-                // A copy is issued only over a range the view itself states: a device copy that
-                // reads outside its allocation is not a lost diagnostic, it is a sticky error on
-                // this stream and the batch after it fails (2.4).
-                if !table_readback_fits(&table, bytes) {
-                    out.push_str(&format!(
-                        " table={} first8=short-view({:?})",
-                        spelled(&table),
-                        table.dtype
-                    ));
-                    return out;
-                }
-                // SAFETY: the source is this view's first eight `i32`, whose extent the view
-                // states, and the destination is this function's own buffer of that length.
-                let copied = unsafe {
-                    platform::memcpy_async(
-                        entries.as_mut_ptr() as u64,
-                        table.ptr.address(),
-                        bytes,
-                        &self.stream,
-                    )
-                };
-                let first = if copied.is_ok() && self.stream.synchronize().is_ok() {
-                    format!("{entries:?}")
-                } else {
-                    "read-failed".to_owned()
-                };
-                out.push_str(&format!(" table={} first8={first}", spelled(&table)));
-            }
-            Err(error) => out.push_str(&format!(" table=refused({error})")),
-        }
-        // The planes the kernel reads K and V out of, for the group's first layer: the group's
-        // layers share the pool, so one layer's views describe every layer's addressing.
-        match self.kv.planes(0) {
-            Ok(layers) => match layers.first() {
-                Some(layer) => {
-                    out.push_str(&format!(
-                        " key={} value={}",
-                        spelled(&layer.key),
-                        spelled(&layer.value)
-                    ));
-                    let key = &layer.key;
-                    if key.shape.rank() == 4 {
-                        out.push_str(&format!(
-                            " num_pages={} pages_per_row={} kv_heads={} head_dim={}",
-                            key.shape.dim(0),
-                            key.shape.dim(1),
-                            key.shape.dim(2),
-                            key.shape.dim(3),
-                        ));
-                    }
-                }
-                None => out.push_str(" planes=none"),
-            },
-            Err(error) => out.push_str(&format!(" planes=refused({error})")),
-        }
-        out
-    }
-
+    /// Every column is copied into a buffer allocated when the runner bound, sized for the largest
+    /// bucket, and the host-side encode indices and draw buffers are the runner's own: a step
+    /// writes fixed addresses and allocates nothing (4.5).
     fn upload(&mut self, bucket: Bucket) -> Result<()> {
         let rows = bucket.rows as usize;
         let tokens = bucket.tokens as usize;
@@ -5628,53 +3631,6 @@ mod tests {
             vec![0, 0],
             "a warm row's slot is absent, and an absent row claims no key"
         );
-    }
-
-    /// A page readback is bounded by the plane it reads before any copy is issued: the driver's
-    /// error sticks to the runner's stream, so a read outside the allocation would not merely lose
-    /// a diagnostic, it would fail the batch after it.
-    #[test]
-    fn a_page_readback_is_confined_to_the_plane_it_reads() {
-        use super::page_readback_range;
-
-        // Page 3 of a plane whose pages are 4096 bytes: the offset is the page's own start.
-        assert_eq!(page_readback_range(3, 8, 4096, 16), Ok(3 * 4096));
-        // A unit past the plane's count and a unit below zero are both refused by name.
-        assert_eq!(
-            page_readback_range(8, 8, 4096, 16),
-            Err("unit 8 outside 8".to_owned())
-        );
-        assert_eq!(
-            page_readback_range(-1, 8, 4096, 16),
-            Err("unit -1 outside 8".to_owned())
-        );
-        // A plane narrower than the read is refused rather than read past.
-        assert_eq!(
-            page_readback_range(0, 8, 8, 16),
-            Err("plane holds 8 bytes, a read wants 16".to_owned())
-        );
-    }
-
-    /// The table readback is taken only from a view that holds that many page indices: a shorter
-    /// column, or one of another element type, names no plan a launch could have made.
-    #[test]
-    fn a_table_readback_is_taken_only_from_a_column_that_holds_page_indices() {
-        use super::table_readback_fits;
-        use ops::{DType, DevicePtr, Shape, Strides, TensorView};
-
-        let table = TensorView::new(DevicePtr::new(0), DType::I32, Shape::new(&[2, 640]));
-        assert!(table_readback_fits(&table, 32));
-        // Eight entries from a two-entry column is a read past it.
-        let short = TensorView::new(DevicePtr::new(0), DType::I32, Shape::new(&[1, 2]));
-        assert!(!table_readback_fits(&short, 32));
-        // The same bytes in floats are not page indices.
-        let floats = TensorView::with_strides(
-            DevicePtr::new(0),
-            DType::F32,
-            Shape::new(&[2, 640]),
-            Strides::row_major(Shape::new(&[2, 640])),
-        );
-        assert!(!table_readback_fits(&floats, 32));
     }
 
     /// A prefill's row is its whole prompt, and the sampler must read the row of the stack that
