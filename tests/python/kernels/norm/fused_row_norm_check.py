@@ -126,7 +126,11 @@ def check(operator, case):
 
     hidden = torch.randn(rows, columns, generator=generator).to(dtype)
     update = torch.randn(rows, columns, generator=generator).to(dtype)
-    scale = torch.randn(columns, generator=generator).to(dtype)
+    # The scale is one per channel, or one for the whole row: the kernel reads lane 0 for
+    # every column when the launch states a scale of width 1.
+    scale = torch.randn(
+        1 if case["scalar_scale"] else columns, generator=generator
+    ).to(dtype)
     weight = torch.randn(columns, generator=generator).to(dtype)
     update_bias = (
         torch.randn(columns, generator=generator).to(dtype)
@@ -161,7 +165,7 @@ def check(operator, case):
         arguments = [hidden, update, update_bias, scale, weight, out]
         if case["absmax"]:
             arguments.append(partials)
-        arguments.append(eps)
+        arguments += [eps, scale.numel()]
         name[(rows,)](
             *arguments,
             HAS_UPDATE_BIAS=update_bias is not None,
@@ -179,7 +183,7 @@ def check(operator, case):
         arguments = [hidden, update, update_bias, scale, weight, bias, out]
         if case["absmax"]:
             arguments.append(partials)
-        arguments.append(eps)
+        arguments += [eps, scale.numel()]
         name[(rows,)](
             *arguments,
             HAS_UPDATE_BIAS=update_bias is not None,
@@ -300,6 +304,7 @@ def cases(operator, flags):
             "cancelling_row": True,
             "flat_row": True,
             "offset_row": False,
+            "scalar_scale": False,
             "seed": 1,
         },
         {
@@ -317,6 +322,7 @@ def cases(operator, flags):
             "cancelling_row": False,
             "flat_row": False,
             "offset_row": True,
+            "scalar_scale": False,
             "seed": 2,
         },
         {
@@ -330,7 +336,20 @@ def cases(operator, flags):
             "cancelling_row": False,
             "flat_row": False,
             "offset_row": False,
+            "scalar_scale": False,
             "seed": 3,
+        },
+        {
+            **common,
+            "label": "one scale for the whole row",
+            "rows": 2,
+            "update_bias": False,
+            "absmax": False,
+            "cancelling_row": True,
+            "flat_row": False,
+            "offset_row": False,
+            "scalar_scale": True,
+            "seed": 4,
         },
     ]
 
