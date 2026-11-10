@@ -17,7 +17,7 @@ backend = "sm120"
 kind = "cute_dsl"
 version = "4.6.2"
 packages = [
-    { name = "flashinfer", version = "0.6.18" },
+    { name = "flashinfer-python", version = "0.6.18" },
     { name = "torch", version = "2.13.0" },
 ]
 

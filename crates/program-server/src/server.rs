@@ -554,6 +554,11 @@ impl ProgramServer {
                 ),
             });
         }
+        self.toolchains.check_packages(
+            &package.manifest.op,
+            &package.manifest.backend,
+            &package.manifest.toolchain,
+        )?;
         let source = package.manifest.source(publisher)?;
         let workspace = crate::source::Workspace::new()?;
         let target = Target::new(crate::manifest::WASM_TARGET);
@@ -1362,6 +1367,11 @@ impl Queue {
                         ),
                     });
                 }
+                self.toolchains.check_packages(
+                    &package.manifest.op,
+                    &package.manifest.backend,
+                    &package.manifest.toolchain,
+                )?;
                 package.source.build(
                     &job.path.op,
                     &job.path.descriptor,

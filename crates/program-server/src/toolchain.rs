@@ -23,11 +23,12 @@
 //! discovered as missing, and only a build that needs it fails. That keeps a
 //! host without a CUDA toolkit able to serve the packages it already has.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::manifest::ToolchainKind;
+use crate::manifest::{PythonPackage, ToolchainDeps, ToolchainKind};
 use crate::{Error, Result};
 
 /// The peak host memory of one Triton compile, in bytes.
@@ -173,6 +174,10 @@ pub struct Toolchains {
     triton: Discovered<Triton>,
     cute_dsl: Discovered<CuteDsl>,
     wasm: Discovered<Wasm>,
+    /// The distributions the Program Server's Python environment has installed, by normalized
+    /// name (PEP 503), with their versions: what a package's `[toolchain] packages` is compared
+    /// with before it is built.
+    distributions: Discovered<BTreeMap<String, String>>,
 }
 
 /// A toolchain the host may not have.
@@ -191,7 +196,42 @@ impl Toolchains {
             triton: Triton::discover(config, interpreter),
             cute_dsl: CuteDsl::discover(config, interpreter),
             wasm: Wasm::discover(config, interpreter),
+            distributions: named_interpreter(interpreter).and_then(python_distributions),
         })
+    }
+
+    /// Refuses a build whose package imports a Python distribution this host's environment does
+    /// not have at the version the package declares (design section 5.2: a package names the
+    /// distributions its sources import, and the environment's lock fixes their versions).
+    ///
+    /// A package that declares none needs no environment for this. Names are compared as PEP 503
+    /// normalizes them, so `flash_attn_4` and `flash-attn-4` are one distribution.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::Toolchain`], naming every distribution that is missing or at another
+    /// version, or why the environment's distributions could not be read.
+    pub fn check_packages(&self, op: &str, backend: &str, toolchain: &ToolchainDeps) -> Result<()> {
+        if toolchain.packages.is_empty() {
+            return Ok(());
+        }
+        let refuse = |message: String| Error::Toolchain {
+            kind: toolchain.kind,
+            message: format!("the package {op} {backend} {message}"),
+        };
+        let installed = self
+            .distributions
+            .as_ref()
+            .map_err(|reason| refuse(format!("imports Python distributions, and {reason}")))?;
+        let disagreements = disagreements(&toolchain.packages, installed);
+        if disagreements.is_empty() {
+            Ok(())
+        } else {
+            Err(refuse(format!(
+                "imports {} that this host's Python environment does not have",
+                disagreements.join(", ")
+            )))
+        }
     }
 
     /// The toolchain of a kind, with the host's configuration.
@@ -522,6 +562,75 @@ fn named_interpreter(interpreter: Option<&Path>) -> Discovered<&Path> {
     })
 }
 
+/// A distribution name as PEP 503 normalizes it: lowercase, with every run of `-`, `_` and `.`
+/// one `-`.
+fn normalized(name: &str) -> String {
+    let mut normal = String::with_capacity(name.len());
+    let mut separated = false;
+    for character in name.chars() {
+        if matches!(character, '-' | '_' | '.') {
+            separated = true;
+            continue;
+        }
+        if separated && !normal.is_empty() {
+            normal.push('-');
+        }
+        separated = false;
+        normal.extend(character.to_lowercase());
+    }
+    normal
+}
+
+/// The declared distributions `installed` does not hold at their declared version, each as
+/// `name version (it has ...)`.
+fn disagreements(declared: &[PythonPackage], installed: &BTreeMap<String, String>) -> Vec<String> {
+    declared
+        .iter()
+        .filter_map(|package| match installed.get(&normalized(&package.name)) {
+            Some(version) if *version == package.version => None,
+            Some(version) => Some(format!(
+                "{} {} (it has {version})",
+                package.name, package.version
+            )),
+            None => Some(format!(
+                "{} {} (it has none)",
+                package.name, package.version
+            )),
+        })
+        .collect()
+}
+
+/// Every distribution the Python environment has installed, by normalized name, with its version.
+fn python_distributions(interpreter: &Path) -> Discovered<BTreeMap<String, String>> {
+    if !interpreter.is_file() {
+        return Err(format!(
+            "no Python interpreter at {}: pass --python <the Program Server's interpreter>",
+            interpreter.display()
+        ));
+    }
+    let reported = Command::new(interpreter)
+        .args([
+            "-c",
+            "import importlib.metadata as m, json; \
+             print(json.dumps({d.metadata['Name']: d.version for d in m.distributions()}))",
+        ])
+        .output()
+        .map_err(|error| format!("running {}: {error}", interpreter.display()))?;
+    if !reported.status.success() {
+        return Err(format!(
+            "{} cannot list its distributions: {}",
+            interpreter.display(),
+            String::from_utf8_lossy(&reported.stderr).trim()
+        ));
+    }
+    let listed: BTreeMap<String, String> = serde_json::from_slice(&reported.stdout)
+        .map_err(|error| format!("{} listed no distributions: {error}", interpreter.display()))?;
+    Ok(listed
+        .into_iter()
+        .map(|(name, version)| (normalized(&name), version))
+        .collect())
+}
+
 /// Asks the Python environment for the version of one of its distributions.
 fn python_version(interpreter: &Path, module: &str) -> Discovered<String> {
     if !interpreter.is_file() {
@@ -671,8 +780,49 @@ pub fn execute(job: &ToolJob, max_jobs: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolJob, execute, parse_nvcc_version, resolve_in};
+    use super::{ToolJob, disagreements, execute, normalized, parse_nvcc_version, resolve_in};
+    use crate::manifest::PythonPackage;
+    use std::collections::BTreeMap;
     use std::path::Path;
+
+    /// A declared distribution is compared by its normalized name and its exact version: the
+    /// environment's spelling of a name does not matter, its version does, and a distribution it
+    /// lacks is named as missing.
+    #[test]
+    fn a_declared_distribution_must_be_installed_at_its_version() {
+        let installed: BTreeMap<String, String> =
+            [("flash_attn_4", "4.0.0b30"), ("Torch", "2.13.0")]
+                .into_iter()
+                .map(|(name, version)| (normalized(name), version.to_owned()))
+                .collect();
+        let declared = |name: &str, version: &str| PythonPackage {
+            name: name.to_owned(),
+            version: version.to_owned(),
+        };
+        assert!(
+            disagreements(
+                &[
+                    declared("flash-attn-4", "4.0.0b30"),
+                    declared("torch", "2.13.0")
+                ],
+                &installed
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            disagreements(
+                &[
+                    declared("flash-attn-4", "4.0.0"),
+                    declared("flashinfer-python", "0.6.18")
+                ],
+                &installed
+            ),
+            [
+                "flash-attn-4 4.0.0 (it has 4.0.0b30)",
+                "flashinfer-python 0.6.18 (it has none)"
+            ]
+        );
+    }
 
     /// A build whose compiler is not where the host said names the program, its
     /// arguments and the directory it ran in. An errno alone says none of them and the

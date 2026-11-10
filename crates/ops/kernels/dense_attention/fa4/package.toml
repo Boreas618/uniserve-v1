@@ -21,7 +21,7 @@ backend = "fa4"
 kind = "cute_dsl"
 version = "4.6.2"
 packages = [
-    { name = "flash-attn", version = "4.0.0" },
+    { name = "flash-attn-4", version = "4.0.0b30" },
     { name = "torch", version = "2.13.0" },
 ]
 

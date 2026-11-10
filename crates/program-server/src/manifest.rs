@@ -154,9 +154,12 @@ pub struct ToolchainDeps {
     /// on whichever host the caller's test uses declares it; a serving package
     /// declares the version its modules were validated against.
     pub version: String,
-    /// The Python packages the sources import, such as FlashAttention-4 and
-    /// FlashInfer's CuTe kernels, with the versions the Program Server's
-    /// environment locks them to (design section 5.2).
+    /// The Python distributions the sources import, such as FlashAttention-4
+    /// and FlashInfer's CuTe kernels, by their distribution names
+    /// (`flash-attn-4`, `flashinfer-python`) and with the versions the Program
+    /// Server's environment locks them to (design section 5.2). A build is
+    /// refused when the environment has one at another version or not at all
+    /// (`Toolchains::check_packages`).
     #[serde(default)]
     pub packages: Vec<PythonPackage>,
 }

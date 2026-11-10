@@ -657,3 +657,61 @@ dimensions = { dtype = ["bf16"], channels = ["512"] }
     assert!(manifest.covers("dtype_bf16_channels_512"));
     assert!(!manifest.covers("dtype_bf16_channels_256"));
 }
+
+/// The Python distributions every kernel package and program fixture of this tree declares are the
+/// ones the Program Server's environment locks, by name and at the locked version: a build checks
+/// them against the installed environment (`Toolchains::check_packages`), which `uv sync --locked`
+/// makes the lock, so a declaration the lock disagrees with is a package no host builds.
+#[test]
+fn every_declared_distribution_is_the_locked_one() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let lock: toml::Table =
+        fs::read_to_string(repository.join("crates/program-server/python/uv.lock"))
+            .expect("the Program Server's lock is in the tree")
+            .parse()
+            .expect("the lock is TOML");
+    let normalized = |name: &str| name.to_lowercase().replace(['_', '.'], "-");
+    let locked: std::collections::BTreeMap<String, String> = lock["package"]
+        .as_array()
+        .expect("the lock lists its packages")
+        .iter()
+        .map(|entry| {
+            (
+                normalized(entry["name"].as_str().unwrap()),
+                entry["version"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+
+    let mut packages: Vec<PathBuf> = Vec::new();
+    for root in ["crates/ops/kernels", "crates/ops/program-fixtures"] {
+        let mut pending = vec![repository.join(root)];
+        while let Some(directory) = pending.pop() {
+            if directory.join("package.toml").is_file() {
+                packages.push(directory.clone());
+            }
+            for entry in fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+    }
+    assert!(!packages.is_empty(), "the tree holds kernel packages");
+
+    let mut disagreements = Vec::new();
+    for package in &packages {
+        let manifest = Manifest::load(package).expect("every package in the tree loads");
+        for declared in &manifest.toolchain.packages {
+            match locked.get(&normalized(&declared.name)) {
+                Some(version) if *version == declared.version => {}
+                found => disagreements.push(format!(
+                    "{} {}: {} {} (the lock has {found:?})",
+                    manifest.op, manifest.backend, declared.name, declared.version
+                )),
+            }
+        }
+    }
+    assert!(disagreements.is_empty(), "{disagreements:#?}");
+}

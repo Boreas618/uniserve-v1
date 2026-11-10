@@ -24,7 +24,7 @@ A server without the interpreter is not an error: the Triton and CuTe DSL toolch
 | `flash-attn-4[cu13]` | 4.0.0b30 | the FlashAttention-4 package |
 | `torch` | 2.13.0 | required by the two above; it is never imported by the Program Server itself |
 
-A package names the distributions it imports and their versions in its `[toolchain] packages`; changing any of them is a new installation and a new revision.
+A package names the distributions it imports and their versions in its `[toolchain] packages`, by distribution name (`flash-attn-4`, `flashinfer-python`) and at the version this lock fixes; changing any of them is a new installation and a new revision. The Program Server refuses to build a package whose declared distribution this environment does not have at that version, naming each disagreement, as it refuses a toolchain of another version.
 
 ## How a package's compile script is run
 
