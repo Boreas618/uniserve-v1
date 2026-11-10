@@ -1304,55 +1304,6 @@ impl Batches for Workers {
     }
 }
 
-/// What the device worker is doing, as the control thread's stall report and probe name it (2.4).
-///
-/// A batch is one command even when it becomes several jobs: the stall report names the batch the
-/// device is serving, which is what the scheduler can act on.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum JobKind {
-    /// Serving one batch: staging it and replaying its bucket's graph.
-    Batch,
-    /// A replay of a captured bucket inside a serving command.
-    Replay,
-    /// A capture of one bucket (warmup or a recapture of the update's generation).
-    Capture,
-    /// A bucket's rebind - or its recapture, when the walk shows the launch structure changed
-    /// (4.5).
-    Rebind,
-    /// A paired forward of one changed operator (7.3).
-    Shadow,
-    /// Serving one media call on the host: encoding, muxing, or the reading of media (2.4).
-    Host,
-    /// Capturing every bucket of the serving generation before it serves.
-    Warmup,
-    /// Preparing the next generation (7.3 step 2).
-    Precopy,
-    /// Switching the serving generation at a batch boundary (7.3 step 3).
-    Switchover,
-    /// The discard of a prepared generation (7.3 step 4's revert).
-    Revert,
-    /// Releasing an old generation's graphs (7.3 step 6).
-    Purge,
-    /// Releasing a prepared generation that never served (an abandoned precopy, 7.3 step 2).
-    Discard,
-    /// Giving the resident cache segments back, for a standby's park (2.5).
-    Sleep,
-    /// Mapping the host KV cache's page pools, or copying pages to them with no batch to ride on.
-    HostCache,
-    /// A latent preparation: stating a trajectory's pages, and restoring a stored one into them.
-    Prepare,
-    /// Copying preempted requests' trajectories to the host latent pool.
-    LatentOffload,
-    /// Mapping the released cache segments again, with the unit resets that follow (2.5).
-    Wake,
-    /// A change of the rank's profiling session.
-    Profile,
-    /// A job that only waits for the events it was given.
-    After,
-}
-
-impl JobKind {}
-
 /// What the caller of a submission holds until its jobs ended.
 ///
 /// A submission completes once the device worker has performed every job's work and the work

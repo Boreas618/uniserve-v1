@@ -25,7 +25,7 @@ use ipc::PhaseId;
 use ops::Generation;
 use platform::DeviceId;
 
-use crate::batch::{Batch, BatchOutput, Job, JobKind, Submission, SubmissionId, SubmissionState};
+use crate::batch::{Batch, BatchOutput, Job, Submission, SubmissionId, SubmissionState};
 use crate::completion::Outcome;
 use crate::stream::events::{EventPool, JobId};
 use crate::{Error, Result, lock};
@@ -39,8 +39,6 @@ pub(crate) struct Entry {
     pub(crate) submission: Option<Arc<SubmissionState>>,
     /// The submission's number, for the watchdog's report.
     pub(crate) submission_id: Option<SubmissionId>,
-    /// What the command is, for the watchdog's report.
-    pub(crate) kind: JobKind,
     /// The batch the command serves, when it serves one.
     pub(crate) batch: Option<crate::batch::BatchId>,
     /// What this command is doing, written when it is queued: the first half of a failure's report,
@@ -176,7 +174,6 @@ struct Current {
     /// The job in hand: a landing clears the watchdog's view only of its own job.
     job: JobId,
     submission: Option<SubmissionId>,
-    kind: JobKind,
     batch: Option<crate::batch::BatchId>,
     started: std::time::Instant,
 }
@@ -227,7 +224,6 @@ impl JobQueue {
         &self,
         command: Command,
         submission: Option<(SubmissionId, Arc<SubmissionState>)>,
-        kind: JobKind,
         batch: Option<crate::batch::BatchId>,
     ) -> Result<JobId> {
         let mut state = lock(&self.state);
@@ -247,7 +243,6 @@ impl JobQueue {
             command,
             submission,
             submission_id,
-            kind,
             batch,
         });
         drop(state);
@@ -273,7 +268,6 @@ impl JobQueue {
             command,
             submission: entry.submission.clone(),
             submission_id: entry.submission_id,
-            kind: entry.kind,
             batch: entry.batch,
         });
         drop(state);
@@ -286,11 +280,10 @@ impl JobQueue {
         &self,
         command: Command,
         submission: &Submission,
-        kind: JobKind,
         batch: Option<crate::batch::BatchId>,
     ) -> Result<JobId> {
         let (state, id) = submission.parts();
-        self.push(command, Some((id, state)), kind, batch)
+        self.push(command, Some((id, state)), batch)
     }
 
     /// The job that completes once `events` completed: the closure
@@ -307,7 +300,6 @@ impl JobQueue {
             command: Command::After(events),
             submission: None,
             submission_id: None,
-            kind: JobKind::After,
             batch: None,
         });
         drop(state);
@@ -326,7 +318,6 @@ impl JobQueue {
                 state.current = Some(Current {
                     job: entry.id,
                     submission: entry.submission_id,
-                    kind: entry.kind,
                     batch: entry.batch,
                     started: std::time::Instant::now(),
                 });
@@ -357,7 +348,6 @@ impl JobQueue {
         state.current = Some(Current {
             job: entry.id,
             submission: entry.submission_id,
-            kind: entry.kind,
             batch: entry.batch,
             started: std::time::Instant::now(),
         });
@@ -387,7 +377,6 @@ impl JobQueue {
         state.current = Some(Current {
             job: entry.id,
             submission: entry.submission_id,
-            kind: entry.kind,
             batch: entry.batch,
             started: std::time::Instant::now(),
         });
@@ -421,7 +410,7 @@ impl JobQueue {
                 state.current = None;
             }
         }
-        if entry.kind == JobKind::After {
+        if matches!(entry.command, Command::After(_)) {
             // The command's only work was its wait, which completing it establishes.
             if let Err(error) = self.events.complete(entry.id, result.is_ok()) {
                 tracing::warn!(%error, "the event pool refused a completed wait");
@@ -466,7 +455,6 @@ impl JobQueue {
                 vec![crate::device::Watch {
                     submission: current.submission,
                     job: current.job,
-                    kind: current.kind,
                     batch: current.batch,
                     started: current.started,
                     elapsed: current.started.elapsed(),
@@ -487,7 +475,6 @@ impl JobQueue {
                 jobs,
             },
             &submission,
-            crate::batch::JobKind::Replay,
             None,
         )
         .map(|_| ())
@@ -623,14 +610,14 @@ mod tests {
         let (queue, _events) = queue();
         let (submission, _) = Submission::pending(crate::batch::SubmissionId(0));
         queue
-            .submit(Command::Batch(batch()), &submission, JobKind::Batch, None)
+            .submit(Command::Batch(batch()), &submission, None)
             .expect("a command is queued");
 
         assert!(submission.outcome().is_none(), "nothing performed yet");
         let entry = queue
             .next(Some(Duration::from_millis(10)))
             .expect("a command");
-        assert_eq!(entry.kind, JobKind::Batch);
+        assert!(matches!(entry.command, Command::Batch(..)));
         assert!(queue.watchdog_is_running());
 
         queue.complete(entry, Ok(crate::batch::BatchOutput::default()), None);
@@ -651,7 +638,6 @@ mod tests {
             .submit(
                 Command::Batch(batch()),
                 &first,
-                JobKind::Batch,
                 Some(crate::batch::BatchId(1)),
             )
             .expect("queued");
@@ -659,7 +645,6 @@ mod tests {
             .submit(
                 Command::Batch(next),
                 &second,
-                JobKind::Batch,
                 Some(crate::batch::BatchId(2)),
             )
             .expect("queued");
@@ -681,17 +666,17 @@ mod tests {
         let (first, _) = Submission::pending(crate::batch::SubmissionId(0));
         let (second, _) = Submission::pending(crate::batch::SubmissionId(1));
         queue
-            .submit(Command::Batch(batch()), &first, JobKind::Batch, None)
+            .submit(Command::Batch(batch()), &first, None)
             .expect("queued");
         queue
-            .submit(Command::Purge(2), &second, JobKind::Purge, None)
+            .submit(Command::Purge(2), &second, None)
             .expect("queued");
 
         let entry = queue.next(Some(Duration::from_millis(10))).expect("first");
-        assert_eq!(entry.kind, JobKind::Batch);
+        assert!(matches!(entry.command, Command::Batch(..)));
         queue.complete(entry, Ok(crate::batch::BatchOutput::default()), None);
         let entry = queue.next(Some(Duration::from_millis(10))).expect("second");
-        assert_eq!(entry.kind, JobKind::Purge);
+        assert!(matches!(entry.command, Command::Purge(..)));
         let capture = Job::Capture {
             runner: crate::runner::RunnerId(0),
             bucket: crate::plan::Bucket::decode(128, crate::plan::Variant::DecodeGreedy),
@@ -737,13 +722,12 @@ mod tests {
                     jobs,
                 },
                 &precopy,
-                JobKind::Precopy,
                 None,
             )
             .expect("the precopy is queued");
         let (served, _) = Submission::pending(crate::batch::SubmissionId(1));
         queue
-            .submit(Command::Batch(batch()), &served, JobKind::Batch, None)
+            .submit(Command::Batch(batch()), &served, None)
             .expect("the batch is queued");
 
         // The device loop, as the worker performs it: one job of a multi-job command per turn.
@@ -815,7 +799,6 @@ mod tests {
                     jobs,
                 },
                 &precopy,
-                JobKind::Precopy,
                 None,
             )
             .expect("queued");
@@ -863,7 +846,6 @@ mod tests {
                     jobs,
                 },
                 &warmup,
-                JobKind::Warmup,
                 None,
             )
             .expect("queued");
@@ -920,7 +902,6 @@ mod tests {
                     jobs,
                 },
                 &warmup,
-                JobKind::Warmup,
                 None,
             )
             .expect("queued");
@@ -962,7 +943,7 @@ mod tests {
             .next(Some(Duration::from_millis(10)))
             .expect("the wait");
         assert_eq!(entry.id, id);
-        assert_eq!(entry.kind, JobKind::After);
+        assert!(matches!(entry.command, Command::After(..)));
         queue.complete(entry, Ok(crate::batch::BatchOutput::default()), None);
 
         // The pool has no deferred work under this job, which is not a failure of the wait.
@@ -971,9 +952,7 @@ mod tests {
         queue.close();
         assert!(queue.next(Some(Duration::from_millis(10))).is_none());
         assert!(
-            queue
-                .push(Command::Purge(3), None, JobKind::Purge, None)
-                .is_err(),
+            queue.push(Command::Purge(3), None, None).is_err(),
             "a closed queue takes no command"
         );
     }

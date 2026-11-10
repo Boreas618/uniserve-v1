@@ -21,7 +21,7 @@ use ops::Generation;
 use platform::DeviceId;
 
 use crate::arena::{Pools, StreamId};
-use crate::batch::{Batch, BatchOutput, Job, JobKind, Submission, SubmissionId};
+use crate::batch::{Batch, BatchOutput, Job, Submission, SubmissionId};
 use crate::job::{Command, JobQueue, jobs_of, phase_of};
 use crate::plan::Bucket;
 use crate::runner::{NamedRunner, RunnerId};
@@ -419,8 +419,7 @@ impl Worker {
     pub fn set_shadow(&self) -> Result<Submission> {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
-        self.queue
-            .submit(Command::SetShadow, &submission, JobKind::Shadow, None)?;
+        self.queue.submit(Command::SetShadow, &submission, None)?;
         Ok(submission)
     }
 
@@ -435,12 +434,8 @@ impl Worker {
         let (submission, _) = Submission::pending(id);
         // The stall report names the batch its job belongs to (2.4).
         let batch_id = batch.id;
-        self.queue.submit(
-            Command::Batch(batch),
-            &submission,
-            JobKind::Batch,
-            Some(batch_id),
-        )?;
+        self.queue
+            .submit(Command::Batch(batch), &submission, Some(batch_id))?;
         Ok(submission)
     }
 
@@ -450,12 +445,8 @@ impl Worker {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
         let batch_id = batch.id;
-        self.queue.submit(
-            Command::Shadow(batch),
-            &submission,
-            JobKind::Shadow,
-            Some(batch_id),
-        )?;
+        self.queue
+            .submit(Command::Shadow(batch), &submission, Some(batch_id))?;
         Ok(submission)
     }
 
@@ -464,8 +455,7 @@ impl Worker {
     pub fn warmup(&self) -> Result<Submission> {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
-        self.queue
-            .submit(Command::Warmup, &submission, JobKind::Warmup, None)?;
+        self.queue.submit(Command::Warmup, &submission, None)?;
         Ok(submission)
     }
 
@@ -475,7 +465,7 @@ impl Worker {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
         self.queue
-            .submit(Command::Precopy(next), &submission, JobKind::Precopy, None)?;
+            .submit(Command::Precopy(next), &submission, None)?;
         Ok(submission)
     }
 
@@ -483,12 +473,8 @@ impl Worker {
     pub fn switchover(&self, generation: u64) -> Result<Submission> {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
-        self.queue.submit(
-            Command::Switchover(generation),
-            &submission,
-            JobKind::Switchover,
-            None,
-        )?;
+        self.queue
+            .submit(Command::Switchover(generation), &submission, None)?;
         Ok(submission)
     }
 
@@ -496,12 +482,8 @@ impl Worker {
     pub fn revert(&self, generation: u64) -> Result<Submission> {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
-        self.queue.submit(
-            Command::Revert(generation),
-            &submission,
-            JobKind::Revert,
-            None,
-        )?;
+        self.queue
+            .submit(Command::Revert(generation), &submission, None)?;
         Ok(submission)
     }
 
@@ -509,12 +491,8 @@ impl Worker {
     pub fn purge(&self, generation: u64) -> Result<Submission> {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
-        self.queue.submit(
-            Command::Purge(generation),
-            &submission,
-            JobKind::Purge,
-            None,
-        )?;
+        self.queue
+            .submit(Command::Purge(generation), &submission, None)?;
         Ok(submission)
     }
 
@@ -528,12 +506,8 @@ impl Worker {
     pub fn discard(&self, generation: u64) -> Result<Submission> {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
-        self.queue.submit(
-            Command::Discard(generation),
-            &submission,
-            JobKind::Discard,
-            None,
-        )?;
+        self.queue
+            .submit(Command::Discard(generation), &submission, None)?;
         Ok(submission)
     }
 
@@ -556,8 +530,7 @@ impl Worker {
     pub fn sleep(&self) -> Result<Submission> {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
-        self.queue
-            .submit(Command::Sleep, &submission, JobKind::Sleep, None)?;
+        self.queue.submit(Command::Sleep, &submission, None)?;
         Ok(submission)
     }
 
@@ -570,7 +543,7 @@ impl Worker {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
         self.queue
-            .submit(Command::Wake { limit }, &submission, JobKind::Wake, None)?;
+            .submit(Command::Wake { limit }, &submission, None)?;
         Ok(submission)
     }
 
@@ -591,7 +564,6 @@ impl Worker {
                 pools: Arc::clone(&pools),
             },
             &submission,
-            JobKind::HostCache,
             None,
         )?;
         match submission.wait() {
@@ -611,28 +583,28 @@ impl Worker {
 
     /// Copies `offloads` to the host KV cache in queue order, with no batch to carry them.
     pub fn copy_pages(&self, offloads: Vec<ipc::PageCopy>) -> Result<Submission> {
-        self.storage_command(Command::CopyPages(offloads), JobKind::HostCache)
+        self.storage_command(Command::CopyPages(offloads))
     }
 
     /// Copies preempted requests' trajectories to the host latent pool in queue order, behind the
     /// batches that advanced them, with no batch to carry them.
     pub fn offload_latents(&self, offloads: Vec<ipc::LatentOffload>) -> Result<Submission> {
-        self.storage_command(Command::OffloadLatents(offloads), JobKind::LatentOffload)
+        self.storage_command(Command::OffloadLatents(offloads))
     }
 
     /// Gives the cache's segments from `from` on back to the Storage Server (7.6).
     pub fn release_cache(&self, from: u32) -> Result<Submission> {
-        self.storage_command(Command::ReleaseCache { from }, JobKind::Sleep)
+        self.storage_command(Command::ReleaseCache { from })
     }
 
     /// Unmaps the graph pools' storage at their reserved addresses, keeping every capture (7.6).
     pub fn suspend_graphs(&self) -> Result<Submission> {
-        self.storage_command(Command::SuspendGraphs, JobKind::Sleep)
+        self.storage_command(Command::SuspendGraphs)
     }
 
     /// Maps the graph pools' storage at the addresses the captures hold (7.6).
     pub fn restore_graphs(&self) -> Result<Submission> {
-        self.storage_command(Command::RestoreGraphs, JobKind::Wake)
+        self.storage_command(Command::RestoreGraphs)
     }
 
     /// Changes the rank's profiling session between two batches and answers what the session says.
@@ -643,8 +615,7 @@ impl Worker {
     /// When the session refuses, or the device's thread is gone.
     pub fn profile(&self, change: crate::profiling::session::Change) -> Result<serde_json::Value> {
         let (answer, answered) = crossbeam_channel::bounded(1);
-        let submission =
-            self.storage_command(Command::Profile { change, answer }, JobKind::Profile)?;
+        let submission = self.storage_command(Command::Profile { change, answer })?;
         match answered.recv() {
             Ok(result) => result,
             Err(_) => match submission.wait() {
@@ -657,13 +628,13 @@ impl Worker {
     /// Runs `work`, which changes what the rank's weights map, in the queue's order: a batch
     /// submitted before it finished, and one submitted after it reads the new weights (7.6).
     pub fn rebind(&self, work: Arc<dyn Fn() -> Result<()> + Send + Sync>) -> Result<Submission> {
-        self.storage_command(Command::Rebind(work), JobKind::Rebind)
+        self.storage_command(Command::Rebind(work))
     }
 
-    fn storage_command(&self, command: Command, kind: JobKind) -> Result<Submission> {
+    fn storage_command(&self, command: Command) -> Result<Submission> {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
-        self.queue.submit(command, &submission, kind, None)?;
+        self.queue.submit(command, &submission, None)?;
         Ok(submission)
     }
 
@@ -761,8 +732,6 @@ pub struct Watch {
     pub submission: Option<SubmissionId>,
     /// The command's number.
     pub job: JobId,
-    /// What kind of command it is.
-    pub kind: JobKind,
     /// The batch it serves, when it serves one.
     pub batch: Option<crate::batch::BatchId>,
     /// When the device thread began it.
