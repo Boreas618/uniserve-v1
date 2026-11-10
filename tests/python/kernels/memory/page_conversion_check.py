@@ -6,26 +6,27 @@
 
 The script has two halves because the two things it checks lie in different places.
 
-An imported rank's cache arrives as raw keys and values in the source's own element type, with one
-FP32 scale per source page and head group when the source stores FP8. This program decodes one field
-of a span into the FP32 scratch block `cache_copy_region` then writes pages from. Two things in it can
-be wrong without any build noticing:
+A page stored in another representation is staged in the conversion scratch in the host page
+encoding: layer-major keys `[layers, block_size, heads, head_dim]`, values in the same shape, and for
+an FP8 page FP32 scales `[2, layers, groups]` (one group per source pool's head range; the host page's
+own tail is `groups = 1`). This program decodes one field of the page into the FP32 scratch block
+`cache_copy_region` then writes units from. Two things in it can be wrong without any build noticing:
 
-* **which scale row a token takes.** The caller packs one row per page the span *touches*, starting
-  with the page `source_offset` falls in, so a span that starts mid-page must not skip that many rows
-  (`page − source_offset // block_size`). Reading the wrong row scales a whole page of keys by another
-  page's factor: the attention comes out wrong and every number still looks like a number. The page
-  cases below start the span inside a page, cross a page boundary, and start in a later page.
+* **which scale a row takes.** A row of layer `l` of field `f` takes the scale
+  `[f, l, head // scale_heads]`. Reading another layer's or the other field's entry scales a layer of
+  keys by a foreign factor: the attention comes out wrong and every number still looks like a number.
+  Every scale entry of a case is a distinct factor, and the cases cover keys and values, one and two
+  scale groups, and more than one layer.
 
-* **the rounding the decoded value takes.** A source page holds `key / scale`; the value times the
-  page's scale is the value the source rank wrote, and it must then round through the source's
-  *logical* type so an imported value equals a locally written one instead of being one rounding
-  better. The check requires the FP32 block to equal a rounding model **exactly**, and proves the case
-  separates the models before trusting the answer: BF16 truncates a mantissa in the interpreter and F16
-  rounds to nearest — measured, not assumed — and each narrow case is built so the two models differ.
+* **the rounding the decoded value takes.** A scaled page holds `key / scale`; the value times its
+  scale is the value the source rank wrote, and it must then round through the source's *logical*
+  type so a loaded value equals a locally written one instead of being one rounding better. The check
+  requires the FP32 block to equal a rounding model **exactly**, and proves the case separates the
+  models before trusting the answer: BF16 truncates a mantissa in the interpreter and F16 rounds to
+  nearest — measured, not assumed — and each narrow case is built so the two models differ.
 
 The scratch is `20·E + 8·S` bytes, and this check asserts every byte it does not name is untouched:
-the FP32 block past the span, the raw areas, and the scale rows.
+the raw areas past the page, and the scale entries.
 
 **The interpreter's E4M3 store is wrong and its E4M3 load is not.** Both measured on all 256 patterns
 of the format with one two-line kernel apiece:
@@ -95,23 +96,28 @@ def load_kernel(package):
     return module
 
 
+def groups_of(case):
+    """The scale groups of a case's page: one per source pool's head range."""
+    if not case["scaled"]:
+        return 1
+    return (case["heads"] + case["scale_heads"] - 1) // case["scale_heads"]
+
+
 def case_scratch(case):
-    """The workspace bytes a case starts from, and the tensors it holds the source in."""
-    span = case["count"] * case["layers"] * case["heads"] * case["head_dim"]
-    groups = (
-        1
-        if not case["scaled"]
-        else (case["heads"] + case["scale_heads"] - 1) // case["scale_heads"]
+    """The workspace bytes a case starts from, and the tensors it holds the staged page in."""
+    shape = (
+        case["layers"],
+        case["block_size"],
+        case["heads"],
+        case["head_dim"],
     )
-    scale_entries = (
-        0 if not case["scaled"] else case["pages"] * case["layers"] * groups
-    )
-    elements = span
+    elements = shape[0] * shape[1] * shape[2] * shape[3]
+    groups = groups_of(case)
+    scale_entries = 2 * case["layers"] * groups if case["scaled"] else 0
     total = 20 * elements + 8 * scale_entries
     scratch = torch.zeros(total, dtype=torch.uint8)
 
     generator = torch.Generator().manual_seed(case["seed"])
-    shape = (case["count"], case["layers"], case["heads"], case["head_dim"])
     # The stored elements, in the source's own type: the source wrote `value / scale`.
     source = SOURCES[case["source"]][2]
     magnitude = {"f8e4m3": 32.0, "bf16": 512.0}[case["source"]]
@@ -125,25 +131,25 @@ def case_scratch(case):
     )
     keys = keys.to(source)
     values = values.to(source)
-    # Each raw area is eight E bytes, which is more than one field's span needs in any source type:
-    # the span is written at its start and the rest of the area stays zero, which the run then checks.
+    # Each raw area is eight E bytes, which is more than one field of the page needs in any source
+    # type: the page's field lands at its start, as the staging copy puts it, and the rest of the area
+    # stays zero, which the run then checks.
     keys_bytes = keys.contiguous().view(torch.uint8).reshape(-1)
     values_bytes = values.contiguous().view(torch.uint8).reshape(-1)
     scratch[0 : keys_bytes.numel()] = keys_bytes
     scratch[8 * elements : 8 * elements + values_bytes.numel()] = values_bytes
 
-    # The FP32 block starts at 16E, and the scale rows past 20E, every one of them a distinct factor
-    # so a program that reads the wrong row cannot pass.
+    # The FP32 block starts at 16E, and the scale entries past 20E.
     block = scratch[16 * elements : 20 * elements].view(torch.float32)
     block.fill_(SENTINEL)
     scales = None
     if case["scaled"]:
         # Scales the way a real FP8 cache carries them — a factor near 1/100 that no mantissa of a
-        # narrow logical type covers — so the product is a value that *must* round, and every row is
-        # its own factor so a program reading the wrong row cannot pass.
+        # narrow logical type covers — so the product is a value that *must* round, and every entry
+        # is its own factor so a program reading another layer's, field's or group's cannot pass.
         scales = (
             torch.rand(
-                (case["pages"], case["layers"], groups),
+                (2, case["layers"], groups),
                 generator=generator,
                 dtype=torch.float32,
             )
@@ -155,26 +161,22 @@ def case_scratch(case):
     return scratch, keys, values, scales, elements, scale_entries
 
 
-def scale_row(case, token):
-    """The scale row a token of the span takes, as the caller packs the rows."""
-    page = (case["source_offset"] + token) // case["source_block_size"]
-    return page - case["source_offset"] // case["source_block_size"]
+def reference_exact(case, keys, values, scales):
+    """The decoded product before the logical type's rounding: what the cast is applied to."""
+    field = case["field"]
+    stored = (keys if field == FIELD_KEYS else values).to(torch.float32)
+    decoded = stored.clone()
+    if case["scaled"]:
+        for head in range(case["heads"]):
+            # `[layers]` factors of this field and head's group, broadcast over tokens and features.
+            factor = scales[field, :, head // case["scale_heads"]]
+            decoded[:, :, head, :] *= factor[:, None, None]
+    return decoded
 
 
 def reference(case, keys, values, scales):
     """The FP32 block the kernel must write, in FP32: the product, then the logical type's rounding."""
-    stored = (keys if case["field"] == FIELD_KEYS else values).to(torch.float32)
-    decoded = stored.clone()
-    if case["scaled"]:
-        groups = (case["heads"] + case["scale_heads"] - 1) // case[
-            "scale_heads"
-        ]
-        for token in range(case["count"]):
-            row = scales[scale_row(case, token)]
-            for head in range(case["heads"]):
-                decoded[token, :, head, :] *= row[
-                    :, head // case["scale_heads"]
-                ][:, None]
+    decoded = reference_exact(case, keys, values, scales)
     if case["compute"] == "f32":
         return decoded
     return decoded.to(COMPUTES[case["compute"]][1]).to(torch.float32)
@@ -202,16 +204,15 @@ def run(module, case, models=("nearest", "truncated")):
     original = scratch.clone()
     source, source_bytes, _ = SOURCES[case["source"]]
     compute = COMPUTES[case["compute"]][0]
-    tiles = (case["heads"] + case["head_dim"] - 1) // case["head_dim"]
-    module._page_conversion_kernel[(case["count"] * case["layers"], tiles)](
-        scratch,
+    # A compiled launch reads device memory; the interpreter reads the host tensor itself. The bytes
+    # come back to the host for the comparison either way.
+    launched = scratch.cuda() if DEVICE else scratch
+    module._page_conversion_kernel[(case["layers"] * case["block_size"], 1)](
+        launched,
         elements,
         scale_entries,
-        case["count"],
-        case["source_offset"],
-        case["source_block_size"],
+        case["block_size"],
         case["scale_heads"] if case["scaled"] else 0,
-        case["pages"],
         FIELD=case["field"],
         SOURCE=source,
         COMPUTE=compute,
@@ -221,13 +222,14 @@ def run(module, case, models=("nearest", "truncated")):
         SCALED=case["scaled"],
         SOURCE_BYTES=source_bytes,
     )
+    scratch = launched.cpu()
 
     where = (
         f"{case['what']}: {case['source']} -> {case['compute']}, "
         f"{'values' if case['field'] else 'keys'}, "
         f"{'scaled' if case['scaled'] else 'dense'}, "
-        f"{case['count']} tokens from offset {case['source_offset']} of "
-        f"{case['source_block_size']}-token pages"
+        f"{case['layers']} layers of a {case['block_size']}-token page, "
+        f"{groups_of(case)} scale groups"
     )
 
     # Nothing outside the FP32 block may move: the raw areas hold the source's bytes, and the scale
@@ -298,159 +300,120 @@ def run(module, case, models=("nearest", "truncated")):
     return got.numel(), named
 
 
-def reference_exact(case, keys, values, scales):
-    """The decoded product before the logical type's rounding: what the cast is applied to."""
-    stored = (keys if case["field"] == FIELD_KEYS else values).to(torch.float32)
-    decoded = stored.clone()
-    if case["scaled"]:
-        for token in range(case["count"]):
-            row = scales[scale_row(case, token)]
-            for head in range(case["heads"]):
-                decoded[token, :, head, :] *= row[
-                    :, head // case["scale_heads"]
-                ][:, None]
-    return decoded
-
-
-#: Every case states `layers = 32` because the descriptor compiles that depth; `count`, the span's
-#: token offset and the page size are launch arguments, so a case may vary them.
+#: `layers` and `heads` are compiled into a module; the page's block size and the scale group's heads
+#: are launch arguments, so a case may vary them.
 CASES = [
-    # The served path: an FP8 source, decoded to FP32, its span starting inside a later page — which
-    # is what makes the row's `− source_offset // block_size` decide the scale a token takes.
+    # The served path's widest source: an FP8 page decoded to FP32, one scale group per field and
+    # layer — the host page's own `[2, layers]` tail.
     dict(
-        what="fp8 keys decoded to f32 from inside a later page",
+        what="fp8 keys decoded to f32 from one source pool",
         field=FIELD_KEYS,
         source="f8e4m3",
         compute="f32",
         scaled=True,
         head_dim=64,
         heads=4,
-        layers=32,
-        count=2,
-        source_block_size=16,
-        source_offset=36,
+        layers=4,
+        block_size=16,
         scale_heads=4,
-        pages=1,
         seed=11,
     ),
-    # The same span of the values: the second raw area is eight E bytes along, and a program that
-    # decoded keys twice would look right on every key case above.
+    # The same page's values: the second raw area is eight E bytes along and the values' scales are
+    # the tail's second row, so a program that decoded keys twice would look right on every key case.
     dict(
-        what="fp8 values decoded to f32 from inside a later page",
+        what="fp8 values decoded to f32 from one source pool",
         field=FIELD_VALUES,
         source="f8e4m3",
         compute="f32",
         scaled=True,
         head_dim=64,
         heads=4,
-        layers=32,
-        count=2,
-        source_block_size=16,
-        source_offset=36,
+        layers=4,
+        block_size=16,
         scale_heads=4,
-        pages=1,
         seed=12,
     ),
-    # One page per token, two head groups: a token that took the other token's row lands on a
+    # Two source pools of two heads each: a head that took the other group's scale lands on a
     # different factor, and the bf16 rounding model is measured here.
     dict(
-        what="fp8 keys to bf16 across two page rows",
+        what="fp8 keys to bf16 from two source pools",
         field=FIELD_KEYS,
         source="f8e4m3",
         compute="bf16",
         scaled=True,
         head_dim=64,
         heads=4,
-        layers=32,
-        count=2,
-        source_block_size=1,
-        source_offset=5,
+        layers=3,
+        block_size=8,
         scale_heads=2,
-        pages=2,
         seed=13,
     ),
     dict(
-        what="bf16 keys to bf16 from page zero",
+        what="bf16 keys to bf16 with scales",
         field=FIELD_KEYS,
         source="bf16",
         compute="bf16",
         scaled=True,
         head_dim=64,
         heads=4,
-        layers=32,
-        count=2,
-        source_block_size=16,
-        source_offset=0,
+        layers=2,
+        block_size=16,
         scale_heads=4,
-        pages=1,
         seed=14,
     ),
-    # Dense sources carry no scales: the value is widened and rounded, and the span starts on the
-    # last token of a page so it crosses into the next.
+    # Dense pages carry no scales: the value is widened and rounded.
     dict(
-        what="dense bf16 keys to f16 across a page boundary",
+        what="dense bf16 keys to f16",
         field=FIELD_KEYS,
         source="bf16",
         compute="f16",
         scaled=False,
         head_dim=64,
         heads=4,
-        layers=32,
-        count=2,
-        source_block_size=16,
-        source_offset=15,
+        layers=3,
+        block_size=16,
         scale_heads=0,
-        pages=2,
         seed=15,
     ),
     dict(
-        what="dense bf16 keys to f32",
-        field=FIELD_KEYS,
+        what="dense bf16 values to f32",
+        field=FIELD_VALUES,
         source="bf16",
         compute="f32",
         scaled=False,
         head_dim=64,
         heads=4,
-        layers=32,
-        count=2,
-        source_block_size=16,
-        source_offset=0,
+        layers=2,
+        block_size=16,
         scale_heads=0,
-        pages=1,
         seed=16,
     ),
-    # The scale-row rule in exact arithmetic: a bf16 source multiplied by an FP32 factor is an FP32
+    # The scale rule in exact arithmetic: a bf16 source multiplied by an FP32 factor is an FP32
     # product with no rounding to argue about, so the interpreter's answer is the kernel's.
     dict(
-        what="bf16 keys to f32 from inside a later page",
+        what="bf16 keys to f32 with per-layer scales",
         field=FIELD_KEYS,
         source="bf16",
         compute="f32",
         scaled=True,
         head_dim=64,
         heads=4,
-        layers=32,
-        count=3,
-        source_block_size=16,
-        source_offset=36,
+        layers=4,
+        block_size=8,
         scale_heads=4,
-        pages=1,
         seed=17,
     ),
     dict(
-        what="bf16 values to f32 across two page rows",
+        what="bf16 values to f32 from two source pools",
         field=FIELD_VALUES,
         source="bf16",
         compute="f32",
         scaled=True,
         head_dim=64,
         heads=4,
-        layers=32,
-        count=2,
-        source_block_size=1,
-        source_offset=5,
+        layers=3,
+        block_size=4,
         scale_heads=2,
-        pages=2,
         seed=18,
     ),
 ]

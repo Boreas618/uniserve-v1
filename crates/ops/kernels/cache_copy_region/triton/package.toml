@@ -3,14 +3,15 @@
 # One module covers one descriptor of `[kernel.descriptors]` for one architecture of
 # `[kernel.architectures]`, built by `src/build.py`.
 #
-# This is the prefix cache's second conversion step: a span of K/V an importing rank decoded into
-# FP32 goes into the destination page's units, each layer's rows into its own unit, in the pool's
+# This is the prefix cache's second conversion step: a span of K/V a loading rank decoded into
+# FP32 (layer-major `[layers, count, heads, head_dim]`, the host page encoding's order) goes into
+# the destination page's units, each layer's rows into its own unit and column, in the pool's
 # stored element type, and the column's initialized flag is raised.
 #
 # The key names the field, the pool's own geometry (`columns`, `units_per_page`, `plane_bytes`,
 # `heads`, `head_dim`), the stored element type and whether the destination stores FP8. The *span* is
 # not in the key: the token count, the page offset and the unit ids are launch words, so one module
-# serves every import size.
+# serves every span size.
 #
 # Both halves are here, and both run one program per (column, unit slot) -- grid
 # `(columns, units_per_page, 1)`. An FP8 destination grows the unit's scale to cover the span and

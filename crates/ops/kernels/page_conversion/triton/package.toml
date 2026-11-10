@@ -3,10 +3,12 @@
 # One module covers one descriptor of `[kernel.descriptors]` for one
 # architecture of `[kernel.architectures]`, built by `src/build.py`.
 #
-# One program decodes one (token, layer) of the imported span, up to `head_dim`
-# heads of it: the grid carries the span's extent and the source's page size,
-# scale group and page count are runtime words, so one module serves every span
-# of that geometry.
+# One program decodes one (layer, token) row of a staged host page, every head
+# of it: the source is the host page encoding, layer-major
+# `[layers, block_size, heads, head_dim]` per field and FP32 scales
+# `[2, layers, groups]`. The grid carries the page's rows; its block size and
+# scale group are runtime words, so one module serves every page of that
+# geometry.
 
 op = "page_conversion"
 backend = "triton"

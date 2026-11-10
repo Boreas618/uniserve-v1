@@ -1,20 +1,25 @@
 """The ``cache_copy_region`` operator's Triton source: an FP32 span into the destination's units.
 
+The source is the FP32 block ``page_conversion`` decoded, layer-major ``[layers, count, heads,
+head_dim]`` like the host page encoding, with ``layers = units_per_page · columns``: the page's layer
+``k`` lies in column ``k % columns`` of its unit ``k / columns``.
+
 One program per (column, unit slot), because the FP8 destination's scale is a property of the whole
 written span and not of a token:
 
 ```text
 dense  (scaled = false)
-    values[column, unit, (offset + token)·row + i] = round_to_stored(source[token, column, i])
+    layer = slot · columns + column
+    values[column, unit, (offset + token)·row + i] = round_to_stored(source[layer, token, i])
     initialized[column, unit]                      = 1
 
 FP8    (scaled = true)
-    maximum  = max(|source[:, column]|)                     # one amax over the span
+    maximum  = max(|source[layer]|)                         # one amax over the span
     proposed = max(maximum, 1e-12) / 448.0
     updated  = initialized ? max(scale, proposed) : proposed        # growth only, once written
     every resident value of the plane *= old / updated
     scale[column, unit] = updated
-    values[column, unit, (offset + token)·row + i] = encode(source[token, column, i] / updated)
+    values[column, unit, (offset + token)·row + i] = encode(source[layer, token, i] / updated)
     initialized[column, unit] = 1                           # last
 ```
 
@@ -143,6 +148,9 @@ def _cache_copy_region_kernel(
     unit = tl.load(units_ptr + slot)
     unit = unit.to(tl.int64)
     flag_index = column * units_total + unit
+    # The page's layer this cell holds: layer `k` of a group lies in column `k % columns` of the
+    # page's unit `k / columns`, so the slot's columns are the layers `slot · columns + column`.
+    layer = slot.to(tl.int64) * COLUMNS + column
     plane_base = (column * units_total + unit) * PLANE_ELEMENTS
     row = tl.arange(0, ROW_POW2)
     row = row.to(tl.int64)
@@ -153,7 +161,7 @@ def _cache_copy_region_kernel(
         # Pass one: the span's largest magnitude, which is the whole reason for one program per unit.
         maximum = 0.0
         for token in tl.range(0, count):
-            index = (token * COLUMNS + column) * ROW_SIZE + row
+            index = (layer * count + token) * ROW_SIZE + row
             value = tl.load(source_ptr + index, mask=live, other=0.0)
             maximum = tl.maximum(maximum, tl.max(tl.abs(value)))
         proposed = tl.maximum(maximum, 1e-12) / 448.0
@@ -178,13 +186,13 @@ def _cache_copy_region_kernel(
         tl.store(scale_ptr + flag_index, updated)
         # Pass two: the span itself, divided by the scale every reader will multiply back.
         for token in tl.range(0, count):
-            index = (token * COLUMNS + column) * ROW_SIZE + row
+            index = (layer * count + token) * ROW_SIZE + row
             value = tl.load(source_ptr + index, mask=live, other=0.0)
             destination = plane_base + (offset + token) * ROW_SIZE + row
             tl.store(values_ptr + destination, _encode_fp8(value / updated), mask=live)
     else:
         for token in tl.range(0, count):
-            index = (token * COLUMNS + column) * ROW_SIZE + row
+            index = (layer * count + token) * ROW_SIZE + row
             value = tl.load(source_ptr + index, mask=live, other=0.0)
             if BF16:
                 value = _round_bf16(value)

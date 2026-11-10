@@ -2,9 +2,9 @@
 
 A descriptor is the field this launch converts, the stored element type, the
 logical type a decoded value rounds through, the head width, the heads and
-layers of this rank's K/V group, and whether the source carries per-page scales.
-The span's extent, the source's page size and scale group, and the number of
-pages are runtime words, so one module serves every span of that geometry.
+layers of this rank's K/V group, and whether the page carries scales. The
+page's block size and scale group are runtime words, so one module serves every
+page of that geometry.
 """
 
 import page_conversion as kernels
@@ -41,11 +41,8 @@ def spec(fields, parameters, target):
             "scratch": "*u8",
             "elements": "u64",
             "scales": "u64",
-            "count": "u64",
-            "source_offset": "u64",
-            "source_block_size": "u32",
+            "block_size": "u32",
             "scale_heads": "u32",
-            "pages": "u64",
             "FIELD": "constexpr",
             "SOURCE": "constexpr",
             "COMPUTE": "constexpr",

@@ -7,7 +7,9 @@ branches of its own:
 * **dense BF16 and F16** — the stored value is the reference cast's own, the span lands at its offset,
   and the flag is raised for exactly the cells the span touches (the fixture's unit vector is a
   permutation ``[2, 0, 1]``, so a program that addressed ``slot`` instead of ``units[slot]`` writes
-  the wrong plane and the comparison says where);
+  the wrong plane and the comparison says where), and each unit slot of the page takes its own
+  layers of the layer-major source (`slot · columns + column`), so a program that read one slot's
+  layers for every slot writes the wrong values and the comparison says where;
 * **FP8 into a fresh unit** (`initialized = 0`) — the scale is the span's own
   ``max(abs(span), 1e-12) / 448`` with nothing resident, and every stored byte decodes to the
   reference's ``clamp(value / scale, ±448)`` cast;
@@ -40,6 +42,8 @@ HEAD_DIM = 8
 ROW = HEADS * HEAD_DIM
 BLOCK_TOKENS = 6
 UNITS_TOTAL = 8
+#: The page's layers: layer `k` lies in column `k % COLUMNS` of the page's unit slot `k // COLUMNS`.
+LAYERS = UNITS_PER_PAGE * COLUMNS
 #: The destination page's units, deliberately not `[0, 1, 2]`: the unit ids are a permutation.
 UNITS = [2, 0, 1]
 #: The reference's constants.
@@ -60,11 +64,19 @@ def load_kernel(package):
 
 
 def source_span(count):
-    """The span the conversion step decodes: values a BF16 and an E4M3 round differently."""
-    span = torch.arange(count * COLUMNS * ROW, dtype=torch.float32).reshape(
-        count, COLUMNS, ROW
+    """The span the conversion step decodes, layer-major `[layers, count, row]` like a host page.
+
+    The values are ones a BF16 and an E4M3 round differently, and every layer's are distinct.
+    """
+    span = torch.arange(LAYERS * count * ROW, dtype=torch.float32).reshape(
+        LAYERS, count, ROW
     )
     return (span - 37.0) / 7.0
+
+
+def layer_of(column, slot):
+    """The page layer a (column, unit slot) cell holds."""
+    return slot * COLUMNS + column
 
 
 def launch(
@@ -146,7 +158,9 @@ def check_dense(kernel, element, offset, count):
             expected = torch.zeros((BLOCK_TOKENS * ROW,), dtype=stored)
             for token in range(count):
                 rows = slice((offset + token) * ROW, (offset + token + 1) * ROW)
-                expected[rows] = source[token, column].to(stored)
+                expected[rows] = source[layer_of(column, slot), token].to(
+                    stored
+                )
             got = values[column, unit]
             if not torch.equal(got, expected):
                 differing = (got != expected).nonzero().flatten().tolist()
@@ -186,7 +200,7 @@ def check_fp8(kernel, offset, count, fresh):
     name = "fresh unit" if fresh else "unit already holding values"
     for column in range(COLUMNS):
         for slot, unit in enumerate(UNITS):
-            span = source[:, column]
+            span = source[layer_of(column, slot)]
             # The reference's expression, in the *store's* precision: the kernel divides float32 by
             # float32, so a float64 quotient here would differ in the last bit and report a failure the
             # kernel did not commit.
@@ -275,11 +289,12 @@ def check_boundaries(kernel):
     )
     scales = torch.zeros((COLUMNS, UNITS_TOTAL), dtype=torch.float32)
     flags = torch.zeros((COLUMNS, UNITS_TOTAL), dtype=torch.uint8)
-    source = torch.zeros((count, COLUMNS, ROW), dtype=torch.float32)
+    source = torch.zeros((LAYERS, count, ROW), dtype=torch.float32)
     # The largest value is at the format's ceiling, so the span's own scale is 1.0 and each crafted
     # number is encoded as itself rather than as a quotient that would blur the edge being tested.
     source[0, 0, : len(BOUNDARY)] = torch.tensor(BOUNDARY, dtype=torch.float32)
     source[0, 0, len(BOUNDARY)] = 448.0
+    # Layer 0 is column 0 of the page's first unit slot, `UNITS[0]`.
     units = torch.tensor(UNITS, dtype=torch.int32)
     row_pow2 = 1
     while row_pow2 < ROW:

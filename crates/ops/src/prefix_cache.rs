@@ -1,48 +1,59 @@
-//! Converting an imported span of K/V pages into the destination pool's representation.
+//! Converting a staged host page of K/V into the destination pool's representation.
 //!
-//! An importing rank receives another rank's cache export as raw keys and values. When the source does
-//! not store this rank's representation — a different element type, FP8 with other scale groups, or a
-//! page shape this rank does not store — the span is read into the workspace's scratch and converted,
-//! so imported values round and scale exactly as locally written ones.
+//! A rank that loads a page another pool stores in another representation — a different element
+//! type, or FP8 with other scale groups — stages the page's bytes in the workspace's scratch and
+//! converts them, so loaded values round and scale exactly as locally written ones.
 //!
-//! Two programs do it, launched per span in this order, once per field:
+//! Two programs do it, launched per page in this order, once per field:
 //!
 //! ```text
-//! page_conversion     raw keys or values (+ their source scales) → the workspace's f32 scratch
+//! page_conversion     raw keys or values (+ their scales) → the workspace's f32 block
 //! cache_copy_region   that f32 block → the destination page's units, with the destination encoding
 //! ```
 //!
-//! The first decodes: an FP8 source's stored value is multiplied by its page's scale in FP32 and
-//! rounded through `compute_dtype`, which is the rounding the source's own writes had; a dense source
-//! is taken as it is. The second writes each layer's rows into its destination unit, grows the unit's
-//! FP8 scale when the new rows need a larger one, rescales the unit's resident values, and raises the
-//! column's initialized flag. It runs **one program per (column, unit slot)**, and that program owns
-//! the written span of its cell: the scale grows once from one amax over the span
-//! (`max(scale, max(abs(span), 1e-12) / 448)`) and the
-//! resident values are rescaled by `old/new` before the write. A program per token would compute a
-//! partial amax each and race several scales into one cell.
+//! The first decodes: an FP8 source's stored value is multiplied by its scale in FP32 and rounded
+//! through `compute_dtype`, which is the rounding the source's own writes had; a dense source is
+//! taken as it is. The second writes each layer's rows into its destination unit and column, grows
+//! the unit's FP8 scale when the new rows need a larger one, rescales the unit's resident values, and
+//! raises the column's initialized flag. It runs **one program per (column, unit slot)**, and that
+//! program owns the written span of its cell: the scale grows once from one amax over the span
+//! (`max(scale, max(abs(span), 1e-12) / 448)`) and the resident values are rescaled by `old/new`
+//! before the write. A program per token would compute a partial amax each and race several scales
+//! into one cell.
+//!
+//! ## The source: the host page encoding
+//!
+//! The staged page is a page of the host page pools (`worker::memory::prefix_cache::host`), which is
+//! layer-major: keys `[layers, block_size, heads, head_dim]`, values in the same shape, and for an FP8
+//! page the scales `[2, layers]` as `f32`, one per field and layer. A page assembled from several
+//! source pools (another tensor-parallel split) carries one scale per source pool's head range, so
+//! the scales are `[2, layers, groups]` with `groups = ceil(heads / scale_heads)`; one source pool is
+//! `groups = 1`, the host page's own tail.
 //!
 //! ## The scratch layout
 //!
-//! One workspace holds `20 E + 8 S` bytes for `E = block_size · heads · head_dim` (the largest group
-//! page's elements) and `S` source scale entries:
+//! A launch addresses `20 E + 8 S` bytes for `E = layers · block_size · heads · head_dim` (one field
+//! of the page it converts) and `S` its scale entries (`2 · layers · groups`); a workspace holds
+//! that figure for the largest page of its groups:
 //!
 //! ```text
-//! [0, 8E)          raw keys
-//! [8E, 16E)        raw values
-//! [16E, 20E)       the FP32 block the two programs pass each other
-//! [20E, 20E + 8S)  the source pages' FP32 scales
+//! [0, 8E)          raw keys      [layers, block_size, heads, head_dim]
+//! [8E, 16E)        raw values    the same shape
+//! [16E, 20E)       the FP32 block the two programs pass each other, the same shape
+//! [20E, 20E + 8S)  the page's FP32 scales [2, layers, groups]
 //! ```
 //!
-//! Both operators take the scratch base and its two extents, so the addresses follow from the layout
-//! once and no caller restates it.
+//! A staged page lands in it with one copy per field and one for its scale tail. Both operators take
+//! the scratch base and its extents, so the addresses follow from the layout once and no caller
+//! restates it.
 //!
 //! ## The unit fields
 //!
 //! A pool's unit field is `[columns, units, plane_bytes]` of raw bytes for values and `[columns, units]`
 //! for scales and initialized flags; `columns` is the greatest common divisor of the resident groups'
-//! layer counts and a group's page is `units_per_page` units. A dense pool has no scale fields, and a
-//! field the pool does not store is absent from the launch rather than empty.
+//! layer counts and a group's page is `units_per_page` units, its layer `k` in column `k % columns` of
+//! unit `k / columns`. A dense pool has no scale fields, and a field the pool does not store is absent
+//! from the launch rather than empty.
 
 use std::fmt;
 
@@ -78,7 +89,8 @@ impl fmt::Display for Field {
     }
 }
 
-/// The bytes the conversion scratch of one workspace holds.
+/// The bytes the conversion scratch of one workspace holds, for `elements` elements of one field
+/// of a page and `scales` scale entries of the page.
 pub fn scratch_bytes(elements: u64, scales: u64) -> u64 {
     20 * elements + 8 * scales
 }
@@ -98,7 +110,7 @@ pub struct ConversionDescriptor {
     pub heads: u32,
     /// Layers of this rank's K/V group.
     pub layers: u32,
-    /// Whether the source carries one FP32 scale per page and head group.
+    /// Whether the page carries one FP32 scale per field, layer and head group.
     pub scaled: bool,
 }
 
@@ -119,25 +131,19 @@ impl fmt::Display for ConversionDescriptor {
 /// The arguments of `page_conversion`.
 #[derive(Clone, Copy)]
 pub struct ConversionArgs {
-    /// `[scratch_bytes]` u8, contiguous: the workspace's scratch.
+    /// `[scratch_bytes]` u8, contiguous: the workspace's scratch, holding the staged page.
     pub scratch: TensorView,
-    /// `E`: elements of the largest group page.
+    /// `E`: elements of one field of the page, `layers · block_size · heads · head_dim`.
     pub elements: u64,
-    /// `S`: source scale entries of the largest group page.
+    /// `S`: scale entries of the page, `2 · layers · groups`; 0 for a dense page.
     pub scales: u64,
-    /// Tokens of the span.
-    pub count: u64,
-    /// Token offset of the span's first token within its first source page.
-    pub source_offset: u64,
-    /// Tokens per page of the source.
-    pub source_block_size: u32,
-    /// Heads of one source scale group; 0 for a dense source.
+    /// Tokens per page.
+    pub block_size: u32,
+    /// Heads of one scale group; 0 for a dense page.
     pub scale_heads: u32,
-    /// Source pages the span covers.
-    pub pages: u64,
 }
 
-/// Decode one field of an imported span into the workspace's FP32 block.
+/// Decode one field of a staged host page into the workspace's FP32 block.
 pub struct PageConversion;
 
 impl Op for PageConversion {
@@ -187,55 +193,46 @@ impl Op for PageConversion {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "the scratch holds {} bytes, the span needs {needed}",
+                    "the scratch holds {} bytes, the page needs {needed}",
                     args.scratch.shape.dim(0)
                 ),
             ));
         }
-        let page = u64::from(descriptor.heads)
-            * u64::from(descriptor.head_dim)
-            * u64::from(args.source_block_size);
+        if args.block_size == 0 {
+            return Err(Error::argument(
+                Self::NAME,
+                "a page of zero tokens converts nothing".to_owned(),
+            ));
+        }
+        let page = u64::from(descriptor.layers)
+            * u64::from(args.block_size)
+            * u64::from(descriptor.heads)
+            * u64::from(descriptor.head_dim);
         if args.elements != page {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "the descriptor's page is {page} elements, the launch says {}",
+                    "the descriptor's page field is {page} elements, the launch says {}",
                     args.elements
-                ),
-            ));
-        }
-        let rows = args.count
-            * u64::from(descriptor.layers)
-            * u64::from(descriptor.heads)
-            * u64::from(descriptor.head_dim);
-        if args.count == 0 || rows > args.elements {
-            return Err(Error::argument(
-                Self::NAME,
-                format!(
-                    "a span of {} tokens needs {rows} elements, the scratch holds {}",
-                    args.count, args.elements
                 ),
             ));
         }
         if descriptor.scaled {
             let groups = u64::from(descriptor.heads).div_ceil(u64::from(args.scale_heads));
-            let needed_scales = args.count.div_ceil(u64::from(args.source_block_size))
-                * u64::from(descriptor.layers)
-                * groups;
-            if needed_scales > args.scales {
+            let needed_scales = 2 * u64::from(descriptor.layers) * groups;
+            if needed_scales != args.scales {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
-                        "{needed_scales} scale entries are needed, the scratch holds {}",
+                        "the page carries {needed_scales} scale entries, the launch says {}",
                         args.scales
                     ),
                 ));
             }
-        }
-        if args.pages == 0 {
+        } else if args.scales != 0 {
             return Err(Error::argument(
                 Self::NAME,
-                "a span covers at least one source page".to_owned(),
+                "a dense page carries no scales".to_owned(),
             ));
         }
         Ok(())
@@ -252,15 +249,13 @@ impl Op for PageConversion {
             .view(args.scratch)
             .u64(args.elements)
             .u64(args.scales)
-            .u64(args.count)
-            .u64(args.source_offset)
-            .u32(args.source_block_size)
-            .u32(args.scale_heads)
-            .u64(args.pages);
+            .u32(args.block_size)
+            .u32(args.scale_heads);
+        // One program per (layer, token) row of the page, every head of it.
         kernel.launch(
             LaunchGrid::new([
-                args.count * u64::from(descriptor.layers),
-                u64::from(descriptor.heads).div_ceil(u64::from(descriptor.head_dim.max(1))),
+                u64::from(descriptor.layers) * u64::from(args.block_size),
+                1,
                 1,
             ])?,
             &mut arguments,
@@ -338,7 +333,8 @@ pub struct CopyRegionArgs {
     pub scale: Option<TensorView>,
     /// `[columns, units]` u8: whether each column's rows of that unit were written.
     pub initialized: TensorView,
-    /// `[count, columns, heads, head_dim]` f32, contiguous: the block `page_conversion` decoded.
+    /// `[units_per_page · columns, count, heads, head_dim]` f32, contiguous: the block
+    /// `page_conversion` decoded, layer-major like the host page encoding.
     pub source: TensorView,
     /// `[units_per_page]` i32: the destination page's units, non-negative.
     pub units: TensorView,
@@ -430,8 +426,8 @@ impl Op for CacheCopyRegion {
         args.source.require_shape(
             Self::NAME,
             Shape::new(&[
+                u64::from(descriptor.units_per_page) * u64::from(descriptor.columns),
                 args.count,
-                u64::from(descriptor.columns),
                 u64::from(descriptor.heads),
                 u64::from(descriptor.head_dim),
             ]),
@@ -528,5 +524,87 @@ impl Op for CacheCopyRegion {
         // The destination encodes each written value once into its stored type; scaling the unit up
         // rescales the resident values, one rounding each.
         Tolerance::new(0.0, 2.0 * descriptor.element.unit_roundoff() as f32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DevicePtr;
+
+    fn view(dtype: DType, dims: &[u64]) -> TensorView {
+        TensorView::new(DevicePtr::new(0x1000), dtype, Shape::new(dims))
+    }
+
+    /// Two layers of a 16-token page of four 64-wide heads, FP8 with one scale per field and layer.
+    fn fp8_page() -> ConversionDescriptor {
+        ConversionDescriptor {
+            field: Field::Key,
+            source: DType::F8E4M3,
+            compute: DType::BF16,
+            head_dim: 64,
+            heads: 4,
+            layers: 2,
+            scaled: true,
+        }
+    }
+
+    fn page_args(elements: u64, scales: u64, scale_heads: u32) -> ConversionArgs {
+        ConversionArgs {
+            scratch: view(DType::U8, &[scratch_bytes(elements, scales)]),
+            elements,
+            scales,
+            block_size: 16,
+            scale_heads,
+        }
+    }
+
+    #[test]
+    fn a_conversion_takes_one_field_of_a_layer_major_page() {
+        let descriptor = fp8_page();
+        let field = 2 * 16 * 4 * 64;
+
+        // One source pool: the host page's own `[2, layers]` scale tail.
+        assert!(PageConversion::check(&descriptor, &page_args(field, 2 * 2, 4)).is_ok());
+        // Two source pools of two heads each: `[2, layers, 2]`.
+        assert!(PageConversion::check(&descriptor, &page_args(field, 2 * 2 * 2, 2)).is_ok());
+        // One layer's page, or a scale tail of the wrong length, is another page.
+        assert!(PageConversion::check(&descriptor, &page_args(field / 2, 2 * 2, 4)).is_err());
+        assert!(PageConversion::check(&descriptor, &page_args(field, 2, 4)).is_err());
+
+        let dense = ConversionDescriptor {
+            source: DType::BF16,
+            scaled: false,
+            ..descriptor
+        };
+        assert!(PageConversion::check(&dense, &page_args(field, 0, 0)).is_ok());
+        assert!(PageConversion::check(&dense, &page_args(field, 2 * 2, 0)).is_err());
+    }
+
+    #[test]
+    fn a_region_copy_reads_every_layer_of_the_page() {
+        // Two units of two columns: the page's four layers.
+        let descriptor = CopyRegionDescriptor {
+            field: Field::Value,
+            columns: 2,
+            units_per_page: 2,
+            plane_bytes: 16 * 4 * 64 * 2,
+            heads: 4,
+            head_dim: 64,
+            element: DType::BF16,
+            scaled: false,
+        };
+        let args = |layers: u64| CopyRegionArgs {
+            values: view(DType::U8, &[2, 8, descriptor.plane_bytes]),
+            scale: None,
+            initialized: view(DType::U8, &[2, 8]),
+            source: view(DType::F32, &[layers, 16, 4, 64]),
+            units: view(DType::I32, &[2]),
+            offset: 0,
+            count: 16,
+        };
+
+        assert!(CacheCopyRegion::check(&descriptor, &args(4)).is_ok());
+        assert!(CacheCopyRegion::check(&descriptor, &args(2)).is_err());
     }
 }
