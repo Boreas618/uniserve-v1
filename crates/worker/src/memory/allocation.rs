@@ -635,7 +635,7 @@ impl Storage {
     ///
     /// No device work may read this storage during the call. A failure after the driver unmapped
     /// the old allocation leaves the address unusable, and the caller retires the rank.
-    pub(crate) fn rebind_retained(&self, source: &Self) -> Result<()> {
+    pub fn rebind_retained(&self, source: &Self) -> Result<()> {
         let (
             Kind::Mapped {
                 mapping: target,

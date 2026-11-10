@@ -21,10 +21,10 @@ use crate::worker::ExecutionBatch;
 use crate::worker::Worker;
 use crate::worker::{WorkerError, WorkerInfo, WorkerSubmitError};
 use ipc::BatchCommand;
-use ipc::execution::Outcome;
 use ipc::execution::{
     Batch as DeviceBatch, BatchId as DeviceBatchId, Batches, CallId as DeviceCallId, Submission,
 };
+use ipc::execution::{EpochOperation, Outcome};
 
 /// What dispatch and the views ask of the epoch: the pools it serves, and
 /// which of them can take a submission now.
@@ -508,34 +508,35 @@ impl Submissions {
         }
     }
 
-    /// Runs the worker hook `name` on every rank while none runs a batch.
-    pub(super) fn hook(&mut self, name: &str, payload: &str) -> Result<Vec<String>, WorkerError> {
+    /// Performs the storage `operation` on every rank while none runs a batch.
+    pub(super) fn operate(
+        &mut self,
+        operation: &EpochOperation,
+    ) -> Result<Vec<String>, WorkerError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(worker) => worker.hook(name, payload),
+            Path::Supplied(worker) => worker.operate(operation),
             Path::InProcess(arm) => arm
                 .batches
-                .hook(name, payload)
+                .operate(operation)
                 .map_err(|error| anyhow::anyhow!(error)),
         }
     }
 
-    /// Runs the worker hook `name`, answering each group with its ranks'
-    /// results.
-    pub(super) fn hook_groups(
+    /// Performs the storage `operation`, answering each group with its ranks' results.
+    pub(super) fn operate_groups(
         &mut self,
-        name: &str,
-        payload: &str,
+        operation: &EpochOperation,
     ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, WorkerError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(worker) => worker.hook_groups(name, payload),
+            Path::Supplied(worker) => worker.operate_groups(operation),
             // This process's ranks are the one pool its inventory states, and its data plane
             // answers for them in rank order.
             Path::InProcess(arm) => {
                 let results = arm
                     .batches
-                    .hook(name, payload)
+                    .operate(operation)
                     .map_err(|error| anyhow::anyhow!(error))?;
                 Ok(arm
                     .info

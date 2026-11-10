@@ -49,7 +49,7 @@ use crate::memory::retained::Retained;
 use crate::{Error, Result};
 
 /// Per-process device storage measurements against the GPU's ledger.
-pub(crate) struct DeviceBudget {
+pub struct DeviceBudget {
     nvml: Nvml,
     retained: Arc<Retained>,
     /// The plugins' communication buffers NVML attributes to no process,
@@ -62,7 +62,7 @@ pub(crate) struct DeviceBudget {
 }
 
 impl DeviceBudget {
-    pub(crate) fn new(
+    pub fn new(
         synchronize: Arc<dyn Fn(DeviceId) -> Result<()> + Send + Sync>,
         retained: Arc<Retained>,
         unattributed: BTreeMap<DeviceId, u64>,
@@ -112,7 +112,7 @@ impl DeviceBudget {
     /// pools' `graph` bytes, and what the process holds beside them and the
     /// retained storages, with the `pending` bytes of product storage it
     /// has yet to make resident.
-    pub(crate) fn booking(
+    pub fn booking(
         &self,
         device: DeviceId,
         fraction: f64,
@@ -161,7 +161,7 @@ impl DeviceBooking {
     /// Fails when the booking takes the ledger past its quota: the rank's
     /// initialized runtime, with a profiling session's storage, exceeds what
     /// the deployment may hold.
-    pub(crate) fn submit(&self, retained: &Retained, graphs: bool) -> Result<GpuLedger> {
+    pub fn submit(&self, retained: &Retained, graphs: bool) -> Result<GpuLedger> {
         let graph = if graphs { self.graph } else { 0 };
         let process = self.process + self.profiling;
         let ledger = retained.book(

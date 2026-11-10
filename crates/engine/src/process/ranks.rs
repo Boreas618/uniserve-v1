@@ -80,7 +80,7 @@ impl LoadedRank {
             Arc::new(RankProducts::new(Arc::clone(products), index));
         // What the rank's trajectories are computed with, which keys the pages of its host latent
         // pool: the weights it loaded.
-        let identity = worker::data_plane::identity_of(&self.weights);
+        let identity = crate::data_plane::identity_of(&self.weights);
         let mut spawned = Vec::with_capacity(self.model_runner.devices().len());
         for device in self.model_runner.devices() {
             let generation = Arc::new(Generation::new(generation, std::iter::empty()));
@@ -356,7 +356,7 @@ pub(super) fn schedulers(
     rank: &ipc::MainProcessInfo,
     memory: &Memory,
     control: ipc::Wake,
-    data: &Arc<worker::data_plane::DataPlane>,
+    data: &Arc<crate::data_plane::DataPlane>,
 ) -> Result<Vec<scheduler::SchedulerHandle>> {
     if !launch.scheduler_node {
         return Ok(Vec::new());
@@ -411,15 +411,17 @@ pub(super) fn schedulers(
         max_model_len: model_runner.engine_config().model.max_model_len,
     };
     let mut stated = worker::batch::Workers::shared(workers.iter().map(Arc::clone).collect())?
-        .stating(vec![inventory])
-        .with_data_plane(Arc::clone(data));
+        .stating(vec![inventory]);
     if host_cache {
         stated = stated.keeping_host_cache(worker::batch::HostCacheKeys {
             fingerprints: vec![data.serving_identity()?; memory.cache_groups()],
             endpoint: None,
         });
     }
-    let batches: Arc<dyn ipc::execution::Batches> = Arc::new(stated);
+    let batches: Arc<dyn ipc::execution::Batches> = Arc::new(crate::data_plane::RankBatches {
+        workers: stated,
+        data: Arc::clone(data),
+    });
 
     // The control thread forwards what a scheduler produced, so it sleeps until a step says there
     // is something: a request's tokens reach the daemon when they exist, not at the next pass.

@@ -180,12 +180,12 @@ impl<S: WeightStorage> WeightStore<S> {
     }
 
     /// How many weights the load reached so far: the position of the next one.
-    pub(crate) fn logged(&self) -> usize {
+    pub fn logged(&self) -> usize {
         self.log.len()
     }
 
     /// Records a weight this load published by another path than [`RetainedWeights::publish`].
-    pub(crate) fn adopt(&mut self, key: &WeightKey, backing: Backing) {
+    pub fn adopt(&mut self, key: &WeightKey, backing: Backing) {
         self.log.push(LoadedWeight {
             key: key.clone(),
             writable: false,
@@ -195,7 +195,7 @@ impl<S: WeightStorage> WeightStore<S> {
     }
 
     /// Records a table the load reached and holds no storage for.
-    pub(crate) fn note_table(&mut self, key: &WeightKey) {
+    pub fn note_table(&mut self, key: &WeightKey) {
         self.log.push(LoadedWeight {
             key: key.clone(),
             writable: true,

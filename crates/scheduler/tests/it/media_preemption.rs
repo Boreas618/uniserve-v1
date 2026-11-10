@@ -147,8 +147,11 @@ impl Worker for GatedWorker {
         self.inner.close()
     }
 
-    fn hook(&mut self, name: &str, payload: &str) -> Result<Vec<String>, WorkerError> {
-        self.inner.hook(name, payload)
+    fn operate(
+        &mut self,
+        operation: &ipc::execution::EpochOperation,
+    ) -> Result<Vec<String>, WorkerError> {
+        self.inner.operate(operation)
     }
 }
 

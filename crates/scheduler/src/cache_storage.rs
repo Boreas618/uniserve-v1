@@ -1,7 +1,7 @@
 //! Giving back and restoring the KV cache's device storage.
 //!
 //! A worker splits its cache planes into segments of whole units
-//! (`uniserve.cache_storage` reports them), and gives back the tail from a
+//! (`EpochOperation::CacheStorage` reports them), and gives back the tail from a
 //! segment on. Making room for device storage beside the cache (a profiling
 //! session's) withdraws the tail's units from allocation, revoking the cached
 //! pages they hold (whose host KV cache copies stay), and lets the requests
@@ -52,7 +52,7 @@ enum Pending {
     Weights(String),
 }
 
-/// Every worker's `uniserve.cache_storage` report: of the workers that hold
+/// Every worker's `EpochOperation::CacheStorage` report: of the workers that hold
 /// the cache, and of the others (`Scheduler::storage_reports`).
 struct StorageReports {
     cache: Vec<CacheStorage>,
@@ -239,23 +239,22 @@ impl Scheduler {
         let result = match resize.change {
             Pending::Sleep => {
                 self.asleep = true;
-                self.run_hook("uniserve.sleep", "").inspect(|_| {
+                self.run_operation(&EpochOperation::Sleep).inspect(|_| {
                     tracing::info!(
                         "the scheduler sleeps: its KV cache and graph storage are given back"
                     );
                 })
             }
-            Pending::Room { from, plan } => {
-                let payload = serde_json::json!({ "from": from }).to_string();
-                self.run_hook("uniserve.release_cache", &payload).map(|_| {
+            Pending::Room { from, plan } => self
+                .run_operation(&EpochOperation::ReleaseCache { from })
+                .map(|_| {
                     tracing::info!(
                         from,
                         units = self.storage.usable_units(),
                         "gave back the tail of the KV cache"
                     );
                     plan
-                })
-            }
+                }),
             Pending::Weights(path) => self.apply_weights(&path),
         };
         let _ = resize.answer.send(result);
@@ -271,10 +270,9 @@ impl Scheduler {
         let slept = !self.asleep;
         if slept {
             self.asleep = true;
-            self.run_hook("uniserve.sleep", "")?;
+            self.run_operation(&EpochOperation::Sleep)?;
         }
-        let payload = serde_json::json!({ "model_path": path }).to_string();
-        let updated = self.run_hook("uniserve.update_weights", &payload);
+        let updated = self.run_operation(&EpochOperation::UpdateWeights);
         if slept && let Err(waking) = self.wake() {
             return Err(match updated {
                 Ok(_) => format!("the workers did not wake after the weight update: {waking}"),
@@ -294,8 +292,7 @@ impl Scheduler {
     /// complete. Every request in flight then publishes no page, and every
     /// cached prefix page is revoked, as the new weights key pages anew.
     fn apply_weights_keeping(&mut self, path: &str) -> Result<Vec<String>, String> {
-        let payload = serde_json::json!({ "model_path": path, "keep": true }).to_string();
-        let results = self.run_hook("uniserve.update_weights", &payload)?;
+        let results = self.run_operation(&EpochOperation::UpdateWeights)?;
         let state_seeds = self
             .storage
             .cache()
@@ -466,7 +463,7 @@ impl Scheduler {
             return Ok(None);
         }
         let (cache, beside): (Vec<CacheStorage>, Vec<CacheStorage>) = self
-            .run_hook("uniserve.cache_storage", "")?
+            .run_operation(&EpochOperation::CacheStorage)?
             .iter()
             .map(|report| serde_json::from_str::<CacheStorage>(report))
             .collect::<Result<Vec<_>, _>>()
@@ -856,8 +853,9 @@ impl Scheduler {
         if !cache.block_pool.has_withdrawn() {
             return Ok(Vec::new());
         }
-        let payload = serde_json::json!({ "segments": segments }).to_string();
-        let results = self.run_hook("uniserve.restore_cache", &payload)?;
+        let results = self.run_operation(&EpochOperation::RestoreCache {
+            segments: Some(segments),
+        })?;
         let end = self
             .cache_storage()?
             .map(|reports| reports[0].first_unit(reports[0].held));
@@ -899,7 +897,7 @@ impl Scheduler {
         if !self.asleep {
             return Ok(Vec::new());
         }
-        let results = self.run_hook("uniserve.wake", "")?;
+        let results = self.run_operation(&EpochOperation::Wake)?;
         if let Some(cache) = self.storage.cache() {
             cache.block_pool.restore();
         }

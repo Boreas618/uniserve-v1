@@ -11,6 +11,7 @@
 //! device has recorded the programs its runners launch, and serves nothing.
 
 mod catalogue;
+pub mod data_plane;
 mod process;
 mod programs;
 mod rank;

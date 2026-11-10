@@ -70,7 +70,7 @@ pub struct Sources {
 }
 
 /// Complete page views at their device addresses or in retained host backing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pages {
     pub pages: Vec<Page>,
     pub host: bool,

@@ -18,7 +18,7 @@
 //!   stay as they were, so a rollback resumes it.
 //! - **Promote** (the successor): its workers copy the predecessor's cache
 //!   flags and scales of the units they inherit and map the lent segments
-//!   writable (`uniserve.adopt_cache`), its pool imports the predecessor's
+//!   writable (`EpochOperation::AdoptCache`), its pool imports the predecessor's
 //!   pages into those units, from which migrated requests reuse their
 //!   prefixes, and allocates the lent ones as its own.
 //! - **Resume** (the parked epoch, at a rollback): it admits and executes
@@ -49,7 +49,7 @@ pub struct GroupCache {
     pub scratch: u32,
 }
 
-/// What a worker reports of its KV cache (`uniserve.cache_storage`).
+/// What a worker reports of its KV cache (`EpochOperation::CacheStorage`).
 #[derive(serde::Deserialize)]
 struct CacheReport {
     #[serde(default)]
@@ -426,13 +426,12 @@ impl Scheduler {
         if inherited.is_empty() {
             return Ok(());
         }
-        let adopt = serde_json::json!({
-            "borrowed": borrowed
+        self.run_operation(&EpochOperation::AdoptCache {
+            borrowed: borrowed
                 .iter()
                 .map(|units| [units.start, units.end])
-                .collect::<Vec<_>>(),
-        });
-        self.run_hook("uniserve.adopt_cache", &adopt.to_string())?;
+                .collect(),
+        })?;
         let source = self
             .worker
             .info()
@@ -518,7 +517,7 @@ impl Scheduler {
         self.closing = closing;
         let reports = self
             .worker
-            .hook_groups("uniserve.cache_storage", "")
+            .operate_groups(&EpochOperation::CacheStorage)
             .map_err(|error| format!("{error:#}"))?;
         let mut groups = Vec::new();
         for (group, results) in reports {

@@ -138,7 +138,7 @@ fn content(fingerprint: &str, layout: &[u8; 32]) -> [u8; 32] {
 
 /// The key seed of each of `plan`'s groups' page pools for a model of
 /// `fingerprint` (`HostKvCache::start` reports them).
-pub(crate) fn page_contents(plan: &CachePlan, fingerprints: &[String]) -> Vec<[u8; 32]> {
+pub fn page_contents(plan: &CachePlan, fingerprints: &[String]) -> Vec<[u8; 32]> {
     (0..plan.groups.len())
         .map(|group| content(&fingerprints[group], &layout(plan, group)))
         .collect()

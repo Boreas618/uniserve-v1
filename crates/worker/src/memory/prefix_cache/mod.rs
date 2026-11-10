@@ -16,11 +16,11 @@
 
 pub(super) mod block_tables;
 pub mod conversion;
-pub(crate) mod host;
+pub mod host;
 mod imports;
 mod manifest;
 pub(super) mod plan;
-pub(crate) mod planes;
+pub mod planes;
 pub mod scratch;
 
 pub use conversion::Unimported;
@@ -189,7 +189,7 @@ impl PrefixCache {
     }
 
     /// Whether the rank copies pages through the host KV cache.
-    pub(crate) fn copies_pages(&self) -> bool {
+    pub fn copies_pages(&self) -> bool {
         self.pages.is_some()
     }
 
@@ -275,7 +275,7 @@ impl PrefixCache {
         Ok(())
     }
 
-    pub(crate) fn planes(&self) -> &Arc<CachePlanes> {
+    pub fn planes(&self) -> &Arc<CachePlanes> {
         &self.planes
     }
 
@@ -303,7 +303,7 @@ impl PrefixCache {
         self.planes.copy_units(copies, issue)
     }
 
-    pub(crate) fn plan(&self) -> &Arc<CachePlan> {
+    pub fn plan(&self) -> &Arc<CachePlan> {
         self.planes.plan()
     }
 

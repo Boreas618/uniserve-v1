@@ -570,7 +570,7 @@ impl Retained {
     }
 
     /// The worker's scope, which its epoch's ledger entries name.
-    pub(crate) fn scope(&self) -> &Scope {
+    pub fn scope(&self) -> &Scope {
         &self.scope
     }
 
@@ -580,7 +580,7 @@ impl Retained {
     }
 
     /// The worker's epoch.
-    pub(crate) fn epoch(&self) -> u64 {
+    pub fn epoch(&self) -> u64 {
         self.epoch
     }
 
@@ -601,7 +601,7 @@ impl Retained {
 
     /// The deployment's ledger of the GPU of `device`, and what the host
     /// admits of new host storage.
-    pub(crate) fn ledger(&self, device: DeviceId) -> Result<(GpuLedger, ::storage::HostStorage)> {
+    pub fn ledger(&self, device: DeviceId) -> Result<(GpuLedger, ::storage::HostStorage)> {
         let mut state = lock(&self.state);
         let gpu = state.gpu(device)?;
         let read = state
@@ -995,11 +995,7 @@ impl Retained {
     }
 
     /// The mapped storage of the weight retained under `key` on `device`, when the server holds it.
-    pub(crate) fn mapped_weight(
-        &self,
-        device: DeviceId,
-        key: &[u8; 32],
-    ) -> Result<Option<Arc<Storage>>> {
+    pub fn mapped_weight(&self, device: DeviceId, key: &[u8; 32]) -> Result<Option<Arc<Storage>>> {
         let key = Self::device_key(key, &lock(&self.state).gpu(device)?);
         self.weight(device, key)
     }
@@ -1014,7 +1010,7 @@ impl Retained {
     /// never maps a half-written weight.
     ///
     /// [`WeightStorage::store`]: crate::memory::weights::WeightStorage::store
-    pub(crate) fn store_on_device(
+    pub fn store_on_device(
         &self,
         device: DeviceId,
         key: &[u8; 32],
@@ -1085,7 +1081,7 @@ impl Retained {
     /// No device work may read the old weights during the call. Returns how many weights moved. A
     /// failure part of the way leaves the rank with weights of two checkpoints, and the caller
     /// retires the rank.
-    pub(crate) fn rebind_weights(
+    pub fn rebind_weights(
         &self,
         device: DeviceId,
         pairs: &[([u8; 32], [u8; 32])],
@@ -1126,7 +1122,7 @@ impl Retained {
 
     /// Unmaps the weights of `keys` on `device` and ends the rank's retention of them: a load that
     /// will not serve leaves no storage behind (§7.6).
-    pub(crate) fn forget_weights(&self, device: DeviceId, keys: &[[u8; 32]]) -> Result<()> {
+    pub fn forget_weights(&self, device: DeviceId, keys: &[[u8; 32]]) -> Result<()> {
         let mut state = lock(&self.state);
         let gpu = state.gpu(device)?;
         let mut released = BTreeSet::new();

@@ -256,14 +256,6 @@ impl Scheduler {
                 let pages = self.storage.flush_prefix_cache();
                 tracing::info!(pages, "flushed the prefix cache");
             }
-            Command::Hook {
-                name,
-                payload,
-                together,
-                answer,
-            } => {
-                let _ = answer.send(self.run_hook_together(&name, &payload, &together));
-            }
             Command::Configure { limits, answer } => {
                 let _ = answer.send(self.reconfigure(*limits));
             }

@@ -282,8 +282,6 @@ pub struct Workers {
     inventory: Vec<Inventory>,
     /// What keys this rank's pages in the host KV cache, when the deployment keeps one.
     host_cache: Option<HostCacheKeys>,
-    /// What the storage operations of 7.6 reach, on a rank that keeps storage at a Storage Server.
-    data: Option<Arc<crate::data_plane::DataPlane>>,
 }
 
 impl Workers {
@@ -298,7 +296,6 @@ impl Workers {
             workers,
             inventory: Vec::new(),
             host_cache: None,
-            data: None,
         })
     }
 
@@ -306,13 +303,6 @@ impl Workers {
     #[must_use]
     pub fn keeping_host_cache(mut self, keys: HostCacheKeys) -> Self {
         self.host_cache = Some(keys);
-        self
-    }
-
-    /// States what the storage operations of 7.6 reach on this rank.
-    #[must_use]
-    pub fn with_data_plane(mut self, data: Arc<crate::data_plane::DataPlane>) -> Self {
-        self.data = Some(data);
         self
     }
 
@@ -533,25 +523,6 @@ impl Workers {
             .ok_or_else(|| crate::Error::Invalid("this rank holds no device".to_owned()))?;
         Ok(first.joined(submissions))
     }
-
-    /// Runs the storage operation `name` on every rank.
-    pub fn hook(&self, name: &str, payload: &str) -> Result<Vec<String>> {
-        match &self.data {
-            Some(data) => data.operate(name, payload),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    /// Puts the prepared expert redistribution of `order` in place.
-    pub fn commit_experts(
-        &self,
-        order: &std::collections::BTreeMap<String, Vec<u32>>,
-    ) -> Result<Vec<String>> {
-        match &self.data {
-            Some(data) => data.commit_experts(order),
-            None => Ok(Vec::new()),
-        }
-    }
 }
 
 impl Batches for Workers {
@@ -583,17 +554,6 @@ impl Batches for Workers {
 
     fn inventory(&self) -> &[Inventory] {
         &self.inventory
-    }
-
-    fn hook(&self, name: &str, payload: &str) -> std::result::Result<Vec<String>, Box<Fault>> {
-        Ok(Workers::hook(self, name, payload)?)
-    }
-
-    fn commit_experts(
-        &self,
-        order: &std::collections::BTreeMap<String, Vec<u32>>,
-    ) -> std::result::Result<Vec<String>, Box<Fault>> {
-        Ok(Workers::commit_experts(self, order)?)
     }
 
     fn map_host_cache(&self, tokens: u64) -> std::result::Result<HostPools, Box<Fault>> {

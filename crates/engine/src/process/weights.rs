@@ -31,13 +31,13 @@ enum WeightStage {
     /// The pass moving it from one stage to the next.
     Between,
     /// The checkpoint's load is walked, moving no byte.
-    Planning(crossbeam_channel::Receiver<worker::Result<worker::data_plane::Planned>>),
+    Planning(crossbeam_channel::Receiver<worker::Result<crate::data_plane::Planned>>),
     /// The schedulers quiesce: for `recompute` and `abort` they sleep, so the cache's storage holds
     /// the new checkpoint, and for a `keep` the free storage does not hold, they stop forming
     /// batches. The load waits.
-    Quiescing(Vec<DataAnswer>, Option<worker::data_plane::Planned>),
+    Quiescing(Vec<DataAnswer>, Option<crate::data_plane::Planned>),
     /// The new weights are published, beside the weights that serve.
-    Loading(crossbeam_channel::Receiver<worker::Result<worker::data_plane::Planned>>),
+    Loading(crossbeam_channel::Receiver<worker::Result<crate::data_plane::Planned>>),
     /// The schedulers put the new weights in place at a boundary.
     Applying(Vec<DataAnswer>),
     /// The graph storage a `keep` load took comes back.
@@ -219,7 +219,7 @@ impl MainProcess {
     fn quiesce(
         &mut self,
         update: &mut WeightUpdate,
-        planned: &worker::data_plane::Planned,
+        planned: &crate::data_plane::Planned,
     ) -> std::result::Result<Vec<DataAnswer>, String> {
         if self.asleep {
             return Ok(Vec::new());
@@ -268,7 +268,7 @@ impl MainProcess {
     /// Starts publishing the new weights beside the ones that serve, after giving the graph storage
     /// up to them when `suspend` says so. A thread of its own: the load reads a checkpoint for
     /// minutes, and neither a scheduler nor this thread may wait for it.
-    fn load_weights(&mut self, planned: worker::data_plane::Planned, suspend: bool) -> WeightStage {
+    fn load_weights(&mut self, planned: crate::data_plane::Planned, suspend: bool) -> WeightStage {
         let (answer, answered) = crossbeam_channel::bounded(1);
         let data = Arc::clone(&self.data);
         let spawned = std::thread::Builder::new()

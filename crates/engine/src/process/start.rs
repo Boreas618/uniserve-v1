@@ -230,7 +230,7 @@ impl MainProcess {
                     )?;
                 }
                 let worker = Arc::new(worker);
-                data_ranks.push(worker::data_plane::Rank {
+                data_ranks.push(crate::data_plane::Rank {
                     rank: rank_runner.rank(),
                     worker: Arc::downgrade(&worker),
                     device,
@@ -258,9 +258,9 @@ impl MainProcess {
                 .context("stating this rank's quota of its device")?;
         }
         // The storage operations and the loads that change what the ranks hold.
-        let data = Arc::new(worker::data_plane::DataPlane::new(
+        let data = Arc::new(crate::data_plane::DataPlane::new(
             data_ranks,
-            worker::data_plane::Target {
+            crate::data_plane::Target {
                 checkpoint: PathBuf::from(&launch.engine_config.model.model),
                 experts: epoch.experts.clone(),
             },

@@ -326,7 +326,7 @@ pub(crate) struct MainProcess {
     /// second request for one of them is answered rather than run again.
     released: std::collections::BTreeSet<u64>,
     /// What this process's storage operations reach.
-    data: Arc<worker::data_plane::DataPlane>,
+    data: Arc<crate::data_plane::DataPlane>,
     /// The storage commands still working, each answered by the pass that sees it end: the
     /// control thread waits for none of them.
     owed: Vec<Owed>,

@@ -540,7 +540,7 @@ impl CachePlanes {
 
     /// The segments the value planes are made of, in unit order; `None` for
     /// planes that are not split.
-    pub(crate) fn segments(&self) -> Option<Vec<ipc::CacheSegment>> {
+    pub fn segments(&self) -> Option<Vec<ipc::CacheSegment>> {
         self.segmenting.as_ref().map(|segmenting| {
             segmenting
                 .segments
@@ -551,7 +551,7 @@ impl CachePlanes {
     }
 
     /// The segments the planes hold, `[0, held)`: the first given back.
-    pub(crate) fn held_segments(&self) -> u32 {
+    pub fn held_segments(&self) -> u32 {
         self.segmenting.as_ref().map_or(0, |segmenting| {
             segmenting.released_from.load(Ordering::Acquire)
         })
@@ -577,7 +577,7 @@ impl CachePlanes {
     }
 
     /// The device bytes one unit of every value plane and column holds.
-    pub(crate) fn unit_bytes(&self) -> u64 {
+    pub fn unit_bytes(&self) -> u64 {
         2 * u64::from(self.plan.columns) * self.plan.plane_bytes
     }
 
@@ -838,7 +838,7 @@ impl CachePlanes {
             .ok_or_else(|| Error::Invalid(format!("a cache pool holds no field {field}")))
     }
 
-    pub(crate) fn plan(&self) -> &Arc<CachePlan> {
+    pub fn plan(&self) -> &Arc<CachePlan> {
         &self.plan
     }
 

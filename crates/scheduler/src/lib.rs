@@ -219,6 +219,7 @@ use crate::kv_cache::{BlockPool, BlockTable, CacheAllocation, PrefixCacheCoordin
 use crossbeam_channel::Receiver;
 use ipc::RequestId;
 use ipc::UnitId;
+use ipc::execution::EpochOperation;
 use ipc::{
     BatchCommand, BlockTable as IpcBlockTable, BufferAllocation, BufferId, CacheUnitAllocation,
     Call, CallId, CallKind, CallStatus, DecodeRange, DimBound, ForwardBatch, ForwardStats,

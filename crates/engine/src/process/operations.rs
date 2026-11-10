@@ -129,9 +129,7 @@ impl MainProcess {
         &mut self,
         front: usize,
         id: u64,
-        work: impl FnOnce(&worker::data_plane::DataPlane) -> worker::Result<Vec<String>>
-        + Send
-        + 'static,
+        work: impl FnOnce(&crate::data_plane::DataPlane) -> worker::Result<Vec<String>> + Send + 'static,
     ) {
         let (answer, answered) = crossbeam_channel::bounded(1);
         let data = Arc::clone(&self.data);

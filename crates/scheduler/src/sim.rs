@@ -877,66 +877,31 @@ impl Worker for SimWorker {
         self.shutdown()
     }
 
-    /// Answers the engine's own worker hooks as a worker without a device
-    /// does: its cache is not split into segments, it gives back no storage,
-    /// it has no fence probes, and a profiling session it takes part in runs
-    /// no collector and writes no file. It loads and unloads LoRA adapters
-    /// as a worker with a LoRA plugin does, answering the slot; other plugin
-    /// hooks fail, as no plugin is loaded.
-    fn hook(&mut self, name: &str, payload: &str) -> anyhow::Result<Vec<String>> {
-        let result = match name {
-            "uniserve.cache_storage" => serde_json::json!({
+    /// Performs a storage operation as a worker without a device does: its cache is not split
+    /// into segments and it gives back no storage. It adopts no predecessor's units and holds no
+    /// cache manifest, so those operations fail.
+    fn operate(
+        &mut self,
+        operation: &ipc::execution::EpochOperation,
+    ) -> anyhow::Result<Vec<String>> {
+        use ipc::execution::EpochOperation;
+        let result = match operation {
+            EpochOperation::CacheStorage => serde_json::json!({
                 "segments": [],
                 "held": 0,
             }),
-            "uniserve.release_cache"
-            | "uniserve.restore_cache"
-            | "uniserve.sleep"
-            | "uniserve.wake" => serde_json::Value::Null,
-            "uniserve.update_weights" => serde_json::json!({ "group": null, "page_contents": [] }),
-            "uniserve.eager" => {
-                let payload: serde_json::Value = serde_json::from_str(payload)?;
-                serde_json::json!({ "eager": payload["eager"] })
+            EpochOperation::ReleaseCache { .. }
+            | EpochOperation::RestoreCache { .. }
+            | EpochOperation::Sleep
+            | EpochOperation::Wake => serde_json::Value::Null,
+            EpochOperation::UpdateWeights => {
+                serde_json::json!({ "group": null, "page_contents": [] })
             }
-            "uniserve.profile_start" => {
-                let start: proto::profile::SessionStart = serde_json::from_str(payload)?;
-                let collectors: serde_json::Map<String, serde_json::Value> = start
-                    .request
-                    .collectors
-                    .iter()
-                    .map(|collector| {
-                        (
-                            collector.as_str().to_owned(),
-                            serde_json::json!("unavailable: the simulated worker has no device"),
-                        )
-                    })
-                    .collect();
-                serde_json::json!({ "rank": 0, "selected": true, "path": null, "collectors": collectors })
+            EpochOperation::AdoptCache { .. }
+            | EpochOperation::PublishCache { .. }
+            | EpochOperation::CacheManifest(_) => {
+                anyhow::bail!("the simulated worker performs no {operation:?}")
             }
-            "uniserve.profile_stop" => {
-                let payload: serde_json::Value = serde_json::from_str(payload)?;
-                serde_json::json!({
-                    "rank": 0,
-                    "session": payload["session"],
-                    "steps": 0,
-                    "reason": payload["reason"],
-                    "file": null,
-                })
-            }
-            "uniserve.profile_release" => serde_json::json!({ "rank": 0, "released": false }),
-            "uniserve.fence_switch" => {
-                let payload: serde_json::Value = serde_json::from_str(payload)?;
-                serde_json::json!({
-                    "probes": false,
-                    "enabled": payload["enabled"],
-                    "off": payload["off"],
-                })
-            }
-            "load_lora_adapter" | "unload_lora_adapter" => {
-                let payload: serde_json::Value = serde_json::from_str(payload)?;
-                serde_json::json!({ "adapter": payload["adapter"] })
-            }
-            other => anyhow::bail!("no plugin implements the worker hook {other}"),
         };
         Ok(vec![result.to_string()])
     }

@@ -20,6 +20,7 @@ program-server.workspace = true
 proto.workspace = true
 scheduler.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 storage.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true

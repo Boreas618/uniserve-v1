@@ -48,8 +48,8 @@ where
     }
 }
 
-/// The meeting point of the schedulers that run one worker hook together
-/// ([`Command::Hook`]).
+/// The meeting point of the schedulers that perform one operation together
+/// (a cache warming, an expert commit, a cache resize).
 ///
 /// The schedulers of one engine serve ranks of one expert union, and a rank
 /// joins the union's steps of other schedulers outside its own. A hook that
@@ -685,17 +685,6 @@ pub enum Command {
     /// Revokes every cached prefix page, so that later prompts compute
     /// their prefixes anew; requests in flight keep their pages.
     FlushCache,
-    /// Runs the worker hook `name` with `payload` on every worker once the
-    /// batches in flight complete, and answers with each worker's result.
-    /// Every scheduler `together` names runs it at once: none runs it
-    /// before all have no batch in flight, and none schedules again before
-    /// all ran it.
-    Hook {
-        name: String,
-        payload: String,
-        together: Arc<HookBarrier>,
-        answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
-    },
     /// Takes other scheduling limits and policy from the next step on
     /// (`Scheduler::reconfigure`), and answers whether it did.
     Configure {
@@ -1335,32 +1324,6 @@ impl CommandSender {
     /// Revokes every cached prefix page (`Command::FlushCache`).
     pub fn flush_cache(&self) {
         let _ = self.send(Command::FlushCache);
-    }
-
-    /// Runs the worker hook `name` (`Command::Hook`) together with the
-    /// other schedulers of `together`; the receiver gets each worker's
-    /// result, or why the hook failed.
-    pub fn hook(
-        &self,
-        name: String,
-        payload: String,
-        together: Arc<HookBarrier>,
-    ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
-        let (answer, receiver) = crossbeam_channel::bounded(1);
-        if let Err(error) = self.send(Command::Hook {
-            name,
-            payload,
-            together,
-            answer,
-        }) && let Command::Hook {
-            answer, together, ..
-        } = error.0
-        {
-            // The schedulers waiting for this one go on without it.
-            together.fail("the scheduler stopped");
-            let _ = answer.send(Err("the scheduler stopped".to_owned()));
-        }
-        receiver
     }
 
     /// Takes other scheduling limits and policy from the next step on

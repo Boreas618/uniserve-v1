@@ -241,7 +241,7 @@ fn slots_of(old: &WeightKey, new: &WeightKey) -> Option<Vec<usize>> {
 }
 
 /// A second load beside the serving weights, on one rank (the module's statement).
-pub(crate) struct Reloading<'a> {
+pub struct Reloading<'a> {
     store: WeightStore<Arc<Retained>>,
     /// The rank's client, which a rearranged stack is copied and published through.
     storage: Arc<Retained>,
@@ -253,7 +253,7 @@ pub(crate) struct Reloading<'a> {
 }
 
 impl<'a> Reloading<'a> {
-    pub(crate) fn new(
+    pub fn new(
         storage: Arc<Retained>,
         device: platform::DeviceId,
         serving: &'a [LoadedWeight],
@@ -269,7 +269,7 @@ impl<'a> Reloading<'a> {
 
     /// What the load reached, how many weights it published, and how many stacks the device
     /// rearranged.
-    pub(crate) fn finish(mut self) -> (Vec<LoadedWeight>, usize, usize) {
+    pub fn finish(mut self) -> (Vec<LoadedWeight>, usize, usize) {
         let published = self.store.published();
         (self.store.take_log(), published, self.gathered)
     }

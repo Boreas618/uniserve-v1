@@ -127,10 +127,9 @@ impl Scheduler {
                     .filter(|page| !page.published)
                     .map(|page| page.page.clone())
                     .collect();
-                let payload = serde_json::to_string(&pages).map_err(|error| error.to_string())?;
                 if !host {
                     self.worker
-                        .hook("uniserve.cache_publish", &payload)
+                        .operate(&EpochOperation::PublishCache { pages })
                         .map_err(|error| format!("{error:#}"))?;
                 }
                 if let Some(cache) = self.storage.cache() {
@@ -189,10 +188,10 @@ impl Scheduler {
         let ranks = if pages.is_empty() {
             Vec::new()
         } else {
-            let payload = serde_json::to_string(&storage::manifest::cache::Pages { pages, host })
-                .map_err(|error| error.to_string())?;
             self.worker
-                .hook("uniserve.cache_manifest", &payload)
+                .operate(&EpochOperation::CacheManifest(
+                    storage::manifest::cache::Pages { pages, host },
+                ))
                 .map_err(|error| format!("{error:#}"))?
                 .into_iter()
                 .map(|value| {

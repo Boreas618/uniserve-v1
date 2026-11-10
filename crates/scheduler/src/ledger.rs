@@ -6,7 +6,7 @@
 //! (weights, each KV cache segment, the other exclusive storages, graph
 //! pools, process storage, staging, the Transfer Server's context), each once
 //! however many epochs map it. Every worker reports its cache's GPU's ledger
-//! with its segments (`uniserve.cache_storage`), and two limits follow from it:
+//! with its segments (`EpochOperation::CacheStorage`), and two limits follow from it:
 //!
 //! - **Room** ([`room`]): device storage beside the cache, a profiling
 //!   session's, takes the room the ledger has, and the tail segments the cache
@@ -17,7 +17,7 @@
 use serde::{Deserialize, Serialize};
 use storage::{GpuLedger, Item, LedgerEntry, Scope};
 
-/// What `uniserve.cache_storage` reports of one worker.
+/// What `EpochOperation::CacheStorage` reports of one worker.
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct CacheStorage {
     /// The segments of each cache plane, in unit order; empty when the

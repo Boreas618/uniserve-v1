@@ -98,10 +98,10 @@ impl RankModel {
     }
 }
 
-impl worker::data_plane::ModelLoad for RankModel {
+impl crate::data_plane::ModelLoad for RankModel {
     fn load(
         &self,
-        target: &worker::data_plane::Target,
+        target: &crate::data_plane::Target,
         weights: &mut dyn nn::RetainedWeights,
     ) -> std::result::Result<(), String> {
         let mut model_runner = self.model_runner.clone();

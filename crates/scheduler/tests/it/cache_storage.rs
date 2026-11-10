@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ipc::execution::EpochOperation;
 use ipc::{BatchCommand, ImageParams, RequestId, SamplingParams};
 use proto::request::MigrationCause;
 use scheduler::{
@@ -40,7 +41,7 @@ const SEGMENT_BYTES: u64 = SEGMENT_UNITS as u64 * UNIT_BYTES;
 /// The serving epoch of the simulated workers.
 const EPOCH: u64 = 1;
 
-/// What the simulated workers report and the hooks they ran.
+/// What the simulated workers report and the storage operations they performed.
 #[derive(Default)]
 struct SimWorkers {
     /// The quota of the worker's GPU.
@@ -75,7 +76,7 @@ struct SimWorkers {
     /// ledger.
     expert_process: Option<u64>,
     /// Each hook run, with its payload.
-    hooks: Vec<String>,
+    operations: Vec<EpochOperation>,
     /// The graph share a successor's warmup takes on the GPU, and whether
     /// the worker's model can be captured at all.
     graph_share_bytes: u64,
@@ -176,7 +177,7 @@ impl SimWorkers {
     }
 }
 
-/// The simulator, whose workers answer the engine's own hooks as workers
+/// The simulator, whose workers answer the engine's storage operations as workers
 /// with segmented planes do and whose results take `STEP` each.
 struct Segmented {
     inner: SimWorker,
@@ -216,13 +217,11 @@ impl Worker for Segmented {
         self.inner.close()
     }
 
-    fn hook(&mut self, name: &str, payload: &str) -> Result<Vec<String>, WorkerError> {
+    fn operate(&mut self, operation: &EpochOperation) -> Result<Vec<String>, WorkerError> {
         let mut workers = self.workers.lock().unwrap();
-        workers
-            .hooks
-            .push(format!("{name} {payload}").trim_end().to_owned());
-        let result = match name {
-            "uniserve.cache_storage" => serde_json::json!({
+        workers.operations.push(operation.clone());
+        let result = match operation {
+            EpochOperation::CacheStorage => serde_json::json!({
                 "segments": (0..SEGMENTS)
                     .map(|ordinal| ipc::CacheSegment {
                         epoch: EPOCH,
@@ -244,37 +243,33 @@ impl Worker for Segmented {
                 "ledger": workers.ledger(),
                 "host_storage": {"available": 1u64 << 40, "reserve": 10u64 << 30, "unallocated": 0},
             }),
-            "uniserve.release_cache" => {
-                let payload: serde_json::Value = serde_json::from_str(payload)?;
-                workers.held = payload["from"].as_u64().unwrap() as u32;
+            EpochOperation::ReleaseCache { from } => {
+                workers.held = *from;
                 serde_json::Value::Null
             }
-            "uniserve.restore_cache" => {
-                let payload: serde_json::Value = if payload.is_empty() {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::from_str(payload)?
-                };
-                workers.held = match payload["segments"].as_u64() {
-                    Some(count) => (workers.held + count as u32).min(SEGMENTS),
+            EpochOperation::RestoreCache { segments } => {
+                workers.held = match segments {
+                    Some(count) => (workers.held + count).min(SEGMENTS),
                     None => SEGMENTS,
                 };
                 serde_json::Value::Null
             }
-            "uniserve.wake" => {
+            EpochOperation::Wake => {
                 workers.held = SEGMENTS;
                 serde_json::Value::Null
             }
-            "uniserve.sleep" => {
+            EpochOperation::Sleep => {
                 workers.held = 0;
                 serde_json::Value::Null
             }
-            "uniserve.update_weights" => serde_json::json!({ "group": null, "page_contents": [] }),
-            "uniserve.adopt_cache" => serde_json::json!({ "inherited": 0 }),
-            other => anyhow::bail!("no worker hook {other}"),
+            EpochOperation::UpdateWeights => {
+                serde_json::json!({ "group": null, "page_contents": [] })
+            }
+            EpochOperation::AdoptCache { .. } => serde_json::json!({ "inherited": 0 }),
+            other => anyhow::bail!("no storage operation {other:?}"),
         };
         let mut results = vec![result.to_string()];
-        if workers.experts && name == "uniserve.cache_storage" {
+        if workers.experts && *operation == EpochOperation::CacheStorage {
             let ledger = workers.expert_process.map(|process| GpuLedger {
                 gpu: [8; 16],
                 deployment: "model".into(),
@@ -456,8 +451,8 @@ fn room_recomputes_the_holders_of_the_tail_that_cannot_continue() {
         "the request that cannot continue is recomputed"
     );
     assert_eq!(
-        workers.lock().unwrap().hooks.last().map(String::as_str),
-        Some(r#"uniserve.release_cache {"from":4}"#)
+        workers.lock().unwrap().operations.last(),
+        Some(&EpochOperation::ReleaseCache { from: 4 })
     );
 
     handle.shutdown();
@@ -490,11 +485,10 @@ fn a_growth_creates_the_segments_the_ledgers_room_holds() {
         workers
             .lock()
             .unwrap()
-            .hooks
-            .iter()
-            .any(|hook| hook == r#"uniserve.restore_cache {"segments":2}"#),
+            .operations
+            .contains(&EpochOperation::RestoreCache { segments: Some(2) }),
         "{:?}",
-        workers.lock().unwrap().hooks
+        workers.lock().unwrap().operations
     );
     assert_eq!(workers.lock().unwrap().held, 6);
     // Twenty-two pages fit the 23 units of six segments.
@@ -772,7 +766,7 @@ fn a_parked_epoch_lends_the_segments_no_request_in_flight_continues_from() {
 }
 
 /// A successor promoted with the segments its predecessor lent maps them
-/// writable (`uniserve.adopt_cache`), counts their units in what its cache
+/// writable (`EpochOperation::AdoptCache`), counts their units in what its cache
 /// holds on trial, and allocates them: the requests handed over fit, and a
 /// request that needs its own free units and the lent ones runs.
 #[test]
@@ -809,10 +803,12 @@ fn a_successor_allocates_the_segments_its_predecessor_lent() {
         workers
             .lock()
             .unwrap()
-            .hooks
-            .contains(&r#"uniserve.adopt_cache {"borrowed":[[8,12],[16,20]]}"#.to_owned()),
+            .operations
+            .contains(&EpochOperation::AdoptCache {
+                borrowed: vec![[8, 12], [16, 20]],
+            }),
         "{:?}",
-        workers.lock().unwrap().hooks
+        workers.lock().unwrap().operations
     );
 
     // Its own 15 free units and the 8 lent hold a request of 22 prompt
@@ -844,16 +840,16 @@ fn a_sleeping_scheduler_admits_nothing_until_it_wakes() {
         })
     ));
     assert_eq!(
-        workers.lock().unwrap().hooks,
-        vec!["uniserve.sleep".to_owned()]
+        workers.lock().unwrap().operations,
+        vec![EpochOperation::Sleep]
     );
 
     let mut waiting = handle.submit(request(2, 2, 4)).unwrap();
     assert_eq!(next_token(&mut waiting, Duration::from_millis(300)), None);
     assert!(resize(&handle, CacheChange::Wake).is_ok());
     assert_eq!(
-        workers.lock().unwrap().hooks.last().map(String::as_str),
-        Some("uniserve.wake")
+        workers.lock().unwrap().operations.last(),
+        Some(&EpochOperation::Wake)
     );
     assert!(matches!(
         terminal(&mut waiting),
@@ -882,8 +878,8 @@ fn an_aborting_sleep_ends_every_request_before_the_workers_sleep() {
         })
     ));
     assert_eq!(
-        workers.lock().unwrap().hooks,
-        vec!["uniserve.sleep".to_owned()]
+        workers.lock().unwrap().operations,
+        vec![EpochOperation::Sleep]
     );
 
     // Asleep, the update needs no second sleep and no wake of its own: the
@@ -895,11 +891,11 @@ fn an_aborting_sleep_ends_every_request_before_the_workers_sleep() {
     assert!(updated.is_ok(), "{updated:?}");
     assert!(resize(&handle, CacheChange::Wake).is_ok());
     assert_eq!(
-        workers.lock().unwrap().hooks,
+        workers.lock().unwrap().operations,
         vec![
-            "uniserve.sleep".to_owned(),
-            r#"uniserve.update_weights {"model_path":"/checkpoints/next"}"#.to_owned(),
-            "uniserve.wake".to_owned(),
+            EpochOperation::Sleep,
+            EpochOperation::UpdateWeights,
+            EpochOperation::Wake,
         ]
     );
 
@@ -960,11 +956,11 @@ fn a_weight_update_recomputing_the_requests_in_flight_runs_while_the_workers_sle
         })
     ));
     assert_eq!(
-        workers.lock().unwrap().hooks,
+        workers.lock().unwrap().operations,
         vec![
-            "uniserve.sleep".to_owned(),
-            r#"uniserve.update_weights {"model_path":"/checkpoints/next"}"#.to_owned(),
-            "uniserve.wake".to_owned(),
+            EpochOperation::Sleep,
+            EpochOperation::UpdateWeights,
+            EpochOperation::Wake,
         ]
     );
     let mut served = handle.submit(request(2, 2, 4)).unwrap();
@@ -992,10 +988,8 @@ fn a_weight_update_keeping_the_requests_in_flight_continues_them() {
         .expect("the scheduler answers");
     assert!(updated.is_ok(), "{updated:?}");
     assert_eq!(
-        workers.lock().unwrap().hooks,
-        vec![
-            r#"uniserve.update_weights {"model_path":"/checkpoints/next","keep":true}"#.to_owned()
-        ]
+        workers.lock().unwrap().operations,
+        vec![EpochOperation::UpdateWeights]
     );
     assert!(matches!(
         terminal(&mut running),

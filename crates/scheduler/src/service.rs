@@ -1067,24 +1067,74 @@ fn submit_all(
     }
 }
 
-/// Runs the worker hook on every scheduler's workers, all schedulers at once
-/// (`scheduler::HookBarrier`), on a thread of its own so that the daemons'
-/// other commands go on, and answers the daemon `front` with `Hooked`.
+/// Answers one of the engine's own operations (`wire::Hook`) the daemon names, as an engine whose
+/// schedulers' workers have no device answers it: one result per scheduler, and the daemon `front`
+/// gets them as `Hooked`. The engine process answers these itself (`engine::process::operations`),
+/// beside its schedulers, so no scheduler takes part.
 fn run_hook(hook: wire::Hook, front: usize, routing: &Arc<Routing>) {
-    tracing::info!(hook = hook.name, "running a worker hook");
-    let together = crate::HookBarrier::new(routing.slots.len());
-    let answers: Vec<_> = routing
-        .slots
-        .iter()
-        .map(|slot| {
-            slot.handle.hook(
-                hook.name.clone(),
-                hook.payload.clone(),
-                Arc::clone(&together),
-            )
-        })
-        .collect();
-    answer_hooked(hook.id, answers, front, routing);
+    let (results, error) = match engine_operation(&hook.name, &hook.payload) {
+        Ok(result) => (vec![result.to_string(); routing.slots.len()], String::new()),
+        Err(error) => (Vec::new(), error),
+    };
+    routing.send(
+        front,
+        Frame::plain(from_engine::Kind::Hooked(wire::Hooked {
+            id: hook.id,
+            results,
+            error,
+        })),
+    );
+}
+
+/// What an engine without devices answers to its operation `name` with the JSON `payload`: a
+/// profiling session it takes part in runs no collector and writes no file, it has no fence probes
+/// to switch, and it loads and unloads LoRA adapters by answering the adapter's slot. Every other
+/// name, an expert redistribution's among them, is refused, as no rank holds routed experts.
+fn engine_operation(name: &str, payload: &str) -> Result<serde_json::Value, String> {
+    let value = || -> Result<serde_json::Value, String> {
+        serde_json::from_str(payload).map_err(|error| format!("{name}'s payload: {error}"))
+    };
+    Ok(match name {
+        "uniserve.profile_start" => {
+            let start: proto::profile::SessionStart = serde_json::from_str(payload)
+                .map_err(|error| format!("{name}'s payload: {error}"))?;
+            let collectors: serde_json::Map<String, serde_json::Value> = start
+                .request
+                .collectors
+                .iter()
+                .map(|collector| {
+                    (
+                        collector.as_str().to_owned(),
+                        serde_json::json!("unavailable: the simulated worker has no device"),
+                    )
+                })
+                .collect();
+            serde_json::json!({ "rank": 0, "selected": true, "path": null, "collectors": collectors })
+        }
+        "uniserve.profile_stop" => {
+            let payload = value()?;
+            serde_json::json!({
+                "rank": 0,
+                "session": payload["session"],
+                "steps": 0,
+                "reason": payload["reason"],
+                "file": null,
+            })
+        }
+        "uniserve.profile_release" => serde_json::json!({ "rank": 0, "released": false }),
+        "uniserve.fence_switch" => {
+            let payload = value()?;
+            serde_json::json!({
+                "probes": false,
+                "enabled": payload["enabled"],
+                "off": payload["off"],
+            })
+        }
+        "load_lora_adapter" | "unload_lora_adapter" => {
+            serde_json::json!({ "adapter": value()?["adapter"] })
+        }
+        other => return Err(format!("this engine has no operation named {other:?}")),
+    })
 }
 
 /// Assigns a continuation to a DP scheduler by its original request identity.

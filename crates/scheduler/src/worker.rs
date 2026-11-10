@@ -749,17 +749,15 @@ pub trait Worker: Send {
     fn storage_nodes(&self) -> std::collections::BTreeMap<String, String> {
         std::collections::BTreeMap::new()
     }
-    /// Runs the worker hook `name` with `payload` on every worker while
-    /// none runs a batch, and returns each worker group's identity with its
-    /// ranks' results, in rank order. The default refuses: the worker has
-    /// no workers to run hooks on.
-    fn hook_groups(
+    /// Performs the storage `operation` on every worker while none runs a
+    /// batch, and returns each worker group's identity with its ranks'
+    /// results, in rank order. The default refuses: the worker has no
+    /// workers to operate on.
+    fn operate_groups(
         &mut self,
-        name: &str,
-        payload: &str,
+        operation: &ipc::execution::EpochOperation,
     ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, WorkerError> {
-        let _ = payload;
-        anyhow::bail!("this worker runs no worker hook ({name})")
+        anyhow::bail!("this worker performs no storage operation ({operation:?})")
     }
     /// Maps the host KV cache's page pools on every worker's ranks, each
     /// holding `tokens` tokens of every cache group (`uniserve.host_cache`),
@@ -772,12 +770,14 @@ pub trait Worker: Send {
     ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, WorkerError> {
         anyhow::bail!("this worker maps no host KV cache ({tokens} tokens)")
     }
-    /// Runs the worker hook `name` with `payload` on every worker while
-    /// none runs a batch, and returns each worker's result. The default
-    /// refuses: the worker has no workers to run hooks on.
-    fn hook(&mut self, name: &str, payload: &str) -> Result<Vec<String>, WorkerError> {
-        let _ = payload;
-        anyhow::bail!("this worker runs no worker hook ({name})")
+    /// Performs the storage `operation` on every worker while none runs a
+    /// batch, and returns each worker's result. The default refuses: the
+    /// worker has no workers to operate on.
+    fn operate(
+        &mut self,
+        operation: &ipc::execution::EpochOperation,
+    ) -> Result<Vec<String>, WorkerError> {
+        anyhow::bail!("this worker performs no storage operation ({operation:?})")
     }
 
     /// Commit prepared expert allocations.

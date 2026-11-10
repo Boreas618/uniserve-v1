@@ -888,29 +888,17 @@ impl Scheduler {
         }
     }
 
-    /// Runs the worker hook `name` with `payload` on every worker
-    /// (`Worker::hook`) once the batches in flight complete, admitting
-    /// and scheduling nothing meanwhile, and returns each worker's result.
-    pub(super) fn run_hook(&mut self, name: &str, payload: &str) -> Result<Vec<String>, String> {
+    /// Performs the storage `operation` on every worker once the batches in flight complete,
+    /// admitting and scheduling nothing meanwhile, and returns each worker's result.
+    pub(super) fn run_operation(
+        &mut self,
+        operation: &EpochOperation,
+    ) -> Result<Vec<String>, String> {
         let closing = std::mem::replace(&mut self.closing, true);
         let drained = self.drain_batches();
         self.closing = closing;
         drained?;
-        self.hook_workers(name, payload)
-    }
-
-    /// Runs the worker hook `name` as [`Self::run_hook`] does, together
-    /// with the engine's other schedulers (`HookBarrier`): it runs once
-    /// every scheduler's batches in flight completed, and this scheduler
-    /// schedules again only once every one ran it. Meanwhile its ranks go on
-    /// joining the union's steps of schedulers still completing theirs.
-    pub(super) fn run_hook_together(
-        &mut self,
-        name: &str,
-        payload: &str,
-        together: &crate::HookBarrier,
-    ) -> Result<Vec<String>, String> {
-        self.run_together(together, |scheduler| scheduler.hook_workers(name, payload))
+        self.operate_workers(operation)
     }
 
     /// Drain all participating schedulers before an operation, and keep them
@@ -986,13 +974,17 @@ impl Scheduler {
         )
     }
 
-    /// Runs the worker hook on every worker, its batches complete.
-    fn hook_workers(&mut self, name: &str, payload: &str) -> Result<Vec<String>, String> {
+    /// Performs the storage `operation` on every worker, its batches complete.
+    fn operate_workers(&mut self, operation: &EpochOperation) -> Result<Vec<String>, String> {
         let results = self
             .worker
-            .hook(name, payload)
+            .operate(operation)
             .map_err(|error| format!("{error:#}"))?;
-        tracing::info!(hook = name, workers = results.len(), "ran the worker hook");
+        tracing::info!(
+            ?operation,
+            workers = results.len(),
+            "performed the storage operation"
+        );
         Ok(results)
     }
 

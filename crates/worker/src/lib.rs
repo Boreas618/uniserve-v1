@@ -36,7 +36,6 @@ pub mod capacity;
 pub mod completion;
 pub mod config;
 pub mod control;
-pub mod data_plane;
 pub mod error;
 pub mod host;
 pub mod hot_update;
@@ -57,7 +56,7 @@ pub use host::{HostPool, HostTask};
 /// process before another thread observes the poisoned lock. Only test builds,
 /// which ignore that setting and unwind, reach the recovery; it returns the
 /// guard rather than raising a second panic in the thread that locks next.
-pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

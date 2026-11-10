@@ -24,17 +24,20 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
-use crate::capacity::device::{DeviceBooking, DeviceBudget};
-use crate::device::Worker;
-use crate::memory::allocation::Backing as _;
-use crate::memory::prefix_cache::PrefixCache;
-use crate::memory::prefix_cache::planes::CachePlanes;
-use crate::memory::reload::{Matching, Reloading, Walk, WeightPair, paired};
-use crate::memory::retained::Retained;
-use crate::memory::weights::{LoadedWeight, WeightStore, retained_key};
-use crate::profiling::session::Change;
-use crate::{Error, Result, lock};
-use ipc::execution::Submission;
+use ipc::PhaseId;
+use ipc::execution::{
+    Batch, Batches, Computation, EpochOperation, Extent, Fault, HostPools, Inventory, Submission,
+};
+use worker::capacity::device::{DeviceBooking, DeviceBudget};
+use worker::device::Worker;
+use worker::memory::allocation::Backing as _;
+use worker::memory::prefix_cache::PrefixCache;
+use worker::memory::prefix_cache::planes::CachePlanes;
+use worker::memory::reload::{Matching, Reloading, Walk, WeightPair, paired};
+use worker::memory::retained::Retained;
+use worker::memory::weights::{LoadedWeight, WeightStore, retained_key};
+use worker::profiling::session::Change;
+use worker::{Error, Result, lock};
 
 /// What a load of the served model reads: which checkpoint, and which expert sits in which slot.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -320,7 +323,7 @@ impl DataPlane {
                 let rank = lock(rank);
                 (rank.rank, rank.worker()?)
             };
-            let held = crate::profiling::session::device_storage(&start.request, number);
+            let held = worker::profiling::session::device_storage(&start.request, number);
             if let Some(refusal) = self.book_profiling(index, held)? {
                 answers.push(
                     serde_json::json!({
@@ -447,7 +450,7 @@ impl DataPlane {
         };
         let plan = Arc::clone(lock(cache).planes());
         let plan = plan.plan();
-        crate::memory::prefix_cache::host::page_contents(
+        worker::memory::prefix_cache::host::page_contents(
             plan,
             &vec![identity.to_owned(); plan.groups.len()],
         )
@@ -860,43 +863,30 @@ impl DataPlane {
         self.restore_cache(None)
     }
 
-    /// Runs the storage operation `name` with the JSON `payload` on every rank, at a boundary where
-    /// no batch runs, and answers each rank's JSON result.
+    /// Performs the storage `operation` on every rank, at a boundary where no batch runs, and
+    /// answers each rank's JSON result.
     ///
     /// # Errors
     ///
-    /// When a rank cannot, and for a name no operation of this process answers to.
-    pub fn operate(&self, name: &str, payload: &str) -> Result<Vec<String>> {
-        let value: serde_json::Value = if payload.is_empty() {
-            serde_json::Value::Null
-        } else {
-            serde_json::from_str(payload)
-                .map_err(|error| rejected("an operation's payload", error))?
-        };
-        match name {
-            "uniserve.cache_storage" => self.cache_storage(),
-            "uniserve.release_cache" => {
-                let from = value["from"]
-                    .as_u64()
-                    .and_then(|from| u32::try_from(from).ok())
-                    .ok_or_else(|| Error::Invalid("release_cache names no segment".into()))?;
-                self.release_cache(from)
-            }
-            "uniserve.restore_cache" => self.restore_cache(
-                value["segments"]
-                    .as_u64()
-                    .and_then(|count| u32::try_from(count).ok()),
-            ),
-            "uniserve.sleep" => self.sleep(),
-            "uniserve.wake" => self.wake(),
-            "uniserve.update_weights" => {
+    /// When a rank cannot, and for an operation this process does not implement: adopting a
+    /// predecessor's cache units and the cache manifest's publication and description.
+    pub fn operate(&self, operation: &EpochOperation) -> Result<Vec<String>> {
+        match operation {
+            EpochOperation::CacheStorage => self.cache_storage(),
+            EpochOperation::ReleaseCache { from } => self.release_cache(*from),
+            EpochOperation::RestoreCache { segments } => self.restore_cache(*segments),
+            EpochOperation::Sleep => self.sleep(),
+            EpochOperation::Wake => self.wake(),
+            EpochOperation::UpdateWeights => {
                 let planned = lock(&self.staged).take().ok_or(Error::State(
                     "no weights are loaded for this update to put in place",
                 ))?;
                 self.rebind(planned)
             }
-            other => Err(Error::Interface(format!(
-                "this process has no storage operation named {other:?}"
+            EpochOperation::AdoptCache { .. }
+            | EpochOperation::PublishCache { .. }
+            | EpochOperation::CacheManifest(_) => Err(Error::Interface(format!(
+                "this process does not implement the storage operation {operation:?}"
             ))),
         }
     }
@@ -1162,6 +1152,75 @@ impl DataPlane {
             .iter()
             .map(|_| serde_json::json!({ "adapter": slot }).to_string())
             .collect())
+    }
+}
+
+/// A rank's batches as the scheduling mechanism reaches them: its devices serve the batches
+/// (`worker::batch::Workers`), and its data plane performs the storage operations and the expert
+/// commit at the batch boundaries the mechanism chooses.
+pub(crate) struct RankBatches {
+    /// The rank's devices.
+    pub(crate) workers: worker::batch::Workers,
+    /// What the storage operations reach on this rank.
+    pub(crate) data: Arc<DataPlane>,
+}
+
+impl Batches for RankBatches {
+    fn submit(&self, batch: Batch) -> std::result::Result<Submission, Box<Fault>> {
+        Batches::submit(&self.workers, batch)
+    }
+
+    fn shadow(&self, batch: Batch) -> std::result::Result<Submission, Box<Fault>> {
+        Batches::shadow(&self.workers, batch)
+    }
+
+    fn media(
+        &self,
+        phase: PhaseId,
+        computation: &Computation,
+    ) -> std::result::Result<Option<Extent>, Box<Fault>> {
+        Batches::media(&self.workers, phase, computation)
+    }
+
+    fn devices(&self, batch: &Batch) -> std::result::Result<Vec<usize>, Box<Fault>> {
+        Batches::devices(&self.workers, batch)
+    }
+
+    fn device_count(&self) -> usize {
+        self.workers.device_count()
+    }
+
+    fn inventory(&self) -> &[Inventory] {
+        self.workers.inventory()
+    }
+
+    fn operate(&self, operation: &EpochOperation) -> std::result::Result<Vec<String>, Box<Fault>> {
+        Ok(self.data.operate(operation)?)
+    }
+
+    fn commit_experts(
+        &self,
+        order: &BTreeMap<String, Vec<u32>>,
+    ) -> std::result::Result<Vec<String>, Box<Fault>> {
+        Ok(self.data.commit_experts(order)?)
+    }
+
+    fn map_host_cache(&self, tokens: u64) -> std::result::Result<HostPools, Box<Fault>> {
+        Batches::map_host_cache(&self.workers, tokens)
+    }
+
+    fn copy_pages(
+        &self,
+        offloads: Vec<ipc::PageCopy>,
+    ) -> std::result::Result<Submission, Box<Fault>> {
+        Batches::copy_pages(&self.workers, offloads)
+    }
+
+    fn offload_latents(
+        &self,
+        offloads: Vec<ipc::LatentOffload>,
+    ) -> std::result::Result<Submission, Box<Fault>> {
+        Batches::offload_latents(&self.workers, offloads)
     }
 }
 
