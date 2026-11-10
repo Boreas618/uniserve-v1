@@ -10,14 +10,19 @@ value rather than as a slow kernel.
     TRITON_INTERPRET=1 python copy_block_check.py [--package .]
 
 Both sides are torch tensors with **explicit strides** (``torch.as_strided``), which is what lets the
-four cases below be four launches of one module rather than four programs:
+cases below be launches of one module rather than separate programs:
 
 * a contiguous copy;
 * a permutation — the video decoder's channel-first to channel-last reorder, expressed by the
   source's stride vector in the destination's axis order;
 * a destination placed inside a larger raster, so its strides are wider than its extents;
 * a destination whose innermost axis is **not** unit stride, which the operator explicitly allows
-  (it has no unit-stride rule).
+  (it has no unit-stride rule);
+* a last axis longer than one program, which the general module walks a row at a time;
+* the wide module (``wide = true``), which moves aligned unit-stride rows as vectors.
+
+The grid of each launch is the operator's (``crates/ops/src/copy_block.rs``): rows times blocks per
+row for the row walk and the wide module, the elements covered otherwise.
 """
 
 import argparse
@@ -55,7 +60,13 @@ def strided_view(shape, strides, dtype):
     return base.as_strided(shape, strides), base
 
 
-def run(kernel, shape, source_strides, out_strides, dtype):
+#: The elements one program moves: `COPY` for the general module, `WIDE_COPY` for a wide one
+#: (``crates/ops/src/copy_block.rs``).
+COPY = 1024
+WIDE_COPY = 2048
+
+
+def run(kernel, shape, source_strides, out_strides, dtype, wide):
     """Launch the kernel once and answer the source's and the destination's logical views."""
     source, _ = strided_view(shape, source_strides, dtype)
     values = torch.arange(
@@ -65,8 +76,15 @@ def run(kernel, shape, source_strides, out_strides, dtype):
     out, base = strided_view(shape, out_strides, dtype)
     base.fill_(-1.0)
     total = int(torch.tensor(shape).prod())
-    block = 1024
-    kernel[((total + block - 1) // block,)](
+    block = WIDE_COPY if wide else COPY
+    # The operator's grid: a wide copy, or a last axis one program wide or more, is walked a row
+    # at a time, so the grid counts each row's blocks; otherwise it covers the elements.
+    if wide or shape[3] >= block:
+        rows = shape[0] * shape[1] * shape[2]
+        grid = rows * ((shape[3] + block - 1) // block)
+    else:
+        grid = (total + block - 1) // block
+    kernel[(grid,)](
         source,
         out,
         *shape,
@@ -76,13 +94,14 @@ def run(kernel, shape, source_strides, out_strides, dtype):
         block,
         0,
         BLOCK=block,
+        WIDE=wide,
     )
     return source, out
 
 
-def check(shape, source_strides, out_strides, dtype):
+def check(shape, source_strides, out_strides, dtype, wide):
     """Compare the destination's logical block with the source's, element by element."""
-    source, out = run(KERNEL, shape, source_strides, out_strides, dtype)
+    source, out = run(KERNEL, shape, source_strides, out_strides, dtype, wide)
     expected = source.clone()
     same = torch.equal(out, expected)
     if same:
@@ -114,7 +133,10 @@ def padded(shape, innermost):
 
 
 def cases():
-    """The four copies: plain, permuted, placed, and an inner stride above one."""
+    """The copies: plain, permuted, placed, an inner stride above one, a row walk and a wide copy.
+
+    Each case is a name, the block's shape, both stride vectors and whether the wide module runs.
+    """
     shape = (2, 3, 4, 5)
 
     def row_major(shape, order):
@@ -127,19 +149,32 @@ def cases():
         return strides
 
     plain = row_major(shape, (3, 2, 1, 0))
-    yield "contiguous", shape, plain, plain
+    yield "contiguous", shape, plain, plain, False
     # The video decoder's reorder: [channels, frames, h, w] -> [frames, h, w, channels].
     yield (
         "permuted",
         shape,
         plain,
         [1, shape[0], shape[0] * shape[1], shape[0] * shape[1] * shape[2]],
+        False,
     )
     # Placed inside a larger raster: the innermost stride is eight for a run of five, so the gaps the
     # destination leaves are the ones a placed block has.
-    yield "placed", shape, plain, padded(shape, 8)
+    yield "placed", shape, plain, padded(shape, 8), False
     # An innermost axis that is not unit stride, which the operator permits.
-    yield "inner_two", shape, plain, padded(shape, 2)
+    yield "inner_two", shape, plain, padded(shape, 2), False
+    # A last axis longer than one program: the general module walks it a row at a time, with a
+    # partial last block and the destination's inner stride above one.
+    rows = (1, 2, 2, COPY + 3)
+    yield "row_walk", rows, padded(rows, 1), padded(rows, 2), False
+    # The wide module: unit-stride rows of whole 16-element runs, placed in a wider raster, with a
+    # partial last block of the row.
+    wide = (1, 2, 2, WIDE_COPY + 16)
+    placed = padded(wide, 1)
+    placed[2] = WIDE_COPY + 48
+    placed[1] = placed[2] * wide[2]
+    placed[0] = placed[1] * wide[1]
+    yield "wide", wide, padded(wide, 1), placed, True
 
 
 def main():
@@ -149,9 +184,9 @@ def main():
     arguments = parser.parse_args()
     KERNEL = load_kernel(arguments.package)
     failures = 0
-    for name, shape, source_strides, out_strides in cases():
+    for name, shape, source_strides, out_strides, wide in cases():
         for dtype in (torch.float32, torch.float16):
-            problem = check(shape, source_strides, out_strides, dtype)
+            problem = check(shape, source_strides, out_strides, dtype, wide)
             if problem is None:
                 print(f"ok   {name} {str(dtype).split('.')[-1]}")
             else:
