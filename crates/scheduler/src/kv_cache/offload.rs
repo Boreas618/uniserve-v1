@@ -512,6 +512,8 @@ struct Read {
     request: Option<RequestId>,
     read: PoolRead,
     task: Option<u64>,
+    /// When the read was submitted.
+    submitted: Instant,
 }
 
 /// The pages of one cache group a hit loads.
@@ -1442,6 +1444,7 @@ impl KvOffloadManager {
                         request: Some(request),
                         read,
                         task: None,
+                        submitted: Instant::now(),
                     },
                 );
                 submitted += 1;
@@ -1477,7 +1480,8 @@ impl KvOffloadManager {
 
     /// Peer read `number`'s task ended as `end`: settle its slots and pins,
     /// and count it for the admission that waits for it.
-    fn read_ended(&mut self, number: u64, complete: bool) {
+    fn read_ended(&mut self, number: u64, end: &TransferEnd) {
+        let complete = matches!(end, TransferEnd::Complete);
         let Some(read) = self.reads.remove(&number) else {
             return;
         };
@@ -1486,17 +1490,21 @@ impl KvOffloadManager {
         }
         self.servers
             .settle_read(&read.read, complete, || Purpose::Settle);
+        let micros = read.submitted.elapsed().as_micros() as u64;
         if complete {
-            tracing::debug!(
+            tracing::info!(
                 pages = read.read.pages.len(),
                 bytes = read.read.bytes(),
+                micros,
                 endpoint = read.read.endpoint,
                 "read host KV cache pages from a peer"
             );
         } else {
             tracing::warn!(
                 pages = read.read.pages.len(),
+                micros,
                 endpoint = read.read.endpoint,
+                ?end,
                 "a peer read of host KV cache pages did not complete: its pages are computed"
             );
         }
@@ -1965,7 +1973,7 @@ impl KvOffloadManager {
         for (client, event) in events {
             if let Event::Transferred { task, end, .. } = event {
                 if let Some(read) = self.tasks.get(&(client, task)).copied() {
-                    self.read_ended(read, matches!(end, TransferEnd::Complete));
+                    self.read_ended(read, &end);
                     admissions = true;
                 }
                 continue;
@@ -2150,7 +2158,10 @@ impl KvOffloadManager {
                     }
                     other => {
                         tracing::warn!(?other, "a peer read of host KV cache pages was refused");
-                        self.read_ended(read, false);
+                        let refused = TransferEnd::Failed {
+                            message: format!("{other:?}"),
+                        };
+                        self.read_ended(read, &refused);
                         admissions = true;
                     }
                 },

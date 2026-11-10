@@ -143,6 +143,20 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
         },
     ));
     let network = Arc::new(Network::new(options.nixl_library.clone()));
+    // A server that names its NIXL library serves other hosts: its agent starts now, beside the
+    // first tasks, so the first READ from or of this host does not wait for UCX to come up (several
+    // seconds) inside a request's bounded wait. Without a named library the agent starts at the
+    // first task that needs it, and a host without NIXL never starts one.
+    if options.nixl_library.is_some() {
+        let starting = Arc::clone(&network);
+        std::thread::Builder::new()
+            .name("nixl-agent".into())
+            .spawn(move || {
+                if let Err(error) = starting.agent() {
+                    tracing::warn!(%error, "the NIXL agent did not start");
+                }
+            })?;
+    }
     let (sender, finished) = mpsc::channel();
     let mut server = Served {
         gpus,
