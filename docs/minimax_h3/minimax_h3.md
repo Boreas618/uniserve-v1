@@ -36,12 +36,25 @@ The first sync builds the `uniserve` executable and installs the NCCL and CUPTI 
 | [`FastVideo/FastVideo-FastH3-8-Step-V2`](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2), [`-NVFP4`](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2-NVFP4) | `t2va`, `fl2va` | 768p | 8 |
 | [`FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree), [`-NVFP4`](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4) | `t2va`, `fl2va` | 768p | 4 |
 | FastH3 OmniRef exports | `ref2va` | 768p | The export's schedule |
+| [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) with a [FastH3 adapter](#fasth3-adapters) | `t2va`, `fl2va` | 768p | 4 |
 | [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) `transformer` | `t2va`, `fl2va` | 768p | 49 |
 | [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) `transformer_ref` | `ref2va` | 768p | 49 |
 
 The NVFP4 repositories are ModelOpt PTQ checkpoints and need Blackwell. A FastH3 export's `fastvideo_inference.json` states its task, which selects the base partition it replaces and so the tasks it serves (`transformer`, `t2va` and `fl2va`, for a `t2av` student; `transformer_ref`, `ref2va`, for a `ref2va` student), its schedule (DMD rungs or parallel-decoding blocks) and its sparse attention; the base checkpoint evaluates 50 sigma points with video shift 12 and audio shift 3. Each checkpoint's schedulers state its shifts. A server places one DiT partition, so a deployment serves either `t2va` and `fl2va` or `ref2va`.
 
 An OmniRef export holds only its DiT partition and schedulers. Its `fastvideo_inference.json` pins the base revision (`base_model_revision`) whose text encoder, tokenizer, processor and VAEs it uses, and the server and workers read every directory the export omits from the Hugging Face cache at that revision, downloading what the cache lacks.
+
+### FastH3 adapters
+
+The [FastH3 Preview v1 adapters](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA) (`dense-datafree`, `vsa-datafree`) are FastVideo's four-step DMD students of the base release's `transformer`, stored as edits of the base checkpoint in FastVideo's `fastvideo-lora-v2` container: rank-64 `lora_A`/`lora_B` factors of the attention, feed-forward and modulation projections, full-rank `.diff`/`.diff_b` deltas of the patch, condition and time embeddings, the norms, the biases and the final layer, and, in the VSA variant, the layers' sparse-attention compression gates as `.set_weight` tensors the base does not hold. Serve one over the base release with `--lora-path`, naming the adapter file or the directory that holds `adapter_model.safetensors`:
+
+```bash
+uniserve serve "$H3_ROOT" --lora-path /workspace/models/FastH3-LoRA/vsa-datafree \
+  --worker-groups configs/minimax_h3/ulysses4.toml --served-model-name FastH3 \
+  --host 0.0.0.0 --max-running-requests 2
+```
+
+The adapter is fused into the weights once, as each rank loads them: every element of an edited parameter is `(lora_B @ lora_A + diff) + base`, evaluated in FP32 and rounded once to the base tensor's element type, the format's own reconstruction with no `alpha` (a scale of one), and a parameter the adapter does not edit is read unchanged. The deployment then serves that student for every request, as its full export would: `t2va` and `fl2va` from the `transformer` partition on the release's ladder of four DMD rungs (`[999, 749, 500, 250]`) at the base schedulers' shifts, with VSA sparse attention at 64-row tiles and 0.9 sparsity when the adapter carries the compression gates and dense attention when it does not. A request cannot select or drop the adapter; another adapter is another deployment, and changing `lora_path` with `PUT /admin/config` starts a new epoch. An adapter is refused at startup when its metadata does not name a FastH3 student of FastVideo over `MiniMaxAI/MiniMax-H3`, when it carries other tensor counts or another rank than its metadata states, when it edits a tensor the checkpoint does not hold or assigns one it does, or when the checkpoint is a FastH3 export rather than the base release.
 
 ```bash
 export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2

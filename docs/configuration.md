@@ -29,6 +29,7 @@ uniserve serve --config fasth3.toml --set quantization.mode=performance
 | `--tensor-parallel-size`, `--data-parallel-size` | `tensor_parallel_size`, `data_parallel_size` |
 | `--max-running-requests` | `max_running_requests` |
 | `--max-model-len` | `max_model_len` |
+| `--lora-path` | `lora_path` |
 | `--mem-fraction-static` | `mem_fraction_static` |
 | `--host-identity` | `host_identity` |
 | `--nnodes`, `--node-rank`, `--dist-init-addr` | `nnodes`, `node_rank`, `dist_init_addr` |
@@ -89,7 +90,7 @@ Three backend-name fields are read with `attention_backend` (`FilledPrograms::of
 | Destination | Options |
 | --- | --- |
 | Deployment identity, cannot change | `model`, `served_model_name` |
-| Build config | `max_model_len`, `dtype`, `quantization`, `max_running_requests`, `mem_fraction_static`, `tensor_parallel_size`, `data_parallel_size`, `worker_groups`, `engine_host` |
+| Build config | `max_model_len`, `lora_path`, `dtype`, `quantization`, `max_running_requests`, `mem_fraction_static`, `tensor_parallel_size`, `data_parallel_size`, `worker_groups`, `engine_host` |
 | Host layer, daemon (a node's startup arguments) | `host_identity`, `nnodes`, `node_rank`, `dist_init_addr` |
 | Host layer | `mm_processor_kwargs` |
 | Program backend name | `attention_backend` (attention), with `prefill_attention_backend` and `decode_attention_backend` overriding it per phase |
@@ -101,6 +102,7 @@ Three backend-name fields are read with `attention_backend` (`FilledPrograms::of
 | `model` | Required | Local model directory or Hugging Face repository |
 | `served_model_name` | `model` | The single model name the API serves |
 | `max_model_len` | The checkpoint's `max_position_embeddings`, 8192 when it declares none; 16384 prompt tokens for a MiniMax-H3 pipeline | Longest sequence a request may reach, in tokens |
+| `lora_path` | Unset | A weight adapter fused into the checkpoint's weights at load and serving every request: an adapter file, or a directory holding `adapter_model.safetensors`; video families only, and the family must recognize it ([FastH3 adapters](minimax_h3/minimax_h3.md#fasth3-adapters)) |
 | `dtype` | `"bfloat16"` | Element type of parameters and activations: `bfloat16`, `float16` or `float32` |
 | `quantization` | `{}` | Precision policy: `mode` (`quality`, `balanced`, `performance`, `maximum`) and per-component selections under `components`; empty selects the checkpoint's own quantization |
 | `mm_processor_kwargs` | `{}` | Options of the model's multimodal processor; MiniMax-H3 takes `reference_image_short_edge` and `enlarge_references` ([FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity)) |

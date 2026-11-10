@@ -604,6 +604,7 @@ mod tests {
             model: proto::config::ModelConfig {
                 model: "model".to_owned(),
                 base: None,
+                lora_path: None,
                 max_model_len: 4096,
                 dtype: proto::request::ModelDtype::BFloat16,
                 quantization: Default::default(),

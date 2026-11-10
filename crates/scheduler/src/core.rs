@@ -74,6 +74,7 @@ pub fn sim_args(model: impl Into<String>) -> EngineArgs {
         model: proto::config::ModelConfig {
             model: model.into(),
             base: None,
+            lora_path: None,
             max_model_len: 0,
             dtype: crate::ModelDtype::BFloat16,
             quantization: Default::default(),

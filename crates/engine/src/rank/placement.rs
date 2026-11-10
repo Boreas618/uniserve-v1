@@ -32,14 +32,28 @@ impl ModelRunner {
     }
 
     /// This rank's video checkpoint, opened over its roots: the checkpoint the launch names and the
-    /// base release it continues.
+    /// base release it continues, with the deployment's adapter fused into the component the
+    /// family says it edits.
     pub(super) fn open_video_checkpoint(&self) -> Result<nn::Checkpoint> {
+        let model = &self.engine_config().model;
         let mut roots = vec![self.checkpoint().to_path_buf()];
-        if let Some(base) = &self.engine_config().model.base {
+        if let Some(base) = &model.base {
             roots.push(PathBuf::from(base));
         }
         let roots: Vec<&std::path::Path> = roots.iter().map(PathBuf::as_path).collect();
-        Ok(nn::Checkpoint::open_roots(&roots)?)
+        let checkpoint = nn::Checkpoint::open_roots(&roots)?;
+        let Some(path) = &model.lora_path else {
+            return Ok(checkpoint);
+        };
+        let Model::Video(family) = self.family.model else {
+            bail!("a causal language model fuses no adapter");
+        };
+        let adapter = nn::Adapter::open(std::path::Path::new(path))
+            .with_context(|| format!("reading the adapter {path}"))?;
+        let component = family.adapter_component(&checkpoint, &adapter)?;
+        checkpoint
+            .attach(component, adapter)
+            .with_context(|| format!("fusing the adapter {path}"))
     }
 
     /// The video family's reading of `checkpoint`, which [`Self::open_video_checkpoint`] opened.

@@ -52,6 +52,36 @@ impl VideoFamily for MinimaxH3Family {
         let config = Config::open(checkpoint)?;
         Ok(Box::new(H3Checkpoint { config }))
     }
+
+    /// A FastH3 adapter edits the base release's `transformer` partition, the one its student was
+    /// distilled from; it is fused there and the checkpoint then reads as that student
+    /// ([`crate::checkpoint::Contract::of_adapter`]).
+    fn adapter_component(
+        &self,
+        checkpoint: &Checkpoint,
+        adapter: &nn::Adapter,
+    ) -> nn::Result<Option<&'static str>> {
+        if !crate::checkpoint::fasth3_adapter(adapter.metadata()) {
+            return Err(nn::Error::Unsupported(format!(
+                "{} is not a FastH3 adapter (its metadata names the student {:?} over {:?}); \
+                 MiniMax-H3 fuses the FastH3 releases of FastVideo over {}",
+                adapter.path().display(),
+                adapter.metadata().get("finetuned_model"),
+                adapter.metadata().get("base_model"),
+                crate::checkpoint::FASTH3_BASE_MODEL,
+            )));
+        }
+        // An adapter edits the base release: a FastH3 export is already a student.
+        if crate::checkpoint::Contract::read(checkpoint)?.is_some() {
+            return Err(nn::Error::Unsupported(format!(
+                "{} is a FastH3 export, and a FastH3 adapter is fused into the base release {} \
+                 it was extracted from",
+                checkpoint.root().display(),
+                crate::checkpoint::FASTH3_BASE_MODEL,
+            )));
+        }
+        Ok(Some(crate::checkpoint::Dit::Base.directory()))
+    }
 }
 
 /// A MiniMax-H3 checkpoint: the configuration read from it and its base, once.

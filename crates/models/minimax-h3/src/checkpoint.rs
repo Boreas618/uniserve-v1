@@ -163,6 +163,19 @@ impl Layout {
                 contract: Some(contract),
             });
         }
+        // A base release with a FastH3 adapter fused into its base partition is that student: it
+        // serves the partition it was distilled from on the student's contract.
+        if let Some(fusion) = checkpoint
+            .component(Dit::Base.directory())
+            .ok()
+            .and_then(nn::Checkpoint::adapter)
+        {
+            let contract = Contract::of_adapter(fusion, checkpoint)?;
+            return Ok(Self {
+                dits: vec![(contract.dit, tasks_of(contract.dit))],
+                contract: Some(contract),
+            });
+        }
 
         let index = checkpoint.sidecar("model_index.json")?.ok_or_else(|| {
             Error::checkpoint(format!(
@@ -278,6 +291,57 @@ impl Contract {
         })
     }
 
+    /// The contract of the FastH3 adapter `fusion`, fused into `checkpoint`'s base partition.
+    ///
+    /// A FastH3 adapter ([`fasth3_adapter`]) is the rank-64 extraction of a FastH3 Preview v1
+    /// student from the base release, and it ships no `fastvideo_inference.json`: its contract is
+    /// the one that release's full exports state, the four DMD rungs `[999, 749, 500, 250]` of the
+    /// `t2av` partition at the base release's own scheduler shifts. An adapter that assigns the
+    /// layers' VSA compression gates (`attn.to_gate_compress.weight`, which the base does not
+    /// hold) is the VSA student, distilled at 64-row tiles and 0.9 sparsity
+    /// (`FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`); one that assigns none is the dense
+    /// student.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the scheduler sidecars cannot be read.
+    pub fn of_adapter(fusion: &nn::Fusion, checkpoint: &nn::Checkpoint) -> Result<Self> {
+        let sidecar = |relative: &str| -> Result<f32> {
+            let value = checkpoint.sidecar(relative)?.ok_or_else(|| {
+                Error::checkpoint(format!(
+                    "no root of the checkpoint at {} holds {relative}",
+                    checkpoint.root().display()
+                ))
+            })?;
+            crate::config::shift(&value, relative)
+        };
+        let gated = fusion
+            .assigned()
+            .any(|name| name.ends_with(".attn.to_gate_compress.weight"));
+        let (backend, attention) = if gated {
+            (
+                AttentionBackend::VideoSparseH3,
+                Some(SparseContract {
+                    tile: 64,
+                    sparsity: 0.9,
+                    reference_keep: None,
+                }),
+            )
+        } else {
+            (AttentionBackend::Dense, None)
+        };
+        Ok(Self {
+            task: VideoTask::TextToVideoAudio,
+            dit: Dit::Base,
+            base_revision: None,
+            video_shift: sidecar("scheduler/scheduler_config.json")?,
+            audio_shift: sidecar("audio_scheduler/scheduler_config.json")?,
+            schedule: ContractSchedule::Rungs(vec![999, 749, 500, 250]),
+            backend,
+            attention,
+        })
+    }
+
     /// The schedule the contract states: a DMD ladder or a parallel-decoding block grid.
     fn schedule(object: &Fields<'_>) -> Result<ContractSchedule> {
         match (
@@ -300,6 +364,28 @@ impl Contract {
             )),
         }
     }
+}
+
+/// The base model a FastH3 adapter states it edits.
+pub const FASTH3_BASE_MODEL: &str = "MiniMaxAI/MiniMax-H3";
+
+/// Whether an adapter's header `metadata` identifies a FastH3 release.
+///
+/// FastVideo writes its container for ordinary H3 adapters too, so the container alone does not
+/// claim one: the adapter must name a student of FastVideo's own namespace that is FastH3
+/// (`finetuned_model`, such as `FastVideo/FastVideo-FastH3-4-step-v1`) over the base release
+/// (`base_model`). Claiming another adapter would put it on a four-step schedule it was never
+/// distilled for.
+pub fn fasth3_adapter(metadata: &BTreeMap<String, String>) -> bool {
+    let student = metadata
+        .get("finetuned_model")
+        .map(|name| name.to_lowercase())
+        .unwrap_or_default();
+    let base = metadata.get("base_model").map(String::as_str);
+    metadata.get("format").map(String::as_str) == Some(nn::adapter::FASTVIDEO_FORMAT)
+        && student.starts_with("fastvideo/")
+        && student.contains("fasth3")
+        && base.is_some_and(|base| base.eq_ignore_ascii_case(FASTH3_BASE_MODEL))
 }
 
 /// The parsed JSON of every sidecar the loading boundary reads.
@@ -653,6 +739,139 @@ mod tests {
             .attention
             .expect("an OmniRef export states its sparse attention");
         assert_eq!((tile, sparsity, reference_keep), (128, 0.9, Some(0.1)));
+    }
+
+    /// Write a safetensors file of `tensors`, each `(name, extents)` of BF16 zeros, under the
+    /// header metadata `metadata`.
+    fn safetensors(path: &Path, metadata: &[(&str, &str)], tensors: &[(&str, &[u64])]) {
+        let mut entries = vec![format!(
+            r#""__metadata__":{{{}}}"#,
+            metadata
+                .iter()
+                .map(|(key, value)| format!(r#""{key}":"{value}""#))
+                .collect::<Vec<_>>()
+                .join(",")
+        )];
+        let mut bytes = 0;
+        for (name, shape) in tensors {
+            let length = shape.iter().product::<u64>() * 2;
+            let extents = shape.iter().map(u64::to_string).collect::<Vec<_>>();
+            entries.push(format!(
+                r#""{name}":{{"dtype":"BF16","shape":[{}],"data_offsets":[{bytes},{}]}}"#,
+                extents.join(","),
+                bytes + length
+            ));
+            bytes += length;
+        }
+        let mut header = format!("{{{}}}", entries.join(","));
+        header.push_str(&" ".repeat(header.len().div_ceil(8) * 8 - header.len()));
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(header.as_bytes());
+        file.resize(file.len() + bytes as usize, 0);
+        fs::write(path, file).expect("write");
+    }
+
+    /// A base release with a FastH3 adapter fused into its `transformer` reads as that student:
+    /// the four-step DMD ladder at the base's shifts, sparse exactly when the adapter assigns the
+    /// compression gates, serving the base partition's tasks only.
+    #[test]
+    fn a_fasth3_adapter_over_the_base_release_is_its_student() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write(
+            root.path(),
+            "model_index.json",
+            &base_index(&["transformer", "transformer_ref"]),
+        );
+        for dit in Dit::ALL {
+            write(
+                root.path(),
+                &format!("{}/config.json", dit.directory()),
+                "{}",
+            );
+            safetensors(
+                &root.path().join(dit.directory()).join("model.safetensors"),
+                &[],
+                &[("blocks.0.attn.to_q.weight", &[4, 4])],
+            );
+        }
+        write(
+            root.path(),
+            "scheduler/scheduler_config.json",
+            r#"{"shift": 12.0}"#,
+        );
+        write(
+            root.path(),
+            "audio_scheduler/scheduler_config.json",
+            r#"{"shift": 3.0}"#,
+        );
+
+        let adapters = tempfile::tempdir().expect("tempdir");
+        fn student(gates: &str) -> [(&str, &str); 7] {
+            [
+                ("format", "fastvideo-lora-v2"),
+                ("finetuned_model", "FastVideo/FastVideo-FastH3-4-step-v1"),
+                ("base_model", "MiniMaxAI/MiniMax-H3"),
+                ("rank", "2"),
+                ("low_rank_tensors", "2"),
+                ("diff_tensors", "0"),
+                ("set_weight_tensors", gates),
+            ]
+        }
+        let low_rank: [(&str, &[u64]); 2] = [
+            ("blocks.0.attn.to_q.lora_A.weight", &[2, 4]),
+            ("blocks.0.attn.to_q.lora_B.weight", &[4, 2]),
+        ];
+        let gate: (&str, &[u64]) = ("blocks.0.attn.to_gate_compress.set_weight", &[4, 4]);
+
+        let detect = |metadata: &[(&str, &str)], tensors: &[(&str, &[u64])]| {
+            let file = adapters.path().join("adapter_model.safetensors");
+            safetensors(&file, metadata, tensors);
+            let adapter = nn::Adapter::open(&file)?;
+            let checkpoint = nn::Checkpoint::open(root.path())?;
+            let nn::family::Model::Video(family) = crate::family::FAMILY.model else {
+                unreachable!("MiniMax-H3 is a video family")
+            };
+            let component = family.adapter_component(&checkpoint, &adapter)?;
+            assert_eq!(component, Some("transformer"));
+            Layout::detect(&checkpoint.attach(component, adapter)?)
+                .map_err(|error| nn::Error::Unsupported(error.to_string()))
+        };
+
+        let mut sparse = low_rank.to_vec();
+        sparse.push(gate);
+        let layout = detect(&student("1"), &sparse).expect("the VSA student");
+        assert_eq!(layout.dits, vec![(Dit::Base, tasks_of(Dit::Base))]);
+        let contract = layout
+            .contract
+            .expect("an adapter states the student's contract");
+        assert_eq!(
+            contract.schedule,
+            ContractSchedule::Rungs(vec![999, 749, 500, 250])
+        );
+        assert_eq!((contract.video_shift, contract.audio_shift), (12.0, 3.0));
+        assert_eq!(contract.backend, AttentionBackend::VideoSparseH3);
+        assert_eq!(
+            contract.attention,
+            Some(SparseContract {
+                tile: 64,
+                sparsity: 0.9,
+                reference_keep: None
+            })
+        );
+
+        let dense = detect(&student("0"), &low_rank).expect("the dense student");
+        let contract = dense.contract.expect("a contract");
+        assert_eq!(contract.backend, AttentionBackend::Dense);
+        assert_eq!(contract.attention, None);
+
+        // FastVideo's container over another model is not claimed as FastH3.
+        let mut other = student("0");
+        other[1] = ("finetuned_model", "someone/H3-style-lora");
+        let error = detect(&other, &low_rank).expect_err("not a FastH3 release");
+        assert!(
+            error.to_string().contains("not a FastH3 adapter"),
+            "{error}"
+        );
     }
 
     #[test]

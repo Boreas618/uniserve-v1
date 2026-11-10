@@ -76,7 +76,12 @@ const KIND_OPTIONS: [(Kind, &[&str]); 2] = [
     ),
     (
         Kind::Video,
-        &["video_config", "media_config", "video_job_config"],
+        &[
+            "video_config",
+            "media_config",
+            "video_job_config",
+            "lora_path",
+        ],
     ),
 ];
 
@@ -147,6 +152,12 @@ pub struct ServerArgs {
     /// prompt bound.
     #[arg(long)]
     pub max_model_len: Option<NonZeroU32>,
+    /// A weight adapter fused into the checkpoint's weights at load, for
+    /// every request of the deployment: an adapter file, or a local directory
+    /// holding one. The model family must recognize it; video families only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long, value_name = "PATH")]
+    pub lora_path: Option<PathBuf>,
     /// Element type of parameters and activations.
     #[arg(skip = ServerArgs::default().dtype)]
     pub dtype: ModelDtype,
@@ -317,6 +328,7 @@ impl Default for ServerArgs {
             model: None,
             served_model_name: None,
             max_model_len: None,
+            lora_path: None,
             dtype: ModelDtype::BFloat16,
             quantization: serde_json::Map::new(),
             mm_processor_kwargs: serde_json::Map::new(),
@@ -547,6 +559,10 @@ impl ServerArgs {
             model: proto::config::ModelConfig {
                 model: self.model().to_owned(),
                 base: None,
+                lora_path: self
+                    .lora_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
                 max_model_len: self.max_model_len.map_or(0, NonZeroU32::get),
                 dtype: self.dtype,
                 quantization: self.quantization.clone(),

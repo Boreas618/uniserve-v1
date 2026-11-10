@@ -2067,6 +2067,9 @@ mod tests {
             ("mem_fraction_static", |config: &mut ServerArgs| {
                 config.mem_fraction_static = 0.5
             }),
+            ("lora_path", |config: &mut ServerArgs| {
+                config.lora_path = Some("/adapters/fasth3".into())
+            }),
             (
                 "speculative_config.num_draft_tokens",
                 |config: &mut ServerArgs| config.speculative_config.num_draft_tokens = 4,

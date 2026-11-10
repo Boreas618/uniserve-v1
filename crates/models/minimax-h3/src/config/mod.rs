@@ -365,7 +365,7 @@ impl Config {
 }
 
 /// The noise level shift a scheduler sidecar states.
-fn shift(sidecar: &serde_json::Value, path: &str) -> Result<f32> {
+pub(crate) fn shift(sidecar: &serde_json::Value, path: &str) -> Result<f32> {
     Ok(Fields::of(path, sidecar)?.positive("shift")? as f32)
 }
 
