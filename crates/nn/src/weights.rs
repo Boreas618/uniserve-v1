@@ -246,6 +246,18 @@ pub enum WeightSource {
         /// the same block, so the fused weight is the rank's shard of every part in order.
         block: Option<PartBlock>,
     },
+    /// The row-major concatenation of one block of each part, every part naming its own block,
+    /// viewed as `shape`.
+    ///
+    /// This is how a stacked checkpoint tensor (every expert's projections in one
+    /// `[experts, rows, columns]` tensor) becomes the stack its reading operator expects in
+    /// another order: each block is one expert's half, in the order the operator reads them.
+    Blocks {
+        /// The checkpoint tensors and the block each contributes, in fused order.
+        parts: Vec<(String, PartBlock)>,
+        /// The fused tensor's extents.
+        shape: Shape,
+    },
 }
 
 /// One block of a part: `rows` rows of `columns` elements, the first at element `start` of the
@@ -380,6 +392,23 @@ impl WeightRequest {
     pub fn nonzero(mut self) -> Self {
         self.nonzero = true;
         self
+    }
+
+    /// A weight fused from one block of each of `parts`, viewed as `shape`, in `layout`.
+    pub fn blocks(
+        tensor: impl Into<String>,
+        parts: Vec<(String, PartBlock)>,
+        shape: Shape,
+        layout: WeightLayout,
+    ) -> Self {
+        Self {
+            tensor: tensor.into(),
+            source: WeightSource::Blocks { parts, shape },
+            layout,
+            shape,
+            pinned: None,
+            nonzero: false,
+        }
     }
 
     /// The same request read as `dtype`, whatever the loader's policy states.
@@ -1179,8 +1208,26 @@ impl<'a> WeightLoader<'a> {
                 *shape,
                 block.map(|block| block.row_stride),
             ),
+            // The first block's start keys the region: two ranks' blocks of one stacked tensor
+            // begin at different rows.
+            WeightSource::Blocks { parts, shape } => {
+                let mut names: Vec<String> = Vec::new();
+                for (name, _) in parts {
+                    if !names.contains(name) {
+                        names.push(name.clone());
+                    }
+                }
+                let first = parts.first().map(|(_, block)| *block);
+                (
+                    names,
+                    first.map_or(0, |block| block.start),
+                    *shape,
+                    first.map(|block| block.row_stride),
+                )
+            }
         };
-        if let WeightSource::Parts { shape, .. } = &request.source
+        if let WeightSource::Parts { shape, .. } | WeightSource::Blocks { shape, .. } =
+            &request.source
             && !request.shape.matches(shape)
         {
             return Err(Error::weight(
@@ -1573,7 +1620,7 @@ impl<'a> WeightLoader<'a> {
                 WeightSource::Strided {
                     start, row_stride, ..
                 } => (*start, *row_stride),
-                WeightSource::Parts { .. } => {
+                WeightSource::Parts { .. } | WeightSource::Blocks { .. } => {
                     return Err(Error::weight(
                         &scales.tensor,
                         "block scales gathered from fused parts have no single row stride"
@@ -2401,6 +2448,19 @@ impl<'a> WeightLoader<'a> {
                 }
                 Ok(spans)
             }
+            WeightSource::Blocks { parts, .. } => {
+                let mut spans = Vec::new();
+                for (name, block) in parts {
+                    spans.extend(block_spans(checkpoint, name, block)?);
+                }
+                if spans.iter().all(|span| span.from == span.to) {
+                    return Err(Error::weight(
+                        &key.region.tensors.join("+"),
+                        "a fused weight has no part",
+                    ));
+                }
+                Ok(spans)
+            }
             WeightSource::Parts {
                 parts,
                 block: Some(block),
@@ -2734,6 +2794,9 @@ impl<'s, 'a> Scope<'s, 'a> {
                 vec![tensor.clone()]
             }
             WeightSource::Parts { parts, .. } => parts.clone(),
+            WeightSource::Blocks { parts, .. } => {
+                parts.iter().map(|(name, _)| name.clone()).collect()
+            }
         };
         self.refuse_packed(&names)?;
         let request = match self.pinned {
@@ -2765,12 +2828,56 @@ impl<'s, 'a> Scope<'s, 'a> {
     }
 }
 
+/// The byte ranges of `block`'s rows in the checkpoint tensor `name`, checked against its length.
+fn block_spans<'a>(
+    checkpoint: &'a Checkpoint,
+    name: &str,
+    block: &PartBlock,
+) -> Result<Vec<Span<'a>>> {
+    let location = checkpoint
+        .tensor(name)
+        .ok_or_else(|| Error::MissingTensor(name.to_owned()))?;
+    let element = location
+        .dtype
+        .bytes()
+        .ok_or_else(|| Error::weight(name, format!("{} has no whole-byte size", location.dtype)))?;
+    if block.row_stride < block.columns {
+        return Err(Error::weight(
+            name,
+            format!(
+                "a stride of {} overlaps rows of {} elements",
+                block.row_stride, block.columns
+            ),
+        ));
+    }
+    let length = stored_bytes(location);
+    let mut spans = Vec::with_capacity(usize::try_from(block.rows).unwrap_or(0));
+    for row in 0..block.rows {
+        let first = (block.start + row * block.row_stride) * element;
+        let last = first + block.columns * element;
+        let (Ok(from), Ok(to)) = (usize::try_from(first), usize::try_from(last)) else {
+            return Err(Error::weight(name, "a block row is past usize::MAX"));
+        };
+        if to as u64 > length {
+            return Err(Error::weight(
+                name,
+                format!(
+                    "row {row} of the block (bytes {from}..{to}) reaches past the part's {length} \
+                     bytes"
+                ),
+            ));
+        }
+        spans.push(Span { location, from, to });
+    }
+    Ok(spans)
+}
+
 /// Verify the loader can produce `layout` from `source`.
 fn check_layout(tensor: &str, source: &WeightSource, layout: WeightLayout) -> Result<()> {
     match layout {
         WeightLayout::ROW_MAJOR => Ok(()),
         WeightLayout::UP_GATE | WeightLayout::DOWN => match source {
-            WeightSource::Parts { .. } => Ok(()),
+            WeightSource::Parts { .. } | WeightSource::Blocks { .. } => Ok(()),
             WeightSource::Region { .. } | WeightSource::Strided { .. } => Err(Error::weight(
                 tensor,
                 format!(

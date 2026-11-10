@@ -75,6 +75,7 @@ impl RefinerBlock {
                     heads: config.num_attention_heads,
                     kv_heads: config.num_attention_heads,
                     head_dim: config.head_dim,
+                    gated: false,
                 },
                 names: QkvNames::Separate(["to_q", "to_k", "to_v"]),
                 bias: QkvBias::Absent,

@@ -212,6 +212,7 @@ fn attention_spec(qk_norm: QkNormNames<'static>, kind: AttentionKind) -> QkvAtte
             heads: HEADS as u32,
             kv_heads: KV_HEADS as u32,
             head_dim: HEAD_DIM as u32,
+            gated: false,
         },
         names: QkvNames::Separate(["q_proj", "k_proj", "v_proj"]),
         bias: QkvBias::Absent,

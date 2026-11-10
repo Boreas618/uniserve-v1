@@ -16,6 +16,19 @@
 //!
 //! The fused and the separate forms round differently (the fused program normalizes and rotates in
 //! FP32 and rounds once), so they are two forms and a consumer keeps its baseline's.
+//!
+//! ## The output gate
+//!
+//! A gated block (Qwen3-Next's and Qwen3.5's `attn_output_gate`, [`QkvSpec::gated`]) projects each
+//! query head together with a gate of the head's width; the attended heads are multiplied by the
+//! sigmoid of their gates before the output projection:
+//!
+//! ```text
+//! [q_h | g_h] = q_proj(x)_h;   o_h = attention(q, k, v)_h · sigmoid(g_h);   out = o_proj(o)
+//! ```
+//!
+//! The query halves are gathered into a packed tensor for the normalization and rotation, and the
+//! gate halves are read where the projection wrote them.
 
 use ops::{Shape, TensorView};
 
@@ -23,11 +36,13 @@ use crate::capability::{KvView, TokenBatch};
 use crate::error::{Error, Result};
 use crate::family::Split;
 use crate::forward::Forward;
+use crate::layers::{Access, Copy, GateBias, GatedActivation, Halves, Rounding};
 use crate::layers::{
     Bias, DenseAttention, DenseSpec, Gain, Gains, Linear, PagedAttention, PagedSpec, Parallel,
     QkvBias, QkvLinear, QkvNames, QkvSpec, RmsNorm, Rotary, Varlen,
 };
 use crate::weights::{Scope, Weight};
+use ops::activation::Activation;
 
 /// The module names of a block's per-head q/k normalization, and its form.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -106,6 +121,13 @@ pub enum Keys<'a> {
         group: usize,
         layer: usize,
     },
+    /// The recurrent state of the cache's recurrent layer `layer`, which a linear-attention mixer
+    /// reads and advances in place of keys ([`crate::blocks::GatedDeltaNet`]).
+    Recurrent {
+        batch: &'a TokenBatch,
+        cache: &'a KvView<'a>,
+        layer: usize,
+    },
 }
 
 /// The per-head normalization a block holds.
@@ -131,6 +153,8 @@ pub struct QkvAttention {
     qk_norm: QkNorm,
     attention: Attention,
     output: Linear,
+    /// The sigmoid gate of a gated block's attended heads, `None` for an ungated one.
+    gate: Option<GatedActivation>,
     heads: u32,
     kv_heads: u32,
     head_dim: u32,
@@ -153,7 +177,8 @@ impl QkvAttention {
     ) -> Result<Self> {
         let head_dim = spec.qkv.head_dim;
         let qkv = QkvLinear::load(scope, spec.qkv, spec.names, spec.bias, split)?;
-        let heads = qkv.query().n() / head_dim;
+        let gated = spec.qkv.gated;
+        let heads = qkv.query().n() / head_dim / if gated { 2 } else { 1 };
         let kv_heads = qkv.key().n() / head_dim;
         let parallel = if split.size == 1 {
             Parallel::None
@@ -208,11 +233,21 @@ impl QkvAttention {
                 })?)
             }
         };
+        let gate = if gated {
+            Some(GatedActivation::new(
+                Activation::Sigmoid,
+                Rounding::Fused,
+                GateBias::None,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             qkv,
             qk_norm,
             attention,
             output,
+            gate,
             heads,
             kv_heads,
             head_dim,
@@ -223,6 +258,52 @@ impl QkvAttention {
     /// writes whole row classes).
     pub fn query(&self) -> &Linear {
         self.qkv.query()
+    }
+
+    /// A gated projection `[rows, heads · 2 · head_dim]` as its packed queries
+    /// `[rows, heads, head_dim]`, gathered from the projection, and its gates
+    /// `[rows · heads, head_dim]`, read in place.
+    fn split_gate(
+        &self,
+        f: &Forward,
+        projected: TensorView,
+    ) -> Result<(TensorView, Option<TensorView>)> {
+        let rows = projected.rows();
+        let heads = u64::from(self.heads);
+        let head_dim = u64::from(self.head_dim);
+        let dtype = projected.dtype;
+        // A head's query and gate sit side by side: the halves are two views of one head stride.
+        let half = |offset: u64| {
+            TensorView::with_strides(
+                projected.offset_elements(offset),
+                dtype,
+                Shape::new(&[1, rows, heads, head_dim]),
+                ops::Strides::new(&[
+                    rows * heads * 2 * head_dim,
+                    heads * 2 * head_dim,
+                    2 * head_dim,
+                    1,
+                ]),
+            )
+        };
+        let query = f
+            .arena()
+            .tensor(dtype, Shape::new(&[rows, heads, head_dim]))?;
+        let packed = query.reshape(Shape::new(&[1, rows, heads, head_dim]));
+        let strides = [
+            (rows * heads * head_dim) as i64,
+            (heads * head_dim) as i64,
+            head_dim as i64,
+            1,
+        ];
+        Copy::new(dtype, Access::Vector)?.forward(f, half(0), packed, &strides)?;
+        let gate = TensorView::with_strides(
+            projected.offset_elements(head_dim),
+            dtype,
+            Shape::new(&[rows * heads, head_dim]),
+            ops::Strides::new(&[2 * head_dim, 1]),
+        );
+        Ok((query, Some(gate)))
     }
 
     /// `[rows, count · head_dim]` as `[rows, count, head_dim]`.
@@ -255,7 +336,11 @@ impl QkvAttention {
         let arena = f.arena();
         let mark = arena.mark();
         let dtype = hidden.dtype;
-        let query = self.heads_of(self.qkv.query().apply(f, hidden, dtype)?, self.heads);
+        let projected = self.qkv.query().apply(f, hidden, dtype)?;
+        let (query, gate) = match self.gate {
+            None => (self.heads_of(projected, self.heads), None),
+            Some(_) => self.split_gate(f, projected)?,
+        };
         let key = self.heads_of(self.qkv.key().apply(f, hidden, dtype)?, self.kv_heads);
         let value = self.heads_of(self.qkv.value().apply(f, hidden, dtype)?, self.kv_heads);
 
@@ -356,6 +441,14 @@ impl QkvAttention {
                         .to_owned(),
                 ));
             }
+        }
+        if let (Some(activation), Some(gate)) = (&self.gate, gate) {
+            // Each attended head is scaled by the sigmoid of its own gate, in place.
+            let rows = attended.reshape(Shape::new(&[
+                attended.shape.dim(0) * u64::from(self.heads),
+                u64::from(self.head_dim),
+            ]));
+            activation.forward(f, Halves::Split { gate, value: rows }, rows)?;
         }
         // Row parallel: the projection sums each rank's partial output over the head split.
         let flat = Shape::new(&[

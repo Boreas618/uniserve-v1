@@ -1,14 +1,16 @@
 //! The Qwen3 decoder layer and the stack of them, which every Qwen3 model composes.
 //!
 //! The layer is Hugging Face's `Qwen3DecoderLayer` (and `Qwen3MoeDecoderLayer`, which differs only
-//! in its feed-forward block), under vLLM's residual contract:
+//! in its feed-forward block, and `Qwen3_5MoeDecoderLayer`, which differs in its token mixer and
+//! its shared expert), under vLLM's residual contract:
 //!
 //! ```text
 //! residual None:     residual = hidden;            hidden = input_layernorm(hidden)
 //! residual Some(r):  hidden, residual = add_rms_norm(hidden, r, input_layernorm)
-//! attention:         hidden = self_attn(hidden)     (q/k RMSNorm fused into the rotation)
+//! mixer:             hidden = self_attn(hidden)     (q/k RMSNorm fused into the rotation)
+//!                 or hidden = linear_attn(hidden)   (a gated delta network over the slot's state)
 //!                    hidden, residual = add_rms_norm(hidden, residual, post_attention_layernorm)
-//! feed-forward:      hidden = mlp(hidden)           (gated MLP or routed experts)
+//! feed-forward:      hidden = mlp(hidden)           (gated MLP, or routed experts and a shared one)
 //! ```
 //!
 //! A layer returns its update unsummed with the residual stream, and the addition is fused into
@@ -22,6 +24,8 @@
 //!
 //! - the attention: paged over the prefix cache for a causal LM, dense over packed sequences for
 //!   an encoder ([`AttentionKind`]);
+//! - per layer, its token mixer ([`MixerSpec`]): attention, or a gated delta network for a hybrid
+//!   stack's linear layers;
 //! - the dense gated product's rounding ([`Rounding`]);
 //! - the rotary spectrum and its precision, which the stack's one [`Rotary`] holds;
 //! - the fence components the deployment's probes name the layer and its sublayers by.
@@ -36,8 +40,8 @@
 use std::ops::Range;
 
 use nn::blocks::{
-    AttentionKind, GateUp, GatedMlp, GatedMlpSpec, Keys, QkNormNames, QkvAttention,
-    QkvAttentionSpec, RopeFactors,
+    AttentionKind, GateUp, GatedDeltaNet, GatedDeltaNetSpec, GatedMlp, GatedMlpSpec, Keys,
+    QkNormNames, QkvAttention, QkvAttentionSpec, RopeFactors, SharedExpert,
 };
 use nn::family::Split;
 use nn::layers::{
@@ -89,17 +93,52 @@ pub struct LayerForm {
 pub enum Mlp {
     /// `down(act(gate(x)) · up(x))`, column parallel in and row parallel out.
     Dense(GatedMlp),
-    /// Routed experts: a replicated router and the grouped products over the local expert set.
-    Experts(Moe),
+    /// Routed experts: a replicated router and the grouped products over the local expert set,
+    /// and the gated shared expert every token also passes through, when the checkpoint has one.
+    Experts {
+        routed: Moe,
+        shared: Option<SharedExpert>,
+    },
+}
+
+/// What a decoder layer mixes its tokens with, as the stack's consumer states it per layer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MixerSpec {
+    /// Softmax attention of the stack's heads, at module `self_attn`.
+    Attention,
+    /// A gated delta network of this geometry, at module `linear_attn`.
+    Linear(GatedDeltaNetSpec),
+}
+
+/// A decoder layer's token mixer.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one mixer per layer, held for the model's lifetime and read on every forward"
+)]
+pub enum Mixer {
+    /// Q/K/V column parallel over the heads, per-head gains fused into the stack's rotation, the
+    /// form's attention, and the row-parallel output projection (`self_attn`).
+    Attention(QkvAttention),
+    /// A gated delta network over the request slots' recurrent state (`linear_attn`).
+    Linear(GatedDeltaNet),
+}
+
+impl Mixer {
+    /// Whether the mixer's projections are read packed, so its update is written in whole row
+    /// classes.
+    fn is_packed(&self) -> bool {
+        match self {
+            Self::Attention(attention) => attention.query().is_packed(),
+            Self::Linear(delta) => delta.output().is_packed(),
+        }
+    }
 }
 
 /// One decoder layer: two pre-norms and the two sublayers between them, named as the checkpoint
 /// names its modules.
 pub struct DecoderLayer {
     pub input_layernorm: RmsNorm,
-    /// Q/K/V column parallel over the heads, per-head gains fused into the stack's rotation, the
-    /// form's attention, and the row-parallel output projection.
-    pub self_attn: QkvAttention,
+    pub mixer: Mixer,
     pub post_attention_layernorm: RmsNorm,
     pub mlp: Mlp,
 }
@@ -128,9 +167,10 @@ pub struct StackBuffers {
 impl DecoderLayer {
     /// The layer the module at `scope` states, at `split`'s rank of its tensor-parallel group.
     ///
-    /// `scale` is the softmax scale the stack's spectrum states for a head; `experts` answers the
-    /// routed block read from the layer's `mlp` scope when the layer routes, and `None` for a dense
-    /// layer. The modules are read in the checkpoint's order: the norms, the attention, the MLP.
+    /// `scale` is the softmax scale the stack's spectrum states for a head; `mixer` is the layer's
+    /// token mixer; `experts` answers the routed block (and its shared expert) read from the
+    /// layer's `mlp` scope when the layer routes, and `None` for a dense layer. The modules are read
+    /// in the checkpoint's order: the norms, the mixer, the MLP.
     ///
     /// # Errors
     ///
@@ -141,7 +181,8 @@ impl DecoderLayer {
         form: &LayerForm,
         scale: f32,
         split: Split,
-        experts: impl FnOnce(&mut Scope<'_, '_>) -> Result<Option<Moe>>,
+        mixer: MixerSpec,
+        experts: impl FnOnce(&mut Scope<'_, '_>) -> Result<Option<Mlp>>,
     ) -> Result<Self> {
         let eps = text.rms_norm_eps;
         let gain = text.rms_norm_gain;
@@ -157,36 +198,19 @@ impl DecoderLayer {
             eps,
             gain,
         )?;
-        let bias = if text.attention_bias {
-            (QkvBias::Present, Bias::Present)
-        } else {
-            (QkvBias::Absent, Bias::Absent)
+        let mixer = match mixer {
+            MixerSpec::Linear(spec) => Mixer::Linear(GatedDeltaNet::load(
+                &mut scope.scope("linear_attn"),
+                spec,
+                split,
+            )?),
+            MixerSpec::Attention => {
+                Mixer::Attention(Self::attention(scope, text, form, scale, split)?)
+            }
         };
-        let self_attn = QkvAttention::load(
-            &mut scope.scope("self_attn"),
-            QkvAttentionSpec {
-                qkv: QkvSpec {
-                    hidden: text.hidden_size,
-                    heads: text.num_attention_heads,
-                    kv_heads: text.num_key_value_heads,
-                    head_dim: text.head_dim,
-                },
-                names: QkvNames::Separate(["q_proj", "k_proj", "v_proj"]),
-                bias: bias.0,
-                output: "o_proj",
-                output_bias: bias.1,
-                qk_norm: QkNormNames::Fused {
-                    query: "q_norm",
-                    key: "k_norm",
-                },
-                kind: form.attention,
-                scale,
-            },
-            split,
-        )?;
         let mut mlp_scope = scope.scope("mlp");
         let mlp = match experts(&mut mlp_scope)? {
-            Some(moe) => Mlp::Experts(moe),
+            Some(mlp) => mlp,
             None => Mlp::Dense(GatedMlp::load(
                 &mut mlp_scope,
                 GatedMlpSpec {
@@ -206,10 +230,48 @@ impl DecoderLayer {
         };
         Ok(Self {
             input_layernorm,
-            self_attn,
+            mixer,
             post_attention_layernorm,
             mlp,
         })
+    }
+
+    /// The layer's attention at `self_attn`: the stack's heads, gated when the configuration says so.
+    fn attention(
+        scope: &mut Scope<'_, '_>,
+        text: &TextConfig,
+        form: &LayerForm,
+        scale: f32,
+        split: Split,
+    ) -> Result<QkvAttention> {
+        let bias = if text.attention_bias {
+            (QkvBias::Present, Bias::Present)
+        } else {
+            (QkvBias::Absent, Bias::Absent)
+        };
+        Ok(QkvAttention::load(
+            &mut scope.scope("self_attn"),
+            QkvAttentionSpec {
+                qkv: QkvSpec {
+                    hidden: text.hidden_size,
+                    heads: text.num_attention_heads,
+                    kv_heads: text.num_key_value_heads,
+                    head_dim: text.head_dim,
+                    gated: text.attn_output_gate,
+                },
+                names: QkvNames::Separate(["q_proj", "k_proj", "v_proj"]),
+                bias: bias.0,
+                output: "o_proj",
+                output_bias: bias.1,
+                qk_norm: QkNormNames::Fused {
+                    query: "q_norm",
+                    key: "k_norm",
+                },
+                kind: form.attention,
+                scale,
+            },
+            split,
+        )?)
     }
 
     /// Run the layer over `input`: normalize (adding the update into the stream when there is
@@ -260,11 +322,29 @@ impl DecoderLayer {
             }
         };
 
-        fence(f, components.attention, index, "self_attn", || {
-            Ok(self
-                .self_attn
-                .forward(f, normalized, Some(rope), keys, update)?)
-        })?;
+        match &self.mixer {
+            Mixer::Attention(attention) => {
+                fence(f, components.attention, index, "self_attn", || {
+                    Ok(attention.forward(f, normalized, Some(rope), keys, update)?)
+                })?
+            }
+            Mixer::Linear(delta) => {
+                let Keys::Recurrent {
+                    batch,
+                    cache,
+                    layer,
+                } = keys
+                else {
+                    return Err(crate::Error::Config(format!(
+                        "decoder layer {index} is a gated delta network and was handed no \
+                         recurrent state"
+                    )));
+                };
+                fence(f, components.attention, index, "linear_attn", || {
+                    Ok(delta.forward(f, normalized, batch, cache.state()?, layer, update)?)
+                })?;
+            }
+        }
 
         self.post_attention_layernorm.forward(
             f,
@@ -280,7 +360,12 @@ impl DecoderLayer {
             // Both blocks sum their tensor-parallel partial outputs themselves: the routed block
             // after its experts, the dense one in its row-parallel down projection.
             match &self.mlp {
-                Mlp::Experts(moe) => moe.forward(f, normalized, update)?,
+                Mlp::Experts { routed, shared } => {
+                    routed.forward(f, normalized, update)?;
+                    if let Some(shared) = shared {
+                        shared.forward(f, normalized, update)?;
+                    }
+                }
                 Mlp::Dense(dense) => dense.forward(f, normalized, update)?,
             }
             Ok(())
@@ -319,9 +404,9 @@ impl DecoderStack {
     /// The decoder layers `layers` of the checkpoint module at `scope` (`<scope>.layers.<i>`), with
     /// the stack's rotary (`<scope>.rotary_emb`), at `split`'s rank of the tensor-parallel group.
     ///
-    /// A consumer that truncates the checkpoint's stack loads a prefix of its layers. `experts`
-    /// answers the routed block of a layer that routes, read from the layer's scope, and `None`
-    /// for a dense layer.
+    /// A consumer that truncates the checkpoint's stack loads a prefix of its layers. `mixers`
+    /// states each layer's token mixer; `experts` answers the routed block of a layer that routes,
+    /// read from the layer's scope, and `None` for a dense layer.
     ///
     /// # Errors
     ///
@@ -332,7 +417,8 @@ impl DecoderStack {
         form: LayerForm,
         split: Split,
         layers: Range<u32>,
-        mut experts: impl FnMut(u32, &mut Scope<'_, '_>) -> Result<Option<Moe>>,
+        mixers: impl Fn(u32) -> MixerSpec,
+        mut experts: impl FnMut(u32, &mut Scope<'_, '_>) -> Result<Option<Mlp>>,
     ) -> Result<Self> {
         if layers.is_empty() || layers.end > text.num_hidden_layers {
             return Err(crate::Error::Config(format!(
@@ -365,6 +451,7 @@ impl DecoderStack {
                     &form,
                     scale,
                     split,
+                    mixers(layer),
                     |mlp| experts(layer, mlp),
                 )
             })
@@ -424,7 +511,7 @@ impl DecoderStack {
         let packed = self
             .layers
             .first()
-            .is_some_and(|layer| layer.self_attn.query().is_packed());
+            .is_some_and(|layer| layer.mixer.is_packed());
         let held = if packed {
             let counted = u32::try_from(tokens)
                 .map_err(|_| crate::Error::Config(format!("{tokens} activation rows")))?;

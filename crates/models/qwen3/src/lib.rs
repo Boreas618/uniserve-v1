@@ -19,11 +19,15 @@
 pub mod config;
 pub mod decoder;
 pub mod family;
+pub mod hybrid;
 pub mod moe;
 pub mod processor;
 pub mod vl;
 
-pub use config::{MoeConfig, TextConfig, VisionConfig, VlConfig};
+pub use config::{
+    HybridConfig, LinearAttentionConfig, Mixer, MoeConfig, MtpConfig, TextConfig, VisionConfig,
+    VlConfig,
+};
 pub use decoder::{DecoderLayer, DecoderStack};
 
 /// What this crate can fail with.

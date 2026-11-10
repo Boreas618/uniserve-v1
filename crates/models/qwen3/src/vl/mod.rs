@@ -38,7 +38,7 @@ use nn::weights::WeightLoader;
 use nn::{DType, Forward, Shape, TensorView};
 
 use crate::config::VlConfig;
-use crate::decoder::{Components, DecoderStack, Hidden, LayerForm};
+use crate::decoder::{Components, DecoderStack, Hidden, LayerForm, MixerSpec};
 use crate::{Error, Result};
 use vision::{BlockRows, ImageTables, Outputs, VisionTower};
 
@@ -226,8 +226,15 @@ impl Qwen3VlModel {
             rounding: Rounding::Fused,
             components,
         };
-        let stack =
-            DecoderStack::load(&mut language, text, form, split, 0..layers, |_, _| Ok(None))?;
+        let stack = DecoderStack::load(
+            &mut language,
+            text,
+            form,
+            split,
+            0..layers,
+            |_| MixerSpec::Attention,
+            |_, _| Ok(None),
+        )?;
         let final_norm = if final_norm {
             Some(RmsNorm::load(
                 &mut language.scope("norm"),

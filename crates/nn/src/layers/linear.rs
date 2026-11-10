@@ -660,6 +660,10 @@ pub struct QkvSpec {
     pub kv_heads: u32,
     /// Width of one head.
     pub head_dim: u32,
+    /// Whether each query head's rows are followed by as many rows of its output gate (Qwen3-Next's
+    /// and Qwen3.5's `attn_output_gate`): the query projection is then twice as wide, a head's
+    /// query and gate side by side in its output row.
+    pub gated: bool,
 }
 
 /// Where a checkpoint stores an attention's three projections.
@@ -740,7 +744,7 @@ impl QkvLinear {
                 rank: split.rank / (split.size / spec.kv_heads),
             }
         };
-        let query_width = spec.heads * spec.head_dim;
+        let query_width = spec.heads * spec.head_dim * if spec.gated { 2 } else { 1 };
         let kv_width = spec.kv_heads * spec.head_dim;
         let parallel = |split: Split| {
             if split.size == 1 {
@@ -775,6 +779,9 @@ impl QkvLinear {
                     value: load(modules[2], kv_width, kv_split)?,
                 })
             }
+            QkvNames::Fused(_) if spec.gated => Err(refuse(
+                "a fused projection holds no output gate beside its queries".to_owned(),
+            )),
             QkvNames::Fused(module) => {
                 let hidden = u64::from(spec.hidden);
                 // The query rows, then the key rows, then the value rows; each split's block is its

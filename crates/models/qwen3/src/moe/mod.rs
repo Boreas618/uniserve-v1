@@ -141,7 +141,7 @@ impl Qwen3Moe {
 impl CausalLm for Qwen3Moe {
     fn join_expert_step(&self, f: &Forward) -> nn::Result<()> {
         for layer in self.stack.layers() {
-            if let Mlp::Experts(moe) = &layer.mlp {
+            if let Mlp::Experts { routed: moe, .. } = &layer.mlp {
                 // A layer's scratch is dead once its launches are enqueued, as in a forward.
                 let mark = f.arena().mark();
                 moe.join_expert_step(f)?;

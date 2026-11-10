@@ -12,6 +12,7 @@
 
 mod adaln;
 mod attention;
+mod delta_net;
 mod mlp;
 mod prenorm;
 
@@ -19,5 +20,6 @@ pub use adaln::{AdaLnBlock, AdaLnOut, AdaLnSpec, ModulationTable, Stage};
 pub use attention::{
     AttentionKind, Keys, QkNormNames, QkvAttention, QkvAttentionSpec, RopeFactors,
 };
-pub use mlp::{GateUp, GatedMlp, GatedMlpSpec};
+pub use delta_net::{GatedDeltaNet, GatedDeltaNetSpec};
+pub use mlp::{GateUp, GatedMlp, GatedMlpSpec, SharedExpert, SharedExpertSpec};
 pub use prenorm::{Pending, PreNormBlock, PreNormSpec, ResidualForm};

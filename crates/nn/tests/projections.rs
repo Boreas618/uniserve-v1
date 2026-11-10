@@ -210,6 +210,7 @@ fn a_projection_of_separate_or_fused_modules_reads_each_head_window() {
         heads: 4,
         kv_heads: 2,
         head_dim: 2,
+        gated: false,
     };
     let mut store = Store::default();
     let load = |store: &mut Store, module: &str, names, bias, split| {
@@ -544,6 +545,7 @@ fn a_routed_block_loads_its_window_and_reduces_its_split() {
         up: "up_proj",
         gate: "gate_proj",
         down: "down_proj",
+        stacked: None,
     };
     let mut loader = WeightLoader::meta(&checkpoint, None, None);
     let map = loader

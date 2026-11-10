@@ -32,6 +32,7 @@ mod noise;
 mod norm;
 mod pool;
 mod posterior;
+mod recurrent;
 mod residual;
 mod rope;
 mod rows;
@@ -54,13 +55,20 @@ pub use linear::{
     Bias, ENCODE_CHUNK, Linear, MergedColumnLinear, Parallel, QkvBias, QkvLinear, QkvNames,
     QkvSpec, encode_block,
 };
-pub use moe::{DispatchViews, ExpertNames, ExpertSlots, Moe, MoeSpec, WEIGHT_SCALE_LAYOUT};
+pub use moe::{
+    DispatchViews, ExpertNames, ExpertSlots, Moe, MoeSpec, StackedExperts, WEIGHT_SCALE_LAYOUT,
+};
 pub use noise::{Key as NoiseKey, Noise};
-pub use norm::{Epilogue, Gain, GroupNorm, LayerNorm, Modulation, ResidualStream, RmsNorm};
+pub use norm::{
+    Epilogue, Gain, GatedRmsNorm, GroupNorm, LayerNorm, Modulation, ResidualStream, RmsNorm,
+};
 pub use ops::activation::Activation;
 pub use ops::gemm::WeightOrder;
 pub use pool::AdaptiveAvgPool2d;
 pub use posterior::Posterior;
+pub use recurrent::{
+    CausalConv1d, CausalConv1dSpec, DELTA_RULE_CHUNK, GatedDeltaRule, GatedDeltaRuleSpec,
+};
 pub use residual::{Axpby, Cast, Residual, Scale};
 pub use rope::{
     Gains, Normalization, Precision, QkNorm, Rotary, RotarySpec, Sections, Spectrum, Yarn,

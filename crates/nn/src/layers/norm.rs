@@ -463,6 +463,60 @@ impl RmsNorm {
     }
 }
 
+/// RMS normalization gated by the SiLU of a second input:
+/// `out = x · rsqrt(mean(x²) + eps) · weight · silu(gate)`, the output norm of a gated delta network.
+///
+/// The row is normalized before it is gated, in FP32, and rounds once (`gated_rms_norm`).
+pub struct GatedRmsNorm {
+    weight: Weight,
+    eps: f32,
+    columns: u32,
+}
+
+impl GatedRmsNorm {
+    /// The module at `scope`: its `weight` of `width` channels, with variance floor `eps`.
+    ///
+    /// # Errors
+    ///
+    /// When the checkpoint lacks the weight or holds another width.
+    pub fn load(scope: &mut Scope<'_, '_>, width: u32, eps: f32) -> Result<Self> {
+        let weight = scope.tensor("weight", &[u64::from(width)])?;
+        Ok(Self {
+            weight,
+            eps,
+            columns: width,
+        })
+    }
+
+    /// Normalize `x [rows, columns]`, gated by `gate [rows, columns]`, into `out`.
+    ///
+    /// # Errors
+    ///
+    /// What the operator refuses.
+    pub fn forward(
+        &self,
+        f: &Forward,
+        x: TensorView,
+        gate: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        f.operate::<norm::GatedRmsNorm>(
+            &norm::GatedRmsNormDescriptor {
+                dtype: x.dtype,
+                columns: self.columns,
+                tile: row_tile(self.columns),
+            },
+            norm::GatedRmsNormArgs {
+                x,
+                gate,
+                weight: self.weight.view(),
+                out,
+                eps: self.eps,
+            },
+        )
+    }
+}
+
 /// Layer normalization with a per-channel scale and an optional bias:
 /// `norm(s) = (s − mean(s)) · rsqrt(var(s) + eps) · weight + bias`.
 pub struct LayerNorm {

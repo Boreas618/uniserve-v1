@@ -21,7 +21,7 @@ use nn::weights::WeightLoader;
 
 use super::{COMPONENTS, Qwen3Moe};
 use crate::config::MoeConfig;
-use crate::decoder::{DecoderStack, LayerForm};
+use crate::decoder::{DecoderStack, LayerForm, MixerSpec, Mlp};
 use crate::{Error, Result};
 
 /// The module names a Qwen3-MoE checkpoint states a routed block under: `mlp.gate` routes, and
@@ -32,6 +32,7 @@ const EXPERT_NAMES: ExpertNames<'static> = ExpertNames {
     up: "up_proj",
     gate: "gate_proj",
     down: "down_proj",
+    stacked: None,
 };
 
 /// The path an [`ExpertOrder`] names the routed experts of decoder layer `layer` by:
@@ -42,9 +43,16 @@ pub fn expert_module(layer: u32) -> String {
 
 /// The [`expert_module`] of every routed layer of `config`, in layer order.
 pub fn expert_modules(config: &MoeConfig) -> Vec<String> {
+    routed_layers(config)
+        .into_iter()
+        .map(expert_module)
+        .collect()
+}
+
+/// The routed layers of `config`, in layer order.
+fn routed_layers(config: &MoeConfig) -> Vec<u32> {
     (0..config.text.num_hidden_layers)
         .filter(|&layer| config.sparse(layer))
-        .map(expert_module)
         .collect()
 }
 
@@ -103,7 +111,12 @@ pub fn load(
         text.rms_norm_gain,
     )?;
 
-    let (slots, slot_table) = expert_slots(config, order, loader)?;
+    let (slots, slot_table) = expert_slots(
+        config.num_experts,
+        &routed_layers(config),
+        order,
+        loader.scope("model"),
+    )?;
     let form = LayerForm {
         attention: AttentionKind::Paged {
             max_kv_len: text.max_position_embeddings,
@@ -119,23 +132,13 @@ pub fn load(
         form,
         tensor,
         0..text.num_hidden_layers,
+        |_| MixerSpec::Attention,
         |layer, scope| {
             if !config.sparse(layer) {
                 return Ok(None);
             }
-            let Some((table, routed)) = &slot_table else {
-                return Err(Error::Config(format!(
-                    "layer {layer} routes and no routed layer has a table"
-                )));
-            };
-            let row = routed
-                .iter()
-                .position(|routed| *routed == layer)
-                .ok_or_else(|| {
-                    Error::Config(format!("layer {layer} has no row of the expert table"))
-                })?;
-            let map = table.row(as_u64(row, "an expert table row")?)?;
-            Ok(Some(Moe::load(
+            let map = slot_map(&slot_table, layer)?;
+            let routed = Moe::load(
                 scope,
                 MoeSpec {
                     experts: config.num_experts,
@@ -152,7 +155,11 @@ pub fn load(
                 },
                 tensor,
                 experts,
-            )?))
+            )?;
+            Ok(Some(Mlp::Experts {
+                routed,
+                shared: None,
+            }))
         },
     )?;
 
@@ -169,7 +176,7 @@ pub fn load(
 }
 
 /// A count as an element count.
-fn as_u64(count: impl TryInto<u64>, what: &str) -> Result<u64> {
+pub(crate) fn as_u64(count: impl TryInto<u64>, what: &str) -> Result<u64> {
     count
         .try_into()
         .map_err(|_| Error::Config(format!("{what} does not fit an element count")))
@@ -192,23 +199,21 @@ fn slot_row(module: &str, order: &[u32], experts: usize) -> Result<Vec<u32>> {
 
 /// Each routed layer's logical experts in slot order, keyed by layer index, and the published slot
 /// table with the routed layers whose rows it holds, in row order (`None` without a routed layer).
-type SlotTable = (HashMap<u32, Vec<u32>>, Option<(nn::Weight, Vec<u32>)>);
+pub(crate) type SlotTable = (HashMap<u32, Vec<u32>>, Option<(nn::Weight, Vec<u32>)>);
 
-/// The experts of each routed layer in slot order, checked, with the table a route reads its slot
-/// from: `[routed layers, experts]` i32, row by row in layer order.
+/// The experts of each routed layer of `layers` in slot order, checked, with the table a route
+/// reads its slot from: `[routed layers, experts]` i32, row by row in layer order, published as
+/// `expert_slots` under `scope`.
 ///
 /// Every layer's row is one weight's row, because a retained weight takes a whole allocation
 /// granule: one table per layer would hold 2 MiB each for 512 bytes of content.
-fn expert_slots(
-    config: &MoeConfig,
+pub(crate) fn expert_slots(
+    experts: u32,
+    layers: &[u32],
     order: &ExpertOrder,
-    loader: &mut WeightLoader<'_>,
+    mut scope: nn::weights::Scope<'_, '_>,
 ) -> Result<SlotTable> {
-    let experts = config.num_experts;
-    let layers: Vec<u32> = (0..config.text.num_hidden_layers)
-        .filter(|&layer| config.sparse(layer))
-        .collect();
-    let modules = expert_modules(config);
+    let modules: Vec<String> = layers.iter().copied().map(expert_module).collect();
     for module in order.keys() {
         if !modules.contains(module) {
             return Err(Error::Config(format!(
@@ -218,7 +223,7 @@ fn expert_slots(
     }
     let mut slots = HashMap::with_capacity(layers.len());
     let mut table = Vec::with_capacity(layers.len() * experts as usize);
-    for &layer in &layers {
+    for &layer in layers {
         let module = expert_module(layer);
         let order: Vec<u32> = match order.get(&module) {
             Some(order) => order.clone(),
@@ -236,7 +241,7 @@ fn expert_slots(
     if layers.is_empty() {
         return Ok((slots, None));
     }
-    let weight = loader.scope("model").constant_i32(
+    let weight = scope.constant_i32(
         "expert_slots",
         &[
             as_u64(layers.len(), "the routed layers")?,
@@ -244,7 +249,24 @@ fn expert_slots(
         ],
         &table,
     )?;
-    Ok((slots, Some((weight, layers))))
+    Ok((slots, Some((weight, layers.to_vec()))))
+}
+
+/// The row of the published slot table routed layer `layer` reads its slots from.
+pub(crate) fn slot_map(
+    slot_table: &Option<(nn::Weight, Vec<u32>)>,
+    layer: u32,
+) -> Result<nn::Weight> {
+    let Some((table, routed)) = slot_table else {
+        return Err(Error::Config(format!(
+            "layer {layer} routes and no routed layer has a table"
+        )));
+    };
+    let row = routed
+        .iter()
+        .position(|routed| *routed == layer)
+        .ok_or_else(|| Error::Config(format!("layer {layer} has no row of the expert table")))?;
+    Ok(table.row(as_u64(row, "an expert table row")?)?)
 }
 
 #[cfg(test)]

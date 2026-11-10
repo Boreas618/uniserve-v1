@@ -418,6 +418,7 @@ impl Block {
                     heads: config.num_heads,
                     kv_heads: config.num_heads,
                     head_dim,
+                    gated: false,
                 },
                 names: QkvNames::Fused("qkv"),
                 bias: QkvBias::Present,

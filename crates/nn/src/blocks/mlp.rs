@@ -157,3 +157,83 @@ impl GatedMlp {
         Ok(out)
     }
 }
+
+/// The module names of a [`SharedExpert`]: its gated MLP's and its gate's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SharedExpertSpec<'n> {
+    /// The shared expert's gated MLP, at the module `mlp`.
+    pub mlp: GatedMlpSpec<'n>,
+    /// The module holding the MLP.
+    pub module: &'n str,
+    /// The module of the `[1, hidden]` gate projection beside it.
+    pub gate: &'n str,
+}
+
+/// A shared expert beside a routed block: a gated MLP every token passes through, its output
+/// scaled by the sigmoid of a per-token gate and added into the routed output (Qwen2-MoE,
+/// Qwen3-Next, Qwen3.5):
+///
+/// ```text
+/// out ← out + sigmoid(gate · x) · mlp(x)
+/// ```
+pub struct SharedExpert {
+    mlp: GatedMlp,
+    gate: Linear,
+    hidden: u32,
+}
+
+impl SharedExpert {
+    /// The shared expert the modules under `scope` state, at `split`'s rank. The gate is
+    /// replicated: one logit per token.
+    ///
+    /// # Errors
+    ///
+    /// A module the loader refuses or a split the MLP refuses.
+    pub fn load(
+        scope: &mut Scope<'_, '_>,
+        spec: SharedExpertSpec<'_>,
+        split: Split,
+    ) -> Result<Self> {
+        let mlp = GatedMlp::load(&mut scope.scope(spec.module), spec.mlp, split)?;
+        let gate = Linear::load(
+            &mut scope.scope(spec.gate),
+            spec.mlp.hidden,
+            1,
+            Bias::Absent,
+            Parallel::None,
+        )?;
+        Ok(Self {
+            mlp,
+            gate,
+            hidden: spec.mlp.hidden,
+        })
+    }
+
+    /// Add the shared expert's gated output of `x [rows, hidden]` into `out [rows, hidden]`.
+    ///
+    /// # Errors
+    ///
+    /// A view a layer refuses, or an arena that cannot hold the intermediates.
+    pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
+        use ops::residual::{SigmoidGatedAdd, SigmoidGatedAddArgs, SigmoidGatedAddDescriptor};
+
+        let arena = f.arena();
+        let mark = arena.mark();
+        let update = self.mlp.apply(f, x)?;
+        let gate = self.gate.apply(f, x, x.dtype)?;
+        f.operate::<SigmoidGatedAdd>(
+            &SigmoidGatedAddDescriptor {
+                dtype: out.dtype,
+                columns: self.hidden,
+                block: crate::layers::launch::row_tile(self.hidden).min(1024),
+            },
+            SigmoidGatedAddArgs {
+                target: out,
+                update,
+                gate,
+            },
+        )?;
+        arena.release(mark);
+        Ok(())
+    }
+}

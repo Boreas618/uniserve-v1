@@ -25,7 +25,8 @@ pub struct TextConfig {
     pub vocab_size: u32,
     /// Hidden width of the residual stream.
     pub hidden_size: u32,
-    /// Width of a dense layer's gated MLP.
+    /// Width of a dense layer's gated MLP; zero for a stack whose every layer routes and that states
+    /// none (Qwen3.5-MoE).
     pub intermediate_size: u32,
     /// Depth of the decoder stack the checkpoint holds.
     pub num_hidden_layers: u32,
@@ -42,12 +43,16 @@ pub struct TextConfig {
     /// How those norms' stored weights scale: Qwen3 and Qwen3-VL store the scale, Qwen3.5 stores it
     /// zero-centred (`x̂ · (1 + w)`).
     pub rms_norm_gain: Gain,
-    /// The rotary spectrum over every channel of a head.
+    /// The rotary spectrum over a head's leading channels: every channel for Qwen3 and Qwen3-VL,
+    /// the `partial_rotary_factor` of them for Qwen3.5.
     pub rope: Spectrum,
     /// The context length the checkpoint was trained for.
     pub max_position_embeddings: u32,
     /// Whether the Q/K/V and output projections carry a bias.
     pub attention_bias: bool,
+    /// Whether each query head projects a gate of its width beside it, whose sigmoid scales the
+    /// attended head (Qwen3.5's `attn_output_gate`).
+    pub attn_output_gate: bool,
     /// Whether the vocabulary head shares the embedding matrix.
     pub tie_word_embeddings: bool,
 }
@@ -65,6 +70,29 @@ impl TextConfig {
     /// A field of the wrong type or outside its domain, sliding-window attention, a head count
     /// the key/value heads do not divide, or a rotary recipe that is not served.
     pub fn parse(fields: &Fields<'_>, precision: Precision) -> Result<Self> {
+        if let Some(kinds) = fields.optional_texts("layer_types")?
+            && kinds.iter().any(|kind| *kind != "full_attention")
+        {
+            return Err(Error::Config(
+                "layer_types other than full_attention are not supported".to_owned(),
+            ));
+        }
+        Self::read(
+            fields,
+            fields.count("intermediate_size")?,
+            |head_dim, max_position_embeddings| {
+                spectrum(fields, head_dim, max_position_embeddings, precision)
+            },
+        )
+    }
+
+    /// The fields every Qwen3 decoder stack states, with the dense MLP's width `intermediate_size`
+    /// and the spectrum `rope` reads for a head width and a context length.
+    fn read(
+        fields: &Fields<'_>,
+        intermediate_size: u32,
+        rope: impl FnOnce(u32, u32) -> Result<Spectrum>,
+    ) -> Result<Self> {
         let hidden_size = fields.count("hidden_size")?;
         let num_attention_heads = fields.count("num_attention_heads")?;
 
@@ -89,14 +117,6 @@ impl TextConfig {
                 "sliding-window attention is not supported".to_owned(),
             ));
         }
-        if let Some(kinds) = fields.optional_texts("layer_types")?
-            && kinds.iter().any(|kind| *kind != "full_attention")
-        {
-            return Err(Error::Config(
-                "layer_types other than full_attention are not supported".to_owned(),
-            ));
-        }
-
         let num_key_value_heads = fields.count("num_key_value_heads")?;
         if !num_attention_heads.is_multiple_of(num_key_value_heads) {
             return Err(Error::Config(
@@ -112,12 +132,12 @@ impl TextConfig {
         let max_position_embeddings = fields
             .optional_count("max_position_embeddings")?
             .unwrap_or(32768);
-        let rope = spectrum(fields, head_dim, max_position_embeddings, precision)?;
+        let rope = rope(head_dim, max_position_embeddings)?;
 
         Ok(Self {
             vocab_size: fields.count("vocab_size")?,
             hidden_size,
-            intermediate_size: fields.count("intermediate_size")?,
+            intermediate_size,
             num_hidden_layers: fields.count("num_hidden_layers")?,
             num_attention_heads,
             num_key_value_heads,
@@ -132,6 +152,7 @@ impl TextConfig {
             rope,
             max_position_embeddings,
             attention_bias: fields.optional_flag("attention_bias")?.unwrap_or(false),
+            attn_output_gate: false,
             tie_word_embeddings: fields
                 .optional_flag("tie_word_embeddings")?
                 .unwrap_or(false),
@@ -274,25 +295,7 @@ impl MoeConfig {
             ));
         }
 
-        // Transformers serializes the expert count as `num_local_experts` in newer releases; a
-        // checkpoint carrying both must agree.
-        let experts = fields
-            .alias(&["num_experts", "num_local_experts"])?
-            .ok_or_else(|| {
-                Error::Config("Qwen3MoeForCausalLM checkpoint declares no expert count".to_owned())
-            })?;
-        let experts = fields.index(experts)?;
-        if experts == 0 {
-            return Err(Error::Config(
-                "Qwen3MoeForCausalLM checkpoint declares no experts".to_owned(),
-            ));
-        }
-        let num_experts_per_tok = fields.optional_count("num_experts_per_tok")?.unwrap_or(8);
-        if num_experts_per_tok > experts {
-            return Err(Error::Config(
-                "num_experts_per_tok must not exceed num_experts".to_owned(),
-            ));
-        }
+        let (experts, num_experts_per_tok) = routed_experts(fields, "Qwen3MoeForCausalLM")?;
         let moe_intermediate_size = fields
             .optional_count("moe_intermediate_size")?
             .unwrap_or(768);
@@ -358,6 +361,30 @@ impl MoeConfig {
     }
 }
 
+/// The routed experts a mixture-of-experts text configuration states: the expert count and the
+/// experts each token is routed to.
+///
+/// Transformers serializes the expert count as `num_local_experts` in newer releases; a checkpoint
+/// carrying both must agree.
+fn routed_experts(fields: &Fields<'_>, class: &str) -> Result<(u32, u32)> {
+    let experts = fields
+        .alias(&["num_experts", "num_local_experts"])?
+        .ok_or_else(|| Error::Config(format!("{class} checkpoint declares no expert count")))?;
+    let experts = fields.index(experts)?;
+    if experts == 0 {
+        return Err(Error::Config(format!(
+            "{class} checkpoint declares no experts"
+        )));
+    }
+    let num_experts_per_tok = fields.optional_count("num_experts_per_tok")?.unwrap_or(8);
+    if num_experts_per_tok > experts {
+        return Err(Error::Config(
+            "num_experts_per_tok must not exceed num_experts".to_owned(),
+        ));
+    }
+    Ok((experts, num_experts_per_tok))
+}
+
 /// The dimensions of the Qwen3-VL vision encoder and its token mergers.
 ///
 /// Pixels arrive as tubelets of `in_channels x temporal_patch_size x patch_size x patch_size`
@@ -412,7 +439,12 @@ impl VisionConfig {
         let depth = values.count("depth")?;
         // The DeepStack mergers join the language model after the blocks their indexes name, so an
         // index outside the tower, or two out of order, is refused here.
-        let deepstack_visual_indexes = values.indices("deepstack_visual_indexes")?;
+        // Qwen3.5's tower states an empty list: no block feeds a DeepStack merger.
+        let deepstack_visual_indexes = values
+            .optional_indices("deepstack_visual_indexes")?
+            .ok_or_else(|| {
+                Error::Config(format!("{owner}.deepstack_visual_indexes is required"))
+            })?;
         if deepstack_visual_indexes
             .windows(2)
             .any(|pair| pair[0] >= pair[1])
@@ -532,6 +564,357 @@ impl VlConfig {
         }
         Ok(config)
     }
+}
+
+/// The token mixer of one decoder layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mixer {
+    /// Softmax attention over the key/value cache (`full_attention`).
+    Attention,
+    /// A gated delta network whose state a request slot keeps (`linear_attention`).
+    Linear,
+}
+
+/// The gated delta networks of a hybrid stack: Hugging Face's `linear_*` fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinearAttentionConfig {
+    /// Query and key heads.
+    pub num_key_heads: u32,
+    /// Value heads, each with its own state; a multiple of the key heads.
+    pub num_value_heads: u32,
+    /// Elements of a query or key head.
+    pub key_head_dim: u32,
+    /// Elements of a value head.
+    pub value_head_dim: u32,
+    /// Taps of the short convolution.
+    pub conv_kernel_dim: u32,
+}
+
+/// The multi-token-prediction layers a checkpoint carries for speculative drafting (`mtp.*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MtpConfig {
+    /// Decoder layers of the drafter.
+    pub num_hidden_layers: u32,
+    /// Whether the drafter embeds with a table of its own rather than the model's.
+    pub use_dedicated_embeddings: bool,
+}
+
+/// A `Qwen3_5MoeForConditionalGeneration` checkpoint's configuration (Qwen3.5-MoE and Qwen3.6, for
+/// example Qwen3.6-35B-A3B): a hybrid decoder stack of gated delta networks and gated full
+/// attention, every layer routed with a gated shared expert, its multi-token-prediction layers, its
+/// vision tower and the placeholder tokens a prompt presents media by.
+///
+/// The text model normalizes with zero-centred RMS norms (`x̂ · (1 + w)`), rotates the leading
+/// `partial_rotary_factor` of each attention head by interleaved M-RoPE, and gates each attended
+/// head by the sigmoid of a gate projected beside its query.
+#[derive(Clone, PartialEq, Debug)]
+pub struct HybridConfig {
+    /// The decoder stack's shared fields; its attention heads are the full-attention layers'.
+    pub text: TextConfig,
+    /// Each decoder layer's token mixer, in stack order (`layer_types`).
+    pub mixers: Vec<Mixer>,
+    /// The gated delta networks.
+    pub linear: LinearAttentionConfig,
+    /// Routed experts of every layer.
+    pub num_experts: u32,
+    /// Experts each token is routed to; their weights always renormalize to one.
+    pub num_experts_per_tok: u32,
+    /// Hidden width of one routed expert's intermediate projection.
+    pub moe_intermediate_size: u32,
+    /// Hidden width of the shared expert's intermediate projection.
+    pub shared_expert_intermediate_size: u32,
+    /// The drafter's layers.
+    pub mtp: MtpConfig,
+    /// The vision tower.
+    pub vision: VisionConfig,
+    /// The token that stands for one merged image patch.
+    pub image_token_id: u32,
+    /// The token that stands for one merged video patch.
+    pub video_token_id: u32,
+    /// The token that opens a vision span.
+    pub vision_start_token_id: u32,
+    /// The token that closes a vision span.
+    pub vision_end_token_id: u32,
+}
+
+impl HybridConfig {
+    /// The checkpoint class this configuration describes.
+    pub const CLASS: &'static str = "Qwen3_5MoeForConditionalGeneration";
+
+    /// The precision the references compute the rotary spectrum in: FP32, as Hugging Face's
+    /// `compute_default_rope_parameters` and vLLM's rotary embedding do.
+    const PRECISION: Precision = Precision::F32;
+
+    /// The position axes of the language model's M-RoPE: time, height and width.
+    pub const POSITION_AXES: u32 = 3;
+
+    /// Read and validate the checkpoint's `config.json`.
+    ///
+    /// # Errors
+    ///
+    /// A missing file, or what [`Self::parse`] refuses.
+    pub fn open(checkpoint: &nn::Checkpoint) -> Result<Self> {
+        let value = checkpoint.sidecar("config.json")?.ok_or_else(|| {
+            Error::Config(format!(
+                "{} holds no config.json",
+                checkpoint.root().display()
+            ))
+        })?;
+        Self::parse(&Fields::of("config.json", &value)?)
+    }
+
+    /// Validate an already-parsed `config.json`.
+    ///
+    /// # Errors
+    ///
+    /// Another architecture, a field of the wrong type or outside its domain, a layer type other
+    /// than `linear_attention` or `full_attention`, a stack without both kinds' counts consistent,
+    /// a rotary recipe other than interleaved three-axis M-RoPE over the rotated channels, or a
+    /// placeholder outside the vocabulary.
+    pub fn parse(fields: &Fields<'_>) -> Result<Self> {
+        let architectures = fields
+            .optional_texts("architectures")?
+            .ok_or_else(|| Error::Config("checkpoint declares no architectures".to_owned()))?;
+        if architectures != [Self::CLASS] {
+            return Err(Error::Config(format!(
+                "expected exactly one architecture {}, found {architectures:?}",
+                Self::CLASS
+            )));
+        }
+        let values = fields.object("text_config")?;
+        if values.optional_flag("use_sliding_window")?.unwrap_or(false) {
+            return Err(Error::Config(
+                "sliding-window attention is not supported".to_owned(),
+            ));
+        }
+        // Every layer routes: the stack states no dense MLP width.
+        let mut text =
+            TextConfig::read(&values, 0, |head_dim, _| hybrid_spectrum(&values, head_dim))?;
+        text.rms_norm_gain = Gain::Centred;
+        text.attn_output_gate = values.optional_flag("attn_output_gate")?.unwrap_or(true);
+        if text.hidden_act != Activation::Silu {
+            return Err(Error::Config(format!(
+                "the experts of a {} gate with silu, not {}",
+                Self::CLASS,
+                text.hidden_act
+            )));
+        }
+
+        let mixers = mixers(&values, text.num_hidden_layers)?;
+        let linear = LinearAttentionConfig {
+            num_key_heads: values.count("linear_num_key_heads")?,
+            num_value_heads: values.count("linear_num_value_heads")?,
+            key_head_dim: values.count("linear_key_head_dim")?,
+            value_head_dim: values.count("linear_value_head_dim")?,
+            conv_kernel_dim: values.count("linear_conv_kernel_dim")?,
+        };
+        if !linear.num_value_heads.is_multiple_of(linear.num_key_heads) {
+            return Err(Error::Config(format!(
+                "{} linear value heads do not group over {} key heads",
+                linear.num_value_heads, linear.num_key_heads
+            )));
+        }
+        if linear.conv_kernel_dim < 2 {
+            return Err(Error::Config(
+                "a short convolution of fewer than two taps keeps no state".to_owned(),
+            ));
+        }
+        // The state is FP32 in every reference; a checkpoint that asks for another is refused
+        // rather than silently computed in FP32.
+        if let Some(dtype) = values.optional_text("mamba_ssm_dtype")?
+            && dtype != "float32"
+        {
+            return Err(Error::Config(format!(
+                "a recurrent state of {dtype} is not served; the state is float32"
+            )));
+        }
+
+        let (num_experts, num_experts_per_tok) = routed_experts(&values, Self::CLASS)?;
+        let mtp = MtpConfig {
+            num_hidden_layers: values.optional_index("mtp_num_hidden_layers")?.unwrap_or(0),
+            use_dedicated_embeddings: values
+                .optional_flag("mtp_use_dedicated_embeddings")?
+                .unwrap_or(false),
+        };
+        let config = Self {
+            mixers,
+            linear,
+            num_experts,
+            num_experts_per_tok,
+            moe_intermediate_size: values.count("moe_intermediate_size")?,
+            shared_expert_intermediate_size: values.count("shared_expert_intermediate_size")?,
+            mtp,
+            vision: VisionConfig::parse(&fields.object("vision_config")?)?,
+            image_token_id: fields.index("image_token_id")?,
+            video_token_id: fields.index("video_token_id")?,
+            vision_start_token_id: fields.index("vision_start_token_id")?,
+            vision_end_token_id: fields.index("vision_end_token_id")?,
+            text,
+        };
+        for token in [
+            config.image_token_id,
+            config.video_token_id,
+            config.vision_start_token_id,
+            config.vision_end_token_id,
+        ] {
+            if token >= config.text.vocab_size {
+                return Err(Error::Config(format!(
+                    "vision token {token} is outside the {} entry vocabulary",
+                    config.text.vocab_size
+                )));
+            }
+        }
+        if config.vision.out_hidden_size != config.text.hidden_size {
+            return Err(Error::Config(format!(
+                "vision tokens are {} wide and the language model {}",
+                config.vision.out_hidden_size, config.text.hidden_size
+            )));
+        }
+        Ok(config)
+    }
+
+    /// The decoder layers whose mixer is `mixer`, in stack order.
+    pub fn layers_of(&self, mixer: Mixer) -> impl Iterator<Item = u32> + '_ {
+        (0..self.text.num_hidden_layers).filter(move |layer| self.mixers[*layer as usize] == mixer)
+    }
+
+    /// The ordinal of `layer` among the layers of its own mixer: its index into the key/value cache
+    /// for an attention layer, into the recurrent state for a linear one.
+    pub fn ordinal(&self, layer: u32) -> u32 {
+        let mixer = self.mixers[layer as usize];
+        self.mixers[..layer as usize]
+            .iter()
+            .filter(|kind| **kind == mixer)
+            .count() as u32
+    }
+
+    /// Check a deployment's tensor and expert splits against the model.
+    ///
+    /// # Errors
+    ///
+    /// A split that does not divide the attention heads or the experts, or a rank outside its
+    /// split.
+    pub fn check_splits(&self, tensor: Split, experts: Split) -> Result<()> {
+        self.text.local_heads(tensor)?;
+        if experts.size == 0 || experts.rank >= experts.size {
+            return Err(Error::Config(format!(
+                "expert rank {} of a group of {}",
+                experts.rank, experts.size
+            )));
+        }
+        if !self.num_experts.is_multiple_of(experts.size) {
+            return Err(Error::Config(format!(
+                "expert parallel degree {} does not divide {} experts",
+                experts.size, self.num_experts
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Each decoder layer's mixer, from `layer_types`, or from `full_attention_interval` (every
+/// interval-th layer attends) when the list is absent; a checkpoint stating both must agree.
+fn mixers(values: &Fields<'_>, layers: u32) -> Result<Vec<Mixer>> {
+    let interval = values.optional_count("full_attention_interval")?;
+    let from_interval = interval.map(|interval| {
+        (0..layers)
+            .map(|layer| {
+                if (layer + 1).is_multiple_of(interval) {
+                    Mixer::Attention
+                } else {
+                    Mixer::Linear
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+    let stated = match values.optional_texts("layer_types")? {
+        Some(kinds) => Some(
+            kinds
+                .iter()
+                .map(|kind| match *kind {
+                    "full_attention" => Ok(Mixer::Attention),
+                    "linear_attention" => Ok(Mixer::Linear),
+                    other => Err(Error::Config(format!(
+                        "layer type {other} is neither full_attention nor linear_attention"
+                    ))),
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        None => None,
+    };
+    let mixers = match (stated, from_interval) {
+        (Some(stated), Some(derived)) if stated != derived => {
+            return Err(Error::Config(
+                "layer_types disagrees with full_attention_interval".to_owned(),
+            ));
+        }
+        (Some(stated), _) => stated,
+        (None, Some(derived)) => derived,
+        (None, None) => {
+            return Err(Error::Config(
+                "a hybrid stack states neither layer_types nor full_attention_interval".to_owned(),
+            ));
+        }
+    };
+    if mixers.len() != layers as usize {
+        return Err(Error::Config(format!(
+            "{} layer types for {layers} layers",
+            mixers.len()
+        )));
+    }
+    Ok(mixers)
+}
+
+/// The spectrum of a hybrid stack's attention heads: interleaved M-RoPE over the leading
+/// `partial_rotary_factor` of a `head_dim`-wide head, from `rope_parameters` (or its older
+/// spelling `rope_scaling` with a top-level `rope_theta` and `partial_rotary_factor`).
+fn hybrid_spectrum(values: &Fields<'_>, head_dim: u32) -> Result<Spectrum> {
+    let parameters = match values.optional_object("rope_parameters")? {
+        Some(parameters) => parameters,
+        None => values.object("rope_scaling")?,
+    };
+    let read = |key: &str| -> Result<f64> {
+        match parameters.optional_number(key)? {
+            Some(value) => Ok(value),
+            None => Ok(values.number(key)?),
+        }
+    };
+    if parameters.optional_text("rope_type")?.unwrap_or("default") != "default"
+        || !parameters.flag("mrope_interleaved")?
+    {
+        return Err(Error::Config(
+            "a hybrid stack rotates by the default recipe with interleaved M-RoPE sections"
+                .to_owned(),
+        ));
+    }
+    let factor = read("partial_rotary_factor")?;
+    let rotated = f64::from(head_dim) * factor;
+    if !(factor > 0.0 && factor <= 1.0)
+        || rotated.fract() != 0.0
+        || !(rotated as u32).is_multiple_of(2)
+    {
+        return Err(Error::Config(format!(
+            "a partial_rotary_factor of {factor} rotates no whole number of pairs of a \
+             {head_dim}-channel head"
+        )));
+    }
+    let dim = rotated as u32;
+    let sections = parameters.indices("mrope_section")?;
+    if sections.len() != HybridConfig::POSITION_AXES as usize
+        || sections.iter().sum::<u32>() != dim / 2
+    {
+        return Err(Error::Config(format!(
+            "M-RoPE sections {sections:?} must split the {dim} rotated channels' {} frequencies \
+             over three axes",
+            dim / 2
+        )));
+    }
+    Ok(Spectrum::Sectioned {
+        theta: read("rope_theta")? as f32,
+        dim,
+        sections: nn::layers::Sections::new(&sections)?,
+        precision: HybridConfig::PRECISION,
+    })
 }
 
 /// A released Qwen3-VL checkpoint's configuration, as this crate's tests read it.

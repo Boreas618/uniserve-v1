@@ -160,6 +160,21 @@ pub struct ExpertNames<'n> {
     pub gate: &'n str,
     /// An expert's down projection.
     pub down: &'n str,
+    /// The stacked tensors a checkpoint may hold its experts in instead of one module per expert,
+    /// when its family writes them so.
+    pub stacked: Option<StackedExperts<'n>>,
+}
+
+/// A routed block's experts as stacked tensors (Hugging Face transformers' fused experts, as
+/// Qwen3.5 checkpoints write them): `<experts>.<gate_up>` is `[experts, 2·intermediate, hidden]`
+/// with each expert's gate rows before its up rows, and `<experts>.<down>` is
+/// `[experts, hidden, intermediate]`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StackedExperts<'n> {
+    /// The stacked gate and up projections.
+    pub gate_up: &'n str,
+    /// The stacked down projections.
+    pub down: &'n str,
 }
 
 /// Where a block's experts sit: the expert each slot holds, and the table a route reads its slot
@@ -736,6 +751,21 @@ impl Moe {
                 exchange,
                 router,
             )?
+        } else if let Some(stacked) = names
+            .stacked
+            .filter(|stacked| experts_scope.contains(stacked.gate_up))
+        {
+            let (up_gate, down) = Self::load_stacked(
+                &mut experts_scope,
+                stacked,
+                window,
+                hidden,
+                intermediate,
+                tensor,
+            )?;
+            Self::dense_block(
+                router, up_gate, down, slots.map, experts, local, offset, spec, exchange,
+            )?
         } else {
             let mut up_gate_parts = Vec::with_capacity(window.len() * 2);
             let mut down_parts = Vec::with_capacity(window.len());
@@ -781,36 +811,113 @@ impl Moe {
                     row_stride: intermediate,
                 },
             ))?;
-            if exchange.size == 1 {
-                Self::new(
-                    router,
-                    up_gate,
-                    down,
-                    Some(slots.map),
-                    local,
-                    spec.top,
-                    spec.activation,
-                    spec.renormalize,
-                    None,
-                )?
-            } else {
-                Self::expert_parallel(
-                    router,
-                    up_gate,
-                    down,
-                    Some(slots.map),
-                    experts,
-                    local,
-                    offset,
-                    spec.top,
-                    spec.activation,
-                    spec.renormalize,
-                    None,
-                )?
-            }
+            Self::dense_block(
+                router, up_gate, down, slots.map, experts, local, offset, spec, exchange,
+            )?
         };
         block.reduce = tensor.size;
         Ok(block)
+    }
+
+    /// The block over dense stacks, on one rank or over an expert group.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the block's parts as `load` resolved them"
+    )]
+    fn dense_block(
+        router: Linear,
+        up_gate: Weight,
+        down: Weight,
+        map: Weight,
+        experts: u32,
+        local: u32,
+        offset: u32,
+        spec: MoeSpec,
+        exchange: Split,
+    ) -> Result<Self> {
+        if exchange.size == 1 {
+            Self::new(
+                router,
+                up_gate,
+                down,
+                Some(map),
+                local,
+                spec.top,
+                spec.activation,
+                spec.renormalize,
+                None,
+            )
+        } else {
+            Self::expert_parallel(
+                router,
+                up_gate,
+                down,
+                Some(map),
+                experts,
+                local,
+                offset,
+                spec.top,
+                spec.activation,
+                spec.renormalize,
+                None,
+            )
+        }
+    }
+
+    /// The dense stacks of `window` read from a checkpoint's stacked expert tensors, in the
+    /// arrangement the products read: each expert's up rows before its gate rows, and the down
+    /// projection's columns of this tensor rank.
+    fn load_stacked(
+        scope: &mut Scope<'_, '_>,
+        stacked: StackedExperts<'_>,
+        window: &[u32],
+        hidden: u64,
+        intermediate: u64,
+        tensor: Split,
+    ) -> Result<(Weight, Weight)> {
+        let path = scope.path().to_owned();
+        let local_intermediate = intermediate / u64::from(tensor.size);
+        let rank = u64::from(tensor.rank);
+        let count = window.len() as u64;
+        let gate_up = scope.name(stacked.gate_up);
+        let down = scope.name(stacked.down);
+        // One expert's slab of the stacked first projection is its gate rows, then its up rows; the
+        // product reads up before gate, each rank its block of both halves.
+        let mut up_gate_parts = Vec::with_capacity(window.len() * 2);
+        let mut down_parts = Vec::with_capacity(window.len());
+        for &expert in window {
+            let slab = u64::from(expert) * 2 * intermediate * hidden;
+            let half = |first_row: u64| PartBlock {
+                start: slab + (first_row + rank * local_intermediate) * hidden,
+                rows: local_intermediate,
+                columns: hidden,
+                row_stride: hidden,
+            };
+            up_gate_parts.push((gate_up.clone(), half(intermediate)));
+            up_gate_parts.push((gate_up.clone(), half(0)));
+            down_parts.push((
+                down.clone(),
+                PartBlock {
+                    start: u64::from(expert) * hidden * intermediate + rank * local_intermediate,
+                    rows: hidden,
+                    columns: local_intermediate,
+                    row_stride: intermediate,
+                },
+            ));
+        }
+        let up_gate = scope.load(WeightRequest::blocks(
+            format!("{path}.up_gate"),
+            up_gate_parts,
+            Shape::new(&[count, 2 * local_intermediate, hidden]),
+            WeightLayout::UP_GATE,
+        ))?;
+        let down = scope.load(WeightRequest::blocks(
+            format!("{path}.down"),
+            down_parts,
+            Shape::new(&[count, hidden, local_intermediate]),
+            WeightLayout::DOWN,
+        ))?;
+        Ok((up_gate, down))
     }
 
     /// The packed experts of `window`, as [`Self::load`] reads a calibrated checkpoint's.
