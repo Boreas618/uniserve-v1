@@ -71,11 +71,13 @@ pub(crate) fn image_digest(id: u64) -> [u8; 32] {
     digest
 }
 
-use ipc::{CallKind, ForwardMode, MediaCall};
+use std::sync::Arc;
+
+use ipc::execution::Batches;
+use ipc::{CallKind, ForwardMode, MainProcessInfo, MediaCall};
 use scheduler::{GenerationFeatures, GenerationLimits};
-use scheduler::{
-    Parameters, PolicyProgram, Scheduler, SchedulerConfig, SimEngine, SpecialTokenIds, Worker,
-};
+use scheduler::{Parameters, PolicyProgram, Scheduler, SchedulerConfig, SpecialTokenIds, Worker};
+use testkit::EndOfText;
 
 /// Builds a scheduler whose model limits follow from `worker`'s call kinds.
 ///
@@ -100,6 +102,100 @@ pub(crate) fn scheduler_with_stating(
     stated: Parameters,
 ) -> anyhow::Result<Scheduler> {
     let info = worker.info().runtime_info()?;
+    build(
+        scheduler::Submissions::new(worker),
+        &info,
+        special_tokens,
+        config,
+        stated,
+    )
+}
+
+/// A scheduler over `batches` through the production submission door
+/// (`Submissions::over_batches`), whose model limits follow from the call
+/// kinds its pools serve as [`scheduler_with`]'s do.
+pub(crate) fn scheduler_over(
+    batches: &Arc<FakeBatches>,
+    config: SchedulerConfig,
+) -> anyhow::Result<Scheduler> {
+    let batches: Arc<dyn Batches> = Arc::clone(batches) as Arc<dyn Batches>;
+    let info = scheduler::WorkerInfo::from_inventory(batches.inventory())?.runtime_info()?;
+    build(
+        scheduler::Submissions::over_batches(batches)?,
+        &info,
+        testkit::special_tokens(),
+        config,
+        Parameters::default(),
+    )
+}
+
+/// [`scheduler_over`] batching at most `max_batch` calls per pass.
+pub(crate) fn scheduler_over_batching(
+    batches: &Arc<FakeBatches>,
+    max_batch: usize,
+) -> anyhow::Result<Scheduler> {
+    scheduler_over(
+        batches,
+        SchedulerConfig {
+            max_batch: proto::config::positive(max_batch),
+            ..Default::default()
+        },
+    )
+}
+
+/// A rank of the scheduler tests' text deployment: every call kind, a buffer
+/// pool and encoder cache large enough for any test's products, up to 1024
+/// calls a batch and two unresolved calls a request slot, and the paged KV
+/// pool of `MainProcessInfo::default` (64-token pages, one unit each).
+pub(crate) fn text_rank() -> MainProcessInfo {
+    MainProcessInfo {
+        supported_calls: CallKind::ALL.to_vec(),
+        buffer_pool_bytes: 257_u64 * (256 << 20),
+        encoder_cache_entries: 256,
+        encoder_entry_bytes: 256 << 20,
+        max_batch_calls: 1024,
+        max_unresolved_calls: 2,
+        transfer_tickets: 1024,
+        ..MainProcessInfo::default()
+    }
+}
+
+/// The longest sequence the tests' text deployment is launched for.
+pub(crate) const TEXT_MAX_MODEL_LEN: u32 = 32_768;
+
+/// A fake worker of one pool named `model` (the pool `testkit::args` launches) of one `rank`, holding `queue_depth`
+/// batches in flight, whose text ends at `end` (never, with `None`).
+pub(crate) fn text_pool(
+    rank: MainProcessInfo,
+    queue_depth: usize,
+    end: Option<EndOfText>,
+) -> FakeBatches {
+    let pool = ipc::execution::Inventory {
+        group: "model".to_owned(),
+        ranks: vec![rank],
+        layout: ipc::execution::PoolLayout {
+            queue_depth,
+            ranks: 1,
+            components: std::collections::BTreeMap::new(),
+        },
+        max_model_len: TEXT_MAX_MODEL_LEN,
+    };
+    let batches = FakeBatches::new(vec![pool]);
+    match end {
+        Some(end) => batches.with_end(end),
+        None => batches,
+    }
+}
+
+/// Builds a scheduler over `submissions` serving a pool whose rank is `info`,
+/// with the model limits its call kinds imply, and installs `fcfs`.
+fn build(
+    submissions: scheduler::Submissions,
+    info: &MainProcessInfo,
+    special_tokens: SpecialTokenIds,
+    config: SchedulerConfig,
+    stated: Parameters,
+) -> anyhow::Result<Scheduler> {
     let calls = &info.supported_calls;
     let decodes = calls.contains(&CallKind::Forward(ForwardMode::Decode));
     let limits = if calls.contains(&CallKind::Forward(ForwardMode::TokenDenoising)) && !decodes {
@@ -118,20 +214,24 @@ pub(crate) fn scheduler_with_stating(
         || calls.contains(&CallKind::Media(MediaCall::VisionEncoding))
         || calls.contains(&CallKind::Media(MediaCall::LatentEncoding))
     {
-        SimEngine::generation_limits()
+        // Model limits of a deployment without a model-imposed bound: the
+        // scheduler clamps them to the worker's capacities.
+        GenerationLimits {
+            max_vae_grid_tokens: u32::MAX,
+            max_vit_grid_tokens: u32::MAX,
+            max_latent_feature_bytes: 256 << 20,
+            max_vision_feature_bytes: 256 << 20,
+            encoder_cache_entries: 256,
+            ..Default::default()
+        }
     } else {
         GenerationLimits {
             features: GenerationFeatures::UNDERSTANDING,
             ..Default::default()
         }
     };
-    let mut scheduler = Scheduler::new(
-        scheduler::Submissions::new(worker),
-        special_tokens,
-        config,
-        limits,
-    )?;
-    install_policy_stating(&mut scheduler, scheduler::BatchCapacity::of(&info), stated);
+    let mut scheduler = Scheduler::new(submissions, special_tokens, config, limits)?;
+    install_policy_stating(&mut scheduler, scheduler::BatchCapacity::of(info), stated);
     Ok(scheduler)
 }
 
@@ -222,23 +322,6 @@ pub(crate) fn install_policy_on(
 
 /// Builds a scheduler that batches at most `max_batch` calls per pass.
 pub(crate) fn scheduler(
-    worker: Box<dyn Worker>,
-    special_tokens: SpecialTokenIds,
-    max_batch: usize,
-) -> anyhow::Result<Scheduler> {
-    scheduler_with(
-        worker,
-        special_tokens,
-        SchedulerConfig {
-            max_batch: proto::config::positive(max_batch),
-            ..Default::default()
-        },
-    )
-}
-
-/// Builds a scheduler that batches at most `max_batch` calls per pass and
-/// orders waiting requests by `policy`.
-pub(crate) fn scheduler_with_depth(
     worker: Box<dyn Worker>,
     special_tokens: SpecialTokenIds,
     max_batch: usize,

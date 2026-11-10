@@ -31,6 +31,8 @@ use ipc::execution::{
 };
 use ipc::philox::DrawAddress;
 
+use crate::text::EndOfText;
+
 /// The first token id a fake samples: every token it samples lies in `SAMPLED..SAMPLED + 5000`, a
 /// window of legal ids that no prompt of the tests uses.
 pub const SAMPLED: u32 = 1000;
@@ -99,6 +101,7 @@ pub struct FakeBatches {
     extent: Extent,
     answer: Option<Answer>,
     media: Option<Media>,
+    end: Option<EndOfText>,
     /// Every batch submitted, in submission order: what the mechanism asked for is half of what a
     /// case observes.
     submitted: Mutex<Vec<Batch>>,
@@ -129,6 +132,7 @@ impl FakeBatches {
             extent: Extent::default(),
             answer: None,
             media: None,
+            end: None,
             submitted: Mutex::new(Vec::new()),
             shadows: Mutex::new(Vec::new()),
             refusal: Mutex::new(None),
@@ -156,6 +160,14 @@ impl FakeBatches {
     #[must_use]
     pub fn with_devices(mut self, devices: usize) -> Self {
         self.devices = devices.max(1);
+        self
+    }
+
+    /// Samples `end.token` for every row whose draw lies at or past `end.position`: a model whose
+    /// text ends there (`crate::text`).
+    #[must_use]
+    pub fn with_end(mut self, end: EndOfText) -> Self {
+        self.end = Some(end);
         self
     }
 
@@ -272,6 +284,14 @@ impl FakeBatches {
             Tokens::Positional => SAMPLED + index as u32,
             Tokens::Extent => SAMPLED + seen % VOCABULARY,
         };
+        let ended = self.end.filter(|end| {
+            batch
+                .columns
+                .draws
+                .get(row)
+                .is_some_and(|draw| draw.position >= end.position)
+        });
+        let token = ended.map_or(token, |end| end.token);
         let state = match self.extent {
             // A text call carries no denoising trajectory: its step index stays at zero.
             Extent::Stated => RowState {
@@ -286,7 +306,17 @@ impl FakeBatches {
             },
         };
 
-        CallOutput::completed(batch.calls[index], vec![token], state)
+        // A causal-LM step reports the raw log-probability of every token it samples, asked for or
+        // not (`CallOutput::token_logprobs`); the scheduler keeps them for the requests that ask.
+        // A row whose logits the mechanism did not ask for (`logits_rows` states -1 for it: a chunk
+        // that ends no prompt) samples nothing, as a device's projection skips it.
+        let samples = rows.logits_rows.get(row).is_none_or(|&logits| logits >= 0);
+        if !samples {
+            return CallOutput::completed(batch.calls[index], Vec::new(), state);
+        }
+        let mut output = CallOutput::completed(batch.calls[index], vec![token], state);
+        output.token_logprobs = vec![crate::text::LOGPROB];
+        output
     }
 
     /// Accepts `batch` and answers its submission: completed now, or held.
