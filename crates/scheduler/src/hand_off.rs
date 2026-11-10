@@ -237,6 +237,13 @@ impl HandOffs {
         Ok(())
     }
 
+    /// Whether a server's answer or a copy's end is awaited: a task's end
+    /// arrives as an event after its answer, on a connection the worker does
+    /// not wait on, so the scheduler parks briefly until every copy ended.
+    pub(crate) fn waiting(&self) -> bool {
+        self.servers.waiting() || !self.copies.is_empty()
+    }
+
     /// Take the servers' answers and events, and the hand-offs that ended.
     pub(crate) fn poll(&mut self) -> Vec<(RequestId, HandOffEnd)> {
         let (events, answers) = self.servers.take();
@@ -440,6 +447,10 @@ impl Scheduler {
                     );
                     state.hand_off = crate::generation::HandOff::Copied;
                     state.phase = crate::generation::GenerationPhase::DecodeUnd;
+                    // The token the prefill group sampled lies in a product of
+                    // its own devices, which the decode group cannot read: the
+                    // first decode there takes the committed token from the host.
+                    state.latest_token = None;
                 }
                 HandOffEnd::Failed(reason) => {
                     state.hand_off = crate::generation::HandOff::None;

@@ -111,7 +111,7 @@ Three backend-name fields are read with `attention_backend` (`FilledPrograms::of
 | `max_num_batched_tokens` | `8192` | Token work admitted in one scheduling step; token models only |
 | `mem_fraction_static` | `0.7` | The deployment's share of each device's storage for weights, static allocations, graph pools and the KV cache, in (0, 1]: the quota `⌊total × fraction⌋` of the GPU's storage ledger, which both epochs of a configuration change and the host's Transfer Server share (`docs/admin.md`); a deployment group's `mem_fraction_static` overrides it |
 | `tensor_parallel_size` | `1` | Tensor-parallel workers of each scheduler's group without `worker_groups` |
-| `data_parallel_size` | `1` | DP ranks, each a scheduler with its own KV cache and worker groups; requests go to the scheduler with the fewest in flight. With `worker_groups`, the file's model groups form the schedulers as equal consecutive blocks |
+| `data_parallel_size` | `1` | DP ranks, each a scheduler with its own KV cache and worker groups. Independent replicas each run an engine of their own, and the leader sends a request to the one with the fewest in flight; with `moe_config.expert_parallel`, whose replicas exchange experts, one engine runs every replica's scheduler and the scheduling policy's `route` names each request's. With `worker_groups`, the file's groups that serve requests form the schedulers as equal consecutive blocks |
 | `worker_groups` | Unset | [Deployment file](#deployment-files) placing worker groups and their components |
 | `host_identity` | `"localhost"` | This node's host name; its daemon runs the ranks assigned to this host |
 | `engine_host` | This node's identity | The joined node that runs the engine and any ranks without an explicit host. Changing it starts a successor epoch there while the HTTP daemon remains on its node |
@@ -479,7 +479,25 @@ A `[[worker_groups]]` table takes:
 | `queue_depth` | Required | Batches in flight per rank. A rank that keeps video requests resident takes three positions per request, so such a group holds up to `queue_depth / 3` requests at once; a group serving several replicas, such as a shared text encoder, needs positions for all of them |
 | `mem_fraction_static` | Top-level `mem_fraction_static` | Each rank's device-storage share for this group |
 
-A `prefill` group prefills prompts only and a `decode` group decodes only; a deployment configures both or neither, and each places the `model` component alone. A request prefills on a prefill group; once its prompt is complete and its first token sampled, the host's Storage Server copies the request's cache units, device to device, from the prefill group's KV cache into the same units of a decode group's (a transfer task of the Transfer Server, reading a prefill group of another host through NIXL), and the request decodes there from its first token. The two groups must have the same number of ranks and the same KV cache layout. The epoch layer runs one main process per node, which serves a deployment's groups as one worker group: until the groups run as separate workers of the scheduler, a prefill/decode deployment prefills and decodes each request on the same ranks and hands nothing off. Such a deployment generates text: canvas requests are refused.
+A `prefill` group prefills prompts only and a `decode` group decodes only; a deployment configures both or neither, and each places the `model` component alone. A request prefills on a prefill group; once its prompt is complete and its first token sampled, the host's Storage Server copies the request's cache units, device to device, from the prefill group's KV cache into the same units of a decode group's (a transfer task of the Transfer Server, reading a prefill group of another host through NIXL), and the request decodes there from its first token. One scheduler drives both groups as separate workers, each group's ranks running only that group's batches, so the two groups' devices compute side by side. The groups must have the same number of ranks, which startup checks, and the same KV cache layout, which the ranks agree at startup: every rank of the deployment sizes its cache to the same units. A group on another host (`rank-1/cuda:0`) needs a deployment of several nodes, whose Storage Servers listen on TCP, with NIXL on both hosts' library search path ([NIXL transfers](nixl.md)). Such a deployment generates text: canvas requests are refused.
+
+```toml
+[[worker_groups]]
+id = "prefill"
+role = "prefill"
+ranks = ["cuda:0"]
+queue_depth = 2
+
+[worker_groups.blocks.model]
+
+[[worker_groups]]
+id = "decode"
+role = "decode"
+ranks = ["cuda:1"]
+queue_depth = 2
+
+[worker_groups.blocks.model]
+```
 
 A `ranks` entry is `[HOST/]DEVICE`. `DEVICE` is one device (`cuda:0`, `cpu`), an inclusive index range (`cuda:0-3`) or a device repeated for CPU workers (`cpu*4`). Without `HOST` the ranks run on the leader's own host, the `host_identity` of the process that reads the file; `rank-1/cuda:0-3` places four ranks on the node whose `uniserve serve` starts with `--host-identity rank-1`.
 

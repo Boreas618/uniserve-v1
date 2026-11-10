@@ -362,6 +362,10 @@ pub struct Batch {
     pub id: BatchId,
     /// The phase this batch advances, as the scheduler addresses it (`crate::PhaseId`).
     pub phase: PhaseId,
+    /// The worker group whose ranks run the batch, by the name its [`Inventory`] states: a
+    /// process whose devices serve several groups, such as a deployment's prefill and decode
+    /// groups, hands the batch to the devices of this group alone.
+    pub group: String,
     /// The calls whose progress this batch advances, in scheduling order.
     pub calls: Vec<CallId>,
     /// The rows and tokens the mechanism wrote, and what the batch computes.

@@ -830,6 +830,8 @@ impl Scheduler {
         batch.device = Some(ipc::execution::Batch {
             id: ipc::execution::BatchId(batch.id),
             phase,
+            // The group the mechanism placed the batch's calls on.
+            group: placed_group(batch),
             calls: (0..batch.requests.len() as u64)
                 .map(ipc::execution::CallId)
                 .collect(),
@@ -1019,6 +1021,8 @@ impl Scheduler {
         batch.device = Some(ipc::execution::Batch {
             id: ipc::execution::BatchId(batch.id),
             phase,
+            // The group the mechanism placed the batch's calls on.
+            group: placed_group(batch),
             calls: (0..batch.requests.len() as u64)
                 .map(ipc::execution::CallId)
                 .collect(),
@@ -1176,6 +1180,16 @@ fn media_batch(batch: &ExecutionBatch) -> bool {
         .requests
         .first()
         .is_some_and(|(call, _)| matches!(call.kind, CallKind::Media(_)))
+}
+
+/// The worker group `batch` runs on: the one its calls were placed on (dispatch forms a batch per
+/// group, and submission refuses one whose calls name two).
+fn placed_group(batch: &ExecutionBatch) -> String {
+    batch
+        .requests
+        .first()
+        .map(|(_, dispatch)| dispatch.worker.0.clone())
+        .unwrap_or_default()
 }
 
 impl Scheduler {

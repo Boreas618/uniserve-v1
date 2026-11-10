@@ -145,9 +145,15 @@ pub(crate) struct ModelRunner {
     targets: Vec<Target>,
     /// The bucket catalog every device of this rank captures.
     buckets: Buckets,
-    /// This rank's ordinal inside its group, which the storage claims and the cache plan's
-    /// agreement with its group are keyed by.
+    /// This rank's ordinal among the deployment's ranks (every worker group's, in the order the
+    /// deployment states them), which the storage claims and the cache plan's agreement over the
+    /// process's host group are keyed by.
     rank: u32,
+    /// The worker group this rank serves in, as the scheduler addresses it: a text rank's group of
+    /// the deployment (its prefill or decode group, or one data-parallel replica), and the
+    /// process's own group for the ranks of a media deployment, whose groups one scheduler drives
+    /// as one pool.
+    group: String,
     /// The epoch whose cache planes this rank maps, on a standby: it serves from the planes its
     /// predecessor serves from, whose segments that epoch created.
     cache_epoch: Option<u64>,
@@ -185,6 +191,15 @@ impl Default for ParallelShape {
             tensor_rank: 0,
         }
     }
+}
+
+/// The collective groups one kind of a deployment's parallel groups forms over the host group, and
+/// this rank's place among them.
+pub(crate) struct Collective {
+    /// Each group's members, `(first, count)`: consecutive members of the host group.
+    pub(crate) spans: Vec<(usize, usize)>,
+    /// The span this rank is a member of and its rank in it, absent when it is in none.
+    pub(crate) member: Option<(usize, usize)>,
 }
 
 /// The collective groups a rank's runners issue on, absent where one rank holds the block.
@@ -280,6 +295,7 @@ impl ModelRunner {
             targets,
             buckets,
             rank: launch.rank,
+            group: launch.group.clone(),
             cache_epoch: None,
             adopted_cache: None,
             world_size: launch.world_size as usize,
@@ -315,43 +331,39 @@ impl ModelRunner {
         };
         let union_ranks = expert_ranks + attention;
         let tensor = self.mapping.tensor_parallel;
-        if text && union_ranks == 1 && tensor == 1 {
-            return Ok(vec![self.clone()]);
+        if text && tensor > 1 && union_ranks > 1 {
+            bail!(
+                "a deployment of {tensor} tensor ranks and {union_ranks} expert ranks in one \
+                 process: a tensor group and an expert union of one process's devices are not \
+                 served together"
+            );
         }
         let count = self.devices.len();
-        // A tensor group splits every layer of one model over the group's devices: each device is a
-        // rank of its own, which loads its block of every weight on its own device and joins the
-        // group's collectives, and the one scheduler of the group submits each batch to all of them
-        // (`schedulers`), those of another host's process through its peer link. This process holds
-        // `count` consecutive ranks of the group from its first, `self.rank`.
-        if text && tensor > 1 {
-            if union_ranks > 1 {
-                bail!(
-                    "a deployment of {tensor} tensor ranks and {union_ranks} expert ranks in one \
-                     process: a tensor group and an expert union of one process's devices are not \
-                     served together"
-                );
-            }
-            let first = self.rank as usize;
-            if first + count > tensor as usize {
-                bail!(
-                    "this node serves {count} devices from rank {first} and the deployment's \
-                     tensor group has {tensor} ranks: each of a group's ranks is one device"
-                );
-            }
-            return Ok(self
+        // Each device is a rank of the deployment's worker group that places it: its prefill or
+        // decode group, a data-parallel replica, or the one group of a tensor-parallel deployment.
+        // A group's ranks split every layer of one model over the group's devices: each loads its
+        // block of every weight on its own device and joins the group's collectives, and the
+        // scheduler that drives the group submits each batch to all of them (`process::ranks::scheduler`), those
+        // of another host's process through its peer link. This process holds `count` consecutive
+        // ranks of the deployment from its first, `self.rank`.
+        if text && union_ranks == 1 {
+            return self
                 .devices
                 .iter()
                 .enumerate()
                 .map(|(index, device)| {
+                    let rank = self.rank + index as u32;
+                    let (group, position, tensor) = self.placed(rank)?;
                     let mut rank_runner = self.clone();
                     rank_runner.devices = vec![*device];
-                    rank_runner.rank = self.rank + index as u32;
+                    rank_runner.rank = rank;
+                    rank_runner.group = group;
                     rank_runner.world_size = tensor as usize;
-                    rank_runner.mapping.tensor_rank = self.rank + index as u32;
-                    rank_runner
+                    rank_runner.mapping.tensor_parallel = tensor;
+                    rank_runner.mapping.tensor_rank = position;
+                    Ok(rank_runner)
                 })
-                .collect());
+                .collect();
         }
         // The schedulers of an expert-parallel deployment each hold one rank: its own cache and
         // attention, its share of the experts, and a member of the union that runs their steps. A
@@ -378,6 +390,15 @@ impl ModelRunner {
                 // process does not.
                 rank_runner.world_size = self.world_size.max(count);
                 if text {
+                    // Each scheduler of the union drives its rank's own group.
+                    if let Some((group, _)) = scheduler::WorkerGroupConfig::place_rank(
+                        &self.engine_config().parallel.worker_groups,
+                        rank_runner.rank as usize,
+                    ) {
+                        rank_runner
+                            .group
+                            .clone_from(&self.engine_config().parallel.worker_groups[group].id.0);
+                    }
                     // An attention rank holds the first rank's window and computes nothing with
                     // it; `DispatchViews::source_only` keeps it out of its forward.
                     rank_runner.mapping.union_rank = index as u32;
@@ -390,6 +411,76 @@ impl ModelRunner {
                 rank_runner
             })
             .collect())
+    }
+
+    /// The worker group that places the deployment's rank `rank`, the rank's position in it and
+    /// the group's tensor-parallel degree, which its ranks number.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no group places the rank, or when the group's ranks are not one tensor group of
+    /// its `model` block.
+    fn placed(&self, rank: u32) -> Result<(String, u32, u32)> {
+        let groups = &self.engine_config().parallel.worker_groups;
+        let (index, position) = scheduler::WorkerGroupConfig::place_rank(groups, rank as usize)
+            .with_context(|| {
+                format!("the deployment's worker groups place no rank {rank} for this process")
+            })?;
+        let group = &groups[index];
+        let tensor = group
+            .blocks
+            .get(proto::config::DEFAULT_BLOCK)
+            .map_or(1, |block| block.tensor_parallel_size);
+        if tensor != group.ranks.len() {
+            bail!(
+                "worker group {} places {} ranks and its `{}` block is {tensor}-way tensor \
+                 parallel: a text group's ranks are one tensor group",
+                group.id,
+                group.ranks.len(),
+                proto::config::DEFAULT_BLOCK
+            );
+        }
+        Ok((
+            group.id.0.clone(),
+            u32::try_from(position).context("a group wider than the protocol addresses")?,
+            u32::try_from(tensor).context("a group wider than the protocol addresses")?,
+        ))
+    }
+
+    /// The worker group this rank serves in, as the scheduler addresses it.
+    pub(crate) fn group(&self) -> &str {
+        &self.group
+    }
+
+    /// The tensor groups of a text deployment whose ranks are each one group's
+    /// ([`Self::ranks`]), with this rank's place among them: every worker group of more than one
+    /// rank, as consecutive members of the host group, whose members are the deployment's ranks.
+    /// `None` for a media rank and a member of an expert union, whose tensor group is the
+    /// parallel shape's over the whole host group.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::placed`] fails for this rank.
+    pub(crate) fn tensor_spans(&self) -> Result<Option<Collective>> {
+        if !matches!(self.family.model, Model::Text(_)) || self.union.is_some() {
+            return Ok(None);
+        }
+        let groups = &self.engine_config().parallel.worker_groups;
+        let firsts = scheduler::WorkerGroupConfig::first_ranks(groups);
+        let spans: Vec<(usize, usize)> = firsts
+            .iter()
+            .zip(groups)
+            .map(|(first, group)| (*first, group.ranks.len()))
+            .collect();
+        let (_, position, _) = self.placed(self.rank)?;
+        let (group, _) = scheduler::WorkerGroupConfig::place_rank(groups, self.rank as usize)
+            .with_context(|| {
+                format!("the deployment's worker groups place no rank {}", self.rank)
+            })?;
+        Ok(Some(Collective {
+            spans,
+            member: Some((group, position as usize)),
+        }))
     }
 
     /// The rows one rank's exchange carries at most: the largest batch its buckets hold.

@@ -988,9 +988,9 @@ impl Scheduler {
     /// liveness deadline.
     pub(super) fn park_for_progress(&mut self) {
         let _span = tracing::trace_span!("scheduler.park").entered();
-        // Answers of the host KV cache and of the host latent and encoder
-        // pools arrive on connections the worker does not wait on: while
-        // some are awaited, the park is short.
+        // Answers of the host KV cache, of the host latent and encoder pools
+        // and of the hand-offs' copies arrive on connections the worker does
+        // not wait on: while some are awaited, the park is short.
         // So is the park of a closing scheduler, which awaits its last
         // page commits.
         let timeout = if self.draining
@@ -1006,6 +1006,10 @@ impl Scheduler {
                 .encoder_outputs
                 .as_ref()
                 .is_some_and(crate::encoder_outputs::EncoderStore::waiting)
+            || self
+                .hand_offs
+                .as_ref()
+                .is_some_and(crate::hand_off::HandOffs::waiting)
         {
             KV_OFFLOAD_POLL
         } else {

@@ -262,38 +262,43 @@ pub struct HostCacheEndpoint {
     pub endpoint: Option<String>,
 }
 
-/// The mechanism's `Batches` over a node's devices (2.4, 4.4): a batch goes to every device whose
-/// runners serve its phase.
+/// The mechanism's `Batches` over a node's devices (2.4, 4.4): a batch goes to every device of its
+/// worker group whose runners serve its phase.
 ///
-/// A node's workers are its devices, and a device's runners are the blocks of the model placed
-/// on it; the mechanism addresses a batch by phase, not by device. This is the one place that
-/// translation happens, so a scheduler never needs to know how many devices it drives. A phase one
-/// device serves is that device's. A phase several devices serve is a parallel group's: each runs
-/// its part of one batch, so each must see it. The scheduler's thread is the one thread that submits,
-/// so every device's queue holds the group's batches in one order, which is the order their
-/// collectives need. It is a plain route on purpose: the phase list is fixed at spawn, so no lock,
-/// no schedule, no retry.
+/// A node's workers are its devices, each a rank of one worker group of the deployment, and a
+/// device's runners are the blocks of the model placed on it; the mechanism addresses a batch by its
+/// group and phase, not by device. This is the one place that translation happens, so a scheduler
+/// never needs to know how many devices it drives. A phase one device of the group serves is that
+/// device's. A phase several devices serve is a parallel group's: each runs its part of one batch,
+/// so each must see it. The scheduler's thread is the one thread that submits, so every device's
+/// queue holds the group's batches in one order, which is the order their collectives need. It is a
+/// plain route on purpose: the groups and phases are fixed at spawn, so no lock, no schedule, no
+/// retry.
 pub struct Workers {
-    workers: Vec<Arc<crate::device::Worker>>,
+    /// The devices, each with the worker group it is a rank of.
+    workers: Vec<(String, Arc<crate::device::Worker>)>,
     /// The pools this rank serves, as the deployment launched them (4.2): the scheduler builds its
     /// worker facts from this and refuses to start on an empty answer, so a rank states its pools
     /// before it is handed over rather than after the first batch finds none.
     inventory: Vec<Inventory>,
     /// What keys this rank's pages in the host KV cache, when the deployment keeps one.
     host_cache: Option<HostCacheEndpoint>,
-    /// The group's ranks on other hosts, each main process's peer link: every batch of the
-    /// group's phases goes to them too, and its submission ends when theirs did.
-    remotes: Vec<Arc<crate::peers::Remote>>,
+    /// The main processes of other hosts that hold ranks of these groups, each its peer link with
+    /// the groups it holds ranks of: every batch of such a group goes to them too, and its
+    /// submission ends when theirs did. A group whose ranks are all another host's is served
+    /// through its links alone.
+    remotes: Vec<(Vec<String>, Arc<crate::peers::Remote>)>,
 }
 
 impl Workers {
-    /// The rank's devices, as the handles the rest of the process already holds.
+    /// The rank's devices, as the handles the rest of the process already holds, each with the
+    /// worker group it is a rank of.
     ///
     /// A main process holds one handle per device from the moment it spawns them: the control
     /// thread reads their running jobs for the stall rule and their counters for the metrics,
     /// and a scheduler submits through the same handles. Sharing them rather than moving them in
     /// keeps one device one owner.
-    pub fn shared(workers: Vec<Arc<crate::device::Worker>>) -> Result<Self> {
+    pub fn shared(workers: Vec<(String, Arc<crate::device::Worker>)>) -> Result<Self> {
         Ok(Self {
             workers,
             inventory: Vec::new(),
@@ -302,9 +307,10 @@ impl Workers {
         })
     }
 
-    /// States the group's ranks on other hosts, which run every batch beside this node's devices.
+    /// States the main processes of other hosts that hold ranks of these groups, each with the
+    /// groups it holds ranks of; they run every batch of those groups beside this node's devices.
     #[must_use]
-    pub fn with_remotes(mut self, remotes: Vec<Arc<crate::peers::Remote>>) -> Self {
+    pub fn with_remotes(mut self, remotes: Vec<(Vec<String>, Arc<crate::peers::Remote>)>) -> Self {
         self.remotes = remotes;
         self
     }
@@ -328,30 +334,53 @@ impl Workers {
         self
     }
 
-    /// The device that serves `phase`.
-    fn route(&self, phase: PhaseId) -> Result<&Arc<crate::device::Worker>> {
+    /// The devices of `group` whose runners serve `phase`, by their place among this node's.
+    fn serving(&self, group: &str, phase: PhaseId) -> Vec<(usize, &Arc<crate::device::Worker>)> {
         self.workers
             .iter()
-            .find(|worker| worker.serves(phase))
-            .ok_or_else(|| {
-                route_refusal(
-                    phase,
-                    &self
-                        .workers
-                        .iter()
-                        .flat_map(|worker| worker.phases().iter().copied())
-                        .collect::<Vec<_>>(),
-                )
-            })
+            .enumerate()
+            .filter(|(_, (held, worker))| held == group && worker.serves(phase))
+            .map(|(index, (_, worker))| (index, worker))
+            .collect()
     }
 
-    /// The one device a unit-measured call runs on, when `batch` is one.
+    /// The peer links of the processes that hold ranks of `group`, by their place after this
+    /// node's devices.
+    fn remotes_of(&self, group: &str) -> Vec<(usize, &Arc<crate::peers::Remote>)> {
+        let devices = self.workers.len();
+        self.remotes
+            .iter()
+            .enumerate()
+            .filter(|(_, (groups, _))| groups.iter().any(|held| held == group))
+            .map(|(index, (_, remote))| (devices + index, remote))
+            .collect()
+    }
+
+    /// The refusal of `batch` when neither a device of this node nor a peer serves it.
+    fn unrouted(&self, batch: &Batch) -> Error {
+        route_refusal(
+            &batch.group,
+            batch.phase,
+            &self
+                .workers
+                .iter()
+                .filter(|(group, _)| *group == batch.group)
+                .flat_map(|(_, worker)| worker.phases().iter().copied())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// The one device a unit-measured call runs on, when `batch` is one, with its place among
+    /// this node's devices.
     ///
     /// A video decode is one unit of the timeline and needs no other unit, so the devices that serve
     /// the phase take the units in turn instead of each decoding the same one: a device's clip is
     /// independent of its neighbours' but for the tail the decoder hands across. A video encode
     /// follows its unit, so the device that decoded a clip encodes it from its own column.
-    fn device_of_unit(&self, batch: &Batch) -> Result<Option<&Arc<crate::device::Worker>>> {
+    fn device_of_unit(
+        &self,
+        batch: &Batch,
+    ) -> Result<Option<(usize, &Arc<crate::device::Worker>)>> {
         let Some(media) = &batch.media else {
             return Ok(None);
         };
@@ -361,57 +390,57 @@ impl Workers {
         ) {
             return Ok(None);
         }
-        let serving: Vec<&Arc<crate::device::Worker>> = self
-            .workers
-            .iter()
-            .filter(|worker| worker.serves(batch.phase))
-            .collect();
+        let serving = self.serving(&batch.group, batch.phase);
         if serving.is_empty() {
-            return Err(route_refusal(batch.phase, &[]));
+            return Err(self.unrouted(batch));
         }
         let unit = media.request(0)?.unit as usize;
         Ok(Some(serving[unit % serving.len()]))
     }
 
-    /// Hands `batch` to every device that serves its phase and to the group's ranks on other
-    /// hosts (`remote`), as one submission.
+    /// Hands `batch` to every device of its group that serves its phase and to the group's ranks on
+    /// other hosts (`remote`), as one submission.
     fn on_every_device(
         &self,
         batch: Batch,
-        submit: impl Fn(&crate::device::Worker, Batch) -> Result<Submission>,
+        submit: impl Fn(usize, &crate::device::Worker, Batch) -> Result<Submission>,
         remote: impl Fn(&crate::peers::Remote, Batch) -> Result<Submission>,
     ) -> Result<Submission> {
-        let first = self.route(batch.phase)?;
-        let mut peers = Vec::new();
+        let devices = self.serving(&batch.group, batch.phase);
+        let peers = self.remotes_of(&batch.group);
+        if devices.is_empty() && peers.is_empty() {
+            return Err(self.unrouted(&batch));
+        }
+        let mut parts = Vec::with_capacity(devices.len() + peers.len());
         // The other hosts' ranks take the batch first: their submissions travel while this node's
         // devices stage theirs, and the ranks' collectives meet in the batch's forward.
-        for peer in &self.remotes {
-            peers.push(remote(peer, batch.clone())?);
+        for (_, peer) in peers {
+            parts.push(remote(peer, batch.clone())?);
         }
-        for peer in self
-            .workers
-            .iter()
-            .filter(|worker| worker.serves(batch.phase) && !Arc::ptr_eq(worker, first))
-        {
-            peers.push(submit(peer, batch.clone())?);
+        for (index, device) in devices {
+            parts.push(submit(index, device, batch.clone())?);
         }
-        Ok(submit(first, batch)?.joined(peers))
+        // The last part is the submission the others join: this node's last device, or the last
+        // peer of a group whose ranks are all another host's.
+        let last = parts.pop().ok_or_else(|| self.unrouted(&batch))?;
+        Ok(last.joined(parts))
     }
 }
 
-/// The refusal of a batch whose phase no device of this rank serves.
+/// The refusal of a batch whose group and phase no device of this rank serves.
 ///
 /// A phase number is a plan's, and the plan that numbers the batches and the plan that splits the
 /// model must agree on it; when they do not, the batch reaches this rank and nothing here can serve
-/// it. Both numbers are named - the phase asked for and the phases this rank's devices serve -
-/// because the disagreement is between two plans and one figure alone cannot show it. The answer is
-/// `Invalid`: the batch is not servable here, which is a refusal rather than a broken device. What a
-/// reader of the number does with that distinction is the caller's - the in-process submission path
-/// currently wraps every worker error alike, so an `Invalid` and a broken context read the same
-/// there.
-fn route_refusal(phase: PhaseId, served: &[PhaseId]) -> Error {
+/// it. Both numbers are named - the phase asked for and the phases this rank's devices of the group
+/// serve - because the disagreement is between two plans and one figure alone cannot show it. The
+/// answer is `Invalid`: the batch is not servable here, which is a refusal rather than a broken
+/// device. What a reader of the number does with that distinction is the caller's - the in-process
+/// submission path currently wraps every worker error alike, so an `Invalid` and a broken context
+/// read the same there.
+fn route_refusal(group: &str, phase: PhaseId, served: &[PhaseId]) -> Error {
     Error::Invalid(format!(
-        "no device of this rank serves phase {}; its devices serve {:?}",
+        "no device of this rank in worker group {group:?} serves phase {}; its devices of the \
+         group serve {:?}",
         phase.0,
         served.iter().map(|served| served.0).collect::<Vec<_>>()
     ))
@@ -420,51 +449,67 @@ fn route_refusal(phase: PhaseId, served: &[PhaseId]) -> Error {
 /// The routes themselves, in the worker's own error: [`Batches`] answers them across the crossing,
 /// and the main process, which holds the concrete `Workers`, reads the worker's error directly.
 impl Workers {
-    /// The bucket the device serving `phase` would serve `computation` in.
+    /// The bucket the device serving `phase` would serve `computation` in: a media deployment's
+    /// devices are one group, so the first device that serves the phase answers.
     pub fn media(&self, phase: PhaseId, computation: &Computation) -> Result<Option<Bucket>> {
-        Ok(self.route(phase)?.media(computation))
-    }
-
-    /// The devices `batch` runs on, by their place among this node's devices.
-    pub fn devices(&self, batch: &Batch) -> Result<Vec<usize>> {
-        // The same two routes `submit` takes: a unit-measured call's one device, or every device
-        // that serves the phase, refused by name when none does.
-        if let Some(worker) = self.device_of_unit(batch)? {
-            return Ok(self
-                .workers
-                .iter()
-                .position(|held| Arc::ptr_eq(held, worker))
-                .into_iter()
-                .collect());
-        }
-        self.route(batch.phase)?;
-        Ok(self
+        let worker = self
             .workers
             .iter()
-            .enumerate()
-            .filter(|(_, worker)| worker.serves(batch.phase))
-            .map(|(index, _)| index)
-            .collect())
+            .map(|(_, worker)| worker)
+            .find(|worker| worker.serves(phase))
+            .ok_or_else(|| route_refusal("", phase, &[]))?;
+        Ok(worker.media(computation))
     }
 
-    /// Serves `batch` on the devices of its phase, or on its unit's one device.
+    /// The devices `batch` runs on, by their place among this node's devices and, after them,
+    /// its peer links: a group whose ranks are all another host's runs on its links.
+    pub fn devices(&self, batch: &Batch) -> Result<Vec<usize>> {
+        // The same two routes `submit` takes: a unit-measured call's one device, or every device
+        // of the group that serves the phase, refused by name when none does.
+        if let Some((index, _)) = self.device_of_unit(batch)? {
+            return Ok(vec![index]);
+        }
+        let mut devices: Vec<usize> = self
+            .serving(&batch.group, batch.phase)
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect();
+        if devices.is_empty() {
+            devices = self
+                .remotes_of(&batch.group)
+                .into_iter()
+                .map(|(index, _)| index)
+                .collect();
+        }
+        if devices.is_empty() {
+            return Err(self.unrouted(batch));
+        }
+        Ok(devices)
+    }
+
+    /// How many devices and peer links run this node's batches, one queue each.
+    pub fn device_count(&self) -> usize {
+        self.workers.len() + self.remotes.len()
+    }
+
+    /// Serves `batch` on the devices of its group and phase, or on its unit's one device.
     pub fn submit(&self, batch: Batch) -> Result<Submission> {
         match self.device_of_unit(&batch)? {
-            Some(worker) => worker.submit(batch),
+            Some((_, worker)) => worker.submit(batch),
             None => self.on_every_device(
                 batch,
-                |worker, mut batch| {
-                    // A page copy names the rank that makes it, and a rank is a device here.
-                    if let Some(rank) = self
-                        .workers
+                |index, worker, mut batch| {
+                    // A page copy names the rank that makes it: its place among the group's ranks
+                    // on this node.
+                    let group = &self.workers[index].0;
+                    let rank = self.workers[..index]
                         .iter()
-                        .position(|held| std::ptr::eq(held.as_ref(), worker))
-                    {
-                        batch.page_loads.retain(|copy| copy.rank as usize == rank);
-                        batch
-                            .page_offloads
-                            .retain(|copy| copy.rank as usize == rank);
-                    }
+                        .filter(|(held, _)| held == group)
+                        .count();
+                    batch.page_loads.retain(|copy| copy.rank as usize == rank);
+                    batch
+                        .page_offloads
+                        .retain(|copy| copy.rank as usize == rank);
                     worker.submit(batch)
                 },
                 crate::peers::Remote::submit,
@@ -472,11 +517,11 @@ impl Workers {
         }
     }
 
-    /// Runs `batch`'s paired forwards on every device of its phase.
+    /// Runs `batch`'s paired forwards on every device of its group and phase.
     pub fn shadow(&self, batch: Batch) -> Result<Submission> {
         self.on_every_device(
             batch,
-            |worker, batch| worker.shadow(batch),
+            |_, worker, batch| worker.shadow(batch),
             crate::peers::Remote::shadow,
         )
     }
@@ -489,7 +534,7 @@ impl Workers {
         let ranks = self
             .workers
             .iter()
-            .map(|worker| worker.map_host_cache(tokens, keys))
+            .map(|(_, worker)| worker.map_host_cache(tokens, keys))
             .collect::<Result<Vec<_>>>()?;
         Ok(self
             .inventory
@@ -504,7 +549,7 @@ impl Workers {
             .workers
             .iter()
             .enumerate()
-            .map(|(rank, worker)| {
+            .map(|(rank, (_, worker))| {
                 let own = offloads
                     .iter()
                     .filter(|copy| copy.rank as usize == rank)
@@ -526,7 +571,7 @@ impl Workers {
             .workers
             .iter()
             .enumerate()
-            .map(|(rank, worker)| {
+            .map(|(rank, (_, worker))| {
                 let own = offloads
                     .iter()
                     .map(|offload| ipc::LatentOffload {
@@ -574,7 +619,7 @@ impl Batches for Workers {
     }
 
     fn device_count(&self) -> usize {
-        self.workers.len()
+        Workers::device_count(self)
     }
 
     fn inventory(&self) -> &[Inventory] {
@@ -612,14 +657,18 @@ mod tests {
     /// batch instead of the epoch.
     #[test]
     fn a_phase_no_device_serves_is_refused_by_both_numbers() {
-        let refusal = route_refusal(ipc::PhaseId(3), &[ipc::PhaseId(0), ipc::PhaseId(1)]);
+        let refusal = route_refusal(
+            "decode",
+            ipc::PhaseId(3),
+            &[ipc::PhaseId(0), ipc::PhaseId(1)],
+        );
         assert!(
             matches!(refusal, Error::Invalid(_)),
             "a batch nothing here can serve was refused as a device failure: {refusal:?}"
         );
         let text = refusal.to_string();
         assert!(
-            text.contains("phase 3") && text.contains("[0, 1]"),
+            text.contains("phase 3") && text.contains("[0, 1]") && text.contains("decode"),
             "the refusal names neither the phase asked for nor the ones served: {text}"
         );
     }

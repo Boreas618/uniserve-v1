@@ -303,31 +303,42 @@ impl SchedulerHandle {
         Ok(())
     }
 
-    /// Refuses a worker that does not serve the launch's pool: the process's
-    /// own group (`EngineArgs::group`), on its world's ranks.
+    /// Refuses a worker whose pools the launch does not place: each pool is a
+    /// worker group of the deployment (a text deployment's groups are its
+    /// pools) or the process's own group (`EngineArgs::group`, the one pool of
+    /// a media deployment's groups), on the launch's ranks.
     ///
-    /// The pool is the process, named as the launch names it: the cache segments a successor
-    /// adopts, the storage the process claims and the epoch's records all key it by that name.
-    /// A scheduler started for a pool the worker does not serve, or for a
+    /// The cache segments a successor adopts are keyed by the pool's name. A
+    /// scheduler started for a pool the deployment does not place, or for a
     /// rank count it does not serve, would place calls on ranks it does not
     /// have; the launch and the worker are two statements of one process,
     /// so they are compared before anything runs.
     fn check_pool(args: &EngineArgs, info: &crate::worker::WorkerInfo) -> anyhow::Result<()> {
-        let group = WorkerGroupId(args.group.clone());
-        anyhow::ensure!(
-            info.workers.iter().any(|(served, _)| *served == group),
-            "the launch names the pool {}, which the worker does not serve",
-            group.0
-        );
-        // `from_inventory` states every pool's rank count; a worker
-        // that reports none places the pool on one rank.
-        let served = info.layouts.get(&group).map_or(1, |layout| layout.ranks);
-        anyhow::ensure!(
-            u32::try_from(served).is_ok_and(|served| served == args.world_size),
-            "the launch places {} ranks of pool {}, but the worker serves {served}",
-            args.world_size,
-            group.0
-        );
+        let placed = |group: &WorkerGroupId| {
+            group.0 == args.group
+                || args
+                    .engine_config
+                    .parallel
+                    .worker_groups
+                    .iter()
+                    .any(|stated| stated.id == *group)
+        };
+        for (group, _) in &info.workers {
+            anyhow::ensure!(
+                placed(group),
+                "the worker serves the pool {}, which the deployment does not place",
+                group.0
+            );
+            // `from_inventory` states every pool's rank count; a worker
+            // that reports none places the pool on one rank.
+            let served = info.layouts.get(group).map_or(1, |layout| layout.ranks);
+            anyhow::ensure!(
+                u32::try_from(served).is_ok_and(|served| served == args.world_size),
+                "the launch places {} ranks of pool {}, but the worker serves {served}",
+                args.world_size,
+                group.0
+            );
+        }
         Ok(())
     }
 

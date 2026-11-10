@@ -337,6 +337,7 @@ fn token_batch() -> execution::Batch {
     execution::Batch {
         id: execution::BatchId(7),
         phase: PhaseId(1),
+        group: "model".to_owned(),
         calls: vec![execution::CallId(0), execution::CallId(1)],
         shape: Shape::decode(2, Variant::DecodeSampled),
         columns: BatchColumns {

@@ -17,7 +17,7 @@ use worker::watchdog::Watchdog;
 use super::claim::claim;
 use super::device_command;
 use super::launch::{Epoch, ProcessInterface, handshake};
-use super::ranks::{Backing, LoadedRank, Meeting, load_ranks, schedulers};
+use super::ranks::{Backing, LoadedRank, Meeting, load_ranks};
 use super::reports::{announce, state_failure};
 use super::serve::Wait;
 use super::{MainProcess, Peers};
@@ -200,10 +200,20 @@ impl MainProcess {
         let mut scheduled = Vec::with_capacity(ranks.len());
         // The group's products, which every rank's runners reach through their own view of them.
         let group_products = GroupProducts::new(ranks.len());
-        let rank_count = ranks.len();
+        // The worker group of each device, in the order `workers` holds them.
+        let mut groups: Vec<String> = Vec::with_capacity(ranks.len());
+        let placed_groups: Vec<String> = ranks
+            .iter()
+            .map(|rank| rank.model_runner.group().to_owned())
+            .collect();
         for (rank_index, mut rank) in ranks.into_iter().enumerate() {
+            // The ranks of its group this process holds, which the scheduler counts as one.
+            let group_ranks = placed_groups
+                .iter()
+                .filter(|group| **group == placed_groups[rank_index])
+                .count();
             let spawned = rank.spawn_workers(
-                (rank_index, rank_count),
+                (rank_index, group_ranks),
                 &group_products,
                 epoch.generation,
                 &blocking,
@@ -255,6 +265,7 @@ impl MainProcess {
                     host: epoch.host.clone(),
                 });
                 workers.push(worker);
+                groups.push(rank_runner.group().to_owned());
                 generations.push(generation);
             }
             scheduled.push(rank_runner.scheduled());
@@ -280,6 +291,12 @@ impl MainProcess {
             },
             build.mem_fraction_static,
         ));
+        // Each device with the worker group its rank serves in, which routes a batch to it.
+        let placed: Vec<(String, Arc<worker::device::Worker>)> = groups
+            .iter()
+            .cloned()
+            .zip(workers.iter().map(Arc::clone))
+            .collect();
         // The links to the epoch's other main processes, over the channels `meet` opened: on the
         // scheduler node one per peer, which the schedulers' batches go through, and on a peer the
         // one that runs the scheduler node's batches on this process's workers.
@@ -297,13 +314,16 @@ impl MainProcess {
             }
             Links::Registered(channel) => {
                 let liveness = worker::peers::Liveness::new(connected.wake());
-                let ranks = Arc::new(worker::batch::Workers::shared(
-                    workers.iter().map(Arc::clone).collect(),
-                )?);
+                let ranks = Arc::new(worker::batch::Workers::shared(placed.clone())?);
+                // The scheduler node plans a group whose first rank is this process's against
+                // that rank's report.
+                let report =
+                    super::ranks::stated_report(&inventories[0], &memories[0], &data, false)?;
                 Peers::Peer {
                     upstream: worker::peers::Upstream::serve(
                         channel,
                         ranks,
+                        report,
                         Arc::clone(&liveness),
                     )?,
                     liveness,
@@ -318,38 +338,66 @@ impl MainProcess {
         // above through `worker::Batches`. A node that holds none keeps an empty list
         // and serves only what the scheduler node's batches ask of it; a node that is the scheduler
         // node and holds none would accept requests and dispatch nothing, which is refused by name.
-        let schedulers = if union.is_some() {
+        let schedulers = if !launch.scheduler_node {
+            Vec::new()
+        } else if union.is_some() {
             let mut handles = Vec::with_capacity(workers.len());
             for (index, model_runner) in scheduled.iter().enumerate() {
                 // A dedicated expert rank takes no request: it joins the steps the others open.
                 if !model_runner.schedules() {
                     continue;
                 }
-                handles.extend(schedulers(
+                let host_cache = model_runner.host_kv_cache(&models[index]);
+                let pool = super::ranks::Pool {
+                    group: groups[index].clone(),
+                    report: super::ranks::stated_report(
+                        &inventories[index],
+                        &memories[index],
+                        &data,
+                        host_cache,
+                    )?,
+                };
+                handles.push(super::ranks::scheduler(
                     model_runner,
                     launch,
                     &models[index],
-                    &workers[index..=index],
-                    &[],
-                    &inventories[index],
-                    &memories[index],
+                    vec![placed[index].clone()],
+                    Vec::new(),
+                    vec![pool],
+                    host_cache,
                     connected.wake(),
                     &data,
                 )?);
             }
             handles
         } else {
-            schedulers(
-                &first_plan,
-                launch,
-                &models[0],
-                &workers,
-                &remotes,
-                &inventories[0],
-                &memories[0],
-                connected.wake(),
-                &data,
-            )?
+            let blocks = super::ranks::Blocks {
+                first: launch.rank as usize,
+                groups: &groups,
+                inventories: &inventories,
+                memories: &memories,
+                remotes: &remotes,
+                data: &data,
+            };
+            let mut handles = Vec::new();
+            for block in blocks.of(&first_plan, &models[0], launch)? {
+                handles.push(super::ranks::scheduler(
+                    &first_plan,
+                    launch,
+                    &models[0],
+                    placed
+                        .iter()
+                        .filter(|(group, _)| block.groups.contains(group))
+                        .cloned()
+                        .collect(),
+                    block.remotes,
+                    block.pools,
+                    block.host_cache,
+                    connected.wake(),
+                    &data,
+                )?);
+            }
+            handles
         };
 
         // The always-on counters: every stream a runner computes on is `device`, and the one the

@@ -548,20 +548,22 @@ impl Submissions {
         match &mut self.path {
             #[cfg(feature = "testing")]
             Path::Supplied(worker) => worker.operate_groups(operation),
-            // This process's ranks are the one pool its inventory states, and its data plane
-            // answers for them in rank order.
+            // This process's data plane answers for its ranks in rank order. Every group of a
+            // scheduler indexes the one unit space its ranks agreed their cache over, so each
+            // group states what every rank reports.
             Path::InProcess(arm) => {
                 let results = arm
                     .batches
                     .operate(operation)
                     .map_err(|error| anyhow::anyhow!(error))?;
+                if results.is_empty() {
+                    return Ok(Vec::new());
+                }
                 Ok(arm
                     .info
                     .workers
-                    .first()
-                    .filter(|_| !results.is_empty())
-                    .map(|(group, _)| (group.clone(), results))
-                    .into_iter()
+                    .iter()
+                    .map(|(group, _)| (group.clone(), results.clone()))
                     .collect())
             }
         }
@@ -862,6 +864,14 @@ impl InProcess {
         DeviceBatch {
             id: ipc::execution::BatchId(batch.id),
             phase,
+            // Image features are encoded where a request's prompt is computed, which is the first
+            // group of a scheduler that serves several (a deployment's prefill group).
+            group: self
+                .info
+                .workers
+                .first()
+                .map(|(group, _)| group.0.clone())
+                .unwrap_or_default(),
             calls: Vec::new(),
             shape: ipc::execution::Shape {
                 rows: 0,
@@ -915,7 +925,15 @@ impl InProcess {
         // own stated parameters.
         let media = device.media.is_some();
         let mut calls = Vec::with_capacity(batch.requests.len());
-        for (call, _) in &batch.requests {
+        for (call, dispatch) in &batch.requests {
+            // The devices of the batch's group run it, so every call is that group's.
+            anyhow::ensure!(
+                dispatch.worker.0 == device.group,
+                "batch {} runs on worker group {} and carries a call placed on {}",
+                batch.id,
+                device.group,
+                dispatch.worker.0
+            );
             let media_call = matches!(call.kind, ipc::CallKind::Media(_));
             anyhow::ensure!(
                 !media_call || media,
@@ -1174,9 +1192,11 @@ mod tests {
     fn with_media(batch: &mut ExecutionBatch, media: MediaColumns) {
         let phase = wire_phase(batch.requests[0].0.kind).expect("a media call has a phase");
         let computation = media.computation;
+        let group = batch.requests[0].1.worker.0.clone();
         batch.device = Some(DeviceBatch {
             id: ipc::execution::BatchId(batch.id),
             phase,
+            group,
             calls: (0..batch.requests.len() as u64)
                 .map(ipc::execution::CallId)
                 .collect(),

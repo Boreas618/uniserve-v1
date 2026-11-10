@@ -2928,17 +2928,69 @@ impl<M: TextModel> CausalLmRunner<M> {
     /// the slot's previous request committed its own tokens there, and the request may have
     /// generated tokens on another group or before it was admitted again - and the batch's bias
     /// rows are installed. Both are stream-ordered device writes, so nothing waits for them.
+    ///
+    /// A fresh slot of a decode batch starts a request whose prompt another worker computed and
+    /// whose first token it sampled - a decode group continuing a prefill group's request - so its
+    /// commit state starts as that worker's explicit commit left it ([`super::sampling::SlotStart`]):
+    /// the decode reads its input token from the slot's state, not from the host.
     fn start_slots(&mut self, stream: &platform::Stream) -> Result<()> {
         let fresh = self.staging.fresh_slots();
         let installs = self.staging.adjustments().installs();
         if fresh.is_empty() && installs.is_empty() {
             return Ok(());
         }
+        let starts = self.decode_starts()?;
+        for start in starts {
+            self.commit.start(start, stream)?;
+        }
+        let fresh = self.staging.fresh_slots();
         let sampling = self.sampling.as_mut().ok_or(Error::State(
             "a batch starts sampling state in a runner that samples nothing",
         ))?;
         sampling.start_counts(fresh, stream)?;
         sampling.install(installs, stream)
+    }
+
+    /// The commit state each fresh slot of a staged decode batch starts with: its row's input
+    /// token at the row's position, the row's draw, and the cache before the token as verified.
+    /// None for any other batch, whose first call on a slot is a prompt whose explicit commit
+    /// states the slot's state.
+    fn decode_starts(&self) -> Result<Vec<super::sampling::SlotStart>> {
+        let Some(bucket) = self.staging.staged() else {
+            return Ok(Vec::new());
+        };
+        let fresh = self.staging.fresh_slots();
+        if !bucket.variant.is_decode() || fresh.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = bucket.rows as usize;
+        let batch = self.staging.batch_rows();
+        let slots = self.staging.slots(rows);
+        let input_ids = self.staging.input_ids(bucket.tokens as usize);
+        let draws = self.staging.draws(rows);
+        let mut starts = Vec::with_capacity(fresh.len());
+        for fresh in fresh {
+            let slot = fresh.slot;
+            let row = slots
+                .iter()
+                .position(|held| u32::try_from(*held).ok() == Some(slot))
+                .ok_or_else(|| {
+                    Error::Invalid(format!("fresh slot {slot} has no row in its decode batch"))
+                })?;
+            // A decode row is one token: its query offset is the token's index.
+            let token = usize::try_from(batch.query_offsets[row])
+                .map_err(|_| Error::Invalid("a negative query offset".into()))?;
+            let sampling = i32::try_from(draws[row].position)
+                .map_err(|_| Error::Invalid("a draw position past i32".into()))?;
+            starts.push(super::sampling::SlotStart {
+                slot,
+                token: input_ids[token],
+                logical: batch.positions[token],
+                sampling,
+                verified: batch.seq_lens[row] - 1,
+            });
+        }
+        Ok(starts)
     }
 
     /// Uploads the staged batch into the device columns the captured graphs address.

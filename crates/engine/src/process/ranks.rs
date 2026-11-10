@@ -58,7 +58,8 @@ impl LoadedRank {
     /// region from it. Answers each device with its worker and the epoch's first generation, which
     /// holds no kernel yet.
     ///
-    /// `(index, count)` is this rank's place among the process's ranks and their count, `products`
+    /// `(index, count)` is this rank's place among the process's ranks and the count of its worker
+    /// group's ranks this process holds, which the scheduler sees as one pool, `products`
     /// the products the ranks share, `generation` the epoch's program generation and `blocking` the
     /// process's lanes. A serving start and a recorded start build their workers here alike, so
     /// what a recorded start reports is what a serving one launches.
@@ -231,7 +232,7 @@ fn load_rank(
     let adopted = epoch
         .predecessor_cache
         .iter()
-        .find(|cache| cache.worker_group == launch.group && !cache.segments.is_empty())
+        .find(|cache| cache.worker_group == model_runner.group() && !cache.segments.is_empty())
         .map(|cache| ipc::CacheTable {
             segments: cache
                 .segments
@@ -277,30 +278,40 @@ fn load_rank(
     let shape = model_runner.parallel_shape()?;
 
     // NCCL keeps its own device buffers, so a communicator opens before the capacity plan measures
-    // what is left of the device.
+    // what is left of the device. A media rank's groups span the host group; a text rank's tensor
+    // group is its worker group's ranks, one span of the host group among the deployment's groups.
+    let whole = |size: usize, rank: usize| {
+        if size > 1 && size != members {
+            bail!(
+                "a parallel group of {size} ranks in a host group of {members}: the group's ranks \
+                 form one parallel group, and a deployment of several such groups is not served"
+            );
+        }
+        Ok(crate::rank::Collective {
+            spans: vec![(0, size)],
+            member: Some((0, rank)),
+        })
+    };
+    let tensor = match model_runner.tensor_spans()? {
+        Some(collective) => collective,
+        None => whole(shape.tensor, shape.tensor_rank)?,
+    };
     let groups = crate::rank::RankGroups {
         sequence: group_over(
             &host,
             device,
-            (shape.sequence, shape.sequence_rank),
-            members,
+            &whole(shape.sequence, shape.sequence_rank)?,
             communicates,
         )
         .context("forming the sequence group")?,
-        tensor: group_over(
-            &host,
-            device,
-            (shape.tensor, shape.tensor_rank),
-            members,
-            communicates,
-        )
-        .context("forming the tensor group")?,
+        tensor: group_over(&host, device, &tensor, communicates)
+            .context("forming the tensor group")?,
     };
 
     // The load and the capacity plan are one call because the order between them is the plan's: the
     // weights are mapped first, so what the plan measures is what is left of the device rather than
     // what was there before the model.
-    let ((model, memory, inventory, graph), weights) = match &client {
+    let ((model, memory, mut inventory, graph), weights) = match &client {
         Some(client) => {
             let mut weights = WeightStore::new(Arc::clone(client), device);
             let loaded = model_runner
@@ -322,7 +333,17 @@ fn load_rank(
             (loaded, Vec::new())
         }
     };
-    tracing::info!(rank = model_runner.rank(), "the rank loaded its model");
+    // Where another host's Transfer Server reads this rank's planes from, for a prefill/decode
+    // hand-off between groups of two hosts: this host's Storage Server endpoint, which a
+    // deployment of several nodes states.
+    if let (Backing::Serving(storage), Some(cache)) = (backing, inventory.prefix_cache.as_mut()) {
+        cache.storage_endpoint.clone_from(&storage.tcp);
+    }
+    tracing::info!(
+        rank = model_runner.rank(),
+        group = model_runner.group(),
+        "the rank loaded its model"
+    );
     Ok(LoadedRank {
         model_runner,
         weights,
@@ -335,42 +356,66 @@ fn load_rank(
     })
 }
 
-/// The collective group of `size` ranks this rank is member `rank` of, absent for a group of one.
+/// The collective group of `collective` this rank is a member of, absent for a group of one.
 ///
-/// A group that `communicates` forms its NCCL communicator: the first member draws the group's id
-/// and the host group carries it (`parallel`'s statement of what that channel is for);
-/// `Communicator::init` then blocks until every member joined. One that does not states the split
-/// alone ([`nn::Group::recording`]).
+/// A group that `communicates` forms its NCCL communicator: each group's first member draws the
+/// group's id and the host group carries it (`parallel`'s statement of what that channel is for),
+/// one broadcast per group of more than one member, which every member of the host group takes part
+/// in, in the order the spans state; `Communicator::init` then blocks until every member of the
+/// rank's own group joined. One that does not states the split alone ([`nn::Group::recording`]).
 fn group_over(
     host: &HostGroup,
     device: platform::DeviceId,
-    (size, rank): (usize, usize),
-    ranks: usize,
+    collective: &crate::rank::Collective,
     communicates: bool,
 ) -> Result<Option<Arc<nn::Group>>> {
-    if size == 1 {
-        return Ok(None);
+    let members = host.size();
+    for &(first, size) in &collective.spans {
+        if size > 1 && first + size > members {
+            bail!(
+                "a parallel group of {size} ranks from member {first} in a host group of \
+                 {members}: a group's ranks are members of the host group"
+            );
+        }
     }
-    if size != ranks {
-        bail!(
-            "a parallel group of {size} ranks in a host group of {ranks}: the group's ranks form \
-             one parallel group, and a deployment of several groups per worker group is not served"
-        );
-    }
+    let mine = collective.member.filter(|(span, _)| {
+        collective
+            .spans
+            .get(*span)
+            .is_some_and(|(_, size)| *size > 1)
+    });
     if !communicates {
-        return Ok(Some(Arc::new(nn::Group::recording(
-            rank as u64,
-            size as u64,
-        )?)));
+        return mine
+            .map(|(span, rank)| {
+                let size = collective.spans[span].1;
+                Ok(Arc::new(nn::Group::recording(rank as u64, size as u64)?))
+            })
+            .transpose();
     }
-    let id = match rank {
-        0 => Some(platform::UniqueId::new()?),
-        _ => None,
+    let mut own = None;
+    for (index, &(first, size)) in collective.spans.iter().enumerate() {
+        if size <= 1 {
+            continue;
+        }
+        let root = host.rank() == first;
+        let id = if root {
+            Some(platform::UniqueId::new()?)
+        } else {
+            None
+        };
+        let bytes = host.broadcast_bytes(id.as_ref().map(|id| &id.0[..]), first)?;
+        if mine.is_some_and(|(span, _)| span == index) {
+            own = Some(platform::UniqueId(bytes.try_into().map_err(
+                |bytes: Vec<u8>| {
+                    anyhow::anyhow!("a communicator's id is 128 bytes, not {}", bytes.len())
+                },
+            )?));
+        }
+    }
+    let (Some((span, rank)), Some(id)) = (mine, own) else {
+        return Ok(None);
     };
-    let bytes = host.broadcast_bytes(id.as_ref().map(|id| &id.0[..]), 0)?;
-    let id = platform::UniqueId(bytes.try_into().map_err(|bytes: Vec<u8>| {
-        anyhow::anyhow!("a communicator's id is 128 bytes, not {}", bytes.len())
-    })?);
+    let size = collective.spans[span].1;
     let size = i32::try_from(size).context("a group wider than NCCL addresses")?;
     let member = i32::try_from(rank).context("a rank past what NCCL addresses")?;
     let communicator = platform::Communicator::init(device, size, member, &id)
@@ -378,90 +423,104 @@ fn group_over(
     Ok(Some(Arc::new(nn::Group::new(communicator, size as u64)?)))
 }
 
-/// This node's scheduler threads, one per DP rank.
+/// What a rank states of itself to the scheduler that drives its group, from `rank`, the report its
+/// capacity plan made: the identities every cache level keys its pages by (`storage::key::page_seed`,
+/// from the weights the process serves and the pages' layout), and with `host_cache` the bytes one
+/// token takes in its host KV cache.
 ///
-/// A node that is not the scheduler node serves only what the scheduler node's batches ask of it,
-/// so it builds none. The scheduler node builds one thread per data-parallel rank, each handed this
-/// node's workers through `worker::Batches`, and the peer links (`remotes`) of the group's ranks on
-/// other hosts: the scheduler forms a batch, every rank issues it, and the scheduler reads the
-/// result - nothing crosses threads except the batch and its result.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument has its own owner in the process - the launch, the loaded model, the \
-              workers, the peer links, the memory, the wake and the data plane - and a struct \
-              gathering them would bundle unrelated state for one call"
-)]
-pub(super) fn schedulers(
-    model_runner: &ModelRunner,
-    launch: &EngineArgs,
-    model: &crate::rank::Loaded,
-    workers: &[Arc<Worker>],
-    remotes: &[Arc<worker::peers::Remote>],
+/// The scheduler node states its own ranks with this, and a peer states its first rank with it
+/// when the scheduler node asks ([`worker::peers::Remote::info`]).
+pub(super) fn stated_report(
     rank: &ipc::MainProcessInfo,
     memory: &Memory,
-    control: ipc::Wake,
-    data: &Arc<crate::data_plane::DataPlane>,
-) -> Result<Vec<scheduler::SchedulerHandle>> {
-    if !launch.scheduler_node {
-        return Ok(Vec::new());
-    }
-    if workers.is_empty() {
-        bail!("the scheduler node holds no device to serve a batch on");
-    }
-
-    // The host KV cache copies a rank's pages on that rank's copy stream, into the pool the one rank
-    // of this scheduler's inventory states. A scheduler of an expert union serves one device, as a
-    // scheduler of one rank does, and its peers' schedulers keep their own pools of the same pages:
-    // a page holds what the union computed. A scheduler over several devices, on this host or
-    // others, would copy one device's share of every page, so it keeps none, and no text model runs
-    // one today: a rank maps its model on one device.
-    let host_cache = model_runner.host_kv_cache(model) && workers.len() == 1 && remotes.is_empty();
-
-    // One scheduler per scheduler thread: it reads the engine configuration as this rank resolves
-    // it, with the model's facts, and the limits this rank captured.
-    let (args, limits) = model_runner.scheduler_args(launch, model, host_cache)?;
+    data: &crate::data_plane::DataPlane,
+    host_cache: bool,
+) -> Result<ipc::MainProcessInfo> {
     let mut rank = rank.clone();
     if let Some(cache) = rank.prefix_cache.as_mut() {
-        // Every cache level keys the rank's pages from the weights it serves and the pages'
-        // layout (`storage::key::page_seed`).
         cache.identities = memory.page_identities(&data.serving_identity()?);
         if host_cache {
             cache.host_token_bytes = memory.host_token_bytes();
         }
     }
+    Ok(rank)
+}
 
+/// One worker group a scheduler drives: its name, and the report of its first rank, which the
+/// scheduler plans the group against ([`stated_report`]).
+pub(super) struct Pool {
+    pub(super) group: String,
+    pub(super) report: ipc::MainProcessInfo,
+}
+
+/// One scheduler thread over `pools`, the worker groups of one data-parallel rank.
+///
+/// The scheduler forms a batch for one of its groups, every rank of that group issues it, and the
+/// scheduler reads the result - nothing crosses threads except the batch and its result. Its batches
+/// go to `devices`, this node's devices with the group each is a rank of, and to `remotes`, the peer
+/// links of the processes that hold ranks of these groups on other hosts.
+///
+/// `model_runner` is a rank of this process as the scheduler plans it ([`ModelRunner::scheduled`]),
+/// `model` its loaded model: every rank of a deployment is built from one configuration, so its
+/// bounds are every group's. `host_cache` says whether the scheduler keeps a host KV cache, which
+/// it does for a group of one device of this node.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument has its own owner in the process - the launch, the loaded model, the \
+              workers, the peer links, the pools, the wake and the data plane - and a struct \
+              gathering them would bundle unrelated state for one call"
+)]
+pub(super) fn scheduler(
+    model_runner: &ModelRunner,
+    launch: &EngineArgs,
+    model: &crate::rank::Loaded,
+    devices: Vec<(String, Arc<Worker>)>,
+    remotes: Vec<(Vec<String>, Arc<worker::peers::Remote>)>,
+    pools: Vec<Pool>,
+    host_cache: bool,
+    control: ipc::Wake,
+    data: &Arc<crate::data_plane::DataPlane>,
+) -> Result<scheduler::SchedulerHandle> {
+    // One scheduler per scheduler thread: it reads the engine configuration as this rank resolves
+    // it, with the model's facts, and the limits this rank captured.
+    let (args, limits) = model_runner.scheduler_args(launch, model, host_cache)?;
+
+    // The scheduler plans against a description of each group, and a group is one rank to it: its
+    // ranks run each batch together, its first rank's report states what they hold, its capacities
+    // are the launch's (the rank reports what it holds, not what it was launched for), and its
+    // longest sequence is the model's bound. The inventory is the worker's to hold and the boot's
+    // to state, because neither number can be derived from a batch.
+    let inventory = pools
+        .into_iter()
+        .map(|pool| ipc::execution::Inventory {
+            layout: ipc::execution::PoolLayout {
+                queue_depth: model_runner.queue_depth(),
+                ranks: model_runner.world_size(),
+                // Every component the rank reports is placed on the group's ranks. A text rank
+                // reports the one default component, and a media rank one per block of its
+                // pipeline, which the scheduler reads a call's width and owner from.
+                components: pool
+                    .report
+                    .components
+                    .iter()
+                    .flat_map(|component| {
+                        scheduler::WorkerGroupConfig::single_component(
+                            &component.name,
+                            model_runner.world_size(),
+                        )
+                    })
+                    .collect(),
+            },
+            group: pool.group,
+            ranks: vec![pool.report],
+            max_model_len: model_runner.engine_config().model.max_model_len,
+        })
+        .collect();
     // The scheduler submits through the same devices this process drives, so a batch and a
     // switchover reach one worker thread per device and never two.
-    // The scheduler plans against a description of the pool, and this process is the one pool it
-    // holds: its single rank is this one, its capacities are the launch's (the rank reports what it
-    // holds, not what it was launched for), and its longest sequence is the model's bound. The
-    // inventory is the worker's to hold and the boot's to state, because neither number can be
-    // derived from a batch.
-    let inventory = ipc::execution::Inventory {
-        group: launch.group.clone(),
-        ranks: vec![rank.clone()],
-        layout: ipc::execution::PoolLayout {
-            queue_depth: model_runner.queue_depth(),
-            ranks: model_runner.world_size(),
-            // Every component the rank reports is placed on the group's ranks. A text rank reports
-            // the one default component, and a media rank one per block of its pipeline, which the
-            // scheduler reads a call's width and owner from.
-            components: rank
-                .components
-                .iter()
-                .flat_map(|component| {
-                    scheduler::WorkerGroupConfig::single_component(
-                        &component.name,
-                        model_runner.world_size(),
-                    )
-                })
-                .collect(),
-        },
-        max_model_len: model_runner.engine_config().model.max_model_len,
-    };
-    let mut stated = worker::batch::Workers::shared(workers.iter().map(Arc::clone).collect())?
-        .stating(vec![inventory])
-        .with_remotes(remotes.to_vec());
+    let mut stated = worker::batch::Workers::shared(devices)?
+        .stating(inventory)
+        .with_remotes(remotes);
     if host_cache {
         stated = stated.keeping_host_cache(worker::batch::HostCacheEndpoint { endpoint: None });
     }
@@ -473,7 +532,191 @@ pub(super) fn schedulers(
     // The control thread forwards what a scheduler produced, so it sleeps until a step says there
     // is something: a request's tokens reach the daemon when they exist, not at the next pass.
     let progress = scheduler::CommandWaker::new(move || control.wake());
-    let handle =
-        scheduler::SchedulerHandle::over_batches_telling(&args, limits, batches, progress)?;
-    Ok(vec![handle])
+    scheduler::SchedulerHandle::over_batches_telling(&args, limits, batches, progress)
+}
+
+/// How long the scheduler node waits for a peer to report the first rank of a worker group it
+/// holds: the peer answers once its ranks loaded, which the host group's capacity agreement has
+/// just shown they did, so this bounds only the peer's start of its workers.
+const PEER_REPORT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// What the scheduler node forms its schedulers from: this process's ranks and its links to the
+/// epoch's other main processes.
+pub(super) struct Blocks<'a> {
+    /// The deployment rank of this process's first rank.
+    pub(super) first: usize,
+    /// The worker group of each of this process's ranks, in rank order.
+    pub(super) groups: &'a [String],
+    /// What each of this process's ranks reports of itself, in rank order.
+    pub(super) inventories: &'a [ipc::MainProcessInfo],
+    /// Each rank's resident owners, in rank order.
+    pub(super) memories: &'a [Memory],
+    /// The peer links, one per other main process of the epoch.
+    pub(super) remotes: &'a [Arc<worker::peers::Remote>],
+    /// The process's data plane.
+    pub(super) data: &'a Arc<crate::data_plane::DataPlane>,
+}
+
+/// One scheduler's share of the epoch: the worker groups it drives, each with its first rank's
+/// report, and the peer links of the processes that hold their ranks on other hosts.
+pub(super) struct Block {
+    pub(super) groups: Vec<String>,
+    pub(super) pools: Vec<Pool>,
+    pub(super) remotes: Vec<(Vec<String>, Arc<worker::peers::Remote>)>,
+    /// Whether the scheduler keeps a host KV cache: it does for one group of one device of this
+    /// node, whose pages its copy stream moves.
+    pub(super) host_cache: bool,
+}
+
+impl Blocks<'_> {
+    /// The schedulers of a deployment whose ranks `model_runner` and `model` are one of: for a
+    /// text deployment one per data-parallel rank, over its block of the deployment's serving
+    /// groups ([`scheduler::WorkerGroupConfig::scheduler_blocks`]) - a prefill/decode deployment's
+    /// two groups are one scheduler's - and for a media deployment one over the process's group,
+    /// which its blocks' groups form together.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the process holds no device, when the serving groups do not form the
+    /// deployment's data-parallel blocks, or when a group's first rank cannot be reported: a peer
+    /// reports only its process's first rank, so a group whose first rank lies on another host
+    /// starts that host's run of ranks.
+    pub(super) fn of(
+        &self,
+        model_runner: &ModelRunner,
+        model: &crate::rank::Loaded,
+        launch: &EngineArgs,
+    ) -> Result<Vec<Block>> {
+        if self.groups.is_empty() {
+            bail!("the scheduler node holds no device to serve a batch on");
+        }
+        let config = &launch.engine_config;
+        let deployment = &config.parallel.worker_groups;
+        let text = matches!(model, crate::rank::Loaded::Text(_));
+        let blocks: Vec<Vec<String>> = if text {
+            scheduler::WorkerGroupConfig::scheduler_blocks(
+                deployment,
+                config.parallel.data_parallel_size.get(),
+            )?
+            .into_iter()
+            .map(|block| {
+                block
+                    .into_iter()
+                    .map(|index| deployment[index].id.0.clone())
+                    .collect()
+            })
+            .collect()
+        } else {
+            vec![vec![launch.group.clone()]]
+        };
+        // Each peer link with the groups its process holds ranks of: a text group with a rank on
+        // the peer's host, and the process's one group for a media deployment.
+        let tagged: Vec<(Vec<String>, Arc<worker::peers::Remote>)> = self
+            .remotes
+            .iter()
+            .map(|remote| {
+                let held = if text {
+                    groups_on_host_of(deployment, remote.rank() as usize)
+                } else {
+                    vec![launch.group.clone()]
+                };
+                (held, Arc::clone(remote))
+            })
+            .collect();
+        let firsts = scheduler::WorkerGroupConfig::first_ranks(deployment);
+        let mut formed = Vec::with_capacity(blocks.len());
+        for groups in blocks {
+            let local_devices = self
+                .groups
+                .iter()
+                .filter(|group| groups.contains(group))
+                .count();
+            let remotes: Vec<(Vec<String>, Arc<worker::peers::Remote>)> = tagged
+                .iter()
+                .filter(|(held, _)| held.iter().any(|group| groups.contains(group)))
+                .map(|(held, remote)| {
+                    let mine = held
+                        .iter()
+                        .filter(|group| groups.contains(group))
+                        .cloned()
+                        .collect();
+                    (mine, Arc::clone(remote))
+                })
+                .collect();
+            let host_cache = model_runner.host_kv_cache(model)
+                && groups.len() == 1
+                && local_devices == 1
+                && remotes.is_empty();
+            let mut pools = Vec::with_capacity(groups.len());
+            for group in &groups {
+                let report = if text {
+                    let index = deployment
+                        .iter()
+                        .position(|stated| stated.id.0 == *group)
+                        .with_context(|| format!("the deployment places no group {group}"))?;
+                    self.report_of(firsts[index], host_cache)
+                        .with_context(|| format!("reporting worker group {group}"))?
+                } else {
+                    stated_report(
+                        &self.inventories[0],
+                        &self.memories[0],
+                        self.data,
+                        host_cache,
+                    )?
+                };
+                pools.push(Pool {
+                    group: group.clone(),
+                    report,
+                });
+            }
+            formed.push(Block {
+                groups,
+                pools,
+                remotes,
+                host_cache,
+            });
+        }
+        Ok(formed)
+    }
+
+    /// The report of the deployment's rank `rank`: this process's own rank, or the first rank of
+    /// a peer's process, which the peer answers.
+    fn report_of(&self, rank: usize, host_cache: bool) -> Result<ipc::MainProcessInfo> {
+        if let Some(local) = rank
+            .checked_sub(self.first)
+            .filter(|local| *local < self.inventories.len())
+        {
+            return stated_report(
+                &self.inventories[local],
+                &self.memories[local],
+                self.data,
+                host_cache,
+            );
+        }
+        let remote = self
+            .remotes
+            .iter()
+            .find(|remote| remote.rank() as usize == rank)
+            .with_context(|| {
+                format!(
+                    "rank {rank} starts a worker group and no main process of the epoch starts its \
+                     ranks there: a peer reports its first rank, so a group's ranks on another \
+                     host begin that host's ranks"
+                )
+            })?;
+        Ok(remote.info(PEER_REPORT)?)
+    }
+}
+
+/// The groups of `groups` with a rank on the host of the deployment's rank `rank`.
+fn groups_on_host_of(groups: &[scheduler::WorkerGroupConfig], rank: usize) -> Vec<String> {
+    let Some((group, position)) = scheduler::WorkerGroupConfig::place_rank(groups, rank) else {
+        return Vec::new();
+    };
+    let host = &groups[group].ranks[position].host;
+    groups
+        .iter()
+        .filter(|group| group.ranks.iter().any(|placed| placed.host == *host))
+        .map(|group| group.id.0.clone())
+        .collect()
 }

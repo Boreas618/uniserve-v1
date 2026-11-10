@@ -1171,7 +1171,32 @@ pub(crate) struct CommitColumns {
     /// advances them, so only the device knows where a call's slot stands. Two, because a replay's
     /// positions are read while the next replay's copy is on its way.
     pub(crate) readback: [platform::PinnedBuffer; 2],
+    /// The host side of [`CommitColumns::start`]: `[4, slots]` i32 cells (next input token,
+    /// logical position, sampling position, verified length) and `[slots]` u8 predicates, one cell
+    /// per slot, so a slot's start is copied from cells no other slot's start rewrites.
+    starts: platform::PinnedBuffer,
 }
+
+/// The state a slot starts with when its first call on this worker is a decode: a request whose
+/// prompt another worker computed and whose first token that worker sampled, as a decode group
+/// continues a prefill group's request. It is what that worker's explicit commit left in its own
+/// slot, which the decode then advances by one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SlotStart {
+    /// The request's slot.
+    pub(crate) slot: u32,
+    /// The token the decode reads as its input: the last token the request generated.
+    pub(crate) token: i32,
+    /// The token's logical position, which is also the cache extent before it.
+    pub(crate) logical: i32,
+    /// The position of the draw the decode samples with.
+    pub(crate) sampling: i32,
+    /// The cache length the request's slot has verified: its tokens before the input token.
+    pub(crate) verified: i32,
+}
+
+/// The i32 fields of a [`SlotStart`] after its slot: token, logical, sampling and verified.
+const START_FIELDS: usize = 4;
 
 impl CommitColumns {
     /// The commit operands of a runner whose largest bucket has `rows` rows over `slots` slots.
@@ -1205,6 +1230,10 @@ impl CommitColumns {
                     2 * slots.max(1) as usize * std::mem::size_of::<i32>(),
                 )?,
             ],
+            starts: platform::PinnedBuffer::new(
+                device,
+                slots.max(1) as usize * (START_FIELDS * std::mem::size_of::<i32>() + 1),
+            )?,
         };
         // The roles a decode step leaves inert hold their starting values; only `table` is written
         // again per batch.
@@ -1236,6 +1265,67 @@ impl CommitColumns {
     /// The slots the per-slot state columns address.
     pub(crate) fn slots(&self) -> usize {
         self.slots as usize
+    }
+
+    /// Starts `start.slot`'s state on `stream`, before the step that reads it: its next input
+    /// token, its logical and sampling positions and verified length, and a set predicate.
+    ///
+    /// A decode reads its input token from the slot's state and the commit after it advances the
+    /// positions by one, so a slot whose first call here is a decode holds the state the worker that
+    /// sampled the request's last token committed. Each value is a stream-ordered copy of one cell
+    /// into the slot's element of its column, so no other slot's state, which only the device holds,
+    /// is touched.
+    ///
+    /// # Errors
+    ///
+    /// Fails for a slot past the columns' slots, or when a copy cannot be issued.
+    pub(crate) fn start(&mut self, start: SlotStart, stream: &platform::Stream) -> Result<()> {
+        let slots = self.slots as usize;
+        let slot = start.slot as usize;
+        if slot >= slots {
+            return Err(Error::Invalid(format!(
+                "a slot start names slot {slot} of a commit state of {slots} slots"
+            )));
+        }
+        let word = std::mem::size_of::<i32>();
+        let values = [start.token, start.logical, start.sampling, start.verified];
+        let flags = START_FIELDS * slots * word;
+        // SAFETY: the cells written are this slot's, and a copy from them that may still be pending
+        // is a previous start of the same slot, which a slot's next request cannot overtake: the
+        // slot is started again only after the request that held it ended, its steps completed.
+        unsafe {
+            let cells = self.starts.as_mut_slice();
+            for (field, value) in values.iter().enumerate() {
+                let at = (field * slots + slot) * word;
+                cells[at..at + word].copy_from_slice(&value.to_ne_bytes());
+            }
+            cells[flags + slot] = 1;
+        }
+        let base = self.starts.address();
+        let targets = [&self.future, &self.logical, &self.sampling, &self.verified];
+        for (field, column) in targets.into_iter().enumerate() {
+            // SAFETY: the destination is element `slot` of an i32 column of `slots` elements, the
+            // source this slot's cell of the pinned start buffer; both outlive the copy, which the
+            // stream orders before the step that reads the slot.
+            unsafe {
+                platform::memcpy_async(
+                    column.device.ptr.address() + (slot * word) as u64,
+                    base + ((field * slots + slot) * word) as u64,
+                    word,
+                    stream,
+                )?;
+            }
+        }
+        // SAFETY: as above, for element `slot` of the u8 predicates.
+        unsafe {
+            platform::memcpy_async(
+                self.predicates.device.ptr.address() + slot as u64,
+                base + (flags + slot) as u64,
+                1,
+                stream,
+            )?;
+        }
+        Ok(())
     }
 
     /// Moves the columns the host rewrites or reads to device storage. The others hold values no

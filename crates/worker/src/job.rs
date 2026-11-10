@@ -618,6 +618,7 @@ mod tests {
             frees: Vec::new(),
             id: ipc::execution::BatchId(1),
             phase: ipc::PhaseId(0),
+            group: "model".to_owned(),
             calls: Vec::new(),
             shape: Shape::decode(1, Variant::DecodeGreedy),
             columns: BatchColumns::default(),

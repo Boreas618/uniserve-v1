@@ -78,8 +78,8 @@ pub enum WorkerGroupRole {
     #[default]
     Model,
     /// A model group that prefills prompts only: a request continues on a
-    /// `Decode` group of its scheduler, which installs the KV cache the
-    /// prefill exported (prefill/decode disaggregation).
+    /// `Decode` group of its scheduler, into whose device cache the scheduler
+    /// copies the request's units (prefill/decode disaggregation).
     Prefill,
     /// A model group that decodes only, continuing requests a `Prefill`
     /// group prefilled.
@@ -417,6 +417,9 @@ impl WorkerGroupConfig {
             has(WorkerGroupRole::Prefill) == has(WorkerGroupRole::Decode),
             "prefill groups and decode groups are configured together"
         );
+        // A hand-off copies each prefill rank's units into the decode rank of the same index, so
+        // every prefill and decode group has as many ranks as the others.
+        let mut split_ranks: Option<(usize, &WorkerGroupId)> = None;
         for worker in workers {
             if matches!(
                 worker.role,
@@ -427,9 +430,80 @@ impl WorkerGroupConfig {
                     "worker {}: a prefill or decode group places the `{DEFAULT_BLOCK}` block alone",
                     worker.id
                 );
+                match split_ranks {
+                    Some((ranks, first)) => anyhow::ensure!(
+                        ranks == worker.ranks.len(),
+                        "worker {} has {} ranks and worker {first} has {ranks}: prefill and decode \
+                         groups hand a request's cache rank by rank",
+                        worker.id,
+                        worker.ranks.len()
+                    ),
+                    None => split_ranks = Some((worker.ranks.len(), &worker.id)),
+                }
             }
         }
         Ok(())
+    }
+
+    /// The group that holds the deployment's rank `rank` and the rank's position in it.
+    ///
+    /// The deployment numbers its ranks over every group in the order the groups are stated, each
+    /// group's ranks in their own order, as the daemon places one main process per host over that
+    /// numbering; `None` past the last rank.
+    pub fn place_rank(groups: &[Self], rank: usize) -> Option<(usize, usize)> {
+        let mut first = 0;
+        for (index, group) in groups.iter().enumerate() {
+            if rank < first + group.ranks.len() {
+                return Some((index, rank - first));
+            }
+            first += group.ranks.len();
+        }
+        None
+    }
+
+    /// The deployment rank of position 0 of each group, in the order the groups are stated.
+    pub fn first_ranks(groups: &[Self]) -> Vec<usize> {
+        groups
+            .iter()
+            .scan(0, |first, group| {
+                let at = *first;
+                *first += group.ranks.len();
+                Some(at)
+            })
+            .collect()
+    }
+
+    /// The groups each of `data_parallel` schedulers serves, by index into `groups`: the groups
+    /// that serve requests, in order, dealt as equal consecutive blocks.
+    ///
+    /// A scheduler drives every group of its block as one of its worker groups, so a deployment's
+    /// prefill and decode groups are one scheduler's, and the shorthand's `model-<i>` group is
+    /// scheduler `i`'s alone.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the serving groups do not divide into `data_parallel` equal blocks.
+    pub fn scheduler_blocks(
+        groups: &[Self],
+        data_parallel: usize,
+    ) -> anyhow::Result<Vec<Vec<usize>>> {
+        let serving: Vec<usize> = groups
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| group.role.serves_requests())
+            .map(|(index, _)| index)
+            .collect();
+        let data_parallel = data_parallel.max(1);
+        anyhow::ensure!(
+            !serving.is_empty() && serving.len().is_multiple_of(data_parallel),
+            "{} groups serve requests, which do not form {data_parallel} equal blocks of \
+             data-parallel schedulers",
+            serving.len()
+        );
+        Ok(serving
+            .chunks(serving.len() / data_parallel)
+            .map(<[usize]>::to_vec)
+            .collect())
     }
 
     /// One block tensor-parallel over every rank.
@@ -843,5 +917,49 @@ mod tests {
             }
         }
         assert!(files > 0, "configs/ publishes deployments");
+    }
+
+    /// A prefill/decode deployment's groups are one scheduler's, the shorthand's data-parallel
+    /// groups one scheduler's each; a rank is found in its group by the deployment's numbering, and
+    /// a prefill and a decode group of different rank counts are refused.
+    #[test]
+    fn serving_groups_form_the_schedulers_and_ranks_find_their_group() {
+        let split = workers(
+            "[[worker_groups]]\nid = \"prefill\"\nrole = \"prefill\"\nranks = [\"cuda:0\"]\n\
+             queue_depth = 2\n[worker_groups.blocks.model]\n\
+             [[worker_groups]]\nid = \"decode\"\nrole = \"decode\"\nranks = [\"r2/cuda:0\"]\n\
+             queue_depth = 2\n[worker_groups.blocks.model]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            WorkerGroupConfig::scheduler_blocks(&split, 1).unwrap(),
+            vec![vec![0, 1]]
+        );
+        assert_eq!(WorkerGroupConfig::place_rank(&split, 1), Some((1, 0)));
+        assert_eq!(WorkerGroupConfig::place_rank(&split, 2), None);
+
+        let shorthand = WorkerGroupConfig::data_parallel(
+            &["engine".to_owned()],
+            "cuda",
+            2,
+            2,
+            2,
+            WorkerGroupConfig::single_component(DEFAULT_BLOCK, 2),
+        );
+        assert_eq!(
+            WorkerGroupConfig::scheduler_blocks(&shorthand, 2).unwrap(),
+            vec![vec![0], vec![1]]
+        );
+        assert_eq!(WorkerGroupConfig::first_ranks(&shorthand), vec![0, 2]);
+        assert_eq!(WorkerGroupConfig::place_rank(&shorthand, 3), Some((1, 1)));
+        assert!(WorkerGroupConfig::scheduler_blocks(&shorthand, 3).is_err());
+
+        let uneven = workers(
+            "[[worker_groups]]\nid = \"prefill\"\nrole = \"prefill\"\nranks = [\"cuda:0-1\"]\n\
+             queue_depth = 2\n[worker_groups.blocks.model]\ntensor_parallel_size = 2\n\
+             [[worker_groups]]\nid = \"decode\"\nrole = \"decode\"\nranks = [\"cuda:2\"]\n\
+             queue_depth = 2\n[worker_groups.blocks.model]\n",
+        );
+        assert!(uneven.is_err(), "a hand-off copies between equal ranks");
     }
 }

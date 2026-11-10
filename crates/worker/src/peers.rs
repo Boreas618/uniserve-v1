@@ -12,7 +12,10 @@
 //! scheduler formed, and the peer answers [`ipc::MainProcessResponse::Result`] with the
 //! [`ipc::execution::BatchOutput`] its ranks produced, or `Error`, under the request's
 //! `message_id`. The ranks of one group run every batch together, so the scheduler's submission
-//! of a batch is joined with the peer's ([`ipc::execution::Submission::joined`]).
+//! of a batch is joined with the peer's ([`ipc::execution::Submission::joined`]). The scheduler
+//! node asks [`ipc::MainProcessRequest::Info`] once the ranks loaded, and the peer answers
+//! [`ipc::MainProcessResponse::Info`] with its first rank's report, which the scheduler plans a
+//! worker group that starts on the peer's host against ([`Remote::info`]).
 //!
 //! Each end's connection is owned by one link thread, which sends what other threads queued
 //! (firing the channel's local wake), reads what arrived and settles it; nothing else touches
@@ -234,6 +237,12 @@ pub fn register(address: &str, rank: u32, engine: u64, timeout: Duration) -> Res
     }
 }
 
+/// The answer to an [`MainProcessRequest::Info`] the scheduler node asked, or the peer's refusal.
+type InfoAnswer = std::result::Result<ipc::MainProcessInfo, String>;
+
+/// The `Info` requests a peer has not answered yet, by the `message_id` they were sent under.
+type PendingInfos = Mutex<HashMap<u64, Sender<InfoAnswer>>>;
+
 /// The scheduler node's link to one peer main process: where its scheduler's batches for the
 /// peer's ranks go, and how their outcomes come back.
 pub struct Remote {
@@ -243,6 +252,8 @@ pub struct Remote {
     wake: ipc::Wake,
     /// The submissions the peer has not answered yet, by the `message_id` they were sent under.
     pending: Arc<Mutex<HashMap<u64, Arc<SubmissionState>>>>,
+    /// The reports of its first rank the peer has not answered yet.
+    infos: Arc<PendingInfos>,
     next: AtomicU64,
     liveness: Arc<Liveness>,
     closing: Arc<AtomicBool>,
@@ -259,15 +270,20 @@ impl Remote {
     pub fn spawn(rank: u32, channel: Channel, liveness: Arc<Liveness>) -> Result<Arc<Self>> {
         let (outbox, queued) = crossbeam_channel::unbounded();
         let pending = Arc::new(Mutex::new(HashMap::new()));
+        let infos = Arc::new(Mutex::new(HashMap::new()));
         let closing = Arc::new(AtomicBool::new(false));
         let wake = channel.wake();
         let thread = {
-            let pending = Arc::clone(&pending);
+            let link = Link {
+                rank,
+                pending: Arc::clone(&pending),
+                infos: Arc::clone(&infos),
+            };
             let liveness = Arc::clone(&liveness);
             let closing = Arc::clone(&closing);
             std::thread::Builder::new()
                 .name(format!("peer-{rank}"))
-                .spawn(move || remote_link(rank, channel, &queued, &pending, &liveness, &closing))
+                .spawn(move || remote_link(&link, channel, &queued, &liveness, &closing))
                 .map_err(|error| Error::transport_source("starting a peer link", error))?
         };
         Ok(Arc::new(Self {
@@ -275,6 +291,7 @@ impl Remote {
             outbox,
             wake,
             pending,
+            infos,
             next: AtomicU64::new(1),
             liveness,
             closing,
@@ -294,6 +311,45 @@ impl Remote {
     /// Fails once the link is lost: the group cannot run the batch without the peer's ranks.
     pub fn submit(&self, batch: Batch) -> Result<Submission> {
         self.send(MainProcessRequest::submit(batch))
+    }
+
+    /// What the peer's first rank reports of itself, which the scheduler plans a worker group
+    /// against: the peer answers once its ranks loaded, within `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Fails once the link is lost, when the peer refuses, or when no answer arrives in time.
+    pub fn info(&self, timeout: Duration) -> Result<ipc::MainProcessInfo> {
+        if let Some(reason) = self.liveness.lost() {
+            return Err(Error::transport(format!(
+                "the peer link of rank {} is lost: {reason}",
+                self.rank
+            )));
+        }
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let (answer, answered) = crossbeam_channel::bounded(1);
+        lock(&self.infos).insert(id, answer);
+        self.outbox
+            .send(MainProcessRequest::Info {
+                message_id: Some(id),
+            })
+            .map_err(|_| Error::State("the peer link's thread has ended"))?;
+        self.wake.wake();
+        match answered.recv_timeout(timeout) {
+            Ok(Ok(info)) => Ok(info),
+            Ok(Err(reason)) => Err(Error::transport(format!(
+                "rank {}'s main process did not report itself: {reason}",
+                self.rank
+            ))),
+            Err(_) => {
+                lock(&self.infos).remove(&id);
+                Err(Error::transport(format!(
+                    "rank {}'s main process did not report itself within {} s",
+                    self.rank,
+                    timeout.as_secs()
+                )))
+            }
+        }
     }
 
     /// Sends the shadow `batch` to the peer's ranks, as [`Self::submit`] sends a batch.
@@ -342,16 +398,34 @@ impl Drop for Remote {
     }
 }
 
+/// What a link thread settles the peer's answers into.
+struct Link {
+    /// The first rank of the peer's process.
+    rank: u32,
+    pending: Arc<Mutex<HashMap<u64, Arc<SubmissionState>>>>,
+    infos: Arc<PendingInfos>,
+}
+
+impl Link {
+    /// Fails every unanswered submission and report request with `reason`.
+    fn fail(&self, reason: &str) {
+        fail_pending(&self.pending, reason);
+        for (_, answer) in lock(&self.infos).drain() {
+            let _ = answer.send(Err(reason.to_owned()));
+        }
+    }
+}
+
 /// The scheduler node's side of one peer connection: sends what the scheduler queued, settles
 /// each answer by its `message_id`, and on a close fails every unanswered submission.
 fn remote_link(
-    rank: u32,
+    link: &Link,
     mut channel: Channel,
     queued: &Receiver<MainProcessRequest>,
-    pending: &Mutex<HashMap<u64, Arc<SubmissionState>>>,
     liveness: &Liveness,
     closing: &AtomicBool,
 ) {
+    let rank = link.rank;
     let failure = loop {
         let mut failed = None;
         while let Ok(request) = queued.try_recv() {
@@ -364,7 +438,7 @@ fn remote_link(
                 // An orderly close: the frame goes out before the connection does.
                 let _ = channel.flush();
                 channel.shutdown();
-                fail_pending(pending, "the epoch's scheduler node closed its peer links");
+                link.fail("the epoch's scheduler node closed its peer links");
                 return;
             }
         }
@@ -373,7 +447,7 @@ fn remote_link(
         }
         loop {
             match channel.try_recv::<MainProcessResponse>() {
-                Ok(Some(response)) => settle(rank, pending, response),
+                Ok(Some(response)) => settle(link, response),
                 Ok(None) => break,
                 Err(error) => {
                     failed = Some(format!("rank {rank}'s main process: {error}"));
@@ -388,19 +462,32 @@ fn remote_link(
             break format!("rank {rank}'s main process: {error}");
         }
     };
-    fail_pending(pending, &failure);
+    link.fail(&failure);
     // A close this side asked for is not a loss of the peer.
     if !closing.load(Ordering::Acquire) {
         liveness.lose(failure);
     }
 }
 
-/// Settles the submission `response` answers.
-fn settle(
-    rank: u32,
-    pending: &Mutex<HashMap<u64, Arc<SubmissionState>>>,
-    response: MainProcessResponse,
-) {
+/// Settles the submission or report request `response` answers.
+fn settle(link: &Link, response: MainProcessResponse) {
+    let (rank, pending) = (link.rank, &link.pending);
+    // A report request's answer, or its refusal, settles that request.
+    let asked = match &response {
+        MainProcessResponse::Info { message_id, .. }
+        | MainProcessResponse::Error { message_id, .. } => {
+            message_id.and_then(|id| lock(&link.infos).remove(&id))
+        }
+        _ => None,
+    };
+    if let Some(answer) = asked {
+        let _ = answer.send(match response {
+            MainProcessResponse::Info { info, .. } => Ok(info),
+            MainProcessResponse::Error { error, .. } => Err(error.message),
+            _ => Err("the peer answered a report request with another kind".to_owned()),
+        });
+        return;
+    }
     let (id, outcome) = match response {
         MainProcessResponse::Result { message_id, result } => {
             (message_id, Outcome::Success(result))
@@ -460,7 +547,8 @@ pub struct Upstream {
 
 impl Upstream {
     /// Serves the scheduler node's requests arriving on `channel` with `workers`, this process's
-    /// ranks; a close of the connection marks `liveness` lost.
+    /// ranks, answering a report request with `info`, its first rank's report; a close of the
+    /// connection marks `liveness` lost.
     ///
     /// Two threads: the link, which owns the connection, and the responder, which waits for each
     /// submission in the order it was made (each device runs its batches in that order) and hands
@@ -469,7 +557,12 @@ impl Upstream {
     /// # Errors
     ///
     /// Fails when a thread cannot start.
-    pub fn serve(channel: Channel, workers: Arc<Workers>, liveness: Arc<Liveness>) -> Result<Self> {
+    pub fn serve(
+        channel: Channel,
+        workers: Arc<Workers>,
+        info: ipc::MainProcessInfo,
+        liveness: Arc<Liveness>,
+    ) -> Result<Self> {
         let (answers, answered) = crossbeam_channel::unbounded::<MainProcessResponse>();
         let (waiting, awaited) = crossbeam_channel::unbounded::<(u64, Submission)>();
         let closing = Arc::new(AtomicBool::new(false));
@@ -501,7 +594,9 @@ impl Upstream {
             std::thread::Builder::new()
                 .name("peer-upstream".into())
                 .spawn(move || {
-                    upstream_link(channel, &workers, &waiting, &answered, &liveness, &closing);
+                    upstream_link(
+                        channel, &workers, &info, &waiting, &answered, &liveness, &closing,
+                    );
                 })
                 .map_err(|error| Error::transport_source("starting the peer link", error))?
         };
@@ -535,6 +630,7 @@ impl Drop for Upstream {
 fn upstream_link(
     mut channel: Channel,
     workers: &Workers,
+    info: &ipc::MainProcessInfo,
     waiting: &Sender<(u64, Submission)>,
     answered: &Receiver<MainProcessResponse>,
     liveness: &Liveness,
@@ -576,13 +672,25 @@ fn upstream_link(
                     failed = Some("the scheduler node closed the epoch's peer links".into());
                     break;
                 }
+                // The scheduler node plans a worker group whose first rank is this process's
+                // against its report.
+                MainProcessRequest::Info { message_id } => {
+                    let answer = MainProcessResponse::Info {
+                        message_id,
+                        info: info.clone(),
+                    };
+                    if let Err(error) = channel.send(&answer) {
+                        failed = Some(format!("answering the scheduler node: {error}"));
+                        break;
+                    }
+                    continue;
+                }
                 other => {
                     // The scheduler node's daemon commands this process itself (its programs, a
                     // promotion, a shutdown) over its own process interface; the peer channel
                     // carries batches.
                     let id = match &other {
-                        MainProcessRequest::Info { message_id }
-                        | MainProcessRequest::Promote { message_id }
+                        MainProcessRequest::Promote { message_id }
                         | MainProcessRequest::Hook { message_id, .. } => message_id.unwrap_or(0),
                         _ => 0,
                     };
@@ -654,6 +762,7 @@ mod tests {
         Batch {
             id: ipc::execution::BatchId(1),
             phase: ipc::PhaseId(0),
+            group: "model".to_owned(),
             calls: Vec::new(),
             shape: ipc::execution::Shape::decode(1, ipc::execution::Variant::DecodeGreedy),
             columns: ipc::execution::BatchColumns::default(),
@@ -700,6 +809,65 @@ mod tests {
             "a registration of another epoch is refused"
         );
         stranger.join().expect("the stranger's dial");
+    }
+
+    /// The scheduler node's report request is answered with the report the peer states, and a
+    /// refusal of it is the request's error, not a batch's.
+    #[test]
+    fn a_peer_answers_the_report_of_its_first_rank() {
+        let listener = Listener::bind(&["127.0.0.1:0"]).expect("a listener");
+        let address = listener.addresses()[0].clone();
+        let stated = ipc::MainProcessInfo {
+            request_slots: 7,
+            ..ipc::MainProcessInfo::default()
+        };
+        let answer = stated.clone();
+        let peer = std::thread::spawn(move || {
+            let mut channel = register(&address, 2, 5, Duration::from_secs(10)).expect("registers");
+            // Answer the first request with the report and the second with a refusal.
+            for answered in 0..2 {
+                let request = loop {
+                    if let Some(request) =
+                        channel.try_recv::<MainProcessRequest>().expect("a request")
+                    {
+                        break request;
+                    }
+                    channel
+                        .wait(Duration::from_secs(5))
+                        .expect("the request arrives");
+                };
+                let MainProcessRequest::Info { message_id } = request else {
+                    panic!("the scheduler node asked for a report: {request:?}");
+                };
+                let response = if answered == 0 {
+                    MainProcessResponse::Info {
+                        message_id,
+                        info: answer.clone(),
+                    }
+                } else {
+                    refusal(message_id.unwrap_or(0), "not loaded".to_owned())
+                };
+                channel.send(&response).expect("the answer is sent");
+                channel.flush().expect("the answer leaves");
+            }
+            channel
+        });
+        let (rank, channel) = accept(&listener, 1, 5, Duration::from_secs(10))
+            .expect("the peer registers")
+            .pop()
+            .expect("one peer");
+        let waker = ipc::Waker::new().expect("a waker");
+        let remote = Remote::spawn(rank, channel, Liveness::new(waker.wake())).expect("the link");
+        let reported = remote
+            .info(Duration::from_secs(10))
+            .expect("the peer reports");
+        assert_eq!(reported, stated);
+        let refused = remote
+            .info(Duration::from_secs(10))
+            .expect_err("a refusal is the request's error");
+        assert!(refused.to_string().contains("not loaded"), "{refused}");
+        drop(peer.join().expect("the peer"));
+        remote.close();
     }
 
     /// A submission to a peer whose connection closes fails, and the close marks the scheduler
