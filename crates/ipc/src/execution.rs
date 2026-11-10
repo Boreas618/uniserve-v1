@@ -1625,10 +1625,17 @@ pub struct Submission {
     peers: Vec<Submission>,
 }
 
+/// What a submission's completion calls once its outcome lands ([`Submission::on_settled`]).
+///
+/// It runs on the thread that completed the submission (a device's worker thread), so it must
+/// only signal: wake a waiter, never do the waiter's work.
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
+
 /// The completion state of one submission, which the worker's queue completes.
 pub struct SubmissionState {
-    /// The submission's own outcome, which `Completion` records once and waits on.
-    completion: Completion<std::convert::Infallible, BatchOutput>,
+    /// The submission's own outcome, which `Completion` records once and waits on, with the
+    /// wakers [`Submission::on_settled`] registered.
+    completion: Completion<Waker, BatchOutput>,
     /// What the submission was doing when it failed, written where the failure happened: the
     /// caller cannot know it, and an error alone does not say which bucket or operator broke.
     failure: Mutex<Option<String>>,
@@ -1728,6 +1735,21 @@ impl Submission {
             .wait_timeout(deadline.saturating_duration_since(Instant::now()))
     }
 
+    /// Calls `wake` when this rank's part or any peer's part settles, at once for a part that
+    /// already has: a caller holding several submissions waits on one signal of its own and reads
+    /// [`Submission::outcome`] of each when it fires, instead of polling them.
+    ///
+    /// `wake` may be called once per part, so a waiter re-checks the outcome rather than counting
+    /// calls.
+    pub fn on_settled(&self, wake: &Waker) {
+        if let Some(wake) = self.state.completion.subscribe(Arc::clone(wake)) {
+            wake();
+        }
+        for peer in &self.peers {
+            peer.on_settled(wake);
+        }
+    }
+
     /// The submission's outcome, when it completed.
     pub fn outcome(&self) -> Option<Outcome<BatchOutput>> {
         let own = self.state.completion.outcome()?;
@@ -1761,7 +1783,9 @@ impl SubmissionState {
     /// Completes the submission with `outcome`; the first completion wins.
     pub fn finish(self: Arc<Self>, outcome: Outcome<BatchOutput>) {
         // The first outcome stands; a later one (a cancel racing a completion) is dropped.
-        self.completion.settle(outcome);
+        for wake in self.completion.settle(outcome).unwrap_or_default() {
+            wake();
+        }
     }
 }
 

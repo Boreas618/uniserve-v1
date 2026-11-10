@@ -42,9 +42,6 @@ pub(super) trait Epoch {
     fn has_capacity(&self, worker: &WorkerGroupId) -> bool;
 }
 
-/// How often the waiting thread looks at the batches in flight.
-const REPORT_POLL: std::time::Duration = std::time::Duration::from_micros(50);
-
 /// What the mechanism executes through.
 ///
 /// Public because a scheduler is built with one: `Scheduler::new` takes a
@@ -184,15 +181,31 @@ impl Submissions {
                 // in their own order, so a batch is reported when it ends: a
                 // report held behind an earlier batch on another device is a
                 // next call that many milliseconds late.
+                //
+                // The thread blocks: on the queue while nothing is held, and
+                // otherwise on `settled`, which every held submission signals
+                // when one of its parts lands (`Submission::on_settled`) and
+                // the queue's forwarder signals when a new one is handed over.
+                let (settled, woken) = crossbeam_channel::bounded::<()>(1);
+                let wake: ipc::execution::Waker = Arc::new(move || {
+                    // A full slot already wakes the thread.
+                    let _ = settled.try_send(());
+                });
                 let mut held: Vec<Pending> = Vec::new();
                 loop {
                     if held.is_empty() {
                         match pending.recv() {
-                            Ok(next) => held.push(next),
+                            Ok(next) => {
+                                next.submission.on_settled(&wake);
+                                held.push(next);
+                            }
                             Err(_) => break,
                         }
                     }
-                    held.extend(pending.try_iter());
+                    for next in pending.try_iter() {
+                        next.submission.on_settled(&wake);
+                        held.push(next);
+                    }
                     let mut index = 0;
                     let mut reported = false;
                     while index < held.len() {
@@ -208,7 +221,22 @@ impl Submissions {
                         reported = true;
                     }
                     if !reported && !held.is_empty() {
-                        std::thread::sleep(REPORT_POLL);
+                        // Either a held part settled or another batch was
+                        // handed over; both are re-read at the top.
+                        crossbeam_channel::select! {
+                            recv(woken) -> _ => {}
+                            recv(pending) -> next => match next {
+                                Ok(next) => {
+                                    next.submission.on_settled(&wake);
+                                    held.push(next);
+                                }
+                                Err(_) => {
+                                    // No further batch; the held ones still
+                                    // settle and wake the thread.
+                                    let _ = woken.recv();
+                                }
+                            },
+                        }
                     }
                 }
             })
