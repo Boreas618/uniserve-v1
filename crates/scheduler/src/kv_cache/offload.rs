@@ -2552,6 +2552,7 @@ mod tests {
     /// pages by.
     fn page_keys(cache: &PrefixCacheInfo, prompt: &[u32]) -> Vec<Vec<Key>> {
         let mut coordinator = super::super::PrefixCacheCoordinator::new(
+            BlockPool::new(cache.num_units, cache.scratch_units),
             cache.groups.iter().map(GroupShape::from_group).collect(),
         );
         coordinator.set_seeds(super::super::prefix_seeds(cache));

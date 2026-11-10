@@ -222,7 +222,7 @@ impl Scheduler {
         let held = self
             .storage
             .cache()
-            .map_or(0, |cache| cache.block_pool.withdrawn_held());
+            .map_or(0, |cache| cache.pool().withdrawn_held());
         if held > 0
             || (resize.change.quiesces()
                 && !(self.running.is_empty()
@@ -299,14 +299,7 @@ impl Scheduler {
         let state_seeds = self
             .storage
             .cache()
-            .map(|cache| {
-                cache
-                    .coordinator
-                    .seeds()
-                    .iter()
-                    .map(|seed| seed.0)
-                    .collect::<Vec<_>>()
-            })
+            .map(|cache| cache.seeds().iter().map(|seed| seed.0).collect::<Vec<_>>())
             .unwrap_or_default();
         let mut kept = 0;
         for state in self.running.values_mut() {
@@ -357,8 +350,7 @@ impl Scheduler {
         if let Some(cache) = self.storage.cache.as_mut() {
             // Pipeline stages contribute different layers to the same
             // scheduler group. Union their components just as startup does.
-            let mut groups =
-                vec![std::collections::BTreeSet::new(); cache.coordinator.groups().len()];
+            let mut groups = vec![std::collections::BTreeSet::new(); cache.groups().len()];
             for result in results
                 .iter()
                 .filter(|result| !result.identities.is_empty())
@@ -371,7 +363,7 @@ impl Scheduler {
                 }
             }
             if groups.iter().all(|group| !group.is_empty()) {
-                cache.coordinator.set_seeds(
+                cache.set_seeds(
                     groups
                         .into_iter()
                         .map(|group| {
@@ -444,7 +436,7 @@ impl Scheduler {
         let inherited = self
             .storage
             .cache()
-            .map_or(0..0, |cache| cache.block_pool.inherited());
+            .map_or(0..0, |cache| cache.pool().inherited());
         (1..first.held)
             .rev()
             .find(|&index| first.first_unit(index) < inherited.end)
@@ -527,7 +519,7 @@ impl Scheduler {
         let Some(cache) = self.storage.cache() else {
             return 0;
         };
-        let idle = cache.block_pool.acquire_idle_from(unit);
+        let idle = cache.pool().acquire_idle_from(unit);
         self.offload_pages(idle)
     }
 
@@ -540,7 +532,7 @@ impl Scheduler {
         let Some(cache) = self.storage.cache() else {
             return 0;
         };
-        let idle = cache.block_pool.acquire_idle_units(units);
+        let idle = cache.pool().acquire_idle_units(units);
         self.offload_pages(idle)
     }
 
@@ -630,8 +622,8 @@ impl Scheduler {
         let Some(cache) = self.storage.cache() else {
             return;
         };
-        let held = cache.block_pool.withdraw(first);
-        let withdrawn = cache.block_pool.withdrawn();
+        let held = cache.pool().withdraw(first);
+        let withdrawn = cache.pool().withdrawn();
         tracing::info!(
             first = withdrawn,
             held,
@@ -655,11 +647,7 @@ impl Scheduler {
         if !withdrawing {
             return;
         }
-        let Some(first) = self
-            .storage
-            .cache()
-            .map(|cache| cache.block_pool.withdrawn())
-        else {
+        let Some(first) = self.storage.cache().map(|cache| cache.pool().withdrawn()) else {
             return;
         };
         let holds = self
@@ -695,7 +683,7 @@ impl Scheduler {
         let Some(cache) = self.storage.cache() else {
             return Ok(Vec::new());
         };
-        if !cache.block_pool.has_withdrawn() {
+        if !cache.pool().has_withdrawn() {
             return Ok(Vec::new());
         }
         let results = self.run_operation(ipc::memory::RestoreCache {
@@ -705,7 +693,7 @@ impl Scheduler {
             .cache_storage()?
             .map(|reports| reports[0].first_unit(reports[0].held));
         if let (Some(cache), Some(end)) = (self.storage.cache(), end) {
-            cache.block_pool.restore_to(end);
+            cache.pool().restore_to(end);
         }
         tracing::info!(units = self.storage.usable_units(), "restored the KV cache");
         answers(&results)
@@ -744,7 +732,7 @@ impl Scheduler {
         }
         let results = self.run_operation(ipc::memory::Wake)?;
         if let Some(cache) = self.storage.cache() {
-            cache.block_pool.restore();
+            cache.pool().restore();
         }
         self.asleep = false;
         tracing::info!("the scheduler woke");

@@ -271,7 +271,7 @@ impl Scheduler {
         // prefix-cache lookup; pages still referenced keep their owners.
         if let Some(cache) = &self.storage.cache {
             for endpoint in &loss.endpoints {
-                cache.block_pool.invalidate_source(endpoint);
+                cache.pool().invalidate_source(endpoint);
             }
         }
         // The failed worker's page offloads are aborted and its admission pins

@@ -138,9 +138,9 @@ impl Scheduler {
                             continue;
                         }
                         if !host {
-                            cache.block_pool.activate([&page.reference]);
+                            cache.pool().activate([&page.reference]);
                         }
-                        cache.block_pool.publish(
+                        cache.pool().publish(
                             &page.reference,
                             page.page.group,
                             page.hash,
@@ -159,7 +159,7 @@ impl Scheduler {
                         *end = (*end).max(page.page.start + page.page.tokens);
                     }
                     self.warming.reserved.retain(|page| {
-                        cache.coordinator.groups()[page.page.group as usize]
+                        cache.groups()[page.page.group as usize]
                             .window()
                             .is_none_or(|window| {
                                 let end = ends[&(page.resume, page.page.group)];
@@ -259,7 +259,6 @@ impl Scheduler {
             .cache()
             .and_then(|cache| {
                 cache
-                    .coordinator
                     .groups()
                     .iter()
                     .map(|shape| shape.block_size as u32)
@@ -313,12 +312,7 @@ impl Scheduler {
                 cached: 0,
                 isolation_key: state.req.cache.isolation_key,
                 state_seeds: if state.req.cache.state_seeds.is_empty() {
-                    cache
-                        .coordinator
-                        .seeds()
-                        .iter()
-                        .map(|seed| seed.0)
-                        .collect()
+                    cache.seeds().iter().map(|seed| seed.0).collect()
                 } else {
                     state.req.cache.state_seeds.clone()
                 },
@@ -327,7 +321,7 @@ impl Scheduler {
             for (group, (table, shape)) in allocation
                 .block_tables()
                 .iter()
-                .zip(cache.coordinator.groups())
+                .zip(cache.groups())
                 .enumerate()
             {
                 if shape.draft() {
@@ -392,14 +386,10 @@ impl Scheduler {
                 state_seeds: if keep { &prefix.state_seeds } else { &[] },
                 resume: Some(resume),
             };
-            let mut hashes = vec![Vec::new(); cache.coordinator.groups().len()];
-            cache.coordinator.extend_hashes(
-                &mut hashes,
-                CachedTokens::prompt(&prefix.tokens),
-                scope,
-            );
+            let mut hashes = vec![Vec::new(); cache.groups().len()];
+            cache.extend_hashes(&mut hashes, CachedTokens::prompt(&prefix.tokens), scope);
             let source_pages = std::mem::take(&mut prefix.pages);
-            for (group, shape) in cache.coordinator.groups().iter().enumerate() {
+            for (group, shape) in cache.groups().iter().enumerate() {
                 if shape.draft() {
                     continue;
                 }
@@ -431,10 +421,10 @@ impl Scheduler {
                         continue;
                     }
                     let reference = if host {
-                        cache.block_pool.reserve_future(shape.units_per_page)
+                        cache.pool().reserve_future(shape.units_per_page)
                     } else {
                         cache
-                            .block_pool
+                            .pool()
                             .allocate(1, shape.units_per_page)
                             .map(|mut pages| pages.remove(0))
                     }
@@ -490,15 +480,7 @@ impl Scheduler {
                     .filter(|(_, worker)| worker.prefix_cache.is_some())
                     .map(|(_, worker)| {
                         cache
-                            .coordinator
-                            .probe_prefix(
-                                &cache.block_pool,
-                                &prefix.tokens,
-                                true,
-                                false,
-                                scope,
-                                &worker.endpoint,
-                            )
+                            .probe_prefix(&prefix.tokens, true, false, scope, &worker.endpoint)
                             .cached_tokens as u32
                     })
                     .max()

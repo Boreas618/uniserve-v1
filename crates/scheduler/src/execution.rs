@@ -641,9 +641,10 @@ impl Scheduler {
         // A page the host was offered as it was published has nothing left to move. A policy names
         // the same idle pages step after step, and taking one again pins it out of the free queue
         // until the host answers, so requests that need units would wait behind cached pages.
-        let units = self.storage.cache().map_or(units.clone(), |cache| {
-            cache.block_pool.without_host_key(&units)
-        });
+        let units = self
+            .storage
+            .cache()
+            .map_or(units.clone(), |cache| cache.pool().without_host_key(&units));
         if !units.is_empty() {
             let moved = self.offload_units(&units);
             if moved < units.len() {
@@ -685,7 +686,7 @@ impl Scheduler {
         let device_hit = hit.cached_tokens.min(state.req.prompt_token_ids.len());
         if let admission::HostHit::Serving(boundary) = admission::host_prefix(
             &mut self.kv_offload,
-            self.storage.cache().map(|cache| &cache.coordinator),
+            self.storage.cache(),
             state,
             &target,
             device_hit,
@@ -1077,7 +1078,7 @@ impl Scheduler {
         let Some(cache) = self.storage.cache() else {
             return;
         };
-        let (published, freed) = cache.block_pool.take_page_changes();
+        let (published, freed) = cache.pool().take_page_changes();
         if published.is_empty() && freed.is_empty() {
             return;
         }
@@ -1088,7 +1089,7 @@ impl Scheduler {
         let announced: Vec<scheduling::guest::PageView> = published
             .into_iter()
             .filter_map(|(head, tokens)| {
-                let units = cache.block_pool.page_units(head)?;
+                let units = cache.pool().page_units(head)?;
                 views::page_of(self, &units, tokens)
             })
             .collect();
@@ -1242,7 +1243,7 @@ impl Scheduler {
             .in_flight
             .store(self.inflight.pending_batches.len(), Ordering::Relaxed);
         if let Some(prefix_cache) = self.storage.cache.as_ref() {
-            let pool = prefix_cache.block_pool.stats();
+            let pool = prefix_cache.pool().stats();
             self.stats
                 .prefix_cache
                 .pages_evicted
@@ -1254,7 +1255,7 @@ impl Scheduler {
             self.stats
                 .prefix_cache
                 .cached_pages
-                .store(prefix_cache.block_pool.cached_pages(), Ordering::Relaxed);
+                .store(prefix_cache.pool().cached_pages(), Ordering::Relaxed);
         }
         self.stats
             .encoder

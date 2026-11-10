@@ -197,7 +197,7 @@ use crate::generation::{
     BlockCursor, GenerationPhase as Phase, consumes_image_features, is_prompt_extend,
 };
 
-use crate::allocation::{BufferPool, BufferSpan, PrefixCacheManager, RequestPool, RequestSlot};
+use crate::allocation::{BufferPool, BufferSpan, RequestPool, RequestSlot};
 use crate::kv_cache::{BlockPool, BlockTable, CacheAllocation, PrefixCacheCoordinator};
 use crossbeam_channel::Receiver;
 use ipc::RequestId;

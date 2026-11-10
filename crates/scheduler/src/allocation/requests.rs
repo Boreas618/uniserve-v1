@@ -15,7 +15,7 @@ use ipc::BufferId;
 /// Logical storage reservations and retained exports owned by the engine.
 pub(crate) struct Storage {
     /// Text cache pages and prefix cache; `None` when the runtime has no prefix cache.
-    pub(crate) cache: Option<PrefixCacheManager>,
+    pub(crate) cache: Option<PrefixCacheCoordinator>,
     pub(crate) encoder_cache: crate::kv_cache::EncoderCacheManager,
     /// Encoder-cache entries promised to admitted requests. `admit` checks it
     /// against `EncoderCacheManager::budget` only for requests that reserve
@@ -87,30 +87,28 @@ impl Storage {
 
     /// Returns the text prefix cache, which exists when the worker serves token
     /// generation; token requests are rejected at submission without it.
-    pub(crate) fn cache(&self) -> Option<&PrefixCacheManager> {
+    pub(crate) fn cache(&self) -> Option<&PrefixCacheCoordinator> {
         self.cache.as_ref()
     }
 
     /// Revokes the prefix identity of every cached page (`BlockPool::flush`);
     /// returns how many pages it revoked.
     pub(crate) fn flush_prefix_cache(&self) -> usize {
-        self.cache
-            .as_ref()
-            .map_or(0, |cache| cache.block_pool.flush())
+        self.cache.as_ref().map_or(0, |cache| cache.pool().flush())
     }
 
     /// Returns the queued cache units, including cached ones allocation evicts.
     pub(crate) fn free_units(&self) -> usize {
         self.cache
             .as_ref()
-            .map_or(0, |cache| cache.block_pool.free_units())
+            .map_or(0, |cache| cache.pool().free_units())
     }
 
     /// Returns the cache units the scheduler may allocate.
     pub(crate) fn usable_units(&self) -> usize {
         self.cache
             .as_ref()
-            .map_or(0, PrefixCacheManager::usable_units)
+            .map_or(0, |cache| cache.pool().usable_units())
     }
 
     /// Returns the cache units the scheduler may allocate once none is
@@ -119,7 +117,7 @@ impl Storage {
     pub(crate) fn capacity_units(&self) -> usize {
         self.cache
             .as_ref()
-            .map_or(0, PrefixCacheManager::capacity_units)
+            .map_or(0, |cache| cache.pool().capacity_units())
     }
 
     /// Transfer the existing Tensor allocation to encoder-cache retention.

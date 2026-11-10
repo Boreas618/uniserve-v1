@@ -178,10 +178,12 @@ impl Scheduler {
         }
 
         // Storage and scheduler statistics share the resolved worker capacities.
-        let cache = PrefixCacheManager::from_main_process_info(&info);
+        let cache = PrefixCacheCoordinator::from_main_process_info(&info);
         let stats = Arc::new(SchedulerStats::default());
         stats.prefix_cache.num_units.store(
-            cache.as_ref().map_or(0, PrefixCacheManager::usable_units),
+            cache
+                .as_ref()
+                .map_or(0, |cache| cache.pool().usable_units()),
             Ordering::Relaxed,
         );
 
@@ -385,7 +387,7 @@ impl Scheduler {
     /// Enables or disables reusable prefix caching.
     pub fn set_prefix_reuse(&mut self, on: bool) {
         if let Some(cache) = self.storage.cache.as_mut() {
-            cache.set_prefix_reuse(on);
+            cache.set_prefix_enabled(on);
         }
     }
 

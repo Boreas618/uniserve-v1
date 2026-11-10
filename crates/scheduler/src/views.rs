@@ -389,7 +389,7 @@ pub(crate) fn room(scheduler: &Scheduler, step: u64) -> Room {
     let page_tokens = scheduler
         .storage
         .cache()
-        .map_or(1, |cache| cache.coordinator.max_block_size());
+        .map_or(1, |cache| cache.max_block_size());
     Room {
         step,
         kv_units: scheduler.storage.free_units() as u64,
@@ -449,7 +449,7 @@ pub(crate) fn shortage_now(scheduler: &Scheduler) -> Option<Shortage> {
     // have returned, and the units of the requests already leaving, which
     // return once their calls drain: a victim named for those would be one
     // too many.
-    let free = u64::try_from(cache.block_pool.free_units()).unwrap_or(0);
+    let free = u64::try_from(cache.pool().free_units()).unwrap_or(0);
     let leaving = scheduler
         .running
         .values()
@@ -572,9 +572,7 @@ fn reservation_units(scheduler: &Scheduler, state: &RequestState) -> u64 {
     if !state.reserve_worstcase {
         return 0;
     }
-    cache
-        .coordinator
-        .units_for_tokens(state.max_reserved_cache_tokens) as u64
+    cache.units_for_tokens(state.max_reserved_cache_tokens) as u64
 }
 
 /// The gap in the request's draft cache: the tokens a refill would evaluate,
@@ -595,7 +593,7 @@ fn refill_gap(scheduler: &Scheduler, state: &RequestState) -> Option<u32> {
         .storage
         .cache
         .as_ref()
-        .is_some_and(|cache| cache.coordinator.state_block_size().is_some())
+        .is_some_and(|cache| cache.state_block_size().is_some())
     {
         return None;
     }
@@ -827,7 +825,7 @@ pub(crate) fn pages(scheduler: &Scheduler) -> Vec<PageView> {
     let held = held_units(scheduler);
     let mut seen = HashSet::new();
     let mut views = Vec::new();
-    for page in cache.block_pool.export() {
+    for page in cache.pool().export() {
         let Some(first) = page.units.first().copied() else {
             continue;
         };

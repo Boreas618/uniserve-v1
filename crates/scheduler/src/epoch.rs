@@ -100,7 +100,7 @@ impl Scheduler {
                 lent: self
                     .storage
                     .cache()
-                    .map(|cache| cache.block_pool.lent())
+                    .map(|cache| cache.pool().lent())
                     .unwrap_or_default(),
                 ..ParkedCache::default()
             }));
@@ -245,7 +245,7 @@ impl Scheduler {
             tracing::info!("the parked scheduler resumes");
         }
         if reclaim && let Some(cache) = self.storage.cache() {
-            let reclaimed = cache.block_pool.reclaim();
+            let reclaimed = cache.pool().reclaim();
             if reclaimed > 0 {
                 tracing::info!(
                     units = reclaimed,
@@ -278,7 +278,7 @@ impl Scheduler {
         }) else {
             return Vec::new();
         };
-        let pool = &cache.block_pool;
+        let pool = cache.pool();
         let inherited = pool.inherited();
         let held = pool.withdrawn();
         let continued: std::collections::BTreeSet<u32> = index
@@ -341,7 +341,6 @@ impl Scheduler {
             return Ok(());
         };
         let page_units: u32 = cache
-            .coordinator
             .groups()
             .iter()
             .map(|group| group.units_per_page as u32)
@@ -357,10 +356,10 @@ impl Scheduler {
             } else {
                 0
             };
-        let own_free = cache.block_pool.free_units() as u32;
+        let own_free = cache.pool().free_units() as u32;
         // The segments the predecessor lent, in this pool's units, where the
         // workers map the predecessor's planes after the epoch's head.
-        let inherited = cache.block_pool.inherited();
+        let inherited = cache.pool().inherited();
         let borrowed: Vec<std::ops::Range<u32>> = parked
             .lent
             .iter()
@@ -436,8 +435,8 @@ impl Scheduler {
         let Some(cache) = self.storage.cache() else {
             return Ok(());
         };
-        let imported = cache.block_pool.import(index, inherited.start, &source);
-        let borrowed = cache.block_pool.borrow(&borrowed);
+        let imported = cache.pool().import(index, inherited.start, &source);
+        let borrowed = cache.pool().borrow(&borrowed);
         tracing::info!(
             pages = imported,
             offered = index.len(),
@@ -467,7 +466,7 @@ impl Scheduler {
         self.draining = draining;
         let results = self.worker.commit().map_err(|error| format!("{error:#}"))?;
         if let Some(cache) = self.storage.cache() {
-            cache.block_pool.take_inherited();
+            cache.pool().take_inherited();
         }
         self.trial = false;
         tracing::info!(
@@ -556,7 +555,7 @@ impl Scheduler {
     fn index(&self) -> Vec<IndexedPage> {
         self.storage
             .cache()
-            .map(|cache| cache.block_pool.export())
+            .map(|cache| cache.pool().export())
             .unwrap_or_default()
     }
 }

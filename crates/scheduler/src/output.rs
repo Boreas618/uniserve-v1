@@ -1087,7 +1087,7 @@ impl Scheduler {
                 && let Some(resume) = st.req.cache.resume
                 && let Some(cache) = &self.storage.cache
             {
-                cache.block_pool.forget_resume(resume);
+                cache.pool().forget_resume(resume);
             }
             let request_key = RequestKey::new(self.engine_id, id, st.request_epoch);
             if st.worker_registered {
@@ -1273,16 +1273,13 @@ impl Scheduler {
             .zip(worker.as_ref())
             .filter(|(kv_offload, worker)| kv_offload.serves(worker));
         if !generated.is_empty() && !hashes.is_empty() {
-            prefix_cache
-                .coordinator
-                .extend_hashes(&mut hashes, tokens, scope);
+            prefix_cache.extend_hashes(&mut hashes, tokens, scope);
         }
 
         let mut reserved = Vec::new();
         let advanced = state.prefix_cache_mut().is_some_and(|allocation| {
             allocation.complete_copies();
-            let published_now = prefix_cache.coordinator.publish_computed(
-                &prefix_cache.block_pool,
+            let published_now = prefix_cache.publish_computed(
                 allocation,
                 tokens,
                 &hashes,
@@ -1294,8 +1291,7 @@ impl Scheduler {
                 scope.resume,
             );
             if immutable {
-                prefix_cache.coordinator.publish_tails(
-                    &prefix_cache.block_pool,
+                prefix_cache.publish_tails(
                     allocation,
                     tokens,
                     computed,
@@ -1312,7 +1308,7 @@ impl Scheduler {
                     kv_offload,
                     worker,
                     id,
-                    &prefix_cache.block_pool,
+                    prefix_cache.pool(),
                     allocation,
                     PublishedPages {
                         tokens,
@@ -1325,10 +1321,7 @@ impl Scheduler {
                     &source,
                 );
             }
-            published_now
-                && prefix_cache
-                    .coordinator
-                    .release_window(allocation, visible, refill_cursor)
+            published_now && prefix_cache.release_window(allocation, visible, refill_cursor)
         });
         if let Some((kv_offload, worker)) = kv_offload {
             // Pages published now are offloaded to the host KV cache, but
@@ -1337,7 +1330,7 @@ impl Scheduler {
             // verifies its copy first.
             for (_, keys, pages, _) in &reserved {
                 for (key, page) in keys.iter().zip(pages) {
-                    prefix_cache.block_pool.set_host_key(page, *key);
+                    prefix_cache.pool().set_host_key(page, *key);
                 }
             }
             for (group, keys, pages, kind) in reserved {

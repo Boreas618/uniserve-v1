@@ -1838,12 +1838,14 @@ pub fn prefix_seeds(cache: &ipc::PrefixCacheInfo) -> Vec<Key> {
 }
 
 /// Coordinates capacity, window release and prefix state across cache
-/// groups.
+/// groups over the unit pool it owns.
 ///
 /// Callers pass one [`CacheAllocation`] whose tables match `groups` in order;
 /// the methods return `None` or `false` for any other table set.
 #[derive(Debug)]
 pub(crate) struct PrefixCacheCoordinator {
+    /// The units every group's pages take, shared by all of them.
+    pool: BlockPool,
     groups: Vec<GroupShape>,
     prefix_enabled: bool,
     /// The page seed of each group's chain; a request's isolation key is
@@ -1852,14 +1854,78 @@ pub(crate) struct PrefixCacheCoordinator {
 }
 
 impl PrefixCacheCoordinator {
-    /// Creates a coordinator for the given cache groups with prefix caching
-    /// enabled and a zero chain seed.
-    pub(crate) fn new(groups: Vec<GroupShape>) -> Self {
+    /// Creates a coordinator for the given cache groups over `pool`, with
+    /// prefix caching enabled and a zero chain seed.
+    pub(crate) fn new(pool: BlockPool, groups: Vec<GroupShape>) -> Self {
         Self {
+            pool,
             hash_seeds: vec![Key([0; 32]); groups.len()],
             groups,
             prefix_enabled: true,
         }
+    }
+
+    /// Builds the scheduler's cache state when a worker advertises a paged
+    /// unit pool; `None` when `info` has no prefix cache.
+    ///
+    /// `BlockPool::new` panics on a pool without an allocatable unit and
+    /// `BlockTable::new` on an empty page shape; `PrefixCacheInfo::validate`
+    /// rejects each of these.
+    pub(crate) fn from_main_process_info(info: &ipc::MainProcessInfo) -> Option<Self> {
+        info.prefix_cache.as_ref().map(|prefix_cache| {
+            let pool = BlockPool::new(prefix_cache.num_units, prefix_cache.scratch_units);
+            // The units of the segments the planes do not hold (a
+            // successor's tail its storage does not hold yet, or what a
+            // standby's predecessor gave back) stay withdrawn until they are
+            // created; the units mapped from a predecessor epoch stay out of
+            // allocation until the epoch takes them.
+            let usable = prefix_cache.allocatable_units();
+            if usable < prefix_cache.num_units {
+                pool.withdraw(usable);
+            }
+            pool.inherit(prefix_cache.inherited());
+            let mut coordinator = Self::new(
+                pool,
+                prefix_cache
+                    .groups
+                    .iter()
+                    .map(GroupShape::from_group)
+                    .collect(),
+            );
+            coordinator.set_seeds(prefix_seeds(prefix_cache));
+            coordinator
+        })
+    }
+
+    /// The unit pool the groups' pages take their units from.
+    pub(crate) fn pool(&self) -> &BlockPool {
+        &self.pool
+    }
+
+    /// Acquires one table per cache group holding `tokens` tokens for a read
+    /// from token zero, atomically.
+    pub(crate) fn allocate(
+        &self,
+        tokens: u32,
+    ) -> Result<CacheAllocation, crate::allocation::OutOfStorage> {
+        let mut allocation = self.empty();
+        self.ensure_capacity(&mut allocation, 0, tokens as usize, Checkpoint::Boundary)
+            .ok_or(crate::allocation::OutOfStorage::PrefixCache)?;
+        Ok(allocation)
+    }
+
+    /// Grows every cache group atomically for a call that reads from token
+    /// `read_start` and holds `tokens` tokens, retaining shared prefix
+    /// references; its state groups checkpoint as `checkpoint` says.
+    pub(crate) fn grow(
+        &self,
+        allocation: &mut CacheAllocation,
+        read_start: u32,
+        tokens: u32,
+        checkpoint: Checkpoint,
+    ) -> Result<(), crate::allocation::OutOfStorage> {
+        self.ensure_capacity(allocation, read_start as usize, tokens as usize, checkpoint)
+            .ok_or(crate::allocation::OutOfStorage::PrefixCache)
     }
 
     /// Root subsequent page hashes at each group's upstream computation.
@@ -1946,12 +2012,12 @@ impl PrefixCacheCoordinator {
     /// none. Returns `None` when the tables do not match the groups.
     pub(crate) fn units_needed(
         &self,
-        pool: &BlockPool,
         allocation: &CacheAllocation,
         read_start: usize,
         total_tokens: usize,
         checkpoint: Checkpoint,
     ) -> Option<usize> {
+        let pool = &self.pool;
         if !self.matches(allocation) {
             return None;
         }
@@ -2053,13 +2119,13 @@ impl PrefixCacheCoordinator {
     /// allow ([`Self::grow_draft`]).
     pub(crate) fn ensure_capacity(
         &self,
-        pool: &BlockPool,
         allocation: &mut CacheAllocation,
         read_start: usize,
         total_tokens: usize,
         checkpoint: Checkpoint,
     ) -> Option<()> {
-        let demand = self.units_needed(pool, allocation, read_start, total_tokens, checkpoint)?;
+        let pool = &self.pool;
+        let demand = self.units_needed(allocation, read_start, total_tokens, checkpoint)?;
         let growths: Vec<Growth> = allocation
             .tables
             .iter()
@@ -2131,7 +2197,7 @@ impl PrefixCacheCoordinator {
             }
         }
         if let Some(group) = self.draft_group() {
-            self.grow_draft(pool, allocation, group, read_start, total_tokens);
+            self.grow_draft(allocation, group, read_start, total_tokens);
         }
         Some(())
     }
@@ -2145,12 +2211,12 @@ impl PrefixCacheCoordinator {
     /// before it until a refill fills it.
     fn grow_draft(
         &self,
-        pool: &BlockPool,
         allocation: &mut CacheAllocation,
         group: usize,
         read_start: usize,
         total_tokens: usize,
     ) {
+        let pool = &self.pool;
         let table = &mut allocation.tables[group];
         let shape = table.shape;
         let end = shape.pages_covering(total_tokens);
@@ -2356,13 +2422,13 @@ impl PrefixCacheCoordinator {
     /// its window before it.
     fn select_prefix(
         &self,
-        pool: &BlockPool,
         prompt: &[u32],
         hashes: &[Vec<Key>],
         source: &MainProcessEndpoint,
         scope: PrefixScope,
         public: bool,
     ) -> PrefixSelection {
+        let pool = &self.pool;
         let resume = scope.resume;
         let step = self.max_block_size();
         let limit = prompt.len().saturating_sub(1) / step * step;
@@ -2506,7 +2572,6 @@ impl PrefixCacheCoordinator {
         // acquisition uses whichever complete prefix is longer.
         if resume.is_some() && public {
             let shared = self.select_prefix(
-                pool,
                 prompt,
                 hashes,
                 source,
@@ -2533,7 +2598,6 @@ impl PrefixCacheCoordinator {
     /// `cache_read` is false, or the request carries images.
     pub(crate) fn probe_prefix(
         &self,
-        pool: &BlockPool,
         prompt: &[u32],
         cache_read: bool,
         has_images: bool,
@@ -2548,7 +2612,6 @@ impl PrefixCacheCoordinator {
         }
         let hashes = self.prefix_hashes(prompt, scope);
         let selection = self.select_prefix(
-            pool,
             prompt,
             &hashes,
             source,
@@ -2594,13 +2657,8 @@ impl PrefixCacheCoordinator {
     /// false, so the prompt can still be published as prefill completes.
     /// Returns `None` when the tables do not match the groups or are not
     /// empty.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one lookup's prompt, cache policy and source worker"
-    )]
     pub(crate) fn acquire_prefix(
         &self,
-        pool: &BlockPool,
         allocation: &mut CacheAllocation,
         prompt: &[u32],
         cache_read: bool,
@@ -2608,6 +2666,7 @@ impl PrefixCacheCoordinator {
         scope: PrefixScope,
         source: &MainProcessEndpoint,
     ) -> Option<PrefixLookup> {
+        let pool = &self.pool;
         if !self.matches(allocation)
             || allocation
                 .tables
@@ -2634,7 +2693,6 @@ impl PrefixCacheCoordinator {
         }
 
         let selection = self.select_prefix(
-            pool,
             prompt,
             &result.page_hashes,
             source,
@@ -2763,13 +2821,8 @@ impl PrefixCacheCoordinator {
     /// Publish immutable partial pages after the request's writes have
     /// drained. Ordinary preemption and epoch promotion use the same
     /// continuation lookup; consumers copy these pages before appending.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one drained request's cache publication"
-    )]
     pub(crate) fn publish_tails(
         &self,
-        pool: &BlockPool,
         allocation: &CacheAllocation,
         tokens: CachedTokens<'_>,
         computed: usize,
@@ -2777,6 +2830,7 @@ impl PrefixCacheCoordinator {
         public: bool,
         source: &Arc<MainProcessEndpoint>,
     ) {
+        let pool = &self.pool;
         if (!public && scope.resume.is_none()) || !self.matches(allocation) {
             return;
         }
@@ -2833,7 +2887,6 @@ impl PrefixCacheCoordinator {
     )]
     pub(crate) fn publish_computed(
         &self,
-        pool: &BlockPool,
         allocation: &CacheAllocation,
         tokens: CachedTokens<'_>,
         hashes: &[Vec<Key>],
@@ -2844,6 +2897,7 @@ impl PrefixCacheCoordinator {
         source: &Arc<MainProcessEndpoint>,
         resume: Option<proto::request::CacheResume>,
     ) -> bool {
+        let pool = &self.pool;
         let public = self.prefix_enabled && cache_write;
         if (!public && resume.is_none()) || hashes.is_empty() {
             return true;
@@ -2955,11 +3009,11 @@ mod tests {
     /// takes nothing: taking it would pin it out of the free queue at every step.
     #[test]
     fn a_page_offered_to_the_host_is_not_offered_again() {
-        let pool = BlockPool::new(8, 0);
-        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
+        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(8, 0), vec![full(4, 1)]);
+        let pool = coordinator.pool();
         let source = endpoint();
-        let offered = publish_pages(&coordinator, &pool, &[1, 2, 3, 4], 0, &[0], &source);
-        let kept = publish_pages(&coordinator, &pool, &[5, 6, 7, 8], 0, &[0], &source);
+        let offered = publish_pages(&coordinator, &[1, 2, 3, 4], 0, &[0], &source);
+        let kept = publish_pages(&coordinator, &[5, 6, 7, 8], 0, &[0], &source);
         pool.set_host_key(&offered[0], storage::Key([7; 32]));
         let units = [offered[0].units()[0].0, kept[0].units()[0].0];
         assert_eq!(pool.without_host_key(&units), vec![units[1]]);
@@ -2967,8 +3021,8 @@ mod tests {
 
     #[test]
     fn private_recovery_pages_are_held_and_reused_only_by_their_continuation() {
-        let pool = BlockPool::new(8, 0);
-        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
+        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(8, 0), vec![full(4, 1)]);
+        let pool = coordinator.pool();
         let source = endpoint();
         let tokens = vec![1, 2, 3, 4, 5];
         let resume = proto::request::CacheResume {
@@ -2988,7 +3042,7 @@ mod tests {
         pool.publish(&lease, 0, hashes[0][0], &tokens[..4], &source, Some(resume));
         assert_eq!(
             coordinator
-                .probe_prefix(&pool, &tokens, true, false, PrefixScope::default(), &source)
+                .probe_prefix(&tokens, true, false, PrefixScope::default(), &source)
                 .cached_tokens,
             0
         );
@@ -3001,31 +3055,32 @@ mod tests {
         };
         assert_eq!(
             coordinator
-                .probe_prefix(&pool, &tokens, true, false, other, &source)
+                .probe_prefix(&tokens, true, false, other, &source)
                 .cached_tokens,
             0
         );
         let mut allocation = coordinator.empty();
         assert_eq!(
             coordinator
-                .probe_prefix(&pool, &tokens, false, true, scope, &source)
+                .probe_prefix(&tokens, false, true, scope, &source)
                 .cached_tokens,
             4
         );
         let hit = coordinator
-            .acquire_prefix(&pool, &mut allocation, &tokens, false, true, scope, &source)
+            .acquire_prefix(&mut allocation, &tokens, false, true, scope, &source)
             .unwrap();
         assert_eq!(hit.cached_tokens, 4);
         drop(lease);
         assert_eq!(pool.free_units(), 6);
         drop(allocation);
         assert_eq!(pool.free_units(), 7);
-        let successor = BlockPool::new(16, 0);
+        let successor_cache = PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![full(4, 1)]);
+        let successor = successor_cache.pool();
         successor.inherit(8..16);
         successor.import(&pool.export(), 8, &source);
         assert_eq!(
-            coordinator
-                .probe_prefix(&successor, &tokens, false, true, scope, &source)
+            successor_cache
+                .probe_prefix(&tokens, false, true, scope, &source)
                 .cached_tokens,
             4,
         );
@@ -3034,11 +3089,10 @@ mod tests {
 
     #[test]
     fn a_continuation_reuses_public_pages_only_under_its_read_policy() {
-        let pool = BlockPool::new(8, 0);
-        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
+        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(8, 0), vec![full(4, 1)]);
         let source = endpoint();
         let tokens = vec![1, 2, 3, 4, 5];
-        let _published = publish(&coordinator, &pool, &tokens, &source);
+        let _published = publish(&coordinator, &tokens, &source);
         let scope = PrefixScope {
             resume: Some(proto::request::CacheResume {
                 epoch: 3,
@@ -3062,22 +3116,14 @@ mod tests {
             };
             assert_eq!(
                 coordinator
-                    .probe_prefix(&pool, &tokens, read, images, scope, &source)
+                    .probe_prefix(&tokens, read, images, scope, &source)
                     .cached_tokens,
                 expected,
             );
             let mut allocation = coordinator.empty();
             assert_eq!(
                 coordinator
-                    .acquire_prefix(
-                        &pool,
-                        &mut allocation,
-                        &tokens,
-                        read,
-                        images,
-                        scope,
-                        &source
-                    )
+                    .acquire_prefix(&mut allocation, &tokens, read, images, scope, &source)
                     .unwrap()
                     .cached_tokens,
                 expected,
@@ -3087,11 +3133,11 @@ mod tests {
 
     #[test]
     fn mapped_pages_preserve_public_and_private_reuse_on_the_same_units() {
-        let pool = BlockPool::new(16, 0);
-        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
+        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![full(4, 1)]);
+        let pool = coordinator.pool();
         let source = endpoint();
         let tokens = vec![1, 2, 3, 4, 5];
-        drop(publish(&coordinator, &pool, &tokens, &source));
+        drop(publish(&coordinator, &tokens, &source));
         let resume = proto::request::CacheResume {
             epoch: 3,
             request_id: 7,
@@ -3103,14 +3149,16 @@ mod tests {
         let mut allocation = coordinator.empty();
         assert_eq!(
             coordinator
-                .acquire_prefix(&pool, &mut allocation, &tokens, true, false, scope, &source,)
+                .acquire_prefix(&mut allocation, &tokens, true, false, scope, &source,)
                 .unwrap()
                 .cached_tokens,
             4
         );
         drop(allocation);
 
-        let successor = BlockPool::new(32, 0);
+        let successor_cache = PrefixCacheCoordinator::new(BlockPool::new(32, 0), vec![full(4, 1)]);
+
+        let successor = successor_cache.pool();
         successor.inherit(16..32);
         successor.import(&pool.export(), 16, &source);
         successor.take_inherited();
@@ -3122,8 +3170,8 @@ mod tests {
             (&mut private, scope, false),
         ] {
             assert_eq!(
-                coordinator
-                    .acquire_prefix(&successor, allocation, &tokens, read, false, scope, &source,)
+                successor_cache
+                    .acquire_prefix(allocation, &tokens, read, false, scope, &source,)
                     .unwrap()
                     .cached_tokens,
                 4
@@ -3133,21 +3181,14 @@ mod tests {
         drop((public, private));
         successor.forget_resume(resume);
         assert_eq!(
-            coordinator
-                .probe_prefix(&successor, &tokens, false, false, scope, &source,)
+            successor_cache
+                .probe_prefix(&tokens, false, false, scope, &source,)
                 .cached_tokens,
             0
         );
         assert_eq!(
-            coordinator
-                .probe_prefix(
-                    &successor,
-                    &tokens,
-                    true,
-                    false,
-                    PrefixScope::default(),
-                    &source,
-                )
+            successor_cache
+                .probe_prefix(&tokens, true, false, PrefixScope::default(), &source,)
                 .cached_tokens,
             4
         );
@@ -3155,8 +3196,8 @@ mod tests {
 
     #[test]
     fn private_publication_keeps_the_latest_completed_state_checkpoint() {
-        let pool = BlockPool::new(64, 0);
-        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1), state(4, 2)]);
+        let coordinator =
+            PrefixCacheCoordinator::new(BlockPool::new(64, 0), vec![full(4, 1), state(4, 2)]);
         let source = endpoint();
         let tokens: Vec<_> = (1..=25).collect();
         let resume = proto::request::CacheResume {
@@ -3169,28 +3210,19 @@ mod tests {
         };
         let mut allocation = coordinator.empty();
         let lookup = coordinator
-            .acquire_prefix(
-                &pool,
-                &mut allocation,
-                &tokens,
-                false,
-                false,
-                scope,
-                &source,
-            )
+            .acquire_prefix(&mut allocation, &tokens, false, false, scope, &source)
             .unwrap();
         let mut published = Vec::new();
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 0, 10, Checkpoint::Boundary)
+            .ensure_capacity(&mut allocation, 0, 10, Checkpoint::Boundary)
             .unwrap();
         for (start, end) in [(0, 10), (10, 14), (14, 18)] {
             if start > 0 {
                 coordinator
-                    .ensure_capacity(&pool, &mut allocation, start, end, Checkpoint::Interval(8))
+                    .ensure_capacity(&mut allocation, start, end, Checkpoint::Interval(8))
                     .unwrap();
             }
             assert!(coordinator.publish_computed(
-                &pool,
                 &allocation,
                 CachedTokens::prompt(&tokens),
                 &lookup.page_hashes,
@@ -3206,26 +3238,26 @@ mod tests {
             assert!(allocation.tables[1].holds(checkpoint - 4, checkpoint));
             assert_eq!(
                 coordinator
-                    .probe_prefix(&pool, &tokens, false, false, scope, &source,)
+                    .probe_prefix(&tokens, false, false, scope, &source,)
                     .cached_tokens,
                 checkpoint
             );
             assert_eq!(
                 coordinator
-                    .probe_prefix(&pool, &tokens, true, false, PrefixScope::default(), &source,)
+                    .probe_prefix(&tokens, true, false, PrefixScope::default(), &source,)
                     .cached_tokens,
                 0
             );
         }
         // A future checkpoint's reserved units are not yet a completed state.
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 18, 24, Checkpoint::Interval(8))
+            .ensure_capacity(&mut allocation, 18, 24, Checkpoint::Interval(8))
             .unwrap();
         assert!(coordinator.release_window(&mut allocation, 22, None));
         assert!(allocation.tables[1].holds(12, 16));
         assert_eq!(
             coordinator
-                .probe_prefix(&pool, &tokens, false, false, scope, &source,)
+                .probe_prefix(&tokens, false, false, scope, &source,)
                 .cached_tokens,
             16
         );
@@ -3260,8 +3292,8 @@ mod tests {
             (sliding(64, 1, 128), false),
             (sliding(64, 1, 128), true),
         ] {
-            let pool = BlockPool::new(128, 0);
-            let coordinator = PrefixCacheCoordinator::new(vec![shape]);
+            let coordinator = PrefixCacheCoordinator::new(BlockPool::new(128, 0), vec![shape]);
+            let pool = coordinator.pool();
             let source = endpoint();
             let tokens: Vec<u32> = (0..145).collect();
             let scope = PrefixScope {
@@ -3271,10 +3303,9 @@ mod tests {
                 }),
                 ..Default::default()
             };
-            let allocation = publish(&coordinator, &pool, &tokens, &source);
+            let allocation = publish(&coordinator, &tokens, &source);
             let hashes = coordinator.prefix_hashes(&tokens, scope);
             assert!(coordinator.publish_computed(
-                &pool,
                 &allocation,
                 CachedTokens::prompt(&tokens),
                 &hashes,
@@ -3286,7 +3317,6 @@ mod tests {
                 scope.resume,
             ));
             coordinator.publish_tails(
-                &pool,
                 &allocation,
                 CachedTokens::prompt(&tokens),
                 tokens.len(),
@@ -3296,20 +3326,23 @@ mod tests {
             );
             let original = allocation.tables[0].unit_ids();
             drop(allocation);
-            let (pool, offset) = if inherited {
-                let successor = BlockPool::new(256, 0);
-                successor.inherit(128..256);
-                successor.import(&pool.export(), 128, &source);
-                (successor, 128)
-            } else {
-                (pool, 0)
+            let successor = inherited.then(|| {
+                let successor = PrefixCacheCoordinator::new(BlockPool::new(256, 0), vec![shape]);
+                successor.pool().inherit(128..256);
+                successor.pool().import(&pool.export(), 128, &source);
+                successor
+            });
+            let (cache, offset) = match &successor {
+                Some(successor) => (successor, 128),
+                None => (&coordinator, 0),
             };
+            let pool = cache.pool();
             let mut prompt = tokens;
             prompt.push(145);
             let free = pool.free_units();
-            let mut resumed = coordinator.empty();
-            let hit = coordinator
-                .acquire_prefix(&pool, &mut resumed, &prompt, false, false, scope, &source)
+            let mut resumed = cache.empty();
+            let hit = cache
+                .acquire_prefix(&mut resumed, &prompt, false, false, scope, &source)
                 .unwrap();
             assert_eq!(hit.cached_tokens, 145);
             let units = resumed.tables[0].unit_ids();
@@ -3339,15 +3372,15 @@ mod tests {
                 ..scope
             };
             assert_eq!(
-                coordinator
-                    .probe_prefix(&pool, &prompt, false, false, foreign, &source)
+                cache
+                    .probe_prefix(&prompt, false, false, foreign, &source)
                     .cached_tokens,
                 0
             );
             if shape.window().is_some() {
                 // Host admission can advance beyond the local partial
                 // page. No copy may name a destination it released.
-                assert!(coordinator.release_window(&mut resumed, 512, None));
+                assert!(cache.release_window(&mut resumed, 512, None));
                 assert!(resumed.copies(0, 0).is_empty());
             }
             resumed.complete_copies();
@@ -3358,14 +3391,12 @@ mod tests {
     /// Prefills `prompt` into fresh tables and publishes every complete page.
     fn publish(
         coordinator: &PrefixCacheCoordinator,
-        pool: &BlockPool,
         prompt: &[u32],
         source: &Arc<MainProcessEndpoint>,
     ) -> CacheAllocation {
         let mut allocation = coordinator.empty();
         let lookup = coordinator
             .acquire_prefix(
-                pool,
                 &mut allocation,
                 prompt,
                 false,
@@ -3375,11 +3406,10 @@ mod tests {
             )
             .unwrap();
         coordinator
-            .ensure_capacity(pool, &mut allocation, 0, prompt.len(), Checkpoint::Boundary)
+            .ensure_capacity(&mut allocation, 0, prompt.len(), Checkpoint::Boundary)
             .unwrap();
         let mut published = Vec::new();
         assert!(coordinator.publish_computed(
-            pool,
             &allocation,
             CachedTokens::prompt(prompt),
             &lookup.page_hashes,
@@ -3397,12 +3427,12 @@ mod tests {
     /// on its own freshly allocated units, and returns their references.
     fn publish_pages(
         coordinator: &PrefixCacheCoordinator,
-        pool: &BlockPool,
         prompt: &[u32],
         group: usize,
         pages: &[usize],
         source: &Arc<MainProcessEndpoint>,
     ) -> Vec<PageRef> {
+        let pool = coordinator.pool();
         let shape = coordinator.groups()[group];
         let hashes = coordinator.prefix_hashes(prompt, PrefixScope::default());
         pages
@@ -3428,7 +3458,8 @@ mod tests {
     /// migration finds every page the request generated.
     #[test]
     fn a_chain_extended_over_generated_tokens_is_its_migrations_chain() {
-        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1), sliding(2, 1, 8)]);
+        let coordinator =
+            PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![full(4, 1), sliding(2, 1, 8)]);
         let prompt: Vec<u32> = (10..19).collect();
         let generated: Vec<u32> = (100..107).collect();
         let migrated: Vec<u32> = prompt.iter().chain(&generated).copied().collect();
@@ -3497,8 +3528,7 @@ mod tests {
     /// migration's prompt reuses them.
     #[test]
     fn published_generated_pages_serve_the_migrations_prompt() {
-        let pool = BlockPool::new(16, 0);
-        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
+        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![full(4, 1)]);
         let source = endpoint();
         let prompt: Vec<u32> = (10..18).collect();
         let generated: Vec<u32> = (100..110).collect();
@@ -3507,7 +3537,6 @@ mod tests {
         let mut allocation = coordinator.empty();
         let mut lookup = coordinator
             .acquire_prefix(
-                &pool,
                 &mut allocation,
                 &prompt,
                 false,
@@ -3517,18 +3546,11 @@ mod tests {
             )
             .unwrap();
         coordinator
-            .ensure_capacity(
-                &pool,
-                &mut allocation,
-                0,
-                tokens.len(),
-                Checkpoint::Boundary,
-            )
+            .ensure_capacity(&mut allocation, 0, tokens.len(), Checkpoint::Boundary)
             .unwrap();
         coordinator.extend_hashes(&mut lookup.page_hashes, tokens, PrefixScope::default());
         let mut published = Vec::new();
         assert!(coordinator.publish_computed(
-            &pool,
             &allocation,
             tokens,
             &lookup.page_hashes,
@@ -3542,31 +3564,27 @@ mod tests {
         assert_eq!(published, vec![4]);
 
         let migrated: Vec<u32> = prompt.iter().chain(&generated).copied().collect();
-        let hit = coordinator.probe_prefix(
-            &pool,
-            &migrated,
-            true,
-            false,
-            PrefixScope::default(),
-            &source,
-        );
+        let hit = coordinator.probe_prefix(&migrated, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 16);
     }
 
     #[test]
     fn pages_of_several_units_draw_from_one_pool_and_return_together() {
         // Nine allocatable units: a sliding page takes three, a full page one.
-        let pool = BlockPool::new(10, 0);
-        let coordinator = PrefixCacheCoordinator::new(vec![full(8, 1), sliding(4, 3, 100)]);
+        let coordinator = PrefixCacheCoordinator::new(
+            BlockPool::new(10, 0),
+            vec![full(8, 1), sliding(4, 3, 100)],
+        );
+        let pool = coordinator.pool();
         let mut allocation = coordinator.empty();
 
         // Eight tokens need one full page and two sliding pages: 1 + 6 units.
         assert_eq!(
-            coordinator.units_needed(&pool, &allocation, 0, 8, Checkpoint::Boundary),
+            coordinator.units_needed(&allocation, 0, 8, Checkpoint::Boundary),
             Some(7)
         );
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 0, 8, Checkpoint::Boundary)
+            .ensure_capacity(&mut allocation, 0, 8, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(pool.free_units(), 2);
         assert_eq!(allocation.tables[1].unit_ids().len(), 6);
@@ -3582,7 +3600,7 @@ mod tests {
         // four units, but only two are free: nothing is allocated.
         assert!(
             coordinator
-                .ensure_capacity(&pool, &mut allocation, 8, 12, Checkpoint::Boundary)
+                .ensure_capacity(&mut allocation, 8, 12, Checkpoint::Boundary)
                 .is_none()
         );
         assert_eq!(pool.free_units(), 2);
@@ -3596,12 +3614,12 @@ mod tests {
     #[test]
     fn the_warmup_scratch_units_are_never_allocated() {
         // Units 1..=3 are scratch: six of ten units are allocatable.
-        let pool = BlockPool::new(10, 3);
+        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(10, 3), vec![full(1, 1)]);
+        let pool = coordinator.pool();
         assert_eq!((pool.usable_units(), pool.free_units()), (6, 6));
-        let coordinator = PrefixCacheCoordinator::new(vec![full(1, 1)]);
         let mut allocation = coordinator.empty();
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 0, 6, Checkpoint::Boundary)
+            .ensure_capacity(&mut allocation, 0, 6, Checkpoint::Boundary)
             .unwrap();
         let units: Vec<u32> = allocation.tables[0]
             .unit_ids()
@@ -3612,7 +3630,7 @@ mod tests {
         assert!(units.iter().all(|unit| *unit > 3));
         assert!(
             coordinator
-                .ensure_capacity(&pool, &mut allocation, 6, 7, Checkpoint::Boundary)
+                .ensure_capacity(&mut allocation, 6, 7, Checkpoint::Boundary)
                 .is_none()
         );
     }
@@ -3620,11 +3638,11 @@ mod tests {
     #[test]
     fn withdrawn_units_leave_allocation_until_restored() {
         // Fifteen allocatable units; a request holds units 1..=12.
-        let pool = BlockPool::new(16, 0);
-        let coordinator = PrefixCacheCoordinator::new(vec![full(1, 1)]);
+        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![full(1, 1)]);
+        let pool = coordinator.pool();
         let mut allocation = coordinator.empty();
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 0, 12, Checkpoint::Boundary)
+            .ensure_capacity(&mut allocation, 0, 12, Checkpoint::Boundary)
             .unwrap();
         let held: Vec<u32> = allocation.tables[0]
             .unit_ids()
@@ -3647,7 +3665,7 @@ mod tests {
         assert_eq!(pool.free_units(), 7);
         let mut allocation = coordinator.empty();
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 0, 7, Checkpoint::Boundary)
+            .ensure_capacity(&mut allocation, 0, 7, Checkpoint::Boundary)
             .unwrap();
         assert!(
             allocation.tables[0]
@@ -3657,7 +3675,7 @@ mod tests {
         );
         assert!(
             coordinator
-                .ensure_capacity(&pool, &mut allocation, 7, 8, Checkpoint::Boundary)
+                .ensure_capacity(&mut allocation, 7, 8, Checkpoint::Boundary)
                 .is_none()
         );
 
@@ -3671,11 +3689,11 @@ mod tests {
 
     #[test]
     fn a_restore_queues_the_withdrawn_units_requests_hold_once_released() {
-        let pool = BlockPool::new(8, 0);
-        let coordinator = PrefixCacheCoordinator::new(vec![full(1, 1)]);
+        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(8, 0), vec![full(1, 1)]);
+        let pool = coordinator.pool();
         let mut allocation = coordinator.empty();
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 0, 7, Checkpoint::Boundary)
+            .ensure_capacity(&mut allocation, 0, 7, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(pool.withdraw(4), 4);
         pool.restore();
@@ -3689,33 +3707,35 @@ mod tests {
         // Eight tokens need two units in one group and three in the other.
         // With one of five units taken, the four free units cover either
         // group alone, which a per-group minimum would accept, but not both.
-        let pool = BlockPool::new(6, 0);
-        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1), full(8, 3)]);
+        let coordinator =
+            PrefixCacheCoordinator::new(BlockPool::new(6, 0), vec![full(4, 1), full(8, 3)]);
+        let pool = coordinator.pool();
         let mut allocation = coordinator.empty();
         assert_eq!(
-            coordinator.units_needed(&pool, &allocation, 0, 8, Checkpoint::Boundary),
+            coordinator.units_needed(&allocation, 0, 8, Checkpoint::Boundary),
             Some(5)
         );
         let blocker = pool.allocate(1, 1).unwrap();
         assert!(
             coordinator
-                .ensure_capacity(&pool, &mut allocation, 0, 8, Checkpoint::Boundary)
+                .ensure_capacity(&mut allocation, 0, 8, Checkpoint::Boundary)
                 .is_none()
         );
         drop(blocker);
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 0, 8, Checkpoint::Boundary)
+            .ensure_capacity(&mut allocation, 0, 8, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(pool.free_units(), 0);
     }
 
     #[test]
     fn sliding_pages_retire_only_behind_the_window_and_keep_published_copies() {
-        let pool = BlockPool::new(64, 0);
+        let coordinator =
+            PrefixCacheCoordinator::new(BlockPool::new(64, 0), vec![full(4, 1), sliding(4, 2, 6)]);
+        let pool = coordinator.pool();
         let source = endpoint();
-        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1), sliding(4, 2, 6)]);
         let prompt = (1..=16).collect::<Vec<u32>>();
-        let mut allocation = publish(&coordinator, &pool, &prompt, &source);
+        let mut allocation = publish(&coordinator, &prompt, &source);
         let free = pool.free_units();
         let retired = (0..2)
             .flat_map(|page| allocation.tables[1].page(page).unwrap().units().to_vec())
@@ -3737,19 +3757,13 @@ mod tests {
                 .iter()
                 .all(|unit| pool.unit_state(*unit) == UnitState::Cached)
         );
-        let hit = coordinator.probe_prefix(
-            &pool,
-            &prompt[..13],
-            true,
-            false,
-            PrefixScope::default(),
-            &source,
-        );
+        let hit =
+            coordinator.probe_prefix(&prompt[..13], true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 12);
 
         // Growth appends after the window and never moves the start back.
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 16, 20, Checkpoint::Boundary)
+            .ensure_capacity(&mut allocation, 16, 20, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(allocation.tables[1].start_page(), 2);
         assert_eq!(allocation.tables[1].end_page(), 5);
@@ -3761,14 +3775,14 @@ mod tests {
     /// prompt's reuse, which ends where one is held.
     #[test]
     fn state_tables_hold_only_checkpoints_and_reuse_ends_at_one() {
-        let pool = BlockPool::new(128, 0);
+        let coordinator =
+            PrefixCacheCoordinator::new(BlockPool::new(128, 0), vec![full(4, 1), state(4, 3)]);
+        let pool = coordinator.pool();
         let source = endpoint();
-        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1), state(4, 3)]);
         let tokens = (1..=24).collect::<Vec<u32>>();
         let mut allocation = coordinator.empty();
         let lookup = coordinator
             .acquire_prefix(
-                &pool,
                 &mut allocation,
                 &tokens,
                 false,
@@ -3782,7 +3796,7 @@ mod tests {
         // boundary 8 alone: one state page of three units.
         let free = pool.free_units();
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 0, 10, Checkpoint::Boundary)
+            .ensure_capacity(&mut allocation, 0, 10, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(free - pool.free_units(), 3 + 3);
         assert_eq!(
@@ -3809,7 +3823,6 @@ mod tests {
         // the latest completed checkpoint across non-checkpoint boundaries.
         let mut published = Vec::new();
         assert!(coordinator.publish_computed(
-            &pool,
             &allocation,
             CachedTokens::prompt(&tokens),
             &lookup.page_hashes,
@@ -3829,14 +3842,13 @@ mod tests {
         // boundary 24, a multiple of the interval, but not boundary 20, in
         // the page the table held without units since token 20.
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 10, 18, Checkpoint::Boundary)
+            .ensure_capacity(&mut allocation, 10, 18, Checkpoint::Boundary)
             .unwrap();
         assert!(allocation.tables[1].page(3).is_some());
         assert!(allocation.tables[1].page(4).is_none());
         for position in 18..23 {
             coordinator
                 .ensure_capacity(
-                    &pool,
                     &mut allocation,
                     position,
                     position + 1,
@@ -3848,7 +3860,7 @@ mod tests {
         assert!(allocation.tables[1].page(5).is_none());
         allocation.tables[1].mark_sent();
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 23, 24, Checkpoint::Interval(8))
+            .ensure_capacity(&mut allocation, 23, 24, Checkpoint::Interval(8))
             .unwrap();
         assert!(allocation.tables[1].page(5).is_some());
         assert!(allocation.tables[1].changed_since_sent());
@@ -3856,19 +3868,12 @@ mod tests {
         // A later prompt of the first 13 tokens finds no checkpoint at 12,
         // the deepest boundary it may reuse, and reuses the one at 8: its
         // state table starts at the checkpoint's page.
-        let hit = coordinator.probe_prefix(
-            &pool,
-            &tokens[..13],
-            true,
-            false,
-            PrefixScope::default(),
-            &source,
-        );
+        let hit =
+            coordinator.probe_prefix(&tokens[..13], true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 8);
         let mut target = coordinator.empty();
         let reused = coordinator
             .acquire_prefix(
-                &pool,
                 &mut target,
                 &tokens[..13],
                 true,
@@ -3894,16 +3899,18 @@ mod tests {
     /// units for its other readers.
     #[test]
     fn a_refill_checkpoints_into_units_of_its_own() {
-        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1), state(4, 3)]);
+        let groups = vec![full(4, 1), state(4, 3)];
         let source = endpoint();
         let prompt = (1..=10).collect::<Vec<u32>>();
         for inherited in [false, true] {
-            let publisher = BlockPool::new(64, 0);
-            drop(publish(&coordinator, &publisher, &prompt, &source));
-            let pool = if inherited {
-                let successor = BlockPool::new(128, 0);
-                successor.inherit(64..128);
-                successor.import(&publisher.export(), 64, &source);
+            let publisher = PrefixCacheCoordinator::new(BlockPool::new(64, 0), groups.clone());
+            drop(publish(&publisher, &prompt, &source));
+            let coordinator = if inherited {
+                let successor = PrefixCacheCoordinator::new(BlockPool::new(128, 0), groups.clone());
+                successor.pool().inherit(64..128);
+                successor
+                    .pool()
+                    .import(&publisher.pool().export(), 64, &source);
                 successor
             } else {
                 publisher
@@ -3914,7 +3921,6 @@ mod tests {
             let mut resumed = coordinator.empty();
             let hit = coordinator
                 .acquire_prefix(
-                    &pool,
                     &mut resumed,
                     &prompt,
                     true,
@@ -3925,7 +3931,7 @@ mod tests {
                 .unwrap();
             assert_eq!(hit.cached_tokens, 8);
             coordinator
-                .ensure_capacity(&pool, &mut resumed, 8, 10, Checkpoint::Boundary)
+                .ensure_capacity(&mut resumed, 8, 10, Checkpoint::Boundary)
                 .unwrap();
             let shared = resumed.tables[1].page(1).unwrap().units().to_vec();
             assert_eq!(shared.iter().all(|unit| unit.0 >= 64), inherited);
@@ -3933,11 +3939,11 @@ mod tests {
             // The refill's last chunk ends at boundary 8.
             coordinator.hold_states_from(&mut resumed, 0);
             assert_eq!(
-                coordinator.units_needed(&pool, &resumed, 0, 8, Checkpoint::Boundary),
+                coordinator.units_needed(&resumed, 0, 8, Checkpoint::Boundary),
                 Some(3)
             );
             coordinator
-                .ensure_capacity(&pool, &mut resumed, 0, 8, Checkpoint::Boundary)
+                .ensure_capacity(&mut resumed, 0, 8, Checkpoint::Boundary)
                 .unwrap();
             let written = resumed.tables[1].page(1).unwrap().units().to_vec();
             assert!(
@@ -3951,7 +3957,6 @@ mod tests {
             let mut other = coordinator.empty();
             let hit = coordinator
                 .acquire_prefix(
-                    &pool,
                     &mut other,
                     &prompt,
                     true,
@@ -3967,11 +3972,12 @@ mod tests {
 
     #[test]
     fn unpublished_sliding_pages_return_free() {
-        let pool = BlockPool::new(16, 0);
-        let coordinator = PrefixCacheCoordinator::new(vec![sliding(4, 1, 4)]);
+        let coordinator =
+            PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![sliding(4, 1, 4)]);
+        let pool = coordinator.pool();
         let mut allocation = coordinator.empty();
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 0, 12, Checkpoint::Boundary)
+            .ensure_capacity(&mut allocation, 0, 12, Checkpoint::Boundary)
             .unwrap();
         let first = allocation.tables[0].page(0).unwrap().units()[0];
         assert!(coordinator.release_window(&mut allocation, 12, None));
@@ -3982,18 +3988,18 @@ mod tests {
 
     #[test]
     fn a_fresh_sliding_table_starts_at_the_first_page_its_read_needs() {
-        let pool = BlockPool::new(32, 0);
-        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1), sliding(4, 1, 5)]);
+        let coordinator =
+            PrefixCacheCoordinator::new(BlockPool::new(32, 0), vec![full(4, 1), sliding(4, 1, 5)]);
         let mut allocation = coordinator.empty();
 
         // A read from token 16 needs history [11, 20): sliding pages 2..5,
         // while the full group needs pages 0..5.
         assert_eq!(
-            coordinator.units_needed(&pool, &allocation, 16, 20, Checkpoint::Boundary),
+            coordinator.units_needed(&allocation, 16, 20, Checkpoint::Boundary),
             Some(5 + 3)
         );
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 16, 20, Checkpoint::Boundary)
+            .ensure_capacity(&mut allocation, 16, 20, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(allocation.tables[1].start_page(), 2);
         assert_eq!(allocation.tables[1].end_page(), 5);
@@ -4002,27 +4008,27 @@ mod tests {
 
     #[test]
     fn prefix_validation_iterates_until_every_sliding_window_holds() {
-        let pool = BlockPool::new(64, 0);
+        let coordinator = PrefixCacheCoordinator::new(
+            BlockPool::new(64, 0),
+            vec![sliding(4, 1, 4), sliding(8, 1, 8)],
+        );
         let source = endpoint();
         // A prefix of M tokens needs group 0 pages intersecting [M - 4, M)
         // (4-token pages) and group 1 pages intersecting [M - 8, M) (8-token
         // pages). Candidates are multiples of 8.
-        let coordinator = PrefixCacheCoordinator::new(vec![sliding(4, 1, 4), sliding(8, 1, 8)]);
         let prompt = (1..=40).collect::<Vec<u32>>();
         // Group 0 misses pages 3 and 7; group 1 misses page 2. Group 0 lowers
         // 32 to 24, group 1 lowers 24 to 16, group 0 then lowers 16 to 8,
         // where both windows hold: group 0 page 1 and group 1 page 0.
-        let _first = publish_pages(&coordinator, &pool, &prompt, 0, &[1, 5], &source);
-        let _second = publish_pages(&coordinator, &pool, &prompt, 1, &[0, 1, 3], &source);
+        let _first = publish_pages(&coordinator, &prompt, 0, &[1, 5], &source);
+        let _second = publish_pages(&coordinator, &prompt, 1, &[0, 1, 3], &source);
 
-        let hit =
-            coordinator.probe_prefix(&pool, &prompt, true, false, PrefixScope::default(), &source);
+        let hit = coordinator.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 8);
 
         let mut target = coordinator.empty();
         let lookup = coordinator
             .acquire_prefix(
-                &pool,
                 &mut target,
                 &prompt,
                 true,
@@ -4044,30 +4050,29 @@ mod tests {
 
     #[test]
     fn full_groups_lock_the_whole_prefix_and_sliding_groups_only_their_window() {
-        let pool = BlockPool::new(128, 0);
+        let coordinator =
+            PrefixCacheCoordinator::new(BlockPool::new(128, 0), vec![full(8, 1), sliding(4, 2, 6)]);
+        let pool = coordinator.pool();
         let source = endpoint();
         // Full pages of 8 tokens and sliding pages of 4 with a 6-token window.
-        let coordinator = PrefixCacheCoordinator::new(vec![full(8, 1), sliding(4, 2, 6)]);
         let prompt = (1..=40).collect::<Vec<u32>>();
         // Every full page is cached, but the sliding group holds only pages
         // 2 and 3: the window of M = 16. M = 32 and M = 24 need sliding pages
         // 6 and 7, and 4 and 5.
-        let full_pages = publish_pages(&coordinator, &pool, &prompt, 0, &[0, 1, 2, 3, 4], &source);
-        let sliding_pages = publish_pages(&coordinator, &pool, &prompt, 1, &[2, 3], &source);
+        let full_pages = publish_pages(&coordinator, &prompt, 0, &[0, 1, 2, 3, 4], &source);
+        let sliding_pages = publish_pages(&coordinator, &prompt, 1, &[2, 3], &source);
         drop(full_pages);
         drop(sliding_pages);
 
         // Every hit page is unreferenced: two full units and two sliding
         // pages of two units each count as free until acquired.
-        let hit =
-            coordinator.probe_prefix(&pool, &prompt, true, false, PrefixScope::default(), &source);
+        let hit = coordinator.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 16);
         assert_eq!(hit.cached_free_units, 2 + 4);
 
         let mut target = coordinator.empty();
         let lookup = coordinator
             .acquire_prefix(
-                &pool,
                 &mut target,
                 &prompt,
                 true,
@@ -4102,7 +4107,7 @@ mod tests {
 
         // The first prefill chunk appends after the prefix in every group.
         coordinator
-            .ensure_capacity(&pool, &mut target, 16, 24, Checkpoint::Boundary)
+            .ensure_capacity(&mut target, 16, 24, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(target.tables[0].end_page(), 3);
         assert_eq!(target.tables[1].end_page(), 6);
@@ -4110,22 +4115,20 @@ mod tests {
 
     #[test]
     fn a_full_group_miss_limits_the_sliding_prefix() {
-        let pool = BlockPool::new(64, 0);
+        let coordinator =
+            PrefixCacheCoordinator::new(BlockPool::new(64, 0), vec![sliding(4, 1, 4), full(8, 1)]);
         let source = endpoint();
-        let coordinator = PrefixCacheCoordinator::new(vec![sliding(4, 1, 4), full(8, 1)]);
         let prompt = (1..=33).collect::<Vec<u32>>();
-        let owner = publish(&coordinator, &pool, &prompt[..16], &source);
+        let owner = publish(&coordinator, &prompt[..16], &source);
 
         // Only 16 prompt tokens were published: the full group limits every
         // group to 16 even though a longer prompt is probed.
-        let hit =
-            coordinator.probe_prefix(&pool, &prompt, true, false, PrefixScope::default(), &source);
+        let hit = coordinator.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 16);
         // Both groups' hit pages are referenced by the owner.
         assert_eq!(hit.cached_free_units, 0);
         drop(owner);
-        let hit =
-            coordinator.probe_prefix(&pool, &prompt, true, false, PrefixScope::default(), &source);
+        let hit = coordinator.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
         // Unreferenced hits count as free: sliding page 3 and full pages 0
         // and 1.
         assert_eq!(hit.cached_free_units, 3);
@@ -4137,7 +4140,6 @@ mod tests {
     /// under their seed.
     #[test]
     fn a_request_continuing_another_epochs_state_finds_its_pages() {
-        let pool = BlockPool::new(64, 0);
         let source = endpoint();
         let prompt = (1..=9).collect::<Vec<u32>>();
         let groups = vec![
@@ -4147,28 +4149,28 @@ mod tests {
                 ..full(4, 1)
             },
         ];
-        let mut previous = PrefixCacheCoordinator::new(groups.clone());
-        previous.set_seeds(vec![prefix_seed("previous"), prefix_seed("draft")]);
-        drop(publish(&previous, &pool, &prompt, &source));
+        // The previous epoch publishes under its seeds; the serving one reads
+        // the same pool under its own.
+        let mut serving = PrefixCacheCoordinator::new(BlockPool::new(64, 0), groups);
+        serving.set_seeds(vec![prefix_seed("previous"), prefix_seed("draft")]);
+        drop(publish(&serving, &prompt, &source));
 
-        let mut serving = PrefixCacheCoordinator::new(groups);
         serving.set_seeds(vec![prefix_seed("previous"), prefix_seed("revised-draft")]);
         assert_eq!(
             serving
-                .probe_prefix(&pool, &prompt, true, false, PrefixScope::default(), &source)
+                .probe_prefix(&prompt, true, false, PrefixScope::default(), &source)
                 .cached_tokens,
             8
         );
         serving.set_seeds(vec![prefix_seed("serving"), prefix_seed("revised-draft")]);
-        let own =
-            serving.probe_prefix(&pool, &prompt, true, false, PrefixScope::default(), &source);
+        let own = serving.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(own.cached_tokens, 0);
         let kept = PrefixScope {
             isolation_key: None,
             state_seeds: &[prefix_seed("previous").0],
             resume: None,
         };
-        let continued = serving.probe_prefix(&pool, &prompt, true, false, kept, &source);
+        let continued = serving.probe_prefix(&prompt, true, false, kept, &source);
         assert_eq!(continued.cached_tokens, 8);
     }
 
@@ -4177,39 +4179,30 @@ mod tests {
     /// units to allocation.
     #[test]
     fn imported_pages_count_as_free_only_once_their_units_are_taken() {
-        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
         let source = endpoint();
         let prompt = (1..=9).collect::<Vec<u32>>();
-        let predecessor = BlockPool::new(64, 0);
-        drop(publish(&coordinator, &predecessor, &prompt, &source));
+        let predecessor_cache =
+            PrefixCacheCoordinator::new(BlockPool::new(64, 0), vec![full(4, 1)]);
+        let predecessor = predecessor_cache.pool();
+        drop(publish(&predecessor_cache, &prompt, &source));
         let index = predecessor.export();
         assert_eq!(index.len(), 2);
 
-        let successor = BlockPool::new(64, 0);
+        let successor_cache = PrefixCacheCoordinator::new(BlockPool::new(64, 0), vec![full(4, 1)]);
+
+        let successor = successor_cache.pool();
         successor.inherit(16..32);
         assert_eq!(successor.import(&index, 16, &source), 2);
         let free = successor.free_units();
-        let hit = coordinator.probe_prefix(
-            &successor,
-            &prompt,
-            true,
-            false,
-            PrefixScope::default(),
-            &source,
-        );
+        let hit =
+            successor_cache.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 8);
         assert_eq!(hit.cached_free_units, 0);
         assert_eq!(successor.free_units(), free);
 
         successor.take_inherited();
-        let hit = coordinator.probe_prefix(
-            &successor,
-            &prompt,
-            true,
-            false,
-            PrefixScope::default(),
-            &source,
-        );
+        let hit =
+            successor_cache.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 8);
         assert_eq!(hit.cached_free_units, 2);
     }
@@ -4217,15 +4210,14 @@ mod tests {
     /// A predecessor's pool of 16 units whose units 8, 9 and 10 hold
     /// `prompt`'s two complete pages and its partial last page, then released.
     fn pages_past_a_filler(
-        coordinator: &PrefixCacheCoordinator,
         prompt: &[u32],
         source: &Arc<MainProcessEndpoint>,
-    ) -> BlockPool {
-        let pool = BlockPool::new(16, 0);
-        let filler = pool.allocate(7, 1).unwrap();
-        drop(publish(coordinator, &pool, prompt, source));
+    ) -> PrefixCacheCoordinator {
+        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![full(4, 1)]);
+        let filler = coordinator.pool().allocate(7, 1).unwrap();
+        drop(publish(&coordinator, prompt, source));
         drop(filler);
-        pool
+        coordinator
     }
 
     /// The inherited units a successor borrows are allocated as its own on
@@ -4234,26 +4226,22 @@ mod tests {
     /// not borrow stay out of allocation until the commit.
     #[test]
     fn a_successor_allocates_the_inherited_units_it_borrows() {
-        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
         let source = endpoint();
         let prompt = (1..=9).collect::<Vec<u32>>();
-        let predecessor = pages_past_a_filler(&coordinator, &prompt, &source);
+        let predecessor = pages_past_a_filler(&prompt, &source);
 
         // The successor maps the predecessor's 16 units after its own 16.
-        let successor = BlockPool::new(32, 0);
+        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(32, 0), vec![full(4, 1)]);
+        let successor = coordinator.pool();
         successor.inherit(16..32);
-        assert_eq!(successor.import(&predecessor.export(), 16, &source), 2);
+        assert_eq!(
+            successor.import(&predecessor.pool().export(), 16, &source),
+            2
+        );
         assert_eq!(successor.borrow(std::slice::from_ref(&(24..32))), 8);
         assert_eq!(successor.free_units(), 15 + 8);
         assert_eq!(successor.usable_units(), 15 + 8);
-        let hit = coordinator.probe_prefix(
-            &successor,
-            &prompt,
-            true,
-            false,
-            PrefixScope::default(),
-            &source,
-        );
+        let hit = coordinator.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 8);
         assert_eq!(hit.cached_free_units, 2);
 
@@ -4269,14 +4257,7 @@ mod tests {
         );
         assert!(pages.iter().all(|page| !successor.shared(page)));
         assert!(successor.allocate(1, 1).is_none());
-        let hit = coordinator.probe_prefix(
-            &successor,
-            &prompt,
-            true,
-            false,
-            PrefixScope::default(),
-            &source,
-        );
+        let hit = coordinator.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 0);
 
         successor.take_inherited();
@@ -4289,18 +4270,17 @@ mod tests {
     /// pages it forgets, until it takes them back.
     #[test]
     fn a_epoch_allocates_no_unit_it_lent_until_it_takes_them_back() {
-        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
         let source = endpoint();
         let prompt = (1..=9).collect::<Vec<u32>>();
-        let pool = pages_past_a_filler(&coordinator, &prompt, &source);
+        let coordinator = pages_past_a_filler(&prompt, &source);
+        let pool = coordinator.pool();
         assert_eq!(pool.free_units(), 15);
 
         assert_eq!(pool.lend(std::slice::from_ref(&(8..16))), 2);
         assert_eq!(pool.lent(), vec![8..16]);
         assert_eq!(pool.free_units(), 7);
         assert_eq!(pool.usable_units(), 7);
-        let hit =
-            coordinator.probe_prefix(&pool, &prompt, true, false, PrefixScope::default(), &source);
+        let hit = coordinator.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 0);
         let pages = pool.allocate(7, 1).unwrap();
         assert!(pages.iter().all(|page| page.units()[0].0 < 8));
@@ -4316,8 +4296,8 @@ mod tests {
 
     #[test]
     fn prefix_copies_follow_worker_incarnations_without_releasing_active_pages() {
-        let pool = BlockPool::new(5, 0);
-        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
+        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(5, 0), vec![full(4, 1)]);
+        let pool = coordinator.pool();
         let prompt = [1, 2, 3, 4, 5];
         let first = endpoint();
         let second = Arc::new(MainProcessEndpoint {
@@ -4325,10 +4305,10 @@ mod tests {
             ..first.as_ref().clone()
         });
         let owners = [&first, &second].map(|source| {
-            let allocation = publish(&coordinator, &pool, &prompt, source);
+            let allocation = publish(&coordinator, &prompt, source);
             assert_eq!(
                 coordinator
-                    .probe_prefix(&pool, &prompt, true, false, PrefixScope::default(), source)
+                    .probe_prefix(&prompt, true, false, PrefixScope::default(), source)
                     .cached_tokens,
                 4
             );
@@ -4340,14 +4320,7 @@ mod tests {
         };
         assert_eq!(
             coordinator
-                .probe_prefix(
-                    &pool,
-                    &prompt,
-                    true,
-                    false,
-                    PrefixScope::default(),
-                    &replacement
-                )
+                .probe_prefix(&prompt, true, false, PrefixScope::default(), &replacement)
                 .cached_tokens,
             0
         );
@@ -4357,14 +4330,13 @@ mod tests {
         assert_eq!(pool.free_units(), free_before);
         assert_eq!(
             coordinator
-                .probe_prefix(&pool, &prompt, true, false, PrefixScope::default(), &first)
+                .probe_prefix(&prompt, true, false, PrefixScope::default(), &first)
                 .cached_tokens,
             0
         );
         let mut consumer = coordinator.empty();
         let reused = coordinator
             .acquire_prefix(
-                &pool,
                 &mut consumer,
                 &prompt,
                 true,
@@ -4385,11 +4357,11 @@ mod tests {
 
     #[test]
     fn fresh_units_follow_the_allocation_serial_in_every_group() {
-        let pool = BlockPool::new(32, 0);
-        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1), sliding(2, 2, 4)]);
+        let coordinator =
+            PrefixCacheCoordinator::new(BlockPool::new(32, 0), vec![full(4, 1), sliding(2, 2, 4)]);
         let mut allocation = coordinator.empty();
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 0, 4, Checkpoint::Boundary)
+            .ensure_capacity(&mut allocation, 0, 4, Checkpoint::Boundary)
             .unwrap();
         let watermark = allocation.allocated_units();
         assert_eq!(watermark, 1 + 4);
@@ -4399,7 +4371,7 @@ mod tests {
         // Growth to six tokens adds one full page and one sliding page; only
         // those units are fresh past the watermark, and both tables changed.
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 4, 6, Checkpoint::Boundary)
+            .ensure_capacity(&mut allocation, 4, 6, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(allocation.tables[0].fresh_units(watermark).len(), 1);
         assert_eq!(allocation.tables[1].fresh_units(watermark).len(), 2);
@@ -4411,12 +4383,12 @@ mod tests {
     /// withdrawn unit do not count.
     #[test]
     fn cached_pages_from_a_unit_count_the_idle_published_ones() {
-        let pool = BlockPool::new(16, 0);
-        let coordinator = PrefixCacheCoordinator::new(vec![full(1, 1)]);
+        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![full(1, 1)]);
+        let pool = coordinator.pool();
         let source = endpoint();
         let prompt: Vec<u32> = (100..112).collect();
         // Twelve pages on units 1..=12, all held by the request.
-        let held = publish(&coordinator, &pool, &prompt, &source);
+        let held = publish(&coordinator, &prompt, &source);
         assert_eq!(pool.cached_from(1), 0);
 
         // Released, they are cached and idle.

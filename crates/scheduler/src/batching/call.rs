@@ -513,8 +513,7 @@ impl Scheduler {
             {
                 return Ok(());
             }
-            needed = cache.coordinator.units_needed(
-                &cache.block_pool,
+            needed = cache.units_needed(
                 &allocations.prefix_cache,
                 read_start as usize,
                 total_tokens as usize,
@@ -532,7 +531,7 @@ impl Scheduler {
         let tables = self.running.get(&id).and_then(RequestState::block_tables);
         if let (Some(tables), Some(prefix_cache)) = (tables, self.storage.cache()) {
             for table in tables {
-                table.activate(&prefix_cache.block_pool);
+                table.activate(prefix_cache.pool());
             }
         }
     }

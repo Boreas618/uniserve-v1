@@ -634,7 +634,7 @@ impl Scheduler {
             tracing::debug!("a batch is dropped: this scheduler holds no cache to address");
             return;
         };
-        let Some(group) = cache.coordinator.groups().first() else {
+        let Some(group) = cache.groups().first() else {
             tracing::debug!("a batch is dropped: the cache coordinator states no group");
             return;
         };
@@ -676,12 +676,11 @@ impl Scheduler {
         // A model that keeps a recurrent state per request slot has a state group, whose pages the
         // columns name the checkpoints and restores of.
         let state_pages = cache
-            .coordinator
             .groups()
             .iter()
             .position(|group| group.state())
             .and_then(|group_id| {
-                let shape = &cache.coordinator.groups()[group_id];
+                let shape = &cache.groups()[group_id];
                 Some(columns::StatePages {
                     group_id: u32::try_from(group_id).ok()?,
                     block_size: u32::try_from(shape.block_size).ok()?,

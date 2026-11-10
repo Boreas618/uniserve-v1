@@ -1118,7 +1118,7 @@ impl Scheduler {
 
             if head.reserve_worstcase {
                 let tokens = head.max_reserved_cache_tokens;
-                let need = cache.coordinator.units_for_tokens(tokens);
+                let need = cache.units_for_tokens(tokens);
                 let encoder_entries = head.req.num_encoder_cache_entries();
                 let encoder_ok = self
                     .storage
@@ -1186,7 +1186,7 @@ impl Scheduler {
                 let mut host_tokens = 0;
                 let mut answer = host_prefix(
                     &mut self.kv_offload,
-                    self.storage.cache().map(|cache| &cache.coordinator),
+                    self.storage.cache(),
                     head,
                     &target,
                     cached_tokens,
@@ -1209,7 +1209,7 @@ impl Scheduler {
                         std::thread::yield_now();
                         answer = host_prefix(
                             &mut self.kv_offload,
-                            self.storage.cache().map(|cache| &cache.coordinator),
+                            self.storage.cache(),
                             head,
                             &target,
                             cached_tokens,
@@ -1240,15 +1240,12 @@ impl Scheduler {
                 }
                 let prefix_tokens = cached_tokens + host_tokens;
                 let first_chunk = n.saturating_sub(prefix_tokens).min(chunk_limit).max(1);
-                let first_chunk_units = cache
-                    .coordinator
-                    .units_after_prefix(cached_tokens, prefix_tokens + first_chunk);
+                let first_chunk_units =
+                    cache.units_after_prefix(cached_tokens, prefix_tokens + first_chunk);
 
                 // The prompt alone must fit the pool: every full-attention page
                 // and each sliding-window group's pages of one chunk.
-                if cache.coordinator.min_units_for_prompt(n, chunk_limit)
-                    > self.storage.capacity_units()
-                {
+                if cache.min_units_for_prompt(n, chunk_limit) > self.storage.capacity_units() {
                     let Some(st) = self.waiting.pop_front() else {
                         break;
                     };
@@ -1271,9 +1268,8 @@ impl Scheduler {
                 // gives up the request admitted last to be computed again from
                 // its tokens (`Scheduler::reclaim_shortage`).
                 let head_units = cache
-                    .coordinator
                     .units_after_prefix(cached_tokens, n)
-                    .min(cache.coordinator.min_units_for_prompt(n, chunk_limit))
+                    .min(cache.min_units_for_prompt(n, chunk_limit))
                     .max(first_chunk_units);
                 let capacity_available = self
                     .storage
@@ -1328,7 +1324,6 @@ impl Scheduler {
                 let prompt = state.req.prompt_token_ids.len();
                 Some(
                     cache
-                        .coordinator
                         .min_units_for_prompt(prompt, chunk)
                         .saturating_sub(held),
                 )
@@ -1356,8 +1351,7 @@ impl Scheduler {
             )
             .filter(|(worker, _, _)| self.worker.is_ready(worker))
             .map(|(worker, component, info)| {
-                let hit = cache.coordinator.probe_prefix(
-                    &cache.block_pool,
+                let hit = cache.probe_prefix(
                     &state.req.prompt_token_ids,
                     state.req.cache.read,
                     state.has_context_images(),
@@ -1501,13 +1495,9 @@ impl Scheduler {
         // Prefix-cache acquisition pins every reused block to this request's
         // newly installed block tables.
         let acquired = match (self.running.get_mut(&id), self.storage.cache.as_ref()) {
-            (Some(st), Some(prefix_cache)) => acquire_cached_prefix(
-                &prefix_cache.coordinator,
-                st,
-                &prefix_cache.block_pool,
-                &self.stats,
-                &source,
-            ),
+            (Some(st), Some(prefix_cache)) => {
+                acquire_cached_prefix(prefix_cache, st, &self.stats, &source)
+            }
             _ => Err("an admitted request runs with a prefix cache"),
         };
         if let Err(invariant) = acquired {
@@ -1553,9 +1543,7 @@ impl Scheduler {
         // pages before its window there are not read again, and the window's
         // pages the device lacks are allocated for the loads.
         let released = match (self.storage.cache.as_ref(), state.prefix_cache_mut()) {
-            (Some(cache), Some(allocation)) => {
-                cache.coordinator.release_window(allocation, boundary, None)
-            }
+            (Some(cache), Some(allocation)) => cache.release_window(allocation, boundary, None),
             _ => false,
         };
         if !released || !self.ensure_request_capacity(id, computed, boundary) {
@@ -1570,13 +1558,12 @@ impl Scheduler {
         // The draft cache pages the hit loads into units are valid once
         // loaded, as its other pages are.
         let draft = self.storage.cache.as_ref().and_then(|cache| {
-            let group = cache.coordinator.draft_group()?;
+            let group = cache.draft_group()?;
             let pages = self.kv_offload.as_ref()?.hit_pages(id).get(group)?.clone();
-            let block = cache.coordinator.groups()[group].block_size;
+            let block = cache.groups()[group].block_size;
             let (start, end) = (pages.start * block, pages.end * block);
             let allocation = &state.allocations()?.prefix_cache;
             cache
-                .coordinator
                 .holds_draft(allocation, start, end)
                 .then_some((start as u32, end as u32))
         });
@@ -1692,7 +1679,6 @@ pub(super) fn host_prefix(
 fn acquire_cached_prefix(
     coordinator: &PrefixCacheCoordinator,
     state: &mut RequestState,
-    pool: &BlockPool,
     stats: &SchedulerStats,
     source: &ipc::MainProcessEndpoint,
 ) -> Result<(), &'static str> {
@@ -1706,7 +1692,6 @@ fn acquire_cached_prefix(
         .ok_or("an admitted request holds its block tables")?;
     let hit = coordinator
         .acquire_prefix(
-            pool,
             allocation,
             &prompt,
             cache_read,

@@ -212,7 +212,7 @@ impl Scheduler {
                 .storage
                 .cache
                 .as_ref()
-                .is_some_and(|cache| cache.coordinator.draft_group().is_some())
+                .is_some_and(|cache| cache.draft_group().is_some())
     }
 
     /// The drafts `id`'s next verification carries, from token position
@@ -365,9 +365,7 @@ impl Scheduler {
             return false;
         };
         state.allocations().is_some_and(|allocations| {
-            cache
-                .coordinator
-                .holds_draft(&allocations.prefix_cache, start as usize, end as usize)
+            cache.holds_draft(&allocations.prefix_cache, start as usize, end as usize)
         })
     }
 
@@ -399,17 +397,14 @@ impl Scheduler {
         let visible = state.cache_visible_len;
         let target = state.draft.refill_end(visible);
         let allocation = &state.allocations()?.prefix_cache;
-        let start = if cache
-            .coordinator
-            .resumes_at(allocation, state.draft.valid as usize)
-        {
+        let start = if cache.resumes_at(allocation, state.draft.valid as usize) {
             state.draft.valid
         } else {
             0
         };
         let mut end = (start as usize + budget).min(target as usize) as u32;
         if end < target
-            && let Some(block) = cache.coordinator.state_block_size()
+            && let Some(block) = cache.state_block_size()
         {
             end = end / block as u32 * block as u32;
         }
@@ -430,9 +425,7 @@ impl Scheduler {
         let state = self.running.get_mut(&id)?;
         let allocations = state.allocations_mut()?;
         let cache = self.storage.cache.as_ref()?;
-        cache
-            .coordinator
-            .hold_states_from(&mut allocations.prefix_cache, start as usize);
+        cache.hold_states_from(&mut allocations.prefix_cache, start as usize);
         cache
             .grow(
                 &mut allocations.prefix_cache,
@@ -441,10 +434,7 @@ impl Scheduler {
                 Checkpoint::Boundary,
             )
             .ok()?;
-        if !cache
-            .coordinator
-            .holds_draft(&allocations.prefix_cache, start as usize, end as usize)
-        {
+        if !cache.holds_draft(&allocations.prefix_cache, start as usize, end as usize) {
             return None;
         }
         self.plan_call(id, |_scheduler, request| {
@@ -487,10 +477,10 @@ impl Scheduler {
         let Some(cache) = self.storage.cache.as_ref() else {
             return false;
         };
-        if cache.block_pool.free_units() >= units {
+        if cache.pool().free_units() >= units {
             return true;
         }
-        if cache.coordinator.draft_group().is_none() {
+        if cache.draft_group().is_none() {
             return false;
         }
         let mut candidates: Vec<(usize, RequestId)> = self
@@ -515,16 +505,14 @@ impl Scheduler {
             let Some(cache) = self.storage.cache.as_ref() else {
                 return false;
             };
-            if cache.block_pool.free_units() >= units {
+            if cache.pool().free_units() >= units {
                 break;
             }
             let Some(state) = self.running.get_mut(&id) else {
                 continue;
             };
             if let Some(allocations) = state.allocations_mut() {
-                cache
-                    .coordinator
-                    .release_draft(&mut allocations.prefix_cache);
+                cache.release_draft(&mut allocations.prefix_cache);
             }
             state.draft.clear();
             tracing::debug!(
@@ -535,7 +523,7 @@ impl Scheduler {
         self.storage
             .cache
             .as_ref()
-            .is_some_and(|cache| cache.block_pool.free_units() >= units)
+            .is_some_and(|cache| cache.pool().free_units() >= units)
     }
 }
 

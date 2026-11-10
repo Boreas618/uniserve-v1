@@ -17,14 +17,11 @@
 //! [`requests`] holds what a request owns of these pools from its admission
 //! to its retirement, and `Storage`, the scheduler's aggregate of every pool.
 
-use ipc::{MainProcessInfo, RequestKey};
+use ipc::RequestKey;
 
 mod bytes;
 pub(crate) mod requests;
 pub(crate) use bytes::ByteAllocator;
-
-pub(crate) use crate::kv_cache::CacheAllocation;
-use crate::kv_cache::{BlockPool, Checkpoint, GroupShape, PrefixCacheCoordinator};
 
 /// Owned request row, returned only after its request epoch retires.
 ///
@@ -103,58 +100,6 @@ impl RequestPool {
     }
 }
 
-/// Cache unit pool and cross-group coordination derived from worker
-/// capabilities.
-pub(crate) struct PrefixCacheManager {
-    pub(crate) block_pool: BlockPool,
-    pub(crate) coordinator: PrefixCacheCoordinator,
-}
-
-impl PrefixCacheManager {
-    /// Builds scheduler cache state when a worker advertises a paged unit pool.
-    ///
-    /// Returns `None` when `info` has no prefix cache. `BlockPool::new` panics on
-    /// a pool without an allocatable unit and `BlockTable::new` on an empty
-    /// page shape; `PrefixCacheInfo::validate` rejects each of these.
-    pub(crate) fn from_main_process_info(info: &MainProcessInfo) -> Option<Self> {
-        info.prefix_cache.as_ref().map(|prefix_cache| {
-            let block_pool = BlockPool::new(prefix_cache.num_units, prefix_cache.scratch_units);
-            // The units of the segments the planes do not hold (a
-            // successor's tail its storage does not hold yet, or what a
-            // standby's predecessor gave back) stay withdrawn until they are
-            // created; the units mapped from a predecessor epoch stay out of
-            // allocation until the epoch takes them.
-            let usable = prefix_cache.allocatable_units();
-            if usable < prefix_cache.num_units {
-                block_pool.withdraw(usable);
-            }
-            block_pool.inherit(prefix_cache.inherited());
-            let mut coordinator = PrefixCacheCoordinator::new(
-                prefix_cache
-                    .groups
-                    .iter()
-                    .map(GroupShape::from_group)
-                    .collect(),
-            );
-            coordinator.set_seeds(crate::kv_cache::prefix_seeds(prefix_cache));
-            PrefixCacheManager {
-                block_pool,
-                coordinator,
-            }
-        })
-    }
-
-    /// Returns the units the scheduler may allocate, excluding the sentinel.
-    pub(crate) fn usable_units(&self) -> usize {
-        self.block_pool.usable_units()
-    }
-
-    /// Returns the units the scheduler may allocate once none is withdrawn.
-    pub(crate) fn capacity_units(&self) -> usize {
-        self.block_pool.capacity_units()
-    }
-}
-
 /// Aligned, byte-addressed persistent Tensor storage.
 ///
 /// A first-fit allocator over free byte extents. Adjacent free extents are
@@ -214,50 +159,6 @@ impl BufferPool {
     pub(crate) fn free(&mut self, allocation: BufferSpan) {
         let BufferSpan { offset, bytes, .. } = allocation;
         self.bytes.free(offset..offset + bytes);
-    }
-}
-
-impl PrefixCacheManager {
-    /// Acquire one table per cache group holding `tokens` tokens for a read
-    /// from token zero, atomically.
-    pub(crate) fn allocate(&self, tokens: u32) -> Result<CacheAllocation, OutOfStorage> {
-        let mut allocation = self.coordinator.empty();
-        self.coordinator
-            .ensure_capacity(
-                &self.block_pool,
-                &mut allocation,
-                0,
-                tokens as usize,
-                Checkpoint::Boundary,
-            )
-            .ok_or(OutOfStorage::PrefixCache)?;
-        Ok(allocation)
-    }
-
-    /// Grow every cache group atomically for a call that reads from token
-    /// `read_start` and holds `tokens` tokens, retaining shared prefix
-    /// references; its state groups checkpoint as `checkpoint` says.
-    pub(crate) fn grow(
-        &self,
-        allocation: &mut CacheAllocation,
-        read_start: u32,
-        tokens: u32,
-        checkpoint: Checkpoint,
-    ) -> Result<(), OutOfStorage> {
-        self.coordinator
-            .ensure_capacity(
-                &self.block_pool,
-                allocation,
-                read_start as usize,
-                tokens as usize,
-                checkpoint,
-            )
-            .ok_or(OutOfStorage::PrefixCache)
-    }
-
-    /// Enables or disables prefix reuse.
-    pub(crate) fn set_prefix_reuse(&mut self, enabled: bool) {
-        self.coordinator.set_prefix_enabled(enabled);
     }
 }
 
