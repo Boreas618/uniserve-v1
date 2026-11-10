@@ -156,16 +156,19 @@ def wait_until(
     timeout_s: float,
     what: str,
     interval_s: float = 1.0,
+    context: Callable[[], str] | None = None,
 ) -> None:
     """Wait until `predicate` holds, for at most `timeout_s` seconds stretched
-    by `TIME_SCALE`; raise :class:`TimeoutError` naming `what` otherwise.
+    by `TIME_SCALE`; raise :class:`TimeoutError` naming `what` otherwise,
+    followed by what `context` returns then, such as a server's log tail.
     """  # noqa: D205
     deadline = time.monotonic() + scaled(timeout_s)
     while time.monotonic() < deadline:
         if predicate():
             return
         time.sleep(interval_s)
-    raise TimeoutError(f"{what} within {scaled(timeout_s):.0f} s")
+    detail = context() if context is not None else ""
+    raise TimeoutError(f"{what} within {scaled(timeout_s):.0f} s{detail}")
 
 
 def runs(pid: int) -> bool:

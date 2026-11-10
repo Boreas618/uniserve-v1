@@ -31,6 +31,11 @@ their addresses: the promotion rebuilds them and captures the graphs that
 run expert steps again). Killing a serving rank promotes that epoch in
 place of a relaunch, and the request continues on it.
 
+Which main process serves before and after a kill is what ``GET
+/admin/status`` reports: the serving process's launch generation
+(``generation``) and the parked standby's (``standby``), which a promotion
+makes the serving one.
+
 Each test runs a Storage Server of its own: ``XDG_RUNTIME_DIR`` points the
 daemon at a directory of the test's, and the server the daemon starts there
 is stopped at the end.
@@ -40,11 +45,8 @@ from __future__ import annotations
 
 import json
 import os
-import re
-import shutil
 import signal
-import tempfile
-import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -52,13 +54,16 @@ import pytest
 
 from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
-    QWEN3_CHECKPOINT,
+    admin_status,
     dedicated_experts,
     find_free_port,
     granted_devices,
-    host_asset,
+    log_tail,
+    qwen3_checkpoint,
     require_uniserve_binary,
+    runtime_directory,
     server_process,
+    wait_until,
     worker_executable,
 )
 
@@ -139,37 +144,26 @@ def _processes(
     return pids
 
 
-def _stop_storage_server(socket: Path) -> None:
-    """Stop the Storage Server serving `socket`, found by its command line."""
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            command = (entry / "cmdline").read_bytes().split(b"\0")
-        except OSError:
-            continue
-        if b"serve" in command and str(socket).encode() in command:
-            os.kill(int(entry.name), signal.SIGTERM)
+@dataclass
+class Killed:
+    """What a stream through a kill read, and what the deployment reported.
 
+    `streamed` and `usage` are the stream's tokens and usage, `reference`
+    and `reference_usage` those of the count asked again afterwards.
+    `before` and `after` are the deployment of ``GET /admin/status`` before
+    the kill and once the count was asked again; `alive` says whether a
+    worker of the group's first launch still ran then, and `workers` how
+    many of the deployment's workers ran.
+    """
 
-def _checkpoint() -> str:
-    checkpoint = str(host_asset("UNISERVE_QWEN3_MODEL", QWEN3_CHECKPOINT))
-    return checkpoint
-
-
-def _log_lines(log: Path) -> list[str]:
-    """The lines of `log` without their terminal colors."""
-    colors = re.compile(r"\x1b\[[0-9;]*m")
-    return [colors.sub("", line) for line in log.read_text().splitlines()]
-
-
-def _await_line(log: Path, text: str, timeout_s: float) -> None:
-    """Wait until the server log holds a line containing `text`."""
-    deadline = time.monotonic() + timeout_s
-    while not any(text in line for line in _log_lines(log)):
-        if time.monotonic() > deadline:
-            pytest.fail(f"the server did not log {text!r}")
-        time.sleep(1)
+    streamed: list[str]
+    usage: dict
+    reference: list[str]
+    reference_usage: dict
+    before: dict
+    after: dict
+    alive: bool
+    workers: int
 
 
 def _stream_through_a_kill(
@@ -178,23 +172,20 @@ def _stream_through_a_kill(
     *,
     options: tuple[str, ...] = (),
     devices: str | None = None,
-    parked: str | None = None,
-) -> tuple[list[str], dict, list[str], dict, list[str]]:
+    standby: bool = False,
+) -> Killed:
     """Stream the count, killing a `victim` process after the first tokens.
 
     `victim` is `worker` (a rank of a group's first launch) or `engine`.
-    The server runs on `devices` with the extra `options`; with `parked`,
-    the stream starts once the server logged it. Returns the streamed
-    tokens and usage, the tokens and usage of the count asked again
-    afterwards, and the server log's lines.
+    The server runs on `devices` with the extra `options`; with `standby`,
+    the stream starts once the deployment reports its standby prepared.
     """
-    runtime = Path(tempfile.mkdtemp(prefix="uniserve-"))
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     command = [
         str(require_uniserve_binary()),
         "serve",
-        _checkpoint(),
+        qwen3_checkpoint(),
         "--served-model-name",
         SERVED_MODEL,
         "--host",
@@ -217,17 +208,25 @@ def _stream_through_a_kill(
         "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
         *options,
     ]
-    env = {
-        "CUDA_VISIBLE_DEVICES": devices or granted_devices(1),
-        "XDG_RUNTIME_DIR": str(runtime),
-    }
     log = tmp_path / "server.log"
     streamed: list[str] = []
     usage = None
-    try:
+    with runtime_directory(tmp_path / "storage-server.log") as runtime:
+        env = {
+            "CUDA_VISIBLE_DEVICES": devices or granted_devices(1),
+            "XDG_RUNTIME_DIR": str(runtime),
+        }
         with server_process(command, base_url, log, timeout_s=900, env=env):
-            if parked is not None:
-                _await_line(log, parked, timeout_s=900)
+            if standby:
+                wait_until(
+                    lambda: (
+                        admin_status(base_url)["deployment"]["standby"] or {}
+                    ).get("prepared"),
+                    900,
+                    "the deployment reported no prepared standby",
+                    context=lambda: log_tail(log),
+                )
+            before = admin_status(base_url)["deployment"]
             with httpx.stream(
                 "POST",
                 f"{base_url}/v1/chat/completions",
@@ -258,43 +257,52 @@ def _stream_through_a_kill(
             )
             reply.raise_for_status()
             answer = reply.json()
-            reference = [
-                entry["token"]
-                for entry in answer["choices"][0]["logprobs"]["content"]
-            ]
-            reference_usage = answer["usage"]
-    finally:
-        _stop_storage_server(runtime / "uniserve" / "storage-server.sock")
-        storage_log = runtime / "uniserve" / "storage-server.log"
-        if storage_log.is_file():
-            shutil.copy(storage_log, tmp_path / "storage-server.log")
-        shutil.rmtree(runtime, ignore_errors=True)
-    return streamed, usage, reference, reference_usage, _log_lines(log)
+            after = admin_status(base_url)["deployment"]
+            alive = bool(_processes("worker", runtime, generation=1))
+            workers = len(_processes("worker", runtime))
+    return Killed(
+        streamed=streamed,
+        usage=usage,
+        reference=[
+            entry["token"]
+            for entry in answer["choices"][0]["logprobs"]["content"]
+        ],
+        reference_usage=answer["usage"],
+        before=before,
+        after=after,
+        alive=alive,
+        workers=workers,
+    )
+
+
+def _continued(killed: Killed) -> None:
+    """The stream read the count the deployment answers alone, with the
+    same usage: it continued where the kill stopped it, and the deployment
+    serves again.
+    """  # noqa: D205
+    assert killed.streamed == killed.reference
+    assert killed.usage == killed.reference_usage
+    assert killed.after["engine"] == "ready", killed.after
 
 
 def test_a_request_continues_after_its_worker_rank_is_lost(tmp_path: Path):
-    streamed, usage, reference, reference_usage, lines = _stream_through_a_kill(
-        tmp_path, "worker"
-    )
-    assert any("a request migrated" in line for line in lines), (
-        "the streaming request did not migrate"
-    )
-    assert streamed == reference
-    assert usage == reference_usage
+    killed = _stream_through_a_kill(tmp_path, "worker")
+    _continued(killed)
+    # The engine process served throughout, and its group's ranks were
+    # launched again.
+    assert killed.after["generation"] == killed.before["generation"]
+    assert not killed.alive, "a worker of the lost launch still runs"
+    assert killed.workers > 0, "no worker serves the relaunched group"
 
 
 def test_a_request_continues_after_its_engine_process_is_lost(tmp_path: Path):
-    streamed, usage, reference, reference_usage, lines = _stream_through_a_kill(
-        tmp_path, "engine"
-    )
-    assert any("the relaunched engine serves" in line for line in lines), (
-        "the daemon did not start another engine"
-    )
-    assert any("a request migrated" in line for line in lines), (
-        "the streaming request did not migrate"
-    )
-    assert streamed == reference
-    assert usage == reference_usage
+    killed = _stream_through_a_kill(tmp_path, "engine")
+    _continued(killed)
+    # The daemon started another engine process, which serves.
+    assert killed.after["generation"] not in (
+        None,
+        killed.before["generation"],
+    ), (killed.before, killed.after)
 
 
 def _expert_world(topology: str, tmp_path: Path) -> tuple[str, ...]:
@@ -320,7 +328,7 @@ def _expert_world(topology: str, tmp_path: Path) -> tuple[str, ...]:
 def test_an_expert_world_promotes_its_standby_world_when_a_rank_is_lost(
     tmp_path: Path, standby_storage: str, topology: str
 ):
-    streamed, usage, reference, reference_usage, lines = _stream_through_a_kill(
+    killed = _stream_through_a_kill(
         tmp_path,
         "worker",
         options=(
@@ -333,32 +341,12 @@ def test_an_expert_world_promotes_its_standby_world_when_a_rank_is_lost(
             f"worker_config.standby_storage={standby_storage}",
         ),
         devices=granted_devices(2),
-        parked="the standby epoch of the failure domain is parked",
+        standby=True,
     )
-
-    def logged(text: str) -> bool:
-        return any(text in line for line in lines)
-
-    assert logged("the failure domain's standby epoch was promoted")
-    assert not logged("relaunching the failure domain's worker groups")
-    assert logged("a request migrated"), "the streaming request did not migrate"
-    if standby_storage == "resident":
-        assert logged("the standby worker keeps its graph storage resident")
-    elif topology == "replicas":
-        for event in (
-            "the standby worker suspended its expert transports",
-            "the standby worker suspended its communicators",
-            "the promoted standby worker restored its expert transports",
-            "the promoted standby worker resumed its communicators",
-        ):
-            assert logged(event), event
-    else:
-        for event in (
-            "the standby worker released its expert workspaces",
-            "the standby worker suspended its communicators",
-            "the promoted standby worker resumed its communicators",
-            "the promoted standby worker captured its expert graphs again",
-        ):
-            assert logged(event), event
-    assert streamed == reference
-    assert usage == reference_usage
+    _continued(killed)
+    # The parked standby serves now, rather than a world launched anew.
+    standby = killed.before["standby"]
+    assert killed.after["generation"] == standby["generations"][0], (
+        killed.before,
+        killed.after,
+    )
