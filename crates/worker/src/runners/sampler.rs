@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! logits [rows, vocabulary]        → logits_shape   → shaped [rows, vocabulary] f32
-//! shaped                           → log_softmax   → logprobs [rows, vocabulary] f32  (when asked)
+//! logits                           → log_softmax   → logprobs [rows, vocabulary] f32  (when asked)
 //! shaped                           → top_k          → values [rows, width] f32, ids [rows, width] i32
 //! values + ids                     → filter_candidates → values (dropped = -inf), valid [rows]
 //! values + ids                     → candidate_order → the same rows in ascending token id
@@ -13,6 +13,10 @@
 //! probabilities + draws            → inverse_cdf    → tokens [rows]
 //! logprobs + tokens                → logprob_gather → logp [rows] f32                    (when asked)
 //! ```
+//!
+//! The reported log-probabilities are the raw distribution's: `log_softmax` of the model's logits
+//! before penalties, temperature and filtering, written over the shaped row once the selection no
+//! longer reads it. A greedy step reports them the same way after its argmax.
 //!
 //! A greedy row takes the second of two launch sequences instead, and only its first step:
 //!
@@ -336,27 +340,47 @@ impl Sampler {
 
         f.operate::<InverseCdf>(&draw, args)?;
 
-        // 5. The reported log-probabilities, over the shaped distribution of the whole vocabulary.
-        if let Some(logprobabilities) = samples.logprobabilities {
-            let softmax = self.log_softmax_descriptor();
-            let logprobs = arena.tensor(DType::F32, Shape::new(&[rows, vocabulary]))?;
-            let args = LogSoftmaxArgs {
-                x: candidates.shaped,
-                out: logprobs,
-            };
+        // 5. The reported log-probabilities. The shaped row is dead once the draw has read the
+        // candidates, so it holds the scores and the step reserves nothing more for them.
+        self.report(f, logits, candidates.shaped, samples)?;
 
-            f.operate::<LogSoftmax>(&softmax, args)?;
+        Ok(())
+    }
 
-            let gather = self.logprob_descriptor();
-            let args = LogprobArgs {
-                logprobabilities: logprobs,
-                tokens: samples.tokens,
-                out: logprobabilities,
-            };
+    /// Write the log-probability of each row's sampled token into `samples`, when it carries a
+    /// row for them.
+    ///
+    /// The scores are those of the model's raw distribution: `log_softmax` of the unshaped
+    /// `logits`, before penalties, temperature and candidate filtering, which is what
+    /// `docs/architecture.md` states the engine reports and vLLM's default (`raw_logprobs`)
+    /// answers. `scratch` is a `[rows, vocabulary]` f32 view the caller no longer reads; the
+    /// scores of the whole vocabulary are written there before one per row is gathered.
+    fn report(
+        &self,
+        f: &Forward,
+        logits: TensorView,
+        scratch: TensorView,
+        samples: &Samples,
+    ) -> Result<()> {
+        let Some(logprobabilities) = samples.logprobabilities else {
+            return Ok(());
+        };
+        let softmax = self.log_softmax_descriptor(logits.dtype);
+        let args = LogSoftmaxArgs {
+            x: logits,
+            out: scratch,
+        };
 
-            f.operate::<LogprobGather>(&gather, args)?;
-        }
+        f.operate::<LogSoftmax>(&softmax, args)?;
 
+        let gather = self.logprob_descriptor();
+        let args = LogprobArgs {
+            logprobabilities: scratch,
+            tokens: samples.tokens,
+            out: logprobabilities,
+        };
+
+        f.operate::<LogprobGather>(&gather, args)?;
         Ok(())
     }
 
@@ -458,10 +482,11 @@ impl Sampler {
         }
     }
 
-    /// The reported log-probabilities over the shaped distribution of the whole vocabulary.
-    fn log_softmax_descriptor(&self) -> LogSoftmaxDescriptor {
+    /// The reported log-probabilities over the raw distribution of the whole vocabulary, read in
+    /// the logits' own element type.
+    fn log_softmax_descriptor(&self, logits: DType) -> LogSoftmaxDescriptor {
         LogSoftmaxDescriptor {
-            dtype: DType::F32,
+            dtype: logits,
             columns: self.vocabulary,
             tile: self.block,
             pdl: launch::PDL,
@@ -631,25 +656,8 @@ impl Sampler {
 
         f.operate::<ArgMax>(&argmax, args)?;
 
-        if let Some(logprobabilities) = samples.logprobabilities {
-            let softmax = self.log_softmax_descriptor();
-            let logprobs = arena.tensor(DType::F32, Shape::new(&[rows, vocabulary]))?;
-            let args = LogSoftmaxArgs {
-                x: shaped,
-                out: logprobs,
-            };
-
-            f.operate::<LogSoftmax>(&softmax, args)?;
-
-            let gather = self.logprob_descriptor();
-            let args = LogprobArgs {
-                logprobabilities: logprobs,
-                tokens: samples.tokens,
-                out: logprobabilities,
-            };
-
-            f.operate::<LogprobGather>(&gather, args)?;
-        }
+        // The shaped row is dead once the argmax has read it, so it holds the scores.
+        self.report(f, logits, shaped, samples)?;
 
         Ok(())
     }

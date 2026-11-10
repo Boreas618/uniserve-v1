@@ -372,6 +372,8 @@ struct Columns {
     live_tokens: Column,
     /// `[rows]` the sampled ids, read back after a replay: two, as the commit's positions are.
     readback: [platform::PinnedBuffer; 2],
+    /// `[rows]` f32 the raw log-probability of each sampled id, read back beside it.
+    logprob_readback: [platform::PinnedBuffer; 2],
     /// One row of logits, `[vocabulary]`, read back for a greedy request whose first token is taken
     /// on the host (see `read_sampled`): a bucket is homogeneous in its sampling path, so a prefill
     /// bucket that ends a greedy prompt cannot argmax in its graph - the graph draws.
@@ -453,6 +455,10 @@ impl Columns {
             draws: Column::new(device, DType::F32, rows)?,
             live_tokens: Column::new(device, DType::I32, 1)?,
             readback: [
+                platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
+                platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
+            ],
+            logprob_readback: [
                 platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
                 platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
             ],
@@ -794,6 +800,8 @@ struct Flight {
 struct Sampled {
     /// `[rows]` i32 sampled token ids, in the bucket's row order.
     tokens: TensorView,
+    /// `[rows]` f32 each sampled id's log-probability under the raw logits.
+    logprobs: TensorView,
     /// `[rows, vocabulary]` the bucket's raw logits, kept for a bucket that may hold a greedy
     /// request's prompt ending: its first token is the argmax of that row, which the captured graph
     /// cannot produce because a bucket is homogeneous in its sampling path.
@@ -923,6 +931,25 @@ fn runner_up(values: &[f32], best: usize) -> f32 {
         }
     }
     values.get(best).copied().unwrap_or(f32::NAN) - second
+}
+
+/// The raw log-probability of `index` in a row of logits: `x[index] - logsumexp(x)`, accumulated
+/// in f64 so the host's answer for a greedy prompt ending is no coarser than the device's.
+fn log_softmax_at(values: &[f32], index: usize) -> f32 {
+    let max = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return f32::NAN;
+    }
+    let total: f64 = values
+        .iter()
+        .map(|value| f64::from(*value - max).exp())
+        .sum();
+    let chosen = values.get(index).copied().unwrap_or(f32::NAN);
+    (f64::from(chosen - max) - total.ln()) as f32
 }
 
 fn argmax(values: &[f32]) -> usize {
@@ -2441,6 +2468,10 @@ impl<M: TextModel> CausalLmRunner<M> {
             // SAFETY: the readback buffer holds `rows` i32 and `row` is inside it.
             unsafe {
                 *self.columns.readback[turn].as_ptr().cast::<i32>().add(row) = best as i32;
+                *self.columns.logprob_readback[turn]
+                    .as_ptr()
+                    .cast::<f32>()
+                    .add(row) = log_softmax_at(row_logits, best);
             }
             // The graph committed its own draw as this slot's next input, and the next decode
             // embeds what the client was told.
@@ -2491,6 +2522,12 @@ impl<M: TextModel> CausalLmRunner<M> {
             platform::memcpy_async(
                 self.columns.readback[turn].address(),
                 samples.tokens.ptr.address(),
+                bytes,
+                &self.stream,
+            )?;
+            platform::memcpy_async(
+                self.columns.logprob_readback[turn].address(),
+                samples.logprobs.ptr.address(),
                 bytes,
                 &self.stream,
             )?;
@@ -2585,8 +2622,17 @@ impl<M: TextModel> CausalLmRunner<M> {
             logical,
             sampling,
         );
+        // SAFETY: the copy above filled `rows` f32 with the sampled ids' log-probabilities, and the
+        // host argmax rewrote the rows it decided.
+        let logprobs = unsafe {
+            std::slice::from_raw_parts(
+                self.columns.logprob_readback[turn].as_ptr().cast::<f32>(),
+                rows,
+            )
+        };
         let calls = calls_output(
             ids,
+            logprobs,
             &flight.logits_rows,
             &flight.rows,
             &flight.calls,
@@ -3149,7 +3195,11 @@ impl<M: TextModel> CausalLmRunner<M> {
             slots,
             extras: None,
         };
-        let samples = Samples::reserve(arena, DType::I32, rows, false)?;
+        // Every sampling bucket reports its tokens' log-probabilities: whether a row's request asked
+        // for them is request data a captured graph cannot branch on, and the scores reuse the
+        // sampler's dead shaped row, so the only extra memory is one f32 per row. The scheduler keeps
+        // them for the requests that asked.
+        let samples = Samples::reserve(arena, DType::I32, rows, true)?;
         // A greedy bucket takes each row's largest candidate; every other sampling bucket draws one
         // from the row's distribution. The two are different launch sequences in the sampler layer
         // (`Sampler::greedy` and `Sampler::forward`), and a draw cannot produce a greedy token: the
@@ -3178,6 +3228,9 @@ impl<M: TextModel> CausalLmRunner<M> {
                 bucket,
                 Sampled {
                     tokens: samples.tokens,
+                    logprobs: samples.logprobabilities.ok_or(Error::State(
+                        "a sampling bucket reserved no log-probabilities",
+                    ))?,
                     logits,
                 },
             );
@@ -3342,6 +3395,7 @@ fn length_at(column: &[i32], row: usize) -> u32 {
 /// its batch row; a row whose logits entry is negative contributes nothing.
 pub fn calls_output(
     ids: &[i32],
+    logprobs: &[f32],
     sampling_rows: &[i32],
     rows: &BatchRows,
     calls: &[CallId],
@@ -3398,6 +3452,9 @@ pub fn calls_output(
             Error::Invariant(format!("the batch names no call id for its row {position}"))
         })?;
         entry.tokens.push(ids[index] as u32);
+        if let Some(logprob) = logprobs.get(index) {
+            entry.token_logprobs.push(*logprob);
+        }
     }
     Ok(output)
 }
@@ -4348,6 +4405,35 @@ mod sampled_output_tests {
         }
     }
 
+    /// Each sampled token carries its own row's log-probability, and a row that samples nothing
+    /// reports none.
+    #[test]
+    fn a_sampled_token_carries_its_rows_logprob() {
+        let batch = rows(&[(0, 0..1), (1, 1..2)]);
+        let output = calls_output(
+            &[111, 222],
+            &[-0.5, -2.0],
+            &[0, -1],
+            &batch,
+            &[CallId(7), CallId(9)],
+            &[RowState::default(), RowState::default()],
+        )
+        .expect("the batch's calls");
+        assert_eq!(output[0].tokens, vec![111]);
+        assert_eq!(output[0].token_logprobs, vec![-0.5]);
+        assert!(output[1].tokens.is_empty() && output[1].token_logprobs.is_empty());
+    }
+
+    /// The host's score of a greedy prompt ending is the raw row's log-softmax.
+    #[test]
+    fn the_host_logprob_is_the_rows_log_softmax() {
+        // exp(0) : exp(ln 3) is 1 : 3, so the second logit holds three quarters of the mass.
+        let row = [0.0, 3.0_f32.ln(), f32::NEG_INFINITY];
+        assert!((log_softmax_at(&row, 1) - 0.75_f32.ln()).abs() < 1e-6);
+        assert!((log_softmax_at(&row, 0) - 0.25_f32.ln()).abs() < 1e-6);
+        assert_eq!(log_softmax_at(&row, 2), f32::NEG_INFINITY);
+    }
+
     /// The step's output names every call of the batch, and each call's tokens are its own rows'
     /// samples in row order, whatever order the mechanism listed the calls in.
     #[test]
@@ -4355,6 +4441,7 @@ mod sampled_output_tests {
         let batch = rows(&[(0, 0..1), (1, 1..2)]);
         let output = calls_output(
             &[111, 222],
+            &[],
             &[1, 0],
             &batch,
             &[CallId(7), CallId(9)],
@@ -4404,6 +4491,7 @@ mod sampled_output_tests {
     fn a_call_that_samples_nothing_still_completes() {
         let output = calls_output(
             &[0],
+            &[],
             &[-1],
             &rows(&[(0, 0..4)]),
             &[CallId(1)],
@@ -4462,11 +4550,18 @@ mod sampled_output_tests {
     #[test]
     fn a_row_no_call_owns_is_refused() {
         let batch = rows(&[(0, 0..1)]);
-        calls_output(&[5], &[3], &batch, &[CallId(1)], &[RowState::default()])
-            .expect_err("row 3 belongs to no call");
-        calls_output(&[], &[0], &batch, &[CallId(1)], &[RowState::default()])
+        calls_output(
+            &[5],
+            &[],
+            &[3],
+            &batch,
+            &[CallId(1)],
+            &[RowState::default()],
+        )
+        .expect_err("row 3 belongs to no call");
+        calls_output(&[], &[], &[0], &batch, &[CallId(1)], &[RowState::default()])
             .expect_err("no id was sampled for row 0");
-        calls_output(&[5], &[0], &batch, &[CallId(1)], &[])
+        calls_output(&[5], &[], &[0], &batch, &[CallId(1)], &[])
             .expect_err("one call, no trajectory position");
     }
 

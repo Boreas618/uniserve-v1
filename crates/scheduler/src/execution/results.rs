@@ -757,7 +757,7 @@ impl Scheduler {
             let mut to_resolve = Vec::with_capacity(completions.len());
             for completion in completions {
                 let PendingCompletion {
-                    record,
+                    mut record,
                     media,
                     arrival_seq,
                 } = completion;
@@ -847,6 +847,12 @@ impl Scheduler {
                     // outputs still being produced when cancellation arrived.
                     continue;
                 };
+                // A rank reports the log-probability of every token its sampler selected, because
+                // whether a row's request asked for them is not a fact its captured graph can
+                // branch on; a request that did not ask reports none.
+                if !state.req.sampling.generated_logprobs_requested() {
+                    record.token_logprobs.clear();
+                }
                 if let Err(error) = generation::validate_generation_result(
                     &call,
                     image_cache,

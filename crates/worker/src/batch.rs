@@ -74,12 +74,13 @@ pub struct CallOutput {
     pub cache_computed_len: u32,
     /// The accepted prefix a successor may read: the slot's sampling position after the commit.
     pub cache_visible_len: u32,
-    /// The log-probability of each accepted token, aligned with [`CallOutput::tokens`].
+    /// The log-probability of each accepted token, aligned with [`CallOutput::tokens`]: the raw
+    /// distribution's, `log_softmax` of the model's logits before penalties, temperature and
+    /// filtering (vLLM's default `raw_logprobs`).
     ///
-    /// Empty unless the deployment planned logprob buckets (4.5): producing them costs a
-    /// full-vocabulary softmax on every sampling step and its `[rows, vocabulary]` buffer, so a
-    /// deployment that serves without clients asking for them plans the plain buckets and every
-    /// call reports this empty. **Empty means "not planned", never "zero".**
+    /// A causal-LM step reports one for every token it sampled, whether or not the request asked,
+    /// because a captured graph cannot branch on a request parameter; the scheduler drops them for
+    /// the requests that did not ask. A call that sampled nothing reports none.
     pub token_logprobs: Vec<f32>,
     /// Ranked log-probabilities for each scored prompt position, in input order.
     pub prompt_logprobs: Vec<Vec<ipc::TokenLogprob>>,
