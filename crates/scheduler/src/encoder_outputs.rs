@@ -198,18 +198,16 @@ impl EncoderStore {
         let Some((first_rank, first)) = ranks.first() else {
             return false;
         };
-        if ranks.iter().any(|(_, report)| {
-            report.pool.pool != first.pool.pool
-                || report.pool.page_bytes != first.pool.page_bytes
-                || report.pool.endpoint != first.pool.endpoint
-                || report.local != first.local
-        }) || first.pool.page_bytes == 0
+        if ranks
+            .iter()
+            .any(|(_, report)| report.pool.pages != first.pool.pages || report.local != first.local)
+            || first.pool.pages.page_bytes == 0
         {
             return false;
         }
         let Some(client) = self
             .servers
-            .client(first.local, first.pool.endpoint.as_deref())
+            .client(first.local, first.pool.pages.endpoint.as_deref())
         else {
             return false;
         };
@@ -230,7 +228,7 @@ impl EncoderStore {
         }
         tracing::info!(
             worker = %worker.0,
-            pool = first.pool.pool,
+            pool = first.pool.pages.pool,
             outputs = identities.len(),
             "the host encoder pool serves the worker group"
         );
@@ -239,8 +237,8 @@ impl EncoderStore {
             GroupPool {
                 worker: worker.clone(),
                 client,
-                pool: first.pool.pool,
-                page_bytes: first.pool.page_bytes,
+                pool: first.pool.pages.pool,
+                page_bytes: first.pool.pages.page_bytes,
                 scope: Scope {
                     deployment: self.servers.deployment().to_owned(),
                     group: worker.0.clone(),

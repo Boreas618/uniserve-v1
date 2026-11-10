@@ -13,18 +13,15 @@
 //! keys it, and a rank only copies the rows of its calls' outputs, on the
 //! stream of the encoder that writes them.
 
-use std::sync::Arc;
-
 use ::storage::Key;
-use ::storage::protocol::{PageShape, Reply, Request};
-use ipc::EncoderPoolInfo;
+use ::storage::protocol::PageShape;
+use ipc::{EncoderPoolInfo, HostPoolInfo};
 use platform::DeviceId;
 
-use crate::memory::allocation::Backing;
-use crate::memory::allocation::ElementType;
-use crate::memory::allocation::{Storage, StorageView};
+use crate::Result;
+use crate::memory::allocation::StorageView;
+use crate::memory::host_pages::HostPages;
 use crate::memory::retained::Retained;
-use crate::{Error, Result};
 
 /// The version of the page encoding: an output's bytes, rows in order,
 /// in consecutive pages.
@@ -50,7 +47,7 @@ pub const PAGE_BYTES: u64 = 256 << 10;
 /// it again.
 pub fn pool_pages(largest: &[u64], request_slots: usize) -> u64 {
     let request: u64 = largest.iter().map(|bytes| bytes.div_ceil(PAGE_BYTES)).sum();
-    2 * request_slots as u64 * request
+    crate::memory::host_pages::resuming_pages(request_slots as u64 * request)
 }
 
 /// The pool layout identifier: its domain, encoding version and page size.
@@ -65,10 +62,7 @@ fn layout() -> [u8; 32] {
 /// The rank's view of its host's encoder pool, mapped and registered for
 /// device copies.
 pub struct EncoderHostPool {
-    pool: u64,
-    storage: Arc<Storage>,
-    slots: u64,
-    page_bytes: u64,
+    pages: HostPages,
 }
 
 impl EncoderHostPool {
@@ -93,73 +87,38 @@ impl EncoderHostPool {
         };
         // The host's ranks share the pool across their NUMA nodes, so it
         // names none.
-        let answer = retained.call("mapping the host encoder pool", |client| {
-            client.call(
-                &Request::PagePool {
-                    shape,
-                    numa_node: None,
-                    bytes: Some(pages * PAGE_BYTES),
-                },
-                &[],
-            )
-        })?;
-        let Reply::PagePool {
-            pool,
-            slots,
-            page_bytes,
-        } = answer.reply
-        else {
-            return Err(Error::Interface(format!(
-                "the storage server answered the encoder pool with {:?}",
-                answer.reply
-            )));
-        };
-        let descriptor = answer.descriptors.into_iter().next().ok_or_else(|| {
-            Error::Interface("the encoder pool arrived without its storage".into())
-        })?;
-        let storage = Storage::map_host(descriptor, (slots * page_bytes) as usize, device, true)?;
-        tracing::info!(pool, slots, page_bytes, "mapped the host encoder pool");
+        let pages = HostPages::map(
+            retained,
+            device,
+            shape,
+            None,
+            Some(pages * PAGE_BYTES),
+            "the host encoder pool",
+        )?;
         let info = EncoderPoolInfo {
-            pool,
-            page_bytes,
-            identities,
-            endpoint: endpoint.map(str::to_owned),
-        };
-        Ok((
-            Self {
-                pool,
-                storage,
-                slots,
-                page_bytes,
+            pages: HostPoolInfo {
+                pool: pages.pool(),
+                page_bytes: pages.page_bytes(),
+                endpoint: endpoint.map(str::to_owned),
             },
-            info,
-        ))
+            identities,
+        };
+        Ok((Self { pages }, info))
     }
 
     /// The pool's identity at its Storage Server.
     pub(crate) fn pool(&self) -> u64 {
-        self.pool
+        self.pages.pool()
     }
 
     /// The bytes of one page.
     pub(crate) fn page_bytes(&self) -> u64 {
-        self.page_bytes
+        self.pages.page_bytes()
     }
 
     /// The `uint8 [page_bytes]` view of pool slot `slot`.
     pub(crate) fn view(&self, slot: u64) -> Result<StorageView> {
-        if slot >= self.slots {
-            return Err(Error::Invalid(format!(
-                "encoder pool slot {slot} is not a slot of pool {} of {} slots",
-                self.pool, self.slots
-            )));
-        }
-        StorageView::contiguous(
-            Arc::clone(&self.storage) as Arc<dyn Backing>,
-            (slot * self.page_bytes) as usize,
-            ElementType::U8,
-            &[self.page_bytes as i64],
-        )
+        self.pages.view(slot)
     }
 }
 

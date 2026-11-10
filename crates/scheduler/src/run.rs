@@ -494,7 +494,7 @@ impl Scheduler {
                 continue;
             };
             for ((_, cache), result) in ranks.iter_mut().zip(results) {
-                let pools: Option<Vec<ipc::PagePoolInfo>> = serde_json::from_str(&result)?;
+                let pools: Option<Vec<ipc::HostPoolInfo>> = serde_json::from_str(&result)?;
                 if let (Some(cache), Some(pools)) = (cache.as_mut(), pools) {
                     cache.page_pools = pools;
                 }

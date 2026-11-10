@@ -100,7 +100,7 @@ pub(crate) enum Command {
     MapHostCache {
         tokens: u64,
         keys: crate::batch::HostCacheEndpoint,
-        pools: Arc<std::sync::Mutex<Vec<ipc::PagePoolInfo>>>,
+        pools: Arc<std::sync::Mutex<Vec<ipc::HostPoolInfo>>>,
     },
     /// Copy published pages to the host KV cache, with no batch to carry them.
     CopyPages(Vec<ipc::PageCopy>),

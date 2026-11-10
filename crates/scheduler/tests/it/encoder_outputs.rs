@@ -50,13 +50,15 @@ impl Encoders {
         sim.set_encoder_pools(vec![(
             HOST.to_owned(),
             Some(Box::new(EncoderPoolInfo {
-                pool,
-                page_bytes: PAGE_BYTES,
+                pages: ipc::HostPoolInfo {
+                    pool,
+                    page_bytes: PAGE_BYTES,
+                    endpoint: None,
+                },
                 identities: identities
                     .iter()
                     .map(|(output, identity)| ((*output).to_owned(), (*identity).to_owned()))
                     .collect(),
-                endpoint: None,
             })),
         )]);
         let mut inner = SimWorker::new(sim);

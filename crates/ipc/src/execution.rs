@@ -1499,7 +1499,7 @@ pub enum EpochOperation {
 
 /// The host KV cache's page pools a worker mapped: each pool's name with its ranks' pools, in rank
 /// order ([`Batches::map_host_cache`]).
-pub type HostPools = Vec<(String, Vec<Vec<crate::PagePoolInfo>>)>;
+pub type HostPools = Vec<(String, Vec<Vec<crate::HostPoolInfo>>)>;
 
 /// One pool of the deployment a worker serves (4.2, 7.3).
 #[derive(Clone, Debug, Default)]

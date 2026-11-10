@@ -9,6 +9,7 @@
 
 pub mod allocation;
 pub mod encoders;
+pub(crate) mod host_pages;
 pub mod latent;
 pub mod prefix_cache;
 pub mod reload;

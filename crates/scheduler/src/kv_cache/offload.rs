@@ -611,13 +611,7 @@ impl KvOffloadManager {
             {
                 return false;
             }
-            for pool in &report.cache.page_pools {
-                let Some(group) = groups.get_mut(pool.group_id as usize) else {
-                    return false;
-                };
-                if group.ranks.len() != rank {
-                    return false;
-                }
+            for (group, pool) in groups.iter_mut().zip(&report.cache.page_pools) {
                 let client = if report.local {
                     0
                 } else {
@@ -1738,7 +1732,7 @@ mod tests {
     use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use ipc::PagePoolInfo;
+    use ipc::HostPoolInfo;
     use ipc::{CacheGroup, CacheGroupKind, PrefixCacheDtype};
     use storage::Claim;
     use storage::protocol::PageShape;
@@ -1908,10 +1902,9 @@ mod tests {
             groups,
             page_pools: pools
                 .iter()
-                .enumerate()
-                .map(|(group, pool)| PagePoolInfo {
-                    group_id: group as u32,
+                .map(|pool| HostPoolInfo {
                     pool: *pool,
+                    page_bytes: 0,
                     endpoint: None,
                 })
                 .collect(),

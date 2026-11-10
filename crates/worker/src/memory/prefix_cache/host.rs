@@ -26,17 +26,15 @@
 //! column.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use ::storage::Key;
-use ::storage::protocol::{PageShape, Reply, Request};
-use ipc::{PageCopy, PagePoolInfo};
-use platform::{CopyBatch, DeviceAttribute, DeviceId, SourceOrder, Stream};
+use ::storage::protocol::PageShape;
+use ipc::{HostPoolInfo, PageCopy};
+use platform::{CopyBatch, DeviceId, SourceOrder, Stream};
 
 use super::plan::{CacheGroupPlan, CachePlan};
 use super::planes::{CachePlanes, UnitColumn};
-use crate::memory::allocation::Backing;
-use crate::memory::allocation::Storage;
+use crate::memory::host_pages::{self, HostPages};
 use crate::memory::retained::Retained;
 use crate::stream::Issue;
 use crate::{Error, Result};
@@ -47,10 +45,7 @@ const PAGE_ENCODING: u32 = 1;
 
 /// One group's page pool, mapped into the rank.
 struct GroupPool {
-    pool: u64,
-    storage: Arc<Storage>,
-    slots: u64,
-    page_bytes: u64,
+    pages: HostPages,
     /// Planes of one field a page spans (`CachePlan::page_planes`).
     planes: u32,
 }
@@ -159,7 +154,7 @@ impl HostCacheSetup {
         retained: &Retained,
         cache: &mut super::PrefixCache,
         tokens: u64,
-    ) -> Result<Vec<PagePoolInfo>> {
+    ) -> Result<Vec<HostPoolInfo>> {
         let (host, pools) = HostKvCache::start(
             retained,
             cache.plan(),
@@ -189,17 +184,14 @@ impl HostKvCache {
         device: DeviceId,
         endpoint: Option<&str>,
         tokens: u64,
-    ) -> Result<(Self, Vec<PagePoolInfo>)> {
+    ) -> Result<(Self, Vec<HostPoolInfo>)> {
         let mut pools = BTreeMap::new();
         let mut infos = Vec::new();
         for (index, group) in plan.groups.iter().enumerate() {
             let layout = layout(plan, index);
             // The pool lies on the host NUMA node closest to the device, so
             // the copies between them cross no inter-node link.
-            let numa_node = device
-                .attribute(DeviceAttribute::HostNumaId)
-                .ok()
-                .and_then(|node| u32::try_from(node).ok());
+            let numa_node = host_pages::numa_node(device);
             let shape = PageShape {
                 layout: Key(layout),
                 kv_head_offset: group.kv_head_offset,
@@ -212,56 +204,27 @@ impl HostKvCache {
                     "the host KV cache holds no page of each cache group",
                 ));
             }
-            let bytes = Some(slots * shape.page_bytes);
-            let answer = retained.call("mapping a page pool", |client| {
-                client.call(
-                    &Request::PagePool {
-                        shape,
-                        numa_node,
-                        bytes,
-                    },
-                    &[],
-                )
-            })?;
-            let Reply::PagePool {
-                pool,
-                slots,
-                page_bytes,
-            } = answer.reply
-            else {
-                return Err(Error::Interface(format!(
-                    "the storage server answered a page pool with {:?}",
-                    answer.reply
-                )));
-            };
-            let descriptor = answer.descriptors.into_iter().next().ok_or_else(|| {
-                Error::Interface("a page pool arrived without its storage".into())
-            })?;
-            let storage =
-                Storage::map_host(descriptor, (slots * page_bytes) as usize, device, true)?;
-            tracing::info!(
-                group = index,
-                pool,
-                slots,
-                page_bytes,
+            let pages = HostPages::map(
+                retained,
+                device,
+                shape,
                 numa_node,
-                "mapped the host page pool"
-            );
+                Some(slots * shape.page_bytes),
+                "a host KV cache pool",
+            )?;
+            let info = HostPoolInfo {
+                pool: pages.pool(),
+                page_bytes: pages.page_bytes(),
+                endpoint: endpoint.map(str::to_owned),
+            };
             pools.insert(
                 index as u32,
                 GroupPool {
-                    pool,
-                    storage,
-                    slots,
-                    page_bytes,
+                    pages,
                     planes: plan.page_planes(group) as u32,
                 },
             );
-            infos.push(PagePoolInfo {
-                group_id: index as u32,
-                pool,
-                endpoint: endpoint.map(str::to_owned),
-            });
+            infos.push(info);
         }
         Ok((Self { pools }, infos))
     }
@@ -272,19 +235,13 @@ impl HostKvCache {
         let pool = self
             .pools
             .get(&copy.group_id)
-            .filter(|pool| pool.pool == copy.pool)
+            .filter(|pool| pool.pages.pool() == copy.pool)
             .ok_or_else(|| {
                 Error::Invalid(format!(
                     "page pool {} is not the pool of cache group {}",
                     copy.pool, copy.group_id
                 ))
             })?;
-        if copy.host_page >= pool.slots {
-            return Err(Error::Invalid(format!(
-                "page slot {} is outside the pool of {} slots",
-                copy.host_page, pool.slots
-            )));
-        }
         let plan = planes.plan();
         let columns = plan.columns;
         if copy.units.len() as u32 * columns != pool.planes {
@@ -296,7 +253,7 @@ impl HostKvCache {
             )));
         }
         let plane = plan.plane_bytes;
-        let slot = pool.storage.address() + copy.host_page * pool.page_bytes;
+        let slot = pool.pages.address(copy.host_page)?;
         let count = u64::from(pool.planes);
         let mut runs = Vec::with_capacity(2 * pool.planes as usize * 2);
         for field in 0..2 {

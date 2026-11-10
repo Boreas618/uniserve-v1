@@ -28,8 +28,8 @@ pub struct PrefixCacheInfo {
     /// Cache groups in table order.
     pub groups: Vec<CacheGroup>,
     /// The host page pools this rank copies its cache groups' pages
-    /// through, one per group; empty without a host KV cache.
-    pub page_pools: Vec<PagePoolInfo>,
+    /// through, one per group in group order; empty without a host KV cache.
+    pub page_pools: Vec<HostPoolInfo>,
     /// Units `1..=scratch_units` the rank's warmup lends to its startup
     /// forwards. A standby worker warms up on them while its predecessor
     /// serves, so the engine never allocates them.
@@ -116,15 +116,18 @@ pub struct CacheTable {
     pub held: u32,
 }
 
-/// The host page pool of one cache group on one rank: the Storage Server
-/// pool its pages are copied to and from, and what the pages hold.
+/// A host page pool a rank maps at its host's Storage Server
+/// (`storage::protocol::Request::PagePool`), as it reports it: the pool the
+/// engine pins, reserves, commits and looks pages up in, and where it
+/// reaches it. What the pages hold is the report's that carries it: a cache
+/// group's pages (`PrefixCacheInfo::page_pools`), keyed by the group's page
+/// chain, or encoder outputs (`EncoderPoolInfo`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PagePoolInfo {
-    /// The cache group whose pages the pool holds.
-    pub group_id: u32,
-    /// The pool's identity at the rank's host's Storage Server. Its pages
-    /// are keyed by the group's page chain (`PrefixCacheInfo::identities`).
+pub struct HostPoolInfo {
+    /// The pool's identity at the rank's host's Storage Server.
     pub pool: u64,
+    /// The bytes of one pool page.
+    pub page_bytes: u64,
     /// Where an engine on another host reaches the pool's Storage Server
     /// (`StorageLaunch::tcp`).
     pub endpoint: Option<String>,
@@ -166,19 +169,13 @@ pub struct LatentPoolInfo {
 /// the encoder read and what computes it (`Call::host_output`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncoderPoolInfo {
-    /// The pool's identity at the rank's host's Storage Server.
-    pub pool: u64,
-    /// The bytes of one pool page; an output takes as many pages as its
-    /// bytes fill.
-    pub page_bytes: u64,
+    /// The pool; an output takes as many pages as its bytes fill.
+    pub pages: HostPoolInfo,
     /// The identity of what computes each encoder output the rank writes,
     /// by the product's name: the weights' values and the declared
     /// function and format identities of the modules computing it
     /// (`uniserve.numerics`).
     pub identities: std::collections::BTreeMap<String, String>,
-    /// Where an engine on another host reaches the pool's Storage Server
-    /// (`StorageLaunch::tcp`).
-    pub endpoint: Option<String>,
 }
 
 /// What an image encoder writes for one image (`MainProcessInfo::image_encoders`):

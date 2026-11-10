@@ -22,13 +22,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use ::storage::Key;
-use ::storage::protocol::{PageShape, Reply, Request};
+use ::storage::protocol::PageShape;
 use ipc::{LatentPageCopy, LatentPoolInfo, LatentPoolRef};
-use platform::{DeviceAttribute, DeviceId};
+use platform::DeviceId;
 
-use crate::memory::allocation::Backing;
-use crate::memory::allocation::ElementType;
-use crate::memory::allocation::{Storage, StorageView};
+use crate::memory::allocation::{ElementType, StorageView};
+use crate::memory::host_pages::{self, HostPages};
 use crate::memory::retained::Retained;
 use crate::{Error, Result};
 
@@ -55,7 +54,7 @@ const PAGE_ENCODING: u32 = 1;
 /// A trajectory the pool evicted beyond that, as when requests reach the
 /// engine in another order, is a miss: its request starts from noise.
 fn pool_pages(pages: BankPages) -> u64 {
-    2 * pages.pages
+    host_pages::resuming_pages(pages.pages)
 }
 
 /// The latent pages a rank holds trajectories in.
@@ -83,13 +82,11 @@ impl BankPages {
 /// and the pools of other ranks it read stored pages from.
 pub struct LatentHostPool {
     pool: LatentPoolRef,
-    storage: Arc<Storage>,
-    slots: u64,
+    pages: Arc<HostPages>,
     retained: Arc<Retained>,
     device: DeviceId,
-    /// The other ranks' pools mapped for restores, by pool, with their
-    /// slots and page bytes.
-    sources: Mutex<HashMap<u64, (Arc<Storage>, u64)>>,
+    /// The other ranks' pools mapped for restores, by pool.
+    sources: Mutex<HashMap<u64, Arc<HostPages>>>,
 }
 
 /// The digest of the byte layout of a pool's pages: the page encoding, the
@@ -128,46 +125,6 @@ fn rank_pool(pages: &BankPages, scope: &::storage::Scope) -> [u8; 32] {
     key.finish()
 }
 
-/// Map the page pool of `shape` on `numa_node` at the rank's host's
-/// Storage Server, creating it with `bytes` when the server holds none,
-/// registered with `device`. Returns its identity, its storage and its
-/// slots.
-fn map_pool(
-    retained: &Retained,
-    device: DeviceId,
-    shape: PageShape,
-    numa_node: Option<u32>,
-    bytes: Option<u64>,
-) -> Result<(u64, Arc<Storage>, u64)> {
-    let answer = retained.call("mapping a host latent pool", |client| {
-        client.call(
-            &Request::PagePool {
-                shape,
-                numa_node,
-                bytes,
-            },
-            &[],
-        )
-    })?;
-    let Reply::PagePool {
-        pool,
-        slots,
-        page_bytes,
-    } = answer.reply
-    else {
-        return Err(Error::Interface(format!(
-            "the storage server answered the latent pool with {:?}",
-            answer.reply
-        )));
-    };
-    let descriptor =
-        answer.descriptors.into_iter().next().ok_or_else(|| {
-            Error::Interface("the latent pool arrived without its storage".into())
-        })?;
-    let storage = Storage::map_host(descriptor, (slots * page_bytes) as usize, device, true)?;
-    Ok((pool, storage, slots))
-}
-
 impl LatentHostPool {
     /// Map the rank's latent pool for pages of its banks (`pages`) at its
     /// host's Storage Server, registered with `device` and sized by
@@ -187,32 +144,23 @@ impl LatentHostPool {
         let page_bytes = pages.page_bytes();
         // The pool lies on the host NUMA node closest to the device, so the
         // copies between them cross no inter-node link.
-        let numa_node = device
-            .attribute(DeviceAttribute::HostNumaId)
-            .ok()
-            .and_then(|node| u32::try_from(node).ok());
+        let numa_node = host_pages::numa_node(device);
         let shape = PageShape {
             layout: Key(rank_pool(&pages, retained.scope())),
             kv_head_offset: 0,
             kv_head_count: 0,
             page_bytes,
         };
-        let (pool, storage, pool_slots) = map_pool(
+        let mapped = HostPages::map(
             retained,
             device,
             shape,
             numa_node,
             Some(pool_pages(pages) * page_bytes),
+            "the host latent pool",
         )?;
-        tracing::info!(
-            pool,
-            slots = pool_slots,
-            page_bytes,
-            numa_node,
-            "mapped the host latent pool"
-        );
         let pool = LatentPoolRef {
-            pool,
+            pool: mapped.pool(),
             shape: shape.layout.0,
             numa_node,
             page_bytes,
@@ -227,8 +175,7 @@ impl LatentHostPool {
         Ok((
             Self {
                 pool,
-                storage,
-                slots: pool_slots,
+                pages: Arc::new(mapped),
                 retained: Arc::clone(retained),
                 device,
                 sources: Mutex::new(HashMap::new()),
@@ -240,13 +187,13 @@ impl LatentHostPool {
     /// The host address of the pool slot `copy` names, after checking that
     /// it is this pool's.
     pub(crate) fn address(&self, copy: &LatentPageCopy) -> Result<u64> {
-        if copy.pool != self.pool.pool || copy.host_page >= self.slots {
+        if copy.pool != self.pool.pool {
             return Err(Error::Invalid(format!(
-                "latent pool slot {} of pool {} is not a slot of this rank's pool {} of {} slots",
-                copy.host_page, copy.pool, self.pool.pool, self.slots
+                "latent pool {} is not this rank's pool {}",
+                copy.pool, self.pool.pool
             )));
         }
-        Ok(self.storage.address() + copy.host_page * self.pool.page_bytes)
+        self.pages.address(copy.host_page)
     }
 
     /// The bytes of one page of the rank's pool.
@@ -262,15 +209,15 @@ impl LatentHostPool {
     /// Fails when the server holds no such pool or the slot lies outside
     /// it.
     pub(crate) fn source(&self, pool: &LatentPoolRef, slot: u64) -> Result<StorageView> {
-        let (storage, slots) = if pool.pool == self.pool.pool {
-            (Arc::clone(&self.storage), self.slots)
+        let pages = if pool.pool == self.pool.pool {
+            Arc::clone(&self.pages)
         } else {
             let mut sources = self
                 .sources
                 .lock()
                 .map_err(|_| Error::State("the latent source pools' lock is poisoned"))?;
             match sources.get(&pool.pool) {
-                Some((storage, slots)) => (Arc::clone(storage), *slots),
+                Some(pages) => Arc::clone(pages),
                 None => {
                     let shape = PageShape {
                         layout: Key(pool.shape),
@@ -280,35 +227,26 @@ impl LatentHostPool {
                     };
                     // The pool holds pinned pages, so the server finds it;
                     // a pool of another identity is not the one named.
-                    let (found, storage, slots) =
-                        map_pool(&self.retained, self.device, shape, pool.numa_node, None)?;
-                    if found != pool.pool {
+                    let found = HostPages::map(
+                        &self.retained,
+                        self.device,
+                        shape,
+                        pool.numa_node,
+                        None,
+                        "another rank's host latent pool",
+                    )?;
+                    if found.pool() != pool.pool {
                         return Err(Error::Invalid(format!(
                             "latent pool {} is no longer at the storage server",
                             pool.pool
                         )));
                     }
-                    tracing::info!(
-                        pool = found,
-                        slots,
-                        "mapped another rank's host latent pool for a restore"
-                    );
-                    sources.insert(found, (Arc::clone(&storage), slots));
-                    (storage, slots)
+                    let found = Arc::new(found);
+                    sources.insert(pool.pool, Arc::clone(&found));
+                    found
                 }
             }
         };
-        if slot >= slots {
-            return Err(Error::Invalid(format!(
-                "latent pool slot {slot} lies outside pool {} of {slots} slots",
-                pool.pool
-            )));
-        }
-        StorageView::contiguous(
-            storage as Arc<dyn Backing>,
-            (slot * pool.page_bytes) as usize,
-            ElementType::U8,
-            &[pool.page_bytes as i64],
-        )
+        pages.view(slot)
     }
 }

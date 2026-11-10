@@ -543,7 +543,7 @@ impl Worker {
         &self,
         tokens: u64,
         keys: &crate::batch::HostCacheEndpoint,
-    ) -> Result<Vec<ipc::PagePoolInfo>> {
+    ) -> Result<Vec<ipc::HostPoolInfo>> {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
         let pools = Arc::new(std::sync::Mutex::new(Vec::new()));
