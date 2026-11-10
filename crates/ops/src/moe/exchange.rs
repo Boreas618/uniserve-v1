@@ -632,12 +632,6 @@ impl Op for ExpertExchange {
                 ),
             ));
         }
-        if args.transport.handle().is_null() {
-            return Err(Error::argument(
-                Self::NAME,
-                "the call passed no transport; the exchange runs over the group's workspace",
-            ));
-        }
         if tokens > max_tokens {
             return Err(Error::argument(
                 Self::NAME,
@@ -696,6 +690,15 @@ impl Op for ExpertExchange {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
+        // The transport is the group's launch resource, like the stream and the kernel: a recorded
+        // walk checks the call before any transport exists, so its presence is a launch rule and
+        // not one of `check`'s argument rules.
+        if args.transport.handle().is_null() {
+            return Err(Error::argument(
+                Self::NAME,
+                "the call passed no transport; the exchange runs over the group's workspace",
+            ));
+        }
         let hidden = u64::from(descriptor.hidden);
         let top = u64::from(descriptor.top);
         let experts = u64::from(descriptor.experts);
@@ -771,6 +774,47 @@ mod tests {
             device: 0,
             attention_ranks,
         }
+    }
+
+    /// A dispatch whose views meet its descriptor passes `check` before any transport exists, as
+    /// the recorded walk calls it; the transport is required only by a launch.
+    #[test]
+    fn a_dispatch_without_a_transport_passes_its_check() {
+        let descriptor = Descriptor {
+            mode: Mode::Dispatch,
+            hidden: 64,
+            intermediate: 128,
+            top: 2,
+            experts: 8,
+            max_tokens: 16,
+            ranks: 2,
+            attention: 0,
+            dtype: DType::BF16,
+        };
+        let view = |dtype, dims: &[u64]| {
+            TensorView::new(
+                crate::tensor::DevicePtr::new(0x1000),
+                dtype,
+                Shape::new(dims),
+            )
+        };
+        let args = ExchangeArgs {
+            // SAFETY: `check` reads no handle; this call is never launched.
+            transport: unsafe { ExchangeTransport::from_handle(std::ptr::null_mut()) },
+            tokens: 4,
+            state: view(DType::BF16, &[4, 64]),
+            ids: view(DType::I32, &[4, 2]),
+            weights: view(DType::F32, &[4, 2]),
+            live: None,
+            out: view(DType::BF16, &[4, 64]),
+            fused: None,
+            ranks: 2,
+        };
+        ExpertExchange::check(&descriptor, &args).unwrap();
+
+        // The argument rules still hold without a transport: a group of another size is refused.
+        let other = ExchangeArgs { ranks: 4, ..args };
+        assert!(ExpertExchange::check(&descriptor, &other).is_err());
     }
 
     #[test]
