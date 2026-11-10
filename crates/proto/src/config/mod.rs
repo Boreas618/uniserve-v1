@@ -653,8 +653,9 @@ pub struct VideoConfig {
     /// model refuses a size it does not generate.
     #[serde(deserialize_with = "values::list::deserialize")]
     pub sizes: Vec<String>,
-    /// Prompt capacities below `max_model_len`, strictly increasing; 1024,
-    /// then steps of 2048, when unset.
+    /// Prompt capacities startup captures, strictly increasing and none above
+    /// `max_model_len`, which completes them as the largest; 1024, then steps
+    /// of 2048 below `max_model_len`, when unset.
     #[serde(deserialize_with = "values::optional_list::deserialize")]
     pub text_capacities: Option<Vec<NonZeroU32>>,
     /// Denoiser rows one request's conditions may take; the largest

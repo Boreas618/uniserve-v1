@@ -898,16 +898,8 @@ impl Leader {
         let max_model_len = model_config.max_model_len;
 
         // The options state the scheduler and the rank layout; the loaded model
-        // completes what it determines.
-        // A media pipeline keeps no key/value cache, so no checkpoint figure
-        // implies a context length: the deployment states the length its
-        // prompt capacities are checked against.
-        anyhow::ensure!(
-            model_config.video().is_none() || config.max_model_len.is_some(),
-            "a deployment of the media class states no `max_model_len`: the pipeline keeps no \
-             key/value cache, so a length that decides one is the deployment's to state rather \
-             than a checkpoint's to imply"
-        );
+        // completes what it determines, a media pipeline's prompt length
+        // included, which its deployment must state (`ModelConfig::from_pipeline`).
         let mut engine = config.engine_config()?;
         let control_tokens = special_token_ids(&model_config);
         let model = &mut engine.model;

@@ -46,6 +46,13 @@ pub enum Error {
         /// family id when `ModelConfig::from_pipeline` rejects the family.
         class_name: String,
     },
+    #[error(
+        "a media deployment states its `max_model_len`, the longest prompt it admits: the \
+         pipeline keeps no key/value cache, so no checkpoint figure implies one"
+    )]
+    /// A media pipeline is served without the prompt length its deployment
+    /// must state.
+    MissingPromptLength,
     #[error("unsupported model type {actual}")]
     /// Model metadata declares an architecture family UniServe does not serve.
     UnsupportedModelType {

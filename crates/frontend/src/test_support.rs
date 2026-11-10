@@ -100,10 +100,6 @@ pub const VIDEO: processing::Family = processing::Family {
 struct TestVideo;
 
 impl processing::VideoFamily for TestVideo {
-    fn default_prompt_tokens(&self) -> u32 {
-        4096
-    }
-
     fn processor_files(&self) -> &'static [(&'static str, &'static str)] {
         &[]
     }

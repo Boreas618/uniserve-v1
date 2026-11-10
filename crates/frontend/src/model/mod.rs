@@ -134,15 +134,18 @@ impl ModelConfig {
     /// Resolves a family that ships as a diffusers pipeline.
     ///
     /// A pipeline checkpoint has no root generation or tokenizer metadata, so
-    /// the result carries no sampling defaults and no EOS tokens.
-    /// `max_model_len` overrides the family's prompt bound.
+    /// the result carries no sampling defaults and no EOS tokens. The
+    /// deployment states `max_model_len`, the longest prompt it admits: a
+    /// pipeline keeps no key/value cache, so nothing in the checkpoint implies
+    /// one.
     ///
     /// # Errors
     ///
     /// Returns [`assets::Error::UnsupportedPipeline`] for a family that does
-    /// not serve video.
+    /// not serve video, and [`assets::Error::MissingPromptLength`] when the
+    /// deployment states no `max_model_len`.
     pub fn from_pipeline(family: Family, max_model_len: Option<u32>) -> assets::Result<Self> {
-        let Serving::Video(video) = family.serving else {
+        let Serving::Video(_) = family.serving else {
             return Err(assets::Error::UnsupportedPipeline {
                 class_name: family.id.to_owned(),
             });
@@ -150,7 +153,7 @@ impl ModelConfig {
         Ok(Self {
             family,
             sampling_defaults: SamplingDefaults::default(),
-            max_model_len: max_model_len.unwrap_or(video.default_prompt_tokens()),
+            max_model_len: max_model_len.ok_or(assets::Error::MissingPromptLength)?,
             primary_eos_token_id: None,
             eos_token_ids: BTreeSet::new(),
         })
@@ -333,14 +336,10 @@ mod tests {
         }),
     };
 
-    /// A video family that binds nothing: these tests read only its prompt bound.
+    /// A video family that binds nothing: these tests read only how it is resolved.
     struct Video;
 
     impl VideoFamily for Video {
-        fn default_prompt_tokens(&self) -> u32 {
-            16_384
-        }
-
         fn processor_files(&self) -> &'static [(&'static str, &'static str)] {
             &[]
         }
@@ -375,12 +374,19 @@ mod tests {
         assert!(config.is_err());
     }
 
+    /// A pipeline admits the prompt length its deployment states, and a
+    /// deployment that states none is refused: no checkpoint figure implies
+    /// one.
     #[test]
-    fn a_pipeline_family_takes_its_default_prompt_bound() {
-        let profile = ModelConfig::from_pipeline(VIDEO, None).unwrap();
+    fn a_pipeline_admits_the_prompt_length_its_deployment_states() {
+        let profile = ModelConfig::from_pipeline(VIDEO, Some(2048)).unwrap();
         assert_eq!(profile.family, VIDEO);
-        assert_eq!(profile.max_model_len, 16_384);
-        assert!(ModelConfig::from_pipeline(CHAT, None).is_err());
+        assert_eq!(profile.max_model_len, 2048);
+        assert!(matches!(
+            ModelConfig::from_pipeline(VIDEO, None),
+            Err(super::assets::Error::MissingPromptLength)
+        ));
+        assert!(ModelConfig::from_pipeline(CHAT, Some(2048)).is_err());
     }
 
     #[tokio::test]

@@ -78,7 +78,8 @@ uniserve serve "$H3_MODEL" \
   --worker-groups configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
-  --max-running-requests 2
+  --max-running-requests 2 \
+  --max-model-len 2048
 ```
 
 Base text-to-video and keyframe requests:
@@ -154,9 +155,9 @@ One replica across every GPU gives the lowest latency; replicas serve more reque
 | 4 x GB200 | Latency and throughput | `ulysses4.toml` | `--max-running-requests 2` |
 | 8 x GB200, two hosts | Latency | `ulysses8-two-host.toml` | `--max-running-requests 2` |
 | 8 x GB200, two hosts | Throughput | `fasth3-ulysses4x2-two-host.toml` | `--max-running-requests 4` |
-| 8 x RTX PRO 6000 | Latency | `ulysses8.toml` | `--max-running-requests 2 --mem-fraction-static 0.92 --set video_config.text_capacities=1024,10240` |
-| 8 x RTX PRO 6000 | Throughput | `fasth3-ulysses4x2.toml` | `--max-running-requests 4 --mem-fraction-static 0.92 --set video_config.text_capacities=1024,10240` |
-| 4 x H200 | Latency and throughput | `ulysses4.toml` | `--max-running-requests 2 --mem-fraction-static 0.92 --set video_config.text_capacities=1024` |
+| 8 x RTX PRO 6000 | Latency | `ulysses8.toml` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 10240 --set video_config.text_capacities=1024` |
+| 8 x RTX PRO 6000 | Throughput | `fasth3-ulysses4x2.toml` | `--max-running-requests 4 --mem-fraction-static 0.92 --max-model-len 10240 --set video_config.text_capacities=1024` |
+| 4 x H200 | Latency and throughput | `ulysses4.toml` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 1024` |
 | 8 x H200 | Latency, up to 10240 prompt tokens | `ulysses8.toml` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 10240 --set video_config.text_capacities=1024` |
 | 8 x H200 | Throughput, up to 5 s and 1024 prompt tokens | `fasth3-dp8-text-tp8.toml` | `--max-running-requests 8 --set video_config.max_seconds=5 --max-model-len 1024` |
 
@@ -183,8 +184,8 @@ uniserve serve --nnodes 2 --node-rank 1 --dist-init-addr <rank-0 address>:<port>
 | --- | --- |
 | `video_config.max_seconds` | Longest admitted duration, 4 to 15 seconds; 15 by default. A value outside that range is refused at startup. |
 | `video_config.sizes` | The output sizes startup prepares, each `WxH` in pixels, `1344x768,768x1344` by default; the sizes are listed under [Generate a video](#generate-a-video). The workers refuse at startup a size the checkpoint does not generate, naming the sizes it does, and a request for any other size is refused. |
-| `--max-model-len` | Longest prompt presentation in tokens, vision tokens included; 16384 by default. The text encoder itself accepts up to 262144 positions; the default bounds the prompt capacities startup prepares layouts and storage for (`video_config.text_capacities`). The official keyframe request presents 1935 tokens and the official video-plus-audio request 6913. |
-| `video_config.text_capacities` | Prompt capacities below `--max-model-len` that startup prepares; `--max-model-len` itself is always the largest, and each prompt runs in the smallest capacity that holds it. By default 1024, then steps of 2048. |
+| `--max-model-len` | Longest prompt presentation in tokens, vision tokens included; required, since a pipeline keeps no key/value cache from which a length would follow. The text encoder itself accepts up to 262144 positions; the stated length bounds the prompt capacities startup prepares layouts and storage for (`video_config.text_capacities`). The official keyframe request presents 1935 tokens and the official video-plus-audio request 6913. |
+| `video_config.text_capacities` | Prompt capacities that startup prepares, strictly increasing and none above `--max-model-len`; `--max-model-len` itself is always the largest, and each prompt runs in the smallest capacity that holds it. By default 1024, then steps of 2048, below `--max-model-len`. |
 | `--max-running-requests` | Concurrently resident requests, up to the workers' request slots. |
 | `video_config.max_condition_rows` | Denoiser rows one request's conditions may occupy. Without it the deployment provisions the largest condition set its denoiser admits at `video_config.max_seconds`, so no request is refused for its conditions: two keyframes for keyframe generation, and for references nine images at 4:1 and three videos of the generated length with their soundtracks, beside two keyframes where the denoiser packs them. A machine that cannot hold that set fails at startup, and a deployment that serves less states the rows, as below. A request whose conditions exceed a stated capacity is refused with `invalid_request`: the server counts the conditions as the denoiser packs them and names that total and `video_config.max_condition_rows`, and admission names a condition product that exceeds its own bound and the rows it needs. |
 | `media_config.directory` | Directory under which `file://` condition URIs resolve; `file://` is refused without it. |

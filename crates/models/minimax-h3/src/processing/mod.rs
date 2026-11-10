@@ -23,12 +23,6 @@ use serde::{Deserialize, Serialize};
 pub(crate) struct H3Family;
 
 impl ::processing::VideoFamily for H3Family {
-    fn default_prompt_tokens(&self) -> u32 {
-        // The checkpoint's text encoder accepts 262,144 positions; the default is the prompt
-        // length a deployment prepares layouts and storage for.
-        16_384
-    }
-
     fn processor_files(&self) -> &'static [(&'static str, &'static str)] {
         processor::PROCESSOR_FILES
     }

@@ -418,8 +418,8 @@ pub struct VideoServing {
     pub sizes: Vec<(u32, u32)>,
     /// The longest output it serves, in seconds.
     pub max_seconds: f64,
-    /// The prompt capacities it captures, strictly increasing: a request rides the smallest that
-    /// holds its prompt.
+    /// The prompt capacities it captures, strictly increasing, the largest the longest prompt it
+    /// admits (`max_model_len`): a request rides the smallest that holds its prompt.
     pub text_capacities: Vec<u32>,
     /// The denoiser rows one request's conditions may take; the model's whole condition capacity
     /// when `None`.

@@ -221,9 +221,6 @@ pub struct VideoBinding<'a> {
 
 /// A video family, as request processing serves it.
 pub trait VideoFamily: Send + Sync {
-    /// The prompt tokens a deployment admits when it states no `max_model_len`.
-    fn default_prompt_tokens(&self) -> u32;
-
     /// The checkpoint files the processor reads, as `(component, file)` of the pipeline.
     fn processor_files(&self) -> &'static [(&'static str, &'static str)];
 

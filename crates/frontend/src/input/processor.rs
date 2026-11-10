@@ -155,9 +155,9 @@ impl ModelConfig {
     /// A diffusers pipeline has no chat template and carries its conditioner's
     /// vision processor geometry instead. The returned `max_model_len` is the
     /// configured `max_model_len`, else, for a root configuration, its
-    /// `max_position_embeddings` or `ModelConfig::DEFAULT_MAX_MODEL_LEN`,
-    /// and for a pipeline the model's default prompt limit. `chat` configures
-    /// a chat checkpoint's template.
+    /// `max_position_embeddings` or `ModelConfig::DEFAULT_MAX_MODEL_LEN`; a
+    /// pipeline's deployment must state it. `chat` configures a chat
+    /// checkpoint's template.
     ///
     /// # Errors
     ///

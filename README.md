@@ -48,8 +48,11 @@ uniserve serve "$H3_MODEL" \
   --worker-groups configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
-  --max-running-requests 2
+  --max-running-requests 2 \
+  --max-model-len 2048
 ```
+
+A video deployment states `--max-model-len`, the longest prompt it admits in tokens: the pipeline keeps no key/value cache from which a length would follow. Startup captures prompt capacities up to it (`video_config.text_capacities`, by default 1024 and then steps of 2048), the length itself the largest.
 
 Startup prepares and captures every admitted request shape before `/health` reports ready; on four GB200 GPUs this takes about 11 minutes. The first startup on a machine also compiles and caches the kernels FastH3 runs and takes about 19 minutes. Then generate a video:
 

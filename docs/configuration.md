@@ -14,8 +14,8 @@ Options none of them states keep their defaults. `GET /admin/config` returns the
 
 ```bash
 uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
-  --max-running-requests 2 \
-  --set video_config.text_capacities=1024,10240
+  --max-running-requests 2 --max-model-len 10240 \
+  --set video_config.text_capacities=1024
 
 uniserve serve --config fasth3.toml --set quantization.mode=performance
 ```
@@ -101,7 +101,7 @@ Three backend-name fields are read with `attention_backend` (`FilledPrograms::of
 | --- | --- | --- |
 | `model` | Required | Local model directory or Hugging Face repository |
 | `served_model_name` | `model` | The single model name the API serves |
-| `max_model_len` | The checkpoint's `max_position_embeddings`, 8192 when it declares none; 16384 prompt tokens for a MiniMax-H3 pipeline | Longest sequence a request may reach, in tokens |
+| `max_model_len` | The checkpoint's `max_position_embeddings`, 8192 when it declares none; a media pipeline (MiniMax-H3) has none and its deployment must state it | Longest sequence a request may reach, in tokens; for a media pipeline the longest prompt presentation it admits |
 | `lora_path` | Unset | A weight adapter fused into the checkpoint's weights at load and serving every request: an adapter file, or a directory holding `adapter_model.safetensors`; video families only, and the family must recognize it ([FastH3 adapters](minimax_h3/minimax_h3.md#fasth3-adapters)) |
 | `dtype` | `"bfloat16"` | Element type of parameters and activations: `bfloat16`, `float16` or `float32` |
 | `quantization` | `{}` | Precision policy: `mode` (`quality`, `balanced`, `performance`, `maximum`) and per-component selections under `components`; empty selects the checkpoint's own quantization |
@@ -377,7 +377,7 @@ The [FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity) explains how t
 | --- | --- | --- |
 | `max_seconds` | `15` | Longest admitted output, in seconds: a positive number, which the served model also holds to its own bounds when its request processor binds (4 to 15 for MiniMax-H3) |
 | `sizes` | `["1344x768", "768x1344"]` | Output sizes startup prepares and requests may name, each `WxH` in pixels; the served model refuses at startup a size its checkpoint does not generate |
-| `text_capacities` | `1024`, then steps of 2048 | Prompt capacities below `max_model_len`, strictly increasing |
+| `text_capacities` | `1024`, then steps of 2048, below `max_model_len` | Prompt capacities startup captures, strictly increasing and none above `max_model_len`; `max_model_len` itself completes them as the largest, so every admitted prompt runs in the smallest capacity that holds it |
 | `max_condition_rows` | Largest condition set | Denoiser rows one request's conditions may take |
 
 ### `media_config`

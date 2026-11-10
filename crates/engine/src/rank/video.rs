@@ -429,16 +429,22 @@ const LATENT_PAGE_VALUES: u32 = 1 << 18;
 /// solver's update.
 const WHOLE_SAMPLES: &str = "video and audio latents, whole on every rank";
 
-/// The prompt capacities a media deployment captures: its own statement, or the default ladder.
+/// The prompt capacities a media deployment captures: its own statement, or the default ladder,
+/// completed with `longest`, the prompt length it admits (`max_model_len`).
 ///
-/// The deployment's `text_capacities`, when stated, must be strictly increasing and below the
-/// length it admits - a capacity above it would capture an encoder graph no request can fill. The
-/// default is the one its options document states: `1024`, then steps of `2048`, below the length.
+/// Every prompt the deployment admits rides the smallest capacity that holds it, so the largest
+/// capacity is `longest` itself. The deployment's `text_capacities`, when stated, must be strictly
+/// increasing and none above `longest` - a capacity above it would capture an encoder graph no
+/// request can fill; a statement whose largest is below `longest` is completed with it. The
+/// default ladder is `1024`, then steps of `2048`, below `longest`, completed the same way.
 pub(super) fn prompt_capacities(
     video: &proto::config::VideoConfig,
     longest: u32,
 ) -> Result<Vec<u32>> {
-    let stated: Vec<u32> = match &video.text_capacities {
+    if longest == 0 {
+        bail!("this media deployment states no prompt length (`max_model_len`) to capture");
+    }
+    let mut stated: Vec<u32> = match &video.text_capacities {
         Some(capacities) => capacities.iter().map(|value| value.get()).collect(),
         None => {
             let mut ladder = Vec::new();
@@ -450,12 +456,6 @@ pub(super) fn prompt_capacities(
             ladder
         }
     };
-    if stated.is_empty() {
-        bail!(
-            "this deployment's video options state no prompt capacity below the {longest} tokens \
-             it admits, so no encoder bucket could be captured"
-        );
-    }
     for pair in stated.windows(2) {
         if pair[0] >= pair[1] {
             bail!(
@@ -476,6 +476,9 @@ pub(super) fn prompt_capacities(
              admits: the graph would be captured and never filled"
         );
     }
+    if stated.last() != Some(&longest) {
+        stated.push(longest);
+    }
     Ok(stated)
 }
 
@@ -485,4 +488,52 @@ pub(super) fn prompt_capacity(video: &proto::config::VideoConfig, longest: u32) 
         .into_iter()
         .max()
         .ok_or_else(|| anyhow::anyhow!("this deployment captures no prompt capacity"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+
+    use super::prompt_capacities;
+
+    /// Video options stating `capacities`, or none.
+    fn video(capacities: Option<&[u32]>) -> proto::config::VideoConfig {
+        proto::config::VideoConfig {
+            text_capacities: capacities.map(|capacities| {
+                capacities
+                    .iter()
+                    .map(|capacity| NonZeroU32::new(*capacity).unwrap())
+                    .collect()
+            }),
+            ..proto::config::VideoConfig::default()
+        }
+    }
+
+    /// The largest capacity is the prompt length the deployment admits, whether its options state
+    /// the ladder or take the default, so every admitted prompt has a capacity that holds it.
+    #[test]
+    fn the_admitted_prompt_length_is_the_largest_capacity() {
+        assert_eq!(prompt_capacities(&video(None), 1024).unwrap(), [1024]);
+        assert_eq!(
+            prompt_capacities(&video(None), 4096).unwrap(),
+            [1024, 3072, 4096]
+        );
+        assert_eq!(
+            prompt_capacities(&video(Some(&[1024])), 10240).unwrap(),
+            [1024, 10240]
+        );
+        assert_eq!(
+            prompt_capacities(&video(Some(&[1024, 2048])), 2048).unwrap(),
+            [1024, 2048]
+        );
+    }
+
+    /// A capacity above the admitted length, or a ladder that is not strictly increasing, is
+    /// refused.
+    #[test]
+    fn a_capacity_no_prompt_fills_is_refused() {
+        assert!(prompt_capacities(&video(Some(&[4096])), 2048).is_err());
+        assert!(prompt_capacities(&video(Some(&[2048, 1024])), 4096).is_err());
+        assert!(prompt_capacities(&video(None), 0).is_err());
+    }
 }
