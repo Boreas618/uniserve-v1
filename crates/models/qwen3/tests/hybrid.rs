@@ -17,7 +17,7 @@ use nn::{Checkpoint, DType, Shape, TensorView, WeightLoader};
 fn checkpoint_root() -> PathBuf {
     std::env::var_os("UNISERVE_QWEN36_MODEL")
         .map(PathBuf::from)
-        .expect("UNISERVE_QWEN36_MODEL names a Qwen3.6-35B-A3B checkpoint")
+        .unwrap_or_else(|| panic!("UNISERVE_QWEN36_MODEL names a Qwen3.6-35B-A3B checkpoint"))
 }
 
 /// The programs a launch reported, as `(operator, key)` pairs.
@@ -56,7 +56,7 @@ fn recorded_forward(
         logits_rows: tensor(DType::I32, &[rows]),
         phase,
         page_size,
-        num_tokens: u32::try_from(tokens).expect("a token count"),
+        num_tokens: u32::try_from(tokens).unwrap_or_else(|_| panic!("{tokens} tokens")),
         max_kv_len: page_size * row_pages as u32,
         draft_lens: None,
     };
@@ -87,7 +87,7 @@ fn recorded_forward(
     // Every recurrent layer's live and checkpoint banks, as the infrastructure binds them.
     let shape = model
         .state()
-        .expect("a hybrid model keeps a recurrent state");
+        .unwrap_or_else(|| panic!("a hybrid model keeps a recurrent state"));
     let slots = 8_u64;
     let bank = |field: &nn::family::StateField| {
         let mut dims = vec![slots];
@@ -132,8 +132,11 @@ fn a_released_hybrid_checkpoint_loads_and_composes_both_phases() {
     let Model::Text(family) = qwen3::family::HYBRID_FAMILY.model else {
         panic!("Qwen3.5-MoE is a text family");
     };
-    let checkpoint = Checkpoint::open(&checkpoint_root()).expect("the shards");
-    let opened = family.open(&checkpoint).expect("the configuration");
+    let checkpoint =
+        Checkpoint::open(&checkpoint_root()).unwrap_or_else(|error| panic!("the shards: {error}"));
+    let opened = family
+        .open(&checkpoint)
+        .unwrap_or_else(|error| panic!("the configuration: {error}"));
     let mut loader = WeightLoader::meta(&checkpoint, None, None);
     let placement = TextPlacement {
         tensor: Split::WHOLE,
@@ -152,7 +155,7 @@ fn a_released_hybrid_checkpoint_loads_and_composes_both_phases() {
     // three inputs of 8192 channels and a 128 × 128 FP32 state per value head.
     let cache = model.cache();
     assert_eq!((cache.layers, cache.kv_heads, cache.head_dim), (10, 2, 256));
-    let state = model.state().expect("a recurrent state");
+    let state = model.state().unwrap_or_else(|| panic!("a recurrent state"));
     assert_eq!(state.layers, 30);
     assert_eq!(state.fields[0].dims, vec![3, 8192]);
     assert_eq!(state.fields[1].dims, vec![32, 128, 128]);

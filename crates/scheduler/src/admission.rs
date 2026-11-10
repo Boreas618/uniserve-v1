@@ -337,6 +337,7 @@ impl Scheduler {
         let st = RequestState {
             finish_token_ids,
             allocations: None,
+            state_resident: false,
             guidance_prefix: None,
             request_epoch: self.next_request_epoch,
             last_state_call_id: CallId::default(),

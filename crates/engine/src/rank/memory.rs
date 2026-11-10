@@ -168,18 +168,38 @@ impl ModelRunner {
         // rank that keeps none states its absence.
         let (request, report) = match loaded {
             Loaded::Text(model) => {
-                // The KV layout is the model's layer count, the heads each layer stores on this rank
-                // and the width of a head, in the deployment's pages.
+                // The KV layout is the model's attention layer count, the heads each layer stores on
+                // this rank and the width of a head, in the deployment's pages; a model that keeps a
+                // recurrent state per request slot adds the state group its checkpoints fill.
                 let shape = model.cache();
-                let cache = (worker::memory::CachePlan::dense(
-                    PAGE_TOKENS,
-                    shape.layers,
-                    shape.kv_heads,
-                    shape.head_dim,
-                    cache_dtype(model.dtype(), self.engine_config().kv_cache.dtype)?,
-                ))
-                .validated()
+                let dtype = cache_dtype(model.dtype(), self.engine_config().kv_cache.dtype)?;
+                let state = model.state();
+                let cache = match &state {
+                    None => worker::memory::CachePlan::dense(
+                        PAGE_TOKENS,
+                        shape.layers,
+                        shape.kv_heads,
+                        shape.head_dim,
+                        dtype,
+                    )
+                    .validated(),
+                    Some(state) => worker::memory::CachePlan::hybrid(
+                        PAGE_TOKENS,
+                        shape.layers,
+                        shape.kv_heads,
+                        shape.head_dim,
+                        dtype,
+                        state,
+                    ),
+                }
                 .context("describing the model's KV cache")?;
+                // The request slots' state banks are the runner's, carved from the resident pool
+                // beside the cache.
+                let slots = u32::try_from(self.engine_config().max_running_requests.get())
+                    .context("more request slots than the protocol addresses")?;
+                let state_bytes = state
+                    .as_ref()
+                    .map_or(0, |state| worker::runners::state::bank_bytes(state, slots));
                 let request = worker::capacity::MemoryRequest {
                     device: worker::config::Device::Cuda(device),
                     epoch: self.cache_epoch.unwrap_or(self.launch.epoch),
@@ -189,6 +209,7 @@ impl ModelRunner {
                     cache: Some(Arc::new(cache)),
                     segments: self.adopted_cache.clone(),
                     transport_bytes: self.transport_bytes(device, model.as_ref())?,
+                    state_bytes,
                 };
                 (request, rank_report(device, host)?)
             }
@@ -203,6 +224,7 @@ impl ModelRunner {
                     cache: None,
                     segments: None,
                     transport_bytes: 0,
+                    state_bytes: 0,
                 };
                 let longest = pipeline.timeline(self.engine_config().video.max_seconds)?;
                 let states = proto::tensor::DType::from(self.engine_config().model.dtype);
@@ -226,7 +248,10 @@ impl ModelRunner {
         // unit, and the plan charged them all against the same device allowance the pools are
         // booked against. A plan that fitted no cache (a rank that serves none) states zero.
         let resident = match (&planned.cache, planned.info.prefix_cache.as_ref()) {
-            (Some(cache), Some(info)) => u64::from(info.num_units) * cache.unit_bytes,
+            // The recurrent state's banks are carved from the same pool, beside the block tables.
+            (Some(cache), Some(info)) => {
+                u64::from(info.num_units) * cache.unit_bytes + request.state_bytes
+            }
             // A media rank keeps no cache, and its resident pool holds the tables its model
             // declares per layout. The reservation is addresses and not storage: a table books the
             // allowance as it maps, so the range is what the device has left to give.

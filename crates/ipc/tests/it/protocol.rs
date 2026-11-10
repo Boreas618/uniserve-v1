@@ -528,6 +528,8 @@ fn token_batch() -> execution::Batch {
             commit: vec![0; 16],
             page_size: 16,
             max_kv_len: 4096,
+            checkpoints: Vec::new(),
+            state_copies: Vec::new(),
         },
         generation: 3,
         cache_units: Vec::new(),
@@ -921,6 +923,55 @@ fn a_page_read_fills_only_new_units_of_the_batch() {
         ..token_batch()
     };
     assert!(refusal(empty.validate()).contains("page copy is empty"));
+}
+
+/// A state copy moves a page of its own slot's tables, restores run before checkpoints, and each
+/// checkpoint answers a row that keeps its state.
+#[test]
+fn a_state_copy_moves_a_page_of_its_slot_around_the_forward() {
+    use execution::{StateCopy, StateDirection};
+    let copy = |slot: u32, units: &[u32], direction| StateCopy {
+        slot,
+        units: units.iter().copied().map(UnitId).collect(),
+        direction,
+    };
+    let stated = |copies: Vec<StateCopy>, checkpoints: Vec<i32>| {
+        let mut batch = execution::Batch {
+            block_tables: vec![table(1, &[5, 6]), table(2, &[7, 8])],
+            ..token_batch()
+        };
+        batch.columns.checkpoints = checkpoints;
+        batch.columns.state_copies = copies;
+        batch
+    };
+
+    stated(
+        vec![
+            copy(1, &[5], StateDirection::Restore),
+            copy(1, &[6], StateDirection::Keep),
+        ],
+        vec![16, 0],
+    )
+    .validate()
+    .expect("a restore and a checkpoint of one slot are valid");
+
+    let foreign = stated(vec![copy(1, &[7], StateDirection::Restore)], vec![0, 0]);
+    assert!(refusal(foreign.validate()).contains("no block table of its slot"));
+
+    let idle = stated(vec![copy(3, &[5], StateDirection::Restore)], vec![0, 0]);
+    assert!(refusal(idle.validate()).contains("no call of the batch runs on"));
+
+    let reordered = stated(
+        vec![
+            copy(1, &[6], StateDirection::Keep),
+            copy(2, &[7], StateDirection::Restore),
+        ],
+        vec![16, 0],
+    );
+    assert!(refusal(reordered.validate()).contains("precedes a restore"));
+
+    let unanswered = stated(vec![copy(1, &[6], StateDirection::Keep)], vec![0, 0]);
+    assert!(refusal(unanswered.validate()).contains("checkpoint tokens"));
 }
 
 #[test]

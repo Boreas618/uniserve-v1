@@ -1078,6 +1078,28 @@ impl CachePlanes {
             .map_or(0, |plan| plan.layers.len())
     }
 
+    /// The state group's checkpoint planes, one view per field run: `[columns · units, plane_bytes]`
+    /// bytes, plane `(column, unit)` at row `column · units + unit`, as the K/V planes lay their
+    /// cells out. Empty for a pool without a state group.
+    pub fn state_views(&self) -> Vec<ops::TensorView> {
+        let cells = u64::from(self.plan.columns) * u64::from(self.num_units);
+        self.state
+            .iter()
+            .map(|storage| {
+                ops::TensorView::new(
+                    ops::DevicePtr::new(storage.address()),
+                    ops::DType::U8,
+                    ops::Shape::new(&[cells, self.plan.plane_bytes]),
+                )
+            })
+            .collect()
+    }
+
+    /// The units the pool holds, the padding sentinel included.
+    pub fn num_units(&self) -> u32 {
+        self.num_units
+    }
+
     /// The columns a page of the pool is split into.
     ///
     /// A group's page holds `block_size = plane_bytes / row_bytes` tokens of
@@ -1096,6 +1118,11 @@ impl CachePlanes {
         let columns = self.plan.columns;
         if columns == 0 {
             return Err(Error::Invariant("a cache pool holds no column".into()));
+        }
+        // A state page's units are the ones its checkpoints' planes fill, which the plan states:
+        // its layers lie in no cell of their own.
+        if plan.state() {
+            return Ok(plan.units_per_page);
         }
         let derived = u32::try_from(plan.layers.len())
             .map_err(|_| Error::Invariant("a cache group's layers overflow a u32".into()))?

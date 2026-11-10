@@ -146,7 +146,7 @@ impl ResidentCache {
             let cache = cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            cache.groups()
+            cache.attention_groups()
         };
         if groups == 0 {
             return Err(Error::Invalid(
@@ -538,12 +538,14 @@ impl KvProvider for ResidentCache {
                      {groups} group(s)"
                 )));
             }
-            let pages = cache.pages(group).map_err(|error| {
+            // Every group's pages are units of the one pool, whatever units one page spans.
+            cache.pages(group).map_err(|error| {
                 Error::Invalid(format!(
                     "the mechanism allocated units of cache group {group}, which this pool \
                      cannot describe: {error}"
                 ))
             })?;
+            let pages = cache.num_units();
             let held = |unit: ipc::UnitId, what: &str| -> Result<()> {
                 // Unit zero is the block tables' sentinel, so a page is one of `1..pages`.
                 if unit.0 == 0 || unit.0 >= pages {

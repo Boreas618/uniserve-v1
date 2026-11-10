@@ -29,7 +29,14 @@
 //! - **input_ids**: the tokens each call's rows embed, which the caller states
 //!   because a decode's token comes from the mechanism's request state and not
 //!   from the call;
-//! - **page_size** and **max_kv_len**: the cache's geometry.
+//! - **page_size** and **max_kv_len**: the cache's geometry;
+//! - **checkpoints** and **state_copies**, for a deployment whose cache holds a
+//!   state group: the token count each row keeps its recurrent state at (the
+//!   last page boundary inside the row whose state page the request's table
+//!   names a unit for, as the allocation chose it), and the copies the worker
+//!   makes between the slot's banks and those pages - a checkpoint after the
+//!   forward, and before it a restore for a request's first call on its slot
+//!   when it resumes from a cached prefix ([`StatePages`]).
 //!
 //! Three counts, one per column family, and every column follows exactly one
 //! of them: a token column is as long as the batch's tokens, a row column as
@@ -56,7 +63,7 @@
 
 use std::ops::Range;
 
-use ipc::execution::{BatchColumns, BatchRow, BatchRows, RowKind};
+use ipc::execution::{BatchColumns, BatchRow, BatchRows, RowKind, StateCopy, StateDirection};
 use ipc::{Call, CallKind, ForwardMode};
 use proto::program::commit;
 use proto::request::SamplingParams;
@@ -109,6 +116,33 @@ fn uses_penalties(sampling: &SamplingParams) -> bool {
         || sampling.presence_penalty != 0.0
 }
 
+/// The state group of a deployment whose model keeps a recurrent state per
+/// request slot: where its pages lie in the requests' tables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StatePages {
+    /// The state group's id among the cache groups.
+    pub(crate) group_id: u32,
+    /// Tokens per page: page `k` holds the state after token `(k + 1) · block_size − 1`.
+    pub(crate) block_size: u32,
+    /// Units one page spans.
+    pub(crate) units_per_page: u32,
+}
+
+impl StatePages {
+    /// The units of `table`'s page ending at token count `boundary`, or `None` when the table holds
+    /// no checkpoint there (a retired page, a page past its end, or the padding sentinel).
+    fn page(&self, table: &crate::IpcBlockTable, boundary: u32) -> Option<Vec<ipc::UnitId>> {
+        if boundary == 0 || !boundary.is_multiple_of(self.block_size) {
+            return None;
+        }
+        let page = boundary / self.block_size - 1;
+        let held = page.checked_sub(table.start_page)? as usize;
+        let per_page = self.units_per_page as usize;
+        let units = table.unit_ids.get(held * per_page..(held + 1) * per_page)?;
+        (units.iter().all(|unit| unit.0 != 0)).then(|| units.to_vec())
+    }
+}
+
 /// The sampler's columns per row (`proto::program::sampler::PARAMETER_COLUMNS`).
 pub(crate) const SAMPLER_PARAMETERS: usize = proto::program::sampler::PARAMETER_COLUMNS as usize;
 
@@ -139,6 +173,18 @@ const TEMPERATURE_COLUMN: usize = proto::program::sampler::TEMPERATURE as usize;
 /// could address the others. Until then the first group is the only one, and
 /// `None` says so rather than mapping through a group the batch does not own.
 /// The same holds of the page size the caller passes.
+///
+/// `state` is the deployment's state group, when its model keeps one, and
+/// `resident[i]` whether call `i`'s request slot already holds the request's
+/// recurrent state at the call's first token: false for a request's first call
+/// on its slot, which restores the state from the checkpoint ending at its read
+/// start when it resumes from a cached prefix. A call that resumes past position
+/// zero with no checkpoint there is a planning fault.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the calls, their tables, inputs, sampling, draws and slot residency, and the cache's \
+              geometry"
+)]
 pub(crate) fn columns(
     requests: &[(Call, RequestDispatch)],
     tables: &[Vec<crate::IpcBlockTable>],
@@ -147,14 +193,20 @@ pub(crate) fn columns(
     draws: &[u32],
     block_size: u32,
     max_kv_len: u32,
+    state: Option<StatePages>,
+    resident: &[bool],
 ) -> Option<BatchColumns> {
     if requests.len() != inputs.len()
         || requests.len() != sampling.len()
         || requests.len() != draws.len()
         || requests.len() != tables.len()
+        || (state.is_some() && requests.len() != resident.len())
     {
         return None;
     }
+    let mut checkpoints: Vec<i32> = Vec::new();
+    let mut restores: Vec<StateCopy> = Vec::new();
+    let mut keeps: Vec<StateCopy> = Vec::new();
     let mut rows = BatchRows::default();
     let mut commit_rows: Vec<[i64; commit::COMMIT_FIELDS]> = Vec::with_capacity(requests.len());
     let mut tasks = 0usize;
@@ -226,6 +278,40 @@ pub(crate) fn columns(
 
         for seq_len in &forward.seq_lens {
             rows.seq_lens.push(i32::try_from(*seq_len).ok()?);
+        }
+        if let Some(state) = state {
+            let table = tables
+                .get(index)?
+                .iter()
+                .find(|table| table.group_id == state.group_id)?;
+            for (row, (seq_len, query)) in
+                forward.seq_lens.iter().zip(&forward.query_lens).enumerate()
+            {
+                let start = seq_len.checked_sub(*query)?;
+                // The first row of a request's first call on its slot continues from the
+                // checkpoint its reused prefix ends at; a row from position zero starts from a zero
+                // state the kernels write themselves.
+                if row == 0 && start > 0 && !resident.get(index).copied()? {
+                    restores.push(StateCopy {
+                        slot: request,
+                        units: state.page(table, start)?,
+                        direction: StateDirection::Restore,
+                    });
+                }
+                // The last boundary inside the row, when the allocation gave its page a unit.
+                let boundary = seq_len / state.block_size * state.block_size;
+                match state.page(table, boundary).filter(|_| boundary > start) {
+                    Some(units) => {
+                        checkpoints.push(i32::try_from(boundary).ok()?);
+                        keeps.push(StateCopy {
+                            slot: request,
+                            units,
+                            direction: StateDirection::Keep,
+                        });
+                    }
+                    None => checkpoints.push(0),
+                }
+            }
         }
         queries.extend_from_slice(&forward.query_lens);
         slots.extend(
@@ -380,6 +466,9 @@ pub(crate) fn columns(
         commit,
         page_size: block_size,
         max_kv_len,
+        checkpoints,
+        // Every restore precedes the forward and every checkpoint follows it.
+        state_copies: restores.into_iter().chain(keeps).collect(),
     })
 }
 
@@ -561,6 +650,75 @@ mod tests {
         CallKind::Forward(ForwardMode::Decode)
     }
 
+    /// A request's first prompt call over a reused prefix restores the checkpoint its prefix ends
+    /// at, and a call that reaches a boundary whose state page the allocation gave units keeps its
+    /// state there; a later call of the same request, whose slot holds its state, restores nothing.
+    #[test]
+    fn a_state_group_restores_a_resumed_prefix_and_keeps_the_boundary_it_reaches() {
+        let state = StatePages {
+            group_id: 1,
+            block_size: BLOCK_SIZE,
+            units_per_page: 2,
+        };
+        // Pages 1..4 of the state group: the checkpoint after token 8, none after 12, and the
+        // page the allocation gave the boundary at 16.
+        let state_table = ipc::BlockTable {
+            request_pool_idx: 1,
+            group_id: 1,
+            start_page: 1,
+            unit_ids: [11, 12, 0, 0, 13, 14]
+                .into_iter()
+                .map(ipc::UnitId)
+                .collect(),
+            allocated_tokens: 16,
+        };
+        let mut kv = table();
+        kv.allocated_tokens = 20;
+        let requests = vec![(call(prefill(), 8, &[8]), dispatch(1, &[8], &[true]))];
+        let tables = vec![vec![kv, state_table]];
+        let fill = |resident: bool| {
+            columns(
+                &requests,
+                &tables,
+                &[vec![1; 8]],
+                &[&sampling()],
+                &[0],
+                BLOCK_SIZE,
+                2048,
+                Some(state),
+                &[resident],
+            )
+            .expect("a prompt batch over a state group")
+        };
+        let units = |ids: [u32; 2]| ids.into_iter().map(ipc::UnitId).collect::<Vec<_>>();
+
+        let first = fill(false);
+        assert_eq!(first.checkpoints, vec![16]);
+        assert_eq!(
+            first.state_copies,
+            vec![
+                StateCopy {
+                    slot: 1,
+                    units: units([11, 12]),
+                    direction: StateDirection::Restore,
+                },
+                StateCopy {
+                    slot: 1,
+                    units: units([13, 14]),
+                    direction: StateDirection::Keep,
+                },
+            ]
+        );
+        let later = fill(true);
+        assert_eq!(later.checkpoints, vec![16]);
+        assert!(
+            later
+                .state_copies
+                .iter()
+                .all(|copy| copy.direction == StateDirection::Keep)
+        );
+    }
+
     #[test]
     fn a_decode_advances_its_own_slot_and_states_only_its_task() {
         let mut decode_call = call(decode(), 12, &[1]);
@@ -574,6 +732,8 @@ mod tests {
             &[5],
             BLOCK_SIZE,
             2048,
+            None,
+            &[],
         )
         .expect("a decode batch");
 
@@ -640,6 +800,8 @@ mod tests {
                 &[5],
                 BLOCK_SIZE,
                 2048,
+                None,
+                &[],
             )
             .expect("a decode batch")
             .draws
@@ -670,6 +832,8 @@ mod tests {
             &[2],
             BLOCK_SIZE,
             2048,
+            None,
+            &[],
         )
         .expect("a prefill batch");
 
@@ -715,6 +879,8 @@ mod tests {
             &[7],
             BLOCK_SIZE,
             2048,
+            None,
+            &[],
         )
         .expect("a chunked prefill batch");
 
@@ -755,6 +921,8 @@ mod tests {
             &[4],
             BLOCK_SIZE,
             2048,
+            None,
+            &[],
         )
         .expect("a verify batch");
 
@@ -809,6 +977,8 @@ mod tests {
             &[0, 0, 0],
             BLOCK_SIZE,
             2048,
+            None,
+            &[],
         )
         .expect("a mixed batch");
 
@@ -842,6 +1012,8 @@ mod tests {
                 &[0],
                 BLOCK_SIZE,
                 2048,
+                None,
+                &[],
             )
             .is_none()
         );
@@ -859,6 +1031,8 @@ mod tests {
                 &[0],
                 BLOCK_SIZE,
                 2048,
+                None,
+                &[],
             )
             .is_none()
         );
@@ -866,8 +1040,8 @@ mod tests {
 
     #[test]
     fn an_empty_batch_states_its_geometry_and_nothing_else() {
-        let columns =
-            columns(&[], &[], &[], &[], &[], BLOCK_SIZE, 2048).expect("an empty batch is a batch");
+        let columns = columns(&[], &[], &[], &[], &[], BLOCK_SIZE, 2048, None, &[])
+            .expect("an empty batch is a batch");
         assert_eq!(columns.rows(), 0);
         assert_eq!(columns.tokens(), 0);
         assert!(columns.rows.query_offsets.is_empty() || columns.rows.query_offsets == vec![0]);
@@ -892,6 +1066,8 @@ mod tests {
             &[0, 0],
             BLOCK_SIZE,
             2048,
+            None,
+            &[],
         )
         .expect("a prefill batch");
 
@@ -952,6 +1128,8 @@ mod tests {
             &[0, 0],
             BLOCK_SIZE,
             2048,
+            None,
+            &[],
         )
         .expect("a chunk and the chunk that ends a prompt");
 
@@ -980,6 +1158,8 @@ mod tests {
             &[0],
             BLOCK_SIZE,
             2048,
+            None,
+            &[],
         )
         .expect("a prefill batch");
         assert_eq!(columns.parameters.len(), SAMPLER_PARAMETERS);
@@ -1011,6 +1191,8 @@ mod tests {
             &[0],
             BLOCK_SIZE,
             2048,
+            None,
+            &[],
         )
         .expect("a sampling prefill");
         let shape = batch_shape(&sampling_batch);
@@ -1035,6 +1217,8 @@ mod tests {
             &[0],
             BLOCK_SIZE,
             2048,
+            None,
+            &[],
         )
         .expect("a chunked prefill");
         let shape = batch_shape(&writing_batch);
@@ -1060,6 +1244,8 @@ mod tests {
             &[0],
             BLOCK_SIZE,
             2048,
+            None,
+            &[],
         )
         .expect("a greedy decode");
         assert_eq!(
@@ -1076,6 +1262,8 @@ mod tests {
             &[0],
             BLOCK_SIZE,
             2048,
+            None,
+            &[],
         )
         .expect("a sampling decode");
         assert_eq!(
@@ -1100,6 +1288,8 @@ mod tests {
             &[0, 0],
             BLOCK_SIZE,
             2048,
+            None,
+            &[],
         )
         .expect("a mixed decode");
         assert_eq!(
@@ -1123,6 +1313,8 @@ mod tests {
             &[0],
             BLOCK_SIZE,
             2048,
+            None,
+            &[],
         )
         .expect("a greedy verification");
         assert_eq!(
@@ -1137,6 +1329,8 @@ mod tests {
             &[0],
             BLOCK_SIZE,
             2048,
+            None,
+            &[],
         )
         .expect("a sampling verification");
         assert_eq!(
@@ -1156,6 +1350,8 @@ mod tests {
             &[0],
             BLOCK_SIZE,
             64,
+            None,
+            &[],
         )
         .expect("a prefill batch");
         assert_eq!(columns.rows.slot_mapping, vec![-1, -1]);
@@ -1176,6 +1372,8 @@ mod tests {
             &[0],
             BLOCK_SIZE,
             64,
+            None,
+            &[],
         )
         .expect("a verify batch");
         assert_eq!(columns.rows(), 3);
@@ -1218,7 +1416,9 @@ mod tests {
                 &[&sampling()],
                 &[0],
                 BLOCK_SIZE,
-                64
+                64,
+                None,
+                &[],
             )
             .is_none(),
             "a media call has no token row"
@@ -1240,7 +1440,9 @@ mod tests {
                 &[&sampling()],
                 &[0],
                 BLOCK_SIZE,
-                64
+                64,
+                None,
+                &[],
             )
             .is_none()
         );
@@ -1258,7 +1460,9 @@ mod tests {
                 &[&sampling()],
                 &[0],
                 BLOCK_SIZE,
-                64
+                64,
+                None,
+                &[],
             )
             .is_none()
         );
@@ -1277,7 +1481,9 @@ mod tests {
                 &[&sampling()],
                 &[0],
                 BLOCK_SIZE,
-                64
+                64,
+                None,
+                &[],
             )
             .is_none()
         );
@@ -1294,7 +1500,9 @@ mod tests {
                 &[&sampling()],
                 &[0],
                 BLOCK_SIZE,
-                64
+                64,
+                None,
+                &[],
             )
             .is_none()
         );
@@ -1306,7 +1514,9 @@ mod tests {
                 &[&sampling()],
                 &[0],
                 BLOCK_SIZE,
-                64
+                64,
+                None,
+                &[],
             )
             .is_none()
         );
@@ -1318,7 +1528,9 @@ mod tests {
                 &[&sampling(), &sampling()],
                 &[0, 0],
                 BLOCK_SIZE,
-                64
+                64,
+                None,
+                &[],
             )
             .is_none(),
             "an input list per call, not one more than there are calls"

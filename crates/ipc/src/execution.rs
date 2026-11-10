@@ -423,6 +423,8 @@ impl Batch {
     /// - each `(slot, group)` has at most one block table and one unit allocation, and an
     ///   allocation's units lie inside the table of the same slot and group;
     /// - a page read fills only units the batch newly allocates, which the worker resets first;
+    /// - a recurrent-state copy moves a page of one of its slot's tables, restores precede
+    ///   checkpoints, and each checkpoint answers a row's checkpoint token count;
     /// - a request has at most one stored trajectory to restore and one host encoder output.
     pub fn validate(&self) -> ValidationResult<()> {
         let mut calls = std::collections::HashSet::with_capacity(self.calls.len());
@@ -500,6 +502,8 @@ impl Batch {
             "a page read fills units that are not new units of the batch"
         );
 
+        self.check_state_copies(&slots, &tables)?;
+
         let mut restored = std::collections::HashSet::with_capacity(self.latent_restores.len());
         for (request, restore) in &self.latent_restores {
             restore.validate()?;
@@ -514,6 +518,58 @@ impl Batch {
                 .iter()
                 .all(|(request, _)| hosted.insert(*request)),
             "a batch names two host encoder outputs for one request"
+        );
+        Ok(())
+    }
+
+    /// Checks the recurrent-state copies against the calls and tables of the batch: a copy moves a
+    /// state page of one of the batch's request slots, every restore precedes every checkpoint (the
+    /// restores run before the forward and the checkpoints after it), a slot restores at most once,
+    /// and each checkpoint answers one row's non-zero `checkpoints` entry.
+    fn check_state_copies(
+        &self,
+        slots: &std::collections::HashSet<u32>,
+        tables: &std::collections::HashMap<(u32, u32), &crate::BlockTable>,
+    ) -> ValidationResult<()> {
+        let copies = &self.columns.state_copies;
+        let mut restored = std::collections::HashSet::with_capacity(copies.len());
+        for copy in copies {
+            ensure_valid!(!copy.units.is_empty(), "a state copy names no unit");
+            ensure_valid!(
+                slots.contains(&copy.slot),
+                "a state copy names a slot no call of the batch runs on"
+            );
+            // The copy's page is one of the slot's tables' pages; the copy does not name its
+            // group, so any table of the slot may hold it.
+            ensure_valid!(
+                tables.iter().any(|((slot, _), table)| *slot == copy.slot
+                    && copy.units.iter().all(|unit| table.unit_ids.contains(unit))),
+                "a state copy's units lie in no block table of its slot"
+            );
+            if copy.direction == StateDirection::Restore {
+                ensure_valid!(
+                    restored.insert(copy.slot),
+                    "a batch restores one slot's state twice"
+                );
+            }
+        }
+        ensure_valid!(
+            copies.is_sorted_by_key(|copy| copy.direction != StateDirection::Restore),
+            "a state checkpoint precedes a restore"
+        );
+        let keeps = copies
+            .iter()
+            .filter(|copy| copy.direction == StateDirection::Keep)
+            .count();
+        let kept_rows = self
+            .columns
+            .checkpoints
+            .iter()
+            .filter(|tokens| **tokens != 0)
+            .count();
+        ensure_valid!(
+            keeps == kept_rows,
+            "the batch's state checkpoints do not answer its rows' checkpoint tokens"
         );
         Ok(())
     }
@@ -712,6 +768,36 @@ pub struct BatchColumns {
     pub page_size: u32,
     /// The attention descriptor's static bound on a sequence's KV length.
     pub max_kv_len: u32,
+    /// `[rows]` the absolute token count after which each row's recurrent state is kept for the
+    /// prefix cache, zero for a row that keeps none; empty for a model that keeps no recurrent
+    /// state. The model's recurrent layers write that state into the row's slot of the checkpoint
+    /// banks, and the worker moves it into the page `state_copies` names.
+    pub checkpoints: Vec<i32>,
+    /// The recurrent-state copies between the request slots' banks and the cache's state pages
+    /// this batch needs: every restore before the forward, every checkpoint after it.
+    pub state_copies: Vec<StateCopy>,
+}
+
+/// One copy of a request slot's recurrent state between its banks and a state page of the cache.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateCopy {
+    /// The request slot whose banks the copy reads or writes.
+    pub slot: u32,
+    /// The state page's units, page-major as its block table names them.
+    pub units: Vec<crate::UnitId>,
+    /// Which way the state moves.
+    pub direction: StateDirection,
+}
+
+/// Which way a [`StateCopy`] moves a slot's recurrent state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StateDirection {
+    /// The page's checkpoint into the slot's live banks, before the forward: a row that resumes
+    /// from a cached prefix continues from the state its prefix's last token left.
+    Restore,
+    /// The slot's checkpoint banks into the page, after the forward: the row's state at the page's
+    /// last token, which a later request reusing the prefix resumes from.
+    Keep,
 }
 
 /// One media computation's columns: the buffers the model prepared, per request (4.5).
@@ -1006,6 +1092,12 @@ impl BatchColumns {
         }
         if self.page_size == 0 {
             return Err(ValidationError::message("the batch's page size is zero"));
+        }
+        if !self.checkpoints.is_empty() && self.checkpoints.len() != rows {
+            return Err(ValidationError::message(format!(
+                "checkpoints has {} entries, the batch has {rows} rows",
+                self.checkpoints.len()
+            )));
         }
         Ok(())
     }

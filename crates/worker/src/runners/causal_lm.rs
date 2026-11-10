@@ -60,6 +60,11 @@ pub struct Staging {
     rows: BatchRows,
     input_ids: Vec<i32>,
     slots: Vec<i32>,
+    /// `[rows]` each row's recurrent-state checkpoint, zero for padding and for a row that keeps
+    /// none.
+    checkpoints: Vec<i32>,
+    /// The batch's recurrent-state copies, which the replay launches around its forward.
+    state_copies: Vec<ipc::execution::StateCopy>,
     parameters: Vec<f32>,
     /// `[rows]` each row's draw address; a padded row's is the default, and its draw is discarded.
     draws: Vec<ipc::philox::DrawAddress>,
@@ -94,6 +99,8 @@ impl Staging {
             .ok_or_else(|| Error::Invalid("the runner has no bucket to serve".into()))?;
         self.input_ids = vec![0; largest.tokens as usize];
         self.slots = vec![0; largest.rows as usize];
+        self.checkpoints = vec![0; largest.rows as usize];
+        self.state_copies = Vec::new();
         self.parameters =
             vec![0.0; largest.rows as usize * proto::program::sampler::PARAMETER_COLUMNS as usize];
         self.draws = vec![ipc::philox::DrawAddress::default(); largest.rows as usize];
@@ -177,6 +184,13 @@ impl Staging {
 
         // Row columns: the mechanism's rows, then rows that sample nothing and commit nothing.
         self.slots[..rows].copy_from_slice(&columns.slots[..rows]);
+        // A model without recurrent state states no checkpoint column; every row then keeps none.
+        self.checkpoints[..bucket_rows].fill(0);
+        if !columns.checkpoints.is_empty() {
+            self.checkpoints[..rows].copy_from_slice(&columns.checkpoints[..rows]);
+        }
+        self.state_copies.clear();
+        self.state_copies.extend_from_slice(&columns.state_copies);
         let parameters = proto::program::sampler::PARAMETER_COLUMNS as usize;
         self.parameters[..rows * parameters]
             .copy_from_slice(&columns.parameters[..rows * parameters]);
@@ -313,6 +327,16 @@ impl Staging {
     /// The staged sampler slot view.
     pub fn slots(&self, rows: usize) -> &[i32] {
         &self.slots[..rows]
+    }
+
+    /// The staged recurrent-state checkpoints, one per row.
+    pub fn checkpoints(&self, rows: usize) -> &[i32] {
+        &self.checkpoints[..rows]
+    }
+
+    /// The staged batch's recurrent-state copies.
+    pub fn state_copies(&self) -> &[ipc::execution::StateCopy] {
+        &self.state_copies
     }
 
     /// The staged sampling parameters, row-major.
@@ -980,6 +1004,9 @@ pub struct CausalLmRunner<M: TextModel> {
     /// The tensor group this rank's model is a member of: every forward issues the group's
     /// collectives, the partial sums after the row-parallel products and the gathered logits.
     tensor: Option<std::sync::Arc<nn::Group>>,
+    /// The request slots' recurrent-state banks, for a model that keeps a recurrent state: carved
+    /// when the device's pools are attached, before the walk and the first capture.
+    state: Option<super::state::StateBanks>,
 }
 
 /// One model object shared by the runners of every device a rank serves.
@@ -1157,6 +1184,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             warmed: None,
             experts: None,
             tensor: None,
+            state: None,
             encoded: Vec::new(),
             indices: Vec::new(),
             draws: Vec::new(),
@@ -1438,6 +1466,9 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
     fn attach_pools(&mut self, pools: Arc<std::sync::Mutex<Pools>>) {
         self.pools = Some(Arc::clone(&pools));
         self.lifecycle.attach_pools(Arc::clone(&pools));
+        if let Err(error) = self.bind_state(&pools) {
+            tracing::error!(%error, "the recurrent state's banks were not bound; a forward will fail");
+        }
         if let Err(error) = self.kv.attach_pools(pools) {
             tracing::warn!(%error, "the cache provider took no pools; a gathered table will fail");
         }
@@ -1458,6 +1489,23 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
         let mut footprint = Footprint::default();
         for bucket in self.capture_plan() {
             footprint.walk(Some(bucket), |walk| self.walk_recorded(walk, bucket))?;
+        }
+        // A recurrent state's copies are launched eagerly around a replay, so the walk states them
+        // beside the forwards: one copy of each direction states every descriptor a batch's copies
+        // launch.
+        let stream = self.stream.clone();
+        if let Some(state) = self.state.as_mut() {
+            let copies = state.recorded_copies();
+            footprint.walk(None, |walk| {
+                let forward = walk.forward(None)?;
+                for direction in [
+                    ipc::execution::StateDirection::Restore,
+                    ipc::execution::StateDirection::Keep,
+                ] {
+                    state.copy(&forward, &copies, direction, &stream)?;
+                }
+                Ok(())
+            })?;
         }
         Ok(footprint)
     }
@@ -1528,6 +1576,9 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
                 // stages and uploads it, so a replay that skipped the upload would serve the pose
                 // the bucket was captured with.
                 self.upload(*bucket)?;
+                // A row that resumes from a cached prefix continues from the checkpoint its prefix
+                // ends at: the page's state is in the slot's live banks before the graph reads them.
+                self.copy_state(*generation, ipc::execution::StateDirection::Restore)?;
                 // Every rank of an expert union runs this step: the graph's dispatches wait on their
                 // devices for the peers', so the union is entered before the launch.
                 let mut expert_bucket = None;
@@ -1592,6 +1643,9 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
                 if !eager {
                     captured.launch(&stream)?;
                 }
+                // The rows' checkpoints move into the state pages the mechanism allocated for them,
+                // behind the forward that wrote them.
+                self.copy_state(*generation, ipc::execution::StateDirection::Keep)?;
                 // The output read behind this says the batch's offloads finished: the mechanism
                 // commits their pages from it, and the forward above did not wait for them.
                 if let Some(fence) = self.offload_fence.take() {
@@ -1693,6 +1747,62 @@ impl<M: TextModel> CausalLmRunner<M> {
         self.lifecycle.capture(bucket, generation, walked, &kernels)
     }
 
+    /// Carves the request slots' recurrent-state banks from `pools`, for a model that keeps a
+    /// recurrent state; a model that keeps none binds nothing.
+    fn bind_state(&mut self, pools: &Arc<std::sync::Mutex<Pools>>) -> Result<()> {
+        let Some(shape) = self.model.state() else {
+            return Ok(());
+        };
+        if self.state.is_some() {
+            return Ok(());
+        }
+        let cache = self.kv.cache().cloned().ok_or_else(|| {
+            Error::Invalid("a model that keeps a recurrent state reads a prefix cache".into())
+        })?;
+        let plan = Arc::clone(
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .plan(),
+        );
+        let rows = largest_rows(&self.buckets)?;
+        let mut locked = pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.state = Some(super::state::StateBanks::new(
+            shape,
+            self.slots,
+            rows,
+            &plan,
+            &cache,
+            self.device,
+            &mut locked,
+        )?);
+        Ok(())
+    }
+
+    /// Launches the staged batch's recurrent-state copies of `direction` on the stream with
+    /// `generation`'s kernels: the restores before its forward, the checkpoints after it.
+    fn copy_state(
+        &mut self,
+        generation: u64,
+        direction: ipc::execution::StateDirection,
+    ) -> Result<()> {
+        if self.state.is_none() || self.staging.state_copies().is_empty() {
+            return Ok(());
+        }
+        let kernels = self.lifecycle.generation_named(generation)?;
+        let stream = self.stream.clone();
+        let arena = nn::Arena::new(ops::DevicePtr::new(0), 0);
+        let forward = Forward::new(&stream, &kernels, &arena);
+        let copies = self.staging.state_copies().to_vec();
+        let state = self
+            .state
+            .as_mut()
+            .ok_or(Error::State("the recurrent state's banks are bound"))?;
+        state.copy(&forward, &copies, direction, &stream)
+    }
+
     /// Moves the batch columns to device storage, before any graph addresses them.
     fn place_columns(&mut self) -> Result<()> {
         if self.placed {
@@ -1708,6 +1818,9 @@ impl<M: TextModel> CausalLmRunner<M> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.columns.place(device, &mut pools, &stream)?;
         self.commit.place(device, &mut pools, &stream)?;
+        if let Some(state) = self.state.as_mut() {
+            state.checkpoints.place(device, &mut pools, &stream)?;
+        }
         drop(pools);
         stream.synchronize()?;
         self.placed = true;
@@ -2446,6 +2559,9 @@ impl<M: TextModel> CausalLmRunner<M> {
 
         self.commit
             .stage(self.staging.commit(), rows, self.commit.capacity as usize)?;
+        if let Some(state) = self.state.as_mut() {
+            state.stage(self.staging.checkpoints(rows))?;
+        }
 
         // A copy issued inside a recording would be part of the graph, and replay the warm pose.
         if self.capturing {
@@ -2454,6 +2570,9 @@ impl<M: TextModel> CausalLmRunner<M> {
         let stream = self.stream.clone();
         for column in self.columns.staged() {
             column.push(&stream)?;
+        }
+        if let Some(state) = self.state.as_mut() {
+            state.checkpoints.push(&stream)?;
         }
         self.commit.upload(&stream)?;
         Ok(())
@@ -2565,12 +2684,30 @@ impl<M: TextModel> CausalLmRunner<M> {
                 layers: &layers[group],
             })
             .collect();
-        operation(&KvView {
-            groups: &view,
-            workspace,
-            // The recurrent banks are bound once the runner keeps a state group's banks.
-            state: None,
-        })
+        match &self.state {
+            None => operation(&KvView {
+                groups: &view,
+                workspace,
+                state: None,
+            }),
+            // A paired forward writes scratch pages and must not advance a served slot's state,
+            // and no scratch bank exists for it to advance instead.
+            Some(_) if scratch_pages.is_some() => Err(Error::Unsupported(
+                "a paired forward of a model that keeps a recurrent state has no scratch banks to \
+                 advance"
+                    .into(),
+            )),
+            Some(state) => {
+                let rows = slots.len() as u64;
+                state.with_view(self.columns.slots.extent(0..rows), rows, |state| {
+                    operation(&KvView {
+                        groups: &view,
+                        workspace,
+                        state: Some(state),
+                    })
+                })
+            }
+        }
     }
 
     /// Walks one bucket's forward under the active capture with `generation`'s kernels.
@@ -2962,6 +3099,10 @@ impl<M: TextModel> CausalLmRunner<M> {
             // states one of its own.
             page_size: self.kv.page_size(),
             max_kv_len: self.max_kv_len,
+            // A warm pose keeps no checkpoint and resumes from none: its rows start at position
+            // zero over the padding slot, whose banks no request owns.
+            checkpoints: Vec::new(),
+            state_copies: Vec::new(),
         };
         self.staging
             .stage(&columns, &warm_call_ids(bucket), &bucket.shape(), bucket)
@@ -3566,6 +3707,8 @@ mod tests {
             commit: committed(&[0, 1]),
             page_size: 16,
             max_kv_len: 4096,
+            checkpoints: Vec::new(),
+            state_copies: Vec::new(),
         }
     }
 
@@ -3591,6 +3734,8 @@ mod tests {
             commit: committed(&[0]),
             page_size: 16,
             max_kv_len: 4096,
+            checkpoints: Vec::new(),
+            state_copies: Vec::new(),
         }
     }
 
@@ -3720,6 +3865,8 @@ mod tests {
             commit: committed(&[0]),
             page_size: 16,
             max_kv_len: 4096,
+            checkpoints: Vec::new(),
+            state_copies: Vec::new(),
         };
         columns.input_ids.truncate(count);
         staging.stage(

@@ -302,9 +302,24 @@ impl PrefixCache {
         self.planes.plan()
     }
 
-    /// How many attention groups the plan holds, which the model's layers index.
+    /// How many cache groups the plan holds, the state group included.
     pub fn groups(&self) -> usize {
         self.planes.groups()
+    }
+
+    /// How many attention groups the plan holds, which the model's attention layers index: every
+    /// group but the state group, which the plan keeps last.
+    pub fn attention_groups(&self) -> usize {
+        self.plan()
+            .groups
+            .iter()
+            .filter(|group| !group.state())
+            .count()
+    }
+
+    /// The state group's index, when the plan holds one.
+    pub fn state_group(&self) -> Option<usize> {
+        self.plan().groups.iter().position(|group| group.state())
     }
 
     /// How many layers read `group`, in model order: the bound of the
@@ -317,6 +332,17 @@ impl PrefixCache {
     /// layer, so a caller that needs it once asks here.
     pub fn pages(&self, group: usize) -> Result<u32> {
         self.planes.pages(group)
+    }
+
+    /// The state group's checkpoint planes, one `[columns · units, plane_bytes]` byte view per field
+    /// run ([`CachePlanes::state_views`]).
+    pub fn state_views(&self) -> Vec<ops::TensorView> {
+        self.planes.state_views()
+    }
+
+    /// The units the pool holds, the sentinel included: every group's pages are drawn from them.
+    pub fn num_units(&self) -> u32 {
+        self.planes.num_units()
     }
 
     /// One layer's pages as the model's cache reads them: the page geometry

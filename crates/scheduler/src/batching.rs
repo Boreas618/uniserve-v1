@@ -661,6 +661,7 @@ impl Scheduler {
                 self.attach_media(&mut batch);
             } else {
                 self.attach_columns(&mut batch);
+                self.note_state_resident(&batch);
             }
             batches.push(batch);
         }
@@ -724,6 +725,22 @@ impl Scheduler {
             );
             return;
         }
+        // A model that keeps a recurrent state per request slot has a state group, whose pages the
+        // columns name the checkpoints and restores of.
+        let state = cache
+            .coordinator
+            .groups()
+            .iter()
+            .position(|group| group.state())
+            .and_then(|group_id| {
+                let shape = &cache.coordinator.groups()[group_id];
+                Some(columns::StatePages {
+                    group_id: u32::try_from(group_id).ok()?,
+                    block_size: u32::try_from(shape.block_size).ok()?,
+                    units_per_page: u32::try_from(shape.units_per_page).ok()?,
+                })
+            });
+        let mut resident = Vec::with_capacity(batch.requests.len());
         let mut inputs = Vec::with_capacity(batch.requests.len());
         let mut sampling = Vec::with_capacity(batch.requests.len());
         let mut draws = Vec::with_capacity(batch.requests.len());
@@ -755,6 +772,7 @@ impl Scheduler {
                     .collect(),
             };
             inputs.push(tokens);
+            resident.push(state.state_resident);
             sampling.push(&state.req.sampling);
             draws.push(state.sampling_position);
             // The layout addresses the request's current cache tables. A call
@@ -799,6 +817,8 @@ impl Scheduler {
             &draws,
             block_size,
             max_kv_len,
+            state,
+            &resident,
         );
 
         if batch.columns.is_none() {
@@ -812,6 +832,20 @@ impl Scheduler {
                 batch.requests.len(),
                 block_size,
             );
+        }
+    }
+
+    /// Marks every request a token batch carries as holding its recurrent state in its slot: the
+    /// batch's first call of a request restored it there (or started it from zero), so its later
+    /// calls continue from the slot's banks and restore nothing.
+    fn note_state_resident(&mut self, batch: &ExecutionBatch) {
+        if batch.columns.is_none() {
+            return;
+        }
+        for (call, _) in &batch.requests {
+            if let Some(state) = self.running.get_mut(&call.request_key.request_id) {
+                state.state_resident = true;
+            }
         }
     }
 

@@ -1544,6 +1544,12 @@ pub(crate) struct RequestState {
     pub(super) feedback_features: Option<TensorRef>,
     /// Whether the current epoch is registered with its execution workers.
     pub(super) worker_registered: bool,
+    /// Whether the request's slot holds the request's recurrent state at its
+    /// accepted position: false until the request's first token call is
+    /// planned on the slot, which restores the state from the checkpoint its
+    /// reused prefix ends at (`batching::columns`). A preempted or migrated
+    /// request is admitted again as a new state, so it restores again.
+    pub(crate) state_resident: bool,
     /// Allocation serial of the request's cache units already declared to the
     /// workers: units allocated at or after it are fresh for the next
     /// dispatch (`CacheAllocation::allocated_units`).

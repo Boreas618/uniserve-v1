@@ -20,7 +20,7 @@ pub use prefix_cache::PrefixCache;
 pub use prefix_cache::block_tables::{
     BlockTableStorage, BlockTableUpdate, BlockTables, GroupShape, GroupTable,
 };
-pub use prefix_cache::plan::{CacheGroupPlan, CachePlan, Checkpoint, GroupAxis};
+pub use prefix_cache::plan::{CacheGroupPlan, CachePlan, Checkpoint, GroupAxis, StatePlanes};
 pub use prefix_cache::planes::{CachePlanes, LaidSegment, PlaneLayout, UnitColumn};
 
 use std::sync::Mutex;
