@@ -49,7 +49,7 @@ use supervisor::Supervisor;
 pub const JOIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Where a daemon runs and how it reaches the other nodes' daemons.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct DaemonOptions {
     /// Nodes of the deployment.
     pub nnodes: u32,
@@ -69,7 +69,18 @@ pub struct DaemonOptions {
     /// How long the leader waits for the members and a member for the
     /// leader.
     pub join_timeout: Duration,
+    /// Reads which of this host's devices are idle, for the deployment's
+    /// planning of where its processes run.
+    pub devices: DeviceProbe,
 }
+
+/// Reads the ordinals of this host's idle devices from the driver.
+///
+/// The daemon plans placements and supervises processes but runs no device
+/// code itself, so the executable that links the platform supplies the probe,
+/// as it supplies the Program Server's host targets. An `Err` states why the
+/// devices could not be read; the daemon answers the asking engine with it.
+pub type DeviceProbe = fn() -> Result<Vec<u32>, String>;
 
 /// The daemon's downward path to the main processes its service supervises,
 /// and the reports they send up (§2.3, §7.3): the daemon commands a main
@@ -326,6 +337,7 @@ impl Daemon {
     /// Fails when the service thread cannot start.
     pub(crate) fn resume(
         host: String,
+        devices: DeviceProbe,
         address: Option<(String, Option<PathBuf>)>,
         handed: HandedService,
         descriptors: Vec<OwnedFd>,
@@ -354,6 +366,7 @@ impl Daemon {
             .spawn(move || {
                 service::resume(
                     node,
+                    devices,
                     handed,
                     descriptors,
                     commands_rx,
@@ -556,6 +569,7 @@ fn local(
             .context("creating the daemon's lifeline")?,
         claims: ClaimHolder::new(options.executable.clone(), remote_pages, address),
         address,
+        devices: options.devices,
     })
 }
 
@@ -720,6 +734,7 @@ mod tests {
             socket: socket.clone(),
             executable: PathBuf::from("uniserve"),
             join_timeout: Duration::from_secs(5),
+            devices: || Ok(Vec::new()),
         })
         .unwrap();
         let address = daemon.address().unwrap().to_owned();
@@ -763,6 +778,7 @@ mod tests {
         assert!(Path::new(&format!("/proc/{}", spawned.pid)).exists());
         let mut successor = Daemon::resume(
             "localhost".to_owned(),
+            || Ok(Vec::new()),
             Some((address, (!network).then_some(socket.clone()))),
             handed,
             descriptors,

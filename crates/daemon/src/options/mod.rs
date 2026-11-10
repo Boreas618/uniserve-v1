@@ -835,7 +835,7 @@ impl ServerArgs {
     /// The options of this node's daemon. The leader's process socket is
     /// this process's own, in the user's runtime directory; `executable`
     /// starts the node's Storage Server when it has none.
-    pub fn daemon_options(&self) -> DaemonOptions {
+    pub fn daemon_options(&self, devices: crate::supervision::DeviceProbe) -> DaemonOptions {
         let directory = runtime_directory();
         DaemonOptions {
             nnodes: self.nnodes.get(),
@@ -845,6 +845,7 @@ impl ServerArgs {
             socket: directory.join(format!("process-{}.sock", std::process::id())),
             executable: self.worker_config.executable.clone(),
             join_timeout: crate::supervision::JOIN_TIMEOUT,
+            devices,
         }
     }
 }

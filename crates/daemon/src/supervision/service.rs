@@ -81,6 +81,8 @@ pub(crate) struct Local {
     pub(crate) claims: ClaimHolder,
     /// This node's address other nodes reach; `None` on a single node.
     pub(crate) address: Option<IpAddr>,
+    /// Reads this host's idle devices (`Request::Devices`).
+    pub(crate) devices: super::DeviceProbe,
 }
 
 impl Local {
@@ -105,6 +107,7 @@ impl Local {
     /// descriptors from `descriptors`.
     fn adopt(
         host: String,
+        devices: super::DeviceProbe,
         handed: HandedLocal,
         descriptors: &mut std::vec::IntoIter<OwnedFd>,
     ) -> anyhow::Result<Self> {
@@ -125,6 +128,7 @@ impl Local {
             supervisor: Supervisor::adopt(host, handed.processes, processes)?,
             claims: ClaimHolder::adopt(handed.address, handed.claims, claims),
             address: handed.address,
+            devices,
         })
     }
 
@@ -205,27 +209,16 @@ impl Local {
             Some(request::Kind::Nodes(_)) => {
                 reply.error = "the leader answers for the deployment's nodes".to_owned();
             }
-            Some(request::Kind::Devices(_)) => match available_devices() {
+            Some(request::Kind::Devices(_)) => match (self.devices)() {
                 Ok(available) => {
                     reply.kind = Some(reply::Kind::Devices(process::DeviceInventory { available }))
                 }
-                Err(error) => reply.error = format!("{error:#}"),
+                Err(error) => reply.error = error,
             },
             None => reply.error = "an empty request".to_owned(),
         }
         reply
     }
-}
-
-fn available_devices() -> anyhow::Result<Vec<u32>> {
-    let nvml = platform::Nvml::init()?;
-    let mut available = Vec::new();
-    for ordinal in 0..platform::DeviceId::count()? {
-        if nvml.is_idle(platform::DeviceId(ordinal))? {
-            available.push(ordinal as u32);
-        }
-    }
-    Ok(available)
 }
 
 /// A member daemon as the leader holds it.
@@ -1498,6 +1491,7 @@ impl LeaderService {
 )]
 pub(crate) fn resume(
     host: String,
+    devices: super::DeviceProbe,
     handed: HandedService,
     descriptors: Vec<OwnedFd>,
     commands: Receiver<(u64, process::Command)>,
@@ -1581,7 +1575,7 @@ pub(crate) fn resume(
                 });
             }
             let mut rest: std::vec::IntoIter<OwnedFd> = descriptors.collect::<Vec<_>>().into_iter();
-            let local = Local::adopt(host, local, &mut rest)?;
+            let local = Local::adopt(host, devices, local, &mut rest)?;
             let nodes = nodes
                 .iter()
                 .map(|node| Node::decode(node.as_slice()))
@@ -1634,7 +1628,7 @@ pub(crate) fn resume(
         HandedService::Member { leader, local } => {
             let leader = leader.resume(next()?)?;
             let mut rest: std::vec::IntoIter<OwnedFd> = descriptors.collect::<Vec<_>>().into_iter();
-            let local = Local::adopt(host, local, &mut rest)?;
+            let local = Local::adopt(host, devices, local, &mut rest)?;
             tracing::info!("the service goes on from the previous daemon");
             serve_member(local, leader, stop)
         }

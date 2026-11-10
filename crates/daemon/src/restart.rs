@@ -673,6 +673,7 @@ async fn receive(
 pub async fn take_over(
     descriptor: i32,
     catalogue: nn::family::Catalogue,
+    devices: crate::supervision::DeviceProbe,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     // SAFETY: the daemon that started this process placed the handoff
@@ -684,7 +685,7 @@ pub async fn take_over(
         (Message::Prepare(prepare), _) => prepare,
         (other, _) => anyhow::bail!("the daemon sent {other:?} first"),
     };
-    match prepared_successor(&mut channel, *prepare, &catalogue, shutdown).await {
+    match prepared_successor(&mut channel, *prepare, &catalogue, devices, shutdown).await {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = send(
@@ -704,6 +705,7 @@ async fn prepared_successor(
     channel: &mut Channel,
     prepare: Prepare,
     catalogue: &nn::family::Catalogue,
+    devices: crate::supervision::DeviceProbe,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let (mut config, _) = crate::options::resolve_text(&prepare.config, &[])?;
@@ -808,6 +810,7 @@ async fn prepared_successor(
         .map(std::path::PathBuf::from);
     let daemon = Daemon::resume(
         config.host_identity.clone(),
+        devices,
         Some((prepare.processes.clone(), socket)),
         service,
         service_fds,

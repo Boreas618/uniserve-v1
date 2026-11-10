@@ -86,6 +86,7 @@ pub async fn serve(
     config: ServerArgs,
     stated: Stated,
     catalogue: nn::family::Catalogue,
+    devices: crate::supervision::DeviceProbe,
     shutdown: CancellationToken,
 ) -> Result<()> {
     config
@@ -93,7 +94,7 @@ pub async fn serve(
         .context("invalid serving configuration")?;
 
     // The leader's start waits for the other nodes to join, which blocks.
-    let options = config.daemon_options();
+    let options = config.daemon_options(devices);
     let starting = tokio::task::spawn_blocking(move || Daemon::start(options));
     let daemon = tokio::select! {
         daemon = starting => daemon

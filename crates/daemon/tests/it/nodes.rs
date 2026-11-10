@@ -36,6 +36,7 @@ impl Deployment {
             socket: directory.path().join(format!("{host}.sock")),
             executable: "uniserve".into(),
             join_timeout: TIMEOUT,
+            devices: || Ok(Vec::new()),
         };
 
         // The leader's start returns once every member joined, and a
@@ -142,6 +143,7 @@ fn a_node_joins_a_running_deployment_and_the_next_engine_runs_processes_there() 
         socket: directory.path().join(format!("{host}.sock")),
         executable: "uniserve".into(),
         join_timeout: TIMEOUT,
+        devices: || Ok(Vec::new()),
     };
 
     // A leader of one node that names its address serves at once.

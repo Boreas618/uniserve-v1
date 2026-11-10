@@ -26,6 +26,7 @@ pub(crate) fn single_node(host: &str, socket: PathBuf) -> DaemonOptions {
         // No test claims storage, which is the only use of the executable.
         executable: PathBuf::from("uniserve"),
         join_timeout: TIMEOUT,
+        devices: || Ok(Vec::new()),
     }
 }
 

@@ -65,6 +65,8 @@ struct Node {
     program_config: program_server::command::Settings,
     /// The model families the executable serves.
     catalogue: nn::family::Catalogue,
+    /// Reads this host's idle devices, for each deployment's daemon.
+    devices: crate::supervision::DeviceProbe,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -83,6 +85,7 @@ pub async fn node(
     server: ServerConfig,
     program_config: program_server::command::Settings,
     catalogue: nn::family::Catalogue,
+    devices: crate::supervision::DeviceProbe,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let listener = Listener::bind(&admin)
@@ -96,6 +99,7 @@ pub async fn node(
         server: server.clone(),
         program_config,
         catalogue,
+        devices,
     });
     let mut app = Router::new()
         .route("/admin/config", put(deploy).get(idle_config))
@@ -271,7 +275,7 @@ async fn serve_deployment(
     token: &CancellationToken,
 ) -> Result<()> {
     let name = config.served_model_name().to_owned();
-    let options = config.daemon_options();
+    let options = config.daemon_options(node.devices);
     let daemon = tokio::task::spawn_blocking(move || Daemon::start(options))
         .await
         .context("the daemon's start did not complete")?

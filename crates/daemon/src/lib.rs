@@ -63,4 +63,4 @@ pub use frontend::tokenizer;
 
 pub use crate::http::{node, serve};
 pub use crate::leader::{Leader, Task};
-pub use crate::supervision::{Daemon, DaemonOptions, JOIN_TIMEOUT};
+pub use crate::supervision::{Daemon, DaemonOptions, DeviceProbe, JOIN_TIMEOUT};

@@ -163,6 +163,25 @@ fn host_targets() -> std::result::Result<Vec<program_server::Target>, String> {
         .collect()
 }
 
+/// The ordinals of this host's idle devices, read through the driver and NVML: what the daemon
+/// answers a deployment's planning with (`daemon::DeviceProbe`).
+fn idle_devices() -> std::result::Result<Vec<u32>, String> {
+    let nvml = platform::Nvml::init().map_err(|error| format!("opening NVML: {error}"))?;
+    let count = platform::DeviceId::count()
+        .map_err(|error| format!("counting this host's devices: {error}"))?;
+    let mut idle = Vec::new();
+    for ordinal in 0..count {
+        let device = platform::DeviceId(ordinal);
+        if nvml
+            .is_idle(device)
+            .map_err(|error| format!("reading device {ordinal}'s activity: {error}"))?
+        {
+            idle.push(ordinal as u32);
+        }
+    }
+    Ok(idle)
+}
+
 /// The model families this executable serves: the one place a concrete model is named. Its main
 /// processes load them and its daemon serves requests of them. A model is added with its crate and
 /// one entry here.
