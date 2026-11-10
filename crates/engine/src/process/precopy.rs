@@ -114,8 +114,6 @@ fn shadow_stall_message(changed: &[String], waited: u64) -> String {
 /// The precopy of one generation, advanced between serve passes.
 pub(super) struct Precopy {
     pub(super) generation: u64,
-    /// The peer whose command this precopy answers, when a peer asked.
-    pub(super) reply: Option<u32>,
     /// The operators whose program this precopy changed, in sorted order: the set the shadow pass
     /// pairs, and the set a stall names. Empty when nothing changed - a first generation, or an
     /// update that touched no kernel.
@@ -293,19 +291,15 @@ impl MainProcess {
         generation: u64,
         programs: &Programs,
         policy: &Program,
-        reply: Option<u32>,
     ) -> Result<()> {
         if let Err(error) = self.update.begin_precopy(generation) {
             let failure = UpdateFailure::Precopy {
                 reason: error.to_string(),
             };
-            self.answer(
-                reply,
-                ProgramStatus::PrecopyFailed {
-                    generation,
-                    failure,
-                },
-            );
+            self.answer(ProgramStatus::PrecopyFailed {
+                generation,
+                failure,
+            });
             return Ok(());
         }
 
@@ -323,11 +317,10 @@ impl MainProcess {
         );
         let task = match self.admit_selection(programs, keys) {
             Ok(task) => task,
-            Err(failure) => return self.abandon_precopy(generation, failure, reply),
+            Err(failure) => return self.abandon_precopy(generation, failure),
         };
         self.precopy = Some(Precopy {
             generation,
-            reply,
             changed: Vec::new(),
             policy: policy.clone(),
             named: programs.clone(),
@@ -441,16 +434,16 @@ impl MainProcess {
                     let failure = refuse(
                         "the module lane answered the selection with a kernel load".to_owned(),
                     );
-                    return self.abandon_precopy(generation, failure, precopy.reply);
+                    return self.abandon_precopy(generation, failure);
                 }
             },
             Some(Outcome::Failed(error)) => {
                 let failure = refuse(format!("selecting this generation's programs: {error}"));
-                return self.abandon_precopy(generation, failure, precopy.reply);
+                return self.abandon_precopy(generation, failure);
             }
             Some(Outcome::Cancelled) => {
                 let failure = refuse("the selection was cancelled".to_owned());
-                return self.abandon_precopy(generation, failure, precopy.reply);
+                return self.abandon_precopy(generation, failure);
             }
         };
 
@@ -465,7 +458,7 @@ impl MainProcess {
                  install"
                     .to_owned(),
             );
-            return self.abandon_precopy(generation, failure, precopy.reply);
+            return self.abandon_precopy(generation, failure);
         }
         let replaced = replaced_operators(&selection.programs, &self.update.serving_programs);
         precopy.programs = selection
@@ -490,7 +483,7 @@ impl MainProcess {
         );
         let tasks = match self.admit_installs(&precopy.programs, &precopy.routes) {
             Ok(tasks) => tasks,
-            Err(failure) => return self.abandon_precopy(generation, failure, precopy.reply),
+            Err(failure) => return self.abandon_precopy(generation, failure),
         };
         precopy.stage = PrecopyStage::Modules(ModuleLane::Installs(tasks));
         self.precopy = Some(precopy);
@@ -525,7 +518,6 @@ impl MainProcess {
                                          selection"
                                     .to_owned(),
                             },
-                            precopy.reply,
                         );
                     }
                 },
@@ -535,7 +527,6 @@ impl MainProcess {
                         UpdateFailure::Precopy {
                             reason: format!("loading this node's kernels: {error}"),
                         },
-                        precopy.reply,
                     );
                 }
                 Some(Outcome::Cancelled) => {
@@ -544,7 +535,6 @@ impl MainProcess {
                         UpdateFailure::Precopy {
                             reason: "the module load was cancelled".to_owned(),
                         },
-                        precopy.reply,
                     );
                 }
             }
@@ -592,7 +582,6 @@ impl MainProcess {
                         precopy.since.elapsed().as_secs()
                     ),
                 },
-                precopy.reply,
             );
         }
         // The policy's module is built on each scheduler's blocking thread, so its answer
@@ -611,11 +600,7 @@ impl MainProcess {
                     .get(TOKEN_LIMIT)
                     .map(|value| value.to_string());
                 let error = limit_refusal(&reason, stated.as_deref(), self.catalogue);
-                return self.abandon_precopy(
-                    generation,
-                    UpdateFailure::Policy { error },
-                    precopy.reply,
-                );
+                return self.abandon_precopy(generation, UpdateFailure::Policy { error });
             }
             None => {}
         }
@@ -636,7 +621,7 @@ impl MainProcess {
                     ),
                     None => reason,
                 };
-                self.abandon_precopy(generation, UpdateFailure::Precopy { reason }, precopy.reply)
+                self.abandon_precopy(generation, UpdateFailure::Precopy { reason })
             }
             None => self.start_shadow(precopy),
         }
@@ -695,11 +680,7 @@ impl MainProcess {
         // waiting out the daemon's whole bound and then passing without the comparison.
         if precopy.since.elapsed() > self.watchdog.stall_bound() * 2 {
             let reason = shadow_stall_message(&precopy.changed, precopy.since.elapsed().as_secs());
-            return self.abandon_precopy(
-                generation,
-                UpdateFailure::Precopy { reason },
-                precopy.reply,
-            );
+            return self.abandon_precopy(generation, UpdateFailure::Precopy { reason });
         }
         // The shadow pass runs on the scheduler's own thread, one step of the batches it
         // formed, so the serve pass polls it rather than waiting.
@@ -710,11 +691,7 @@ impl MainProcess {
                 return Ok(());
             }
             Some(StageFailure::Failed(reason)) => {
-                return self.abandon_precopy(
-                    generation,
-                    UpdateFailure::Precopy { reason },
-                    precopy.reply,
-                );
+                return self.abandon_precopy(generation, UpdateFailure::Precopy { reason });
             }
             None => {}
         }
@@ -778,13 +755,10 @@ impl MainProcess {
                     .to_owned(),
             );
         }
-        self.answer(
-            precopy.reply,
-            ProgramStatus::Precopied {
-                generation,
-                uncompared,
-            },
-        );
+        self.answer(ProgramStatus::Precopied {
+            generation,
+            uncompared,
+        });
         Ok(())
     }
 
@@ -811,7 +785,6 @@ impl MainProcess {
                     UpdateFailure::Policy {
                         error: format!("{error:#}"),
                     },
-                    precopy.reply,
                 );
             }
         };
@@ -834,7 +807,6 @@ impl MainProcess {
         &mut self,
         generation: u64,
         failure: UpdateFailure,
-        reply: Option<u32>,
     ) -> Result<()> {
         self.discard_policy();
         // The workers already rebound or recaptured this generation's graphs, and a generation
@@ -860,13 +832,10 @@ impl MainProcess {
         if let Err(error) = self.update.precopy_failed(generation, failure.clone()) {
             tracing::error!(%error, "discarding a failed precopy failed");
         }
-        self.answer(
-            reply,
-            ProgramStatus::PrecopyFailed {
-                generation,
-                failure,
-            },
-        );
+        self.answer(ProgramStatus::PrecopyFailed {
+            generation,
+            failure,
+        });
         Ok(())
     }
 }

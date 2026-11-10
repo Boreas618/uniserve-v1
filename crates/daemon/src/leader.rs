@@ -607,9 +607,9 @@ impl Leader {
             .context("failed to start the UniServe engine")?;
         // The main processes this node started, by the engine number their
         // reports carry, for the epoch's first program switch.
-        let engines: Vec<u64> = clients
+        let engines: Vec<crate::engine::control::EpochProcess> = clients
             .iter()
-            .filter_map(|(client, _, _)| client.engine())
+            .flat_map(|(client, _, _)| client.processes())
             .collect();
         let epoch = clients.first().map_or(0, |(client, _, _)| client.epoch());
         let mut clients = clients.into_iter();
@@ -698,7 +698,7 @@ impl Leader {
         &self,
         commands: &crate::supervision::ProcessCommands,
         config: &ServerArgs,
-        engines: Vec<u64>,
+        engines: Vec<crate::engine::control::EpochProcess>,
         epoch: u64,
     ) -> anyhow::Result<()> {
         let filled = self.named_programs(config);
@@ -788,13 +788,9 @@ impl Leader {
         // handover to a joining process (`Epochs::hand_to`) sending a revision
         // the store never built.
         let deployment = crate::epoch::Epoch::with_programs(config.clone(), prepared.clone())?;
-        let processes: Vec<crate::engine::control::EpochProcess> = engines
-            .into_iter()
-            .map(|engine| crate::engine::control::EpochProcess {
-                host: config.host_identity.clone(),
-                engine,
-            })
-            .collect();
+        // Every main process of every engine, each on its own host: a worker group that spans
+        // hosts switches every one of its processes together.
+        let processes = engines;
         let commands = commands.clone();
         let installed = deployment.clone();
         let switching = tokio::task::spawn_blocking(move || {
@@ -2067,6 +2063,11 @@ pub(crate) struct Replica {
     /// live. Started by [`Replica::keep_standby`], taken by
     /// [`Replica::promote_standby`].
     pub(crate) standby: std::sync::Mutex<Option<Standby>>,
+    /// The failure-domain rules over the serving engine's main processes
+    /// (`crate::standby::Roster`), which decide whether its standby starts, is
+    /// promoted or is ended; built for the engine that serves, and anew when
+    /// another serves.
+    domain: std::sync::Mutex<Option<crate::standby::Roster>>,
     /// Serializes starting a standby: two callers that both saw none must not
     /// both start a process, since a second engine of the same scope is a
     /// whole copy of its device storage.
@@ -2117,6 +2118,7 @@ impl Replica {
             observer,
             profiles: crate::profiling::Profiles::default(),
             standby: std::sync::Mutex::new(None),
+            domain: std::sync::Mutex::new(None),
             standby_starting: tokio::sync::Mutex::new(()),
             programs_serve: std::sync::atomic::AtomicBool::new(false),
             handed_over: AtomicBool::new(false),
@@ -2511,10 +2513,9 @@ impl Replica {
         );
         reload_adapters(self, &client).await;
         let handing = Arc::clone(updates.epochs());
-        let host = config.host_identity.clone();
         let config = config.clone();
-        let handed =
-            tokio::task::spawn_blocking(move || handing.hand_to(&host, generation, &config));
+        let processes = client.processes();
+        let handed = tokio::task::spawn_blocking(move || handing.hand_to(processes, &config));
         match tokio::time::timeout(SWITCH_TIMEOUT, handed).await {
             Ok(joined) => joined
                 .context("handing the epoch's programs to the started engine")?
@@ -2570,13 +2571,13 @@ impl Replica {
             .map(|driver| Arc::clone(driver.epochs()))
         {
             let config = locked(&self.config).clone();
-            let host = config.host_identity.clone();
-            let engine = client
-                .engine()
-                .context("the relaunched engine states no number")?;
+            let processes = client.processes();
+            anyhow::ensure!(
+                !processes.is_empty(),
+                "the relaunched engine states no number"
+            );
             let handing = Arc::clone(&epochs);
-            let handed =
-                tokio::task::spawn_blocking(move || handing.hand_to(&host, engine, &config));
+            let handed = tokio::task::spawn_blocking(move || handing.hand_to(processes, &config));
             match tokio::time::timeout(SWITCH_TIMEOUT, handed).await {
                 Ok(joined) => joined
                     .context("handing the epoch's programs to the relaunched engine")?
@@ -2622,17 +2623,52 @@ fn keeps_standby(wanted: bool, serving: EngineState, epoch_serves: bool) -> bool
     wanted && epoch_serves && serving == EngineState::Ready
 }
 
-/// A standby main process started beside this replica's serving engine (§2.5):
-/// a second process of the serving epoch, parked with its scope's storage
-/// claimed read-only, promoted in place when the serving engine is lost.
+/// The standby world started beside this replica's serving engine (§2.5): a second process of the
+/// serving epoch on every host its worker group spans, each parked with its scope's storage
+/// claimed read-only, promoted in place together when the serving engine is lost.
 pub(crate) struct Standby {
+    /// The standby world's scheduler node client, which holds its peers'.
     pub(crate) client: Arc<EngineClient>,
-    /// The launch generation the standby was started under, from the epoch
-    /// layer's one allocator.
-    pub(crate) generation: u64,
+    /// Each host's standby process and the launch generation it was started under, from the epoch
+    /// layer's one allocator, in the world's order.
+    pub(crate) generations: Vec<(String, u64)>,
     /// Whether it holds the epoch's programs and has captured its graphs, so a
     /// promotion is the promotion alone (§2.5).
     prepared: bool,
+}
+
+impl Standby {
+    /// The scheduler node's standby generation, which names the standby in the log.
+    fn generation(&self) -> u64 {
+        self.generations
+            .first()
+            .map_or(0, |(_, generation)| *generation)
+    }
+}
+
+/// The failure-domain rules' view of the serving engine: one main process per host of its worker
+/// group, which form one domain when there are several (`crate::standby::Roster`).
+fn domain_processes(
+    serving: &EngineClient,
+    config: &proto::config::EngineConfig,
+) -> Vec<crate::standby::MainProcess> {
+    let processes = serving.processes();
+    let ranks = crate::engine::control::world_hosts(config).unwrap_or_default();
+    let spans = processes.len() > 1;
+    processes
+        .into_iter()
+        .map(|process| crate::standby::MainProcess {
+            rank: ranks
+                .iter()
+                .find(|host| host.host == process.host)
+                .map_or(0, |host| host.first),
+            host: process.host,
+            group: crate::engine::control::ENGINE_GROUP.to_owned(),
+            generation: process.engine,
+            standby_generation: 0,
+            epoch: spans.then(|| serving.epoch()),
+        })
+        .collect()
 }
 
 impl Replica {
@@ -2662,7 +2698,7 @@ impl Replica {
         let parked = locked(&self.standby)
             .as_ref()
             .filter(|standby| !standby.prepared)
-            .map(|standby| (Arc::clone(&standby.client), standby.generation));
+            .map(|standby| (Arc::clone(&standby.client), standby.generation()));
         let Some((client, generation)) = parked else {
             return;
         };
@@ -2670,7 +2706,7 @@ impl Replica {
             Ok(()) => {
                 if let Some(standby) = locked(&self.standby)
                     .as_mut()
-                    .filter(|standby| standby.generation == generation)
+                    .filter(|standby| standby.generation() == generation)
                 {
                     standby.prepared = true;
                 }
@@ -2684,7 +2720,7 @@ impl Replica {
         }
     }
 
-    /// Gives `client`'s process the programs the epoch serves.
+    /// Gives every main process of `client`'s engine the programs the epoch serves.
     async fn hand_programs(self: &Arc<Self>, client: &Arc<EngineClient>) -> Result<(), String> {
         let Some(epochs) = self
             .registry
@@ -2695,11 +2731,11 @@ impl Replica {
             return Ok(());
         };
         let config = locked(&self.config).clone();
-        let host = config.host_identity.clone();
-        let engine = client
-            .engine()
-            .ok_or_else(|| "the standby states no engine number".to_owned())?;
-        let handed = tokio::task::spawn_blocking(move || epochs.hand_to(&host, engine, &config));
+        let processes = client.processes();
+        if processes.is_empty() {
+            return Err("the standby states no engine number".to_owned());
+        }
+        let handed = tokio::task::spawn_blocking(move || epochs.hand_to(processes, &config));
         match tokio::time::timeout(SWITCH_TIMEOUT, handed).await {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(failure))) => Err(format!("{}: {}", failure.kind, failure.reason)),
@@ -2753,14 +2789,81 @@ impl Replica {
         epoch == served
     }
 
+    /// The failure-domain rules over `serving`'s main processes: the rules this replica keeps, or
+    /// new ones when `serving` is another engine than theirs (a promotion or a relaunch replaced
+    /// it).
+    fn domain_of(
+        &self,
+        serving: &EngineClient,
+    ) -> std::sync::MutexGuard<'_, Option<crate::standby::Roster>> {
+        let config = locked(&self.config).engine_config().ok();
+        let mut domain = locked(&self.domain);
+        let current = domain.as_ref().is_some_and(|roster| {
+            let members: Vec<u64> = roster
+                .domains()
+                .iter()
+                .flatten()
+                .map(|process| process.generation)
+                .collect();
+            let serving: Vec<u64> = serving
+                .processes()
+                .iter()
+                .map(|process| process.engine)
+                .collect();
+            members == serving
+        });
+        if !current && let Some(config) = config {
+            *domain = Some(crate::standby::Roster::new(domain_processes(
+                serving, &config,
+            )));
+        }
+        domain
+    }
+
+    /// Applies the rules' `actions` that end standby processes: the standby world they name is
+    /// dropped, and with it every one of its processes.
+    fn end_standby_world(&self, actions: &[crate::standby::Action]) {
+        let ends = actions.iter().any(|action| {
+            matches!(
+                action,
+                crate::standby::Action::Terminate { .. } | crate::standby::Action::Stop { .. }
+            )
+        });
+        if ends && let Some(standby) = locked(&self.standby).take() {
+            info!(
+                generation = standby.generation(),
+                "the failure domain's standby epoch is ended"
+            );
+        }
+    }
+
     /// Ends the parked standby, if one is live: dropping its client closes the
-    /// control connection, which ends its process and releases the read-only
-    /// claim it holds on its epoch's storage.
+    /// control connections, which ends its processes and releases the read-only
+    /// claims they hold on their epoch's storage.
     pub(crate) fn drop_standby(&self) {
+        let retired: Vec<crate::standby::Action> = {
+            let mut domain = locked(&self.domain);
+            let hosts: Vec<String> = domain
+                .as_ref()
+                .map(|roster| {
+                    roster
+                        .domains()
+                        .iter()
+                        .flatten()
+                        .map(|process| process.host.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            domain
+                .as_mut()
+                .map(|roster| hosts.iter().flat_map(|host| roster.retired(host)).collect())
+                .unwrap_or_default()
+        };
+        self.end_standby_world(&retired);
         let dropped = { locked(&self.standby).take() };
         if let Some(standby) = dropped {
             info!(
-                generation = standby.generation,
+                generation = standby.generation(),
                 "the standby is dropped: its epoch no longer serves"
             );
         }
@@ -2770,34 +2873,79 @@ impl Replica {
     /// runs now: a program update moves the serving engine in place, and a
     /// standby started before it holds the programs the update replaced. A
     /// promoted standby would then serve kernels the epoch's record no longer
-    /// names, so the parked process is dropped and another started.
+    /// names, so the parked processes are dropped and others started.
     pub(crate) fn restart_standby(self: &Arc<Self>) {
-        // Dropping the parked client closes its control connection, which ends
-        // its process.
+        let lost: Vec<crate::standby::Action> = {
+            let mut domain = locked(&self.domain);
+            let host = domain.as_ref().and_then(|roster| {
+                roster
+                    .domains()
+                    .first()
+                    .and_then(|members| members.first().map(|process| process.host.clone()))
+            });
+            match (domain.as_mut(), host) {
+                (Some(roster), Some(host)) => roster.standby_lost(&host),
+                _ => Vec::new(),
+            }
+        };
+        self.end_standby_world(&lost);
+        // Dropping the parked client closes its control connections, which ends
+        // its processes.
         let replaced = { locked(&self.standby).take() };
         drop(replaced);
         self.start_standby();
     }
 
+    /// What each host of the serving engine can keep of a parked standby (`StandbyRoom`), as the
+    /// Storage Servers' ledgers state it now.
+    async fn standby_rooms(
+        &self,
+        control: &Arc<EngineControl>,
+    ) -> BTreeMap<String, crate::standby::StandbyRoom> {
+        let reading = Arc::clone(control);
+        let reports = tokio::task::spawn_blocking(move || reading.storage_reports()).await;
+        let deployment = self.served_model_name.clone();
+        match reports {
+            Ok(Ok(reports)) => crate::standby::rooms(&reports, &deployment),
+            Ok(Err(error)) => {
+                warn!("the nodes' storage ledgers could not be read: {error:#}");
+                BTreeMap::new()
+            }
+            Err(error) => {
+                warn!("reading the nodes' storage ledgers did not complete: {error}");
+                BTreeMap::new()
+            }
+        }
+    }
+
     /// Starts the standby that stands beside this replica's serving engine, if
     /// one is wanted and none is live (§2.5).
     ///
-    /// The standby stands by for the epoch the serving engine executes: it is
-    /// started under a number from the epoch layer's one allocator, claims the
-    /// scope's storage read-only (the launch file states the role), and parks
-    /// once it is prepared. A replica whose engine is itself parked, draining or
-    /// failing has no standby: there is nothing to stand beside.
+    /// The failure-domain rules decide (`crate::standby::Roster::serve`): the serving engine's
+    /// main processes are one domain, one per host its worker group spans, and the domain keeps a
+    /// standby of every member or of none, all resident or all suspended (the deployment's
+    /// `worker_config.standby_storage`, its `auto` decided by what each host's devices can keep).
+    /// The standby world is started under numbers from the epoch layer's one allocator, claims
+    /// each scope's storage read-only (the launch file states the role and the storage mode), and
+    /// parks once it is prepared. A replica whose engine is itself parked, draining or failing has
+    /// no standby: there is nothing to stand beside.
     ///
     /// # Errors
     ///
-    /// Fails when the process cannot be started or does not report that it
-    /// stands by. The caller decides whether to retry.
+    /// Fails when the processes cannot be started or do not report that they
+    /// stand by. The caller decides whether to retry.
     pub(crate) async fn keep_standby(self: &Arc<Self>) -> anyhow::Result<()> {
         // `worker_config.standby` decides whether a standby exists at all
         // (§2.5): each standby rank holds a CUDA context, graph pools and
         // workspaces of its own, and a deployment that has not reserved them
         // cannot hold a second engine of the same scope.
-        let wanted = locked(&self.config).worker_config.standby;
+        let (wanted, storage) = {
+            let config = locked(&self.config);
+            (
+                config.worker_config.standby,
+                config.worker_config.standby_storage,
+            )
+        };
         if !wanted {
             return Ok(());
         }
@@ -2817,7 +2965,7 @@ impl Replica {
                 // A parked standby is the one this replica wants.
                 Some(EngineState::Standby) => return Ok(()),
                 // A standby that failed or ended is replaced: dropping the
-                // client closes its control connection, and its process ends.
+                // client closes its control connections, and its processes end.
                 Some(_) => *slot = None,
                 None => {}
             }
@@ -2833,7 +2981,79 @@ impl Replica {
             return Ok(());
         };
         let epochs = Arc::clone(driver.epochs());
-        let generation = epochs.next_generation(crate::engine::control::ENGINE_GROUP, 0);
+        // The engine control numbered every main process it started, those of other hosts
+        // included: the standby's numbers come after them.
+        epochs.launched_up_to(
+            crate::engine::control::ENGINE_GROUP,
+            0,
+            control.next_engine().saturating_sub(1),
+        );
+        let rooms = self.standby_rooms(&control).await;
+        let options = crate::standby::StandbyOptions {
+            enabled: wanted,
+            storage,
+        };
+
+        // The rules' round: every member's next number from the one counter, then the spawns. One
+        // counter numbers every main process of the deployment, so the members' numbers differ.
+        let (spawns, members) = {
+            let mut domain = self.domain_of(&serving);
+            let Some(roster) = domain.as_mut() else {
+                return Ok(());
+            };
+            let members = roster
+                .domains()
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut actions = roster.serve(crate::epoch::Status::Serving, options, &rooms);
+            if actions
+                .iter()
+                .any(|action| matches!(action, crate::standby::Action::Allocate { .. }))
+            {
+                for action in &actions {
+                    if let crate::standby::Action::Allocate { host, group, .. } = action {
+                        let generation = epochs.next_generation(group, 0);
+                        roster.allocated(host, generation);
+                    }
+                }
+                actions = roster.serve(crate::epoch::Status::Serving, options, &rooms);
+            }
+            let spawns: Vec<(String, u64, crate::standby::Storage)> = actions
+                .into_iter()
+                .filter_map(|action| match action {
+                    crate::standby::Action::Spawn {
+                        host,
+                        generation,
+                        storage,
+                        ..
+                    } => Some((host, generation, storage)),
+                    _ => None,
+                })
+                .collect();
+            (spawns, members)
+        };
+        if spawns.is_empty() {
+            info!(
+                model = %self.model_name,
+                hosts = ?rooms.keys().collect::<Vec<_>>(),
+                "the failure domain keeps no standby: a member's devices cannot keep one"
+            );
+            return Ok(());
+        }
+        // The world's processes in its own order, each at the number the rules spawned it at.
+        let generations: Vec<(String, u64)> = members
+            .iter()
+            .filter_map(|member| {
+                spawns
+                    .iter()
+                    .find(|(host, _, _)| *host == member.host)
+                    .map(|(host, generation, _)| (host.clone(), *generation))
+            })
+            .collect();
+        let storage = spawns[0].2;
+
         // The standby executes the serving engine's epoch: it maps that epoch's
         // weights and its KV cache read-only, ready to be promoted into the same
         // scope (§2.5). What a successor maps is the cache the serving engine
@@ -2851,42 +3071,107 @@ impl Replica {
                     model = %self.model_name,
                     "the standby was not started: the serving engine did not describe its cache: {reason}"
                 );
+                self.lose_standby(&generations);
                 return Ok(());
             }
         };
         args.predecessor = Some(predecessor);
+        args.standby_storage = match storage {
+            crate::standby::Storage::Resident => crate::options::StandbyStorage::Resident,
+            crate::standby::Storage::Suspended => crate::options::StandbyStorage::Suspended,
+        };
         let sink = stats_sink(
             self.model_name.clone(),
             Arc::clone(&self.observer),
             self.ordinal,
         );
-        let client = Arc::new(
-            tokio::task::spawn_blocking(move || control.start_at(args, generation, sink)).await??,
-        );
+        let numbers: Vec<u64> = generations
+            .iter()
+            .map(|(_, generation)| *generation)
+            .collect();
+        let started =
+            tokio::task::spawn_blocking(move || control.start_world(args, &numbers, sink)).await?;
+        let client = match started {
+            Ok(client) => Arc::new(client),
+            Err(error) => {
+                self.lose_standby(&generations);
+                return Err(error);
+            }
+        };
+        if let Some(roster) = locked(&self.domain).as_mut() {
+            for (host, generation) in &generations {
+                roster.parked(host, *generation);
+            }
+        }
         info!(
-            generation,
-            "the standby is prepared beside the serving engine"
+            generations = ?generations,
+            storage = ?storage,
+            "the standby epoch of the failure domain is parked"
         );
         *locked(&self.standby) = Some(Standby {
             client,
-            generation,
+            generations,
             prepared: false,
         });
         self.prepare_parked_standby().await;
         Ok(())
     }
 
+    /// The standby of the hosts `generations` names did not start: the domain keeps none, and a
+    /// loss relaunches it.
+    fn lose_standby(&self, generations: &[(String, u64)]) {
+        let actions: Vec<crate::standby::Action> = match locked(&self.domain).as_mut() {
+            Some(roster) => generations
+                .iter()
+                .flat_map(|(host, _)| roster.standby_lost(host))
+                .collect(),
+            None => Vec::new(),
+        };
+        self.end_standby_world(&actions);
+    }
+
     /// Promotes the parked standby in place if this replica has one (§2.5), and
     /// answers the client that now serves.
     ///
-    /// The promoted process is the same process, with its graphs at their
-    /// addresses: it takes the storage its scope claimed read-only and serves
-    /// under the serving engine's epoch. A standby that cannot be promoted is
-    /// dropped, and the caller's loss path relaunches the engine instead.
+    /// The failure-domain rules decide (`crate::standby::Roster::failed`): the domain's parked
+    /// standbys are promoted together, every promotion issued before any is awaited, or, when a
+    /// member has none, the domain is relaunched instead and this answers `None`. The promoted
+    /// processes are the same processes, with their graphs at their addresses: each takes the
+    /// storage its scope claimed read-only and serves under the serving engine's epoch.
     pub(crate) async fn promote_standby(self: &Arc<Self>) -> Option<Arc<EngineClient>> {
         // A standby being started or prepared is waited for: it is closer to serving than a
         // process this replica has yet to launch.
         let starting = self.standby_starting.lock().await;
+        let failure = crate::epoch::Failure {
+            kind: "process_exit".to_owned(),
+            reason: "the serving engine's main process ended".to_owned(),
+            device: None,
+        };
+        let promotions: Vec<(String, u64)> = {
+            let mut domain = locked(&self.domain);
+            let roster = domain.as_mut()?;
+            let host = roster
+                .domains()
+                .first()
+                .and_then(|members| members.first().map(|process| process.host.clone()))?;
+            roster
+                .failed(&host, &failure)
+                .into_iter()
+                .filter_map(|action| match action {
+                    crate::standby::Action::Promote { host, generation } => {
+                        Some((host, generation))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        if promotions.is_empty() {
+            // A member has no parked standby: the domain is relaunched.
+            let dropped = locked(&self.standby).take();
+            drop(dropped);
+            *locked(&self.domain) = None;
+            return None;
+        }
         let standby = locked(&self.standby).take()?;
         self.hold.hold();
         // A standby prepares while it parks (`prepare_parked_standby`), and one that is lost to
@@ -2898,25 +3183,39 @@ impl Replica {
             && let Err(reason) = self.hand_programs(&standby.client).await
         {
             warn!(
-                generation = standby.generation,
+                generation = standby.generation(),
                 "the standby did not take the epoch's programs: {reason}; the engine is relaunched"
             );
+            *locked(&self.domain) = None;
             return None;
         }
         drop(starting);
         match standby.client.promote(Vec::new(), false, true).await {
             Ok(()) => {
+                if let Some(roster) = locked(&self.domain).as_mut() {
+                    for (host, generation) in &promotions {
+                        roster.promoted(host, *generation);
+                    }
+                }
+                // The promoted world is the engine that serves; the rules over it start anew.
+                *locked(&self.domain) = None;
                 self.hold.serve(Arc::clone(&standby.client));
                 info!(
-                    generation = standby.generation,
-                    "the standby was promoted and serves"
+                    generations = ?standby.generations,
+                    "the failure domain's standby epoch was promoted"
                 );
                 self.start_standby();
                 Some(standby.client)
             }
             Err(error) => {
+                if let Some(roster) = locked(&self.domain).as_mut() {
+                    for (host, _) in &promotions {
+                        roster.promote_failed(host);
+                    }
+                }
+                *locked(&self.domain) = None;
                 warn!(
-                    generation = standby.generation,
+                    generation = standby.generation(),
                     "the standby could not be promoted: {error}; the engine is relaunched"
                 );
                 None
@@ -2940,6 +3239,7 @@ impl Replica {
     /// Dropping the client closes the control connection, which the standby's
     /// engine treats as the end of the process.
     pub(crate) async fn end_standby(&self) {
+        *locked(&self.domain) = None;
         let standby = { locked(&self.standby).take() };
         if let Some(standby) = standby
             && let Err(error) = tokio::task::spawn_blocking(move || standby.client.shutdown()).await

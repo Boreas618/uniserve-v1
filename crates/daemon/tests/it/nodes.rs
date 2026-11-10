@@ -37,6 +37,7 @@ impl Deployment {
             executable: "uniserve".into(),
             join_timeout: TIMEOUT,
             devices: || Ok(Vec::new()),
+            program_server: program_server::command::Settings::default(),
         };
 
         // The leader's start returns once every member joined, and a
@@ -144,6 +145,7 @@ fn a_node_joins_a_running_deployment_and_the_next_engine_runs_processes_there() 
         executable: "uniserve".into(),
         join_timeout: TIMEOUT,
         devices: || Ok(Vec::new()),
+        program_server: program_server::command::Settings::default(),
     };
 
     // A leader of one node that names its address serves at once.

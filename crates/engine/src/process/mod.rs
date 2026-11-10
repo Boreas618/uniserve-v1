@@ -4,9 +4,12 @@
 //! serves it until the daemon commands it down or the epoch fails. The process computes nothing
 //! itself; it assembles
 //!
-//! - the [`Control`] thread, which serves the daemon's request interface, its process supervision
-//!   and the epoch's peer main processes, and never waits for a job;
+//! - the [`Control`] thread, which serves the daemon's request interface and its process
+//!   supervision, and never waits for a job;
 //! - one `scheduler::Scheduler` per DP rank, on the node that holds them;
+//! - the peer links of an epoch whose worker group has ranks on other hosts ([`worker::peers`]):
+//!   on the scheduler node one per peer main process, which carries the schedulers' batches to the
+//!   peer's ranks, and on a peer the one link that runs them;
 //! - one `worker::device::Worker` per device, the only thread that issues to that device's streams;
 //! - the node's resident memory ([`Memory`]);
 //! - the blocking pool host work runs on ([`ThreadPool`]),
@@ -48,7 +51,7 @@
 //! - `record`: a start that records the programs its devices launch and serves nothing
 //!   ([`record()`]).
 //! - `serve`, `commands`, `requests`, `reports`, `operations`, `weights`: the serve loop and
-//!   what it serves - the daemon's and the peers' messages, requests and their event streams,
+//!   what it serves - the daemon's messages, requests and their event streams,
 //!   reports and metrics, storage commands and weight updates.
 //! - `policy`, `installs`, `precopy`, `switchover`: the program-layer update.
 //! - `epoch`: the epoch layer's drain, resume, promotion and admission.
@@ -116,6 +119,13 @@ pub fn run(launch_file: &Path, catalogue: &nn::family::Catalogue) -> Result<()> 
     let launch = read_engine_args(launch_file)?;
     let mut main = MainProcess::start(&launch, catalogue)?;
     let ending = main.serve();
+    // A process that lost another of its epoch's main processes ends without its orderly close:
+    // its device's collectives wait for ranks that are gone, so no close of its workers ends. Its
+    // requests go with its connection, which the daemon reads as the engine's loss.
+    if let Some(reason) = main.peers.lost() {
+        tracing::error!(%reason, "the main process ends: a main process of its epoch was lost");
+        std::process::exit(1);
+    }
     main.close();
 
     // Why this process ends is the daemon's own diagnostic: the supervisor reports
@@ -142,6 +152,47 @@ pub fn run(launch_file: &Path, catalogue: &nn::family::Catalogue) -> Result<()> 
     Ok(())
 }
 
+/// A main process's links to the other main processes of its epoch ([`worker::peers`]).
+pub(super) enum Peers {
+    /// The process holds every rank of its worker group.
+    Alone,
+    /// The scheduler node's process: one link per peer, which its schedulers' batches reach the
+    /// peers' ranks through.
+    Scheduler {
+        remotes: Vec<Arc<worker::peers::Remote>>,
+        liveness: Arc<worker::peers::Liveness>,
+    },
+    /// A peer's process: the one link the scheduler node's batches arrive on.
+    Peer {
+        upstream: worker::peers::Upstream,
+        liveness: Arc<worker::peers::Liveness>,
+    },
+}
+
+impl Peers {
+    /// Why a link to another main process of the epoch was lost, once one was: the group cannot
+    /// run a batch without that process's ranks, so this process ends.
+    pub(super) fn lost(&self) -> Option<String> {
+        match self {
+            Self::Alone => None,
+            Self::Scheduler { liveness, .. } | Self::Peer { liveness, .. } => liveness.lost(),
+        }
+    }
+
+    /// Closes every link, which the processes at their other ends read as this one's end.
+    pub(super) fn close(&mut self) {
+        match std::mem::replace(self, Self::Alone) {
+            Self::Alone => {}
+            Self::Scheduler { remotes, .. } => {
+                for remote in remotes {
+                    remote.close();
+                }
+            }
+            Self::Peer { upstream, .. } => upstream.close(),
+        }
+    }
+}
+
 /// One node's main process for one epoch: the threads it started and the owners they borrow.
 ///
 /// Every field is owned by exactly one thread: the control thread owns itself,
@@ -150,6 +201,9 @@ pub fn run(launch_file: &Path, catalogue: &nn::family::Catalogue) -> Result<()> 
 /// owners that must outlive them.
 pub(crate) struct MainProcess {
     control: Control,
+    /// This process's links to the epoch's other main processes, when its worker group has ranks
+    /// on other hosts.
+    peers: Peers,
     /// This node's schedulers, one per DP rank. The handle is the interface: each scheduler's thread
     /// owns the instance, so every call the control thread makes goes through the handle and the
     /// command channel carries the mutation.
@@ -221,10 +275,10 @@ pub(crate) struct MainProcess {
     /// node's warmup.
     command_wait: Wait,
     warmup_wait: Wait,
-    /// A switchover whose answer is owed to the warmup it queued: the generation, and the peer to
-    /// answer when admission opens. `Switched` means this process serves, so it waits for the
-    /// buckets a batch would be planned into; a warmup that fails answers the switchover instead.
-    pending_switch: Option<(u64, Option<u32>)>,
+    /// A switchover whose answer is owed to the warmup it queued: the generation to answer when
+    /// admission opens. `Switched` means this process serves, so it waits for the buckets a batch
+    /// would be planned into; a warmup that fails answers the switchover instead.
+    pending_switch: Option<u64>,
     /// When the warmup now running last moved on - it was queued, or a device took up another
     /// capture: a warmup that stands on one step for twice the stall bound is failed by name
     /// rather than left to answer nothing, and one that keeps moving runs as long as its captures
@@ -292,6 +346,10 @@ pub(crate) struct MainProcess {
     /// Whether a promoted standby has been promoted: a standby that has not been stays silent
     /// through the boundary, and one that has follows the rule of any other process.
     promoted: bool,
+    /// How a standby keeps its graph pools' device storage while it parks, as the daemon resolved
+    /// `worker_config.standby_storage` for its failure domain: a suspended standby gives it back
+    /// once its graphs are captured and takes it again, at the addresses they hold, when promoted.
+    standby_storage: proto::request::StandbyStorage,
     /// What each scheduler parked with, in `schedulers` order: kept from the drain to the resume,
     /// which adopts it, so a resumed epoch reuses the pages it still holds instead of reading them
     /// again.

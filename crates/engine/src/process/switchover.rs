@@ -140,13 +140,13 @@ impl MainProcess {
         // The switchover's answer is owed to the warmup, and it is sent here - after admission
         // opened - so that `Switched` states the one thing it means: this process can serve.
         if self.warming.is_empty()
-            && let Some((generation, reply)) = self.pending_switch.take()
+            && let Some(generation) = self.pending_switch.take()
         {
             tracing::info!(
                 generation,
                 "answering the switchover now that admission is open"
             );
-            self.answer(reply, ProgramStatus::Switched { generation });
+            self.answer(ProgramStatus::Switched { generation });
         }
         Ok(None)
     }
@@ -191,7 +191,7 @@ impl MainProcess {
             .first()
             .map_or(0, |(_, _, generation)| *generation);
         // The daemon reads progress, not an answer: the peer that asked is told `Switched` alone.
-        self.answer(None, ProgramStatus::Warming { generation, step });
+        self.answer(ProgramStatus::Warming { generation, step });
     }
 
     /// The switchover: cut over at the batch boundary whose step the scheduler put
@@ -200,7 +200,6 @@ impl MainProcess {
         &mut self,
         generation: u64,
         step: Option<u64>,
-        reply: Option<u32>,
     ) -> Result<Option<ProgramStatus>> {
         // A switchover to a generation this process never prepared cannot succeed, and cutting the
         // devices over to try it costs a live graph rebuild to end where it started: it is refused
@@ -360,7 +359,7 @@ impl MainProcess {
             // waits for it: a warmup that fails then answers with the failure, and the daemon never
             // opens a frontend onto a process that cannot take a request.
             SwitchoverAnswer::AfterTheWarmup => {
-                self.pending_switch = Some((generation, reply));
+                self.pending_switch = Some(generation);
                 self.warming_since = Some(Instant::now());
                 Ok(None)
             }
@@ -379,8 +378,30 @@ impl MainProcess {
             self.update.retired.clear();
             self.update.retired_programs.clear();
             self.commit_policy(generation);
+            // A standby commits the generation it captured while it parks: its graphs exist now,
+            // and their storage is kept as the daemon decided for the failure domain.
+            if self.standby && !self.promoted {
+                self.park_graph_storage()?;
+            }
         }
         Ok(status)
+    }
+
+    /// Keeps a parked standby's graph pools as its launch states (`standby_storage`): resident,
+    /// or suspended to host storage at unchanged addresses until the promotion restores them.
+    fn park_graph_storage(&mut self) -> Result<()> {
+        match self.standby_storage {
+            proto::request::StandbyStorage::Suspended => {
+                self.data
+                    .suspend_graphs()
+                    .context("suspending the standby's graph pools")?;
+                tracing::info!("the standby worker suspended its graph storage");
+            }
+            proto::request::StandbyStorage::Resident | proto::request::StandbyStorage::Auto => {
+                tracing::info!("the standby worker keeps its graph storage resident");
+            }
+        }
+        Ok(())
     }
 
     /// Probation: an update left on probation past the window the launch file states is

@@ -9,11 +9,10 @@
 //! The child reads it in its first instruction, so nothing may be observable
 //! half-written.
 //!
-//! The writer is only used where the child shares this daemon's runtime
-//! directory. A child on another host cannot open a path that exists only
-//! here; that spawn is refused, and the general form (the launch contents
-//! travelling in `process::Spawn`) is a protocol change this module does not
-//! make.
+//! The launch's contents travel in the spawn request (`process::Spawn::launch`),
+//! and the daemon of the node that starts the child writes the file into its own
+//! runtime directory (`supervision::supervisor`), so a child on any node reads a
+//! file of its own host.
 
 use std::io;
 use std::io::Write;
@@ -122,7 +121,8 @@ mod tests {
             group: "engine".to_owned(),
             rank: 0,
             scheduler_node: true,
-            peers: Vec::new(),
+            world: None,
+            standby_storage: crate::options::StandbyStorage::Resident,
             watchdog_timeout_s: None,
             rollback_s: None,
             queue_depth: 4,
@@ -173,7 +173,8 @@ mod tests {
             "group",
             "rank",
             "scheduler_node",
-            "peers",
+            "world",
+            "standby_storage",
             "watchdog_timeout_s",
             "rollback_s",
             "queue_depth",

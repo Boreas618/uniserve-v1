@@ -1051,13 +1051,18 @@ pub struct EngineArgs {
     pub devices: Vec<u32>,
     /// This rank's worker group, which keys its storage claims.
     pub group: String,
-    /// This rank's ordinal inside its group.
+    /// The ordinal inside its group of the first rank this process serves; its other devices'
+    /// ranks follow it.
     pub rank: u32,
     /// Whether this node holds the epoch's schedulers.
     pub scheduler_node: bool,
-    /// The addresses on which this node accepts its peer main processes'
-    /// connections; empty for a world of one.
-    pub peers: Vec<String>,
+    /// The epoch's other main processes and where this one meets them, when the epoch's worker
+    /// group has ranks on several hosts; `None` when this process holds every rank.
+    pub world: Option<World>,
+    /// How this process, started as a standby ([`Self::standby`]), keeps the device storage of its
+    /// graph pools while it parks: the daemon resolves `worker_config.standby_storage` for the
+    /// failure domain, so it states `resident` or `suspended` and never `auto`.
+    pub standby_storage: StandbyStorage,
     /// How long a job may run without progress before it is reported
     /// `Stalled`, when the daemon states it apart from the engine configuration.
     pub watchdog_timeout_s: Option<u64>,
@@ -1065,9 +1070,45 @@ pub struct EngineArgs {
     pub rollback_s: Option<u64>,
     /// The rank layout's queue depth for this rank's worker groups.
     pub queue_depth: u32,
-    /// The number of ranks in this process's world, of which this group's rank
-    /// is one.
+    /// The number of ranks in the epoch's worker group, on every host: this process's ranks and
+    /// those of its peers.
     pub world_size: u32,
+}
+
+/// Where the main processes of one epoch meet when its worker group has ranks on several hosts
+/// (`docs/architecture.md`, The channel).
+///
+/// The scheduler node's main process holds the group's rank 0 and its schedulers; each other
+/// host's main process (a peer) holds that host's ranks. The leader's daemon reserves two sockets
+/// on the scheduler node before it starts any process of the epoch, so both addresses are live
+/// before a peer dials them: the peer channel's listener and the group's host-collective
+/// rendezvous.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct World {
+    /// The engine number of the scheduler node's main process, which a peer's registration states:
+    /// the channel of another epoch is refused.
+    pub scheduler: u64,
+    /// Where the scheduler node's main process accepts its peers (`host:port`).
+    pub channel: String,
+    /// Where the group's ranks form their host collectives (`host:port`), served by the process
+    /// that holds rank 0.
+    pub store: String,
+    /// How many peers the scheduler node's process accepts before its ranks load.
+    pub peers: u32,
+    /// The descriptors at which the scheduler node's process inherits the two reserved sockets;
+    /// `None` on a peer, which dials them.
+    pub inherited: Option<Inherited>,
+}
+
+/// The descriptors of the sockets the scheduler node's main process inherits from its daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Inherited {
+    /// The peer channel's listener.
+    pub channel: i32,
+    /// The host-collective rendezvous.
+    pub store: i32,
 }
 
 impl EngineArgs {
@@ -1089,7 +1130,8 @@ impl EngineArgs {
             group: String::new(),
             rank: 0,
             scheduler_node: false,
-            peers: Vec::new(),
+            world: None,
+            standby_storage: StandbyStorage::Resident,
             watchdog_timeout_s: None,
             rollback_s: None,
             queue_depth: 0,

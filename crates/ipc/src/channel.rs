@@ -830,6 +830,24 @@ impl Listener {
         Ok(Self { sockets, addresses })
     }
 
+    /// Accepts on a TCP socket that is already bound and listening: one its
+    /// process inherited from the daemon that reserved it, so the address
+    /// its peers were given is live before the process starts.
+    ///
+    /// Fails when the socket's address cannot be read or it cannot be made
+    /// non-blocking.
+    pub fn from_tcp(listener: TcpListener) -> IpcResult<Self> {
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| transport("taking an inherited listener", error))?;
+        let socket = Socket::Tcp(listener);
+        let addresses = vec![socket.address()?];
+        Ok(Self {
+            sockets: vec![socket],
+            addresses,
+        })
+    }
+
     /// Returns the bound addresses, in the order they were given to
     /// [`Self::bind`].
     pub fn addresses(&self) -> &[String] {

@@ -281,6 +281,9 @@ pub struct Workers {
     inventory: Vec<Inventory>,
     /// What keys this rank's pages in the host KV cache, when the deployment keeps one.
     host_cache: Option<HostCacheEndpoint>,
+    /// The group's ranks on other hosts, each main process's peer link: every batch of the
+    /// group's phases goes to them too, and its submission ends when theirs did.
+    remotes: Vec<Arc<crate::peers::Remote>>,
 }
 
 impl Workers {
@@ -295,7 +298,15 @@ impl Workers {
             workers,
             inventory: Vec::new(),
             host_cache: None,
+            remotes: Vec::new(),
         })
+    }
+
+    /// States the group's ranks on other hosts, which run every batch beside this node's devices.
+    #[must_use]
+    pub fn with_remotes(mut self, remotes: Vec<Arc<crate::peers::Remote>>) -> Self {
+        self.remotes = remotes;
+        self
     }
 
     /// States that this rank keeps a host KV cache, with what keys its pages.
@@ -362,14 +373,21 @@ impl Workers {
         Ok(Some(serving[unit % serving.len()]))
     }
 
-    /// Hands `batch` to every device that serves its phase, as one submission.
+    /// Hands `batch` to every device that serves its phase and to the group's ranks on other
+    /// hosts (`remote`), as one submission.
     fn on_every_device(
         &self,
         batch: Batch,
         submit: impl Fn(&crate::device::Worker, Batch) -> Result<Submission>,
+        remote: impl Fn(&crate::peers::Remote, Batch) -> Result<Submission>,
     ) -> Result<Submission> {
         let first = self.route(batch.phase)?;
         let mut peers = Vec::new();
+        // The other hosts' ranks take the batch first: their submissions travel while this node's
+        // devices stage theirs, and the ranks' collectives meet in the batch's forward.
+        for peer in &self.remotes {
+            peers.push(remote(peer, batch.clone())?);
+        }
         for peer in self
             .workers
             .iter()
@@ -433,26 +451,34 @@ impl Workers {
     pub fn submit(&self, batch: Batch) -> Result<Submission> {
         match self.device_of_unit(&batch)? {
             Some(worker) => worker.submit(batch),
-            None => self.on_every_device(batch, |worker, mut batch| {
-                // A page copy names the rank that makes it, and a rank is a device here.
-                if let Some(rank) = self
-                    .workers
-                    .iter()
-                    .position(|held| std::ptr::eq(held.as_ref(), worker))
-                {
-                    batch.page_loads.retain(|copy| copy.rank as usize == rank);
-                    batch
-                        .page_offloads
-                        .retain(|copy| copy.rank as usize == rank);
-                }
-                worker.submit(batch)
-            }),
+            None => self.on_every_device(
+                batch,
+                |worker, mut batch| {
+                    // A page copy names the rank that makes it, and a rank is a device here.
+                    if let Some(rank) = self
+                        .workers
+                        .iter()
+                        .position(|held| std::ptr::eq(held.as_ref(), worker))
+                    {
+                        batch.page_loads.retain(|copy| copy.rank as usize == rank);
+                        batch
+                            .page_offloads
+                            .retain(|copy| copy.rank as usize == rank);
+                    }
+                    worker.submit(batch)
+                },
+                crate::peers::Remote::submit,
+            ),
         }
     }
 
     /// Runs `batch`'s paired forwards on every device of its phase.
     pub fn shadow(&self, batch: Batch) -> Result<Submission> {
-        self.on_every_device(batch, |worker, batch| worker.shadow(batch))
+        self.on_every_device(
+            batch,
+            |worker, batch| worker.shadow(batch),
+            crate::peers::Remote::shadow,
+        )
     }
 
     /// Maps the host KV cache's page pools on every device.

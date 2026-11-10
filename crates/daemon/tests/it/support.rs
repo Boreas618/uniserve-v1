@@ -27,6 +27,7 @@ pub(crate) fn single_node(host: &str, socket: PathBuf) -> DaemonOptions {
         executable: PathBuf::from("uniserve"),
         join_timeout: TIMEOUT,
         devices: || Ok(Vec::new()),
+        program_server: program_server::command::Settings::default(),
     }
 }
 

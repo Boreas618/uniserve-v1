@@ -100,6 +100,13 @@ impl MainProcess {
         let _watched = platform::cupti::blocking::Watched::enter();
         loop {
             let pass = Instant::now();
+            // A lost peer link is the end of the epoch's failure domain: its group cannot run a
+            // batch without that process's ranks, and the daemon replaces the domain once this
+            // process is gone. It is read first: the rest of a pass may wait on a scheduler whose
+            // batch waits for the lost ranks.
+            if let Some(reason) = self.peers.lost() {
+                bail!("a main process of this epoch was lost: {reason}");
+            }
             if self.stopping {
                 // The report is stated once more on the way out: an epoch's counters are additive
                 // and a frontend that only saw the passes would lose the last second of them.
@@ -148,17 +155,13 @@ impl MainProcess {
                             return Ok(Some(failure));
                         }
                     }
-                    Ready::PeerConnecting => {
-                        self.control.accept()?;
-                    }
-                    Ready::Peer(rank) => {
-                        if let Some(failure) = self.peer_messages(rank)? {
-                            return Ok(Some(failure));
-                        }
-                    }
                     // What these announce is read by the pass below, whatever woke it.
                     Ready::Process | Ready::Woken | Ready::Idle => {}
                 }
+            }
+
+            if let Some(reason) = self.peers.lost() {
+                bail!("a main process of this epoch was lost: {reason}");
             }
 
             // What the admitted requests produced since the last pass.

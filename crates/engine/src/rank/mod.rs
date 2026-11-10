@@ -319,10 +319,11 @@ impl ModelRunner {
             return Ok(vec![self.clone()]);
         }
         let count = self.devices.len();
-        // A tensor group splits every layer of one model over this process's devices: each device
-        // is a rank of its own, which loads its block of every weight on its own device and joins
-        // the group's collectives, and the one scheduler of the group submits each batch to all of
-        // them (`schedulers`).
+        // A tensor group splits every layer of one model over the group's devices: each device is a
+        // rank of its own, which loads its block of every weight on its own device and joins the
+        // group's collectives, and the one scheduler of the group submits each batch to all of them
+        // (`schedulers`), those of another host's process through its peer link. This process holds
+        // `count` consecutive ranks of the group from its first, `self.rank`.
         if text && tensor > 1 {
             if union_ranks > 1 {
                 bail!(
@@ -331,10 +332,11 @@ impl ModelRunner {
                      served together"
                 );
             }
-            if count != tensor as usize {
+            let first = self.rank as usize;
+            if first + count > tensor as usize {
                 bail!(
-                    "this node serves {count} devices and the deployment's tensor group has \
-                     {tensor} ranks: a tensor group lives on one node's devices, one rank each"
+                    "this node serves {count} devices from rank {first} and the deployment's \
+                     tensor group has {tensor} ranks: each of a group's ranks is one device"
                 );
             }
             return Ok(self
@@ -345,8 +347,8 @@ impl ModelRunner {
                     let mut rank_runner = self.clone();
                     rank_runner.devices = vec![*device];
                     rank_runner.rank = self.rank + index as u32;
-                    rank_runner.world_size = count;
-                    rank_runner.mapping.tensor_rank = index as u32;
+                    rank_runner.world_size = tensor as usize;
+                    rank_runner.mapping.tensor_rank = self.rank + index as u32;
                     rank_runner
                 })
                 .collect());
@@ -372,7 +374,9 @@ impl ModelRunner {
                 let mut rank_runner = self.clone();
                 rank_runner.devices = vec![*device];
                 rank_runner.rank = self.rank + index as u32;
-                rank_runner.world_size = count;
+                // The group's ranks on every host: a media group's other hosts hold the ranks this
+                // process does not.
+                rank_runner.world_size = self.world_size.max(count);
                 if text {
                     // An attention rank holds the first rank's window and computes nothing with
                     // it; `DispatchViews::source_only` keeps it out of its forward.
@@ -606,6 +610,10 @@ impl ModelRunner {
     ) -> Result<(EngineArgs, scheduler::SchedulerConfig)> {
         let running = self.engine_config().max_running_requests.get();
         let mut args = launch.clone();
+        // The scheduler plans its group as the one pool its batches go to (`Self::scheduled`):
+        // the ranks it places are this runner's, whatever the group's ranks on every host are.
+        args.world_size =
+            u32::try_from(self.world_size).context("a pool wider than the launch addresses")?;
         let model = &mut args.engine_config.model;
         let (max_batch, max_num_batched_tokens, graph_tiers) = match loaded {
             Loaded::Text(_) => {

@@ -69,7 +69,7 @@ pub(super) fn claim(
         // read-only until it is promoted, and claiming it writable would give the scope two
         // writers. The launch file states the role, so the process never has to infer it.
         standby: launch.standby(),
-        standby_storage: ipc::StandbyStorage::Auto,
+        standby_storage: launch.standby_storage,
     })
 }
 

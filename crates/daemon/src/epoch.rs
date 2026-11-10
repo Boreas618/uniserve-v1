@@ -445,6 +445,20 @@ impl Epochs {
     /// This is the one place a generation is allocated: a caller that
     /// computed one itself would launch two processes under one number.
     pub fn next_generation(&self, group: &str, rank: u64) -> u64 {
+        self.allocate(group, rank)
+    }
+
+    /// Records that the deployment launched processes under numbers up to `generation`, which
+    /// were taken elsewhere than [`Self::next_generation`]: the engine control numbers the main
+    /// processes of an engine over several hosts as it starts them, and processes of another node
+    /// are not in this node's process table. Later numbers of `group`'s rank `rank` are above it.
+    pub fn launched_up_to(&self, group: &str, rank: u64, generation: u64) {
+        let mut allocated = locked(&self.generations);
+        let last = allocated.entry((group.to_owned(), rank)).or_insert(0);
+        *last = (*last).max(generation);
+    }
+
+    fn allocate(&self, group: &str, rank: u64) -> u64 {
         let runnning = self
             .processes()
             .iter()
@@ -612,11 +626,10 @@ impl Epochs {
     /// # Errors
     ///
     /// Fails when no epoch serves, when the daemon has no channel to its main
-    /// processes, and when the process refuses the programs or does not answer.
+    /// processes, and when a process refuses the programs or does not answer.
     pub fn hand_to(
         &self,
-        host: &str,
-        engine: u64,
+        processes: Vec<crate::engine::control::EpochProcess>,
         config: &crate::options::ServerArgs,
     ) -> Result<(), Failure> {
         let commands = locked(&self.commands).clone().ok_or_else(|| Failure {
@@ -633,7 +646,7 @@ impl Epochs {
             kernels: record.kernels.clone(),
             policy: record.policy.clone(),
         };
-        self.hand_programs(host, engine, config, &programs, commands)
+        self.hand_programs(processes, config, &programs, commands)
     }
 
     /// Gives an epoch switch's target `programs`, as [`Self::hand_to`] gives a joining process the
@@ -656,13 +669,18 @@ impl Epochs {
             reason: "the daemon has no channel to its main processes".to_owned(),
             device: None,
         })?;
-        self.hand_programs(host, engine, config, programs, commands)
+        let process = crate::engine::control::EpochProcess {
+            host: host.to_owned(),
+            engine,
+        };
+        self.hand_programs(vec![process], config, programs, commands)
     }
 
+    /// Switches `processes`, every main process of one engine, to `programs` together: the ranks
+    /// of a worker group that spans hosts warm up their collectives together.
     fn hand_programs(
         &self,
-        host: &str,
-        engine: u64,
+        processes: Vec<crate::engine::control::EpochProcess>,
         config: &crate::options::ServerArgs,
         programs: &FilledPrograms,
         commands: crate::supervision::ProcessCommands,
@@ -674,20 +692,17 @@ impl Epochs {
                 reason: format!("{error:#}"),
                 device: None,
             })?;
-        let process = crate::engine::control::EpochProcess {
-            host: host.to_owned(),
-            engine,
-        };
+        let engines: Vec<u64> = processes.iter().map(|process| process.engine).collect();
         let mut switch = crate::engine::control::ProgramSwitch::new(
             &commands,
-            vec![process],
+            processes,
             Update::new(0, deployment),
         );
         switch.precopy(&record.kernels, &record.policy)?;
         switch.switchover()?;
         switch.commit()?;
         tracing::info!(
-            engine,
+            engines = ?engines,
             kernels = record.kernels.len(),
             policy = %record.policy.backend,
             "the joining main process took the epoch's programs"
@@ -1418,7 +1433,13 @@ mod tests {
         epochs.supervise(commands);
 
         epochs
-            .hand_to("node-0", 9, &config)
+            .hand_to(
+                vec![crate::engine::control::EpochProcess {
+                    host: "node-0".to_owned(),
+                    engine: 9,
+                }],
+                &config,
+            )
             .expect("the epoch's programs reached the joining process");
         assert_eq!(
             *seen.lock().unwrap(),
@@ -1449,7 +1470,13 @@ mod tests {
         let empty = Epochs::new();
         empty.supervise(commands);
         let failure = empty
-            .hand_to("node-0", 9, &config)
+            .hand_to(
+                vec![crate::engine::control::EpochProcess {
+                    host: "node-0".to_owned(),
+                    engine: 9,
+                }],
+                &config,
+            )
             .expect_err("a daemon with no epoch hands nothing over");
         assert_eq!(failure.kind, "no_epoch");
     }

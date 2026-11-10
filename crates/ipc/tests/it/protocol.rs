@@ -572,6 +572,7 @@ fn request_fixtures() -> Vec<MainProcessRequest> {
     vec![
         MainProcessRequest::info(),
         submit,
+        MainProcessRequest::shadow(token_batch()),
         MainProcessRequest::close(),
     ]
 }
@@ -682,7 +683,12 @@ fn video_components() -> std::collections::BTreeMap<MediaCall, String> {
 #[test]
 fn every_request_kind_round_trips_through_ipc() {
     let fixtures = request_fixtures();
-    for kind in [RequestKind::Info, RequestKind::Submit, RequestKind::Close] {
+    for kind in [
+        RequestKind::Info,
+        RequestKind::Submit,
+        RequestKind::Shadow,
+        RequestKind::Close,
+    ] {
         assert!(
             fixtures.iter().any(|request| request.kind() == kind),
             "no fixture covers request kind {kind:?}"

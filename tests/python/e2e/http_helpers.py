@@ -370,9 +370,10 @@ def second_host(
     devices: str | None = None,
     env: dict[str, str] | None = None,
     leader_log: Path | None = None,
+    arguments: tuple[str, ...] = (),
 ) -> Iterator[Callable[[], None]]:
     """The daemon of a deployment's second host, joining the leader at
-    `address` as node `rank-1`.
+    `address` as node `rank-1`, with `arguments` after its own options.
 
     `host` is an ssh destination whose checkout path holds this build. The
     daemon runs in this test's environment (its search and package paths,
@@ -397,6 +398,7 @@ def second_host(
             "LD_LIBRARY_PATH",
             "PYTHONPATH",
             "MAX_JOBS",
+            "UNISERVE_PROGRAM_SERVER_PYTHON",
             "FLASHINFER_WORKSPACE_BASE",
             "UCX_NET_DEVICES",
         )
@@ -418,6 +420,8 @@ def second_host(
         f"--node-rank 1 --dist-init-addr {address} --host-identity rank-1 "
         f"--worker-executable {shlex.quote(str(worker_executable()))}"
     )
+    if arguments:
+        remote += " " + shlex.join(arguments)
     started: list[subprocess.Popen[str]] = []
     leaving = threading.Event()
 

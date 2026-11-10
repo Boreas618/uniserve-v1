@@ -14,13 +14,13 @@ use worker::control::{Control, Endpoints};
 use worker::runners::products::GroupProducts;
 use worker::watchdog::Watchdog;
 
-use super::MainProcess;
 use super::claim::claim;
 use super::device_command;
 use super::launch::{Epoch, ProcessInterface, handshake};
-use super::ranks::{Backing, LoadedRank, load_ranks, schedulers};
+use super::ranks::{Backing, LoadedRank, Meeting, load_ranks, schedulers};
 use super::reports::{announce, state_failure};
 use super::serve::Wait;
+use super::{MainProcess, Peers};
 use crate::programs::modules::ModuleWork;
 use crate::rank::ModelRunner;
 
@@ -39,25 +39,31 @@ impl MainProcess {
         let mut control = Control::connect(
             &Endpoints {
                 requests: launch.requests.clone(),
-                peers: launch.peers.clone(),
             },
             launch.engine,
         )?;
         // The request interface's handshake: this process says who it is, and the
         // daemon answers with the epoch this node serves.
-        // The epoch this rank belongs to is the daemon's, and both of its facts decide the storage
-        // this process claims and the peers it exchanges products with. A zero epoch names no
-        // epoch, and a peer list on a world of one is a second node this epoch does not have: each
-        // is refused here, by name, rather than at the claim or the first transfer.
+        // The epoch this rank belongs to is the daemon's, and it decides the storage this process
+        // claims. A zero epoch names no epoch, and a world whose processes do not divide its ranks
+        // between them is another deployment's: each is refused here, by name, rather than at the
+        // claim or the first collective.
         if launch.epoch == 0 {
             bail!("the launch file states epoch 0, which names no epoch for this rank to serve");
         }
-        if launch.world_size == 1 && !launch.peers.is_empty() {
-            bail!(
-                "the launch file states a world of one rank and {} peer address(es): a peer is \
-                 another main process of the same world, and this epoch has no other",
-                launch.peers.len()
-            );
+        if let Some(world) = &launch.world {
+            if world.peers == 0 {
+                bail!("the launch file states a world of several hosts with no peer main process");
+            }
+            if launch.scheduler_node != world.inherited.is_some() {
+                bail!(
+                    "the scheduler node's main process, and only it, inherits the world's reserved \
+                     sockets: this one is{} the scheduler node",
+                    if launch.scheduler_node { "" } else { " not" }
+                );
+            }
+        } else if !launch.scheduler_node {
+            bail!("a main process that holds every rank of its group holds its schedulers too");
         }
         let epoch = handshake(&mut control, launch)?;
         // The daemon's launch path blocks until this process states what it is, and it
@@ -115,6 +121,9 @@ impl MainProcess {
         // This process serves every rank of its node, each on its own device.
         let rank_runners = model_runner.ranks()?;
         let rank_numbers: Vec<u32> = rank_runners.iter().map(ModelRunner::rank).collect();
+        // The epoch's other main processes, before any rank loads: the ranks' host group and their
+        // communicators span every host, so each process must know the others are there first.
+        let (meeting, links) = meet(launch)?;
         let storage = claim(
             &mut process,
             launch,
@@ -122,7 +131,13 @@ impl MainProcess {
             host_kv_cache,
             &rank_numbers,
         )?;
-        let ranks = load_ranks(rank_runners, Backing::Serving(&storage), launch, &epoch)?;
+        let ranks = load_ranks(
+            rank_runners,
+            Backing::Serving(&storage),
+            launch,
+            &epoch,
+            meeting,
+        )?;
 
         // The resident owners are opened before any thread that borrows them, and
         // released in reverse order by `close`. The weights are mapped before the capacity plan
@@ -265,10 +280,44 @@ impl MainProcess {
             },
             build.mem_fraction_static,
         ));
+        // The links to the epoch's other main processes, over the channels `meet` opened: on the
+        // scheduler node one per peer, which the schedulers' batches go through, and on a peer the
+        // one that runs the scheduler node's batches on this process's workers.
+        let peers = match links {
+            Links::Alone => Peers::Alone,
+            Links::Accepted(channels) => {
+                let liveness = worker::peers::Liveness::new(connected.wake());
+                let remotes = channels
+                    .into_iter()
+                    .map(|(rank, channel)| {
+                        worker::peers::Remote::spawn(rank, channel, Arc::clone(&liveness))
+                    })
+                    .collect::<worker::Result<Vec<_>>>()?;
+                Peers::Scheduler { remotes, liveness }
+            }
+            Links::Registered(channel) => {
+                let liveness = worker::peers::Liveness::new(connected.wake());
+                let ranks = Arc::new(worker::batch::Workers::shared(
+                    workers.iter().map(Arc::clone).collect(),
+                )?);
+                Peers::Peer {
+                    upstream: worker::peers::Upstream::serve(
+                        channel,
+                        ranks,
+                        Arc::clone(&liveness),
+                    )?,
+                    liveness,
+                }
+            }
+        };
+        let remotes = match &peers {
+            Peers::Scheduler { remotes, .. } => remotes.clone(),
+            Peers::Alone | Peers::Peer { .. } => Vec::new(),
+        };
         // This node's schedulers, one thread per DP rank, each handing its batches to the workers
         // above through `worker::Batches`. A node that holds none keeps an empty list
-        // and serves only what its peers' schedulers ask of it; a node that is the scheduler node
-        // and holds none would accept requests and dispatch nothing, which is refused by name.
+        // and serves only what the scheduler node's batches ask of it; a node that is the scheduler
+        // node and holds none would accept requests and dispatch nothing, which is refused by name.
         let schedulers = if union.is_some() {
             let mut handles = Vec::with_capacity(workers.len());
             for (index, model_runner) in scheduled.iter().enumerate() {
@@ -281,6 +330,7 @@ impl MainProcess {
                     launch,
                     &models[index],
                     &workers[index..=index],
+                    &[],
                     &inventories[index],
                     &memories[index],
                     connected.wake(),
@@ -294,6 +344,7 @@ impl MainProcess {
                 launch,
                 &models[0],
                 &workers,
+                &remotes,
                 &inventories[0],
                 &memories[0],
                 connected.wake(),
@@ -325,6 +376,7 @@ impl MainProcess {
             control: control
                 .take()
                 .context("a main process starts on the connection it opened")?,
+            peers,
             schedulers,
             union,
             stats_reporters,
@@ -373,6 +425,7 @@ impl MainProcess {
             catalogue: model_runner.prefill_catalogue(),
             standby: launch.standby(),
             promoted: false,
+            standby_storage: launch.standby_storage,
             parked: None,
             draining: None,
             paused: false,
@@ -430,8 +483,12 @@ impl MainProcess {
     pub(super) fn close(&mut self) {
         // A shutdown finishes every request in flight as aborted, and the daemon learns that
         // from the request's own event - a connection that closes under it says only that the
-        // process ended, not which request was lost with it.
-        for served in std::mem::take(&mut self.streams) {
+        // process ended, not which request was lost with it. An epoch that lost another of its
+        // main processes is a loss and not a shutdown: its requests are left to the close of this
+        // connection, which the daemon reads as the engine's loss and migrates them on.
+        let streams = std::mem::take(&mut self.streams);
+        let lost = self.peers.lost().is_some();
+        for served in streams.into_iter().filter(|_| !lost) {
             let event = proto::request::wire::Event {
                 request: served.request,
                 kind: Some(proto::request::wire::event::Kind::Error(
@@ -449,8 +506,11 @@ impl MainProcess {
         if let Some(union) = &self.union {
             union.end();
         }
-        // The schedulers go first: their `Batches` holds a clone of every worker, and a device
-        // thread cannot be joined while a scheduler could still submit to it.
+        // The peer links close first: a scheduler waiting for a peer's answer is answered by the
+        // close, and the peers read it as this process's end. The schedulers go next: their
+        // `Batches` holds a clone of every worker, and a device thread cannot be joined while a
+        // scheduler could still submit to it.
+        self.peers.close();
         self.schedulers.clear();
         for worker in std::mem::take(&mut self.workers) {
             let Some(worker) = Arc::into_inner(worker) else {
@@ -476,5 +536,79 @@ impl MainProcess {
             }
         }
         self.control.close();
+    }
+}
+
+/// How long the scheduler node waits for every peer main process to register, and a peer for the
+/// scheduler node to accept it: each starts at once and registers before it loads anything.
+const PEER_START: Duration = Duration::from_secs(300);
+
+/// The channels to the epoch's other main processes, as [`meet`] opened them.
+enum Links {
+    /// This process holds every rank of its group.
+    Alone,
+    /// The scheduler node's: every peer's registered channel, by the first rank it serves.
+    Accepted(Vec<(u32, ipc::Channel)>),
+    /// A peer's: its channel to the scheduler node.
+    Registered(ipc::Channel),
+}
+
+/// Meets the epoch's other main processes the launch names: the scheduler node accepts every
+/// peer's registration on the listener it inherited, and a peer dials it and registers. Answers
+/// where the group's ranks form their host group, and the channels.
+///
+/// # Errors
+///
+/// Fails when a peer does not register in time, or registers for another epoch or build.
+fn meet(launch: &EngineArgs) -> Result<(Meeting, Links)> {
+    let Some(world) = &launch.world else {
+        return Ok((Meeting::Local, Links::Alone));
+    };
+    match world.inherited {
+        Some(inherited) => {
+            // SAFETY: the daemon reserved both sockets for this process and its supervisor
+            // placed them at these descriptors (`Spawn::inherit`); nothing else in the process
+            // owns them.
+            let (channel, store) = unsafe {
+                (
+                    <std::net::TcpListener as std::os::fd::FromRawFd>::from_raw_fd(
+                        inherited.channel,
+                    ),
+                    <std::net::TcpListener as std::os::fd::FromRawFd>::from_raw_fd(inherited.store),
+                )
+            };
+            let listener = ipc::Listener::from_tcp(channel)
+                .context("taking the peer listener this process inherited")?;
+            tracing::info!(
+                peers = world.peers,
+                channel = %world.channel,
+                "awaiting the epoch's peer main processes"
+            );
+            let accepted =
+                worker::peers::accept(&listener, world.peers as usize, launch.engine, PEER_START)?;
+            Ok((
+                Meeting::World {
+                    address: world.store.clone(),
+                    listener: Some(store),
+                },
+                Links::Accepted(accepted),
+            ))
+        }
+        None => {
+            let channel =
+                worker::peers::register(&world.channel, launch.rank, world.scheduler, PEER_START)?;
+            tracing::info!(
+                rank = launch.rank,
+                scheduler = %world.channel,
+                "registered with the epoch's scheduler node"
+            );
+            Ok((
+                Meeting::World {
+                    address: world.store.clone(),
+                    listener: None,
+                },
+                Links::Registered(channel),
+            ))
+        }
     }
 }

@@ -353,16 +353,10 @@ impl Roster for ProcessRoster {
         }
         let mut launch = launch.clone();
         launch.engine = generation;
-        let path =
-            crate::engine::launch::write(&crate::options::runtime_directory(), generation, &launch)
-                .map_err(|error| {
-                    format!("writing the launch file of engine {generation}: {error}")
-                })?;
-        spawn.arguments = vec![
-            "engine".to_owned(),
-            "--launch".to_owned(),
-            path.display().to_string(),
-        ];
+        // The node that starts the process writes its launch file (`Spawn::launch`).
+        spawn.launch = serde_json::to_vec(&launch)
+            .map_err(|error| format!("encoding the launch of engine {generation}: {error}"))?;
+        spawn.arguments = vec!["engine".to_owned()];
         self.launches.insert(
             generation,
             Launch {
@@ -536,8 +530,13 @@ impl Roster for ProcessRoster {
                 self.builds.insert(engine, greeting.build);
             }
         }
+        // A caller that awaits the answers to the commands it sent (a program switch outside an
+        // epoch change: the epoch's installation, a handover of its programs) reads the reports
+        // itself; draining them here would take its answers away.
         let mut drained = Vec::new();
-        while let Some((engine, report)) = self.link.commands.report(Duration::ZERO) {
+        while !self.link.commands.awaited()
+            && let Some((engine, report)) = self.link.commands.report(Duration::ZERO)
+        {
             drained.push((engine, report));
         }
         for (engine, report) in drained {
@@ -641,6 +640,7 @@ mod tests {
             arguments: vec!["engine".to_owned()],
             environment: Default::default(),
             inherit: Vec::new(),
+            launch: Vec::new(),
         }
     }
 
@@ -661,7 +661,8 @@ mod tests {
             rank: 0,
             epoch: 1,
             scheduler_node: true,
-            peers: Vec::new(),
+            world: None,
+            standby_storage: crate::options::StandbyStorage::Resident,
             watchdog_timeout_s: None,
             rollback_s: None,
             queue_depth: 4,

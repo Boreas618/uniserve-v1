@@ -184,6 +184,12 @@ message Spawn {
   // Reservations of this node whose sockets the process inherits, each at
   // the descriptor number its `Reserved` named.
   repeated uint64 inherit = 8;
+  // A main process's launch file (`proto::config::EngineArgs` as JSON); empty
+  // for any other process. The node's daemon states its own node's facts in
+  // it (its Program Server's socket), writes it to its runtime directory and
+  // passes `--launch <path>` after `arguments`, so a main process starts on
+  // any node of the deployment from the same request.
+  bytes launch = 9;
 }
 
 message Spawned {

@@ -846,6 +846,7 @@ impl ServerArgs {
             executable: self.worker_config.executable.clone(),
             join_timeout: crate::supervision::JOIN_TIMEOUT,
             devices,
+            program_server: self.program_config.clone(),
         }
     }
 }

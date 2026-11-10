@@ -1,12 +1,19 @@
 //! Starting the deployment's engine process and connecting to it.
 //!
-//! The leader daemon starts each engine process as a child of its own node's
+//! The leader daemon starts each engine process as a child of a node's
 //! supervision, through the process interface like any process of the
 //! deployment: [`EngineControl`] connects to the daemon's process socket and
-//! asks it to spawn `uniserve engine`, which connects back to the daemon's
-//! request socket and says hello. The daemon answers with the engine's
-//! specification and waits until the engine reports that it serves; the
-//! engine's process lives for as long as its control connection does.
+//! asks it to spawn `uniserve engine` on the node, which connects back to the
+//! daemon's request socket and says hello. The daemon answers with the
+//! engine's specification and waits until the engine reports that it serves;
+//! the engine's process lives for as long as its control connection does.
+//!
+//! An engine whose worker group has ranks on several hosts is one main process
+//! per host ([`world_hosts`]): the scheduler node's, on the deployment's engine
+//! host, and a peer on each other host. They are started together, the daemon
+//! having reserved on the scheduler node the two sockets the peers dial (the
+//! peer channel and the ranks' host-collective rendezvous), and the engine is
+//! the scheduler node's client, which holds its peers' and ends with them.
 
 use proto::config::EngineArgs;
 use std::collections::BTreeMap;
@@ -19,8 +26,7 @@ use proto::process::{self, command, downstream, event, hello, reply, report, req
 use proto::request::wire;
 use proto::{Connection, Listener};
 
-use crate::engine::client::{EngineClient, EngineState, StatsSink};
-use crate::engine::launch;
+use crate::engine::client::{EngineClient, EngineInfo, EngineState, StatsSink};
 
 /// The worker group a daemon supervises an engine process under.
 pub(crate) const ENGINE_GROUP: &str = "engine";
@@ -120,9 +126,6 @@ pub struct EngineControl {
     /// This node's Program Server socket, which every engine process is told
     /// to resolve an epoch's modules from (§5.3, §7.3).
     program_server: PathBuf,
-    /// Where this daemon writes the file each of its main processes reads:
-    /// the process's launch file (§2.3).
-    runtime: PathBuf,
     next_engine: AtomicU64,
     /// Engine handoffs can connect in any order. Reading and assigning
     /// their greetings is serialized; each client keeps its buffered reader.
@@ -164,7 +167,6 @@ impl EngineControl {
             host,
             deployment,
             program_server,
-            runtime: crate::options::runtime_directory(),
             next_engine: AtomicU64::new(1),
             incoming: std::sync::Mutex::new(BTreeMap::new()),
         })
@@ -204,18 +206,160 @@ impl EngineControl {
         engine: u64,
         stats: StatsSink,
     ) -> anyhow::Result<EngineClient> {
-        let launch = self.launch(args, engine)?;
-        let epoch = launch.epoch;
-        let standby = launch.standby();
-        let executable = launch
-            .engine_config
-            .worker
-            .executable
-            .to_string_lossy()
-            .into_owned();
-        let path = launch::write(&self.runtime, engine, &launch)?;
-        let mut control = self.spawn(engine, &executable, &launch.host, Self::arguments(&path))?;
-        let (mut reader, mut writer, hello) = self.accept(engine, Some(&mut control))?;
+        self.next_engine.fetch_max(engine + 1, Ordering::Relaxed);
+        let hosts = world_hosts(&args.engine_config)?;
+        // The peers' numbers follow the scheduler node's from the same counter, so one number names
+        // one process of the deployment.
+        let numbers: Vec<u64> = std::iter::once(engine)
+            .chain((1..hosts.len()).map(|_| self.next_engine.fetch_add(1, Ordering::Relaxed)))
+            .collect();
+        self.start_world(args, &numbers, stats)
+    }
+
+    /// Starts the engine of `args` as one main process per host of its worker group, numbered
+    /// `numbers` in [`world_hosts`]'s order (the scheduler node's first), and returns the scheduler
+    /// node's client, which holds the peers'. Each process reports that it serves, or that it
+    /// stands by when `args` names a predecessor.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`EngineControl::start`] does, for any of the processes; a process that started is
+    /// ended with its control connection.
+    pub fn start_world(
+        &self,
+        args: EngineArgs,
+        numbers: &[u64],
+        stats: StatsSink,
+    ) -> anyhow::Result<EngineClient> {
+        let hosts = world_hosts(&args.engine_config)?;
+        anyhow::ensure!(
+            numbers.len() == hosts.len(),
+            "{} engine numbers for the main processes of {} hosts",
+            numbers.len(),
+            hosts.len()
+        );
+        for number in numbers {
+            self.next_engine.fetch_max(number + 1, Ordering::Relaxed);
+        }
+        let world_size = hosts.iter().map(|host| host.devices.len()).sum::<usize>();
+        let world_size = u32::try_from(world_size).context("a world wider than u32 ranks")?;
+        let interfaces = Interfaces {
+            requests: &self.request_address,
+            processes: &self.processes,
+            program_server: &self.program_server,
+        };
+        let mut launches = hosts
+            .iter()
+            .zip(numbers)
+            .map(|(host, number)| place_on(args.clone(), *number, &interfaces, host, world_size))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        // A new epoch takes its first engine's number, on every host.
+        let epoch = launches[0].epoch;
+        for launch in &mut launches {
+            launch.epoch = epoch;
+        }
+        let mut inherit = vec![Vec::new(); launches.len()];
+        if launches.len() > 1 {
+            let (channel, store) = self.reserve_world(&hosts[0].host)?;
+            let world = proto::config::World {
+                scheduler: numbers[0],
+                channel: channel.address.clone(),
+                store: store.address.clone(),
+                peers: u32::try_from(launches.len() - 1).unwrap_or(u32::MAX),
+                inherited: None,
+            };
+            for launch in &mut launches {
+                launch.world = Some(world.clone());
+            }
+            if let Some(scheduler) = launches[0].world.as_mut() {
+                scheduler.inherited = Some(proto::config::Inherited {
+                    channel: channel.descriptor,
+                    store: store.descriptor,
+                });
+            }
+            inherit[0] = vec![channel.reservation, store.reservation];
+            tracing::info!(
+                hosts = ?hosts.iter().map(|host| host.host.as_str()).collect::<Vec<_>>(),
+                engines = ?numbers,
+                channel = %world.channel,
+                store = %world.store,
+                "starting an engine whose worker group spans hosts"
+            );
+        }
+        let standby = launches[0].standby();
+
+        // Every process starts before any is awaited: the scheduler node's waits for its peers.
+        let mut controls = Vec::with_capacity(launches.len());
+        for (launch, inherit) in launches.iter().zip(inherit) {
+            controls.push(self.spawn(launch, inherit)?);
+        }
+        let mut links = Vec::with_capacity(launches.len());
+        for (launch, control) in launches.iter().zip(controls.iter_mut()) {
+            links.push(self.welcome(launch.engine, control)?);
+        }
+        let started = await_started(&mut links, &mut controls, &launches, standby)?;
+
+        let mut clients = Vec::with_capacity(launches.len());
+        let mut sinks = std::iter::once(stats);
+        for (((reader, writer), control), (launch, (info, state))) in links
+            .into_iter()
+            .zip(controls)
+            .zip(launches.iter().zip(started))
+        {
+            // A peer holds no scheduler, so it reports no statistics.
+            let sink = sinks.next().unwrap_or_else(|| Box::new(|_, _, _| {}));
+            clients.push(
+                EngineClient::new(reader, writer, info, state, sink, Some(control))?
+                    .numbered(launch.engine)
+                    .in_epoch(epoch)
+                    .on_host(&launch.host),
+            );
+        }
+        let mut clients = clients.into_iter();
+        let scheduler = clients.next().context("an engine of no main process")?;
+        Ok(scheduler.with_peers(clients.collect()))
+    }
+
+    /// Reserves on `host` the world's two sockets, which the scheduler node's process inherits:
+    /// its peer channel's listener and its ranks' host-collective rendezvous.
+    fn reserve_world(&self, host: &str) -> anyhow::Result<(process::Reserved, process::Reserved)> {
+        let (mut control, _) = self.connect()?;
+        let mut reserve = |id| -> anyhow::Result<process::Reserved> {
+            control.send(&process::Upstream {
+                kind: Some(upstream::Kind::Request(process::Request {
+                    id,
+                    kind: Some(request::Kind::Reserve(process::Reserve {
+                        host: host.to_owned(),
+                        group: ENGINE_GROUP.to_owned(),
+                        engine: 0,
+                        routable: true,
+                    })),
+                })),
+            })?;
+            let reply = await_reply(&mut control, id, "a reservation")?;
+            anyhow::ensure!(
+                reply.error.is_empty(),
+                "reserving a socket on {host}: {}",
+                reply.error
+            );
+            match reply.kind {
+                Some(reply::Kind::Reserved(reserved)) => Ok(reserved),
+                _ => anyhow::bail!("the daemon answered a reservation with another reply"),
+            }
+        };
+        let channel = reserve(1)?;
+        let store = reserve(2)?;
+        Ok((channel, store))
+    }
+
+    /// Accepts engine `engine`'s request link and welcomes it, or refuses it when it speaks
+    /// another major version or states another number.
+    fn welcome(
+        &self,
+        engine: u64,
+        control: &mut Connection,
+    ) -> anyhow::Result<(Connection, Connection)> {
+        let (reader, mut writer, hello) = self.accept(engine, Some(control))?;
         let refusal = if hello.major != proto::PROTOCOL_MAJOR {
             format!(
                 "the engine speaks major version {} and this daemon {}",
@@ -234,57 +378,7 @@ impl EngineControl {
         })?;
         anyhow::ensure!(refusal.is_empty(), "refused the engine process: {refusal}");
         tracing::info!(engine, build = %hello.build, "the engine process connected; awaiting its start");
-
-        // The engine reports itself starting, then ready or failed. Its
-        // process's exit, which the control connection reports, ends the
-        // wait too.
-        loop {
-            match reader.try_recv::<wire::FromEngine>()? {
-                Some(wire::FromEngine {
-                    kind: Some(wire::from_engine::Kind::State(state)),
-                }) => match wire::EngineState::try_from(state.state) {
-                    Ok(started @ (wire::EngineState::Ready | wire::EngineState::Standby))
-                        if (started == wire::EngineState::Standby) == standby =>
-                    {
-                        let info = state.info.context("the engine reported no info")?;
-                        let state = if standby {
-                            tracing::info!(engine, "the engine is prepared beside its predecessor");
-                            EngineState::Standby
-                        } else {
-                            tracing::info!(
-                                engine,
-                                schedulers = info.schedulers,
-                                "the engine serves"
-                            );
-                            EngineState::Ready
-                        };
-                        return EngineClient::new(
-                            reader,
-                            writer,
-                            info.into(),
-                            state,
-                            stats,
-                            // The process lives as long as its control
-                            // connection.
-                            Some(control),
-                        )
-                        .map(|client| client.numbered(engine).in_epoch(epoch));
-                    }
-                    Ok(wire::EngineState::Failed) => {
-                        // The failed engine closes its workers and exits;
-                        // their storage is free once it has.
-                        await_exit(&mut reader, &mut control, FAILED_EXIT);
-                        anyhow::bail!("the engine failed to start: {}", state.error);
-                    }
-                    _ => {}
-                },
-                Some(_) => {}
-                None => {
-                    exited(&mut control)?;
-                    reader.wait(POLL_INTERVAL)?;
-                }
-            }
-        }
+        Ok((reader, writer))
     }
 
     /// The request socket's address, which an engine attaches to
@@ -583,19 +677,7 @@ impl EngineControl {
         Ok(hosts)
     }
 
-    /// The arguments of a main process: its program name and the launch file
-    /// the daemon wrote for it, and nothing else. Everything the process needs
-    /// is in that file, so a flag beside it would be a second account of the
-    /// same thing.
-    fn arguments(launch: &Path) -> Vec<String> {
-        vec![
-            "engine".to_owned(),
-            "--launch".to_owned(),
-            launch.display().to_string(),
-        ]
-    }
-
-    /// The launch file's contents for the process `engine`: `args`, with this
+    /// The launch file's contents for the scheduler node's process `engine`: `args`, with this
     /// control's statement of the process's place and interfaces ([`place`]).
     ///
     /// # Errors
@@ -606,7 +688,6 @@ impl EngineControl {
             args,
             engine,
             &Interfaces {
-                host: &self.host,
                 requests: &self.request_address,
                 processes: &self.processes,
                 program_server: &self.program_server,
@@ -626,6 +707,12 @@ impl EngineControl {
         args: &EngineArgs,
         engine: u64,
     ) -> anyhow::Result<crate::updates::switch::Start> {
+        anyhow::ensure!(
+            world_hosts(&args.engine_config)?.len() == 1,
+            "an epoch switch starts the target's main processes from one launch, and a worker \
+             group with ranks on several hosts starts one per host: such a deployment changes \
+             epochs by a relaunch"
+        );
         let launch = self.launch(args.clone(), engine)?;
         let executable = launch
             .engine_config
@@ -641,13 +728,11 @@ impl EngineControl {
         })
     }
 
-    fn spawn(
-        &self,
-        engine: u64,
-        executable: &str,
-        host: &str,
-        arguments: Vec<String>,
-    ) -> anyhow::Result<Connection> {
+    /// Has the daemon of `launch`'s host start the main process `launch` describes, inheriting the
+    /// sockets of `inherit`; returns the control connection the process lives under.
+    fn spawn(&self, launch: &EngineArgs, inherit: Vec<u64>) -> anyhow::Result<Connection> {
+        let engine = launch.engine;
+        let host = launch.host.as_str();
         let (mut control, nodes) = self.connect()?;
         anyhow::ensure!(
             nodes.iter().any(|node| node.host == host),
@@ -658,44 +743,44 @@ impl EngineControl {
             "a remote engine needs the deployment's network control address"
         );
 
-        let executable = executable.to_owned();
+        let executable = launch
+            .engine_config
+            .worker
+            .executable
+            .to_string_lossy()
+            .into_owned();
         control.send(&process::Upstream {
             kind: Some(upstream::Kind::Request(process::Request {
                 id: 1,
                 kind: Some(request::Kind::Spawn(process::Spawn {
                     host: host.to_owned(),
                     group: ENGINE_GROUP.to_owned(),
-                    rank: 0,
+                    rank: launch.rank,
                     generation: engine,
                     executable,
-                    arguments,
+                    arguments: vec!["engine".to_owned()],
                     environment: main_process_environment(),
-                    ..process::Spawn::default()
+                    inherit,
+                    // The node that starts the process writes its launch file.
+                    launch: serde_json::to_vec(launch).context("encoding the launch file")?,
                 })),
             })),
         })?;
-        let deadline = Instant::now() + DAEMON_TIMEOUT;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            anyhow::ensure!(
-                !remaining.is_zero(),
-                "the daemon did not start the engine in time"
+        let answer = await_reply(&mut control, 1, "the engine's start")?;
+        anyhow::ensure!(
+            answer.error.is_empty(),
+            "starting the engine process on {host}: {}",
+            answer.error
+        );
+        if let Some(reply::Kind::Spawned(spawned)) = answer.kind {
+            tracing::info!(
+                engine,
+                host,
+                pid = spawned.pid,
+                "started the engine process"
             );
-            let Some(message) = control.recv::<process::Downstream>(remaining)? else {
-                continue;
-            };
-            if let Some(downstream::Kind::Reply(answer)) = message.kind {
-                anyhow::ensure!(
-                    answer.error.is_empty(),
-                    "starting the engine process: {}",
-                    answer.error
-                );
-                if let Some(reply::Kind::Spawned(spawned)) = answer.kind {
-                    tracing::info!(engine, pid = spawned.pid, "started the engine process");
-                }
-                return Ok(control);
-            }
         }
+        Ok(control)
     }
 
     /// Accepts engine `engine`'s connection to the request socket, failing
@@ -781,6 +866,95 @@ impl EngineControl {
 impl Drop for EngineControl {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+/// Reads the reply `id` on a control connection, within the daemon's answer time.
+fn await_reply(control: &mut Connection, id: u64, what: &str) -> anyhow::Result<process::Reply> {
+    let deadline = Instant::now() + DAEMON_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        anyhow::ensure!(
+            !remaining.is_zero(),
+            "the daemon did not answer {what} in time"
+        );
+        let Some(message) = control.recv::<process::Downstream>(remaining)? else {
+            continue;
+        };
+        if let Some(downstream::Kind::Reply(answer)) = message.kind
+            && answer.id == id
+        {
+            return Ok(answer);
+        }
+    }
+}
+
+/// Waits until every process of a world reported that it serves, or that it stands by when
+/// `standby`, and answers what each reported. The first failure ends the wait: a process that
+/// reports its start failed, or exits, as its control connection says.
+fn await_started(
+    links: &mut [(Connection, Connection)],
+    controls: &mut [Connection],
+    launches: &[EngineArgs],
+    standby: bool,
+) -> anyhow::Result<Vec<(EngineInfo, EngineState)>> {
+    let mut started: Vec<Option<(EngineInfo, EngineState)>> =
+        (0..links.len()).map(|_| None).collect();
+    loop {
+        for (index, (reader, _)) in links.iter_mut().enumerate() {
+            if started[index].is_some() {
+                continue;
+            }
+            let engine = launches[index].engine;
+            let host = &launches[index].host;
+            while let Some(message) = reader.try_recv::<wire::FromEngine>()? {
+                let Some(wire::from_engine::Kind::State(state)) = message.kind else {
+                    continue;
+                };
+                match wire::EngineState::try_from(state.state) {
+                    Ok(reported @ (wire::EngineState::Ready | wire::EngineState::Standby))
+                        if (reported == wire::EngineState::Standby) == standby =>
+                    {
+                        let info = state.info.context("the engine reported no info")?;
+                        let state = if standby {
+                            tracing::info!(
+                                engine,
+                                host,
+                                "the engine is prepared beside its predecessor"
+                            );
+                            EngineState::Standby
+                        } else {
+                            tracing::info!(
+                                engine,
+                                host,
+                                schedulers = info.schedulers,
+                                "the engine serves"
+                            );
+                            EngineState::Ready
+                        };
+                        started[index] = Some((info.into(), state));
+                        break;
+                    }
+                    Ok(wire::EngineState::Failed) => {
+                        // The failed engine closes its workers and exits;
+                        // their storage is free once it has.
+                        await_exit(reader, &mut controls[index], FAILED_EXIT);
+                        anyhow::bail!("the engine on {host} failed to start: {}", state.error);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if started.iter().all(Option::is_some) {
+            return Ok(started.into_iter().flatten().collect());
+        }
+        for (index, control) in controls.iter_mut().enumerate() {
+            if started[index].is_none() {
+                exited(control)
+                    .with_context(|| format!("the engine on {}", launches[index].host))?;
+            }
+        }
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -1158,6 +1332,7 @@ fn selected(selector: Selector, program: &proto::program::Program) -> program_se
 /// One epoch's main process on a node, and the daemon's process connection
 /// to it: the connection its `Report`s arrive on and the `Command`s go down
 /// (§2.3, §7.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EpochProcess {
     /// The node the main process runs on.
     pub host: String,
@@ -1300,47 +1475,47 @@ impl<'a> ProgramSwitch<'a> {
         generations.clear();
         for process in processes.iter() {
             send(commands, process, command.clone(), "Precopy")?;
-            let prepared = await_report(
-                commands,
-                process,
-                update,
-                PRECOPY_TIMEOUT,
-                "Precopy",
-                |report| match report.kind.as_ref() {
-                    Some(report::Kind::Precopied(precopied)) => {
-                        // The answer carries the operators this update could
-                        // not compare, and an empty list is the statement that
-                        // every replaced operator was (process.proto,
-                        // `Precopied`). Nothing else prints it: a generation
-                        // with no shadow evidence for part of what it changed
-                        // would read exactly like one with evidence for all of
-                        // it, which is what an update's trial rests on.
-                        if !precopied.uncompared.is_empty() {
-                            tracing::warn!(
-                                host = %process.host,
-                                engine = process.engine,
-                                uncompared = ?precopied.uncompared,
-                                "a generation was prepared with operators it could not compare",
-                            );
-                        }
-                        Some(Ok(precopied.generation))
+        }
+        let prepared = await_reports(
+            commands,
+            processes,
+            update,
+            PRECOPY_TIMEOUT,
+            "Precopy",
+            |process, report| match report.kind.as_ref() {
+                Some(report::Kind::Precopied(precopied)) => {
+                    // The answer carries the operators this update could
+                    // not compare, and an empty list is the statement that
+                    // every replaced operator was (process.proto,
+                    // `Precopied`). Nothing else prints it: a generation
+                    // with no shadow evidence for part of what it changed
+                    // would read exactly like one with evidence for all of
+                    // it, which is what an update's trial rests on.
+                    if !precopied.uncompared.is_empty() {
+                        tracing::warn!(
+                            host = %process.host,
+                            engine = process.engine,
+                            uncompared = ?precopied.uncompared,
+                            "a generation was prepared with operators it could not compare",
+                        );
                     }
-                    Some(report::Kind::PrecopyFailed(failed)) => Some(Err(crate::epoch::Failure {
-                        kind: "precopy_failed".to_owned(),
-                        reason: failed.reason.clone(),
-                        device: None,
-                    })),
-                    _ => None,
-                },
-            );
-            match prepared {
-                Ok(generation) => generations.push(generation),
-                Err(failure) => {
-                    // What was prepared is not switchable as a set: the
-                    // serving generation stays, and no generation moves.
-                    generations.clear();
-                    return Err(failure);
+                    Some(Ok(precopied.generation))
                 }
+                Some(report::Kind::PrecopyFailed(failed)) => Some(Err(crate::epoch::Failure {
+                    kind: "precopy_failed".to_owned(),
+                    reason: failed.reason.clone(),
+                    device: None,
+                })),
+                _ => None,
+            },
+        );
+        match prepared {
+            Ok(prepared) => *generations = prepared,
+            Err(failure) => {
+                // What was prepared is not switchable as a set: the
+                // serving generation stays, and no generation moves.
+                generations.clear();
+                return Err(failure);
             }
         }
         Ok(())
@@ -1356,6 +1531,8 @@ impl<'a> ProgramSwitch<'a> {
     /// does not answer, or a call before [`Self::precopy`].
     pub fn switchover(&mut self) -> Result<(), crate::epoch::Failure> {
         self.prepared()?;
+        // Every process switches before any answer is awaited: a switchover warms the generation
+        // up, and the ranks of a group that spans processes capture their collectives together.
         for (process, generation) in self.processes.iter().zip(self.generations.clone()) {
             send(
                 self.commands,
@@ -1367,36 +1544,43 @@ impl<'a> ProgramSwitch<'a> {
                 },
                 "Switchover",
             )?;
-            await_report(
-                self.commands,
-                process,
-                &mut self.update,
-                COMMAND_TIMEOUT,
-                "Switchover",
-                |report| match report.kind.as_ref() {
-                    Some(report::Kind::Switched(switched)) => {
-                        Some(answered(report, switched.generation == generation))
-                    }
-                    // A generation that cannot warm up is answered with a
-                    // refusal, never with `Switched`: discarded before it took
-                    // over (`PrecopyFailed`) or reverted after it did
-                    // (`Reverted`). Waiting for the switchover answer would
-                    // turn a named engine failure into two minutes of silence
-                    // and then a timeout.
-                    Some(report::Kind::PrecopyFailed(failed)) => Some(Err(crate::epoch::Failure {
-                        kind: "precopy_failed".to_owned(),
-                        reason: failed.reason.clone(),
-                        device: None,
-                    })),
-                    Some(report::Kind::Reverted(reverted)) => Some(Err(crate::epoch::Failure {
-                        kind: "reverted".to_owned(),
-                        reason: reverted.reason.clone(),
-                        device: None,
-                    })),
-                    _ => None,
-                },
-            )?;
         }
+        let generations: BTreeMap<u64, u64> = self
+            .processes
+            .iter()
+            .map(|process| process.engine)
+            .zip(self.generations.iter().copied())
+            .collect();
+        await_reports(
+            self.commands,
+            &self.processes,
+            &mut self.update,
+            COMMAND_TIMEOUT,
+            "Switchover",
+            |process, report| match report.kind.as_ref() {
+                Some(report::Kind::Switched(switched)) => Some(answered(
+                    report,
+                    generations.get(&process.engine) == Some(&switched.generation),
+                )),
+                // A generation that cannot warm up is answered with a
+                // refusal, never with `Switched`: discarded before it took
+                // over (`PrecopyFailed`) or reverted after it did
+                // (`Reverted`). Waiting for the switchover answer would
+                // turn a named engine failure into two minutes of silence
+                // and then a timeout.
+                Some(report::Kind::PrecopyFailed(failed)) => Some(Err(crate::epoch::Failure {
+                    kind: "precopy_failed".to_owned(),
+                    reason: failed.reason.clone(),
+                    device: None,
+                })),
+                Some(report::Kind::Reverted(reverted)) => Some(Err(crate::epoch::Failure {
+                    kind: "reverted".to_owned(),
+                    reason: reverted.reason.clone(),
+                    device: None,
+                })),
+                _ => None,
+            },
+        )?;
         Ok(())
     }
 
@@ -1411,23 +1595,19 @@ impl<'a> ProgramSwitch<'a> {
         let command = process::Command {
             kind: Some(command::Kind::Commit(process::Commit {})),
         };
-        let mut acknowledged = 0;
         for process in self.processes.iter() {
             send(self.commands, process, command.clone(), "Commit")?;
-            await_report(
-                self.commands,
-                process,
-                &mut self.update,
-                COMMAND_TIMEOUT,
-                "Commit",
-                |report| {
-                    matches!(report.kind.as_ref(), Some(report::Kind::Committed(_)))
-                        .then_some(Ok(()))
-                },
-            )?;
-            acknowledged += 1;
         }
-        debug_assert_eq!(acknowledged, self.processes.len());
+        await_reports(
+            self.commands,
+            &self.processes,
+            &mut self.update,
+            COMMAND_TIMEOUT,
+            "Commit",
+            |_, report| {
+                matches!(report.kind.as_ref(), Some(report::Kind::Committed(_))).then_some(Ok(()))
+            },
+        )?;
         self.update.commit();
         Ok(())
     }
@@ -1448,24 +1628,29 @@ impl<'a> ProgramSwitch<'a> {
             })),
         };
         let mut outcome = Ok(());
+        let mut sent = Vec::with_capacity(self.processes.len());
         for process in self.processes.iter() {
-            let answered = send(self.commands, process, command.clone(), "Revert").and_then(|()| {
-                await_report(
-                    self.commands,
-                    process,
-                    &mut self.update,
-                    COMMAND_TIMEOUT,
-                    "Revert",
-                    |report| {
-                        matches!(report.kind.as_ref(), Some(report::Kind::Reverted(_)))
-                            .then_some(Ok(()))
-                    },
-                )
-            });
-            if let Err(failure) = answered {
-                self.update.fail(failure.clone());
-                outcome = Err(failure);
+            match send(self.commands, process, command.clone(), "Revert") {
+                Ok(()) => sent.push(process.clone()),
+                Err(failure) => {
+                    self.update.fail(failure.clone());
+                    outcome = Err(failure);
+                }
             }
+        }
+        let answered = await_reports(
+            self.commands,
+            &sent,
+            &mut self.update,
+            COMMAND_TIMEOUT,
+            "Revert",
+            |_, report| {
+                matches!(report.kind.as_ref(), Some(report::Kind::Reverted(_))).then_some(Ok(()))
+            },
+        );
+        if let Err(failure) = answered {
+            self.update.fail(failure.clone());
+            outcome = Err(failure);
         }
         self.update.revert();
         outcome
@@ -1490,17 +1675,17 @@ impl<'a> ProgramSwitch<'a> {
                 },
                 "Purge",
             )?;
-            await_report(
-                self.commands,
-                process,
-                &mut self.update,
-                COMMAND_TIMEOUT,
-                "Purge",
-                |report| {
-                    matches!(report.kind.as_ref(), Some(report::Kind::Purged(_))).then_some(Ok(()))
-                },
-            )?;
         }
+        await_reports(
+            self.commands,
+            &self.processes,
+            &mut self.update,
+            COMMAND_TIMEOUT,
+            "Purge",
+            |_, report| {
+                matches!(report.kind.as_ref(), Some(report::Kind::Purged(_))).then_some(Ok(()))
+            },
+        )?;
         Ok(())
     }
 
@@ -1548,43 +1733,53 @@ fn send(
     sent
 }
 
-/// Reads the reports the main processes send until `matches` takes one from
-/// this process: the answer to the command that waits, or the failure that
-/// ends the wait. A failure report from any main process fails the update
-/// with the first such failure (§7.3 step 4); an acknowledgement for another
-/// process's command is not this wait's. A `Warming` report of this process
-/// is its warmup moving on to another capture, and restarts `timeout`: the
-/// wait ends on a main process that stops making progress, not on a long
-/// catalogue.
-fn await_report<T>(
+/// Reads the reports the main processes send until `matches` took one from each of `processes`:
+/// the answers to the command every one of them was sent, in `processes`' order, or the failure
+/// that ends the wait. A failure report from any main process fails the update with the first such
+/// failure (§7.3 step 4); a report of a process this wait does not list, or of one that answered
+/// already, is not this wait's. A `Warming` report of a listed process is its warmup moving on to
+/// another capture, and restarts `timeout`: the wait ends on a main process that stops making
+/// progress, not on a long catalogue.
+///
+/// The command goes to every process before any answer is awaited, so the processes of a worker
+/// group that spans hosts carry it out together: a switchover's warmup captures collectives every
+/// rank must reach.
+fn await_reports<T>(
     commands: &crate::supervision::ProcessCommands,
-    process: &EpochProcess,
+    processes: &[EpochProcess],
     update: &mut crate::epoch::Update,
     timeout: Duration,
     what: &str,
-    matches: impl Fn(&process::Report) -> Option<Result<T, crate::epoch::Failure>>,
-) -> Result<T, crate::epoch::Failure> {
+    matches: impl Fn(&EpochProcess, &process::Report) -> Option<Result<T, crate::epoch::Failure>>,
+) -> Result<Vec<T>, crate::epoch::Failure> {
+    let _awaiting = commands.awaiting();
+    let mut answers: Vec<Option<T>> = processes.iter().map(|_| None).collect();
     let mut deadline = Instant::now() + timeout;
-    loop {
+    while let Some(waiting) = answers.iter().position(Option::is_none) {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(unanswered(process, timeout, what));
+            return Err(unanswered(&processes[waiting], timeout, what));
         }
         let Some((engine, report)) = commands.report(remaining) else {
-            return Err(unanswered(process, timeout, what));
+            return Err(unanswered(&processes[waiting], timeout, what));
         };
         if let Some(failure) = crate::epoch::Failure::of_report(&report) {
             update.fail(failure.clone());
             return Err(failure);
         }
-        if engine != process.engine {
+        let Some(index) = processes
+            .iter()
+            .position(|process| process.engine == engine)
+            .filter(|&index| answers[index].is_none())
+        else {
             tracing::debug!(
                 engine,
-                waiting_for = process.engine,
+                command = what,
                 "a main process reported while a switch waited"
             );
             continue;
-        }
+        };
+        let process = &processes[index];
         if let Some(process::report::Kind::Warming(warming)) = report.kind.as_ref() {
             tracing::info!(
                 host = %process.host,
@@ -1597,19 +1792,25 @@ fn await_report<T>(
             deadline = Instant::now() + timeout;
             continue;
         }
-        if let Some(outcome) = matches(&report) {
-            if let Err(failure) = &outcome {
-                update.fail(failure.clone());
+        if let Some(outcome) = matches(process, &report) {
+            match outcome {
+                Ok(answer) => {
+                    tracing::info!(
+                        host = %process.host,
+                        engine = process.engine,
+                        command = what,
+                        "a main process answered"
+                    );
+                    answers[index] = Some(answer);
+                }
+                Err(failure) => {
+                    update.fail(failure.clone());
+                    return Err(failure);
+                }
             }
-            tracing::info!(
-                host = %process.host,
-                engine = process.engine,
-                command = what,
-                "a main process answered"
-            );
-            return outcome;
         }
     }
+    Ok(answers.into_iter().flatten().collect())
 }
 
 /// The failure of a main process that did not answer within its time.
@@ -1652,8 +1853,6 @@ fn unanswerable(host: &str, error: impl std::fmt::Display) -> crate::epoch::Fail
 
 /// What a node's main process reaches, as its launch file states it.
 pub(crate) struct Interfaces<'a> {
-    /// The node's host identity: the deployment's engine host must be this one.
-    pub(crate) host: &'a str,
     /// The leader daemon's request interface.
     pub(crate) requests: &'a str,
     /// The daemon's process interface.
@@ -1662,9 +1861,9 @@ pub(crate) struct Interfaces<'a> {
     pub(crate) program_server: &'a Path,
 }
 
-/// The launch file's contents for the process `engine` on the node `interfaces` describes:
-/// `args`, with the process's place in the deployment (its devices, group, rank and world) and
-/// its interfaces stated.
+/// The launch file's contents for the scheduler node's process `engine`: `args`, with the
+/// process's place in the deployment (its devices, group, first rank and world) and the interfaces
+/// `interfaces` states. The scheduler node is the deployment's engine host.
 ///
 /// A value the file requires and the daemon cannot state is an error here
 /// rather than a default: the engine refuses a launch file that lacks one,
@@ -1672,64 +1871,121 @@ pub(crate) struct Interfaces<'a> {
 ///
 /// # Errors
 ///
-/// Fails for a configuration of no model, an engine host that is not this
-/// node (a child on another host does not share this daemon's runtime
-/// directory), a rank of this host on a device that is not CUDA's, and a
-/// queue depth the file cannot hold.
+/// Fails for a configuration of no model, ranks the engine host does not lead
+/// ([`world_hosts`]), a rank on a device that is not CUDA's, and a queue depth
+/// the file cannot hold.
 pub(crate) fn place(
+    args: EngineArgs,
+    engine: u64,
+    interfaces: &Interfaces<'_>,
+) -> anyhow::Result<EngineArgs> {
+    let hosts = world_hosts(&args.engine_config)?;
+    let world_size = hosts.iter().map(|host| host.devices.len()).sum::<usize>();
+    place_on(
+        args,
+        engine,
+        interfaces,
+        &hosts[0],
+        u32::try_from(world_size).context("a world wider than u32 ranks")?,
+    )
+}
+
+/// The ranks of the deployment's worker groups one host holds: a main process's place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostRanks {
+    /// The host, by host identity.
+    pub(crate) host: String,
+    /// The group rank of its first rank; its others follow it.
+    pub(crate) first: u32,
+    /// The CUDA ordinals of its ranks, in rank order.
+    pub(crate) devices: Vec<u32>,
+}
+
+/// The hosts of the deployment's worker groups, the engine host first, each with the consecutive
+/// ranks it holds: one main process per host serves an epoch (`docs/architecture.md`, The
+/// channel), the engine host's holding rank 0 and the schedulers.
+///
+/// # Errors
+///
+/// Fails when the engine host holds no rank or not rank 0, when a host's ranks are not
+/// consecutive, or as [`local_devices`] fails.
+pub(crate) fn world_hosts(config: &proto::config::EngineConfig) -> anyhow::Result<Vec<HostRanks>> {
+    let engine_host = &config.parallel.engine_host;
+    let mut order: Vec<String> = Vec::new();
+    let mut previous: Option<&str> = None;
+    for rank in config
+        .parallel
+        .worker_groups
+        .iter()
+        .flat_map(|group| group.ranks.iter())
+    {
+        if previous != Some(rank.host.as_str()) {
+            anyhow::ensure!(
+                !order.contains(&rank.host),
+                "the ranks of host {} are not consecutive: a host's main process serves one run \
+                 of its group's ranks",
+                rank.host
+            );
+            order.push(rank.host.clone());
+            previous = Some(rank.host.as_str());
+        }
+    }
+    anyhow::ensure!(
+        order.first() == Some(engine_host),
+        "the deployment's first rank runs on {:?} and its engine host is {engine_host}: the engine \
+         host's main process holds rank 0 and the schedulers",
+        order.first()
+    );
+    let mut first = 0_u32;
+    let mut hosts = Vec::with_capacity(order.len());
+    for host in order {
+        let devices = local_devices(&host, config)?;
+        let count = u32::try_from(devices.len()).context("a host of more than u32 ranks")?;
+        hosts.push(HostRanks {
+            host,
+            first,
+            devices,
+        });
+        first += count;
+    }
+    Ok(hosts)
+}
+
+/// The launch file's contents for the process `engine` on `host`, in a world of `world_size`
+/// ranks: `args`, with the process's place and the interfaces `interfaces` states. The node that
+/// starts it states its own Program Server (`Spawn::launch`).
+fn place_on(
     mut args: EngineArgs,
     engine: u64,
     interfaces: &Interfaces<'_>,
+    host: &HostRanks,
+    world_size: u32,
 ) -> anyhow::Result<EngineArgs> {
     let config = &args.engine_config;
     anyhow::ensure!(
         !config.model.model.is_empty(),
         "the engine configuration names no model"
     );
-    // Form (A): the child opens the launch file this daemon wrote, so it
-    // has to be this daemon's own host. A remote host needs the launch
-    // contents carried in `process::Spawn`, which the protocol does not do
-    // yet, and a path that exists only here would fail in the child.
-    anyhow::ensure!(
-        config.parallel.engine_host == interfaces.host,
-        "engine host {} is not this node ({}), whose runtime directory the launch file is \
-         written to: a main process on another host needs the launch contents carried in \
-         `process::Spawn`",
-        config.parallel.engine_host,
-        interfaces.host
-    );
-    // The devices are the deployment's own: each host's ranks are on the
-    // ordinals the shorthand gives them (`0..` in rank order), or on the
-    // order `device_config.devices` names, which the shorthand has already
-    // folded into the ranks. Reading them from the ranks is the one account:
-    // a config that states no order still gives this node's ranks their
-    // devices, and a rank on `cpu` is refused here rather than in the child.
-    let devices = local_devices(interfaces.host, config)?;
     let queue_depth = u32::try_from(config.device.queue_depth.get())
         .context("`device_config.queue_depth` exceeds the launch file's field")?;
+    let scheduler_node = host.host == config.parallel.engine_host;
     // A new epoch takes the identity of its first engine; an engine that
     // replaces a lost one goes on with its epoch.
     if args.epoch == 0 {
         args.epoch = engine;
     }
-    // One main process per node today, so it has no peer to accept: the
-    // world is this rank alone. A deployment that starts more states their
-    // addresses here, and the world grows with them (exec's rule: the
-    // epoch is its peers and itself).
-    let peers: Vec<String> = Vec::new();
-    args.world_size = u32::try_from(peers.len() + 1).unwrap_or(u32::MAX);
-    args.host = interfaces.host.to_owned();
+    args.world_size = world_size;
+    args.host = host.host.clone();
     args.requests = interfaces.requests.to_owned();
     args.processes = interfaces.processes.to_owned();
     args.engine = engine;
     args.program_server = interfaces.program_server.display().to_string();
-    args.devices = devices;
+    args.devices = host.devices.clone();
     args.group = ENGINE_GROUP.to_owned();
-    args.rank = 0;
-    // The check above makes this node the engine's host, and the
-    // deployment keeps one scheduler node, which is this one.
-    args.scheduler_node = true;
-    args.peers = peers;
+    args.rank = host.first;
+    args.scheduler_node = scheduler_node;
+    // The world is stated by the start that reserves its sockets.
+    args.world = None;
     // Both are the epoch's, and the epoch states them in its engine
     // configuration, which the child reads.
     args.watchdog_timeout_s = None;
@@ -1792,11 +2048,10 @@ mod tests {
     use crate::engine::stand_in::{Answer, Seen, main_processes, process};
     use crate::options::ServerArgs;
 
-    /// A launch places the process on this node's devices, as the deployment's ranks name them,
-    /// with the interfaces the node states and none it does not; a deployment whose engine runs
-    /// on another host is refused, because its launch file could not be read there.
+    /// A launch places the scheduler node's process on the engine host's devices, as the
+    /// deployment's ranks name them, with the interfaces the leader states and none it does not.
     #[test]
-    fn a_launch_places_the_process_on_this_nodes_devices() {
+    fn a_launch_places_the_process_on_the_engine_hosts_devices() {
         let mut options = ServerArgs {
             model: Some("/models/qwen3".to_owned()),
             host_identity: "rank-0".to_owned(),
@@ -1805,25 +2060,53 @@ mod tests {
         };
         options.device_config.devices = vec![6, 7];
         let args = EngineArgs::new(options.engine_config().expect("the configuration resolves"));
-        let interfaces = |host| Interfaces {
-            host,
+        let interfaces = Interfaces {
             requests: "",
             processes: "",
             program_server: Path::new(""),
         };
 
-        let placed = place(args.clone(), 1, &interfaces("rank-0")).expect("the process places");
+        let placed = place(args, 1, &interfaces).expect("the process places");
         assert_eq!(placed.devices, vec![6, 7]);
         assert_eq!(placed.host, "rank-0");
         assert_eq!(placed.engine, 1);
         // A new epoch takes its first engine's number.
         assert_eq!(placed.epoch, 1);
-        assert_eq!((placed.rank, placed.world_size), (0, 1));
+        assert_eq!((placed.rank, placed.world_size), (0, 2));
         assert!(placed.scheduler_node);
+        assert!(placed.world.is_none());
         assert!(placed.requests.is_empty() && placed.processes.is_empty());
         assert!(placed.program_server.is_empty());
+    }
 
-        place(args, 1, &interfaces("rank-1")).expect_err("another host's engine is refused");
+    /// A worker group whose ranks spread over two hosts is one main process per host, the engine
+    /// host's first and holding rank 0, each with its own run of the group's ranks.
+    #[test]
+    fn a_group_over_two_hosts_is_one_process_per_host() {
+        let mut options = ServerArgs {
+            model: Some("/models/qwen3".to_owned()),
+            host_identity: "rank-0".to_owned(),
+            tensor_parallel_size: std::num::NonZeroUsize::new(4).unwrap(),
+            ..Default::default()
+        };
+        options.device_config.worker_hosts = vec!["rank-1".to_owned()];
+        let config = options.engine_config().expect("the configuration resolves");
+        let hosts = world_hosts(&config).expect("the hosts of the group");
+        assert_eq!(
+            hosts,
+            vec![
+                HostRanks {
+                    host: "rank-0".to_owned(),
+                    first: 0,
+                    devices: vec![0, 1],
+                },
+                HostRanks {
+                    host: "rank-1".to_owned(),
+                    first: 2,
+                    devices: vec![0, 1],
+                },
+            ]
+        );
     }
 
     /// An epoch's start names this daemon's own build only for its own binary,

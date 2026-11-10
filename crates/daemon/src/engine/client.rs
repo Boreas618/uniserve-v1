@@ -200,6 +200,13 @@ pub struct EngineClient {
     /// The identity this daemon's engine control gave the engine; `None`
     /// for an engine it did not start.
     engine: Option<u64>,
+    /// The host the engine's main process runs on, when this daemon's engine
+    /// control started it.
+    host: Option<String>,
+    /// The engine's other main processes, when its worker group has ranks on
+    /// other hosts: one client per peer, which this client holds so that they
+    /// end with it.
+    peers: Vec<EngineClient>,
 }
 
 impl EngineClient {
@@ -243,6 +250,8 @@ impl EngineClient {
             control: Mutex::new(control),
             detached: std::sync::atomic::AtomicBool::new(false),
             engine: None,
+            host: None,
+            peers: Vec::new(),
         })
     }
 
@@ -259,6 +268,35 @@ impl EngineClient {
     pub fn in_epoch(self, epoch: u64) -> Self {
         self.shared.epoch.store(epoch, Ordering::Relaxed);
         self
+    }
+
+    /// The client of an engine whose main process runs on `host`.
+    #[must_use]
+    pub fn on_host(mut self, host: &str) -> Self {
+        self.host = Some(host.to_owned());
+        self
+    }
+
+    /// The scheduler node's client of an engine whose other main processes `peers` are: they end
+    /// with it, and a promotion promotes them with it.
+    #[must_use]
+    pub fn with_peers(mut self, peers: Vec<EngineClient>) -> Self {
+        self.peers = peers;
+        self
+    }
+
+    /// Every main process of the engine as the epoch layer commands it, the scheduler node's
+    /// first: its host and its number. Empty for an engine this daemon did not start.
+    pub fn processes(&self) -> Vec<crate::engine::control::EpochProcess> {
+        std::iter::once(self)
+            .chain(&self.peers)
+            .filter_map(|client| {
+                Some(crate::engine::control::EpochProcess {
+                    host: client.host.clone()?,
+                    engine: client.engine?,
+                })
+            })
+            .collect()
     }
 
     /// The engine's identity, when this daemon's engine control started or
@@ -432,8 +470,22 @@ impl EngineClient {
         recompute: bool,
         grows: bool,
     ) -> Result<(), SubmitError> {
-        let mut states = self.states();
-        if *states.borrow_and_update() == EngineState::Standby {
+        // The peers are promoted with the scheduler node's process, every promotion issued before
+        // any is awaited: each process takes its storage over once its predecessor is out, and the
+        // ranks' collectives resume together.
+        for peer in &self.peers {
+            peer.send_promote(Vec::new(), recompute, grows);
+        }
+        self.send_promote(index, recompute, grows);
+        for peer in &self.peers {
+            peer.await_promoted().await?;
+        }
+        self.await_promoted().await
+    }
+
+    /// Sends the engine its promotion while it stands by.
+    fn send_promote(&self, index: Vec<wire::GroupIndex>, recompute: bool, grows: bool) {
+        if *self.states().borrow() == EngineState::Standby {
             self.shared
                 .send(to_engine::Kind::Engine(wire::EngineCommand {
                     kind: Some(wire::engine_command::Kind::Promote(wire::Promote {
@@ -443,6 +495,11 @@ impl EngineClient {
                     })),
                 }));
         }
+    }
+
+    /// Waits until the promoted engine serves.
+    async fn await_promoted(&self) -> Result<(), SubmitError> {
+        let mut states = self.states();
         loop {
             match states.borrow_and_update().clone() {
                 EngineState::Ready => return Ok(()),

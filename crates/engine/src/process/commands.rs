@@ -1,5 +1,5 @@
-//! The daemon's and the peers' messages: the process interface's commands, the request
-//! interface's frames, and the dispatch of every program-layer command ([`ipc::ProgramCommand`])
+//! The daemon's messages: the process interface's commands, the request interface's frames, and
+//! the dispatch of every program-layer command ([`ipc::ProgramCommand`])
 //! to the stage that applies it, with the answer each one is owed.
 
 use anyhow::{Result, bail};
@@ -244,7 +244,7 @@ impl MainProcess {
             }
             return Ok(None);
         };
-        match self.program_with(program, None, reverted_by)? {
+        match self.program(program, reverted_by)? {
             // A precopy answers when its installs finish, from `advance_precopy`.
             None => Ok(None),
             Some(status) => {
@@ -254,46 +254,17 @@ impl MainProcess {
         }
     }
 
-    /// Serves one peer's program-layer messages: the scheduler node's fan-out
-    /// of the precopy and the commands of the switchover, commit, revert and purge.
-    pub(super) fn peer_messages(&mut self, rank: u32) -> Result<Option<UpdateFailure>> {
-        loop {
-            let Some(command) = ({
-                let Some(channel) = self.control.peer_mut(rank) else {
-                    return Ok(None);
-                };
-                channel.try_recv::<ProgramCommand>()?
-            }) else {
-                return Ok(None);
-            };
-            if let Some(status) = self.program(command, Some(rank))? {
-                self.answer(Some(rank), status);
-            }
-        }
-    }
-
-    /// One program-layer command.
-    ///
-    /// A precopy answers later, from [`Self::advance_precopy`], because its
-    /// module builds run between serve passes; every other stage answers at
-    /// once.
-    fn program(
-        &mut self,
-        command: ProgramCommand,
-        reply: Option<u32>,
-    ) -> Result<Option<ProgramStatus>> {
-        self.program_with(command, reply, None)
-    }
-
     /// One program-layer command, with the daemon's own reason when it stated one.
     ///
     /// A revert's reason is the daemon's account of why an operator ended the probation; it is
-    /// carried into the epoch's record instead of a reason this process makes up. A peer's command
-    /// states none, and the epoch's own failures state their own.
-    fn program_with(
+    /// carried into the epoch's record instead of a reason this process makes up, and the epoch's
+    /// own failures state their own.
+    ///
+    /// A precopy answers later, from [`Self::advance_precopy`], because its module builds run
+    /// between serve passes; every other stage answers at once.
+    fn program(
         &mut self,
         command: ProgramCommand,
-        reply: Option<u32>,
         reverted_by: Option<String>,
     ) -> Result<Option<ProgramStatus>> {
         // The program layer's stages are the epoch's steps, and a step that never arrives is the
@@ -324,7 +295,7 @@ impl MainProcess {
                     policy_revision = policy.revision,
                     "the daemon's Precopy arrived"
                 );
-                self.start_precopy(generation, &programs, &policy, reply)?;
+                self.start_precopy(generation, &programs, &policy)?;
                 return Ok(None);
             }
             ProgramCommand::Switchover { generation, step } => {
@@ -333,7 +304,7 @@ impl MainProcess {
                     step = step.unwrap_or_default(),
                     "received the daemon's switchover"
                 );
-                match self.switchover(generation, step, reply)? {
+                match self.switchover(generation, step)? {
                     Some(status) => status,
                     // The answer is owed to the warmup: it is sent from `advance_warmup` when
                     // admission opens, or replaced by the failure that keeps admission shut.
@@ -356,9 +327,8 @@ impl MainProcess {
         Ok(Some(status))
     }
 
-    /// Delivers a program-layer status: to the peer that asked, and to the
-    /// daemon.
-    pub(super) fn answer(&mut self, reply: Option<u32>, status: ProgramStatus) {
+    /// Delivers a program-layer status to the daemon.
+    pub(super) fn answer(&mut self, status: ProgramStatus) {
         // The program layer's steps are answered here. A run that stops between two of them needs
         // to know which one was answered last, and the daemon's own log of its commands is not this
         // side's. The reason travels with the status, and a run that reads only this log needs it
@@ -369,16 +339,9 @@ impl MainProcess {
         };
         tracing::info!(
             status = status_name(&status),
-            to_peer = reply.is_some(),
             failure,
             "answering the epoch's program layer"
         );
-        if let Some(rank) = reply
-            && let Some(channel) = self.control.peer_mut(rank)
-            && let Err(error) = channel.send(&status)
-        {
-            tracing::warn!(%error, rank, "answering a peer's program command failed");
-        }
         self.report(status);
     }
 }

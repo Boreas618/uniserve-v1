@@ -41,7 +41,6 @@ pub async fn launches(
                 EngineArgs::new(replica),
                 engine,
                 &Interfaces {
-                    host: &config.host_identity,
                     requests: "",
                     processes: "",
                     program_server: Path::new(""),

@@ -19,6 +19,8 @@ pub enum RequestKind {
     Info,
     /// Submits a batch.
     Submit,
+    /// Submits a shadow batch.
+    Shadow,
     /// Requests orderly worker shutdown.
     Close,
     /// Promotes a standby worker to serving.
@@ -43,6 +45,15 @@ pub enum MainProcessRequest {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
         /// Fully lowered batch.
+        batch: Box<crate::execution::Batch>,
+    },
+    /// Submits a shadow batch (§7.3 step 2): the paired forwards of the batch's generation
+    /// against the serving one, which a group's ranks run together as they run its serving
+    /// batches. Answered as [`Self::Submit`] is.
+    Shadow {
+        /// Optional request-response correlation identity.
+        message_id: Option<u64>,
+        /// Fully lowered shadow batch.
         batch: Box<crate::execution::Batch>,
     },
     /// Requests orderly worker shutdown.
@@ -76,6 +87,7 @@ impl MainProcessRequest {
         match self {
             Self::Info { .. } => RequestKind::Info,
             Self::Submit { .. } => RequestKind::Submit,
+            Self::Shadow { .. } => RequestKind::Shadow,
             Self::Close { .. } => RequestKind::Close,
             Self::Promote { .. } => RequestKind::Promote,
             Self::Hook { .. } => RequestKind::Hook,
@@ -87,6 +99,7 @@ impl MainProcessRequest {
         match self {
             Self::Info { message_id }
             | Self::Submit { message_id, .. }
+            | Self::Shadow { message_id, .. }
             | Self::Close { message_id }
             | Self::Promote { message_id }
             | Self::Hook { message_id, .. } => *message_id = value,
@@ -96,7 +109,7 @@ impl MainProcessRequest {
     /// Returns the batch carried by this request, if any.
     pub const fn batch(&self) -> Option<&crate::execution::Batch> {
         match self {
-            Self::Submit { batch, .. } => Some(batch),
+            Self::Submit { batch, .. } | Self::Shadow { batch, .. } => Some(batch),
             _ => None,
         }
     }
@@ -109,6 +122,14 @@ impl MainProcessRequest {
     /// Constructs a batch-submission request.
     pub fn submit(batch: crate::execution::Batch) -> Self {
         Self::Submit {
+            message_id: None,
+            batch: Box::new(batch),
+        }
+    }
+
+    /// Constructs a shadow-batch request.
+    pub fn shadow(batch: crate::execution::Batch) -> Self {
+        Self::Shadow {
             message_id: None,
             batch: Box::new(batch),
         }

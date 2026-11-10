@@ -573,11 +573,12 @@ impl Switch {
                 rank: node.rank,
                 generation: self.spawn_generation,
                 executable: self.start.executable.clone(),
-                // The adapter writes the launch file for this process and
-                // passes its path: the arguments are its to state.
+                // The adapter states the launch file for this process and
+                // its arguments: they are its to state.
                 arguments: Vec::new(),
                 environment: self.start.environment.clone(),
                 inherit: Vec::new(),
+                launch: Vec::new(),
             };
             let spawned = match roster.spawn(spawn, &self.start.launch) {
                 Ok(spawned) => spawned,
@@ -1518,7 +1519,8 @@ mod tests {
                 rank: 0,
                 epoch: 11,
                 scheduler_node: true,
-                peers: Vec::new(),
+                world: None,
+                standby_storage: crate::options::StandbyStorage::Resident,
                 watchdog_timeout_s: None,
                 rollback_s: None,
                 queue_depth: 4,

@@ -350,6 +350,11 @@ impl MainProcess {
     /// each scheduler describes for itself: a successor needs what the workers hold now, not what
     /// this process planned.
     pub(super) fn engine_info(&self) -> Result<proto::request::wire::EngineInfo> {
+        // A peer of an epoch over several hosts holds ranks and no scheduler: it admits no request
+        // and holds no cache a successor maps, so it states that it schedules nothing.
+        if self.schedulers.is_empty() && matches!(self.peers, super::Peers::Peer { .. }) {
+            return Ok(proto::request::wire::EngineInfo::default());
+        }
         let first = self
             .schedulers
             .first()

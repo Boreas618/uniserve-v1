@@ -779,6 +779,59 @@ impl Phase {
     }
 }
 
+/// What each host's devices can keep of a parked standby, as the hosts' Storage Server ledgers of
+/// `deployment` state it: `reports` holds one JSON report per node, `{"host": ..., "ledgers":
+/// [GpuLedger...], "host_storage": HostStorage}` (`EngineControl::storage_reports`).
+///
+/// A standby keeps graph pools of the serving process's size beside it. A device is crowded when
+/// what its ledger leaves unbooked is less than the graph pools the deployment books on it: a
+/// resident standby's would not fit. Suspended pools move to host storage, so they fit when the
+/// host's Storage Server admits every graph pool its devices book. A report that does not parse
+/// states nothing about its host, which then keeps no standby.
+pub fn rooms(reports: &[String], deployment: &str) -> BTreeMap<String, StandbyRoom> {
+    #[derive(serde::Deserialize)]
+    struct Report {
+        host: String,
+        ledgers: Vec<storage::GpuLedger>,
+        host_storage: storage::HostStorage,
+    }
+    let mut rooms = BTreeMap::new();
+    for text in reports {
+        let report: Report = match serde_json::from_str(text) {
+            Ok(report) => report,
+            Err(error) => {
+                tracing::warn!(%error, "a node's storage ledger report does not parse");
+                continue;
+            }
+        };
+        let mut crowded = false;
+        let mut graphs = 0_u64;
+        for ledger in report
+            .ledgers
+            .iter()
+            .filter(|ledger| ledger.deployment == deployment)
+        {
+            let booked: u64 = ledger.entries.iter().map(|entry| entry.bytes).sum();
+            let graph: u64 = ledger
+                .entries
+                .iter()
+                .filter(|entry| entry.item == storage::Item::GraphPool)
+                .map(|entry| entry.bytes)
+                .sum();
+            graphs += graph;
+            crowded |= ledger.total.saturating_sub(booked) < graph;
+        }
+        rooms.insert(
+            report.host,
+            StandbyRoom {
+                crowded,
+                fits_suspended: report.host_storage.room() >= graphs,
+            },
+        );
+    }
+    rooms
+}
+
 /// The one storage mode a domain's standby children take, or `None` when no
 /// member can keep one.
 fn storage(mode: StandbyStorage, observed: &[StandbyRoom]) -> Option<Storage> {

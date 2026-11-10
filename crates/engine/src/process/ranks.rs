@@ -116,26 +116,68 @@ impl LoadedRank {
     }
 }
 
+/// Where the ranks of a process's worker group form their host group.
+pub(super) enum Meeting {
+    /// This process holds every rank: they meet over the loopback.
+    Local,
+    /// The group has ranks on other hosts: its members meet at `address`, which the process that
+    /// holds rank 0 serves on `listener`, the socket its daemon reserved; a peer holds none.
+    World {
+        address: String,
+        listener: Option<std::net::TcpListener>,
+    },
+}
+
 /// Loads every rank of this process, each on a thread of its own.
 ///
 /// The ranks agree their capacity and exchange their communicators' ids over one host group, whose
 /// collectives every member must reach, so they run side by side rather than one after another; the
-/// weights of four ranks then also load at once. The group is the one the capacity plan
-/// agrees over, formed here over the loopback because this process holds all its members.
+/// weights of four ranks then also load at once. The group is the one the capacity plan agrees
+/// over: formed over the loopback when this process holds all its members, and at the group's
+/// rendezvous ([`Meeting::World`]) when other hosts hold some, each rank a member under its rank
+/// number in the group.
 pub(super) fn load_ranks(
     model_runners: Vec<ModelRunner>,
     backing: Backing<'_>,
     launch: &EngineArgs,
     epoch: &Epoch,
+    meeting: Meeting,
 ) -> Result<Vec<LoadedRank>> {
     let count = model_runners.len();
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
-        .context("binding the rendezvous of this process's ranks")?;
-    let address = listener
-        .local_addr()
-        .context("reading the rendezvous of this process's ranks")?
-        .to_string();
-    let mut listener = Some(listener);
+    // The members' numbers: this process's place among them, and how many there are.
+    let (first, members, address, mut listener) = match meeting {
+        Meeting::Local => {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+                .context("binding the rendezvous of this process's ranks")?;
+            let address = listener
+                .local_addr()
+                .context("reading the rendezvous of this process's ranks")?
+                .to_string();
+            (0, count, address, Some(listener))
+        }
+        Meeting::World { address, listener } => {
+            let first = launch.rank as usize;
+            let members = launch.world_size as usize;
+            if first + count > members {
+                bail!(
+                    "this process serves ranks {first}..{} of a group of {members}",
+                    first + count
+                );
+            }
+            if (first == 0) != listener.is_some() {
+                bail!(
+                    "the process that holds rank 0 serves the group's rendezvous, and only it: \
+                     this one holds rank {first} and {} the socket",
+                    if listener.is_some() {
+                        "inherited"
+                    } else {
+                        "was given no"
+                    }
+                );
+            }
+            (first, members, address, listener)
+        }
+    };
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(count);
         for (index, model_runner) in model_runners.into_iter().enumerate() {
@@ -149,8 +191,8 @@ pub(super) fn load_ranks(
                     load_rank(
                         model_runner,
                         rendezvous,
-                        index,
-                        count,
+                        first + index,
+                        members,
                         backing,
                         launch,
                         epoch,
@@ -170,12 +212,13 @@ pub(super) fn load_ranks(
     })
 }
 
-/// Joins the group, opens the rank's collectives, loads its partition and opens its memory.
+/// Joins the group as `member` of its `members`, opens the rank's collectives, loads its partition
+/// and opens its memory.
 fn load_rank(
     model_runner: ModelRunner,
     rendezvous: Rendezvous,
-    index: usize,
-    count: usize,
+    member: usize,
+    members: usize,
     backing: Backing<'_>,
     launch: &EngineArgs,
     epoch: &Epoch,
@@ -205,7 +248,7 @@ fn load_rank(
         epoch.predecessor_epoch.filter(|_| launch.standby()),
         adopted,
     );
-    let host = HostGroup::connect(rendezvous, index, count, STARTUP_TIMEOUT)
+    let host = HostGroup::connect(rendezvous, member, members, STARTUP_TIMEOUT)
         .context("joining this process's ranks")?;
     // The rank's Storage Server and its claim are the node's, which the daemon answered for; the
     // retained weights outlive the epoch, so the store is built once, before the model loads,
@@ -240,7 +283,7 @@ fn load_rank(
             &host,
             device,
             (shape.sequence, shape.sequence_rank),
-            count,
+            members,
             communicates,
         )
         .context("forming the sequence group")?,
@@ -248,7 +291,7 @@ fn load_rank(
             &host,
             device,
             (shape.tensor, shape.tensor_rank),
-            count,
+            members,
             communicates,
         )
         .context("forming the tensor group")?,
@@ -310,8 +353,8 @@ fn group_over(
     }
     if size != ranks {
         bail!(
-            "a parallel group of {size} ranks in a process of {ranks}: this process forms one \
-             group of all its ranks, and a deployment of several groups per host is not served"
+            "a parallel group of {size} ranks in a host group of {ranks}: the group's ranks form \
+             one parallel group, and a deployment of several groups per worker group is not served"
         );
     }
     if !communicates {
@@ -337,22 +380,23 @@ fn group_over(
 
 /// This node's scheduler threads, one per DP rank.
 ///
-/// A node that is not the scheduler node serves only what its peers' schedulers ask of it, so it
-/// builds none. The scheduler node builds one thread per data-parallel rank, each handed this
-/// node's workers through `worker::Batches`: the scheduler forms a batch, the worker issues
-/// it, and the scheduler reads the result - nothing crosses threads except the batch and its
-/// result.
+/// A node that is not the scheduler node serves only what the scheduler node's batches ask of it,
+/// so it builds none. The scheduler node builds one thread per data-parallel rank, each handed this
+/// node's workers through `worker::Batches`, and the peer links (`remotes`) of the group's ranks on
+/// other hosts: the scheduler forms a batch, every rank issues it, and the scheduler reads the
+/// result - nothing crosses threads except the batch and its result.
 #[expect(
     clippy::too_many_arguments,
     reason = "each argument has its own owner in the process - the launch, the loaded model, the \
-              workers, the memory, the wake and the data plane - and a struct gathering them would \
-              bundle unrelated state for one call"
+              workers, the peer links, the memory, the wake and the data plane - and a struct \
+              gathering them would bundle unrelated state for one call"
 )]
 pub(super) fn schedulers(
     model_runner: &ModelRunner,
     launch: &EngineArgs,
     model: &crate::rank::Loaded,
     workers: &[Arc<Worker>],
+    remotes: &[Arc<worker::peers::Remote>],
     rank: &ipc::MainProcessInfo,
     memory: &Memory,
     control: ipc::Wake,
@@ -368,10 +412,10 @@ pub(super) fn schedulers(
     // The host KV cache copies a rank's pages on that rank's copy stream, into the pool the one rank
     // of this scheduler's inventory states. A scheduler of an expert union serves one device, as a
     // scheduler of one rank does, and its peers' schedulers keep their own pools of the same pages:
-    // a page holds what the union computed. A scheduler over several devices would copy one
-    // device's share of every page, so it keeps none, and no text model runs one today: a rank
-    // maps its model on one device.
-    let host_cache = model_runner.host_kv_cache(model) && workers.len() == 1;
+    // a page holds what the union computed. A scheduler over several devices, on this host or
+    // others, would copy one device's share of every page, so it keeps none, and no text model runs
+    // one today: a rank maps its model on one device.
+    let host_cache = model_runner.host_kv_cache(model) && workers.len() == 1 && remotes.is_empty();
 
     // One scheduler per scheduler thread: it reads the engine configuration as this rank resolves
     // it, with the model's facts, and the limits this rank captured.
@@ -416,7 +460,8 @@ pub(super) fn schedulers(
         max_model_len: model_runner.engine_config().model.max_model_len,
     };
     let mut stated = worker::batch::Workers::shared(workers.iter().map(Arc::clone).collect())?
-        .stating(vec![inventory]);
+        .stating(vec![inventory])
+        .with_remotes(remotes.to_vec());
     if host_cache {
         stated = stated.keeping_host_cache(worker::batch::HostCacheEndpoint { endpoint: None });
     }

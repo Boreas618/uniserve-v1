@@ -117,20 +117,18 @@ impl MainProcess {
     /// Gives back what an in-flight update prepared, by name.
     ///
     /// A precopy still running is abandoned through its own path, which discards the captures on
-    /// every device, reinstates the serving policy and answers the peer or the daemon that asked.
+    /// every device, reinstates the serving policy and answers the daemon.
     /// A generation already prepared is discarded the same way: the device queue orders the discard
     /// after the walk that captured it, and the generation that serves keeps its plans.
     fn drop_prepared(&mut self, reason: &str) -> Result<()> {
         if let Some(precopy) = self.precopy.take() {
             let generation = precopy.generation;
-            let reply = precopy.reply;
             self.precopy = Some(precopy);
             return self.abandon_precopy(
                 generation,
                 UpdateFailure::Precopy {
                     reason: reason.to_owned(),
                 },
-                reply,
             );
         }
         let Some(generation) = self.update.prepared.first().map(|built| built.number()) else {
@@ -233,6 +231,14 @@ impl MainProcess {
             bail!("{reason}");
         }
         self.promoted = true;
+        // A suspended standby takes its graph pools' storage back, at the addresses the graphs
+        // hold, before anything is admitted.
+        if self.standby_storage == proto::request::StandbyStorage::Suspended {
+            self.data
+                .restore_graphs()
+                .context("restoring the promoted standby's graph pools")?;
+            tracing::info!("the promoted standby worker restored its graph storage");
+        }
         // The generation the schedulers must stamp this process's batches with: the one it
         // holds. A promotion is the one cut-over that reaches no `switchover` of this
         // process's own, so nothing else records it, and a promoted standby whose batches

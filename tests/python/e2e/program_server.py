@@ -22,6 +22,7 @@ the ``uniserve`` binary.
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -196,12 +197,7 @@ def program_server(
         raise TimeoutError(f"the Program Server left no socket at {socket}")
 
     try:
-        manifests = (repository() / KERNEL_PACKAGES).glob("*/*/package.toml")
-        kernels = sorted(
-            str(manifest.parent.relative_to(repository()))
-            for manifest in manifests
-        )
-        for package in (*kernels, POLICY_PACKAGE):
+        for package in packages_in_order():
             installed = subprocess.run(
                 [
                     str(binary),
@@ -226,3 +222,106 @@ def program_server(
     finally:
         stop_server(process)
         shutil.rmtree(sockets, ignore_errors=True)
+
+
+def packages_in_order() -> list[str]:
+    """Every package a test's Program Server holds, in the order it installs
+    them: a revision counts from 1 in a fresh package root, so two servers
+    that install the same packages in this order number them alike.
+    """  # noqa: D205
+    manifests = (repository() / KERNEL_PACKAGES).glob("*/*/package.toml")
+    kernels = sorted(
+        str(manifest.parent.relative_to(repository())) for manifest in manifests
+    )
+    return [*kernels, POLICY_PACKAGE]
+
+
+@contextmanager
+def remote_program_server(host: str) -> Iterator[str]:
+    """A Program Server on the ssh destination `host`, as
+    :func:`program_server` starts one on this host, and its socket there.
+
+    A main process resolves its modules from its own host's Program Server,
+    which the daemon of a deployment's second host names (its
+    ``program_config.socket``). The leader pins the epoch's revisions at this
+    host's server; this one installs the same packages in the same order, so
+    it numbers them alike and builds each module the second host's main
+    process asks for. The checkout lies at the same path on `host`; the
+    server's sockets, packages and store lie in a directory of its own there,
+    removed with the server.
+    """  # noqa: D205
+    binary = require_uniserve_binary()
+    work = f"/tmp/uniserve-programs-{os.getpid()}-{time.monotonic_ns()}"
+    socket = f"{work}/program-server.sock"
+    serve = [
+        str(binary),
+        "program-server",
+        "serve",
+        "--socket",
+        socket,
+        "--package-root",
+        f"{work}/packages",
+        "--store-root",
+        f"{work}/modules",
+        "--target",
+        program_target(),
+        "--wasm",
+        str(precompiler()),
+        "--python",
+        str(compiler()),
+    ]
+    # The server runs in this test's environment: its search paths, native
+    # libraries and CUDA toolkit, and its compilations' parallelism.
+    variables = " ".join(
+        f"{name}={shlex.quote(os.environ.get(name, default))}"
+        for name, default in (
+            ("PATH", ""),
+            ("LD_LIBRARY_PATH", ""),
+            ("CUDA_HOME", ""),
+            ("MAX_JOBS", "16"),
+        )
+    )
+    remote = (
+        f"mkdir -m 700 {work} && cd {shlex.quote(str(repository()))} "
+        "|| exit 1; "
+        f"{variables} nohup {shlex.join(serve)} > {work}/program-server.log "
+        f"2>&1 < /dev/null & echo $!"
+    )
+
+    def on_host(command: str, timeout: float = 120) -> str:
+        return subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", host, command],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=True,
+        ).stdout
+
+    pid = on_host(remote).strip()
+    try:
+        deadline = time.monotonic() + 120.0
+        while on_host(f"test -S {socket} && echo up || true").strip() != "up":
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"the Program Server on {host} left no socket at {socket}: "
+                    + on_host(f"cat {work}/program-server.log")
+                )
+            time.sleep(0.5)
+        for package in packages_in_order():
+            on_host(
+                f"{variables} "
+                + shlex.join(
+                    [
+                        str(binary),
+                        "program-server",
+                        "install",
+                        "--socket",
+                        socket,
+                        str(repository() / package),
+                    ]
+                ),
+                timeout=3600,
+            )
+        yield socket
+    finally:
+        on_host(f"kill {pid}; sleep 1; rm -rf {work}")

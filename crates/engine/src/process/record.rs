@@ -29,7 +29,7 @@ use worker::device::Worker;
 use worker::runners::products::GroupProducts;
 
 use super::launch::Epoch;
-use super::ranks::{Backing, load_ranks};
+use super::ranks::{Backing, Meeting, load_ranks};
 use crate::rank::ModelRunner;
 
 /// Every program a main process launches: descriptor keys by operator name (`ops::Op::NAME`).
@@ -47,7 +47,13 @@ pub fn record(launch: &EngineArgs, catalogue: &nn::family::Catalogue) -> Result<
     let family = crate::resolve(catalogue, Path::new(&launch.engine_config.model.model))?;
     let model_runner = ModelRunner::of(launch, family)?;
     let epoch = Epoch::of(launch)?;
-    let mut ranks = load_ranks(model_runner.ranks()?, Backing::Recording, launch, &epoch)?;
+    let mut ranks = load_ranks(
+        model_runner.ranks()?,
+        Backing::Recording,
+        launch,
+        &epoch,
+        Meeting::Local,
+    )?;
     let blocking = ThreadPool::new(model_runner.blocking_limits());
     let products = GroupProducts::new(ranks.len());
     let count = ranks.len();

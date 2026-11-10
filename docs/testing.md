@@ -40,7 +40,7 @@ These name the checkpoints and inputs of the host. Set the ones the host has; th
 | `UNISERVE_MINIMAX_H3_INPUTS` | The protocol inputs directory holding `media/`, the reference files of `uniserve_eval/workloads/minimax_h3` ([MiniMax-H3 workloads](minimax_h3/evaluation.md)) | `test_minimax_h3_conditions_http.py` |
 | `UNISERVE_MOONCAKE_MASTER`, `MOONCAKE_STORE_LIBRARY` | A running Mooncake master (`host:port`) and the `libmooncake_store.so` its clients load | the Mooncake cases of `test_epoch_changes_http.py` |
 | `UNISERVE_AFD_URL`, `UNISERVE_AFD_MODEL` | A running attention-expert disaggregated deployment and its served model name | `test_disaggregated_http.py` |
-| `UNISERVE_H3_FOLLOWER`, `UNISERVE_H3_LEADER_ADDRESS` | A second host and this host's address that the second reaches, for the eight-rank layouts ([Two hosts](#two-hosts)) | `test_h3_parallel_http.py` |
+| `UNISERVE_H3_FOLLOWER`, `UNISERVE_H3_LEADER_ADDRESS` | A second host and this host's address that the second reaches, for the layouts of two hosts ([Two hosts](#two-hosts)) | `test_h3_parallel_http.py`, `test_cross_host_http.py` |
 
 ### Run settings
 
@@ -61,7 +61,7 @@ These name the checkpoints and inputs of the host. Set the ones the host has; th
 
 ### Two hosts
 
-The eight-rank layouts of `test_h3_parallel_http.py` run on this host and a second one when `UNISERVE_H3_FOLLOWER` names the second as an ssh destination (reachable without a password prompt) and `UNISERVE_H3_LEADER_ADDRESS` names this host's address as the second reaches it. The second host must hold the same checkout at the same path with the same build, which a filesystem both hosts mount provides, and four free GPUs: the test leases this host's GPUs, not the second's. The second host's daemon runs in the test's environment, and `UNISERVE_FOLLOWER_LAUNCHER` names a command it runs under, such as one that sets up the second host's environment. Without the two variables the eight-rank layouts are skipped, naming the device count they need.
+The eight-rank layouts of `test_h3_parallel_http.py` run on this host and a second one when `UNISERVE_H3_FOLLOWER` names the second as an ssh destination (reachable without a password prompt) and `UNISERVE_H3_LEADER_ADDRESS` names this host's address as the second reaches it. The second host must hold the same checkout at the same path with the same build, which a filesystem both hosts mount provides, and four free GPUs: the test leases this host's GPUs, not the second's. The second host's daemon runs in the test's environment, and `UNISERVE_FOLLOWER_LAUNCHER` names a command it runs under, such as one that sets up the second host's environment. Without the two variables the eight-rank layouts are skipped, naming the device count they need. `test_cross_host_http.py` serves a tensor group of two ranks, one on each host, with a standby epoch over both: it kills the second host's serving main process while a request streams and checks that the standby epoch is promoted and the request continues; it needs one free GPU on each host (the second host's first).
 
 ### A build shared by several hosts
 

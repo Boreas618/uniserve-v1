@@ -72,6 +72,9 @@ pub struct DaemonOptions {
     /// Reads which of this host's devices are idle, for the deployment's
     /// planning of where its processes run.
     pub devices: DeviceProbe,
+    /// This node's Program Server, which the main processes the node starts resolve their
+    /// modules from (`program_config`).
+    pub program_server: program_server::command::Settings,
 }
 
 /// Reads the ordinals of this host's idle devices from the driver.
@@ -88,13 +91,27 @@ pub type DeviceProbe = fn() -> Result<Vec<u32>, String>;
 /// service owns.
 ///
 /// A clone of this shares the same ends: one reporter’s queue, so one
-/// consumer at a time.
+/// consumer at a time. A caller that waits for the answers to commands it sent
+/// holds an [`Awaiting`] while it waits, and the epoch layer, which otherwise
+/// drains the queue, leaves the reports to it meanwhile.
 #[derive(Clone)]
 pub struct ProcessCommands {
     /// Commands, by the engine whose main process is to execute them.
     commands: std::sync::mpsc::Sender<(u64, proto::process::Command)>,
     /// Every report a main process sent, by the engine that sent it.
     reports: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<(u64, proto::process::Report)>>>,
+    /// How many callers wait for answers to the commands they sent.
+    awaiting: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// A caller's wait for the answers to its commands, which keeps the reports
+/// for it until it ends ([`ProcessCommands::awaiting`]).
+pub struct Awaiting(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Awaiting {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl std::fmt::Debug for ProcessCommands {
@@ -120,10 +137,23 @@ impl ProcessCommands {
             Self {
                 commands,
                 reports: Arc::new(std::sync::Mutex::new(reports_rx)),
+                awaiting: Arc::default(),
             },
             commands_rx,
             reports,
         )
+    }
+
+    /// Marks a wait for the answers to commands the caller sent: until the
+    /// guard drops, the reports are the caller's to read.
+    pub fn awaiting(&self) -> Awaiting {
+        self.awaiting.fetch_add(1, Ordering::AcqRel);
+        Awaiting(Arc::clone(&self.awaiting))
+    }
+
+    /// Whether a caller waits for the answers to its commands.
+    pub fn awaited(&self) -> bool {
+        self.awaiting.load(Ordering::Acquire) > 0
     }
 
     /// Sends `command` to engine `engine`'s main process.
@@ -286,6 +316,7 @@ impl Daemon {
             let commands = ProcessCommands {
                 commands,
                 reports: Arc::new(std::sync::Mutex::new(reports_rx)),
+                awaiting: Arc::default(),
             };
             let link = Some(roster::EpochLink {
                 requests: requests.clone(),
@@ -383,6 +414,7 @@ impl Daemon {
         let commands = leader.then_some(ProcessCommands {
             commands,
             reports: Arc::new(std::sync::Mutex::new(reports_rx)),
+            awaiting: Arc::default(),
         });
         let link = match (&commands, leader) {
             (Some(commands), true) => Some(roster::EpochLink {
@@ -566,7 +598,8 @@ fn local(
 ) -> anyhow::Result<Local> {
     Ok(Local {
         supervisor: Supervisor::new(options.host.clone())
-            .context("creating the daemon's lifeline")?,
+            .context("creating the daemon's lifeline")?
+            .with_program_server(options.program_server.clone()),
         claims: ClaimHolder::new(options.executable.clone(), remote_pages, address),
         address,
         devices: options.devices,
@@ -735,6 +768,7 @@ mod tests {
             executable: PathBuf::from("uniserve"),
             join_timeout: Duration::from_secs(5),
             devices: || Ok(Vec::new()),
+            program_server: program_server::command::Settings::default(),
         })
         .unwrap();
         let address = daemon.address().unwrap().to_owned();
@@ -824,6 +858,7 @@ impl ProcessCommands {
             Self {
                 commands,
                 reports: Arc::new(std::sync::Mutex::new(received)),
+                awaiting: Arc::default(),
             },
             sent,
             reports,
@@ -846,6 +881,7 @@ mod command_tests {
         let processes = ProcessCommands {
             commands,
             reports: Arc::new(std::sync::Mutex::new(reports_rx)),
+            awaiting: Arc::default(),
         };
 
         let command = proto::process::Command {
