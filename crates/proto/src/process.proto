@@ -510,6 +510,10 @@ message Report {
     // generation it was spawned at, on the addresses its graphs already use
     // (§2.5). The epoch layer starts `Serve` and `Drain` only after it.
     Promoted promoted = 13;
+    // A switchover's warmup moved on to another capture on a device: the
+    // generation is still being warmed, and the daemon's wait for `Switched`
+    // lasts as long as the warmup keeps moving (§7.3 step 3).
+    Warming warming = 14;
   }
 }
 
@@ -562,6 +566,13 @@ message PolicyReverted {
 
 message Switched {
   uint64 generation = 1;
+}
+
+message Warming {
+  // The generation whose warmup moved on.
+  uint64 generation = 1;
+  // The step a device took up, as its worker names it.
+  string step = 2;
 }
 
 message Committed {}

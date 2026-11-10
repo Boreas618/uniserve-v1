@@ -15,6 +15,7 @@ pub(super) fn status_name(status: &ProgramStatus) -> &'static str {
         ProgramStatus::Precopied { .. } => "precopied",
         ProgramStatus::PrecopyFailed { .. } => "precopy_failed",
         ProgramStatus::Switched { .. } => "switched",
+        ProgramStatus::Warming { .. } => "warming",
         ProgramStatus::Committed { .. } => "committed",
         ProgramStatus::Reverted { .. } => "reverted",
         ProgramStatus::Purged { .. } => "purged",
@@ -45,6 +46,10 @@ fn report_of(status: &ProgramStatus) -> Option<proto::process::Report> {
         }
         ProgramStatus::Switched { generation } => Kind::Switched(proto::process::Switched {
             generation: *generation,
+        }),
+        ProgramStatus::Warming { generation, step } => Kind::Warming(proto::process::Warming {
+            generation: *generation,
+            step: step.clone(),
         }),
         ProgramStatus::Committed { .. } => Kind::Committed(proto::process::Committed {}),
         ProgramStatus::Reverted { reason, .. } => Kind::Reverted(proto::process::Reverted {

@@ -75,10 +75,11 @@ impl MainProcess {
     /// the cut-over happened, which is why the failure goes through the update's decision table
     /// rather than through the switchover's answer.
     pub(super) fn advance_warmup(&mut self) -> Result<Option<UpdateFailure>> {
-        // A warmup still running past twice the stall bound is a device that will not finish it: its
-        // answer is owed to the daemon's switchover wait, so silence here is a timeout with no cause
-        // in the log. Failing it by name reverts the update and leaves the process serving what it
-        // held.
+        self.note_warmup_progress();
+        // A warmup standing on one step past twice the stall bound is a device that will not finish
+        // it: its answer is owed to the daemon's switchover wait, so silence here is a timeout with
+        // no cause in the log. Failing it by name reverts the update and leaves the process serving
+        // what it held.
         if let (Some(since), true) = (self.warming_since, !self.warming.is_empty())
             && since.elapsed() > self.watchdog.stall_bound() * 2
         {
@@ -89,7 +90,7 @@ impl MainProcess {
             let failure = UpdateFailure::Device {
                 device,
                 error: format!(
-                    "warming generation {generation} on device {device} did not finish in {}s",
+                    "warming generation {generation} on device {device} stood on one step for {}s",
                     since.elapsed().as_secs()
                 ),
                 batch: None,
@@ -150,6 +151,49 @@ impl MainProcess {
             self.answer(reply, ProgramStatus::Switched { generation });
         }
         Ok(None)
+    }
+
+    /// Reports a warmup that moved on since the last pass.
+    ///
+    /// A warmup is one capture per bucket in a row, and a deployment's catalogue decides how many
+    /// there are, so no fixed bound fits its length. What a device stands on (`Worker::performing`)
+    /// changes with each capture: a change restarts this process's own bound and is sent to the
+    /// daemon as `Warming`, which keeps its wait for `Switched` alive for as long as the captures
+    /// keep moving.
+    fn note_warmup_progress(&mut self) {
+        if self.warming.is_empty() {
+            self.warming_steps.clear();
+            return;
+        }
+        let steps: Vec<Option<String>> = self
+            .warming
+            .iter()
+            .map(|(device, _, _)| {
+                self.workers
+                    .iter()
+                    .find(|worker| u32::try_from(worker.device().0).ok() == Some(*device))
+                    .and_then(|worker| worker.performing())
+            })
+            .collect();
+        if steps == self.warming_steps {
+            return;
+        }
+        let moved = steps
+            .iter()
+            .zip(self.warming_steps.iter().chain(std::iter::repeat(&None)))
+            .find(|(now, before)| now.is_some() && now != before)
+            .and_then(|(now, _)| now.clone());
+        self.warming_steps = steps;
+        let Some(step) = moved else {
+            return;
+        };
+        self.warming_since = Some(Instant::now());
+        let generation = self
+            .warming
+            .first()
+            .map_or(0, |(_, _, generation)| *generation);
+        // The daemon reads progress, not an answer: the peer that asked is told `Switched` alone.
+        self.answer(None, ProgramStatus::Warming { generation, step });
     }
 
     /// The switchover: cut over at the batch boundary whose step the scheduler put
@@ -247,10 +291,10 @@ impl MainProcess {
         // first one also warms the buckets no update touched, because until now nothing served
         // them.
         // The warmups are queued, not waited for: each is a device job that runs one bucket per
-        // queue turn behind serving batches, so a model with many buckets warms for minutes while
-        // the daemon waits two minutes for `Switched` - and a control thread that waited here would
-        // answer no command, no request event and no metrics for the same minutes. `advance_warmup`
-        // reads them on the passes that follow, and a device that fails reverts the update.
+        // queue turn behind serving batches, so a model with many buckets warms for minutes - and a
+        // control thread that waited here would answer no command, no request event and no metrics
+        // for the same minutes. `advance_warmup` reads them on the passes that follow, reports each
+        // capture a device moves on to as `Warming`, and a device that fails reverts the update.
         for worker in &self.workers {
             let device = worker.device();
             let ordinal = u32::try_from(device.0).unwrap_or_default();

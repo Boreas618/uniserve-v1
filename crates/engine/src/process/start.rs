@@ -351,6 +351,7 @@ impl MainProcess {
             warmup_wait: Wait::default(),
             pending_switch: None,
             warming_since: None,
+            warming_steps: Vec::new(),
             policy_probe_at: None,
             policy_missing_since: None,
             prepared: Vec::new(),

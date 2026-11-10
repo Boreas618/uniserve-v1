@@ -283,6 +283,7 @@ impl Failure {
             | Kind::Promoted(_)
             | Kind::Precopied(_)
             | Kind::Switched(_)
+            | Kind::Warming(_)
             | Kind::Committed(_)
             | Kind::Reverted(_)
             | Kind::Purged(_)

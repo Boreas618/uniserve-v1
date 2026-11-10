@@ -1180,7 +1180,10 @@ impl crate::interference::Throttle for EngineControl {
 
 /// How long a main process takes to switch, commit, revert or purge: each is
 /// a boundary decision the main process makes at its next batch (§7.3 steps
-/// 3-6).
+/// 3-6). A switchover also warms the generation, one capture per bucket of
+/// the deployment's catalogue, and its wait is measured from the last
+/// `Warming` report rather than from the command: the bound is on a capture
+/// that stops moving, never on how many captures a deployment has.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The program layer of a change (§7.3): it moves the serving main processes
@@ -1549,7 +1552,10 @@ fn send(
 /// this process: the answer to the command that waits, or the failure that
 /// ends the wait. A failure report from any main process fails the update
 /// with the first such failure (§7.3 step 4); an acknowledgement for another
-/// process's command is not this wait's.
+/// process's command is not this wait's. A `Warming` report of this process
+/// is its warmup moving on to another capture, and restarts `timeout`: the
+/// wait ends on a main process that stops making progress, not on a long
+/// catalogue.
 fn await_report<T>(
     commands: &crate::supervision::ProcessCommands,
     process: &EpochProcess,
@@ -1558,7 +1564,7 @@ fn await_report<T>(
     what: &str,
     matches: impl Fn(&process::Report) -> Option<Result<T, crate::epoch::Failure>>,
 ) -> Result<T, crate::epoch::Failure> {
-    let deadline = Instant::now() + timeout;
+    let mut deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -1577,6 +1583,18 @@ fn await_report<T>(
                 waiting_for = process.engine,
                 "a main process reported while a switch waited"
             );
+            continue;
+        }
+        if let Some(process::report::Kind::Warming(warming)) = report.kind.as_ref() {
+            tracing::info!(
+                host = %process.host,
+                engine = process.engine,
+                generation = warming.generation,
+                step = %warming.step,
+                command = what,
+                "a main process's warmup moved on"
+            );
+            deadline = Instant::now() + timeout;
             continue;
         }
         if let Some(outcome) = matches(&report) {

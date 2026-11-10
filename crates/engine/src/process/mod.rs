@@ -191,8 +191,8 @@ pub(crate) struct MainProcess {
     precopy: Option<Precopy>,
     /// The warmups a switchover queued, one per device, with the generation each was queued for.
     /// They are read on later passes rather than waited for: a warmup is a device job of its
-    /// own, one bucket per queue turn behind serving, and a model with many buckets warms for longer
-    /// than the daemon waits for `Switched`.
+    /// own, one bucket per queue turn behind serving, and a model with many buckets warms for
+    /// minutes, which the daemon's wait for `Switched` follows through the `Warming` reports.
     warming: Vec<(u32, Submission, u64)>,
     /// How many switchovers this epoch has served. The epoch's first one is what
     /// installs a policy, so only it is checked for a policy that never arrived.
@@ -226,9 +226,15 @@ pub(crate) struct MainProcess {
     /// answer when admission opens. `Switched` means this process serves, so it waits for the
     /// buckets a batch would be planned into; a warmup that fails answers the switchover instead.
     pending_switch: Option<(u64, Option<u32>)>,
-    /// When the warmup now running was queued: a warmup that outlives twice the stall bound is
-    /// failed by name rather than left to answer nothing.
+    /// When the warmup now running last moved on - it was queued, or a device took up another
+    /// capture: a warmup that stands on one step for twice the stall bound is failed by name
+    /// rather than left to answer nothing, and one that keeps moving runs as long as its captures
+    /// take.
     warming_since: Option<Instant>,
+    /// The steps the warming devices stood on at the last pass, in `warming` order: a change is
+    /// the warmup's progress, reported to the daemon so its wait for `Switched` lasts as long as
+    /// the deployment's own capture work.
+    warming_steps: Vec<Option<String>>,
     /// When the next check for a serving policy is due, and since when none serves.
     ///
     /// `crates/scheduler`'s first switchover with no prepared candidate adopts no policy, calls

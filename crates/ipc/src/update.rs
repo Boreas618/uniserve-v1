@@ -128,6 +128,15 @@ pub enum ProgramStatus {
         /// The generation now serving.
         generation: u64,
     },
+    /// A switchover's warmup moved on to another capture on a device: the
+    /// generation is still warming, and `Switched` follows once every device
+    /// finished it.
+    Warming {
+        /// The generation being warmed.
+        generation: u64,
+        /// The step a device took up, as its worker names it.
+        step: String,
+    },
     /// Probation ended in a commit; the old generation is purged next.
     Committed {
         /// The generation committed.
