@@ -111,7 +111,7 @@ pub struct FramePadArgs {
 pub struct FramePad;
 
 impl Op for FramePad {
-    const NAME: &'static str = "frame_pad";
+    const NAME: &'static str = proto::program::operator::FRAME_PAD;
 
     type Descriptor = FramePadDescriptor;
     type Args<'a> = FramePadArgs;
@@ -427,7 +427,7 @@ pub struct FrameMomentsArgs {
 pub struct FrameMoments;
 
 impl Op for FrameMoments {
-    const NAME: &'static str = "frame_moments";
+    const NAME: &'static str = proto::program::operator::FRAME_MOMENTS;
 
     type Descriptor = FrameMomentsDescriptor;
     type Args<'a> = FrameMomentsArgs;
@@ -683,7 +683,7 @@ pub struct FrameNormPadArgs {
 pub struct FrameNormPad;
 
 impl Op for FrameNormPad {
-    const NAME: &'static str = "frame_norm_pad";
+    const NAME: &'static str = proto::program::operator::FRAME_NORM_PAD;
 
     type Descriptor = FrameNormPadDescriptor;
     type Args<'a> = FrameNormPadArgs;

@@ -8,7 +8,8 @@
 //! type with a name, a descriptor, and an argument struct; a kernel program — a Triton package, a
 //! CuTe DSL package, a CUDA C++ package or a native library — fills that operator, and
 //! `uniserve engine` resolves the programs the epoch record names and hands the modules to
-//! [`Kernel`]. `ops` depends on `platform` alone: it launches what it is given, allocates nothing
+//! [`Kernel`]. `ops` depends on `platform` and on the program vocabulary of `proto` (operator
+//! names and phases) alone: it launches what it is given, allocates nothing
 //! that outlives a launch, owns no model and knows no layer.
 //!
 //! ## The operators
@@ -110,7 +111,6 @@ pub mod norm;
 pub mod op;
 pub mod patch;
 pub mod pcm;
-pub mod phase;
 pub mod platform;
 pub mod position;
 pub mod posterior;
@@ -134,10 +134,9 @@ pub use descriptor::{Float, Key};
 pub use error::{Error, Result};
 pub use fp4::{Nvfp4Gemm, Nvfp4Quantize, ScaleLayout};
 pub use generation::{Generation, KernelEntry};
-pub use install::{Module, install, operator_name, operators};
+pub use install::{Module, install};
 pub use kernel::{Arguments, CubinMetadata, Entry, Kernel, LaunchGrid, NativeCall, NativeEntry};
 pub use op::{Call, Checked, Op, Route};
-pub use phase::PhaseKind;
 pub use platform::zero_bytes;
 pub use platform::{
     CollectiveType, Communicator, DeviceRange, PlatformDevicePtr, ReduceOp, Stream, collective_type,

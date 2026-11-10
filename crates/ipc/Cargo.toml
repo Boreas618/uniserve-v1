@@ -10,7 +10,6 @@ ignored = ["serde_bytes"]
 
 [dependencies]
 libc.workspace = true
-program-server.workspace = true
 prost.workspace = true
 proto.workspace = true
 rmp-serde.workspace = true

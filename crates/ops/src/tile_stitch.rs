@@ -90,7 +90,7 @@ pub struct Args {
 pub struct TileStitch;
 
 impl Op for TileStitch {
-    const NAME: &'static str = "tile_stitch";
+    const NAME: &'static str = proto::program::operator::TILE_STITCH;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

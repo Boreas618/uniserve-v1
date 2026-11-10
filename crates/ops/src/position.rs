@@ -91,7 +91,7 @@ pub struct Args {
 pub struct PositionInterpolate;
 
 impl Op for PositionInterpolate {
-    const NAME: &'static str = "position_interpolate";
+    const NAME: &'static str = proto::program::operator::POSITION_INTERPOLATE;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

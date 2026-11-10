@@ -9,8 +9,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use program_server::program::Programs;
-use program_server::{Named, PhaseKind, Program, ProgramSlot};
+use program_server::Named;
+use proto::program::{PhaseKind, Program, ProgramSlot, Programs};
 
 /// The descriptor keys of each slot a selection filled, by slot: the keys its package was selected
 /// for, and the only keys that package is asked to build.

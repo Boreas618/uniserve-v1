@@ -55,7 +55,7 @@ pub struct GatherArgs {
 pub struct LogitsGather;
 
 impl Op for LogitsGather {
-    const NAME: &'static str = "logits_gather";
+    const NAME: &'static str = proto::program::operator::LOGITS_GATHER;
 
     type Descriptor = GatherDescriptor;
     type Args<'a> = GatherArgs;
@@ -167,7 +167,7 @@ pub struct UnpadArgs {
 pub struct VocabUnpad;
 
 impl Op for VocabUnpad {
-    const NAME: &'static str = "vocab_unpad";
+    const NAME: &'static str = proto::program::operator::VOCAB_UNPAD;
 
     type Descriptor = UnpadDescriptor;
     type Args<'a> = UnpadArgs;

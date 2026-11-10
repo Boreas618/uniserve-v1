@@ -332,9 +332,9 @@ mod device {
     use ops::{Generation, KernelEntry};
     use platform::{DeviceAllocation, DeviceId, Stream};
     use program_server::{
-        Client, Descriptors, ModuleForm, PrepareRequest, ProgramRequest, ProgramSlot, Selector,
-        Target,
+        Client, Descriptors, ModuleForm, PrepareRequest, ProgramRequest, Selector, Target,
     };
+    use proto::program::ProgramSlot;
 
     use super::*;
 
@@ -534,7 +534,7 @@ mod device {
             };
             let prepared = self.client.prepare(&request, &mut |_| {})?;
             for chosen in prepared.programs {
-                let operator = ops::operator_name(&chosen.slot.op)
+                let operator = proto::program::operator::named(&chosen.slot.op)
                     .ok_or_else(|| format!("{} is no operator of this build", chosen.slot.op))?;
                 for key in missing.get(operator).into_iter().flatten() {
                     let module = self.client.resolve(

@@ -7,13 +7,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use program_server::PhaseKind;
 use program_server::builder::Limits;
 use program_server::protocol::{Client, CoverRequest, Coverage, Covered, Named, Package};
 use program_server::server::{ProgramServer, ServerConfig};
 use program_server::store::Root;
 use program_server::target::{Device, Target};
 use program_server::toolchain::ToolchainConfig;
+use proto::program::PhaseKind;
 
 /// The operator every fixture package implements.
 const OP: &str = "dense_attention";

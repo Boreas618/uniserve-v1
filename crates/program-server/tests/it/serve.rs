@@ -157,7 +157,7 @@ fn request(backend: &str) -> program_server::protocol::PrepareRequest {
     program_server::protocol::PrepareRequest {
         targets: Vec::new(),
         programs: vec![program_server::protocol::ProgramRequest {
-            slot: program_server::ProgramSlot::all("rms_norm"),
+            slot: proto::program::ProgramSlot::all("rms_norm"),
             selector: program_server::protocol::Selector::Latest {
                 backend: backend.to_owned(),
                 arguments: toml::Table::new(),

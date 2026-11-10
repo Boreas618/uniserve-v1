@@ -125,7 +125,7 @@ fn scaled_output(output: DType) -> bool {
 }
 
 impl Op for ModulatedRmsNorm {
-    const NAME: &'static str = "modulated_rms_norm";
+    const NAME: &'static str = proto::program::operator::MODULATED_RMS_NORM;
 
     type Descriptor = ModulatedRmsNormDescriptor;
     type Args<'a> = Args;
@@ -393,7 +393,7 @@ pub struct GatedResidualArgs {
 pub struct GatedResidual;
 
 impl Op for GatedResidual {
-    const NAME: &'static str = "gated_residual";
+    const NAME: &'static str = proto::program::operator::GATED_RESIDUAL;
 
     type Descriptor = GatedResidualDescriptor;
     type Args<'a> = GatedResidualArgs;

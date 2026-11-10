@@ -63,7 +63,7 @@ pub struct RmsNormArgs {
 pub struct RmsNorm;
 
 impl Op for RmsNorm {
-    const NAME: &'static str = "rms_norm";
+    const NAME: &'static str = proto::program::operator::RMS_NORM;
 
     type Descriptor = RmsNormDescriptor;
     type Args<'a> = RmsNormArgs;
@@ -165,7 +165,7 @@ pub struct AddRmsNormArgs {
 pub struct AddRmsNorm;
 
 impl Op for AddRmsNorm {
-    const NAME: &'static str = "add_rms_norm";
+    const NAME: &'static str = proto::program::operator::ADD_RMS_NORM;
 
     type Descriptor = AddRmsNormDescriptor;
     type Args<'a> = AddRmsNormArgs;
@@ -277,7 +277,7 @@ pub struct LayerNormArgs {
 pub struct LayerNorm;
 
 impl Op for LayerNorm {
-    const NAME: &'static str = "layer_norm";
+    const NAME: &'static str = proto::program::operator::LAYER_NORM;
 
     type Descriptor = LayerNormDescriptor;
     type Args<'a> = LayerNormArgs;
@@ -399,7 +399,7 @@ pub struct SoftmaxArgs {
 pub struct Softmax;
 
 impl Op for Softmax {
-    const NAME: &'static str = "softmax";
+    const NAME: &'static str = proto::program::operator::SOFTMAX;
 
     type Descriptor = SoftmaxDescriptor;
     type Args<'a> = SoftmaxArgs;

@@ -114,7 +114,7 @@ fn matrix(view: &TensorView, name: &str, dtype: DType) -> Result<(u64, u64)> {
 }
 
 impl Op for Transpose {
-    const NAME: &'static str = "transpose";
+    const NAME: &'static str = proto::program::operator::TRANSPOSE;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

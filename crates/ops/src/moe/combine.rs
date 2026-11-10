@@ -196,7 +196,7 @@ impl NativeCall for Call {
 pub struct MoeUnpermute;
 
 impl Op for MoeUnpermute {
-    const NAME: &'static str = "moe_unpermute";
+    const NAME: &'static str = proto::program::operator::MOE_UNPERMUTE;
 
     type Descriptor = Descriptor;
     type Args<'a> = UnpermuteArgs;

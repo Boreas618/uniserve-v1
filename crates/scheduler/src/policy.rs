@@ -115,12 +115,12 @@ impl PolicyProgram {
 
     /// The program as the Program Server names it (§5.1): the backend, the
     /// revision, and the stated arguments as TOML.
-    pub fn to_server_program(&self) -> Result<program_server::Program, PolicyError> {
+    pub fn to_server_program(&self) -> Result<proto::program::Program, PolicyError> {
         let mut arguments = toml::Table::new();
         for (name, value) in &self.stated {
             arguments.insert(name.clone(), argument::<toml::Value>(value, name)?);
         }
-        Ok(program_server::Program {
+        Ok(proto::program::Program {
             backend: self.backend.clone(),
             revision: self.revision,
             arguments,

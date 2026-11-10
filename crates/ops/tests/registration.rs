@@ -119,7 +119,7 @@ fn every_declared_operator_is_registered_by_name() -> Result<(), String> {
 #[test]
 fn the_names_this_build_installs_are_distinct() {
     // Two operators answering one name would make the second unloadable and the first ambiguous.
-    let names = ops::operators();
+    let names = proto::program::operator::ALL;
     let distinct: BTreeSet<&&str> = names.iter().collect();
     assert_eq!(
         names.len(),

@@ -921,7 +921,6 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "nn",
- "ops",
  "platform",
  "processing",
  "program-server",
@@ -2029,7 +2028,6 @@ name = "ipc"
 version = "2.0.0"
 dependencies = [
  "libc",
- "program-server",
  "prost",
  "proto",
  "rmp-serde",
@@ -2599,6 +2597,7 @@ dependencies = [
  "platform",
  "processing",
  "program-server",
+ "proto",
  "safetensors",
  "serde",
  "serde_json",
@@ -2764,6 +2763,7 @@ name = "ops"
 version = "2.0.0"
 dependencies = [
  "platform",
+ "proto",
  "serde",
  "thiserror",
 ]
@@ -3046,6 +3046,7 @@ dependencies = [
  "platform",
  "prost",
  "prost-build",
+ "proto",
  "protox",
  "rustix",
  "serde",

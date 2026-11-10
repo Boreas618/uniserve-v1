@@ -95,7 +95,7 @@ pub struct WeightedRmsNormArgs {
 pub struct WeightedRmsNorm;
 
 impl Op for WeightedRmsNorm {
-    const NAME: &'static str = "weighted_rms_norm";
+    const NAME: &'static str = proto::program::operator::WEIGHTED_RMS_NORM;
 
     type Descriptor = WeightedRmsNormDescriptor;
     type Args<'a> = WeightedRmsNormArgs;
@@ -217,7 +217,7 @@ pub struct ScaledResidualRmsNormArgs {
 pub struct ScaledResidualRmsNorm;
 
 impl Op for ScaledResidualRmsNorm {
-    const NAME: &'static str = "scaled_residual_rms_norm";
+    const NAME: &'static str = proto::program::operator::SCALED_RESIDUAL_RMS_NORM;
 
     type Descriptor = ScaledResidualRmsNormDescriptor;
     type Args<'a> = ScaledResidualRmsNormArgs;
@@ -384,7 +384,7 @@ pub struct ScaledResidualLayerNormArgs {
 pub struct ScaledResidualLayerNorm;
 
 impl Op for ScaledResidualLayerNorm {
-    const NAME: &'static str = "scaled_residual_layer_norm";
+    const NAME: &'static str = proto::program::operator::SCALED_RESIDUAL_LAYER_NORM;
 
     type Descriptor = ScaledResidualLayerNormDescriptor;
     type Args<'a> = ScaledResidualLayerNormArgs;
@@ -537,7 +537,7 @@ pub struct ScaledResidualArgs {
 pub struct ScaledResidual;
 
 impl Op for ScaledResidual {
-    const NAME: &'static str = "scaled_residual";
+    const NAME: &'static str = proto::program::operator::SCALED_RESIDUAL;
 
     type Descriptor = ScaledResidualDescriptor;
     type Args<'a> = ScaledResidualArgs;
@@ -761,7 +761,7 @@ pub struct ScaledAddArgs {
 pub struct ScaledAdd;
 
 impl Op for ScaledAdd {
-    const NAME: &'static str = "scaled_add";
+    const NAME: &'static str = proto::program::operator::SCALED_ADD;
 
     type Descriptor = ScaledAddDescriptor;
     type Args<'a> = ScaledAddArgs;

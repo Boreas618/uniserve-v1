@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use ops::KernelEntry;
-use program_server::program::Programs;
 use program_server::{Client, CoverRequest, PrepareRequest, Target};
+use proto::program::Programs;
 use worker::completion::Outcome;
 use worker::host::HostAction;
 
@@ -591,7 +591,7 @@ impl HostAction for Install {
         let mut entries = Vec::new();
         let mut copies = 0_usize;
         for chosen in &prepared.programs {
-            let operator = ops::operator_name(&chosen.slot.op).ok_or_else(|| {
+            let operator = proto::program::operator::named(&chosen.slot.op).ok_or_else(|| {
                 worker::Error::Invalid(format!(
                     "operator {} has no implementation in this build",
                     chosen.slot.op

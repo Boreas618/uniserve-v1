@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use program_server::Client;
-use program_server::program::Programs;
 use proto::config::EngineArgs;
+use proto::program::Programs;
 use worker::blocking::{BlockingKind, ThreadPool};
 use worker::control::{Control, Endpoints};
 use worker::hot_update::HotUpdate;

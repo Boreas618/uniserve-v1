@@ -2496,8 +2496,8 @@ impl<M: TextModel> CausalLmRunner<M> {
             query_offsets: self.columns.query_offsets.extent(0..bucket.rows as u64 + 1),
             logits_rows: self.columns.logits_rows.extent(0..bucket.rows as u64),
             phase: match bucket.variant.is_decode() {
-                true => ops::PhaseKind::Decode,
-                false => ops::PhaseKind::Prefill,
+                true => proto::program::PhaseKind::Decode,
+                false => proto::program::PhaseKind::Prefill,
             },
             page_size: self.kv.page_size(),
             num_tokens: bucket.tokens,

@@ -409,30 +409,30 @@ fn an_operator_is_found_by_the_name_its_programs_are_filed_under() {
     // A program layer's packages name their operators as text; the worker resolves one to the
     // static name a generation is keyed by, and gets nothing when this build has no such operator.
     assert_eq!(
-        ops::operator_name("rms_norm"),
+        proto::program::operator::named("rms_norm"),
         Some(<ops::norm::RmsNorm as ops::Op>::NAME)
     );
     assert_eq!(
-        ops::operator_name(<ops::gemm::Gemm as ops::Op>::NAME),
+        proto::program::operator::named(<ops::gemm::Gemm as ops::Op>::NAME),
         Some(<ops::gemm::Gemm as ops::Op>::NAME),
         "an operator's own name resolves to itself, not to a prefix or a neighbour"
     );
-    assert_eq!(ops::operator_name("no_such_operator"), None);
-    assert_eq!(ops::operator_name(""), None);
+    assert_eq!(proto::program::operator::named("no_such_operator"), None);
+    assert_eq!(proto::program::operator::named(""), None);
     assert_eq!(
-        ops::operator_name("gemm_prefill"),
+        proto::program::operator::named("gemm_prefill"),
         None,
         "a descriptor is not a name"
     );
 
     // Every name the build lists is a real operator name, and no name is listed twice: the list is
     // what a package's coverage is checked against.
-    let mut names: Vec<&'static str> = ops::operators().to_vec();
+    let mut names: Vec<&'static str> = proto::program::operator::ALL.to_vec();
     let listed = names.len();
     names.sort_unstable();
     names.dedup();
     assert_eq!(names.len(), listed, "an operator name is listed once");
-    for name in ops::operators() {
+    for name in proto::program::operator::ALL {
         assert!(!name.is_empty());
         assert!(
             name.chars()
@@ -440,7 +440,7 @@ fn an_operator_is_found_by_the_name_its_programs_are_filed_under() {
             "{name} is not a program directory name"
         );
         assert_eq!(
-            ops::operator_name(name),
+            proto::program::operator::named(name),
             Some(*name),
             "{name} resolves to itself"
         );

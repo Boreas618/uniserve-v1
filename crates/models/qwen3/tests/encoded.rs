@@ -600,8 +600,8 @@ fn recorded_forward(
     model: &dyn nn::family::TextModel,
     tokens: u64,
 ) -> std::collections::BTreeSet<(String, String)> {
-    use nn::PhaseKind;
     use nn::capability::{KvGroup, KvPlanes, KvView, TokenBatch};
+    use proto::program::PhaseKind;
 
     let cache = model.cache();
     let arena = nn::Arena::counting();

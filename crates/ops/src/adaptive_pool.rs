@@ -77,7 +77,7 @@ pub struct Args {
 pub struct AdaptivePool;
 
 impl Op for AdaptivePool {
-    const NAME: &'static str = "adaptive_pool";
+    const NAME: &'static str = proto::program::operator::ADAPTIVE_POOL;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

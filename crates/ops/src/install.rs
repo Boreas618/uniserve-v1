@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::generation::KernelEntry;
 use crate::kernel::{CubinMetadata, Kernel};
 use crate::platform::NativeLibrary;
-use crate::{Op, Result, platform};
+use crate::{Result, platform};
 
 /// One module of a program layer, as the package delivered it.
 pub enum Module<'a> {
@@ -39,109 +39,6 @@ pub enum Module<'a> {
     },
 }
 
-/// Every operator this build of `ops` has, by the name its programs are filed under.
-///
-/// A build without an operator's program packages still names it here: the table lists the crate's
-/// operators, not the loaded modules, and [`install`] answers `None` for a name this table lacks.
-const OPERATORS: &[&str] = &[
-    <crate::activation::ActAndMul as Op>::NAME,
-    <crate::activation::ValueFirstSwiglu as Op>::NAME,
-    <crate::activation::Swiglu as Op>::NAME,
-    <crate::block_copy::CacheBlockSnapshot as Op>::NAME,
-    <crate::block_copy::CacheBlockScatter as Op>::NAME,
-    <crate::commit::SlotCommit as Op>::NAME,
-    <crate::transpose::Transpose as Op>::NAME,
-    <crate::vsa::VsaScores as Op>::NAME,
-    <crate::conv::Conv3d as Op>::NAME,
-    <crate::conv::Conv1d as Op>::NAME,
-    <crate::conv::ConvTranspose1d as Op>::NAME,
-    <crate::embedding::Embedding as Op>::NAME,
-    <crate::frame::FramePad as Op>::NAME,
-    <crate::frame::FrameMoments as Op>::NAME,
-    <crate::frame::FrameNormPad as Op>::NAME,
-    <crate::gemm::Gemm as Op>::NAME,
-    <crate::kv::KvWrite as Op>::NAME,
-    <crate::kv::KvWriteScaled as Op>::NAME,
-    <crate::logits::LogitsGather as Op>::NAME,
-    <crate::logits::VocabUnpad as Op>::NAME,
-    <crate::modulation::ModulatedRmsNorm as Op>::NAME,
-    <crate::modulation::GatedResidual as Op>::NAME,
-    <crate::noise::PhiloxNoise as Op>::NAME,
-    <crate::norm::RmsNorm as Op>::NAME,
-    <crate::norm::AddRmsNorm as Op>::NAME,
-    <crate::norm::LayerNorm as Op>::NAME,
-    <crate::norm::Softmax as Op>::NAME,
-    <crate::prefix_cache::PageConversion as Op>::NAME,
-    <crate::prefix_cache::CacheCopyRegion as Op>::NAME,
-    <crate::residual::WeightedRmsNorm as Op>::NAME,
-    <crate::residual::ScaledResidualRmsNorm as Op>::NAME,
-    <crate::residual::ScaledResidualLayerNorm as Op>::NAME,
-    <crate::residual::ScaledResidual as Op>::NAME,
-    <crate::residual::ScaledAdd as Op>::NAME,
-    <crate::rope::RotaryFactors as Op>::NAME,
-    <crate::rope::QkNormRope as Op>::NAME,
-    <crate::sampler::LogitsShape as Op>::NAME,
-    <crate::sampler::TopK as Op>::NAME,
-    <crate::sampler::FilterCandidates as Op>::NAME,
-    <crate::sampler::CandidateOrder as Op>::NAME,
-    <crate::sampler::InverseCdf as Op>::NAME,
-    <crate::sampler::ArgMax as Op>::NAME,
-    <crate::sampler::LogSoftmax as Op>::NAME,
-    <crate::sampler::LogprobGather as Op>::NAME,
-    <crate::vsa::VsaZeroPadding as Op>::NAME,
-    <crate::vsa::VsaAddGatedTiles as Op>::NAME,
-    <crate::vsa::VsaComposeGatedRows as Op>::NAME,
-    <crate::vsa::VsaSelectTiles as Op>::NAME,
-    <crate::vsa::VsaPrepareTiles as Op>::NAME,
-    <crate::vsa::VsaCompressPooled as Op>::NAME,
-    <crate::attention::dense::DenseAttention as Op>::NAME,
-    <crate::attention::PagedAttention as Op>::NAME,
-    <crate::attention::sparse::SparseAttention as Op>::NAME,
-    <crate::moe::combine::MoeUnpermute as Op>::NAME,
-    <crate::moe::exchange::ExpertExchange as Op>::NAME,
-    <crate::moe::grouped::GatherGemm as Op>::NAME,
-    <crate::moe::grouped::GatherGemmNvfp4 as Op>::NAME,
-    <crate::moe::grouped::RouteGemm as Op>::NAME,
-    <crate::moe::grouped::RouteGemmNvfp4 as Op>::NAME,
-    <crate::moe::routing::TopkSoftmax as Op>::NAME,
-    <crate::moe::sort::MoeSort as Op>::NAME,
-    <crate::fp4::Nvfp4Quantize as Op>::NAME,
-    <crate::fp4::Nvfp4Gemm as Op>::NAME,
-    <crate::snake::Snake as Op>::NAME,
-    <crate::channel_affine::ChannelAffine as Op>::NAME,
-    <crate::gelu::Gelu as Op>::NAME,
-    <crate::activation::Silu as Op>::NAME,
-    <crate::adaptive_pool::AdaptivePool as Op>::NAME,
-    <crate::rows::Rows as Op>::NAME,
-    <crate::position::PositionInterpolate as Op>::NAME,
-    <crate::activation1d::Activation1d as Op>::NAME,
-    <crate::patch::Patch as Op>::NAME,
-    <crate::unpatchify::Unpatchify as Op>::NAME,
-    <crate::copy_block::CopyBlock as Op>::NAME,
-    <crate::cross_fade::CrossFade as Op>::NAME,
-    <crate::tile_stitch::TileStitch as Op>::NAME,
-    <crate::posterior::Posterior as Op>::NAME,
-    <crate::rope::RopeApply as Op>::NAME,
-    <crate::pcm::PcmInterleave as Op>::NAME,
-    <crate::rgb::RgbBytes as Op>::NAME,
-];
-
-/// `name`, interned, when this build has an operator by that name.
-///
-/// The worker's precopy reads a package's operator names as text; this gives back the static name
-/// the generation is keyed by, or `None` when no operator of this build answers to `name`.
-pub fn operator_name(name: &str) -> Option<&'static str> {
-    OPERATORS
-        .iter()
-        .copied()
-        .find(|candidate| *candidate == name)
-}
-
-/// Every operator name this build has, in a stable order for a package's coverage check.
-pub fn operators() -> &'static [&'static str] {
-    OPERATORS
-}
-
 /// Load `module` as the kernel of `operator` for `descriptor_key`.
 ///
 /// `Ok(None)` means this build of `ops` has no operator called `operator`: the module belongs to a
@@ -153,7 +50,7 @@ pub fn install(
     descriptor_key: &str,
     module: Module<'_>,
 ) -> Result<Option<KernelEntry>> {
-    let Some(name) = operator_name(operator) else {
+    let Some(name) = proto::program::operator::named(operator) else {
         return Ok(None);
     };
     let kernel = load(device, module)?;

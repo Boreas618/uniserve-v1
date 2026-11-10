@@ -86,7 +86,7 @@ pub struct Args {
 pub struct Posterior;
 
 impl Op for Posterior {
-    const NAME: &'static str = "posterior";
+    const NAME: &'static str = proto::program::operator::POSTERIOR;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

@@ -290,7 +290,7 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
     let precopy = ipc::ProgramCommand::Precopy {
         generation: 1,
         programs: Box::default(),
-        policy: program_server::Program {
+        policy: proto::program::Program {
             backend: "fcfs".to_owned(),
             revision: 1,
             arguments: Default::default(),

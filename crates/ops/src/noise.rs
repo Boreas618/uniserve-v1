@@ -148,7 +148,7 @@ pub struct NoiseArgs {
 pub struct PhiloxNoise;
 
 impl Op for PhiloxNoise {
-    const NAME: &'static str = "philox_noise";
+    const NAME: &'static str = proto::program::operator::PHILOX_NOISE;
 
     type Descriptor = NoiseDescriptor;
     type Args<'a> = NoiseArgs;

@@ -35,11 +35,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::program::ProgramSlot;
 use crate::protocol::{Descriptors, PrepareRequest, ProgramRequest, Selector};
 use crate::server::{ProgramServer, ServerConfig};
 use crate::target::Target;
 use crate::{Error, Manifest, Result};
+use proto::program::ProgramSlot;
 
 /// One line of a key list: an operator and one of its descriptor keys.
 #[derive(Clone, Debug, PartialEq, Eq)]

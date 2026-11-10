@@ -6,13 +6,14 @@ use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 
+use program_server::Error;
 use program_server::manifest::ModuleForm;
 use program_server::protocol::{
     Client, Connection, Descriptors, PrepareRequest, ProgramRequest, Selector, wire,
 };
 use program_server::store::ModulePath;
 use program_server::target::Target;
-use program_server::{Error, PhaseKind, Program, ProgramSlot};
+use proto::program::{PhaseKind, Program, ProgramSlot};
 
 /// A program of the Triton `rms_norm` package.
 fn program() -> Program {
@@ -173,7 +174,7 @@ fn prepare_reports_each_build_and_answers_the_selected_programs() {
             },
         }],
         descriptors: vec![Descriptors {
-            slot: program_server::ProgramSlot::all("rms_norm"),
+            slot: proto::program::ProgramSlot::all("rms_norm"),
             keys: vec!["dtype_bf16".into()],
         }],
     };

@@ -294,7 +294,7 @@ impl NativeCall for SparseCall {
 pub struct SparseAttention;
 
 impl Op for SparseAttention {
-    const NAME: &'static str = "sparse_attention";
+    const NAME: &'static str = proto::program::operator::SPARSE_ATTENTION;
 
     type Descriptor = SparseDescriptor;
     type Args<'a> = SparseArgs;

@@ -21,16 +21,11 @@
 //! The messages carry a program's names — its backend, its revision and its
 //! arguments — and never its content: content comes from the Program Server by
 //! `resolve` (§6.3). `Program`, `ProgramSlot`, `PhaseKind` and `Programs` are
-//! defined in `crates/program-server` (design §5.1); this module gives them their
-//! form on the peer channel, exactly as the daemon's append-only Protobuf
-//! carries them across builds.
-//!
-//! This module is declared in `crates/ipc/src/lib.rs` when `program-server` is a
-//! workspace member here. Until then the commands cannot be compiled, because
-//! their payload's owners are not in the tree; the statuses they answer with are
-//! in [`crate::update`] and compile today.
+//! the program vocabulary of `proto::program` (design §5.1); this module gives
+//! them their form on the peer channel, exactly as the daemon's append-only
+//! Protobuf carries them across builds.
 
-use program_server::program::Programs;
+use proto::program::Programs;
 use serde::{Deserialize, Serialize};
 
 /// A command of the program-layer update, as a main process receives it.
@@ -54,7 +49,7 @@ pub enum ProgramCommand {
         /// `programs`: a policy is one program per epoch, named by its own
         /// backend, and the daemon's epoch record keeps the two apart
         /// (`crates/daemon/src/epoch.rs`).
-        policy: program_server::Program,
+        policy: proto::program::Program,
     },
     /// §7.3 step 3: cut over at the batch boundary whose step is `step`.
     Switchover {
@@ -179,7 +174,7 @@ impl ProgramCommand {
                         .program
                         .ok_or_else(|| program_error("a precopy's kernel states no program"))?;
                     let phase = kernel.phase.map(phase_from_wire).transpose()?.flatten();
-                    let slot = program_server::ProgramSlot {
+                    let slot = proto::program::ProgramSlot {
                         op: kernel.op,
                         phase,
                         part: None,
@@ -218,7 +213,7 @@ impl ProgramCommand {
 
 /// A program as the daemon's Protobuf carries it: its backend, its revision and
 /// its arguments, never the module's bytes (§6.3).
-fn program_to_wire(program: &program_server::Program) -> proto::process::Program {
+fn program_to_wire(program: &proto::program::Program) -> proto::process::Program {
     proto::process::Program {
         backend: program.backend.clone(),
         revision: program.revision,
@@ -233,7 +228,7 @@ fn program_to_wire(program: &program_server::Program) -> proto::process::Program
 /// The program a Protobuf form states, its arguments read back as TOML values.
 fn program_from_wire(
     program: proto::process::Program,
-) -> Result<program_server::Program, crate::IpcError> {
+) -> Result<proto::program::Program, crate::IpcError> {
     let mut arguments = toml::Table::new();
     for (name, value) in program.arguments {
         let value = value.parse::<toml::Value>().map_err(|_| {
@@ -244,16 +239,16 @@ fn program_from_wire(
         })?;
         arguments.insert(name, value);
     }
-    Ok(program_server::Program {
+    Ok(proto::program::Program {
         backend: program.backend,
         revision: program.revision,
         arguments,
     })
 }
 
-/// `ops::PhaseKind` as the wire's enum.
-fn phase_to_wire(phase: program_server::PhaseKind) -> proto::process::PhaseKind {
-    use program_server::PhaseKind;
+/// `proto::program::PhaseKind` as the wire's enum.
+fn phase_to_wire(phase: proto::program::PhaseKind) -> proto::process::PhaseKind {
+    use proto::program::PhaseKind;
     match phase {
         PhaseKind::Prefill => proto::process::PhaseKind::Prefill,
         PhaseKind::Decode => proto::process::PhaseKind::Decode,
@@ -262,15 +257,15 @@ fn phase_to_wire(phase: program_server::PhaseKind) -> proto::process::PhaseKind 
     }
 }
 
-/// The wire's enum as `ops::PhaseKind`; `Ok(None)` for the unspecified value,
+/// The wire's enum as `proto::program::PhaseKind`; `Ok(None)` for the unspecified value,
 /// which means the program fills every phase of its operator.
-fn phase_from_wire(phase: i32) -> Result<Option<program_server::PhaseKind>, crate::IpcError> {
+fn phase_from_wire(phase: i32) -> Result<Option<proto::program::PhaseKind>, crate::IpcError> {
     use proto::process::PhaseKind;
     Ok(match PhaseKind::try_from(phase) {
-        Ok(PhaseKind::Prefill) => Some(program_server::PhaseKind::Prefill),
-        Ok(PhaseKind::Decode) => Some(program_server::PhaseKind::Decode),
-        Ok(PhaseKind::Encode) => Some(program_server::PhaseKind::Encode),
-        Ok(PhaseKind::Denoise) => Some(program_server::PhaseKind::Denoise),
+        Ok(PhaseKind::Prefill) => Some(proto::program::PhaseKind::Prefill),
+        Ok(PhaseKind::Decode) => Some(proto::program::PhaseKind::Decode),
+        Ok(PhaseKind::Encode) => Some(proto::program::PhaseKind::Encode),
+        Ok(PhaseKind::Denoise) => Some(proto::program::PhaseKind::Denoise),
         Ok(PhaseKind::Unspecified) => None,
         Err(_) => return Err(program_error(format!("phase {phase} is not a phase kind"))),
     })
@@ -299,16 +294,16 @@ mod tests {
     fn a_precopy_carries_program_names_and_arguments_and_never_content() {
         let mut programs = Programs::new();
         programs.insert(
-            program_server::ProgramSlot::all("decode_attention"),
-            program_server::Program {
+            proto::program::ProgramSlot::all("decode_attention"),
+            proto::program::Program {
                 backend: "trtllm".to_owned(),
                 revision: 3,
                 arguments: "block = 16".parse().expect("the program's arguments"),
             },
         );
         programs.insert(
-            program_server::ProgramSlot::phase("rms_norm", program_server::PhaseKind::Prefill),
-            program_server::Program {
+            proto::program::ProgramSlot::phase("rms_norm", proto::program::PhaseKind::Prefill),
+            proto::program::Program {
                 backend: "triton".to_owned(),
                 revision: 2,
                 arguments: toml::Table::new(),
@@ -317,7 +312,7 @@ mod tests {
         let command = ProgramCommand::Precopy {
             generation: 5,
             programs: Box::new(programs.clone()),
-            policy: program_server::Program {
+            policy: proto::program::Program {
                 backend: "fcfs".to_owned(),
                 revision: 1,
                 arguments: "chunked_prefill_size = 4096"
@@ -347,7 +342,7 @@ mod tests {
         };
         assert_eq!(generation, 5);
         assert_eq!(
-            programs[&program_server::ProgramSlot::all("decode_attention")].revision,
+            programs[&proto::program::ProgramSlot::all("decode_attention")].revision,
             3
         );
         assert_eq!(policy.backend, "fcfs");
@@ -374,8 +369,8 @@ mod tests {
     fn a_precopy_survives_the_daemon_wire_with_its_policy_and_arguments() {
         let mut programs = Programs::new();
         programs.insert(
-            program_server::ProgramSlot::phase("rms_norm", program_server::PhaseKind::Prefill),
-            program_server::Program {
+            proto::program::ProgramSlot::phase("rms_norm", proto::program::PhaseKind::Prefill),
+            proto::program::Program {
                 backend: "triton".to_owned(),
                 revision: 2,
                 arguments: "block = 256".parse().expect("the program's arguments"),
@@ -384,7 +379,7 @@ mod tests {
         let command = ProgramCommand::Precopy {
             generation: 9,
             programs: Box::new(programs.clone()),
-            policy: program_server::Program {
+            policy: proto::program::Program {
                 backend: "fcfs".to_owned(),
                 revision: 4,
                 arguments: "chunked_prefill_size = 4096"
@@ -405,7 +400,7 @@ mod tests {
         let expected = ProgramCommand::Precopy {
             generation: 4,
             programs: Box::new(programs.clone()),
-            policy: program_server::Program {
+            policy: proto::program::Program {
                 backend: "fcfs".to_owned(),
                 revision: 4,
                 arguments: "chunked_prefill_size = 4096"

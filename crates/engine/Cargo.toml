@@ -30,7 +30,7 @@ worker.workspace = true
 processing.workspace = true
 tempfile.workspace = true
 # A test states the arguments a deployment pinned on a program, which are a TOML table
-# (`program_server::Program`).
+# (`proto::program::Program`).
 toml.workspace = true
 
 [lints]

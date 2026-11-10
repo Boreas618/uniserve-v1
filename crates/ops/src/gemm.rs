@@ -230,7 +230,7 @@ impl Gemm {
 }
 
 impl Op for Gemm {
-    const NAME: &'static str = "gemm";
+    const NAME: &'static str = proto::program::operator::GEMM;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

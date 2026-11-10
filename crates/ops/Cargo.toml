@@ -12,6 +12,8 @@ publish = false
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 platform = { path = "../platform" }
+# The operator names and phases the kernel library keys its generations by.
+proto.workspace = true
 thiserror.workspace = true
 
 [lints]

@@ -76,8 +76,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use ops::Generation;
-use program_server::program::Programs;
 use program_server::{Client, Target};
+use proto::program::Programs;
 use worker::batch::Submission;
 use worker::blocking::ThreadPool;
 use worker::completion::Outcome;

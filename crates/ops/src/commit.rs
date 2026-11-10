@@ -158,7 +158,7 @@ pub struct CommitArgs {
 pub struct SlotCommit;
 
 impl Op for SlotCommit {
-    const NAME: &'static str = "slot_commit";
+    const NAME: &'static str = proto::program::operator::SLOT_COMMIT;
 
     type Descriptor = CommitDescriptor;
     type Args<'a> = CommitArgs;

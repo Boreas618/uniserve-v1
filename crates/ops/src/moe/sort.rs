@@ -239,7 +239,7 @@ impl NativeCall for Call {
 pub struct MoeSort;
 
 impl Op for MoeSort {
-    const NAME: &'static str = "moe_sort";
+    const NAME: &'static str = proto::program::operator::MOE_SORT;
 
     type Descriptor = Descriptor;
     type Args<'a> = SortArgs;

@@ -61,7 +61,7 @@ pub struct Args {
 pub struct ChannelAffine;
 
 impl Op for ChannelAffine {
-    const NAME: &'static str = "channel_affine";
+    const NAME: &'static str = proto::program::operator::CHANNEL_AFFINE;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

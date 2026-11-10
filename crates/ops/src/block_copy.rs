@@ -136,7 +136,7 @@ pub struct SnapshotArgs {
 pub struct CacheBlockSnapshot;
 
 impl Op for CacheBlockSnapshot {
-    const NAME: &'static str = "cache_block_snapshot";
+    const NAME: &'static str = proto::program::operator::CACHE_BLOCK_SNAPSHOT;
 
     type Descriptor = SnapshotDescriptor;
     type Args<'a> = SnapshotArgs;
@@ -221,7 +221,7 @@ pub struct ScatterArgs {
 pub struct CacheBlockScatter;
 
 impl Op for CacheBlockScatter {
-    const NAME: &'static str = "cache_block_scatter";
+    const NAME: &'static str = proto::program::operator::CACHE_BLOCK_SCATTER;
 
     type Descriptor = ScatterDescriptor;
     type Args<'a> = ScatterArgs;

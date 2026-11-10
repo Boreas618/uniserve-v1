@@ -32,15 +32,15 @@
 //! - [`manifest`]: the `package.toml` of section 5.2.
 //! - [`protocol`]: the append-only Protobuf protocol and its client, which
 //!   the daemon and the main process use.
-//! - [`program`]: [`Program`], the backend name, revision and arguments an
-//!   epoch fills each operator with (section 5.1), shared by the daemon and
-//!   the main process.
+//!
+//! The programs it serves, the slots they fill and their phases are
+//! `proto::program`'s (section 5.1), which the daemon and the main process
+//! name them with too.
 
 pub mod build;
 pub mod builder;
 pub mod command;
 pub mod manifest;
-pub mod program;
 pub mod protocol;
 pub mod server;
 pub mod source;
@@ -50,7 +50,6 @@ pub mod toolchain;
 
 pub use builder::{BuildState, Limits, Urgency};
 pub use manifest::{Manifest, ManifestError, ModuleForm, SourceKind, TargetKind, ToolchainKind};
-pub use program::{PhaseKind, Program, ProgramSlot};
 pub use protocol::{
     Client, CoverRequest, Coverage, Covered, Descriptors, Module, ModuleFile, Named,
     PrepareRequest, Prepared, ProgramRequest, Progress, Selector,

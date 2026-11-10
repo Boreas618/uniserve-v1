@@ -75,7 +75,7 @@ pub struct Args {
 pub struct PcmInterleave;
 
 impl Op for PcmInterleave {
-    const NAME: &'static str = "pcm_interleave";
+    const NAME: &'static str = proto::program::operator::PCM_INTERLEAVE;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

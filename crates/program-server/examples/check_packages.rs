@@ -404,7 +404,7 @@ fn the_exchange_keeps_its_group_sizes_apart(kernels: &Path) -> Result<(), String
 /// Every package names an operator the `ops` crate declares: a package under another name is a
 /// program nothing can request.
 fn every_package_names_an_operator(packages: &[PathBuf]) -> Result<(), String> {
-    let operators = ops::operators();
+    let operators = proto::program::operator::ALL;
     let mut failures = Vec::new();
     for package in packages {
         let Ok(manifest) = Manifest::load(package) else {

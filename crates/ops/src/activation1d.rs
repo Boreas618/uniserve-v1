@@ -162,7 +162,7 @@ pub struct Args {
 pub struct Activation1d;
 
 impl Op for Activation1d {
-    const NAME: &'static str = "audio_activation";
+    const NAME: &'static str = proto::program::operator::AUDIO_ACTIVATION;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use ipc::UpdateFailure;
-use program_server::program::Programs;
 use program_server::{Descriptors, PrepareRequest, ProgramRequest, Selector, Target};
+use proto::program::Programs;
 use worker::host::HostTask;
 
 use super::MainProcess;
@@ -49,7 +49,7 @@ impl MainProcess {
         keys: BTreeMap<String, BTreeSet<String>>,
     ) -> std::result::Result<Arc<HostTask<ModuleWork>>, UpdateFailure> {
         for operator in keys.keys() {
-            if ops::operator_name(operator).is_none() {
+            if proto::program::operator::named(operator).is_none() {
                 return Err(UpdateFailure::Precopy {
                     reason: format!("operator {operator} has no implementation in this build"),
                 });

@@ -169,7 +169,7 @@ pub struct Args {
 pub struct RgbBytes;
 
 impl Op for RgbBytes {
-    const NAME: &'static str = "rgb_bytes";
+    const NAME: &'static str = proto::program::operator::RGB_BYTES;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

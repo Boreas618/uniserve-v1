@@ -24,44 +24,20 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-pub use program_server::{PhaseKind, Program, ProgramSlot};
+pub use proto::program::{PhaseKind, Program, ProgramSlot};
+// The operators the configuration selects a backend for are named by the
+// program vocabulary (`proto::program::operator`), whose names each
+// operator's `Op::NAME` is: the daemon, the Program Server and the main
+// process cannot disagree about a slot's name.
+use proto::program::operator;
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::options::ServerArgs;
 
-/// The operator names the epoch record keys its kernel programs by (§5.1,
-/// §5.2), of the operators whose backend a configuration selects. They are
-/// `crates/ops`'s `Op::NAME` of the same operator, so the daemon, the
-/// Program Server and the main process cannot disagree about a slot's name.
-///
-/// The complete slot set is `crates/ops`'s operator names. The rest are
-/// filled by the epoch's programs like any other slot and need no entry
-/// here: their backend is not a configuration field, so this module names
-/// only the operators the configuration selects a backend for. The
-/// scheduling interface is not an operator at all: its program is the epoch
-/// record's `policy` field.
-pub mod operators {
-    use ops::Op as _;
-
-    /// Paged attention, the operator `attention_backend` and the per-phase
-    /// attention fields select a backend for (§4.2, §9).
-    pub const PAGED_ATTENTION: &str = ops::attention::PagedAttention::NAME;
-    /// The grouped expert GEMM's gather and compute, the operator
-    /// `moe_runner_backend` selects a backend for (§5.1, §9). The grouped
-    /// experts are two operators, and one program backend fills both.
-    pub const GATHER_GEMM: &str = ops::moe::GatherGemm::NAME;
-    /// The grouped expert GEMM's route and combine, filled by the same
-    /// program backend as [`GATHER_GEMM`].
-    pub const ROUTE_GEMM: &str = ops::moe::RouteGemm::NAME;
-    /// The expert exchange around the grouped expert GEMM, the operator
-    /// `moe_config.exchange` selects a backend for (§9).
-    pub const EXPERT_EXCHANGE: &str = ops::moe::ExpertExchange::NAME;
-}
-
 /// The key an epoch's programs are stored under: the operator, and the
 /// phase when the configuration fills it per phase (§5.2). Programs and
-/// slots are `crates/program-server`'s types, which the daemon, the main
+/// slots are `proto::program`'s types, which the daemon, the main
 /// process and the Program Server all name programs with (§5.1).
 pub type KernelKey = ProgramSlot;
 
@@ -1142,7 +1118,7 @@ impl FilledPrograms {
         // package nothing runs.
         if config.moe_config.expert_parallel {
             kernels.insert(
-                KernelKey::all(operators::EXPERT_EXCHANGE),
+                KernelKey::all(operator::EXPERT_EXCHANGE),
                 Program {
                     backend: word(&config.moe_config.exchange),
                     revision: 0,
@@ -1157,7 +1133,7 @@ impl FilledPrograms {
         {
             // The grouped expert GEMM is two operators, gather and route,
             // and one program backend fills both (§9).
-            for operator in [operators::GATHER_GEMM, operators::ROUTE_GEMM] {
+            for operator in [operator::GATHER_GEMM, operator::ROUTE_GEMM] {
                 kernels.insert(
                     KernelKey::all(operator),
                     Program {
@@ -1205,14 +1181,14 @@ fn attention_programs(config: &ServerArgs) -> Vec<(KernelKey, Program)> {
         if prefill == AUTO_BACKEND {
             return Vec::new();
         }
-        return vec![(KernelKey::all(operators::PAGED_ATTENTION), program(prefill))];
+        return vec![(KernelKey::all(operator::PAGED_ATTENTION), program(prefill))];
     }
     [(PhaseKind::Prefill, prefill), (PhaseKind::Decode, decode)]
         .into_iter()
         .filter(|(_, backend)| backend != AUTO_BACKEND)
         .map(|(phase, backend)| {
             (
-                KernelKey::phase(operators::PAGED_ATTENTION, phase),
+                KernelKey::phase(operator::PAGED_ATTENTION, phase),
                 program(backend),
             )
         })
@@ -2253,10 +2229,10 @@ mod tests {
         // The default attention backend is `auto`: the deployment names no
         // attention program, and the Program Server selects its packages.
         for operator in [
-            operators::PAGED_ATTENTION,
-            operators::EXPERT_EXCHANGE,
-            operators::GATHER_GEMM,
-            operators::ROUTE_GEMM,
+            operator::PAGED_ATTENTION,
+            operator::EXPERT_EXCHANGE,
+            operator::GATHER_GEMM,
+            operator::ROUTE_GEMM,
         ] {
             assert!(
                 !programs.kernels.contains_key(&KernelKey::all(operator)),
@@ -2271,7 +2247,7 @@ mod tests {
         parallel.moe_config.expert_parallel = true;
         let programs = FilledPrograms::of(&parallel);
         assert_eq!(
-            programs.kernels[&KernelKey::all(operators::EXPERT_EXCHANGE)].backend,
+            programs.kernels[&KernelKey::all(operator::EXPERT_EXCHANGE)].backend,
             "alltoall"
         );
 
@@ -2320,9 +2296,9 @@ mod tests {
         };
         let programs = FilledPrograms::of(&split);
         let prefill =
-            &programs.kernels[&KernelKey::phase(operators::PAGED_ATTENTION, PhaseKind::Prefill)];
+            &programs.kernels[&KernelKey::phase(operator::PAGED_ATTENTION, PhaseKind::Prefill)];
         let decode =
-            &programs.kernels[&KernelKey::phase(operators::PAGED_ATTENTION, PhaseKind::Decode)];
+            &programs.kernels[&KernelKey::phase(operator::PAGED_ATTENTION, PhaseKind::Decode)];
         assert_eq!(
             (prefill.backend.as_str(), decode.backend.as_str()),
             ("fa4", "trtllm")
@@ -2330,7 +2306,7 @@ mod tests {
         assert!(
             !programs
                 .kernels
-                .contains_key(&KernelKey::all(operators::PAGED_ATTENTION)),
+                .contains_key(&KernelKey::all(operator::PAGED_ATTENTION)),
             "a per-phase fill covers no whole operator"
         );
 
@@ -2344,12 +2320,12 @@ mod tests {
         };
         let programs = FilledPrograms::of(&one);
         assert_eq!(
-            programs.kernels[&KernelKey::all(operators::PAGED_ATTENTION)].backend,
+            programs.kernels[&KernelKey::all(operator::PAGED_ATTENTION)].backend,
             "fa4"
         );
         assert!(
             !programs.kernels.contains_key(&KernelKey::phase(
-                operators::PAGED_ATTENTION,
+                operator::PAGED_ATTENTION,
                 PhaseKind::Prefill
             )),
             "one backend covers every phase of the operator"
@@ -2361,7 +2337,7 @@ mod tests {
         };
         let programs = FilledPrograms::of(&agreed);
         assert_eq!(
-            programs.kernels[&KernelKey::all(operators::PAGED_ATTENTION)].backend,
+            programs.kernels[&KernelKey::all(operator::PAGED_ATTENTION)].backend,
             "fa4",
             "phases that agree collapse to the operator's slot"
         );
@@ -2372,7 +2348,7 @@ mod tests {
             ..Default::default()
         };
         let programs = FilledPrograms::of(&moe);
-        for operator in [operators::GATHER_GEMM, operators::ROUTE_GEMM] {
+        for operator in [operator::GATHER_GEMM, operator::ROUTE_GEMM] {
             assert_eq!(
                 programs.kernels[&KernelKey::all(operator)].backend,
                 "cutlass"
@@ -2394,7 +2370,7 @@ mod tests {
         assert_eq!(
             programs.kernels.keys().cloned().collect::<Vec<_>>(),
             vec![KernelKey::phase(
-                operators::PAGED_ATTENTION,
+                operator::PAGED_ATTENTION,
                 PhaseKind::Decode
             )]
         );
@@ -2403,7 +2379,7 @@ mod tests {
         config.decode_attention_backend = None;
         let programs = FilledPrograms::of(&config);
         assert_eq!(
-            programs.kernels[&KernelKey::all(operators::PAGED_ATTENTION)].backend,
+            programs.kernels[&KernelKey::all(operator::PAGED_ATTENTION)].backend,
             "trtllm"
         );
     }
@@ -2565,7 +2541,7 @@ mod tests {
         let mut second = record();
         second.status = Status::Precopy;
         second.kernels.insert(
-            KernelKey::phase(operators::PAGED_ATTENTION, PhaseKind::Decode),
+            KernelKey::phase(operator::PAGED_ATTENTION, PhaseKind::Decode),
             program("trtllm"),
         );
         epochs.record(2, second);

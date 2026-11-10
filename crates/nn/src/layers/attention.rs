@@ -15,7 +15,8 @@
 use ops::attention::dense::{DenseArgs, DenseAttention as DenseOp, DenseDescriptor};
 use ops::attention::{Args, Descriptor, Mask, PagedAttention as PagedOp, Phase};
 use ops::kv::{self, Descriptor as KvDescriptor, KvWrite, KvWriteScaled};
-use ops::{DType, PhaseKind, Shape, TensorView};
+use ops::{DType, Shape, TensorView};
+use proto::program::PhaseKind;
 
 use crate::capability::{KvGroup, KvPlanes, KvView, TokenBatch};
 use crate::error::{Error, Result};

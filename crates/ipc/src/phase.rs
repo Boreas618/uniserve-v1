@@ -9,7 +9,7 @@
 //!
 //! The number is opaque on purpose. A scheduling policy runs as wasm and must
 //! not link CUDA or `ops`, so the identifier it carries is a plain number; a
-//! kernel-program selection key (`ops::PhaseKind`) is a different thing and
+//! kernel-program selection key (`proto::program::PhaseKind`) is a different thing and
 //! stays where programs are selected.
 
 use std::fmt;

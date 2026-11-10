@@ -79,7 +79,7 @@ pub struct Args {
 pub struct Snake;
 
 impl Op for Snake {
-    const NAME: &'static str = "snake";
+    const NAME: &'static str = proto::program::operator::SNAKE;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

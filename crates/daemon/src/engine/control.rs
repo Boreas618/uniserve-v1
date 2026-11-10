@@ -991,19 +991,19 @@ pub fn with_store_programs(
     let mut complete = filled.clone();
     for package in listing.packages {
         if package.op == POLICY_SLOT
-            || ops::operator_name(&package.op).is_none()
+            || proto::program::operator::named(&package.op).is_none()
             || filled.kernels.keys().any(|slot| slot.op == package.op)
         {
             continue;
         }
         // Each backend's latest revision: `prepare` selects the same one for the slot.
         complete.kernels.insert(
-            program_server::ProgramSlot {
+            proto::program::ProgramSlot {
                 op: package.op,
                 phase: None,
                 part: Some(package.backend.clone()),
             },
-            program_server::Program {
+            proto::program::Program {
                 backend: package.backend,
                 revision: 0,
                 arguments: toml::Table::new(),
@@ -1032,7 +1032,7 @@ fn prepare_at(
     descriptors: &[program_server::Descriptors],
     steps: &PrepareSteps,
 ) -> anyhow::Result<crate::epoch::FilledPrograms> {
-    let policy_slot = program_server::ProgramSlot::all(POLICY_SLOT);
+    let policy_slot = proto::program::ProgramSlot::all(POLICY_SLOT);
     let mut requests = Vec::with_capacity(filled.kernels.len() + 1);
     for (slot, program) in &filled.kernels {
         requests.push(program_server::ProgramRequest {
@@ -1145,7 +1145,7 @@ fn prepare_at(
 const POLICY_SLOT: &str = "scheduling";
 
 /// The selector a `prepare` request uses for `program`.
-fn selected(selector: Selector, program: &program_server::Program) -> program_server::Selector {
+fn selected(selector: Selector, program: &proto::program::Program) -> program_server::Selector {
     match selector {
         Selector::Latest => program_server::Selector::Latest {
             backend: program.backend.clone(),

@@ -93,7 +93,7 @@ pub struct Args {
 pub struct KvWrite;
 
 impl Op for KvWrite {
-    const NAME: &'static str = "kv_write";
+    const NAME: &'static str = proto::program::operator::KV_WRITE;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;
@@ -313,7 +313,7 @@ pub struct ScaledWriteArgs {
 pub struct KvWriteScaled;
 
 impl Op for KvWriteScaled {
-    const NAME: &'static str = "kv_write_scaled";
+    const NAME: &'static str = proto::program::operator::KV_WRITE_SCALED;
 
     type Descriptor = ScaledWriteDescriptor;
     type Args<'a> = ScaledWriteArgs;

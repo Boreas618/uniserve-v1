@@ -111,7 +111,7 @@ impl TopkSoftmax {
 }
 
 impl Op for TopkSoftmax {
-    const NAME: &'static str = "topk_softmax";
+    const NAME: &'static str = proto::program::operator::TOPK_SOFTMAX;
 
     type Descriptor = TopkDescriptor;
     type Args<'a> = TopkArgs;

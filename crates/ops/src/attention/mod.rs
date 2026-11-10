@@ -423,7 +423,7 @@ impl NativeCall for Call {
 pub struct PagedAttention;
 
 impl Op for PagedAttention {
-    const NAME: &'static str = "paged_attention";
+    const NAME: &'static str = proto::program::operator::PAGED_ATTENTION;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

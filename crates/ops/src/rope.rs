@@ -182,7 +182,7 @@ pub struct FactorsArgs {
 pub struct RotaryFactors;
 
 impl Op for RotaryFactors {
-    const NAME: &'static str = "rotary_factors";
+    const NAME: &'static str = proto::program::operator::ROTARY_FACTORS;
 
     type Descriptor = FactorsDescriptor;
     type Args<'a> = FactorsArgs;
@@ -506,7 +506,7 @@ pub struct QkNormRopeArgs {
 pub struct QkNormRope;
 
 impl Op for QkNormRope {
-    const NAME: &'static str = "qk_norm_rope";
+    const NAME: &'static str = proto::program::operator::QK_NORM_ROPE;
 
     type Descriptor = QkNormRopeDescriptor;
     type Args<'a> = QkNormRopeArgs;
@@ -740,7 +740,7 @@ pub struct RopeApplyArgs {
 pub struct RopeApply;
 
 impl Op for RopeApply {
-    const NAME: &'static str = "rope_apply";
+    const NAME: &'static str = proto::program::operator::ROPE_APPLY;
 
     type Descriptor = RopeApplyDescriptor;
     type Args<'a> = RopeApplyArgs;

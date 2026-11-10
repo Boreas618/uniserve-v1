@@ -1,7 +1,7 @@
 //! A program (design section 5.1): the backend, revision and arguments that
 //! fill one operator, and the slot it fills.
 
-use program_server::{PhaseKind, Program, ProgramSlot};
+use proto::program::{PhaseKind, Program, ProgramSlot};
 
 #[test]
 fn a_program_keeps_its_arguments_between_a_record_and_its_next_read() {

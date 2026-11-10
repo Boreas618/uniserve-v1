@@ -181,7 +181,7 @@ pub struct QuantizeArgs {
 pub struct Nvfp4Quantize;
 
 impl Op for Nvfp4Quantize {
-    const NAME: &'static str = "nvfp4_quantize";
+    const NAME: &'static str = proto::program::operator::NVFP4_QUANTIZE;
 
     type Descriptor = QuantizeDescriptor;
     type Args<'a> = QuantizeArgs;
@@ -444,7 +444,7 @@ pub fn check_gemm(descriptor: &GemmDescriptor) -> Result<()> {
 pub struct Nvfp4Gemm;
 
 impl Op for Nvfp4Gemm {
-    const NAME: &'static str = "nvfp4_gemm";
+    const NAME: &'static str = proto::program::operator::NVFP4_GEMM;
 
     type Descriptor = GemmDescriptor;
     type Args<'a> = GemmArgs;

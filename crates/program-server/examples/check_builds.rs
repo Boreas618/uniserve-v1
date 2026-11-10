@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use program_server::Client;
 use program_server::builder::{BuildState, Limits};
 use program_server::manifest::{Manifest, ModuleForm};
 use program_server::protocol::{Descriptors, Module, PrepareRequest, ProgramRequest, Selector};
@@ -28,7 +29,7 @@ use program_server::server::{ProgramServer, ServerConfig};
 use program_server::store::{ModulePath, Root};
 use program_server::target::{Device, Target};
 use program_server::toolchain::ToolchainConfig;
-use program_server::{Client, ProgramSlot};
+use proto::program::ProgramSlot;
 
 /// A check's result: `Err` names what failed, and `main` reports it beside the check's name. An
 /// assertion that fails panics instead, and `main` reports that panic the same way.
@@ -491,7 +492,7 @@ struct Witness {
     thread: std::thread::JoinHandle<()>,
     /// The program `prepare` selected: its revision, and the package's
     /// parameter defaults merged into its arguments.
-    program: program_server::Program,
+    program: proto::program::Program,
     progress: Vec<program_server::protocol::Progress>,
     resolved: Module,
 }
@@ -526,7 +527,7 @@ fn witness(
             },
         }],
         descriptors: vec![Descriptors {
-            slot: program_server::ProgramSlot::all(op),
+            slot: proto::program::ProgramSlot::all(op),
             keys: vec![key.to_owned()],
         }],
     };
@@ -604,7 +605,7 @@ fn prepare_outcome(
                     },
                 }],
                 descriptors: vec![Descriptors {
-                    slot: program_server::ProgramSlot::all(op),
+                    slot: proto::program::ProgramSlot::all(op),
                     keys: vec![key.to_owned()],
                 }],
             };
@@ -939,7 +940,7 @@ fn a_package_compiles_from_the_copy_its_install_kept(args: &Args) -> Outcome {
             },
         }],
         descriptors: vec![Descriptors {
-            slot: program_server::ProgramSlot::all("moe_sort"),
+            slot: proto::program::ProgramSlot::all("moe_sort"),
             keys: vec![key],
         }],
     };
@@ -1031,7 +1032,7 @@ fn the_policy_fixture_installs_and_serves_without_a_compiler(args: &Args) -> Out
     without_precompiler.toolchains.wasm = None;
     let (_server, stop, thread) = start(&without_precompiler)?;
     let mut client = Client::connect(&without_precompiler.socket).context("a client connects")?;
-    let program = program_server::Program {
+    let program = proto::program::Program {
         backend: "fcfs".to_owned(),
         revision: 1,
         arguments: toml::Table::new(),

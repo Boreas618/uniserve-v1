@@ -34,7 +34,6 @@ use std::time::Duration;
 
 use crate::builder::{Build, BuildState, Builder, Limits, Urgency};
 use crate::manifest::Manifest;
-use crate::program::Program;
 use crate::protocol::{
     self, Chosen, Connection, Descriptors, Module, ModuleFile, PrepareRequest, Progress, Selector,
     wire,
@@ -44,6 +43,7 @@ use crate::store::{ModulePath, Root, Store};
 use crate::target::{self, Device, Target};
 use crate::toolchain::{ToolchainConfig, Toolchains};
 use crate::{Error, Result};
+use proto::program::Program;
 
 pub use crate::protocol::{Installed, Listing};
 
@@ -876,7 +876,7 @@ impl ProgramServer {
     /// operator - or the revision a named backend states - that builds for
     /// every requested target. A key goes to the first candidate whose manifest
     /// covers it, in the selection order: a backend the request names for the
-    /// key's phase ([`ops::PhaseKind::of_key`]) first, then the manifest's
+    /// key's phase ([`proto::program::PhaseKind::of_key`]) first, then the manifest's
     /// `priority`, highest first, then the backend whose name sorts first. A
     /// named backend that does not cover a key leaves it to the next candidate,
     /// so a deployment that names its attention backend still serves the keys
@@ -960,7 +960,7 @@ impl ProgramServer {
             if !seen.insert(key.as_str()) {
                 continue;
             }
-            let phase = ops::PhaseKind::of_key(key);
+            let phase = proto::program::PhaseKind::of_key(key);
             let named = |backend: &str| {
                 request.named.iter().any(|named| {
                     named.backend == backend && (named.phase.is_none() || named.phase == phase)

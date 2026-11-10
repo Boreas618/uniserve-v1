@@ -4,13 +4,14 @@
 
 use std::path::{Path, PathBuf};
 
+use program_server::Error;
 use program_server::builder::{BuildState, Limits};
 use program_server::protocol::{Descriptors, PrepareRequest, ProgramRequest, Selector};
 use program_server::server::{ProgramServer, ServerConfig};
 use program_server::store::{ModulePath, Root};
 use program_server::target::{Device, Target};
 use program_server::toolchain::ToolchainConfig;
-use program_server::{Error, Program, ProgramSlot};
+use proto::program::{Program, ProgramSlot};
 
 /// The manifest of a Triton `rms_norm` package.
 const MANIFEST: &str = r#"
@@ -287,7 +288,7 @@ fn prepare_builds_a_scheduling_policy_once_for_wasm32() {
             },
         }],
         descriptors: vec![Descriptors {
-            slot: program_server::ProgramSlot::all("scheduling"),
+            slot: proto::program::ProgramSlot::all("scheduling"),
             keys: vec!["default".into()],
         }],
     };
@@ -436,7 +437,7 @@ fn prepare_selects_the_latest_revision_of_a_backend() {
         // The package covers `dtype_bf16` only: asking for another value
         // names the descriptor and the program that fails to cover it.
         descriptors: vec![Descriptors {
-            slot: program_server::ProgramSlot::all("rms_norm"),
+            slot: proto::program::ProgramSlot::all("rms_norm"),
             keys: vec!["dtype_fp32".into()],
         }],
     };
@@ -470,7 +471,7 @@ fn prepare_refuses_descriptors_of_an_operator_no_program_fills() {
             },
         }],
         descriptors: vec![Descriptors {
-            slot: program_server::ProgramSlot::all("paged_attention"),
+            slot: proto::program::ProgramSlot::all("paged_attention"),
             keys: vec!["dtype_bf16".into()],
         }],
     };

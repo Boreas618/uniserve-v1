@@ -129,7 +129,7 @@ impl Args {
 pub struct Patch;
 
 impl Op for Patch {
-    const NAME: &'static str = "patch";
+    const NAME: &'static str = proto::program::operator::PATCH;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

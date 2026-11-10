@@ -30,10 +30,10 @@ use rustix::net::{RecvAncillaryBuffer, SendAncillaryBuffer, SendAncillaryMessage
 
 use crate::builder::BuildState;
 use crate::manifest::ModuleForm;
-use crate::program::{PhaseKind, Program, ProgramSlot};
 use crate::store::ModulePath;
 use crate::target::Target;
 use crate::{Error, Result};
+use proto::program::{PhaseKind, Program, ProgramSlot};
 
 /// The messages of the protocol, as the build script compiled them.
 pub mod wire {

@@ -141,7 +141,7 @@ pub struct ConversionArgs {
 pub struct PageConversion;
 
 impl Op for PageConversion {
-    const NAME: &'static str = "page_conversion";
+    const NAME: &'static str = proto::program::operator::PAGE_CONVERSION;
 
     type Descriptor = ConversionDescriptor;
     type Args<'a> = ConversionArgs;
@@ -352,7 +352,7 @@ pub struct CopyRegionArgs {
 pub struct CacheCopyRegion;
 
 impl Op for CacheCopyRegion {
-    const NAME: &'static str = "cache_copy_region";
+    const NAME: &'static str = proto::program::operator::CACHE_COPY_REGION;
 
     type Descriptor = CopyRegionDescriptor;
     type Args<'a> = CopyRegionArgs;

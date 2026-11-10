@@ -89,7 +89,7 @@ pub struct Args {
 pub struct Gelu;
 
 impl Op for Gelu {
-    const NAME: &'static str = "gelu";
+    const NAME: &'static str = proto::program::operator::GELU;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

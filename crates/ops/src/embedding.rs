@@ -62,7 +62,7 @@ pub struct Args {
 pub struct Embedding;
 
 impl Op for Embedding {
-    const NAME: &'static str = "embedding";
+    const NAME: &'static str = proto::program::operator::EMBEDDING;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

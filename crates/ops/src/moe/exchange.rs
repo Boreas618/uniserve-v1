@@ -611,7 +611,7 @@ fn check(status: i32, entry: &str, error: &[u8; 512]) -> Result<()> {
 pub struct ExpertExchange;
 
 impl Op for ExpertExchange {
-    const NAME: &'static str = "expert_exchange";
+    const NAME: &'static str = proto::program::operator::EXPERT_EXCHANGE;
 
     type Descriptor = Descriptor;
     type Args<'a> = ExchangeArgs;

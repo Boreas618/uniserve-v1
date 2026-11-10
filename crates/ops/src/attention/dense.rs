@@ -332,7 +332,7 @@ impl NativeCall for DenseCall {
 pub struct DenseAttention;
 
 impl Op for DenseAttention {
-    const NAME: &'static str = "dense_attention";
+    const NAME: &'static str = proto::program::operator::DENSE_ATTENTION;
 
     type Descriptor = DenseDescriptor;
     type Args<'a> = DenseArgs;

@@ -152,8 +152,8 @@ struct Takeover {
 /// The programs of the epoch a takeover continues.
 #[derive(Debug, Serialize, Deserialize)]
 struct HandedPrograms {
-    kernels: Vec<(crate::epoch::KernelKey, program_server::program::Program)>,
-    policy: program_server::program::Program,
+    kernels: Vec<(crate::epoch::KernelKey, proto::program::Program)>,
+    policy: proto::program::Program,
 }
 
 /// One replica's control connection and executing epoch. Descriptors follow

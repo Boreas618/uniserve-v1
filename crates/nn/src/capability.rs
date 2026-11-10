@@ -19,7 +19,7 @@
 //! page geometry and its per-layer key/value planes. A model with one attention type has one group;
 //! a model whose blocks attend differently has one per group.
 
-use ops::PhaseKind;
+use proto::program::PhaseKind;
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;

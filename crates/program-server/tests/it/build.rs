@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use program_server::Client;
 use program_server::builder::{BuildState, Limits};
 use program_server::manifest::ModuleForm;
 use program_server::protocol::{Descriptors, Module, PrepareRequest, ProgramRequest, Selector};
@@ -21,7 +22,7 @@ use program_server::server::{ProgramServer, ServerConfig};
 use program_server::store::Root;
 use program_server::target::{Device, Target};
 use program_server::toolchain::ToolchainConfig;
-use program_server::{Client, ProgramSlot};
+use proto::program::ProgramSlot;
 
 /// Starts a server on its socket and answers it with its stop flag.
 fn start(
@@ -116,7 +117,7 @@ fn witness(
             },
         }],
         descriptors: vec![Descriptors {
-            slot: program_server::ProgramSlot::all(op),
+            slot: proto::program::ProgramSlot::all(op),
             keys: vec![key.to_owned()],
         }],
     };
@@ -240,7 +241,7 @@ fn a_vendor_cubin_is_installed_stored_and_resolved_as_it_is() {
             },
         }],
         descriptors: vec![Descriptors {
-            slot: program_server::ProgramSlot::all("paged_attention"),
+            slot: proto::program::ProgramSlot::all("paged_attention"),
             keys: vec![key.to_owned()],
         }],
     };

@@ -105,7 +105,7 @@ pub struct Args {
 pub struct Rows;
 
 impl Op for Rows {
-    const NAME: &'static str = "rows";
+    const NAME: &'static str = proto::program::operator::ROWS;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

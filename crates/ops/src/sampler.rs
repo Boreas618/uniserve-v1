@@ -109,7 +109,7 @@ pub struct ShapeArgs {
 pub struct LogitsShape;
 
 impl Op for LogitsShape {
-    const NAME: &'static str = "logits_shape";
+    const NAME: &'static str = proto::program::operator::LOGITS_SHAPE;
 
     type Descriptor = ShapeDescriptor;
     type Args<'a> = ShapeArgs;
@@ -270,7 +270,7 @@ pub struct TopKArgs {
 pub struct TopK;
 
 impl Op for TopK {
-    const NAME: &'static str = "top_k";
+    const NAME: &'static str = proto::program::operator::TOP_K;
 
     type Descriptor = TopKDescriptor;
     type Args<'a> = TopKArgs;
@@ -410,7 +410,7 @@ pub struct FilterArgs {
 pub struct FilterCandidates;
 
 impl Op for FilterCandidates {
-    const NAME: &'static str = "filter_candidates";
+    const NAME: &'static str = proto::program::operator::FILTER_CANDIDATES;
 
     type Descriptor = FilterDescriptor;
     type Args<'a> = FilterArgs;
@@ -523,7 +523,7 @@ pub struct InverseCdfArgs {
 pub struct InverseCdf;
 
 impl Op for InverseCdf {
-    const NAME: &'static str = "inverse_cdf";
+    const NAME: &'static str = proto::program::operator::INVERSE_CDF;
 
     type Descriptor = InverseCdfDescriptor;
     type Args<'a> = InverseCdfArgs;
@@ -643,7 +643,7 @@ pub struct ArgMaxArgs {
 pub struct ArgMax;
 
 impl Op for ArgMax {
-    const NAME: &'static str = "argmax";
+    const NAME: &'static str = proto::program::operator::ARGMAX;
 
     type Descriptor = ArgMaxDescriptor;
     type Args<'a> = ArgMaxArgs;
@@ -731,7 +731,7 @@ pub struct LogSoftmaxArgs {
 pub struct LogSoftmax;
 
 impl Op for LogSoftmax {
-    const NAME: &'static str = "log_softmax";
+    const NAME: &'static str = proto::program::operator::LOG_SOFTMAX;
 
     type Descriptor = LogSoftmaxDescriptor;
     type Args<'a> = LogSoftmaxArgs;
@@ -819,7 +819,7 @@ pub struct LogprobArgs {
 pub struct LogprobGather;
 
 impl Op for LogprobGather {
-    const NAME: &'static str = "logprob_gather";
+    const NAME: &'static str = proto::program::operator::LOGPROB_GATHER;
 
     type Descriptor = LogprobDescriptor;
     type Args<'a> = LogprobArgs;
@@ -954,7 +954,7 @@ pub struct OrderArgs {
 pub struct CandidateOrder;
 
 impl Op for CandidateOrder {
-    const NAME: &'static str = "candidate_order";
+    const NAME: &'static str = proto::program::operator::CANDIDATE_ORDER;
 
     type Descriptor = OrderDescriptor;
     type Args<'a> = OrderArgs;

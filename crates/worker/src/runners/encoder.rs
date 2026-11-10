@@ -33,8 +33,9 @@ use nn::capability::{
     Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageInput, ImageShape,
     PatchFormat, StateTable, TableValues, TokenBatch, WarmPrompt,
 };
-use ops::{DType, PhaseKind, TensorView};
+use ops::{DType, TensorView};
 use platform::DeviceId;
+use proto::program::PhaseKind;
 
 use crate::arena::Pools;
 use crate::batch::{Batch, BatchOutput, CallId, Job, Jobs, answered};

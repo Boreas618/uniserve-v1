@@ -214,7 +214,7 @@ impl Args {
 pub struct Unpatchify;
 
 impl Op for Unpatchify {
-    const NAME: &'static str = "unpatchify_video";
+    const NAME: &'static str = proto::program::operator::UNPATCHIFY_VIDEO;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

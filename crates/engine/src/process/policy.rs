@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ipc::UpdateFailure;
-use program_server::Program;
+use proto::program::Program;
 use scheduler::{PolicyProgram, PolicySource, ProgramSource};
 use worker::watchdog::Running;
 

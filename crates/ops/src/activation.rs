@@ -115,7 +115,7 @@ pub struct ActAndMulArgs {
 pub struct ActAndMul;
 
 impl Op for ActAndMul {
-    const NAME: &'static str = "act_and_mul";
+    const NAME: &'static str = proto::program::operator::ACT_AND_MUL;
 
     type Descriptor = ActAndMulDescriptor;
     type Args<'a> = ActAndMulArgs;
@@ -316,7 +316,7 @@ pub struct ValueFirstSwigluArgs {
 pub struct ValueFirstSwiglu;
 
 impl Op for ValueFirstSwiglu {
-    const NAME: &'static str = "value_first_swiglu";
+    const NAME: &'static str = proto::program::operator::VALUE_FIRST_SWIGLU;
 
     type Descriptor = ValueFirstSwigluDescriptor;
     type Args<'a> = ValueFirstSwigluArgs;
@@ -504,7 +504,7 @@ pub struct SwigluArgs {
 pub struct Swiglu;
 
 impl Op for Swiglu {
-    const NAME: &'static str = "swiglu";
+    const NAME: &'static str = proto::program::operator::SWIGLU;
 
     type Descriptor = SwigluDescriptor;
     type Args<'a> = SwigluArgs;
@@ -682,7 +682,7 @@ pub struct SiluArgs {
 pub struct Silu;
 
 impl Op for Silu {
-    const NAME: &'static str = "silu";
+    const NAME: &'static str = proto::program::operator::SILU;
 
     type Descriptor = SiluDescriptor;
     type Args<'a> = SiluArgs;
