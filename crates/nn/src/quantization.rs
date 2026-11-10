@@ -17,12 +17,23 @@
 //! the weight), and [`Declaration::scheme`] answers from that record, falling back to the
 //! declaration only when no shard was consulted.
 //!
+//! ## Mixed precision
+//!
+//! A ModelOpt `MIXED_PRECISION` export states one algorithm per module (`quantized_layers`), and
+//! each weight takes the scheme its module states: per-tensor FP8 ([`Scheme::Fp8`]), NVFP4 with
+//! encoded activations ([`Scheme::Nvfp4`]) or NVFP4 weights under 16-bit activations
+//! ([`Scheme::Nvfp4Weights`], ModelOpt's `W4A16_NVFP4`). The per-module statement wins over the
+//! file's `config_groups`, which summarize it.
+//!
 //! ## The method follows the layer
 //!
 //! There is no table of roles: a layer asks for its weight through [`crate::weights::Scope`], and
-//! the layer's type decides what a packed weight means. A [`crate::layers::Linear`] reads a packed
-//! weight as NVFP4 (an activation encoder and a packed product); every other layer reads dense
-//! weights only, so a packed tensor reaching it is refused by name rather than read as a matrix.
+//! the layer's type decides what a packed weight means. A [`crate::layers::Linear`] reads an NVFP4
+//! weight as an activation encoder and a packed product, and an FP8 weight as a product that
+//! encodes its activations by their static scale. A weight-only NVFP4 weight is read by every
+//! layer as the dense matrix its codes and scales state, decoded once at load
+//! ([`crate::weights::Scope`]), so its products are the 16-bit products the declaration states.
+//! Every other packed tensor reaching a layer is refused by name rather than read as a matrix.
 
 use std::collections::BTreeSet;
 
@@ -43,6 +54,12 @@ pub enum Scheme {
     /// ModelOpt NVFP4: `weight` (packed E2M1), `weight_scale` (K16 block scales in `F8_E4M3`),
     /// `weight_scale_2` (one tensor scale) and `input_scale` (the calibration's activation scale).
     Nvfp4,
+    /// ModelOpt `W4A16_NVFP4`: the same fields, and activations that stay in their 16-bit type, so
+    /// the product is the 16-bit activation times the matrix the codes and scales state.
+    Nvfp4Weights,
+    /// ModelOpt per-tensor FP8: `weight` in `F8_E4M3`, one `weight_scale` and the static
+    /// `input_scale` the activations are encoded by.
+    Fp8,
 }
 
 /// The scheme a checkpoint's key/value cache scales follow.
@@ -66,6 +83,9 @@ pub struct Declaration {
     /// The weights whose shards store a block scale beside them, once [`Self::resolve`] has read
     /// the shards; `None` before, when the declaration alone answers.
     packed: Option<BTreeSet<String>>,
+    /// A mixed-precision export's scheme per module, longest name first; `None` when one scheme
+    /// covers every packed weight.
+    layers: Option<Vec<(String, Scheme)>>,
 }
 
 impl Declaration {
@@ -76,6 +96,7 @@ impl Declaration {
             excluded: Vec::new(),
             kv_cache: KvCache::Unquantized,
             packed: None,
+            layers: None,
         }
     }
 
@@ -148,7 +169,7 @@ impl Declaration {
     /// This declaration with every weight's packing taken from what `checkpoint`'s shards hold: a
     /// weight is packed when the shard stores a `weight_scale` beside it.
     pub fn resolve(&self, checkpoint: &Checkpoint) -> Self {
-        if self.scheme == Scheme::Dense {
+        if self.scheme == Scheme::Dense && self.layers.is_none() {
             return self.clone();
         }
         let packed = checkpoint
@@ -168,6 +189,20 @@ impl Declaration {
     /// The shards' answer once [`Self::resolve`] has read them; the declaration's intent (packed
     /// unless an excluded module owns it) before.
     pub fn scheme(&self, weight: &str) -> Scheme {
+        if let Some(layers) = &self.layers {
+            // A mixed export: a weight its shard stores packed takes its module's scheme.
+            let packed = self
+                .packed
+                .as_ref()
+                .is_none_or(|packed| packed.contains(weight));
+            if !packed {
+                return Scheme::Dense;
+            }
+            return layers
+                .iter()
+                .find(|(module, _)| owns(module, weight))
+                .map_or(Scheme::Dense, |(_, scheme)| *scheme);
+        }
         if self.scheme == Scheme::Dense {
             return Scheme::Dense;
         }
@@ -183,13 +218,119 @@ impl Declaration {
 
     /// Whether any weight is declared packed: whether the encoded programs are the ones that run.
     pub fn is_encoded(&self) -> bool {
-        self.scheme != Scheme::Dense
+        self.scheme == Scheme::Nvfp4
+            || self
+                .layers
+                .iter()
+                .flatten()
+                .any(|(_, scheme)| *scheme == Scheme::Nvfp4)
     }
 
     /// The scheme the key/value cache scales follow.
     pub fn kv_cache(&self) -> KvCache {
         self.kv_cache
     }
+}
+
+/// The E2M1 values of the eight unsigned codes, the sign in the code's fourth bit.
+const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+
+/// An E4M3 byte (`F8_E4M3`, bias 7, no infinities, `S.1111.111` NaN) as an FP32 value.
+pub(crate) fn e4m3(byte: u8) -> f32 {
+    let sign = if byte & 0x80 != 0 { -1.0 } else { 1.0 };
+    let exponent = i32::from((byte >> 3) & 0x0f);
+    let mantissa = f32::from(byte & 0x07);
+    if exponent == 0x0f && byte & 0x07 == 0x07 {
+        return f32::NAN;
+    }
+    let magnitude = if exponent == 0 {
+        // Subnormal: no implicit one, the smallest exponent.
+        mantissa / 8.0 * 2f32.powi(-6)
+    } else {
+        (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7)
+    };
+    sign * magnitude
+}
+
+/// `value` as BF16 bits, rounded to nearest even.
+fn bf16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    if value.is_nan() {
+        return ((bits >> 16) as u16) | 0x0040;
+    }
+    let lower = bits & 0xffff;
+    let mut upper = bits >> 16;
+    if lower > 0x8000 || (lower == 0x8000 && upper & 1 == 1) {
+        upper += 1;
+    }
+    upper as u16
+}
+
+/// The BF16 bytes of the `[rows, columns]` matrix a ModelOpt NVFP4 weight states: `packed` holds
+/// two E2M1 codes a byte (the even element in the low nibble), `scales` one E4M3 block scale per
+/// sixteen elements of a row, and `tensor_scale` the weight's one tensor scale.
+///
+/// Each element is `code · block_scale · tensor_scale` evaluated in FP32 and rounded once to BF16.
+/// `code · block_scale` is exact in BF16 (two and four significant bits), so the one rounding is
+/// the tensor scale's, where a 16-bit-activation kernel applies the tensor scale to its FP32
+/// accumulator instead: the two differ by at most half a BF16 unit of each weight.
+pub(crate) fn decode_nvfp4(
+    packed: &[u8],
+    scales: &[u8],
+    tensor_scale: f32,
+    columns: usize,
+) -> Vec<u8> {
+    let elements = packed.len() * 2;
+    let mut out = Vec::with_capacity(elements * 2);
+    for element in 0..elements {
+        let byte = packed[element / 2];
+        let code = if element % 2 == 0 {
+            byte & 0x0f
+        } else {
+            byte >> 4
+        };
+        let value = E2M1[usize::from(code & 0x07)] * if code & 0x08 != 0 { -1.0 } else { 1.0 };
+        let (row, column) = (element / columns, element % columns);
+        let scale = e4m3(scales[row * (columns / 16) + column / 16]);
+        out.extend_from_slice(&bf16_bits(value * scale * tensor_scale).to_le_bytes());
+    }
+    out
+}
+
+/// Whether the module `module` owns `weight`, a weight's full checkpoint name: the weight is a
+/// leaf of the module or of a module under it (`mlp.experts` owns `mlp.experts.3.up_proj.weight`).
+fn owns(module: &str, weight: &str) -> bool {
+    weight
+        .strip_prefix(module)
+        .is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// The scheme of one `quantized_layers` entry of a mixed-precision export.
+fn layer_scheme(owner: &str, module: &str, layer: &Fields<'_>) -> Result<Scheme> {
+    let algorithm = layer.text("quant_algo")?;
+    let scheme = match algorithm.to_ascii_uppercase().as_str() {
+        "FP8" => Scheme::Fp8,
+        "NVFP4" => Scheme::Nvfp4,
+        "W4A16_NVFP4" => Scheme::Nvfp4Weights,
+        other => {
+            return Err(refuse(
+                owner,
+                format!(
+                    "states `{other}` for {module}, and the per-module algorithms served are FP8,                      NVFP4 and W4A16_NVFP4"
+                ),
+            ));
+        }
+    };
+    if matches!(scheme, Scheme::Nvfp4 | Scheme::Nvfp4Weights)
+        && let Some(group) = layer.optional_index("group_size")?
+        && group != 16
+    {
+        return Err(refuse(
+            owner,
+            format!("states NVFP4 blocks of {group} for {module}; NVFP4 blocks are sixteen"),
+        ));
+    }
+    Ok(scheme)
 }
 
 /// A refusal of `what` a declaration states.
@@ -211,6 +352,8 @@ struct Declared {
     excluded: Vec<String>,
     /// The key/value cache scheme the file states.
     kv_cache: KvCache,
+    /// A mixed-precision export's per-module schemes.
+    layers: Option<Vec<(String, Scheme)>>,
     /// Where the fields were read, for refusals.
     owner: String,
 }
@@ -276,7 +419,24 @@ impl Declared {
                 ));
             }
         };
+        let layers = match fields.optional_object("quantized_layers")? {
+            None => None,
+            Some(map) => {
+                let mut layers = Vec::new();
+                for module in map.keys() {
+                    let layer = map.object(module)?;
+                    layers.push((
+                        module.to_owned(),
+                        layer_scheme(map.owner(), module, &layer)?,
+                    ));
+                }
+                // The longest module first, so a module nested in another takes its own entry.
+                layers.sort_by_key(|(module, _)| std::cmp::Reverse(module.len()));
+                Some(layers)
+            }
+        };
         Ok(Self {
+            layers,
             algorithm,
             method: fields.optional_text("quant_method")?.map(str::to_owned),
             excluded: if excluded.is_empty() {
@@ -294,6 +454,16 @@ impl Declared {
         let scheme = match self.algorithm.to_ascii_uppercase().as_str() {
             // Absent, empty or an explicit "none" is a dense checkpoint that wrote the field anyway.
             "" | "NONE" | "BF16" => Scheme::Dense,
+            // Each module states its own algorithm; a weight takes its module's.
+            "MIXED_PRECISION" => {
+                if self.layers.as_ref().is_none_or(Vec::is_empty) {
+                    return Err(refuse(
+                        &self.owner,
+                        "declares MIXED_PRECISION and no `quantized_layers`: a mixed export                          states each module's algorithm",
+                    ));
+                }
+                Scheme::Dense
+            }
             "NVFP4" => {
                 if let Some(method) = &self.method
                     && !method.eq_ignore_ascii_case("modelopt")
@@ -321,11 +491,17 @@ impl Declared {
                 ));
             }
         };
+        let layers = if self.algorithm.eq_ignore_ascii_case("MIXED_PRECISION") {
+            self.layers
+        } else {
+            None
+        };
         Ok(Declaration {
             scheme,
             excluded: self.excluded,
             kv_cache: self.kv_cache,
             packed: None,
+            layers,
         })
     }
 }
@@ -430,6 +606,97 @@ fn matches_module(entry: &str, weight: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An E4M3 byte decodes to its value: normal, subnormal, the largest finite and NaN.
+    #[test]
+    fn an_e4m3_byte_decodes_to_its_value() {
+        assert_eq!(e4m3(0x38), 1.0);
+        assert_eq!(e4m3(0xb8), -1.0);
+        assert_eq!(e4m3(0x7e), 448.0);
+        assert_eq!(e4m3(0x01), 2f32.powi(-9));
+        assert_eq!(e4m3(0x3c), 1.5);
+        assert!(e4m3(0x7f).is_nan());
+    }
+
+    /// A weight-only NVFP4 row decodes to `code · block scale · tensor scale`, the even element in
+    /// the low nibble, each sixteen elements reading their own scale.
+    #[test]
+    fn an_nvfp4_matrix_decodes_to_its_codes_times_its_scales() {
+        // Thirty-two elements of one row: two blocks. Byte 0x2f holds code 0xf (−6) then 0x2 (1).
+        let mut packed = vec![0_u8; 16];
+        packed[0] = 0x2f;
+        packed[8] = 0x07; // element 16: code 7 (6), element 17: 0
+        // The first block's scale is 1, the second's 2.
+        let scales = [0x38, 0x40];
+        let decoded = decode_nvfp4(&packed, &scales, 0.5, 32);
+        let value = |index: usize| {
+            f32::from_bits(
+                u32::from(u16::from_le_bytes([
+                    decoded[2 * index],
+                    decoded[2 * index + 1],
+                ])) << 16,
+            )
+        };
+        assert_eq!(value(0), -3.0);
+        assert_eq!(value(1), 0.5);
+        assert_eq!(value(2), 0.0);
+        assert_eq!(value(16), 6.0);
+        assert_eq!(value(17), 0.0);
+        // A product that is not a BF16 value rounds to the nearest: 1.5 · 1 · (1 + 2⁻⁹) lies a
+        // quarter of a BF16 unit above 1.5 and rounds to it.
+        let rounded = decode_nvfp4(&[0x03], &[0x38], 1.0 + 2f32.powi(-9), 2);
+        assert_eq!(u16::from_le_bytes([rounded[0], rounded[1]]), 0x3fc0);
+    }
+
+    /// A mixed export's weights take their modules' algorithms, the nested module its own entry,
+    /// and a weight its shard holds unpacked stays dense.
+    #[test]
+    fn a_mixed_export_states_each_modules_scheme() {
+        let value = serde_json::json!({
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "m.layers.0.linear_attn.in_proj_qkv": {"quant_algo": "FP8"},
+                "m.layers.0.mlp.experts": {"quant_algo": "W4A16_NVFP4", "group_size": 16},
+                "lm_head": {"quant_algo": "NVFP4", "group_size": 16},
+            }
+        });
+        let declaration = Declared::of(&Fields::of("q", &value).unwrap())
+            .unwrap()
+            .declaration()
+            .unwrap();
+        assert_eq!(
+            declaration.scheme("m.layers.0.linear_attn.in_proj_qkv.weight"),
+            Scheme::Fp8
+        );
+        assert_eq!(
+            declaration.scheme("m.layers.0.mlp.experts.7.up_proj.weight"),
+            Scheme::Nvfp4Weights
+        );
+        assert_eq!(declaration.scheme("lm_head.weight"), Scheme::Nvfp4);
+        assert_eq!(
+            declaration.scheme("m.layers.0.linear_attn.in_proj_a.weight"),
+            Scheme::Dense
+        );
+        assert!(declaration.is_encoded());
+    }
+
+    #[test]
+    fn a_mixed_export_refuses_an_algorithm_it_does_not_serve() {
+        let value = serde_json::json!({
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {"m.q_proj": {"quant_algo": "INT4_AWQ"}}
+        });
+        let error = Declared::of(&Fields::of("q", &value).unwrap())
+            .and_then(Declared::declaration)
+            .expect_err("an unserved per-module algorithm");
+        assert!(error.to_string().contains("INT4_AWQ"), "{error}");
+        let empty = serde_json::json!({"quant_algo": "MIXED_PRECISION"});
+        assert!(
+            Declared::of(&Fields::of("q", &empty).unwrap())
+                .and_then(Declared::declaration)
+                .is_err()
+        );
+    }
 
     #[test]
     fn an_excluded_entry_names_a_module_a_subtree_or_a_pattern() {

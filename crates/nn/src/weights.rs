@@ -1172,6 +1172,125 @@ impl<'a> WeightLoader<'a> {
         })
     }
 
+    /// Load `request`, whose tensors the checkpoint stores as weight-only NVFP4
+    /// ([`Scheme::Nvfp4Weights`]), as the BF16 matrix their codes and scales state.
+    ///
+    /// The request names the logical matrix, `[rows, columns]` of every tensor it reads, exactly as
+    /// a dense read names it: a tensor-parallel block, a strided column block or a fused stack of
+    /// experts. Each tensor is decoded once for the read, `code · block_scale · tensor_scale` in
+    /// FP32 rounded once to BF16 (round to nearest even), and the request's region is gathered from
+    /// the decoded matrices. The product that reads the weight is then the 16-bit product the
+    /// declaration states; the stored weight is BF16, twice the 16-bit-activation kernels' four.
+    ///
+    /// # Errors
+    ///
+    /// A tensor whose fields are missing or of another extent, or the request's own refusals.
+    pub(crate) fn load_decoded(&mut self, request: &WeightRequest) -> Result<Weight> {
+        let names = source_names(&request.source);
+        let mut logical = Vec::with_capacity(names.len());
+        for name in &names {
+            let packed = self.checkpoint.locate(name)?;
+            if packed.dtype != DType::U8 || packed.shape.rank() != 2 {
+                return Err(Error::weight(
+                    name,
+                    format!(
+                        "a weight-only NVFP4 weight is [rows, columns / 2] U8, not {} {:?}",
+                        packed.dtype,
+                        packed.shape.dims()
+                    ),
+                ));
+            }
+            let (rows, columns) = (packed.shape.dim(0), packed.shape.dim(1) * 2);
+            logical.push(TensorLocation {
+                file: packed.file,
+                tensor: name.clone(),
+                dtype: DType::BF16,
+                shape: Shape::new(&[rows, columns]),
+                bytes: (0, rows * columns * 2),
+            });
+        }
+        let files = self.identities(&names)?;
+        let (start, shape, stride) = source_region(&request.source);
+        let key = WeightKey {
+            files,
+            dtype: DType::BF16,
+            layout: request.layout,
+            region: WeightRegion {
+                tensors: names.clone(),
+                start,
+                shape,
+                stride,
+            },
+            provenance: None,
+        };
+        if let Some(weight) = self.retained(&key, request.shape)? {
+            return Ok(weight);
+        }
+        let spans = spans_in(&request.source, &key, &|name| {
+            logical.iter().find(|location| location.tensor == name)
+        })?;
+        let read: u64 = spans.iter().map(|span| (span.to - span.from) as u64).sum();
+        if read != request.shape.numel() * 2 {
+            return Err(Error::weight(
+                &request.tensor,
+                format!(
+                    "{read} bytes were read, {} expected for {:?} of bf16",
+                    request.shape.numel() * 2,
+                    request.shape.dims()
+                ),
+            ));
+        }
+        check_layout(&request.tensor, &request.source, request.layout)?;
+        self.publish_with(&key, request.shape, false, |loader| {
+            let mut decoded: Vec<(String, Vec<u8>)> = Vec::new();
+            let mut bytes = Vec::with_capacity(read as usize);
+            for span in &spans {
+                let name = &span.location.tensor;
+                if !decoded.iter().any(|(decoded, _)| decoded == name) {
+                    let matrix = loader.decode_nvfp4(name, span.location.shape)?;
+                    decoded.push((name.clone(), matrix));
+                }
+                let (_, matrix) = decoded
+                    .iter()
+                    .find(|(decoded, _)| decoded == name)
+                    .ok_or_else(|| Error::weight(name, "a decoded matrix went missing"))?;
+                bytes.extend_from_slice(&matrix[span.from..span.to]);
+            }
+            Ok(Cow::Owned(bytes))
+        })
+    }
+
+    /// The BF16 bytes of the `[rows, columns]` matrix the NVFP4 fields of `name` state.
+    fn decode_nvfp4(&self, name: &str, shape: Shape) -> Result<Vec<u8>> {
+        let stem = name.strip_suffix("weight").ok_or_else(|| {
+            Error::weight(name, "an NVFP4 weight is a module's `weight`".to_owned())
+        })?;
+        let (rows, columns) = (shape.dim(0), shape.dim(1));
+        let packed = self.checkpoint.read(name)?;
+        let scales = self.checkpoint.read(&format!("{stem}weight_scale"))?;
+        if scales.dtype != DType::F8E4M3 || scales.shape.numel() * 16 != rows * columns {
+            return Err(Error::weight(
+                name,
+                format!(
+                    "block scales of {} {:?} for a {rows} × {columns} matrix; one F8_E4M3 per \
+                     sixteen elements expected",
+                    scales.dtype,
+                    scales.shape.dims()
+                ),
+            ));
+        }
+        let tensor_scale = self.tensor_scale(&WeightRequest::region(
+            format!("{stem}weight_scale_2"),
+            0,
+            Shape::new(&[1]),
+        ))?;
+        Ok(crate::quantization::decode_nvfp4(
+            &packed.bytes,
+            &scales.bytes,
+            tensor_scale,
+            columns as usize,
+        ))
+    }
     /// Load `request`, converting and publishing it the first time and reusing it afterwards.
     pub fn load(&mut self, request: &WeightRequest) -> Result<Weight> {
         if self.quantization.is_some() {
@@ -1184,48 +1303,8 @@ impl<'a> WeightLoader<'a> {
             )));
         }
 
-        let (names, start, source_shape, stride) = match &request.source {
-            WeightSource::Region {
-                tensor,
-                start,
-                shape,
-            } => (vec![tensor.clone()], *start, *shape, None),
-            WeightSource::Strided {
-                tensor,
-                start,
-                shape,
-                row_stride,
-            } => (vec![tensor.clone()], *start, *shape, Some(*row_stride)),
-            // A block's start and stride key the region: two ranks' blocks of one expert stack have
-            // one fused shape and must not share retained storage.
-            WeightSource::Parts {
-                parts,
-                shape,
-                block,
-            } => (
-                parts.clone(),
-                block.map_or(0, |block| block.start),
-                *shape,
-                block.map(|block| block.row_stride),
-            ),
-            // The first block's start keys the region: two ranks' blocks of one stacked tensor
-            // begin at different rows.
-            WeightSource::Blocks { parts, shape } => {
-                let mut names: Vec<String> = Vec::new();
-                for (name, _) in parts {
-                    if !names.contains(name) {
-                        names.push(name.clone());
-                    }
-                }
-                let first = parts.first().map(|(_, block)| *block);
-                (
-                    names,
-                    first.map_or(0, |block| block.start),
-                    *shape,
-                    first.map(|block| block.row_stride),
-                )
-            }
-        };
+        let names = source_names(&request.source);
+        let (start, source_shape, stride) = source_region(&request.source);
         if let WeightSource::Parts { shape, .. } | WeightSource::Blocks { shape, .. } =
             &request.source
             && !request.shape.matches(shape)
@@ -2364,200 +2443,7 @@ impl<'a> WeightLoader<'a> {
     /// length of the payload slice a device load copies from.
     fn spans(&self, source: &WeightSource, key: &WeightKey) -> Result<Vec<Span<'a>>> {
         let checkpoint = self.checkpoint;
-        match source {
-            WeightSource::Region {
-                tensor,
-                start,
-                shape,
-            } => {
-                let location = checkpoint
-                    .tensor(tensor)
-                    .ok_or_else(|| Error::MissingTensor(tensor.clone()))?;
-                let length = stored_bytes(location);
-                let element = location.dtype.bytes().ok_or_else(|| {
-                    Error::weight(tensor, format!("{} has no whole-byte size", location.dtype))
-                })?;
-                let begin = usize::try_from(start * element).map_err(|_| {
-                    Error::weight(tensor, "the region's first element is past usize::MAX")
-                })?;
-                let end = usize::try_from((start + shape.numel()) * element).map_err(|_| {
-                    Error::weight(tensor, "the region's last element is past usize::MAX")
-                })?;
-                if end as u64 > length {
-                    return Err(Error::weight(
-                        tensor,
-                        format!(
-                            "elements {start}..{} of {:?} reach past the tensor's {length}",
-                            start + shape.numel(),
-                            location.shape.dims(),
-                        ),
-                    ));
-                }
-                Ok(vec![Span {
-                    location,
-                    from: begin,
-                    to: end,
-                }])
-            }
-            WeightSource::Strided {
-                tensor,
-                start,
-                shape,
-                row_stride,
-            } => {
-                let location = checkpoint
-                    .tensor(tensor)
-                    .ok_or_else(|| Error::MissingTensor(tensor.clone()))?;
-                let element = location.dtype.bytes().ok_or_else(|| {
-                    Error::weight(tensor, format!("{} has no whole-byte size", location.dtype))
-                })?;
-                if shape.rank() == 0 {
-                    return Err(Error::weight(
-                        tensor,
-                        "a gathered weight has an axis".to_owned(),
-                    ));
-                }
-                let row = shape.last();
-                if *row_stride < row {
-                    return Err(Error::weight(
-                        tensor,
-                        format!("a stride of {row_stride} overlaps rows of {row} elements"),
-                    ));
-                }
-                let rows = shape.numel() / row.max(1);
-                let length = stored_bytes(location);
-                let mut spans = Vec::with_capacity(usize::try_from(rows).unwrap_or(0));
-                for index in 0..rows {
-                    let begin = start + index * row_stride;
-                    let from = usize::try_from(begin * element).map_err(|_| {
-                        Error::weight(tensor, "a gathered row starts past usize::MAX")
-                    })?;
-                    let to = usize::try_from((begin + row) * element).map_err(|_| {
-                        Error::weight(tensor, "a gathered row ends past usize::MAX")
-                    })?;
-                    if to as u64 > length {
-                        return Err(Error::weight(
-                            tensor,
-                            format!(
-                                "row {index} (elements {begin}..{}) reaches past the tensor's {length} bytes",
-                                begin + row,
-                            ),
-                        ));
-                    }
-                    spans.push(Span { location, from, to });
-                }
-                Ok(spans)
-            }
-            WeightSource::Blocks { parts, .. } => {
-                let mut spans = Vec::new();
-                for (name, block) in parts {
-                    spans.extend(block_spans(checkpoint, name, block)?);
-                }
-                if spans.iter().all(|span| span.from == span.to) {
-                    return Err(Error::weight(
-                        &key.region.tensors.join("+"),
-                        "a fused weight has no part",
-                    ));
-                }
-                Ok(spans)
-            }
-            WeightSource::Parts {
-                parts,
-                block: Some(block),
-                ..
-            } => {
-                let mut spans = Vec::new();
-                for name in parts {
-                    let location = checkpoint
-                        .tensor(name)
-                        .ok_or_else(|| Error::MissingTensor(name.clone()))?;
-                    let element = location.dtype.bytes().ok_or_else(|| {
-                        Error::weight(name, format!("{} has no whole-byte size", location.dtype))
-                    })?;
-                    if block.row_stride < block.columns {
-                        return Err(Error::weight(
-                            name,
-                            format!(
-                                "a stride of {} overlaps rows of {} elements",
-                                block.row_stride, block.columns
-                            ),
-                        ));
-                    }
-                    let length = stored_bytes(location);
-                    for row in 0..block.rows {
-                        let first = (block.start + row * block.row_stride) * element;
-                        let last = first + block.columns * element;
-                        let (Ok(from), Ok(to)) = (usize::try_from(first), usize::try_from(last))
-                        else {
-                            return Err(Error::weight(name, "a block row is past usize::MAX"));
-                        };
-                        if to as u64 > length {
-                            return Err(Error::weight(
-                                name,
-                                format!(
-                                    "row {row} of the block (bytes {from}..{to}) reaches past the \
-                                     part's {length} bytes"
-                                ),
-                            ));
-                        }
-                        spans.push(Span { location, from, to });
-                    }
-                }
-                if spans.iter().all(|span| span.from == span.to) {
-                    return Err(Error::weight(
-                        &key.region.tensors.join("+"),
-                        "a fused weight has no part",
-                    ));
-                }
-                Ok(spans)
-            }
-            WeightSource::Parts { parts, .. } => {
-                let mut spans = Vec::with_capacity(parts.len());
-                let mut part_shape: Option<Shape> = None;
-                for name in parts {
-                    let location = checkpoint
-                        .tensor(name)
-                        .ok_or_else(|| Error::MissingTensor(name.clone()))?;
-                    if location.shape.rank() == 0 {
-                        return Err(Error::weight(name, "a scalar cannot be fused"));
-                    }
-                    match part_shape {
-                        None => part_shape = Some(location.shape),
-                        Some(first) => {
-                            let same_tail = first.dims().iter().skip(1).eq(location
-                                .shape
-                                .dims()
-                                .iter()
-                                .skip(1));
-                            if !same_tail {
-                                return Err(Error::weight(
-                                    name,
-                                    format!(
-                                        "fusing {:?} with {:?} joins different tails",
-                                        first.dims(),
-                                        location.shape.dims()
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                    let to = usize::try_from(stored_bytes(location))
-                        .map_err(|_| Error::weight(name, "a part is past usize::MAX"))?;
-                    spans.push(Span {
-                        location,
-                        from: 0,
-                        to,
-                    });
-                }
-                if spans.iter().all(|span| span.from == span.to) {
-                    return Err(Error::weight(
-                        &key.region.tensors.join("+"),
-                        "a fused weight has no part",
-                    ));
-                }
-                Ok(spans)
-            }
-        }
+        spans_in(source, key, &|name| checkpoint.tensor(name))
     }
 
     /// The payload bytes of `spans`, concatenated in order.
@@ -2789,15 +2675,15 @@ impl<'s, 'a> Scope<'s, 'a> {
 
     /// Load `request` at this scope's pin, refusing a packed source.
     pub(crate) fn load(&mut self, request: WeightRequest) -> Result<Weight> {
-        let names = match &request.source {
-            WeightSource::Region { tensor, .. } | WeightSource::Strided { tensor, .. } => {
-                vec![tensor.clone()]
-            }
-            WeightSource::Parts { parts, .. } => parts.clone(),
-            WeightSource::Blocks { parts, .. } => {
-                parts.iter().map(|(name, _)| name.clone()).collect()
-            }
-        };
+        let names = source_names(&request.source);
+        // A weight-only NVFP4 matrix is read as the dense matrix it states, by every layer.
+        if !names.is_empty()
+            && names
+                .iter()
+                .all(|name| self.loader.scheme(name) == Scheme::Nvfp4Weights)
+        {
+            return self.loader.load_decoded(&request);
+        }
         self.refuse_packed(&names)?;
         let request = match self.pinned {
             Some(dtype) => request.pinned(dtype),
@@ -2828,15 +2714,256 @@ impl<'s, 'a> Scope<'s, 'a> {
     }
 }
 
+/// The checkpoint tensors `source` reads, each once, in the order it first names them.
+fn source_names(source: &WeightSource) -> Vec<String> {
+    match source {
+        WeightSource::Region { tensor, .. } | WeightSource::Strided { tensor, .. } => {
+            vec![tensor.clone()]
+        }
+        WeightSource::Parts { parts, .. } => parts.clone(),
+        WeightSource::Blocks { parts, .. } => {
+            let mut names: Vec<String> = Vec::new();
+            for (name, _) in parts {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+            names
+        }
+    }
+}
+
+/// The first element, the extents and the row stride that key `source`'s region.
+///
+/// A block's start and stride key the region: two ranks' blocks of one expert stack have one fused
+/// shape and must not share retained storage, and two ranks' blocks of one stacked tensor begin at
+/// different rows.
+fn source_region(source: &WeightSource) -> (u64, Shape, Option<u64>) {
+    match source {
+        WeightSource::Region { start, shape, .. } => (*start, *shape, None),
+        WeightSource::Strided {
+            start,
+            shape,
+            row_stride,
+            ..
+        } => (*start, *shape, Some(*row_stride)),
+        WeightSource::Parts { shape, block, .. } => (
+            block.map_or(0, |block| block.start),
+            *shape,
+            block.map(|block| block.row_stride),
+        ),
+        WeightSource::Blocks { parts, shape } => {
+            let first = parts.first().map(|(_, block)| *block);
+            (
+                first.map_or(0, |block| block.start),
+                *shape,
+                first.map(|block| block.row_stride),
+            )
+        }
+    }
+}
+
+/// The byte ranges `source` names, in its logical order, over the tensors `locate` answers: the
+/// checkpoint's own, or the decoded matrices a weight-only NVFP4 read gathers from.
+///
+/// Every bound is checked against the length each location states.
+fn spans_in<'l>(
+    source: &WeightSource,
+    key: &WeightKey,
+    locate: &dyn Fn(&str) -> Option<&'l TensorLocation>,
+) -> Result<Vec<Span<'l>>> {
+    match source {
+        WeightSource::Region {
+            tensor,
+            start,
+            shape,
+        } => {
+            let location = locate(tensor).ok_or_else(|| Error::MissingTensor(tensor.clone()))?;
+            let length = stored_bytes(location);
+            let element = location.dtype.bytes().ok_or_else(|| {
+                Error::weight(tensor, format!("{} has no whole-byte size", location.dtype))
+            })?;
+            let begin = usize::try_from(start * element).map_err(|_| {
+                Error::weight(tensor, "the region's first element is past usize::MAX")
+            })?;
+            let end = usize::try_from((start + shape.numel()) * element).map_err(|_| {
+                Error::weight(tensor, "the region's last element is past usize::MAX")
+            })?;
+            if end as u64 > length {
+                return Err(Error::weight(
+                    tensor,
+                    format!(
+                        "elements {start}..{} of {:?} reach past the tensor's {length}",
+                        start + shape.numel(),
+                        location.shape.dims(),
+                    ),
+                ));
+            }
+            Ok(vec![Span {
+                location,
+                from: begin,
+                to: end,
+            }])
+        }
+        WeightSource::Strided {
+            tensor,
+            start,
+            shape,
+            row_stride,
+        } => {
+            let location = locate(tensor).ok_or_else(|| Error::MissingTensor(tensor.clone()))?;
+            let element = location.dtype.bytes().ok_or_else(|| {
+                Error::weight(tensor, format!("{} has no whole-byte size", location.dtype))
+            })?;
+            if shape.rank() == 0 {
+                return Err(Error::weight(
+                    tensor,
+                    "a gathered weight has an axis".to_owned(),
+                ));
+            }
+            let row = shape.last();
+            if *row_stride < row {
+                return Err(Error::weight(
+                    tensor,
+                    format!("a stride of {row_stride} overlaps rows of {row} elements"),
+                ));
+            }
+            let rows = shape.numel() / row.max(1);
+            let length = stored_bytes(location);
+            let mut spans = Vec::with_capacity(usize::try_from(rows).unwrap_or(0));
+            for index in 0..rows {
+                let begin = start + index * row_stride;
+                let from = usize::try_from(begin * element)
+                    .map_err(|_| Error::weight(tensor, "a gathered row starts past usize::MAX"))?;
+                let to = usize::try_from((begin + row) * element)
+                    .map_err(|_| Error::weight(tensor, "a gathered row ends past usize::MAX"))?;
+                if to as u64 > length {
+                    return Err(Error::weight(
+                        tensor,
+                        format!(
+                            "row {index} (elements {begin}..{}) reaches past the tensor's {length} bytes",
+                            begin + row,
+                        ),
+                    ));
+                }
+                spans.push(Span { location, from, to });
+            }
+            Ok(spans)
+        }
+        WeightSource::Blocks { parts, .. } => {
+            let mut spans = Vec::new();
+            for (name, block) in parts {
+                spans.extend(block_spans(locate, name, block)?);
+            }
+            if spans.iter().all(|span| span.from == span.to) {
+                return Err(Error::weight(
+                    &key.region.tensors.join("+"),
+                    "a fused weight has no part",
+                ));
+            }
+            Ok(spans)
+        }
+        WeightSource::Parts {
+            parts,
+            block: Some(block),
+            ..
+        } => {
+            let mut spans = Vec::new();
+            for name in parts {
+                let location = locate(name).ok_or_else(|| Error::MissingTensor(name.clone()))?;
+                let element = location.dtype.bytes().ok_or_else(|| {
+                    Error::weight(name, format!("{} has no whole-byte size", location.dtype))
+                })?;
+                if block.row_stride < block.columns {
+                    return Err(Error::weight(
+                        name,
+                        format!(
+                            "a stride of {} overlaps rows of {} elements",
+                            block.row_stride, block.columns
+                        ),
+                    ));
+                }
+                let length = stored_bytes(location);
+                for row in 0..block.rows {
+                    let first = (block.start + row * block.row_stride) * element;
+                    let last = first + block.columns * element;
+                    let (Ok(from), Ok(to)) = (usize::try_from(first), usize::try_from(last)) else {
+                        return Err(Error::weight(name, "a block row is past usize::MAX"));
+                    };
+                    if to as u64 > length {
+                        return Err(Error::weight(
+                            name,
+                            format!(
+                                "row {row} of the block (bytes {from}..{to}) reaches past the \
+                                 part's {length} bytes"
+                            ),
+                        ));
+                    }
+                    spans.push(Span { location, from, to });
+                }
+            }
+            if spans.iter().all(|span| span.from == span.to) {
+                return Err(Error::weight(
+                    &key.region.tensors.join("+"),
+                    "a fused weight has no part",
+                ));
+            }
+            Ok(spans)
+        }
+        WeightSource::Parts { parts, .. } => {
+            let mut spans = Vec::with_capacity(parts.len());
+            let mut part_shape: Option<Shape> = None;
+            for name in parts {
+                let location = locate(name).ok_or_else(|| Error::MissingTensor(name.clone()))?;
+                if location.shape.rank() == 0 {
+                    return Err(Error::weight(name, "a scalar cannot be fused"));
+                }
+                match part_shape {
+                    None => part_shape = Some(location.shape),
+                    Some(first) => {
+                        let same_tail = first.dims().iter().skip(1).eq(location
+                            .shape
+                            .dims()
+                            .iter()
+                            .skip(1));
+                        if !same_tail {
+                            return Err(Error::weight(
+                                name,
+                                format!(
+                                    "fusing {:?} with {:?} joins different tails",
+                                    first.dims(),
+                                    location.shape.dims()
+                                ),
+                            ));
+                        }
+                    }
+                }
+                let to = usize::try_from(stored_bytes(location))
+                    .map_err(|_| Error::weight(name, "a part is past usize::MAX"))?;
+                spans.push(Span {
+                    location,
+                    from: 0,
+                    to,
+                });
+            }
+            if spans.iter().all(|span| span.from == span.to) {
+                return Err(Error::weight(
+                    &key.region.tensors.join("+"),
+                    "a fused weight has no part",
+                ));
+            }
+            Ok(spans)
+        }
+    }
+}
+
 /// The byte ranges of `block`'s rows in the checkpoint tensor `name`, checked against its length.
 fn block_spans<'a>(
-    checkpoint: &'a Checkpoint,
+    locate: &dyn Fn(&str) -> Option<&'a TensorLocation>,
     name: &str,
     block: &PartBlock,
 ) -> Result<Vec<Span<'a>>> {
-    let location = checkpoint
-        .tensor(name)
-        .ok_or_else(|| Error::MissingTensor(name.to_owned()))?;
+    let location = locate(name).ok_or_else(|| Error::MissingTensor(name.to_owned()))?;
     let element = location
         .dtype
         .bytes()

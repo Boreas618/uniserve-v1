@@ -6,7 +6,9 @@
 //! [`Linear::load`] reads one module's `weight` (and `bias`) through its [`Scope`] and chooses the
 //! representation from the checkpoint's quantization declaration: a dense weight is one `gemm`; a
 //! calibrated NVFP4 weight is an activation encoder (`nvfp4_quantize`) and a packed product
-//! (`nvfp4_gemm`) whose `alpha` is the weight's tensor scale times the activation's. The caller
+//! (`nvfp4_gemm`) whose `alpha` is the weight's tensor scale times the activation's; a per-tensor
+//! FP8 weight is one `fp8_gemm`, which encodes the activation by its static scale as it loads it;
+//! a weight-only NVFP4 weight is the dense matrix its fields state, decoded at load. The caller
 //! names the module, its widths and its split, and never the representation.
 //!
 //! ## Parallelism
@@ -26,6 +28,7 @@ use ops::fp4::{
     BLOCK_ELEMENTS, GemmArgs, GemmDescriptor, Nvfp4Gemm, Nvfp4Quantize, QuantizeArgs,
     QuantizeDescriptor, ScaleLayout,
 };
+use ops::fp8::{Fp8Gemm, Fp8GemmArgs, Fp8GemmDescriptor};
 use ops::gemm::{self, Descriptor, Epilogue, Gemm, WeightOrder};
 use ops::{DType, Shape, TensorView};
 
@@ -101,6 +104,9 @@ struct Packed {
     alpha: Weight,
 }
 
+/// The tile an `fp8_gemm` program covers: one program set serves every projection.
+const FP8_TILE: (u32, u32, u32) = (64, 128, 128);
+
 /// The representation a projection's weight is held in.
 #[derive(Clone)]
 enum Form {
@@ -108,6 +114,13 @@ enum Form {
     Dense { weight: Weight, order: WeightOrder },
     /// A calibrated NVFP4 matrix.
     Packed(Box<Packed>),
+    /// A per-tensor FP8 matrix, `[n, k]` E4M3, and its two static scales: the activation is divided
+    /// by `input_scale` before it is encoded, and the accumulator is multiplied by `alpha`.
+    Fp8 {
+        weight: Weight,
+        input_scale: f32,
+        alpha: f32,
+    },
 }
 
 /// A linear projection in the representation its checkpoint stores.
@@ -172,7 +185,9 @@ impl Linear {
         };
         let name = scope.name("weight");
         match scope.loader().scheme(&name) {
-            Scheme::Dense => {
+            Scheme::Fp8 => Self::load_fp8(scope, inputs, local_in, local_out, bias, parallel),
+            // A weight-only NVFP4 matrix is read as the dense matrix it states (`Scope::load`).
+            Scheme::Dense | Scheme::Nvfp4Weights => {
                 let weight =
                     scope.load(weight_request(&name, inputs, local_out, local_in, parallel))?;
                 let bias = match (bias, parallel) {
@@ -217,6 +232,62 @@ impl Linear {
                 Self::load_packed(scope, inputs, local_in, local_out, parallel)
             }
         }
+    }
+
+    /// The per-tensor FP8 fields of the module at `scope`, at this rank's block: the E4M3
+    /// `weight`, its `weight_scale` and the activation's static `input_scale`, one positive float
+    /// each and the same for every rank's block.
+    fn load_fp8(
+        scope: &mut Scope<'_, '_>,
+        inputs: u64,
+        local_in: u64,
+        local_out: u64,
+        bias: Bias,
+        parallel: Parallel,
+    ) -> Result<Self> {
+        let name = scope.name("weight");
+        let request =
+            weight_request(&name, inputs, local_out, local_in, parallel).pinned(DType::F8E4M3);
+        let weight_scale = WeightRequest::region(scope.name("weight_scale"), 0, Shape::new(&[1]));
+        let input_scale = WeightRequest::region(scope.name("input_scale"), 0, Shape::new(&[1]));
+        let loader = scope.loader();
+        let weight = loader.load(&request.nonzero())?;
+        if weight.dtype() != DType::F8E4M3 {
+            return Err(Error::weight(
+                &name,
+                format!(
+                    "an FP8 projection's weight is F8_E4M3, not {}",
+                    weight.dtype()
+                ),
+            ));
+        }
+        let weight_scale = loader.tensor_scale(&weight_scale)?;
+        let input_scale = loader.tensor_scale(&input_scale)?;
+        let bias = match (bias, parallel) {
+            (Bias::Absent, _) => None,
+            (Bias::Present, Parallel::Row(split)) if split.rank != 0 => None,
+            (Bias::Present, Parallel::Column(split)) => Some(scope.load(WeightRequest::region(
+                scope.name("bias"),
+                u64::from(split.rank) * local_out,
+                Shape::new(&[local_out]),
+            ))?),
+            (Bias::Present, _) => Some(scope.tensor("bias", &[local_out])?),
+        };
+        let reduce = match parallel {
+            Parallel::Row(split) => split.size,
+            _ => 1,
+        };
+        Self::build(
+            Form::Fp8 {
+                weight,
+                input_scale,
+                alpha: input_scale * weight_scale,
+            },
+            bias,
+            local_in,
+            local_out,
+            reduce,
+        )
     }
 
     /// The packed fields of the module at `scope`, at this rank's block.
@@ -386,7 +457,7 @@ impl Linear {
     /// The weight view: the dense matrix, or the packed values of a packed projection.
     pub fn weight(&self) -> TensorView {
         match &self.form {
-            Form::Dense { weight, .. } => weight.view(),
+            Form::Dense { weight, .. } | Form::Fp8 { weight, .. } => weight.view(),
             Form::Packed(packed) => packed.values.view(),
         }
     }
@@ -446,6 +517,30 @@ impl Linear {
                 f.operate::<Gemm>(&descriptor, args)?;
             }
             Form::Packed(packed) => self.forward_packed(f, packed, input, out)?,
+            Form::Fp8 {
+                weight,
+                input_scale,
+                alpha,
+            } => {
+                let (block_m, block_n, block_k) = FP8_TILE;
+                f.operate::<Fp8Gemm>(
+                    &Fp8GemmDescriptor {
+                        dtype: input.dtype,
+                        block_m,
+                        block_n,
+                        block_k,
+                        bias: self.bias.is_some(),
+                    },
+                    Fp8GemmArgs {
+                        input,
+                        weight: weight.view(),
+                        bias: self.bias.as_ref().map(Weight::view),
+                        out,
+                        input_scale: *input_scale,
+                        alpha: *alpha,
+                    },
+                )?;
+            }
         }
         if self.reduce > 1 {
             // A partial sum over this rank's block of the contraction: the group sums the ranks'.
