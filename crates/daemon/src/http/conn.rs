@@ -1662,13 +1662,6 @@ mod tests {
             self.stream.write_all(bytes).await.expect("a request");
         }
 
-        /// Sends `bytes` and lets the caller judge a failed write: a connection
-        /// that ended before this write answers `EPIPE`, which is what some
-        /// tests are about rather than a failure to reach the connection.
-        async fn try_send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-            self.stream.write_all(bytes).await
-        }
-
         /// Reads once from the connection into the buffer, failing the test
         /// rather than hanging.
         async fn fill(&mut self) -> usize {
@@ -2079,27 +2072,49 @@ mod tests {
         let admitting = Admissions::default();
         admitting.close();
         let (io, client) = pair();
+
+        // The request is in the socket before the connection runs, so the
+        // case under test is the same on every schedule: a request arrived,
+        // and the connection must end without taking it.
+        let mut client = TestClient::new(client);
+        client
+            .send(b"GET /health HTTP/1.1\r\nhost: test\r\n\r\n")
+            .await;
         let serving = tokio::spawn(serve_connection(
             io,
             app,
             CancellationToken::new(),
             admitting,
         ));
-
-        let mut client = TestClient::new(client);
-        // The connection is closed before it reads anything, so the peer may
-        // already be gone when this write arrives: that is the behaviour under
-        // test, and a closed peer answers `EPIPE` rather than taking the
-        // request. What the test then asserts is that no response was written.
-        let _ = client
-            .try_send(b"GET /health HTTP/1.1\r\nhost: test\r\n\r\n")
-            .await;
         tokio::time::timeout(std::time::Duration::from_secs(10), serving)
             .await
             .expect("the connection ends")
             .expect("the connection task")
             .expect("the connection ends without an error");
-        assert_eq!(client.fill().await, 0, "the connection wrote no response");
+
+        // A peer that closes with request bytes it never read resets the
+        // connection (`ECONNRESET`); one that read them closes it (end of
+        // stream). Either is an ending without a response, which the client
+        // answers by reconnecting; a response byte would arrive before either.
+        let mut received = Vec::new();
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.stream.read_to_end(&mut received),
+        )
+        .await
+        .expect("the connection closes");
+        if let Err(error) = ended {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset,
+                "the connection ends by closing: {error}"
+            );
+        }
+        assert!(
+            received.is_empty(),
+            "the connection wrote no response: {:?}",
+            String::from_utf8_lossy(&received)
+        );
     }
 
     /// The same, for a response that cannot be handed over when `freezable`
