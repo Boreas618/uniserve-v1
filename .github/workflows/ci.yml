@@ -10,10 +10,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The toolchain, its components and the wasm32 target scheduling policies are built for
+      # come from rust-toolchain.toml.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/ffmpeg
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
@@ -23,13 +27,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-      - run: python -m pip install -U pip
-      - run: python -m pip install -e ".[dev,test,bench]"
-      - run: python -m ruff check uniserve_eval tests
-      - run: python -m ruff format --check uniserve_eval tests
-      - run: python -m mypy
-      - run: python -m pytest -m "unit and not gpu"
+      - uses: astral-sh/setup-uv@v6
+      # The job checks the Python sources and needs no `uniserve` executable, so the locked
+      # environment is synced without building the project itself (the rust job builds it).
+      - run: uv sync --locked --python 3.12 --no-install-project --extra dev --extra test --extra bench
+      - run: .venv/bin/python -m ruff check uniserve_eval tests
+      - run: .venv/bin/python -m ruff format --check uniserve_eval tests
+      - run: .venv/bin/python -m mypy
+      - run: .venv/bin/python -m pytest -m "unit and not gpu"

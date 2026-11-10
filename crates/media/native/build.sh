@@ -11,10 +11,10 @@
 # names with UNISERVE_FFMPEG_DIR. The build is idempotent: an existing PREFIX
 # with both libraries is left alone.
 #
-# Requirements: gcc, make, pkg-config, zlib and the FFmpeg 8.1.2 source tree
-# FFMPEG_SOURCE names. The x264 tarball is pinned by its SHA-256; if upstream's master archive has
-# moved, download the archive, verify it is a working x264, and update
-# X264_SHA256 below.
+# Requirements: gcc, make, nasm (x264's assembly), pkg-config, zlib, patchelf and
+# the FFmpeg 8.1.2 source tree FFMPEG_SOURCE names. The x264 tarball is pinned
+# by its SHA-256; if upstream's master archive has moved, download the archive,
+# verify it is a working x264, and update X264_SHA256 below.
 set -euo pipefail
 
 PREFIX=${1:?usage: build.sh <PREFIX>, the directory the runtime is installed into}

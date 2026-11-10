@@ -1,0 +1,26 @@
+name: FFmpeg runtime
+description: >-
+  The shared FFmpeg 8.1.2 + libx264 prefix every build of the workspace links
+  (crates/media/README.md), built by crates/media/native/build.sh from the
+  release source and cached by that script's contents. Exports
+  UNISERVE_FFMPEG_DIR.
+
+runs:
+  using: composite
+  steps:
+    - id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/ffmpeg-8.1.2
+        key: ffmpeg-8.1.2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('crates/media/native/build.sh') }}
+    - if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential nasm patchelf pkg-config zlib1g-dev
+        curl -L --fail -o "$RUNNER_TEMP/ffmpeg-8.1.2.tar.xz" https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
+        echo "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c  $RUNNER_TEMP/ffmpeg-8.1.2.tar.xz" | sha256sum -c -
+        tar -xJf "$RUNNER_TEMP/ffmpeg-8.1.2.tar.xz" -C "$RUNNER_TEMP"
+        FFMPEG_SOURCE="$RUNNER_TEMP/ffmpeg-8.1.2" crates/media/native/build.sh "$HOME/ffmpeg-8.1.2"
+    - shell: bash
+      run: echo "UNISERVE_FFMPEG_DIR=$HOME/ffmpeg-8.1.2" >> "$GITHUB_ENV"
