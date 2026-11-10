@@ -66,6 +66,14 @@ def _softmax_kernel(
     #
     #     m' = max(m, tile's maximum)
     #     s' = s * exp(m - m') + Σ_tile exp(x - m')
+    #
+    # Until a tile holds a finite value the maximum is still `-inf`, and `-inf - -inf` is NaN, which
+    # would poison the denominator of the whole row. A sampler's candidate row in token order is
+    # mostly `-inf` (every candidate past its top-k and nucleus), so its leading tiles often hold
+    # none of its kept candidates. Such a tile is shifted by zero instead: every term it adds is
+    # `exp(-inf) = 0` and it rescales the empty sum by `exp(-inf) = 0`, so the denominator stays
+    # zero until the first finite value; from that tile on the shift is the finite maximum and the
+    # recurrence is the one above.
     maximum = -float("inf")
     total = 0.0
     for tile in range(0, tiles):
@@ -75,8 +83,9 @@ def _softmax_kernel(
             tl.float32
         )
         raised = tl.maximum(maximum, tl.max(values, axis=0))
-        total = total * tl.exp(maximum - raised) + tl.sum(
-            tl.where(live, tl.exp(values - raised), 0.0), axis=0
+        shift = tl.where(raised == -float("inf"), 0.0, raised)
+        total = total * tl.exp(maximum - shift) + tl.sum(
+            tl.where(live, tl.exp(values - shift), 0.0), axis=0
         )
         maximum = raised
 

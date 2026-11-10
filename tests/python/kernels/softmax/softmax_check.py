@@ -16,7 +16,9 @@ same file is kept in both packages, byte for byte, and a test in
 The cases are what a row reduction can get wrong: the shapes the fixture's keys name, a
 width far below the tile where almost every lane is masked, a width far above it - the row is
 walked in as many tiles as it has, and the running maximum must be rescaled when a later tile
-raises it - a row of one repeated logit
+raises it - a softmax row whose leading tiles hold only `-inf`, as a sampler's candidates
+ordered by token id do, where the running maximum is still `-inf` when the first tiles are
+summed - a row of one repeated logit
 (a uniform distribution, whose probabilities are `1/columns`), and a row with one dominant
 logit a hundred nats above the rest, where the probabilities are `1` and `0` and the
 log-probabilities are `0` and `−100` — the case a relative comparison cannot survive.
@@ -141,6 +143,11 @@ def check(operator, case):
         x[0, columns // 2] = 0.0
     if case["flat_row"]:
         x[0, :] = 0.5
+    if case.get("masked_head"):
+        # A sampler's candidates in token order: every dropped candidate is `-inf`, so the
+        # tiles before the first kept one hold no finite value at all. The kept ones sit in
+        # the last tile, and the probabilities of the dropped ones are exactly zero.
+        x[:, : columns - tile // 2] = float("-inf")
     x = x.to(dtype)
 
     out_dtype = dtype if operator == "softmax" else torch.float32
@@ -240,7 +247,24 @@ def cases(flags):
             "flat_row": True,
             "seed": 3,
         },
-    ]
+    ] + (
+        [
+            {
+                **common,
+                "label": "a row whose leading tiles are all -inf, a sampler's ordered candidates",
+                "rows": 2,
+                "columns": 20480,
+                "tile": 2048,
+                "dominant_row": False,
+                "flat_row": False,
+                "masked_head": True,
+                "seed": 5,
+            }
+        ]
+        # `log_softmax` scores the model's raw logits, which are finite.
+        if flags.op == "softmax"
+        else []
+    )
 
 
 def main() -> int:
