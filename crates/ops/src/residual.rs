@@ -818,8 +818,15 @@ impl Op for SigmoidGatedAdd {
     }
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
-        // The sigmoid's few FP32 ulps, one product and one sum, rounded once into the target type.
-        Tolerance::new(0.0, 2.0 * descriptor.dtype.unit_roundoff() as f32)
+        // The sigmoid's few FP32 ulps (its exponential is the device's approximate one), one product
+        // and one sum, rounded once into the target type. The sum may cancel, so the bound is
+        // relative to the output's largest magnitude.
+        Tolerance {
+            atol: 0.0,
+            rtol: (2.0 * descriptor.dtype.unit_roundoff() + 4.0 * DType::F32.unit_roundoff())
+                as f32,
+            cancels: true,
+        }
     }
 }
 

@@ -1,0 +1,36 @@
+# The sigmoid_gated_add operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# One program walks `block` elements of one row: it reads the row's scalar gate
+# logit, and adds `sigmoid(gate) · update` into the target in FP32, rounding once.
+# `columns` is a launch value, the row count the grid's second axis.
+
+op = "sigmoid_gated_add"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/sigmoid_gated_add.py", "src/build.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_bf16_columns_2048_block_1024`.
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], columns = { min = 1 }, block = { power_of_two = true } }
+
+[parameters]

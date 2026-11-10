@@ -31,7 +31,12 @@ INTERPRETED = (
     "layer_norm_check.py",
     "weighted_rms_norm_check.py",
     "scaled_residual_check.py",
+    "gated_rms_norm_check.py",
+    "sigmoid_gated_add_check.py",
 )
+
+#: The checks that also run on a device, where stores round and exponentials are approximate.
+ON_DEVICE = ("gated_rms_norm_check.py", "sigmoid_gated_add_check.py")
 
 #: The native frame norms: their host half needs no module and no device.
 FRAME = (
@@ -43,6 +48,11 @@ FRAME = (
 @pytest.mark.parametrize(("check", "op"), SHARED)
 def test_a_row_norm_matches_its_reference_on_the_interpreter(check, op):
     interpreted(FAMILY / check, "--op", op)
+
+
+@pytest.mark.parametrize("op", ["rms_norm", "add_rms_norm"])
+def test_a_zero_centred_row_norm_matches_its_reference_on_the_interpreter(op):
+    interpreted(FAMILY / "row_norm_check.py", "--op", op, "--centred", "true")
 
 
 @pytest.mark.parametrize("check", INTERPRETED)
@@ -60,6 +70,13 @@ def test_a_frame_norm_states_a_consistent_call_structure(check, op):
 def test_a_modulation_stores_its_narrow_output_on_the_device(op):
     """The interpreter stores E4M3 wrong, so the E4M3 output is checked here."""
     on_device(FAMILY / "modulation_check.py", "--op", op)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", ["bf16", "f32"])
+@pytest.mark.parametrize("check", ON_DEVICE)
+def test_a_gated_norm_or_add_matches_its_reference_on_the_device(check, dtype):
+    on_device(FAMILY / check, "--dtype", dtype)
 
 
 @pytest.mark.gpu
