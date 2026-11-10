@@ -119,6 +119,8 @@ Three backend-name fields are read with `attention_backend` (`FilledPrograms::of
 | `node_rank` | `0` | This node's rank. The leader, rank 0, serves the API and requires `model`; the other node daemons join it and launch engines or workers assigned to their hosts |
 | `dist_init_addr` | Unset | The leader's `HOST:PORT`, which the other nodes' daemons join at and the leader binds on every interface; required with several nodes |
 
+A checkpoint that declares its own quantization (ModelOpt's `quantization_config` in `config.json` or `hf_quant_config.json`) is read in the representation each weight's declaration and shard state. NVFP4 (`quant_algo: NVFP4`) runs NVFP4 products over activations encoded to NVFP4. A `MIXED_PRECISION` export states one algorithm per module in `quantized_layers`, and each module is read in its own: `FP8` is a per-tensor E4M3 product whose activation is encoded at the calibrated static `input_scale`; `NVFP4` as above; `W4A16_NVFP4` keeps activations in 16 bits, and its weight is read as the BF16 matrix its codes and scales state (`code · block_scale · tensor_scale`, rounded once), so its products are 16-bit products. That weight is resident in BF16: a `W4A16_NVFP4` export does not keep its 4-bit memory footprint, and the products differ from a 16-bit-activation FP4 kernel's, which applies the tensor scale to its accumulator, by at most half a BF16 unit per weight. Another per-module algorithm is refused by name. The key/value cache keeps the element type `kv_cache_config` states, the activations' otherwise.
+
 ### `server_config`
 
 **Destination: host layer.** The leader daemon's application server reads these: the HTTP and OpenAI API; the daemon's own listener has its own address (`admin_config`).
