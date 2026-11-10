@@ -948,7 +948,7 @@ mod tests {
     fn a_state_snapshot_is_reserved_out_of_the_grant_before_the_units() {
         let reserved = crate::capacity::reserved_bytes(TOTAL, true);
         let mut state = CachePlan::dense(64, 2, 4, 64, ipc::PrefixCacheDtype::BFloat16);
-        state.groups[0].state = true;
+        state.groups[0].kind = ipc::CacheGroupKind::State;
         state.checkpoints = vec![Checkpoint {
             first_plane: 0,
             planes: 8,

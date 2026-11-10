@@ -1486,9 +1486,7 @@ mod layer_view_tests {
     /// row a token of one layer occupies.
     fn group(layers: usize, units_per_page: u32) -> CacheGroupPlan {
         CacheGroupPlan {
-            window: None,
-            state: false,
-            draft: false,
+            kind: ipc::CacheGroupKind::Full,
             block_size: 16,
             units_per_page,
             layers: (0..layers).map(|layer| format!("layers.{layer}")).collect(),
@@ -1741,7 +1739,7 @@ mod layer_view_tests {
     #[test]
     fn a_state_page_holds_its_checkpoints_in_its_own_storages() -> Result<()> {
         let mut with_state = group(2, 1);
-        with_state.state = true;
+        with_state.kind = ipc::CacheGroupKind::State;
         let plan = CachePlan {
             columns: 2,
             plane_bytes: 16,

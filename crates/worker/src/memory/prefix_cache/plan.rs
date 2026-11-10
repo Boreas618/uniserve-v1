@@ -37,18 +37,16 @@ pub struct GroupAxis {
 }
 
 /// One cache group: layers sharing a history window and a K/V page shape,
-/// or the state group, whose pages hold the checkpoints of the layers kept
-/// per request slot (`state`).
+/// the state group, whose pages hold the checkpoints of the layers kept per
+/// request slot, or the draft cache. The group's kind is the engine's
+/// `CacheGroupKind`; the plan adds the group's column layout on this rank.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheGroupPlan {
-    pub window: Option<u32>,
-    /// Whether the group's pages hold state checkpoints: each of its layers'
-    /// state after the page's last token, in bytes the library lays out.
-    pub state: bool,
-    /// Whether the group holds the draft cache, which a request may lack: a
-    /// drafter's K/V, each layer's page laid over the columns of its unit
-    /// (`uniserve.prefix_cache.units`).
-    pub draft: bool,
+    /// The group's history policy: a state group's pages hold each of its
+    /// layers' state after the page's last token, in bytes the library lays
+    /// out; a draft group's hold a drafter's K/V, each layer's page laid over
+    /// the columns of its unit.
+    pub kind: CacheGroupKind,
     pub block_size: u32,
     pub units_per_page: u32,
     /// Resident layer names in column order: layer `k` lies in column
@@ -74,30 +72,28 @@ impl CacheGroupPlan {
     }
 
     pub(crate) fn shape(&self) -> Result<GroupShape> {
-        // A state checkpoint's reader continuing from token `t` reads the
-        // page ending at `t`, the page holding token `t - 1`: the pages a
-        // one-token window reads.
-        let window = if self.state { Some(1) } else { self.window };
-        GroupShape::new(self.block_size, self.units_per_page, window)
+        GroupShape::new(self.block_size, self.units_per_page, self.kind)
+    }
+
+    /// The sliding window of a sliding-window group.
+    pub(crate) fn window(&self) -> Option<u32> {
+        self.kind.window()
+    }
+
+    /// Whether the group's pages hold state checkpoints.
+    pub(crate) fn state(&self) -> bool {
+        self.kind.is_state()
+    }
+
+    /// Whether the group holds the draft cache.
+    pub(crate) fn draft(&self) -> bool {
+        self.kind.is_draft()
     }
 
     /// Whether the group holds K/V rows a request needs: neither the state
     /// group's checkpoints nor the optional draft cache.
     pub(crate) fn required_rows(&self) -> bool {
-        !self.state && !self.draft
-    }
-
-    /// The group as the engine sees it.
-    fn kind(&self) -> CacheGroupKind {
-        if self.state {
-            return CacheGroupKind::State;
-        }
-        if self.draft {
-            return CacheGroupKind::Draft;
-        }
-        self.window.map_or(CacheGroupKind::Full, |window| {
-            CacheGroupKind::SlidingWindow { window }
-        })
+        self.kind.required_rows()
     }
 }
 
@@ -156,9 +152,7 @@ impl CachePlan {
             unit_bytes: u64::from(columns) * per_column,
             dtype,
             groups: vec![CacheGroupPlan {
-                window: None,
-                state: false,
-                draft: false,
+                kind: CacheGroupKind::Full,
                 block_size,
                 units_per_page: 1,
                 layers: (0..layers).map(|layer| format!("layers.{layer}")).collect(),
@@ -198,7 +192,7 @@ impl CachePlan {
             .iter()
             .map(|checkpoint| checkpoint.planes)
             .sum();
-        if rows == 0 || !self.groups.iter().any(|group| group.state) {
+        if rows == 0 || !self.groups.iter().any(|group| group.state()) {
             return 0;
         }
         u64::from(rows) * self.plane_bytes + u64::from(rows) * 8
@@ -254,7 +248,7 @@ impl CachePlan {
             }
         }
         if let Some((last, rest)) = groups.split_last()
-            && rest.iter().any(|group| group.state)
+            && rest.iter().any(|group| group.state())
         {
             return Err(Error::Invalid(format!(
                 "the state group {:?} must be the last cache group",
@@ -297,7 +291,7 @@ impl CachePlan {
     /// pool indexes the same units, so a K/V plane and a state plane at one
     /// (column, unit) are different bytes of the page.
     pub fn state_fields(&self) -> u32 {
-        let Some(group) = self.groups.iter().find(|group| group.state) else {
+        let Some(group) = self.groups.iter().find(|group| group.state()) else {
             return 0;
         };
         let capacity = group.units_per_page.saturating_mul(self.columns);
@@ -326,7 +320,7 @@ impl CachePlan {
                 .groups
                 .iter()
                 .map(|group| CacheGroup {
-                    kind: group.kind(),
+                    kind: group.kind,
                     block_size: group.block_size,
                     units_per_page: group.units_per_page,
                     layer_ids: group.layer_ids.clone(),
@@ -361,9 +355,9 @@ impl CachePlan {
     pub(crate) fn token_units(&self, tokens: u64, request_slots: u64) -> u64 {
         self.groups
             .iter()
-            .filter(|group| !group.draft)
+            .filter(|group| !group.draft())
             .map(|group| {
-                let pages = if group.state {
+                let pages = if group.state() {
                     request_slots
                 } else {
                     tokens / u64::from(group.block_size)
@@ -418,9 +412,11 @@ mod tests {
     #[test]
     fn a_state_page_asks_for_the_fields_its_checkpoints_span() {
         let group = |state: bool| CacheGroupPlan {
-            window: None,
-            state,
-            draft: false,
+            kind: if state {
+                CacheGroupKind::State
+            } else {
+                CacheGroupKind::Full
+            },
             block_size: 64,
             units_per_page: 1,
             layers: vec!["layers.0".into(), "layers.1".into()],

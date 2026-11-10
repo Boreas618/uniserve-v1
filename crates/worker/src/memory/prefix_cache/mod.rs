@@ -484,9 +484,7 @@ mod tests {
                 unit_bytes: 2 * 128 + 2,
                 dtype: ipc::PrefixCacheDtype::BFloat16,
                 groups: vec![plan::CacheGroupPlan {
-                    window: None,
-                    state: false,
-                    draft: false,
+                    kind: ipc::CacheGroupKind::Full,
                     block_size: 8,
                     units_per_page: 1,
                     layers: vec!["layers.0".into(), "layers.1".into()],

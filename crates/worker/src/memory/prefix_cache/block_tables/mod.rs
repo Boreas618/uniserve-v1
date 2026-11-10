@@ -12,16 +12,17 @@ mod backing;
 
 pub use backing::BlockTableStorage;
 
-/// Page dimensions needed to address one cache group.
+/// Page dimensions needed to address one cache group, and the group's kind,
+/// which decides the history its readers need.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GroupShape {
     pub block_size: u32,
     pub units_per_page: u32,
-    pub window: Option<u32>,
+    pub kind: ipc::CacheGroupKind,
 }
 
 impl GroupShape {
-    pub fn new(block_size: u32, units_per_page: u32, window: Option<u32>) -> Result<Self> {
+    pub fn new(block_size: u32, units_per_page: u32, kind: ipc::CacheGroupKind) -> Result<Self> {
         if block_size == 0 || units_per_page == 0 {
             return Err(Error::Invalid(
                 "cache page dimensions must be positive".into(),
@@ -31,8 +32,14 @@ impl GroupShape {
         Ok(Self {
             block_size,
             units_per_page,
-            window,
+            kind,
         })
+    }
+
+    /// History tokens any reader needs, or `None` for every earlier token
+    /// (`CacheGroupKind::reader_window`).
+    pub fn window(&self) -> Option<u32> {
+        self.kind.reader_window()
     }
 }
 
@@ -351,8 +358,8 @@ mod tests {
     #[test]
     fn batch_assignments_replace_only_supplied_groups_until_commit() -> Result<()> {
         let groups = vec![
-            GroupShape::new(4, 1, None)?,
-            GroupShape::new(8, 2, Some(8))?,
+            GroupShape::new(4, 1, ipc::CacheGroupKind::Full)?,
+            GroupShape::new(8, 2, ipc::CacheGroupKind::SlidingWindow { window: 8 })?,
         ];
         let mut tables = BlockTables::new(groups, 1, 2, 7)?;
         let first = BlockTable {
@@ -397,7 +404,7 @@ mod tests {
     #[test]
     fn token_spans_cover_each_layers_unit_without_crossing_retired_pages() -> Result<()> {
         let table = GroupTable {
-            shape: GroupShape::new(8, 2, Some(8))?,
+            shape: GroupShape::new(8, 2, ipc::CacheGroupKind::SlidingWindow { window: 8 })?,
             start_page: 3,
             units: vec![UnitId(2), UnitId(3), UnitId(4), UnitId(5)],
             allocated_tokens: 40,

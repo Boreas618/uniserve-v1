@@ -2048,7 +2048,7 @@ fn acquire_cached_prefix(
         .groups()
         .iter()
         .map(|group| {
-            if group.draft {
+            if group.draft() {
                 hit.draft_tokens / group.block_size
             } else {
                 hit.cached_tokens / group.block_size

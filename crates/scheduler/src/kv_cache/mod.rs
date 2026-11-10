@@ -65,7 +65,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 
 use ipc::MainProcessEndpoint;
-use ipc::{CacheGroup, UnitId};
+use ipc::{CacheGroup, CacheGroupKind, UnitId};
 use storage::Key;
 
 use crate::lock;
@@ -1259,27 +1259,16 @@ impl fmt::Debug for BlockPool {
     }
 }
 
-/// The page shape and history policy of one cache group, in scheduler terms.
+/// The page shape and history policy of one cache group, in the scheduler's
+/// index widths: the worker's `ipc::CacheGroup` page dimensions and its kind,
+/// which decides the history a reader needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GroupShape {
     /// Tokens per logical page.
     pub(crate) block_size: usize,
     /// Units one logical page occupies.
     pub(crate) units_per_page: usize,
-    /// History tokens any reader needs, or `None` for full attention. A
-    /// state group's reader needs one: the checkpoint ending at its first
-    /// token.
-    pub(crate) window: Option<usize>,
-    /// Whether the group holds state checkpoints, whose tables hold units
-    /// only for the pages that hold a checkpoint
-    /// ([`GroupShape::checkpoint_page`]).
-    pub(crate) state: bool,
-    /// Whether the group holds the draft cache, optional state a request
-    /// may lack: its tables take units as the pool allows
-    /// ([`PrefixCacheCoordinator::ensure_capacity`]), its pages never bound
-    /// a reuse of the other groups, and a page's key covers the token after
-    /// the page, which its last entry reads.
-    pub(crate) draft: bool,
+    pub(crate) kind: CacheGroupKind,
 }
 
 /// Where a call growing a request's tables checkpoints its state groups.
@@ -1308,10 +1297,34 @@ impl GroupShape {
         Self {
             block_size,
             units_per_page,
-            window,
-            state: false,
-            draft: false,
+            kind: window.map_or(CacheGroupKind::Full, |window| {
+                CacheGroupKind::SlidingWindow {
+                    window: window as u32,
+                }
+            }),
         }
+    }
+
+    /// History tokens any reader needs, or `None` for every earlier token
+    /// (`CacheGroupKind::reader_window`).
+    pub(crate) fn window(&self) -> Option<usize> {
+        self.kind.reader_window().map(|window| window as usize)
+    }
+
+    /// Whether the group holds state checkpoints, whose tables hold units
+    /// only for the pages that hold a checkpoint
+    /// ([`GroupShape::checkpoint_page`]).
+    pub(crate) fn state(&self) -> bool {
+        self.kind.is_state()
+    }
+
+    /// Whether the group holds the draft cache, optional state a request
+    /// may lack: its tables take units as the pool allows
+    /// ([`PrefixCacheCoordinator::ensure_capacity`]), its pages never bound
+    /// a reuse of the other groups, and a page's key covers the token after
+    /// the page ([`GroupShape::key_tokens`]).
+    pub(crate) fn draft(&self) -> bool {
+        self.kind.is_draft()
     }
 
     /// The logical page a call reading from token `read_start` and holding
@@ -1324,7 +1337,7 @@ impl GroupShape {
         total_tokens: usize,
         checkpoint: Checkpoint,
     ) -> Option<usize> {
-        if !self.state {
+        if !self.state() {
             return None;
         }
         let boundary = total_tokens / self.block_size * self.block_size;
@@ -1339,7 +1352,7 @@ impl GroupShape {
     /// The reuse rules of the group's attention type; a state group's are
     /// those of a one-token window.
     pub(crate) fn manager(&self) -> manager::AttentionManager {
-        match self.window {
+        match self.window() {
             None => manager::AttentionManager::Full(manager::FullAttentionManager {
                 block_size: self.block_size,
             }),
@@ -1354,31 +1367,23 @@ impl GroupShape {
 
     /// Derives the scheduler shape of a worker-reported group.
     pub(crate) fn from_group(group: &CacheGroup) -> Self {
-        let state = group.kind.is_state();
         Self {
             block_size: group.block_size as usize,
             units_per_page: group.units_per_page as usize,
-            window: if state {
-                Some(1)
-            } else {
-                group.kind.window().map(|window| window as usize)
-            },
-            state,
-            draft: group.kind.is_draft(),
+            kind: group.kind,
         }
     }
 
-    /// Tokens a page's key covers: its own, and for the draft cache the
-    /// token after it.
+    /// Tokens a page's key covers (`CacheGroupKind::key_tokens`).
     fn key_tokens(&self) -> usize {
-        self.block_size + usize::from(self.draft)
+        self.kind.key_tokens(self.block_size as u32) as usize
     }
 
     /// Returns the first logical page a read starting at token `read_start`
     /// needs: page zero for full attention, otherwise the page holding the
     /// oldest history token of the window.
     fn first_needed_page(&self, read_start: usize) -> usize {
-        self.window.map_or(0, |window| {
+        self.window().map_or(0, |window| {
             read_start.saturating_sub(window) / self.block_size
         })
     }
@@ -1579,7 +1584,7 @@ impl BlockTable {
             .shape
             .checkpoint_page(read_start, total_tokens, checkpoint);
         let appended = (current_end..end.max(current_end))
-            .map(|page| !self.shape.state || target == Some(page))
+            .map(|page| !self.shape.state() || target == Some(page))
             .collect();
         let filled = target.filter(|&page| {
             page >= start
@@ -1895,7 +1900,7 @@ impl PrefixCacheCoordinator {
     pub(crate) fn max_block_size(&self) -> usize {
         self.groups
             .iter()
-            .filter(|group| !group.draft)
+            .filter(|group| !group.draft())
             .map(|group| group.block_size)
             .max()
             .unwrap_or(1)
@@ -1903,7 +1908,7 @@ impl PrefixCacheCoordinator {
 
     /// The draft cache's group, when the pool keeps one.
     pub(crate) fn draft_group(&self) -> Option<usize> {
-        self.groups.iter().position(|group| group.draft)
+        self.groups.iter().position(|group| group.draft())
     }
 
     /// Creates empty tables for every group.
@@ -1954,7 +1959,7 @@ impl PrefixCacheCoordinator {
             allocation
                 .tables
                 .iter()
-                .filter(|table| !table.shape.draft)
+                .filter(|table| !table.shape.draft())
                 .map(|table| {
                     table
                         .demand(read_start, total_tokens, checkpoint, |page| {
@@ -1977,9 +1982,9 @@ impl PrefixCacheCoordinator {
     pub(crate) fn units_after_prefix(&self, prefix_tokens: usize, total_tokens: usize) -> usize {
         self.groups
             .iter()
-            .filter(|group| !group.draft)
+            .filter(|group| !group.draft())
             .map(|group| {
-                let pages = if group.state {
+                let pages = if group.state() {
                     usize::from(
                         group
                             .checkpoint_page(prefix_tokens, total_tokens, Checkpoint::Boundary)
@@ -2001,9 +2006,9 @@ impl PrefixCacheCoordinator {
     pub(crate) fn units_for_tokens(&self, tokens: usize) -> usize {
         self.groups
             .iter()
-            .filter(|group| !group.draft)
+            .filter(|group| !group.draft())
             .map(|group| {
-                let pages = if group.state {
+                let pages = if group.state() {
                     usize::from(tokens >= group.block_size)
                 } else {
                     group.pages_covering(tokens)
@@ -2022,13 +2027,13 @@ impl PrefixCacheCoordinator {
     pub(crate) fn min_units_for_prompt(&self, tokens: usize, chunk: usize) -> usize {
         self.groups
             .iter()
-            .filter(|group| !group.draft)
+            .filter(|group| !group.draft())
             .map(|group| {
                 let pages = group.pages_covering(tokens);
-                let pages = if group.state {
+                let pages = if group.state() {
                     pages.min(2)
                 } else {
-                    group.window.map_or(pages, |window| {
+                    group.window().map_or(pages, |window| {
                         pages.min((window + chunk.max(1)).div_ceil(group.block_size) + 1)
                     })
                 };
@@ -2059,7 +2064,7 @@ impl PrefixCacheCoordinator {
             .tables
             .iter()
             .map(|table| {
-                if table.shape.draft {
+                if table.shape.draft() {
                     // The draft table grows on its own below.
                     Growth {
                         start: table.start_page,
@@ -2201,7 +2206,7 @@ impl PrefixCacheCoordinator {
         allocation
             .tables
             .iter()
-            .filter(|table| table.shape.state)
+            .filter(|table| table.shape.state())
             .all(|table| tokens == 0 || table.page(tokens / table.shape.block_size - 1).is_some())
     }
 
@@ -2210,7 +2215,7 @@ impl PrefixCacheCoordinator {
     pub(crate) fn state_block_size(&self) -> Option<usize> {
         self.groups
             .iter()
-            .find(|group| group.state)
+            .find(|group| group.state())
             .map(|group| group.block_size)
     }
 
@@ -2223,7 +2228,7 @@ impl PrefixCacheCoordinator {
             return;
         }
         for table in &mut allocation.tables {
-            if !table.shape.state {
+            if !table.shape.state() {
                 continue;
             }
             let first = tokens / table.shape.block_size;
@@ -2276,9 +2281,9 @@ impl PrefixCacheCoordinator {
             return false;
         }
         for table in &mut allocation.tables {
-            if let Some(window) = table.shape.window {
+            if let Some(window) = table.shape.window() {
                 let bound = visible.saturating_sub(window) / table.shape.block_size;
-                if table.shape.state {
+                if table.shape.state() {
                     // Decode can cross many page boundaries between state
                     // checkpoints. Keep the latest page actually written,
                     // excluding partial pages and future reservations.
@@ -2384,7 +2389,7 @@ impl PrefixCacheCoordinator {
         // Misses before each page, so a window check is one subtraction. The
         // draft cache bounds no reuse: the boundary is the other groups'.
         let required: Vec<usize> = (0..self.groups.len())
-            .filter(|&group| !self.groups[group].draft)
+            .filter(|&group| !self.groups[group].draft())
             .collect();
         let misses = required
             .iter()
@@ -2405,7 +2410,7 @@ impl PrefixCacheCoordinator {
             .iter()
             .enumerate()
             .map(|(group, shape)| {
-                if shape.draft {
+                if shape.draft() {
                     let held = hits[group]
                         .iter()
                         .take(tokens / shape.block_size)
@@ -2438,7 +2443,7 @@ impl PrefixCacheCoordinator {
                 let shape = self.groups[group];
                 let full = end / shape.block_size;
                 let rest = end % shape.block_size;
-                if shape.state && rest != 0 {
+                if shape.state() && rest != 0 {
                     return false;
                 }
                 let start = shape.first_needed_page(end).min(full);
@@ -2475,7 +2480,7 @@ impl PrefixCacheCoordinator {
                 .enumerate()
                 .map(|(group, shape)| {
                     let full = end / shape.block_size;
-                    if shape.draft {
+                    if shape.draft() {
                         return (
                             0,
                             hits[group]
@@ -2662,7 +2667,7 @@ impl PrefixCacheCoordinator {
             .iter()
             .enumerate()
             .map(|(group, (start, pages))| {
-                if self.groups[group].draft {
+                if self.groups[group].draft() {
                     // A draft page that changed identity leaves the request
                     // without its draft cache alone.
                     return Some((*start, acquire(group, *start, pages).unwrap_or_default()));
@@ -2725,7 +2730,7 @@ impl PrefixCacheCoordinator {
                     );
                 }
             }
-            if table.shape.draft {
+            if table.shape.draft() {
                 result.draft_tokens = references.len() * table.shape.block_size;
             }
             table.start_page = start;
@@ -2783,7 +2788,7 @@ impl PrefixCacheCoordinator {
             let shape = table.shape;
             // Request-slot checkpoints and speculative draft state have
             // their own completed-boundary rules, unchanged here.
-            if shape.state || shape.draft || computed.is_multiple_of(shape.block_size) {
+            if shape.state() || shape.draft() || computed.is_multiple_of(shape.block_size) {
                 continue;
             }
             let page = computed / shape.block_size;
@@ -2851,7 +2856,7 @@ impl PrefixCacheCoordinator {
         let computed = computed_tokens.min(tokens.len());
         for (group, (table, group_hashes)) in allocation.tables.iter().zip(hashes).enumerate() {
             let block_size = table.shape.block_size;
-            let valid = if table.shape.draft {
+            let valid = if table.shape.draft() {
                 draft_tokens.min(computed)
             } else {
                 computed
@@ -3339,7 +3344,7 @@ mod tests {
                     .cached_tokens,
                 0
             );
-            if shape.window.is_some() {
+            if shape.window().is_some() {
                 // Host admission can advance beyond the local partial
                 // page. No copy may name a destination it released.
                 assert!(coordinator.release_window(&mut resumed, 512, None));
@@ -4138,7 +4143,7 @@ mod tests {
         let groups = vec![
             full(4, 1),
             GroupShape {
-                draft: true,
+                kind: CacheGroupKind::Draft,
                 ..full(4, 1)
             },
         ];

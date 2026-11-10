@@ -129,7 +129,7 @@ impl BlockTableStorage {
                 let row = [
                     group as i32,
                     shape.block_size as i32,
-                    shape.window.map_or(-1, |window| window as i32),
+                    shape.window().map_or(-1, |window| window as i32),
                 ];
                 std::iter::repeat_n(row, shape.units_per_page as usize).flatten()
             })
@@ -360,8 +360,8 @@ mod tests {
     #[test]
     fn host_installs_write_full_rows_and_clears_reset_slots() -> Result<()> {
         let groups = vec![
-            GroupShape::new(4, 1, None)?,
-            GroupShape::new(8, 2, Some(8))?,
+            GroupShape::new(4, 1, ipc::CacheGroupKind::Full)?,
+            GroupShape::new(8, 2, ipc::CacheGroupKind::SlidingWindow { window: 8 })?,
         ];
         let storage = BlockTableStorage::allocate(&groups, 2, 3, None, None)?;
         assert_eq!(

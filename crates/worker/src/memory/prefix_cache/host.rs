@@ -77,7 +77,7 @@ const STATE_SPACING: u64 = 64;
 /// its block size's, and a state group keeps one checkpoint per
 /// [`STATE_SPACING`] pages.
 fn page_tokens(group: &CacheGroupPlan) -> u64 {
-    let pages = if group.state { STATE_SPACING } else { 1 };
+    let pages = if group.state() { STATE_SPACING } else { 1 };
     u64::from(group.block_size) * pages
 }
 
@@ -103,7 +103,7 @@ fn layout(plan: &CachePlan, group: usize) -> [u8; 32] {
     digest.number(u64::from(plan.quantized));
     digest.number(plan.plane_bytes);
     digest.number(u64::from(plan.columns));
-    digest.number(u64::from(entry.window.unwrap_or(0)));
+    digest.number(u64::from(entry.window().unwrap_or(0)));
     digest.number(u64::from(entry.block_size));
     let layers: Vec<u64> = entry
         .layer_ids
@@ -116,7 +116,7 @@ fn layout(plan: &CachePlan, group: usize) -> [u8; 32] {
     digest.text(entry.dtype.name());
     // A state group's pages are its units' bytes, as many as its
     // checkpoints fill.
-    if entry.state {
+    if entry.state() {
         digest.text("state");
         digest.number(u64::from(entry.units_per_page));
     }

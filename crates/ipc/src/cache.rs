@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// A model whose layers read different histories (for example full and
 /// sliding-window attention) reports one group per policy and page shape.
 /// Every group draws its pages from the same unit pool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CacheGroupKind {
     /// Full attention: every page is retained for the request's lifetime.
@@ -59,6 +59,34 @@ impl CacheGroupKind {
     /// Whether the group holds the draft cache, which a request may lack.
     pub const fn is_draft(self) -> bool {
         matches!(self, Self::Draft)
+    }
+
+    /// The history any reader of the group needs, in tokens, or `None` for
+    /// every earlier token: a sliding window's, and one token for a state
+    /// group, whose reader continuing from token `t` reads only the
+    /// checkpoint ending at `t`, the page a one-token window holds.
+    pub const fn reader_window(self) -> Option<u32> {
+        match self {
+            Self::Full | Self::Draft => None,
+            Self::SlidingWindow { window } => Some(window),
+            Self::State => Some(1),
+        }
+    }
+
+    /// The tokens a page's key covers for pages of `block_size` tokens: its
+    /// own, and for the draft cache the token after it, which the page's
+    /// last entry reads.
+    pub const fn key_tokens(self, block_size: u32) -> u32 {
+        match self {
+            Self::Draft => block_size + 1,
+            Self::Full | Self::SlidingWindow { .. } | Self::State => block_size,
+        }
+    }
+
+    /// Whether the group holds K/V rows every request needs: neither state
+    /// checkpoints nor the optional draft cache.
+    pub const fn required_rows(self) -> bool {
+        matches!(self, Self::Full | Self::SlidingWindow { .. })
     }
 }
 

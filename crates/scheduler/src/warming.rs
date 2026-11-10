@@ -160,7 +160,7 @@ impl Scheduler {
                     }
                     self.warming.reserved.retain(|page| {
                         cache.coordinator.groups()[page.page.group as usize]
-                            .window
+                            .window()
                             .is_none_or(|window| {
                                 let end = ends[&(page.resume, page.page.group)];
                                 page.page.start + page.page.tokens
@@ -332,7 +332,7 @@ impl Scheduler {
                 .zip(cache.coordinator.groups())
                 .enumerate()
             {
-                if shape.draft {
+                if shape.draft() {
                     continue;
                 }
                 let copied = after
@@ -351,8 +351,8 @@ impl Scheduler {
                         start: (index * shape.block_size) as u32,
                         tokens: shape.block_size as u32,
                         total_tokens: prefix.capacity_tokens,
-                        state: shape.state,
-                        window: shape.window.map(|window| window as u32),
+                        state: shape.state(),
+                        window: shape.window().map(|window| window as u32),
                         units: page.units().iter().map(|unit| unit.0).collect(),
                     });
                     self.warming.leased.push(page.clone());
@@ -402,10 +402,10 @@ impl Scheduler {
             );
             let source_pages = std::mem::take(&mut prefix.pages);
             for (group, shape) in cache.coordinator.groups().iter().enumerate() {
-                if shape.draft {
+                if shape.draft() {
                     continue;
                 }
-                let complete = if shape.state {
+                let complete = if shape.state() {
                     // A recurrent checkpoint describes the state at exactly
                     // this boundary. Repartition its fields, never relabel an
                     // earlier or later checkpoint as the desired state.
@@ -420,7 +420,7 @@ impl Scheduler {
                 } else {
                     prefix.computed as usize / shape.block_size
                 };
-                let first = shape.window.map_or(0, |window| {
+                let first = shape.window().map_or(0, |window| {
                     (complete * shape.block_size).saturating_sub(window) / shape.block_size
                 });
                 for (index, &hash) in hashes[group].iter().enumerate().take(complete).skip(first) {
@@ -448,8 +448,8 @@ impl Scheduler {
                         start,
                         tokens: shape.block_size as u32,
                         total_tokens: prefix.capacity_tokens,
-                        state: shape.state,
-                        window: shape.window.map(|window| window as u32),
+                        state: shape.state(),
+                        window: shape.window().map(|window| window as u32),
                         units: reference.units().iter().map(|unit| unit.0).collect(),
                     };
                     reserved.push(Reserved {
