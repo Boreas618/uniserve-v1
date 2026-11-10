@@ -1114,9 +1114,10 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// The backends and parameters come from the configuration; the revisions
 /// come from `prepare`, which selects each package's latest revision at the
 /// upstream Program Server (§5.1). A program's `revision` is zero until it
-/// was prepared. An operator whose backend the configuration does not state
-/// is absent: `prepare` resolves it by the GPU's architecture and the model
-/// and fills it in.
+/// was prepared. An operator whose backend the configuration does not state,
+/// or leaves at `auto`, is absent: the deployment names nothing for it, and
+/// the Program Server selects its package for each of its descriptor keys
+/// among the packages that cover them, by manifest priority (§6.3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FilledPrograms {
     /// The kernel program that fills each operator, or each phase of one.
@@ -1148,7 +1149,11 @@ impl FilledPrograms {
                 },
             );
         }
-        if let Some(backend) = &config.moe_runner_backend {
+        if let Some(backend) = config
+            .moe_runner_backend
+            .as_ref()
+            .filter(|backend| *backend != AUTO_BACKEND)
+        {
             // The grouped expert GEMM is two operators, gather and route,
             // and one program backend fills both (§9).
             for operator in [operators::GATHER_GEMM, operators::ROUTE_GEMM] {
@@ -1171,56 +1176,16 @@ impl FilledPrograms {
             },
         }
     }
-
-    /// Refuses a program the deployment left at `auto`, naming the option that
-    /// would state it.
-    ///
-    /// A program is selected by its backend's name: a Program Server holds its
-    /// packages under `(operator, backend, revision)` and answers `Latest` by
-    /// that name alone, so `auto` resolves at no server — it is a
-    /// configuration literal, not a package. A deployment that leaves one of
-    /// these at `auto` has not said which program it means, and the refusal
-    /// says so here rather than as a missing package later.
-    ///
-    /// # Errors
-    ///
-    /// Fails with the option to state for the first program left at `auto`.
-    pub fn stated(&self) -> Result<(), String> {
-        let option = |key: &KernelKey| match key.op.as_str() {
-            operators::PAGED_ATTENTION => "attention_backend",
-            operators::EXPERT_EXCHANGE => "moe_config.exchange",
-            operators::GATHER_GEMM | operators::ROUTE_GEMM => "moe_runner_backend",
-            _ => "the option that names its backend",
-        };
-        for (key, program) in &self.kernels {
-            if program.backend == AUTO_BACKEND {
-                return Err(format!(
-                    "the deployment leaves {} at `{AUTO_BACKEND}`, and a program is selected by \
-                     its backend's name: state the backend this deployment means (§5.1) — the \
-                     operator `{}` is filled by the package of that name at the Program Server",
-                    option(key),
-                    key.op
-                ));
-            }
-        }
-        if self.policy.backend == AUTO_BACKEND {
-            return Err(format!(
-                "the deployment leaves scheduler_config.policy at `{AUTO_BACKEND}`, and a \
-                 program is selected by its backend's name: state the scheduling policy this \
-                 deployment serves (§5.1, §7.7)"
-            ));
-        }
-        Ok(())
-    }
 }
 
-/// The backend name `auto`: a choice the deployment has not made yet, which no
-/// Program Server holds a package under.
+/// The backend name `auto`: a backend option the deployment leaves to the
+/// Program Server's selection, which names no slot of its own.
 const AUTO_BACKEND: &str = "auto";
 
 /// The attention operator's programs: one entry for every phase when the
-/// per-phase backends differ, or a single entry whose phase is `None` when
-/// they agree (§5.2).
+/// per-phase backends agree, or one entry per phase when they differ (§5.2).
+/// A phase left at `auto` names no program: the Program Server selects its
+/// keys' packages.
 fn attention_programs(config: &ServerArgs) -> Vec<(KernelKey, Program)> {
     let prefill = config
         .prefill_attention_backend
@@ -1230,35 +1195,27 @@ fn attention_programs(config: &ServerArgs) -> Vec<(KernelKey, Program)> {
         .decode_attention_backend
         .clone()
         .unwrap_or_else(|| config.attention_backend.clone());
-    let arguments = || toml_arguments(&config.flashinfer_config);
+    let program = |backend: String| Program {
+        backend,
+        revision: 0,
+        arguments: toml_arguments(&config.flashinfer_config),
+    };
     if prefill == decode {
-        return vec![(
-            KernelKey::all(operators::PAGED_ATTENTION),
-            Program {
-                backend: prefill,
-                revision: 0,
-                arguments: arguments(),
-            },
-        )];
+        if prefill == AUTO_BACKEND {
+            return Vec::new();
+        }
+        return vec![(KernelKey::all(operators::PAGED_ATTENTION), program(prefill))];
     }
-    vec![
-        (
-            KernelKey::phase(operators::PAGED_ATTENTION, PhaseKind::Prefill),
-            Program {
-                backend: prefill,
-                revision: 0,
-                arguments: arguments(),
-            },
-        ),
-        (
-            KernelKey::phase(operators::PAGED_ATTENTION, PhaseKind::Decode),
-            Program {
-                backend: decode,
-                revision: 0,
-                arguments: arguments(),
-            },
-        ),
-    ]
+    [(PhaseKind::Prefill, prefill), (PhaseKind::Decode, decode)]
+        .into_iter()
+        .filter(|(_, backend)| backend != AUTO_BACKEND)
+        .map(|(phase, backend)| {
+            (
+                KernelKey::phase(operators::PAGED_ATTENTION, phase),
+                program(backend),
+            )
+        })
+        .collect()
 }
 
 /// The scheduling program's parameters: the values §7.7 assigns to the
@@ -2159,10 +2116,6 @@ mod tests {
             ("moe_runner_backend", |config: &mut ServerArgs| {
                 config.moe_runner_backend = Some("cutlass".to_owned())
             }),
-            (
-                "flashinfer_config.workspace_size",
-                |config: &mut ServerArgs| config.flashinfer_config.workspace_size = 1 << 30,
-            ),
         ];
 
         let base = Epoch::of(ServerArgs::default()).expect("the configuration resolves");
@@ -2192,6 +2145,20 @@ mod tests {
                 "{what} moves the programs"
             );
         }
+
+        // The attention program's arguments are a program change of a
+        // deployment that names its attention backend. One left at `auto`
+        // names no attention program, so they move nothing there.
+        fn named(config: &mut ServerArgs) {
+            config.attention_backend = "trtllm".to_owned();
+        }
+        let named_base = Epoch::of(set(named)).expect("the configuration resolves");
+        let workspace = Epoch::of(set(|config: &mut ServerArgs| {
+            named(config);
+            config.flashinfer_config.workspace_size = 1 << 30;
+        }))
+        .expect("the configuration resolves");
+        assert_eq!(layer(&named_base, &workspace), Layer::Program);
 
         // The exchange is a program only where experts are spread over ranks:
         // a single-rank deployment's MoE block takes its local arm and launches
@@ -2253,11 +2220,15 @@ mod tests {
 
         // A program's revision is a program-layer change: the same backend
         // and parameters at a newly installed revision move the programs.
-        let mut installed = base.clone();
+        let mut installed = named_base.clone();
         for program in installed.programs.kernels.values_mut() {
             program.revision = 3;
         }
-        assert_eq!(layer(&base, &installed), Layer::Program, "a new revision");
+        assert_eq!(
+            layer(&named_base, &installed),
+            Layer::Program,
+            "a new revision"
+        );
     }
 
     /// The programs a configuration fills are keyed by the operators the
@@ -2275,10 +2246,10 @@ mod tests {
         // takes its local arm and launches no exchange, so the slot is absent
         // rather than filled with a program nothing calls (§5.1, §9). No
         // grouped expert GEMM either, until the configuration names one.
-        let attention = &programs.kernels[&KernelKey::all(operators::PAGED_ATTENTION)];
-        assert_eq!(attention.backend, "auto");
-        assert_eq!(attention.revision, 0, "no revision before prepare");
+        // The default attention backend is `auto`: the deployment names no
+        // attention program, and the Program Server selects its packages.
         for operator in [
+            operators::PAGED_ATTENTION,
             operators::EXPERT_EXCHANGE,
             operators::GATHER_GEMM,
             operators::ROUTE_GEMM,
@@ -2405,29 +2376,32 @@ mod tests {
         }
     }
 
-    /// A program is selected by its backend's name, and `auto` names no
-    /// package: a deployment that leaves a program at `auto` is refused here,
-    /// with the option that states it, rather than at a Program Server that
-    /// has no such package (§5.1).
+    /// A backend option left at `auto` names no slot, whichever phase it is
+    /// for: the Program Server selects that operator's packages, and a phase
+    /// the deployment does name keeps its program.
     #[test]
-    fn a_program_left_at_auto_is_refused_by_the_option_that_states_it() {
-        let refused = FilledPrograms::of(&ServerArgs::default())
-            .stated()
-            .expect_err("the default attention backend is a choice, not a package");
-        assert!(
-            refused.contains("attention_backend") && refused.contains("auto"),
-            "{refused}"
-        );
-
-        let mut stated = ServerArgs {
-            attention_backend: "trtllm".to_owned(),
+    fn a_backend_left_at_auto_names_no_program() {
+        let mut config = ServerArgs {
+            decode_attention_backend: Some("triton".to_owned()),
+            moe_runner_backend: Some("auto".to_owned()),
             ..Default::default()
         };
-        stated.moe_config.expert_parallel = true;
-        stated.moe_config.exchange = proto::request::ExpertExchange::AllToAll;
-        FilledPrograms::of(&stated)
-            .stated()
-            .expect("every program this deployment fills has a backend's name");
+        let programs = FilledPrograms::of(&config);
+        assert_eq!(
+            programs.kernels.keys().cloned().collect::<Vec<_>>(),
+            vec![KernelKey::phase(
+                operators::PAGED_ATTENTION,
+                PhaseKind::Decode
+            )]
+        );
+
+        config.attention_backend = "trtllm".to_owned();
+        config.decode_attention_backend = None;
+        let programs = FilledPrograms::of(&config);
+        assert_eq!(
+            programs.kernels[&KernelKey::all(operators::PAGED_ATTENTION)].backend,
+            "trtllm"
+        );
     }
 
     /// The update keeps the first failure it meets, not the last, and a

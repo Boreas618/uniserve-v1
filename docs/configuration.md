@@ -82,7 +82,7 @@ retention = "30m"
 
 Each option's destination follows what its value is used for: a value that builds the main process is **build config**; one that selects an implementation is a **program backend name**; one that only steers a decision is a **program parameter**; what the daemon reads stays in the **host layer**. An option a section does not name separately has the destination stated under that section's heading; the sections whose options split state it per field below.
 
-Three backend-name fields the split names already exist in the code and are read with `attention_backend` (`crates/daemon/src/epoch.rs:1293-1299`): `prefill_attention_backend` and `decode_attention_backend` each override it for their phase, and `moe_runner_backend` selects the grouped expert GEMM (`epoch.rs:1218`).
+Three backend-name fields are read with `attention_backend` (`FilledPrograms::of`, `crates/daemon/src/epoch.rs`): `prefill_attention_backend` and `decode_attention_backend` each override it for their phase, and `moe_runner_backend` selects the grouped expert GEMM. A backend name selects the package of that name at the Program Server for every descriptor key it covers; a key it does not cover, and every key of an operator whose backend is unset or `auto`, takes the installed package that covers it with the highest manifest `priority` (`architecture.md`, the Program Server). A named backend no installed package has is refused when the epoch's programs are prepared.
 
 ### Top level
 
@@ -92,7 +92,7 @@ Three backend-name fields the split names already exist in the code and are read
 | Build config | `max_model_len`, `dtype`, `quantization`, `max_running_requests`, `mem_fraction_static`, `tensor_parallel_size`, `data_parallel_size`, `worker_groups`, `engine_host` |
 | Host layer, daemon (a node's startup arguments) | `host_identity`, `nnodes`, `node_rank`, `dist_init_addr` |
 | Host layer | `mm_processor_kwargs` |
-| Program backend name | `attention_backend` (attention), with `prefill_attention_backend` and `decode_attention_backend` overriding it per phase; read at `crates/daemon/src/epoch.rs:1293-1299` |
+| Program backend name | `attention_backend` (attention), with `prefill_attention_backend` and `decode_attention_backend` overriding it per phase |
 | Program parameter | `max_num_batched_tokens` (the scheduling policy's bound); read at `crates/daemon/src/epoch.rs:1364-1366` |
 | Retired, refused by name | `quantization_config`: the option is stated as `quantization`, and the retired spelling is refused with the name to state instead |
 
@@ -104,7 +104,7 @@ Three backend-name fields the split names already exist in the code and are read
 | `dtype` | `"bfloat16"` | Element type of parameters and activations: `bfloat16`, `float16` or `float32` |
 | `quantization` | `{}` | Precision policy: `mode` (`quality`, `balanced`, `performance`, `maximum`) and per-component selections under `components`; empty selects the checkpoint's own quantization |
 | `mm_processor_kwargs` | `{}` | Options of the model's multimodal processor; MiniMax-H3 takes `reference_image_short_edge` and `enlarge_references` ([FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity)) |
-| `attention_backend` | `"auto"` | Attention provider: `auto` selects a native kernel per call; `flashinfer`, `trtllm`, `flash_attn_4`, `torch`, `prefix_block`, `flash_attn` or `sgl_kernel` serves every call |
+| `attention_backend` | `"auto"` | Attention package: `auto` has the Program Server select, for each attention descriptor key the deployment launches, the installed package that covers it by manifest priority; a package's backend name (`trtllm`, `triton`) serves every key it covers, and the others are selected as for `auto` |
 | `max_running_requests` | `128` | Concurrently resident requests, clamped to what the workers hold |
 | `max_num_batched_tokens` | `8192` | Token work admitted in one scheduling step; token models only |
 | `mem_fraction_static` | `0.7` | The deployment's share of each device's storage for weights, static allocations, graph pools and the KV cache, in (0, 1]: the quota `⌊total × fraction⌋` of the GPU's storage ledger, which both epochs of a configuration change and the host's Transfer Server share (`docs/admin.md`); a deployment group's `mem_fraction_static` overrides it |
@@ -265,7 +265,7 @@ Each entry is the median over the point's reports of the step time over its run'
 
 **Destination, per field:** `expert_parallel` and `microbatches` are build config; `exchange` is a program backend name (expert exchange).
 
-**Read at:** `exchange` in `crates/daemon/src/epoch.rs:1212`, where it becomes the expert-exchange operator's backend; `moe_runner_backend` `:1218`.
+**Read at:** `exchange` in `FilledPrograms::of` (`crates/daemon/src/epoch.rs`), where it becomes the expert-exchange operator's backend name for a deployment with `expert_parallel`; `moe_runner_backend` beside it.
 
 
 [Expert parallelism](expert_parallelism.md) describes each exchange.
