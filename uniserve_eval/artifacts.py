@@ -10,13 +10,21 @@ destination directory, flushed and fsynced, then moved into place with
 `os.replace`. A reader therefore sees either the previous or the new complete
 version of such a file, never a partial write. `run_point` writes
 `summary.md` directly, so that file does not have this guarantee.
+
+`supersede` moves the evidence of an earlier run of a point -- its bundle,
+its media directory and its deployment's server logs -- out of the canonical
+paths before the point runs again, so a rerun neither overwrites nor mixes
+with the earlier run's files and the earlier run stays inspectable.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
+import time
+from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -162,6 +170,55 @@ class ArtifactWriter:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
         return path
+
+
+#: The directory under an output root that holds superseded runs, as
+#: `superseded/<point>/<UTC time of supersession>/<role>`.
+SUPERSEDED_DIR = "superseded"
+
+
+def supersede(
+    output_root: Path, point: str, evidence: Mapping[str, Path]
+) -> Path | None:
+    """Move an earlier run's evidence of `point` out of its canonical paths.
+
+    Args:
+        output_root: The run's output root, which holds the archive.
+        point: The benchmark point about to run again.
+        evidence: The canonical paths an earlier run of the point may have
+            left, keyed by the name each keeps in the archive, such as
+            `bundle`, `media` or `server-logs/<point>.log`. A missing path
+            and an empty directory hold no evidence and are skipped.
+
+    Returns:
+        The archive directory `<output_root>/superseded/<point>/<UTC time>`
+        that now holds every path that held evidence, each under its key, or
+        `None` when no path held any.
+
+    Raises:
+        FileExistsError: If an archive of the same point and time exists.
+    """
+    held = {
+        name: path
+        for name, path in evidence.items()
+        if path.is_file() or (path.is_dir() and any(path.iterdir()))
+    }
+    if not held:
+        return None
+
+    # Microseconds keep two supersessions of one point apart; `mkdir`
+    # without `exist_ok` refuses to merge into an existing archive.
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    stamp += f".{time.time_ns() // 1000 % 1_000_000:06d}Z"
+    archive = output_root / SUPERSEDED_DIR / point / stamp
+    archive.mkdir(parents=True)
+    for name, path in held.items():
+        destination = archive / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        # `shutil.move` renames within a filesystem and copies across one,
+        # so a media directory outside the output root moves as well.
+        shutil.move(path, destination)
+    return archive
 
 
 def _jsonable(payload: Any) -> Any:

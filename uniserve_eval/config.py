@@ -232,6 +232,7 @@ def load_config(path: Path = DEFAULT_CONFIG) -> EvaluationConfig:
         name: _benchmark_point(name, value, servers, root)
         for name, value in _table(raw, "benchmarks").items()
     }
+    _require_own_media(benchmarks)
     suites = {
         name: _suite_profile(name, value, benchmarks)
         for name, value in _table(raw, "suites").items()
@@ -617,6 +618,29 @@ def _resolve_paths(
     ):
         value["tokenizer"] = str(root / tokenizer)
     return value
+
+
+def _require_own_media(benchmarks: dict[str, BenchmarkPoint]) -> None:
+    """Reject two benchmarks that name the same `video.media_dir`.
+
+    A point's media directory belongs to its run: the run requires it empty
+    and a rerun moves it aside (`artifacts.supersede`), which would take a
+    second point's videos with it.
+
+    Raises:
+        ValueError: Naming both benchmarks.
+    """
+    owners: dict[Path, str] = {}
+    for name, point in benchmarks.items():
+        if not point.video.media_dir:
+            continue
+        directory = Path(point.video.media_dir)
+        if directory in owners:
+            raise ValueError(
+                f"benchmarks.{name}.video.media_dir is also the media "
+                f"directory of benchmarks.{owners[directory]}"
+            )
+        owners[directory] = name
 
 
 def _rooted(path: str, root: Path) -> str:

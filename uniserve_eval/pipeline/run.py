@@ -15,7 +15,9 @@ The bundle in the output directory contains:
   `run.json` is `failed`.
 - `gpu_samples.jsonl`: `GpuStorageSampler` telemetry snapshots.
 - `samples/`: image outputs and original video response bodies, including
-  invalid bodies. A configured `video.media_dir` holds measured videos.
+  invalid bodies. A configured `video.media_dir` holds measured videos
+  instead, and belongs to this run as the bundle does: it must be absent or
+  empty when the point starts.
 - `media_index.jsonl` and `media_validity.jsonl`: original-output references,
   checksums, request identities, timing records, and validity checks.
 - `server_metrics.json`: each replica's `/metrics` exposition immediately
@@ -86,7 +88,9 @@ async def run_point(
         still returns normally, with `validation.valid` false.
 
     Raises:
-        FileExistsError: If `output_dir` is not empty; nothing is written.
+        FileExistsError: If `output_dir` or the point's `video.media_dir`
+            is not empty; nothing is written. `cli.run` moves an earlier
+            run's bundle and media aside (`artifacts.supersede`) first.
         BaseException: Any error from task lookup, dataset loading, the load
             run (including `WarmupFailure` and cancellation), summarizing, or
             artifact writing is re-raised after the records collected so far
@@ -100,6 +104,13 @@ async def run_point(
     router = ReplicaRouter([url.rstrip("/") for url in base_urls])
     if output_path.exists() and any(output_path.iterdir()):
         raise FileExistsError(f"result directory is not empty: {output_path}")
+    # Measured videos are named by request ID, which every run of the point
+    # shares, so a run that found another run's files would either fail on
+    # the first differing video after the measured window or keep a video
+    # it did not produce.
+    media = point.video.media_dir
+    if media and Path(media).is_dir() and any(Path(media).iterdir()):
+        raise FileExistsError(f"media directory is not empty: {media}")
 
     writer = ArtifactWriter(output_path)
     started_at = time.time()

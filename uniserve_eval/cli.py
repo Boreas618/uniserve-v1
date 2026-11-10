@@ -8,6 +8,7 @@ import json
 import sys
 from pathlib import Path
 
+from .artifacts import supersede
 from .config import DEFAULT_CONFIG, load_config, server_launch
 from .pipeline.compare import compare_runs
 from .pipeline.run import run_point
@@ -90,7 +91,12 @@ def run(args: argparse.Namespace) -> None:
     still performs its own declared warmup and priming. Results go to
     `<output root>/<point name>`, which `run_point` requires to be absent or
     empty, and server output goes to `<output root>/server-logs/<first point
-    of the deployment>.log`, with a `.replica-<i>` infix per replica. Each
+    of the deployment>.log`, with a `.replica-<i>` infix per replica. Before
+    a deployment launches, the evidence an earlier run of each of its points
+    left -- the bundle, the point's `video.media_dir` and, for the first
+    point, the server logs -- moves to `<output root>/superseded/<point>/<UTC
+    time>/` (`artifacts.supersede`), so the canonical paths hold only the
+    latest run and every earlier run is kept beside them. Each
     point's launch record carries its deployment's `startup_s`, the seconds
     from launch until every process was ready (`ManagedServer`).
 
@@ -148,6 +154,16 @@ def run(args: argparse.Namespace) -> None:
                 "started_for": first.name,
                 "logs": [str(path) for _, _, path in processes],
             }
+            for point in group:
+                evidence = {"bundle": output_root / point.name}
+                if point.video.media_dir:
+                    evidence["media"] = Path(point.video.media_dir)
+                if point is first:
+                    for _, _, path in processes:
+                        evidence[f"server-logs/{path.name}"] = path
+                archive = supersede(output_root, point.name, evidence)
+                if archive is not None:
+                    print(f"{point.name}: earlier run moved to {archive}")
 
             # The shared deployment environment also applies to this process
             # while the group runs and is restored afterwards; each server
