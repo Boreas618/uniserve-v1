@@ -472,6 +472,15 @@ pub struct Scheduler {
     /// schedules nothing new meanwhile. The operation restores what it found,
     /// so a nested drain keeps the outer one's.
     draining: bool,
+    /// Until when a promoted successor holds the requests that continue
+    /// from its predecessor's pages (`cache.resume`), whose index arrives
+    /// once the predecessor drained (`Scheduler::inherit`); `None` once it
+    /// arrived, or for a scheduler that awaits none.
+    awaiting_index: Option<std::time::Instant>,
+    /// The requests held for the index meanwhile, in arrival order: the
+    /// others are admitted past them, and they return to the head of the
+    /// queue when the index arrives or the wait ends.
+    held_for_index: Vec<RequestState>,
     /// Whether forming batches is held for a change of the device's storage
     /// (`CacheChange::Hold`): nothing runs, and every request keeps its state.
     ///

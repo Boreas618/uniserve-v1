@@ -837,6 +837,50 @@ impl DataPlane {
         Ok(answers)
     }
 
+    /// Takes over the predecessor epoch's pages on every rank (`memory::AdoptCache`): the value
+    /// planes are the predecessor's segments, mapped whole, so its pages lie at their own units,
+    /// and what the rank copies is the flag and scale cells of `units` from the predecessor's
+    /// planes into its own, where they are other storages (a switch's target; a standby's are the
+    /// predecessor's).
+    ///
+    /// # Errors
+    ///
+    /// When the predecessor lent segments, which planes that map its segments whole never
+    /// borrow, or a copy fails.
+    fn adopt_cache(&self, message: &memory::AdoptCache) -> Result<Vec<memory::CacheAdopted>> {
+        if !message.borrowed.is_empty() {
+            return Err(Error::Invalid(
+                "the ranks map the predecessor's cache segments whole: no segment is lent to them"
+                    .into(),
+            ));
+        }
+        let mut answers = Vec::with_capacity(self.ranks.len());
+        for rank in &self.ranks {
+            let rank = lock(rank);
+            let Some(planes) = Self::planes_of(&rank) else {
+                answers.push(memory::CacheAdopted::default());
+                continue;
+            };
+            let mut storages = vec![
+                ("prefix_cache.key.initialized", 1),
+                ("prefix_cache.value.initialized", 1),
+            ];
+            if planes.plan().quantized {
+                storages.push(("prefix_cache.key.scale", 4));
+                storages.push(("prefix_cache.value.scale", 4));
+            }
+            let inherited = rank.storage.copy_predecessor_cells(
+                rank.device,
+                &storages,
+                planes.columns(),
+                planes.num_units(),
+                &message.units,
+            )?;
+            answers.push(memory::CacheAdopted { inherited });
+        }
+        Ok(answers)
+    }
+
     /// Gives back every segment and the graph storage, on every rank.
     fn sleep(&self) -> Result<Vec<()>> {
         self.suspend_graphs()?;
@@ -861,8 +905,9 @@ impl DataPlane {
     ///
     /// # Errors
     ///
-    /// When a rank cannot, and for an operation this process does not implement: adopting a
-    /// predecessor's cache units and the cache manifest's publication and description.
+    /// When a rank cannot, and for an operation this process does not implement: the cache
+    /// manifest's publication and description, the steps of copy rounds into a target's own
+    /// units, which a target that shares the serving epoch's planes never runs.
     pub fn operate(&self, operation: &EpochOperation) -> Result<Vec<String>> {
         match operation {
             EpochOperation::CacheStorage(message) => answer(message, self.cache_storage()?),
@@ -880,11 +925,12 @@ impl DataPlane {
                 ))?;
                 answer(message, self.rebind(planned)?)
             }
-            EpochOperation::AdoptCache(_)
-            | EpochOperation::PublishCache(_)
-            | EpochOperation::CacheManifest(_) => Err(Error::Interface(format!(
-                "this process does not implement the storage operation {operation:?}"
-            ))),
+            EpochOperation::AdoptCache(message) => answer(message, self.adopt_cache(message)?),
+            EpochOperation::PublishCache(_) | EpochOperation::CacheManifest(_) => {
+                Err(Error::Interface(format!(
+                    "this process does not implement the storage operation {operation:?}"
+                )))
+            }
         }
     }
 

@@ -447,7 +447,7 @@ mod tests {
 
         for kind in [
             Kind::Park(proto::process::Park {}),
-            Kind::Promote(proto::process::Promote {}),
+            Kind::Promote(proto::process::Promote::default()),
             Kind::Drain(proto::process::Drain { epoch: 2 }),
             Kind::Pause(proto::process::Pause { paused: true }),
         ] {

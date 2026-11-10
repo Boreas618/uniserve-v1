@@ -1095,6 +1095,29 @@ impl Scheduler {
     /// The token half of the plan's admission: at most `named` requests, the
     /// ones the plan named, and never one behind a request the hard limits
     /// refused.
+    /// Whether the scheduler still holds the requests that continue from
+    /// its predecessor's pages; once the wait ends, they return to the head
+    /// of the queue, in their order.
+    fn awaits_index(&mut self) -> bool {
+        if self
+            .awaiting_index
+            .is_some_and(|until| std::time::Instant::now() < until)
+        {
+            return true;
+        }
+        self.release_held_for_index();
+        false
+    }
+
+    /// Ends the wait for the predecessor's index: the requests held for it
+    /// return to the head of the queue, in their order.
+    pub(super) fn release_held_for_index(&mut self) {
+        self.awaiting_index = None;
+        for held in std::mem::take(&mut self.held_for_index).into_iter().rev() {
+            self.waiting.push_front(held);
+        }
+    }
+
     fn admit_tokens(&mut self, named: usize) {
         for _ in 0..named {
             // A resident the last assembly could not grow takes the units that
@@ -1105,6 +1128,23 @@ impl Scheduler {
                 || !self.starved.is_empty()
             {
                 break;
+            }
+            let Some(continues) = self
+                .waiting
+                .front()
+                .map(|head| head.req.cache.resume.is_some())
+            else {
+                break;
+            };
+            // A request that continues from the drained predecessor's pages
+            // waits for their index, which arrives once that epoch parked: a
+            // request admitted before it computes again what the pages hold.
+            // It steps aside, and the requests behind it are admitted.
+            if continues && self.awaits_index() {
+                if let Some(held) = self.waiting.pop_front() {
+                    self.held_for_index.push(held);
+                }
+                continue;
             }
             let Some(head) = self.waiting.front() else {
                 break;

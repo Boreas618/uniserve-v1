@@ -391,7 +391,7 @@ impl MainProcess {
             // connection, because no epoch switch is running to command it on the process one. The
             // daemon moves the frontend when this process states that it serves.
             Some(proto::request::wire::engine_command::Kind::Promote(_)) => {
-                self.promote_in_place()?;
+                self.promote_in_place(false)?;
                 return Ok(None);
             }
             // A hot restart's successor gives this engine a second daemon front, so

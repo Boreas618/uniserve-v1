@@ -653,12 +653,12 @@ mod tests {
             "n0",
             7,
             Command {
-                kind: Some(command::Kind::Promote(process::Promote {})),
+                kind: Some(command::Kind::Promote(process::Promote::default())),
             },
         );
         assert_eq!(
             nodes.sent(),
-            vec![(5, command::Kind::Promote(process::Promote {}))]
+            vec![(5, command::Kind::Promote(process::Promote::default()))]
         );
     }
 
@@ -674,7 +674,13 @@ mod tests {
         // its connection to the launch: `Drained` names no launch generation,
         // so a process drains under the binding it already has.
         nodes.report(5, report::Kind::Parked(process::Parked { generation: 7 }));
-        nodes.report(5, report::Kind::Drained(process::Drained { epoch: 11 }));
+        nodes.report(
+            5,
+            report::Kind::Drained(process::Drained {
+                epoch: 11,
+                index: Vec::new(),
+            }),
+        );
         let _ = roster.events();
 
         // The previous epoch's process drained and is still alive: the

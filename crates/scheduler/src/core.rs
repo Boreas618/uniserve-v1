@@ -167,6 +167,9 @@ pub struct SchedulerHandle {
     /// which a successor epoch matches the scheduler's prefix cache index;
     /// `None` without a prefix cache.
     cache_group: Option<String>,
+    /// The worker groups that keep a paged cache, with their workers'
+    /// endpoints ([`Self::cache_workers`]).
+    cache_workers: Vec<(String, ipc::MainProcessEndpoint)>,
     /// The latent seed of what the scheduler's denoising computes, which
     /// keys the trajectories it stores (`Scheduler::latent_seed`).
     latent_seed: u64,
@@ -467,6 +470,7 @@ impl SchedulerHandle {
         let info = scheduler.info().clone();
         let generation_limits = scheduler.generation_limits().clone();
         let cache_group = scheduler.cache_group();
+        let cache_workers = scheduler.cache_workers();
         let latent_seed = scheduler.latent_seed();
         let stats = scheduler.stats_handle();
         let failure = scheduler.failure_handle();
@@ -494,6 +498,7 @@ impl SchedulerHandle {
             stats,
             generation_limits,
             cache_group,
+            cache_workers,
             latent_seed,
             model: model.into(),
             dead,
@@ -658,6 +663,31 @@ impl SchedulerHandle {
             .recv()
             .map_err(|_| anyhow::anyhow!("the scheduler stopped while it promoted"))?
             .map_err(|error| anyhow::anyhow!(error))
+    }
+
+    /// Holds the requests that continue from the predecessor epoch's pages
+    /// until its index arrives ([`Self::inherit`]), for at most `bound`.
+    pub fn await_index(&self, bound: std::time::Duration) {
+        self.commands.await_index(bound);
+    }
+
+    /// Adopts the pages the drained predecessor epoch parked with, by the
+    /// worker group whose planes hold them ([`Self::cache_workers`]), which
+    /// lie in the cache segments this scheduler's workers map; the receiver
+    /// gets the outcome. The requests held for the index are admitted from
+    /// then on, whatever it is.
+    pub fn inherit(
+        &self,
+        parked: Vec<(String, crate::ParkedCache)>,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.inherit(parked)
+    }
+
+    /// The worker groups of this scheduler that keep a paged cache, each with
+    /// its worker's endpoint: the groups a prefix cache index names
+    /// (`ParkedCache::into_indexes`).
+    pub fn cache_workers(&self) -> Vec<(String, ipc::MainProcessEndpoint)> {
+        self.cache_workers.clone()
     }
 
     /// Returns live scheduler statistics shared with the scheduler thread.

@@ -24,6 +24,14 @@
 //! - **Resume** (the parked epoch, at a rollback): it admits and executes
 //!   again, with the index it parked with, and allocates the units it lent
 //!   once the epoch on trial writes none of them any more.
+//! - **Inherit** (a successor whose planes map the predecessor's segments
+//!   whole, as every epoch on the same devices does): once the predecessor
+//!   drained, its index arrives through the daemon (`Drained`, `Inherit`).
+//!   The workers copy the predecessor's cache flags and scales of the units
+//!   its pages hold (`EpochOperation::AdoptCache`), and the pool adopts the
+//!   pages at their own units, except those this epoch wrote meanwhile;
+//!   the requests the predecessor handed over wait for it, and continue
+//!   from those pages.
 //! - **Commit** (the successor, once the predecessor is gone): its workers
 //!   take the segments they mapped read-only (`uniserve.take_cache`), and its
 //!   pool allocates the inherited units.
@@ -70,6 +78,98 @@ pub struct ParkedCache {
     /// anew, whether or not it recomputes the others.
     pub reserved_units: u32,
     pub reserving: u32,
+}
+
+impl ParkedCache {
+    /// The index as the process interface carries it: one entry per worker
+    /// group of `workers` (each group with the endpoint of its worker), the
+    /// pages whose planes that group's worker holds. The first entry carries
+    /// what the migrating requests held and the lent units, which are the
+    /// scheduler's; a page of no named worker is left out.
+    pub fn into_indexes(
+        self,
+        workers: &[(String, ipc::MainProcessEndpoint)],
+    ) -> Vec<proto::request::GroupIndex> {
+        use proto::request::wire;
+        let mut indexes: Vec<wire::GroupIndex> = workers
+            .iter()
+            .map(|(group, _)| wire::GroupIndex {
+                worker_group: group.clone(),
+                ..wire::GroupIndex::default()
+            })
+            .collect();
+        for page in self.pages {
+            let Some(at) = workers.iter().position(|(_, endpoint)| {
+                page.source
+                    .as_deref()
+                    .is_some_and(|source| source == endpoint)
+            }) else {
+                continue;
+            };
+            indexes[at].pages.push(wire::IndexedPage {
+                group: page.group,
+                hash: page.hash.0.to_vec(),
+                tokens: page.tokens,
+                units: page.units,
+                resume: page.resume.map(|resume| wire::CacheResume {
+                    epoch: resume.epoch,
+                    request_id: resume.request_id,
+                }),
+            });
+        }
+        if let Some(first) = indexes.first_mut() {
+            first.held_units = self.held_units;
+            first.requests = self.requests;
+            first.reserved_units = self.reserved_units;
+            first.reserving = self.reserving;
+            first.lent = self
+                .lent
+                .into_iter()
+                .map(|units| wire::UnitRange {
+                    start: units.start,
+                    end: units.end,
+                })
+                .collect();
+        }
+        indexes
+    }
+
+    /// The parked cache an index carried. A page whose key is not 32 bytes
+    /// is no page of this build's chains: it is left out, and a prompt
+    /// computes it.
+    pub fn from_index(index: &proto::request::GroupIndex) -> Self {
+        Self {
+            pages: index
+                .pages
+                .iter()
+                .filter_map(|page| {
+                    Some(IndexedPage {
+                        group: page.group,
+                        hash: storage::Key(page.hash.as_slice().try_into().ok()?),
+                        tokens: page.tokens.clone(),
+                        units: page.units.clone(),
+                        resume: page
+                            .resume
+                            .as_ref()
+                            .map(|resume| proto::request::CacheResume {
+                                epoch: resume.epoch,
+                                request_id: resume.request_id,
+                            }),
+                        source: None,
+                    })
+                })
+                .collect(),
+            held_units: index.held_units,
+            requests: index.requests,
+            reserved_units: index.reserved_units,
+            reserving: index.reserving,
+            lent: index
+                .lent
+                .iter()
+                .map(|units| units.start..units.end)
+                .collect(),
+        }
+    }
 }
 
 /// A park waiting for the scheduler's requests to end.
@@ -133,6 +233,8 @@ impl Scheduler {
             .map(|(units, _)| *units)
             .collect();
         tracing::info!("parking: the requests that resume elsewhere end as migratable");
+        // The requests held for a predecessor's index leave with the others.
+        self.release_held_for_index();
         self.migrate_requests(MigrationCause::Drain);
         // Video requests leave at their next denoising step boundary, their
         // trajectories stored for the epoch that serves next.
@@ -419,6 +521,7 @@ impl Scheduler {
                 .iter()
                 .map(|units| [units.start, units.end])
                 .collect(),
+            units: vec![[inherited.start, inherited.end]],
         })?;
         let source = self
             .worker
@@ -442,6 +545,86 @@ impl Scheduler {
             offered = index.len(),
             units = inherited.end - inherited.start,
             borrowed,
+            "imported the predecessor's prefix cache index"
+        );
+        Ok(())
+    }
+
+    /// Adopts the pages the drained predecessor epoch parked with, which lie
+    /// at their own units of the planes this scheduler's workers map (see
+    /// the module documentation): the workers copy the predecessor's flags
+    /// and scales of those units, and the pool adopts every page none of
+    /// whose units this epoch wrote. The requests held for the index are
+    /// admitted from then on.
+    ///
+    /// `parked` holds one cache per worker group of the scheduler whose
+    /// predecessor's planes held pages: a page is read where that group's
+    /// worker maps it, and the groups share one unit space.
+    pub(super) fn inherit(&mut self, parked: &[(String, ParkedCache)]) -> Result<(), String> {
+        let inherited = self.adopt_index(parked);
+        self.release_held_for_index();
+        inherited
+    }
+
+    fn adopt_index(&mut self, parked: &[(String, ParkedCache)]) -> Result<(), String> {
+        let Some(cache) = self.storage.cache() else {
+            return Ok(());
+        };
+        if parked.iter().all(|(_, cache)| cache.pages.is_empty()) {
+            return Ok(());
+        }
+        if !cache.pool().inherited().is_empty() {
+            return Err(
+                "a scheduler that maps its predecessor's planes behind its own \
+                        imports its index at its promotion"
+                    .to_owned(),
+            );
+        }
+        // The pages whose units still hold what the predecessor left, and
+        // those units, whose flags and scales the workers copy, as half-open
+        // runs. Nothing allocates between the two: this thread does.
+        let workers = self.worker.info().workers.clone();
+        let mut adoptable = Vec::with_capacity(parked.len());
+        for (group, parked) in parked {
+            let source = workers
+                .iter()
+                .find(|(id, info)| id.to_string() == *group && info.prefix_cache.is_some())
+                .map(|(_, info)| Arc::new(info.endpoint.clone()))
+                .ok_or_else(|| format!("no worker of group {group} maps a cache"))?;
+            adoptable.push((source, cache.pool().adoptable(&parked.pages)));
+        }
+        let mut units: Vec<u32> = adoptable
+            .iter()
+            .flat_map(|(_, pages)| pages.iter().flat_map(|page| page.units.iter().copied()))
+            .collect();
+        units.sort_unstable();
+        units.dedup();
+        let mut runs: Vec<[u32; 2]> = Vec::new();
+        for unit in units {
+            match runs.last_mut() {
+                Some(run) if run[1] == unit => run[1] += 1,
+                _ => runs.push([unit, unit + 1]),
+            }
+        }
+        let adopted: Vec<ipc::memory::CacheAdopted> =
+            self.run_operation(ipc::memory::AdoptCache {
+                borrowed: Vec::new(),
+                units: runs,
+            })?;
+        let Some(cache) = self.storage.cache() else {
+            return Ok(());
+        };
+        let imported: usize = adoptable
+            .iter()
+            .map(|(source, pages)| cache.pool().adopt(pages, source))
+            .sum();
+        tracing::info!(
+            pages = imported,
+            offered = parked
+                .iter()
+                .map(|(_, cache)| cache.pages.len())
+                .sum::<usize>(),
+            copied_units = adopted.iter().map(|rank| rank.inherited).max().unwrap_or(0),
             "imported the predecessor's prefix cache index"
         );
         Ok(())
@@ -557,5 +740,69 @@ impl Scheduler {
             .cache()
             .map(|cache| cache.pool().export())
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn endpoint(incarnation: &str) -> ipc::MainProcessEndpoint {
+        ipc::MainProcessEndpoint {
+            incarnation: incarnation.to_owned(),
+            ..ipc::MainProcessInfo::default().endpoint
+        }
+    }
+
+    fn page(unit: u32, source: &ipc::MainProcessEndpoint) -> IndexedPage {
+        IndexedPage {
+            group: 0,
+            hash: storage::Key([unit as u8; 32]),
+            tokens: vec![unit; 4],
+            units: vec![unit],
+            resume: None,
+            source: Some(Arc::new(source.clone())),
+        }
+    }
+
+    /// A scheduler of two worker groups (prefill and decode) hands each
+    /// group the pages its worker's planes hold, and a receiver reads each
+    /// group's pages back as they were.
+    #[test]
+    fn an_index_names_each_page_by_the_group_whose_planes_hold_it() {
+        let (prefill, decode) = (endpoint("prefill"), endpoint("decode"));
+        let parked = ParkedCache {
+            pages: vec![page(3, &prefill), page(5, &decode), page(7, &decode)],
+            held_units: 4,
+            requests: 1,
+            ..ParkedCache::default()
+        };
+        let workers = vec![
+            ("prefill".to_owned(), prefill),
+            ("decode".to_owned(), decode),
+        ];
+        let indexes = parked.into_indexes(&workers);
+        let groups: Vec<(&str, Vec<u32>)> = indexes
+            .iter()
+            .map(|index| {
+                let units = index
+                    .pages
+                    .iter()
+                    .flat_map(|page| page.units.clone())
+                    .collect();
+                (index.worker_group.as_str(), units)
+            })
+            .collect();
+        assert_eq!(groups, [("prefill", vec![3]), ("decode", vec![5, 7])]);
+        assert_eq!((indexes[0].held_units, indexes[0].requests), (4, 1));
+
+        let decoded = ParkedCache::from_index(&indexes[1]);
+        let units: Vec<u32> = decoded
+            .pages
+            .iter()
+            .flat_map(|page| page.units.clone())
+            .collect();
+        assert_eq!(units, [5, 7]);
+        assert!(decoded.pages.iter().all(|page| page.source.is_none()));
     }
 }

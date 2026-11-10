@@ -242,6 +242,8 @@ impl Scheduler {
             encoder_outputs: None,
             hand_offs: None,
             draining: false,
+            awaiting_index: None,
+            held_for_index: Vec::new(),
             held: false,
             resizing: None,
             starved: Vec::new(),
@@ -666,6 +668,18 @@ impl Scheduler {
             .iter()
             .find(|(_, info)| info.prefix_cache.is_some())
             .map(|(group, _)| group.to_string())
+    }
+
+    /// The worker groups that keep a paged cache, each with its worker's
+    /// endpoint: the groups a prefix cache index names.
+    pub fn cache_workers(&self) -> Vec<(String, ipc::MainProcessEndpoint)> {
+        self.worker
+            .info()
+            .workers
+            .iter()
+            .filter(|(_, info)| info.prefix_cache.is_some())
+            .map(|(group, info)| (group.to_string(), info.endpoint.clone()))
+            .collect()
     }
 
     /// Returns the model limits supported by the loaded execution workers.

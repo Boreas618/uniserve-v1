@@ -20,6 +20,9 @@ pub(crate) struct UnitMeta {
     /// First unit of the published prefix page this unit belongs to, which
     /// keys the page's identity in the pool; `None` for an unpublished unit.
     pub published: Option<u32>,
+    /// Whether this epoch allocated the unit: its bytes are this epoch's, and
+    /// no longer what a predecessor whose planes the epoch adopted left there.
+    pub written: bool,
     /// Intrusive queue links, valid only while `in_fq` is set.
     pub fq_prev: Option<u32>,
     pub fq_next: Option<u32>,
@@ -34,6 +37,7 @@ impl UnitMeta {
             state: UnitState::Free,
             ref_cnt: 0,
             published: None,
+            written: false,
             fq_prev: None,
             fq_next: None,
             in_fq: false,

@@ -112,7 +112,8 @@ pub(crate) enum UnitState {
 }
 
 /// One published page as an epoch hands its prefix cache index to its
-/// successor: its group, chained hash, tokens and units.
+/// successor: its group, chained hash, tokens and units, and the worker
+/// whose planes hold it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexedPage {
     pub group: u32,
@@ -120,6 +121,10 @@ pub struct IndexedPage {
     pub tokens: Vec<u32>,
     pub units: Vec<u32>,
     pub resume: Option<proto::request::CacheResume>,
+    /// The worker whose planes hold the page; `None` for a page an index
+    /// carried from another process, whose receiver names the worker
+    /// (`ParkedCache::from_index`).
+    pub source: Option<Arc<MainProcessEndpoint>>,
 }
 
 /// Aggregate cache counters retained by the block pool.
@@ -212,6 +217,24 @@ struct PoolInner {
     /// (`BlockPool::lend`), which the successor may write: never queued or
     /// allocated until the epoch takes them back (`BlockPool::reclaim`).
     lent: Vec<std::ops::Range<u32>>,
+}
+
+impl PoolInner {
+    /// Whether every unit of `page` holds what a predecessor whose planes
+    /// these units are left: not the warmup scratch, not withdrawn or
+    /// inherited, never allocated by this epoch, and neither held nor
+    /// published here.
+    fn adoptable(&self, page: &IndexedPage) -> bool {
+        !page.units.is_empty()
+            && page.units.iter().all(|&unit| {
+                unit > self.scratch
+                    && unit < self.withdrawn
+                    && !self.inherited.contains(&unit)
+                    && self.meta.get(unit as usize).is_some_and(|meta| {
+                        !meta.written && meta.ref_cnt == 0 && meta.published.is_none()
+                    })
+            })
+    }
 }
 
 /// The units of `range` below `end`.
@@ -720,6 +743,7 @@ impl BlockPool {
                     tokens: page.tokens.clone(),
                     units: page.units.iter().map(|unit| unit.0).collect(),
                     resume: *resume,
+                    source: Some(Arc::clone(&page.source)),
                 })
             })
             .collect();
@@ -805,6 +829,80 @@ impl BlockPool {
         imported
     }
 
+    /// Adopts the published pages of the predecessor epoch whose planes this
+    /// pool's units are, unit for unit (the planes map its segments whole), as
+    /// unreferenced pages of `source`. A page is left out when one of its
+    /// units is the warmup scratch, is withdrawn or inherited, or was
+    /// allocated by this epoch since it started: its bytes are no longer
+    /// the predecessor's. Adopted pages stay in the free queue as cached
+    /// units, which allocation evicts. Returns how many pages it adopted.
+    pub(crate) fn adopt(&self, pages: &[IndexedPage], source: &Arc<MainProcessEndpoint>) -> usize {
+        let mut inner = lock(&self.inner);
+        let mut adopted = 0;
+        for page in pages {
+            let Some(&head) = page.units.first() else {
+                continue;
+            };
+            if let Some(existing) = inner.pages.get_mut(&head)
+                && existing.hash == page.hash
+                && existing.group == page.group
+                && existing.tokens == page.tokens
+                && existing
+                    .units
+                    .iter()
+                    .map(|unit| unit.0)
+                    .eq(page.units.iter().copied())
+                && existing.source == *source
+            {
+                if !existing.aliases.contains(&page.resume) {
+                    existing.aliases.push(page.resume);
+                    if page.resume.is_none() {
+                        inner.stats.pages_stored += 1;
+                    }
+                }
+                continue;
+            }
+            if !inner.adoptable(page) {
+                continue;
+            }
+            for &unit in &page.units {
+                let meta = &mut inner.meta[unit as usize];
+                meta.published = Some(head);
+                meta.state = UnitState::Cached;
+            }
+            inner.pages.insert(
+                head,
+                PublishedPage {
+                    aliases: vec![page.resume],
+                    hash: page.hash,
+                    group: page.group,
+                    tokens: page.tokens.clone(),
+                    source: Arc::clone(source),
+                    units: page.units.iter().copied().map(UnitId).collect(),
+                    // The predecessor's offloads keyed the pages it published.
+                    host_key: None,
+                },
+            );
+            inner.hash_to_pages.entry(page.hash).or_default().push(head);
+            if page.resume.is_none() {
+                inner.stats.pages_stored += 1;
+            }
+            adopted += 1;
+        }
+        adopted
+    }
+
+    /// The pages of `pages` [`Self::adopt`] would adopt now: those whose
+    /// units still hold what the predecessor left.
+    pub(crate) fn adoptable(&self, pages: &[IndexedPage]) -> Vec<IndexedPage> {
+        let inner = lock(&self.inner);
+        pages
+            .iter()
+            .filter(|page| inner.adoptable(page))
+            .cloned()
+            .collect()
+    }
+
     /// Retires a completed request's private aliases without invalidating
     /// public reuse or another continuation of the same physical pages.
     pub(crate) fn forget_resume(&self, resume: proto::request::CacheResume) {
@@ -875,6 +973,7 @@ impl BlockPool {
                 let meta = &mut inner.meta[index as usize];
                 meta.state = UnitState::Reserved;
                 meta.ref_cnt = 1;
+                meta.written = true;
                 units.push(UnitId(index));
             }
             pages.push(PageRef {
@@ -906,6 +1005,7 @@ impl BlockPool {
             let meta = &mut inner.meta[unit.0 as usize];
             meta.state = UnitState::Reserved;
             meta.ref_cnt = 1;
+            meta.written = true;
         }
         Some(PageRef {
             units: units.into_boxed_slice(),
@@ -4172,6 +4272,36 @@ mod tests {
         };
         let continued = serving.probe_prefix(&prompt, true, false, kept, &source);
         assert_eq!(continued.cached_tokens, 8);
+    }
+
+    /// A successor whose planes are its predecessor's adopts the pages at
+    /// their own units, unless it allocated one of their units meanwhile: its
+    /// bytes are no longer the predecessor's. The adopted pages are hit, and
+    /// stay free capacity, which allocation evicts.
+    #[test]
+    fn a_successor_adopts_the_pages_at_units_it_never_wrote() {
+        let source = endpoint();
+        let prompt = (1..=9).collect::<Vec<u32>>();
+        let predecessor = pages_past_a_filler(&prompt, &source);
+        let index = predecessor.pool().export();
+        assert_eq!(index.len(), 2);
+
+        let successor = PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![full(4, 1)]);
+        let pool = successor.pool();
+        let free = pool.free_units();
+        assert_eq!(pool.adopt(&index, &source), 2);
+        let hit = successor.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
+        assert_eq!(hit.cached_tokens, 8);
+        assert_eq!(pool.free_units(), free);
+        // A second delivery of the same index adds nothing.
+        assert_eq!(pool.adopt(&index, &source), 0);
+
+        // A successor that allocated the pages' units (1 to 9) and released
+        // them adopts none of them.
+        let written = PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![full(4, 1)]);
+        drop(written.pool().allocate(9, 1).unwrap());
+        assert!(written.pool().adoptable(&index).is_empty());
+        assert_eq!(written.pool().adopt(&index, &source), 0);
     }
 
     /// A successor's pages imported into the units it inherits are hit like

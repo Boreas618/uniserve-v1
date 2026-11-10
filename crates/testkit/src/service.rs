@@ -1189,40 +1189,7 @@ fn promote_schedulers(promote: wire::Promote, routing: &Arc<Routing>) {
                                     .iter()
                                     .find(|indexed| indexed.worker_group == group)
                             })
-                            .map(|indexed| scheduler::ParkedCache {
-                                pages: indexed
-                                    .pages
-                                    .iter()
-                                    // A page whose key is not 32 bytes is no
-                                    // page of this build's chains: it is not
-                                    // imported, and a prompt computes it.
-                                    .filter_map(|page| {
-                                        Some(scheduler::IndexedPage {
-                                            group: page.group,
-                                            hash: storage::Key(
-                                                page.hash.as_slice().try_into().ok()?,
-                                            ),
-                                            tokens: page.tokens.clone(),
-                                            units: page.units.clone(),
-                                            resume: page.resume.as_ref().map(|resume| {
-                                                proto::request::CacheResume {
-                                                    epoch: resume.epoch,
-                                                    request_id: resume.request_id,
-                                                }
-                                            }),
-                                        })
-                                    })
-                                    .collect(),
-                                held_units: indexed.held_units,
-                                requests: indexed.requests,
-                                reserved_units: indexed.reserved_units,
-                                reserving: indexed.reserving,
-                                lent: indexed
-                                    .lent
-                                    .iter()
-                                    .map(|units| units.start..units.end)
-                                    .collect(),
-                            })
+                            .map(scheduler::ParkedCache::from_index)
                             .unwrap_or_default();
                         for resume in parked.pages.iter().filter_map(|page| page.resume) {
                             lock(&routing.cache_routes).insert(resume, slot_index);
@@ -1285,7 +1252,7 @@ fn park_schedulers(id: u64, lend: bool, front: usize, routing: &Arc<Routing>) {
         .enumerate()
         .map(|(index, slot)| {
             let answer = (!slot.handle.is_dead()).then(|| slot.handle.park(lend));
-            (index, slot.handle.cache_group(), answer)
+            (index, slot.handle.cache_workers(), answer)
         })
         .collect();
     let routing = Arc::clone(routing);
@@ -1306,37 +1273,7 @@ fn park_schedulers(id: u64, lend: bool, front: usize, routing: &Arc<Routing>) {
                         for resume in parked.pages.iter().filter_map(|page| page.resume) {
                             lock(&routing.cache_routes).insert(resume, slot_index);
                         }
-                        if let Some(group) = group {
-                            index.push(wire::GroupIndex {
-                                worker_group: group,
-                                pages: parked
-                                    .pages
-                                    .into_iter()
-                                    .map(|page| wire::IndexedPage {
-                                        group: page.group,
-                                        hash: page.hash.0.to_vec(),
-                                        tokens: page.tokens,
-                                        units: page.units,
-                                        resume: page.resume.map(|resume| wire::CacheResume {
-                                            epoch: resume.epoch,
-                                            request_id: resume.request_id,
-                                        }),
-                                    })
-                                    .collect(),
-                                held_units: parked.held_units,
-                                requests: parked.requests,
-                                reserved_units: parked.reserved_units,
-                                reserving: parked.reserving,
-                                lent: parked
-                                    .lent
-                                    .into_iter()
-                                    .map(|units| wire::UnitRange {
-                                        start: units.start,
-                                        end: units.end,
-                                    })
-                                    .collect(),
-                            });
-                        }
+                        index.extend(parked.into_indexes(&group));
                     }
                     Ok(Err(failed)) if error.is_empty() => error = failed,
                     Ok(Err(_)) => {}

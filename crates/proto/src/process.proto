@@ -17,6 +17,8 @@ syntax = "proto3";
 
 package uniserve.process;
 
+import "request.proto";
+
 // The first message on a connection, from the connecting side.
 message Hello {
   // `PROTOCOL_MAJOR` of the sender's build; the peers refuse each other on a
@@ -418,6 +420,11 @@ message Command {
     // Hold or release the frontend's admissions, the `/admin/pause_generation`
     // gate, without ending any request (§2.3).
     Pause pause = 10;
+    // Read the pages the drained predecessor epoch published, which lie in
+    // the cache segments this epoch maps: its schedulers import the index,
+    // and the requests the predecessor handed over continue from those
+    // pages (§7.4 step 2).
+    Inherit inherit = 11;
   }
 }
 
@@ -429,7 +436,18 @@ message Precopy {
 }
 
 message Park {}
-message Promote {}
+
+message Promote {
+  // Whether the predecessor epoch's index follows once it drained
+  // (`Inherit`): the promoted schedulers hold the requests that continue
+  // from its pages until it arrives.
+  bool inherits = 1;
+}
+
+// The prefix cache index of the drained predecessor, by worker group.
+message Inherit {
+  repeated uniserve.request.GroupIndex index = 1;
+}
 
 message Switchover {
   uint64 generation = 1;
@@ -624,6 +642,9 @@ message NonFiniteLogits {
 
 message Drained {
   uint64 epoch = 1;
+  // The pages the drained epoch's prefix cache index publishes, by worker
+  // group, which an epoch that maps its cache segments reads (`Inherit`).
+  repeated uniserve.request.GroupIndex index = 2;
 }
 
 // A supervised process exited.

@@ -667,6 +667,31 @@ impl Switch {
     /// its requests are kept for the epoch the frontend serves. Whether the
     /// frontend or the old epoch's main processes report it is the caller's
     /// mapping.
+    /// Hands the target's main process on `host` the index the previous
+    /// epoch's process there drained with: the pages lie in the cache
+    /// segments the target maps, and the requests the previous epoch handed
+    /// over continue from them. Every promoted target is told, so that the
+    /// requests it holds for the index go on, an empty index included.
+    fn inherit(
+        &mut self,
+        roster: &mut impl Roster,
+        host: &str,
+        epoch: u64,
+        index: Vec<proto::request::GroupIndex>,
+    ) {
+        if self.phase != Phase::Serving || epoch != self.previous {
+            return;
+        }
+        let generation = self
+            .spawned_generation(host)
+            .unwrap_or_else(|| self.target_generation());
+        roster.command(
+            host,
+            generation,
+            command(process::command::Kind::Inherit(process::Inherit { index })),
+        );
+    }
+
     pub(crate) fn drained(&mut self, roster: &mut impl Roster, host: &str, epoch: u64) {
         if self.phase != Phase::Serving || epoch != self.previous {
             return;
@@ -1159,6 +1184,7 @@ impl Switch {
             (Phase::Serving, Some(Kind::Drained(drained)))
                 if generation == self.previous_generation =>
             {
+                self.inherit(roster, &host, drained.epoch, drained.index);
                 self.drained(roster, &host, drained.epoch);
             }
             (Phase::Preparing, Some(Kind::PrecopyFailed(failed))) if self.is_target(generation) => {
@@ -1253,7 +1279,11 @@ impl Switch {
                     roster.command(
                         &node.host,
                         generation,
-                        command(process::command::Kind::Promote(process::Promote {})),
+                        // The target maps the serving epoch's cache segments: the index
+                        // of the pages they hold follows once that epoch drained.
+                        command(process::command::Kind::Promote(process::Promote {
+                            inherits: true,
+                        })),
                     );
                 }
             }

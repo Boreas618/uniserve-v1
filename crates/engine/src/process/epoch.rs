@@ -30,6 +30,12 @@ pub(super) struct Draining {
 /// holds from one it has reverted. What it *can* tell is whether it holds a generation at all: a
 /// promotion with nothing prepared is a process that would open admission with no kernel and no
 /// graph, and answer `Promoted` to a daemon that then moves the frontend onto it.
+/// The longest a promoted epoch holds the requests that continue from its predecessor's pages for
+/// that epoch's index: the drain that sends it ends at the predecessor's next step boundary, once
+/// its requests left, so the bound only matters when the index never comes; the requests then
+/// compute what the pages held.
+const INDEX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn promote_refusal(standby: bool, prepared: usize) -> Option<String> {
     (standby && prepared == 0).then(|| {
         "this standby holds no prepared generation: its precopy was discarded or never ran, so          promoting it would serve a generation this process does not hold"
@@ -95,6 +101,15 @@ impl MainProcess {
                 }
             }
         }
+        // The index each scheduler parked with goes with the report: the epoch that maps this
+        // one's cache segments reads the pages it names (`Inherit`). The parked index is kept as
+        // well, for a `Serve` that resumes this epoch.
+        let index = self
+            .schedulers
+            .iter()
+            .zip(&draining.parked)
+            .flat_map(|(scheduler, parked)| parked.clone().into_indexes(&scheduler.cache_workers()))
+            .collect();
         self.parked = Some(draining.parked);
         self.serving = false;
         // A drain ends the epoch this process was serving, so admission owed to a warmup of it is
@@ -104,6 +119,7 @@ impl MainProcess {
             kind: Some(proto::process::report::Kind::Drained(
                 proto::process::Drained {
                     epoch: draining.epoch,
+                    index,
                 },
             )),
         });
@@ -202,8 +218,50 @@ impl MainProcess {
         Ok(())
     }
 
-    /// Promotes this standby in place.
-    pub(super) fn promote_in_place(&mut self) -> Result<()> {
+    /// Adopts the index the drained predecessor epoch parked with, each worker group's in the
+    /// schedulers of that group: its pages lie in the cache segments this process maps, and the
+    /// requests the predecessor handed over continue from them. A scheduler whose group the index
+    /// names nothing of adopts none, and admits the requests it held for it.
+    ///
+    /// Each adoption is bounded by the watchdog's stall bound, as a park is.
+    pub(super) fn inherit(&mut self, index: Vec<proto::request::GroupIndex>) -> Result<()> {
+        let bound = self.watchdog.stall_bound();
+        let answers: Vec<_> = self
+            .schedulers
+            .iter()
+            .map(|scheduler| {
+                // Each of the scheduler's groups adopts the pages its predecessor group's planes
+                // held: a prefill/decode scheduler's groups are two.
+                let parked = scheduler
+                    .cache_workers()
+                    .into_iter()
+                    .filter_map(|(group, _)| {
+                        let indexed = index.iter().find(|indexed| indexed.worker_group == group)?;
+                        Some((group, scheduler::ParkedCache::from_index(indexed)))
+                    })
+                    .collect();
+                scheduler.inherit(parked)
+            })
+            .collect();
+        for answer in answers {
+            match answer.recv_timeout(bound) {
+                Ok(Ok(())) => {}
+                // A page the scheduler does not adopt is computed again: the requests go on.
+                Ok(Err(reason)) => {
+                    tracing::warn!(%reason, "a scheduler did not adopt its predecessor's index");
+                }
+                Err(error) => {
+                    bail!("adopting the predecessor's index: no answer within {bound:?}: {error}")
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Promotes this standby in place. When it `inherits`, the predecessor's index follows once
+    /// that epoch drained ([`Self::inherit`]), and the schedulers hold the requests that continue
+    /// from its pages until it arrives, for at most [`INDEX_WAIT`].
+    pub(super) fn promote_in_place(&mut self, inherits: bool) -> Result<()> {
         // A standby is promoted to serve the generation the epoch prepared in it.
         // A promotion that finds nothing prepared - the precopy was discarded, or the
         // epoch moved on before it ran - is a promotion of a process that cannot serve,
@@ -231,6 +289,11 @@ impl MainProcess {
             bail!("{reason}");
         }
         self.promoted = true;
+        if inherits {
+            for scheduler in &self.schedulers {
+                scheduler.await_index(INDEX_WAIT);
+            }
+        }
         // A suspended standby takes its graph pools' storage back, at the addresses the graphs
         // hold, before anything is admitted.
         if self.standby_storage == proto::request::StandbyStorage::Suspended {

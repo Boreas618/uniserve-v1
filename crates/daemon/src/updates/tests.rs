@@ -157,9 +157,18 @@ impl Deployment {
 
     /// The serving epoch's process ended its requests.
     fn drain(&self) {
+        self.drain_with(Vec::new());
+    }
+
+    /// The serving epoch's process ended its requests, with the prefix
+    /// cache `index` it parked with.
+    fn drain_with(&self, index: Vec<proto::request::GroupIndex>) {
         self.nodes.report(
             PREVIOUS,
-            report::Kind::Drained(process::Drained { epoch: SERVING }),
+            report::Kind::Drained(process::Drained {
+                epoch: SERVING,
+                index,
+            }),
         );
         self.driver.advance();
     }
@@ -368,7 +377,9 @@ fn an_epoch_switch_serves_the_target_and_a_commit_retires_the_previous_epoch() {
     deployment.hand();
     assert_eq!(
         deployment.nodes.sent(),
-        vec![kind(command::Kind::Promote(process::Promote {}))]
+        vec![kind(command::Kind::Promote(process::Promote {
+            inherits: true
+        }))]
     );
 
     // Once promoted, the frontend serves the target and the previous epoch
@@ -389,7 +400,24 @@ fn an_epoch_switch_serves_the_target_and_a_commit_retires_the_previous_epoch() {
     assert_eq!(deployment.process(SPAWNED), "serving");
     assert_eq!(deployment.status()["phase"], "serving");
 
-    deployment.drain();
+    // The index the previous epoch drained with goes to the target, whose
+    // planes hold its pages.
+    let index = vec![proto::request::GroupIndex {
+        worker_group: "text".to_owned(),
+        pages: vec![proto::request::wire::IndexedPage {
+            group: 0,
+            hash: vec![7; 32],
+            tokens: vec![1, 2, 3, 4],
+            units: vec![9],
+            resume: None,
+        }],
+        ..Default::default()
+    }];
+    deployment.drain_with(index.clone());
+    assert_eq!(
+        deployment.nodes.sent(),
+        vec![kind(command::Kind::Inherit(process::Inherit { index }))]
+    );
     assert_eq!(deployment.epoch(TARGET)["status"], "probation");
     let status = deployment.status();
     assert_eq!(status["phase"], "probation");
@@ -469,7 +497,10 @@ fn an_operators_decision_before_the_trial_is_carried_out_when_the_trial_starts()
         } else {
             command::Kind::Drain(process::Drain { epoch: TARGET })
         };
-        assert_eq!(deployment.nodes.sent(), vec![kind(expected)]);
+        // The target hears the drained index first: it holds the requests
+        // that continue from the previous epoch's pages until then.
+        let inherit = command::Kind::Inherit(process::Inherit { index: Vec::new() });
+        assert_eq!(deployment.nodes.sent(), vec![kind(inherit), kind(expected)]);
     }
 }
 
@@ -665,7 +696,10 @@ fn a_regressed_trial_drains_the_target_and_returns_the_previous_epoch() {
 
     deployment.nodes.report(
         CHILD,
-        report::Kind::Drained(process::Drained { epoch: TARGET }),
+        report::Kind::Drained(process::Drained {
+            epoch: TARGET,
+            index: Vec::new(),
+        }),
     );
     deployment.driver.advance();
     assert_eq!(deployment.nodes.sent(), vec![deployment.previous_resumes()]);
@@ -758,7 +792,10 @@ fn a_revert_relaunches_a_previous_epoch_whose_processes_were_stopped() {
     );
     deployment.nodes.report(
         CHILD,
-        report::Kind::Drained(process::Drained { epoch: TARGET }),
+        report::Kind::Drained(process::Drained {
+            epoch: TARGET,
+            index: Vec::new(),
+        }),
     );
     deployment.driver.advance();
     assert_eq!(

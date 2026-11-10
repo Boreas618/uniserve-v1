@@ -37,6 +37,7 @@ fn engine_command_name(kind: &proto::process::command::Kind) -> &'static str {
         Kind::Drain(_) => "drain",
         Kind::Serve(_) => "serve",
         Kind::Pause(_) => "pause",
+        Kind::Inherit(_) => "inherit",
     }
 }
 
@@ -74,6 +75,13 @@ impl Scheduler {
 
     /// Removes a queued token request while preserving admission order for its peers.
     pub(super) fn remove_waiting(&mut self, request_id: RequestId) -> Option<RequestState> {
+        if let Some(index) = self
+            .held_for_index
+            .iter()
+            .position(|held| held.req.request_id == request_id)
+        {
+            return Some(self.held_for_index.remove(index));
+        }
         let index = self
             .waiting
             .iter()
@@ -92,6 +100,7 @@ impl Scheduler {
     /// terminal events, are handed to their receivers, since no later flush
     /// will deliver them.
     pub(super) fn abort_all_requests(&mut self) {
+        self.release_held_for_index();
         self.inflight.pending_submissions.clear();
 
         while let Some(submission) = self.waiting_media.pop_front() {
@@ -173,6 +182,12 @@ impl Scheduler {
                 answer,
             } => {
                 let _ = answer.send(self.promote(&cache, recompute, grows));
+            }
+            Command::AwaitIndex(bound) => {
+                self.awaiting_index = Some(std::time::Instant::now() + bound);
+            }
+            Command::Inherit { caches, answer } => {
+                let _ = answer.send(self.inherit(&caches));
             }
             Command::Commit(answer) => {
                 let _ = answer.send(self.commit());

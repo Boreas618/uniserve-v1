@@ -572,6 +572,16 @@ pub enum Command {
         grows: bool,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
+    /// Holds the requests that continue from a predecessor epoch's pages
+    /// until its index arrives (`Inherit`), for at most the duration.
+    AwaitIndex(std::time::Duration),
+    /// Adopts the published pages of the drained predecessor epoch, which
+    /// lie in the cache segments the scheduler's workers map
+    /// (`Scheduler::inherit`), and answers with the outcome.
+    Inherit {
+        caches: Vec<(String, crate::ParkedCache)>,
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    },
     /// Commits a successor scheduler (`Scheduler::commit`), and answers
     /// with what each worker reported.
     Commit(crossbeam_channel::Sender<Result<Vec<String>, String>>),
@@ -942,6 +952,23 @@ impl CommandSender {
             answer,
         });
         promoted
+    }
+
+    /// Holds the requests that continue from the predecessor epoch's pages
+    /// until its index arrives ([`Self::inherit`]), for at most `bound`.
+    pub fn await_index(&self, bound: std::time::Duration) {
+        let _ = self.send(Command::AwaitIndex(bound));
+    }
+
+    /// Adopts the pages the drained predecessor epoch parked with
+    /// (`Command::Inherit`); the receiver gets the outcome.
+    pub fn inherit(
+        &self,
+        caches: Vec<(String, crate::ParkedCache)>,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, inherited) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Inherit { caches, answer });
+        inherited
     }
 
     /// Publishes the committed epoch's immutable pages on every claimed node.

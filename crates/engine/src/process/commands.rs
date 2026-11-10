@@ -255,8 +255,11 @@ impl MainProcess {
                         )),
                     });
                 }
-                Some(proto::process::command::Kind::Promote(_)) => {
-                    self.promote_in_place()?;
+                Some(proto::process::command::Kind::Promote(promote)) => {
+                    self.promote_in_place(promote.inherits)?;
+                }
+                Some(proto::process::command::Kind::Inherit(inherit)) => {
+                    self.inherit(inherit.index)?;
                 }
                 // The five program commands were converted above; a command that states no kind
                 // states nothing to apply.

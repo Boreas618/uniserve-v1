@@ -786,9 +786,12 @@ fn a_successor_allocates_the_segments_its_predecessor_lent() {
             .lock()
             .unwrap()
             .operations
-            .contains(&EpochOperation::from(AdoptCache {
-                borrowed: vec![[8, 12], [16, 20]],
-            })),
+            .iter()
+            .any(|operation| matches!(
+                operation,
+                EpochOperation::AdoptCache(AdoptCache { borrowed, .. })
+                    if *borrowed == [[8, 12], [16, 20]]
+            )),
         "{:?}",
         workers.lock().unwrap().operations
     );

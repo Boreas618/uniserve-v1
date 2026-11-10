@@ -593,6 +593,50 @@ def test_a_serving_epoch_gives_its_graph_storage_to_a_preparing_successor(
         streaming.join()
 
 
+def test_a_successor_continues_a_request_from_its_predecessors_device_pages(
+    tmp_path: Path,
+):
+    """The successor of an epoch change reads the streaming request's pages
+    where the serving epoch left them: with no host KV cache to warm through,
+    every token the request computed is a device prefix cache hit on its
+    first forward on the successor, and the stream is the count alone.
+    """  # noqa: D205
+    name = "qwen3-device-warming"
+    options = ("--set", "kv_cache_config.host_tier=false")
+    with _serve(tmp_path, name, options=options) as base_url:
+        streaming = Streaming(base_url, name)
+        streaming.wait_for(EARLY_TOKENS)
+        wait_until(
+            lambda: _prefix_counter(base_url, "queries") > 0,
+            30,
+            "the original request's cache query was not reported",
+        )
+        queries_before = _prefix_counter(base_url, "queries")
+        hits_before = _prefix_hits(base_url)
+        host_before = _prefix_counter(base_url, "host_hits")
+
+        _epoch_change(base_url, CHANGE)
+        streaming.mark()
+        streaming.wait_for(streaming.marked + 64)
+        wait_until(
+            lambda: _prefix_counter(base_url, "queries") > queries_before,
+            30,
+            "the resumed request's cache query was not reported",
+        )
+        reused = _prefix_hits(base_url) - hits_before
+        queried = _prefix_counter(base_url, "queries") - queries_before
+        assert reused == queried > 0, (reused, queried)
+        assert _prefix_counter(base_url, "host_hits") == host_before
+        streaming.join()
+        reference, reference_usage = _ask(base_url, name)
+
+    assert len(streaming.tokens) > streaming.marked, (
+        "the stream ended before the successor served"
+    )
+    assert streaming.tokens == reference
+    assert streaming.usage == reference_usage
+
+
 # Distinct prompts whose pages together outgrow the device KV cache (32768
 # tokens), pushing out the pages of a prompt asked before them, which the
 # host KV cache keeps.

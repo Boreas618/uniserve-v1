@@ -43,3 +43,7 @@ pub const EVENT_WINDOW: u64 = 64;
 pub mod wire {
     include!(concat!(env!("OUT_DIR"), "/uniserve.request.rs"));
 }
+
+/// A worker group's prefix cache index, as the process interface carries it too
+/// (`process::Drained`, `process::Inherit`).
+pub use wire::GroupIndex;

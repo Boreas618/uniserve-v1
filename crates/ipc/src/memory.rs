@@ -211,18 +211,23 @@ pub struct WeightsUpdated {
     pub moved: usize,
 }
 
-/// Map writable the units `borrowed` (half-open unit ranges, `[start, end)`
-/// each) the predecessor epoch lent, copying its cache flags and scales of
-/// the units the rank inherits.
+/// Take over the predecessor epoch's pages in the planes the rank maps of
+/// it: map writable the units `borrowed` it lent, and copy its cache flags
+/// and scales of the units `units` into the rank's own, where the rank's
+/// flag and scale planes are not the predecessor's (half-open unit ranges,
+/// `[start, end)` each, in the rank's planes).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdoptCache {
     pub borrowed: Vec<[u32; 2]>,
+    #[serde(default)]
+    pub units: Vec<[u32; 2]>,
 }
 
 /// What a rank answers of an [`AdoptCache`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheAdopted {
-    /// The units of the predecessor's planes the rank maps.
+    /// The units of the predecessor's planes the rank maps, or whose flags
+    /// and scales it copied.
     #[serde(default)]
     pub inherited: u32,
 }

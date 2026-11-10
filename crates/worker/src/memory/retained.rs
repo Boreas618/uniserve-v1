@@ -235,6 +235,9 @@ pub struct Retained {
     epoch: u64,
     /// The epoch whose exclusive storages this worker keys: its own, or a standby's predecessor's.
     storage_epoch: u64,
+    /// The epoch whose exclusive storages the predecessor epoch on the same devices keys, for a
+    /// worker that succeeds one; `None` for a first epoch.
+    predecessor_epoch: Option<u64>,
     state: Mutex<State>,
 }
 
@@ -428,6 +431,7 @@ impl Retained {
             storage_epoch: predecessor_epoch
                 .filter(|_| launch.standby)
                 .unwrap_or(launch.epoch),
+            predecessor_epoch,
             state: Mutex::new(State {
                 client,
                 gpus: BTreeMap::new(),
@@ -672,6 +676,92 @@ impl Retained {
         state.used.insert(key);
         state.weights.insert((device.0, key), mapped.clone());
         Ok(mapped)
+    }
+
+    /// Copies the cells of the cache units `units` (half-open ranges) of the predecessor epoch's
+    /// exclusive storages to this worker's own of the same names, through the host's Transfer
+    /// Server: each storage is `(name, cell_bytes)` of cells `[columns, num_units]`, as the cache's
+    /// flag and scale planes are laid out. Answers how many units it copied: none when the worker
+    /// keys its storages under the predecessor's epoch (a standby), whose storages are its own, or
+    /// when it succeeds no epoch.
+    ///
+    /// # Errors
+    ///
+    /// When the server refuses the copy or the transfer fails: the cells are then partly copied,
+    /// and the caller adopts none of the units.
+    pub fn copy_predecessor_cells(
+        &self,
+        device: DeviceId,
+        storages: &[(&str, u64)],
+        columns: u32,
+        num_units: u32,
+        units: &[[u32; 2]],
+    ) -> Result<u32> {
+        let Some(predecessor) = self
+            .predecessor_epoch
+            .filter(|epoch| *epoch != self.storage_epoch)
+        else {
+            return Ok(0);
+        };
+        let mut state = lock(&self.state);
+        let gpu = state.gpu(device)?;
+        let cells = u64::from(columns) * u64::from(num_units);
+        let mut spans = Vec::new();
+        for &(name, cell_bytes) in storages {
+            let bytes = (cells * cell_bytes) as usize;
+            let source = self.storage_key(name, bytes, &gpu, predecessor);
+            let destination = self.storage_key(name, bytes, &gpu, self.storage_epoch);
+            for column in 0..u64::from(columns) {
+                for &[start, end] in units {
+                    if start >= end || end > num_units {
+                        return Err(Error::Invalid(format!(
+                            "the cache units {start}..{end} are not units of a pool of {num_units}"
+                        )));
+                    }
+                    let offset = (column * u64::from(num_units) + u64::from(start)) * cell_bytes;
+                    spans.push(::storage::protocol::Span {
+                        source: ::storage::protocol::Region::Tensor {
+                            key: source,
+                            at: None,
+                        },
+                        source_offset: offset,
+                        destination: ::storage::protocol::Region::Tensor {
+                            key: destination,
+                            at: None,
+                        },
+                        destination_offset: offset,
+                        bytes: u64::from(end - start) * cell_bytes,
+                        rows: 1,
+                        source_pitch: 0,
+                        destination_pitch: 0,
+                    });
+                }
+            }
+        }
+        if spans.is_empty() {
+            return Ok(0);
+        }
+        let task = state
+            .client
+            .transfer(spans, ::storage::protocol::Priority::Promotion, 0)
+            .map_err(|error| storage_error("copying the predecessor's cache flags", error))?;
+        // The copy is a few cells per unit: the worker waits for it at the boundary it runs at.
+        loop {
+            match state
+                .client
+                .poll_transfer(task)
+                .map_err(|error| storage_error("copying the predecessor's cache flags", error))?
+            {
+                Some((_, ::storage::protocol::TransferEnd::Complete)) => break,
+                Some((_, end)) => {
+                    return Err(Error::Interface(format!(
+                        "copying the predecessor's cache flags ended as {end:?}"
+                    )));
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+        Ok(units.iter().map(|[start, end]| end - start).sum())
     }
 
     /// Publishes the open granules of `device`: one `put` each, of the granule's storage and the
