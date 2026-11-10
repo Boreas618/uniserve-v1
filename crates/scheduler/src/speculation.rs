@@ -219,6 +219,13 @@ impl Scheduler {
     /// `visible`: its last forward's proposals when its draft cache is
     /// complete, at most the deployment's limit and one fewer than the
     /// tokens it may still generate, none otherwise.
+    ///
+    /// A verification's rows sample under one set of banned tokens, its call's
+    /// (`SamplingState::suppressed_token_ids`), so the drafts end before the first
+    /// one whose position the request bans differently: where a multi-token bad
+    /// word's prefix forms across the drafts, or where the drafts cross the
+    /// request's `min_tokens` floor. A request without either verifies every
+    /// draft it may.
     pub(crate) fn verify_drafts(&self, id: RequestId, visible: u32) -> Vec<u32> {
         let Some(state) = self.running.get(&id) else {
             return Vec::new();
@@ -237,7 +244,21 @@ impl Scheduler {
             .len()
             .min(self.config.draft_tokens)
             .min(remaining);
-        state.draft.proposals[..count].to_vec()
+        let proposals = &state.draft.proposals[..count];
+        let bans = |drafts: &[u32]| {
+            crate::batching::plan::suppressed_tokens(
+                &state.req.sampling,
+                &self.special_tokens.eos,
+                &state.generated_token_ids,
+                state.num_generated_tokens,
+                drafts,
+            )
+        };
+        let first = bans(&[]);
+        let uniform = (1..=count)
+            .take_while(|&ahead| bans(&proposals[..ahead]) == first)
+            .count();
+        proposals[..uniform].to_vec()
     }
 
     /// The drafts a forward of `id` whose first position is `start` asks

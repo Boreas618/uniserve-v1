@@ -359,6 +359,7 @@ fn token_batch() -> execution::Batch {
             state_copies: Vec::new(),
             drafts: Vec::new(),
             vision: Vec::new(),
+            adjustments: Default::default(),
         },
         generation: 3,
         cache_units: Vec::new(),

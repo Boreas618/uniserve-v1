@@ -2,9 +2,10 @@
 //! reports, and the slot state a step reads and advances.
 //!
 //! The module is the worker's one owner of sampling: the [`Sampler`] layer, the per-slot penalty
-//! count table it reads ([`Sampling`]), and the commit table ([`CommitColumns`], `ops::commit`)
-//! that installs each row's token into its slot after the draw. The causal-LM runner composes them
-//! inside a bucket's captured graph.
+//! count table and bias table it reads ([`Sampling`]), each batch's logit adjustments
+//! ([`Adjustments`]), and the commit table ([`CommitColumns`], `ops::commit`) that installs each
+//! row's token into its slot after the draw. The causal-LM runner composes them inside a bucket's
+//! captured graph.
 //!
 //! One sampling step is a fixed sequence of operator launches over one row per active request:
 //!
@@ -20,8 +21,23 @@
 //! ```
 //!
 //! The reported log-probabilities are the raw distribution's: `log_softmax` of the model's logits
-//! before penalties, temperature and filtering, written over the shaped row once the selection no
-//! longer reads it. A greedy step reports them the same way after its argmax.
+//! before the logit adjustments, penalties, temperature and filtering - vLLM's default
+//! (`logprobs_mode = raw_logprobs`), so a logit bias, an allowed set or a banned token changes which
+//! token is chosen and not the score reported for it. A draw writes them over the candidate
+//! ordering's counts once that ordering is done, so the shaped row survives the step for the host's
+//! greedy prompt ending (`Sampler::forward`); a greedy step writes them over its shaped row after
+//! its argmax.
+//!
+//! ## Logit adjustments
+//!
+//! `logits_shape` applies a row's adjustments before its penalties, in vLLM's order: its slot's
+//! row of the bias table (the request's logit bias, `-inf` outside its allowed set) when the row's
+//! flag names it, then `-inf` at every token its ban mask sets (the last token of a bad word whose
+//! prefix the history ends with, the end-of-sequence tokens under a `min_tokens` floor). Both
+//! paths shape through it, so a greedy row's argmax is over the adjusted logits too. A row with no
+//! adjustment selects its own logits unchanged, so a batch that asks for none samples bit for bit
+//! as without them, with the same launches: the operator reads three more operands and loads none
+//! of them for such a row.
 //!
 //! A greedy row takes the second of two launch sequences instead, and only its first step:
 //!
@@ -116,6 +132,13 @@ pub struct SamplerState {
     /// `[rows, extras]` i32 tokens counted besides the slot's own history, when the state carries
     /// any; `-1` counts nothing.
     pub extras: Option<TensorView>,
+    /// `[slots, vocabulary]` f32 the slots' bias rows ([`Sampling::bias`]).
+    pub bias: TensorView,
+    /// `[rows, 2]` i32 each row's adjustments: its bias flag and its ban mask's index
+    /// ([`Adjustments`]).
+    pub adjustments: TensorView,
+    /// `[masks, ceil(vocabulary / 32)]` i32 the batch's ban masks.
+    pub bans: TensorView,
 }
 
 /// The candidate working set of one sampling step, reserved from the forward's arena.
@@ -258,6 +281,10 @@ impl Sampler {
     /// the values and the ids into token order, which is what makes a fixed draw select the same
     /// token whatever order the top-k program kept the candidates in. Greedy rows do not go
     /// through this method at all — see [`Self::greedy`].
+    ///
+    /// Answers the `[rows, vocabulary]` f32 shaped logits, which the step leaves intact in the
+    /// forward's arena: a greedy prompt ending served by a drawing bucket is the argmax of its
+    /// shaped row, which the host takes from there.
     pub fn forward(
         &self,
         f: &Forward,
@@ -265,7 +292,7 @@ impl Sampler {
         state: &SamplerState,
         draws: TensorView,
         samples: &Samples,
-    ) -> Result<()> {
+    ) -> Result<TensorView> {
         let vocabulary = u64::from(self.vocabulary);
         let width = u64::from(self.width);
         let rows = self.check(logits, state, samples)?;
@@ -282,18 +309,8 @@ impl Sampler {
         let arena = f.arena();
         let candidates = Candidates::reserve(arena, rows, vocabulary, width)?;
 
-        // 1. Penalties and temperature.
-        let shape = self.shape_descriptor(logits.dtype);
-        let args = ShapeArgs {
-            logits,
-            counts: state.counts,
-            slots: state.slots,
-            parameters: state.parameters,
-            extras: state.extras,
-            out: candidates.shaped,
-        };
-
-        f.operate::<LogitsShape>(&shape, args)?;
+        // 1. Logit adjustments, penalties and temperature.
+        self.shape(f, logits, state, candidates.shaped)?;
 
         // 2. The candidate set: the `width` largest, then the row's own thresholds.
         let top = self.top_descriptor();
@@ -350,10 +367,41 @@ impl Sampler {
 
         f.operate::<InverseCdf>(&draw, args)?;
 
-        // 5. The reported log-probabilities. The shaped row is dead once the draw has read the
-        // candidates, so it holds the scores and the step reserves nothing more for them.
-        self.report(f, logits, candidates.shaped, samples)?;
+        // 5. The reported log-probabilities. The ordering's counts are dead once the candidates
+        // are ordered, and they are as wide as a row of scores, so they hold the scores: the step
+        // reserves nothing more for them and the shaped row stays intact.
+        let scratch = TensorView::new(
+            candidates.counts.ptr,
+            DType::F32,
+            Shape::new(&[rows, vocabulary]),
+        );
+        self.report(f, logits, scratch, samples)?;
 
+        Ok(candidates.shaped)
+    }
+
+    /// Adjust, penalize and temperature-scale `logits` into `out`, as both paths do.
+    fn shape(
+        &self,
+        f: &Forward,
+        logits: TensorView,
+        state: &SamplerState,
+        out: TensorView,
+    ) -> Result<()> {
+        let shape = self.shape_descriptor(logits.dtype);
+        let args = ShapeArgs {
+            logits,
+            counts: state.counts,
+            slots: state.slots,
+            parameters: state.parameters,
+            extras: state.extras,
+            bias: state.bias,
+            adjustments: state.adjustments,
+            bans: state.bans,
+            out,
+        };
+
+        f.operate::<LogitsShape>(&shape, args)?;
         Ok(())
     }
 
@@ -594,6 +642,28 @@ impl Sampler {
                 ),
             ));
         }
+        state
+            .bias
+            .require_row("Sampler", DType::F32, vocabulary)
+            .map_err(Error::from)?;
+        if state.bias.rows() != u64::from(self.slots) {
+            return Err(refused(
+                "Sampler",
+                format!("{} bias rows for {} slots", state.bias.rows(), self.slots),
+            ));
+        }
+        state
+            .adjustments
+            .require_shape("Sampler", Shape::new(&[rows, 2]))
+            .map_err(Error::from)?;
+        state
+            .bans
+            .require_row(
+                "Sampler",
+                DType::I32,
+                u64::from(ops::sampler::ban_words(self.vocabulary)),
+            )
+            .map_err(Error::from)?;
         match (self.extras, state.extras) {
             (0, None) => {}
             (0, Some(_)) => {
@@ -629,7 +699,9 @@ impl Sampler {
     /// `samples` carries one.
     ///
     /// This is the greedy step (`torch.max` over the shaped row, the lowest index among ties), for
-    /// the rows whose temperature is zero. It runs the same shaper as [`Self::forward`] and nothing
+    /// the rows whose temperature is zero: the shaped row is the adjusted, penalized logits, so a
+    /// greedy request honours its logit bias, its allowed set and its banned tokens, as vLLM's
+    /// greedy sampler does. It runs the same shaper as [`Self::forward`] and nothing
     /// else: no candidate set, no cutoffs, no draw. It is a separate launch sequence
     /// rather than a branch inside `forward`, because the worker's buckets are homogeneous in the
     /// path their rows take and a bucket's captured plan is one of the two.
@@ -645,17 +717,7 @@ impl Sampler {
         let arena = f.arena();
         let shaped = arena.tensor(DType::F32, Shape::new(&[rows, vocabulary]))?;
 
-        let shape = self.shape_descriptor(logits.dtype);
-        let args = ShapeArgs {
-            logits,
-            counts: state.counts,
-            slots: state.slots,
-            parameters: state.parameters,
-            extras: state.extras,
-            out: shaped,
-        };
-
-        f.operate::<LogitsShape>(&shape, args)?;
+        self.shape(f, logits, state, shaped)?;
 
         // The column of a dense vocabulary row is the token id, so the index is the token.
         let argmax = self.argmax_descriptor();
@@ -988,13 +1050,115 @@ impl CommitColumns {
     }
 }
 
-/// The sampling step's own device state: the slot histories its penalties read.
+/// One batch's logit adjustments ([`ipc::execution::LogitAdjustments`]) in the layout
+/// `logits_shape` reads, encoded on the host into buffers sized when the runner binds.
+///
+/// Per row, two i32: whether the row adds its slot's bias row, and the index of its ban mask, `-1`
+/// for a row that bans nothing. The ban masks are one bit per token (`ops::sampler::ban_words`
+/// words a mask), one mask per row that bans any token, in row order, so a batch whose rows ban
+/// nothing stages no mask at all. A padded row adds nothing and bans nothing.
+#[derive(Default, Debug)]
+pub struct Adjustments {
+    /// `[rows, 2]` the rows' bias flags and mask indices, for the largest bucket.
+    rows: Vec<i32>,
+    /// `[rows, words]` room for one mask per row; the first `masks` are the batch's.
+    bans: Vec<i32>,
+    masks: usize,
+    words: usize,
+    vocabulary: u32,
+    /// The bias rows the batch installs before it samples.
+    installs: Vec<ipc::execution::SlotBias>,
+}
+
+impl Adjustments {
+    /// Sizes the buffers for `rows` rows of a `vocabulary`-wide row.
+    pub fn reserve(&mut self, rows: usize, vocabulary: u32) {
+        self.words = ops::sampler::ban_words(vocabulary) as usize;
+        self.vocabulary = vocabulary;
+        self.rows = vec![0; 2 * rows];
+        self.bans = vec![0; rows * self.words];
+        self.masks = 0;
+        self.installs = Vec::new();
+    }
+
+    /// Encodes the adjustments of a batch of `rows` rows, padded to `bucket_rows`.
+    ///
+    /// A banned token outside the vocabulary bans nothing: no logit carries it.
+    pub fn stage(
+        &mut self,
+        adjustments: &ipc::execution::LogitAdjustments,
+        rows: usize,
+        bucket_rows: usize,
+    ) -> Result<()> {
+        if 2 * bucket_rows > self.rows.len() {
+            return Err(Error::Invariant(format!(
+                "the adjustments hold {} rows, the bucket {bucket_rows}",
+                self.rows.len() / 2
+            )));
+        }
+        self.masks = 0;
+        for row in 0..bucket_rows {
+            let biased = row < rows && adjustments.biased.get(row).copied().unwrap_or(false);
+            self.rows[2 * row] = i32::from(biased);
+            self.rows[2 * row + 1] = -1;
+            let banned = match adjustments.banned.get(row) {
+                Some(banned) if row < rows && !banned.is_empty() => banned,
+                _ => continue,
+            };
+            let index = self.masks;
+            let mask = &mut self.bans[index * self.words..(index + 1) * self.words];
+            mask.fill(0);
+            for &token in banned.iter().filter(|token| **token < self.vocabulary) {
+                // Bit `t % 32` of word `t / 32`; the kernel reads the word as i32 and shifts it,
+                // and bit 31 is the sign bit of the same word.
+                mask[(token / 32) as usize] |= (1_u32 << (token % 32)) as i32;
+            }
+            self.rows[2 * row + 1] = i32::try_from(index)
+                .map_err(|_| Error::Invariant("a ban mask index overflows i32".into()))?;
+            self.masks += 1;
+        }
+        self.installs.clear();
+        self.installs.extend_from_slice(&adjustments.installs);
+        Ok(())
+    }
+
+    /// The `[rows, 2]` flags and mask indices of the first `rows` rows.
+    pub fn rows(&self, rows: usize) -> &[i32] {
+        &self.rows[..2 * rows]
+    }
+
+    /// The batch's ban masks, `[masks, words]`.
+    pub fn bans(&self) -> &[i32] {
+        &self.bans[..self.masks * self.words]
+    }
+
+    /// The bias rows the batch installs.
+    pub fn installs(&self) -> &[ipc::execution::SlotBias] {
+        &self.installs
+    }
+}
+
+/// The sampling step's own device state: the slot histories its penalties read, and the slot
+/// bias rows its logit adjustments add.
 pub(crate) struct Sampling {
     pub(crate) sampler: Sampler,
     /// `[slots, vocabulary]` i32 counts of the tokens each slot has already seen, which the
     /// penalties subtract; zeroed once when the runner binds and advanced by `ops::commit`.
     pub(crate) counts: TensorView,
     pub(crate) _counts: platform::DeviceAllocation,
+    /// `[slots, vocabulary]` f32 each slot's bias row: the logit bias of its request's biased
+    /// tokens, `-inf` outside its allowed set, `0` elsewhere. Zeroed when the runner binds and
+    /// written by [`Self::install`]; a row reads it only when the batch flags it, and the scheduler
+    /// flags a request's rows only once a batch at or before them installed its row.
+    pub(crate) bias: TensorView,
+    _bias: platform::DeviceAllocation,
+    /// The bias table's pinned host image, one row per slot, which an install writes and copies
+    /// from. A slot's row is rewritten only by the next install of that slot, which belongs to a
+    /// later request after the slot's previous request finished and its batches completed (or
+    /// repeats the same request's identical row), so no copy in flight reads a row while it changes.
+    mirror: platform::PinnedBuffer,
+    vocabulary: u32,
+    slots: u32,
 }
 
 impl Sampling {
@@ -1037,11 +1201,97 @@ impl Sampling {
             DType::I32,
             ops::Shape::new(&[u64::from(slots), u64::from(vocabulary)]),
         );
+        // The bias table is as large as the count table: one f32 per slot and token. It starts at
+        // zero, as the counts do, so a row read before any install would add nothing.
+        let words = usize::try_from(bytes / 4)
+            .map_err(|_| Error::Invalid("the sampler's bias table is larger than memory".into()))?;
+        let bias_allocation =
+            platform::DeviceAllocation::linear(device, words * std::mem::size_of::<f32>())?;
+        // SAFETY: as for the counts: this allocation's own `slots × vocabulary` 32-bit words.
+        unsafe {
+            platform::memset_d32(bias_allocation.address(), 0, words, stream)?;
+        }
+        stream.synchronize()?;
+        let bias = TensorView::new(
+            ops::DevicePtr::new(bias_allocation.address()),
+            DType::F32,
+            ops::Shape::new(&[u64::from(slots), u64::from(vocabulary)]),
+        );
+        let mirror = platform::PinnedBuffer::new(device, words * std::mem::size_of::<f32>())?;
         Ok(Self {
             sampler,
             counts,
             _counts: allocation,
+            bias,
+            _bias: bias_allocation,
+            mirror,
+            vocabulary,
+            slots,
         })
+    }
+
+    /// Writes each install's slot row of the bias table, on `stream`, before the step that reads
+    /// it.
+    ///
+    /// The row is built in the slot's row of the pinned image - `-inf` everywhere when the request
+    /// restricts its tokens and `0` otherwise, `0` at each allowed token, then each bias at a token
+    /// the request may sample - and copied to the device row. The copy is stream-ordered before
+    /// the replay that reads it, so nothing waits for it. A token outside the vocabulary is ignored.
+    pub(crate) fn install(
+        &mut self,
+        installs: &[ipc::execution::SlotBias],
+        stream: &platform::Stream,
+    ) -> Result<()> {
+        let width = self.vocabulary as usize;
+        let row_bytes = width * std::mem::size_of::<f32>();
+        for install in installs {
+            if install.slot >= self.slots {
+                return Err(Error::Invalid(format!(
+                    "a bias row for slot {} of a table of {} slots",
+                    install.slot, self.slots
+                )));
+            }
+            let slot = install.slot as usize;
+            // SAFETY: the image holds `slots × vocabulary` f32 and `slot` is below `slots`; no
+            // copy in flight reads this row (the type's own invariant).
+            let row = unsafe {
+                std::slice::from_raw_parts_mut(
+                    self.mirror.as_ptr().cast::<f32>().add(slot * width),
+                    width,
+                )
+            };
+            match &install.allowed {
+                Some(allowed) => {
+                    row.fill(f32::NEG_INFINITY);
+                    for &token in allowed.iter().filter(|token| (**token as usize) < width) {
+                        row[token as usize] = 0.0;
+                    }
+                }
+                None => row.fill(0.0),
+            }
+            for &(token, bias) in install
+                .bias
+                .iter()
+                .filter(|(token, _)| (*token as usize) < width)
+            {
+                let entry = &mut row[token as usize];
+                if *entry != f32::NEG_INFINITY {
+                    *entry = bias;
+                }
+            }
+            let offset = (slot * row_bytes) as u64;
+            // SAFETY: both ranges are the slot's own `vocabulary` f32 of tables of the same layout,
+            // and the image's row stays as written until the copy has run (the type's invariant).
+            unsafe {
+                platform::memcpy_async(
+                    self.bias.ptr.address() + offset,
+                    self.mirror.address() + offset,
+                    row_bytes,
+                    stream,
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1126,6 +1376,9 @@ mod tests {
             parameters: view(&[2, u64::from(PARAMETER_COLUMNS)]),
             slots: ints(&[2]),
             extras: extras.then(|| ints(&[2, 2])),
+            bias: view(&[4, 1_024]),
+            adjustments: ints(&[2, 2]),
+            bans: ints(&[1, 32]),
         };
         let samples = Samples {
             tokens: TensorView::new(DevicePtr::new(0x2000), DType::I32, Shape::new(&[2])),
@@ -1162,6 +1415,9 @@ mod tests {
             parameters: view(&[2, 4]),
             slots: ints(&[2]),
             extras: Some(ints(&[2, 2])),
+            bias: view(&[4, 1_024]),
+            adjustments: ints(&[2, 2]),
+            bans: ints(&[1, 32]),
         };
         assert!(sampler.check(view(&[2, 1_024]), &narrow, &samples).is_err());
         let miscounted = SamplerState {
@@ -1169,6 +1425,9 @@ mod tests {
             parameters: view(&[2, u64::from(PARAMETER_COLUMNS)]),
             slots: ints(&[2]),
             extras: Some(ints(&[2, 2])),
+            bias: view(&[4, 1_024]),
+            adjustments: ints(&[2, 2]),
+            bans: ints(&[1, 32]),
         };
         let text = format!(
             "{}",
@@ -1197,6 +1456,42 @@ mod tests {
         assert!(text.contains("no extra tokens"), "{text}");
     }
 
+    /// A batch's adjustments reach the shaper as one flag pair per row and one ban mask per row that
+    /// bans a token: bit `t % 32` of word `t / 32`, the sign bit included; a padded row, a token past
+    /// the vocabulary and a row that bans nothing set nothing.
+    #[test]
+    fn a_batch_stages_one_ban_mask_per_banning_row() {
+        let mut adjustments = Adjustments::default();
+        adjustments.reserve(4, 100);
+        let batch = ipc::execution::LogitAdjustments {
+            installs: Vec::new(),
+            biased: vec![true, false, true],
+            banned: vec![vec![0, 31, 99, 100], Vec::new(), vec![32]],
+        };
+        adjustments.stage(&batch, 3, 4).unwrap();
+        assert_eq!(adjustments.rows(4), &[1, 0, 0, -1, 1, 1, 0, -1]);
+        let words = ops::sampler::ban_words(100) as usize;
+        assert_eq!(words, 4);
+        let bans = adjustments.bans();
+        assert_eq!(bans.len(), 2 * words);
+        assert_eq!(bans[0], 1 | i32::MIN, "tokens 0 and 31 share word 0");
+        assert_eq!(
+            bans[3],
+            1 << 3,
+            "token 99 is bit 3 of word 3, and 100 is outside"
+        );
+        assert_eq!(&bans[words..], &[0, 1, 0, 0], "token 32 is bit 0 of word 1");
+
+        // A batch that adjusts nothing stages no mask and flags no row.
+        adjustments
+            .stage(&ipc::execution::LogitAdjustments::default(), 3, 4)
+            .unwrap();
+        assert!(adjustments.bans().is_empty());
+        assert_eq!(adjustments.rows(4), &[0, -1, 0, -1, 0, -1, 0, -1]);
+        // A bucket wider than the reservation is refused.
+        assert!(adjustments.stage(&batch, 3, 5).is_err());
+    }
+
     /// A greedy step reads no draws, so the state a greedy caller must supply is exactly the state a
     /// draw caller must supply: what it leaves out is the uniform draw, nothing else.
     #[test]
@@ -1207,6 +1502,9 @@ mod tests {
             parameters: view(&[2, u64::from(PARAMETER_COLUMNS)]),
             slots: ints(&[2]),
             extras: None,
+            bias: view(&[4, 1_024]),
+            adjustments: ints(&[2, 2]),
+            bans: ints(&[1, 32]),
         };
         let samples = Samples {
             tokens: TensorView::new(DevicePtr::new(0x2000), DType::I32, Shape::new(&[2])),

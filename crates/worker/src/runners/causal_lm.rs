@@ -42,7 +42,7 @@ use crate::runners::columns::{Column, encode_f32, encode_i32};
 use crate::runners::lifecycle::{Lifecycle, walk_capture};
 use crate::runners::recording::{Footprint, Walk};
 use crate::runners::sampling::{
-    CommitColumns, SamplerState, Samples, Sampling, commit_descriptor, inert_commit,
+    Adjustments, CommitColumns, SamplerState, Samples, Sampling, commit_descriptor, inert_commit,
 };
 #[cfg(test)]
 use ipc::execution::Variant;
@@ -72,6 +72,8 @@ pub struct Staging {
     parameters: Vec<f32>,
     /// `[rows]` each row's draw address; a padded row's is the default, and its draw is discarded.
     draws: Vec<ipc::philox::DrawAddress>,
+    /// The batch's logit adjustments, encoded as the sampler reads them.
+    adjustments: Adjustments,
     commit: Vec<i64>,
     page_size: u32,
     max_kv_len: u32,
@@ -96,8 +98,8 @@ impl Staging {
         Self::default()
     }
 
-    /// Sizes the buffers for the largest bucket `buckets` holds.
-    pub fn reserve(&mut self, buckets: &Buckets) -> Result<()> {
+    /// Sizes the buffers for the largest bucket `buckets` holds, over a `vocabulary`-wide logit row.
+    pub fn reserve(&mut self, buckets: &Buckets, vocabulary: u32) -> Result<()> {
         let largest = buckets
             .iter()
             .max_by_key(|bucket| (bucket.rows, bucket.tokens))
@@ -110,6 +112,7 @@ impl Staging {
         self.parameters =
             vec![0.0; largest.rows as usize * proto::program::sampler::PARAMETER_COLUMNS as usize];
         self.draws = vec![ipc::philox::DrawAddress::default(); largest.rows as usize];
+        self.adjustments.reserve(largest.rows as usize, vocabulary);
         // The commit table's height is ops' business; `reserve` leaves it empty and `stage` sizes
         // it to whatever the mechanism wrote, which `check` has already validated.
         self.commit = Vec::new();
@@ -211,6 +214,8 @@ impl Staging {
             )));
         }
         self.draws[..rows].copy_from_slice(&columns.draws);
+        self.adjustments
+            .stage(&columns.adjustments, rows, bucket_rows)?;
         for index in rows..bucket_rows {
             self.slots[index] = -1;
             self.draws[index] = ipc::philox::DrawAddress::default();
@@ -370,6 +375,11 @@ impl Staging {
         &self.draws[..rows]
     }
 
+    /// The staged batch's logit adjustments.
+    pub fn adjustments(&self) -> &Adjustments {
+        &self.adjustments
+    }
+
     /// `ops::commit`'s column table of the staged rows.
     pub fn commit(&self) -> &[i64] {
         &self.commit
@@ -415,6 +425,10 @@ struct Columns {
     parameters: Column,
     slots: Column,
     draws: Column,
+    /// `[rows, 2]` i32 each row's logit adjustments: its bias flag and its ban mask's index.
+    adjustments: Column,
+    /// `[rows, ceil(vocabulary / 32)]` i32 the batch's ban masks, one per row that bans a token.
+    bans: Column,
     /// `[1]` i32 the tokens the batch really holds, which a kernel bounds its work by: the bucket's
     /// own token count is a constant inside a captured graph and cannot bound anything.
     live_tokens: Column,
@@ -424,8 +438,11 @@ struct Columns {
     logprob_readback: [platform::PinnedBuffer; 2],
     /// One row of logits, `[vocabulary]`, read back for a greedy request whose first token is taken
     /// on the host (see `read_sampled`): a bucket is homogeneous in its sampling path, so a prefill
-    /// bucket that ends a greedy prompt cannot argmax in its graph - the graph draws.
+    /// bucket that ends a greedy prompt cannot argmax in its graph - the graph draws. The raw row,
+    /// which the reported log-probability is computed over.
     logits_row: platform::PinnedBuffer,
+    /// The same row shaped, `[vocabulary]` f32: the adjusted logits the token is the argmax of.
+    shaped_row: platform::PinnedBuffer,
 }
 
 /// The width of the per-token columns and of the per-row columns, over the buckets a runner serves.
@@ -468,7 +485,7 @@ impl Columns {
     }
 
     /// The columns every batch rewrites.
-    fn staged(&mut self) -> [&mut Column; 11] {
+    fn staged(&mut self) -> [&mut Column; 13] {
         [
             &mut self.positions,
             &mut self.input_ids,
@@ -480,6 +497,8 @@ impl Columns {
             &mut self.parameters,
             &mut self.slots,
             &mut self.draws,
+            &mut self.adjustments,
+            &mut self.bans,
             &mut self.live_tokens,
         ]
     }
@@ -501,6 +520,12 @@ impl Columns {
             parameters: Column::new(device, DType::F32, parameters)?,
             slots: Column::new(device, DType::I32, rows)?,
             draws: Column::new(device, DType::F32, rows)?,
+            adjustments: Column::new(device, DType::I32, 2 * rows)?,
+            bans: Column::new(
+                device,
+                DType::I32,
+                rows * u64::from(ops::sampler::ban_words(vocabulary)),
+            )?,
             live_tokens: Column::new(device, DType::I32, 1)?,
             readback: [
                 platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
@@ -511,6 +536,7 @@ impl Columns {
                 platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
             ],
             logits_row: platform::PinnedBuffer::new(device, (u64::from(vocabulary) * 4) as usize)?,
+            shaped_row: platform::PinnedBuffer::new(device, (u64::from(vocabulary) * 4) as usize)?,
         })
     }
 }
@@ -564,6 +590,9 @@ struct Sampled {
     ///
     /// `None` for a decode bucket, whose variant already states which path it takes.
     logits: Option<TensorView>,
+    /// `[rows, vocabulary]` f32 the same rows shaped - adjusted, penalized and divided by one for a
+    /// greedy row - which the prompt ending's token is the argmax of. Present with `logits`.
+    shaped: Option<TensorView>,
 }
 
 /// The largest candidate of one row: a greedy request's token.
@@ -1181,7 +1210,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             stream,
         } = binding;
         let mut staging = Staging::new();
-        staging.reserve(&buckets)?;
+        staging.reserve(&buckets, model.vocabulary())?;
         let commit_rows = largest_rows(&buckets)?;
         let columns = Columns::new(device, &buckets, model.vocabulary())?;
         // One contract, checked once, before any bucket is captured: the attention program states
@@ -2596,13 +2625,17 @@ impl<M: TextModel> CausalLmRunner<M> {
     /// so the device segment is measured from the launch to this wait and the host segment from
     /// there to the output.
     ///
-    /// Replaces a greedy row's drawn token with the argmax of its logits row, taken on the host.
+    /// Replaces a greedy row's drawn token with the argmax of its shaped row, taken on the host.
     ///
     /// A request whose temperature is zero asks for its largest candidate, and the captured graph of
     /// a prefill bucket draws for every row of the bucket (a bucket is homogeneous in its sampling
     /// path, and a greedy prefill variant would double the largest graphs' memory to decide one
-    /// token). The host has the logits - the arena buffer is live until the next `begin` - so the
-    /// decision is made here, once per request, before the token leaves this process.
+    /// token). The host has the logits and the shaped rows - the arena buffer is live until the next
+    /// `begin` - so the decision is made here, once per request, before the token leaves this
+    /// process. The token is the argmax of the **shaped** row, which the graph's shaper wrote with
+    /// the row's logit adjustments (its slot's bias row, its banned tokens) and divided by one, so
+    /// it is the token the greedy graph would choose; its reported log-probability is the raw row's,
+    /// as every path reports.
     ///
     /// The penalties are no-ops for a row whose slot has committed nothing *before this step*, which
     /// is what a prompt ending is: a row whose slot already held committed tokens would need the
@@ -2612,6 +2645,7 @@ impl<M: TextModel> CausalLmRunner<M> {
     fn greedy_first_tokens(
         &mut self,
         logits: TensorView,
+        shaped: TensorView,
         rows: usize,
         sampling: &[i32],
         turn: usize,
@@ -2625,9 +2659,9 @@ impl<M: TextModel> CausalLmRunner<M> {
         }
         let width = u64::from(self.model.vocabulary());
         let row_bytes = (width * 4) as usize;
-        if row_bytes > self.columns.logits_row.len() {
+        if row_bytes > self.columns.logits_row.len() || row_bytes > self.columns.shaped_row.len() {
             return Err(Error::Invariant(
-                "the logits row buffer is narrower than the vocabulary".into(),
+                "the logits row buffers are narrower than the vocabulary".into(),
             ));
         }
         let columns = proto::program::sampler::PARAMETER_COLUMNS as usize;
@@ -2649,29 +2683,39 @@ impl<M: TextModel> CausalLmRunner<M> {
             if decision != PromptToken::HostArgmax {
                 continue;
             }
-            let source = logits.ptr.address() + row as u64 * width * 4;
-            // SAFETY: the source is the row's `width` f32 inside the logits tensor the graph wrote,
-            // the destination is this runner's pinned row buffer of that length, and the stream has
-            // completed the launch that wrote it.
+            let offset = row as u64 * width * 4;
+            // SAFETY: the sources are the row's `width` f32 inside the logits and shaped tensors the
+            // graph wrote, the destinations are this runner's pinned row buffers of that length, and
+            // the stream has completed the launches that wrote them.
             unsafe {
                 platform::memcpy_async(
                     self.columns.logits_row.address(),
-                    source,
+                    logits.ptr.address() + offset,
+                    row_bytes,
+                    &self.stream,
+                )?;
+                platform::memcpy_async(
+                    self.columns.shaped_row.address(),
+                    shaped.ptr.address() + offset,
                     row_bytes,
                     &self.stream,
                 )?;
             }
             self.stream.synchronize()?;
-            // SAFETY: the copy above filled `width` f32 in the pinned row buffer, and the token
-            // buffer holds one i32 per row of this bucket.
-            // SAFETY: the copy above filled `width` f32 in the pinned row buffer.
-            let row_logits = unsafe {
-                std::slice::from_raw_parts(
-                    self.columns.logits_row.as_ptr().cast::<f32>(),
-                    width as usize,
+            // SAFETY: the copies above filled `width` f32 in each pinned row buffer.
+            let (row_logits, row_shaped) = unsafe {
+                (
+                    std::slice::from_raw_parts(
+                        self.columns.logits_row.as_ptr().cast::<f32>(),
+                        width as usize,
+                    ),
+                    std::slice::from_raw_parts(
+                        self.columns.shaped_row.as_ptr().cast::<f32>(),
+                        width as usize,
+                    ),
                 )
             };
-            let best = argmax(row_logits);
+            let best = argmax(row_shaped);
             // The first token of a prompt is the one value a serving run and a reference stack must
             // agree on before anything downstream means anything, and a wrong token and a right one
             // read the same in a completion. The margin says which it is: a near-tie is numerics,
@@ -2679,8 +2723,8 @@ impl<M: TextModel> CausalLmRunner<M> {
             tracing::debug!(
                 row,
                 token = best,
-                logit = row_logits.get(best).copied().unwrap_or(f32::NAN),
-                runner_up = runner_up(row_logits, best),
+                logit = row_shaped.get(best).copied().unwrap_or(f32::NAN),
+                runner_up = runner_up(row_shaped, best),
                 "the prompt's first token was argmaxed on the host"
             );
             // SAFETY: the readback buffer holds `rows` i32 and `row` is inside it.
@@ -2810,10 +2854,10 @@ impl<M: TextModel> CausalLmRunner<M> {
         // inverse CDF). Only a bucket that kept its logits view can answer this - a decode bucket's
         // variant already states that it is greedy, and its graph argmaxes. The tokens are corrected
         // in place, in the buffer the copy above filled, so a step allocates nothing (4.5).
-        if let Some(logits) = samples.logits
+        if let (Some(logits), Some(shaped)) = (samples.logits, samples.shaped)
             && !bucket.variant.is_decode()
         {
-            self.greedy_first_tokens(logits, rows, sampling, turn)?;
+            self.greedy_first_tokens(logits, shaped, rows, sampling, turn)?;
         }
         // A sampled id is an INDEX into the vocabulary, so it is below `vocabulary` by contract:
         // a kernel that answers the width instead of the last index is a defect and not a token,
@@ -2964,6 +3008,13 @@ impl<M: TextModel> CausalLmRunner<M> {
         encode_f32(&mut self.encoded, &self.draws);
         self.columns.draws.write(&self.encoded)?;
 
+        // The rows' logit adjustments, and the ban masks only as many as the batch's rows that ban
+        // a token: a batch that bans nothing copies no mask.
+        encode_i32(&mut self.encoded, self.staging.adjustments().rows(rows));
+        self.columns.adjustments.write(&self.encoded)?;
+        encode_i32(&mut self.encoded, self.staging.adjustments().bans());
+        self.columns.bans.write(&self.encoded)?;
+
         // The batch's live token count, which no shape of the bucket states: a captured graph reads
         // the bucket's token count as a constant, so the MoE sort - which must write a sentinel into
         // every route row of a padded token - reads this column instead.
@@ -2981,6 +3032,16 @@ impl<M: TextModel> CausalLmRunner<M> {
             return Ok(());
         }
         let stream = self.stream.clone();
+        // The slot bias rows this batch installs, stream-ordered before the replay that reads them.
+        let installs = self.staging.adjustments().installs();
+        if !installs.is_empty() {
+            self.sampling
+                .as_mut()
+                .ok_or(Error::State(
+                    "a batch installs bias rows into a runner that samples nothing",
+                ))?
+                .install(installs, &stream)?;
+        }
         for column in self.columns.staged() {
             column.push(&stream)?;
         }
@@ -3409,11 +3470,15 @@ impl<M: TextModel> CausalLmRunner<M> {
             .parameters
             .shaped(&[rows, u64::from(proto::program::sampler::PARAMETER_COLUMNS)]);
         let slots = self.columns.slots.shaped(&[rows]);
+        let words = u64::from(ops::sampler::ban_words(self.model.vocabulary()));
         let state = SamplerState {
             counts: sampling.counts,
             parameters,
             slots,
             extras: None,
+            bias: sampling.bias,
+            adjustments: self.columns.adjustments.shaped(&[rows, 2]),
+            bans: self.columns.bans.shaped(&[rows, words]),
         };
         // Every sampling bucket reports its tokens' log-probabilities: whether a row's request asked
         // for them is request data a captured graph cannot branch on, and the scores reuse the
@@ -3425,22 +3490,25 @@ impl<M: TextModel> CausalLmRunner<M> {
         // (`Sampler::greedy` and `Sampler::forward`), and a draw cannot produce a greedy token: the
         // candidates are ordered by token id before the inverse CDF, so a draw of zero selects the
         // lowest id rather than the largest logit.
-        if bucket.variant.greedy() {
+        let shaped = if bucket.variant.greedy() {
             sampling.sampler.greedy(forward, logits, &state, &samples)?;
+            None
         } else {
-            sampling.sampler.forward(
+            Some(sampling.sampler.forward(
                 forward,
                 logits,
                 &state,
                 self.columns.draws.shaped(&[rows]),
                 &samples,
-            )?;
-        }
+            )?)
+        };
         // A bucket that draws may end a greedy request's prompt, whose first token is the argmax of
         // the row - a decision the graph cannot make for one row of a bucket that draws. The view
         // is kept (the arena's buffer is live until the next `begin`, and `read_sampled` runs before
         // that); a greedy bucket's own launch already states every token it keeps.
-        let logits = (bucket.variant == ipc::execution::Variant::PrefillOutput).then_some(logits);
+        let prompt_ending = bucket.variant == ipc::execution::Variant::PrefillOutput;
+        let logits = prompt_ending.then_some(logits);
+        let shaped = shaped.filter(|_| prompt_ending);
         // A recording's views address no memory, so only a launching walk names where a replay's
         // tokens land.
         if !forward.is_recording() {
@@ -3452,6 +3520,7 @@ impl<M: TextModel> CausalLmRunner<M> {
                         "a sampling bucket reserved no log-probabilities",
                     ))?,
                     logits,
+                    shaped,
                 },
             );
         }
@@ -3554,6 +3623,9 @@ impl<M: TextModel> CausalLmRunner<M> {
             state_copies: Vec::new(),
             drafts: Vec::new(),
             vision: Vec::new(),
+            // No row adjusts its logits: the shaper's adjustment operands are recorded all the
+            // same, so the graph a serving batch with adjustments replays is this one.
+            adjustments: ipc::execution::LogitAdjustments::default(),
         };
         self.staging
             .stage(&columns, &warm_call_ids(bucket), &bucket.shape(), bucket)
@@ -3947,6 +4019,9 @@ mod tests {
     use super::*;
     use crate::runners::sampling::{commit_block, commit_descriptors, commit_table};
 
+    /// The logit row width a staging is sized for; no case here bans a token.
+    const VOCABULARY_UNDER_TEST: u32 = 1_024;
+
     /// A decode batch is homogeneous in its sampling path: a row of the other class is refused by
     /// name rather than served by a launch sequence that cannot produce its token. A prefill bucket
     /// is exempt, because a prompt-ending greedy row is ordinary there.
@@ -4018,7 +4093,7 @@ mod tests {
             Bucket::decode(4, Variant::DecodeSampled),
         ]);
         let mut staging = Staging::new();
-        staging.reserve(&buckets)?;
+        staging.reserve(&buckets, VOCABULARY_UNDER_TEST)?;
         let bucket = Bucket::decode(4, Variant::DecodeSampled);
         let mut columns = decode_columns();
         let stated = proto::program::sampler::PARAMETER_COLUMNS as usize;
@@ -4162,6 +4237,7 @@ mod tests {
             state_copies: Vec::new(),
             drafts: Vec::new(),
             vision: Vec::new(),
+            adjustments: ipc::execution::LogitAdjustments::default(),
         }
     }
 
@@ -4191,6 +4267,7 @@ mod tests {
             state_copies: Vec::new(),
             drafts: Vec::new(),
             vision: Vec::new(),
+            adjustments: ipc::execution::LogitAdjustments::default(),
         }
     }
 
@@ -4203,7 +4280,7 @@ mod tests {
             Bucket::prefill(4, 64, Variant::PrefillOutput),
         ]);
         let mut staging = Staging::new();
-        staging.reserve(&buckets)?;
+        staging.reserve(&buckets, VOCABULARY_UNDER_TEST)?;
 
         let bucket = Bucket::decode(4, Variant::DecodeGreedy);
         let staged = staging.stage(
@@ -4246,7 +4323,7 @@ mod tests {
         let bucket = Bucket::prefill(1, 64, Variant::PrefillOutput);
         let buckets = Buckets::new([bucket]);
         let mut staging = Staging::new();
-        staging.reserve(&buckets)?;
+        staging.reserve(&buckets, VOCABULARY_UNDER_TEST)?;
         staging.stage(
             &prefill_columns(),
             &[CallId(1)],
@@ -4297,7 +4374,7 @@ mod tests {
         let bucket = Bucket::prefill(1, 512, Variant::PrefillOutput);
         let buckets = Buckets::new([bucket]);
         let mut staging = Staging::new();
-        staging.reserve(&buckets)?;
+        staging.reserve(&buckets, VOCABULARY_UNDER_TEST)?;
         let count = tokens as usize;
         let mut columns = BatchColumns {
             rows: BatchRows {
@@ -4324,6 +4401,7 @@ mod tests {
             state_copies: Vec::new(),
             drafts: Vec::new(),
             vision: Vec::new(),
+            adjustments: ipc::execution::LogitAdjustments::default(),
         };
         columns.input_ids.truncate(count);
         staging.stage(
@@ -4368,7 +4446,7 @@ mod tests {
             Bucket::decode(8, Variant::DecodeGreedy),
         ]);
         let mut staging = Staging::new();
-        staging.reserve(&buckets)?;
+        staging.reserve(&buckets, VOCABULARY_UNDER_TEST)?;
         let bucket = Bucket::decode(8, Variant::DecodeGreedy);
         staging.stage(
             &decode_columns(),
@@ -4515,7 +4593,7 @@ mod tests {
             Bucket::prefill(4, 64, Variant::PrefillOutput),
         ]);
         let mut staging = Staging::new();
-        staging.reserve(&buckets)?;
+        staging.reserve(&buckets, VOCABULARY_UNDER_TEST)?;
 
         staging.stage(
             &prefill_columns(),
@@ -4618,7 +4696,9 @@ mod tests {
     fn a_batch_larger_than_its_bucket_is_refused() {
         let buckets = Buckets::new([Bucket::decode(2, Variant::DecodeGreedy)]);
         let mut staging = Staging::new();
-        staging.reserve(&buckets).expect("one bucket");
+        staging
+            .reserve(&buckets, VOCABULARY_UNDER_TEST)
+            .expect("one bucket");
         let bucket = Bucket::decode(2, Variant::DecodeGreedy);
         staging
             .stage(

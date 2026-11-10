@@ -1,11 +1,16 @@
-"""Penalties and temperature: the Triton source of the ``logits_shape``
-operator.
+"""Logit adjustments, penalties and temperature: the Triton source of the
+``logits_shape`` operator.
 
-One program penalizes, and optionally temperature-scales, the ``block`` columns
-of one row's logits: repetition, frequency and presence penalties over the
-slot's committed token counts plus the row's extra tokens, then division by the
-row's temperature. Every FP32 operation is a separately rounded intrinsic, so the
-result equals the tensor composition this kernel replaces bit for bit.
+One program adjusts, penalizes, and optionally temperature-scales, the ``block``
+columns of one row's logits, in vLLM's order: first the row's adjustments - its
+slot's bias row (the request's logit bias, ``-inf`` outside its allowed set)
+when the row's flag names it, then ``-inf`` at every token its ban mask sets
+(bad words, the ``min_tokens`` floor) - then the repetition, frequency and
+presence penalties over the slot's committed token counts plus the row's extra
+tokens, then division by the row's temperature. Every FP32 operation is a
+separately rounded intrinsic, so the result equals the tensor composition this
+kernel replaces bit for bit; a row with no adjustment selects its own logits
+unchanged, so it is shaped exactly as it would be without them.
 
 A ``block`` that is larger than a program can hold in registers is walked in
 ``STEP`` wide tiles, so one module serves the descriptor's block whatever its
@@ -27,6 +32,9 @@ def _logits_shape_kernel(
     slots_ptr,
     parameters_ptr,
     extras_ptr,
+    bias_ptr,
+    adjustments_ptr,
+    bans_ptr,
     out_ptr,
     rows,
     vocabulary,
@@ -41,7 +49,11 @@ def _logits_shape_kernel(
 
     The program of row ``r`` reads the counts of slot ``slots[r]``, plus one per
     occurrence of a column among the row's ``EXTRAS`` tokens (``-1`` counts
-    nothing). Grid: ``[rows, ceil(vocabulary / BLOCK), 1]``.
+    nothing). ``adjustments[r]`` is ``(biased, mask)``: a nonzero ``biased``
+    adds row ``slots[r]`` of the ``[slots, vocabulary]`` bias table, and a mask
+    index of zero or more bans every token whose bit is set in that row of the
+    ``[masks, ceil(vocabulary / 32)]`` ban table. Grid:
+    ``[rows, ceil(vocabulary / BLOCK), 1]``.
     """
     if PDL:
         tl.extra.cuda.gdc_wait()
@@ -54,6 +66,11 @@ def _logits_shape_kernel(
     repetition = tl.load(parameters + 4)
     frequency = tl.load(parameters + 5)
     presence = tl.load(parameters + 6)
+    # A padded row names slot -1 and reads no bias row, whatever its flag says.
+    biased = (tl.load(adjustments_ptr + row * 2) != 0) & (slot >= 0)
+    mask_row = tl.load(adjustments_ptr + row * 2 + 1).to(tl.int64)
+    banning = mask_row >= 0
+    words = (vocabulary + 31) // 32
 
     first = tl.program_id(1).to(tl.int64) * BLOCK
     last = tl.minimum(first + BLOCK, vocabulary)
@@ -64,6 +81,21 @@ def _logits_shape_kernel(
         current = tl.load(
             logits_ptr + row * vocabulary + columns, mask=mask, other=0.0
         ).to(tl.float32)
+        # The adjustments select, never round, for a row without them: the
+        # loads are masked off and the row keeps its own logits.
+        bias = tl.load(
+            bias_ptr + slot * vocabulary + columns,
+            mask=mask & biased,
+            other=0.0,
+        )
+        current = tl.where(biased, libdevice.add_rn(current, bias), current)
+        word = tl.load(
+            bans_ptr + mask_row * words + columns // 32,
+            mask=mask & banning,
+            other=0,
+        )
+        banned = ((word >> (columns % 32).to(tl.int32)) & 1) != 0
+        current = tl.where(banned, float("-inf"), current)
         # A padded row names slot -1, which addresses memory before the table: it reads no
         # counts, and its logits are discarded.
         counts = tl.load(

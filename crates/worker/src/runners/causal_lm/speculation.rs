@@ -142,6 +142,10 @@ struct SampleRow {
     /// The tokens before it its penalties count beyond the slot's history: a verification's drafts
     /// ahead of the position, `-1` elsewhere; `drafts` of them.
     extras: Vec<i32>,
+    /// Its logit adjustments, its staged row's: the bias flag and the ban mask's index. Every row of
+    /// a verification samples under its call's bans, which the scheduler keeps uniform over the
+    /// drafts it verifies.
+    adjustment: [i32; 2],
 }
 
 /// One step's plan, read from the staged batch.
@@ -209,6 +213,10 @@ pub(crate) struct Speculation {
     sample_slots: Column,
     draws: Column,
     extras: Column,
+    /// `[tokens, 2]` each sampling row's adjustments, and `[rows, ceil(vocabulary / 32)]` the
+    /// staged batch's ban masks they index.
+    adjustments: Column,
+    bans: Column,
     greedy: Column,
     greedy_logprobs: Column,
     drawn: Column,
@@ -296,6 +304,8 @@ impl Speculation {
             sample_slots: i32s(tokens)?,
             draws: f32s(tokens)?,
             extras: i32s(tokens * u64::from(drafts))?,
+            adjustments: i32s(2 * tokens)?,
+            bans: i32s(rows * u64::from(ops::sampler::ban_words(vocabulary)))?,
             greedy: i32s(tokens)?,
             greedy_logprobs: f32s(tokens)?,
             drawn: i32s(tokens)?,
@@ -390,6 +400,8 @@ impl Plan {
         let slots = staging.slots(row_count);
         let parameters = staging.parameters(row_count);
         let draws = staging.draws(row_count);
+        let adjustments = staging.adjustments().rows(row_count);
+        let adjustment = |row: usize| [adjustments[2 * row], adjustments[2 * row + 1]];
         let ids = staging.input_ids(tokens);
         let work = staging.drafts();
         let mut plan = Plan {
@@ -438,6 +450,7 @@ impl Plan {
                                 position: u64::from(start) + ahead as u64 + 1,
                             },
                             extras,
+                            adjustment: adjustment(row),
                         });
                     }
                 }
@@ -454,6 +467,7 @@ impl Plan {
                             .map_err(|_| Error::Invariant("a parameter row".into()))?,
                         draw: draws[row],
                         extras: vec![-1; drafts as usize],
+                        adjustment: adjustment(row),
                     });
                 }
             }
@@ -491,6 +505,7 @@ impl Plan {
             parameters,
             draw: DrawAddress::default(),
             extras: vec![-1; drafts as usize],
+            adjustment: [0, -1],
         };
         let work = DraftWork {
             proposals: drafts,
@@ -597,6 +612,14 @@ impl<M: TextModel> CausalLmRunner<M> {
         // The rows' checkpoints move into the state pages behind the forward that wrote them.
         self.copy_state(generation, ipc::execution::StateDirection::Keep)?;
         self.write_samples(&plan)?;
+        // The slot bias rows the batch installs, stream-ordered before the sampling that reads them.
+        let installs = self.staging.adjustments().installs();
+        if !installs.is_empty() {
+            self.sampling
+                .as_mut()
+                .ok_or(Error::State("a speculating runner samples"))?
+                .install(installs, &stream)?;
+        }
         self.sample_rows(&forward, &plan, hidden)?;
         stream.synchronize()?;
 
@@ -857,12 +880,15 @@ impl<M: TextModel> CausalLmRunner<M> {
             .iter()
             .flat_map(|row| row.extras.iter().copied())
             .collect();
+        let adjustments: Vec<i32> = plan.samples.iter().flat_map(|row| row.adjustment).collect();
         let encoded = &mut spec.encoded;
         Speculation::write_i32(&mut spec.indices, encoded, &indices)?;
         Speculation::write_i32(&mut spec.sample_slots, encoded, &slots)?;
         Speculation::write_f32(&mut spec.parameters, encoded, &parameters)?;
         Speculation::write_f32(&mut spec.draws, encoded, &draws)?;
         Speculation::write_i32(&mut spec.extras, encoded, &extras)?;
+        Speculation::write_i32(&mut spec.adjustments, encoded, &adjustments)?;
+        Speculation::write_i32(&mut spec.bans, encoded, self.staging.adjustments().bans())?;
         Ok(())
     }
 
@@ -902,6 +928,12 @@ impl<M: TextModel> CausalLmRunner<M> {
             parameters: spec.parameters.shaped(&[rows, COLUMNS as u64]),
             slots: spec.sample_slots.extent(0..rows),
             extras: Some(spec.extras.shaped(&[rows, u64::from(spec.drafts)])),
+            bias: sampling.bias,
+            adjustments: spec.adjustments.shaped(&[rows, 2]),
+            bans: spec.bans.shaped(&[
+                spec.rows,
+                u64::from(ops::sampler::ban_words(spec.vocabulary)),
+            ]),
         };
         let greedy = plan
             .samples

@@ -9,8 +9,8 @@ words; a continued chunk's first token is scored from the logits its request
 retained from the chunk before.
 
 Constraints hold exactly under graphs: allowed tokens, a dominating logit
-bias, reported top logprobs that rank the sampled token, and prompt scores
-for every prompt token after the first.
+bias, bad words of one token and of several, reported top logprobs that rank
+the sampled token, and prompt scores for every prompt token after the first.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from typing import Any
 
 import httpx
 import pytest
+import tokenizers
 
 from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
@@ -117,6 +118,18 @@ def _tokens(reply: dict[str, Any]) -> list[str]:
     ]
 
 
+def _ids(reply: dict[str, Any]) -> list[int]:
+    return [int(token.split(":")[1]) for token in _tokens(reply)]
+
+
+def _word(tokenizer: tokenizers.Tokenizer, ids: list[int]) -> str | None:
+    """The text of `ids` when it encodes back to exactly them, as a bad word."""
+    text = tokenizer.decode(ids)
+    if tokenizer.encode(text, add_special_tokens=False).ids != ids:
+        return None
+    return text
+
+
 # Greedy, reporting five top tokens and three per prompt position.
 GREEDY = {
     "temperature": 0,
@@ -183,3 +196,54 @@ def test_constraints_hold_under_graphs(graphs: str) -> None:
         max_completion_tokens=2,
     )
     assert _tokens(biased)[0] == f"token_id:{forced}"
+
+    # A greedy request restricted to one token selects it at every step.
+    only = _chat(
+        graphs,
+        **GREEDY,
+        allowed_token_ids=[forced],
+        ignore_eos=True,
+        max_completion_tokens=4,
+    )
+    assert set(_ids(only)) == {forced}
+
+
+def test_bad_words_never_complete_under_graphs(graphs: str) -> None:
+    tokenizer = tokenizers.Tokenizer.from_file(
+        f"{_checkpoint()}/tokenizer.json"
+    )
+    greedy = _ids(_chat(graphs, **GREEDY, ignore_eos=True))
+
+    # A one-token bad word: the greedy reply's first token that is a word
+    # of its own is never selected again.
+    single = next(
+        token for token in greedy if _word(tokenizer, [token]) is not None
+    )
+    banned = _ids(
+        _chat(
+            graphs,
+            **GREEDY,
+            ignore_eos=True,
+            bad_words=[_word(tokenizer, [single])],
+        )
+    )
+    assert single not in banned
+    assert banned != greedy
+
+    # A two-token bad word that the greedy reply completes: its first token
+    # may still be selected, never followed by its second.
+    pair = next(
+        list(pair)
+        for pair in zip(greedy, greedy[1:])
+        if _word(tokenizer, list(pair)) is not None
+    )
+    reply = _ids(
+        _chat(
+            graphs,
+            **GREEDY,
+            ignore_eos=True,
+            bad_words=[_word(tokenizer, pair)],
+        )
+    )
+    assert all([a, b] != pair for a, b in zip(reply, reply[1:]))
+    assert reply != greedy

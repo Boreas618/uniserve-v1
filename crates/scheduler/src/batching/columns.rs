@@ -32,6 +32,11 @@
 //! - **page_size** and **max_kv_len**: the cache's geometry;
 //! - **drafts**: each call's draft cache work (`ipc::Call::draft`), for a worker
 //!   that speculates with its model's drafter; empty when no call drafts;
+//! - **adjustments**: the logit adjustments the sampler applies before its
+//!   penalties (`ipc::execution::LogitAdjustments`): the bias row of every
+//!   request whose call installs it ([`adjusts_logits`]), each row's flag that
+//!   it reads its slot's row, and each row's banned tokens, which are its
+//!   call's `SamplingState::suppressed_token_ids`;
 //! - **checkpoints** and **state_copies**, for a deployment whose cache holds a
 //!   state group: the token count each row keeps its recurrent state at (the
 //!   last page boundary inside the row whose state page the request's table
@@ -65,7 +70,10 @@
 
 use std::ops::Range;
 
-use ipc::execution::{BatchColumns, BatchRow, BatchRows, RowKind, StateCopy, StateDirection};
+use ipc::execution::{
+    BatchColumns, BatchRow, BatchRows, LogitAdjustments, RowKind, SlotBias, StateCopy,
+    StateDirection,
+};
 use ipc::{Call, CallKind, ForwardMode};
 use proto::program::commit;
 use proto::request::SamplingParams;
@@ -164,6 +172,31 @@ pub(crate) fn sampler_parameters(sampling: &SamplingParams) -> [f32; SAMPLER_PAR
     columns
 }
 
+/// Whether the request's logits carry a per-slot bias row: a logit bias or an
+/// allowed set, both fixed for the request's lifetime, which the worker keeps in
+/// its slot's row of the bias table once the request's first call installs it.
+pub(crate) fn adjusts_logits(sampling: &SamplingParams) -> bool {
+    !sampling.logit_bias.is_empty() || sampling.allowed_token_ids.is_some()
+}
+
+/// The bias row of a request on `slot`, in the canonical order the worker
+/// checks: biases by increasing token (the last of a repeated token's biases
+/// wins, as a map's insertion would), and the allowed set sorted and deduplicated.
+fn slot_bias(slot: u32, sampling: &SamplingParams) -> SlotBias {
+    let bias: std::collections::BTreeMap<u32, f32> = sampling.logit_bias.iter().copied().collect();
+    let allowed = sampling.allowed_token_ids.as_ref().map(|allowed| {
+        let mut allowed = allowed.clone();
+        allowed.sort_unstable();
+        allowed.dedup();
+        allowed
+    });
+    SlotBias {
+        slot,
+        bias: bias.into_iter().collect(),
+        allowed,
+    }
+}
+
 /// Whether the request's token-count penalties shape its selection: the
 /// reference's `SamplingParams::uses_penalties`, which the commit table states
 /// per sampling row.
@@ -237,10 +270,17 @@ const TEMPERATURE_COLUMN: usize = proto::program::sampler::TEMPERATURE as usize;
 /// on its slot, which restores the state from the checkpoint ending at its read
 /// start when it resumes from a cached prefix. A call that resumes past position
 /// zero with no checkpoint there is a planning fault.
+///
+/// `installing[i]` is whether call `i`'s request slot does not yet hold the
+/// request's bias row on its worker ([`adjusts_logits`]); a request that adjusts
+/// its logits installs the row with such a call, and every row of it reads the
+/// row afterwards. An empty `installing` installs nothing. A call whose
+/// `SamplingState` states a per-step allowed set is refused: the worker keeps an
+/// allowed set only as the request's own slot row.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the calls, their tables, inputs, sampling, draws and slot residency, and the cache's \
-              geometry"
+    reason = "the calls, their tables, inputs, sampling, draws, slot residency and bias \
+              installation, and the cache's geometry"
 )]
 pub(crate) fn columns(
     requests: &[(&Call, &CallLayout)],
@@ -252,12 +292,14 @@ pub(crate) fn columns(
     max_kv_len: u32,
     state: Option<StatePages>,
     resident: &[bool],
+    installing: &[bool],
 ) -> Option<BatchColumns> {
     if requests.len() != inputs.len()
         || requests.len() != sampling.len()
         || requests.len() != draws.len()
         || requests.len() != tables.len()
         || (state.is_some() && requests.len() != resident.len())
+        || (!installing.is_empty() && requests.len() != installing.len())
     {
         return None;
     }
@@ -273,6 +315,9 @@ pub(crate) fn columns(
     let mut input_ids: Vec<i32> = Vec::new();
     let mut parameters: Vec<f32> = Vec::new();
     let mut draw_addresses: Vec<ipc::philox::DrawAddress> = Vec::new();
+    let mut installs: Vec<SlotBias> = Vec::new();
+    let mut biased: Vec<bool> = Vec::new();
+    let mut banned: Vec<Vec<u32>> = Vec::new();
     let drafts: Vec<ipc::DraftWork> = requests.iter().map(|(call, _)| call.draft).collect();
     let mut vision: Vec<ipc::execution::VisionRows> = Vec::new();
     for (index, (call, call_rows)) in requests.iter().enumerate() {
@@ -375,6 +420,23 @@ pub(crate) fn columns(
         let row = sampler_parameters(sampling);
         for _ in 0..rows_of_call {
             parameters.extend_from_slice(&row);
+        }
+        // The call's logit adjustments. The bias row is the request's for its lifetime and is
+        // installed once per slot; the banned tokens are this call's sampling position's
+        // (`Scheduler::build_token_masks`), the same for every row of the call: a verification's
+        // drafts are capped where they would sample under different bans (`verify_drafts`).
+        let adjusts = adjusts_logits(sampling);
+        if adjusts && installing.get(index).copied().unwrap_or(false) {
+            installs.push(slot_bias(request, sampling));
+        }
+        let suppressed = match &call.sampling_state {
+            Some(state) if state.allowed_token_ids.is_some() => return None,
+            Some(state) => state.suppressed_token_ids.as_slice(),
+            None => &[],
+        };
+        for _ in 0..rows_of_call {
+            biased.push(adjusts);
+            banned.push(suppressed.to_vec());
         }
         // Each row draws at the logical position of the token it samples: one past its last
         // query token, so a decode at position `p` samples position `p + 1` and a prompt's last
@@ -534,6 +596,21 @@ pub(crate) fn columns(
             drafts
         },
         vision,
+        // A batch that adjusts no row states no per-row column, as one that drafts nothing
+        // states no draft work.
+        adjustments: LogitAdjustments {
+            installs,
+            biased: if biased.iter().any(|row| *row) {
+                biased
+            } else {
+                Vec::new()
+            },
+            banned: if banned.iter().any(|row| !row.is_empty()) {
+                banned
+            } else {
+                Vec::new()
+            },
+        },
     })
 }
 
@@ -693,7 +770,16 @@ mod tests {
         let requests: Vec<(&Call, &CallLayout)> =
             requests.iter().map(|(call, rows)| (call, rows)).collect();
         super::columns(
-            &requests, tables, inputs, sampling, draws, block_size, max_kv_len, state, resident,
+            &requests,
+            tables,
+            inputs,
+            sampling,
+            draws,
+            block_size,
+            max_kv_len,
+            state,
+            resident,
+            &[],
         )
     }
 
@@ -907,6 +993,118 @@ mod tests {
             1,
             "every penalty of this request is set"
         );
+    }
+
+    /// A request with a logit bias or an allowed set installs its slot's bias row with the call
+    /// that is not yet resident, flags every row of it, and bans its call's suppressed tokens; a
+    /// request with neither, beside it, states nothing, and a batch of such requests alone states
+    /// no adjustment at all.
+    #[test]
+    fn a_batch_states_the_logit_adjustments_its_requests_ask_for() {
+        let mut first = call(decode(), 12, &[1]);
+        first.coordinates.cache_visible_len = 12;
+        first.sampling_state = Some(ipc::SamplingState {
+            suppressed_token_ids: vec![2, 9],
+            ..ipc::SamplingState::default()
+        });
+        let mut second = call(decode(), 12, &[1]);
+        second.coordinates.cache_visible_len = 12;
+        let requests = vec![
+            (first, dispatch(3, &[1], &[true])),
+            (second, dispatch(4, &[1], &[true])),
+        ];
+        let restricted = SamplingParams {
+            // Out of order and repeated, as a client may send them.
+            logit_bias: vec![(7, 1.5), (5, -2.0)],
+            allowed_token_ids: Some(vec![7, 5, 7, 11]),
+            ..sampling()
+        };
+        let plain = sampling();
+        let calls: Vec<(&Call, &CallLayout)> =
+            requests.iter().map(|(call, rows)| (call, rows)).collect();
+        let fill = |installing: &[bool], sampling: [&SamplingParams; 2]| {
+            super::columns(
+                &calls,
+                &tables_of(&requests),
+                &[vec![42], vec![43]],
+                &sampling,
+                &[5, 5],
+                BLOCK_SIZE,
+                2048,
+                None,
+                &[],
+                installing,
+            )
+            .expect("a decode batch")
+        };
+
+        let columns = fill(&[true, true], [&restricted, &plain]);
+        let adjustments = &columns.adjustments;
+        assert_eq!(
+            adjustments.installs,
+            vec![SlotBias {
+                slot: 3,
+                bias: vec![(5, -2.0), (7, 1.5)],
+                allowed: Some(vec![5, 7, 11]),
+            }],
+            "only the request that adjusts its logits installs a row, in canonical order"
+        );
+        assert_eq!(adjustments.biased, vec![true, false]);
+        assert_eq!(adjustments.banned, vec![vec![2, 9], Vec::new()]);
+        columns
+            .check(&batch_shape(&columns))
+            .expect("the adjustments are canonical and one per row");
+
+        // Once the row is resident the request still reads it, and installs nothing.
+        let resident = fill(&[false, false], [&restricted, &plain]);
+        assert!(resident.adjustments.installs.is_empty());
+        assert_eq!(resident.adjustments.biased, vec![true, false]);
+
+        // A per-step allowed set has no device form: the batch is refused rather than served
+        // without it.
+        let mut stepped = requests.clone();
+        stepped[1].0.sampling_state = Some(ipc::SamplingState {
+            allowed_token_ids: Some(vec![1]),
+            ..ipc::SamplingState::default()
+        });
+        let stepped_calls: Vec<(&Call, &CallLayout)> =
+            stepped.iter().map(|(call, rows)| (call, rows)).collect();
+        assert!(
+            super::columns(
+                &stepped_calls,
+                &tables_of(&stepped),
+                &[vec![42], vec![43]],
+                &[&plain, &plain],
+                &[5, 5],
+                BLOCK_SIZE,
+                2048,
+                None,
+                &[],
+                &[],
+            )
+            .is_none()
+        );
+
+        // Requests that ask for none of them state nothing.
+        let mut quiet = requests.clone();
+        quiet[0].0.sampling_state = None;
+        let quiet_calls: Vec<(&Call, &CallLayout)> =
+            quiet.iter().map(|(call, rows)| (call, rows)).collect();
+        let none = super::columns(
+            &quiet_calls,
+            &tables_of(&quiet),
+            &[vec![42], vec![43]],
+            &[&plain, &plain],
+            &[5, 5],
+            BLOCK_SIZE,
+            2048,
+            None,
+            &[],
+            &[true, true],
+        )
+        .expect("a decode batch");
+        assert!(none.adjustments.is_empty());
+        assert!(none.adjustments.biased.is_empty() && none.adjustments.banned.is_empty());
     }
 
     /// A seeded request's draw is addressed by its seed and the position of the token it samples:

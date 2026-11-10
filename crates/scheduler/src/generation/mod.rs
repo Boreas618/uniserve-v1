@@ -795,14 +795,10 @@ pub(crate) fn validate_generation_result(
         return Ok(());
     }
 
-    // Sampled tokens: presence, verified-draft prefix, count, and allowed set.
+    // Sampled tokens: presence, verified-draft prefix and count. The allowed
+    // set and the banned tokens are the sampler's to apply, on the device.
     let sampled_tokens = record.committed_tokens.as_slice();
     let produces_token = call.token_output.is_some();
-    let allowed_tokens = call
-        .sampling_state
-        .as_ref()
-        .and_then(|sampling| sampling.allowed_token_ids.as_deref())
-        .or(request.sampling.allowed_token_ids.as_deref());
     if !produces_token && !sampled_tokens.is_empty() {
         return Err(GenerationResultError::Token {
             detail: "unexpected_sampled_token",
@@ -849,16 +845,6 @@ pub(crate) fn validate_generation_result(
             });
         }
     }
-    if let Some(allowed) = allowed_tokens
-        && sampled_tokens
-            .iter()
-            .any(|token_id| !allowed.contains(token_id))
-    {
-        return Err(GenerationResultError::Token {
-            detail: "sampled_token_outside_allowed_set",
-        });
-    }
-
     // Generated logprobs are expected exactly when a forward call samples a
     // token and the request asked for them, one entry per committed token
     // (a verification's accepted drafts and the token after them alike):
@@ -1051,6 +1037,12 @@ pub(crate) struct RequestState {
     /// reused prefix ends at (`batching::columns`). A preempted or migrated
     /// request is admitted again as a new state, so it restores again.
     pub(crate) state_resident: bool,
+    /// Whether the worker's bias table holds the request's row in its slot
+    /// (`batching::columns::adjusts_logits`): false until the request's first
+    /// token batch on a worker group installs it, and again after a hand-off
+    /// moves the request to the decode group. A preempted or migrated request
+    /// is admitted again as a new state, so it installs again.
+    pub(crate) bias_resident: bool,
     /// Allocation serial of the request's cache units already declared to the
     /// workers: units allocated at or after it are fresh for the next
     /// dispatch (`CacheAllocation::allocated_units`).

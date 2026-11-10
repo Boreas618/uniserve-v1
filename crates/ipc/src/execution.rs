@@ -783,6 +783,9 @@ pub struct BatchColumns {
     /// The image blocks the batch's prefill rows write, in token order: each block's token rows
     /// carry no id the embedding reads, and the worker writes the feature product's rows there.
     pub vision: Vec<VisionRows>,
+    /// The logit adjustments the sampler applies before penalties, temperature and filtering:
+    /// the slots' logit bias and allowed sets, and each row's banned tokens.
+    pub adjustments: LogitAdjustments,
 }
 
 /// One vision encoding of a batch: the image a call reads and the feature product it writes.
@@ -809,6 +812,57 @@ pub struct VisionRows {
     pub start: u32,
     /// The feature product the rows are.
     pub feature: crate::BufferId,
+}
+
+/// The logit adjustments of one batch: what the sampler adds to a row's logits before its
+/// penalties, its temperature and its candidate filtering (`ops::sampler::LogitsShape`).
+///
+/// Two lifetimes, so two forms:
+///
+/// - a request's **logit bias** and **allowed set** are fixed for its lifetime, so they live in a
+///   per-slot table on the worker, one `[vocabulary]` f32 row per request slot: the bias of each
+///   biased token, `-inf` at every token outside an allowed set, `0` elsewhere. The batch carrying a
+///   request's first sampling call on a worker states its row once ([`SlotBias`]), and every row of
+///   the request reads it by its flag in [`Self::biased`];
+/// - a row's **banned tokens** move with its history: the end-of-sequence tokens under a
+///   `min_tokens` floor and the last token of every bad word whose prefix the generated tokens end
+///   with (the scheduler's `SamplingState::suppressed_token_ids`). They are stated per row and per
+///   batch, and a banned token's logit is `-inf`.
+///
+/// A batch none of whose requests asks for any of them states nothing here, and its rows sample
+/// exactly as they would without the mechanism.
+#[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LogitAdjustments {
+    /// The slot rows of the bias table this batch writes before it samples.
+    pub installs: Vec<SlotBias>,
+    /// `[rows]` whether each row adds its slot's bias row; empty when no row does.
+    pub biased: Vec<bool>,
+    /// `[rows]` the tokens each row may not sample, strictly increasing; empty when no row bans
+    /// any.
+    pub banned: Vec<Vec<u32>>,
+}
+
+impl LogitAdjustments {
+    /// Whether the batch adjusts no row's logits and installs nothing.
+    pub fn is_empty(&self) -> bool {
+        self.installs.is_empty()
+            && !self.biased.iter().any(|biased| *biased)
+            && self.banned.iter().all(Vec::is_empty)
+    }
+}
+
+/// One request slot's row of the worker's bias table: the additive term of every token of the
+/// slot's request, written before the batch that states it samples.
+#[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SlotBias {
+    /// The request slot whose row this is: the sampler slot of the request's rows.
+    pub slot: u32,
+    /// `(token, bias)` pairs, strictly increasing in token; a token outside the vocabulary is
+    /// ignored, as no logit carries it.
+    pub bias: Vec<(u32, f32)>,
+    /// The tokens the request may sample, strictly increasing, when it restricts them: every other
+    /// token's row entry is `-inf`, whatever its bias.
+    pub allowed: Option<Vec<u32>>,
 }
 
 /// One copy of a request slot's recurrent state between its banks and a state page of the cache.
@@ -1137,6 +1191,39 @@ impl BatchColumns {
                 "drafts has {} entries, the batch has {calls} calls",
                 self.drafts.len()
             )));
+        }
+        let adjustments = &self.adjustments;
+        for (name, actual) in [
+            ("biased", adjustments.biased.len()),
+            ("banned", adjustments.banned.len()),
+        ] {
+            if actual != 0 && actual != rows {
+                return Err(ValidationError::message(format!(
+                    "{name} has {actual} entries, the batch has {rows} rows"
+                )));
+            }
+        }
+        let increasing = |tokens: &[u32]| tokens.windows(2).all(|pair| pair[0] < pair[1]);
+        for install in &adjustments.installs {
+            let biased: Vec<u32> = install.bias.iter().map(|(token, _)| *token).collect();
+            if !increasing(&biased)
+                || install
+                    .allowed
+                    .as_deref()
+                    .is_some_and(|allowed| !increasing(allowed))
+                || install.bias.iter().any(|(_, bias)| !bias.is_finite())
+            {
+                return Err(ValidationError::message(format!(
+                    "slot {}'s bias row is not canonical: its tokens must be strictly increasing \
+                     and its biases finite",
+                    install.slot
+                )));
+            }
+        }
+        if !adjustments.banned.iter().all(|tokens| increasing(tokens)) {
+            return Err(ValidationError::message(
+                "a row's banned tokens are not strictly increasing",
+            ));
         }
         Ok(())
     }

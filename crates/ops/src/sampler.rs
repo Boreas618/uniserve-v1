@@ -4,7 +4,14 @@
 //! The steps are separate operators because each is one kernel program and each is replaced on its
 //! own during a program-layer update; the `Sampler` layer calls them in this order:
 //!
-//! 1. `logits_shape` applies the request's penalties and divides by its temperature. **A row whose
+//! 1. `logits_shape` applies the request's logit adjustments, then its penalties, and divides by its
+//!    temperature. The adjustments come first, in vLLM's order (allowed set, bad words and the
+//!    `min_tokens` floor, then the logit bias, then the penalties): a row that reads its slot's bias
+//!    row adds it, which is `-inf` outside the request's allowed set, and a token the row bans
+//!    becomes `-inf`. A `-inf` logit passes the penalties and the temperature unchanged, so masking
+//!    before or after them is the same, and the bias is the one adjustment whose place matters: the
+//!    repetition penalty scales the biased logit. A row that reads no bias row and bans nothing is
+//!    shaped exactly as without the adjustments, rounding for rounding. **A row whose
 //!    temperature is zero divides by one**, not by zero: callers select those rows by argmax, and
 //!    without that rule every greedy request would be shaped into `inf` and `nan` logits. The
 //!    shaped row is then the penalized logits themselves, so the row's largest candidate is its
@@ -89,11 +96,25 @@ pub struct ShapeArgs {
     pub parameters: TensorView,
     /// `[rows, extras]` i32 tokens counted besides the slot's, `-1` counting nothing.
     pub extras: Option<TensorView>,
+    /// `[slots, vocabulary]` f32 each slot's bias row: its request's logit bias, `-inf` outside its
+    /// allowed set, `0` elsewhere. Read only by a row whose adjustment flag names it.
+    pub bias: TensorView,
+    /// `[rows, 2]` i32 each row's adjustments: whether it adds its slot's bias row (`1`) or not
+    /// (`0`), and the index of its ban mask among `bans`, `-1` for none.
+    pub adjustments: TensorView,
+    /// `[masks, ceil(vocabulary / 32)]` i32 ban masks: bit `t % 32` of word `t / 32` set bans token
+    /// `t`. Read only through a row's mask index.
+    pub bans: TensorView,
     /// `[rows, vocabulary]` FP32 shaped logits.
     pub out: TensorView,
 }
 
-/// Penalize and temperature-scale the logits of every row.
+/// The words of one ban mask over a `vocabulary`-wide row: one bit per token.
+pub const fn ban_words(vocabulary: u32) -> u32 {
+    vocabulary.div_ceil(32)
+}
+
+/// Adjust, penalize and temperature-scale the logits of every row.
 pub struct LogitsShape;
 
 impl Op for LogitsShape {
@@ -121,6 +142,24 @@ impl Op for LogitsShape {
         )?;
         args.counts
             .require_row(Self::NAME, DType::I32, vocabulary)?;
+        args.bias.require_row(Self::NAME, DType::F32, vocabulary)?;
+        if args.bias.rows() != args.counts.rows() {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "{} bias rows for {} count rows: both are one row per slot",
+                    args.bias.rows(),
+                    args.counts.rows()
+                ),
+            ));
+        }
+        args.adjustments
+            .require_shape(Self::NAME, Shape::new(&[rows, 2]))?;
+        args.bans.require_row(
+            Self::NAME,
+            DType::I32,
+            u64::from(ban_words(descriptor.vocabulary)),
+        )?;
         match (descriptor.extras, args.extras) {
             (0, None) => {}
             (extras, Some(extra)) => {
@@ -156,6 +195,9 @@ impl Op for LogitsShape {
             .view(args.slots)
             .view(args.parameters)
             .view(extras)
+            .view(args.bias)
+            .view(args.adjustments)
+            .view(args.bans)
             .view(args.out)
             .u64(rows)
             .u32(descriptor.vocabulary)
@@ -176,10 +218,10 @@ impl Op for LogitsShape {
     }
 
     fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
-        // Four rounded FP32 operations per element at most: the penalty, its two parts and the
-        // temperature division. The comparison is against the same inputs, so the bound is those
-        // roundings twice over.
-        Tolerance::rounding(4, DType::F32, DType::F32)
+        // Five rounded FP32 operations per element at most: the bias, the penalty, its two parts
+        // and the temperature division. The comparison is against the same inputs, so the bound is
+        // those roundings twice over.
+        Tolerance::rounding(5, DType::F32, DType::F32)
     }
 }
 

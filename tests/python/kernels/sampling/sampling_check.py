@@ -16,9 +16,10 @@ Operators, in the order the data meets them:
 - `logits_gather` — copy the rows `lm_head` computes (each request's last position) out of
   the batch's hidden state. Values move, so the comparison is **exact**.
 - `vocab_unpad` — drop the padding a sharded vocabulary carries. Values move, exact.
-- `logits_shape` — apply the repetition, frequency and presence penalties and the
-  temperature to every column. Arithmetic, compared at the operator's bound
-  (`rounding(4, F32, F32)`).
+- `logits_shape` — apply the logit adjustments (a slot's bias row, `-inf` at a row's banned
+  tokens), then the repetition, frequency and presence penalties and the temperature to every
+  column. Arithmetic, compared at the operator's bound (`rounding(5, F32, F32)`); a row without
+  adjustments must not read the bias row or the ban masks it is handed.
 - `filter_candidates` — the top-k width, the nucleus and the min-previews thresholds, which
   drop candidates by writing `-inf` over them, plus the row-validity flag. Decisions, so the
   comparison is exact; the thresholds in every case sit more than `1e-4` away from any
@@ -261,7 +262,7 @@ def run_vocab_unpad(case):
 
 
 def run_logits_shape(case):
-    """Penalize and scale every row's logits, and compare at the operator's bound."""
+    """Adjust, penalize and scale every row's logits, and compare at the operator's bound."""
     import logits_shape as kernels
 
     dtype = TORCH_TYPES[case["dtype"]]
@@ -289,6 +290,34 @@ def run_logits_shape(case):
         extras[:, 0] = 9
         if case["extras"] > 1:
             extras[:, 1] = -1
+    # The adjustments. The bias table and the ban masks are filled in every case: a row whose flag
+    # does not name them must read neither, so a case without adjustments holds values a stray
+    # read would show.
+    words = (vocabulary + 31) // 32
+    bias = torch.randn(rows, vocabulary, generator=generator) * 4.0
+    bans = torch.randint(
+        -(2**31),
+        2**31 - 1,
+        (rows, words),
+        generator=generator,
+        dtype=torch.int32,
+    )
+    adjustments = torch.tensor([[0, -1]] * rows, dtype=torch.int32)
+    if case["adjusted"]:
+        # Row 0 restricts its tokens (the bias row is `-inf` outside its allowed set) and bans
+        # tokens at word edges, the sign bit and the last token; the last row is padding, whose
+        # flag names a bias row its slot cannot address.
+        bias[0, ::3] = float("-inf")
+        bans.zero_()
+        for token in (2, 31, 32, vocabulary - 1):
+            bans[0, token // 32] |= torch.tensor(1 << (token % 32)).to(
+                torch.int32
+            )
+        bans[1, 0] = 1 << 4
+        adjustments[0] = torch.tensor([1, 0])
+        adjustments[1] = torch.tensor([0, 1])
+        slots[-1] = -1
+        adjustments[-1] = torch.tensor([1, -1])
     out = torch.full((rows, vocabulary), float("nan"), dtype=torch.float32)
 
     launch(
@@ -299,6 +328,9 @@ def run_logits_shape(case):
         slots,
         parameters,
         extras if extras is not None else slots,
+        bias,
+        adjustments,
+        bans,
         out,
         rows,
         vocabulary,
@@ -311,7 +343,19 @@ def run_logits_shape(case):
     )
 
     exact_logits = logits.cpu().double()
+    # The adjustments first: a flagged row with a slot adds its bias row, and a row with a mask
+    # bans the tokens its bits name.
+    for row in range(rows):
+        if adjustments[row, 0] != 0 and slots[row] >= 0:
+            exact_logits[row] += bias[slots[row].long()].double()
+        if adjustments[row, 1] >= 0:
+            mask = bans[adjustments[row, 1].long()].long() & 0xFFFFFFFF
+            token = torch.arange(vocabulary)
+            banned = ((mask[token // 32] >> (token % 32)) & 1) != 0
+            exact_logits[row, banned] = float("-inf")
     exact_counts = counts.double()
+    # A padded row reads no counts.
+    exact_counts[slots < 0] = 0.0
     if extras is not None:
         for index in range(case["extras"]):
             token = extras[:, index].cpu().long()
@@ -329,6 +373,10 @@ def run_logits_shape(case):
     adjusted = repeated - frequency * exact_counts - presence
     apply = (exact_counts > 0.0) & (exact_logits != float("-inf"))
     expected = torch.where(apply, adjusted, exact_logits)
+    biased = torch.zeros(rows, vocabulary, dtype=torch.float64)
+    for row in range(rows):
+        if adjustments[row, 0] != 0 and slots[row] >= 0:
+            biased[row] = exact_logits[row].abs()
     if case["divide"]:
         divisor = torch.where(
             temperature > 0.0, temperature, torch.ones_like(temperature)
@@ -337,10 +385,14 @@ def run_logits_shape(case):
     if case["truncate"]:
         expected = truncate(expected)
 
-    relative = gamma(4) + UNIT_ROUNDOFF["f32"]
-    # The penalties are subtracted from a value their own magnitudes set, not the result's.
+    relative = gamma(5) + UNIT_ROUNDOFF["f32"]
+    # The penalties are subtracted from a value their own magnitudes set, not the result's, and
+    # the bias's sum is rounded once before them.
     floor = UNIT_ROUNDOFF["f32"] * (
-        repeated.abs() + (frequency * exact_counts).abs() + presence.abs()
+        repeated.abs().nan_to_num(posinf=0.0)
+        + (frequency * exact_counts).abs()
+        + presence.abs()
+        + biased.nan_to_num(posinf=0.0)
     )
     failures, line = compare_relative(
         "out", out.cpu().double(), expected, relative, floor, case["bound"]
@@ -348,6 +400,7 @@ def run_logits_shape(case):
     print(
         f"{'exact' if failures == 0 else 'FAIL'}: logits_shape, {case['label']} — "
         f"{rows} x {vocabulary}, block {block}, extras {case['extras']}, "
+        f"adjusted {str(case['adjusted']).lower()}, "
         f"divide {str(case['divide']).lower()}, temperature {case['temperature']:g}, "
         f"{case['dtype']} in"
         f"{', interpreter cast truncated' if case['truncate'] else ''}"
@@ -1025,6 +1078,7 @@ def cases(operator, flags):
             "divide": flags.divide == "true",
             "temperature": 0.7,
             "masked": True,
+            "adjusted": False,
             "seed": 1,
         },
         {
@@ -1037,6 +1091,7 @@ def cases(operator, flags):
             "divide": True,
             "temperature": 0.0,
             "masked": False,
+            "adjusted": False,
             "seed": 2,
         },
         {
@@ -1049,7 +1104,34 @@ def cases(operator, flags):
             "divide": False,
             "temperature": 0.7,
             "masked": True,
+            "adjusted": False,
             "seed": 3,
+        },
+        {
+            "label": "a restricted, biased and banning row, a banning row and a padded row",
+            "dtype": flags.dtype,
+            "rows": 3,
+            "vocabulary": 500,
+            "block": 256,
+            "extras": 0,
+            "divide": True,
+            "temperature": 0.7,
+            "masked": True,
+            "adjusted": True,
+            "seed": 4,
+        },
+        {
+            "label": "the fixture's vocabulary adjusted, greedy",
+            "dtype": flags.dtype,
+            "rows": 3,
+            "vocabulary": flags.vocabulary,
+            "block": flags.block,
+            "extras": 0,
+            "divide": True,
+            "temperature": 0.0,
+            "masked": False,
+            "adjusted": True,
+            "seed": 5,
         },
     ]
 

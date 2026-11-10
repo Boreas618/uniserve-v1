@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 ///
 /// Worker-side math (temperature, top_k, top_p, min_p, typical_p, penalties,
 /// logit_bias, allowed and forced tokens) operates on the logits tensor inside
-/// the worker. The engine scheduler enforces the
-/// control-flow fields on the host: `min_tokens` and `bad_words_ids` become
-/// per-step suppression masks, and `ignore_eos` decides whether a sampled EOS
-/// finishes the request. Fields are scalars or small id/weight lists — never
+/// the worker. The engine scheduler decides the fields that depend on a
+/// request's progress: `min_tokens` and `bad_words_ids` become per-step sets of
+/// banned tokens, which the worker's sampler masks, and `ignore_eos` decides
+/// whether a sampled EOS finishes the request. Fields are scalars or small id/weight lists — never
 /// tensors — so they can cross the worker boundary without carrying device
 /// state.
 ///
@@ -51,7 +51,8 @@ pub struct SamplingParams {
     /// How many highest-probability alternatives to return per scored prompt position.
     pub n_prompt_logprobs: u32,
     /// Bad-word token sequences: generation may not complete any of these.
-    /// Enforced host-side by masking the completing token.
+    /// The scheduler bans a word's last token wherever the generated tokens
+    /// end with the rest of it, and the worker's sampler masks it.
     pub bad_words_ids: Vec<Vec<u32>>,
     /// If set, only these token ids may be sampled (whitelist mask).
     pub allowed_token_ids: Option<Vec<u32>>,

@@ -609,22 +609,13 @@ impl Scheduler {
             state.num_generated_tokens.saturating_add(projected)
         });
         let state = self.running.get(&id)?;
-        let sampling = &state.req.sampling;
-        let generated = &state.generated_token_ids;
-        let mut suppress = Vec::new();
-        if n_generated < sampling.min_tokens {
-            suppress.extend_from_slice(&self.special_tokens.eos);
-        }
-        for word in &sampling.bad_words_ids {
-            let Some((&last, prefix)) = word.split_last() else {
-                continue;
-            };
-            if generated.ends_with(prefix) {
-                suppress.push(last);
-            }
-        }
-        suppress.sort_unstable();
-        suppress.dedup();
+        let suppress = suppressed_tokens(
+            &state.req.sampling,
+            &self.special_tokens.eos,
+            &state.generated_token_ids,
+            n_generated,
+            &[],
+        );
 
         let sampling = SamplingState {
             allowed_token_ids: None,
@@ -633,5 +624,88 @@ impl Scheduler {
             force_finish: n_generated.saturating_add(1) >= state.req.max_und_tokens,
         };
         (sampling != SamplingState::default()).then_some(sampling)
+    }
+}
+
+/// The tokens a request sampling with `sampling` may not sample at the position after its
+/// `n_generated` generated tokens followed by `drafts`, where `generated` holds the ids of the
+/// generated tokens (a migrated request's included): its end-of-sequence tokens `eos` while it is
+/// under its `min_tokens` floor, and the last token of every bad word whose prefix the generated
+/// tokens and the drafts end with. The rule is vLLM's (`apply_bad_words`, over the output tokens
+/// only), sorted and deduplicated; the worker's sampler masks these tokens to `-inf` before the
+/// penalties.
+pub(crate) fn suppressed_tokens(
+    sampling: &proto::request::SamplingParams,
+    eos: &[u32],
+    generated: &[u32],
+    n_generated: usize,
+    drafts: &[u32],
+) -> Vec<u32> {
+    let mut suppress = Vec::new();
+    if n_generated.saturating_add(drafts.len()) < sampling.min_tokens {
+        suppress.extend_from_slice(eos);
+    }
+    for word in &sampling.bad_words_ids {
+        let Some((&last, prefix)) = word.split_last() else {
+            continue;
+        };
+        // The history is the generated tokens, then the drafts: a prefix longer than the drafts
+        // ends in the generated tokens, a shorter one in the drafts alone.
+        let matches = if prefix.len() <= drafts.len() {
+            drafts.ends_with(prefix)
+        } else {
+            let (head, tail) = prefix.split_at(prefix.len() - drafts.len());
+            tail == drafts && generated.ends_with(head)
+        };
+        if matches {
+            suppress.push(last);
+        }
+    }
+    suppress.sort_unstable();
+    suppress.dedup();
+    suppress
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bad word bans its last token exactly where the history ends with its prefix, the history
+    /// being the generated tokens and then the drafts; a single-token word bans its token always,
+    /// and the `min_tokens` floor bans the end-of-sequence tokens until the floor is met.
+    #[test]
+    fn a_bad_word_bans_its_last_token_where_its_prefix_ends_the_history() {
+        let sampling = proto::request::SamplingParams {
+            bad_words_ids: vec![vec![4], vec![7, 8, 9]],
+            min_tokens: 3,
+            ..proto::request::SamplingParams::default()
+        };
+        let eos = [2];
+        // Under the floor: the end-of-sequence token and the single-token word.
+        assert_eq!(suppressed_tokens(&sampling, &eos, &[1], 1, &[]), vec![2, 4]);
+        // At the floor, with the three-token word's prefix ending the generated tokens.
+        assert_eq!(
+            suppressed_tokens(&sampling, &eos, &[1, 7, 8], 3, &[]),
+            vec![4, 9]
+        );
+        // The prefix across the generated tokens and the drafts, and in the drafts alone.
+        assert_eq!(
+            suppressed_tokens(&sampling, &eos, &[1, 7], 3, &[8]),
+            vec![4, 9]
+        );
+        assert_eq!(
+            suppressed_tokens(&sampling, &eos, &[1], 3, &[7, 8]),
+            vec![4, 9]
+        );
+        // A prefix the history does not end with bans nothing more; the drafts count toward the
+        // floor.
+        assert_eq!(
+            suppressed_tokens(&sampling, &eos, &[7, 8], 2, &[5]),
+            vec![4]
+        );
+        assert_eq!(
+            suppressed_tokens(&sampling, &eos, &[1], 1, &[5]),
+            vec![2, 4]
+        );
     }
 }
