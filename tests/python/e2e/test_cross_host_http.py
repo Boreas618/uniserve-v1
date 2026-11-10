@@ -26,12 +26,8 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shlex
-import shutil
 import subprocess
-import tempfile
-import time
 from pathlib import Path
 
 import httpx
@@ -39,14 +35,16 @@ import pytest
 
 from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
-    QWEN3_CHECKPOINT,
+    admin_status,
     find_free_port,
     granted_devices,
-    host_asset,
+    log_tail,
+    qwen3_checkpoint,
     require_uniserve_binary,
+    runtime_directory,
     second_host,
     server_process,
-    stop_storage_server,
+    wait_until,
     worker_executable,
 )
 from tests.python.e2e.program_server import remote_program_server
@@ -100,21 +98,6 @@ def _chunk_tokens(line: str) -> tuple[list[str], dict | None, bool]:
     return tokens, chunk.get("usage"), False
 
 
-def _log_lines(log: Path) -> list[str]:
-    """The lines of `log` without their terminal colors."""
-    colors = re.compile(r"\x1b\[[0-9;]*m")
-    return [colors.sub("", line) for line in log.read_text().splitlines()]
-
-
-def _await_line(log: Path, text: str, timeout_s: float) -> None:
-    """Wait until the server log holds a line containing `text`."""
-    deadline = time.monotonic() + timeout_s
-    while not any(text in line for line in _log_lines(log)):
-        if time.monotonic() > deadline:
-            pytest.fail(f"the server did not log {text!r}")
-        time.sleep(1)
-
-
 def _kill_serving_peer(host: str) -> None:
     """Kill the second host's serving main process.
 
@@ -145,8 +128,7 @@ def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
             "a worker group over two hosts needs UNISERVE_H3_FOLLOWER and "
             "UNISERVE_H3_LEADER_ADDRESS"
         )
-    checkpoint = str(host_asset("UNISERVE_QWEN3_MODEL", QWEN3_CHECKPOINT))
-    runtime = Path(tempfile.mkdtemp(prefix="uniserve-"))
+    checkpoint = qwen3_checkpoint()
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     address = f"{LEADER_ADDRESS}:{find_free_port()}"
@@ -190,14 +172,14 @@ def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
         "--set",
         "worker_config.standby=true",
     ]
-    env = {
-        "CUDA_VISIBLE_DEVICES": granted_devices(1),
-        "XDG_RUNTIME_DIR": str(runtime),
-    }
     log = tmp_path / "server.log"
     streamed: list[str] = []
     usage = None
-    try:
+    with runtime_directory(tmp_path / "storage-server.log") as runtime:
+        env = {
+            "CUDA_VISIBLE_DEVICES": granted_devices(1),
+            "XDG_RUNTIME_DIR": str(runtime),
+        }
         with (
             remote_program_server(FOLLOWER) as follower_programs,
             second_host(
@@ -211,11 +193,16 @@ def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
             ),
             server_process(command, base_url, log, timeout_s=1800, env=env),
         ):
-            _await_line(
-                log,
-                "the standby epoch of the failure domain is parked",
-                timeout_s=1800,
+            # The standby epoch over both hosts parked with its graphs.
+            wait_until(
+                lambda: (
+                    admin_status(base_url)["deployment"]["standby"] or {}
+                ).get("prepared"),
+                1800,
+                "the deployment reported no prepared standby",
+                context=lambda: log_tail(log),
             )
+            before = admin_status(base_url)["deployment"]
             with httpx.stream(
                 "POST",
                 f"{base_url}/v1/chat/completions",
@@ -245,21 +232,13 @@ def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
                 for entry in answer["choices"][0]["logprobs"]["content"]
             ]
             reference_usage = answer["usage"]
-    finally:
-        stop_storage_server(runtime)
-        storage_log = runtime / "uniserve" / "storage-server.log"
-        if storage_log.is_file():
-            shutil.copy(storage_log, tmp_path / "storage-server.log")
-        shutil.rmtree(runtime, ignore_errors=True)
+            after = admin_status(base_url)["deployment"]
 
-    lines = _log_lines(log)
-
-    def logged(text: str) -> bool:
-        return any(text in line for line in lines)
-
-    assert logged("starting an engine whose worker group spans hosts")
-    assert logged("the failure domain's standby epoch was promoted")
-    assert not logged("the engine was lost; starting another")
-    assert logged("a request migrated"), "the streaming request did not migrate"
+    # The domain's standby epoch serves now, rather than an engine launched
+    # anew, and the request continued on it where the kill stopped it.
+    assert after["generation"] == before["standby"]["generations"][0], (
+        before,
+        after,
+    )
     assert streamed == reference
     assert usage == reference_usage
