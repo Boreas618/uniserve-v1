@@ -1078,7 +1078,6 @@ fn latent_blocks_are_admitted_only_at_captured_sizes() {
 /// prefix up to the checkpoint the first request's prompt kept at its last
 /// page boundary, and no deeper.
 #[test]
-#[ignore = "no device layout for a batch over several cache groups"]
 fn a_state_group_reuses_prefixes_up_to_a_checkpoint() {
     use scheduler::SchedulerHandle;
     use std::sync::atomic::Ordering;

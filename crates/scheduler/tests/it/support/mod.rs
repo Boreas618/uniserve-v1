@@ -77,36 +77,31 @@ use scheduler::{GenerationFeatures, GenerationLimits};
 use scheduler::{Parameters, PolicyProgram, Scheduler, SchedulerConfig, SpecialTokenIds, Worker};
 use testkit::EndOfText;
 
-/// Builds a scheduler whose model limits follow from `worker`'s call kinds.
+/// Builds a scheduler over the simulated worker `worker`, whose model limits
+/// follow from its call kinds (`generation_limits`), with `fcfs` installed.
 ///
-/// A token-denoising worker without text decode generates block-diffusion
-/// canvases over prompts that may carry encoded images; one that prepares latents without
-/// decoding text serves video diffusion, which needs no generation feature.
-/// Any other denoising, vision-encoding or latent-encoding worker serves
-/// interleaved text and images without bound, and the rest serve text.
+/// Only the block-diffusion cases (`canvas`, `image_context`) still run over
+/// the simulator: the column writer lays out no token-denoising call, so the
+/// batch fake cannot observe them.
 pub(crate) fn scheduler_with(
     worker: Box<dyn Worker>,
     special_tokens: SpecialTokenIds,
     config: SchedulerConfig,
 ) -> anyhow::Result<Scheduler> {
-    scheduler_with_stating(worker, special_tokens, config, Parameters::default())
-}
-
-/// [`scheduler_with`], installing a policy that also states `stated`.
-pub(crate) fn scheduler_with_stating(
-    worker: Box<dyn Worker>,
-    special_tokens: SpecialTokenIds,
-    config: SchedulerConfig,
-    stated: Parameters,
-) -> anyhow::Result<Scheduler> {
     let info = worker.info().runtime_info()?;
-    build(
+    let limits = generation_limits(&info.supported_calls);
+    let mut scheduler = Scheduler::new(
         scheduler::Submissions::new(worker),
-        &info,
         special_tokens,
         config,
-        stated,
-    )
+        limits,
+    )?;
+    install_policy_stating(
+        &mut scheduler,
+        scheduler::BatchCapacity::of(&info),
+        Parameters::default(),
+    );
+    Ok(scheduler)
 }
 
 /// A rank of the scheduler tests' text deployment: every call kind, a buffer
@@ -151,21 +146,6 @@ pub(crate) fn text_pool(
         Some(end) => batches.with_end(end),
         None => batches,
     }
-}
-
-/// Builds a scheduler over `submissions` serving a pool whose rank is `info`,
-/// with the model limits its call kinds imply, and installs `fcfs`.
-fn build(
-    submissions: scheduler::Submissions,
-    info: &MainProcessInfo,
-    special_tokens: SpecialTokenIds,
-    config: SchedulerConfig,
-    stated: Parameters,
-) -> anyhow::Result<Scheduler> {
-    let limits = generation_limits(&info.supported_calls);
-    let mut scheduler = Scheduler::new(submissions, special_tokens, config, limits)?;
-    install_policy_stating(&mut scheduler, scheduler::BatchCapacity::of(info), stated);
-    Ok(scheduler)
 }
 
 /// The model limits a deployment whose workers serve `calls` states.

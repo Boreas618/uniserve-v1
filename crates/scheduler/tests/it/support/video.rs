@@ -13,9 +13,7 @@ use ipc::{
 };
 use proto::tensor::DType;
 use proto::video::Canvas;
-use scheduler::{
-    BlockConfig, BlockDistribution, DiffusionRequest, Request, SimEngine, VideoDenoiserInfo,
-};
+use scheduler::{BlockConfig, BlockDistribution, DiffusionRequest, Request, VideoDenoiserInfo};
 use testkit::{FakeBatches, Media};
 
 /// Denoising steps the model advertises and every request follows.
@@ -273,26 +271,6 @@ pub(crate) fn video_fake(pools: Vec<Inventory>, media: &Arc<Media>) -> Arc<FakeB
             .answering(Arc::clone(media).answering())
             .with_media(Arc::new(Media::serves)),
     )
-}
-
-/// A simulated video worker over [`video_info`] and [`video_components`],
-/// its denoiser on rank 0, for the cases still written against the
-/// simulator.
-pub(crate) fn video_worker(decoder_ranks: usize, host_task_capacity: u32) -> SimEngine {
-    let mut sim = SimEngine::new();
-    sim.set_queue_depth(64);
-    sim.set_results_on_wait(true);
-
-    let components = video_components(decoder_ranks, 1);
-    *sim.mut_info_for_test() = video_info(host_task_capacity, &components);
-    sim.place_components(
-        components
-            .into_iter()
-            .map(|(info, config)| (info.name, config))
-            .collect(),
-    );
-
-    sim
 }
 
 /// A `t2va` request decoded in `video_units` media units.
