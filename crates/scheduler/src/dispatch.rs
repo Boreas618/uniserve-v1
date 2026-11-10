@@ -30,6 +30,9 @@ pub(super) struct Dispatch {
     /// The groups that prefill only (`WorkerGroupRole::Prefill`): their
     /// requests decode on the scheduler's decode groups.
     pub(super) prefill_groups: HashSet<crate::WorkerGroupId>,
+    /// The groups that decode only (`WorkerGroupRole::Decode`): a request
+    /// reaches them by its hand-off, never with its prompt.
+    pub(super) decode_groups: HashSet<crate::WorkerGroupId>,
 }
 
 /// Whether a call of `kind` belongs to a request's decode stage, which a
@@ -136,12 +139,18 @@ impl Dispatch {
         component: &'a str,
         choice: &Choice,
     ) -> Option<(&'a crate::WorkerGroupId, &'a str)> {
-        // A decode-stage call runs on a replica that decodes: a cache
-        // install, which a prefill replica could serve, hands the request to
-        // a decode replica.
+        // A decode-stage call runs on a replica that decodes, and every other
+        // call (a prompt's prefill) on one that is not a decode group: a
+        // request reaches a decode group by its hand-off.
         let candidates = self
             .component_candidates(epoch, kind, component)
-            .filter(|(id, _, _)| !decodes(kind) || !self.prefill_groups.contains(*id))
+            .filter(|(id, _, _)| {
+                if decodes(kind) {
+                    !self.prefill_groups.contains(*id)
+                } else {
+                    !self.decode_groups.contains(*id)
+                }
+            })
             .collect::<Vec<_>>();
         let bound = candidates.first()?.1;
 

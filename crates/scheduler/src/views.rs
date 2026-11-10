@@ -1051,7 +1051,15 @@ fn candidate_facts<'a>(
         CallKind::Forward(ForwardMode::Decode | ForwardMode::Verify)
     );
     candidates
-        .filter(|(id, _, _)| !decode_stage || !scheduler.dispatch.prefill_groups.contains(*id))
+        // A decode-stage call is offered the groups that decode, any other the
+        // groups that are not decode groups (`Dispatch::component_target`).
+        .filter(|(id, _, _)| {
+            if decode_stage {
+                !scheduler.dispatch.prefill_groups.contains(*id)
+            } else {
+                !scheduler.dispatch.decode_groups.contains(*id)
+            }
+        })
         .enumerate()
         .map(|(index, (worker, bound, main_process_info))| {
             let view = ReplicaView {

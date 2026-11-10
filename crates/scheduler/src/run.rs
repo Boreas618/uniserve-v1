@@ -347,6 +347,12 @@ impl Scheduler {
         self.dispatch.prefill_groups = groups.into_iter().collect();
     }
 
+    /// The worker groups that decode only (`WorkerGroupRole::Decode`), which
+    /// take requests by their hand-off alone.
+    pub fn set_decode_groups(&mut self, groups: impl IntoIterator<Item = crate::WorkerGroupId>) {
+        self.dispatch.decode_groups = groups.into_iter().collect();
+    }
+
     /// Hand requests off from the prefill groups to the decode groups through
     /// this host's Storage Server, at `socket`, as a head of `epoch` of
     /// `deployment`, on host `host` (`crate::hand_off`).

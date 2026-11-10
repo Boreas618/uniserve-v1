@@ -431,7 +431,7 @@ impl Scheduler {
                     spans,
                     micros,
                 } => {
-                    tracing::debug!(
+                    tracing::info!(
                         request = id.0,
                         bytes,
                         spans,

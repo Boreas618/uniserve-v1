@@ -353,6 +353,14 @@ impl SchedulerHandle {
                 .filter(|group| group.role == WorkerGroupRole::Prefill)
                 .map(|group| group.id.clone()),
         );
+        scheduler.set_decode_groups(
+            engine
+                .parallel
+                .worker_groups
+                .iter()
+                .filter(|group| group.role == WorkerGroupRole::Decode)
+                .map(|group| group.id.clone()),
+        );
         // A deployment with prefill groups hands its requests' KV caches to
         // its decode groups through the Storage Server.
         if engine
