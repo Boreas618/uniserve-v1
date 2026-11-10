@@ -20,6 +20,7 @@ use nn::quantization::Declaration;
 
 use crate::config::{HybridConfig, Mixer, MoeConfig};
 use crate::hybrid::Qwen35Moe;
+use crate::hybrid::vision::ImageProcessor;
 use crate::moe::Qwen3Moe;
 
 /// The Qwen3 family.
@@ -31,6 +32,7 @@ pub const FAMILY: Family = Family {
         serving: Serving::Chat(ChatProfile {
             reasoning: Some(ReasoningFormat::Qwen3),
             tool_calls: Some(ToolCallFormat::Qwen3),
+            images: None,
         }),
     },
     model: Model::Text(&Qwen3MoeFamily),
@@ -138,9 +140,12 @@ impl TextModel for Qwen3Moe {
 }
 
 /// The Qwen3.5-MoE family: `Qwen3_5MoeForConditionalGeneration` checkpoints (Qwen3.6-35B-A3B among
-/// them), served as a chat text model over their hybrid decoder stack.
+/// them), served as a chat model over their hybrid decoder stack, taking image input through the
+/// checkpoint's vision tower when the checkpoint states its processor files.
 ///
-/// Its outputs delimit reasoning between `<think>` and `</think>`. Its tool calls are written as
+/// Its outputs delimit reasoning between `<think>` and `</think>`, and its chat template writes one
+/// `<|image_pad|>` per image, which request processing replaces by the image's block. Its tool
+/// calls are written as
 /// `<function=…>` blocks between `<tool_call>` and `</tool_call>`, a format no output parser of
 /// request processing reads, so the profile states none.
 pub const HYBRID_FAMILY: Family = Family {
@@ -151,6 +156,7 @@ pub const HYBRID_FAMILY: Family = Family {
         serving: Serving::Chat(ChatProfile {
             reasoning: Some(ReasoningFormat::Qwen3),
             tool_calls: None,
+            images: Some(&crate::hybrid::vision::Images),
         }),
     },
     model: Model::Text(&Qwen35MoeFamily),
@@ -163,17 +169,30 @@ impl TextFamily for Qwen35MoeFamily {
     fn open(&self, checkpoint: &Checkpoint) -> nn::Result<Box<dyn TextCheckpoint>> {
         let config = HybridConfig::open(checkpoint)?;
         let declaration = Declaration::read(checkpoint)?;
+        // The tower serves when the checkpoint holds both its weights and the processor files its
+        // images are sized by; otherwise the checkpoint serves text alone.
+        let images = match checkpoint.tensor(VISION_WEIGHT) {
+            Some(_) => ImageProcessor::open(checkpoint)?,
+            None => None,
+        };
         Ok(Box::new(Qwen35MoeCheckpoint {
             config,
             declaration,
+            images,
         }))
     }
 }
 
-/// A Qwen3.5-MoE checkpoint: the configuration and the quantization declaration read from it.
+/// A tensor every Qwen3.5 vision tower holds: the patch embedding.
+const VISION_WEIGHT: &str = "model.visual.patch_embed.proj.weight";
+
+/// A Qwen3.5-MoE checkpoint: the configuration, the quantization declaration and the image
+/// processor read from it.
 struct Qwen35MoeCheckpoint {
     config: HybridConfig,
     declaration: Declaration,
+    /// The processor rules of a checkpoint whose vision tower serves.
+    images: Option<ImageProcessor>,
 }
 
 impl TextCheckpoint for Qwen35MoeCheckpoint {
@@ -204,6 +223,7 @@ impl TextCheckpoint for Qwen35MoeCheckpoint {
             placement.drafter,
             loader,
             experts,
+            self.images,
         )?;
         Ok(Arc::new(model))
     }
@@ -234,6 +254,10 @@ impl TextModel for Qwen35Moe {
 
     fn state(&self) -> Option<StateShape> {
         Some(self.state_shape())
+    }
+
+    fn vision(&self) -> Option<&dyn nn::capability::Vision> {
+        Qwen35Moe::vision(self).map(|tower| tower as &dyn nn::capability::Vision)
     }
 
     fn experts(&self) -> Option<ExpertShape> {

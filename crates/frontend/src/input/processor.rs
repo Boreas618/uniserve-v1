@@ -463,6 +463,7 @@ impl InputProcessor {
         let profile = self.config.chat().unwrap_or(processing::ChatProfile {
             reasoning: None,
             tool_calls: None,
+            images: None,
         });
         let tools = (profile.tool_calls.is_some() && chat_request.tool_parsing_enabled())
             .then_some(chat_request.tools.as_slice());

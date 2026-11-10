@@ -103,6 +103,7 @@ mod tests {
         let chat = Serving::Chat(ChatProfile {
             reasoning: None,
             tool_calls: None,
+            images: None,
         });
         Catalogue::new([
             Family {

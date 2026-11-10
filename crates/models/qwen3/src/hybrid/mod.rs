@@ -20,8 +20,15 @@
 //! three position axes. A chat text request places every token at the same position on all three
 //! axes, under which interleaved M-RoPE is the default spectrum over the rotated channels: the
 //! frequencies are the same and each reads the one position. The model therefore rotates text by
-//! that spectrum ([`text_spectrum`]); a request carrying vision input states three axes and reads
-//! the sectioned spectrum the configuration holds.
+//! that spectrum ([`text_spectrum`]); a batch carrying an image's rows states three axes
+//! ([`nn::capability::TokenBatch::rope_positions`]) and rotates every row of it by the sectioned
+//! spectrum the configuration holds, a text row reading its one position on all three.
+//!
+//! ## Vision
+//!
+//! A checkpoint with a vision tower and its processor files loads the tower ([`vision`]): an image
+//! is encoded on its own into merged rows of the hidden width, which a prefill's caller writes
+//! into the hidden rows of the image's block before the stack runs.
 //!
 //! ## State
 //!
@@ -39,12 +46,14 @@
 
 pub mod load;
 pub mod mtp;
+pub mod vision;
 
 use nn::blocks::{GatedDeltaNet, GatedDeltaNetSpec, Keys};
 use nn::capability::{CausalLm, KvView, TokenBatch};
 use nn::family::{Split, StateShape};
 use nn::layers::{
-    PagedAttention, ParallelLMHead, ResidualStream, RmsNorm, Spectrum, VocabParallelEmbedding,
+    PagedAttention, ParallelLMHead, ResidualStream, RmsNorm, Rotary, Spectrum,
+    VocabParallelEmbedding,
 };
 use nn::{DType, Forward, TensorView};
 
@@ -116,6 +125,17 @@ pub struct Qwen35Moe {
     experts_encoded: bool,
     /// The multi-token-prediction layers, loaded when the deployment speculates with them.
     drafter: Option<mtp::Mtp>,
+    /// The vision tower and the sectioned rotary its batches turn by, when the checkpoint holds
+    /// both the tower and its processor files.
+    vision: Option<ImageInput>,
+}
+
+/// What a checkpoint with vision input adds to the language model.
+pub(crate) struct ImageInput {
+    /// The tower and its processor rules.
+    pub(crate) tower: vision::HybridVision,
+    /// The configuration's interleaved M-RoPE, which a batch with image rows rotates by.
+    pub(crate) rotary: Rotary,
 }
 
 impl Qwen35Moe {
@@ -137,6 +157,11 @@ impl Qwen35Moe {
     /// Whether the checkpoint's expert stacks were read as calibrated NVFP4.
     pub const fn experts_encoded(&self) -> bool {
         self.experts_encoded
+    }
+
+    /// The vision tower, when the model serves image input.
+    pub fn vision(&self) -> Option<&vision::HybridVision> {
+        self.vision.as_ref().map(|input| &input.tower)
     }
 
     /// The drafter, when the deployment loaded it.
@@ -163,7 +188,27 @@ impl Qwen35Moe {
         hidden: TensorView,
     ) -> Result<Hidden> {
         let tokens = batch.tokens();
-        let (cosine, sine) = self.stack.factors(f, batch.positions, tokens)?;
+        let (cosine, sine) = match batch.rope_positions {
+            None => self.stack.factors(f, batch.positions, tokens)?,
+            // Image rows read three axes, so the whole batch turns by the sectioned spectrum.
+            Some(coordinates) => {
+                let rotary = &self
+                    .vision
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Error::Config(
+                            "a batch states image coordinates for a model without vision input"
+                                .to_owned(),
+                        )
+                    })?
+                    .rotary;
+                let shape = nn::Shape::new(&[tokens, u64::from(rotary.columns())]);
+                let cosine = f.arena().tensor(DType::F32, shape)?;
+                let sine = f.arena().tensor(DType::F32, shape)?;
+                rotary.factors(f, coordinates, cosine, sine)?;
+                (cosine, sine)
+            }
+        };
         let buffers = self.stack.buffers(
             f.arena(),
             tokens,

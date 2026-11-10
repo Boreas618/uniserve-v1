@@ -803,6 +803,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             num_tokens: plan.tokens as u32,
             max_kv_len: self.max_kv_len,
             draft_lens: None,
+            rope_positions: None,
         };
         let state_view = StateRows {
             query_offsets: spec.state_offsets.extent(0..state_rows + 1),
@@ -1370,6 +1371,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             num_tokens: tokens as u32,
             max_kv_len: self.max_kv_len,
             draft_lens: None,
+            rope_positions: None,
         };
         let groups = view(
             spec.draft_tables
@@ -1461,6 +1463,7 @@ impl<M: TextModel> CausalLmRunner<M> {
                 num_tokens: calls as u32,
                 max_kv_len: self.max_kv_len,
                 draft_lens: None,
+                rope_positions: None,
             };
             drafter
                 .forward(

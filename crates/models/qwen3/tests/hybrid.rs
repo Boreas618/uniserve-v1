@@ -71,6 +71,7 @@ fn recorded_forward(
         num_tokens: u32::try_from(tokens).unwrap_or_else(|_| panic!("{tokens} tokens")),
         max_kv_len: page_size * row_pages as u32,
         draft_lens: None,
+        rope_positions: None,
     };
     let cache = model.cache();
     let planes_shape = [
@@ -216,6 +217,7 @@ fn recorded_draft(
         num_tokens: u32::try_from(tokens).unwrap_or_else(|_| panic!("{tokens} tokens")),
         max_kv_len: page_size * row_pages as u32,
         draft_lens: None,
+        rope_positions: None,
     };
     let (tables, layers) = planes(&tensor, drafter.cache(), rows, page_size, row_pages);
     let groups = [KvGroup {

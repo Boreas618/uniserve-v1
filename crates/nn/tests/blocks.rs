@@ -407,6 +407,7 @@ fn a_paged_block_writes_its_layers_planes_then_reads_them() {
         num_tokens: tokens as u32,
         max_kv_len: 64,
         draft_lens: None,
+        rope_positions: None,
     };
     let pages = [1, 64, KV_HEADS, HEAD_DIM];
     let planes = [KvPlanes {

@@ -53,6 +53,10 @@ pub struct TokenBatch {
     pub max_kv_len: u32,
     /// `[rows]` i32 drafted-token counts, when the batch verifies speculative drafts.
     pub draft_lens: Option<TensorView>,
+    /// `[axes, tokens]` i32 multi-axis rotary coordinates, axis-major, when the batch carries the
+    /// rows of an image ([`Vision`]); `None` when every row is text, whose coordinate on every
+    /// axis is its entry of `positions`.
+    pub rope_positions: Option<TensorView>,
 }
 
 impl TokenBatch {
@@ -132,6 +136,20 @@ impl TokenBatch {
                     "logits_rows is {} {} elements for {rows} rows, not at most one i32 per row",
                     self.logits_rows.numel(),
                     self.logits_rows.dtype
+                ),
+            ));
+        }
+        if let Some(coordinates) = self.rope_positions
+            && (coordinates.shape.rank() != 2
+                || coordinates.shape.dim(1) != tokens
+                || coordinates.dtype != DType::I32)
+        {
+            return Err(Error::shape(
+                "TokenBatch",
+                format!(
+                    "rope_positions is {:?} {}, [axes, {tokens}] i32 expected",
+                    coordinates.shape.dims(),
+                    coordinates.dtype
                 ),
             ));
         }
@@ -1392,6 +1410,81 @@ pub trait CausalLm {
     }
 }
 
+/// The vision tower of a causal language model: images to rows of the model's hidden width, which a
+/// prefill writes into the request's context in place of the image's placeholder.
+///
+/// The worker reads an image's bytes, sizes it by [`Vision::image_grid`], resizes and lays its
+/// pixels out in [`Vision::patch_format`] on its host threads, prepares the tables of its grid
+/// ([`Vision::image_tables`], [`Vision::prepare_image`]) and calls [`Vision::encode_image`]; the
+/// features it keeps are the rows a later prefill places, at the rotary coordinates
+/// [`Vision::image_positions`] states. Every input is a borrowed view or a host value of the
+/// image's grid: no request identity crosses.
+pub trait Vision {
+    /// The patch grid `[time, rows, columns]` an image of `height` x `width` pixels is resized to:
+    /// the checkpoint's processor rule.
+    ///
+    /// # Errors
+    ///
+    /// An image the processor cannot size (an aspect it refuses).
+    fn image_grid(&self, height: u32, width: u32) -> Result<[u32; 3]>;
+
+    /// How the tower reads an image's pixels: one patch row per patch of the grid.
+    fn patch_format(&self) -> PatchFormat;
+
+    /// The rows one image of `grid` encodes to: the tokens of its block in the context.
+    ///
+    /// # Errors
+    ///
+    /// A grid that is not whole merge blocks.
+    fn image_rows(&self, grid: [u32; 3]) -> Result<u32>;
+
+    /// The most rows an image the processor sizes encodes to: the block of the largest image.
+    fn max_image_rows(&self) -> u32;
+
+    /// The rotary axes of [`TokenBatch::rope_positions`] a batch with image rows states.
+    fn position_axes(&self) -> u32;
+
+    /// Write the rotary coordinates of an image block of `grid` whose first row takes logical
+    /// position `start`, axis-major: `out[axis][row]`, each of `out`'s slices
+    /// [`Vision::image_rows`] long. A text row reads its own position on every axis.
+    ///
+    /// # Errors
+    ///
+    /// As [`Vision::image_rows`], or slices of another count or length.
+    fn image_positions(&self, grid: [u32; 3], start: u32, out: &mut [&mut [i32]]) -> Result<()>;
+
+    /// The host tables an encode of `grid` reads, in the order [`Vision::prepare_image`] fills
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Vision::image_rows`].
+    fn image_tables(&self, grid: [u32; 3]) -> Result<Vec<StateTable>>;
+
+    /// Write the host values of [`Vision::image_tables`] for `grid`.
+    ///
+    /// # Errors
+    ///
+    /// Buffers of other shapes than the tables'.
+    fn prepare_image(&self, grid: [u32; 3], out: &mut [TableValues]) -> Result<()>;
+
+    /// Encode one image: `pixels` (`[patches, width]` in [`Vision::patch_format`]) with its
+    /// prepared `tables` into `out`, `[rows, hidden]` in the model's activation type, `rows` being
+    /// [`Vision::image_rows`].
+    ///
+    /// # Errors
+    ///
+    /// Views that do not describe `grid`, or what a layer refuses.
+    fn encode_image(
+        &self,
+        f: &Forward,
+        grid: [u32; 3],
+        pixels: TensorView,
+        tables: &[TensorView],
+        out: TensorView,
+    ) -> Result<()>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1485,6 +1578,7 @@ mod batch_tests {
             num_tokens: u32::try_from(rows).unwrap(),
             max_kv_len: 4_096,
             draft_lens: None,
+            rope_positions: None,
         }
     }
 

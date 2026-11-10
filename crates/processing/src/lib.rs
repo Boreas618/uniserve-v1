@@ -7,7 +7,8 @@
 //! - a family states how its checkpoints declare it and what it serves ([`Family`], [`Serving`]);
 //!   the numerical family its model crate exports (`nn::family::Family`) holds that value beside
 //!   what execution loads;
-//! - a chat family names the output formats its checkpoints write ([`ChatProfile`]);
+//! - a chat family names the output formats its checkpoints write and, when it takes images, the
+//!   processor that sizes their blocks ([`ChatProfile`], [`ImageFamily`]);
 //! - a video family binds a [`VideoProcessor`] once its workers described the placed denoiser
 //!   ([`VideoFamily::bind`]); the processor validates a model-agnostic request ([`VideoSpec`])
 //!   and plans it ([`VideoPlan`]).
@@ -23,6 +24,7 @@
 mod canvas;
 mod family;
 mod frames;
+mod image;
 mod media;
 mod serving;
 mod video;
@@ -31,6 +33,7 @@ mod vocabulary;
 pub use canvas::{CanvasError, CanvasRule, CoverCrop, cover_crop};
 pub use family::{Catalogue, ClaimError, Family};
 pub use frames::{ClipSpan, FrameClips, requested_frames};
+pub use image::{ImageBlock, ImageFamily, ImageProcessor};
 pub use media::{
     AudioMetadata, FrameRate, ImageMetadata, MediaMetadata, VideoMetadata, resampled_len,
 };

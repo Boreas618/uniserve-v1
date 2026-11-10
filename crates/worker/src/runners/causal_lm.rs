@@ -2740,6 +2740,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             num_tokens: bucket.tokens,
             max_kv_len: self.max_kv_len,
             draft_lens: None,
+            rope_positions: None,
         })
     }
 

@@ -333,6 +333,7 @@ mod tests {
         serving: Serving::Chat(ChatProfile {
             reasoning: Some(ReasoningFormat::Qwen3),
             tool_calls: Some(ToolCallFormat::Qwen3),
+            images: None,
         }),
     };
 

@@ -451,6 +451,7 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
             // A row attends over its own tokens, and a bucket holds no more than its tokens.
             max_kv_len: bucket.tokens,
             draft_lens: None,
+            rope_positions: None,
         })
     }
 
@@ -749,6 +750,7 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
             num_tokens: tokens,
             max_kv_len: bucket.tokens,
             draft_lens: None,
+            rope_positions: None,
         };
         let hidden = self
             .columns

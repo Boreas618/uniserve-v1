@@ -3,20 +3,22 @@
 //!
 //! The family reads `config.json` and the quantization declaration once, when it opens the
 //! checkpoint; this module builds the model from them. The multi-token-prediction layers (`mtp.*`)
-//! load as the model's drafter when the deployment speculates; the vision tower
-//! (`model.visual.*`) is not read here: the text model serves without it.
+//! load as the model's drafter when the deployment speculates. The vision tower (`model.visual.*`)
+//! is read when the family found the checkpoint's processor files and the tower's weights
+//! ([`super::vision`]).
 
 use nn::blocks::{AttentionKind, GateUp, GatedMlpSpec, SharedExpert, SharedExpertSpec};
 use nn::family::{ExpertOrder, Split};
 use nn::layers::{
-    Bias, ExpertNames, ExpertSlots, Linear, Moe, MoeSpec, Parallel, ParallelLMHead, RmsNorm,
-    Rounding, StackedExperts, VocabParallelEmbedding,
+    Bias, ExpertNames, ExpertSlots, Linear, Moe, MoeSpec, Parallel, ParallelLMHead, QkNorm,
+    RmsNorm, Rotary, RotarySpec, Rounding, StackedExperts, VocabParallelEmbedding,
 };
 use nn::quantization::Declaration;
 use nn::weights::{Scope, WeightLoader};
 
 use super::mtp::{DRAFTER_COMPONENTS, Mtp};
-use super::{COMPONENTS, Qwen35Moe, delta_net_spec, text_spectrum};
+use super::vision::{HybridVision, ImageProcessor};
+use super::{COMPONENTS, ImageInput, Qwen35Moe, delta_net_spec, text_spectrum};
 use crate::config::{HybridConfig, Mixer, TextConfig};
 use crate::decoder::{DecoderStack, LayerForm, MixerSpec, Mlp};
 use crate::moe::load::{SlotTable, expert_module, expert_slots, slot_map};
@@ -207,8 +209,9 @@ fn load_drafter(
 }
 
 /// Load the checkpoint `config` and `declaration` describe at the rank `tensor` and `experts`
-/// place, with the routed experts in the slots `order` states, and its drafter when `drafter`
-/// says the deployment speculates with it.
+/// place, with the routed experts in the slots `order` states, its drafter when `drafter` says the
+/// deployment speculates with it, and its vision tower when `images` states the processor its
+/// images are sized by.
 ///
 /// # Errors
 ///
@@ -221,6 +224,7 @@ pub fn load(
     drafter: bool,
     loader: &mut WeightLoader<'_>,
     order: &ExpertOrder,
+    images: Option<ImageProcessor>,
 ) -> Result<Qwen35Moe> {
     config.check_splits(tensor, experts)?;
     loader.declare(declaration);
@@ -280,6 +284,33 @@ pub fn load(
         .then(|| load_drafter(config, &serving, (tensor, experts), loader))
         .transpose()?;
 
+    let vision = match images {
+        None => None,
+        Some(processor) => {
+            // The interleaved M-RoPE of the checkpoint, published beside the text spectrum the
+            // stack turns by; its factors feed the stack's rotation, whose rotated width is the
+            // same.
+            let (heads, kv_heads) = text.local_heads(tensor)?;
+            let rotary = Rotary::load(
+                &mut loader.scope(format!("{LANGUAGE_MODEL}.rotary_emb.sectioned")),
+                text.rope,
+                RotarySpec {
+                    head_dim: text.head_dim,
+                    heads,
+                    kv_heads,
+                    qk_norm: QkNorm::Fused {
+                        epsilon: text.rms_norm_eps,
+                        gain: text.rms_norm_gain,
+                    },
+                },
+            )?;
+            Some(ImageInput {
+                tower: HybridVision::load(loader, &config.vision, processor, dtype)?,
+                rotary,
+            })
+        }
+    };
+
     let ordinals = (0..text.num_hidden_layers)
         .map(|layer| config.ordinal(layer) as usize)
         .collect();
@@ -294,5 +325,6 @@ pub fn load(
         ordinals,
         experts_encoded,
         drafter,
+        vision,
     })
 }

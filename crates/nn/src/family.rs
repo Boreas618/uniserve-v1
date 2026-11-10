@@ -30,8 +30,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::capability::{
-    CausalLm, Decoder, Denoiser, Encoder, KvView, MediaFormat, Splicer, TokenBatch, WarmPrompt,
-    WarmRequest,
+    CausalLm, Decoder, Denoiser, Encoder, KvView, MediaFormat, Splicer, TokenBatch, Vision,
+    WarmPrompt, WarmRequest,
 };
 use crate::{Checkpoint, DType, Forward, Result, TensorView, WeightLoader};
 
@@ -318,6 +318,12 @@ pub trait TextModel: CausalLm + Send + Sync {
     /// The drafter its checkpoint carries for speculative decoding (multi-token prediction
     /// layers), when the model loaded one; `None` for a model that drafts nothing.
     fn drafter(&self) -> Option<&dyn Drafter>;
+
+    /// Its vision tower, when the checkpoint holds one and the model serves it: the model then
+    /// takes image rows in a prefill ([`crate::capability::TokenBatch::rope_positions`]).
+    fn vision(&self) -> Option<&dyn Vision> {
+        None
+    }
 }
 
 /// A causal language model's own drafter: multi-token-prediction layers that propose the token
@@ -686,6 +692,7 @@ mod tests {
             serving: Serving::Chat(ChatProfile {
                 reasoning: None,
                 tool_calls: None,
+                images: None,
             }),
         },
         model: Model::Text(&Unopened),

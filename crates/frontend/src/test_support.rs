@@ -85,6 +85,7 @@ pub const CHAT: processing::Family = processing::Family {
     serving: processing::Serving::Chat(processing::ChatProfile {
         reasoning: Some(processing::ReasoningFormat::Qwen3),
         tool_calls: Some(processing::ToolCallFormat::Qwen3),
+        images: None,
     }),
 };
 

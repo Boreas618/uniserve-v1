@@ -219,7 +219,7 @@ pub fn rope_index(
                     }
                 }
             }
-            origin += i64::from(height.max(width) / merge);
+            origin += i64::from(span(grid, merge));
         }
         index = stop;
     }
@@ -230,6 +230,14 @@ pub fn rope_index(
         ));
     }
     Ok(positions)
+}
+
+/// The positions one vision block of `grid` (patches, whole `merge` blocks) advances the text
+/// after it by: the larger of its merged sides, as [`rope_index`] advances its origin.
+pub const fn span(grid: [u32; 3], merge: u32) -> u32 {
+    let [_, height, width] = grid;
+    let side = if height > width { height } else { width };
+    side / merge
 }
 
 /// The grids [`rope_index`] reads: one list per placeholder kind, in prompt order.

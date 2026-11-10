@@ -110,6 +110,7 @@ mod tests {
         serving: Serving::Chat(ChatProfile {
             reasoning: None,
             tool_calls: None,
+            images: None,
         }),
     };
 

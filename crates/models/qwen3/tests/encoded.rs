@@ -631,6 +631,7 @@ fn recorded_forward(
         num_tokens: u32::try_from(tokens).unwrap_or_else(|_| panic!("{tokens} tokens")),
         max_kv_len: u32::try_from(row_keys).unwrap_or_else(|_| panic!("{row_keys} keys")),
         draft_lens: None,
+        rope_positions: None,
     };
     let planes_shape = [
         pages,

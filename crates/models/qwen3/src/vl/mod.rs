@@ -604,7 +604,33 @@ fn write_state(
     if plan.images.is_empty() {
         return Ok(());
     }
+    write_image_tables(vision, &plan.grids, &plan.images, &mut out[2..])
+}
 
+/// Write the five vision tables of images of `grids`, one after another, whose patch rows are
+/// `patches`: the learned table's taps and weights, the 2-D rotary factors and the attention
+/// offsets of every time step ([`image_table_specs`]' order).
+///
+/// The arithmetic is the reference's, evaluated in FP32 on the host ([`positions`]).
+///
+/// # Errors
+///
+/// A grid the tower cannot hold, or buffers of other shapes than the tables'.
+pub fn write_image_tables(
+    vision: &crate::config::VisionConfig,
+    grids: &[[u32; 3]],
+    patches: &[u32],
+    out: &mut [TableValues],
+) -> Result<()> {
+    if out.len() != 5 || grids.len() != patches.len() {
+        return Err(Error::Config(format!(
+            "{} buffers and {} patch counts for {} images' five vision tables",
+            out.len(),
+            patches.len(),
+            grids.len()
+        )));
+    }
+    let merge = vision.spatial_merge_size;
     let side = BlockRows::position_grid(vision)?;
     let head_dim = BlockRows::head_dim(vision)?;
     let rotary = positions::VisionRotary::new(head_dim)?;
@@ -618,7 +644,7 @@ fn write_state(
     // its predecessors' and the check below counts against the running total, not the block's own.
     let mut covered = 0_usize;
     let columns = (head_dim / 2) as usize;
-    for (grid, patches) in plan.grids.iter().zip(&plan.images) {
+    for (grid, patches) in grids.iter().zip(patches) {
         let [time, height, width] = *grid;
         let (step_index, step_weight) = positions::position_samples(side, height, width, merge)?;
         let step_coordinates = positions::rotary_coordinates(height, width, merge)?;
@@ -653,11 +679,11 @@ fn write_state(
             )));
         }
     }
-    out[2].write("vision_position_index", &TableValues::I32(index))?;
-    out[3].write("vision_position_weight", &TableValues::F32(weight))?;
-    out[4].write("vision_cosine", &TableValues::F32(cosine))?;
-    out[5].write("vision_sine", &TableValues::F32(sine))?;
-    Ok(out[6].write("vision_lengths", &TableValues::I32(lengths))?)
+    out[0].write("vision_position_index", &TableValues::I32(index))?;
+    out[1].write("vision_position_weight", &TableValues::F32(weight))?;
+    out[2].write("vision_cosine", &TableValues::F32(cosine))?;
+    out[3].write("vision_sine", &TableValues::F32(sine))?;
+    Ok(out[4].write("vision_lengths", &TableValues::I32(lengths))?)
 }
 
 /// The tables' names and shapes for a prompt of `rows` rows whose images are a concatenation of
@@ -680,12 +706,6 @@ fn table_specs(
     let tokens = u64::from(rows);
     let patch_rows: u64 = patches.iter().map(|patches| u64::from(*patches)).sum();
     let steps: u64 = time.iter().map(|time| u64::from(*time) + 1).sum();
-    // The tower rotates on its own head width, which is not the language model's: the released
-    // checkpoint states 1152 elements over 16 heads, so the factors carry 36 frequencies rather
-    // than the language model's 64. The division is total here (this function reports nothing)
-    // and any configuration that does not divide is refused by `write_state`, which derives the
-    // same width through `BlockRows::head_dim`.
-    let tower_columns = u64::from(config.vision.hidden_size / config.vision.num_heads.max(1) / 2);
     let table = |name: &'static str, dtype: DType, shape: Shape| StateTable { name, dtype, shape };
     let mut tables = vec![
         table(
@@ -700,29 +720,48 @@ fn table_specs(
         ),
     ];
     if !patches.is_empty() {
-        tables.push(table(
+        tables.extend(image_table_specs(&config.vision, patch_rows, steps));
+    }
+    tables
+}
+
+/// The five vision tables of images whose patch rows are `patch_rows` over `steps` attention
+/// offsets (one per time step, plus one), in the order [`write_image_tables`] fills them.
+pub fn image_table_specs(
+    vision: &crate::config::VisionConfig,
+    patch_rows: u64,
+    steps: u64,
+) -> Vec<StateTable> {
+    // The tower rotates on its own head width, which is not the language model's: the released
+    // checkpoint states 1152 elements over 16 heads, so the factors carry 36 frequencies rather
+    // than the language model's 64. The division is total here (this function reports nothing)
+    // and any configuration that does not divide is refused by `write_image_tables`, which derives
+    // the same width through `BlockRows::head_dim`.
+    let tower_columns = u64::from(vision.hidden_size / vision.num_heads.max(1) / 2);
+    let table = |name: &'static str, dtype: DType, shape: Shape| StateTable { name, dtype, shape };
+    vec![
+        table(
             "vision_position_index",
             DType::I32,
             Shape::new(&[patch_rows, positions::POSITION_TAPS]),
-        ));
-        tables.push(table(
+        ),
+        table(
             "vision_position_weight",
             DType::F32,
             Shape::new(&[patch_rows, positions::POSITION_TAPS]),
-        ));
-        tables.push(table(
+        ),
+        table(
             "vision_cosine",
             DType::F32,
             Shape::new(&[patch_rows, tower_columns]),
-        ));
-        tables.push(table(
+        ),
+        table(
             "vision_sine",
             DType::F32,
             Shape::new(&[patch_rows, tower_columns]),
-        ));
-        tables.push(table("vision_lengths", DType::I32, Shape::new(&[steps])));
-    }
-    tables
+        ),
+        table("vision_lengths", DType::I32, Shape::new(&[steps])),
+    ]
 }
 
 #[cfg(test)]
