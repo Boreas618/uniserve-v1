@@ -32,7 +32,7 @@ mod slots;
 
 use super::*;
 use crate::views;
-use ipc::{ForwardMode, MediaCall, TransferMode};
+use ipc::{ForwardMode, MediaCall};
 use scheduling::guest::{PhaseId, PhaseKind, Plan};
 
 /// Forward rows a pass may still add to its numerical calls, within the rows
@@ -459,10 +459,13 @@ impl Scheduler {
                     .unwrap_or_default();
                 let engine_id = self.engine_id;
                 let mut admitted = false;
-                // A hand-off's install admits the request on the decode
+                // A handed-off request's first call admits it on the decode
                 // group, with the token it generated on the prefill group,
                 // which its penalties count.
-                let hand_off = call.kind == CallKind::Transfer(TransferMode::CacheInstall);
+                let hand_off = self
+                    .running
+                    .get(&id)
+                    .is_some_and(|st| st.hand_off == generation::HandOff::Copied);
                 if let Some(st) = self.running.get_mut(&id)
                     && (!st.worker_registered || hand_off)
                 {
@@ -1143,10 +1146,8 @@ impl Scheduler {
             // kind and built under another and is dropped unnamed.
             Phase::DecodeUnd if self.speculates() => CallKind::Forward(ForwardMode::Verify),
             Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
-            Phase::HandOff if st.handoff_export.is_some() => {
-                CallKind::Transfer(TransferMode::CacheInstall)
-            }
-            Phase::HandOff => CallKind::Transfer(TransferMode::CacheExport),
+            // The hand-off copies the request's cache with no call.
+            Phase::HandOff => return None,
             Phase::Canvas => CallKind::Forward(ForwardMode::TokenDenoising),
             Phase::CommitCanvas => CallKind::Forward(ForwardMode::Prefill),
         })

@@ -59,14 +59,12 @@ impl ForwardMode {}
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum TransferMode {
-    Tensor,
     CacheExport,
-    CacheInstall,
 }
 
 impl TransferMode {
     /// Every transfer mode in declaration order.
-    pub const ALL: [Self; 3] = [Self::Tensor, Self::CacheExport, Self::CacheInstall];
+    pub const ALL: [Self; 1] = [Self::CacheExport];
 }
 
 /// Exactly one call classification. The sum preserves the distinct
@@ -86,7 +84,7 @@ pub enum CallKind {
 impl CallKind {
     /// Computations accepted as individual scheduled request items. A rank's
     /// reports list its supported calls in this order.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 16] = [
         Self::Forward(ForwardMode::Prefill),
         Self::Forward(ForwardMode::Decode),
         Self::Forward(ForwardMode::Verify),
@@ -102,9 +100,7 @@ impl CallKind {
         Self::Media(MediaCall::VideoEncoding),
         Self::Media(MediaCall::AudioEncoding),
         Self::Media(MediaCall::Muxing),
-        Self::Transfer(TransferMode::Tensor),
         Self::Transfer(TransferMode::CacheExport),
-        Self::Transfer(TransferMode::CacheInstall),
     ];
 
     /// Returns whether a call of this kind advances its request's state.
@@ -283,8 +279,6 @@ pub struct Call {
     /// a published product retires once each has acknowledged it. The
     /// executing rank's own slot is never listed.
     pub consumer_slots: Vec<u32>,
-    /// Source token scalar transported between components.
-    pub token_input: Option<TensorRef>,
     /// Sampled token and continuation bit in one I64 scalar: the token in
     /// the low 31 bits and continuation in bit 31.
     pub token_output: Option<TensorRef>,
@@ -312,9 +306,9 @@ pub struct Call {
     /// Encoded source image in base64, consumed by a vision or latent encoder.
     /// Dispatch and in-flight matching share these immutable bytes.
     pub input_image: Option<std::sync::Arc<str>>,
-    /// Published or installed cache extent consumed by this call.
+    /// Published cache extent consumed by this call (a latent preparation or denoising step).
     pub cache_input: Option<BufferId>,
-    /// Identity under which this call publishes or installs cache state.
+    /// Identity under which a cache export publishes cache state.
     pub cache_output: Option<BufferId>,
     /// What the call does for its request's draft cache; the default, for
     /// a deployment that does not speculate, does nothing.
@@ -427,7 +421,6 @@ impl Call {
             inputs: Vec::new(),
             outputs: Vec::new(),
             consumer_slots: Vec::new(),
-            token_input: None,
             token_output: None,
             vision_inputs: Vec::new(),
             latent_feature_input: None,
@@ -448,12 +441,9 @@ impl Call {
     }
 
     /// Tensor dependencies in the call's signature, excluding its predicate.
-    ///
-    /// Includes `token_input`, which [`Self::buffer_inputs`] omits.
     pub fn tensor_inputs(&self) -> impl Iterator<Item = &TensorRef> {
         self.inputs
             .iter()
-            .chain(self.token_input.iter())
             .chain(self.vision_inputs.iter().map(|input| &input.feature))
             .chain(self.latent_feature_input.iter())
     }
@@ -589,13 +579,10 @@ impl Call {
         // resource class reserved for the call. The cache output shares the
         // output-index space with the tensor outputs.
         let mut output_indices = HashSet::with_capacity(self.outputs.len());
-        let publishes_cache = matches!(
-            self.kind,
-            CallKind::Transfer(TransferMode::CacheExport | TransferMode::CacheInstall)
-        );
+        let publishes_cache = matches!(self.kind, CallKind::Transfer(TransferMode::CacheExport));
         ensure_valid!(
             self.cache_output.is_some() == publishes_cache,
-            "cache export or installation requires one cache output identity"
+            "a cache export requires one cache output identity"
         );
         if let Some(output) = self.cache_output {
             output.validate()?;
@@ -607,8 +594,7 @@ impl Call {
         }
         let consumes_cache = matches!(
             self.kind,
-            CallKind::Transfer(TransferMode::CacheInstall)
-                | CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising)
+            CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising)
         );
         if let Some(input) = self.cache_input {
             input.validate()?;
@@ -617,11 +603,6 @@ impl Call {
                 "cache input is incompatible with its call or request"
             );
         }
-        ensure_valid!(
-            self.kind != CallKind::Transfer(TransferMode::CacheInstall)
-                || self.cache_input.is_some(),
-            "cache installation requires a source export"
-        );
 
         for output in self.tensor_outputs() {
             output.validate()?;
@@ -639,16 +620,6 @@ impl Call {
             );
         }
 
-        if let Some(input) = &self.token_input {
-            ensure_valid!(
-                self.kind == CallKind::Transfer(TransferMode::Tensor),
-                "token transfer input requires a tensor-transfer call"
-            );
-            ensure_valid!(
-                input.dtype == DType::I64 && input.shape_bound.max_elements() == 1,
-                "token transfer input requires one int64 element"
-            );
-        }
         for tensor in self.token_output.iter() {
             ensure_valid!(
                 tensor.dtype == DType::I64 && tensor.shape_bound.max_elements() == 1,

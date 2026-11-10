@@ -186,7 +186,6 @@ pub enum PhaseKind {
     Decode,
     Verify,
     TokenDenoise,
-    CacheInstall,
     // Media work.
     MediaRead,
     Denoise,
@@ -197,7 +196,6 @@ pub enum PhaseKind {
     Mux,
     // Background work.
     LatentPrepare,
-    TensorTransfer,
     CacheExport,
     /// A draft-cache refill: a prefill-class chunk of a decoding request
     /// (design §4.4, `Plan::refill`).
@@ -217,7 +215,7 @@ pub enum PhaseClass {
     Token,
     /// Media work.
     Media,
-    /// Latent preparation, transfers, cache export, and work with no phase.
+    /// Latent preparation, cache export, and work with no phase.
     Background,
 }
 
@@ -231,10 +229,7 @@ impl PhaseKind {
             | PhaseKind::LatentEncoding
             | PhaseKind::Prefill
             | PhaseKind::Refill => PhaseClass::Context,
-            PhaseKind::Decode
-            | PhaseKind::Verify
-            | PhaseKind::TokenDenoise
-            | PhaseKind::CacheInstall => PhaseClass::Token,
+            PhaseKind::Decode | PhaseKind::Verify | PhaseKind::TokenDenoise => PhaseClass::Token,
             PhaseKind::MediaRead
             | PhaseKind::Denoise
             | PhaseKind::VideoDecode
@@ -242,10 +237,9 @@ impl PhaseKind {
             | PhaseKind::VideoEncode
             | PhaseKind::AudioEncode
             | PhaseKind::Mux => PhaseClass::Media,
-            PhaseKind::LatentPrepare
-            | PhaseKind::TensorTransfer
-            | PhaseKind::CacheExport
-            | PhaseKind::Other => PhaseClass::Background,
+            PhaseKind::LatentPrepare | PhaseKind::CacheExport | PhaseKind::Other => {
+                PhaseClass::Background
+            }
         }
     }
 
@@ -254,7 +248,7 @@ impl PhaseKind {
     /// plan, a policy's `Plan` and a batch's phase are all numbered here, so this is the one table
     /// they can agree on.
     ///
-    /// Ids 7 and 8 are reserved: they numbered kinds that no longer exist.
+    /// Ids 7, 8, 9 and 18 are reserved: they numbered kinds that no longer exist.
     ///
     /// [`PhaseKind::Other`] is a policy-side placeholder for a kind a policy does not know: it has
     /// no phase of its own, so its id is `u32::MAX`.
@@ -267,7 +261,6 @@ impl PhaseKind {
             Self::Decode => 4,
             Self::Verify => 5,
             Self::TokenDenoise => 6,
-            Self::CacheInstall => 9,
             Self::MediaRead => 10,
             Self::Denoise => 11,
             Self::VideoDecode => 12,
@@ -276,7 +269,6 @@ impl PhaseKind {
             Self::AudioEncode => 15,
             Self::Mux => 16,
             Self::LatentPrepare => 17,
-            Self::TensorTransfer => 18,
             Self::CacheExport => 19,
             Self::Refill => 20,
             Self::Other => u32::MAX,

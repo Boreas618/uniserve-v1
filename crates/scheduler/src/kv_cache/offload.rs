@@ -2504,6 +2504,7 @@ mod tests {
     /// are `pools` of pages of the identities `contents` name.
     fn report(groups: Vec<CacheGroup>, pools: &[u64], contents: &[u8]) -> PrefixCacheInfo {
         PrefixCacheInfo {
+            plane_runs: Vec::new(),
             num_units: 64,
             dtype: PrefixCacheDtype::BFloat16,
             groups,

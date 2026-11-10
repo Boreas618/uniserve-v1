@@ -196,7 +196,7 @@ fn invalid(call: Call, message: impl Into<String>) -> PolicyError {
 fn decodes(kind: PhaseKind) -> bool {
     matches!(
         kind,
-        PhaseKind::Decode | PhaseKind::Verify | PhaseKind::TokenDenoise | PhaseKind::CacheInstall
+        PhaseKind::Decode | PhaseKind::Verify | PhaseKind::TokenDenoise
     )
 }
 

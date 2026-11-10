@@ -568,9 +568,7 @@ impl Scheduler {
             | CallKind::Media(MediaCall::LatentPreparation)
             | CallKind::Media(MediaCall::Denoising)
             | CallKind::Media(MediaCall::VideoEncoding)
-            | CallKind::Transfer(TransferMode::Tensor)
-            | CallKind::Transfer(TransferMode::CacheExport)
-            | CallKind::Transfer(TransferMode::CacheInstall) => {}
+            | CallKind::Transfer(TransferMode::CacheExport) => {}
         }
     }
 

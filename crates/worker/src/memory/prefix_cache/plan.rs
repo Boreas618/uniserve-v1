@@ -327,6 +327,7 @@ impl CachePlan {
     /// The pool description reported to the engine.
     pub fn info(&self, num_units: u32) -> PrefixCacheInfo {
         PrefixCacheInfo {
+            plane_runs: Vec::new(),
             num_units,
             dtype: self.dtype,
             groups: self

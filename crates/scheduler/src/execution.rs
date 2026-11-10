@@ -332,6 +332,7 @@ impl Scheduler {
         // by one policy and executed under another (design §7.3).
         self.apply_policy_stage();
         progressed |= self.poll_kv_offload();
+        progressed |= self.poll_hand_offs();
         progressed |= self.poll_trajectories();
         progressed |= self
             .encoder_outputs

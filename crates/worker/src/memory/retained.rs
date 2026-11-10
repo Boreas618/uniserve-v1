@@ -52,6 +52,17 @@ pub struct Exclusive {
     /// a standby worker's predecessor still serves from them, and a
     /// successor engine of a handover reads the pages they hold.
     pub created: bool,
+    /// The key the Storage Server retains the storage under and its GPU;
+    /// `None` for storage local to the process.
+    pub retained: Option<RetainedPart>,
+}
+
+/// Where the Storage Server retains a storage: its key and the GPU holding
+/// it, which a copy between processes names it by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedPart {
+    pub key: Key,
+    pub gpu: [u8; 16],
 }
 
 /// One exclusive device storage of segments, each part retained on its own,
@@ -96,6 +107,9 @@ pub struct SegmentedExclusive {
     /// For each part, whether it is absent: a standby finds none for a
     /// segment its predecessor gave back, and leaves it unmapped.
     pub absent: Vec<bool>,
+    /// For each part, where the Storage Server retains it; `None` for an
+    /// absent part and for storage local to the process.
+    pub retained: Vec<Option<RetainedPart>>,
 }
 
 /// Where an owner of exclusive device storage takes it.
@@ -157,6 +171,7 @@ impl ExclusiveStorage for LocalStorage {
                 Ok(Exclusive {
                     storage: Storage::exportable(spec.device, spec.bytes, spec.access)?,
                     created: true,
+                    retained: None,
                 })
             })
             .collect()
@@ -180,6 +195,7 @@ impl ExclusiveStorage for LocalStorage {
         Ok(SegmentedExclusive {
             storage,
             created: absent.iter().map(|absent| !absent).collect(),
+            retained: vec![None; absent.len()],
             absent,
         })
     }
@@ -797,7 +813,14 @@ impl ExclusiveStorage for &Retained {
                     state.written.insert(*key);
                 }
             }
-            mapped.push(Exclusive { storage, created });
+            mapped.push(Exclusive {
+                storage,
+                created,
+                retained: Some(RetainedPart {
+                    key: *key,
+                    gpu: *gpu,
+                }),
+            });
         }
         tracing::debug!(
             reused = specs.len() - got.missing.len(),
@@ -1236,10 +1259,16 @@ impl Retained {
         if let Some(standby) = &mut state.standby {
             standby.storages.push(Arc::clone(&storage));
         }
+        let retained = keys
+            .iter()
+            .zip(&absent)
+            .map(|(key, absent)| (!absent).then_some(RetainedPart { key: *key, gpu }))
+            .collect();
         Ok(SegmentedExclusive {
             storage,
             created,
             absent,
+            retained,
         })
     }
 

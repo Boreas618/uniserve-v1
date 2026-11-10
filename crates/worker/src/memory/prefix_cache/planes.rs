@@ -46,7 +46,7 @@ use crate::memory::allocation::Backing;
 use crate::memory::allocation::ElementType;
 use crate::memory::allocation::{Storage, StorageView};
 use crate::memory::retained::{
-    Exclusive, ExclusiveSpec, ExclusiveStorage, SegmentPart, SegmentedSpec,
+    Exclusive, ExclusiveSpec, ExclusiveStorage, RetainedPart, SegmentPart, SegmentedSpec,
 };
 use crate::stream::{Issue, RowFill};
 use crate::{Error, Result};
@@ -283,6 +283,35 @@ pub struct CachePlanes {
     /// Every binding passes these views, so each field is wrapped as a
     /// torch tensor once.
     fields: Vec<(String, StorageView)>,
+    /// Where the Storage Server retains every unit's bytes, run by run
+    /// (`ipc::CachePlaneRun`); empty for planes local to the process.
+    runs: Vec<ipc::CachePlaneRun>,
+}
+
+/// The runs of a storage of cells `[columns, num_units]` of `cell_bytes`
+/// bytes each, which the Storage Server retains at `retained`: one run of
+/// every unit per column, named `{name}/{column}`.
+fn cell_runs(
+    name: &str,
+    retained: Option<RetainedPart>,
+    columns: u32,
+    num_units: u32,
+    cell_bytes: u64,
+) -> Vec<ipc::CachePlaneRun> {
+    let Some(retained) = retained else {
+        return Vec::new();
+    };
+    (0..columns)
+        .map(|column| ipc::CachePlaneRun {
+            field: format!("{name}/{column}"),
+            key: retained.key,
+            gpu: retained.gpu,
+            first: 0,
+            count: num_units,
+            offset: u64::from(column) * u64::from(num_units) * cell_bytes,
+            bytes: cell_bytes,
+        })
+        .collect()
 }
 
 impl CachePlanes {
@@ -334,6 +363,7 @@ impl CachePlanes {
         // Whether the state storages are new: stale bytes of another pool would
         // otherwise read as a checkpoint of this one.
         let mut state_created = false;
+        let mut runs = Vec::new();
         let (values, initialized, scales, state) = match device {
             Some(device) => {
                 let peers = Storage::peers(device)?;
@@ -370,10 +400,23 @@ impl CachePlanes {
                         .next()
                         .ok_or_else(|| Error::Invariant("an exclusive storage is missing".into()))
                 };
+                let columns = plan.columns;
                 let values = match layout {
                     None => {
                         let (key, value) = (next()?, next()?);
                         created[0] = key.created || value.created;
+                        for (name, taken) in [
+                            ("prefix_cache.key.values", &key),
+                            ("prefix_cache.value.values", &value),
+                        ] {
+                            runs.extend(cell_runs(
+                                name,
+                                taken.retained,
+                                columns,
+                                num_units,
+                                plan.plane_bytes,
+                            ));
+                        }
                         [key.storage, value.storage]
                     }
                     Some(layout) => {
@@ -400,6 +443,31 @@ impl CachePlanes {
                         };
                         let key = take("prefix_cache.key.values")?;
                         let value = take("prefix_cache.value.values")?;
+                        // Part `c * count + k` holds column `c` of segment
+                        // `k`: its units at the plane's bytes each.
+                        for (name, taken) in [
+                            ("prefix_cache.key.values", &key),
+                            ("prefix_cache.value.values", &value),
+                        ] {
+                            let mut first = 0;
+                            for (index, part) in parts.iter().enumerate() {
+                                if (index as u32).is_multiple_of(count) {
+                                    first = 0;
+                                }
+                                if let Some(retained) = taken.retained[index] {
+                                    runs.push(ipc::CachePlaneRun {
+                                        field: format!("{name}/{}", part.column),
+                                        key: retained.key,
+                                        gpu: retained.gpu,
+                                        first,
+                                        count: part.segment.units,
+                                        offset: 0,
+                                        bytes: plan.plane_bytes,
+                                    });
+                                }
+                                first += part.segment.units;
+                            }
+                        }
                         // Segments created for this pool, of every column;
                         // all of them make the values new as a whole.
                         let made: Vec<u32> = (0..count)
@@ -453,10 +521,22 @@ impl CachePlanes {
                 };
                 let (key, value) = (next()?, next()?);
                 created[1] = key.created || value.created;
+                for (name, taken) in [
+                    ("prefix_cache.key.initialized", &key),
+                    ("prefix_cache.value.initialized", &value),
+                ] {
+                    runs.extend(cell_runs(name, taken.retained, columns, num_units, 1));
+                }
                 let initialized = [key.storage, value.storage];
                 let scales = if plan.quantized {
                     let (key, value) = (next()?, next()?);
                     created[2] = key.created || value.created;
+                    for (name, taken) in [
+                        ("prefix_cache.key.scale", &key),
+                        ("prefix_cache.value.scale", &value),
+                    ] {
+                        runs.extend(cell_runs(name, taken.retained, columns, num_units, 4));
+                    }
                     Some([key.storage, value.storage])
                 } else {
                     None
@@ -464,6 +544,15 @@ impl CachePlanes {
                 let state_taken: Vec<Exclusive> =
                     (0..state_fields).map(|_| next()).collect::<Result<_>>()?;
                 state_created = state_taken.iter().any(|taken| taken.created);
+                for (name, taken) in state_names.iter().zip(&state_taken) {
+                    runs.extend(cell_runs(
+                        name,
+                        taken.retained,
+                        columns,
+                        num_units,
+                        plan.plane_bytes,
+                    ));
+                }
                 let state: Vec<Arc<Storage>> =
                     state_taken.into_iter().map(|taken| taken.storage).collect();
                 (values, initialized, scales, state)
@@ -488,6 +577,7 @@ impl CachePlanes {
             scales,
             initialized,
             fields: Vec::new(),
+            runs,
         };
         planes.fields = planes.field_views()?;
 
@@ -537,6 +627,12 @@ impl CachePlanes {
             stream.synchronize()?;
         }
         Ok(planes)
+    }
+
+    /// Where the Storage Server retains every unit's bytes, run by run; empty
+    /// for planes local to the process.
+    pub fn runs(&self) -> &[ipc::CachePlaneRun] {
+        &self.runs
     }
 
     /// The segments the value planes are made of, in unit order; `None` for
@@ -1645,6 +1741,7 @@ mod layer_view_tests {
             scales,
             initialized: [flags(), flags()],
             fields: Vec::new(),
+            runs: Vec::new(),
         }
     }
 

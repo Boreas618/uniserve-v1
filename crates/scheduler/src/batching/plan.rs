@@ -219,22 +219,8 @@ impl Scheduler {
                     generation::plan_decode(request, input_token, relay_input, sampling_state)
                 })
             }
-            // The prefill group exports the request's cache, then the decode
-            // group installs it.
-            Phase::HandOff => {
-                let export = self.running.get(&id)?.handoff_export;
-                self.plan_call(id, |scheduler, request| {
-                    let bytes = scheduler
-                        .info
-                        .prefix_cache
-                        .as_ref()
-                        .map_or(0, |cache| cache.transfer_bytes(cache_visible_len));
-                    match export {
-                        None => generation::plan_cache_export(bytes, request),
-                        Some(export) => generation::plan_cache_install(bytes, export, request),
-                    }
-                })
-            }
+            // The hand-off copies the request's cache with no call.
+            Phase::HandOff => None,
             Phase::IngestState => self.next_context_call(id, budget, rows.context),
             Phase::Canvas => {
                 // One step of the request's block is one read-only canvas row

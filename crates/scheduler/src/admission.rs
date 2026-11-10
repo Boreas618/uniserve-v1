@@ -295,7 +295,7 @@ impl Scheduler {
             sampling_position: 0,
             next_token: 0,
             num_generated_tokens: generated,
-            handoff_export: None,
+            hand_off: generation::HandOff::None,
             worker_registered: false,
             num_cache_units_sent: 0,
             reserve_worstcase,

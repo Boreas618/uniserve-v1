@@ -144,7 +144,7 @@ impl Scheduler {
                 input: 1 + generation::verify_drafts(&call).len() as u32,
             }),
             CallKind::Forward(ForwardMode::TokenDenoising)
-            | CallKind::Transfer(TransferMode::CacheExport | TransferMode::CacheInstall) => {
+            | CallKind::Transfer(TransferMode::CacheExport) => {
                 Some(CacheLengths { visible, input: 0 })
             }
             _ => None,
@@ -199,6 +199,9 @@ impl Scheduler {
             };
             let fresh_count = u64::from(call.bounds.max_cache_units);
             let declared = state.num_cache_units_sent;
+            // A handed-off request's first call is its first on the decode group.
+            let handed_off = state.hand_off == generation::HandOff::Copied;
+            state.hand_off = generation::HandOff::None;
             let (Some(request_pool_idx), Some(allocation)) =
                 (state.request_pool_idx(), state.prefix_cache_mut())
             else {
@@ -215,15 +218,16 @@ impl Scheduler {
             // Admission (or re-admission) declares every table again, with
             // every allocated page fresh; pages acquired from the prefix
             // cache already hold computed keys and values and are never fresh.
-            // A hand-off's install declares them to the decode group, which
-            // has seen none.
-            let declares_all =
-                admitted || call.kind == CallKind::Transfer(TransferMode::CacheInstall);
-            if declares_all {
+            // A handed-off request's first call declares them to the decode
+            // group, which has seen none, with no fresh unit: the hand-off
+            // copied every unit's pages there.
+            if admitted || handed_off {
                 allocation.clear_sent();
             }
-            let fresh_since = if declares_all {
+            let fresh_since = if admitted {
                 Some(0)
+            } else if handed_off {
+                None
             } else {
                 (fresh_count > 0).then(|| declared.saturating_sub(fresh_count))
             };

@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::completion::{BatchReport, CallCompletion};
-use ipc::{ForwardMode, MediaCall, TransferMode};
+use ipc::{ForwardMode, MediaCall};
 
 /// Describes a rejected worker result for the request's terminal error and
 /// its error finish's log line: the rejection, then the call it answered.
@@ -874,13 +874,6 @@ impl Scheduler {
                 if let Some(Err(error)) = progress_result {
                     self.fail_after_inflight(id, rejection_cause(&call, &error));
                     continue;
-                }
-                // An accepted hand-off install releases the prefill group's
-                // export it read.
-                if progress_result.is_some()
-                    && call.kind == CallKind::Transfer(TransferMode::CacheInstall)
-                {
-                    self.free_buffers(call.cache_input);
                 }
                 // An accepted forward extends the request's prefix cache and,
                 // in a speculating deployment, its draft cache: publish the

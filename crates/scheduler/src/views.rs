@@ -85,7 +85,7 @@ use crate::policy::TrialState;
 /// A phase id is the kind's own (`PhaseKind::id`), so it means the same thing
 /// in every epoch: `PhaseKind` appends a kind and never renumbers one, and an
 /// id a removed kind numbered names no phase.
-const PHASES: [PhaseKind; 19] = [
+const PHASES: [PhaseKind; 17] = [
     PhaseKind::TextEncoding,
     PhaseKind::VisionEncoding,
     PhaseKind::LatentEncoding,
@@ -93,7 +93,6 @@ const PHASES: [PhaseKind; 19] = [
     PhaseKind::Decode,
     PhaseKind::Verify,
     PhaseKind::TokenDenoise,
-    PhaseKind::CacheInstall,
     PhaseKind::MediaRead,
     PhaseKind::Denoise,
     PhaseKind::VideoDecode,
@@ -102,7 +101,6 @@ const PHASES: [PhaseKind; 19] = [
     PhaseKind::AudioEncode,
     PhaseKind::Mux,
     PhaseKind::LatentPrepare,
-    PhaseKind::TensorTransfer,
     PhaseKind::CacheExport,
     PhaseKind::Refill,
 ];
@@ -144,9 +142,7 @@ pub(crate) fn call_phase(kind: CallKind) -> PhaseKind {
         CallKind::Media(MediaCall::MediaReading) => PhaseKind::MediaRead,
         CallKind::Media(MediaCall::LatentPreparation) => PhaseKind::LatentPrepare,
         CallKind::Media(MediaCall::Muxing) => PhaseKind::Mux,
-        CallKind::Transfer(TransferMode::Tensor) => PhaseKind::TensorTransfer,
         CallKind::Transfer(TransferMode::CacheExport) => PhaseKind::CacheExport,
-        CallKind::Transfer(TransferMode::CacheInstall) => PhaseKind::CacheInstall,
     }
 }
 
@@ -168,7 +164,6 @@ pub(crate) fn phase_call(kind: PhaseKind) -> Option<CallKind> {
         PhaseKind::Decode => CallKind::Forward(ForwardMode::Decode),
         PhaseKind::Verify => CallKind::Forward(ForwardMode::Verify),
         PhaseKind::TokenDenoise => CallKind::Forward(ForwardMode::TokenDenoising),
-        PhaseKind::CacheInstall => CallKind::Transfer(TransferMode::CacheInstall),
         PhaseKind::MediaRead => CallKind::Media(MediaCall::MediaReading),
         PhaseKind::Denoise => CallKind::Media(MediaCall::Denoising),
         PhaseKind::VideoDecode => CallKind::Media(MediaCall::VideoDecoding),
@@ -177,7 +172,6 @@ pub(crate) fn phase_call(kind: PhaseKind) -> Option<CallKind> {
         PhaseKind::AudioEncode => CallKind::Media(MediaCall::AudioEncoding),
         PhaseKind::Mux => CallKind::Media(MediaCall::Muxing),
         PhaseKind::LatentPrepare => CallKind::Media(MediaCall::LatentPreparation),
-        PhaseKind::TensorTransfer => CallKind::Transfer(TransferMode::Tensor),
         PhaseKind::CacheExport => CallKind::Transfer(TransferMode::CacheExport),
         PhaseKind::Other => return None,
     })
@@ -1055,7 +1049,6 @@ fn candidate_facts<'a>(
     let decode_stage = matches!(
         kind,
         CallKind::Forward(ForwardMode::Decode | ForwardMode::Verify)
-            | CallKind::Transfer(TransferMode::CacheInstall)
     );
     candidates
         .filter(|(id, _, _)| !decode_stage || !scheduler.dispatch.prefill_groups.contains(*id))
@@ -1379,9 +1372,7 @@ mod tests {
             CallKind::Media(MediaCall::MediaReading),
             CallKind::Media(MediaCall::LatentPreparation),
             CallKind::Media(MediaCall::Muxing),
-            CallKind::Transfer(TransferMode::Tensor),
             CallKind::Transfer(TransferMode::CacheExport),
-            CallKind::Transfer(TransferMode::CacheInstall),
         ];
         for call in calls {
             let phase = call_phase(call);

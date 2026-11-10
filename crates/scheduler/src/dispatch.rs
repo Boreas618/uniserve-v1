@@ -6,10 +6,11 @@
 //! component, its later calls for that component stay there. A request's
 //! decode calls stay on the replica that took its first decode-stage call,
 //! which is its prefill replica unless that replica only prefills
-//! (`WorkerGroupRole::Prefill`): then a decode replica installs its cache.
+//! (`WorkerGroupRole::Prefill`): then its cache is handed off to a decode
+//! replica (`crate::hand_off`).
 
 use super::*;
-use ipc::{ForwardMode, TransferMode};
+use ipc::ForwardMode;
 
 #[derive(Default)]
 pub(super) struct Dispatch {
@@ -37,7 +38,6 @@ fn decodes(kind: CallKind) -> bool {
     matches!(
         kind,
         CallKind::Forward(ForwardMode::Decode | ForwardMode::Verify)
-            | CallKind::Transfer(TransferMode::CacheInstall)
     )
 }
 

@@ -54,6 +54,7 @@ pub mod allocation;
 mod clock;
 mod core;
 mod encoder_outputs;
+mod hand_off;
 mod handle;
 mod host_pages;
 mod kv_cache;
@@ -462,6 +463,9 @@ pub struct Scheduler {
     /// The host encoder pools of the video encoders, when they serve their
     /// worker groups (`Scheduler::enable_encoder_store`).
     encoder_outputs: Option<crate::encoder_outputs::EncoderStore>,
+    /// The hand-offs from the prefill groups to the decode groups, when the
+    /// deployment has prefill groups (`Scheduler::enable_hand_off`).
+    hand_offs: Option<crate::hand_off::HandOffs>,
     /// Set while an operation waits for the batches in flight to complete
     /// (`Scheduler::drain_batches`, `Scheduler::flush_offloads` and the
     /// commands that drain before they act): the scheduler admits and
@@ -584,21 +588,18 @@ fn batch_kind(call_variant: CallKind) -> BatchKind {
             | MediaCall::AudioDecoding
             | MediaCall::Muxing,
         )
-        | CallKind::Transfer(TransferMode::Tensor)
-        | CallKind::Transfer(TransferMode::CacheExport)
-        | CallKind::Transfer(TransferMode::CacheInstall) => BatchKind::Media,
+        | CallKind::Transfer(TransferMode::CacheExport) => BatchKind::Media,
     }
 }
 
 /// Returns the order in which ready completions are applied; lower values go
 /// first, and equal values keep arrival order.
 ///
-/// Denoising and cache installation completions precede all
-/// other kinds (`Inflight::take_ready_completions` and the resolution pass in
+/// Denoising completions precede all other kinds (`Inflight::take_ready_completions` and the resolution pass in
 /// `execution`).
 fn completion_priority(call_variant: CallKind) -> u8 {
     match call_variant {
-        CallKind::Media(MediaCall::Denoising) | CallKind::Transfer(TransferMode::CacheInstall) => 0,
+        CallKind::Media(MediaCall::Denoising) => 0,
         _ => 1,
     }
 }

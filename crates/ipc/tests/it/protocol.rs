@@ -36,7 +36,6 @@ fn ar_decode_call() -> Call {
     let kind = CallKind::Forward(ForwardMode::Decode);
     Call {
         consumer_slots: Vec::new(),
-        token_input: None,
         coordinates: CallCoordinates {
             logical_position: 7,
             cache_visible_len: 5,
@@ -141,6 +140,7 @@ fn product_validation_enforces_generation_and_shape_bounds() {
 fn main_process_info_round_trips() {
     let info = MainProcessInfo {
         prefix_cache: Some(PrefixCacheInfo {
+            plane_runs: Vec::new(),
             groups: vec![CacheGroup {
                 layer_ids: (11..20).collect(),
                 ..MainProcessInfo::default().prefix_cache.unwrap().groups[0].clone()
@@ -472,6 +472,7 @@ fn full_caps() -> MainProcessInfo {
         // sliding-window group with 32-token pages of two units share one
         // pool.
         prefix_cache: Some(PrefixCacheInfo {
+            plane_runs: Vec::new(),
             groups: vec![
                 CacheGroup {
                     layer_ids: (0..14).collect(),

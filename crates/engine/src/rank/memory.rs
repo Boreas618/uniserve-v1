@@ -325,6 +325,16 @@ impl ModelRunner {
             info.encoder_cache_entries = worker::runners::vision::FEATURE_ENTRIES;
             info.buffer_pool_bytes = entry * u64::from(worker::runners::vision::FEATURE_ENTRIES);
         }
+        // Where the planes the Storage Server retains hold each unit, which a copy between
+        // processes (a prefill/decode hand-off) addresses.
+        if let (Some(cache), Some(prefix_cache)) =
+            (info.prefix_cache.as_mut(), memory.prefix_cache.as_ref())
+        {
+            let prefix_cache = prefix_cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("the prefix cache's lock is poisoned"))?;
+            cache.plane_runs = prefix_cache.planes().runs().to_vec();
+        }
         if let Loaded::Video(pipeline) = loaded {
             let description = pipeline.description(&self.video_serving()?)?;
             info.video_denoiser = Some(ipc::VideoDenoiserInfo {

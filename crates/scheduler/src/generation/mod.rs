@@ -20,12 +20,12 @@ use super::{EncoderCachePin, Phase, RequestAllocations, Terminal};
 use crate::completion::CallCompletion;
 use crate::kv_cache::{BlockTable, CacheAllocation};
 
-use ipc::{ForwardMode, MediaCall, TransferMode};
+use ipc::{ForwardMode, MediaCall};
 
 use crate::{GenerationRequest, ImageEncoderInput, ImageInput};
 use ipc::{
-    Bounds, BufferId, Call, CallId, CallKind, CallStatus, CanvasStep, DimBound, RequestKey,
-    SamplingState, ShapeBound, TensorRef, VisionInput,
+    Bounds, Call, CallId, CallKind, CallStatus, CanvasStep, DimBound, RequestKey, SamplingState,
+    ShapeBound, TensorRef, VisionInput,
 };
 use ipc::{CanvasSampling, RequestId, SamplingParams};
 use proto::tensor::DType;
@@ -120,6 +120,20 @@ fn logprob_result_bytes(
     Ok(Some(bytes))
 }
 
+/// Where a request's prefill/decode hand-off stands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum HandOff {
+    /// No hand-off is under way.
+    #[default]
+    None,
+    /// Its units are being copied into the decode group's planes.
+    Copying,
+    /// Its units are in the decode group's planes: the request's next call
+    /// admits it there with the token it committed, and declares its tables
+    /// with no fresh unit, since the copied units hold its pages.
+    Copied,
+}
+
 /// Lifecycle phase for a canonical generation request.
 ///
 /// `RequestState::phase` records the accepted phase. Scheduling projects the
@@ -136,9 +150,11 @@ pub(crate) enum GenerationPhase {
     /// (`Scheduler::next_context_call`).
     Prefill,
     /// Move the request's KV cache from the prefill group that prefilled its
-    /// prompt to a decode group (`WorkerGroupRole::Decode`): export it on
-    /// the prefill group (`RequestState::handoff_export`), then install it
-    /// on the decode group, which decodes the request from then on.
+    /// prompt to a decode group (`WorkerGroupRole::Decode`): the Storage
+    /// Server's Transfer Server copies the request's units from the prefill
+    /// group's device planes into the decode group's (`crate::hand_off`),
+    /// and no call runs meanwhile (`RequestState::hand_off`). The decode
+    /// group then decodes the request from its committed token on.
     HandOff,
     /// Decode understanding (text) tokens.
     DecodeUnd,
@@ -274,17 +290,6 @@ impl RequestState {
                     self.canvas_commit = record.committed_tokens.clone();
                     self.phase = GenerationPhase::CommitCanvas;
                 }
-            }
-            CallKind::Transfer(TransferMode::CacheExport)
-                if self.phase == GenerationPhase::HandOff =>
-            {
-                self.handoff_export = call.cache_output;
-            }
-            // The decode group holds the request's cache: it decodes from
-            // the committed token on.
-            CallKind::Transfer(TransferMode::CacheInstall) => {
-                self.handoff_export = None;
-                self.phase = GenerationPhase::DecodeUnd;
             }
             _ => {}
         }
@@ -588,61 +593,6 @@ pub(super) fn latent_draw(request: &GenerationRequest, block: BlockCursor) -> u3
             latent(&image.encoders[..block.encoder.min(image.encoders.len())])
         });
     u32::try_from(draw).unwrap_or(u32::MAX)
-}
-
-/// Exports the request's visible KV cache from the prefill group that
-/// prefilled it, which a decode group installs (`GenerationPhase::HandOff`).
-///
-/// `transfer_bytes` bounds the export of the visible extent over
-/// every cache group (`PrefixCacheInfo::transfer_bytes`); it also makes the
-/// call hold one of the scheduler's transfer reservations. Fails with
-/// `MissingProductBound` when it is zero, which includes an empty extent.
-pub(super) fn plan_cache_export(
-    transfer_bytes: u64,
-    request: &GenerationRequest,
-) -> Result<Call, PlanningError> {
-    if transfer_bytes == 0 {
-        return Err(PlanningError::MissingProductBound);
-    }
-    let mut call = new_call(request, CallKind::Transfer(TransferMode::CacheExport));
-    call.bounds.max_tokens = 0;
-    call.bounds.max_transfer_bytes = transfer_bytes;
-    // Owner and producer are the placeholders from `new_call`;
-    // `register_call` stamps them.
-    call.cache_output = Some(BufferId {
-        owner: call.request_key,
-        producer_call_id: call.call_id,
-        output_index: 0,
-        generation: 0,
-    });
-    call.completion_output = Some(output_tensor(1, DType::U8));
-    finish_plan(request, call, 0)
-}
-
-/// Installs the KV cache the prefill group exported (`export`) on the
-/// decode group that decodes the request from now on
-/// (`GenerationPhase::HandOff`). `transfer_bytes` bounds the export, as
-/// for `plan_cache_export`.
-pub(super) fn plan_cache_install(
-    transfer_bytes: u64,
-    export: BufferId,
-    request: &GenerationRequest,
-) -> Result<Call, PlanningError> {
-    if transfer_bytes == 0 {
-        return Err(PlanningError::MissingProductBound);
-    }
-    let mut call = new_call(request, CallKind::Transfer(TransferMode::CacheInstall));
-    call.bounds.max_tokens = 0;
-    call.bounds.max_transfer_bytes = transfer_bytes;
-    call.cache_input = Some(export);
-    call.cache_output = Some(BufferId {
-        owner: call.request_key,
-        producer_call_id: call.call_id,
-        output_index: 0,
-        generation: 0,
-    });
-    call.completion_output = Some(output_tensor(1, DType::U8));
-    finish_plan(request, call, 0)
 }
 
 /// Derives storage bounds directly from the call's actual inputs and outputs.
@@ -1090,9 +1040,9 @@ pub(crate) struct RequestState {
     /// Committed token the next decode continues from.
     pub(super) next_token: u32,
     pub(super) num_generated_tokens: usize,
-    /// The prefill group's export of the request's KV cache during
-    /// `HandOff`, which the decode group installs.
-    pub(super) handoff_export: Option<ipc::BufferId>,
+    /// Where the request's hand-off from its prefill group to a decode group
+    /// stands (`GenerationPhase::HandOff`).
+    pub(super) hand_off: HandOff,
     /// Whether the current epoch is registered with its execution workers.
     pub(super) worker_registered: bool,
     /// Whether the request's slot holds the request's recurrent state at its

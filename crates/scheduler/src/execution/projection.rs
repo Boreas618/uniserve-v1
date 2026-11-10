@@ -161,11 +161,6 @@ impl Scheduler {
                 CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
                     Phase::Prefill
                 }
-                // A hand-off's export or install leaves the request handing
-                // off until the install is accepted.
-                CallKind::Transfer(TransferMode::CacheExport | TransferMode::CacheInstall) => {
-                    Phase::HandOff
-                }
                 _ => state.phase,
             },
             None => state.phase,
@@ -320,12 +315,8 @@ impl Scheduler {
             return false;
         };
 
-        // A cache export or install is never queued behind an unresolved
-        // call.
-        if matches!(
-            target,
-            CallKind::Transfer(TransferMode::CacheExport | TransferMode::CacheInstall)
-        ) {
+        // A cache export is never queued behind an unresolved call.
+        if matches!(target, CallKind::Transfer(TransferMode::CacheExport)) {
             return false;
         }
 
@@ -423,16 +414,11 @@ impl Scheduler {
         {
             return None;
         }
-        let last = &self.inflight.pending_calls.get(&id)?.back()?.call;
+        self.inflight.pending_calls.get(&id)?.back()?;
         Some(match self.next_generation_phase(id)? {
             Phase::Prefill | Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
-            Phase::HandOff
-                if state.handoff_export.is_some()
-                    || last.kind == CallKind::Transfer(TransferMode::CacheExport) =>
-            {
-                CallKind::Transfer(TransferMode::CacheInstall)
-            }
-            Phase::HandOff => CallKind::Transfer(TransferMode::CacheExport),
+            // The hand-off copies the request's cache with no call.
+            Phase::HandOff => return None,
             Phase::Canvas => CallKind::Forward(ForwardMode::TokenDenoising),
             Phase::CommitCanvas => CallKind::Forward(ForwardMode::Prefill),
             Phase::IngestState => return None,

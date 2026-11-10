@@ -30,6 +30,11 @@ pub struct PrefixCacheInfo {
     /// The host page pools this rank copies its cache groups' pages
     /// through, one per group in group order; empty without a host KV cache.
     pub page_pools: Vec<HostPoolInfo>,
+    /// Where the bytes of every unit lie in the rank's retained device
+    /// storage, run by run, for copies between processes (a prefill/decode
+    /// hand-off); empty for planes not retained at a Storage Server.
+    #[serde(default)]
+    pub plane_runs: Vec<CachePlaneRun>,
     /// Units `1..=scratch_units` the rank's warmup lends to its startup
     /// forwards. A standby worker warms up on them while its predecessor
     /// serves, so the engine never allocates them.
@@ -133,6 +138,28 @@ pub struct HostPoolInfo {
     /// Where an engine on another host reaches the pool's Storage Server
     /// (`StorageLaunch::tcp`).
     pub endpoint: Option<String>,
+}
+
+/// One run of a rank's device cache planes, as a copy between processes
+/// addresses it: for each unit `u` in `first..first + count`, `bytes` bytes
+/// at `offset + (u - first) * bytes` of the retained exclusive tensor `key`
+/// on the GPU `gpu`.
+///
+/// The runs of one `field` (`prefix_cache.key.values/0` for the key values
+/// of a page's column 0, and so on for the values, the initialization flags,
+/// the FP8 scales and the state checkpoints) hold that field's bytes of every
+/// unit once. Two ranks of the same cache plan name the same fields at the
+/// same bytes per unit, so a unit copies between them field by field, from
+/// the run of one holding the unit to the run of the other holding it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachePlaneRun {
+    pub field: String,
+    pub key: storage::Key,
+    pub gpu: [u8; 16],
+    pub first: u32,
+    pub count: u32,
+    pub offset: u64,
+    pub bytes: u64,
 }
 
 /// The host latent pool of a denoising rank (a video model's, or an image
@@ -342,6 +369,8 @@ impl PrefixCacheInfo {
             // Each stage holds other layers of a page: its pages are its own
             // content, which the merged view does not name.
             page_pools: Vec::new(),
+            // Each stage's runs address its own layers' storage.
+            plane_runs: Vec::new(),
             // A unit the warmup of any stage lends stays out of the pool.
             scratch_units: self.scratch_units.max(other.scratch_units),
             // The stages compute the pages together: every stage's identity
@@ -739,6 +768,7 @@ impl Default for MainProcessInfo {
             // One full-attention group of 28 layers with 8 BF16 heads of 128,
             // one unit per 64-token page.
             prefix_cache: Some(PrefixCacheInfo {
+                plane_runs: Vec::new(),
                 num_units: 4096,
                 dtype: PrefixCacheDtype::BFloat16,
                 groups: vec![CacheGroup {

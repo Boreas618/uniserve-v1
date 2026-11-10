@@ -635,10 +635,7 @@ impl<K: Order> Policy for Arrival<K> {
     fn place(&mut self, call: &CallView, replicas: &[ReplicaView]) -> usize {
         // A decode-stage call never lands on a replica that only prefills
         // (today's prefill groups).
-        let decode_stage = matches!(
-            call.kind,
-            PhaseKind::Decode | PhaseKind::Verify | PhaseKind::CacheInstall
-        );
+        let decode_stage = matches!(call.kind, PhaseKind::Decode | PhaseKind::Verify);
         let mut candidates = replicas.iter().filter(|replica| {
             replica.kinds.contains(&call.kind) && !(decode_stage && replica.prefills_only)
         });

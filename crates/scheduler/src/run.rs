@@ -236,6 +236,7 @@ impl Scheduler {
             state_interval: crate::kv_cache::DEFAULT_STATE_INTERVAL,
             trajectories: None,
             encoder_outputs: None,
+            hand_offs: None,
             draining: false,
             held: false,
             resizing: None,
@@ -344,6 +345,28 @@ impl Scheduler {
     /// whose requests hand their KV cache to a decode group.
     pub fn set_prefill_groups(&mut self, groups: impl IntoIterator<Item = crate::WorkerGroupId>) {
         self.dispatch.prefill_groups = groups.into_iter().collect();
+    }
+
+    /// Hand requests off from the prefill groups to the decode groups through
+    /// this host's Storage Server, at `socket`, as a head of `epoch` of
+    /// `deployment`, on host `host` (`crate::hand_off`).
+    ///
+    /// # Errors
+    ///
+    /// Fails when a Storage Server cannot be reached or a rank reports no
+    /// retained cache planes.
+    pub fn enable_hand_off(
+        &mut self,
+        socket: &std::path::Path,
+        deployment: &str,
+        epoch: u64,
+        host: &str,
+    ) -> anyhow::Result<()> {
+        let ranks = self.worker.info().rank_caches.clone();
+        self.hand_offs = Some(crate::hand_off::HandOffs::connect(
+            socket, deployment, epoch, host, &ranks,
+        )?);
+        Ok(())
     }
 
     /// Sets the epoch that owns new requests' private cache continuations.

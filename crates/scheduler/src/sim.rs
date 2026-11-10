@@ -1912,9 +1912,7 @@ impl SimEngine {
             | CallKind::Media(MediaCall::TextEncoding)
             | CallKind::Media(MediaCall::VisionEncoding)
             | CallKind::Media(MediaCall::LatentEncoding) => {}
-            CallKind::Transfer(TransferMode::Tensor)
-            | CallKind::Transfer(TransferMode::CacheExport)
-            | CallKind::Transfer(TransferMode::CacheInstall) => {
+            CallKind::Transfer(TransferMode::CacheExport) => {
                 set_cache_lengths(&mut record, request.cache_visible_len);
             }
             CallKind::Media(MediaCall::LatentPreparation) => {
@@ -2480,12 +2478,16 @@ impl SimEngine {
 
         let admissions = batch.admissions().cloned().collect::<Vec<_>>();
         for admission in admissions {
-            // A hand-off's install admits the request on its decode group, which
-            // starts from the install's descriptor. The prefill group serves it
-            // no more, so one state stands for the request on either.
+            // A handed-off request is admitted again on its decode group by
+            // its first decode, with the token it committed on the prefill
+            // group. The prefill group serves it no more, so one state stands
+            // for the request on either.
             let handed_off = batch.requests.iter().any(|(call, _)| {
                 call.request_key == admission.request_key
-                    && call.kind == CallKind::Transfer(TransferMode::CacheInstall)
+                    && matches!(
+                        call.kind,
+                        CallKind::Forward(ForwardMode::Decode | ForwardMode::Verify)
+                    )
             });
             match self.requests.get_mut(&admission.request_key.request_id) {
                 Some(request) if handed_off => {
@@ -2726,7 +2728,6 @@ mod tests {
         let call = Call {
             consumer_slots: Vec::new(),
             coordinates: ipc::CallCoordinates::default(),
-            token_input: None,
 
             token_output: Some(token_output(CallId::new(batch_id, request_index))),
             vision_inputs: Vec::new(),

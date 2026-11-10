@@ -353,6 +353,23 @@ impl SchedulerHandle {
                 .filter(|group| group.role == WorkerGroupRole::Prefill)
                 .map(|group| group.id.clone()),
         );
+        // A deployment with prefill groups hands its requests' KV caches to
+        // its decode groups through the Storage Server.
+        if engine
+            .parallel
+            .worker_groups
+            .iter()
+            .any(|group| group.role == WorkerGroupRole::Prefill)
+        {
+            scheduler
+                .enable_hand_off(
+                    &storage::default_socket(),
+                    &engine.deployment,
+                    args.epoch,
+                    &args.host,
+                )
+                .context("connecting the prefill/decode hand-off")?;
+        }
         // A scheduler with a host tier keeps its storages under the
         // deployment's name, where its claim is; one without keeps them in a
         // scope of its own, so two engine processes of one deployment on a node
