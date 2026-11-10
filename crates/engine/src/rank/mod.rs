@@ -25,7 +25,6 @@ mod memory;
 mod placement;
 mod report;
 mod text;
-mod tokens;
 mod video;
 
 use std::collections::BTreeMap;
@@ -37,7 +36,6 @@ use anyhow::{Context as _, Result, bail};
 use ops::DType;
 use platform::DeviceId;
 use program_server::Target;
-use proto::request::GenerationLimits;
 use worker::blocking::{BlockingKind, LaneLimits, Limits};
 use worker::device::GraphStorage;
 use worker::memory::Memory;
@@ -46,7 +44,6 @@ use worker::stream::EventPool;
 
 use buckets::{PrefillBound, expert_classes, tier_refusal};
 use placement::Mapping;
-use tokens::{checkpoint_tokens, understanding_limits};
 use video::{SharedCodec, prompt_capacity};
 
 use nn::family::{
@@ -592,11 +589,10 @@ impl ModelRunner {
     /// the process's arguments `launch`, with the engine configuration as this process resolves it,
     /// and the mechanism's limits for this rank ([`scheduler::SchedulerConfig::of`]).
     ///
-    /// The configuration takes the facts of the model this rank serves, read where they are
-    /// stated: the control tokens from the checkpoint (`checkpoint_tokens`), since a launch file
-    /// states where the checkpoint is and not what its vocabulary means, and what one request may
-    /// be given to generate from this class of model. It keeps the host KV tier only where
-    /// `host_kv_cache` says this scheduler keeps one.
+    /// The model's control tokens and generation limits are the ones the leader resolved from the
+    /// checkpoint and launched this process with (`frontend::model::ModelConfig`), so the scheduler
+    /// stops on the same end-of-generation set the leader's decoder does. The configuration keeps
+    /// the host KV tier only where `host_kv_cache` says this scheduler keeps one.
     ///
     /// The limits are what this rank captured: a causal-language rank admits up to the largest
     /// bucket of its catalog, whose sizes are the tiers a plan's batch must fit, and a media
@@ -614,21 +610,6 @@ impl ModelRunner {
         let (max_batch, max_num_batched_tokens, graph_tiers) = match loaded {
             Loaded::Text(_) => {
                 let (rows, tokens) = self.buckets.bounds();
-                let Model::Text(family) = self.family.model else {
-                    bail!("a text rank's family is a text family");
-                };
-                let end_of_text = family
-                    .open(&nn::Checkpoint::open(self.checkpoint())?)?
-                    .end_of_text();
-                let control = checkpoint_tokens(self.checkpoint(), end_of_text)?;
-                // What one request may be given to generate on this model; see
-                // `understanding_limits`.
-                model.generation_limits = understanding_limits();
-                model.bos = control.bos;
-                model.eos = control.eos;
-                // A causal LM encodes no image, so no token closes encoded image content, and `0`
-                // stands for that absence rather than for an id.
-                model.end_of_image = 0;
                 let graph_tiers = self
                     .buckets
                     .iter()
@@ -640,20 +621,6 @@ impl ModelRunner {
             }
             Loaded::Video(_) => {
                 let tokens = prompt_capacity(&self.engine_config().video, model.max_model_len)?;
-                // A media request generates a clip, not tokens, so no understanding feature is
-                // served; the engine still needs the two lower bounds, as the frontend's arm for
-                // this class states them (`crates/frontend/src/model/generation.rs`).
-                model.generation_limits = GenerationLimits {
-                    latent_downsample: 1,
-                    max_cfg_branches: 1,
-                    ..GenerationLimits::default()
-                };
-                // The media class decodes no tokens, so no tokenizer fact reaches a scheduler
-                // call: `0` stands for the absence of a token, and the list of terminating tokens
-                // is empty.
-                model.bos = 0;
-                model.eos = Vec::new();
-                model.end_of_image = 0;
                 (running, tokens as usize, Vec::new())
             }
         };
