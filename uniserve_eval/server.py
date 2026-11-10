@@ -3,16 +3,28 @@
 `cli.run` wraps each deployment in one `ManagedDeployment`: a single
 `ManagedServer`, or one per replica. Each process's combined stdout and
 stderr go to its own log file.
+
+A `uniserve serve` process starts the host services it needs -- the Storage
+Server and the Program Server -- in its runtime directory
+(`$XDG_RUNTIME_DIR/uniserve`) as detached processes that outlive it, and the
+Storage Server holds the deployment's host and device storage until it
+stops. A deployment therefore runs under a runtime directory of its own,
+which its replicas share as the processes of one host do, and stopping the
+deployment stops those services and removes the directory, so no page or
+storage state crosses from one point to the next.
 """
 
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import http.client
 import os
+import shutil
 import signal
 import socket
 import subprocess
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -201,6 +213,12 @@ class ManagedDeployment:
     Replicas launch together so their model loading overlaps, and readiness
     requires every process to be ready. Any launch or readiness failure stops
     all of them, as does leaving the context.
+
+    Every process runs with `XDG_RUNTIME_DIR` set to a directory the
+    deployment creates on entry, so the host services its processes start
+    belong to this deployment alone. `stop` stops those services after the
+    processes, keeps each service's log beside the first process's log as
+    `<log stem>.<service>.log`, and removes the directory.
     """
 
     def __init__(
@@ -214,10 +232,22 @@ class ManagedDeployment:
             ManagedServer(profile, launch, log_path, timeout_s=timeout_s)
             for profile, launch, log_path in processes
         ]
+        self.runtime: Path | None = None
 
     def __enter__(self) -> Self:
         """Start every process and return once all are ready."""
         try:
+            # A short directory under the system's temporary directory keeps
+            # the services' Unix socket paths within the kernel's limit.
+            self.runtime = Path(tempfile.mkdtemp(prefix="uniserve-eval-"))
+            for server in self.servers:
+                server.launch = dataclasses.replace(
+                    server.launch,
+                    environment={
+                        **server.launch.environment,
+                        "XDG_RUNTIME_DIR": str(self.runtime),
+                    },
+                )
             for server in self.servers:
                 server.start()
             for server in self.servers:
@@ -237,9 +267,28 @@ class ManagedDeployment:
         self.stop()
 
     def stop(self) -> None:
-        """Stop every process; each stop is a no-op once completed."""
+        """Stop every process, then the host services they started.
+
+        Each step is a no-op once completed, so a repeated call is safe.
+        """
         for server in self.servers:
             server.stop()
+
+        runtime = self.runtime
+        self.runtime = None
+        if runtime is None:
+            return
+        services = runtime / "uniserve"
+        _stop_services(services)
+        # A detached service appends its output to `<service>.log` beside
+        # its socket; the log is the deployment's evidence and outlives the
+        # directory.
+        if self.servers and services.is_dir():
+            first_log = self.servers[0].log_path
+            for log in sorted(services.glob("*.log")):
+                kept = first_log.with_name(f"{first_log.stem}.{log.name}")
+                shutil.copyfile(log, kept)
+        shutil.rmtree(runtime, ignore_errors=True)
 
     @property
     def startup_s(self) -> float | None:
@@ -275,3 +324,72 @@ def _group_exists(group: int) -> bool:
     except ProcessLookupError:
         return False
     return True
+
+
+def _service_pids(services: Path) -> list[int]:
+    """Return the processes that serve a socket inside `services`.
+
+    A host service runs as `<executable> <service> serve --socket <path>`
+    (`service::ensure`), so a service of this directory is a process whose
+    command line holds `serve` and a path inside it.
+    """
+    prefix = f"{services}/".encode()
+    pids = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            command = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if b"serve" in command and any(
+            argument.startswith(prefix) for argument in command
+        ):
+            pids.append(int(entry.name))
+    return pids
+
+
+def _stop_services(services: Path) -> None:
+    """Stop every host service serving inside `services` and wait for it.
+
+    A service stops on SIGTERM and releases its storage as it exits; one
+    still running `_STOP_GRACE_S` seconds later receives SIGKILL. The
+    services are not children of this process, so their exit is observed
+    as their disappearance from `/proc`, which their reaper ensures.
+
+    Raises:
+        RuntimeError: If a service is still running `_STOP_GRACE_S` seconds
+            after SIGKILL.
+    """
+    pids = _service_pids(services)
+    for pid in pids:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + _STOP_GRACE_S
+    while pids and time.monotonic() < deadline:
+        time.sleep(0.1)
+        pids = [pid for pid in pids if _alive(pid)]
+    for pid in pids:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+    deadline = time.monotonic() + _STOP_GRACE_S
+    while pids and time.monotonic() < deadline:
+        time.sleep(0.1)
+        pids = [pid for pid in pids if _alive(pid)]
+    # A service that survives SIGKILL still holds the deployment's storage,
+    # so the next point must not start on this host.
+    if pids:
+        raise RuntimeError(
+            f"host services {pids} of {services} did not exit after SIGKILL"
+        )
+
+
+def _alive(pid: int) -> bool:
+    """Report whether a process exists and has not exited."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    # The state letter follows the parenthesized command name; an exited
+    # process awaiting its reaper is `Z`.
+    return stat.rpartition(")")[2].split()[0] != "Z"

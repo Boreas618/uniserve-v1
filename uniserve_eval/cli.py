@@ -158,8 +158,11 @@ def run(args: argparse.Namespace) -> None:
                 evidence = {"bundle": output_root / point.name}
                 if point.video.media_dir:
                     evidence["media"] = Path(point.video.media_dir)
-                if point is first:
-                    for _, _, path in processes:
+                # The deployment's logs: one per process (`.replica-<i>`)
+                # and one per host service it ran (`.<service>.log`).
+                logs = output_root / "server-logs"
+                if point is first and logs.is_dir():
+                    for path in logs.glob(f"{first.name}.*"):
                         evidence[f"server-logs/{path.name}"] = path
                 archive = supersede(output_root, point.name, evidence)
                 if archive is not None:

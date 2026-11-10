@@ -2,7 +2,9 @@
 
 The stand-in is a real process that the driver launches from the profile's
 command: an OpenAI-compatible chat server that streams one token per
-request with its usage.
+request with its usage. Like `uniserve serve`, it first starts a Storage
+Server in its runtime directory as a detached process of its own session,
+which outlives the server, and records that process's pid beside itself.
 """
 
 from __future__ import annotations
@@ -31,8 +33,24 @@ pytestmark = pytest.mark.unit
 
 # The stand-in server. Its argument is the port it listens on.
 _SERVER = """
-import json, sys
+import json, os, subprocess, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+services = os.path.join(os.environ["XDG_RUNTIME_DIR"], "uniserve")
+os.makedirs(services, exist_ok=True)
+storage_log = open(os.path.join(services, "storage-server.log"), "a")
+storage = subprocess.Popen(
+    [
+        sys.executable, "-c",
+        "import time; print('storage server up', flush=True); time.sleep(300)",
+        "storage-server", "serve",
+        "--socket", os.path.join(services, "storage-server.sock"),
+    ],
+    stdout=storage_log,
+    start_new_session=True,
+)
+with open("storage-server.pid", "a") as handle:
+    handle.write(f"{storage.pid} {services}\\n")
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -250,3 +268,30 @@ videos_per_second = "higher"
 
     with pytest.raises(ValueError, match="media directory of benchmarks"):
         load_config(profile)
+
+
+def _running(pid: int) -> bool:
+    """Report whether a process exists and has not exited."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    return stat.rpartition(")")[2].split()[0] != "Z"
+
+
+def test_a_point_ends_with_the_storage_server_it_started_stopped(
+    tmp_path: Path,
+) -> None:
+    """No Storage Server, and so no storage, outlives its point."""
+    profile = _profile(tmp_path)
+    results = tmp_path / "results"
+
+    assert _run(["--config", str(profile), "run", "point"]) == 0
+
+    pid, services = (tmp_path / "storage-server.pid").read_text().split()
+    assert not _running(int(pid))
+    # The service's log is kept with the deployment's.
+    kept = results / "server-logs" / "point.storage-server.log"
+    assert kept.read_text() == "storage server up\n"
+    # The deployment's runtime directory is gone with its services.
+    assert not Path(services).exists()

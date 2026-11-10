@@ -481,6 +481,14 @@ def _server_environment(value: dict[str, Any], context: str) -> dict[str, str]:
         for key, item in environment.items()
     ):
         raise ValueError(f"{context}.environment must contain string values")
+    # Each deployment runs under a runtime directory the evaluator creates
+    # and removes (`server.ManagedDeployment`), so its host services end
+    # with it.
+    if "XDG_RUNTIME_DIR" in environment:
+        raise ValueError(
+            f"{context}.environment may not set XDG_RUNTIME_DIR: each "
+            "deployment runs under a runtime directory of its own"
+        )
     return dict(environment)
 
 
