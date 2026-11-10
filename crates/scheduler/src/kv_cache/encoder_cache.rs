@@ -361,7 +361,8 @@ impl EncoderCacheManager {
 mod tests {
     use super::*;
     use ipc::RequestId;
-    use ipc::{CallId, DType, RequestKey, ShapeBound};
+    use ipc::{CallId, RequestKey, ShapeBound};
+    use proto::tensor::DType;
 
     fn product(generation: u32) -> TensorRef {
         TensorRef {

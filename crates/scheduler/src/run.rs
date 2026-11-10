@@ -101,7 +101,7 @@ impl Scheduler {
     ) -> anyhow::Result<Self> {
         let info = submissions.info().runtime_info()?;
         let generation_limits = resolve_generation_limits(generation_limits, &info);
-        let latent_dtype = worker_float_dtype(Some(model_dtype));
+        let latent_dtype = Some(proto::tensor::DType::from(model_dtype));
         let media_storage = submissions
             .info()
             .workers

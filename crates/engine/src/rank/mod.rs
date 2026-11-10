@@ -720,11 +720,7 @@ impl ModelRunner {
     /// The element type the deployment computes in, which the daemon resolved against the
     /// checkpoint before it wrote this build config.
     fn dtype(&self) -> DType {
-        match self.engine_config().model.dtype {
-            proto::request::ModelDtype::Float16 => DType::F16,
-            proto::request::ModelDtype::BFloat16 => DType::BF16,
-            proto::request::ModelDtype::Float32 => DType::F32,
-        }
+        self.engine_config().model.dtype.into()
     }
 
     /// Batches this rank's schedulers keep in flight, which the capacity plan relays through (the

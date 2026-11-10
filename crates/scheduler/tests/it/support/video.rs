@@ -5,9 +5,10 @@
 use std::collections::BTreeMap;
 
 use ipc::{
-    CallKind, ComponentInfo, DType, DiffusionSamplingParams, DimBound, MediaCall, OutputInfo,
-    RasterAxes, RequestId, ShapeBound,
+    CallKind, ComponentInfo, DiffusionSamplingParams, DimBound, MediaCall, OutputInfo, RasterAxes,
+    RequestId, ShapeBound,
 };
+use proto::tensor::DType;
 use proto::video::Canvas;
 use scheduler::{
     BlockConfig, BlockDistribution, DiffusionRequest, Request, SimEngine, VideoDenoiserInfo,

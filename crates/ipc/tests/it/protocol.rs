@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use ipc::*;
 use ipc::{CacheGroup, CacheGroupKind, RequestId};
+use proto::tensor::DType;
 use serde::Serialize;
 
 /// Returns `message` as a receiver decodes it from the frame a sender made.

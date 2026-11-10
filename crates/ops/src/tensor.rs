@@ -178,6 +178,30 @@ impl DType {
     }
 }
 
+impl From<proto::tensor::DType> for DType {
+    /// The kernel element type of a tensor that crossed a process boundary: the same variant under
+    /// the same ABI number.
+    fn from(dtype: proto::tensor::DType) -> Self {
+        use proto::tensor::DType as Wire;
+        match dtype {
+            Wire::U8 => Self::U8,
+            Wire::I16 => Self::I16,
+            Wire::I32 => Self::I32,
+            Wire::I64 => Self::I64,
+            Wire::F16 => Self::F16,
+            Wire::BF16 => Self::BF16,
+            Wire::F32 => Self::F32,
+        }
+    }
+}
+
+impl From<proto::request::ModelDtype> for DType {
+    /// The kernel element type of a model's parameters and activations.
+    fn from(dtype: proto::request::ModelDtype) -> Self {
+        proto::tensor::DType::from(dtype).into()
+    }
+}
+
 impl fmt::Display for DType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {

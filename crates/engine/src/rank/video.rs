@@ -109,11 +109,7 @@ impl ModelRunner {
         // The encoder writes its hidden states in the deployment's effective type, which the daemon
         // resolved against the checkpoint before it wrote this build config (a `dtype` of `auto`
         // never reaches a main process as `auto`).
-        let dtype = match self.engine_config().model.dtype {
-            proto::request::ModelDtype::Float16 => DType::F16,
-            proto::request::ModelDtype::BFloat16 => DType::BF16,
-            proto::request::ModelDtype::Float32 => DType::F32,
-        };
+        let dtype = DType::from(self.engine_config().model.dtype);
 
         let stream = |name: &str| -> Result<platform::Stream> {
             platform::Stream::new(device)

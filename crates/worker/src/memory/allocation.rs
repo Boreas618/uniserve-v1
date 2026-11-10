@@ -115,16 +115,16 @@ impl ElementType {
 }
 
 /// The storage element type of a request message's dtype.
-impl From<ipc::DType> for ElementType {
-    fn from(dtype: ipc::DType) -> Self {
+impl From<proto::tensor::DType> for ElementType {
+    fn from(dtype: proto::tensor::DType) -> Self {
         match dtype {
-            ipc::DType::U8 => Self::U8,
-            ipc::DType::I16 => Self::I16,
-            ipc::DType::I32 => Self::I32,
-            ipc::DType::I64 => Self::I64,
-            ipc::DType::F16 => Self::F16,
-            ipc::DType::BF16 => Self::BF16,
-            ipc::DType::F32 => Self::F32,
+            proto::tensor::DType::U8 => Self::U8,
+            proto::tensor::DType::I16 => Self::I16,
+            proto::tensor::DType::I32 => Self::I32,
+            proto::tensor::DType::I64 => Self::I64,
+            proto::tensor::DType::F16 => Self::F16,
+            proto::tensor::DType::BF16 => Self::BF16,
+            proto::tensor::DType::F32 => Self::F32,
         }
     }
 }
@@ -175,7 +175,7 @@ impl ElementType {
 
 /// The message dtype of a storage element type, for the element types messages
 /// carry.
-impl TryFrom<ElementType> for ipc::DType {
+impl TryFrom<ElementType> for proto::tensor::DType {
     type Error = crate::Error;
 
     fn try_from(dtype: ElementType) -> Result<Self> {

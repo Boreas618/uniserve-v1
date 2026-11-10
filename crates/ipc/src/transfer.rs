@@ -824,7 +824,7 @@ fn validate_transfer_handle(product: &TensorRef, handle: &TransferHandle) -> Val
     // actual shape must fit the product's shape bound.
     {
         let tensor = &handle.tensors()[0];
-        let (dtype, element_bytes) = tensor_dtype(product.dtype);
+        let (dtype, element_bytes) = (product.dtype.torch_name(), product.dtype.element_bytes());
         let nbytes = tensor.validate()?;
         ensure_valid!(
             tensor.locations[0].dtype == dtype

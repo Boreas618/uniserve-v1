@@ -27,10 +27,11 @@ use ipc::{ForwardMode, MediaCall, TransferMode};
 
 use crate::{GenerationRequest, ImageEncoderInput, ImageInput};
 use ipc::{
-    Bounds, BufferId, Call, CallId, CallKind, CallStatus, CanvasStep, DType, DimBound, RequestKey,
+    Bounds, BufferId, Call, CallId, CallKind, CallStatus, CanvasStep, DimBound, RequestKey,
     SamplingState, ShapeBound, TensorRef, VisionInput,
 };
 use ipc::{CanvasSampling, RequestId, SamplingParams};
+use proto::tensor::DType;
 
 /// Builds an unstamped product reference for a planned call output.
 ///

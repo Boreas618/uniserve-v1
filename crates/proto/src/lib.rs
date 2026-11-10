@@ -28,6 +28,7 @@ pub mod program;
 pub mod report;
 pub mod request;
 mod shared_memory;
+pub mod tensor;
 pub mod video;
 
 pub use connection::{Connection, Error, Handed, Listener, Result};

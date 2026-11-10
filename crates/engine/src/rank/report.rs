@@ -50,7 +50,7 @@ pub(super) struct MediaBounds {
     pub(super) conditions: ConditionBounds,
     /// One row of the prompt's encoded states: the element type and the width the text encoder
     /// writes, which the engine sizes a stored encoding by.
-    pub(super) conditioning_row: (ipc::DType, u32),
+    pub(super) conditioning_row: (proto::tensor::DType, u32),
 }
 
 impl MediaBounds {
@@ -73,7 +73,7 @@ pub(super) fn media_outputs(component: &str, bounds: &MediaBounds) -> Vec<ipc::O
     use ipc::product;
     let output = |name: &str, extent: Option<u32>| ipc::OutputInfo {
         name: name.to_owned(),
-        dtype: ipc::DType::U8,
+        dtype: proto::tensor::DType::U8,
         shape_bound: ipc::ShapeBound {
             dims: vec![
                 extent.map_or(ipc::DimBound::Static(1), |max| ipc::DimBound::Device {

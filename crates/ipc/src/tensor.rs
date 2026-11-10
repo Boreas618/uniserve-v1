@@ -1,7 +1,7 @@
 //! Tensor identities and bounded representations.
 //!
 //! The engine's scheduler declares a cross-call tensor product as a
-//! [`TensorRef`]: a request-scoped identity plus a [`DType`] and a
+//! [`TensorRef`]: a request-scoped identity plus a `proto::tensor::DType` and a
 //! [`ShapeBound`] that fix the product's maximum size before its producing call
 //! runs. A cross-call buffer, such as a published cache extent, is identified
 //! by a [`BufferId`] alone. How a produced tensor reaches its consumers is
@@ -52,35 +52,6 @@ pub fn subtract_region(
     }
 
     Some(overlap)
-}
-
-/// Element type of a tensor's backing storage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[repr(u8)]
-pub enum DType {
-    /// Unsigned 8-bit integer.
-    U8 = 0,
-    /// Signed 32-bit integer.
-    I32 = 1,
-    /// Signed 64-bit integer.
-    I64 = 2,
-    /// IEEE 754 half precision.
-    F16 = 3,
-    /// Brain floating-point half precision.
-    #[serde(rename = "bf16")]
-    BF16 = 4,
-    /// IEEE 754 single precision.
-    F32 = 5,
-    /// Signed 16-bit integer.
-    I16 = 6,
-}
-
-impl DType {
-    /// Storage width of one element in bytes.
-    pub fn element_bytes(self) -> u64 {
-        tensor_dtype(self).1
-    }
 }
 
 /// One dimension of a bounded shape.
@@ -239,20 +210,4 @@ pub(crate) fn tensor_elements(shape: &[u64]) -> ValidationResult<u64> {
             .checked_mul(extent)
             .ok_or_else(|| invalid_message!("tensor element count overflows"))
     })
-}
-
-/// Transfer locator dtype name and element width in bytes of a declared
-/// dtype, used by both allocation and transfer validation. The names are the
-/// torch dtype names without the `torch.` prefix, as the worker's DLPack
-/// dtype spells them in the locators it writes.
-pub(crate) fn tensor_dtype(dtype: DType) -> (&'static str, u64) {
-    match dtype {
-        DType::U8 => ("uint8", 1),
-        DType::I32 => ("int32", 4),
-        DType::I16 => ("int16", 2),
-        DType::I64 => ("int64", 8),
-        DType::F16 => ("float16", 2),
-        DType::BF16 => ("bfloat16", 2),
-        DType::F32 => ("float32", 4),
-    }
 }

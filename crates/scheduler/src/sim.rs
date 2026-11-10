@@ -2859,9 +2859,8 @@ impl SimEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ipc::{
-        Bounds, CallId, DType, ForwardBatch, GenerationParams, RequestKey, ShapeBound, TensorRef,
-    };
+    use ipc::{Bounds, CallId, ForwardBatch, GenerationParams, RequestKey, ShapeBound, TensorRef};
+    use proto::tensor::DType;
 
     /// The pool states the longest sequence it serves, and `SimWorker`
     /// hands that number to the mechanism: a batch is shaped to

@@ -18,6 +18,7 @@
 
 use std::collections::HashSet;
 
+use proto::tensor::DType;
 use serde::{Deserialize, Serialize};
 
 /// Result type for semantic worker-message validation.

@@ -205,11 +205,7 @@ impl ModelRunner {
                     transport_bytes: 0,
                 };
                 let longest = pipeline.timeline(self.engine_config().video.max_seconds)?;
-                let states = match self.engine_config().model.dtype {
-                    proto::request::ModelDtype::Float16 => ipc::DType::F16,
-                    proto::request::ModelDtype::BFloat16 => ipc::DType::BF16,
-                    proto::request::ModelDtype::Float32 => ipc::DType::F32,
-                };
+                let states = proto::tensor::DType::from(self.engine_config().model.dtype);
                 let bounds = MediaBounds {
                     prompt_tokens: self.engine_config().model.max_model_len,
                     video_units: u32::try_from(pipeline.video_units(longest)?.len())

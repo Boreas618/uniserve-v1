@@ -494,7 +494,7 @@ mod tests {
             producer_call_id: ipc::CallId::new(1, 0),
             output_index: 0,
             generation: 1,
-            dtype: ipc::DType::I64,
+            dtype: proto::tensor::DType::I64,
             shape_bound: Default::default(),
         });
         call.coordinates.logical_position = position;

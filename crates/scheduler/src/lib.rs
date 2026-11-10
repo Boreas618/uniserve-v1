@@ -221,12 +221,13 @@ use ipc::RequestId;
 use ipc::UnitId;
 use ipc::{
     BatchCommand, BlockTable as IpcBlockTable, BufferAllocation, BufferId, CacheUnitAllocation,
-    Call, CallId, CallKind, CallStatus, DType, DecodeRange, DimBound, ForwardBatch, ForwardStats,
+    Call, CallId, CallKind, CallStatus, DecodeRange, DimBound, ForwardBatch, ForwardStats,
     GenerationParams, MainProcessInfo, NewRequest, RequestKey, SamplingState, ShapeBound,
     TensorRef, TimingCounters,
 };
 use ipc::{SharedMedia, TokenLogprob};
 use proto::request::MigrationCause;
+use proto::tensor::DType;
 
 use crate::image_artifact::png_artifact_info;
 use denoising::{Denoising, LatentDispatch};
@@ -659,8 +660,7 @@ pub struct Scheduler {
     /// Maximum number of transfer calls holding a reservation at once
     /// (`Inflight::num_pending_transfers`).
     transfer_capacity: usize,
-    /// IPC dtype of image latents, mapped from the model dtype by
-    /// `worker_float_dtype`.
+    /// Element type of image latents: the model dtype's.
     latent_dtype: Option<DType>,
     /// `engine_id` of every `RequestKey` this scheduler issues.
     engine_id: u64,
@@ -758,17 +758,6 @@ impl Scheduler {
 /// epoch reads as zero instead of panicking.
 fn now() -> f64 {
     crate::clock::now_unix_secs()
-}
-
-/// Maps a model dtype to the IPC dtype of worker latents; `None` maps to
-/// `None`.
-fn worker_float_dtype(value: Option<crate::ModelDtype>) -> Option<ipc::DType> {
-    match value {
-        Some(crate::ModelDtype::Float16) => Some(ipc::DType::F16),
-        Some(crate::ModelDtype::BFloat16) => Some(ipc::DType::BF16),
-        Some(crate::ModelDtype::Float32) => Some(ipc::DType::F32),
-        None => None,
-    }
 }
 
 /// Adds each per-key delta of a worker forward statistic into the shared
