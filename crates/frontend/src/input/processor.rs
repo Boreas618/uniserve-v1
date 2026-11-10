@@ -19,11 +19,14 @@ use crate::model::ModelConfig;
 use crate::model::assets::{PipelineCheckpoint, ResolvedModelFiles};
 use crate::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
 use processing::Catalogue;
-use processing::{ReasoningFormat, Serving, ToolCallFormat, VideoFamily};
+use processing::{
+    ImageFamily, ImageProcessor, ReasoningFormat, Serving, ToolCallFormat, VideoFamily,
+};
 use proto::request::{CachePolicy, GenerationFeatures, GenerationLimits, GenerationRequest};
 use proto::request::{RequestId, SamplingParams as EngineSamplingParams};
 use thiserror::Error;
 
+use crate::input::chat::template::MultimodalRenderInfo;
 use crate::input::chat::{ChatRequest, HfChatRenderer};
 use crate::input::request::GenerateRequest;
 use crate::input::sampling::resolve_max_tokens;
@@ -47,6 +50,8 @@ pub struct InputProcessor {
     // Whether the chat family writes tool calls and its checkpoint's template
     // asks for them in that format.
     tool_calls: bool,
+    // The family's image processor, when the family takes images and the workers encode them.
+    images: Option<Arc<dyn ImageProcessor>>,
 }
 
 #[derive(Debug, Error)]
@@ -70,6 +75,9 @@ pub enum ModelResolutionError {
     /// The model chat renderer cannot be initialized.
     #[error(transparent)]
     Chat(#[from] crate::output::chat::Error),
+    /// The checkpoint's image processor files are not its family's.
+    #[error("binding the image processor: {0}")]
+    ImageProcessor(String),
     /// The running worker lacks a feature required by the selected profile.
     #[error("configured model description `{description}` requires worker feature `{feature}`")]
     MissingFeature {
@@ -92,8 +100,13 @@ pub struct LoadedModel {
 
 /// What renders a loaded checkpoint's requests, fixed by its layout.
 pub enum LoadedRenderer {
-    /// A token model's chat template.
-    Chat { renderer: Box<HfChatRenderer> },
+    /// A token model's chat template, and the image processor of a family that takes images.
+    Chat {
+        renderer: Box<HfChatRenderer>,
+        /// The family's image processor, bound to the checkpoint's processor files; `None` for
+        /// a family that serves text alone.
+        images: Option<Arc<dyn ImageProcessor>>,
+    },
     /// A video family and the contents of the pipeline files its processor
     /// reads; the processor is bound from the denoiser handshake.
     Video {
@@ -205,18 +218,46 @@ impl ModelConfig {
             &files.tokenizer_path,
             files.tokenizer_config_path.as_deref(),
         )?);
-        let model = Self::from_files(catalogue, &files, max_model_len, tokenizer.as_ref()).await?;
-        // No served model's template renders image parts: the families whose
-        // prompts carried images are not served by this daemon.
-        let renderer = HfChatRenderer::load(&files, chat, None)?;
+        let config = Self::from_files(catalogue, &files, max_model_len, tokenizer.as_ref()).await?;
+        // A family that takes images binds its processor to the checkpoint's processor files; a
+        // template that reads content parts writes its own image markup, and one that reads
+        // flattened content is given the family's.
+        let images = match config.chat().and_then(|profile| profile.images) {
+            Some(family) => Some(bind_images(model, family).await?),
+            None => None,
+        };
+        let multimodal = images.as_ref().map(|images| MultimodalRenderInfo {
+            placeholder_token: images.markup().to_owned(),
+        });
+        let renderer = HfChatRenderer::load(&files, chat, multimodal)?;
         Ok(LoadedModel {
-            config: model,
+            config,
             tokenizer,
             renderer: LoadedRenderer::Chat {
                 renderer: Box::new(renderer),
+                images,
             },
         })
     }
+}
+
+/// Binds a chat family's image processor to the processor files of the checkpoint `model` names.
+async fn bind_images(
+    model: &str,
+    family: &'static dyn ImageFamily,
+) -> std::result::Result<Arc<dyn ImageProcessor>, ModelResolutionError> {
+    let source = crate::model::assets::model_files::ModelSource::from_model_id(model)?;
+    let mut files = Vec::with_capacity(family.processor_files().len());
+    for name in family.processor_files() {
+        let path = source.file(name).await?;
+        let text = std::fs::read_to_string(&path)
+            .map_err(|source| ModelResolutionError::ProcessorFile { path, source })?;
+        files.push(text);
+    }
+    family
+        .bind(&files)
+        .map(Arc::from)
+        .map_err(ModelResolutionError::ImageProcessor)
 }
 
 impl InputProcessor {
@@ -268,7 +309,21 @@ impl InputProcessor {
             limits,
             parse_reasoning,
             tool_calls,
+            images: None,
         })
+    }
+
+    /// Takes image parts through `images`, the family's bound image processor, when the workers
+    /// encode images ([`GenerationFeatures::VISION_ENCODE`]); a deployment whose workers do not
+    /// keeps refusing them.
+    #[must_use]
+    pub fn with_images(mut self, images: Option<Arc<dyn ImageProcessor>>) -> Self {
+        self.images = images.filter(|_| {
+            self.limits
+                .covers(GenerationFeatures::VISION_ENCODE)
+                .is_ok()
+        });
+        self
     }
 
     /// Immutable facts of the loaded model.
@@ -302,12 +357,10 @@ impl InputProcessor {
             })
     }
 
-    /// Returns whether the model supports image input.
-    ///
-    /// No model this daemon serves accepts image input, for the same reason:
-    /// the checkpoint that read an image part is not served.
+    /// Returns whether the model supports image input: its family takes images and its workers
+    /// encode them.
     pub fn supports_image_input(&self) -> bool {
-        false
+        self.images.is_some()
     }
 
     /// Returns whether the model parses tool calls from its output.
@@ -413,7 +466,8 @@ impl InputProcessor {
         // No partially prepared request is exposed to the submission boundary.
         // The closure gathers every `TokenizeError` so it maps once to `ServeError::Tokenize`.
         let processor = (|| -> std::result::Result<_, crate::input::TokenizeError> {
-            let processor = self.preprocess_chat_input(prompt, max_tokens, &mut generation)?;
+            let processor =
+                self.preprocess_chat_input(prompt, max_tokens, &images, &mut generation)?;
             generation.validate()?;
             Ok(processor)
         })()
@@ -457,6 +511,7 @@ impl InputProcessor {
         &self,
         chat_request: ChatRequest,
         max_tokens: Option<u32>,
+        images: &[crate::input::ImageInput],
         generation: &mut GenerationRequest,
     ) -> std::result::Result<ChatOutputProcessor, crate::input::TokenizeError> {
         chat_request.validate()?;
@@ -481,9 +536,22 @@ impl InputProcessor {
             .chat_renderer()
             .ok_or(crate::output::chat::Error::MissingChatTemplate)?
             .render(&chat_request)?;
-        let prompt_token_ids = self.tokenizer.encode(&rendered_text, false)?;
+        let mut prompt_token_ids = self.tokenizer.encode(&rendered_text, false)?;
+        generation.multimodal_inputs.images = self.lower_images(
+            &mut prompt_token_ids,
+            images,
+            generation.cache.isolation_key,
+        )?;
 
-        let prompt_len = prompt_token_ids.len() as u32;
+        // The context holds the prompt's tokens and every image block's rows.
+        let image_tokens: u32 = generation
+            .multimodal_inputs
+            .images
+            .iter()
+            .flat_map(|image| &image.encoders)
+            .filter_map(|encoder| encoder.num_cache_tokens)
+            .sum();
+        let prompt_len = prompt_token_ids.len() as u32 + image_tokens;
         let max_tokens = self.resolve_length(generation, max_tokens, prompt_len)?;
 
         generation.prompt_token_ids = prompt_token_ids;
@@ -492,6 +560,83 @@ impl InputProcessor {
         // read would skip.
         generation.cache.read &= !generation.sampling.prompt_logprobs_requested();
         Ok(processor)
+    }
+
+    /// Lowers the fetched `images` of a rendered prompt into the request's image inputs.
+    ///
+    /// The template wrote the family's placeholder token once per image, in the order the images
+    /// were fetched. Each placeholder is removed from `prompt` and its image becomes a vision block
+    /// written before the token that followed it, of the rows and positions the family's processor
+    /// states for the image's size. An image's digest, which keys its encodings, covers its bytes
+    /// and the request's cache partition `isolation`, so requests of other partitions share no
+    /// encoding.
+    fn lower_images(
+        &self,
+        prompt: &mut Vec<u32>,
+        images: &[crate::input::ImageInput],
+        isolation: Option<u64>,
+    ) -> std::result::Result<Vec<proto::request::ImageInput>, crate::input::TokenizeError> {
+        use base64::Engine as _;
+
+        let Some(processor) = self.images.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let placeholder = self
+            .tokenizer
+            .token_to_id(processor.placeholder())
+            .ok_or_else(|| {
+                crate::input::TokenizeError::Invalid(format!(
+                    "the vocabulary has no image placeholder `{}`",
+                    processor.placeholder()
+                ))
+            })?;
+        let found = prompt.iter().filter(|id| **id == placeholder).count();
+        if found != images.len() {
+            return Err(crate::input::TokenizeError::Invalid(format!(
+                "the prompt renders {found} image placeholder(s) for {} image(s)",
+                images.len()
+            )));
+        }
+
+        let mut inputs = Vec::with_capacity(images.len());
+        let mut kept = Vec::with_capacity(prompt.len());
+        let mut next = images.iter();
+        for &id in prompt.iter() {
+            if id != placeholder {
+                kept.push(id);
+                continue;
+            }
+            let image = next.next().ok_or_else(|| {
+                crate::input::TokenizeError::Invalid("an image placeholder has no image".into())
+            })?;
+            let block = processor
+                .block(image.width(), image.height())
+                .map_err(crate::input::TokenizeError::Invalid)?;
+            let mut digest = storage::key::Digest::new(b"chat-image");
+            digest.bytes(&image.digest());
+            match isolation {
+                Some(key) => {
+                    digest.number(1);
+                    digest.number(key);
+                }
+                None => digest.number(0),
+            }
+            inputs.push(proto::request::ImageInput {
+                digest: digest.finish(),
+                b64: base64::engine::general_purpose::STANDARD.encode(image.bytes()),
+                position: kept.len() as u32,
+                num_positions: block.positions,
+                encoders: vec![proto::request::ImageEncoderInput {
+                    encoder: proto::request::ImageEncoder::Vision,
+                    num_cache_tokens: Some(block.tokens),
+                    max_cache_tokens: None,
+                    height: None,
+                    width: None,
+                }],
+            });
+        }
+        *prompt = kept;
+        Ok(inputs)
     }
 
     /// The engine's sampling parameters of a chat `request`: its controls

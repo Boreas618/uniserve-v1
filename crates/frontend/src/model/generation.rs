@@ -11,6 +11,15 @@ impl ModelConfig {
         _model_dtype: proto::request::ModelDtype,
     ) -> proto::request::GenerationLimits {
         // No family this daemon serves states a capacity before its workers do.
-        proto::request::GenerationLimits::default()
+        let mut limits = proto::request::GenerationLimits::default();
+        // A family that takes images states no bound of its own on their encodings: the
+        // engine takes each limit as the smaller of this one and its workers', so the workers'
+        // feature storage and encoder cache bound them.
+        if self.chat().is_some_and(|profile| profile.images.is_some()) {
+            limits.max_vision_feature_bytes = u64::MAX;
+            limits.max_vit_grid_tokens = u32::MAX;
+            limits.encoder_cache_entries = u32::MAX;
+        }
+        limits
     }
 }

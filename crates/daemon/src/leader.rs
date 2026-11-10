@@ -954,8 +954,14 @@ impl Leader {
         // A video checkpoint serves what its placed denoiser declares in the
         // worker handshake, planned against the conditioner's vision
         // processor.
+        // A chat family that takes images lowers them through its bound processor.
+        let mut images = None;
         let renderer = match renderer {
-            LoadedRenderer::Chat { renderer, .. } => {
+            LoadedRenderer::Chat {
+                renderer,
+                images: processor,
+            } => {
+                images = processor;
                 // No other served model's processor takes options.
                 anyhow::ensure!(
                     config.mm_processor_kwargs.is_empty(),
@@ -994,7 +1000,8 @@ impl Leader {
             info.limits.clone(),
             config.chat_config.reasoning_parser == ReasoningParser::Auto,
         )
-        .context("failed to bind the configured model description")?;
+        .context("failed to bind the configured model description")?
+        .with_images(images);
         let images = MediaConnector::from_image_options(&config.image_fetch_config)
             .context("failed to initialize the image URL fetcher")?;
         let engine = Self::observed(

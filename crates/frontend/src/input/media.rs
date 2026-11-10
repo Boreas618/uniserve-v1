@@ -207,7 +207,7 @@ pub struct ImageInput {
 }
 
 impl ImageInput {
-    /// Validates an encoded image file and reads its header dimensions.
+    /// Validates an encoded image file and reads its displayed dimensions.
     ///
     /// # Errors
     ///
@@ -218,11 +218,19 @@ impl ImageInput {
 
         // The format comes from the magic number, not from any declared media
         // type, so a mislabeled file is read as what it actually is.
-        let (width, height) = image::ImageReader::new(Cursor::new(&bytes[..]))
+        image::ImageReader::new(Cursor::new(&bytes[..]))
             .with_guessed_format()
             .map_err(|error| MediaError::Undecodable(image::ImageError::IoError(error)))?
             .into_dimensions()
             .map_err(MediaError::Undecodable)?;
+        // The size an image is processed at is its displayed size: the header's with its EXIF
+        // orientation applied, as the worker decodes its pixels (`media::read`).
+        let media::probe::ImageFacts { width, height, .. } = media::probe::probe_image(&bytes)
+            .map_err(|error| {
+                MediaError::Undecodable(image::ImageError::IoError(std::io::Error::other(
+                    error.to_string(),
+                )))
+            })?;
 
         let mut key = storage::key::Digest::new(b"media");
         key.bytes(&bytes);

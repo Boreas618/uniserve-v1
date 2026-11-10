@@ -33,6 +33,7 @@ const SPECIAL_TOKENS: &[&str] = &[
     "<|im_end|>",
     "<|vision_start|>",
     "<|vision_end|>",
+    "<|image_pad|>",
     "<img>",
     "</img>",
     "<think>",
@@ -491,4 +492,145 @@ fn negative_seeds_and_logprob_counts_are_reinterpreted() {
         assert_eq!(request.sampling.seed, Some(seed as u64));
         assert_eq!(request.sampling.n_logprobs, u32::MAX);
     }
+}
+
+/// An image of a family that takes images: one merged token per 32-pixel square, spanning the
+/// larger side's tokens, as a Qwen-VL processor states a block.
+struct TestImages;
+
+impl processing::ImageProcessor for TestImages {
+    fn placeholder(&self) -> &str {
+        "<|image_pad|>"
+    }
+
+    fn markup(&self) -> &str {
+        "<|vision_start|><|image_pad|><|vision_end|>"
+    }
+
+    fn block(&self, width: u32, height: u32) -> Result<processing::ImageBlock, String> {
+        Ok(processing::ImageBlock {
+            tokens: (width / 32) * (height / 32),
+            positions: (width / 32).max(height / 32),
+        })
+    }
+}
+
+/// A fetched `width` x `height` PNG.
+fn png(width: u32, height: u32) -> ImageInput {
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::RgbImage::new(width, height)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    ImageInput::from_bytes(bytes.into_inner()).unwrap()
+}
+
+/// A chat request whose user turn is the text `before`, an image, then `after`.
+fn image_chat(before: &str, after: &str) -> frontend::openai::ChatCompletionRequest {
+    chat_request(serde_json::json!({
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": before},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            {"type": "text", "text": after},
+        ]}],
+    }))
+}
+
+/// A deployment whose family serves text alone refuses an image part at admission, naming the
+/// feature.
+#[test]
+fn a_text_only_deployment_refuses_an_image_part() {
+    let (_directory, _tokenizer, processor) = resolved_model("qwen3");
+    assert!(!processor.supports_image_input());
+    let error = preprocess_chat(
+        &processor,
+        String::from("text-only"),
+        image_chat("look ", " now"),
+        vec![png(64, 32)],
+    )
+    .err()
+    .expect("an image part reached a text-only deployment");
+    let message = error.to_error_response().error.message;
+    assert!(message.contains("image_input"), "{message}");
+}
+
+/// A family that takes images lowers each image part into a vision block of the rows and
+/// positions its processor states, written where the template's placeholder stood, with a
+/// digest that keys its encodings within the request's cache partition.
+#[test]
+fn an_image_part_becomes_a_vision_block_in_place_of_its_placeholder() {
+    use base64::Engine as _;
+
+    let (_directory, tokenizer, loaded) = resolved_model("qwen3");
+    let renderer = HfChatRenderer::new(
+        Some(CHAT_TEMPLATE.to_string()),
+        HashMap::new(),
+        Some(ChatTemplateContentFormat::String),
+    )
+    .unwrap()
+    .with_multimodal(Some(
+        frontend::input::chat::template::MultimodalRenderInfo {
+            placeholder_token: "<|vision_start|><|image_pad|><|vision_end|>".to_owned(),
+        },
+    ));
+    let processor = InputProcessor::new(
+        loaded.config().clone(),
+        Arc::clone(&tokenizer),
+        RequestRenderer::Chat(renderer),
+        runtime_limits(),
+        true,
+    )
+    .unwrap()
+    .with_images(Some(Arc::new(TestImages)));
+    assert!(processor.supports_image_input());
+
+    let lower = |salt: Option<&str>| {
+        let mut fields = serde_json::json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "look "},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                {"type": "text", "text": " now"},
+            ]}],
+        });
+        if let Some(salt) = salt {
+            fields["cache_salt"] = serde_json::json!(salt);
+        }
+        preprocess_chat(
+            &processor,
+            String::from("image"),
+            chat_request(fields),
+            vec![png(64, 32)],
+        )
+        .unwrap()
+        .0
+    };
+    let generation = lower(None);
+    let pad = tokenizer.token_to_id("<|image_pad|>").unwrap();
+    let start = tokenizer.token_to_id("<|vision_start|>").unwrap();
+    let end = tokenizer.token_to_id("<|vision_end|>").unwrap();
+    assert!(!generation.prompt_token_ids.contains(&pad));
+    let [image] = generation.multimodal_inputs.images.as_slice() else {
+        panic!("one image part lowers to one image input");
+    };
+    // The block is written after `<|vision_start|>`, before `<|vision_end|>`.
+    let position = image.position as usize;
+    assert_eq!(generation.prompt_token_ids[position - 1], start);
+    assert_eq!(generation.prompt_token_ids[position], end);
+    assert_eq!(image.num_positions, 2);
+    let [encoder] = image.encoders.as_slice() else {
+        panic!("one vision encoder");
+    };
+    assert_eq!(encoder.encoder, proto::request::ImageEncoder::Vision);
+    assert_eq!(encoder.num_cache_tokens, Some(2));
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(&image.b64)
+            .unwrap(),
+        png(64, 32).bytes().to_vec()
+    );
+    // Requests of another cache partition share no encoding of the image.
+    assert_ne!(
+        lower(Some("tenant")).multimodal_inputs.images[0].digest,
+        image.digest
+    );
+    assert_eq!(lower(None).multimodal_inputs.images[0].digest, image.digest);
 }
