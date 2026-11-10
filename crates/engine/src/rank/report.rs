@@ -6,12 +6,17 @@ use platform::DeviceId;
 
 /// What this rank advertises of itself: the report the capacity plan is made against.
 ///
-/// A causal-language rank states one component - the model's single block - the two forward calls
-/// it serves, and the three identities that name this process. It publishes no products (`logits`
+/// A causal-language rank states one component - the model's single block - the forward calls it
+/// serves (the prompt and the decode, and a speculating rank's verification), and the three
+/// identities that name this process. It publishes no products (`logits`
 /// returns through the batch, not as an exported tensor), so no device product is exported and no
 /// media component is routed: the deployment is one class of computation, and saying otherwise
 /// would make the engine reserve storage for exports that never happen.
-pub(crate) fn rank_report(device: DeviceId, host: &str) -> Result<worker::capacity::Report> {
+pub(crate) fn rank_report(
+    device: DeviceId,
+    host: &str,
+    speculates: bool,
+) -> Result<worker::capacity::Report> {
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos() as u64);
@@ -25,10 +30,13 @@ pub(crate) fn rank_report(device: DeviceId, host: &str) -> Result<worker::capaci
         },
         device_exports: false,
         fabric_handles: platform::HandleType::probe(device)? == platform::HandleType::Fabric,
-        supported_calls: vec![
+        supported_calls: [
             ipc::CallKind::Forward(ipc::ForwardMode::Prefill),
             ipc::CallKind::Forward(ipc::ForwardMode::Decode),
-        ],
+        ]
+        .into_iter()
+        .chain(speculates.then_some(ipc::CallKind::Forward(ipc::ForwardMode::Verify)))
+        .collect(),
         media_components: std::collections::BTreeMap::new(),
         // The component this rank holds, named as the rank layout names it (`schedulers` places one
         // component over every rank). The scheduler routes a call by component name, so a rank that

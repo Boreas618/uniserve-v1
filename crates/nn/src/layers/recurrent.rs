@@ -1,15 +1,17 @@
 //! The recurrent layers of a gated delta network: the short causal convolution and the gated delta
 //! rule, each advancing a state the batch's request slots keep (`ops::recurrent`).
 //!
-//! Both read a batch the way paged attention does ([`TokenBatch`]'s packed offsets and lengths) and
-//! the state through a [`StateView`]'s slots and checkpoints: a row that starts at position zero
+//! Both read the batch's state rows ([`StateView`]'s packed offsets, lengths, slots and checkpoints),
+//! which are its attention rows except in a verification: a row that starts at position zero
 //! begins from a zero state, every other row continues from its slot's, and a row that crosses a
-//! checkpoint keeps its state there for the prefix cache. The banks are the infrastructure's; a
-//! layer only launches its operator over them.
+//! checkpoint keeps its state there for the prefix cache. A batch that keeps a trail
+//! ([`crate::capability::StateLayer::trail`]) has each operator write the state after every token
+//! as well. The banks are the infrastructure's; a layer only launches its operator over them.
 
 use ops::recurrent::{
     CausalConv1d as CausalConv1dOp, CausalConv1dArgs, CausalConv1dDescriptor, Form,
     GatedDeltaRule as GatedDeltaRuleOp, GatedDeltaRuleArgs, GatedDeltaRuleDescriptor, RowColumns,
+    Trail,
 };
 use ops::{Shape, TensorView};
 use proto::program::PhaseKind;
@@ -30,14 +32,26 @@ pub const DELTA_RULE_CHUNK: u32 = 64;
 /// memory holds `2 · chunk + 4 · block` columns, which bounds it at 64 on sm_100.
 const DELTA_RULE_BLOCK: u32 = 64;
 
-/// The row columns the operators read, from the batch and the state view.
-fn rows(batch: &TokenBatch, state: &StateView<'_>) -> RowColumns {
+/// The row columns the operators read: the state view's rows.
+fn rows(state: &StateView<'_>) -> RowColumns {
     RowColumns {
-        query_offsets: batch.query_offsets,
-        seq_lens: batch.seq_lens,
+        query_offsets: state.query_offsets,
+        seq_lens: state.seq_lens,
         slots: state.slots,
         checkpoints: state.checkpoints,
     }
+}
+
+/// One field's banks a recurrent operator reads and writes: the slots' live state, their
+/// checkpoints, and the batch's trail when it keeps one.
+#[derive(Clone, Copy)]
+pub struct FieldBanks {
+    /// `[slots, …]`: the live state.
+    pub live: TensorView,
+    /// `[slots, …]`: the checkpoints rows keep.
+    pub checkpoint: TensorView,
+    /// `[tokens, …]`: the state after each token, for a batch that keeps a trail.
+    pub trail: Option<TensorView>,
 }
 
 /// The geometry of a [`CausalConv1d`].
@@ -80,22 +94,17 @@ impl CausalConv1d {
     }
 
     /// Convolve `x [tokens, channels]` (rows any stride apart) into `out [tokens, channels]`,
-    /// continuing from and advancing `state`, keeping `checkpoint` where the view asks.
+    /// continuing from and advancing `banks.live`, keeping `banks.checkpoint` where the view asks
+    /// and every token's window in `banks.trail` when the batch keeps one.
     ///
     /// # Errors
     ///
     /// What the operator refuses.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the operator's inputs, its batch and its two banks"
-    )]
     pub fn forward(
         &self,
         f: &Forward,
-        batch: &TokenBatch,
         view: &StateView<'_>,
-        state: TensorView,
-        checkpoint: TensorView,
+        banks: FieldBanks,
         x: TensorView,
         out: TensorView,
     ) -> Result<()> {
@@ -113,9 +122,10 @@ impl CausalConv1d {
                 x,
                 weight,
                 out,
-                rows: rows(batch, view),
-                state,
-                checkpoint,
+                rows: rows(view),
+                state: banks.live,
+                checkpoint: banks.checkpoint,
+                trail: banks.trail.map(|bank| Trail { bank }),
             },
         )
     }
@@ -182,16 +192,19 @@ impl GatedDeltaRule {
     /// # Errors
     ///
     /// What the operator refuses.
+    ///
+    /// A decode-phase batch (a decode, or a verification) walks its state rows one token at a
+    /// time and keeps the trail `banks` carries; any other walks them in chunks.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the rule's five inputs, its batch, its two banks and its output"
+        reason = "the rule's five inputs, its batch, its banks and its output"
     )]
     pub fn forward(
         &self,
         f: &Forward,
         batch: &TokenBatch,
         view: &StateView<'_>,
-        (state, checkpoint): (TensorView, TensorView),
+        banks: FieldBanks,
         (query, key, value): (TensorView, TensorView, TensorView),
         (a, b): (TensorView, TensorView),
         out: TensorView,
@@ -230,9 +243,10 @@ impl GatedDeltaRule {
                 b,
                 a_log: self.a_log.view(),
                 dt_bias: self.dt_bias.view(),
-                rows: rows(batch, view),
-                state,
-                checkpoint,
+                rows: rows(view),
+                state: banks.live,
+                checkpoint: banks.checkpoint,
+                trail: banks.trail.map(|bank| Trail { bank }),
                 out,
             },
         )

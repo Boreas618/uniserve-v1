@@ -23,8 +23,8 @@ use crate::error::{Error, Result};
 use crate::family::{Split, StateField};
 use crate::forward::Forward;
 use crate::layers::{
-    Bias, CausalConv1d, CausalConv1dSpec, GatedDeltaRule, GatedDeltaRuleSpec, GatedRmsNorm, Linear,
-    Parallel,
+    Bias, CausalConv1d, CausalConv1dSpec, FieldBanks, GatedDeltaRule, GatedDeltaRuleSpec,
+    GatedRmsNorm, Linear, Parallel,
 };
 use crate::weights::Scope;
 
@@ -206,6 +206,20 @@ impl GatedDeltaNet {
                 ),
             ));
         };
+        // A batch that keeps a trail keeps one bank per field of every layer.
+        let (conv_trail, recurrent_trail) = match banks.trail {
+            None => (None, None),
+            Some([conv, recurrent]) => (Some(*conv), Some(*recurrent)),
+            Some(trail) => {
+                return Err(Error::shape(
+                    "GatedDeltaNet",
+                    format!(
+                        "recurrent layer {layer} keeps a trail of {} fields, two expected",
+                        trail.len()
+                    ),
+                ));
+            }
+        };
         let arena = f.arena();
         let mark = arena.mark();
         let dtype = hidden.dtype;
@@ -219,8 +233,17 @@ impl GatedDeltaNet {
 
         let channels = u64::from(spec.conv_channels());
         let mixed = arena.tensor(dtype, Shape::new(&[tokens, channels]))?;
-        self.conv1d
-            .forward(f, batch, state, *conv, *conv_kept, qkv, mixed)?;
+        self.conv1d.forward(
+            f,
+            state,
+            FieldBanks {
+                live: *conv,
+                checkpoint: *conv_kept,
+                trail: conv_trail,
+            },
+            qkv,
+            mixed,
+        )?;
 
         // The convolved row is [q | k | v]: three head-major views of one row stride.
         let key_width = u64::from(spec.key_heads) * u64::from(spec.key_dim);
@@ -243,7 +266,11 @@ impl GatedDeltaNet {
             f,
             batch,
             state,
-            (*recurrent, *recurrent_kept),
+            FieldBanks {
+                live: *recurrent,
+                checkpoint: *recurrent_kept,
+                trail: recurrent_trail,
+            },
             (query, key, value),
             (a, b),
             core,

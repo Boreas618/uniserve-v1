@@ -29,6 +29,15 @@
 //! banks moves a checkpoint into the cache pool afterwards (`cache_block_snapshot`,
 //! `cache_block_scatter`); neither operator knows the pool.
 //!
+//! ## Trails
+//!
+//! A batch whose rows' tokens may not all stand - a speculative verification, which learns how
+//! many of a row's drafted tokens it accepts only after the forward - asks either operator for a
+//! [`Trail`]: the state after **every** token, row `t` of a `[tokens, …]` bank for the batch's
+//! token `t`. The infrastructure then installs the state after the last accepted token into the
+//! slot. Only the recurrent walk of the delta rule keeps one; the chunked form solves a chunk at
+//! once and holds no state between its tokens.
+//!
 //! ## The two forms of the delta rule
 //!
 //! [`Form::Recurrent`] walks a row's tokens one at a time, which is the decode step's shape.
@@ -83,6 +92,46 @@ impl RowColumns {
         }
         Ok(rows)
     }
+}
+
+/// The per-token state bank a batch's rows keep beside their slots' banks (the module's Trails):
+/// `[rows, dims…]` of the slot banks' element type, contiguous, row `t` receiving the state after
+/// the batch's token `t`.
+#[derive(Clone, Copy)]
+pub struct Trail {
+    /// `[rows, dims…]`, contiguous, with a row for every token of the batch.
+    pub bank: TensorView,
+}
+
+/// The trail operand of a launch and the flag the kernel tests: the bank, or the state bank itself
+/// and a cleared flag when the batch keeps none, which the kernel then never writes.
+fn trail_operand(trail: Option<Trail>, state: TensorView) -> (TensorView, i32) {
+    match trail {
+        Some(trail) => (trail.bank, 1),
+        None => (state, 0),
+    }
+}
+
+/// Check that `trail`, when the batch keeps one, is a contiguous `[rows, dims…]` bank of `dtype`
+/// with a row for every one of the batch's `tokens`.
+fn check_trail(
+    operator: &'static str,
+    trail: Option<&Trail>,
+    dtype: DType,
+    dims: &[u64],
+    tokens: u64,
+) -> Result<()> {
+    let Some(trail) = trail else {
+        return Ok(());
+    };
+    let rows = check_bank(operator, "trail", &trail.bank, dtype, dims)?;
+    if rows < tokens {
+        return Err(Error::argument(
+            operator,
+            format!("a trail of {rows} rows for a batch of {tokens} tokens"),
+        ));
+    }
+    Ok(())
 }
 
 /// Check that `bank` is `[slots, dims…]` of `dtype`, contiguous, and answer its slot count.
@@ -149,6 +198,9 @@ pub struct CausalConv1dArgs {
     pub state: TensorView,
     /// `[slots, width − 1, channels]`, contiguous: receives a row's inputs before its checkpoint.
     pub checkpoint: TensorView,
+    /// `[tokens, width − 1, channels]`: receives, for each token, the inputs up to and including
+    /// it, when the batch keeps a trail.
+    pub trail: Option<Trail>,
 }
 
 /// The depthwise causal convolution of a linear-attention layer, with its SiLU, over a batch of
@@ -210,6 +262,13 @@ impl Op for CausalConv1d {
                 format!("{kept} checkpoint slots for {slots} state slots"),
             ));
         }
+        check_trail(
+            Self::NAME,
+            args.trail.as_ref(),
+            descriptor.dtype,
+            &dims,
+            tokens,
+        )?;
         if args.x.strides.get(0) > i32::MAX as u64 || tokens * channels > i32::MAX as u64 {
             return Err(Error::argument(
                 Self::NAME,
@@ -226,6 +285,7 @@ impl Op for CausalConv1d {
         stream: &Stream,
     ) -> Result<()> {
         let rows = args.rows.seq_lens.shape.dim(0);
+        let (trail, trailing) = trail_operand(args.trail, args.state);
 
         let mut arguments = Arguments::new();
         arguments
@@ -238,7 +298,9 @@ impl Op for CausalConv1d {
             .view(args.rows.checkpoints)
             .view(args.state)
             .view(args.checkpoint)
-            .i32(args.x.strides.get(0) as i32);
+            .view(trail)
+            .i32(args.x.strides.get(0) as i32)
+            .i32(trailing);
         kernel.launch(
             LaunchGrid::new([
                 u64::from(descriptor.channels).div_ceil(u64::from(descriptor.block)),
@@ -256,6 +318,9 @@ impl Op for CausalConv1d {
             out: twins.shadow_of(args.out),
             state: twins.in_place(args.state, stream),
             checkpoint: twins.in_place(args.checkpoint, stream),
+            trail: args.trail.map(|trail| Trail {
+                bank: twins.shadow_of(trail.bank),
+            }),
             ..args
         }
     }
@@ -355,6 +420,9 @@ pub struct GatedDeltaRuleArgs {
     pub state: TensorView,
     /// `[slots, value_heads, key_dim, value_dim]` FP32, contiguous: receives a row's checkpoint.
     pub checkpoint: TensorView,
+    /// `[tokens, value_heads, key_dim, value_dim]` FP32: receives the state after each token, when
+    /// the batch keeps a trail; only [`Form::Recurrent`] keeps one.
+    pub trail: Option<Trail>,
     /// `[tokens, value_heads, value_dim]`, contiguous: receives `q̂ᵀS` after each token.
     pub out: TensorView,
 }
@@ -473,6 +541,16 @@ impl Op for GatedDeltaRule {
                 format!("{kept} checkpoint slots for {slots} state slots"),
             ));
         }
+        if args.trail.is_some() && d.form != Form::Recurrent {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "a {} rule holds no state between its tokens, so it keeps no trail",
+                    d.form
+                ),
+            ));
+        }
+        check_trail(Self::NAME, args.trail.as_ref(), DType::F32, &dims, tokens)?;
         if row_stride * tokens > i32::MAX as u64 || gate_stride * tokens > i32::MAX as u64 {
             return Err(Error::argument(
                 Self::NAME,
@@ -491,6 +569,7 @@ impl Op for GatedDeltaRule {
         let rows = args.rows.seq_lens.shape.dim(0);
         // The query is scaled by the inverse square root of its width before it reads the state.
         let scale = (f64::from(descriptor.key_dim).sqrt().recip()) as f32;
+        let (trail, trailing) = trail_operand(args.trail, args.state);
 
         let mut arguments = Arguments::new();
         arguments
@@ -507,10 +586,12 @@ impl Op for GatedDeltaRule {
             .view(args.rows.checkpoints)
             .view(args.state)
             .view(args.checkpoint)
+            .view(trail)
             .view(args.out)
             .i32(args.query.strides.get(0) as i32)
             .i32(args.a.strides.get(0) as i32)
-            .f32(scale);
+            .f32(scale)
+            .i32(trailing);
         kernel.launch(
             LaunchGrid::new([
                 u64::from(descriptor.value_dim / descriptor.block),
@@ -528,6 +609,9 @@ impl Op for GatedDeltaRule {
             out: twins.shadow_of(args.out),
             state: twins.in_place(args.state, stream),
             checkpoint: twins.in_place(args.checkpoint, stream),
+            trail: args.trail.map(|trail| Trail {
+                bank: twins.shadow_of(trail.bank),
+            }),
             ..args
         }
     }

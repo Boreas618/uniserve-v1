@@ -129,7 +129,7 @@ impl ModelRunner {
         let encoder = media_encoder::EncoderRunner::new(
             Binding {
                 id: RunnerId(0),
-                phases: served_phases(&encode_set),
+                phases: served_phases(&encode_set, false),
                 device,
                 stream: stream("encoder")?,
             },
@@ -214,7 +214,7 @@ impl ModelRunner {
         };
         // A latent preparation opens the trajectory the denoiser steps, so the denoiser serves its
         // phase beside its steps.
-        let mut denoise_phases = served_phases(&denoise_set);
+        let mut denoise_phases = served_phases(&denoise_set, false);
         denoise_phases.push(phase(scheduler::PhaseKind::LatentPrepare));
         let denoise = media_denoiser::DenoiserRunner::new(
             Binding {
@@ -275,7 +275,7 @@ impl ModelRunner {
         let decode = media_decoder::DecoderRunner::new(
             Binding {
                 id: RunnerId(2),
-                phases: served_phases(&decode_set),
+                phases: served_phases(&decode_set, false),
                 device,
                 stream: stream("decoder")?,
             },
@@ -303,7 +303,7 @@ impl ModelRunner {
             let audio = worker::runners::AudioDecoderRunner::new(
                 Binding {
                     id: RunnerId(3),
-                    phases: served_phases(&audio_set),
+                    phases: served_phases(&audio_set, false),
                     device,
                     stream: stream("audio decoder")?,
                 },

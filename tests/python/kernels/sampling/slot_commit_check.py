@@ -49,7 +49,7 @@ sys.path.insert(0, str(PACKAGE / "src"))
 SLOT, MODE, TASK, CACHE_LENGTH, LOGICAL, SAMPLING, VISIBLE, PENALTIES = range(8)
 
 #: The modes, as the operator numbers them.
-DECODE, EXPLICIT, VERIFY, CACHE = 0, 1, 2, 3
+DECODE, EXPLICIT, VERIFY, CACHE, COUNT = 0, 1, 2, 3, 4
 
 #: A token relay carries the continuation in bit 31 and the token below it.
 TOKEN_VALUE_MASK = (1 << 31) - 1
@@ -114,6 +114,12 @@ def reference(state, rows, tokens, valid, active, continuation, points, vocab):
             continue
         sampled = task >= 0
         verified = expected["verified"]
+        if mode == COUNT:
+            # A verification's accepted draft: its penalty weight, and nothing else moves.
+            token = int(tokens[task]) & TOKEN_VALUE_MASK
+            if sampled and token < vocab and row[PENALTIES] != 0 and valid[task] and active[task]:
+                expected["penalties"][slot, token] += 1
+            continue
         if mode == DECODE:
             expected["verified"][slot] = verified[slot] + 1
             if sampled:
@@ -256,6 +262,30 @@ def scenarios(flags):
                 [3, EXPLICIT, 2, 77, 300, 400, 0, 1],
                 [0, CACHE, -1, 55, 0, 0, 0, 0],
                 [-1, -1, -1, 0, 0, 0, 0, 0],
+            ],
+        },
+        {
+            # A verification that accepted two drafts: its verify row installs the token after
+            # them, and one count row per draft adds the draft to the slot's penalty history,
+            # including a draft that is the same token as the installed one.
+            "label": "a verification's accepted drafts count penalties and move nothing else",
+            "slots": 3,
+            "vocab": 16,
+            "width": 2,
+            "stride": stride,
+            "future_stride": flags.future_stride,
+            "block": flags.block,
+            "seed": 5,
+            "tokens": [9, 4, 9, 2],
+            "valid": [1, 1, 1, 1],
+            "active": [1, 1, 1, 1],
+            "continuation": [1, 0, 0, 1],
+            "points": [3, 0, 0, 1],
+            "rows": [
+                [1, VERIFY, 0, 0, 50, 60, 48, 1],
+                [1, COUNT, 1, 0, 0, 0, 0, 1],
+                [1, COUNT, 2, 0, 0, 0, 0, 1],
+                [2, DECODE, 3, 0, 0, 0, 0, 0],
             ],
         },
         {

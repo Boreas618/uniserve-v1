@@ -40,6 +40,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use platform::{CopyBatch, DeviceId, SourceOrder, Stream};
 
+use super::LayerPlanes;
 use super::plan::{CacheGroupPlan, CachePlan};
 use crate::memory::allocation::Backing;
 use crate::memory::allocation::ElementType;
@@ -1120,8 +1121,9 @@ impl CachePlanes {
             return Err(Error::Invariant("a cache pool holds no column".into()));
         }
         // A state page's units are the ones its checkpoints' planes fill, which the plan states:
-        // its layers lie in no cell of their own.
-        if plan.state() {
+        // its layers lie in no cell of their own; a draft page's layers lie over the columns of its
+        // one unit (`CachePlan::with_draft`).
+        if plan.state() || plan.draft() {
             return Ok(plan.units_per_page);
         }
         let derived = u32::try_from(plan.layers.len())
@@ -1141,6 +1143,85 @@ impl CachePlanes {
             )));
         }
         Ok(derived)
+    }
+
+    /// Draft layer `layer` of the draft group `group` as the drafter's attention reads it: pages of
+    /// one K/V plane's tokens, `[span · units, block_size / span, kv_heads, head_dim]`, page
+    /// `c · units + u` holding the `c`-th run of the draft page in unit `u`, and the flags and
+    /// scales of the same cells (`CachePlan::with_draft`).
+    ///
+    /// The cells of one layer are the columns `layer · span .. (layer + 1) · span` of every unit,
+    /// which lie contiguously in each field's storage (a cell is `column · units + unit`), so the
+    /// view is one contiguous run of planes and nothing is copied.
+    ///
+    /// # Errors
+    ///
+    /// A group that is not the draft group, or a layer it does not hold.
+    pub fn draft_layer(&self, group: usize, layer: usize) -> Result<LayerPlanes> {
+        let plan = self.group(group)?;
+        let span = self
+            .plan
+            .draft_span()
+            .filter(|_| plan.draft())
+            .ok_or_else(|| Error::Invalid(format!("cache group {group} is no draft group")))?;
+        if layer >= plan.layers.len() {
+            return Err(Error::Invalid(format!(
+                "the draft group holds {} layers, not {layer}",
+                plan.layers.len()
+            )));
+        }
+        let dtype = plan.dtype;
+        let element = dtype.bytes() as u64;
+        if element == 0 || !self.plan.plane_bytes.is_multiple_of(element) {
+            return Err(Error::Invariant(format!(
+                "the draft group holds {} bytes of a plane in {element}-byte elements",
+                self.plan.plane_bytes
+            )));
+        }
+        let tokens = plan.block_size / span;
+        let pages = i64::from(span) * i64::from(self.num_units);
+        // The layer's first cell: column `layer · span` of unit zero.
+        let first = u64::from(layer as u32 * span) * u64::from(self.num_units);
+        let heads = i64::from(plan.num_kv_heads);
+        let dim = i64::from(plan.head_dim);
+        let values = |field: usize| -> Result<StorageView> {
+            StorageView::contiguous(
+                Arc::clone(&self.values[field]) as Arc<dyn Backing>,
+                usize::try_from(first * self.plan.plane_bytes).map_err(|_| {
+                    Error::Invariant("a draft layer's planes lie outside their storage".into())
+                })?,
+                dtype,
+                &[pages, i64::from(tokens), heads, dim],
+            )
+        };
+        let cells = |storage: &Arc<_>, cell: ElementType| -> Result<StorageView> {
+            StorageView::contiguous(
+                Arc::clone(storage) as Arc<dyn Backing>,
+                usize::try_from(first * cell.bytes() as u64).map_err(|_| {
+                    Error::Invariant("a draft layer's cells lie outside their storage".into())
+                })?,
+                cell,
+                &[pages, 1, 1, 1],
+            )
+        };
+        let scale = |field: usize| -> Result<Option<StorageView>> {
+            self.scales
+                .as_ref()
+                .map(|scales| cells(&scales[field], ElementType::F32))
+                .transpose()
+        };
+        Ok(LayerPlanes {
+            block_size: tokens,
+            pages: u32::try_from(pages)
+                .map_err(|_| Error::Invariant("a draft layer of too many pages".into()))?,
+            dtype: self.dtype(group)?,
+            key: values(0)?,
+            value: values(1)?,
+            key_scale: scale(0)?,
+            value_scale: scale(1)?,
+            key_initialized: cells(&self.initialized[0], ElementType::U8)?,
+            value_initialized: cells(&self.initialized[1], ElementType::U8)?,
+        })
     }
 
     /// The cell of a page layer `layer` of `group` occupies: column

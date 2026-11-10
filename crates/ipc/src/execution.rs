@@ -776,6 +776,10 @@ pub struct BatchColumns {
     /// The recurrent-state copies between the request slots' banks and the cache's state pages
     /// this batch needs: every restore before the forward, every checkpoint after it.
     pub state_copies: Vec<StateCopy>,
+    /// One per call, in call order: what the call does for its request's draft cache
+    /// (`crate::Call::draft`), which a worker that speculates with its model's drafter reads; empty
+    /// for a batch whose calls draft nothing.
+    pub drafts: Vec<crate::DraftWork>,
 }
 
 /// One copy of a request slot's recurrent state between its banks and a state page of the cache.
@@ -1097,6 +1101,12 @@ impl BatchColumns {
             return Err(ValidationError::message(format!(
                 "checkpoints has {} entries, the batch has {rows} rows",
                 self.checkpoints.len()
+            )));
+        }
+        if !self.drafts.is_empty() && self.drafts.len() != calls {
+            return Err(ValidationError::message(format!(
+                "drafts has {} entries, the batch has {calls} calls",
+                self.drafts.len()
             )));
         }
         Ok(())

@@ -597,6 +597,18 @@ fn refill_gap(scheduler: &Scheduler, state: &RequestState) -> Option<u32> {
     if !scheduler.speculates() {
         return None;
     }
+    // A refill evaluates the model again from a state checkpoint without
+    // advancing the request's slot, which a model that keeps a recurrent
+    // state per slot has no scratch state to do in: such a request decodes
+    // without drafts until its draft cache is whole again.
+    if scheduler
+        .storage
+        .cache
+        .as_ref()
+        .is_some_and(|cache| cache.coordinator.state_block_size().is_some())
+    {
+        return None;
+    }
     // The position the refill evaluates up to: the first the request wrote
     // itself after the gap, or the visible length (`DraftCache::refill_end`,
     // which is private to the speculation module).

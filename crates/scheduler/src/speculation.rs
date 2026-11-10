@@ -293,11 +293,16 @@ impl Scheduler {
         state.draft.proposals = record.draft_token_ids.clone();
     }
 
-    /// Counts an accepted verification's drafts: those it accepted, the
-    /// accepted prefix of its committed tokens (all of them when a finish
-    /// token among the drafts ended the commit), and those it rejected.
+    /// Counts an accepted verification that carried drafts: the
+    /// verification, its drafts, those it accepted (the accepted prefix of
+    /// its committed tokens, all of them when a finish token among the drafts
+    /// ended the commit), those it rejected and the tokens it committed. A
+    /// verification of no draft is a decode and counts nothing here.
     fn count_verification(&self, id: RequestId, call: &Call, record: &CallCompletion) {
         let drafts = generation::verify_drafts(call);
+        if drafts.is_empty() {
+            return;
+        }
         let committed = &record.committed_tokens;
         let matching = committed
             .iter()
@@ -316,6 +321,10 @@ impl Scheduler {
             matching.min(committed.len().saturating_sub(1))
         };
         let stats = &self.stats.worker;
+        stats.spec_verify_rows.fetch_add(1, Ordering::Relaxed);
+        stats
+            .spec_verify_draft_tokens
+            .fetch_add(drafts.len() as u64, Ordering::Relaxed);
         stats
             .spec_verify_accepted_tokens
             .fetch_add(accepted as u64, Ordering::Relaxed);

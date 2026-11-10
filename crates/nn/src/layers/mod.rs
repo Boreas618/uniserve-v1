@@ -67,7 +67,8 @@ pub use ops::gemm::WeightOrder;
 pub use pool::AdaptiveAvgPool2d;
 pub use posterior::Posterior;
 pub use recurrent::{
-    CausalConv1d, CausalConv1dSpec, DELTA_RULE_CHUNK, GatedDeltaRule, GatedDeltaRuleSpec,
+    CausalConv1d, CausalConv1dSpec, DELTA_RULE_CHUNK, FieldBanks, GatedDeltaRule,
+    GatedDeltaRuleSpec,
 };
 pub use residual::{Axpby, Cast, Residual, Scale};
 pub use rope::{

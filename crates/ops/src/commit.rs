@@ -10,6 +10,7 @@
 //! verify    verified  = visible + points              logical  = host_logical + points
 //!                                                     sampling = host_sampling + points
 //! explicit  verified  = host cache length             logical, sampling from the host columns
+//! count     nothing but the penalty add below          (a verification's accepted drafts)
 //! all       future[slot, 0] = token;  predicate[slot] = continuation;
 //!           penalties[slot, token] += valid · active   (for the rows that count penalties)
 //! ```

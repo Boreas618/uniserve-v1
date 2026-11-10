@@ -255,9 +255,22 @@ impl CachePlan {
                 last.layers
             )));
         }
+        // A draft group's layers are laid over the columns of its units rather than one cell each
+        // ([`CachePlan::with_draft`]), so they bound no column count.
         let columns_of_groups = groups
             .iter()
+            .filter(|group| !group.draft())
             .fold(0, |columns, group| gcd(columns, group.layers.len() as u32));
+        if let Some(draft) = groups.iter().find(|group| group.draft())
+            && (draft.layers.len() as u32 > columns || draft.units_per_page != 1)
+        {
+            return Err(Error::Invalid(format!(
+                "the draft group's {} layers lie over the {columns} columns of one unit per page, \
+                 not {}",
+                draft.layers.len(),
+                draft.units_per_page
+            )));
+        }
         if columns != columns_of_groups {
             return Err(Error::Invalid(format!(
                 "the cache plan's {columns} columns disagree with its groups' \
@@ -494,6 +507,85 @@ impl CachePlan {
         plan.validated()
     }
 
+    /// The plan with the draft cache added: the K/V of a drafter's `layers` attention layers,
+    /// which store `kv_heads` heads of `head_dim` each as the pool's first group does.
+    ///
+    /// A drafter has fewer layers than a unit has columns (one or two against the pool's ten), so a
+    /// draft page does not take a cell per layer as a K/V group's page does. It takes **one unit**,
+    /// and each of its layers lies over [`Self::draft_span`] of the unit's columns: column `c` of the
+    /// layer's run holds the page's `c`-th run of `block_size / span` tokens. A draft page therefore
+    /// holds `span` times the tokens of a K/V page in one unit, and the group's block size is that,
+    /// a power of two as every page's is. The group sits before the state group, which stays last.
+    ///
+    /// # Errors
+    ///
+    /// A drafter of more layers than the pool has columns, a head geometry the pool's planes do not
+    /// hold, or a plan that is no longer valid.
+    pub fn with_draft(mut self, layers: u32, kv_heads: u32, head_dim: u32) -> Result<Self> {
+        let first = self
+            .groups
+            .first()
+            .cloned()
+            .ok_or_else(|| Error::Invalid("a draft cache beside no K/V group".into()))?;
+        if layers == 0 || layers > self.columns {
+            return Err(Error::Invalid(format!(
+                "a drafter of {layers} layers over a pool of {} columns",
+                self.columns
+            )));
+        }
+        if kv_heads != first.num_kv_heads || head_dim != first.head_dim {
+            return Err(Error::Invalid(format!(
+                "a drafter of {kv_heads} heads of {head_dim} over planes of {} heads of {}",
+                first.num_kv_heads, first.head_dim
+            )));
+        }
+        let span = Self::span_of(self.columns, layers);
+        let ids = self
+            .groups
+            .iter()
+            .flat_map(|group| group.layer_ids.iter().copied())
+            .max()
+            .map_or(0, |id| id + 1);
+        let draft = CacheGroupPlan {
+            kind: CacheGroupKind::Draft,
+            block_size: first.block_size * span,
+            units_per_page: 1,
+            layers: (0..layers).map(|layer| format!("draft.{layer}")).collect(),
+            layer_ids: (ids..ids + layers).collect(),
+            axis: GroupAxis {
+                offset: 0,
+                total: layers,
+            },
+            ..first
+        };
+        let at = self
+            .groups
+            .iter()
+            .position(|group| group.state())
+            .unwrap_or(self.groups.len());
+        self.groups.insert(at, draft);
+        self.validated()
+    }
+
+    /// The columns of a unit each draft layer lies over: the largest power of two the columns hold
+    /// `layers` runs of, so a draft page's tokens are a power of two.
+    fn span_of(columns: u32, layers: u32) -> u32 {
+        let share = (columns / layers.max(1)).max(1);
+        1 << (u32::BITS - 1 - share.leading_zeros())
+    }
+
+    /// The columns of a unit each layer of the draft group lies over, or `None` for a plan without
+    /// one.
+    pub fn draft_span(&self) -> Option<u32> {
+        let draft = self.groups.iter().find(|group| group.draft())?;
+        Some(Self::span_of(self.columns, draft.layers.len() as u32))
+    }
+
+    /// The draft group's index, when the plan holds one.
+    pub fn draft_group(&self) -> Option<usize> {
+        self.groups.iter().position(|group| group.draft())
+    }
+
     /// Where each field of a recurrent layer's checkpoint lies, field by field, for layer
     /// `layer` of `fields`: the layout [`Self::hybrid`] planned.
     pub fn state_planes(&self, layer: u32, fields: &[nn::family::StateField]) -> Vec<StatePlanes> {
@@ -622,6 +714,29 @@ mod tests {
         assert_eq!(planes[1].bytes, 2 << 20);
         let dense = CachePlan::dense(64, 10, 2, 256, PrefixCacheDtype::BFloat16);
         assert_eq!(plan.unit_bytes, dense.unit_bytes + 10 * plan.plane_bytes);
+
+        // A drafter of one layer lies over eight of a unit's ten columns: its pages hold 512
+        // tokens in one unit, before the state group, and leave the pool's columns and units as
+        // they were.
+        let unit_bytes = plan.unit_bytes;
+        let drafting = plan.with_draft(1, 2, 256)?;
+        assert_eq!(drafting.columns, 10);
+        assert_eq!(drafting.unit_bytes, unit_bytes);
+        assert_eq!(drafting.draft_group(), Some(1));
+        assert_eq!(drafting.draft_span(), Some(8));
+        let draft = &drafting.groups[1];
+        assert!(draft.draft() && drafting.groups[2].state());
+        assert_eq!((draft.block_size, draft.units_per_page), (512, 1));
+        assert_eq!(draft.layer_ids, vec![40]);
+        // Two layers lie over four columns each; more layers than columns lie over none.
+        let two = CachePlan::hybrid(64, 10, 2, 256, PrefixCacheDtype::BFloat16, &state)?
+            .with_draft(2, 2, 256)?;
+        assert_eq!(two.draft_span(), Some(4));
+        assert!(
+            CachePlan::hybrid(64, 10, 2, 256, PrefixCacheDtype::BFloat16, &state)?
+                .with_draft(11, 2, 256)
+                .is_err()
+        );
         Ok(())
     }
 

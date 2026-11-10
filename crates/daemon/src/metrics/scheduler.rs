@@ -249,6 +249,9 @@ pub struct SchedulerMetrics {
     pub worker_spec_verify_committed_tokens: Family<EngineLabels, U64Counter>,
     /// Speculative verification rows grouped by resolution path.
     pub worker_spec_verify_path_counts: Family<EnginePathLabels, U64Counter>,
+    /// The tokens one verification carrying drafts committed, on average over the last report:
+    /// its accepted drafts and the target's token after them.
+    pub spec_decode_accepted_length: Family<EngineLabels, F64Gauge>,
 
     // Batch latency uses cumulative microseconds plus a normalization count.
     /// Cumulative worker-reported batch execution time in microseconds.
@@ -595,6 +598,13 @@ impl SchedulerMetrics {
             "Worker speculative verifier rows by verifier path.",
             worker_spec_verify_path_counts.clone(),
         );
+        let spec_decode_accepted_length: Family<EngineLabels, F64Gauge> = Default::default();
+        registry.register(
+            "uniserve:spec_decode_accepted_length",
+            "Tokens committed per speculative verification step carrying drafts, on average over \
+             the last report.",
+            spec_decode_accepted_length.clone(),
+        );
         let worker_exec_us: Family<EngineLabels, U64Counter> = Default::default();
         registry.register(
             "uniserve:worker_exec_us",
@@ -661,6 +671,7 @@ impl SchedulerMetrics {
             worker_flashinfer_decode_graph_plan_reuses,
             worker_spec_verify_rows,
             worker_spec_verify_draft_tokens,
+            spec_decode_accepted_length,
             worker_spec_verify_accepted_tokens,
             worker_spec_verify_rejected_tokens,
             worker_spec_verify_committed_tokens,

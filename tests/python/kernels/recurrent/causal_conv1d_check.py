@@ -75,6 +75,8 @@ def run(case, device):
     expected = torch.zeros(tokens, channels, dtype=torch.float64)
     terms = torch.zeros(tokens, channels, dtype=torch.float64)
     finals, kept = {}, {}
+    # The window after each token of a row: the slot's state had the row ended there.
+    trailed = torch.zeros(tokens, width - 1, channels, dtype=torch.float64)
     for r in range(rows):
         if slots[r] < 0:
             continue
@@ -88,6 +90,8 @@ def run(case, device):
         expected[lo:hi] = summed * torch.sigmoid(summed)
         terms[lo:hi] = magnitude
         finals[slots[r]] = extended[-(width - 1):]
+        for index in range(hi - lo):
+            trailed[lo + index] = extended[index + 1 : index + width]
         point = checkpoints[r] - starts[r]  # the checkpoint's place among the row's new tokens
         if 0 < point <= lengths[r]:
             kept[slots[r]] = extended[point : point + width - 1]
@@ -99,10 +103,12 @@ def run(case, device):
     state = initial.clone().to(device)
     checkpoint = torch.full_like(state, float("nan"))
     out = torch.full((tokens, channels), float("nan"), dtype=dtype, device=device)
+    trailing = case.get("trailing", False)
+    trail = torch.full((tokens, width - 1, channels), float("nan"), dtype=dtype, device=device)
     wide_d = wide.to(device)
     kernels._causal_conv1d_kernel[((channels + block - 1) // block, rows)](
         wide_d[:, 16 : 16 + channels], weight.to(device), out, column(offsets), column(seq_lens),
-        column(slots), column(checkpoints), state, checkpoint, stride,
+        column(slots), column(checkpoints), state, checkpoint, trail, stride, int(trailing),
         CHANNELS=channels, WIDTH=width, KEPT=1 << (width - 2).bit_length(), BLOCK=block,
         TOKENS=16, num_warps=4,
     )
@@ -132,6 +138,11 @@ def run(case, device):
         differ = int((checkpoint[slot].cpu().double() != expected_kept).sum())
         outside += differ
         print(f"  checkpoint of slot {slot}: {differ} elements differ")
+    if trailing:
+        live_rows = torch.tensor([slots[r] >= 0 for r in range(rows) for _ in range(lengths[r])])
+        differ = int((trail.cpu().double()[live_rows] != trailed[live_rows]).sum())
+        outside += differ
+        print(f"  trail of every live token: {differ} elements differ")
     for slot in range(slot_count):
         if slot not in finals:
             outside += int((state[slot].cpu() != initial[slot]).sum())
@@ -152,6 +163,10 @@ def main():
         {"label": "decode rows", "lengths": [1] * 9, "starts": [3 * r + 1 for r in range(9)],
          "slots": [r if r % 4 else -1 for r in range(9)],
          "checkpoints": [3 * r + 2 if r % 2 else 0 for r in range(9)]},
+        # A verification's rows: a few tokens each, continuing from their slots, with the window
+        # after every token kept in the trail.
+        {"label": "verification rows", "lengths": [4, 1, 3, 4], "starts": [9, 30, 61, 2],
+         "slots": [1, 3, -1, 0], "checkpoints": [0, 0, 0, 4], "trailing": True},
     ):
         bad, _, _ = run({**case, **shape, "dtype": FLAGS.dtype, "seed": FLAGS.seed}, device)
         outside += bad

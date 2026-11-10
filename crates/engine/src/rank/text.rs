@@ -71,10 +71,19 @@ impl ModelRunner {
                     .context("more request slots than the protocol addresses")?;
                 let stream = platform::Stream::new(device)
                     .with_context(|| format!("creating device {}'s stream", device.0))?;
+                let drafts = self.engine_config().speculative.num_draft_tokens;
                 let rows = self
                     .buckets
                     .largest(Variant::DecodeGreedy)
                     .map_or(1, |bucket| bucket.rows);
+                // A verification attends as one row per token.
+                let rows = if drafts > 0 {
+                    CausalLmRunner::<Shared<dyn nn::family::TextModel>>::speculative_rows(
+                        slots, drafts, rows,
+                    )
+                } else {
+                    rows
+                };
                 let cache = memory.shared_cache().context(
                     "a causal-language rank reads a paged cache, and this rank opened none",
                 )?;
@@ -84,7 +93,7 @@ impl ModelRunner {
                 let runner = CausalLmRunner::new(
                     Binding {
                         id: RunnerId(0),
-                        phases: served_phases(&self.buckets),
+                        phases: served_phases(&self.buckets, drafts > 0),
                         device,
                         stream,
                     },
@@ -100,6 +109,11 @@ impl ModelRunner {
                 let runner = match member {
                     Some(member) => runner.in_union(member),
                     None => runner,
+                };
+                let runner = if drafts > 0 {
+                    runner.speculating(drafts)?
+                } else {
+                    runner
                 };
                 let runner = match &groups.tensor {
                     Some(group) => runner.in_tensor_group(Arc::clone(group)),

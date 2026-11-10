@@ -7,7 +7,11 @@
 //! - the **live** banks hold each slot's state after its request's last computed token, which every
 //!   row of a batch reads and advances in place;
 //! - the **checkpoint** banks receive the state a row keeps at the page boundary the batch's
-//!   `checkpoints` column names.
+//!   `checkpoints` column names;
+//! - in a deployment that speculates, the **trail** banks, `[tokens, …]` each, receive the state
+//!   after every token of a verification, whose accepted length is known only once its tokens are
+//!   sampled: the runner then settles each row's slot on the trail's entry after its last accepted
+//!   token ([`StateBanks::settle`]).
 //!
 //! The banks are carved once from the device's resident pool, so every captured graph addresses
 //! them unchanged. Between batches the state moves between the banks and the prefix cache's state
@@ -54,11 +58,25 @@ struct Pages {
     units_per_page: u32,
 }
 
-/// The device bytes the banks of `shape` take for `slots` request slots: both banks of every field
-/// of every layer, a row per slot and one for the padding slot. The capacity plan charges them
-/// beside the cache pool.
-pub fn bank_bytes(shape: &StateShape, slots: u32) -> u64 {
-    2 * (u64::from(slots) + 1) * u64::from(shape.layers) * shape.layer_bytes()
+/// The device bytes the banks of `shape` take for `slots` request slots and a trail of `trail`
+/// tokens: both banks of every field of every layer, a row per slot and one for the padding slot,
+/// and the trail's row per token. The capacity plan charges them beside the cache pool.
+pub fn bank_bytes(shape: &StateShape, slots: u32, trail: u32) -> u64 {
+    (2 * (u64::from(slots) + 1) + u64::from(trail)) * u64::from(shape.layers) * shape.layer_bytes()
+}
+
+/// The rows a batch's recurrent layers advance (`nn::StateView`'s rows): device columns of the
+/// runner's, one entry per state row.
+#[derive(Clone, Copy)]
+pub(crate) struct StateRows {
+    /// `[rows + 1]` i32 packed token offsets.
+    pub(crate) query_offsets: TensorView,
+    /// `[rows]` i32 tokens each row has seen.
+    pub(crate) seq_lens: TensorView,
+    /// `[rows]` i32 each row's slot.
+    pub(crate) slots: TensorView,
+    /// The rows.
+    pub(crate) count: u64,
 }
 
 /// A slot's recurrent-state banks and the copies that move them.
@@ -70,6 +88,11 @@ pub(crate) struct StateBanks {
     live: Vec<Vec<Buffer>>,
     /// `[layer][field]` the checkpoint banks.
     kept: Vec<Vec<Buffer>>,
+    /// `[layer][field]` the trail banks, `[trail_rows, …]`; empty in a deployment that does not
+    /// speculate.
+    trail: Vec<Vec<Buffer>>,
+    /// Rows of every trail bank: the most tokens a verification batch holds.
+    trail_rows: u64,
     /// `[layer][field]` where each field lies in a state page.
     planes: Vec<Vec<StatePlanes>>,
     plane_bytes: u64,
@@ -92,15 +115,22 @@ pub(crate) struct StateBanks {
 
 impl StateBanks {
     /// The banks of `shape` for `slots` request slots, carved from `pools` on `device`, over the
-    /// cache pool `cache` whose plan is `plan`, for batches of at most `rows` rows.
+    /// cache pool `cache` whose plan is `plan`, for batches of at most `rows` rows, with a trail of
+    /// `trail` tokens (zero for a deployment that does not speculate).
     ///
     /// # Errors
     ///
     /// A plan that holds no state group, or a pool that cannot hold the banks.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the state's shape, its three extents, the cache it checkpoints into and the \
+                  device's pools"
+    )]
     pub(crate) fn new(
         shape: StateShape,
         slots: u32,
         rows: u32,
+        trail: u32,
         plan: &CachePlan,
         cache: &Arc<Mutex<crate::memory::PrefixCache>>,
         device: DeviceId,
@@ -122,6 +152,19 @@ impl StateBanks {
         for _ in 0..shape.layers {
             live.push(shape.fields.iter().map(&mut carve).collect::<Result<_>>()?);
             kept.push(shape.fields.iter().map(&mut carve).collect::<Result<_>>()?);
+        }
+        let trail_rows = u64::from(trail);
+        let mut trails = Vec::new();
+        if trail_rows > 0 {
+            for _ in 0..shape.layers {
+                trails.push(
+                    shape
+                        .fields
+                        .iter()
+                        .map(|field| pools.allocate(PoolKind::Resident, trail_rows * field.bytes()))
+                        .collect::<Result<Vec<_>>>()?,
+                );
+            }
         }
         let planes = (0..shape.layers)
             .map(|layer| plan.state_planes(layer, &shape.fields))
@@ -160,6 +203,8 @@ impl StateBanks {
             rows: banks,
             live,
             kept,
+            trail: trails,
+            trail_rows,
             planes,
             plane_bytes: plan.plane_bytes,
             page_planes,
@@ -174,9 +219,9 @@ impl StateBanks {
         })
     }
 
-    /// A bank's view: `[rows, dims…]` of the field's type.
-    fn bank(&self, buffer: &Buffer, field: &StateField) -> TensorView {
-        let mut dims = vec![self.rows];
+    /// A `[rows, dims…]` view of `buffer` in `field`'s type.
+    fn rows_of(buffer: &Buffer, field: &StateField, rows: u64) -> TensorView {
+        let mut dims = vec![rows];
         dims.extend(&field.dims);
         TensorView::new(
             DevicePtr::new(buffer.address()),
@@ -194,40 +239,108 @@ impl StateBanks {
         )
     }
 
-    /// Runs `operation` with the state view of a batch whose rows' slots are `slots`, every layer's
-    /// banks bound and the staged checkpoints column read for `rows` rows.
+    /// Runs `operation` with the state view of a batch whose state rows are `rows`, every layer's
+    /// banks bound, the staged checkpoints column read for its rows, and the trail when `trailing`.
+    ///
+    /// # Errors
+    ///
+    /// A trailing batch in a deployment whose banks keep no trail, or what `operation` answers.
     pub(crate) fn with_view<R>(
         &self,
-        slots: TensorView,
-        rows: u64,
-        operation: impl FnOnce(StateView<'_>) -> R,
-    ) -> R {
-        let views: Vec<(Vec<TensorView>, Vec<TensorView>)> = self
-            .live
-            .iter()
-            .zip(&self.kept)
-            .map(|(live, kept)| {
+        rows: StateRows,
+        trailing: bool,
+        operation: impl FnOnce(StateView<'_>) -> Result<R>,
+    ) -> Result<R> {
+        if trailing && self.trail.is_empty() {
+            return Err(Error::Invariant(
+                "a verification keeps a trail and the state banks hold none: the deployment does \
+                 not speculate"
+                    .into(),
+            ));
+        }
+        let bound = |banks: &[Buffer], rows: u64| -> Vec<TensorView> {
+            banks
+                .iter()
+                .zip(&self.shape.fields)
+                .map(|(buffer, field)| Self::rows_of(buffer, field, rows))
+                .collect()
+        };
+        let views: Vec<(Vec<TensorView>, Vec<TensorView>, Vec<TensorView>)> = (0..self.live.len())
+            .map(|layer| {
                 (
-                    live.iter()
-                        .zip(&self.shape.fields)
-                        .map(|(buffer, field)| self.bank(buffer, field))
-                        .collect(),
-                    kept.iter()
-                        .zip(&self.shape.fields)
-                        .map(|(buffer, field)| self.bank(buffer, field))
-                        .collect(),
+                    bound(&self.live[layer], self.rows),
+                    bound(&self.kept[layer], self.rows),
+                    self.trail
+                        .get(layer)
+                        .map_or_else(Vec::new, |trail| bound(trail, self.trail_rows)),
                 )
             })
             .collect();
         let layers: Vec<StateLayer<'_>> = views
             .iter()
-            .map(|(live, checkpoint)| StateLayer { live, checkpoint })
+            .map(|(live, checkpoint, trail)| StateLayer {
+                live,
+                checkpoint,
+                trail: trailing.then_some(trail.as_slice()),
+            })
             .collect();
         operation(StateView {
-            slots,
-            checkpoints: self.checkpoints.extent(0..rows),
+            query_offsets: rows.query_offsets,
+            seq_lens: rows.seq_lens,
+            slots: rows.slots,
+            checkpoints: self.checkpoints.extent(0..rows.count),
             layers: &layers,
         })
+    }
+
+    /// Settles slot `slot` on the trail's entry of token `token`: every layer's live state becomes
+    /// the state the trailing batch's forward left after that token, the last its slot's request
+    /// accepted. Issued on `stream` behind the forward that wrote the trail; a recording forward
+    /// moves nothing.
+    ///
+    /// # Errors
+    ///
+    /// A deployment whose banks keep no trail, a token past the trail or a slot past the banks, or
+    /// a refused copy.
+    pub(crate) fn settle(
+        &self,
+        f: &Forward<'_>,
+        slot: u32,
+        token: u32,
+        stream: &platform::Stream,
+    ) -> Result<()> {
+        if self.trail.is_empty() || u64::from(token) >= self.trail_rows {
+            return Err(Error::Invariant(format!(
+                "a verification settles slot {slot} on token {token} of a trail of {} rows",
+                self.trail_rows
+            )));
+        }
+        if u64::from(slot) >= self.rows {
+            return Err(Error::Invariant(format!(
+                "a verification settles slot {slot} of banks of {} rows",
+                self.rows
+            )));
+        }
+        if f.is_recording() {
+            return Ok(());
+        }
+        for (live, trail) in self.live.iter().zip(&self.trail) {
+            for ((bank, entry), field) in live.iter().zip(trail).zip(&self.shape.fields) {
+                let bytes = field.bytes();
+                // SAFETY: both ranges are one field's row inside their own banks, which the checks
+                // above bound, and the copy is ordered on the stream behind the forward that wrote
+                // the trail and ahead of the next forward that reads the slot.
+                unsafe {
+                    platform::memcpy_async(
+                        bank.address() + u64::from(slot) * bytes,
+                        entry.address() + u64::from(token) * bytes,
+                        bytes as usize,
+                        stream,
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Stages a batch's checkpoints column, `rows` rows of them.

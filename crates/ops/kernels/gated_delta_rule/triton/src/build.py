@@ -44,7 +44,9 @@ def spec(fields, parameters, target):
             f"tensor-memory columns of {TENSOR_MEMORY}"
         )
     return {
-        "aligned": ["query_ptr", "key_ptr", "value_ptr", "state_ptr", "checkpoint_ptr", "out_ptr"],
+        "aligned": [
+            "query_ptr", "key_ptr", "value_ptr", "state_ptr", "checkpoint_ptr", "trail_ptr", "out_ptr"
+        ],
         "kernel": kernels._gated_delta_rule_kernel,
         "signature": {
             "query_ptr": dtype,
@@ -60,10 +62,12 @@ def spec(fields, parameters, target):
             "checkpoints_ptr": "*i32",
             "state_ptr": "*fp32",
             "checkpoint_ptr": "*fp32",
+            "trail_ptr": "*fp32",
             "out_ptr": dtype,
             "row_stride": "i32",
             "gate_stride": "i32",
             "scale": "fp32",
+            "trailing": "i32",
             "KEY_HEADS": "constexpr",
             "VALUE_HEADS": "constexpr",
             "KEY_DIM": "constexpr",

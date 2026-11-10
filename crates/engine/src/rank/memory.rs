@@ -193,13 +193,31 @@ impl ModelRunner {
                     ),
                 }
                 .context("describing the model's KV cache")?;
+                // A deployment that speculates keeps its drafter's draft cache in the same pool.
+                let drafts = self.engine_config().speculative.num_draft_tokens;
+                let cache = match model.drafter().filter(|_| drafts > 0) {
+                    Some(drafter) => {
+                        let shape = drafter.cache();
+                        cache
+                            .with_draft(shape.layers, shape.kv_heads, shape.head_dim)
+                            .context("describing the drafter's draft cache")?
+                    }
+                    None => cache,
+                };
                 // The request slots' state banks are the runner's, carved from the resident pool
                 // beside the cache.
                 let slots = u32::try_from(self.engine_config().max_running_requests.get())
                     .context("more request slots than the protocol addresses")?;
-                let state_bytes = state
-                    .as_ref()
-                    .map_or(0, |state| worker::runners::state::bank_bytes(state, slots));
+                // A speculating rank's state also keeps a verification's trail: every slot's drafts
+                // and the token before them.
+                let trail = if drafts > 0 {
+                    slots.saturating_mul(drafts + 1)
+                } else {
+                    0
+                };
+                let state_bytes = state.as_ref().map_or(0, |state| {
+                    worker::runners::state::bank_bytes(state, slots, trail)
+                });
                 let request = worker::capacity::MemoryRequest {
                     device: worker::config::Device::Cuda(device),
                     epoch: self.cache_epoch.unwrap_or(self.launch.epoch),
@@ -211,7 +229,7 @@ impl ModelRunner {
                     transport_bytes: self.transport_bytes(device, model.as_ref())?,
                     state_bytes,
                 };
-                (request, rank_report(device, host)?)
+                (request, rank_report(device, host, drafts > 0)?)
             }
             Loaded::Video(pipeline) => {
                 // No cache: a video rank addresses no paged request.

@@ -149,7 +149,7 @@ pub(super) fn host_phases() -> Vec<PhaseId> {
     .collect()
 }
 
-pub(super) fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
+pub(super) fn served_phases(buckets: &Buckets, verifies: bool) -> Vec<PhaseId> {
     let mut kinds: Vec<scheduler::PhaseKind> = buckets
         .iter()
         .map(|bucket| match bucket.variant {
@@ -185,6 +185,11 @@ pub(super) fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
     if kinds.contains(&scheduler::PhaseKind::Prefill) {
         kinds.push(scheduler::PhaseKind::Refill);
     }
+    // A speculating device's decoding requests verify: their calls run in the verification phase,
+    // which an eager step serves and no bucket names.
+    if verifies && kinds.contains(&scheduler::PhaseKind::Decode) {
+        kinds.push(scheduler::PhaseKind::Verify);
+    }
     kinds.sort_by_key(|kind| scheduler::phase_id(*kind).0);
     kinds.dedup();
     kinds
@@ -205,7 +210,7 @@ mod tests {
     #[test]
     fn a_model_runner_serves_the_phases_its_buckets_are_planned_as() {
         let buckets = Buckets::causal_lm(&[8], &[64], true);
-        let phases = served_phases(&buckets);
+        let phases = served_phases(&buckets, false);
         let id =
             |kind| PhaseId(u16::try_from(scheduler::phase_id(kind).0).expect("a phase id fits"));
         assert!(

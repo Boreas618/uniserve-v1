@@ -226,11 +226,25 @@ pub struct StateLayer<'a> {
     pub live: &'a [TensorView],
     /// The checkpoint banks, in the same order and extents.
     pub checkpoint: &'a [TensorView],
+    /// The trail banks of a batch that keeps one, in the same order: `[tokens, …]` per field, row
+    /// `t` receiving the layer's state after the batch's token `t`. A speculative verification
+    /// keeps one, because only after the forward does it learn after which of a row's tokens the
+    /// slot's state stands; `None` for every other batch.
+    pub trail: Option<&'a [TensorView]>,
 }
 
 /// The recurrent state a batch's rows read and advance.
+///
+/// Its rows are the batch's **state rows**: one request's consecutive tokens each, which advance
+/// one slot's state in order. They are the batch's attention rows ([`TokenBatch`]) except in a
+/// verification, whose tokens attend as one row each (a decode's shape, so each is evaluated as
+/// the decode step at its position would be) while one state row walks them all.
 #[derive(Clone, Copy)]
 pub struct StateView<'a> {
+    /// `[rows + 1]` i32: the packed offsets of each state row's tokens in the batch.
+    pub query_offsets: TensorView,
+    /// `[rows]` i32: the tokens each state row has seen, its new ones included.
+    pub seq_lens: TensorView,
     /// `[rows]` i32: each row's request slot in the banks; negative for a padding row, whose state
     /// is neither read nor written.
     pub slots: TensorView,

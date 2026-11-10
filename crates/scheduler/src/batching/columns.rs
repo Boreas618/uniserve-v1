@@ -30,6 +30,8 @@
 //!   because a decode's token comes from the mechanism's request state and not
 //!   from the call;
 //! - **page_size** and **max_kv_len**: the cache's geometry;
+//! - **drafts**: each call's draft cache work (`ipc::Call::draft`), for a worker
+//!   that speculates with its model's drafter; empty when no call drafts;
 //! - **checkpoints** and **state_copies**, for a deployment whose cache holds a
 //!   state group: the token count each row keeps its recurrent state at (the
 //!   last page boundary inside the row whose state page the request's table
@@ -271,6 +273,7 @@ pub(crate) fn columns(
     let mut input_ids: Vec<i32> = Vec::new();
     let mut parameters: Vec<f32> = Vec::new();
     let mut draw_addresses: Vec<ipc::philox::DrawAddress> = Vec::new();
+    let drafts: Vec<ipc::DraftWork> = requests.iter().map(|(call, _)| call.draft).collect();
     for (index, (call, call_rows)) in requests.iter().enumerate() {
         let inputs = inputs.get(index)?;
         let sampling = *sampling.get(index)?;
@@ -505,6 +508,16 @@ pub(crate) fn columns(
         checkpoints,
         // Every restore precedes the forward and every checkpoint follows it.
         state_copies: restores.into_iter().chain(keeps).collect(),
+        // A batch none of whose calls drafts states none, as a deployment that does not
+        // speculate plans.
+        drafts: if drafts
+            .iter()
+            .all(|draft| *draft == ipc::DraftWork::default())
+        {
+            Vec::new()
+        } else {
+            drafts
+        },
     })
 }
 

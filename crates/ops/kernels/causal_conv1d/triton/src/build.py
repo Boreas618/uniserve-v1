@@ -27,7 +27,7 @@ def spec(fields, parameters, target):
     if width < 2:
         raise SystemExit(f"a convolution of {width} taps keeps no state")
     return {
-        "aligned": ["x_ptr", "out_ptr", "state_ptr", "checkpoint_ptr"],
+        "aligned": ["x_ptr", "out_ptr", "state_ptr", "checkpoint_ptr", "trail_ptr"],
         "kernel": kernels._causal_conv1d_kernel,
         "signature": {
             "x_ptr": dtype,
@@ -39,7 +39,9 @@ def spec(fields, parameters, target):
             "checkpoints_ptr": "*i32",
             "state_ptr": dtype,
             "checkpoint_ptr": dtype,
+            "trail_ptr": dtype,
             "x_row_stride": "i32",
+            "trailing": "i32",
             "CHANNELS": "constexpr",
             "WIDTH": "constexpr",
             "KEPT": "constexpr",

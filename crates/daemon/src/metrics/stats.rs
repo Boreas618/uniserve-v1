@@ -350,6 +350,15 @@ pub(crate) fn record_scheduler_stats(
             .worker_spec_verify_committed_tokens
             .get_or_create(&labels)
             .inc_by(worker_stats.spec_verify_committed_tokens);
+        if worker_stats.spec_verify_rows > 0 {
+            metrics
+                .spec_decode_accepted_length
+                .get_or_create(&labels)
+                .set(
+                    worker_stats.spec_verify_committed_tokens as f64
+                        / worker_stats.spec_verify_rows as f64,
+                );
+        }
         for (path, count) in &worker_stats.spec_verify_path_counts {
             metrics
                 .worker_spec_verify_path_counts

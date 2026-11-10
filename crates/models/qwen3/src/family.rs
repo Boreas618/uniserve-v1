@@ -10,8 +10,8 @@
 use std::sync::Arc;
 
 use nn::family::{
-    CacheShape, ExpertOrder, ExpertShape, Family, Model, StateShape, TextCheckpoint, TextFamily,
-    TextModel, TextPlacement,
+    CacheShape, Drafter, ExpertOrder, ExpertShape, Family, Model, StateShape, TextCheckpoint,
+    TextFamily, TextModel, TextPlacement,
 };
 use nn::{Checkpoint, DType, WeightLoader};
 use processing::{ChatProfile, ReasoningFormat, Serving, ToolCallFormat};
@@ -130,6 +130,11 @@ impl TextModel for Qwen3Moe {
             encoded: self.experts_encoded(),
         })
     }
+
+    fn drafter(&self) -> Option<&dyn Drafter> {
+        // A Qwen3-MoE checkpoint carries no multi-token-prediction layers.
+        None
+    }
 }
 
 /// The Qwen3.5-MoE family: `Qwen3_5MoeForConditionalGeneration` checkpoints (Qwen3.6-35B-A3B among
@@ -195,8 +200,8 @@ impl TextCheckpoint for Qwen35MoeCheckpoint {
         let model = crate::hybrid::load::load(
             &self.config,
             &self.declaration,
-            placement.tensor,
-            placement.experts,
+            (placement.tensor, placement.experts),
+            placement.drafter,
             loader,
             experts,
         )?;
@@ -239,5 +244,9 @@ impl TextModel for Qwen35Moe {
             top: config.num_experts_per_tok,
             encoded: self.experts_encoded(),
         })
+    }
+
+    fn drafter(&self) -> Option<&dyn Drafter> {
+        Qwen35Moe::drafter(self).map(|drafter| drafter as &dyn Drafter)
     }
 }

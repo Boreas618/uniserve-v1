@@ -14,7 +14,10 @@ it installs:
 - ``EXPLICIT``: install a prefill's sampled token at the host's coordinates;
 - ``VERIFY``: install a verification's emitted token, taking the three lengths
   to the host base plus the device-selected emitted-token count;
-- ``CACHE``: set only the cache length (a prefill without a sample).
+- ``CACHE``: set only the cache length (a prefill without a sample);
+- ``COUNT``: count the task's token in the slot's penalty history and touch nothing
+  else: a verification's accepted drafts, which precede the token its ``VERIFY`` row
+  installs.
 
 Only rows that sampled write the next input token, the predicate and the
 positions; every row that has a slot writes the cache length. A row whose slot is
@@ -24,7 +27,8 @@ an atomic add, weighted by whether the selection is valid and active, so
 speculation counts only its final emitted token. A row's token relay carries the
 continuation in bit 31 and the token in the low 31 bits.
 
-A token's slot is unique within a step, so a slot's state needs no
+A token's slot is unique within a step among the rows that write its state (a
+``COUNT`` row writes only the penalty counts, atomically), so a slot's state needs no
 synchronization between rows.
 """
 
@@ -46,6 +50,7 @@ PENALTIES = tl.constexpr(7)
 DECODE = tl.constexpr(0)
 VERIFY = tl.constexpr(2)
 CACHE = tl.constexpr(3)
+COUNT = tl.constexpr(4)
 
 # A token relay carries the continuation in bit 31 and the token below it.
 TOKEN_VALUE_MASK = tl.constexpr((1 << 31) - 1)
@@ -107,6 +112,8 @@ def _slot_commit_kernel(
     dedicated = mask & (slot >= 0)
     decode = mode == DECODE
     verify = mode == VERIFY
+    # A count row adds its token's penalty weight and stores nothing else.
+    states = dedicated & (mode != COUNT)
     cache = tl.load(verified + slot, mask=dedicated, other=0)
     position = tl.load(logical + slot, mask=dedicated, other=0)
     sampling_position = tl.load(sampling + slot, mask=dedicated, other=0)
@@ -124,7 +131,7 @@ def _slot_commit_kernel(
         tl.where(verify, host_sampling + accepted, host_sampling),
     )
 
-    tl.store(verified + slot, cache.to(VERIFIED), mask=dedicated)
+    tl.store(verified + slot, cache.to(VERIFIED), mask=states)
     # A token is a row of the vocabulary, and the three things below are the only places this step
     # uses one *as an index*: the next input column, the predicate relay and the penalty counts. A
     # sampler can answer one past its vocabulary (an `argmax` over a row with no numeric value does
@@ -133,10 +140,10 @@ def _slot_commit_kernel(
     # count plane. So the impossible value installs nothing - its request is refused where the
     # batch's tokens are read back, and no slot is poisoned in the meantime.
     token_valid = token < VOCAB
-    tl.store(future + slot * FUTURE_STRIDE, token, mask=sampled & dedicated & token_valid)
-    tl.store(predicates + slot, carries, mask=sampled & dedicated & token_valid)
-    tl.store(logical + slot, position, mask=sampled & dedicated)
-    tl.store(sampling + slot, sampling_position, mask=sampled & dedicated)
+    tl.store(future + slot * FUTURE_STRIDE, token, mask=sampled & states & token_valid)
+    tl.store(predicates + slot, carries, mask=sampled & states & token_valid)
+    tl.store(logical + slot, position, mask=sampled & states)
+    tl.store(sampling + slot, sampling_position, mask=sampled & states)
     # The penalty counts are the one field two rows could share: the add is
     # atomic so a step that installs two tokens of one slot to the same word
     # still sums both weights.

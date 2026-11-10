@@ -14,6 +14,12 @@ and a row whose ``checkpoints[r]`` falls in ``(start, end]`` also writes the
 ``K − 1`` inputs before that position into its slot of the checkpoint bank. A row
 of a negative slot is padding: its output rows are zero and no state is touched.
 
+When ``trailing`` is set the row also keeps its **trail**: the ``K − 1`` inputs before each of its
+positions ``start + 1 .. end`` go into row ``t`` of ``trail`` (``[tokens, K − 1, channels]``) for
+the row's token ``t``, the state the slot would hold had the row ended at that token, so a caller
+that learns afterwards how many of the row's tokens stand (a speculative verification) can take the
+slot's state after any of them.
+
 One program owns ``BLOCK`` channels of one row and walks its tokens in tiles of
 ``TOKENS``; each output reads its ``K`` inputs straight from the row's inputs or
 the slot's state, so a program reads every state value it needs before it
@@ -70,7 +76,7 @@ def _inputs(
     return taken + remembered
 
 
-@triton.jit(do_not_specialize=["x_row_stride"])
+@triton.jit(do_not_specialize=["x_row_stride", "trailing"])
 def _causal_conv1d_kernel(
     x_ptr,
     weight_ptr,
@@ -81,7 +87,9 @@ def _causal_conv1d_kernel(
     checkpoints_ptr,
     state_ptr,
     checkpoint_ptr,
+    trail_ptr,
     x_row_stride,
+    trailing,
     CHANNELS: tl.constexpr,  # noqa: N803
     WIDTH: tl.constexpr,  # noqa: N803
     KEPT: tl.constexpr,  # noqa: N803
@@ -185,6 +193,30 @@ def _causal_conv1d_kernel(
             CHANNELS,
             WIDTH,
         )
+        # The trail reads the slot's old state too, so it lands before the barrier as well: the
+        # window after token `t` is the `K − 1` inputs ending at its position.
+        if trailing != 0:
+            for index in range(0, count):
+                window = _inputs(
+                    x_ptr,
+                    state_ptr,
+                    start + index + 1 - (WIDTH - 1) + entry,
+                    held,
+                    channels,
+                    live,
+                    first,
+                    start,
+                    slot,
+                    x_row_stride,
+                    CHANNELS,
+                    WIDTH,
+                )
+                trailed = (
+                    (first + index).to(tl.int64) * ((WIDTH - 1) * CHANNELS)
+                    + entry[:, None].to(tl.int64) * CHANNELS
+                    + channels[None, :]
+                )
+                tl.store(trail_ptr + trailed, window, mask=held[:, None] & live[None, :])
         tl.debug_barrier()
         tl.store(checkpoint_ptr + stored, kept, mask=(held & keeps)[:, None] & live[None, :])
         tl.store(state_ptr + stored, last, mask=held[:, None] & live[None, :])

@@ -690,6 +690,8 @@ impl ModelRunner {
                         size: mapping.expert_parallel,
                         rank: mapping.expert_rank,
                     },
+                    // The drafter's layers load when the deployment speculates with them.
+                    drafter: self.engine_config().speculative.num_draft_tokens > 0,
                 };
                 let model = checkpoint.load(&opened, &mut loader, &placement, experts)?;
                 Ok(Loaded::Text(model))

@@ -182,6 +182,7 @@ impl Arena {
 }
 
 /// The borrowed execution resources of one forward.
+#[derive(Clone)]
 pub struct Forward<'a> {
     /// The stream this forward's work is issued on, or `None` for a **recording** forward: one that
     /// states the programs a graph launches instead of launching them.

@@ -539,6 +539,7 @@ fn load_model(
     let placement = nn::family::TextPlacement {
         tensor: nn::family::Split { size: ranks, rank },
         experts: nn::family::Split::WHOLE,
+        drafter: false,
     };
     opened.load(
         &checkpoint,

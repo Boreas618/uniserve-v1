@@ -38,6 +38,7 @@
 //! Boundary).
 
 pub mod load;
+pub mod mtp;
 
 use nn::blocks::{GatedDeltaNet, GatedDeltaNetSpec, Keys};
 use nn::capability::{CausalLm, KvView, TokenBatch};
@@ -113,6 +114,8 @@ pub struct Qwen35Moe {
     ordinals: Vec<usize>,
     /// Whether the checkpoint's experts were read as calibrated NVFP4.
     experts_encoded: bool,
+    /// The multi-token-prediction layers, loaded when the deployment speculates with them.
+    drafter: Option<mtp::Mtp>,
 }
 
 impl Qwen35Moe {
@@ -134,6 +137,11 @@ impl Qwen35Moe {
     /// Whether the checkpoint's expert stacks were read as calibrated NVFP4.
     pub const fn experts_encoded(&self) -> bool {
         self.experts_encoded
+    }
+
+    /// The drafter, when the deployment loaded it.
+    pub const fn drafter(&self) -> Option<&mtp::Mtp> {
+        self.drafter.as_ref()
     }
 
     /// The recurrent state this rank's linear layers keep per request slot.

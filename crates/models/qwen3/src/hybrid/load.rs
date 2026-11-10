@@ -3,22 +3,27 @@
 //!
 //! The family reads `config.json` and the quantization declaration once, when it opens the
 //! checkpoint; this module builds the model from them. The multi-token-prediction layers (`mtp.*`)
-//! and the vision tower (`model.visual.*`) are not read here: the text model serves without them.
+//! load as the model's drafter when the deployment speculates; the vision tower
+//! (`model.visual.*`) is not read here: the text model serves without it.
 
 use nn::blocks::{AttentionKind, GateUp, GatedMlpSpec, SharedExpert, SharedExpertSpec};
 use nn::family::{ExpertOrder, Split};
 use nn::layers::{
-    Bias, ExpertNames, ExpertSlots, Moe, MoeSpec, ParallelLMHead, RmsNorm, Rounding,
-    StackedExperts, VocabParallelEmbedding,
+    Bias, ExpertNames, ExpertSlots, Linear, Moe, MoeSpec, Parallel, ParallelLMHead, RmsNorm,
+    Rounding, StackedExperts, VocabParallelEmbedding,
 };
 use nn::quantization::Declaration;
-use nn::weights::WeightLoader;
+use nn::weights::{Scope, WeightLoader};
 
+use super::mtp::{DRAFTER_COMPONENTS, Mtp};
 use super::{COMPONENTS, Qwen35Moe, delta_net_spec, text_spectrum};
-use crate::Result;
-use crate::config::{HybridConfig, Mixer};
+use crate::config::{HybridConfig, Mixer, TextConfig};
 use crate::decoder::{DecoderStack, LayerForm, MixerSpec, Mlp};
-use crate::moe::load::{expert_module, expert_slots, slot_map};
+use crate::moe::load::{SlotTable, expert_module, expert_slots, slot_map};
+use crate::{Error, Result};
+
+/// The module path the drafter's modules sit under.
+const DRAFTER: &str = "mtp";
 
 /// The module path the language model's modules sit under.
 const LANGUAGE_MODEL: &str = "model.language_model";
@@ -45,17 +50,175 @@ pub fn expert_modules(config: &HybridConfig) -> Vec<String> {
         .collect()
 }
 
-/// Load the checkpoint `config` and `declaration` describe at the rank `tensor` and `experts`
-/// place, with the routed experts in the slots `order` states.
+/// The attention, rounding and fence components a stack of the checkpoint computes its layers
+/// with, the model's or its drafter's.
+fn layer_form(text: &TextConfig, components: crate::decoder::Components) -> LayerForm {
+    LayerForm {
+        attention: AttentionKind::Paged {
+            max_kv_len: text.max_position_embeddings,
+            window: None,
+        },
+        // The shared expert's SiLU and product are one FP32 expression rounded once, as the
+        // references' fused `SiluAndMul` evaluates them.
+        rounding: Rounding::Fused,
+        components,
+    }
+}
+
+/// The routed block of layer `layer` at `scope` (its `mlp` module): the experts in the slots
+/// `slots` states, read through the slot table's row for the layer, and the gated shared expert.
+fn routed_block(
+    scope: &mut Scope<'_, '_>,
+    config: &HybridConfig,
+    form: &LayerForm,
+    (tensor, experts): (Split, Split),
+    (slots, slot_table): &SlotTable,
+    layer: u32,
+) -> Result<Option<Mlp>> {
+    let text = &config.text;
+    let routed = Moe::load(
+        scope,
+        MoeSpec {
+            experts: config.num_experts,
+            top: config.num_experts_per_tok,
+            hidden: text.hidden_size,
+            intermediate: config.moe_intermediate_size,
+            activation: text.hidden_act,
+            // The router's top-k weights always renormalize to one.
+            renormalize: true,
+        },
+        EXPERT_NAMES,
+        ExpertSlots {
+            order: &slots[&layer],
+            map: slot_map(slot_table, layer)?,
+        },
+        tensor,
+        experts,
+    )?;
+    let shared = SharedExpert::load(
+        scope,
+        SharedExpertSpec {
+            mlp: GatedMlpSpec {
+                hidden: text.hidden_size,
+                intermediate: config.shared_expert_intermediate_size,
+                activation: text.hidden_act,
+                rounding: form.rounding,
+                gate_up: GateUp::Split {
+                    gate: "gate_proj",
+                    up: "up_proj",
+                },
+                down: "down_proj",
+                bias: Bias::Absent,
+            },
+            module: "shared_expert",
+            gate: "shared_expert_gate",
+        },
+        tensor,
+    )?;
+    Ok(Some(Mlp::Experts {
+        routed,
+        shared: Some(shared),
+    }))
+}
+
+/// Load the drafter at `mtp`: the multi-token-prediction layers' norms and input projection, their
+/// full-attention decoder layers (every one routed) and their output norm.
+///
+/// The drafter's experts keep the checkpoint's order: an expert redistribution orders the model's
+/// layers ([`TextCheckpoint::expert_layers`](nn::family::TextCheckpoint::expert_layers)), and it
+/// names none of the drafter's.
 ///
 /// # Errors
 ///
-/// A split the model does not divide, or a module the loader refuses.
+/// A checkpoint whose drafter embeds with a table of its own, which this drafter does not read, or
+/// a module the loader refuses.
+fn load_drafter(
+    config: &HybridConfig,
+    serving: &TextConfig,
+    splits: (Split, Split),
+    loader: &mut WeightLoader<'_>,
+) -> Result<Mtp> {
+    let mtp = &config.mtp;
+    if mtp.num_hidden_layers == 0 {
+        return Err(Error::Config(
+            "the deployment speculates and the checkpoint carries no multi-token-prediction layer              (`mtp_num_hidden_layers` is 0)"
+                .to_owned(),
+        ));
+    }
+    if mtp.use_dedicated_embeddings {
+        return Err(Error::Config(
+            "the checkpoint's drafter embeds with a table of its own              (`mtp_use_dedicated_embeddings`), which this drafter does not read"
+                .to_owned(),
+        ));
+    }
+    let text = &config.text;
+    let (tensor, _) = splits;
+    let mut scope = loader.scope(DRAFTER);
+    let norm = |scope: &mut Scope<'_, '_>, module: &str| {
+        RmsNorm::load(
+            &mut scope.scope(module),
+            text.hidden_size,
+            text.rms_norm_eps,
+            text.rms_norm_gain,
+        )
+    };
+    let pre_fc_norm_embedding = norm(&mut scope, "pre_fc_norm_embedding")?;
+    let pre_fc_norm_hidden = norm(&mut scope, "pre_fc_norm_hidden")?;
+    // `fc` contracts the concatenation `[embedding, hidden]` back to the hidden width.
+    let fc = Linear::load(
+        &mut scope.scope("fc"),
+        2 * text.hidden_size,
+        text.hidden_size,
+        Bias::Absent,
+        Parallel::None,
+    )?;
+    let output_norm = norm(&mut scope, "norm")?;
+    let layers: Vec<u32> = (0..mtp.num_hidden_layers).collect();
+    let table = expert_slots(
+        config.num_experts,
+        &layers,
+        &ExpertOrder::new(),
+        loader.scope(DRAFTER),
+    )?;
+    let form = layer_form(text, DRAFTER_COMPONENTS);
+    let mut drafter_text = serving.clone();
+    // The drafter's stack is its own layers, which the stack's range check reads against.
+    drafter_text.num_hidden_layers = mtp.num_hidden_layers;
+    let stack = DecoderStack::load(
+        &mut loader.scope(DRAFTER),
+        &drafter_text,
+        form,
+        tensor,
+        0..mtp.num_hidden_layers,
+        |_| MixerSpec::Attention,
+        |layer, scope| routed_block(scope, config, &form, splits, &table, layer),
+    )?;
+    Ok(Mtp::new(
+        text.hidden_size,
+        mtp.num_hidden_layers,
+        text.num_key_value_heads / tensor.size,
+        text.head_dim,
+        pre_fc_norm_embedding,
+        pre_fc_norm_hidden,
+        fc,
+        stack,
+        output_norm,
+    ))
+}
+
+/// Load the checkpoint `config` and `declaration` describe at the rank `tensor` and `experts`
+/// place, with the routed experts in the slots `order` states, and its drafter when `drafter`
+/// says the deployment speculates with it.
+///
+/// # Errors
+///
+/// A split the model does not divide, a drafter the checkpoint does not carry, or a module the
+/// loader refuses.
 pub fn load(
     config: &HybridConfig,
     declaration: &Declaration,
-    tensor: Split,
-    experts: Split,
+    (tensor, experts): (Split, Split),
+    drafter: bool,
     loader: &mut WeightLoader<'_>,
     order: &ExpertOrder,
 ) -> Result<Qwen35Moe> {
@@ -89,22 +252,13 @@ pub fn load(
     )?;
 
     let layers: Vec<u32> = (0..text.num_hidden_layers).collect();
-    let (slots, slot_table) = expert_slots(
+    let table = expert_slots(
         config.num_experts,
         &layers,
         order,
         loader.scope(LANGUAGE_MODEL),
     )?;
-    let form = LayerForm {
-        attention: AttentionKind::Paged {
-            max_kv_len: text.max_position_embeddings,
-            window: None,
-        },
-        // The shared expert's SiLU and product are one FP32 expression rounded once, as the
-        // references' fused `SiluAndMul` evaluates them.
-        rounding: Rounding::Fused,
-        components: COMPONENTS,
-    };
+    let form = layer_form(text, COMPONENTS);
     // A text request rotates by the default spectrum over the rotated channels (`super`'s module
     // documentation); every other field is the checkpoint's.
     let mut serving = text.clone();
@@ -120,52 +274,11 @@ pub fn load(
             Mixer::Attention => MixerSpec::Attention,
             Mixer::Linear => MixerSpec::Linear(delta),
         },
-        |layer, scope| {
-            let routed = Moe::load(
-                scope,
-                MoeSpec {
-                    experts: config.num_experts,
-                    top: config.num_experts_per_tok,
-                    hidden: text.hidden_size,
-                    intermediate: config.moe_intermediate_size,
-                    activation: text.hidden_act,
-                    // The router's top-k weights always renormalize to one.
-                    renormalize: true,
-                },
-                EXPERT_NAMES,
-                ExpertSlots {
-                    order: &slots[&layer],
-                    map: slot_map(&slot_table, layer)?,
-                },
-                tensor,
-                experts,
-            )?;
-            let shared = SharedExpert::load(
-                scope,
-                SharedExpertSpec {
-                    mlp: GatedMlpSpec {
-                        hidden: text.hidden_size,
-                        intermediate: config.shared_expert_intermediate_size,
-                        activation: text.hidden_act,
-                        rounding: form.rounding,
-                        gate_up: GateUp::Split {
-                            gate: "gate_proj",
-                            up: "up_proj",
-                        },
-                        down: "down_proj",
-                        bias: Bias::Absent,
-                    },
-                    module: "shared_expert",
-                    gate: "shared_expert_gate",
-                },
-                tensor,
-            )?;
-            Ok(Some(Mlp::Experts {
-                routed,
-                shared: Some(shared),
-            }))
-        },
+        |layer, scope| routed_block(scope, config, &form, (tensor, experts), &table, layer),
     )?;
+    let drafter = drafter
+        .then(|| load_drafter(config, &serving, (tensor, experts), loader))
+        .transpose()?;
 
     let ordinals = (0..text.num_hidden_layers)
         .map(|layer| config.ordinal(layer) as usize)
@@ -180,5 +293,6 @@ pub fn load(
         head,
         ordinals,
         experts_encoded,
+        drafter,
     })
 }

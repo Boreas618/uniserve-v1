@@ -307,14 +307,21 @@ impl PrefixCache {
         self.planes.groups()
     }
 
-    /// How many attention groups the plan holds, which the model's attention layers index: every
-    /// group but the state group, which the plan keeps last.
+    /// How many attention groups the plan holds, which the model's attention layers index: the
+    /// groups of K/V rows every request needs, which come first. The draft cache, read by the
+    /// drafter alone, and the state group, which the plan keeps last, are none of them.
     pub fn attention_groups(&self) -> usize {
         self.plan()
             .groups
             .iter()
-            .filter(|group| !group.state())
+            .filter(|group| group.required_rows())
             .count()
+    }
+
+    /// The draft group's layer `layer`, as the drafter's attention reads it
+    /// ([`planes::CachePlanes::draft_layer`]).
+    pub fn draft_layer(&self, group: usize, layer: usize) -> Result<LayerPlanes> {
+        self.planes.draft_layer(group, layer)
     }
 
     /// The state group's index, when the plan holds one.
@@ -375,6 +382,14 @@ impl PrefixCache {
 
     pub fn tables(&self) -> &BlockTables {
         &self.tables
+    }
+
+    /// The pages `slot`'s installed table of `group` holds: its first page and one unit per page
+    /// (a page's first unit, for a group whose page spans several), unit zero for a page it holds
+    /// none for. `None` when the slot holds no table of the group.
+    pub fn installed_pages(&self, slot: u32, group: u32) -> Option<(u32, Vec<u32>)> {
+        let table = self.tables.table(slot, group).ok()?;
+        Some((table.start_page, table.row_units(0).collect()))
     }
 
     /// Every bound tensor of the cache: the planes and the block tables,

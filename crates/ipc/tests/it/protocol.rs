@@ -432,6 +432,7 @@ fn token_batch() -> execution::Batch {
             max_kv_len: 4096,
             checkpoints: Vec::new(),
             state_copies: Vec::new(),
+            drafts: Vec::new(),
         },
         generation: 3,
         cache_units: Vec::new(),

@@ -15,6 +15,11 @@ token. When ``start < checkpoints[r] ≤ end`` names a position the walk stops a
 the state after the token at ``checkpoints[r] − 1`` also goes into the slot of the
 checkpoint bank. A negative slot is a padding row: zero output, no state.
 
+A recurrent walk may also keep its **trail**: when ``trailing`` is set, the state after every
+token ``t`` of the batch goes into row ``t`` of ``trail`` (``[tokens, value_heads, key_dim,
+value_dim]``), so a caller that learns afterwards how many of a row's tokens stand (a speculative
+verification) can take the slot's state after any of them. The chunked form keeps no trail.
+
 One program owns ``BLOCK`` value columns of one value head of one row, so the
 state it carries is ``key_dim × BLOCK`` FP32 and it never shares a state column
 with another program. Two forms:
@@ -104,6 +109,8 @@ def _recurrent(
     b_ptr,
     out_ptr,
     checkpoint_ptr,
+    trail_ptr,
+    trailing,
     state,
     first,
     count,
@@ -124,6 +131,8 @@ def _recurrent(
 ):
     """Walk ``count`` tokens one at a time from ``state``; answer the state after the last."""
     keys = tl.arange(0, KEY_DIM)
+    # This program's columns of one token's `[key_dim, value_dim]` state of this head in the trail.
+    within = keys[:, None] * VALUE_DIM + columns[None, :]
     for index in range(0, count):
         token = (first + index).to(tl.int64)
         q = tl.load(query_ptr + token * row_stride + key_head * KEY_DIM + keys).to(tl.float32)
@@ -144,6 +153,8 @@ def _recurrent(
 
         if checkpoint == start + index + 1:
             tl.store(checkpoint_ptr + bank, state)
+        if trailing != 0:
+            tl.store(trail_ptr + (token * VALUE_HEADS + head) * (KEY_DIM * VALUE_DIM) + within, state)
     return state
 
 
@@ -273,7 +284,7 @@ def _chunked(
     return state
 
 
-@triton.jit(do_not_specialize=["row_stride", "gate_stride"])
+@triton.jit(do_not_specialize=["row_stride", "gate_stride", "trailing"])
 def _gated_delta_rule_kernel(
     query_ptr,
     key_ptr,
@@ -288,10 +299,12 @@ def _gated_delta_rule_kernel(
     checkpoints_ptr,
     state_ptr,
     checkpoint_ptr,
+    trail_ptr,
     out_ptr,
     row_stride,
     gate_stride,
     scale,
+    trailing,
     KEY_HEADS: tl.constexpr,  # noqa: N803
     VALUE_HEADS: tl.constexpr,  # noqa: N803
     KEY_DIM: tl.constexpr,  # noqa: N803
@@ -349,6 +362,8 @@ def _gated_delta_rule_kernel(
                 b_ptr,
                 out_ptr,
                 checkpoint_ptr,
+                trail_ptr,
+                trailing,
                 state,
                 first,
                 count,

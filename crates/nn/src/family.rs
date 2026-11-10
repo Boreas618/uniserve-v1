@@ -30,9 +30,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::capability::{
-    CausalLm, Decoder, Denoiser, Encoder, MediaFormat, Splicer, WarmPrompt, WarmRequest,
+    CausalLm, Decoder, Denoiser, Encoder, KvView, MediaFormat, Splicer, TokenBatch, WarmPrompt,
+    WarmRequest,
 };
-use crate::{Checkpoint, DType, Result, WeightLoader};
+use crate::{Checkpoint, DType, Forward, Result, TensorView, WeightLoader};
 
 /// One model family a build serves: what execution loads of its checkpoints, beside how they
 /// declare it and what request processing serves ([`processing::Family`]).
@@ -288,6 +289,9 @@ pub struct TextPlacement {
     pub tensor: Split,
     /// The expert-parallel split of the routed experts.
     pub experts: Split,
+    /// Whether the deployment speculates with the checkpoint's own drafter, so its layers load
+    /// beside the model's ([`TextModel::drafter`]); a deployment that does not leaves them unread.
+    pub drafter: bool,
 }
 
 /// A loaded causal language model, as execution plans and serves it.
@@ -310,6 +314,46 @@ pub trait TextModel: CausalLm + Send + Sync {
 
     /// Its routed experts, when it has any.
     fn experts(&self) -> Option<ExpertShape>;
+
+    /// The drafter its checkpoint carries for speculative decoding (multi-token prediction
+    /// layers), when the model loaded one; `None` for a model that drafts nothing.
+    fn drafter(&self) -> Option<&dyn Drafter>;
+}
+
+/// A causal language model's own drafter: multi-token-prediction layers that propose the token
+/// after the next from the model's hidden state and the next token (DeepSeek-V3's and Qwen3-Next's
+/// MTP module, vLLM's and SGLang's `*MTP` drafters).
+///
+/// The drafter's entry at position `i` reads the model's final hidden state at `i` (the output of
+/// its [`CausalLm::forward`]) and the embedding of the token at `i + 1`; its own hidden state there
+/// is what [`CausalLm::compute_logits`] turns into the distribution of the token at `i + 2`, and
+/// what its next entry reads in place of the model's when it drafts further ahead. The drafter
+/// embeds its tokens with the model's [`CausalLm::embed_input_ids`] and projects with the model's
+/// head; its own layers attend over a key/value cache of their own, the draft cache, which the
+/// infrastructure allocates as it does the model's ([`KvView`]).
+///
+/// Which positions a step evaluates, which drafts it proposes and how a verification accepts them
+/// are execution's: the drafter computes one forward over the rows it is handed.
+pub trait Drafter: Send + Sync {
+    /// The key/value cache its layers read, the draft cache, as this rank holds it.
+    fn cache(&self) -> CacheShape;
+
+    /// Run the drafter over `batch`: `embedded [tokens, hidden]` holds the embedding of each
+    /// entry's next token and `hidden [tokens, hidden]` the hidden state each entry reads, which
+    /// the drafter overwrites with its own normalized hidden state. `cache` holds the draft cache's
+    /// one attention group, which the batch's slot mapping writes.
+    ///
+    /// # Errors
+    ///
+    /// A view a layer refuses.
+    fn forward(
+        &self,
+        f: &Forward,
+        batch: &TokenBatch,
+        cache: &KvView<'_>,
+        embedded: TensorView,
+        hidden: TensorView,
+    ) -> Result<()>;
 }
 
 /// The recurrent state a causal language model keeps per request slot, as one rank holds it: every

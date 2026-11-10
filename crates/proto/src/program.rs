@@ -334,7 +334,7 @@ pub mod commit {
     pub mod column {
         /// The row's destination slot.
         pub const SLOT: usize = 0;
-        /// The row's mode: decode, explicit, verify or cache.
+        /// The row's mode: decode, explicit, verify, cache or count.
         pub const MODE: usize = 1;
         /// The task the row sampled, or -1 when it sampled none.
         pub const TASK: usize = 2;
@@ -360,6 +360,9 @@ pub mod commit {
         pub const VERIFY: i64 = 2;
         /// The lengths are left as they are.
         pub const CACHE: i64 = 3;
+        /// The row's token joins the slot's penalty history and nothing else moves: a
+        /// verification's accepted drafts, which precede the token its `VERIFY` row installs.
+        pub const COUNT: i64 = 4;
     }
 }
 

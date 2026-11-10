@@ -665,6 +665,20 @@ impl KvProvider for ResidentCache {
         Ok(planes)
     }
 
+    fn draft_planes(&self) -> Result<Vec<KvPlanes>> {
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let group = cache
+            .plan()
+            .draft_group()
+            .ok_or_else(|| Error::Invalid("the resident cache keeps no draft group".to_owned()))?;
+        (0..cache.layers(group))
+            .map(|layer| planes_of(&cache.draft_layer(group, layer)?))
+            .collect()
+    }
+
     fn attach_scratch_bytes(&mut self, bytes: u64) {
         self.scratch_bytes = bytes;
     }

@@ -16,6 +16,8 @@
 //! bucket adds one sequence holding every padding token and then empty sequences, so no padding
 //! token writes the KV cache.
 
+mod speculation;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -65,6 +67,8 @@ pub struct Staging {
     checkpoints: Vec<i32>,
     /// The batch's recurrent-state copies, which the replay launches around its forward.
     state_copies: Vec<ipc::execution::StateCopy>,
+    /// Each call's draft cache work, empty for a batch whose calls draft nothing.
+    drafts: Vec<ipc::DraftWork>,
     parameters: Vec<f32>,
     /// `[rows]` each row's draw address; a padded row's is the default, and its draw is discarded.
     draws: Vec<ipc::philox::DrawAddress>,
@@ -191,6 +195,8 @@ impl Staging {
         }
         self.state_copies.clear();
         self.state_copies.extend_from_slice(&columns.state_copies);
+        self.drafts.clear();
+        self.drafts.extend_from_slice(&columns.drafts);
         let parameters = proto::program::sampler::PARAMETER_COLUMNS as usize;
         self.parameters[..rows * parameters]
             .copy_from_slice(&columns.parameters[..rows * parameters]);
@@ -332,6 +338,11 @@ impl Staging {
     /// The staged recurrent-state checkpoints, one per row.
     pub fn checkpoints(&self, rows: usize) -> &[i32] {
         &self.checkpoints[..rows]
+    }
+
+    /// The staged calls' draft cache work, empty when no call drafts.
+    pub fn drafts(&self) -> &[ipc::DraftWork] {
+        &self.drafts
     }
 
     /// The staged batch's recurrent-state copies.
@@ -863,6 +874,15 @@ pub trait KvProvider: Send + Sync {
     /// The plane views of `group`'s layers, in model order.
     fn planes(&self, group: usize) -> Result<Vec<nn::KvPlanes>>;
 
+    /// The plane views of the draft cache's layers, in the drafter's order, as its attention reads
+    /// them: pages of one K/V page's tokens ([`crate::memory::prefix_cache::planes::CachePlanes::draft_layer`]).
+    /// A provider whose cache keeps no draft group refuses.
+    fn draft_planes(&self) -> Result<Vec<nn::KvPlanes>> {
+        Err(Error::Invalid(
+            "this runner's cache keeps no draft cache".to_owned(),
+        ))
+    }
+
     /// Gives the provider the bytes of the device's scratch pool its page set may map.
     fn attach_scratch_bytes(&mut self, bytes: u64) {
         let _ = bytes;
@@ -1007,6 +1027,13 @@ pub struct CausalLmRunner<M: TextModel> {
     /// The request slots' recurrent-state banks, for a model that keeps a recurrent state: carved
     /// when the device's pools are attached, before the walk and the first capture.
     state: Option<super::state::StateBanks>,
+    /// The eager speculative step's columns, in a deployment that speculates with the model's
+    /// drafter: every batch is then served by that step rather than a captured graph
+    /// (`speculation`).
+    speculation: Option<speculation::Speculation>,
+    /// The sampler of a speculative step, whose rows count a verification's drafts in their
+    /// penalties.
+    verifier: Option<super::sampling::Sampler>,
 }
 
 /// One model object shared by the runners of every device a rank serves.
@@ -1087,6 +1114,10 @@ impl<M: TextModel + ?Sized> TextModel for Shared<M> {
 
     fn experts(&self) -> Option<nn::family::ExpertShape> {
         self.0.experts()
+    }
+
+    fn drafter(&self) -> Option<&dyn nn::family::Drafter> {
+        self.0.drafter()
     }
 }
 
@@ -1185,11 +1216,67 @@ impl<M: TextModel> CausalLmRunner<M> {
             experts: None,
             tensor: None,
             state: None,
+            speculation: None,
+            verifier: None,
             encoded: Vec::new(),
             indices: Vec::new(),
             draws: Vec::new(),
             kv,
         })
+    }
+
+    /// Makes this runner speculate with its model's drafter, verifying at most `drafts` drafts per
+    /// call: every batch is served by the eager speculative step, over a cache that keeps the draft
+    /// group.
+    ///
+    /// # Errors
+    ///
+    /// A model that carries no drafter, a cache without a draft group, a runner in an expert union
+    /// (whose ranks step in lockstep through captured graphs), or columns the device cannot hold.
+    pub fn speculating(mut self, drafts: u32) -> Result<Self> {
+        if self.model.drafter().is_none() {
+            return Err(Error::Invalid(
+                "the deployment speculates and its model loaded no drafter".into(),
+            ));
+        }
+        if self.experts.is_some() {
+            return Err(Error::Unsupported(
+                "speculative decoding of a model whose experts are split across ranks".into(),
+            ));
+        }
+        let (tokens, rows) = column_extents(&self.buckets)?;
+        let mut speculation = speculation::Speculation::new(
+            self.device,
+            tokens,
+            rows,
+            self.slots,
+            drafts,
+            self.model.vocabulary(),
+            self.max_kv_len,
+            self.kv.page_size(),
+        )?;
+        let cache =
+            self.kv.cache().cloned().ok_or_else(|| {
+                Error::Invalid("a speculating runner reads a prefix cache".into())
+            })?;
+        speculation.bind(
+            &cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )?;
+        let vocabulary = self.model.vocabulary();
+        self.verifier = Some(super::sampling::Sampler::new(
+            vocabulary, self.slots, vocabulary, drafts,
+        )?);
+        self.speculation = Some(speculation);
+        Ok(self)
+    }
+
+    /// The rows a speculating runner's block tables gather for a batch of at most `tokens`
+    /// tokens over `slots` slots verifying `drafts` drafts each: a verification attends as one
+    /// row per token.
+    pub fn speculative_rows(slots: u32, drafts: u32, rows: u32) -> u32 {
+        rows.max(slots.saturating_mul(drafts + 1))
     }
 
     /// Makes this runner a member of an expert union: every step goes through the union, and the
@@ -1280,7 +1367,7 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
     /// graph, so it waits. A union's ranks enter its steps in order on each device thread, so a
     /// step entered behind one in flight is the next step on every rank.
     fn overlaps_replays(&self) -> bool {
-        !eager_replay()
+        !eager_replay() && self.speculation.is_none()
     }
 
     /// A batch that keeps its logits answers its greedy rows on the host, and the next step reads
@@ -1319,7 +1406,20 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
             .columns
             .check(&shape)
             .map_err(|error| refused(error.into()))?;
-        let bucket = self.bucket_for(&shape).map_err(refused)?;
+        // A speculative step is eager and serves the batch as it is: its bucket is the batch's own
+        // shape, which no graph is captured for.
+        let bucket = if self.speculation.is_some() {
+            Bucket {
+                variant: shape.variant,
+                rows: shape.rows,
+                tokens: shape.tokens,
+                extent: ipc::execution::Extent::None,
+                serves: None,
+                capacity: 0,
+            }
+        } else {
+            self.bucket_for(&shape).map_err(refused)?
+        };
         self.staging
             .stage(&batch.columns, &batch.calls, &shape, bucket)
             .map_err(refused)?;
@@ -1490,6 +1590,7 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
         for bucket in self.capture_plan() {
             footprint.walk(Some(bucket), |walk| self.walk_recorded(walk, bucket))?;
         }
+        self.record_speculation(&mut footprint)?;
         // A recurrent state's copies are launched eagerly around a replay, so the walk states them
         // beside the forwards: one copy of each direction states every descriptor a batch's copies
         // launch.
@@ -1565,6 +1666,9 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
                     stream = self.stream.raw(),
                     "a bucket is replayed"
                 );
+                if self.speculation.is_some() {
+                    return self.speculate(*generation, *batch);
+                }
                 let stream = self.stream.clone();
                 // The batch's cache rows and page copies first, on this thread: the gather reads
                 // row `slot` of the cache's pooled table, so the row must state the request's own
@@ -1773,6 +1877,10 @@ impl<M: TextModel> CausalLmRunner<M> {
             shape,
             self.slots,
             rows,
+            // A verification's recurrent state keeps a trail of its tokens.
+            self.speculation
+                .as_ref()
+                .map_or(0, speculation::Speculation::trail_tokens),
             &plan,
             &cache,
             self.device,
@@ -2651,6 +2759,25 @@ impl<M: TextModel> CausalLmRunner<M> {
         operation: impl FnOnce(&KvView<'_>) -> Result<R>,
     ) -> Result<R> {
         let workspace = arena.tensor(DType::U8, ops::Shape::new(&[ATTENTION_WORKSPACE_BYTES]))?;
+        self.with_kv_over(workspace, slots, scratch_pages, quiet, None, operation)
+    }
+
+    /// [`Self::with_kv`] over the reserved `workspace`, with the batch's state rows `state` (and
+    /// whether they keep a trail) where they are not its attention rows: a verification's.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the view's workspace, its rows' slots, the paired forward's pages, the table \
+                  gather's mode, the state rows and the operation"
+    )]
+    fn with_kv_over<R>(
+        &self,
+        workspace: TensorView,
+        slots: &[i32],
+        scratch_pages: Option<(u32, &[i32])>,
+        quiet: bool,
+        state_rows: Option<(super::state::StateRows, bool)>,
+        operation: impl FnOnce(&KvView<'_>) -> Result<R>,
+    ) -> Result<R> {
         let groups = self.kv.groups();
         let mut layers: Vec<Vec<nn::KvPlanes>> = Vec::with_capacity(groups);
         let mut tables = Vec::with_capacity(groups);
@@ -2698,8 +2825,18 @@ impl<M: TextModel> CausalLmRunner<M> {
                     .into(),
             )),
             Some(state) => {
+                // A batch's state rows are its attention rows unless the caller states others.
                 let rows = slots.len() as u64;
-                state.with_view(self.columns.slots.extent(0..rows), rows, |state| {
+                let (rows, trailing) = state_rows.unwrap_or((
+                    super::state::StateRows {
+                        query_offsets: self.columns.query_offsets.extent(0..rows + 1),
+                        seq_lens: self.columns.seq_lens.extent(0..rows),
+                        slots: self.columns.slots.extent(0..rows),
+                        count: rows,
+                    },
+                    false,
+                ));
+                state.with_view(rows, trailing, |state| {
                     operation(&KvView {
                         groups: &view,
                         workspace,
@@ -3103,6 +3240,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             // zero over the padding slot, whose banks no request owns.
             checkpoints: Vec::new(),
             state_copies: Vec::new(),
+            drafts: Vec::new(),
         };
         self.staging
             .stage(&columns, &warm_call_ids(bucket), &bucket.shape(), bucket)
@@ -3709,6 +3847,7 @@ mod tests {
             max_kv_len: 4096,
             checkpoints: Vec::new(),
             state_copies: Vec::new(),
+            drafts: Vec::new(),
         }
     }
 
@@ -3736,6 +3875,7 @@ mod tests {
             max_kv_len: 4096,
             checkpoints: Vec::new(),
             state_copies: Vec::new(),
+            drafts: Vec::new(),
         }
     }
 
@@ -3867,6 +4007,7 @@ mod tests {
             max_kv_len: 4096,
             checkpoints: Vec::new(),
             state_copies: Vec::new(),
+            drafts: Vec::new(),
         };
         columns.input_ids.truncate(count);
         staging.stage(
