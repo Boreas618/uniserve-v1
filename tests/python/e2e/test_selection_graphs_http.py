@@ -140,6 +140,14 @@ GREEDY = {
     "top_logprobs": 5,
     "prompt_logprobs": 3,
 }
+# Greedy, reporting each selected token and no prompt scores.
+SELECTED = {
+    "temperature": 0,
+    "top_p": 1.0,
+    "top_k": 0,
+    "min_p": 0.0,
+    "logprobs": True,
+}
 # Seeded sampling through the general sampler.
 SAMPLED = {
     "temperature": 0.8,
@@ -197,32 +205,35 @@ def test_constraints_hold_under_graphs(graphs: str) -> None:
     )
     assert _tokens(biased)[0] == f"token_id:{forced}"
 
-    # A greedy request restricted to one token selects it at every step.
-    only = _chat(
-        graphs,
-        **GREEDY,
-        allowed_token_ids=[forced],
-        ignore_eos=True,
-        max_completion_tokens=4,
-    )
-    assert set(_ids(only)) == {forced}
 
-
-def test_bad_words_never_complete_under_graphs(graphs: str) -> None:
+def test_greedy_constraints_hold_under_graphs(graphs: str) -> None:
     tokenizer = tokenizers.Tokenizer.from_file(
         f"{_checkpoint()}/tokenizer.json"
     )
-    greedy = _ids(_chat(graphs, **GREEDY, ignore_eos=True))
+    special = set(tokenizer.get_added_tokens_decoder())
+    greedy = _ids(_chat(graphs, **SELECTED, ignore_eos=True))
 
-    # A one-token bad word: the greedy reply's first token that is a word
-    # of its own is never selected again.
+    # A greedy request restricted to one token selects it at every step.
+    only = _chat(
+        graphs,
+        **SELECTED,
+        allowed_token_ids=[greedy[-1]],
+        ignore_eos=True,
+        max_completion_tokens=4,
+    )
+    assert set(_ids(only)) == {greedy[-1]}
+
+    # A one-token bad word: the greedy reply's first ordinary token that is a
+    # word of its own is never selected.
     single = next(
-        token for token in greedy if _word(tokenizer, [token]) is not None
+        token
+        for token in greedy
+        if token not in special and _word(tokenizer, [token]) is not None
     )
     banned = _ids(
         _chat(
             graphs,
-            **GREEDY,
+            **SELECTED,
             ignore_eos=True,
             bad_words=[_word(tokenizer, [single])],
         )
@@ -240,7 +251,7 @@ def test_bad_words_never_complete_under_graphs(graphs: str) -> None:
     reply = _ids(
         _chat(
             graphs,
-            **GREEDY,
+            **SELECTED,
             ignore_eos=True,
             bad_words=[_word(tokenizer, pair)],
         )
