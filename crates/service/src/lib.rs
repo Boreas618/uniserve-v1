@@ -11,14 +11,15 @@
 //! A process that needs a service its host does not run starts one with
 //! [`ensure`]: the executable's `NAME serve --socket PATH --daemon` command,
 //! which leaves its starter's session and process tree, so the starter's end
-//! never ends the service. A server logs to standard error at the level of
-//! `UNISERVE_<NAME>_LOG` ([`init_logging`]) and stops on SIGTERM or SIGINT
-//! ([`stop_signals`]).
+//! never ends the service. A server logs to standard error in the one
+//! convention of every process ([`logging`]) and stops on SIGTERM or SIGINT
+//! ([`stop_signals`]), the one stop mechanism every process waits on.
 //!
 //! [`shm`] removes the shared memory a process of the host's libraries leaves
 //! behind when it ends without closing them, which the process that reaps it
 //! clears.
 
+pub mod logging;
 pub mod shm;
 
 use std::fs::{File, OpenOptions};
@@ -212,24 +213,6 @@ pub fn detach(socket: &Path) -> io::Result<Ready> {
             unsafe { libc::_exit(if started { 0 } else { 1 }) }
         }
     }
-}
-
-/// Logs the host service `name` to standard error, at the level of
-/// `UNISERVE_<NAME>_LOG` (`name` upper-cased, `-` as `_`; such as
-/// `UNISERVE_STORAGE_SERVER_LOG`), `info` when unset.
-///
-/// A server started detached has its standard error on its log beside its
-/// socket ([`detach`]), so it calls this after [`detach`].
-pub fn init_logging(name: &str) {
-    let variable = format!("UNISERVE_{}_LOG", name.to_uppercase().replace('-', "_"));
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env(&variable)
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .init();
 }
 
 /// A descriptor that becomes readable, and a flag that is set, when SIGTERM

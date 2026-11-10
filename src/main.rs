@@ -14,13 +14,13 @@
 //! executable's own: every command that starts threads takes them from here.
 
 mod cli;
-mod logging;
 mod programs;
 mod serve;
 
 use std::env;
 
 use anyhow::{Context, Result};
+use service::logging;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -63,43 +63,33 @@ fn tokio_worker_threads() -> Option<usize> {
         .ok()
 }
 
-/// Returns a cancellation token triggered by Ctrl-C or SIGTERM.
+/// Returns a cancellation token triggered by SIGINT (Ctrl-C) or SIGTERM.
 ///
-/// Must be called from within a Tokio runtime, since it spawns the listening
-/// task. A handler that fails to install is logged and never fires, leaving
-/// the other signal able to cancel the token.
+/// The signals arrive through the one stop mechanism every `uniserve` process uses
+/// (`service::stop_signals`): a self-pipe the runtime waits on. Must be called from within a Tokio
+/// runtime, since it spawns the waiting task. When the pipe or its handlers cannot be installed,
+/// that is logged and the token never fires.
 pub(crate) fn shutdown_signal() -> CancellationToken {
     let token = CancellationToken::new();
     let shutdown = token.clone();
-
-    tokio::spawn(async move {
-        let ctrl_c = async {
-            if let Err(error) = tokio::signal::ctrl_c().await {
-                warn!(%error, "failed to install Ctrl-C signal handler");
-                std::future::pending::<()>().await;
-            }
-        };
-
-        let sigterm = async {
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(mut signal) => {
-                    signal.recv().await;
+    let stopped = service::stop_signals().and_then(|(wake, _)| tokio::io::unix::AsyncFd::new(wake));
+    match stopped {
+        Ok(wake) => {
+            tokio::spawn(async move {
+                match wake.readable().await {
+                    Ok(_) => {
+                        info!("received a shutdown signal (SIGINT or SIGTERM), shutting down...")
+                    }
+                    Err(error) => {
+                        warn!(%error, "waiting for the shutdown signals failed");
+                        std::future::pending::<()>().await;
+                    }
                 }
-                Err(error) => {
-                    warn!(%error, "failed to install SIGTERM signal handler");
-                    std::future::pending::<()>().await;
-                }
-            }
-        };
-
-        tokio::select! {
-            _ = ctrl_c => info!("received shutdown signal (Ctrl-C), shutting down..."),
-            _ = sigterm => info!("received shutdown signal (SIGTERM), shutting down..."),
+                shutdown.cancel();
+            });
         }
-
-        shutdown.cancel();
-    });
-
+        Err(error) => warn!(%error, "failed to install the shutdown signal handlers"),
+    }
     token
 }
 
@@ -131,7 +121,7 @@ fn main() -> Result<std::process::ExitCode> {
         Command::Programs(args) => programs::run(*args, &command_matches(), &cli.log),
         Command::Engine { launch } => {
             follow_lifeline(lifeline);
-            logging::init_tracing(
+            logging::init(
                 "Engine",
                 cli.log.log_level.as_deref(),
                 cli.log.log_level_http.as_deref(),

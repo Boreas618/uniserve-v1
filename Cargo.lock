@@ -3918,6 +3918,8 @@ dependencies = [
  "libc",
  "signal-hook-registry",
  "tempfile",
+ "time",
+ "tracing",
  "tracing-subscriber",
 ]
 
@@ -4697,11 +4699,9 @@ dependencies = [
  "storage",
  "storage-server",
  "tempfile",
- "time",
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

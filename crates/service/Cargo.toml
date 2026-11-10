@@ -12,6 +12,8 @@ publish = false
 [dependencies]
 libc.workspace = true
 signal-hook-registry.workspace = true
+time.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]

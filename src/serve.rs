@@ -17,7 +17,7 @@ use anyhow::Result;
 use tracing::info;
 
 use crate::cli::LogLevels;
-use crate::logging;
+use service::logging;
 
 /// Runs the `serve` command with the daemon's `args`, logging under `log`.
 pub(crate) fn run(
@@ -25,7 +25,7 @@ pub(crate) fn run(
     matches: &clap::ArgMatches,
     log: &LogLevels,
 ) -> Result<ExitCode> {
-    logging::init_tracing(
+    logging::init(
         "Daemon",
         log.log_level.as_deref(),
         log.log_level_http.as_deref(),

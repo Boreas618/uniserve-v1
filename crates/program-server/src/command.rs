@@ -447,7 +447,12 @@ fn run_serve(serve: ServeArgs, host: HostTargets<'_>) -> Result<()> {
     } else {
         None
     };
-    service::init_logging("program-server");
+    service::logging::init(
+        "ProgramServer",
+        None,
+        None,
+        service::logging::Output::Stderr,
+    );
     let (_wake, stop) = service::stop_signals()?;
 
     let Some((listener, lock)) = service::bind(&socket)? else {

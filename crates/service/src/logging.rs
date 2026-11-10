@@ -1,20 +1,21 @@
-//! Process-wide tracing configuration and compact terminal log formatting.
+//! The one logging convention of every `uniserve` process: process-wide tracing configuration and
+//! compact terminal log formatting.
 //!
-//! `main` calls `init_tracing` once, before the Tokio runtime is built. Each
-//! event is written as one line of the form
-//! `(<process> pid=<pid>) <LEVEL> <MM-DD HH:MM:SS> [<file>:<line>] <fields>`,
-//! where the process is `Daemon` for `uniserve serve` and `Engine` for an
-//! engine process,
-//! with the active spans, if any, written as `outer{..}:inner{..}: ` before
-//! the fields.
+//! Every command calls [`init`] once with its process label, before it starts threads or a Tokio
+//! runtime (a host service after it detached). Each event is written as one line of the form
+//! `(<process> pid=<pid>) <LEVEL> <MM-DD HH:MM:SS> [<file>:<line>] <fields>`, where the process is
+//! the label (`Daemon` for `uniserve serve`, `Engine` for an engine process, `StorageServer`,
+//! `ProgramServer` and the Storage Server's helpers for the host services), with the active spans,
+//! if any, written as `outer{..}:inner{..}: ` before the fields.
 //!
-//! `WARN` is printed as `WARNING`, the Python `logging` name, and
-//! `--log-level` and `--log-level-http` take Python level names.
+//! `WARN` is printed as `WARNING`, the Python `logging` name, and `--log-level` and
+//! `--log-level-http` take Python level names; `RUST_LOG` refines them (`build_targets_filter`).
 //!
-//! Logs go to stdout, except where a command's own output is stdout
-//! (`uniserve programs`): there they go to stderr ([`Output`]). ANSI colors follow the `fmt` layer's default: they are
-//! on unless `NO_COLOR` is set to a non-empty value, with no terminal
-//! detection, so redirected output also carries escape sequences.
+//! The daemon and the engine log to stdout. A command whose own output is stdout
+//! (`uniserve programs`) and a host service, whose standard error is the log beside its socket,
+//! log to stderr ([`Output`]). ANSI colors follow the `fmt` layer's default: they are on unless
+//! `NO_COLOR` is set to a non-empty value, with no terminal detection, so redirected output also
+//! carries escape sequences.
 
 use std::{env, fmt, process};
 
@@ -49,7 +50,7 @@ const HTTP_LOG_TARGETS: &[&str] = &["axum", "hyper", "tower_http", "server"];
 
 /// Where a process's log lines are written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Output {
+pub enum Output {
     /// Standard output: the log every process of a deployment shares.
     Stdout,
     /// Standard error, for a command whose standard output is its result.
@@ -61,12 +62,7 @@ pub(crate) enum Output {
 /// Reads `RUST_LOG` from the environment (see `build_targets_filter` for
 /// precedence). Installation failure, for example because a global subscriber
 /// is already set, is reported on stderr and is not fatal.
-pub(crate) fn init_tracing(
-    process: &str,
-    log_level: Option<&str>,
-    log_level_http: Option<&str>,
-    output: Output,
-) {
+pub fn init(process: &str, log_level: Option<&str>, log_level_http: Option<&str>, output: Output) {
     let filter = build_targets_filter(
         log_level,
         log_level_http,

@@ -74,7 +74,12 @@ pub fn serve(options: ServeOptions) -> anyhow::Result<()> {
     } else {
         None
     };
-    service::init_logging("storage-server");
+    service::logging::init(
+        "StorageServer",
+        None,
+        None,
+        service::logging::Output::Stderr,
+    );
     let served = match options.predecessor {
         Some(descriptor) => serve_resumed(&options, descriptor),
         None => serve_on(&options, ready),
@@ -92,7 +97,12 @@ pub fn serve(options: ServeOptions) -> anyhow::Result<()> {
 ///
 /// Fails when the connector cannot reach Mooncake or the server.
 pub fn run_connector(socket: &Path, settings: &Settings) -> anyhow::Result<()> {
-    service::init_logging("storage-server");
+    service::logging::init(
+        "MooncakeConnector",
+        None,
+        None,
+        service::logging::Output::Stderr,
+    );
     let ran = crate::mooncake::run(socket, settings).map_err(anyhow::Error::from);
     if let Err(error) = &ran {
         tracing::error!("the Mooncake connector failed: {error:#}");
@@ -110,7 +120,12 @@ pub fn run_transfer_server(
     socket: &Path,
     options: &crate::transfer::Options,
 ) -> anyhow::Result<()> {
-    service::init_logging("storage-server");
+    service::logging::init(
+        "TransferServer",
+        None,
+        None,
+        service::logging::Output::Stderr,
+    );
     let ran = crate::transfer::run(socket, options).map_err(anyhow::Error::from);
     if let Err(error) = &ran {
         tracing::error!("the Transfer Server failed: {error:#}");

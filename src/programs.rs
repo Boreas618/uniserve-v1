@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use anyhow::{Context as _, Result};
 
 use crate::cli::LogLevels;
-use crate::logging;
+use service::logging;
 
 /// Runs the `programs` command with the serving options `args`, logging under `log`.
 pub(crate) fn run(
@@ -22,7 +22,7 @@ pub(crate) fn run(
     matches: &clap::ArgMatches,
     log: &LogLevels,
 ) -> Result<ExitCode> {
-    logging::init_tracing(
+    logging::init(
         "Programs",
         log.log_level.as_deref(),
         log.log_level_http.as_deref(),
