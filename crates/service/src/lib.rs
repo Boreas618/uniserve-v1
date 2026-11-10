@@ -19,6 +19,7 @@
 //! behind when it ends without closing them, which the process that reaps it
 //! clears.
 
+pub mod frame;
 pub mod logging;
 pub mod shm;
 

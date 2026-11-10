@@ -19,14 +19,14 @@
 //! program changes, and [`Client::cover`] to learn which installed package
 //! builds each descriptor key of an operator the deployment does not name.
 
-use std::io::{self, IoSlice, IoSliceMut};
-use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::collections::VecDeque;
+use std::io;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use prost::Message;
-use rustix::net::{RecvAncillaryBuffer, SendAncillaryBuffer, SendAncillaryMessage};
+use service::frame;
 
 use crate::builder::BuildState;
 use crate::manifest::ModuleForm;
@@ -39,12 +39,6 @@ use proto::program::{PhaseKind, Program, ProgramSlot};
 pub mod wire {
     include!(concat!(env!("OUT_DIR"), "/uniserve.program_server.rs"));
 }
-
-/// Descriptors one `sendmsg` carries: the kernel's `SCM_MAX_FD`.
-pub const MAX_DESCRIPTORS: usize = 253;
-
-/// Bytes of a frame header: the payload's length and its descriptor count.
-const HEADER: usize = 8;
 
 /// Bytes one receive reads at most.
 const READ_CHUNK: usize = 64 * 1024;
@@ -404,7 +398,7 @@ fn prepare_message(request: &PrepareRequest) -> Result<wire::Prepare> {
 pub struct Connection {
     stream: UnixStream,
     inbox: Vec<u8>,
-    descriptors: Vec<OwnedFd>,
+    descriptors: VecDeque<OwnedFd>,
 }
 
 /// How long a `prepare` or a `resolve` waits through a restart, and how often
@@ -446,57 +440,22 @@ impl Connection {
         Connection {
             stream,
             inbox: Vec::new(),
-            descriptors: Vec::new(),
+            descriptors: VecDeque::new(),
         }
     }
 
-    /// Sends one frame with the descriptors that belong to it.
-    ///
-    /// Descriptors ride on the frame's first byte, so a receiver that reads a
-    /// frame exactly never gets another frame's descriptors.
+    /// Sends one frame with the descriptors that belong to it, as a descriptor frame of the
+    /// workspace's framing module (`service::frame`): they ride on the frame's first byte, so a
+    /// receiver that reads a frame exactly never gets another frame's descriptors.
     pub fn send<M: Message>(&mut self, message: &M, descriptors: &[OwnedFd]) -> Result<()> {
-        if descriptors.len() > MAX_DESCRIPTORS {
-            return Err(Error::Protocol(format!(
-                "a frame carries at most {MAX_DESCRIPTORS} descriptors, not {}",
-                descriptors.len()
-            )));
-        }
-        let payload = message.encode_to_vec();
-        let length = u32::try_from(payload.len())
-            .map_err(|_| Error::Protocol("a frame exceeds 4 GiB".into()))?;
-        let count = u32::try_from(descriptors.len())
-            .map_err(|_| Error::Protocol("too many descriptors".into()))?;
-        let mut bytes = Vec::with_capacity(HEADER + payload.len());
-        bytes.extend_from_slice(&length.to_le_bytes());
-        bytes.extend_from_slice(&count.to_le_bytes());
-        bytes.extend_from_slice(&payload);
-
-        let mut sent = 0;
-        while sent < bytes.len() {
-            let borrowed: Vec<BorrowedFd<'_>> = descriptors.iter().map(AsFd::as_fd).collect();
-            let mut space =
-                [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_DESCRIPTORS))];
-            let mut control = SendAncillaryBuffer::new(&mut space);
-            if sent == 0 && !borrowed.is_empty() {
-                control.push(SendAncillaryMessage::ScmRights(&borrowed));
+        let owned = descriptors
+            .iter()
+            .map(OwnedFd::try_clone)
+            .collect::<io::Result<Vec<_>>>()?;
+        for mut segment in frame::descriptor_frame(&message.encode_to_vec(), owned)? {
+            while !segment.sent() {
+                segment.send(self.stream.as_fd())?;
             }
-            let written = loop {
-                match rustix::net::sendmsg(
-                    &self.stream,
-                    &[IoSlice::new(&bytes[sent..])],
-                    &mut control,
-                    rustix::net::SendFlags::NOSIGNAL,
-                ) {
-                    Ok(written) => break written,
-                    Err(rustix::io::Errno::INTR) => continue,
-                    Err(error) => return Err(Error::Io(error.into())),
-                }
-            };
-            drop(borrowed);
-            if written == 0 {
-                return Err(Error::Io(io::Error::from(io::ErrorKind::WriteZero)));
-            }
-            sent += written;
         }
         Ok(())
     }
@@ -504,75 +463,32 @@ impl Connection {
     /// Receives one frame and the descriptors that came with it.
     pub fn receive<M: Message + Default>(&mut self) -> Result<(M, Vec<OwnedFd>)> {
         loop {
-            if let Some(frame) = self.next_frame()? {
-                return Ok(frame);
+            if let Some((payload, descriptors)) =
+                frame::take_descriptor_frame(&mut self.inbox, &mut self.descriptors)
+            {
+                let message = M::decode(payload.as_slice())
+                    .map_err(|error| Error::Protocol(format!("undecodable frame: {error}")))?;
+                return Ok((message, descriptors));
             }
             self.fill()?;
         }
     }
 
-    /// The whole frame once its bytes and descriptors have arrived.
-    fn next_frame<M: Message + Default>(&mut self) -> Result<Option<(M, Vec<OwnedFd>)>> {
-        if self.inbox.len() < HEADER {
-            return Ok(None);
-        }
-        let length = u32::from_le_bytes(self.inbox[..4].try_into().unwrap_or([0; 4])) as usize;
-        let count = u32::from_le_bytes(self.inbox[4..HEADER].try_into().unwrap_or([0; 4])) as usize;
-        if self.inbox.len() < HEADER + length || self.descriptors.len() < count {
-            return Ok(None);
-        }
-        let message = M::decode(&self.inbox[HEADER..HEADER + length])
-            .map_err(|error| Error::Protocol(format!("undecodable frame: {error}")))?;
-        self.inbox.drain(..HEADER + length);
-        let descriptors = self.descriptors.drain(..count).collect();
-        Ok(Some((message, descriptors)))
-    }
-
-    /// Reads the bytes the current frame still needs, and the descriptors
-    /// that ride on its first byte.
+    /// Reads the bytes the current frame still needs, and the descriptors that ride on them.
     fn fill(&mut self) -> Result<()> {
-        let needed = self.frame_bytes().saturating_sub(self.inbox.len()).max(1);
+        let frame_bytes = frame::descriptor_frame_bytes(&self.inbox).unwrap_or(frame::HEADER_BYTES);
+        let needed = frame_bytes.saturating_sub(self.inbox.len()).max(1);
         let mut buffer = vec![0_u8; needed.min(READ_CHUNK)];
-        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_DESCRIPTORS))];
-        let mut control = RecvAncillaryBuffer::new(&mut space);
-        let message = loop {
-            match rustix::net::recvmsg(
-                &self.stream,
-                &mut [IoSliceMut::new(&mut buffer)],
-                &mut control,
-                rustix::net::RecvFlags::CMSG_CLOEXEC,
-            ) {
-                Ok(message) => break message,
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(error) => return Err(Error::Io(error.into())),
-            }
-        };
-        if message.flags.contains(rustix::net::ReturnFlags::CTRUNC) {
-            return Err(Error::Protocol(
-                "a frame carried more descriptors than one receive takes".into(),
-            ));
-        }
-        for received in control.drain() {
-            if let rustix::net::RecvAncillaryMessage::ScmRights(descriptors) = received {
-                self.descriptors.extend(descriptors);
-            }
-        }
-        if message.bytes == 0 {
+        let received = frame::receive_with_descriptors(
+            self.stream.as_fd(),
+            &mut buffer,
+            &mut self.descriptors,
+        )?;
+        if received == 0 {
             return Err(Error::Io(io::Error::from(io::ErrorKind::UnexpectedEof)));
         }
-        let received = buffer[..message.bytes].to_vec();
-        self.inbox.extend_from_slice(&received);
+        self.inbox.extend_from_slice(&buffer[..received]);
         Ok(())
-    }
-
-    /// The bytes of the frame being received: the header, or the whole frame
-    /// once the header is here.
-    fn frame_bytes(&self) -> usize {
-        if self.inbox.len() < HEADER {
-            return HEADER;
-        }
-        let length = u32::from_le_bytes(self.inbox[..4].try_into().unwrap_or([0; 4])) as usize;
-        HEADER + length
     }
 }
 
@@ -936,7 +852,7 @@ impl Connection {
     /// A `resolve` answer's files ride on its frame, so they are taken after
     /// the frame is read; the client pairs them with the names in the answer.
     pub fn take_descriptors(&mut self) -> Vec<OwnedFd> {
-        std::mem::take(&mut self.descriptors)
+        std::mem::take(&mut self.descriptors).into()
     }
 }
 

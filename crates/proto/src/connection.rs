@@ -1,6 +1,8 @@
 //! One end of a connection that carries the interfaces' messages.
 //!
-//! A frame is a little-endian `u32` length followed by one Protobuf message.
+//! A frame is a length-prefixed frame of the workspace's framing module
+//! (`service::frame`): a little-endian `u32` length followed by one Protobuf
+//! message.
 //! An address is written `unix:<path>` for a Unix socket and `<host>:<port>`
 //! for TCP. A connection is non-blocking: [`Connection::try_recv`] returns a
 //! message once one arrived whole, and [`Connection::wait`] blocks until the
@@ -17,11 +19,12 @@
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::Duration;
 
 use prost::Message;
+use service::frame;
 
 /// The prefix of a Unix socket address; the rest is the socket's path.
 const UNIX_PREFIX: &str = "unix:";
@@ -29,14 +32,6 @@ const UNIX_PREFIX: &str = "unix:";
 /// The largest frame a peer may send. The interfaces' messages are small;
 /// a larger length is a corrupt stream.
 const MAX_FRAME: usize = 64 << 20;
-
-/// The most descriptors one receive takes; a frame carries at most one, and
-/// a receive may take the bytes of several frames.
-const MAX_DESCRIPTORS: usize = 16;
-
-/// Bytes of the control messages one receive takes: a control header (16
-/// bytes on 64-bit Linux) and [`MAX_DESCRIPTORS`] descriptors.
-const CONTROL_BYTES: usize = 16 + MAX_DESCRIPTORS * std::mem::size_of::<RawFd>();
 
 /// Seconds after which a TCP connection whose peer stopped answering fails.
 const DEAD_PEER_SECS: libc::c_int = 60;
@@ -90,7 +85,9 @@ impl Stream {
         descriptors: &mut VecDeque<OwnedFd>,
     ) -> std::io::Result<usize> {
         match self {
-            Self::Unix(stream) => receive_with_descriptors(stream, buffer, descriptors),
+            Self::Unix(stream) => {
+                frame::receive_with_descriptors(stream.as_fd(), buffer, descriptors)
+            }
             Self::Tcp(stream) => stream.read(buffer),
         }
     }
@@ -178,7 +175,7 @@ impl Connection {
     ///
     /// Fails when the peer closed or the socket failed.
     pub fn send(&mut self, message: &impl Message) -> Result<()> {
-        let frame = frame(message);
+        let frame = encode(message)?;
         self.write_from(&frame, 0)
     }
 
@@ -201,10 +198,10 @@ impl Connection {
                 "descriptors pass over Unix sockets only",
             )));
         };
-        let frame = frame(message);
+        let frame = encode(message)?;
         // The descriptor travels with the first bytes the socket accepts.
         let written = loop {
-            match send_with_descriptor(stream, &frame, descriptor) {
+            match frame::send_with_descriptors(stream.as_fd(), &frame, &[descriptor]) {
                 Ok(0) => return Err(Error::Closed),
                 Ok(count) => break count,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
@@ -337,120 +334,21 @@ impl Connection {
 
     /// Takes one whole frame from the received bytes.
     fn take_frame<M: Message + Default>(&mut self) -> Result<Option<M>> {
-        let Some(header) = self.received.get(..4) else {
-            return Ok(None);
-        };
-        let length = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
-        if length > MAX_FRAME {
+        if let Some(length) = frame::peek_length(&self.received)
+            && length > MAX_FRAME
+        {
             return Err(Error::Oversized(length));
         }
-        if self.received.len() < 4 + length {
-            return Ok(None);
+        match frame::take_length_prefixed(&mut self.received) {
+            Some(payload) => Ok(Some(M::decode(payload.as_slice())?)),
+            None => Ok(None),
         }
-        let message = M::decode(&self.received[4..4 + length])?;
-        self.received.drain(..4 + length);
-        Ok(Some(message))
     }
 }
 
 /// One frame of `message`: its length, then its encoding.
-fn frame(message: &impl Message) -> Vec<u8> {
-    let body = message.encode_to_vec();
-    let mut frame = Vec::with_capacity(4 + body.len());
-    frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&body);
-    frame
-}
-
-/// The control message buffer of up to [`MAX_DESCRIPTORS`] descriptors,
-/// aligned as `cmsghdr` requires.
-#[repr(C, align(8))]
-struct ControlBuffer([u8; CONTROL_BYTES]);
-
-/// Sends the start of `bytes` with `descriptor` attached, returning how many
-/// bytes the socket accepted.
-fn send_with_descriptor(
-    stream: &UnixStream,
-    bytes: &[u8],
-    descriptor: BorrowedFd<'_>,
-) -> std::io::Result<usize> {
-    let mut control = ControlBuffer([0; CONTROL_BYTES]);
-    let mut iov = libc::iovec {
-        iov_base: bytes.as_ptr() as *mut libc::c_void,
-        iov_len: bytes.len(),
-    };
-    // SAFETY: CMSG_SPACE only computes a length.
-    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
-    // SAFETY: an all-zero `msghdr` is a valid value to fill in.
-    let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
-    header.msg_iov = &mut iov;
-    header.msg_iovlen = 1;
-    header.msg_control = control.0.as_mut_ptr().cast();
-    header.msg_controllen = space as _;
-    // SAFETY: the header names a control buffer of `space` bytes, room for
-    // one descriptor, so the first control header lies inside it and its
-    // data holds one `RawFd`.
-    unsafe {
-        let message = libc::CMSG_FIRSTHDR(&header);
-        (*message).cmsg_level = libc::SOL_SOCKET;
-        (*message).cmsg_type = libc::SCM_RIGHTS;
-        (*message).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
-        std::ptr::write_unaligned(
-            libc::CMSG_DATA(message).cast::<RawFd>(),
-            descriptor.as_raw_fd(),
-        );
-    }
-    // SAFETY: the header and the buffers it names live through the call.
-    let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &header, libc::MSG_NOSIGNAL) };
-    if sent < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(sent as usize)
-}
-
-/// Receives into `buffer`, taking every descriptor that arrived with the
-/// bytes into `descriptors`, close-on-exec.
-fn receive_with_descriptors(
-    stream: &UnixStream,
-    buffer: &mut [u8],
-    descriptors: &mut VecDeque<OwnedFd>,
-) -> std::io::Result<usize> {
-    let mut control = ControlBuffer([0; CONTROL_BYTES]);
-    let mut iov = libc::iovec {
-        iov_base: buffer.as_mut_ptr().cast(),
-        iov_len: buffer.len(),
-    };
-    // SAFETY: an all-zero `msghdr` is a valid value to fill in.
-    let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
-    header.msg_iov = &mut iov;
-    header.msg_iovlen = 1;
-    header.msg_control = control.0.as_mut_ptr().cast();
-    header.msg_controllen = control.0.len() as _;
-    // SAFETY: the header and the buffers it names live through the call.
-    let received =
-        unsafe { libc::recvmsg(stream.as_raw_fd(), &mut header, libc::MSG_CMSG_CLOEXEC) };
-    if received < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: recvmsg filled `msg_controllen` bytes of control messages; the
-    // CMSG macros walk only within them, and each SCM_RIGHTS message's data
-    // holds descriptors this process now owns.
-    unsafe {
-        let mut message = libc::CMSG_FIRSTHDR(&header);
-        while !message.is_null() {
-            if (*message).cmsg_level == libc::SOL_SOCKET && (*message).cmsg_type == libc::SCM_RIGHTS
-            {
-                let data = libc::CMSG_DATA(message);
-                let length = (*message).cmsg_len as usize - (data as usize - message as usize);
-                for index in 0..length / std::mem::size_of::<RawFd>() {
-                    let descriptor = std::ptr::read_unaligned(data.cast::<RawFd>().add(index));
-                    descriptors.push_back(OwnedFd::from_raw_fd(descriptor));
-                }
-            }
-            message = libc::CMSG_NXTHDR(&header, message);
-        }
-    }
-    Ok(received as usize)
+fn encode(message: &impl Message) -> Result<Vec<u8>> {
+    frame::length_prefixed(&message.encode_to_vec()).map_err(io("framing a message"))
 }
 
 /// Makes a TCP connection fail when its peer's node stops answering.

@@ -20,7 +20,6 @@ libc.workspace = true
 prost.workspace = true
 # The program vocabulary: programs, slots and phases (`proto::program`).
 proto.workspace = true
-rustix = { workspace = true, features = ["net"] }
 serde.workspace = true
 serde_json.workspace = true
 service.workspace = true

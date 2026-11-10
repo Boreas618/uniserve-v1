@@ -17,6 +17,8 @@ serde = { workspace = true, features = ["rc"] }
 serde_bytes.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+# The framing of every socket transport.
+service.workspace = true
 # The cache manifest's pages, which a storage operation names.
 storage.workspace = true
 thiserror.workspace = true

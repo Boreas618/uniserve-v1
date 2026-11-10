@@ -11,6 +11,7 @@ publish = false
 # host services; this crate depends on no workspace crate and links no CUDA.
 [dependencies]
 libc.workspace = true
+rustix = { workspace = true, features = ["net"] }
 signal-hook-registry.workspace = true
 time.workspace = true
 tracing.workspace = true

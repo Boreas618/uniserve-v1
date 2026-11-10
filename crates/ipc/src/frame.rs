@@ -1,7 +1,8 @@
 //! Frames: the unit a channel carries.
 //!
-//! A frame is the length of one encoded message, as a little-endian `u32`,
-//! followed by that message in MessagePack (`rmp-serde`). The message types of
+//! A frame is a length-prefixed frame of the workspace's framing module
+//! (`service::frame`): the length of one encoded message, as a little-endian
+//! `u32`, followed by that message in MessagePack (`rmp-serde`). The message types of
 //! this crate are the only definition of the protocol: the encoding is the one
 //! their `serde` derives describe, and both ends are built from this
 //! workspace, so no schema, generated code or version field accompanies it.
@@ -30,26 +31,22 @@ pub struct Frame {
 
 impl Frame {
     /// Bytes of the length field that starts every frame.
-    pub const LENGTH_BYTES: usize = 4;
+    pub const LENGTH_BYTES: usize = service::frame::LENGTH_BYTES;
 
     /// Encodes `message` as one frame.
     ///
     /// Fails when the message cannot be encoded or is longer than the length
     /// field can state.
     pub fn encode<M: Serialize>(message: &M) -> IpcResult<Self> {
-        // Encode behind a placeholder length, which is known only afterwards.
-        let mut bytes = vec![0_u8; Self::LENGTH_BYTES];
-        rmp_serde::encode::write(&mut bytes, message)
+        let payload = rmp_serde::to_vec(message)
             .map_err(|error| IpcError::Encoding(EncodingError::Encode(error)))?;
-
-        let length = bytes.len() - Self::LENGTH_BYTES;
-        let field = u32::try_from(length).map_err(|_| {
+        let length = payload.len();
+        let bytes = service::frame::length_prefixed(&payload).map_err(|_| {
             IpcError::Encoding(EncodingError::Oversized {
                 length,
                 limit: u32::MAX as usize,
             })
         })?;
-        bytes[..Self::LENGTH_BYTES].copy_from_slice(&field.to_le_bytes());
         Ok(Self { bytes })
     }
 
@@ -64,7 +61,7 @@ impl Frame {
 
     /// Reads a length field: the bytes of encoded message that follow it.
     pub fn message_len(field: [u8; Self::LENGTH_BYTES]) -> usize {
-        u32::from_le_bytes(field) as usize
+        service::frame::stated_length(field)
     }
 
     /// Takes one complete frame as it was received: a length field and the

@@ -2035,6 +2035,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "service",
  "sha2",
  "storage",
  "tempfile",
@@ -3049,7 +3050,6 @@ dependencies = [
  "prost-build",
  "proto",
  "protox",
- "rustix",
  "serde",
  "serde_json",
  "service",
@@ -3160,6 +3160,7 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "serde_with",
+ "service",
  "sha2",
  "thiserror",
  "toml",
@@ -3916,6 +3917,7 @@ name = "service"
 version = "2.0.0"
 dependencies = [
  "libc",
+ "rustix",
  "signal-hook-registry",
  "tempfile",
  "time",
@@ -4075,7 +4077,6 @@ version = "2.0.0"
 dependencies = [
  "libc",
  "rmp-serde",
- "rustix",
  "serde",
  "serde_bytes",
  "serde_json",
