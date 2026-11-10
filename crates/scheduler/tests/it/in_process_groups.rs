@@ -43,7 +43,6 @@ fn request(id: u64, length: u32, first: u32) -> GenerationRequest {
         cache: CachePolicy::default(),
         include_stop_token: false,
         image_generation: ImageGenerationConfig::default(),
-        readout: Vec::new(),
         generated_token_ids: Vec::new(),
         adapter: 0,
         generated_images: Vec::new(),

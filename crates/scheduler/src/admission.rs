@@ -136,7 +136,7 @@ impl Scheduler {
             });
             return;
         }
-        if req.is_migratable() && req.cache.resume.is_none() {
+        if req.cache.resume.is_none() {
             req.cache.resume = Some(proto::request::CacheResume {
                 epoch: self.epoch,
                 request_id: req.request_id.0,
@@ -164,8 +164,7 @@ impl Scheduler {
     ///
     /// Refuses, with the client's message, a request when the runtime has no
     /// prefix cache, the request fails validation, a unit the scheduler never
-    /// splits (a readout row, a generation canvas, an input image's vision
-    /// block) exceeds the step token budget, the worker lacks a required
+    /// splits (a generation canvas, an input image's vision block) exceeds the step token budget, the worker lacks a required
     /// generation feature, or `validate_resources` or `max_cache_tokens`
     /// fails against `generation_limits`.
     pub(super) fn validate_submission(&self, req: &GenerationRequest) -> Result<usize, String> {
@@ -175,22 +174,9 @@ impl Scheduler {
         if let Err(error) = req.validate() {
             return Err(format!("invalid generation request: {error:?}"));
         }
-        // A canvas pass holds whole rows, so every readout row must fit one
-        // scheduling step's token budget.
-        if let Some(row) = req
-            .readout
-            .iter()
-            .find(|row| row.token_ids.len() > self.config.max_num_batched_tokens)
-        {
-            return Err(format!(
-                "a {}-token readout canvas exceeds the {}-token step budget",
-                row.token_ids.len(),
-                self.config.max_num_batched_tokens
-            ));
-        }
         // A request the deployment generates in canvases generates text only
         // and names the seed its draws follow.
-        if self.config.canvas.is_some() && !req.is_readout() {
+        if self.config.canvas.is_some() {
             let error = if req.generates_images() {
                 Some(GenerationRequestError::CanvasGeneratesTextOnly)
             } else if req.sampling.seed.is_none() {
@@ -248,9 +234,7 @@ impl Scheduler {
         }
         // A prefill group hands a request's cache to a decode group once,
         // after its prompt: such a deployment generates text.
-        if self.splits_prefill()
-            && (req.generates_images() || req.is_readout() || self.config.canvas.is_some())
-        {
+        if self.splits_prefill() && (req.generates_images() || self.config.canvas.is_some()) {
             return Err("a deployment of prefill and decode groups generates text only".into());
         }
         // Resource validation includes the cache bound, so a request that passes
@@ -405,8 +389,6 @@ impl Scheduler {
             encoder_cache_pins: Vec::new(),
             host_encoding: None,
             transient_encoder_products: Vec::new(),
-            readout_rows: 0,
-            readout_logprobs: Vec::with_capacity(req.readout_candidates()),
             canvas_block: 0,
             canvas_step: 0,
             canvas_commit: Vec::new(),
@@ -1118,9 +1100,8 @@ impl Scheduler {
         &self,
         request: &GenerationRequest,
     ) -> Option<crate::GenerationFeatures> {
-        // A block-diffusion runtime generates every request it does not read
-        // out in canvases.
-        let features = if self.config.canvas.is_some() && !request.is_readout() {
+        // A block-diffusion runtime generates every request in canvases.
+        let features = if self.config.canvas.is_some() {
             request.canvas_features()
         } else {
             request.required_features()

@@ -1,9 +1,8 @@
 //! Generation lifecycle state and worker-call planning.
 //!
 //! A request advances through context ingestion, then either understanding
-//! decode, image generation and optional feedback, block-diffusion canvases
-//! of text, or, for a readout, canvas denoising, and finally terminal
-//! export ([`GenerationPhase`]).
+//! decode, image generation and optional feedback, or block-diffusion
+//! canvases of text, and finally terminal export ([`GenerationPhase`]).
 //! [`RequestState`] holds the accepted progress of one admitted token request.
 //!
 //! Each `plan_*` builder returns one call whose identities are placeholders
@@ -28,8 +27,8 @@ use ipc::{ForwardMode, MediaCall, TransferMode};
 
 use crate::{GenerationRequest, ImageEncoderInput, ImageInput};
 use ipc::{
-    Bounds, BufferId, Call, CallId, CallKind, CallStatus, CanvasStep, DType, DimBound, Readout,
-    RequestKey, SamplingState, ShapeBound, TensorRef, VisionInput,
+    Bounds, BufferId, Call, CallId, CallKind, CallStatus, CanvasStep, DType, DimBound, RequestKey,
+    SamplingState, ShapeBound, TensorRef, VisionInput,
 };
 use ipc::{CanvasSampling, RequestId, SamplingParams};
 
@@ -180,9 +179,6 @@ pub(crate) enum GenerationPhase {
     FeedbackEncode,
     /// Write the feedback encoder's feature into the prefix cache.
     FeedbackState,
-    /// Denoise a readout request's canvas rows over its prompt, a bounded
-    /// group of rows per call, until every row has reported its slots.
-    Readout,
     /// Run one denoising step of a canvas-generating request's current block
     /// over its context. The step that stops the block reports the block's
     /// tokens.
@@ -237,8 +233,8 @@ pub(super) fn prefill_rows(call: &Call) -> usize {
 /// Prompt extension, a context prefill, writes prompt tokens into the prefix cache together
 /// with the vision blocks of the input images between them
 /// (`Call::vision_inputs`): a prefill with no image extension and no
-/// completion predicate. It samples the next token unless its request is a
-/// readout or generates canvases, whose prompt only conditions its canvases;
+/// completion predicate. It samples the next token unless its request
+/// generates canvases, whose prompt only conditions its canvases;
 /// the `CloseCache` write is the prefill that declares a completion instead. A
 /// canvas-generating request's block commit is a prompt extension too, of the
 /// tokens of its stopped block.
@@ -408,26 +404,13 @@ impl RequestState {
             // A canvas step that reports no tokens leaves its block running;
             // one that reports the block's tokens stopped it, and `output`
             // publishes them before the block is committed.
-            CallKind::Forward(ForwardMode::TokenDenoising) if call.canvas.is_some() => {
+            CallKind::Forward(ForwardMode::TokenDenoising) => {
                 if record.committed_tokens.is_empty() {
                     self.canvas_step = self.canvas_step.saturating_add(1);
                 } else {
                     self.canvas_commit = record.committed_tokens.clone();
                     self.phase = GenerationPhase::CommitCanvas;
                 }
-            }
-            CallKind::Forward(ForwardMode::TokenDenoising) => {
-                // The call covers the rows after the accepted ones whose
-                // canvases it carries; their log-probabilities follow the
-                // accepted ones in report order.
-                let rows = self
-                    .readout_rows_covering(self.readout_rows, call.input_token_ids.len())
-                    .ok_or(GenerationResultError::Progress {
-                        detail: "readout_rows_mismatch",
-                    })?;
-                self.readout_rows += rows;
-                self.readout_logprobs
-                    .extend_from_slice(&record.candidate_logprobs);
             }
             CallKind::Transfer(TransferMode::CacheExport)
                 if self.phase == GenerationPhase::HandOff =>
@@ -580,15 +563,15 @@ fn new_call(request: &GenerationRequest, kind: CallKind) -> Call {
 /// Plans a context prefill: prompt tokens `start..end` and the vision
 /// `blocks` of the input images between them, which write `block_tokens` cache
 /// tokens together, with a sampled-token output when this call ends the prompt
-/// and the request `samples` from its prompt, unless it is a readout or the
-/// context ends with a block of this call. A chunk before the prompt's end
+/// and the request `samples` from its prompt, unless the context ends with a
+/// block of this call. A chunk before the prompt's end
 /// only writes the cache: it draws nothing from the request's stream, so a
 /// prompt split over several batches draws its first token once. A request
 /// samples nothing from its prompt on a deployment that generates canvases, or
 /// while it rebuilds a migrated context, until it resumes.
 ///
-/// The prompt of a readout or of a canvas-generating request only conditions
-/// its canvases, so its prefill samples nothing. A context that ends with an
+/// The prompt of a canvas-generating request only conditions its canvases, so
+/// its prefill samples nothing. A context that ends with an
 /// image block samples nothing either: understanding decode
 /// then starts from BOS, as after a trailing latent block. Fails with
 /// `InvalidPromptRange` for a range past the prompt, or an empty one that
@@ -622,7 +605,7 @@ pub(super) fn plan_prompt(
         && end as usize == request.prompt_token_ids.len();
     call.vision_inputs = blocks;
     let ends_prompt = end as usize == request.prompt_token_ids.len();
-    if request.is_readout() || !samples || !ends_prompt || ends_with_block {
+    if !samples || !ends_prompt || ends_with_block {
         return finish_plan(request, call, 0);
     }
     call.token_output = Some(output_tensor(0, DType::I64));
@@ -641,55 +624,6 @@ pub(super) fn plan_prompt(
         0
     };
     finish_plan(request, call, prompt_positions)
-}
-
-/// Plans one token-denoising pass over the readout rows `rows` of `request`.
-///
-/// The call carries the rows' canvases back to back as its input tokens and
-/// their slots as a `Readout` whose slot tokens index that concatenation;
-/// candidates keep the request's report order, and each returns one FP32
-/// log-probability. Fails with `InvalidReadoutRows` for an empty range or
-/// one past the request's rows.
-pub(super) fn plan_readout(
-    request: &GenerationRequest,
-    rows: std::ops::Range<usize>,
-) -> Result<Call, PlanningError> {
-    let selected = request
-        .readout
-        .get(rows.clone())
-        .filter(|selected| !selected.is_empty())
-        .ok_or(PlanningError::InvalidReadoutRows {
-            start: rows.start,
-            end: rows.end,
-            rows: request.readout.len(),
-        })?;
-
-    let mut call = new_call(request, CallKind::Forward(ForwardMode::TokenDenoising));
-    let mut readout = Readout {
-        slot_tokens: Vec::new(),
-        candidate_offsets: vec![0],
-        candidate_ids: Vec::new(),
-    };
-    for row in selected {
-        // Slot positions are row-relative; the call addresses them in its
-        // concatenated canvas tokens.
-        let offset = call.input_token_ids.len() as u32;
-        for slot in &row.slots {
-            readout.slot_tokens.push(offset + slot.position);
-            readout.candidate_ids.extend_from_slice(&slot.candidates);
-            readout
-                .candidate_offsets
-                .push(readout.candidate_ids.len() as u32);
-        }
-        call.input_token_ids.extend_from_slice(&row.token_ids);
-    }
-    call.bounds.max_tokens = u32::try_from(call.input_token_ids.len())
-        .map_err(|_| PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
-    let completion_bytes = (readout.candidate_ids.len() as u64).saturating_mul(4);
-    call.readout = Some(readout);
-    let mut call = finish_plan(request, call, 0)?;
-    call.bounds.max_completion_bytes = completion_bytes;
-    Ok(call)
 }
 
 /// Plans denoising step `step` of the canvas-generating `request`'s block
@@ -1168,12 +1102,6 @@ pub(crate) enum PlanningError {
         end: u32,
         prompt_tokens: usize,
     },
-    #[error("invalid readout rows {start}..{end} of {rows} rows")]
-    InvalidReadoutRows {
-        start: usize,
-        end: usize,
-        rows: usize,
-    },
     #[error("a canvas commit carries no tokens")]
     EmptyCanvasCommit,
     #[error("image generation branch is disabled")]
@@ -1290,19 +1218,6 @@ pub(crate) fn validate_generation_result(
         return Err(GenerationResultError::Status {
             detail: "call_failed",
         });
-    }
-
-    // A readout reports one finite log-probability per declared candidate,
-    // and no other call reports any.
-    if let Some(readout) = &call.readout {
-        validate_readout_logprobs(readout, state, &record.candidate_logprobs)
-            .map_err(GenerationResultError::Readout)?;
-    } else if !record.candidate_logprobs.is_empty() {
-        return Err(GenerationResultError::Readout(
-            ReadoutRejection::Unexpected {
-                reported: record.candidate_logprobs.len(),
-            },
-        ));
     }
 
     // A feature write must reach exactly `start + tokens` when the encoder
@@ -1511,95 +1426,6 @@ pub(crate) fn validate_generation_result(
     Ok(())
 }
 
-/// Checks a readout call's reported log-probabilities against its declared
-/// candidates.
-///
-/// The call covers the request's readout rows from `state.readout_rows`, the
-/// rows accepted before it, since results apply in submission order. A
-/// rejection names the request-level readout row and the slot within that
-/// row of the first non-finite value, so a failure points at the answer it
-/// would have corrupted.
-fn validate_readout_logprobs(
-    readout: &Readout,
-    state: &RequestState,
-    logprobs: &[f32],
-) -> Result<(), ReadoutRejection> {
-    let declared = readout.candidate_count();
-    if logprobs.len() != declared {
-        return Err(ReadoutRejection::CandidateCount {
-            reported: logprobs.len(),
-            declared,
-        });
-    }
-
-    let mut non_finite = logprobs
-        .iter()
-        .enumerate()
-        .filter(|(_, logprob)| !logprob.is_finite());
-    let Some((candidate, &value)) = non_finite.next() else {
-        return Ok(());
-    };
-
-    // `candidate_offsets` partitions the candidates by the call's slots, so
-    // the slot is the last one starting at or before the candidate. Rows
-    // contribute their slots to the call in order.
-    let call_slot = readout
-        .candidate_offsets
-        .partition_point(|&offset| offset as usize <= candidate)
-        .saturating_sub(1);
-    let rows = state
-        .req
-        .readout
-        .get(state.readout_rows..)
-        .unwrap_or_default();
-    let mut row = state.readout_rows;
-    let mut slot = call_slot;
-    for readout_row in rows {
-        if slot < readout_row.slots.len() {
-            break;
-        }
-        slot -= readout_row.slots.len();
-        row += 1;
-    }
-
-    Err(ReadoutRejection::NonFinite {
-        candidate,
-        value,
-        row,
-        slot,
-        count: 1 + non_finite.count(),
-        total: declared,
-    })
-}
-
-/// Why a readout call's reported log-probabilities were rejected.
-///
-/// Rows are the request's readout rows and slots the answer slots of one
-/// row, both counted from zero; `candidate` indexes the call's reported
-/// `candidate_logprobs`.
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
-pub(crate) enum ReadoutRejection {
-    /// The result's value count differs from the call's declared candidates.
-    #[error("candidate_logprobs has {reported} values for {declared} declared candidates")]
-    CandidateCount { reported: usize, declared: usize },
-    /// A value is NaN or infinite; `count` of the `total` values are.
-    #[error(
-        "candidate_logprobs[{candidate}] = {value} is not finite (readout row {row}, slot \
-         {slot}); {count} of {total} values are not finite"
-    )]
-    NonFinite {
-        candidate: usize,
-        value: f32,
-        row: usize,
-        slot: usize,
-        count: usize,
-        total: usize,
-    },
-    /// A call without a readout reports candidate log-probabilities.
-    #[error("candidate_logprobs has {reported} values for a call without a readout")]
-    Unexpected { reported: usize },
-}
-
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 /// Invalid execution identity, numerical result, or produced value.
 pub(crate) enum GenerationResultError {
@@ -1617,8 +1443,6 @@ pub(crate) enum GenerationResultError {
     Token { detail: &'static str },
     #[error("worker logprob result invalid: {detail}")]
     Logprob { detail: &'static str },
-    #[error("worker readout result invalid: {0}")]
-    Readout(ReadoutRejection),
 }
 
 /// Engine-owned state for one admitted request.
@@ -1768,11 +1592,6 @@ pub(crate) struct RequestState {
     /// cache, freed by `Scheduler::free_transient_products` or when the
     /// request finishes.
     pub(super) transient_encoder_products: Vec<TensorRef>,
-    /// Leading readout rows whose candidate log-probabilities have been
-    /// accepted.
-    pub(super) readout_rows: usize,
-    /// Accepted candidate log-probabilities of those rows, in report order.
-    pub(super) readout_logprobs: Vec<f32>,
     /// Blocks a canvas-generating request has committed to its context.
     pub(super) canvas_block: u32,
     /// Accepted denoising steps of the current block.
@@ -1909,26 +1728,6 @@ impl RequestState {
         self.replayable
     }
 
-    /// Returns how many readout rows from row `start` a token-denoising call
-    /// of `canvas_tokens` canvas tokens covers, or `None` when no whole
-    /// number of rows there has exactly that many tokens.
-    pub(super) fn readout_rows_covering(
-        &self,
-        start: usize,
-        canvas_tokens: usize,
-    ) -> Option<usize> {
-        let mut remaining = canvas_tokens;
-        let mut rows = 0;
-        for row in self.req.readout.get(start..)? {
-            if remaining == 0 {
-                break;
-            }
-            remaining = remaining.checked_sub(row.token_ids.len())?;
-            rows += 1;
-        }
-        (remaining == 0 && rows > 0).then_some(rows)
-    }
-
     /// Returns the accepted block cursor: the next input-image block to
     /// write into the context.
     pub(super) fn block_cursor(&self) -> BlockCursor {
@@ -2057,7 +1856,6 @@ mod tests {
             priority: 3,
             cache: Default::default(),
             image_generation: Default::default(),
-            readout: Vec::new(),
             generated_token_ids: Vec::new(),
             generated_images: Vec::new(),
             trajectory: Default::default(),

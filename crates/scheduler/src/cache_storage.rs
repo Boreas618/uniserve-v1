@@ -783,7 +783,6 @@ impl Scheduler {
         }
         let Some(victim) = live
             .iter()
-            .filter(|(_, state)| state.req.is_migratable())
             .max_by(|(_, a), (_, b)| {
                 (a.req.priority, a.queued_at)
                     .partial_cmp(&(b.req.priority, b.queued_at))

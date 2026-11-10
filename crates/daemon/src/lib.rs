@@ -8,8 +8,7 @@
 //! each using only those below it:
 //!
 //! - `http`: the HTTP server, its router, middleware and listener;
-//! - `openai`: the OpenAI-compatible API's wire schemas and route handlers,
-//!   and the System One readout's route;
+//! - `openai`: the OpenAI-compatible API's wire schemas and route handlers;
 //! - [`Leader`]: the served model, which carries every request through its
 //!   input processing, the engine process and its output processing;
 //! - `input`: input processing (chat templates, tokenization, multimodal

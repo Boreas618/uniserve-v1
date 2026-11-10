@@ -969,10 +969,10 @@ impl Scheduler {
     /// Ends every token request that resumes from its generated tokens as
     /// migratable, for `cause`.
     ///
-    /// A request resumes from the tokens and images it generated when it is
-    /// no readout (`GenerationRequest::is_migratable`), on a deployment that
-    /// does not generate in canvases. A queued one ends at once. A running
-    /// one stops scheduling, drops the decoder decisions it awaits, and ends
+    /// A request resumes from the tokens and images it generated on a
+    /// deployment that does not generate in canvases. A queued one ends at
+    /// once. A running one stops scheduling, drops the decoder decisions it
+    /// awaits, and ends
     /// once its calls in flight drain, after every token and image it
     /// generated, whatever it computes; tokens those calls produce are
     /// discarded, and the engine that serves next generates them again.
@@ -981,17 +981,12 @@ impl Scheduler {
     /// begun advance its trajectory, which is stored in the host latent
     /// pools before the request leaves (`Scheduler::retire_preempted_token`)
     /// and which the engine that serves next continues. A request already
-    /// finishing finishes. Video requests and readouts go on.
+    /// finishing finishes. Video requests go on.
     pub(super) fn migrate_requests(&mut self, cause: MigrationCause) {
         if self.config.canvas.is_some() {
             return;
         }
-        let queued: Vec<RequestId> = self
-            .waiting
-            .iter()
-            .filter(|st| st.req.is_migratable())
-            .map(|st| st.req.request_id)
-            .collect();
+        let queued: Vec<RequestId> = self.waiting.iter().map(|st| st.req.request_id).collect();
         for id in queued {
             if let Some(st) = self.remove_waiting(id) {
                 self.announce_end(id, scheduling::guest::event::End::Migratable);
@@ -1018,7 +1013,6 @@ impl Scheduler {
         }
         for (id, st) in &mut self.running {
             if select(*id)
-                && st.req.is_migratable()
                 && !st.terminal_intent.is_terminal()
                 && !self.inflight.pending_finishes.contains_key(id)
             {

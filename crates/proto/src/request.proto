@@ -627,6 +627,8 @@ message Stats {
 // ---------------------------------------------------------------- requests
 
 message GenerationRequest {
+  reserved 14;
+  reserved "readout";
   repeated uint32 prompt_token_ids = 1;
   repeated uint32 negative_prompt_token_ids = 2;
   repeated ImageInput images = 3;
@@ -640,7 +642,6 @@ message GenerationRequest {
   CachePolicy cache = 11;
   bool include_stop_token = 12;
   ImageGenerationConfig image_generation = 13;
-  repeated ReadoutRow readout = 14;
   // The tokens a migrated request generated on the engines that served it
   // before, in order; empty for a new request. They continue its prompt, and
   // the engine counts them as generated: against `max_und_tokens` and
@@ -853,16 +854,6 @@ message FeedbackNextToken {
   }
 }
 
-message ReadoutRow {
-  repeated uint32 token_ids = 1;
-  repeated ReadoutSlot slots = 2;
-}
-
-message ReadoutSlot {
-  uint32 position = 1;
-  repeated uint32 candidates = 2;
-}
-
 message DiffusionRequest {
   reserved 1;
   repeated uint32 prompt_token_ids = 2;
@@ -916,6 +907,8 @@ message DiffusionSamplingParams {
 // ------------------------------------------------------------------ events
 
 message Event {
+  reserved 7;
+  reserved "readout";
   uint64 request = 1;
   oneof kind {
     Scheduled scheduled = 2;
@@ -923,7 +916,6 @@ message Event {
     TextTokens text_tokens = 4;
     TokenLogprobs token_logprobs = 5;
     PromptLogprobs prompt_logprobs = 6;
-    Readout readout = 7;
     ImageBegin image_begin = 8;
     ImageStep image_step = 9;
     ImageCommit image_commit = 10;
@@ -1000,10 +992,6 @@ message PositionLogprobs {
 
 message PromptLogprobs {
   repeated PositionLogprobs positions = 1;
-}
-
-message Readout {
-  repeated float candidate_logprobs = 1;
 }
 
 message ImageBegin {

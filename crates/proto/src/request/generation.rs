@@ -80,32 +80,6 @@ pub struct MultimodalInputs {
     pub images: Vec<ImageInput>,
 }
 
-/// One token canvas a readout request denoises once over its prompt.
-///
-/// Canvas token `j` sits at the model position that follows the prompt's
-/// logical positions by `j`. Every canvas token attends to the whole prompt
-/// and to every token of its own row, and the pass writes nothing to the prefix cache. The rows of
-/// one request are independent computations over the same prompt.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReadoutRow {
-    /// Canvas token ids.
-    pub token_ids: Vec<u32>,
-    /// Positions whose candidate log-probabilities the row reports, in
-    /// increasing position order, which is also report order.
-    pub slots: Vec<ReadoutSlot>,
-}
-
-/// One canvas position whose candidate log-probabilities a readout reports.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReadoutSlot {
-    /// Index of the slot's token within its row.
-    pub position: u32,
-    /// Token ids whose natural-log probabilities, under the log-softmax over
-    /// the full vocabulary of the model's logits at `position`, are reported
-    /// in this order.
-    pub candidates: Vec<u32>,
-}
-
 /// An encoded image and the model's requirements for adding it to context.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageInput {
@@ -946,12 +920,6 @@ pub struct GenerationRequest {
     pub include_stop_token: bool,
     /// Model-specific image trigger and feedback requirements.
     pub image_generation: ImageGenerationConfig,
-    /// Canvas rows a readout request denoises once over its prompt, in
-    /// report order. A readout generates nothing: it answers with the
-    /// candidate log-probabilities of every row's slots, and an empty list
-    /// makes the request a generating one.
-    #[serde(default)]
-    pub readout: Vec<ReadoutRow>,
     /// The tokens a migrated request generated on the engines that served it
     /// before, in order, every one it counted as generated: the text it
     /// published and the control tokens it did not (`Event::ControlToken`),
@@ -992,48 +960,20 @@ impl GenerationRequest {
         !self.generated_token_ids.is_empty() || !self.generated_images.is_empty()
     }
 
-    /// Returns whether the request can resume on another engine from what it
-    /// generated: its tokens and images, which its client received, and from
-    /// which the engine that continues it computes everything else. A
-    /// readout generates nothing to resume from: its answers come whole.
-    pub fn is_migratable(&self) -> bool {
-        !self.is_readout()
-    }
-
     /// Returns whether the request's context holds its prompt and then the
     /// tokens it generates, in order: whether it generates text alone. An
     /// image-generating request's context also holds its images and the
     /// tokens that frame them.
     pub fn generates_text_alone(&self) -> bool {
-        !self.is_readout() && !self.generates_images()
+        !self.generates_images()
     }
 
-    /// Returns whether the request reads canvas slots instead of generating.
-    pub fn is_readout(&self) -> bool {
-        !self.readout.is_empty()
-    }
-
-    /// Returns the number of candidate log-probabilities a readout reports:
-    /// one per candidate of every slot of every row.
-    pub fn readout_candidates(&self) -> usize {
-        self.readout
-            .iter()
-            .flat_map(|row| &row.slots)
-            .map(|slot| slot.candidates.len())
-            .sum()
-    }
-
-    /// Returns the runtime features the request's computation reaches.
-    ///
-    /// A readout needs token denoising and the encoders of its context
-    /// images; any other request needs what its generation graph reaches
+    /// Returns the runtime features the request's computation reaches: what
+    /// its generation graph reaches
     /// (`ImageGenerationConfig::required_features`). A request a
     /// block-diffusion runtime generates in canvases needs
     /// [`GenerationRequest::canvas_features`] instead.
     pub fn required_features(&self) -> GenerationFeatures {
-        if self.is_readout() {
-            return self.canvas_features();
-        }
         self.image_generation
             .required_features(self.constraint, self.context_encoders())
     }
@@ -1065,9 +1005,7 @@ impl GenerationRequest {
         if self.prompt_token_ids.is_empty() && self.multimodal_inputs.images.is_empty() {
             return Err(GenerationRequestError::EmptyContext);
         }
-        if self.is_readout() {
-            validate_readout(self)?;
-        } else if self.max_und_tokens == 0 && !self.finishes_after_image() {
+        if self.max_und_tokens == 0 && !self.finishes_after_image() {
             return Err(GenerationRequestError::ZeroMaxUndTokens);
         }
         self.sampling
@@ -1089,9 +1027,6 @@ impl GenerationRequest {
             return Err(GenerationRequestError::GenOnlyCannotProduceImage);
         }
         if self.is_migrated() {
-            if !self.is_migratable() {
-                return Err(GenerationRequestError::MigratedReadout);
-            }
             // Its prompt's log-probabilities were reported where it began.
             if self.sampling.return_prompt_logprobs {
                 return Err(GenerationRequestError::MigratedPromptLogprobs);
@@ -1233,39 +1168,6 @@ impl GenerationRequest {
     }
 }
 
-/// Validates a readout's canvas rows: it generates no tokens or images, and
-/// every row holds tokens and reads at least one slot inside itself, each
-/// with at least one candidate.
-fn validate_readout(request: &GenerationRequest) -> Result<(), GenerationRequestError> {
-    if request.max_und_tokens != 0 || request.generates_images() {
-        return Err(GenerationRequestError::GeneratingReadout);
-    }
-    for row in &request.readout {
-        if row.token_ids.is_empty() || row.slots.is_empty() {
-            return Err(GenerationRequestError::EmptyReadoutRow);
-        }
-        if row
-            .slots
-            .windows(2)
-            .any(|pair| pair[0].position >= pair[1].position)
-        {
-            return Err(GenerationRequestError::UnorderedReadoutSlots);
-        }
-        for slot in &row.slots {
-            if slot.position as usize >= row.token_ids.len() {
-                return Err(GenerationRequestError::ReadoutSlotOutsideRow {
-                    position: slot.position,
-                    row_tokens: row.token_ids.len(),
-                });
-            }
-            if slot.candidates.is_empty() {
-                return Err(GenerationRequestError::EmptyReadoutSlot);
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Validates an image's encoder inputs and logical position contribution.
 fn validate_image_encoders(
     inputs: &[ImageEncoderInput],
@@ -1347,13 +1249,6 @@ pub enum GenerationRequestError {
     /// A configured stop string is empty.
     #[error("stop strings must not be empty")]
     EmptyStopString,
-    /// A readout request also asks to generate tokens or images.
-    #[error("a readout request generates no tokens or images")]
-    GeneratingReadout,
-    /// A migrated request reads canvas slots: a readout generates nothing to
-    /// resume from.
-    #[error("a readout does not resume from generated tokens")]
-    MigratedReadout,
     /// A migrated request asks for its prompt's log-probabilities again.
     #[error("a migrated request does not report prompt log-probabilities again")]
     MigratedPromptLogprobs,
@@ -1392,23 +1287,6 @@ pub enum GenerationRequestError {
         /// Index of the image among the carried images.
         image: usize,
     },
-    /// A readout row has no tokens or reads no slot.
-    #[error("every readout row must hold tokens and read at least one slot")]
-    EmptyReadoutRow,
-    /// A readout slot lies beyond its row.
-    #[error("readout slot {position} lies outside its {row_tokens}-token row")]
-    ReadoutSlotOutsideRow {
-        /// Slot position within its row.
-        position: u32,
-        /// Length of the row.
-        row_tokens: usize,
-    },
-    /// A readout slot names no candidate token.
-    #[error("every readout slot must read at least one candidate")]
-    EmptyReadoutSlot,
-    /// A readout row's slot positions do not strictly increase.
-    #[error("readout slots must be listed in increasing position order")]
-    UnorderedReadoutSlots,
     /// A request a block-diffusion runtime generates in canvases generates
     /// text only.
     #[error("a canvas-generating request generates text only")]
@@ -1550,7 +1428,6 @@ mod tests {
                 resume: None,
             },
             image_generation: policy,
-            readout: Vec::new(),
             generated_token_ids: Vec::new(),
             adapter: 4,
             generated_images: Vec::new(),
@@ -1853,99 +1730,6 @@ mod tests {
         assert_eq!(
             unordered_images.validate(),
             Err(GenerationRequestError::UnorderedImageInputs)
-        );
-    }
-
-    /// A readout of one context image's prompt: two canvas rows, the first
-    /// with two slots and the second with one.
-    fn readout_request() -> GenerationRequest {
-        let mut request = complete_request();
-        request.constraint = GenerationConstraint::UndOnly;
-        request.max_und_tokens = 0;
-        request.image_generation = ImageGenerationConfig::default();
-        request.multimodal_inputs.images[0].encoders.truncate(1);
-        request.multimodal_inputs.images[0].encoders[0].encoder = ImageEncoder::Vision;
-        request.multimodal_inputs.images[0].encoders[0].num_cache_tokens = Some(64);
-        request.readout = vec![
-            ReadoutRow {
-                token_ids: vec![11, 4, 12, 4, 13],
-                slots: vec![
-                    ReadoutSlot {
-                        position: 1,
-                        candidates: vec![30, 31],
-                    },
-                    ReadoutSlot {
-                        position: 3,
-                        candidates: vec![40, 41, 42],
-                    },
-                ],
-            },
-            ReadoutRow {
-                token_ids: vec![11, 30, 4],
-                slots: vec![ReadoutSlot {
-                    position: 2,
-                    candidates: vec![50],
-                }],
-            },
-        ];
-        request
-    }
-
-    /// A readout generates nothing, counts every candidate it reports, and
-    /// needs canvas denoising plus the encoders of its context images rather
-    /// than text decoding.
-    #[test]
-    fn a_readout_reports_its_candidates_and_needs_canvas_denoising() {
-        let request = readout_request();
-        assert_eq!(request.validate(), Ok(()));
-        assert!(request.is_readout());
-        assert_eq!(request.readout_candidates(), 6);
-        assert_eq!(
-            request.required_features(),
-            GenerationFeatures::TOKEN_DENOISING | GenerationFeatures::VISION_ENCODE
-        );
-        // Its cache holds the prompt and image only; canvases write none.
-        assert_eq!(request.max_cache_tokens(&runtime_limits()).unwrap(), 4 + 64);
-    }
-
-    #[test]
-    fn readout_validation_rejects_generation_and_misplaced_slots() {
-        let mut generating = readout_request();
-        generating.max_und_tokens = 4;
-        assert_eq!(
-            generating.validate(),
-            Err(GenerationRequestError::GeneratingReadout)
-        );
-
-        let mut empty = readout_request();
-        empty.readout[1].slots.clear();
-        assert_eq!(
-            empty.validate(),
-            Err(GenerationRequestError::EmptyReadoutRow)
-        );
-
-        let mut outside = readout_request();
-        outside.readout[1].slots[0].position = 3;
-        assert_eq!(
-            outside.validate(),
-            Err(GenerationRequestError::ReadoutSlotOutsideRow {
-                position: 3,
-                row_tokens: 3
-            })
-        );
-
-        let mut unread = readout_request();
-        unread.readout[0].slots[0].candidates.clear();
-        assert_eq!(
-            unread.validate(),
-            Err(GenerationRequestError::EmptyReadoutSlot)
-        );
-
-        let mut unordered = readout_request();
-        unordered.readout[0].slots.swap(0, 1);
-        assert_eq!(
-            unordered.validate(),
-            Err(GenerationRequestError::UnorderedReadoutSlots)
         );
     }
 }

@@ -693,7 +693,7 @@ impl SchedulerHandle {
     }
 
     /// Parks the scheduler: every token request it holds that resumes from
-    /// its generated tokens (`GenerationRequest::is_migratable`) ends as
+    /// its generated tokens (`Scheduler::migrate_requests`) ends as
     /// migratable, a queued one at once, a running one once its calls in
     /// flight drain, after every token it generated; the other requests
     /// finish; then it executes nothing more until resumed. The receiver

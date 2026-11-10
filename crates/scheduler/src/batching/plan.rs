@@ -63,12 +63,11 @@ impl Scheduler {
     ///
     /// Prompt text and input images still to ingest go through
     /// `next_context_call`; otherwise the request's next phase decides.
-    /// A canvas pass takes the next readout rows that fit both `budget`
-    /// tokens and the pass's canvas `rows`, and a context prefill the
-    /// segments that fit its context rows. Returns `None` when nothing can be
-    /// planned now, including when the cache capacity a call needs, the
-    /// image-branch reservation, or room for one whole canvas row is
-    /// unavailable.
+    /// A canvas step takes one of the pass's canvas `rows`, and a context
+    /// prefill the segments that fit its context rows within `budget` tokens.
+    /// Returns `None` when nothing can be planned now, including when the
+    /// cache capacity a call needs, the image-branch reservation, or room for
+    /// one whole canvas row is unavailable.
     pub(crate) fn next_generation_call(
         &mut self,
         id: RequestId,
@@ -441,27 +440,6 @@ impl Scheduler {
                 })
             }
             Phase::IngestState => self.next_context_call(id, budget, rows.context),
-            Phase::Readout => {
-                // Whole rows join the pass in report order while they fit its
-                // remaining tokens and canvas rows.
-                let start = self.scheduled_readout_rows(id)?;
-                let st = self.running.get(&id)?;
-                let mut end = start;
-                let mut tokens = 0usize;
-                for row in st.req.readout.get(start..)? {
-                    if end - start >= canvas_rows || tokens + row.token_ids.len() > budget {
-                        break;
-                    }
-                    tokens += row.token_ids.len();
-                    end += 1;
-                }
-                if end == start {
-                    return None;
-                }
-                self.plan_call(id, |_scheduler, request| {
-                    generation::plan_readout(request, start..end)
-                })
-            }
             Phase::Canvas => {
                 // One step of the request's block is one read-only canvas row
                 // of the pass. The next step may be queued behind the steps

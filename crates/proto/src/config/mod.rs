@@ -61,8 +61,8 @@ pub struct ServerConfig {
     /// expires; streamed bodies are not bounded.
     #[serde(with = "values::optional_duration")]
     pub request_timeout: Option<Duration>,
-    /// In-flight chat, image generation, System One and synchronous video
-    /// requests above which requests are shed with 503.
+    /// In-flight chat, image generation and synchronous video requests above
+    /// which requests are shed with 503.
     pub max_concurrent_requests: Option<NonZeroU64>,
     /// Longest drain of in-flight requests at shutdown; zero stops at once.
     #[serde(with = "values::duration")]
@@ -259,8 +259,8 @@ pub struct SchedulerConfig {
     #[serde(skip)]
     pub max_running_requests: usize,
     /// Block-diffusion sampling of every canvas the deployment generates, resolved from the model.
-    /// A block-diffusion runtime has no autoregressive decode, so each request it does not read
-    /// out runs under this sampling; without it the runtime serves readouts only.
+    /// A block-diffusion runtime has no autoregressive decode, so each request it serves runs
+    /// under this sampling.
     #[serde(skip)]
     pub canvas: Option<crate::request::CanvasSampling>,
     /// The most draft tokens a verification carries per request

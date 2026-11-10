@@ -438,7 +438,6 @@ fn an_image_resumes_after_its_stored_step_and_recomputes_missing_pages() {
             requires_text_for_image: false,
             ..Default::default()
         },
-        readout: Vec::new(),
         generated_token_ids: Vec::new(),
         adapter: 0,
         generated_images: Vec::new(),

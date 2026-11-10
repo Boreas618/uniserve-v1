@@ -86,7 +86,6 @@ fn text_request(id: u64, length: u32) -> GenerationRequest {
         cache: Default::default(),
         include_stop_token: false,
         image_generation: Default::default(),
-        readout: Vec::new(),
         generated_token_ids: Vec::new(),
         adapter: 0,
         generated_images: Vec::new(),

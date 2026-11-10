@@ -64,7 +64,6 @@ fn ar_decode_call() -> Call {
         cache_input: None,
         cache_output: None,
         input_token_ids: Vec::new(),
-        readout: None,
         canvas: None,
         sampling_state: None,
         request_key: request_key(),
@@ -83,16 +82,6 @@ fn ar_decode_call() -> Call {
         host_output: None,
         latent_draw: (kind == CallKind::Media(MediaCall::LatentEncoding)).then_some(2),
         carried_image: None,
-    }
-}
-
-/// Two readout slots over a four-token canvas: slot 0 reads two candidates at
-/// canvas token 0, slot 1 one candidate at canvas token 2.
-fn readout() -> Readout {
-    Readout {
-        slot_tokens: vec![0, 2],
-        candidate_offsets: vec![0, 2, 3],
-        candidate_ids: vec![31, 32, 33],
     }
 }
 
@@ -132,14 +121,9 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
             output_index: 0,
             generation: 2,
         }),
-        // A token-denoising call carries its canvas and the slots it reads.
-        input_token_ids: if denoises {
-            vec![4, 9, 4, 1]
-        } else {
-            Vec::new()
-        },
-        readout: denoises.then(readout),
-        canvas: None,
+        // A token-denoising call steps its request's resident canvas.
+        input_token_ids: Vec::new(),
+        canvas: denoises.then_some(CanvasStep::default()),
         sampling_state: None,
         request_key: request_key(),
         call_id,
@@ -193,7 +177,6 @@ fn completion_record() -> CallOutput {
         step_index: 0,
 
         committed_tokens: vec![271],
-        candidate_logprobs: Vec::new(),
         finish_flags: FinishFlags::default(),
         media_output: None,
         cache_output: None,
@@ -453,71 +436,11 @@ fn only_an_image_latent_preparation_names_its_image_index() {
         .expect("an image latent preparation with its image index");
 }
 
-/// A token-denoising readout reaches the rank with its canvas and slots, and
-/// its completion returns the candidates' log-probabilities in candidate
-/// order.
-#[test]
-fn a_readout_and_its_candidate_logprobs_round_trip() {
-    let call_id = CallId::new(5, 0);
-    let call = call_for(CallKind::Forward(ForwardMode::TokenDenoising), call_id);
-    let batch = execute_round_trip(batch_with_calls(5, Vec::new(), vec![call.clone()]));
-    assert_eq!(batch.calls().next().unwrap(), &call);
-
-    let mut record = completion_record();
-    record.call_id = call_id;
-    record.token_logprobs.clear();
-    record.prompt_logprobs.clear();
-    record.committed_tokens.clear();
-    record.candidate_logprobs = vec![-0.25, -3.5, -17.75];
-    let report = batch_output(5, vec![record], Vec::new(), None, None);
-    let decoded = round_trip(&MainProcessResponse::result(report.clone()));
-    assert_eq!(decoded.output().unwrap(), &report);
-}
-
-/// A readout belongs to a token-denoising call and must address the canvas
-/// that call carries, with every slot reading at least one candidate.
-#[test]
-fn a_readout_must_address_the_canvas_of_a_token_denoising_call() {
-    let call_id = CallId::new(5, 0);
-    let valid = call_for(CallKind::Forward(ForwardMode::TokenDenoising), call_id);
-    assert!(valid.validate().is_ok());
-
-    let mut unread = valid.clone();
-    unread.readout = None;
-    let mut misplaced = call_for(CallKind::Forward(ForwardMode::Prefill), call_id);
-    misplaced.readout = Some(readout());
-    misplaced.input_token_ids = vec![1, 2, 3, 4];
-    misplaced.bounds.max_tokens = 4;
-    let mut outside = valid.clone();
-    outside.readout.as_mut().unwrap().slot_tokens[1] = 4;
-    let mut empty_slot = valid.clone();
-    empty_slot.readout.as_mut().unwrap().candidate_offsets = vec![0, 3, 3];
-    let mut short_offsets = valid.clone();
-    short_offsets.readout.as_mut().unwrap().candidate_offsets = vec![0, 2];
-    let mut unordered = valid.clone();
-    unordered.readout.as_mut().unwrap().slot_tokens.reverse();
-    let mut sampling = valid.clone();
-    sampling.token_output = Some(output_product(call_id));
-    for call in [
-        unread,
-        misplaced,
-        outside,
-        empty_slot,
-        short_offsets,
-        unordered,
-        sampling,
-    ] {
-        assert!(call.validate().is_err(), "{:?}", call.readout);
-    }
-}
-
 /// A canvas step of a block-diffusion request whose admission names its
 /// canvas sampling.
 fn canvas_step_batch() -> Batch {
     let call_id = CallId::new(6, 0);
     let mut call = call_for(CallKind::Forward(ForwardMode::TokenDenoising), call_id);
-    call.readout = None;
-    call.input_token_ids.clear();
     call.bounds.max_tokens = 256;
     call.canvas = Some(CanvasStep { block: 2, step: 5 });
     let admission = NewRequest::new(
@@ -558,9 +481,8 @@ fn a_canvas_step_its_sampling_and_its_block_round_trip() {
     assert_eq!(decoded.output().unwrap(), &report);
 }
 
-/// A canvas step belongs to a token-denoising call, which carries either a
-/// readout or a canvas step, and denoises its resident canvas without input
-/// tokens.
+/// A canvas step belongs to a token-denoising call, which always carries one,
+/// and denoises its resident canvas without input tokens.
 #[test]
 fn a_canvas_step_is_a_token_denoising_call_without_input_tokens() {
     let valid = canvas_step_batch().calls().next().unwrap().clone();
@@ -568,29 +490,15 @@ fn a_canvas_step_is_a_token_denoising_call_without_input_tokens() {
 
     let mut misplaced = call_for(CallKind::Forward(ForwardMode::Prefill), valid.call_id);
     misplaced.canvas = valid.canvas;
-    let mut both = valid.clone();
-    both.readout = Some(readout());
-    both.input_token_ids = vec![4, 9, 4, 1];
+    let mut unstepped = valid.clone();
+    unstepped.canvas = None;
     let mut with_tokens = valid.clone();
     with_tokens.input_token_ids = vec![1; 256];
     let mut empty = valid.clone();
     empty.bounds.max_tokens = 0;
-    for call in [misplaced, both, with_tokens, empty] {
+    for call in [misplaced, unstepped, with_tokens, empty] {
         assert!(call.validate().is_err(), "{:?}", call.canvas);
     }
-}
-
-/// Only a successful completion reports candidate log-probabilities; that
-/// it answers a token-denoising call is the engine's check, which holds the
-/// call.
-#[test]
-fn candidate_logprobs_belong_to_a_successful_completion() {
-    let mut record = completion_record();
-    record.candidate_logprobs = vec![-1.0];
-    assert!(record.validate().is_ok());
-    record.status = CallStatus::Error;
-    record.error_code = Some(ErrorCode::ComputeError);
-    assert!(record.validate().is_err());
 }
 
 #[test]
@@ -671,7 +579,6 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
             cache_input: None,
             cache_output: None,
             input_token_ids: Vec::new(),
-            readout: None,
             canvas: None,
             sampling_state: None,
             request_key: request_key(),
@@ -1793,13 +1700,9 @@ fn comprehensive_batches() -> Vec<Batch> {
                 output_index: 1,
                 generation: 2,
             }),
-            input_token_ids: if kind == CallKind::Forward(ForwardMode::TokenDenoising) {
-                vec![4, 9, 4, 1]
-            } else {
-                Vec::new()
-            },
-            readout: (kind == CallKind::Forward(ForwardMode::TokenDenoising)).then(readout),
-            canvas: None,
+            input_token_ids: Vec::new(),
+            canvas: (kind == CallKind::Forward(ForwardMode::TokenDenoising))
+                .then_some(CanvasStep::default()),
             sampling_state: None,
             request_key: key,
             call_id,
@@ -1997,7 +1900,6 @@ fn full_run_result() -> BatchOutput {
         cache_computed_len: 8,
 
         committed_tokens: vec![271, 272],
-        candidate_logprobs: Vec::new(),
         finish_flags: FinishFlags {
             eos: true,
             length: false,

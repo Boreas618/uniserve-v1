@@ -12,9 +12,8 @@
 //! - a list is an array, a comma-separated string (`"1024,10240"`) or one
 //!   element, printed as an array.
 //!
-//! It also defines the option values a component reads by name: the chat
-//! template's content format and the System One readout's layout, canvas and
-//! candidate tokens.
+//! It also defines [`ImageSize`], the `HEIGHTxWIDTH` value image-size options
+//! are written in.
 
 use std::fmt;
 use std::marker::PhantomData;

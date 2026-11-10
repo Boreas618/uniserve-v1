@@ -59,8 +59,8 @@ use scheduler::{
 
 /// Builds a scheduler whose model limits follow from `worker`'s call kinds.
 ///
-/// A token-denoising worker without text decode serves canvas readouts over
-/// prompts that may carry encoded images; one that prepares latents without
+/// A token-denoising worker without text decode generates block-diffusion
+/// canvases over prompts that may carry encoded images; one that prepares latents without
 /// decoding text serves video diffusion, which needs no generation feature.
 /// Any other denoising, vision-encoding or latent-encoding worker serves
 /// interleaved text and images without bound, and the rest serve text.

@@ -16,8 +16,8 @@ use super::{
     FeedbackNextToken, FeedbackSource, FinishReason, GeneratedImage, GenerationConstraint,
     GenerationFeatures, GenerationLimits, GenerationRequest, ImageEncoder, ImageEncoderInput,
     ImageGenerationConfig, ImageInput, ImageParams, ImagePixels, ImageTrigger, MediaKind,
-    MigrationCause, MultimodalInputs, PixelRange, PositionLogprobs, ReadoutRow, ReadoutSlot,
-    RejectionKind, Request, RequestId, SamplingParams, StopReason, TokenLogprob, Trajectory,
+    MigrationCause, MultimodalInputs, PixelRange, PositionLogprobs, RejectionKind, Request,
+    RequestId, SamplingParams, StopReason, TokenLogprob, Trajectory,
 };
 
 /// A message that states no valid value.
@@ -120,21 +120,6 @@ impl From<&GenerationRequest> for wire::GenerationRequest {
             }),
             include_stop_token: request.include_stop_token,
             image_generation: Some((&request.image_generation).into()),
-            readout: request
-                .readout
-                .iter()
-                .map(|row| wire::ReadoutRow {
-                    token_ids: row.token_ids.clone(),
-                    slots: row
-                        .slots
-                        .iter()
-                        .map(|slot| wire::ReadoutSlot {
-                            position: slot.position,
-                            candidates: slot.candidates.clone(),
-                        })
-                        .collect(),
-                })
-                .collect(),
             generated_token_ids: request.generated_token_ids.clone(),
             adapter: request.adapter,
             generated_images: request
@@ -249,21 +234,6 @@ impl TryFrom<wire::GenerationRequest> for GenerationRequest {
             },
             include_stop_token: request.include_stop_token,
             image_generation: present(request.image_generation, "image generation")?.try_into()?,
-            readout: request
-                .readout
-                .into_iter()
-                .map(|row| ReadoutRow {
-                    token_ids: row.token_ids,
-                    slots: row
-                        .slots
-                        .into_iter()
-                        .map(|slot| ReadoutSlot {
-                            position: slot.position,
-                            candidates: slot.candidates,
-                        })
-                        .collect(),
-                })
-                .collect(),
             generated_token_ids: request.generated_token_ids,
             adapter: request.adapter,
             generated_images: request
@@ -749,9 +719,6 @@ impl Event {
                     })
                     .collect(),
             }),
-            Self::Readout { candidate_logprobs } => Kind::Readout(wire::Readout {
-                candidate_logprobs: candidate_logprobs.clone(),
-            }),
             Self::ImageBegin {
                 image_id,
                 height,
@@ -896,9 +863,6 @@ impl Event {
                         entries: position.entries.into_iter().map(Into::into).collect(),
                     })
                     .collect(),
-            },
-            Kind::Readout(readout) => Self::Readout {
-                candidate_logprobs: readout.candidate_logprobs,
             },
             Kind::ImageBegin(begin) => Self::ImageBegin {
                 image_id: begin.image_id,

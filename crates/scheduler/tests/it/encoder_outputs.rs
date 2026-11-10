@@ -285,7 +285,6 @@ fn image_request(id: u64, image: u8, seed: u64, cache: CachePolicy) -> Generatio
             feedback_encoders: vec![encoder(ImageEncoder::Latent, 6)],
             sample_feedback_continuation: false,
         },
-        readout: Vec::new(),
         generated_token_ids: Vec::new(),
         adapter: 0,
         generated_images: Vec::new(),

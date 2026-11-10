@@ -468,7 +468,6 @@ fn generation_request(
         priority: 0,
         cache,
         image_generation: policy,
-        readout: Vec::new(),
         generated_token_ids: Vec::new(),
         adapter: 0,
         generated_images: Vec::new(),

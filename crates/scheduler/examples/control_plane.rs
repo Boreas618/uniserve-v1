@@ -117,7 +117,6 @@ fn main() -> anyhow::Result<()> {
             priority: 0,
             cache,
             image_generation: policy,
-            readout: Vec::new(),
             generated_token_ids: generated,
             adapter: 0,
             generated_images: Vec::new(),

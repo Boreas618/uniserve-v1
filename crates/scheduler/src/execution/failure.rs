@@ -196,12 +196,7 @@ impl Scheduler {
             .unwrap_or_else(|| "the epoch on trial failed".to_owned());
         self.fail_all_inflight(&failure);
 
-        let queued: Vec<RequestId> = self
-            .waiting
-            .iter()
-            .filter(|st| st.req.is_migratable())
-            .map(|st| st.req.request_id)
-            .collect();
+        let queued: Vec<RequestId> = self.waiting.iter().map(|st| st.req.request_id).collect();
         for id in queued {
             if let Some(st) = self.remove_waiting(id) {
                 self.announce_end(id, scheduling::guest::event::End::Migratable);
@@ -256,9 +251,10 @@ impl Scheduler {
     fn migrates_on_loss(&self, id: RequestId) -> bool {
         self.config.canvas.is_none()
             && !self.inflight.pending_finishes.contains_key(&id)
-            && self.running.get(&id).is_some_and(|state| {
-                state.req.is_migratable() && !state.terminal_intent.is_terminal()
-            })
+            && self
+                .running
+                .get(&id)
+                .is_some_and(|state| !state.terminal_intent.is_terminal())
     }
 
     /// Reconciles failed work without resetting allocations owned by live consumers.
@@ -427,7 +423,6 @@ impl Scheduler {
                 state.output.decoder_boundaries.clear();
                 if migrates
                     && refusal.is_none()
-                    && state.req.is_migratable()
                     && !state.terminal_intent.is_terminal()
                     && !self.inflight.pending_finishes.contains_key(&id)
                 {

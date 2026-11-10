@@ -481,13 +481,7 @@ impl Scheduler {
                 if prefill {
                     prefill_budget = prefill_budget.saturating_sub(cost);
                 }
-                if call.readout.is_some() {
-                    let rows = self.running.get(&id).and_then(|state| {
-                        let start = self.scheduled_readout_rows(id)?;
-                        state.readout_rows_covering(start, call.input_token_ids.len())
-                    });
-                    rows_left.canvas = rows_left.canvas.saturating_sub(rows.unwrap_or(0));
-                } else if call.canvas.is_some() {
+                if call.canvas.is_some() {
                     rows_left.canvas = rows_left.canvas.saturating_sub(1);
                 } else if prefill {
                     rows_left.context = rows_left
@@ -1073,7 +1067,7 @@ impl Scheduler {
                 )
             }
             Phase::FeedbackState => CallKind::Forward(ForwardMode::Prefill),
-            Phase::Readout | Phase::Canvas => CallKind::Forward(ForwardMode::TokenDenoising),
+            Phase::Canvas => CallKind::Forward(ForwardMode::TokenDenoising),
             Phase::CommitCanvas => CallKind::Forward(ForwardMode::Prefill),
         })
     }

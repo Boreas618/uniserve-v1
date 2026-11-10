@@ -59,8 +59,6 @@ pub(crate) struct CallCompletion {
     pub token_logprobs: Vec<Vec<TokenLogprob>>,
     /// Ranked candidates for each scored prompt position, in input order.
     pub prompt_logprobs: Vec<Vec<TokenLogprob>>,
-    /// A token-denoising readout's candidate probabilities.
-    pub candidate_logprobs: Vec<f32>,
     /// The drafter's proposals after the last committed token.
     pub draft_token_ids: Vec<u32>,
     /// A video latent preparation's per-rank page layout.
@@ -94,7 +92,6 @@ impl CallCompletion {
             committed_tokens: output.committed_tokens,
             token_logprobs: output.token_logprobs,
             prompt_logprobs: output.prompt_logprobs,
-            candidate_logprobs: output.candidate_logprobs,
             draft_token_ids: output.draft_token_ids,
             latent_layouts: output.latent_layouts,
             media: result.media,
@@ -150,7 +147,6 @@ impl CallCompletion {
             committed_tokens: output.tokens,
             token_logprobs,
             prompt_logprobs: output.prompt_logprobs,
-            candidate_logprobs: output.candidate_logprobs,
             draft_token_ids: output.draft_token_ids,
             latent_layouts: output.latent_layouts,
             media: match output.media_output.as_ref() {

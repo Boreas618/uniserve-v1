@@ -93,7 +93,6 @@ fn a_reported_stall_names_the_forward_and_the_requests_it_held() {
                 priority: 0,
                 cache: Default::default(),
                 image_generation: Default::default(),
-                readout: Vec::new(),
                 generated_token_ids: Vec::new(),
                 adapter: 0,
                 generated_images: Vec::new(),

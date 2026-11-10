@@ -1222,9 +1222,6 @@ pub struct SimEngine {
     /// every configured control token, and never shrinks.
     vocab: usize,
     results_on_wait: bool,
-    /// Readout candidate whose log-probability is reported as NaN, as a
-    /// worker with a numerical defect reports it.
-    non_finite_candidate: Option<u32>,
     /// Block-diffusion sampling the simulated worker runs under.
     canvas_sampling: Option<ipc::CanvasSampling>,
     /// How the simulated worker speculates, when it runs a drafter.
@@ -1424,7 +1421,6 @@ impl SimEngine {
             fake_eos: FAKE_EOS_TOKEN,
             vocab: SYNTH_VOCAB_SIZE,
             results_on_wait: false,
-            non_finite_candidate: None,
             canvas_sampling: None,
             speculation: None,
             media_overstatement: 0,
@@ -1582,7 +1578,6 @@ impl SimEngine {
         vocab: usize,
         text_len: usize,
         fake_eos: u32,
-        non_finite_candidate: Option<u32>,
         canvas_sampling: Option<ipc::CanvasSampling>,
         speculation: Option<SimSpeculation>,
         media_overstatement: u64,
@@ -1623,7 +1618,6 @@ impl SimEngine {
             cache_computed_len: 0,
             step_index: 0,
             committed_tokens: Vec::new(),
-            candidate_logprobs: Vec::new(),
             finish_flags: FinishFlags::default(),
             media_output: None,
             cache_output: None,
@@ -1684,8 +1678,8 @@ impl SimEngine {
                     }
                 }
                 if !visual_state && !samples_token {
-                    // A readout's prompt chunk samples nothing and advances
-                    // positions with its tokens; the `CloseCache` write, which
+                    // A prompt chunk that samples nothing advances positions
+                    // with its tokens; the `CloseCache` write, which
                     // declares a completion, only extends the prefix cache.
                     request.cache_visible_len = request
                         .cache_visible_len
@@ -1867,9 +1861,8 @@ impl SimEngine {
                 }
             }
             CallKind::Forward(ForwardMode::TokenDenoising) => {
-                // A canvas pass reads the prefix cache without writing it and reports one
-                // deterministic log-probability per readout candidate, or runs
-                // one step of the request's generation canvas.
+                // A canvas pass reads the prefix cache without writing it and
+                // runs one step of the request's generation canvas.
                 if let Some(step) = call.canvas {
                     // A step queued behind the one that stopped its block is
                     // predicated on that step's false completion and never
@@ -1915,19 +1908,6 @@ impl SimEngine {
                             request.predicate_values.insert(completion.clone(), false);
                         }
                     }
-                }
-                if let Some(readout) = &call.readout {
-                    record.candidate_logprobs = readout
-                        .candidate_ids
-                        .iter()
-                        .map(|&token| {
-                            if non_finite_candidate == Some(token) {
-                                f32::NAN
-                            } else {
-                                sim_candidate_logprob(call.request_key.request_id, token)
-                            }
-                        })
-                        .collect();
                 }
             }
             CallKind::Media(MediaCall::MediaReading)
@@ -2047,7 +2027,6 @@ impl SimEngine {
             cache_computed_len: request.cache_visible_len,
             step_index: u32::from(request.step_index),
             committed_tokens: Vec::new(),
-            candidate_logprobs: Vec::new(),
             finish_flags: FinishFlags::default(),
             media_output: None,
             cache_output: None,
@@ -2269,12 +2248,6 @@ impl SimEngine {
         self.canvas_sampling = Some(sampling);
     }
 
-    /// Reports NaN as the log-probability of readout candidate `token`,
-    /// wherever a readout reads it.
-    pub fn set_non_finite_candidate(&mut self, token: u32) {
-        self.non_finite_candidate = Some(token);
-    }
-
     /// Holds every batch that skips a predicated call until the returned
     /// sender releases it, as a worker whose skipped step is still running
     /// holds its batch's result: each message releases one held batch, and
@@ -2493,8 +2466,8 @@ pub fn sim_canvas_stop_step(request_id: RequestId, block: u32, max_steps: u32) -
 }
 
 /// Sets every logical cache frontier to the visible token position.
-/// Deterministic natural-log probability the simulator reports for readout
-/// candidate `token` of request `request_id`: a value in `[-7, -1]`.
+/// Deterministic natural-log probability the simulator reports for token
+/// `token` of request `request_id`: a value in `[-7, -1]`.
 pub fn sim_candidate_logprob(request_id: RequestId, token: u32) -> f32 {
     -1.0 - ((request_id.0.wrapping_add(u64::from(token))) % 7) as f32
 }
@@ -2662,7 +2635,6 @@ impl SimEngine {
         let vocab = self.vocab;
         let text_len = self.text_len;
         let fake_eos = self.fake_eos;
-        let non_finite_candidate = self.non_finite_candidate;
         let canvas_sampling = self.canvas_sampling;
         let speculation = self.speculation;
         let worker_exec_us = speculation
@@ -2728,7 +2700,6 @@ impl SimEngine {
                 vocab,
                 text_len,
                 fake_eos,
-                non_finite_candidate,
                 canvas_sampling,
                 speculation,
                 self.media_overstatement,
@@ -2892,7 +2863,6 @@ mod tests {
             cache_input: None,
             cache_output: None,
             input_token_ids: Vec::new(),
-            readout: None,
             canvas: None,
             sampling_state: None,
             request_key,

@@ -114,8 +114,7 @@ pub use proto::request::{
     GenerationFeatures, GenerationLimits, GenerationRequest, GenerationRequestError,
     GenerationResourceError, ImageEncoder, ImageEncoderInput, ImageGenerationConfig, ImageInput,
     ImagePixels, ImageTrigger, MediaKind, ModelDtype, ModelDtypeParseError, MultimodalInputs,
-    PixelRange, PositionLogprobs, ReadoutRow, ReadoutSlot, RejectionKind, Request, StopReason,
-    Trajectory,
+    PixelRange, PositionLogprobs, RejectionKind, Request, StopReason, Trajectory,
 };
 
 /// Lock `mutex`, keeping the state a panicking holder left.

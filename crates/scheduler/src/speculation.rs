@@ -71,7 +71,6 @@ impl MeasuredStep {
             call.kind == CallKind::Forward(ForwardMode::Prefill)
                 && call.vision_inputs.is_empty()
                 && call.latent_feature_input.is_none()
-                && call.readout.is_none()
         });
         let tokens: u64 = calls.map(|call| call.input_token_ids.len() as u64).sum();
         (prompt && tokens > 0).then_some(Self::Prompt { tokens })

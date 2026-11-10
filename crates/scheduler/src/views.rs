@@ -87,10 +87,10 @@ use crate::policy::TrialState;
 /// Every phase kind the interface distinguishes, in the order the ids number
 /// them.
 ///
-/// A phase id is the position of its kind here, so it means the same thing in
-/// every epoch: `PhaseKind` appends a kind and never renumbers one, and
-/// [`phase_id`] is exhaustive so a new kind cannot be forgotten.
-const PHASES: [PhaseKind; 21] = [
+/// A phase id is the kind's own (`PhaseKind::id`), so it means the same thing
+/// in every epoch: `PhaseKind` appends a kind and never renumbers one, and an
+/// id a removed kind numbered names no phase.
+const PHASES: [PhaseKind; 20] = [
     PhaseKind::TextEncoding,
     PhaseKind::VisionEncoding,
     PhaseKind::LatentEncoding,
@@ -98,7 +98,6 @@ const PHASES: [PhaseKind; 21] = [
     PhaseKind::Decode,
     PhaseKind::Verify,
     PhaseKind::TokenDenoise,
-    PhaseKind::Readout,
     PhaseKind::ImageDecode,
     PhaseKind::CacheInstall,
     PhaseKind::MediaRead,
@@ -126,15 +125,14 @@ pub const fn phase_id(kind: PhaseKind) -> PhaseId {
 /// The phase kind an id names; `None` for an id this epoch has no phase for,
 /// which no `Plan` may name.
 pub(crate) fn phase_kind(id: PhaseId) -> Option<PhaseKind> {
-    PHASES.get(usize::try_from(id.0).ok()?).copied()
+    PHASES.iter().copied().find(|kind| phase_id(*kind) == id)
 }
 
 /// The phase a call of `kind` runs.
 ///
 /// The call kinds are the phases' vocabulary: every `CallKind` is one phase,
 /// except that a refill chunk is planned as a prefill call and named by its
-/// request's draft state instead ([`next_phase`]), and that a readout is a
-/// token-denoising call of a readout request.
+/// request's draft state instead ([`next_phase`]).
 pub(crate) fn call_phase(kind: CallKind) -> PhaseKind {
     match kind {
         CallKind::Forward(ForwardMode::Prefill) => PhaseKind::Prefill,
@@ -176,9 +174,7 @@ pub(crate) fn phase_call(kind: PhaseKind) -> Option<CallKind> {
         PhaseKind::Prefill | PhaseKind::Refill => CallKind::Forward(ForwardMode::Prefill),
         PhaseKind::Decode => CallKind::Forward(ForwardMode::Decode),
         PhaseKind::Verify => CallKind::Forward(ForwardMode::Verify),
-        PhaseKind::TokenDenoise | PhaseKind::Readout => {
-            CallKind::Forward(ForwardMode::TokenDenoising)
-        }
+        PhaseKind::TokenDenoise => CallKind::Forward(ForwardMode::TokenDenoising),
         PhaseKind::ImageDecode => CallKind::Media(MediaCall::ImageDecoding),
         PhaseKind::CacheInstall => CallKind::Transfer(TransferMode::CacheInstall),
         PhaseKind::MediaRead => CallKind::Media(MediaCall::MediaReading),
@@ -525,14 +521,10 @@ pub(crate) fn shortage_now(scheduler: &Scheduler) -> Option<Shortage> {
 
 /// The phase of a request's next call, when it has one ready.
 ///
-/// A refill chunk is a prefill call named by the request's draft state, and a
-/// readout request's token-denoising call is the readout phase.
+/// A refill chunk is a prefill call named by the request's draft state.
 fn next_phase(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> Option<PhaseId> {
     let kind = scheduler.peek_next_call_variant(id)?;
     let phase = match kind {
-        CallKind::Forward(ForwardMode::TokenDenoising) if state.req.is_readout() => {
-            PhaseKind::Readout
-        }
         // A refill chunk is the policy's decision alone (`Plan::refill`), and
         // the mechanism builds its call: the request's phase is the serving
         // phase it needs next, and its draft gap appears in `refill_tokens`.
@@ -615,16 +607,13 @@ fn next_tokens(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> u3
             let drafts = scheduler.verify_drafts(id, state.cache_visible_len).len();
             u32::try_from(1 + drafts).unwrap_or(u32::MAX)
         }
-        Some(CallKind::Forward(ForwardMode::TokenDenoising)) if state.req.is_readout() => {
-            u32::try_from(state.req.readout.len()).unwrap_or(u32::MAX)
-        }
         // A canvas step spends a whole canvas of a step's token budget, the
         // same bound the deployment was checked against: it denoises text
         // tokens on the worker's canvas, not an image of the request's
         // latent raster, so it is charged neither the image's latent units nor
         // its guidance branches.
         Some(CallKind::Forward(ForwardMode::TokenDenoising))
-            if scheduler.config.canvas.is_some() && !state.req.is_readout() =>
+            if scheduler.config.canvas.is_some() =>
         {
             scheduler
                 .config
@@ -712,9 +701,7 @@ fn waiting_transfer(scheduler: &Scheduler, id: RequestId) -> bool {
 
 /// The class of a request, as scheduling distinguishes it.
 fn request_class(req: &GenerationRequest) -> RequestClass {
-    if req.is_readout() {
-        RequestClass::Readout
-    } else if req.decodes_text() {
+    if req.decodes_text() {
         RequestClass::Token
     } else {
         RequestClass::Media
@@ -765,7 +752,7 @@ pub(crate) fn request(
         // A request already leaving cannot be given up again
         // (`Scheduler::migrate_running` skips it), so a policy does not
         // name it.
-        migratable: state.req.is_migratable() && !state.terminal_intent.is_terminal(),
+        migratable: !state.terminal_intent.is_terminal(),
         cache_rank: recorded.cache_rank,
     }
 }
@@ -1485,12 +1472,20 @@ mod tests {
 
     #[test]
     fn a_phase_id_numbers_its_kind() {
-        for (index, kind) in PHASES.iter().copied().enumerate() {
-            assert_eq!(phase_id(kind), PhaseId(index as u32));
+        for kind in PHASES {
             assert_eq!(phase_kind(phase_id(kind)), Some(kind));
         }
+        // Ids ascend in table order and are never shared.
+        assert!(
+            PHASES
+                .windows(2)
+                .all(|pair| phase_id(pair[0]).0 < phase_id(pair[1]).0)
+        );
         assert_eq!(phase_id(PhaseKind::Other).0, u32::MAX);
-        assert_eq!(phase_kind(PhaseId(PHASES.len() as u32)), None);
+        // A reserved id and an id past the last kind name no phase.
+        assert_eq!(phase_kind(PhaseId(7)), None);
+        let last = phase_id(PHASES[PHASES.len() - 1]).0;
+        assert_eq!(phase_kind(PhaseId(last + 1)), None);
     }
 
     #[test]

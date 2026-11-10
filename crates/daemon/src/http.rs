@@ -449,8 +449,8 @@ async fn serve_on(
 /// which take no API key and are not counted in HTTP metrics, and `/version`,
 /// which takes the key but is not counted. `GET /v1/models` and the routes of
 /// each served task (`Leader::supported_tasks`) take the key and are counted.
-/// The generation routes (chat completions, image generation, synchronous
-/// video, and the System One readout) share the in-flight limit. A path no
+/// The generation routes (chat completions, image generation and synchronous
+/// video) share the in-flight limit. A path no
 /// route serves answers FastAPI's `404 {"detail": "Not Found"}`.
 ///
 /// Layers apply from the outside in: request ID (which also sets the

@@ -172,9 +172,6 @@ pub struct CallOutput {
     pub token_logprobs: Vec<Vec<TokenLogprob>>,
     /// Ranked candidates for each scored prompt position, in input order.
     pub prompt_logprobs: Vec<Vec<TokenLogprob>>,
-    /// Natural-log probability of every candidate of a token-denoising
-    /// readout, in the call's `Readout::candidate_ids` order.
-    pub candidate_logprobs: Vec<f32>,
     /// Device-observed terminal conditions.
     pub finish_flags: FinishFlags,
     /// Completed artifact and its external storage lifetime, when produced.
@@ -211,8 +208,7 @@ impl CallOutput {
     ///
     /// Rules that relate a completion to the kind of the call it answers
     /// belong to the engine, which holds the call: a cache export answers a
-    /// successful cache-export call, and candidate log-probabilities a
-    /// successful token-denoising call.
+    /// successful cache-export call.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             self.call_id.batch_id > 0,
@@ -245,10 +241,6 @@ impl CallOutput {
         ensure_valid!(
             self.error_message.is_none() || self.error_code == Some(ErrorCode::InputError),
             "only an input-error completion states why the rank refused its request"
-        );
-        ensure_valid!(
-            self.candidate_logprobs.is_empty() || self.status == CallStatus::Ok,
-            "candidate log-probabilities belong to a successful completion"
         );
         ensure_valid!(
             self.latent_layouts.is_empty() || self.status == CallStatus::Ok,

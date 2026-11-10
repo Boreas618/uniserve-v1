@@ -184,7 +184,6 @@ fn request(
         priority: 0,
         cache: Default::default(),
         image_generation: policy(feedback),
-        readout: Vec::new(),
         generated_token_ids: Vec::new(),
         adapter: 0,
         generated_images: Vec::new(),

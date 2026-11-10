@@ -228,7 +228,7 @@ impl Scheduler {
         let mut prefixes = Vec::new();
         let mut live = HashMap::new();
         for (&id, state) in &self.running {
-            if !state.req.is_migratable() || state.terminal_intent.is_terminal() {
+            if state.terminal_intent.is_terminal() {
                 continue;
             }
             // A request that publishes no page computes its state again whatever a wait does.
@@ -280,7 +280,7 @@ impl Scheduler {
         };
         let mut prefixes = Vec::new();
         for (&id, state) in &self.running {
-            if !state.req.is_migratable() || state.terminal_intent.is_terminal() {
+            if state.terminal_intent.is_terminal() {
                 continue;
             }
             let Some(allocation) = state.allocations.as_ref() else {

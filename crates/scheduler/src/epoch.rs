@@ -7,8 +7,8 @@
 //!   the scheduler ends every request that resumes from its generated tokens
 //!   as migratable, ends every video request as migratable at its next
 //!   denoising step boundary once its trajectory is stored (`preemption`),
-//!   lets its readouts finish, and once nothing runs, offloads
-//!   the pages it reserved for the host KV cache and executes nothing more.
+//!   and once nothing runs, offloads the pages it reserved for the host KV
+//!   cache and executes nothing more.
 //!   It answers with its cache index: every published page's public and
 //!   private continuation aliases with their units, which the successor
 //!   reads from the planes it maps read-only without duplicating the bytes.
@@ -126,7 +126,7 @@ impl Scheduler {
         let migrating: Vec<(u32, bool)> = self
             .running
             .values()
-            .filter(|state| state.req.is_migratable() && !state.terminal_intent.is_terminal())
+            .filter(|state| !state.terminal_intent.is_terminal())
             .map(|state| {
                 let units = state.allocations.as_ref().map_or(0, |allocations| {
                     allocations
@@ -167,7 +167,7 @@ impl Scheduler {
         for state in self
             .running
             .values()
-            .filter(|state| state.req.is_migratable() && !state.terminal_intent.is_terminal())
+            .filter(|state| !state.terminal_intent.is_terminal())
         {
             units += state.allocations.as_ref().map_or(0, |allocations| {
                 allocations

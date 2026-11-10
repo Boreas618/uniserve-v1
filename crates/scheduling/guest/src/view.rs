@@ -65,8 +65,6 @@ pub enum RequestClass {
     Token,
     /// Media work: encoding, denoising, decoding, muxing.
     Media,
-    /// A readout of a canvas-generating request.
-    Readout,
     /// A class this policy does not know.
     #[serde(other)]
     Unknown,
@@ -188,7 +186,6 @@ pub enum PhaseKind {
     Decode,
     Verify,
     TokenDenoise,
-    Readout,
     ImageDecode,
     CacheInstall,
     // Media work.
@@ -238,7 +235,6 @@ impl PhaseKind {
             PhaseKind::Decode
             | PhaseKind::Verify
             | PhaseKind::TokenDenoise
-            | PhaseKind::Readout
             | PhaseKind::ImageDecode
             | PhaseKind::CacheInstall => PhaseClass::Token,
             PhaseKind::MediaRead
@@ -255,9 +251,12 @@ impl PhaseKind {
         }
     }
 
-    /// The id this kind is numbered with: the declaration order of [`PhaseKind`], which is what
-    /// "appended, never renumbered" protects. A rank's plan, a policy's `Plan` and a batch's phase
-    /// are all numbered here, so this is the one table they can agree on.
+    /// The id this kind is numbered with, which "appended, never renumbered" protects: a new kind
+    /// takes the next unused id, and the id of a removed kind is never given to another. A rank's
+    /// plan, a policy's `Plan` and a batch's phase are all numbered here, so this is the one table
+    /// they can agree on.
+    ///
+    /// Id 7 is reserved: it numbered a kind that no longer exists.
     ///
     /// [`PhaseKind::Other`] is a policy-side placeholder for a kind a policy does not know: it has
     /// no phase of its own, so its id is `u32::MAX`.
@@ -270,7 +269,6 @@ impl PhaseKind {
             Self::Decode => 4,
             Self::Verify => 5,
             Self::TokenDenoise => 6,
-            Self::Readout => 7,
             Self::ImageDecode => 8,
             Self::CacheInstall => 9,
             Self::MediaRead => 10,

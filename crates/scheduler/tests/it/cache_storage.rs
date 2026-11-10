@@ -382,7 +382,6 @@ fn request_of(id: u64, prompt: usize, tokens: usize) -> GenerationRequest {
         priority: 0,
         cache: Default::default(),
         image_generation: ImageGenerationConfig::default(),
-        readout: Vec::new(),
         generated_token_ids: Vec::new(),
         adapter: 0,
         generated_images: Vec::new(),

@@ -28,7 +28,6 @@ pub use generation::{
     GenerationConstraint, GenerationConstraintParseError, GenerationFeatures, GenerationLimits,
     GenerationRequest, GenerationRequestError, GenerationResourceError, ImageEncoderInput,
     ImageGenerationConfig, ImageInput, ImagePixels, ImageTrigger, MultimodalInputs, PixelRange,
-    ReadoutRow, ReadoutSlot,
 };
 pub use image::{CfgRenorm, CfgRenormParseError, ImageParams, ImageParamsError};
 pub use sampling::{SamplingParams, SamplingParamsError};

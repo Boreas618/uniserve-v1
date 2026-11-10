@@ -9,8 +9,8 @@ use proto::request::{
     FeedbackSource, FinishReason, GeneratedImage, GenerationConstraint, GenerationFeatures,
     GenerationLimits, GenerationRequest, ImageEncoder, ImageEncoderInput, ImageGenerationConfig,
     ImageInput, ImageParams, ImagePixels, ImageTrigger, MediaKind, MigrationCause,
-    MultimodalInputs, PixelRange, PositionLogprobs, ReadoutRow, ReadoutSlot, RejectionKind,
-    Request, RequestId, SamplingParams, StopReason, TokenLogprob, Trajectory, wire,
+    MultimodalInputs, PixelRange, PositionLogprobs, RejectionKind, Request, RequestId,
+    SamplingParams, StopReason, TokenLogprob, Trajectory, wire,
 };
 
 /// A generation request with every field away from its default.
@@ -111,13 +111,6 @@ fn generation() -> GenerationRequest {
             feedback_next_token: FeedbackNextToken::Token { token_id: 13 },
             sample_feedback_continuation: true,
         },
-        readout: vec![ReadoutRow {
-            token_ids: vec![20, 21],
-            slots: vec![ReadoutSlot {
-                position: 1,
-                candidates: vec![30, 31],
-            }],
-        }],
         generated_token_ids: vec![40, 41, 42],
         adapter: 0,
         generated_images: vec![
@@ -269,9 +262,6 @@ fn events_come_back_from_their_messages_unchanged() {
             positions: vec![PositionLogprobs {
                 entries: vec![candidate],
             }],
-        },
-        Event::Readout {
-            candidate_logprobs: vec![-1.0, -2.0],
         },
         Event::ImageBegin {
             image_id: 1,

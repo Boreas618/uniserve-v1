@@ -41,8 +41,6 @@
 //!
 //! A migration caused by a drain is not counted. A request survives
 //! `max_migrations` migrations caused by losses and fails on the next one.
-//! A request that does not resume (a readout) fails when its engine ends it
-//! as migratable.
 //!
 //! The random stream of a migrated request continues as it began: the
 //! migrator gives a token request that names no seed one of its own when it
@@ -111,7 +109,7 @@ impl Migrator {
         mut request: Request,
     ) -> Result<(RequestEvents, Option<u32>), SubmitError> {
         let resumable = match &mut request {
-            Request::Generation(generation) if generation.is_migratable() => {
+            Request::Generation(generation) => {
                 if generation.sampling.seed.is_none() {
                     generation.sampling.seed = Some(uuid::Uuid::new_v4().as_u64_pair().0);
                 }
@@ -126,7 +124,6 @@ impl Migrator {
                 }
                 Some(Resumable::Diffusion(diffusion.clone()))
             }
-            Request::Generation(_) => None,
         };
         let (stream, scheduler) = self.hold.submit(request).await?;
         let events = RequestEvents {
@@ -763,7 +760,6 @@ mod tests {
             priority: 0,
             cache: Default::default(),
             image_generation: ImageGenerationConfig::default(),
-            readout: Vec::new(),
             generated_token_ids: Vec::new(),
             adapter: 0,
             generated_images: Vec::new(),

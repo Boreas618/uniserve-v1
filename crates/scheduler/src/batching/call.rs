@@ -176,27 +176,9 @@ impl Scheduler {
             None
         };
 
-        // A canvas pass covers the readout rows after those already scheduled;
-        // each row's canvas becomes one read-only forward row below.
-        let canvas_lengths = if call.readout.is_some() {
-            let rows = self.scheduled_readout_rows(request_id).and_then(|start| {
-                let state = self.running.get(&request_id)?;
-                let count = state.readout_rows_covering(start, call.input_token_ids.len())?;
-                Some(
-                    state.req.readout[start..start + count]
-                        .iter()
-                        .map(|row| row.token_ids.len() as u32)
-                        .collect::<Vec<_>>(),
-                )
-            });
-            let Some(rows) = rows else {
-                self.invariant_broken("a canvas pass covers whole scheduled readout rows");
-                return None;
-            };
-            rows
-        } else if call.canvas.is_some() {
-            // A generation step denoises the request's resident canvas of
-            // `max_tokens` tokens.
+        // A generation step denoises the request's resident canvas of
+        // `max_tokens` tokens, one read-only forward row below.
+        let canvas_lengths = if call.canvas.is_some() {
             vec![call.bounds.max_tokens]
         } else {
             Vec::new()

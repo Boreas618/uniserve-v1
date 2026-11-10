@@ -491,12 +491,12 @@ impl DecodeStream {
                     message: "a migration's event reached the decoder".to_string(),
                 });
             }
-            // Media artifacts belong to diffusion requests, and readout
-            // answers to readout requests, which other consumers collect.
-            Event::Artifact(_) | Event::MediaProgress { .. } | Event::Readout { .. } => {
+            // Media artifacts belong to diffusion requests, which other
+            // consumers collect.
+            Event::Artifact(_) | Event::MediaProgress { .. } => {
                 return Err(Error::MalformedOutput {
                     request_id: self.request_id.clone(),
-                    message: "a generation request received a media or readout event".to_string(),
+                    message: "a generation request received a media event".to_string(),
                 });
             }
         }

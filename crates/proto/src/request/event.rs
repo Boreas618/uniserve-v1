@@ -87,13 +87,6 @@ pub enum Event {
         /// Scored prompt positions in prompt order.
         positions: Vec<PositionLogprobs>,
     },
-    /// Publishes a readout request's answer, once, before its `Finished`.
-    Readout {
-        /// Natural-log probability of every candidate of every slot, in
-        /// row, slot, and candidate order
-        /// (`GenerationRequest::readout_candidates` values).
-        candidate_logprobs: Vec<f32>,
-    },
     /// Opens the lifecycle of one generated image.
     ///
     /// The engine emits it together with the image's first committed
@@ -510,7 +503,7 @@ pub enum DiffusionRequestError {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
     /// Token generation: autoregressive text, interleaved text and images, or
-    /// block-diffusion canvases and readouts. Boxed, as it is several times
+    /// block-diffusion canvases. Boxed, as it is several times
     /// the size of a diffusion request.
     Generation(Box<super::GenerationRequest>),
     /// Video diffusion.

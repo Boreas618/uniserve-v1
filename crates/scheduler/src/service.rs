@@ -1774,26 +1774,17 @@ fn wire_cache(group: crate::GroupCache) -> wire::CacheSegments {
     }
 }
 
-/// Answers the requests a parked engine is submitted: a token request that
-/// resumes from its generated tokens, and a video request, leave at once as
-/// migratable, as the ones it held did, and any other is refused.
+/// Answers the requests a parked engine is submitted: a token request and a
+/// video request leave at once as migratable, as the ones it held did, and a
+/// submission that does not decode is refused.
 fn refuse_unready(submit: wire::Submit, front: usize, routing: &Routing) {
     for message in submit.requests {
         let id = RequestId(message.id);
         let event = match Request::from_wire(message) {
-            Ok(Request::Generation(request)) if request.is_migratable() => Event::Migratable {
+            Ok(Request::Generation(_) | Request::Diffusion(_)) => Event::Migratable {
                 cause: MigrationCause::Drain,
                 denoised_steps: 0,
                 stored_layout: Vec::new(),
-            },
-            // A video request leaves naming the trajectory it named.
-            Ok(Request::Diffusion(_)) => Event::Migratable {
-                cause: MigrationCause::Drain,
-                denoised_steps: 0,
-                stored_layout: Vec::new(),
-            },
-            Ok(_) => Event::Error {
-                message: "the engine is not ready to admit requests".to_owned(),
             },
             Err(error) => {
                 refuse(front, routing, id, error.to_string());
@@ -2173,7 +2164,6 @@ mod tests {
             priority: 3,
             cache: Default::default(),
             image_generation: Default::default(),
-            readout: Vec::new(),
             generated_token_ids: Vec::new(),
             generated_images: Vec::new(),
             trajectory: Default::default(),

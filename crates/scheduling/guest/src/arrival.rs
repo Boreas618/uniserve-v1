@@ -155,24 +155,9 @@ impl<K: Order> Arrival<K> {
         })
     }
 
-    /// Whether a resident request is a readout that can advance this step:
-    /// today a ready readout takes the step before prefill does.
-    fn has_readout(&self) -> bool {
-        self.views.values().any(|view| {
-            view.state == RequestState::Resident
-                && view.class == RequestClass::Readout
-                && self
-                    .next_kind(view)
-                    .is_some_and(|kind| class_of(kind) == PhaseClass::Token)
-        })
-    }
-
     /// The pass of this step: prefill (context work only) or token progress
     /// (everything but context work), as today's `select_batch_kind` decides.
     fn pass(&self, room: &Room) -> Pass {
-        if self.has_readout() {
-            return Pass::Token;
-        }
         // A refill is a prefill-class chunk: a step whose only prefill work is
         // a refill's is a prefill step, as today's `select_batch_kind` has it.
         let prefill_ready = self.has_work_of_class(PhaseClass::Context)

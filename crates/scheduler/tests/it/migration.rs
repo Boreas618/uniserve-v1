@@ -38,7 +38,6 @@ fn request(
         priority: 0,
         cache: Default::default(),
         image_generation: ImageGenerationConfig::default(),
-        readout: Vec::new(),
         generated_token_ids: generated,
         adapter: 0,
         generated_images: Vec::new(),

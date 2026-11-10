@@ -180,11 +180,11 @@ pub(crate) fn groups(
     let supports = |kind| info.supported_calls.contains(&kind);
     // Keeps the requests clients could submit, naming what it leaves out.
     let servable = |what: &str, requests: Vec<GenerationRequest>| {
-        // A deployment with block sampling generates every request but a
-        // readout in canvases, so admission checks its canvas features.
+        // A deployment with block sampling generates every request in
+        // canvases, so admission checks its canvas features.
         let canvases = facts.canvas_sampling.is_some();
         let (kept, refused): (Vec<_>, Vec<_>) = requests.into_iter().partition(|request| {
-            let needs = if canvases && !request.is_readout() {
+            let needs = if canvases {
                 request.canvas_features()
             } else {
                 request.required_features()
@@ -375,7 +375,6 @@ fn warmup_request(
             feedback_next_token: FeedbackNextToken::None,
             sample_feedback_continuation: false,
         },
-        readout: Vec::new(),
         generated_token_ids: Vec::new(),
         adapter: 0,
         generated_images: Vec::new(),

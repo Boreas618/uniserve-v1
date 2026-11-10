@@ -439,9 +439,8 @@ impl Scheduler {
                             .is_some_and(|state| state.image_encoder_index == 0);
 
                         // Writing the last image of a fully consumed prompt
-                        // starts a readout's canvases, a canvas-generating
-                        // request's first block, or understanding decode from
-                        // BOS.
+                        // starts a canvas-generating request's first block, or
+                        // understanding decode from BOS.
                         if is_final_step
                             && self.running.get(&id).is_some_and(|st| {
                                 st.num_ingested_images >= st.req.multimodal_inputs.images.len()
@@ -452,9 +451,7 @@ impl Scheduler {
                             let bos = self.special_tokens.bos;
                             let generates_canvases = self.config.canvas.is_some();
                             if let Some(st) = self.running.get_mut(&id) {
-                                if st.req.is_readout() {
-                                    st.phase = Phase::Readout;
-                                } else if generates_canvases {
+                                if generates_canvases {
                                     st.phase = Phase::Canvas;
                                 } else {
                                     st.next_token = bos;
@@ -592,19 +589,13 @@ impl Scheduler {
                     return;
                 }
 
-                // A readout's complete prompt samples nothing; its canvases
-                // follow. So does a canvas-generating request's, and each of
-                // its block commits, which extend the context the same way;
-                // the next block follows.
-                let generates_canvases = self.config.canvas.is_some();
-                if let Some(st) = self.running.get_mut(&id)
-                    && (st.req.is_readout() || generates_canvases)
+                // A canvas-generating request's complete prompt samples
+                // nothing, and nor does each of its block commits, which
+                // extend the context the same way; the next block follows.
+                if self.config.canvas.is_some()
+                    && let Some(st) = self.running.get_mut(&id)
                 {
-                    st.phase = if st.req.is_readout() {
-                        Phase::Readout
-                    } else {
-                        Phase::Canvas
-                    };
+                    st.phase = Phase::Canvas;
                     return;
                 }
 
@@ -726,33 +717,12 @@ impl Scheduler {
             // A canvas step that stopped its block left the block's tokens
             // for their commit; they are published first, in order, and the
             // request finishes on the first that ends it.
-            CallKind::Forward(ForwardMode::TokenDenoising) if call.canvas.is_some() => {
+            CallKind::Forward(ForwardMode::TokenDenoising) => {
                 let tokens = match self.running.get(&id) {
                     Some(st) if st.phase == Phase::CommitCanvas => st.canvas_commit.clone(),
                     _ => return,
                 };
                 self.emit_or_finish_block(id, &tokens);
-            }
-            CallKind::Forward(ForwardMode::TokenDenoising) => {
-                // `process_generation_result` accepted the pass's rows and
-                // their log-probabilities. Once every row has reported, the
-                // request answers with all of them, in report order.
-                let Some(st) = self.running.get_mut(&id) else {
-                    return;
-                };
-                if st.readout_rows < st.req.readout.len() {
-                    return;
-                }
-                let candidate_logprobs = std::mem::take(&mut st.readout_logprobs);
-                if candidate_logprobs.len() != st.req.readout_candidates() {
-                    tracing::error!(
-                        request_id = id.0,
-                        "a completed readout lacks candidate log-probabilities"
-                    );
-                    return self.finish(id, FinishReason::Error);
-                }
-                self.emit(id, Event::Readout { candidate_logprobs });
-                self.finish(id, FinishReason::Completed);
             }
             CallKind::Media(MediaCall::Denoising) => {
                 // Publish the newly committed step exactly once. A denoising

@@ -4,8 +4,8 @@
 //! [`MediaConnector`] resolves a reference into its bytes before model
 //! preprocessing runs, so network and file I/O stay on the async runtime and
 //! never enter the blocking preprocessing pool. Two connectors serve the
-//! server, each under its own option table: input images of chat, image
-//! generation and System One readouts (`image_fetch_config`), and video
+//! server, each under its own option table: input images of chat and image
+//! generation (`image_fetch_config`), and video
 //! condition media (`media_config`). [`MediaConnector::fetch_images`]
 //! additionally validates each image into an [`ImageInput`] (the encoded
 //! file bytes, their header dimensions and a content digest).

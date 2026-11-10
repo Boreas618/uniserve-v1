@@ -156,27 +156,6 @@ impl Scheduler {
         })
     }
 
-    /// Readout rows accepted or covered by submitted canvas passes.
-    ///
-    /// Canvas passes cover consecutive rows from the accepted cursor in
-    /// submission order, so each in-flight pass continues where the previous
-    /// one ends. Returns `None` for a request that is not running or whose
-    /// in-flight passes do not cover whole rows.
-    pub(crate) fn scheduled_readout_rows(&self, id: RequestId) -> Option<usize> {
-        let state = self.running.get(&id)?;
-        self.inflight
-            .pending_calls
-            .get(&id)
-            .into_iter()
-            .flatten()
-            .filter(|pending| pending.call.readout.is_some())
-            .try_fold(state.readout_rows, |rows, pending| {
-                let covered =
-                    state.readout_rows_covering(rows, pending.call.input_token_ids.len())?;
-                Some(rows + covered)
-            })
-    }
-
     /// Denoising steps covered once the submitted calls complete, without
     /// accepting them.
     pub(crate) fn num_scheduled_denoise_steps(&self, id: RequestId) -> Option<u32> {
@@ -260,7 +239,7 @@ impl Scheduler {
                 // Steps queued behind the accepted one that stopped the block
                 // are no-ops; the block's commit follows them. A step queued
                 // behind the commit itself starts the next block.
-                CallKind::Forward(ForwardMode::TokenDenoising) if call.canvas.is_some() => {
+                CallKind::Forward(ForwardMode::TokenDenoising) => {
                     let behind_commit = self.inflight.pending_calls.get(&id).is_some_and(|calls| {
                         calls
                             .iter()
@@ -272,7 +251,6 @@ impl Scheduler {
                         Phase::Canvas
                     }
                 }
-                CallKind::Forward(ForwardMode::TokenDenoising) => Phase::Readout,
                 CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
                     if is_feedback_call(call) {
                         if self.scheduled_feedback(id)?.0 == 0 {
@@ -308,19 +286,17 @@ impl Scheduler {
             None => state.phase,
         };
         Some(match phase {
-            // A complete prompt conditions a readout's canvases or a
-            // canvas-generating request's blocks; any other request decodes
-            // from it. A block commit also projects here, since it extends
-            // the context the same way, and the next block follows it.
+            // A complete prompt conditions a canvas-generating request's
+            // blocks; any other request decodes from it. A block commit also
+            // projects here, since it extends the context the same way, and
+            // the next block follows it.
             Phase::Prefill
                 if self.num_scheduled_prompt_tokens(id)?
                     >= state.req.prompt_token_ids.len() as u32
                     && self.num_scheduled_images(id)?
                         >= state.req.multimodal_inputs.images.len() =>
             {
-                if state.req.is_readout() {
-                    Phase::Readout
-                } else if self.config.canvas.is_some() {
+                if self.config.canvas.is_some() {
                     Phase::Canvas
                 } else if self.decodes_elsewhere(id) {
                     Phase::HandOff
@@ -537,8 +513,8 @@ impl Scheduler {
     ///
     /// Two successors follow unconditionally:
     /// - The canvas pass that follows the prefill completing a context (a
-    ///   readout's pass or a block's first step), since the prefill cannot
-    ///   stop the request. The pass reads the prefix cache the prefill writes, and only
+    ///   block's first step), since the prefill cannot stop the request.
+    ///   The pass reads the prefix cache the prefill writes, and only
     ///   the worker's device order puts the write first: the worker runs the
     ///   forwards over the prefix cache in submission order on the device's
     ///   primary stream, and work on another stream orders behind their
@@ -627,7 +603,7 @@ impl Scheduler {
             Phase::LatentPreparation => CallKind::Media(MediaCall::LatentPreparation),
             Phase::Denoising => CallKind::Media(MediaCall::Denoising),
             Phase::ImageDecoding => CallKind::Media(MediaCall::ImageDecoding),
-            Phase::Readout | Phase::Canvas => CallKind::Forward(ForwardMode::TokenDenoising),
+            Phase::Canvas => CallKind::Forward(ForwardMode::TokenDenoising),
             Phase::CommitCanvas => CallKind::Forward(ForwardMode::Prefill),
             Phase::FeedbackEncode => {
                 let feedback = &state.req.image_generation;

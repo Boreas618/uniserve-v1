@@ -213,67 +213,6 @@ pub struct CanvasStep {
     pub step: u32,
 }
 
-/// Candidate log-probabilities a token-denoising call reads at canvas slots.
-///
-/// The call's `input_token_ids` hold its canvas rows back to back. Slot `i`
-/// is canvas token `slot_tokens[i]` of that sequence and reads the candidate
-/// token ids `candidate_ids[candidate_offsets[i]..candidate_offsets[i + 1]]`.
-/// The worker reports, in `candidate_ids` order, each candidate's natural-log
-/// probability under the log-softmax over the full vocabulary of the model's
-/// logits at its slot (`CallOutput::candidate_logprobs`).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct Readout {
-    /// Index of each slot's token in the call's concatenated canvas rows.
-    pub slot_tokens: Vec<u32>,
-    /// Offsets of each slot's candidates in `candidate_ids`: one more entry
-    /// than there are slots, starting at zero and ending at the id count.
-    pub candidate_offsets: Vec<u32>,
-    /// Candidate token ids of every slot, slot after slot.
-    pub candidate_ids: Vec<u32>,
-}
-
-impl Readout {
-    /// Number of candidate log-probabilities the readout reports.
-    pub fn candidate_count(&self) -> usize {
-        self.candidate_ids.len()
-    }
-
-    /// Validates the slot layout against a call of `canvas_tokens` canvas
-    /// tokens.
-    ///
-    /// Slots address canvas tokens in increasing order, each reads at least
-    /// one candidate, and the offsets partition `candidate_ids` in slot
-    /// order.
-    pub fn validate(&self, canvas_tokens: usize) -> ValidationResult<()> {
-        ensure_valid!(!self.slot_tokens.is_empty(), "readout reads no slot");
-        ensure_valid!(
-            self.candidate_offsets.len() == self.slot_tokens.len() + 1,
-            "readout candidate offsets do not bound every slot"
-        );
-        ensure_valid!(
-            self.candidate_offsets.first() == Some(&0)
-                && self.candidate_offsets.last().map(|&end| end as usize)
-                    == Some(self.candidate_ids.len())
-                && self
-                    .candidate_offsets
-                    .windows(2)
-                    .all(|pair| pair[0] < pair[1]),
-            "readout candidate offsets do not partition the candidates"
-        );
-        ensure_valid!(
-            self.slot_tokens
-                .iter()
-                .all(|&token| (token as usize) < canvas_tokens),
-            "readout slot lies outside the call's canvas rows"
-        );
-        ensure_valid!(
-            self.slot_tokens.windows(2).all(|pair| pair[0] < pair[1]),
-            "readout slots are not in canvas order"
-        );
-        Ok(())
-    }
-}
-
 /// One image block of a context prefill.
 ///
 /// The block writes the vision-encoder product `feature` into the prefix cache as one
@@ -380,13 +319,10 @@ pub struct Call {
     pub image_index: Option<u32>,
     /// Host-side sampler constraints for this call; absent uses admission defaults.
     pub sampling_state: Option<SamplingState>,
-    /// Host-known prompt, draft, or decode input tokens in model input order,
-    /// or a token-denoising call's canvas rows back to back. Empty when
-    /// continuation reads its predecessor's device token.
+    /// Host-known prompt, draft, or decode input tokens in model input order.
+    /// Empty when continuation reads its predecessor's device token, and for
+    /// a token-denoising call, which denoises its resident canvas.
     pub input_token_ids: Vec<u32>,
-    /// Candidate slots a token-denoising readout reports; absent for every
-    /// other call.
-    pub readout: Option<Readout>,
     /// The step a token-denoising call runs on its request's generation
     /// canvas; absent for every other call.
     pub canvas: Option<CanvasStep>,
@@ -530,7 +466,6 @@ impl Call {
             image_index: None,
             sampling_state: None,
             input_token_ids: Vec::new(),
-            readout: None,
             canvas: None,
             input_image: None,
             cache_input: None,
@@ -700,27 +635,18 @@ impl Call {
             "only a latent encoding names a posterior draw"
         );
 
-        // A token-denoising call either reads candidate log-probabilities at
-        // slots of the canvas rows it carries, or runs one step of its
-        // request's resident generation canvas of `max_tokens` tokens. Either
-        // way it produces no sampled token output.
+        // A token-denoising call runs one step of its request's resident
+        // generation canvas of `max_tokens` tokens, and produces no sampled
+        // token output.
         let denoises = self.kind == CallKind::Forward(ForwardMode::TokenDenoising);
         ensure_valid!(
-            u8::from(self.readout.is_some()) + u8::from(self.canvas.is_some())
-                == u8::from(denoises),
-            "a token-denoising call carries exactly one readout or canvas step"
+            self.canvas.is_some() == denoises,
+            "a token-denoising call carries a canvas step, and no other call does"
         );
         ensure_valid!(
             !denoises || (self.token_output.is_none() && self.transition_output.is_none()),
             "token denoising samples no token output"
         );
-        if let Some(readout) = &self.readout {
-            ensure_valid!(
-                !self.input_token_ids.is_empty(),
-                "a readout requires canvas tokens"
-            );
-            readout.validate(self.input_token_ids.len())?;
-        }
         if self.canvas.is_some() {
             ensure_valid!(
                 self.input_token_ids.is_empty() && self.bounds.max_tokens > 0,
