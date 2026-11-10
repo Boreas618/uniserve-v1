@@ -8,10 +8,7 @@
 //! Besides the trait, this module owns the values that cross that boundary:
 //! [`WorkerInfo`], which merges the pools' reported capabilities, beside
 //! their layout, into the single capacity view the scheduler plans against;
-//! the result types a poll returns; and [`ConnectorConfig`], the directed
-//! transfer edges a deployment names between its worker groups, which each
-//! replica's engine configuration keeps for its own groups (the daemon's
-//! `replica_configs`).
+//! and the result types a poll returns.
 
 pub use proto::config::{BlockConfig, BlockDistribution, SequenceParallel, WorkerGroupId};
 
@@ -409,15 +406,6 @@ impl WorkerInfo {
             .workers
             .iter()
             .map(|(_, info)| info.max_unresolved_calls)
-            .filter(|limit| *limit > 0)
-            .min()
-            .unwrap_or(0);
-        // A transfer call may be placed on any pool, so the narrowest
-        // transport binds the engine's window of reserved transfers.
-        merged.transfer_tickets = self
-            .workers
-            .iter()
-            .map(|(_, info)| info.transfer_tickets)
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);

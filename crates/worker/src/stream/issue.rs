@@ -20,10 +20,9 @@
 
 use std::sync::Arc;
 
-use platform::{CopyBatch, Event, Stream, StridedCopy};
+use platform::{CopyBatch, Event, PitchedBatch, Stream, StridedCopy};
 
 use super::{Deferred, EventPool};
-use crate::transfer::copy_on_host;
 use crate::{Error, Result};
 
 /// A fill of `count` elements of `width` bytes (1, 2 or 4) with the low
@@ -381,5 +380,42 @@ impl<'a> Issue for &'a Stream {
 
     fn synchronize(&self) -> Result<()> {
         Issue::synchronize(&Some(*self))
+    }
+}
+
+/// Execute planned copies between host operands on the calling thread: the work a host
+/// [`Issue`] (no stream) performs where a stream would submit the same plan.
+///
+/// # Safety
+/// Every planned operand is host storage that stays valid, and that no other
+/// thread or device accesses, for the duration of the call.
+pub(crate) unsafe fn copy_on_host(plan: &StridedCopy) {
+    // SAFETY: forwarded from the caller.
+    unsafe {
+        copy_host(plan.linear());
+        copy_pitched(plan.pitched());
+    }
+}
+
+/// Copy each pitched copy's `depth` layers of `height` rows of `width` bytes, row by row.
+unsafe fn copy_pitched(batch: &PitchedBatch) {
+    for copy in batch.copies() {
+        for layer in 0..copy.depth {
+            for row in 0..copy.height {
+                let destination = copy.destination
+                    + ((layer * copy.destination_layer + row) * copy.destination_pitch) as u64;
+                let source =
+                    copy.source + ((layer * copy.source_layer + row) * copy.source_pitch) as u64;
+
+                // SAFETY: the caller guarantees valid, disjoint host operands.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        source as *const u8,
+                        destination as *mut u8,
+                        copy.width,
+                    );
+                }
+            }
+        }
     }
 }

@@ -13,17 +13,31 @@ pub type Outcome<T = ()> = ipc::execution::Outcome<T, Error>;
 
 /// One completion shared by an operation and its consumers, failing with the worker's own error.
 ///
-/// `C` is the observer type: a shared [`crate::transfer::Notify`] for physical retirements, which
+/// `C` is the observer type: a shared [`Notify`] for physical retirements, which
 /// one observer may watch together with other signals, or a one-shot boxed closure for host task
 /// results. `T` is the operation's value. The type is `ipc::execution::Completion`, which a
 /// submission is built on too.
 pub type Completion<C, T = ()> = ipc::execution::Completion<C, T, Error>;
 
+/// A completion or readiness observer. Observers only notify (wake a
+/// submission or the service loop); they never block or call back into the
+/// owner that notifies them.
+pub type Notify = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+/// The physical retirement signal of storage an operation used.
+pub type Retirement = Completion<Notify, ()>;
+
+/// Run the observers of a completion, after its owner unlocked its state.
+pub fn notify(observers: Vec<Notify>) {
+    for observer in observers {
+        observer();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Result;
-    use crate::transfer::{Notify, Retirement, notify};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;

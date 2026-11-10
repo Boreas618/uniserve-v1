@@ -13,7 +13,6 @@ import av
 import httpx
 import numpy as np
 import pytest
-import torch
 from transformers import AutoTokenizer
 
 from tests.python.e2e.http_helpers import (
@@ -280,18 +279,6 @@ def test_component_bindings_release_cancelled_requests(
             return f"cuda:{device}"
         return f"rank-1/cuda:{device - local_devices}"
 
-    # Mapping a product into a consumer's device needs peer access between the
-    # two. A host that grants it only within its own device pairs cannot carry
-    # device products between ranks that fall in different pairs, and there the
-    # host mechanism is the one those edges admit.
-    device_products = not two_hosts and all(
-        first == second
-        or torch.cuda.can_device_access_peer(
-            int(leased[first]), int(leased[second])
-        )
-        for first in devices
-        for second in devices
-    )
     # The media components encode and assemble on the host inside the main
     # process, which serves CUDA devices only, so they are placed on CUDA
     # ranks as the deployment files of `configs/minimax_h3` place them: each
@@ -310,7 +297,6 @@ def test_component_bindings_release_cancelled_requests(
         "split": [(name,) for name in worker_config],
     }[grouping]
     workers = []
-    owners = {}
     for names in groups:
         members = sorted(
             {rank for name in names for rank in worker_config[name]["ranks"]}
@@ -333,21 +319,6 @@ def test_component_bindings_release_cancelled_requests(
                 "blocks": components,
             }
         )
-        owners.update(dict.fromkeys(names, worker_id))
-    edges = {
-        (owners[source], owners[destination])
-        for source, destination in (
-            ("media_reader", "text_encoder"),
-            ("media_reader", "latent_encoder"),
-            ("text_encoder", "transformer"),
-            ("latent_encoder", "transformer"),
-            ("transformer", "video_decoder"),
-            ("transformer", "audio_decoder"),
-            ("video_decoder", "video_codec"),
-            ("video_codec", "muxer"),
-            ("audio_decoder", "muxer"),
-        )
-    }
     command = [
         str(require_uniserve_binary()),
         "serve",
@@ -384,8 +355,6 @@ def test_component_bindings_release_cancelled_requests(
         "quantization.mode=balanced",
     ]
     if two_hosts:
-        # Products cross the hosts by the mechanisms each edge derives, as in
-        # the shipped two-host deployments.
         address = f"{LEADER_ADDRESS}:{find_free_port()}"
         command += [
             "--host-identity",
@@ -394,19 +363,6 @@ def test_component_bindings_release_cancelled_requests(
             "2",
             "--dist-init-addr",
             address,
-        ]
-    else:
-        command += [
-            "--set",
-            "device_config.transfer="
-            + ",".join(
-                # Device products cross workers over VMM handles where the
-                # devices can map one another, and host products over shared
-                # storage.
-                f"{source}->{destination}="
-                + ("cuda_vmm+posix_shm" if device_products else "posix_shm")
-                for source, destination in sorted(edges)
-            ),
         ]
     tokenizer = AutoTokenizer.from_pretrained(Path(model_value) / "tokenizer")
     payloads = []

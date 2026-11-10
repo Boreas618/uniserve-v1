@@ -614,10 +614,6 @@ pub struct MainProcessInfo {
     /// Concurrent tasks this rank's bounded host task pool admits. The
     /// scheduler treats zero as one.
     pub host_task_capacity: u32,
-    /// Transfer entries this rank's transport holds in flight at once. The
-    /// scheduler keeps no more transfer calls reserved than the narrowest
-    /// rank holds.
-    pub transfer_tickets: u32,
 }
 
 impl MainProcessInfo {
@@ -694,8 +690,7 @@ impl MainProcessInfo {
             self.max_batch_calls > 0
                 && self.max_batch_tokens > 0
                 && self.request_slots > 0
-                && self.max_unresolved_calls > 0
-                && self.transfer_tickets > 0,
+                && self.max_unresolved_calls > 0,
             "worker info declare a zero scheduling bound"
         );
 
@@ -772,7 +767,6 @@ impl Default for MainProcessInfo {
             encoder_entry_bytes: 0,
             max_unresolved_calls: 1,
             host_task_capacity: 1,
-            transfer_tickets: 1,
         }
     }
 }

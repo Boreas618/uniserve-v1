@@ -277,7 +277,7 @@ impl Scheduler {
         let mut submitted = false;
         for id in queued {
             let mut batch = self.finish_generation_batch(
-                ExecutionBatch::new(0, Vec::new(), Vec::new(), Vec::new()),
+                ExecutionBatch::new(0, Vec::new(), Vec::new()),
                 Instant::now(),
             );
             let Some((worker, offload)) = self

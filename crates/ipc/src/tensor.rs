@@ -4,55 +4,9 @@
 //! [`TensorRef`]: a request-scoped identity plus a `proto::tensor::DType` and a
 //! [`ShapeBound`] that fix the product's maximum size before its producing call
 //! runs. A cross-call buffer, such as a published cache extent, is identified
-//! by a [`BufferId`] alone. How a produced tensor reaches its consumers is
-//! described in `transfer`.
+//! by a [`BufferId`] alone.
 
 use super::*;
-use std::ops::Range;
-
-/// Split a tensor region around its intersection with another region.
-///
-/// Both regions use the same logical axes and nonnegative half-open bounds.
-/// Append disjoint uncovered slabs to `remaining` and return the intersection.
-/// Empty regions contribute neither an intersection nor an uncovered slab.
-pub fn subtract_region(
-    region: &[Range<u64>],
-    covered: &[Range<u64>],
-    remaining: &mut Vec<Vec<Range<u64>>>,
-) -> Option<Vec<Range<u64>>> {
-    if region.iter().any(Range::is_empty) {
-        return None;
-    }
-
-    let overlap: Vec<_> = region
-        .iter()
-        .zip(covered)
-        .map(|(left, right)| left.start.max(right.start)..left.end.min(right.end))
-        .collect();
-    if overlap.iter().any(Range::is_empty) {
-        remaining.push(region.to_vec());
-        return None;
-    }
-
-    // Peel each axis around the intersection. Narrow the middle before the
-    // next axis so slabs from different axes never overlap.
-    let mut middle = region.to_vec();
-    for (axis, bounds) in overlap.iter().enumerate() {
-        if middle[axis].start < bounds.start {
-            let mut slab = middle.clone();
-            slab[axis].end = bounds.start;
-            remaining.push(slab);
-        }
-        if bounds.end < middle[axis].end {
-            let mut slab = middle.clone();
-            slab[axis].start = bounds.end;
-            remaining.push(slab);
-        }
-        middle[axis] = bounds.clone();
-    }
-
-    Some(overlap)
-}
 
 /// One dimension of a bounded shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -116,7 +116,6 @@ pub(crate) fn text_rank() -> MainProcessInfo {
         encoder_entry_bytes: 256 << 20,
         max_batch_calls: 1024,
         max_unresolved_calls: 2,
-        transfer_tickets: 1024,
         ..MainProcessInfo::default()
     }
 }

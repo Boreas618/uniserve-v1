@@ -5,16 +5,12 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-[package.metadata.cargo-machete]
-ignored = ["serde_bytes"]
-
 [dependencies]
 libc.workspace = true
 prost.workspace = true
 proto.workspace = true
 rmp-serde.workspace = true
 serde = { workspace = true, features = ["rc"] }
-serde_bytes.workspace = true
 serde_json.workspace = true
 # The framing of every socket transport.
 service.workspace = true

@@ -210,7 +210,6 @@ pub(crate) fn video_info(
         encoder_entry_bytes: 256 << 20,
         max_batch_calls: 1024,
         max_unresolved_calls: 2,
-        transfer_tickets: 1024,
         video_denoiser: Some(VideoDenoiserInfo {
             takes_conditions: true,
             denoise_steps: STEPS,

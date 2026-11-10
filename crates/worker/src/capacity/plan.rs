@@ -8,7 +8,7 @@
 //!
 //! A rank that keeps a paged cache places its pool beside fixed storage: the
 //! product store's relay arenas and the storage the prefix cache reserves
-//! (block tables and importer scratch). A pool sized from
+//! (block tables and unit columns). A pool sized from
 //! storage takes the grant left after those, the graph range and the scratch
 //! region. A media rank keeps no paged cache: every resident request keeps its
 //! whole media state, so nothing is fitted.
@@ -28,9 +28,9 @@ use crate::memory::prefix_cache::planes::{PlaneLayout, UnitColumn};
 use crate::parallel::host::HostGroup;
 use crate::{Error, Result};
 
-/// Unit columns the computations over the prefix cache bind beside the import
-/// workers': one, on the device's primary stream.
-const COMPUTATION_COLUMNS: usize = 1;
+/// Unit columns the computations over the prefix cache bind: one on the device's primary
+/// stream and one on the page-copy stream of a rank that copies pages through its host pools.
+const COMPUTATION_COLUMNS: usize = 2;
 
 /// What a rank states about itself to the memory planner, beside the
 /// deployment's [`EngineConfig`]: where it runs, what its captured catalog
@@ -95,9 +95,6 @@ pub struct Report {
 pub struct MemoryConfig {
     /// The capacity the rank reports to the engine.
     pub info: MainProcessInfo,
-    /// The host and device arenas of its calls: read where a rank's arenas are
-    /// built, which is inside this crate.
-    pub(crate) arena: ArenaCapacity,
     /// Fixed bytes by device, beside the cache pool.
     pub fixed_device_bytes: BTreeMap<Device, u64>,
     /// The cache layout, with the agreed unit count in `info.prefix_cache`.
@@ -143,7 +140,6 @@ fn base_info(report: Report, request: &MemoryRequest, slots: usize) -> Result<Ma
         encoder_entry_bytes: 0,
         max_unresolved_calls: 0,
         host_task_capacity: 1,
-        transfer_tickets: 1,
         captured_latents: None,
         image_capacity: None,
         diffusion_lm_step_rows: 0,
@@ -171,7 +167,7 @@ pub enum Region {
     /// The state snapshot a unit's checkpoints are copied through.
     Snapshot,
     /// Everything else the resident owners map: block tables,
-    /// import scratch, the buffer pool, the product store's deferred arenas and
+    /// the buffer pool, the product store's deferred arenas and
     /// the latent pool.
     Fixed,
 }
@@ -359,7 +355,6 @@ fn fit(
         device_exports,
     })?;
     info.host_task_capacity = narrow(arena.host_task_inflight, "host task capacity")?;
-    info.transfer_tickets = narrow(arena.transfer_tickets, "transfer tickets")?;
     // The graph range and the scratch region are one reservation (4.1, 4.5): the graph pools the
     // rank captures into and the shadow a replaced operator runs in, both reserved at spawn and
     // both out of the grant the cache is fitted into. `reserved_bytes` answers them as one figure
@@ -373,7 +368,6 @@ fn fit(
     let graph = crate::capacity::graph_storage_bytes(device_total as i64, true, false);
     let mut memory = MemoryConfig {
         info,
-        arena,
         fixed_device_bytes: BTreeMap::from([(request.device, arena.deferred_device_bytes())]),
         cache: None,
         planes: None,
@@ -398,17 +392,10 @@ fn fit(
         .ok_or_else(|| Error::Invalid("the model's cache states no page size".into()))?;
     memory.width = config.model.max_model_len.div_ceil(block_size);
     // The cache's fixed storage beside its units: block tables of the width a request of the
-    // model's length needs and import scratch. Every unit index column is
+    // model's length needs. Every unit index column is
     // charged with each unit instead, because the unit count is not known until the pool is fitted
     // - so no column may be charged here as well.
-    let fixed = PrefixCache::fixed_bytes(
-        cache,
-        0,
-        memory.info.request_slots,
-        memory.width,
-        memory.info.max_unresolved_calls as usize,
-        0,
-    )?;
+    let fixed = PrefixCache::fixed_bytes(cache, 0, memory.info.request_slots, memory.width, 0)?;
     *memory.fixed_device_bytes.entry(request.device).or_default() += fixed + request.carved_bytes;
     // The transport is created at the first capture, when a program exists, so the cache is
     // fitted around what it will take.
@@ -437,8 +424,8 @@ impl MemoryConfig {
     /// padding takes no unit: padding rows read the sentinel unit and write no K/V. A configured
     /// token capacity (`kv_cache_config.max_tokens`) sizes the pool instead.
     ///
-    /// Every unit index column holds one index per unit and is charged with each unit: the import
-    /// workers' columns and the streams the computations over the cache bind. Charging them here
+    /// Every unit index column holds one index per unit and is charged with each unit: the
+    /// columns the streams of the computations over the cache bind. Charging them here
     /// and not in the fixed figure is what keeps a unit's bytes the same whether the pool is fitted
     /// before or after its size is known.
     #[expect(
@@ -455,9 +442,7 @@ impl MemoryConfig {
         granularity: Option<u64>,
         group: &HostGroup,
     ) -> Result<()> {
-        let workers = PrefixCache::import_workers(self.info.max_unresolved_calls as usize) as u64;
-        let unit_bytes =
-            cache.unit_bytes + (workers + COMPUTATION_COLUMNS as u64) * UnitColumn::bytes(1);
+        let unit_bytes = cache.unit_bytes + COMPUTATION_COLUMNS as u64 * UnitColumn::bytes(1);
         let pages: Vec<(u32, u32)> = cache
             .groups
             .iter()
@@ -557,13 +542,6 @@ impl MemoryConfig {
         }
         self.info.prefix_cache = Some(info);
         self.planes = planes;
-        // The arena's slot counts and storage are independent of cache
-        // capacity; only its transfer byte budget follows the fitted pool,
-        // since one read may carry a whole pool's export. The budget is
-        // accounting: cache exports name the pages where they lie and
-        // occupy no storage of their own.
-        self.arena.transfer_bytes =
-            (capacity.num_units * cache.unit_bytes).max(1) * self.arena.transfer_tickets as u64;
         Ok(())
     }
 }
@@ -714,28 +692,27 @@ mod tests {
             4096 / 64,
             "the width of a 4096-token context"
         );
-        let tables = PrefixCache::fixed_bytes(
-            &dense(2),
-            0,
-            planned.info.request_slots,
-            planned.width,
-            planned.info.max_unresolved_calls as usize,
-            0,
-        )
-        .expect("the cache's fixed storage");
-        let narrow = PrefixCache::fixed_bytes(
-            &dense(2),
-            0,
-            planned.info.request_slots,
-            0,
-            planned.info.max_unresolved_calls as usize,
-            0,
-        )
-        .expect("the cache's fixed storage without tables");
+        let tables =
+            PrefixCache::fixed_bytes(&dense(2), 0, planned.info.request_slots, planned.width, 0)
+                .expect("the cache's fixed storage");
+        let narrow = PrefixCache::fixed_bytes(&dense(2), 0, planned.info.request_slots, 0, 0)
+            .expect("the cache's fixed storage without tables");
         assert!(tables > narrow, "block tables of width 64 take storage");
+        // A rank without a cache books only the storage every rank defers, so the cache's own
+        // fixed figure is the difference.
+        let cacheless = fit(
+            &config(Some(4096)),
+            &request(None),
+            report(),
+            TOTAL,
+            Some(grant()),
+            None,
+            &HostGroup::single(0),
+        )
+        .expect("a rank without a cache");
         assert_eq!(
             planned.fixed_device_bytes[&Device::Cuda(DeviceId(0))],
-            planned.arena.deferred_device_bytes() + tables,
+            cacheless.fixed_device_bytes[&Device::Cuda(DeviceId(0))] + tables,
             "the plan books the tables at the width it states"
         );
     }
@@ -1030,43 +1007,5 @@ mod tests {
         assert!(
             deep.cache.as_ref().unwrap().unit_bytes > shallow.cache.as_ref().unwrap().unit_bytes
         );
-    }
-
-    /// Every stream column is charged once per unit: a rank that admits more
-    /// imports fits fewer units of the same grant, and its fixed figure does not
-    /// grow by the same bytes - the columns follow the unit count, not the
-    /// tables.
-    ///
-    /// Grant-bound again: a stated token demand caps both ranks at the demand,
-    /// so the column charge would be invisible in the answer.
-    #[test]
-    fn more_import_workers_hold_fewer_units_of_the_same_grant() {
-        let plan = |calls: usize| {
-            let mut request = request(Some(dense(2)));
-            request.max_batch_calls = calls;
-            fit(
-                &config(None),
-                &request,
-                report(),
-                TOTAL,
-                Some(grant()),
-                None,
-                &HostGroup::single(0),
-            )
-            .expect("the device has room for this cache")
-        };
-        let narrow = plan(1);
-        let wide = plan(16);
-        let units = |plan: &MemoryConfig| plan.info.prefix_cache.as_ref().unwrap().num_units;
-        assert!(
-            units(&wide) < units(&narrow),
-            "a rank admitting 16 calls fits {} units, one admitting 1 fits {}: the import \
-             workers' columns are not charged per unit",
-            units(&wide),
-            units(&narrow)
-        );
-        // The fixed figure moves too - an import worker's own scratch is fixed - so what the
-        // units' difference proves is that the columns are charged per unit: were they charged
-        // with the tables, both ranks would fit the same units.
     }
 }

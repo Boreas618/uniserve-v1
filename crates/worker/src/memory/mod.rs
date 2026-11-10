@@ -56,8 +56,7 @@ pub struct Memory {
 /// knows, beside the memory the capacity negotiation resolved.
 ///
 /// Everything the resolved memory carries is read from it - the slot count, the
-/// block-table width, the entry bytes of a product, the relay depth, the import
-/// workers - so a caller does not repeat a figure it already states.
+/// block-table width, the entry bytes of a product, the relay depth - so a caller does not repeat a figure it already states.
 pub struct OpenMemory<'a> {
     /// The memory [`capacity::plan_rank`](crate::capacity::plan_rank) resolved.
     pub plan: &'a crate::capacity::MemoryConfig,
@@ -66,8 +65,6 @@ pub struct OpenMemory<'a> {
     /// The device's stream: any reset the owners queue runs here, before the
     /// worker thread exists, and a stream accepts work without one.
     pub stream: Option<&'a Stream>,
-    /// The conversion program the import path launches.
-    pub conversion: Arc<dyn prefix_cache::conversion::ImportConversion>,
     /// The device's pools, which a paired forward's scratch page set is taken
     /// from.
     pub pools: Arc<Mutex<crate::arena::Pools>>,
@@ -163,11 +160,9 @@ impl Memory {
                 layout,
                 info.request_slots,
                 plan.width,
-                info.max_unresolved_calls as usize,
                 request.device,
                 request.stream,
                 storage,
-                Arc::clone(&request.conversion),
             )?),
             // A rank that keeps no paged cache opens no cache planes and no block tables.
             (None, _) => None,

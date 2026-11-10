@@ -1,8 +1,7 @@
 //! The main process's blocking thread pool.
 //!
-//! The main process does four kinds of blocking host work: loading modules,
-//! reading transfers, reclaiming shared storage, and encoding, muxing and
-//! reading media. None of them runs on a scheduler thread or on a worker
+//! The main process does two kinds of blocking host work: loading modules,
+//! and encoding, muxing and reading media. None of them runs on a scheduler thread or on a worker
 //! thread: those wait only for their own device work and their own queue
 //! (§2.4), and a media encode that takes a second must not hold up the module
 //! load of a program switch.
@@ -25,35 +24,24 @@ use std::sync::{Arc, Mutex};
 use crate::host::{HostAction, HostPool, Lane};
 use crate::{Error, Result, lock};
 
-/// The four kinds of blocking host work of §2.4.
+/// The kinds of blocking host work of §2.4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BlockingKind {
     /// Resolving a program's modules at the Program Server and loading them
     /// into kernels.
     ModuleLoad,
-    /// Reading a transfer the Storage Server sent.
-    TransferRead,
-    /// Reclaiming shared storage whose last device access completed.
-    Reclaim,
     /// Encoding, muxing and reading media.
     Media,
 }
 
 impl BlockingKind {
     /// Every kind, in the order the process creates its lanes.
-    pub const ALL: [Self; 4] = [
-        Self::ModuleLoad,
-        Self::TransferRead,
-        Self::Reclaim,
-        Self::Media,
-    ];
+    pub const ALL: [Self; 2] = [Self::ModuleLoad, Self::Media];
 
     /// The lane's thread-name prefix and log name.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ModuleLoad => "module-load",
-            Self::TransferRead => "transfer-read",
-            Self::Reclaim => "reclaim",
             Self::Media => "media",
         }
     }
@@ -71,12 +59,12 @@ pub struct LaneLimits {
 /// The lanes' admission bounds, one per kind, from the build config.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Limits {
-    lanes: [LaneLimits; 4],
+    lanes: [LaneLimits; 2],
 }
 
 impl Limits {
-    /// The bounds of the four lanes, in [`BlockingKind::ALL`] order.
-    pub fn new(lanes: [LaneLimits; 4]) -> Self {
+    /// The bounds of the lanes, in [`BlockingKind::ALL`] order.
+    pub fn new(lanes: [LaneLimits; 2]) -> Self {
         Self { lanes }
     }
 
@@ -213,7 +201,7 @@ mod tests {
             capacity: 4,
             workers: 1,
         };
-        Limits::new([lane; 4])
+        Limits::new([lane; 2])
     }
 
     fn run_one(lane: &Lane<Probe>, runs: &Arc<AtomicUsize>) -> Result<()> {
@@ -264,7 +252,7 @@ mod tests {
     #[test]
     fn an_aborted_lane_admits_nothing_new() -> Result<()> {
         let threads = ThreadPool::new(limits());
-        let lane = threads.lane::<Probe>(BlockingKind::Reclaim)?;
+        let lane = threads.lane::<Probe>(BlockingKind::Media)?;
         threads.abort();
         assert!(
             lane.admit(Probe {
@@ -283,7 +271,7 @@ mod tests {
             capacity: 1,
             workers: 2,
         };
-        let threads = ThreadPool::new(Limits::new([lane; 4]));
+        let threads = ThreadPool::new(Limits::new([lane; 2]));
         assert!(threads.lane::<Probe>(BlockingKind::ModuleLoad).is_err());
     }
 }

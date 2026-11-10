@@ -42,7 +42,6 @@ pub mod memory;
 pub mod parallel;
 pub mod peers;
 pub mod stream;
-pub mod transfer;
 pub mod watchdog;
 
 pub use completion::Outcome;

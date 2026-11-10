@@ -1,12 +1,10 @@
-//! The rank's prefix cache: unit pool, block tables, accesses and imports.
+//! The rank's prefix cache: unit pool, block tables and page copies.
 //!
 //! [`PrefixCache`] composes the owners the worker drives per batch:
 //!
 //! - [`CachePlanes`]: the pool's device storage;
 //! - [`BlockTables`] (host) and [`BlockTableStorage`] (device): the
 //!   scheduler's page assignments and their numerical tables;
-//! - the import pool: bounded workspaces whose host tasks copy other ranks'
-//!   exports into assigned pages;
 //! - [`HostKvCache`]: the host page pools the engine copies pages through, on
 //!   the rank's copy stream ([`PrefixCache::issue_pages`]).
 //!
@@ -15,18 +13,13 @@
 //! failed or unknown device completions keep their storage retained.
 
 pub(super) mod block_tables;
-pub mod conversion;
 pub mod host;
-mod imports;
 mod manifest;
 pub(super) mod plan;
 pub mod planes;
 pub mod scratch;
 
-pub use conversion::Unimported;
-use imports::Imports;
-
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use ipc::{BlockTable, PageCopy};
 use platform::{DeviceId, Event, EventFlags, Stream};
@@ -36,14 +29,9 @@ pub(crate) use self::host::HostKvCache;
 use self::plan::CachePlan;
 use self::planes::{CachePlanes, UnitColumn};
 use super::allocation::StorageView;
-use crate::host::HostPool;
 use crate::memory::retained::ExclusiveStorage;
 use crate::stream::Issue;
-use crate::transfer::{CacheImporter, ImportWorkspace, Retired};
 use crate::{Error, Result};
-
-/// The most import copy threads (and workspaces) a rank runs.
-const IMPORT_WORKERS: usize = 4;
 
 /// The host KV cache, the copy stream its copies run on and the unit column
 /// bound on that stream.
@@ -93,20 +81,14 @@ pub struct PrefixCache {
     planes: Arc<CachePlanes>,
     storage: BlockTableStorage,
     tables: BlockTables,
-    imports: Imports,
     /// The host KV cache and the copy stream its copies run on, when the engine
     /// copies pages through it.
     pages: Option<PageCopies>,
 }
 
 impl PrefixCache {
-    /// Import workers for `capacity` concurrently admitted imports.
-    pub(crate) fn import_workers(capacity: usize) -> usize {
-        capacity.clamp(1, IMPORT_WORKERS)
-    }
-
-    /// Fixed device bytes besides the pool itself: the block tables, the import
-    /// scratch and the per-stream unit columns.
+    /// Fixed device bytes besides the pool itself: the block tables and the per-stream unit
+    /// columns.
     ///
     /// The unit columns are the cache's index, one per stream that writes a
     /// unit, and each holds one `i64` per unit; the block tables are the batch
@@ -117,29 +99,19 @@ impl PrefixCache {
         num_units: u32,
         request_pool_size: u32,
         width: u32,
-        import_capacity: usize,
         unit_columns: usize,
     ) -> Result<u64> {
-        let workers = Self::import_workers(import_capacity) as u64;
-        let (elements, scales) = plan.page_extents();
         // Every unit column holds one index per unit, charged with each unit:
-        // the import workers', the primary stream's and the copy stream's of a
-        // rank that copies pages through the host KV cache.
+        // the primary stream's and the copy stream's of a rank that copies
+        // pages through the host KV cache.
         let columns = u64::try_from(unit_columns).map_err(|_| {
             crate::Error::Invariant("a rank holds more stream columns than fit".into())
         })? * UnitColumn::bytes(num_units);
-        Ok(
-            BlockTableStorage::bytes(&plan.group_shapes()?, request_pool_size, width)
-                + workers * ImportWorkspace::scratch_bytes(elements, scales)
-                + columns,
-        )
+        Ok(BlockTableStorage::bytes(&plan.group_shapes()?, request_pool_size, width) + columns)
     }
 
-    /// Allocate the pool, the tables and the import workspaces on `device`
-    /// (host storage when `None`), resetting device storage on `stream`.
-    ///
-    /// Every import workspace constructs the library's unit resets and
-    /// page conversion on its own stream.
+    /// Allocate the pool and the tables on `device` (host storage when `None`), resetting device
+    /// storage on `stream`.
     #[expect(
         clippy::too_many_arguments,
         reason = "a pool's shape, its device and stream, and where its planes are taken"
@@ -150,11 +122,9 @@ impl PrefixCache {
         layout: Option<&planes::PlaneLayout>,
         request_pool_size: u32,
         width: u32,
-        import_capacity: usize,
         device: Option<DeviceId>,
         stream: Option<&Stream>,
         storage: &mut dyn ExclusiveStorage,
-        conversion: Arc<dyn conversion::ImportConversion>,
     ) -> Result<Self> {
         let shapes = plan.group_shapes()?;
         let planes = Arc::new(CachePlanes::allocate(
@@ -164,26 +134,10 @@ impl PrefixCache {
             BlockTableStorage::allocate(&shapes, request_pool_size, width, device, stream)?;
         let tables = BlockTables::new(shapes, request_pool_size, width as usize, num_units)?;
 
-        let workers = Self::import_workers(import_capacity);
-        let workspaces = (0..workers)
-            .map(|_| ImportWorkspace::bind(&planes, Arc::clone(&conversion)).map(Arc::new))
-            .collect::<Result<Vec<_>>>()?;
-        let importer = Arc::new(CacheImporter::new(workspaces));
-        let pool = HostPool::new(import_capacity.max(1), workers, "worker-cache-import")?;
-        let retired = Arc::new(Retired {
-            importer: Arc::downgrade(&importer),
-            wake: Mutex::new(None),
-        });
-
         Ok(Self {
             planes,
             storage,
             tables,
-            imports: Imports {
-                importer,
-                pool,
-                retired,
-            },
             pages: None,
         })
     }
@@ -204,7 +158,7 @@ impl PrefixCache {
     /// offload the published units of `offloads` into theirs.
     ///
     /// The loads fill new units of the batch, which are idle (no in-flight
-    /// export, import or execution addresses them, checked here) and which
+    /// execution addresses them, checked here) and which
     /// the loads overwrite whole, so the batch does not recycle them; its
     /// forward waits on the returned load fence. The offloads copy pages the
     /// engine published once it accepted the result of the call that computed
@@ -427,7 +381,7 @@ impl PrefixCache {
     /// page only below the request's length, and a page the request continues from an earlier one
     /// is copied in first. So zeroing its values is a fill of every layer's page that no read
     /// observes, issued on the batch stream ahead of the forward, one fill per column for each run
-    /// of units. The flags and scales are what a later import and a quantized read do observe.
+    /// of units. The flags and scales are what a later page load and a quantized read do observe.
     pub fn acquire_units(&mut self, units: &[u32], stream: impl Issue) -> Result<()> {
         let mut units = units.to_vec();
         units.sort_unstable();
@@ -450,22 +404,8 @@ impl PrefixCache {
         Ok(())
     }
 
-    /// Cancel every import and join the import copy threads, so no import
-    /// reads through the transports any more. Idempotent.
-    pub(crate) fn stop_imports(&mut self) -> Result<()> {
-        let cancelled = self.imports.cancel(self.imports.importer.stop());
-        let mut stopped = Ok(());
-        for error in self.imports.pool.close() {
-            stopped = stopped.and(Err(error));
-        }
-        cancelled.and(stopped).and(self.imports.retired.reap())
-    }
-
-    /// Stop imports and require every import retired. Failed retirements
-    /// keep their storage: the caller must not reuse it.
+    /// Clear the block tables. Idempotent.
     pub fn close(&mut self) -> Result<()> {
-        let stopped = self.stop_imports();
-        stopped.and(self.imports.importer.require_retired())?;
         self.tables.clear();
         Ok(())
     }
@@ -493,7 +433,7 @@ mod fixed_bytes_tests {
     fn unit_columns_are_charged_per_unit_and_per_stream() -> Result<()> {
         let plan = plan();
         let at = |units: u32, columns: usize| {
-            PrefixCache::fixed_bytes(&plan, units, 4, 8, 0, columns).expect("fixed bytes")
+            PrefixCache::fixed_bytes(&plan, units, 4, 8, columns).expect("fixed bytes")
         };
         let one_column = at(100, 1);
         let no_column = at(100, 0);
@@ -559,11 +499,9 @@ mod tests {
             None,
             /* request_pool_size */ 2,
             /* width */ 4,
-            /* import_capacity */ 1,
             None,
             None,
             &mut LocalStorage,
-            Arc::new(conversion::Unimported),
         )?;
         let batch = Batch::new(None, EventPool::new());
 

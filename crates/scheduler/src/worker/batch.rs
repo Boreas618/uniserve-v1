@@ -8,9 +8,7 @@
 //! the simulated one.
 
 use super::WorkerGroupId;
-use ipc::{
-    BatchCommand, BufferAllocation, Call, DecodeRange, NewRequest, RequestKey, TensorExport,
-};
+use ipc::{BatchCommand, BufferAllocation, Call, DecodeRange, NewRequest, RequestKey};
 use std::collections::BTreeMap;
 
 /// A persistent span in the buffer pool one rank of a worker backs.
@@ -80,12 +78,6 @@ pub struct ExecutionBatch {
     pub requests: Vec<(Call, RequestDispatch)>,
     /// Ordered lifecycle and resource commands.
     pub commands: Vec<BatchCommand>,
-    /// Published transfer descriptors supplied by an external storage owner.
-    pub input_transfers: Vec<TensorExport>,
-    /// External cache exports consumed by explicit cache installation.
-    ///
-    /// `ExecutionBatch::new` leaves this empty.
-    pub cache_inputs: Vec<ipc::CacheTransfer>,
     /// Published pages the batch writes to the host KV cache.
     pub page_offloads: Option<PageOffloads>,
     /// The batch as the device worker reads it, laid out once when the
@@ -111,8 +103,6 @@ impl PartialEq for ExecutionBatch {
         self.id == other.id
             && self.requests == other.requests
             && self.commands == other.commands
-            && self.input_transfers == other.input_transfers
-            && self.cache_inputs == other.cache_inputs
             && self.page_offloads == other.page_offloads
             && self.device.is_some() == other.device.is_some()
     }
@@ -136,14 +126,11 @@ impl ExecutionBatch {
         id: u64,
         requests: Vec<(Call, RequestDispatch)>,
         commands: Vec<BatchCommand>,
-        input_transfers: Vec<TensorExport>,
     ) -> Self {
         Self {
             id,
             requests,
             commands,
-            input_transfers,
-            cache_inputs: Vec::new(),
             page_offloads: None,
             device: None,
         }
@@ -176,8 +163,7 @@ impl ExecutionBatch {
     /// independent calls.
     ///
     /// Drops the calls and `Start` commands of every request key in
-    /// `requests`, then the input transfers and cache inputs no remaining call
-    /// reads. The requests' `Finish` and `Free` commands stay, since they still
+    /// `requests`. The requests' `Finish` and `Free` commands stay, since they still
     /// retire physical state and reader obligations on the workers. Returns the
     /// removed calls with the dispatches describing their resources. The batch
     /// may be left with neither calls nor commands; callers decide whether to
@@ -195,18 +181,6 @@ impl ExecutionBatch {
                 return true;
             }
             !matches!(command, BatchCommand::Start { .. })
-        });
-        let inputs = self
-            .requests
-            .iter()
-            .flat_map(|(call, _)| call.tensor_inputs().chain(call.predicate.iter()))
-            .collect::<std::collections::HashSet<_>>();
-        self.input_transfers
-            .retain(|payload| inputs.contains(&payload.product));
-        self.cache_inputs.retain(|export| {
-            self.requests
-                .iter()
-                .any(|(call, _)| call.cache_input == Some(export.source))
         });
         retired
     }

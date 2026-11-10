@@ -947,40 +947,6 @@ impl CachePlanes {
         )
     }
 
-    /// Tokens `[offset, offset + count)` of one layer: column `column` of
-    /// `unit`, as a contiguous `[count, 1, heads, dim]` group-dtype view
-    /// matching one layer of a transfer's `[tokens, layers, heads, dim]`.
-    pub(crate) fn layer_tokens(
-        &self,
-        field: usize,
-        group: usize,
-        column: u32,
-        unit: u32,
-        offset: u32,
-        count: u32,
-    ) -> Result<StorageView> {
-        self.require_unit(unit)?;
-        let plan = &self.plan.groups[group];
-        if offset + count > plan.block_size || column >= self.plan.columns {
-            return Err(Error::Invalid("a layer view exceeds its plane".into()));
-        }
-        let row = i64::from(plan.num_kv_heads) * i64::from(plan.head_dim);
-        let base =
-            self.cell(column, unit) * self.plan.plane_bytes + u64::from(offset) * plan.row_bytes();
-        StorageView::strided(
-            Arc::clone(&self.values[field]) as Arc<dyn Backing>,
-            base as usize,
-            plan.dtype,
-            &[
-                i64::from(count),
-                1,
-                i64::from(plan.num_kv_heads),
-                i64::from(plan.head_dim),
-            ],
-            &[row, row, i64::from(plan.head_dim), 1],
-        )
-    }
-
     /// The bytes the pool's planes map on the device: the two value planes, and
     /// the flag and scale planes of a quantized pool.
     ///
@@ -1547,15 +1513,6 @@ impl UnitColumn {
             return Err(Error::Invariant(
                 "a unit column is used on the stream it was bound to".into(),
             ));
-        }
-        Ok(())
-    }
-
-    /// Reset `units` completely: values zero, flags clear, scales one.
-    pub(crate) fn zero(&self, units: &[u32], stream: impl Issue) -> Result<()> {
-        self.require_stream(stream)?;
-        for &unit in units {
-            self.planes.reset_units(unit, 1, true, stream)?;
         }
         Ok(())
     }

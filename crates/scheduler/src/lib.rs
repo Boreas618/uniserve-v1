@@ -429,9 +429,6 @@ pub struct Scheduler {
     watchdog: mechanism::Watchdog,
     /// The step number this scheduler is at.
     step: u64,
-    /// Maximum number of transfer calls holding a reservation at once
-    /// (`Inflight::num_pending_transfers`).
-    transfer_capacity: usize,
     /// `engine_id` of every `RequestKey` this scheduler issues.
     engine_id: u64,
     epoch: u64,

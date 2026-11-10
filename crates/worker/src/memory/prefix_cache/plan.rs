@@ -387,25 +387,6 @@ impl CachePlan {
     pub(crate) fn page_planes(&self, group: &CacheGroupPlan) -> u64 {
         u64::from(group.units_per_page) * u64::from(self.columns)
     }
-
-    /// Elements `E` and scale entries `S` of the largest K/V group page,
-    /// which size a cache import workspace: `E = block_size * layers *
-    /// heads * dim` and `S = block_size * layers * heads`, maximized over
-    /// groups. Imports carry the K/V pages a request needs alone.
-    pub(crate) fn page_extents(&self) -> (u64, u64) {
-        self.groups
-            .iter()
-            .filter(|group| group.required_rows())
-            .fold((0, 0), |(elements, scales), group| {
-                let rows = u64::from(group.block_size)
-                    * group.layers.len() as u64
-                    * u64::from(group.num_kv_heads);
-                (
-                    elements.max(rows * u64::from(group.head_dim)),
-                    scales.max(rows),
-                )
-            })
-    }
 }
 
 /// Where one field of a recurrent layer's checkpoint lies in a state page: its first plane and its

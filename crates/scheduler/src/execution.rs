@@ -450,7 +450,7 @@ impl Scheduler {
         {
             for worker in workers {
                 let mut batch = self.finish_generation_batch(
-                    ExecutionBatch::new(0, Vec::new(), Vec::new(), Vec::new()),
+                    ExecutionBatch::new(0, Vec::new(), Vec::new()),
                     Instant::now(),
                 );
                 let Some(kv_offload) = self.kv_offload.as_mut() else {
@@ -482,7 +482,7 @@ impl Scheduler {
                 break;
             }
             let batch = self.finish_generation_batch(
-                ExecutionBatch::new(0, Vec::new(), commands, Vec::new()),
+                ExecutionBatch::new(0, Vec::new(), commands),
                 Instant::now(),
             );
             self.inflight.pending_submissions.push_back(batch);

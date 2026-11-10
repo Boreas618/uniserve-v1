@@ -527,7 +527,7 @@ impl ModelRunner {
     /// The build config sizes no pool - a blocking lane's width follows the work it carries, not
     /// the epoch - so the bounds are derived from what the node has: the checkpoint's own reader
     /// count for the lane that maps weights and installs programs, and the host's parallelism for
-    /// the lanes that read transfers, reclaim storage and handle media. A lane whose bound is
+    /// the lane that handles media. A lane whose bound is
     /// narrower than the work in flight queues it; it never drops it.
     pub(crate) fn blocking_limits(&self) -> Limits {
         let available = std::thread::available_parallelism()

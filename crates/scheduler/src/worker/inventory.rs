@@ -179,12 +179,6 @@ pub(crate) fn pool_info(ranks: &[MainProcessInfo]) -> anyhow::Result<MainProcess
         .filter(|bytes| *bytes > 0)
         .min()
         .unwrap_or(0);
-    // The pool holds what its narrowest rank does.
-    info.transfer_tickets = ranks
-        .iter()
-        .map(|rank| rank.transfer_tickets)
-        .min()
-        .unwrap_or(info.transfer_tickets);
 
     // A rank states the shapes the engine warms and its captured image
     // extents only for what it holds: the pool's are those its stating ranks
@@ -469,16 +463,13 @@ mod tests {
 
     #[test]
     fn a_pools_report_is_rank_zeros_with_what_its_ranks_state_jointly() {
-        let mut narrow = rank("gpu-a", 128, None);
-        narrow.transfer_tickets = 4;
-        let mut wide = rank("gpu-b", 96, None);
-        wide.transfer_tickets = 8;
+        let narrow = rank("gpu-a", 128, None);
+        let wide = rank("gpu-b", 96, None);
         let info = pool_info(&[narrow, wide]).expect("two ranks that agree");
         assert_eq!(
             info.buffer_pool_bytes, 96,
             "a pool holds what its narrowest rank does"
         );
-        assert_eq!(info.transfer_tickets, 4);
         assert_eq!(
             info.endpoint.host, "gpu-a",
             "the pool's identity is its first rank's"

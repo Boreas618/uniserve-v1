@@ -127,21 +127,16 @@ impl Scheduler {
     /// Reserves persistent buffers and transfer capacity for one call.
     ///
     /// Returns the call's output buffer spans, in `Call::buffer_outputs`
-    /// order, or `None` when the call cannot run now: transfer capacity is
-    /// exhausted, the request is not running, `Dispatch::worker_target` finds
-    /// no worker, or a buffer allocation fails.
+    /// order, or `None` when the call cannot run now: the request is not
+    /// running, `Dispatch::worker_target` finds no worker, or a buffer
+    /// allocation fails.
     ///
     /// Buffer spans reserved before a failure are returned to the pool, but a
     /// failure is not free of side effects: a failed buffer allocation evicts
     /// one unpinned encoder-cache product, if any, and queues a `Free` for its
-    /// buffer. Only a successful reservation counts against the transfer
-    /// capacity.
+    /// buffer.
     fn reserve_generation_resources(&mut self, call: &Call) -> Option<Vec<BufferSpan>> {
         let id = call.request_key.request_id;
-        let uses_transfer = call.bounds.max_transfer_bytes > 0;
-        if uses_transfer && self.inflight.num_pending_transfers >= self.transfer_capacity {
-            return None;
-        }
         let request_key = self
             .running
             .get(&id)
@@ -173,9 +168,6 @@ impl Scheduler {
             buffer_allocations.push(allocation);
         }
 
-        if uses_transfer {
-            self.inflight.num_pending_transfers += 1;
-        }
         Some(buffer_allocations)
     }
 
@@ -321,12 +313,7 @@ impl Scheduler {
                 let (batch, layouts) = kind_batches.entry(key.clone()).or_insert_with(|| {
                     kind_order.push(key);
                     (
-                        ExecutionBatch::new(
-                            self.inflight.next_batch_id(),
-                            Vec::new(),
-                            Vec::new(),
-                            Vec::new(),
-                        ),
+                        ExecutionBatch::new(self.inflight.next_batch_id(), Vec::new(), Vec::new()),
                         Vec::new(),
                     )
                 });
@@ -448,12 +435,7 @@ impl Scheduler {
                 let (batch, layouts) = kind_batches.entry(key.clone()).or_insert_with(|| {
                     kind_order.push(key);
                     (
-                        ExecutionBatch::new(
-                            self.inflight.next_batch_id(),
-                            Vec::new(),
-                            Vec::new(),
-                            Vec::new(),
-                        ),
+                        ExecutionBatch::new(self.inflight.next_batch_id(), Vec::new(), Vec::new()),
                         Vec::new(),
                     )
                 });

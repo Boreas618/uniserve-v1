@@ -283,8 +283,6 @@ pub struct CallOutput {
     pub prompt_logprobs: Vec<Vec<crate::TokenLogprob>>,
     /// The finished artifact and its storage lifetime, when the call produced one.
     pub media_output: Option<crate::MediaOutput>,
-    /// The physical cache export, when the call publishes one.
-    pub cache_output: Option<crate::CacheTransfer>,
     /// The drafter's proposals after the last committed token.
     pub draft_token_ids: Vec<u32>,
     /// A video latent preparation's per-rank page layout.
@@ -306,10 +304,9 @@ impl CallOutput {
             cache_visible_len: state.cache_visible_len,
             token_logprobs: Vec::new(),
             prompt_logprobs: Vec::new(),
-            // A text call produces no artifact, publishes no export, drafts no token and lays out
-            // no latent page: the mechanism reads these as empty, which is what happened.
+            // A text call produces no artifact, drafts no token and lays out no latent page: the
+            // mechanism reads these as empty, which is what happened.
             media_output: None,
-            cache_output: None,
             draft_token_ids: Vec::new(),
             latent_layouts: Vec::new(),
         }
@@ -611,8 +608,8 @@ impl CallOutput {
         );
         if self.status != CallStatus::Ok {
             ensure_valid!(
-                self.latent_layouts.is_empty() && self.cache_output.is_none(),
-                "latent layouts and a cache export belong to a successful completion"
+                self.latent_layouts.is_empty(),
+                "latent layouts belong to a successful completion"
             );
         }
         if self.status == CallStatus::Predicated {
@@ -620,9 +617,6 @@ impl CallOutput {
                 self.tokens.is_empty() && self.draft_token_ids.is_empty(),
                 "a predicated completion must select its parent without semantic output"
             );
-        }
-        if let Some(export) = &self.cache_output {
-            export.validate()?;
         }
         if let Some(output) = &self.media_output {
             output.handle.validate()?;

@@ -1164,7 +1164,6 @@ mod tests {
                 .map(|row| call(CallKind::Media(call_kind), u64::from(row)))
                 .collect(),
             Vec::new(),
-            Vec::new(),
         );
         let staged = vec![staged(); rows as usize];
         with_media(&mut batch, MediaColumns::staged(computation, &staged));
@@ -1390,7 +1389,6 @@ mod tests {
         let batch = ExecutionBatch::new(
             5,
             vec![call(CallKind::Media(MediaCall::Denoising), 0)],
-            Vec::new(),
             Vec::new(),
         );
         let refusal = submissions

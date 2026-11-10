@@ -67,7 +67,7 @@ An epoch whose worker group has ranks on several hosts runs one main process per
 - **Frames.** A frame is a length followed by one message in a serde binary encoding (MessagePack). The main processes are built from one workspace and replaced together, so the message types are the protocol's only definition. A frame carries a message of any size its `u32` length states; no launch setting bounds it further.
 - **Waiting.** Each side blocks on its socket together with one local wake descriptor, which its own threads fire for work that did not arrive on the socket.
 - **Processes.** The scheduler starts no process itself. Its daemon starts each node's main process on the node its parallel configuration names, through the node's daemon, reserves the sockets the scheduler node inherits, and claims the deployment at a node's Storage Server (an engine claims it at every node's, those that run none of its peers included, so that it retires another epoch's storage and keeps an epoch's weights wherever they lie, and each peer's launch names the other nodes' servers, whose epochs' weights it may receive); the leader serves its own node and forwards the rest to the node's daemon over that daemon's join connection, and every exit comes back the same way, naming the node, group, rank and launch generation. These messages are the process interface (`crates/proto/src/process.proto`), Protobuf that changes only by additions: a daemon keeps running while engines of later builds connect to it, and the two compare major versions when they connect. A main process is its daemon's child, leads a process group of its own and dies with the daemon.
-- **Data.** Tensors, prefix cache pages, latents and products move through the transfer mechanisms. Only a host product routed between hosts travels on the channel.
+- **Data.** Prefix cache pages, latents and encoder outputs move between processes and hosts as Storage Server transfer tasks (see Transfers); the worker groups of a deployment run in one main process, where products pass in place.
 - **Epoch switches.** An epoch switch starts its target from one launch per node, which a group of several hosts cannot share; such a deployment moves to another epoch by a relaunch.
 
 ## The threads of a main process
@@ -80,11 +80,11 @@ A main process's threads are named by their role: the control thread, the schedu
 | Peer links | process, on an epoch of several hosts | One connection to another main process of the epoch (`crates/worker/src/peers.rs`) | The scheduler node's: sends its schedulers' batches to a peer and settles their answers. A peer's: runs the scheduler node's batches on its devices and answers them. A close ends the process |
 | Scheduler threads | DP rank | Its own queue and wake descriptor | Request state, the scheduling mechanism, each step's event batch and plan, batch assembly and completions |
 | Executors | device | The device's work | The only issuer of work on the device's streams: forwards, graph replays, copies, captures and rebinds, in submission order (`crates/worker/src/job.rs`) |
-| Blocking pool | pool | One kind of host work | Module loading, transfer reads, shared-storage retirement, media encoding and muxing, and condition media reads (`crates/worker/src/blocking.rs`) |
+| Blocking pool | pool | One kind of host work | Module loading, media encoding and muxing, and condition media reads (`crates/worker/src/blocking.rs`) |
 
 Threads exchange messages only. The control thread never waits for a job, so a slow launch, a driver call that waits on the device or a job that does not end does not keep it from serving the channel, handling a cancellation or reporting status. The executor is the only issuer of work on its device's streams, so each stream's order is the order the jobs were submitted in; it posts a job's completion once it has issued the job's work, not once the device has finished it, and storage a job used is read, rewritten or freed afterwards only behind something that waited for the device (a read in the job, a stream wait the job recorded, events the job completes after, or the fences that retire storage). A runner is called only on its device executor's thread and only one job at a time, which is why the runner trait takes `&mut self` and carries no synchronization (`crates/worker/src/runner.rs`).
 
-Blocking host work runs on bounded pools of threads (`<pool>-<index>`) that each serve one kind of work: image preparation, prefix cache imports, transfer reads and shared-memory retirement. Signals, VMM descriptor grants, a video runner's host reports and, during startup, the engine watch are dedicated threads (`crates/worker/src/blocking.rs`).
+Blocking host work runs on bounded pools of threads (`<pool>-<index>`) that each serve one kind of work: module loading and media. Signals, a video runner's host reports and, during startup, the engine watch are dedicated threads (`crates/worker/src/blocking.rs`).
 
 ## The numerical library
 
@@ -191,7 +191,7 @@ Retained host allocations are admitted by the Storage Server before it creates t
 
 ### Transfers
 
-Transfers go through one module per mechanism in `crates/worker/src/transfer`: `local` (in-process borrows), `posix_shm` (POSIX shared memory on one host), `vmm` (CUDA VMM allocations exported in place or through a pool, imported by fabric handle or by a descriptor from the exporter's grant socket) and `channel` (bytes carried in the location). A read runs on a transfer-pool thread with one stream per thread and device: it claims the chunk and waits on the host for the claim, orders its copy behind the handoff and the producer's event (a cross-device read waits for the producer on the host), copies, acknowledges, and drains its stream before its task completes, which returns its bytes and read credit. A VMM read imports the allocation's handle, maps it and opens its ready event. An export states whether its allocation is resident (the producer's arenas, pools and cache planes, kept until it closes) or made for that export alone: a reader keeps its mapping of a resident fabric allocation for every later read of it until its transport closes, and releases any other mapping with the read. A rank's transfers share one byte budget and one set of read credits; an exported product holds its bytes once, whatever number of mechanisms publish it, and they return when its last backing physically retires. A rank holds one read credit per queued call (a media rank at least one per concurrent artifact import of each slot and one per rank of the deployment) and reports their count (`MainProcessInfo::transfer_tickets`); the engine keeps no more transfer calls reserved than the narrowest rank holds.
+A main process moves no bytes to another process itself. Every copy between processes or hosts is a Storage Server transfer task (`Request::Transfer`), run by the host's Transfer Server; a rank's own copies between its device cache and its host's page pools run on the rank's copy stream (`PrefixCache::issue_pages`).
 
 ## Startup
 
@@ -255,7 +255,7 @@ crates/ops/             operators, their descriptors and descriptor keys, and th
 crates/scheduling/      the scheduling interface: events, decisions, the WASM policy execution (guest/, policies/)
 crates/media/           H.264/AAC encoding, MP4 muxing, condition media decoding and host resamplers (libav* FFI)
 crates/scheduler/       the main process's mechanism: schedulers, KV cache allocation, executor groups, process launch through the daemons, the request interface's service
-crates/worker/          the executors and the numerics they issue: runners, graphs, arenas, the memory owners, capacity, transfers, the program-layer update
+crates/worker/          the executors and the numerics they issue: runners, graphs, arenas, the memory owners, capacity, the program-layer update
 crates/daemon/          a node's daemon: process supervision, the node's Storage Server claim, the process interface's service; on the leader the HTTP server and its connections, metrics, the served model's facade (`frontend::openai::Server`) and the engine's client
 crates/frontend/        the application layer: the OpenAI-compatible API, input processing and output processing, over the served checkpoint's tokenizer, files, configuration and family profile
 crates/service/         host services: the per-user socket, its owner lock, a detached start and the start of an absent service
@@ -278,7 +278,6 @@ Dependency direction, as the crates' manifests state it (a crate on the right de
 | `graph`, `captured`, `arena`, `plan` | graph pools and capture, the captured node tables, the arenas activations live in, and the buckets a step selects |
 | `memory/` | the storage owners: prefix cache, latent banks, products, request slots, buffers, pinned output, retained weights and encoders |
 | `capacity/` | capacity planning from the runners' manifests and the device's measured storage |
-| `transfer/` | the transfer mechanisms: in-process, POSIX shared memory, CUDA VMM and the channel |
 | `stream`, `device`, `blocking`, `host`, `watchdog`, `profiling` | streams and their scratch, the device and its context, the blocking pools and their host work, the watchdog and its stall bound, and the profiler |
 | `config`, `parallel` | the rank layout and devices resolved before a model loads; host collectives, process-group plans and weight prefetch plans |
 | `keys` | the Storage Server keys of derived state: retained weights, KV pages, encoder outputs and latents |

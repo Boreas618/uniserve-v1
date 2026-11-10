@@ -187,8 +187,7 @@ pub(crate) fn outcomes() -> (u64, u64) {
 ///
 /// # Errors
 ///
-/// Fails when the worker groups do not form equal replicas, when the transfer edges do not parse,
-/// or when a transfer edge connects two replicas.
+/// Fails when the worker groups do not form equal replicas.
 pub(crate) fn replica_configs(
     config: &proto::config::EngineConfig,
 ) -> anyhow::Result<Vec<proto::config::EngineConfig>> {
@@ -201,39 +200,15 @@ pub(crate) fn replica_configs(
         !groups.is_empty() && groups.len().is_multiple_of(count),
         "the worker groups must form {count} equal independent replicas"
     );
-    let transfers = config
-        .device
-        .transfer
-        .as_deref()
-        .unwrap_or_default()
-        .parse::<proto::config::connector::ConnectorConfig>()
-        .context("invalid `device_config.transfer`")?;
-    groups
+    Ok(groups
         .chunks(groups.len() / count)
         .map(|groups| {
-            let contains =
-                |id: &proto::config::WorkerGroupId| groups.iter().any(|group| &group.id == id);
-            let mut local = proto::config::connector::ConnectorConfig::default();
-            for edge in &transfers.edges {
-                let source = contains(&edge.source_worker);
-                let destination = contains(&edge.destination_worker);
-                anyhow::ensure!(
-                    source == destination,
-                    "a transfer edge connects independent replicas: {} -> {}",
-                    edge.source_worker,
-                    edge.destination_worker
-                );
-                if source {
-                    local.edges.push(edge.clone());
-                }
-            }
             let mut replica = config.clone();
             replica.parallel.data_parallel_size = std::num::NonZeroUsize::MIN;
             replica.parallel.worker_groups = groups.to_vec();
-            replica.device.transfer = (!local.edges.is_empty()).then(|| local.to_string());
-            Ok(replica)
+            replica
         })
-        .collect()
+        .collect())
 }
 
 /// What a leader prepares before it has an engine (`Leader::prepare`).

@@ -77,38 +77,6 @@ impl GroupTable {
     pub(crate) fn pages(&self) -> usize {
         self.units.len() / self.shape.units_per_page as usize
     }
-
-    /// Map absolute tokens to `(unit, token offset, token count)` intervals.
-    /// Every unit in a page holds these tokens for its own subset of layers.
-    pub(crate) fn spans(&self, mut start: u64, mut length: u64) -> Result<Vec<(u32, u32, u32)>> {
-        let tokens = u64::from(self.shape.block_size);
-        let units = self.shape.units_per_page as usize;
-        let end = start.checked_add(length);
-        if (length > 0 && start < u64::from(self.start_page) * tokens)
-            || end.is_none_or(|end| end > self.end_page() * tokens)
-        {
-            return Err(Error::Invalid(
-                "cache token interval exceeds its unit table".into(),
-            ));
-        }
-
-        let mut spans = Vec::new();
-        while length > 0 {
-            let page = start / tokens;
-            let offset = start % tokens;
-            let count = length.min(tokens - offset);
-            let first = (page - u64::from(self.start_page)) as usize * units;
-            spans.extend(
-                self.units[first..first + units]
-                    .iter()
-                    .map(|unit| (unit.0, offset as u32, count as u32)),
-            );
-            start += count;
-            length -= count;
-        }
-
-        Ok(spans)
-    }
 }
 
 /// Changed rows and lengths to write to the device tables in one batch.
@@ -391,18 +359,23 @@ mod tests {
             allocated_tokens: 16,
         }];
         let batch = tables.for_batch(1, &assignments)?;
-        assert_eq!(batch[0].spans(2, 4)?, vec![(1, 2, 2), (2, 0, 2)]);
-        assert_eq!(batch[1].spans(10, 4)?, vec![(5, 2, 4), (6, 2, 4)]);
-        assert_eq!(tables.table(1, 1)?.spans(2, 4)?, vec![(3, 2, 4), (4, 2, 4)]);
+        // The batch sees the committed table of the group it does not supply, and its own
+        // assignment for the group it does; the committed tables are unchanged until commit.
+        assert_eq!(batch[0].units, vec![UnitId(1), UnitId(2)]);
+        assert_eq!(
+            (batch[1].start_page, batch[1].units.clone()),
+            (1, vec![UnitId(5), UnitId(6)])
+        );
+        assert_eq!(tables.table(1, 1)?.units, vec![UnitId(3), UnitId(4)]);
 
         let update = tables.prepare(&assignments)?;
         tables.commit(update);
-        assert_eq!(tables.table(1, 1)?.spans(10, 4)?, batch[1].spans(10, 4)?);
+        assert_eq!(tables.table(1, 1)?, batch[1]);
         Ok(())
     }
 
     #[test]
-    fn token_spans_cover_each_layers_unit_without_crossing_retired_pages() -> Result<()> {
+    fn a_row_holds_one_position_of_every_page() -> Result<()> {
         let table = GroupTable {
             shape: GroupShape::new(8, 2, ipc::CacheGroupKind::SlidingWindow { window: 8 })?,
             start_page: 3,
@@ -411,13 +384,6 @@ mod tests {
         };
         assert_eq!(table.row(0), vec![2, 4]);
         assert_eq!(table.row(1), vec![3, 5]);
-        assert_eq!(
-            table.spans(30, 4)?,
-            vec![(2, 6, 2), (3, 6, 2), (4, 0, 2), (5, 0, 2)]
-        );
-        assert!(table.spans(23, 1).is_err());
-        assert!(table.spans(39, 2).is_err());
-        assert!(table.spans(40, 0)?.is_empty());
         Ok(())
     }
 }

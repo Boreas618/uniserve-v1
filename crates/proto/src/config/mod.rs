@@ -6,7 +6,6 @@
 //! section knows fails the parse instead of being ignored.
 
 pub mod block;
-pub mod connector;
 pub mod values;
 pub mod worker_group;
 
@@ -373,9 +372,6 @@ pub struct DeviceConfig {
     pub worker_hosts: Vec<String>,
     /// Batches in flight per rank; a deployment group states its own.
     pub queue_depth: NonZeroUsize,
-    /// Product transport per worker edge,
-    /// `source[:rank]->destination[:rank]=mechanisms`, comma-separated.
-    pub transfer: Option<String>,
 }
 
 impl Default for DeviceConfig {
@@ -385,7 +381,6 @@ impl Default for DeviceConfig {
             devices: Vec::new(),
             worker_hosts: Vec::new(),
             queue_depth: positive(2),
-            transfer: None,
         }
     }
 }

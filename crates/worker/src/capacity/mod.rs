@@ -162,12 +162,6 @@ pub(crate) struct ArenaCapacity {
     /// other products lie in the scheduler-placed buffer pool, which bounds
     /// them.
     pub device_product_bytes: u64,
-    /// The rank's transfer byte budget: bytes every exported product and
-    /// every read hold until they retire, whether or not they occupy storage
-    /// of their own. A product published through several mechanisms holds
-    /// its bytes once.
-    pub transfer_bytes: u64,
-    pub transfer_tickets: usize,
     /// Device bytes of the CUDA VMM export pool of the primary device, where
     /// the relay arenas lie; zero for a rank that exports no device product
     /// over CUDA VMM ([`export_pool_bytes`]).
@@ -186,7 +180,26 @@ pub(crate) struct ArenaCapacity {
 /// most eight each, so `relay_bytes` bounds how many are live, and each
 /// live scalar has at most one export, copied into a chunk of its own.
 pub(crate) fn export_pool_bytes(relay_bytes: u64) -> u64 {
-    crate::transfer::vmm::pool::pool_bytes(relay_bytes, size_of::<i64>())
+    pool_bytes(relay_bytes, size_of::<i64>())
+}
+
+/// Bytes of the reader-acknowledgment header of an export pool chunk: one `u32` word per
+/// consumer slot.
+const EXPORT_HEADER_BYTES: usize = 64 * size_of::<u32>();
+
+/// The alignment of an export pool chunk.
+const EXPORT_CHUNK_ALIGNMENT: usize = 512;
+
+/// Bytes of an export pool that holds `count` payloads of at most `bytes` each at
+/// once, every payload in its own chunk: the reader-word header and the payload,
+/// rounded up to [`EXPORT_CHUNK_ALIGNMENT`].
+pub(crate) fn pool_bytes(count: u64, bytes: usize) -> u64 {
+    let chunk = bytes
+        .checked_add(EXPORT_HEADER_BYTES)
+        .and_then(|value| value.checked_add(EXPORT_CHUNK_ALIGNMENT - 1))
+        .map(|value| value / EXPORT_CHUNK_ALIGNMENT * EXPORT_CHUNK_ALIGNMENT)
+        .unwrap_or(usize::MAX) as u64;
+    count.saturating_mul(chunk)
 }
 
 /// The batching bounds of a token worker's arena.
@@ -206,10 +219,8 @@ impl ArenaCapacity {
     /// The arena of a token worker: relay entries for every unresolved call of
     /// every request slot and the one before them, whose completion the
     /// oldest of them still reads on the device as its predicate, and one
-    /// transfer ticket and one host-pool task per queued call (`depth`
-    /// batches of up to `calls` calls are in flight at once, and a call holds
-    /// at most one of each). The plan budgets each ticket for the largest
-    /// single read once the cache is fitted.
+    /// host-pool task per queued call (`depth` batches of up to `calls` calls
+    /// are in flight at once, and a call holds at most one).
     pub(crate) fn for_tokens(bounds: &TokenBounds) -> Result<Self> {
         let TokenBounds {
             depth,
@@ -218,22 +229,17 @@ impl ArenaCapacity {
             device_exports,
         } = *bounds;
         let window = call_window(depth, calls)?;
-        let transfer_tickets = depth * calls;
         let relay_depth = window + 1;
         let device_product_bytes = relay_bytes(requests, relay_depth);
 
         Ok(Self {
             device_product_bytes,
-            // One byte per ticket until the cache is fitted, whose largest export a read may
-            // carry.
-            transfer_bytes: transfer_tickets as u64,
-            transfer_tickets,
             export_pool_bytes: if device_exports {
                 export_pool_bytes(device_product_bytes)
             } else {
                 0
             },
-            host_task_inflight: transfer_tickets,
+            host_task_inflight: depth * calls,
         })
     }
 

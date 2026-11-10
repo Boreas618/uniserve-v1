@@ -98,9 +98,6 @@ fn query_tokens(call: &ipc::Call) -> u64 {
 pub(super) struct Inflight {
     /// Planned batches the worker has not accepted yet, in dispatch order.
     pub(super) pending_submissions: VecDeque<ExecutionBatch>,
-    /// Transfer calls (nonzero `max_transfer_bytes`) holding a reservation,
-    /// bounded by `Scheduler::transfer_capacity`.
-    pub(super) num_pending_transfers: usize,
     /// Last issued batch id; ids start at 1, so a call id with batch zero has
     /// not been assigned to a batch.
     pub(super) batch_id: u64,
@@ -129,7 +126,6 @@ impl Inflight {
     pub(super) fn new() -> Self {
         Self {
             pending_submissions: VecDeque::new(),
-            num_pending_transfers: 0,
             batch_id: 0,
             next_arrival_seq: 1,
             pending_calls: HashMap::new(),
@@ -306,14 +302,11 @@ impl Inflight {
         if queue.is_empty() {
             self.pending_calls.remove(&id);
         }
-        if inflight.call.bounds.max_transfer_bytes > 0 {
-            self.release_transfer();
-        }
         Some(inflight)
     }
 
     /// Removes one call a worker failure retired, regardless of its queue
-    /// position, and releases its transfer reservation.
+    /// position.
     ///
     /// Returns `None` when the batch is unknown or no longer owns the call, or
     /// when the request's queue does not hold it; the worker-failure path
@@ -341,27 +334,13 @@ impl Inflight {
         if queue.is_empty() {
             self.pending_calls.remove(&request.request_id);
         }
-        if inflight.call.bounds.max_transfer_bytes > 0 {
-            self.release_transfer();
-        }
         Some(inflight)
-    }
-
-    /// Releases the transfer reservation a leaving transfer call holds.
-    ///
-    /// Every registered transfer call holds one reservation, so a release at
-    /// zero reports an accounting defect instead of wrapping the count.
-    fn release_transfer(&mut self) {
-        match self.num_pending_transfers.checked_sub(1) {
-            Some(remaining) => self.num_pending_transfers = remaining,
-            None => tracing::error!("a transfer call released a reservation it did not hold"),
-        }
     }
 
     /// Drops every submitted call after an unrecoverable execution failure.
     ///
     /// Clears the per-request call queues, queued completions, registered
-    /// batches, and transfer reservations. Returns the ids of requests that
+    /// and registered batches. Returns the ids of requests that
     /// owned a submitted call and the recorded commands of every dropped
     /// batch. `pending_submissions`, `pending_finishes`, and `pending_commands`
     /// are left for the caller.
@@ -373,7 +352,6 @@ impl Inflight {
             .flat_map(|(_, batch)| batch.commands)
             .collect();
         self.pending_calls.clear();
-        self.num_pending_transfers = 0;
         self.pending_completions.clear();
         (ids, commands)
     }

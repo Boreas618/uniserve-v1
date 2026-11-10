@@ -106,9 +106,6 @@ impl Scheduler {
         // Queue and batch limits cannot exceed the physical worker envelope.
         let max_batch_calls = info.max_batch_calls as usize;
         let max_batch_tokens = info.max_batch_tokens as usize;
-        // Each worker reports the transfer entries its transport holds in
-        // flight; the merged record carries the narrowest.
-        let transfer_capacity = info.transfer_tickets as usize;
 
         config.max_queued_requests = config
             .max_queued_requests
@@ -214,7 +211,6 @@ impl Scheduler {
             speculation_meter: Default::default(),
             retiring_requests: HashMap::new(),
             rows_held: 0,
-            transfer_capacity,
             engine_id: 1,
             epoch: 0,
             next_product_generation: 1,
@@ -806,7 +802,7 @@ impl Scheduler {
             if idle {
                 for worker in kv_offload.queued_workers() {
                     let mut batch = self.finish_generation_batch(
-                        ExecutionBatch::new(0, Vec::new(), Vec::new(), Vec::new()),
+                        ExecutionBatch::new(0, Vec::new(), Vec::new()),
                         Instant::now(),
                     );
                     let Some(kv_offload) = self.kv_offload.as_mut() else {
@@ -1107,12 +1103,9 @@ mod tests {
     #[test]
     fn a_drain_that_stopped_names_the_submission_the_worker_never_took() {
         let mut inflight = Inflight::new();
-        inflight.pending_submissions.push_back(ExecutionBatch::new(
-            11,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        ));
+        inflight
+            .pending_submissions
+            .push_back(ExecutionBatch::new(11, Vec::new(), Vec::new()));
 
         let message = abandoned_drain(&inflight, (0, 1));
 

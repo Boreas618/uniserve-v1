@@ -1,14 +1,12 @@
 //! Shared CUDA event leases and deferred storage release.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
-use platform::{DeviceId, Event, EventFlags};
+use platform::{DeviceId, Event};
 
-use super::Issue;
 use crate::{Error, Result, lock};
 
 /// The worker's name for the job that waits for deferred work's events, and
@@ -69,8 +67,6 @@ struct ActiveEvent {
     _event: Arc<Event>,
     device: DeviceId,
     references: usize,
-    /// Whether the lease was recorded, at once or into a job.
-    recorded: bool,
 }
 
 struct State {
@@ -119,11 +115,6 @@ struct State {
 /// hands over.
 pub struct EventPool {
     state: Mutex<State>,
-    /// Records booked under the lock and not made yet. Incremented under
-    /// the lock while the pool is open, so [`close`](Self::close), which
-    /// stops the pool under the lock, waits for exactly the records booked
-    /// before it.
-    recording: AtomicUsize,
 }
 
 impl Default for EventPool {
@@ -137,7 +128,6 @@ impl Default for EventPool {
                 status: Status::Open,
                 submitter: None,
             }),
-            recording: AtomicUsize::new(0),
         }
     }
 }
@@ -160,89 +150,6 @@ impl EventPool {
         let submitter = submitter.map(|submitter| (std::thread::current().id(), submitter));
         let previous = std::mem::replace(&mut self.lock().submitter, submitter);
         drop(previous);
-    }
-
-    /// Acquires an unrecorded lease with no retained references. Storage
-    /// owners retain their references before transferring them to release or
-    /// deferral.
-    pub(crate) fn acquire(
-        &self,
-        device: DeviceId,
-        timing: bool,
-        interprocess: bool,
-    ) -> Result<Arc<Event>> {
-        let mut state = self.lock();
-        require_open(&state)?;
-        Ok(book(&mut state, device, (timing, interprocess), 0, false))
-    }
-
-    /// Records this lease once on `stream`.
-    pub(crate) fn record(&self, event: &Arc<Event>, stream: impl Issue) -> Result<()> {
-        let device = producer(&stream)?;
-        {
-            let mut state = self.lock();
-            require_open(&state)?;
-            let active = require(&mut state, event, device)?;
-            if active.recorded {
-                return Err(invariant("device event was recorded more than once"));
-            }
-            active.recorded = true;
-            self.recording.fetch_add(1, Ordering::Relaxed);
-        }
-        self.make_record(event, stream, |state| {
-            if let Some(active) = state.active.get_mut(&key(event)) {
-                active.recorded = false;
-            }
-        })
-    }
-
-    pub(crate) fn retain(&self, event: &Arc<Event>, device: DeviceId, count: usize) -> Result<()> {
-        let mut state = self.lock();
-        require_open(&state)?;
-        if count == 0 {
-            return Err(invariant("device event retain count must be positive"));
-        }
-        require(&mut state, event, device)?.references += count;
-        Ok(())
-    }
-
-    /// Acquire, record on `stream` and retain one reference: the fence of
-    /// work just submitted to `stream`, booked in one lock section and
-    /// recorded after it.
-    pub(crate) fn fence(&self, stream: impl Issue, interprocess: bool) -> Result<Arc<Event>> {
-        let device = producer(&stream)?;
-        let event = {
-            let mut state = self.lock();
-            require_open(&state)?;
-            let event = book(&mut state, device, (false, interprocess), 1, true);
-            self.recording.fetch_add(1, Ordering::Relaxed);
-            event
-        };
-        // Nobody else holds the lease yet. A failed record made nothing:
-        // the lease leaves the pool with its event, whose driver state is
-        // not reused.
-        self.make_record(&event, stream, |state| {
-            state.active.remove(&key(&event));
-        })?;
-        Ok(event)
-    }
-
-    /// Make the record of `event` that was booked under the lock, outside
-    /// it, then end the booking. A failed record is first undone in the
-    /// books with `undo`.
-    fn make_record(
-        &self,
-        event: &Arc<Event>,
-        stream: impl Issue,
-        undo: impl FnOnce(&mut State),
-    ) -> Result<()> {
-        let recorded = stream.record(event);
-        if recorded.is_err() {
-            undo(&mut self.lock());
-        }
-        // Release: whoever observes the count drop also observes the record.
-        self.recording.fetch_sub(1, Ordering::Release);
-        recorded
     }
 
     /// Transfers one retained reference of each event, and the release work
@@ -306,15 +213,6 @@ impl EventPool {
                 .collect()
         };
         run(owners)
-    }
-
-    /// The device of an active lease.
-    pub(crate) fn device(&self, event: &Arc<Event>) -> Result<DeviceId> {
-        self.lock()
-            .active
-            .get(&key(event))
-            .map(|active| active.device)
-            .ok_or_else(|| invariant("device event is not an active lease"))
     }
 
     /// Waits on the host for the events of all deferred work, at most
@@ -420,46 +318,6 @@ fn submit_waiting(state: &mut State, deferral: Deferral) -> Result<()> {
     }
 }
 
-/// Book a lease of `device` with `flags` (timing, interprocess) holding
-/// `references`, `recorded` when its record is made right after the lock is
-/// released: a returned event, or a new one.
-fn book(
-    state: &mut State,
-    device: DeviceId,
-    (timing, interprocess): (bool, bool),
-    references: usize,
-    recorded: bool,
-) -> Arc<Event> {
-    let available = state
-        .available
-        .entry((device, timing, interprocess))
-        .or_default();
-    // A caller may retain an event object after releasing its lease.
-    // Reuse only when the pool is its last owner, preserving that observation.
-    let reusable = available
-        .iter()
-        .position(|event| Arc::strong_count(event) == 1);
-    let event = reusable
-        .map(|index| available.swap_remove(index))
-        .unwrap_or_else(|| {
-            Arc::new(Event::new(EventFlags {
-                timing,
-                interprocess,
-                external: false,
-            }))
-        });
-    state.active.insert(
-        key(&event),
-        ActiveEvent {
-            _event: Arc::clone(&event),
-            device,
-            references,
-            recorded,
-        },
-    );
-    event
-}
-
 /// Run every owner and return the first failure.
 fn run(owners: impl IntoIterator<Item = Deferred>) -> Result<()> {
     let mut result = Ok(());
@@ -471,33 +329,6 @@ fn run(owners: impl IntoIterator<Item = Deferred>) -> Result<()> {
         }
     }
     result
-}
-
-/// The device of the stream `stream` records on.
-fn producer(stream: &impl Issue) -> Result<DeviceId> {
-    let stream = stream
-        .stream()
-        .ok_or_else(|| invariant("a device event is recorded on a stream"))?;
-    Ok(stream.device())
-}
-
-fn require_open(state: &State) -> Result<()> {
-    if state.status != Status::Open {
-        return Err(invariant("device event pool is closed"));
-    }
-    Ok(())
-}
-
-fn require<'a>(
-    state: &'a mut State,
-    event: &Arc<Event>,
-    device: DeviceId,
-) -> Result<&'a mut ActiveEvent> {
-    state
-        .active
-        .get_mut(&key(event))
-        .filter(|active| active.device == device)
-        .ok_or_else(|| invariant("device event is not owned by its declared device"))
 }
 
 fn require_references(state: &State, events: &[Arc<Event>]) -> Result<()> {
@@ -575,62 +406,6 @@ mod tests {
         let runs = Arc::new(AtomicUsize::new(0));
         events.defer(Vec::new(), counting(&runs))?;
         assert_eq!(runs.load(Ordering::Relaxed), 1);
-        Ok(())
-    }
-
-    /// A retained lease of device 0, one reference, not recorded: what an owner
-    /// fences its storage with.
-    fn fence(events: &EventPool) -> Result<Arc<Event>> {
-        let event = events.acquire(platform::DeviceId(0), false, false)?;
-        events.retain(&event, platform::DeviceId(0), 1)?;
-        Ok(event)
-    }
-
-    #[test]
-    fn deferred_work_runs_when_its_job_completes() -> Result<()> {
-        let (events, jobs) = served();
-        let runs = Arc::new(AtomicUsize::new(0));
-        let event = fence(&events)?;
-
-        events.defer(vec![Arc::clone(&event)], counting(&runs))?;
-        assert_eq!(runs.load(Ordering::Relaxed), 0, "the work waits");
-        let job = JobId(jobs.load(Ordering::Relaxed) - 1);
-        assert!(events.owns(job));
-
-        events.complete(job, true)?;
-        assert_eq!(runs.load(Ordering::Relaxed), 1);
-        assert!(!events.owns(job), "the work is handed over once");
-        // The reference the deferral held went with it: the lease returned.
-        assert!(events.device(&event).is_err());
-        Ok(())
-    }
-
-    /// A failed job established nothing: the work it fenced stays deferred and the lease it retained
-    /// is not completed by the failure.
-    ///
-    /// **Shutdown then runs that work**, because the event was never recorded: the platform's rule is
-    /// that "an event that was never recorded is complete", and nothing was issued on the device for
-    /// the fences of a job that never ran. What keeps work deferred through a shutdown is an
-    /// *announced* record (`Event::queue_record`), which is the case a writer of a fence must state
-    /// before handing the record to another thread - not the absence of one.
-    #[test]
-    fn a_failed_job_established_nothing_and_shutdown_runs_the_work_it_fenced() -> Result<()> {
-        let (events, jobs) = served();
-        let runs = Arc::new(AtomicUsize::new(0));
-        let event = fence(&events)?;
-        events.defer(vec![Arc::clone(&event)], counting(&runs))?;
-        let job = JobId(jobs.load(Ordering::Relaxed) - 1);
-
-        assert!(events.complete(job, false).is_err());
-        assert_eq!(runs.load(Ordering::Relaxed), 0);
-        assert!(events.owns(job), "the work stays deferred");
-
-        events.drain()?;
-        assert_eq!(
-            runs.load(Ordering::Relaxed),
-            1,
-            "shutdown left the work of a fence that was never recorded unrun"
-        );
         Ok(())
     }
 

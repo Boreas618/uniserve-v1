@@ -15,7 +15,6 @@
 //! ([`Storage::exportable_containing`]).
 
 use std::collections::BTreeMap;
-use std::ops::Range;
 use std::sync::{Arc, Mutex, Weak};
 
 use std::os::fd::OwnedFd;
@@ -23,7 +22,7 @@ use std::os::fd::OwnedFd;
 use crate::{Error, Result, lock};
 use platform::{
     DeviceAllocation, DeviceId, HostRegistration, PeerMapping, PinnedBuffer, Protection,
-    SegmentedMapping, ShareableHandle, Strided,
+    SegmentedMapping,
 };
 
 /// The element type of storage.
@@ -455,16 +454,6 @@ impl Storage {
         })
     }
 
-    /// Adopt a mapping of exported device storage.
-    pub(crate) fn mapped(mapping: PeerMapping) -> Arc<Self> {
-        Arc::new(Self {
-            kind: Kind::Mapped {
-                mapping: Mutex::new(mapping),
-                descriptor: Mutex::new(None),
-            },
-        })
-    }
-
     /// Device storage of segments of `lengths` bytes back to back, each a
     /// multiple of the allocation granularity, none mapped yet
     /// ([`Storage::create_segment`], [`Storage::import_segment`]), addressed
@@ -598,36 +587,6 @@ impl Storage {
         }))
     }
 
-    /// A handle that exports the whole allocation in place to other
-    /// processes: an exportable allocation's own handle, or the descriptor
-    /// of retained storage, which reaches readers on this host only (an
-    /// imported allocation exports no handle of its own). `None` when the
-    /// allocation cannot be exported in place to the readers `cross_hosts`
-    /// says there are.
-    pub(crate) fn export(&self, cross_hosts: bool) -> Result<Option<ShareableHandle>> {
-        match &self.kind {
-            Kind::Device(allocation) => Ok(allocation.export()?),
-            Kind::Mapped { descriptor, .. } if !cross_hosts => lock(descriptor)
-                .as_ref()
-                .map(|descriptor| {
-                    descriptor
-                        .try_clone()
-                        .map(ShareableHandle::Descriptor)
-                        .map_err(|error| Error::transport_source("duplicating a descriptor", error))
-                })
-                .transpose(),
-            _ => Ok(None),
-        }
-    }
-
-    /// The device allocation, `None` for host storage and mappings.
-    pub(crate) fn allocation(&self) -> Option<&DeviceAllocation> {
-        match &self.kind {
-            Kind::Device(allocation) => Some(allocation),
-            _ => None,
-        }
-    }
-
     /// Puts the physical allocation `source` maps at this storage's address: a retained weight
     /// takes another retained allocation's bytes while every pointer to it, a captured graph's
     /// among them, stays what it was (§7.6). `source` keeps its own mapping until its owner drops
@@ -665,15 +624,6 @@ impl Storage {
         lock(target).remap_from(&lock(source), Protection::ReadOnly)?;
         *lock(target_descriptor) = Some(replacement);
         Ok(())
-    }
-
-    /// The live exportable allocation containing `address`, with the
-    /// address's byte offset inside it.
-    pub(crate) fn exportable_containing(address: u64) -> Option<(Arc<Self>, u64)> {
-        let registry = lock(&EXPORTABLE);
-        let (&base, storage) = registry.range(..=address).next_back()?;
-        let storage = storage.upgrade()?;
-        (address < base + storage.bytes() as u64).then(|| (storage, address - base))
     }
 
     /// The allocation's host-visible bytes. `None` for device storage.
@@ -788,26 +738,6 @@ pub struct StorageView {
     strides: Vec<i64>,
 }
 
-/// An owned copy operand: a view's address, element width, shape and
-/// element strides in the form [`platform::StridedCopy`] plans.
-pub(crate) struct CopyOperand {
-    address: u64,
-    element_bytes: usize,
-    shape: Vec<u64>,
-    strides: Vec<i64>,
-}
-
-impl CopyOperand {
-    pub(crate) fn strided(&self) -> Strided<'_> {
-        Strided {
-            address: self.address,
-            element_bytes: self.element_bytes,
-            shape: &self.shape,
-            strides: &self.strides,
-        }
-    }
-}
-
 impl StorageView {
     /// A contiguous view of `shape` starting `offset` bytes into `storage`.
     pub fn contiguous(
@@ -842,18 +772,6 @@ impl StorageView {
         Ok(view)
     }
 
-    /// Another window of the same allocation and dtype, inside this one:
-    /// a different tensor, wrapped on its own.
-    fn derive(&self, offset: usize, shape: Vec<i64>, strides: Vec<i64>) -> Self {
-        Self {
-            storage: Arc::clone(&self.storage),
-            offset,
-            dtype: self.dtype,
-            shape,
-            strides,
-        }
-    }
-
     /// The allocation this view retains.
     pub fn storage(&self) -> &Arc<dyn Backing> {
         &self.storage
@@ -883,11 +801,6 @@ impl StorageView {
     /// Elements addressed by the view.
     pub fn numel(&self) -> u64 {
         self.shape.iter().map(|&extent| extent as u64).product()
-    }
-
-    /// Bytes of the addressed elements, excluding strided gaps.
-    pub(crate) fn nbytes(&self) -> u64 {
-        self.numel() * self.dtype.bytes() as u64
     }
 
     /// Bytes from the first to one past the last element.
@@ -921,106 +834,6 @@ impl StorageView {
         }
         Ok(bytes)
     }
-
-    /// Elements `[start, start + length)` of `axis`. The whole axis is this
-    /// view itself.
-    pub(crate) fn narrow(&self, axis: usize, start: i64, length: i64) -> Result<Self> {
-        let extent = *self
-            .shape
-            .get(axis)
-            .ok_or_else(|| Error::Invariant(format!("view has no axis {axis}")))?;
-        if start < 0 || length < 0 || start + length > extent {
-            return Err(Error::Invariant(format!(
-                "range {start}..{} exceeds axis {axis} of extent {extent}",
-                start + length
-            )));
-        }
-        if start == 0 && length == extent {
-            return Ok(self.clone());
-        }
-        let offset = self.offset + (start * self.strides[axis]) as usize * self.dtype.bytes();
-        let mut shape = self.shape.clone();
-        shape[axis] = length;
-        Ok(self.derive(offset, shape, self.strides.clone()))
-    }
-
-    /// The per-axis `[start, end)` region of this view.
-    pub(crate) fn region(&self, region: &[Range<u64>]) -> Result<Self> {
-        if region.len() != self.shape.len() {
-            return Err(Error::Invalid(
-                "a region needs one range per view axis".to_owned(),
-            ));
-        }
-        let mut view = self.clone();
-        for (axis, range) in region.iter().enumerate() {
-            if range.start > range.end {
-                return Err(Error::Invalid("a region range is reversed".to_owned()));
-            }
-            view = view.narrow(axis, range.start as i64, (range.end - range.start) as i64)?;
-        }
-        Ok(view)
-    }
-
-    /// The view as a strided copy operand.
-    /// The most bytes one copy may address in the view's storage
-    /// ([`Backing::copy_span`]).
-    pub(crate) fn copy_span(&self) -> u64 {
-        self.storage.copy_span()
-    }
-
-    pub(crate) fn operand(&self) -> CopyOperand {
-        CopyOperand {
-            address: self.address(),
-            element_bytes: self.dtype.bytes(),
-            shape: self.shape.iter().map(|&extent| extent as u64).collect(),
-            strides: self.strides.clone(),
-        }
-    }
-
-    /// The maximal contiguous byte intervals the view addresses, in address
-    /// order. Axes whose stride equals the run below them fold into the run.
-    pub(crate) fn intervals(&self) -> Vec<Range<u64>> {
-        if self.shape.contains(&0) {
-            return Vec::new();
-        }
-        let element = self.dtype.bytes() as u64;
-        let mut axes: Vec<(u64, u64)> = self
-            .strides
-            .iter()
-            .zip(&self.shape)
-            .filter(|(_, extent)| **extent > 1)
-            .map(|(&stride, &extent)| (stride as u64, extent as u64))
-            .collect();
-        axes.sort_unstable();
-
-        let mut width = 1;
-        let mut outer = Vec::new();
-        for (stride, extent) in axes {
-            if stride == width && outer.is_empty() {
-                width *= extent;
-            } else {
-                outer.push((stride, extent));
-            }
-        }
-
-        let base = self.address();
-        let mut starts = vec![0_u64];
-        for (stride, extent) in outer {
-            starts = starts
-                .iter()
-                .flat_map(|&start| (0..extent).map(move |index| start + index * stride))
-                .collect();
-        }
-        let mut intervals: Vec<_> = starts
-            .into_iter()
-            .map(|start| {
-                let start = base + start * element;
-                start..start + width * element
-            })
-            .collect();
-        intervals.sort_unstable_by_key(|interval| interval.start);
-        intervals
-    }
 }
 
 impl std::fmt::Debug for StorageView {
@@ -1050,9 +863,6 @@ mod tests {
             StorageView::contiguous(Arc::clone(&storage), 4, ElementType::F32, &[4, 4]).is_err()
         );
 
-        let rows = StorageView::contiguous(Arc::clone(&storage), 0, ElementType::I64, &[8])?;
-        assert_eq!(rows.narrow(0, 0, 3)?.byte_len()?, 24);
-        assert!(rows.narrow(0, 0, 9).is_err());
         Ok(())
     }
 
@@ -1068,28 +878,6 @@ mod tests {
             assert_eq!(ElementType::parse(dtype.name())?, dtype);
         }
         assert!(ElementType::parse("complex64").is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn regions_and_transposes_address_the_same_elements() -> Result<()> {
-        let storage: Arc<dyn Backing> = Storage::host(4 * 6 * 4);
-        let base = storage.address();
-        let grid = StorageView::contiguous(Arc::clone(&storage), 0, ElementType::F32, &[4, 6])?;
-
-        let window = grid.region(&[1..3, 2..5])?;
-        assert_eq!(window.shape(), &[2, 3]);
-        assert_eq!(window.address(), base + (6 + 2) * 4);
-        assert_eq!(
-            window.intervals(),
-            vec![base + 32..base + 44, base + 56..base + 68,]
-        );
-
-        let transposed = StorageView::strided(storage, 0, ElementType::F32, &[6, 4], &[1, 6])?;
-        assert_eq!(transposed.shape(), &[6, 4]);
-        // A transposed view addresses the same bytes: one contiguous interval.
-        assert_eq!(transposed.intervals(), vec![base..base + 96]);
-        assert!(grid.region(&[0..5, 0..6]).is_err());
         Ok(())
     }
 }

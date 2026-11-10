@@ -297,9 +297,6 @@ impl ModelRunner {
                 plan: &planned,
                 device: Some(device),
                 stream: Some(&stream),
-                // A rank that takes no other rank's export states that as the absence of a
-                // program: a conversion that reaches it is a mistake, and it says so by name.
-                conversion: Arc::new(worker::memory::prefix_cache::conversion::Unimported),
                 pools,
             },
             storage,

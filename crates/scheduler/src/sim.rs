@@ -90,8 +90,6 @@ pub struct CallOutput {
     pub finish_flags: FinishFlags,
     /// Completed artifact and its external storage lifetime, when produced.
     pub media_output: Option<ipc::MediaOutput>,
-    /// Physical cache export, including this rank's tensor locations.
-    pub cache_output: Option<ipc::CacheTransfer>,
     /// Draft tokens the drafter proposed after the call's last committed
     /// token, in order, for the request's next verification: as many as
     /// the call's `DraftWork::proposals` asked for, none otherwise.
@@ -111,8 +109,6 @@ pub(crate) struct BatchOutput {
     pub batch_id: u64,
     /// Call completions, one per call the batch carried.
     pub completions: Vec<CallOutput>,
-    /// Product values published by completed calls.
-    pub products: Vec<ipc::TensorExport>,
     /// Aggregate worker execution time in microseconds, when measured.
     pub worker_exec_us: Option<u64>,
     /// Model-forward statistics, when reported by the worker.
@@ -1420,7 +1416,6 @@ impl SimEngine {
             max_unresolved_calls: 2,
             // One batch in flight (`queue_depth` 1) of up to
             // `max_batch_calls` calls, each holding one transfer entry.
-            transfer_tickets: 1024,
             ..MainProcessInfo::default()
         };
         Self {
@@ -1635,7 +1630,6 @@ impl SimEngine {
             committed_tokens: Vec::new(),
             finish_flags: FinishFlags::default(),
             media_output: None,
-            cache_output: None,
             draft_token_ids: Vec::new(),
             latent_layouts: Vec::new(),
         };
@@ -1997,7 +1991,6 @@ impl SimEngine {
             committed_tokens: Vec::new(),
             finish_flags: FinishFlags::default(),
             media_output: None,
-            cache_output: None,
             draft_token_ids: Vec::new(),
             latent_layouts: Vec::new(),
         }
@@ -2638,7 +2631,6 @@ impl SimEngine {
         let report = BatchOutput {
             batch_id,
             completions,
-            products: Vec::new(),
 
             worker_exec_us,
             forward_stats: None,
@@ -2779,7 +2771,6 @@ mod tests {
             vec![ipc::BatchCommand::Start {
                 request: Box::new(admission),
             }],
-            Vec::new(),
         )
     }
 

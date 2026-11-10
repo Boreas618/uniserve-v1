@@ -2035,7 +2035,6 @@ dependencies = [
  "proto",
  "rmp-serde",
  "serde",
- "serde_bytes",
  "serde_json",
  "service",
  "storage",
@@ -5718,7 +5717,6 @@ dependencies = [
  "thiserror",
  "time",
  "tracing",
- "uuid",
 ]
 
 [[package]]
