@@ -14,72 +14,9 @@
 //! - **Growth** ([`growable`]): a cache creates its deferred segments as the
 //!   ledger's room holds them, the room being the quota less everything booked.
 
-use serde::{Deserialize, Serialize};
-use storage::{GpuLedger, Item, LedgerEntry, Scope};
-
-/// What `EpochOperation::CacheStorage` reports of one worker.
-#[derive(Debug, Clone, Deserialize)]
-pub(super) struct CacheStorage {
-    /// The segments of each cache plane, in unit order; empty when the
-    /// planes are not split.
-    #[serde(default)]
-    pub(super) segments: Vec<ipc::CacheSegment>,
-    /// Segments the worker holds: the first given back.
-    #[serde(default)]
-    pub(super) held: u32,
-    /// Device bytes of one unit across the worker's planes.
-    #[serde(default)]
-    pub(super) unit_bytes: u64,
-    /// Free bytes of the worker's device, which bound what the cache
-    /// creates beside processes outside the deployment.
-    #[serde(default)]
-    pub(super) free_bytes: u64,
-    /// The worker's host.
-    #[serde(default)]
-    pub(super) host: String,
-    /// The worker's scope and epoch, which name its entries in the ledger.
-    #[serde(default)]
-    pub(super) scope: Option<Scope>,
-    #[serde(default)]
-    pub(super) epoch: Option<u64>,
-    /// The deployment's ledger of the cache's GPU; `None` for a worker that
-    /// keeps its storage itself, which no other epoch shares.
-    #[serde(default)]
-    pub(super) ledger: Option<GpuLedger>,
-}
-
-impl CacheStorage {
-    /// The first unit of segment `index`.
-    pub(super) fn first_unit(&self, index: u32) -> u32 {
-        self.segments
-            .iter()
-            .take(index as usize)
-            .map(|segment| segment.units)
-            .sum()
-    }
-
-    /// The device bytes of segment `index`: what the ledger books for it,
-    /// or its units' bytes for a segment not created.
-    pub(super) fn segment_bytes(&self, index: usize) -> u64 {
-        let segment = &self.segments[index];
-        let booked = self.ledger.as_ref().map_or(0, |ledger| {
-            ledger.bytes(|entry| {
-                entry.item == Item::CacheSegment
-                    && entry.scope == self.scope
-                    && entry.segment
-                        == Some(storage::Segment {
-                            epoch: segment.epoch,
-                            ordinal: segment.ordinal,
-                        })
-            })
-        });
-        if booked > 0 {
-            booked
-        } else {
-            u64::from(segment.units) * self.unit_bytes
-        }
-    }
-}
+use ipc::memory::CacheStorageReport;
+use serde::Serialize;
+use storage::LedgerEntry;
 
 /// One device's room for the device storage a profiling session holds:
 /// what its ledger and its free storage leave, and the tail segments the KV
@@ -115,7 +52,7 @@ pub(super) struct Room {
 /// the largest prefix whose given-back tail makes the rest (each segment
 /// given back frees its bytes of both). Fails for a worker that reports no
 /// ledger or no quota.
-pub(super) fn room(report: &CacheStorage, bytes: u64, floor: u32) -> Result<Room, String> {
+pub(super) fn room(report: &CacheStorageReport, bytes: u64, floor: u32) -> Result<Room, String> {
     let Some(ledger) = &report.ledger else {
         return Err("a worker that holds a split KV cache reports no storage ledger".to_owned());
     };
@@ -182,7 +119,7 @@ pub(super) fn room_refusal(rooms: &[Room]) -> String {
 /// ledger's room now, and the device's free storage; with `released`, also
 /// what the processes of the other epoch book, which end as they exit (a
 /// previous epoch kept as its weights).
-pub(super) fn growable(report: &CacheStorage, released: bool) -> u32 {
+pub(super) fn growable(report: &CacheStorageReport, released: bool) -> u32 {
     let (Some(ledger), Some(epoch)) = (&report.ledger, report.epoch) else {
         return 0;
     };

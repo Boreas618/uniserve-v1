@@ -49,17 +49,6 @@ pub struct GroupCache {
     pub scratch: u32,
 }
 
-/// What a worker reports of its KV cache (`EpochOperation::CacheStorage`).
-#[derive(serde::Deserialize)]
-struct CacheReport {
-    #[serde(default)]
-    segments: Vec<ipc::CacheSegment>,
-    #[serde(default)]
-    held: u32,
-    #[serde(default)]
-    scratch_units: u32,
-}
-
 /// What a parked scheduler hands the epoch that succeeds it: its public and
 /// private cache index, and the units and count of the requests it ended as
 /// migratable, which the successor's cache must hold to continue them.
@@ -426,7 +415,7 @@ impl Scheduler {
         if inherited.is_empty() {
             return Ok(());
         }
-        self.run_operation(&EpochOperation::AdoptCache {
+        self.run_operation(ipc::memory::AdoptCache {
             borrowed: borrowed
                 .iter()
                 .map(|units| [units.start, units.end])
@@ -517,17 +506,17 @@ impl Scheduler {
         self.closing = closing;
         let reports = self
             .worker
-            .operate_groups(&EpochOperation::CacheStorage)
+            .operate_groups(&ipc::memory::CacheStorage.into())
             .map_err(|error| format!("{error:#}"))?;
         let mut groups = Vec::new();
         for (group, results) in reports {
             let Some(units) = units.get(&group.to_string()).copied() else {
                 continue;
             };
-            let mut described: Option<CacheReport> = None;
-            for result in &results {
-                let report: CacheReport = serde_json::from_str(result)
-                    .map_err(|error| format!("a worker's cache report: {error}"))?;
+            let mut described: Option<ipc::memory::CacheStorageReport> = None;
+            let replies = ipc::memory::replies::<ipc::memory::CacheStorage>(&results)
+                .map_err(|error| format!("a worker's cache report: {error}"))?;
+            for report in replies {
                 match &described {
                     Some(first)
                         if (&first.segments, first.held) != (&report.segments, report.held) =>
@@ -540,13 +529,23 @@ impl Scheduler {
                     None => described = Some(report),
                 }
             }
+            // The units its warmup lends are the group's report at startup,
+            // which no rank reports again.
+            let scratch = self
+                .worker
+                .info()
+                .workers
+                .iter()
+                .find(|(id, _)| *id == group)
+                .and_then(|(_, info)| info.prefix_cache.as_ref())
+                .map_or(0, |cache| cache.scratch_units);
             if let Some(report) = described {
                 groups.push(GroupCache {
                     worker_group: group.to_string(),
                     segments: report.segments,
                     held: report.held,
                     units,
-                    scratch: report.scratch_units,
+                    scratch,
                 });
             }
         }

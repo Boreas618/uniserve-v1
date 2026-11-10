@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ipc::execution::EpochOperation;
+use ipc::memory::{AdoptCache, ReleaseCache, RestoreCache, Sleep, UpdateWeights, Wake};
 use ipc::{BatchCommand, ImageParams, RequestId, SamplingParams};
 use proto::request::MigrationCause;
 use scheduler::{
@@ -221,7 +222,7 @@ impl Worker for Segmented {
         let mut workers = self.workers.lock().unwrap();
         workers.operations.push(operation.clone());
         let result = match operation {
-            EpochOperation::CacheStorage => serde_json::json!({
+            EpochOperation::CacheStorage(_) => serde_json::json!({
                 "segments": (0..SEGMENTS)
                     .map(|ordinal| ipc::CacheSegment {
                         epoch: EPOCH,
@@ -243,33 +244,33 @@ impl Worker for Segmented {
                 "ledger": workers.ledger(),
                 "host_storage": {"available": 1u64 << 40, "reserve": 10u64 << 30, "unallocated": 0},
             }),
-            EpochOperation::ReleaseCache { from } => {
+            EpochOperation::ReleaseCache(ReleaseCache { from }) => {
                 workers.held = *from;
                 serde_json::Value::Null
             }
-            EpochOperation::RestoreCache { segments } => {
+            EpochOperation::RestoreCache(RestoreCache { segments }) => {
                 workers.held = match segments {
                     Some(count) => (workers.held + count).min(SEGMENTS),
                     None => SEGMENTS,
                 };
                 serde_json::Value::Null
             }
-            EpochOperation::Wake => {
+            EpochOperation::Wake(_) => {
                 workers.held = SEGMENTS;
                 serde_json::Value::Null
             }
-            EpochOperation::Sleep => {
+            EpochOperation::Sleep(_) => {
                 workers.held = 0;
                 serde_json::Value::Null
             }
-            EpochOperation::UpdateWeights => {
+            EpochOperation::UpdateWeights(_) => {
                 serde_json::json!({ "group": null })
             }
-            EpochOperation::AdoptCache { .. } => serde_json::json!({ "inherited": 0 }),
+            EpochOperation::AdoptCache(_) => serde_json::json!({ "inherited": 0 }),
             other => anyhow::bail!("no storage operation {other:?}"),
         };
         let mut results = vec![result.to_string()];
-        if workers.experts && *operation == EpochOperation::CacheStorage {
+        if workers.experts && matches!(operation, EpochOperation::CacheStorage(_)) {
             let ledger = workers.expert_process.map(|process| GpuLedger {
                 gpu: [8; 16],
                 deployment: "model".into(),
@@ -452,7 +453,7 @@ fn room_recomputes_the_holders_of_the_tail_that_cannot_continue() {
     );
     assert_eq!(
         workers.lock().unwrap().operations.last(),
-        Some(&EpochOperation::ReleaseCache { from: 4 })
+        Some(&ReleaseCache { from: 4 }.into())
     );
 
     handle.shutdown();
@@ -486,7 +487,7 @@ fn a_growth_creates_the_segments_the_ledgers_room_holds() {
             .lock()
             .unwrap()
             .operations
-            .contains(&EpochOperation::RestoreCache { segments: Some(2) }),
+            .contains(&RestoreCache { segments: Some(2) }.into()),
         "{:?}",
         workers.lock().unwrap().operations
     );
@@ -805,9 +806,9 @@ fn a_successor_allocates_the_segments_its_predecessor_lent() {
             .lock()
             .unwrap()
             .operations
-            .contains(&EpochOperation::AdoptCache {
+            .contains(&EpochOperation::from(AdoptCache {
                 borrowed: vec![[8, 12], [16, 20]],
-            }),
+            })),
         "{:?}",
         workers.lock().unwrap().operations
     );
@@ -840,17 +841,14 @@ fn a_sleeping_scheduler_admits_nothing_until_it_wakes() {
             ..
         })
     ));
-    assert_eq!(
-        workers.lock().unwrap().operations,
-        vec![EpochOperation::Sleep]
-    );
+    assert_eq!(workers.lock().unwrap().operations, vec![Sleep.into()]);
 
     let mut waiting = handle.submit(request(2, 2, 4)).unwrap();
     assert_eq!(next_token(&mut waiting, Duration::from_millis(300)), None);
     assert!(resize(&handle, CacheChange::Wake).is_ok());
     assert_eq!(
         workers.lock().unwrap().operations.last(),
-        Some(&EpochOperation::Wake)
+        Some(&Wake.into())
     );
     assert!(matches!(
         terminal(&mut waiting),
@@ -878,10 +876,7 @@ fn an_aborting_sleep_ends_every_request_before_the_workers_sleep() {
             ..
         })
     ));
-    assert_eq!(
-        workers.lock().unwrap().operations,
-        vec![EpochOperation::Sleep]
-    );
+    assert_eq!(workers.lock().unwrap().operations, vec![Sleep.into()]);
 
     // Asleep, the update needs no second sleep and no wake of its own: the
     // process that put the workers to sleep wakes them.
@@ -893,11 +888,7 @@ fn an_aborting_sleep_ends_every_request_before_the_workers_sleep() {
     assert!(resize(&handle, CacheChange::Wake).is_ok());
     assert_eq!(
         workers.lock().unwrap().operations,
-        vec![
-            EpochOperation::Sleep,
-            EpochOperation::UpdateWeights,
-            EpochOperation::Wake,
-        ]
+        vec![Sleep.into(), UpdateWeights.into(), Wake.into(),]
     );
 
     handle.shutdown();
@@ -958,11 +949,7 @@ fn a_weight_update_recomputing_the_requests_in_flight_runs_while_the_workers_sle
     ));
     assert_eq!(
         workers.lock().unwrap().operations,
-        vec![
-            EpochOperation::Sleep,
-            EpochOperation::UpdateWeights,
-            EpochOperation::Wake,
-        ]
+        vec![Sleep.into(), UpdateWeights.into(), Wake.into(),]
     );
     let mut served = handle.submit(request(2, 2, 4)).unwrap();
     assert!(matches!(
@@ -990,7 +977,7 @@ fn a_weight_update_keeping_the_requests_in_flight_continues_them() {
     assert!(updated.is_ok(), "{updated:?}");
     assert_eq!(
         workers.lock().unwrap().operations,
-        vec![EpochOperation::UpdateWeights]
+        vec![UpdateWeights.into()]
     );
     assert!(matches!(
         terminal(&mut running),

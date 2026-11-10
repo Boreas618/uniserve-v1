@@ -26,6 +26,7 @@ use ipc::PhaseId;
 use ipc::execution::{
     Batch, Batches, Computation, EpochOperation, Extent, Fault, HostPools, Inventory, Submission,
 };
+use ipc::memory;
 use worker::capacity::device::{DeviceBooking, DeviceBudget};
 use worker::device::Worker;
 use worker::memory::allocation::Backing as _;
@@ -192,15 +193,22 @@ fn done(what: &str, submission: Submission) -> Result<()> {
     }
 }
 
-/// What a rank's planes answer of the segments they hold: `{"held": count}`, `null` for planes
-/// that are not split.
-fn held(planes: Option<&Arc<CachePlanes>>) -> serde_json::Value {
-    match planes {
-        Some(planes) if planes.segments().is_some() => {
-            serde_json::json!({ "held": planes.held_segments() })
-        }
-        _ => serde_json::Value::Null,
-    }
+/// What a rank's planes answer of the segments they hold; none for planes that are not split.
+fn held(planes: Option<&Arc<CachePlanes>>) -> Option<memory::Held> {
+    let planes = planes?;
+    planes.segments()?;
+    Some(memory::Held {
+        held: planes.held_segments(),
+    })
+}
+
+/// Answers each rank's `replies` to the memory operation `message` as the JSON texts
+/// [`Batches::operate`] returns; the message's type fixes the reply type the scheduler reads back.
+fn answer<O: memory::Operation + std::fmt::Debug>(
+    message: &O,
+    replies: Vec<O::Reply>,
+) -> Result<Vec<String>> {
+    memory::answers(&replies).map_err(|error| rejected(&format!("{message:?}"), error))
 }
 
 /// The digest a set of weights is known by: what roots the prefix hash chains of the pages computed
@@ -674,7 +682,7 @@ impl DataPlane {
 
     /// Maps `planned`'s weights at the addresses of the ones they replace, on every rank, at a
     /// boundary where nothing runs, and answers each rank's report.
-    fn rebind(&self, planned: Planned) -> Result<Vec<String>> {
+    fn rebind(&self, planned: Planned) -> Result<Vec<memory::WeightsUpdated>> {
         let Planned { target, ranks, .. } = planned;
         let mut queued = Vec::with_capacity(ranks.len());
         for (rank, load) in self.ranks.iter().zip(&ranks) {
@@ -717,16 +725,13 @@ impl DataPlane {
         for (rank, (identity, moved)) in self.ranks.iter().zip(moved_weights) {
             let rank = lock(rank);
             let identities = Self::page_identities(&rank, &pages_identity);
-            reports.push(
-                serde_json::json!({
-                    "group": rank.storage.scope().group,
-                    "rank": rank.storage.scope().rank,
-                    "identity": identity,
-                    "identities": identities,
-                    "moved": moved,
-                })
-                .to_string(),
-            );
+            reports.push(memory::WeightsUpdated {
+                group: Some(rank.storage.scope().group.clone()),
+                rank: Some(rank.storage.scope().rank),
+                identity: Some(identity),
+                identities,
+                moved,
+            });
         }
         *lock(&self.target) = target;
         Ok(reports)
@@ -770,7 +775,7 @@ impl DataPlane {
     }
 
     /// What every rank reports of its cache's storage (`Scheduler::storage_reports` reads it).
-    fn cache_storage(&self) -> Result<Vec<String>> {
+    fn cache_storage(&self) -> Result<Vec<memory::CacheStorageReport>> {
         self.ranks
             .iter()
             .map(|rank| {
@@ -779,24 +784,26 @@ impl DataPlane {
                 let planes = Self::planes_of(&rank);
                 let memory = device.memory_info()?;
                 let (ledger, _) = rank.storage.ledger(device)?;
-                Ok(serde_json::json!({
-                    "segments": planes.as_ref().and_then(|planes| planes.segments()).unwrap_or_default(),
-                    "held": planes.as_ref().map_or(0, |planes| planes.held_segments()),
-                    "unit_bytes": planes.as_ref().map_or(0, |planes| planes.unit_bytes()),
-                    "free_bytes": memory.free,
-                    "host": rank.host,
-                    "scope": rank.storage.scope(),
-                    "epoch": rank.storage.epoch(),
-                    "ledger": ledger,
+                Ok(memory::CacheStorageReport {
+                    segments: planes
+                        .as_ref()
+                        .and_then(|planes| planes.segments())
+                        .unwrap_or_default(),
+                    held: planes.as_ref().map_or(0, |planes| planes.held_segments()),
+                    unit_bytes: planes.as_ref().map_or(0, |planes| planes.unit_bytes()),
+                    free_bytes: memory.free,
+                    host: rank.host.clone(),
+                    scope: Some(rank.storage.scope().clone()),
+                    epoch: Some(rank.storage.epoch()),
+                    ledger: Some(ledger),
                 })
-                .to_string())
             })
             .collect()
     }
 
     /// Gives back the segments from `from` on, on every rank. No request holds a unit of them: the
     /// scheduler withdrew them and waited.
-    fn release_cache(&self, from: u32) -> Result<Vec<String>> {
+    fn release_cache(&self, from: u32) -> Result<Vec<Option<memory::Held>>> {
         let mut answers = Vec::with_capacity(self.ranks.len());
         for rank in &self.ranks {
             let rank = lock(rank);
@@ -804,13 +811,13 @@ impl DataPlane {
                 "giving the cache's segments back",
                 rank.worker()?.release_cache(from)?,
             )?;
-            answers.push(held(Self::planes_of(&rank).as_ref()).to_string());
+            answers.push(held(Self::planes_of(&rank).as_ref()));
         }
         Ok(answers)
     }
 
     /// Creates the first `limit` given-back segments again, or all of them, on every rank.
-    fn restore_cache(&self, limit: Option<u32>) -> Result<Vec<String>> {
+    fn restore_cache(&self, limit: Option<u32>) -> Result<Vec<Option<memory::Held>>> {
         let mut answers = Vec::with_capacity(self.ranks.len());
         for rank in &self.ranks {
             let rank = lock(rank);
@@ -818,26 +825,26 @@ impl DataPlane {
                 "creating the cache's segments again",
                 rank.worker()?.wake(limit)?,
             )?;
-            answers.push(held(Self::planes_of(&rank).as_ref()).to_string());
+            answers.push(held(Self::planes_of(&rank).as_ref()));
         }
         Ok(answers)
     }
 
     /// Gives back every segment and the graph storage, on every rank.
-    fn sleep(&self) -> Result<Vec<String>> {
+    fn sleep(&self) -> Result<Vec<()>> {
         self.suspend_graphs()?;
         let mut answers = Vec::with_capacity(self.ranks.len());
         for rank in &self.ranks {
             let rank = lock(rank);
             done("the sleep's release", rank.worker()?.sleep()?)?;
-            answers.push(serde_json::Value::Null.to_string());
+            answers.push(());
         }
         tracing::info!("the ranks sleep: their graph storage and cache are given back");
         Ok(answers)
     }
 
     /// Restores what [`Self::sleep`] gave back.
-    fn wake(&self) -> Result<Vec<String>> {
+    fn wake(&self) -> Result<Vec<Option<memory::Held>>> {
         self.restore_graphs()?;
         self.restore_cache(None)
     }
@@ -851,19 +858,23 @@ impl DataPlane {
     /// predecessor's cache units and the cache manifest's publication and description.
     pub fn operate(&self, operation: &EpochOperation) -> Result<Vec<String>> {
         match operation {
-            EpochOperation::CacheStorage => self.cache_storage(),
-            EpochOperation::ReleaseCache { from } => self.release_cache(*from),
-            EpochOperation::RestoreCache { segments } => self.restore_cache(*segments),
-            EpochOperation::Sleep => self.sleep(),
-            EpochOperation::Wake => self.wake(),
-            EpochOperation::UpdateWeights => {
+            EpochOperation::CacheStorage(message) => answer(message, self.cache_storage()?),
+            EpochOperation::ReleaseCache(message) => {
+                answer(message, self.release_cache(message.from)?)
+            }
+            EpochOperation::RestoreCache(message) => {
+                answer(message, self.restore_cache(message.segments)?)
+            }
+            EpochOperation::Sleep(message) => answer(message, self.sleep()?),
+            EpochOperation::Wake(message) => answer(message, self.wake()?),
+            EpochOperation::UpdateWeights(message) => {
                 let planned = lock(&self.staged).take().ok_or(Error::State(
                     "no weights are loaded for this update to put in place",
                 ))?;
-                self.rebind(planned)
+                answer(message, self.rebind(planned)?)
             }
-            EpochOperation::AdoptCache { .. }
-            | EpochOperation::PublishCache { .. }
+            EpochOperation::AdoptCache(_)
+            | EpochOperation::PublishCache(_)
             | EpochOperation::CacheManifest(_) => Err(Error::Interface(format!(
                 "this process does not implement the storage operation {operation:?}"
             ))),
@@ -1020,7 +1031,8 @@ impl DataPlane {
             self.discard(planned);
             return Err(Error::Interface(refusal.into()));
         }
-        self.rebind(planned)
+        let replies = self.rebind(planned)?;
+        memory::answers(&replies).map_err(|error| rejected("an expert redistribution", error))
     }
 
     /// Publishes the LoRA adapter `payload` names into its slot, on every rank (§7.6).

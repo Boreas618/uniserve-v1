@@ -889,16 +889,19 @@ impl Scheduler {
     }
 
     /// Performs the storage `operation` on every worker once the batches in flight complete,
-    /// admitting and scheduling nothing meanwhile, and returns each worker's result.
-    pub(super) fn run_operation(
+    /// admitting and scheduling nothing meanwhile, and returns each rank's typed reply.
+    pub(super) fn run_operation<O: ipc::memory::Operation>(
         &mut self,
-        operation: &EpochOperation,
-    ) -> Result<Vec<String>, String> {
+        operation: O,
+    ) -> Result<Vec<O::Reply>, String> {
+        let operation: EpochOperation = operation.into();
         let closing = std::mem::replace(&mut self.closing, true);
         let drained = self.drain_batches();
         self.closing = closing;
         drained?;
-        self.operate_workers(operation)
+        let answers = self.operate_workers(&operation)?;
+        ipc::memory::replies::<O>(&answers)
+            .map_err(|error| format!("a worker's reply to {operation:?}: {error}"))
     }
 
     /// Drain all participating schedulers before an operation, and keep them

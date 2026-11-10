@@ -129,7 +129,7 @@ impl Scheduler {
                     .collect();
                 if !host {
                     self.worker
-                        .operate(&EpochOperation::PublishCache { pages })
+                        .operate(&ipc::memory::PublishCache { pages }.into())
                         .map_err(|error| format!("{error:#}"))?;
                 }
                 if let Some(cache) = self.storage.cache() {
@@ -188,17 +188,15 @@ impl Scheduler {
         let ranks = if pages.is_empty() {
             Vec::new()
         } else {
-            self.worker
-                .operate(&EpochOperation::CacheManifest(
-                    storage::manifest::cache::Pages { pages, host },
-                ))
-                .map_err(|error| format!("{error:#}"))?
-                .into_iter()
-                .map(|value| {
-                    serde_json::from_str::<Option<storage::manifest::cache::Rank>>(&value)
-                        .map_err(|error| error.to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()?
+            let manifest = ipc::memory::CacheManifest {
+                pages: storage::manifest::cache::Pages { pages, host },
+            };
+            let answers = self
+                .worker
+                .operate(&manifest.into())
+                .map_err(|error| format!("{error:#}"))?;
+            ipc::memory::replies::<ipc::memory::CacheManifest>(&answers)
+                .map_err(|error| error.to_string())?
                 .into_iter()
                 .flatten()
                 .filter(|rank| !rank.storage.storages.is_empty())

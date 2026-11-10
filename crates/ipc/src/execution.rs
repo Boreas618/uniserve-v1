@@ -1462,39 +1462,30 @@ pub trait Batches: Send + Sync {
 /// A storage operation of a serving epoch, which the mechanism performs on every rank at a batch
 /// boundary ([`Batches::operate`]): no batch is in flight while it runs, so no running job shares
 /// a mapping it changes (7.6).
+///
+/// Each variant carries its message from [`crate::memory`], whose [`crate::memory::Operation`]
+/// impl names the reply every rank answers (one JSON text per rank, [`crate::memory::replies`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum EpochOperation {
     /// Reports how the rank's KV cache storage is split into segments and how many it holds.
-    CacheStorage,
-    /// Gives back the KV cache's segments from segment `from` on.
-    ReleaseCache {
-        /// The first segment given back.
-        from: u32,
-    },
-    /// Creates the given-back segments again: `segments` of them, or all when `None`.
-    RestoreCache {
-        /// How many segments to create, counted from the first given back.
-        segments: Option<u32>,
-    },
+    CacheStorage(crate::memory::CacheStorage),
+    /// Gives back the KV cache's segments from one segment on.
+    ReleaseCache(crate::memory::ReleaseCache),
+    /// Creates given-back segments again.
+    RestoreCache(crate::memory::RestoreCache),
     /// Gives back the graph storage and the KV cache while the epoch sleeps.
-    Sleep,
+    Sleep(crate::memory::Sleep),
     /// Restores what [`EpochOperation::Sleep`] gave back.
-    Wake,
+    Wake(crate::memory::Wake),
     /// Puts the weights the engine loaded beside the serving batches in place.
-    UpdateWeights,
-    /// Takes over the KV cache units a predecessor epoch lent, as half-open unit ranges.
-    AdoptCache {
-        /// The borrowed units, `[start, end)` each.
-        borrowed: Vec<[u32; 2]>,
-    },
+    UpdateWeights(crate::memory::UpdateWeights),
+    /// Takes over the KV cache units a predecessor epoch lent.
+    AdoptCache(crate::memory::AdoptCache),
     /// Publishes a precopy's claimed pages, which the ranks then serve as cached prefixes.
-    PublishCache {
-        /// The pages to publish.
-        pages: Vec<storage::manifest::cache::Page>,
-    },
-    /// Describes where the ranks hold `pages`, for a successor's cache manifest.
-    CacheManifest(storage::manifest::cache::Pages),
+    PublishCache(crate::memory::PublishCache),
+    /// Describes where the ranks hold a precopy's pages, for a successor's cache manifest.
+    CacheManifest(crate::memory::CacheManifest),
 }
 
 /// The host KV cache's page pools a worker mapped: each pool's name with its ranks' pools, in rank

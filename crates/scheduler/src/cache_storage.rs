@@ -22,11 +22,12 @@
 //! rewrites the weights while the workers sleep, so that the cache's storage
 //! holds the new checkpoint as it loads.
 
-use super::ledger::{CacheStorage, growable, room, room_refusal};
+use super::ledger::{growable, room, room_refusal};
 use super::*;
 use crate::handle::CacheChange;
 use crate::kv_cache::PageRef;
 use crate::worker::WorkerGroupId;
+use ipc::memory::CacheStorageReport;
 
 /// A change of the cache that waits for the requests holding the withdrawn
 /// units to let them go (`Scheduler::resize_cache`,
@@ -55,8 +56,8 @@ enum Pending {
 /// Every worker's `EpochOperation::CacheStorage` report: of the workers that hold
 /// the cache, and of the others (`Scheduler::storage_reports`).
 struct StorageReports {
-    cache: Vec<CacheStorage>,
-    beside: Vec<CacheStorage>,
+    cache: Vec<CacheStorageReport>,
+    beside: Vec<CacheStorageReport>,
 }
 
 impl Pending {
@@ -239,14 +240,16 @@ impl Scheduler {
         let result = match resize.change {
             Pending::Sleep => {
                 self.asleep = true;
-                self.run_operation(&EpochOperation::Sleep).inspect(|_| {
-                    tracing::info!(
-                        "the scheduler sleeps: its KV cache and graph storage are given back"
-                    );
-                })
+                self.run_operation(ipc::memory::Sleep)
+                    .and_then(|replies| answers(&replies))
+                    .inspect(|_| {
+                        tracing::info!(
+                            "the scheduler sleeps: its KV cache and graph storage are given back"
+                        );
+                    })
             }
             Pending::Room { from, plan } => self
-                .run_operation(&EpochOperation::ReleaseCache { from })
+                .run_operation(ipc::memory::ReleaseCache { from })
                 .map(|_| {
                     tracing::info!(
                         from,
@@ -270,9 +273,9 @@ impl Scheduler {
         let slept = !self.asleep;
         if slept {
             self.asleep = true;
-            self.run_operation(&EpochOperation::Sleep)?;
+            self.run_operation(ipc::memory::Sleep)?;
         }
-        let updated = self.run_operation(&EpochOperation::UpdateWeights);
+        let updated = self.run_operation(ipc::memory::UpdateWeights);
         if slept && let Err(waking) = self.wake() {
             return Err(match updated {
                 Ok(_) => format!("the workers did not wake after the weight update: {waking}"),
@@ -283,7 +286,7 @@ impl Scheduler {
         let pages = self.storage.flush_prefix_cache();
         self.reseed_pages(&results)?;
         tracing::info!(path, pages, "updated the weights in place");
-        Ok(results)
+        answers(&results)
     }
 
     /// Rewrites the weights from the checkpoint at `path` while the requests
@@ -292,7 +295,7 @@ impl Scheduler {
     /// complete. Every request in flight then publishes no page, and every
     /// cached prefix page is revoked, as the new weights key pages anew.
     fn apply_weights_keeping(&mut self, path: &str) -> Result<Vec<String>, String> {
-        let results = self.run_operation(&EpochOperation::UpdateWeights)?;
+        let results = self.run_operation(ipc::memory::UpdateWeights)?;
         let state_seeds = self
             .storage
             .cache()
@@ -325,7 +328,7 @@ impl Scheduler {
             kept,
             "updated the weights in place; the requests in flight keep their KV cache"
         );
-        Ok(results)
+        answers(&results)
     }
 
     /// Ends every request the scheduler holds, aborted: those queued, and
@@ -350,27 +353,20 @@ impl Scheduler {
 
     /// Roots the page chains of every cache level at the page identities
     /// the weight update `results` report (one per worker).
-    fn reseed_pages(&mut self, results: &[String]) -> Result<(), String> {
+    fn reseed_pages(&mut self, results: &[ipc::memory::WeightsUpdated]) -> Result<(), String> {
         if let Some(cache) = self.storage.cache.as_mut() {
             // Pipeline stages contribute different layers to the same
             // scheduler group. Union their components just as startup does.
             let mut groups =
                 vec![std::collections::BTreeSet::new(); cache.coordinator.groups().len()];
-            for result in results {
-                let result: serde_json::Value =
-                    serde_json::from_str(result).map_err(|error| error.to_string())?;
-                let Some(identities) = result
-                    .get("identities")
-                    .and_then(|value| value.as_array())
-                    .filter(|values| !values.is_empty())
-                else {
-                    continue;
-                };
-                if identities.len() != groups.len() {
+            for result in results
+                .iter()
+                .filter(|result| !result.identities.is_empty())
+            {
+                if result.identities.len() != groups.len() {
                     return Err("updated cache identities do not cover every group".into());
                 }
-                for (group, identity) in groups.iter_mut().zip(identities) {
-                    let identity = identity.as_str().ok_or("a cache identity is not text")?;
+                for (group, identity) in groups.iter_mut().zip(&result.identities) {
                     group.extend(identity.split('|').map(str::to_owned));
                 }
             }
@@ -390,21 +386,18 @@ impl Scheduler {
         // The trajectories the new weights compute are keyed apart from the
         // old ones.
         if let Some(store) = self.trajectories.as_mut() {
-            let identities: Vec<String> = results
+            let identities: Vec<&str> = results
                 .iter()
-                .filter_map(|result| {
-                    let value: serde_json::Value = serde_json::from_str(result).ok()?;
-                    let group = value.get("group")?.as_str()?;
-                    store
-                        .serves(&crate::WorkerGroupId(group.to_owned()))
-                        .then(|| value.get("identity")?.as_str().map(str::to_owned))
-                        .flatten()
+                .filter(|result| {
+                    result
+                        .group
+                        .as_ref()
+                        .is_some_and(|group| store.serves(&crate::WorkerGroupId(group.clone())))
                 })
+                .filter_map(|result| result.identity.as_deref())
                 .collect();
             if !identities.is_empty() {
-                store.reseed(storage::key::latent_seed(
-                    identities.iter().map(String::as_str),
-                ));
+                store.reseed(storage::key::latent_seed(identities));
             }
         }
         Ok(())
@@ -415,7 +408,7 @@ impl Scheduler {
     /// `None` when the cache is not split into segments. A worker that
     /// holds no cache, such as an expert worker, reports none and is left
     /// out.
-    pub(super) fn cache_storage(&mut self) -> Result<Option<Vec<CacheStorage>>, String> {
+    pub(super) fn cache_storage(&mut self) -> Result<Option<Vec<CacheStorageReport>>, String> {
         Ok(self.storage_reports()?.map(|reports| reports.cache))
     }
 
@@ -428,12 +421,8 @@ impl Scheduler {
         if self.storage.cache().is_none() {
             return Ok(None);
         }
-        let (cache, beside): (Vec<CacheStorage>, Vec<CacheStorage>) = self
-            .run_operation(&EpochOperation::CacheStorage)?
-            .iter()
-            .map(|report| serde_json::from_str::<CacheStorage>(report))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("a worker's cache storage report: {error}"))?
+        let (cache, beside): (Vec<CacheStorageReport>, Vec<CacheStorageReport>) = self
+            .run_operation(ipc::memory::CacheStorage)?
             .into_iter()
             .partition(|report| !report.segments.is_empty());
         let Some(first) = cache.first() else {
@@ -451,7 +440,7 @@ impl Scheduler {
     /// The segments of a cache split as `first` reports that it cannot give
     /// back: the first, which holds the padding and warmup units, and every
     /// segment it inherited and does not own yet.
-    fn kept_floor(&mut self, first: &CacheStorage) -> u32 {
+    fn kept_floor(&mut self, first: &CacheStorageReport) -> u32 {
         let inherited = self
             .storage
             .cache()
@@ -486,7 +475,7 @@ impl Scheduler {
         };
         let held = reports.first().map_or(0, |first| first.held);
         let floor = reports.first().map_or(0, |first| self.kept_floor(first));
-        let requested = |report: &CacheStorage| {
+        let requested = |report: &CacheStorageReport| {
             report
                 .ledger
                 .as_ref()
@@ -819,7 +808,7 @@ impl Scheduler {
         if !cache.block_pool.has_withdrawn() {
             return Ok(Vec::new());
         }
-        let results = self.run_operation(&EpochOperation::RestoreCache {
+        let results = self.run_operation(ipc::memory::RestoreCache {
             segments: Some(segments),
         })?;
         let end = self
@@ -829,7 +818,7 @@ impl Scheduler {
             cache.block_pool.restore_to(end);
         }
         tracing::info!(units = self.storage.usable_units(), "restored the KV cache");
-        Ok(results)
+        answers(&results)
     }
 
     /// Creates as many of the given-back segments as every device's ledger
@@ -863,14 +852,19 @@ impl Scheduler {
         if !self.asleep {
             return Ok(Vec::new());
         }
-        let results = self.run_operation(&EpochOperation::Wake)?;
+        let results = self.run_operation(ipc::memory::Wake)?;
         if let Some(cache) = self.storage.cache() {
             cache.block_pool.restore();
         }
         self.asleep = false;
         tracing::info!("the scheduler woke");
-        Ok(results)
+        answers(&results)
     }
+}
+
+/// The JSON texts of the workers' `replies`, which a cache change answers.
+fn answers<R: serde::Serialize>(replies: &[R]) -> Result<Vec<String>, String> {
+    ipc::memory::answers(replies).map_err(|error| error.to_string())
 }
 
 /// Returns whether the request holds a unit from `first` on.

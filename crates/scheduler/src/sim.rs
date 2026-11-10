@@ -873,19 +873,19 @@ impl Worker for SimWorker {
     ) -> anyhow::Result<Vec<String>> {
         use ipc::execution::EpochOperation;
         let result = match operation {
-            EpochOperation::CacheStorage => serde_json::json!({
+            EpochOperation::CacheStorage(_) => serde_json::json!({
                 "segments": [],
                 "held": 0,
             }),
-            EpochOperation::ReleaseCache { .. }
-            | EpochOperation::RestoreCache { .. }
-            | EpochOperation::Sleep
-            | EpochOperation::Wake => serde_json::Value::Null,
-            EpochOperation::UpdateWeights => {
+            EpochOperation::ReleaseCache(_)
+            | EpochOperation::RestoreCache(_)
+            | EpochOperation::Sleep(_)
+            | EpochOperation::Wake(_) => serde_json::Value::Null,
+            EpochOperation::UpdateWeights(_) => {
                 serde_json::json!({ "group": null })
             }
-            EpochOperation::AdoptCache { .. }
-            | EpochOperation::PublishCache { .. }
+            EpochOperation::AdoptCache(_)
+            | EpochOperation::PublishCache(_)
             | EpochOperation::CacheManifest(_) => {
                 anyhow::bail!("the simulated worker performs no {operation:?}")
             }

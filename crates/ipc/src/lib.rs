@@ -86,6 +86,7 @@ pub mod execution;
 /// The unit a channel carries: a length and one encoded message.
 pub mod frame;
 pub mod launch;
+pub mod memory;
 
 /// Counter-based random draws of the rank's token sampler.
 pub mod philox;
