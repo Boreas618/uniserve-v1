@@ -685,8 +685,6 @@ pub struct MediaConfig {
     /// Condition media one request may carry in total.
     #[serde(with = "values::bytes")]
     pub max_request_bytes: u64,
-    /// Executable that probes video and audio condition media.
-    pub ffprobe: PathBuf,
     /// Executable the media reader decodes reference videos with.
     pub ffmpeg: PathBuf,
 }
@@ -698,7 +696,6 @@ impl Default for MediaConfig {
             allow_remote: true,
             // 256 MiB.
             max_request_bytes: 256 << 20,
-            ffprobe: PathBuf::from("ffprobe"),
             ffmpeg: PathBuf::from("ffmpeg"),
         }
     }

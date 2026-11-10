@@ -31,7 +31,58 @@ pub(crate) struct DecodedAudio {
     pub(crate) planar: Vec<f32>,
 }
 
+/// What the shim's probe reports of one media file, as `UsvProbe` lays it out.
+#[repr(C)]
+struct RawProbe {
+    format_name: [c_char; 128],
+    has_video: c_int,
+    video_codec: [c_char; 32],
+    width: c_int,
+    height: c_int,
+    sample_aspect_num: c_int,
+    sample_aspect_den: c_int,
+    average_rate_num: c_int,
+    average_rate_den: c_int,
+    base_rate_num: c_int,
+    base_rate_den: c_int,
+    has_rotation: c_int,
+    rotation: f64,
+    frames: i64,
+    has_audio: c_int,
+    audio_rate: c_int,
+    audio_channels: c_int,
+}
+
+/// One media file's container and streams, as libavformat reads them.
+pub(crate) struct Probed {
+    /// The demuxer that read it, as FFmpeg names it (`mov,mp4,m4a,3gp,3g2,mj2`).
+    pub(crate) format_name: String,
+    /// The first video stream that is not cover art.
+    pub(crate) video: Option<ProbedVideo>,
+    /// The first audio stream's declared `(rate, channels)`.
+    pub(crate) audio: Option<(u32, u32)>,
+}
+
+/// A probed video stream.
+pub(crate) struct ProbedVideo {
+    pub(crate) codec: String,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) sample_aspect: (i32, i32),
+    pub(crate) average_rate: (i32, i32),
+    pub(crate) base_rate: (i32, i32),
+    pub(crate) rotation: Option<f64>,
+    pub(crate) frames: u64,
+}
+
 unsafe extern "C" {
+    fn usv_probe_media(
+        data: *const u8,
+        size: usize,
+        formats: *const c_char,
+        timeout_ms: i64,
+        probe: *mut RawProbe,
+    ) -> c_int;
     fn usv_error() -> *const c_char;
     fn usv_free(pointer: *mut c_void);
     fn usv_require_codecs() -> c_int;
@@ -317,5 +368,53 @@ pub(crate) fn decode_audio(data: &[u8]) -> Result<DecodedAudio> {
         channels: channels as usize,
         samples: samples as usize,
         planar: values,
+    })
+}
+
+/// The text of a terminated C string field.
+fn field(text: &[c_char]) -> String {
+    let bytes: Vec<u8> = text
+        .iter()
+        .take_while(|&&byte| byte != 0)
+        // `c_char` is signed on some targets; the byte is the same either way.
+        .map(|&byte| byte.to_ne_bytes()[0])
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Probes `data` through the demuxers `formats` names (FFmpeg's comma-separated
+/// names), within `timeout_ms`; nothing is decoded.
+pub(crate) fn probe_media(data: &[u8], formats: &str, timeout_ms: i64) -> Result<Probed> {
+    let formats = std::ffi::CString::new(formats)
+        .map_err(|_| Error::Codec("a demuxer name holds a NUL byte".to_owned()))?;
+    // SAFETY: all-zero is a valid value of the plain C struct.
+    let mut raw: RawProbe = unsafe { std::mem::zeroed() };
+    // SAFETY: `data` and `formats` outlive the call; the shim writes `raw`
+    // and keeps no pointer.
+    let code = unsafe {
+        usv_probe_media(
+            data.as_ptr(),
+            data.len(),
+            formats.as_ptr(),
+            timeout_ms,
+            &mut raw,
+        )
+    };
+    check(code)?;
+    let unsigned = |value: c_int| u32::try_from(value).unwrap_or(0);
+    Ok(Probed {
+        format_name: field(&raw.format_name),
+        video: (raw.has_video != 0).then(|| ProbedVideo {
+            codec: field(&raw.video_codec),
+            width: unsigned(raw.width),
+            height: unsigned(raw.height),
+            sample_aspect: (raw.sample_aspect_num, raw.sample_aspect_den),
+            average_rate: (raw.average_rate_num, raw.average_rate_den),
+            base_rate: (raw.base_rate_num, raw.base_rate_den),
+            rotation: (raw.has_rotation != 0).then_some(raw.rotation),
+            frames: u64::try_from(raw.frames).unwrap_or(0),
+        }),
+        audio: (raw.has_audio != 0)
+            .then(|| (unsigned(raw.audio_rate), unsigned(raw.audio_channels))),
     })
 }

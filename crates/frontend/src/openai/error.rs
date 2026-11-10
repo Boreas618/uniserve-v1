@@ -337,7 +337,7 @@ mod tests {
         );
 
         let failed = ApiError::from(ServeError::from(InputError::Internal(
-            "ffprobe did not start".to_owned(),
+            "the media probe failed".to_owned(),
         )));
         assert_eq!(failed.code(), "server_error");
     }

@@ -13,9 +13,10 @@
 //! 2. The service's [`MediaConnector`] resolves each `input_references[i].url` under the server's
 //!    media policy (`data:`, `file://` under the media directory, `http(s)://` with size, time and
 //!    address limits) into an owned buffer, the media of one request sharing one total.
-//! 3. [`probe::MediaProber`] reads the facts a plan needs: an image's displayed size from its
-//!    header and EXIF orientation; a video's display aspect, frame rate, decoded frame count and
-//!    soundtrack, and an audio file's sample rate and decoded sample count, through `ffprobe`.
+//! 3. [`probe::MediaProber`] reads the facts a plan needs through the decoders the worker's media
+//!    reader decodes them with (`media::probe`): an image's displayed size, its EXIF orientation
+//!    applied; a video's display aspect, frame rate, decoded frame count and soundtrack, and an
+//!    audio file's sample rate and decoded sample count.
 //! 4. The processor plans the request from the probed media with the checkpoint's tokenizer
 //!    ([`VideoProcessor::plan`]): its size and frames, how each reference is decoded and encoded,
 //!    the prompt as the text encoder encodes it, and the denoiser rows the references take.
@@ -28,7 +29,7 @@
 //!
 //! Every refusal is a `processing::InputError::Invalid` naming the request parameter at fault,
 //! `input_references[i]` for a reference; the API answers it as an `invalid_request_error`.
-//! Failures of the server's own resources (a missing `ffprobe`, scratch storage) are
+//! Failures of the server's own resources (the blocking pool) are
 //! `processing::InputError::Internal`.
 
 mod encodings;
@@ -48,7 +49,7 @@ use crate::input::media::{FetchedMedia, MediaConnector};
 use crate::tokenizer::DynTokenizer;
 use proto::config::MediaConfig;
 
-use probe::{MediaProber, ProbeConfig};
+use probe::MediaProber;
 
 /// One reference medium of a request, in request order.
 ///
@@ -279,7 +280,7 @@ impl VideoService {
             processor: Arc::from(processor),
             media: media.clone(),
             connector: MediaConnector::from_media_options(media)?,
-            prober: MediaProber::new(ProbeConfig::new(media.ffprobe.clone())),
+            prober: MediaProber::per_cpu(),
             tokenizer,
         })
     }

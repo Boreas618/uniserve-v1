@@ -5,7 +5,7 @@ UniServe serves the MiniMax-H3 video-and-audio models: the base MiniMax-H3 check
 ## Requirements
 
 - Linux, CUDA 13, Python 3.12, a stable Rust toolchain, and NVIDIA Hopper or Blackwell GPUs. Four local GPUs are the standard setup. FastH3 is validated on H200, GB200 and RTX PRO 6000 Blackwell Server Edition; the base checkpoint and OmniRef on four GB200. OmniRef's 128-row sparse-attention tiles have kernels on data-center Blackwell (SM100), Hopper (SM90) and SM120 GPUs, and the server refuses OmniRef on any other GPU at startup.
-- FFmpeg for keyframe and reference requests: the server probes condition media with `ffprobe` and the worker decodes reference videos with `ffmpeg`, both from `PATH` unless `media_config.ffprobe` and `media_config.ffmpeg` name them.
+- FFmpeg for keyframe and reference requests: the server probes condition media through the linked FFmpeg runtime's libraries, and the worker decodes reference videos with `ffmpeg` from `PATH` unless `media_config.ffprobe` and `media_config.ffmpeg` name them.
 - Shared storage and pinned-storage access for worker IPC, as the container command below provisions.
 
 ## Install
@@ -307,5 +307,4 @@ Denoiser attention stays BF16. `components` overrides parts of a mode by the nam
 | `invalid_request` naming a condition product's rows and its bound, or the packed condition rows and `video_config.max_condition_rows` | Serve with a larger `video_config.max_condition_rows`, or without it to provision the largest condition set, or send fewer or smaller references. |
 | `invalid_request` naming the prompt length | Raise `--max-model-len`. |
 | A refused `file://` condition | Set `media_config.directory` to a directory that holds the path. |
-| `server_error` naming `cannot run ffprobe` | Put FFmpeg on `PATH` or name it with `media_config.ffprobe`. |
 | An OmniRef start that cannot find a base file | Let the server download the pinned revision, or download it into the Hugging Face cache as above. |

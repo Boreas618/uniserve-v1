@@ -1361,6 +1361,7 @@ dependencies = [
  "itertools 0.14.0",
  "libc",
  "llm-multimodal",
+ "media",
  "minijinja",
  "minijinja-contrib",
  "processing",

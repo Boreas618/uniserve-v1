@@ -109,6 +109,11 @@ pub enum LoadedRenderer {
 }
 
 /// What renders the served model's API requests into engine requests.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a deployment builds one renderer and keeps it for its lifetime; boxing the template \
+              saves nothing"
+)]
 pub enum RequestRenderer {
     /// A token model's chat template.
     Chat(HfChatRenderer),

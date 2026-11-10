@@ -24,7 +24,9 @@
 //! external `ffmpeg` process ([`read::read_video`]). Every reader checks that
 //! it produced exactly the planned extent and fails with [`Error::Plan`]
 //! otherwise, so media that decodes differently from what the server probed
-//! fails the request instead of misaligning its rows.
+//! fails the request instead of misaligning its rows. The server probes the
+//! media through the same decoders ([`probe`]), so a request is planned with
+//! the extent its readers produce.
 //!
 //! The three host resamplers reproduce the reference implementations'
 //! mathematics: Pillow's LANCZOS resize ([`resample::lanczos_resize`]),
@@ -50,6 +52,7 @@ pub mod config;
 pub mod error;
 mod ffi;
 pub mod mux;
+pub mod probe;
 pub mod read;
 #[cfg(test)]
 mod reference;

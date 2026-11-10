@@ -34,10 +34,12 @@
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/display.h>
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/mem.h>
 #include <libavutil/opt.h>
+#include <libavutil/time.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 
@@ -283,10 +285,26 @@ static int64_t seek_memory(void *opaque, int64_t offset, int whence) {
 
 static void close_input_memory(AVFormatContext **input);
 
-/* Opens an input over `data`; the reader keeps the pointer, so `data` must
- * outlive the context. */
-static int open_input_memory(const uint8_t *data, size_t size,
-                             AVFormatContext **input, MemoryReader *reader) {
+/* Refuses every nested open a demuxer asks for: media read from memory never
+ * names another file or URL it may follow. */
+static int refuse_nested_open(struct AVFormatContext *context, AVIOContext **pb,
+                              const char *url, int flags, AVDictionary **options) {
+    (void)context;
+    (void)pb;
+    (void)url;
+    (void)flags;
+    (void)options;
+    return AVERROR(EPERM);
+}
+
+/* Opens an input over `data`, read only through the demuxers `formats` names
+ * (all of them when NULL), with `interrupt` checked during blocking reads
+ * (none when NULL); the reader keeps the pointer, so `data` must outlive the
+ * context. */
+static int open_input_memory_with(const uint8_t *data, size_t size,
+                                  AVFormatContext **input, MemoryReader *reader,
+                                  const char *formats,
+                                  const AVIOInterruptCB *interrupt) {
     reader->data = data;
     reader->size = size;
     reader->position = 0;
@@ -309,6 +327,19 @@ static int open_input_memory(const uint8_t *data, size_t size,
     }
     context->pb = io;
     context->flags |= AVFMT_FLAG_CUSTOM_IO;
+    if (formats) {
+        context->format_whitelist = av_strdup(formats);
+        if (!context->format_whitelist) {
+            avformat_free_context(context);
+            av_freep(&io->buffer);
+            avio_context_free(&io);
+            return fail("out of memory naming a demuxer whitelist");
+        }
+        context->io_open = refuse_nested_open;
+    }
+    if (interrupt) {
+        context->interrupt_callback = *interrupt;
+    }
 
     int code = avformat_open_input(&context, NULL, NULL, NULL);
     if (code < 0) {
@@ -324,6 +355,13 @@ static int open_input_memory(const uint8_t *data, size_t size,
     }
     *input = context;
     return USV_OK;
+}
+
+/* Opens an input over `data` through any demuxer; see
+ * `open_input_memory_with`. */
+static int open_input_memory(const uint8_t *data, size_t size,
+                             AVFormatContext **input, MemoryReader *reader) {
+    return open_input_memory_with(data, size, input, reader, NULL, NULL);
 }
 
 static void close_input_memory(AVFormatContext **input) {
@@ -1402,4 +1440,134 @@ done:
     avcodec_free_context(&context);
     close_input_memory(&input);
     return code;
+}
+
+/* ---- media probing ------------------------------------------------------- */
+
+/* What a probe reports of one media file: its demuxer, its first video
+ * stream that is not cover art, and its first audio stream. */
+typedef struct {
+    char format_name[128];
+    int has_video;
+    char video_codec[32];
+    int width;
+    int height;
+    int sample_aspect_num;
+    int sample_aspect_den;
+    int average_rate_num;
+    int average_rate_den;
+    int base_rate_num;
+    int base_rate_den;
+    int has_rotation;
+    double rotation;
+    int64_t frames;
+    int has_audio;
+    int audio_rate;
+    int audio_channels;
+} UsvProbe;
+
+/* Interrupts a blocking read once the probe's deadline, in microseconds of
+ * `av_gettime_relative`, has passed. */
+static int probe_deadline_passed(void *opaque) {
+    const int64_t *deadline = opaque;
+    return av_gettime_relative() > *deadline;
+}
+
+/* Copies `text` into `target` of `capacity` bytes, truncated and terminated. */
+static void copy_name(char *target, size_t capacity, const char *text) {
+    snprintf(target, capacity, "%s", text ? text : "");
+}
+
+/* Probes `data` through the demuxers `formats` names, within `timeout_ms`.
+ *
+ * The video stream's frame count is the number of its packets a decoder
+ * outputs: packets an edit list marks discard are not counted. Its rotation is
+ * the display matrix's, or the legacy `rotate` tag's, counterclockwise in
+ * degrees. Nothing is decoded. */
+int usv_probe_media(const uint8_t *data, size_t size, const char *formats,
+                    int64_t timeout_ms, UsvProbe *probe) {
+    memset(probe, 0, sizeof(*probe));
+    int64_t deadline = av_gettime_relative() + timeout_ms * 1000;
+    AVIOInterruptCB interrupt = {probe_deadline_passed, &deadline};
+    MemoryReader reader;
+    AVFormatContext *input = NULL;
+    int code = open_input_memory_with(data, size, &input, &reader, formats, &interrupt);
+    if (code != USV_OK) {
+        return code;
+    }
+    copy_name(probe->format_name, sizeof(probe->format_name), input->iformat->name);
+
+    int video = -1;
+    for (unsigned i = 0; i < input->nb_streams; i++) {
+        AVStream *stream = input->streams[i];
+        if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+            !(stream->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+            video = (int)i;
+            break;
+        }
+    }
+    int audio = first_stream_of_type(input, AVMEDIA_TYPE_AUDIO);
+    if (audio >= 0) {
+        AVCodecParameters *parameters = input->streams[audio]->codecpar;
+        probe->has_audio = 1;
+        probe->audio_rate = parameters->sample_rate;
+        probe->audio_channels = parameters->ch_layout.nb_channels;
+    }
+    if (video >= 0) {
+        AVStream *stream = input->streams[video];
+        AVCodecParameters *parameters = stream->codecpar;
+        probe->has_video = 1;
+        copy_name(probe->video_codec, sizeof(probe->video_codec),
+                  avcodec_get_name(parameters->codec_id));
+        probe->width = parameters->width;
+        probe->height = parameters->height;
+        AVRational aspect = av_guess_sample_aspect_ratio(input, stream, NULL);
+        probe->sample_aspect_num = aspect.num;
+        probe->sample_aspect_den = aspect.den;
+        probe->average_rate_num = stream->avg_frame_rate.num;
+        probe->average_rate_den = stream->avg_frame_rate.den;
+        probe->base_rate_num = stream->r_frame_rate.num;
+        probe->base_rate_den = stream->r_frame_rate.den;
+        const AVPacketSideData *matrix = av_packet_side_data_get(
+            parameters->coded_side_data, parameters->nb_coded_side_data,
+            AV_PKT_DATA_DISPLAYMATRIX);
+        if (matrix && matrix->size >= 9 * sizeof(int32_t)) {
+            probe->has_rotation = 1;
+            probe->rotation = av_display_rotation_get((const int32_t *)matrix->data);
+        } else {
+            const AVDictionaryEntry *tag = av_dict_get(stream->metadata, "rotate", NULL, 0);
+            if (tag) {
+                char *end = NULL;
+                double rotation = strtod(tag->value, &end);
+                if (end != tag->value) {
+                    probe->has_rotation = 1;
+                    probe->rotation = rotation;
+                }
+            }
+        }
+
+        AVPacket *packet = av_packet_alloc();
+        if (!packet) {
+            close_input_memory(&input);
+            return fail("out of memory allocating a demuxer packet");
+        }
+        for (;;) {
+            int status = av_read_frame(input, packet);
+            if (status == AVERROR_EOF) {
+                break;
+            }
+            if (status < 0) {
+                av_packet_free(&packet);
+                close_input_memory(&input);
+                return fail_averror("reading the media's packets", status);
+            }
+            if (packet->stream_index == video && !(packet->flags & AV_PKT_FLAG_DISCARD)) {
+                probe->frames++;
+            }
+            av_packet_unref(packet);
+        }
+        av_packet_free(&packet);
+    }
+    close_input_memory(&input);
+    return USV_OK;
 }
