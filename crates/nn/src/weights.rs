@@ -2501,23 +2501,25 @@ impl<'a> WeightLoader<'a> {
     }
 
     /// The payload bytes of `spans`, concatenated in order.
+    ///
+    /// Consecutive spans of one tensor are read in one [`Checkpoint::payload`] call, so a strided
+    /// shard of an adapter-fused tensor, one span a row, reads the adapter's factors once.
     fn gather(&self, spans: &[Span<'_>]) -> Result<Vec<u8>> {
         let total = spans.iter().map(|span| span.to - span.from).sum();
         let mut gathered = Vec::with_capacity(total);
-        for span in spans {
-            let bytes = self.checkpoint.bytes(span.location)?;
-            let range = bytes.get(span.from..span.to).ok_or_else(|| {
-                Error::weight(
-                    &span.location.tensor,
-                    format!(
-                        "bytes {}..{} reach past the tensor's {} bytes",
-                        span.from,
-                        span.to,
-                        bytes.len()
-                    ),
-                )
-            })?;
-            gathered.extend_from_slice(range);
+        let mut at = 0;
+        while at < spans.len() {
+            let location = spans[at].location;
+            let run = spans[at..]
+                .iter()
+                .take_while(|span| std::ptr::eq(span.location, location))
+                .count();
+            let ranges = spans[at..at + run]
+                .iter()
+                .map(|span| (span.from, span.to))
+                .collect::<Vec<_>>();
+            gathered.extend(self.checkpoint.payload(location, &ranges)?);
+            at += run;
         }
         Ok(gathered)
     }

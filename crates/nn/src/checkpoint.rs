@@ -7,9 +7,9 @@
 //! address space, not resident memory.
 //!
 //! **The format is read by the format's own crate, and the element type is ours.** `safetensors`
-//! parses the header, checks each tensor's byte range against its extents and element width, and
-//! drops the optional metadata block; its `Dtype` now names every type this checkpoint set carries,
-//! FP8 and FP4 included. What stays here is the map from that `Dtype` onto the operator ABI's
+//! parses the header and checks each tensor's byte range against its extents and element width,
+//! and the optional metadata block is kept per file as text; its `Dtype` now names every type this
+//! checkpoint set carries, FP8 and FP4 included. What stays here is the map from that `Dtype` onto the operator ABI's
 //! [`DType`], because the ABI names a subset: a format type it cannot express is refused at open
 //! with the tensor and the type in the message, rather than reach a launch that would misread its
 //! bytes. The match names every variant of the crate's enum, and the catch-all that its
@@ -40,6 +40,7 @@ use ops::{DType, Shape};
 use safetensors::Dtype as FormatDtype;
 use safetensors::SafeTensors;
 
+use crate::adapter::{Adapter, Fusion};
 use crate::error::{Error, Result};
 
 /// How long after its last write a file's identity is trusted to stay the same.
@@ -108,6 +109,12 @@ impl FileIdentity {
         ))
     }
 
+    /// The identity of a value produced from the files `base` and `adapter` names together: an
+    /// adapter-fused parameter, which neither file holds alone.
+    pub(crate) fn joined(base: &Self, adapter: &Self) -> Self {
+        Self(format!("{}+adapter:{}", base.0, adapter.0))
+    }
+
     /// The identity as text.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -143,6 +150,8 @@ pub struct CheckpointFile {
     identity: FileIdentity,
     /// Bytes of the file before the tensor payload.
     header: u64,
+    /// The header's `__metadata__` block: the exporter's free-form statements about the file.
+    metadata: BTreeMap<String, String>,
     map: Mmap,
 }
 
@@ -150,6 +159,19 @@ impl CheckpointFile {
     /// The shard's identity.
     pub fn identity(&self) -> &FileIdentity {
         &self.identity
+    }
+
+    /// The shard's path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The header's `__metadata__` block, empty when the exporter wrote none.
+    ///
+    /// No weight reads it; an adapter states its format, rank and provenance there
+    /// ([`crate::adapter::Adapter::open`]).
+    pub fn metadata(&self) -> &BTreeMap<String, String> {
+        &self.metadata
     }
 }
 
@@ -216,6 +238,8 @@ pub struct Checkpoint {
     /// The tensors a `read` has asked this checkpoint for, so [`Checkpoint::reading`] can answer the
     /// other half of the question: what the load never touched.
     read: Mutex<BTreeSet<String>>,
+    /// The adapter fused into this shard set's tensors ([`Checkpoint::attach`]).
+    adapter: Option<Fusion>,
 }
 
 impl Checkpoint {
@@ -232,7 +256,11 @@ impl Checkpoint {
         } else {
             return Self::pipeline(root);
         };
+        Self::from_shards(root, paths)
+    }
 
+    /// Open the shard set `paths` as one flat checkpoint rooted at `root`.
+    pub(crate) fn from_shards(root: &Path, paths: Vec<PathBuf>) -> Result<Self> {
         let mut files = Vec::with_capacity(paths.len());
         let mut locations = BTreeMap::new();
         for path in paths {
@@ -249,7 +277,7 @@ impl Checkpoint {
                 source,
             })?;
             let identity = FileIdentity::of(&path)?;
-            let (header, entries) = read_header(&path, &map)?;
+            let (header, entries, metadata) = read_header(&path, &map)?;
             for (name, entry) in entries {
                 if locations
                     .insert(
@@ -274,6 +302,7 @@ impl Checkpoint {
                 path,
                 identity,
                 header,
+                metadata,
                 map,
             });
         }
@@ -285,6 +314,7 @@ impl Checkpoint {
             tensors: locations,
             components: BTreeMap::new(),
             read: Mutex::new(BTreeSet::new()),
+            adapter: None,
         })
     }
 
@@ -379,6 +409,7 @@ impl Checkpoint {
             tensors: BTreeMap::new(),
             components,
             read: Mutex::new(BTreeSet::new()),
+            adapter: None,
         })
     }
 
@@ -551,7 +582,17 @@ impl Checkpoint {
     }
 
     /// The identity of the file that holds `tensor`.
+    ///
+    /// An adapter-fused tensor is produced from the base shard and the adapter together, and its
+    /// identity names both ([`Checkpoint::attach`]).
     pub fn identity(&self, tensor: &str) -> Option<&FileIdentity> {
+        if let Some(delta) = self
+            .adapter
+            .as_ref()
+            .and_then(|fusion| fusion.delta(tensor))
+        {
+            return Some(&delta.identity);
+        }
         let location = self.tensors.get(tensor)?;
         Some(self.files[location.file].identity())
     }
@@ -588,11 +629,112 @@ impl Checkpoint {
         if let Ok(mut read) = self.read.lock() {
             read.insert(name.to_owned());
         }
+        let length = usize::try_from(location.bytes.1 - location.bytes.0)
+            .map_err(|_| Error::weight(name, "the tensor's bytes are past usize::MAX"))?;
         Ok(HostTensor {
             dtype: location.dtype,
             shape: location.shape,
-            bytes: self.bytes(location)?.to_vec(),
+            bytes: self.payload(location, &[(0, length)])?,
         })
+    }
+
+    /// The bytes `ranges` name of the tensor at `location`, concatenated in order: the shard's own
+    /// bytes, or the fused value of a tensor an attached adapter edits.
+    ///
+    /// Each range is a half-open byte range within the tensor's own bytes. Every weight a load
+    /// publishes and every tensor [`Checkpoint::read`] answers is taken through here, so an
+    /// adapter's edit reaches every reader of the tensor, and a tensor no adapter edits is copied
+    /// from its mapping unchanged.
+    pub(crate) fn payload(
+        &self,
+        location: &TensorLocation,
+        ranges: &[(usize, usize)],
+    ) -> Result<Vec<u8>> {
+        if let Some(delta) = self
+            .adapter
+            .as_ref()
+            .and_then(|fusion| fusion.delta(&location.tensor))
+        {
+            return crate::adapter::fused(self, location, delta, ranges);
+        }
+        let bytes = self.bytes(location)?;
+        let total = ranges
+            .iter()
+            .map(|(from, to)| to.saturating_sub(*from))
+            .sum();
+        let mut gathered = Vec::with_capacity(total);
+        for &(from, to) in ranges {
+            let range = bytes.get(from..to).ok_or_else(|| {
+                Error::weight(
+                    &location.tensor,
+                    format!(
+                        "bytes {from}..{to} reach past the tensor's {} bytes",
+                        bytes.len()
+                    ),
+                )
+            })?;
+            gathered.extend_from_slice(range);
+        }
+        Ok(gathered)
+    }
+
+    /// Fuse `adapter` into this checkpoint's tensors, or into the component `component` of a
+    /// pipeline root, and answer the adapted checkpoint.
+    ///
+    /// From then on every byte read of a tensor the adapter edits is its fused value, a tensor the
+    /// adapter assigns is one of the checkpoint's tensors, and every other tensor reads as it did
+    /// ([`crate::adapter`]). Which component an adapter edits is the model family's statement, as
+    /// its checkpoint mapping is ([`crate::family::VideoFamily::adapter_component`]).
+    ///
+    /// # Errors
+    ///
+    /// Fails when the component does not exist or already holds an adapter, when the adapter edits
+    /// a tensor the checkpoint does not hold, a non-floating-point tensor, or one whose extents its
+    /// delta does not match, or when it assigns a tensor the checkpoint already holds.
+    pub fn attach(mut self, component: Option<&str>, adapter: Adapter) -> Result<Self> {
+        if let Some(name) = component {
+            let held = self
+                .components
+                .remove(name)
+                .ok_or_else(|| Error::Checkpoint {
+                    path: self.root.clone(),
+                    problem: format!("an adapter edits the component `{name}`, which is not here"),
+                })?;
+            let adapted = held.attach(None, adapter)?;
+            self.components.insert(name.to_owned(), adapted);
+            return Ok(self);
+        }
+        if self.adapter.is_some() || !self.components.is_empty() {
+            return Err(Error::Checkpoint {
+                path: self.root.clone(),
+                problem: "an adapter is fused into one shard set that holds none yet".to_owned(),
+            });
+        }
+        let fusion = adapter.fuse_into(&mut self)?;
+        self.adapter = Some(fusion);
+        Ok(self)
+    }
+
+    /// The adapter fused into this shard set, when one is.
+    pub fn adapter(&self) -> Option<&Fusion> {
+        self.adapter.as_ref()
+    }
+
+    /// Append `files` to this checkpoint's files and answer the index the first one takes.
+    pub(crate) fn adopt(&mut self, files: Vec<CheckpointFile>) -> usize {
+        let first = self.files.len();
+        self.files.extend(files);
+        first
+    }
+
+    /// Hold `location` as one of this checkpoint's tensors, under its own name.
+    pub(crate) fn place(&mut self, location: TensorLocation) {
+        self.tensors.insert(location.tensor.clone(), location);
+    }
+
+    /// This flat checkpoint's files and tensor locations, taken apart.
+    pub(crate) fn into_shards(self) -> (Vec<CheckpointFile>, BTreeMap<String, TensorLocation>) {
+        (self.files, self.tensors)
     }
 
     /// What a load has asked this checkpoint for, and what it has left alone.
@@ -747,15 +889,23 @@ struct HeaderTensor {
 }
 
 /// Read one shard's header through the `safetensors` crate: the byte length of the header (its JSON
-/// body plus the eight-byte length that precedes it) and every tensor it names.
+/// body plus the eight-byte length that precedes it), every tensor it names, and its `__metadata__`
+/// block.
 ///
 /// The format's own reader is used rather than one written here. `read_metadata` parses the length
 /// and the header body, checks every tensor's byte range against its extents and element width, and
-/// drops the optional `__metadata__` block, which carries no tensor. **What stays ours is the element
+/// answers the optional `__metadata__` block, which carries no tensor. **What stays ours is the element
 /// type**, because the crate's `Dtype` is the format's and ours is the operator ABI's: a type we
 /// cannot express is refused here, at open, with the tensor in the message, rather than reach a
 /// launch that would misread its bytes.
-fn read_header(path: &Path, bytes: &[u8]) -> Result<(u64, Vec<(String, HeaderTensor)>)> {
+#[allow(
+    clippy::type_complexity,
+    reason = "the header's three parts are one parse's answer, each with its own reader"
+)]
+fn read_header(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(u64, Vec<(String, HeaderTensor)>, BTreeMap<String, String>)> {
     let (header, metadata) =
         SafeTensors::read_metadata(bytes).map_err(|problem| Error::Checkpoint {
             path: path.to_path_buf(),
@@ -806,7 +956,12 @@ fn read_header(path: &Path, bytes: &[u8]) -> Result<(u64, Vec<(String, HeaderTen
             },
         ));
     }
-    Ok((header, tensors))
+    let statements = metadata
+        .metadata()
+        .as_ref()
+        .map(|block| block.clone().into_iter().collect())
+        .unwrap_or_default();
+    Ok((header, tensors, statements))
 }
 
 /// The operator ABI element type the format's `Dtype` names.

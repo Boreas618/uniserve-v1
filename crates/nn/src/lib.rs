@@ -50,6 +50,7 @@
 //! to retained storage, keyed by the identity of the files it was read from, its converted element
 //! type, its layout and its region.
 
+pub mod adapter;
 pub mod blocks;
 pub mod capability;
 pub mod checkpoint;
@@ -68,6 +69,7 @@ pub mod timestep;
 pub mod vocoder;
 pub mod weights;
 
+pub use adapter::{Adapter, Fusion};
 pub use capability::{
     CausalLm, ConditionPiece, ConditionRole, ConditionShape, Conditioning, DecodedMedia, Decoder,
     Denoiser, Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageInput,

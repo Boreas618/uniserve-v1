@@ -361,6 +361,30 @@ pub trait VideoFamily: Send + Sync {
     ///
     /// Fails when the configuration cannot be read or states a pipeline this family cannot build.
     fn open(&self, checkpoint: &Checkpoint) -> Result<Box<dyn VideoCheckpoint>>;
+
+    /// The component of `checkpoint` whose tensors `adapter` edits, or `None` for a flat
+    /// checkpoint's own shard set: where the loading boundary fuses it
+    /// ([`Checkpoint::attach`]) before [`VideoFamily::open`] reads the adapted checkpoint.
+    ///
+    /// Recognizing an adapter is the family's checkpoint mapping: a pipeline may hold several
+    /// networks of one architecture, and only the family knows which one an adapter was trained
+    /// from.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the family does not recognize `adapter` as an adapter of its checkpoints, which
+    /// is every adapter for a family that serves none.
+    fn adapter_component(
+        &self,
+        checkpoint: &Checkpoint,
+        adapter: &crate::Adapter,
+    ) -> Result<Option<&'static str>> {
+        let _ = checkpoint;
+        Err(crate::Error::Unsupported(format!(
+            "{} is not an adapter of a checkpoint this model family serves",
+            adapter.path().display()
+        )))
+    }
 }
 
 /// A video generation checkpoint, read but not loaded.
