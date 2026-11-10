@@ -131,6 +131,8 @@ pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, 
 
 mod completion;
 mod stats;
+mod terminal;
+use terminal::{Terminal, Usage, latch_finish};
 pub(crate) mod stats_report;
 
 pub use epoch::{GroupCache, ParkedCache};
@@ -164,6 +166,7 @@ mod denoising;
 mod dispatch;
 pub(crate) mod encodings;
 mod execution;
+use execution::{MediaFlowState, PendingMedia};
 pub(crate) mod generation;
 pub(crate) mod graph;
 pub(crate) mod image_artifact;
@@ -219,9 +222,9 @@ use ipc::RequestId;
 use ipc::UnitId;
 use ipc::execution::EpochOperation;
 use ipc::{
-    BatchCommand, BlockTable as IpcBlockTable, BufferAllocation, BufferId, CacheUnitAllocation,
-    Call, CallId, CallKind, CallStatus, DecodeRange, DimBound, ForwardStats, GenerationParams,
-    MainProcessInfo, NewRequest, RequestKey, SamplingState, ShapeBound, TensorRef, TimingCounters,
+    BatchCommand, BlockTable as IpcBlockTable, BufferAllocation, CacheUnitAllocation, Call, CallId,
+    CallKind, CallStatus, DecodeRange, DimBound, ForwardStats, GenerationParams, MainProcessInfo,
+    NewRequest, RequestKey, SamplingState, ShapeBound, TensorRef, TimingCounters,
 };
 use ipc::{SharedMedia, TokenLogprob};
 use proto::request::MigrationCause;
@@ -313,36 +316,6 @@ struct EncoderCachePin {
     product: TensorRef,
 }
 
-/// Terminal action deferred until outstanding work is reconciled.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) enum TerminalIntent {
-    #[default]
-    None,
-    Finish(FinishReason),
-    /// The request leaves the scheduler without finishing, for the cause
-    /// given, once its calls in flight drain (`Scheduler::migrate_requests`).
-    Migrate(MigrationCause),
-    Failure(String),
-    /// A worker refused the request itself, for the reason its input-error
-    /// completion states; the client receives an invalid-request rejection.
-    Rejected(String),
-}
-
-impl TerminalIntent {
-    /// Returns whether accepted descendants must drain before retirement.
-    pub(crate) const fn is_terminal(&self) -> bool {
-        !matches!(self, Self::None)
-    }
-
-    /// Records a finish reason unless a terminal intent (finish, failure or
-    /// rejection) is already recorded; the first recorded intent wins.
-    fn finish(&mut self, reason: FinishReason) {
-        if matches!(self, Self::None) {
-            *self = Self::Finish(reason);
-        }
-    }
-}
-
 /// One cache prefix a guidance branch attends to: its own request-pool slot
 /// and cache allocation, separate from the request's main
 /// `RequestAllocations`, sized to the tokens it holds.
@@ -389,76 +362,6 @@ impl GuidancePrefixState {
     }
 }
 
-/// Scheduler state of one admitted diffusion (media) request, advanced by the
-/// media path in `execution` rather than by `RequestState`.
-struct MediaFlowState {
-    request: DiffusionRequest,
-    /// The calls the request runs and the products connecting them.
-    graph: VideoGraph,
-    output: output::EventJournal,
-    allocations: MediaAllocations,
-    /// Each product the request reserved, by its declared name, with the
-    /// component output it is reserved under.
-    reservations: HashMap<&'static str, (String, u32)>,
-    /// Logical products mapped to their reserved component output and unit slice.
-    buffer_bindings: HashMap<BufferId, (String, u32, u32)>,
-    /// The media reader's products, by name, once its call is scheduled.
-    condition_media: HashMap<&'static str, TensorRef>,
-    /// The vision encoder's token features, once its call is scheduled.
-    vision_features: Option<TensorRef>,
-    /// Visual condition units whose latent encoding is scheduled, and of
-    /// those, the units whose encoding completed.
-    scheduled_condition_units: u32,
-    encoded_condition_units: u32,
-    /// Each visual latent encoding round's rows, in unit order.
-    condition_video_latents: Vec<TensorRef>,
-    /// The audio latent encoding's rows, once its call is scheduled.
-    condition_audio_latents: Option<TensorRef>,
-    conditioning: Option<TensorRef>,
-    latents: Vec<TensorRef>,
-    /// Decoded media units by the cursor of the round that produced them,
-    /// until their encode round retires them.
-    decoded_units: BTreeMap<u32, (u32, TensorRef)>,
-    /// Encoded media units by the cursor of the round that produced them,
-    /// until the muxer is handed them.
-    encoded_units: BTreeMap<u32, (u32, TensorRef)>,
-    /// Media unit count of each encode round that has completed and not yet
-    /// been handed to the muxer, by the round's cursor.
-    encoded_ready: BTreeMap<u32, u32>,
-    /// Media units handed to the muxer so far; the next round it takes
-    /// starts here.
-    handed_units: u32,
-    /// Encoded products carried by the muxing call in flight, retired with it.
-    muxing_inputs: Vec<TensorRef>,
-    audio: Option<TensorRef>,
-    /// Static worker admission, sent as a `BatchCommand::Start` in the batch
-    /// of the request's first scheduled call.
-    admission: NewRequest,
-    admission_state: WorkerRegistration,
-    media_reading_scheduled: bool,
-    vision_encoding_scheduled: bool,
-    text_encoding_scheduled: bool,
-    latent_preparation_scheduled: bool,
-    /// Solver progress of the request's latent trajectory.
-    denoising: Denoising,
-    scheduled_decode_units: u32,
-    scheduled_encode_units: u32,
-    audio_decoding_scheduled: bool,
-    audio_encoding_scheduled: bool,
-    audio_encoded: bool,
-    /// Whether a muxing call is in flight; the muxer takes one at a time.
-    muxing_in_flight: bool,
-    /// Whether the call that finalizes the artifact has been scheduled: the
-    /// one that carries no media units, once every unit and the audio are in.
-    final_muxing_scheduled: bool,
-    muxed: bool,
-    predecessor: CallId,
-    terminal_intent: TerminalIntent,
-    artifact: Option<ArtifactEvent>,
-    /// The request's trajectory in the host latent pools.
-    host_trajectory: HostTrajectory,
-}
-
 /// What a request's latent preparation opens its trajectory from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Restoring {
@@ -492,7 +395,7 @@ struct HostTrajectory {
     /// latent preparation waits for.
     restoring: Restoring,
     /// Whether the host latent pools are storing the trajectory, which a
-    /// preemption ended at a step boundary (`TerminalIntent::Migrate`); the
+    /// preemption ended at a step boundary (`Terminal::Migrated`); the
     /// request leaves once they stored it or failed to.
     offloading: bool,
     /// How each denoising rank's pages hold the trajectory's samples, by
@@ -513,28 +416,6 @@ enum WorkerRegistration {
     InFlight,
     /// A valid result of the admitting call has confirmed registration.
     Registered,
-}
-
-enum DiffusionTerminal {
-    Completed(ArtifactEvent),
-    Failed(String),
-    Rejected(String),
-    Finished(FinishReason),
-    /// The request leaves for the cause given, preempted at a denoising
-    /// step boundary, with the steps of its trajectory the host latent
-    /// pools stored (zero for none) and the record of where they lie
-    /// (`Trajectory::stored_layout`); the daemon submits it again.
-    Migrated(MigrationCause, u32, Vec<u8>),
-}
-
-struct PendingMedia {
-    request: DiffusionRequest,
-    /// The request's call graph, built when it was queued.
-    graph: VideoGraph,
-    event_tx: EventTx,
-    /// Monotonic microseconds (`clock::now_monotonic_us`) at which the
-    /// request entered the waiting queue.
-    queued_us: u64,
 }
 
 /// Where a scheduler is in its life. One state at a time; the storage

@@ -395,7 +395,7 @@ impl Scheduler {
             canvas_commit: Vec::new(),
             output: RequestOutput::new(event_tx),
             queued_us: crate::clock::now_monotonic_us(),
-            terminal_intent: super::TerminalIntent::None,
+            terminal_intent: None,
             failure: None,
             prompt_tokens,
             replay,
@@ -918,21 +918,11 @@ impl Scheduler {
                 audio: None,
                 admission,
                 admission_state: WorkerRegistration::Unsubmitted,
-                media_reading_scheduled: false,
-                vision_encoding_scheduled: false,
-                text_encoding_scheduled: false,
-                latent_preparation_scheduled: false,
                 denoising: Denoising::new(steps),
                 scheduled_decode_units: 0,
                 scheduled_encode_units: 0,
-                audio_decoding_scheduled: false,
-                audio_encoding_scheduled: false,
-                audio_encoded: false,
-                muxing_in_flight: false,
-                final_muxing_scheduled: false,
-                muxed: false,
                 predecessor: root,
-                terminal_intent: TerminalIntent::None,
+                terminal_intent: None,
                 artifact: None,
                 host_trajectory: HostTrajectory::default(),
             };
@@ -946,7 +936,7 @@ impl Scheduler {
                 queued_at: crate::clock::unix_secs_at(submission.queued_us),
                 scheduled_at: crate::clock::unix_secs_at(scheduled_us),
             }) {
-                state.terminal_intent.finish(FinishReason::Cancelled);
+                latch_finish(&mut state.terminal_intent, FinishReason::Cancelled);
             }
             // A media request the mechanism admits is announced exactly as a
             // token one is (`admit_running`): the policy's queue is its own, so
@@ -1254,26 +1244,27 @@ impl Scheduler {
         // A cancelled request closes only after every submitted descendant has
         // resolved. Host cache ownership then remains pinned through the close
         // acknowledgement and ordered worker request retirement.
-        let cancelled: Vec<(RequestId, TerminalIntent)> = self
+        let cancelled: Vec<(RequestId, Option<Terminal>)> = self
             .running
             .iter()
             .filter(|(id, state)| {
-                state.terminal_intent.is_terminal() && !self.inflight.has_pending_calls(**id)
+                state.terminal_intent.is_some() && !self.inflight.has_pending_calls(**id)
             })
             .map(|(id, state)| (*id, state.terminal_intent.clone()))
             .collect();
         for (id, intent) in cancelled {
             let reason = match intent {
-                TerminalIntent::Finish(reason) => reason,
+                Some(Terminal::Finished { reason, .. }) => reason,
                 // A preempted request is at a step boundary of the image it
                 // generates: the image's trajectory is stored before it
                 // leaves.
-                TerminalIntent::Migrate(cause) => {
+                Some(Terminal::Migrated { cause, .. }) => {
                     self.retire_preempted_token(id, cause);
                     continue;
                 }
-                TerminalIntent::Failure(_) | TerminalIntent::Rejected(_) => FinishReason::Error,
-                TerminalIntent::None => continue,
+                Some(Terminal::Failed(_) | Terminal::Rejected(_)) => FinishReason::Error,
+                Some(Terminal::Completed(_)) => FinishReason::Completed,
+                None => continue,
             };
             self.finish(id, reason);
         }
@@ -1283,26 +1274,22 @@ impl Scheduler {
             .filter_map(|id| {
                 self.media_state(*id)
                     .filter(|state| {
-                        state.terminal_intent.is_terminal()
+                        state.terminal_intent.is_some()
                             && !self.inflight.has_pending_calls(state.request.request_id)
                     })
                     .map(|state| (state.request.request_id, state.terminal_intent.clone()))
             })
             .collect::<Vec<_>>();
         for (id, intent) in media {
-            let event = match intent {
-                TerminalIntent::Failure(message) => DiffusionTerminal::Failed(message),
-                TerminalIntent::Rejected(message) => DiffusionTerminal::Rejected(message),
-                TerminalIntent::Finish(reason) => DiffusionTerminal::Finished(reason),
+            match intent {
                 // A preempted request is at a step boundary: its trajectory
                 // is stored before it leaves.
-                TerminalIntent::Migrate(cause) => {
+                Some(Terminal::Migrated { cause, .. }) => {
                     self.retire_preempted(id, cause);
-                    continue;
                 }
-                TerminalIntent::None => continue,
-            };
-            self.finish_media(id, event);
+                Some(terminal) => self.finish_media(id, terminal),
+                None => {}
+            }
         }
     }
 
@@ -1804,7 +1791,7 @@ impl Scheduler {
             queued_at: crate::clock::unix_secs_at(queued_us),
             scheduled_at: crate::clock::unix_secs_at(scheduled_us),
         }) {
-            st.terminal_intent = TerminalIntent::Finish(FinishReason::Cancelled);
+            st.terminal_intent = Some(Terminal::finish(FinishReason::Cancelled));
         }
 
         // Running order, resource reservations, and runtime ownership advance

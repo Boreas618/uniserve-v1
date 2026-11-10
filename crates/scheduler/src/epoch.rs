@@ -115,7 +115,7 @@ impl Scheduler {
         let migrating: Vec<(u32, bool)> = self
             .running
             .values()
-            .filter(|state| !state.terminal_intent.is_terminal())
+            .filter(|state| !state.terminal_intent.is_some())
             .map(|state| {
                 let units = state.allocations.as_ref().map_or(0, |allocations| {
                     allocations
@@ -156,7 +156,7 @@ impl Scheduler {
         for state in self
             .running
             .values()
-            .filter(|state| !state.terminal_intent.is_terminal())
+            .filter(|state| !state.terminal_intent.is_some())
         {
             units += state.allocations.as_ref().map_or(0, |allocations| {
                 allocations

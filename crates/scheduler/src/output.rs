@@ -32,30 +32,9 @@ enum TokenOutcome {
     Finish(FinishReason),
 }
 
-/// How a token request ends on this scheduler.
-enum TokenTerminal {
-    /// It finished, with its final usage.
-    Finished {
-        reason: FinishReason,
-        stop_reason: Option<crate::StopReason>,
-    },
-    /// It leaves for another engine, for the cause given, with the steps
-    /// of the trajectory of the image it was generating that the host
-    /// latent pools stored (zero for none) and the record of where they lie
-    /// (`Trajectory::stored_layout`).
-    Migratable(MigrationCause, u32, Vec<u8>),
-}
-
-/// Builds the terminal `Finished` event of a token request with its final
-/// usage.
-fn terminal_event(
-    state: &RequestState,
-    reason: FinishReason,
-    stop_reason: Option<crate::StopReason>,
-) -> Event {
-    Event::Finished {
-        reason,
-        stop_reason,
+/// What a token request was charged, which its `Finished` event reports.
+fn usage(state: &RequestState) -> Usage {
+    Usage {
         prompt_tokens: state.charged_prompt_tokens(),
         completion_tokens: state.num_generated_tokens,
         images: state.num_generated_images,
@@ -1236,7 +1215,7 @@ impl Scheduler {
         {
             let before = events.journal.len();
             if events.is_closed() || events.flush() {
-                *intent = TerminalIntent::Finish(FinishReason::Cancelled);
+                *intent = Some(Terminal::finish(FinishReason::Cancelled));
             }
             progressed |= events.journal.len() != before;
         }
@@ -1263,7 +1242,7 @@ impl Scheduler {
         };
         let accepted = state.output.events.enqueue(event);
         if !accepted {
-            state.terminal_intent = TerminalIntent::Finish(FinishReason::Cancelled);
+            state.terminal_intent = Some(Terminal::finish(FinishReason::Cancelled));
         }
         accepted
     }
@@ -1540,8 +1519,13 @@ impl Scheduler {
             // A closed receiver drops the event; nothing is published later
             // either way.
             if let Some(state) = self.running.get_mut(&id) {
-                let terminal = terminal_event(state, reason.clone(), stop_reason.clone());
-                state.output.events.enqueue(terminal);
+                let terminal = Terminal::Finished {
+                    reason: reason.clone(),
+                    stop_reason: stop_reason.clone(),
+                };
+                for event in terminal.events(usage(state)) {
+                    state.output.events.enqueue(event);
+                }
                 terminal_published = true;
             }
         }
@@ -1605,7 +1589,7 @@ impl Scheduler {
     ) {
         self.retire_token_request(
             id,
-            TokenTerminal::Finished {
+            Terminal::Finished {
                 reason,
                 stop_reason,
             },
@@ -1616,7 +1600,7 @@ impl Scheduler {
     /// owns as `finish_with` does; its terminal event is `Migratable`,
     /// naming no stored trajectory.
     pub(super) fn migrate_request(&mut self, id: RequestId, cause: MigrationCause) {
-        self.retire_token_request(id, TokenTerminal::Migratable(cause, 0, Vec::new()));
+        self.retire_token_request(id, Terminal::migrate(cause));
     }
 
     /// Ends a token request as migratable for `cause`, as `migrate_request`
@@ -1630,29 +1614,29 @@ impl Scheduler {
         steps: u32,
         stored_layout: Vec<u8>,
     ) {
-        self.retire_token_request(id, TokenTerminal::Migratable(cause, steps, stored_layout));
+        self.retire_token_request(
+            id,
+            Terminal::Migrated {
+                cause,
+                denoised_steps: steps,
+                stored_layout,
+            },
+        );
     }
 
     /// Publishes `terminal` and releases every resource owned by one token
     /// request; see `finish_with`.
-    fn retire_token_request(&mut self, id: RequestId, terminal: TokenTerminal) {
+    fn retire_token_request(&mut self, id: RequestId, terminal: Terminal) {
         // A call of this request still queued behind a full worker queue can
         // never be served nor state its layout once the request's allocation
         // goes, so it leaves the queue with the request.
         self.retire_queued_calls(id);
         // The policy sees the request end, with how it ended.
-        let end = match &terminal {
-            TokenTerminal::Migratable(..) => scheduling::guest::End::Migratable,
-            TokenTerminal::Finished { reason, .. } => match reason {
-                FinishReason::Cancelled => scheduling::guest::End::Cancelled,
-                FinishReason::Error => scheduling::guest::End::Failed,
-                _ => scheduling::guest::End::Completed,
-            },
-        };
+        let end = terminal.end();
         let request = scheduling::guest::RequestId(id.0);
         self.recorder.record(views::finished(request, end));
         self.watchdog.finished(request);
-        if matches!(terminal, TokenTerminal::Migratable(..))
+        if terminal.migration().is_some()
             && self.config.canvas.is_none()
             && self
                 .running
@@ -1662,8 +1646,8 @@ impl Scheduler {
             self.advance_request_cache(id, true);
         }
         let reason = match &terminal {
-            TokenTerminal::Finished { reason, .. } => Some(reason.clone()),
-            TokenTerminal::Migratable(..) => None,
+            Terminal::Finished { reason, .. } => Some(reason.clone()),
+            _ => None,
         };
         let terminal_published = self
             .inflight
@@ -1699,7 +1683,7 @@ impl Scheduler {
                 // The pool row this request held is free from here on.
                 self.rows_held = self.rows_held.saturating_sub(1);
             }
-            if matches!(terminal, TokenTerminal::Finished { .. })
+            if matches!(terminal, Terminal::Finished { .. })
                 && let Some(resume) = st.req.cache.resume
                 && let Some(cache) = &self.storage.cache
             {
@@ -1781,20 +1765,12 @@ impl Scheduler {
             // closed receiver drops the terminal event with the journal. A
             // terminal event published by `finish_after_inflight` may still
             // be journaled, and it is the only one the request publishes.
-            let event = match terminal {
-                TokenTerminal::Finished {
-                    reason,
-                    stop_reason,
-                } => terminal_event(&st, reason, stop_reason),
-                TokenTerminal::Migratable(cause, denoised_steps, stored_layout) => {
-                    Event::Migratable {
-                        cause,
-                        denoised_steps,
-                        stored_layout,
-                    }
-                }
-            };
-            let accepted = terminal_published || st.output.events.enqueue(event);
+            let usage = usage(&st);
+            let accepted = terminal_published
+                || terminal
+                    .events(usage)
+                    .into_iter()
+                    .all(|event| st.output.events.enqueue(event));
             if accepted {
                 self.output.retire(id, st.output.events);
             }

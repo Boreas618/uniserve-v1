@@ -145,22 +145,20 @@ impl Scheduler {
                 .running
                 .get(&id)
                 .and_then(|state| match state.terminal_intent {
-                    TerminalIntent::Migrate(cause) => Some(cause),
+                    Some(Terminal::Migrated { cause, .. }) => Some(cause),
                     _ => None,
                 });
             if let Some(state) = self.media_state(id) {
                 // A video request leaves as migratable, for the cause its
                 // preemption states or as lost, its trajectory not stored.
                 let cause = match state.terminal_intent {
-                    TerminalIntent::Migrate(cause) => Some(cause),
-                    TerminalIntent::None if self.config.canvas.is_none() => {
-                        Some(MigrationCause::Loss)
-                    }
+                    Some(Terminal::Migrated { cause, .. }) => Some(cause),
+                    None if self.config.canvas.is_none() => Some(MigrationCause::Loss),
                     _ => None,
                 };
                 let terminal = match cause {
-                    Some(cause) => DiffusionTerminal::Migrated(cause, 0, Vec::new()),
-                    None => DiffusionTerminal::Failed(msg.to_string()),
+                    Some(cause) => Terminal::migrate(cause),
+                    None => Terminal::Failed(msg.to_string()),
                 };
                 self.finish_media(id, terminal);
             } else if let Some(cause) = migrating {
@@ -226,18 +224,18 @@ impl Scheduler {
         }
         for id in self.media_ids() {
             let cause = match self.media_state(id).map(|state| &state.terminal_intent) {
-                Some(TerminalIntent::Migrate(cause)) => *cause,
-                Some(TerminalIntent::None) => MigrationCause::Loss,
+                Some(Some(Terminal::Migrated { cause, .. })) => *cause,
+                Some(None) => MigrationCause::Loss,
                 _ => continue,
             };
-            self.finish_media(id, DiffusionTerminal::Migrated(cause, 0, Vec::new()));
+            self.finish_media(id, Terminal::migrate(cause));
         }
 
         let running: Vec<(RequestId, MigrationCause)> = self
             .running
             .iter()
             .filter_map(|(id, state)| match state.terminal_intent {
-                TerminalIntent::Migrate(cause) => Some((*id, cause)),
+                Some(Terminal::Migrated { cause, .. }) => Some((*id, cause)),
                 _ if self.migrates_on_loss(*id) => Some((*id, MigrationCause::Loss)),
                 _ => None,
             })
@@ -257,7 +255,7 @@ impl Scheduler {
             && self
                 .running
                 .get(&id)
-                .is_some_and(|state| !state.terminal_intent.is_terminal())
+                .is_some_and(|state| !state.terminal_intent.is_some())
     }
 
     /// Reconciles failed work without resetting allocations owned by live consumers.
@@ -407,17 +405,17 @@ impl Scheduler {
                 // the daemon submits it again.
                 if state.admission.request_key == request {
                     state.terminal_intent = match refusal {
-                        Some(reason) => TerminalIntent::Rejected(reason.clone()),
+                        Some(reason) => Some(Terminal::Rejected(reason.clone())),
                         None if migrates
-                            && !matches!(
-                                state.terminal_intent,
-                                TerminalIntent::Failure(_) | TerminalIntent::Rejected(_)
-                            ) =>
+                            && !state
+                                .terminal_intent
+                                .as_ref()
+                                .is_some_and(Terminal::is_failure) =>
                         {
                             migrating = true;
-                            TerminalIntent::Migrate(MigrationCause::Loss)
+                            Some(Terminal::migrate(MigrationCause::Loss))
                         }
-                        None => TerminalIntent::Failure(loss.message.clone()),
+                        None => Some(Terminal::Failed(loss.message.clone())),
                     };
                 }
             } else if let Some(state) = self.running.get_mut(&id) {
@@ -427,10 +425,10 @@ impl Scheduler {
                 state.output.decoder_boundaries.clear();
                 if migrates
                     && refusal.is_none()
-                    && !state.terminal_intent.is_terminal()
+                    && !state.terminal_intent.is_some()
                     && !self.inflight.pending_finishes.contains_key(&id)
                 {
-                    state.terminal_intent = TerminalIntent::Migrate(MigrationCause::Loss);
+                    state.terminal_intent = Some(Terminal::migrate(MigrationCause::Loss));
                     migrating = true;
                 } else {
                     if !error_emitted {
@@ -496,11 +494,9 @@ impl Scheduler {
             {
                 if !self.inflight.has_pending_calls(id) {
                     let terminal = match refusal {
-                        Some(reason) => DiffusionTerminal::Rejected(reason.clone()),
-                        None if migrating => {
-                            DiffusionTerminal::Migrated(MigrationCause::Loss, 0, Vec::new())
-                        }
-                        None => DiffusionTerminal::Failed(loss.message.clone()),
+                        Some(reason) => Terminal::Rejected(reason.clone()),
+                        None if migrating => Terminal::migrate(MigrationCause::Loss),
+                        None => Terminal::Failed(loss.message.clone()),
                     };
                     self.finish_media(id, terminal);
                 }
@@ -530,7 +526,7 @@ impl Scheduler {
         }
         let media = self.media_ids();
         for id in media {
-            self.finish_media(id, DiffusionTerminal::Failed(message.to_string()));
+            self.finish_media(id, Terminal::Failed(message.to_string()));
         }
         let ids = self.running.keys().copied().collect::<Vec<_>>();
         for id in ids {

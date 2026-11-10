@@ -1,7 +1,7 @@
 //! How a migrated image-generating request rebuilds its context.
 //!
 //! A token request that generates images leaves an engine as migratable like
-//! any token request (`TerminalIntent::Migrate`), and the daemon submits it
+//! any token request (`Terminal::Migrated`), and the daemon submits it
 //! again with its facts: the tokens it generated, every one it counted, and
 //! the images it generated, each with what its feedback encoders read
 //! (`GenerationRequest::generated_images`). Its context is derived state:

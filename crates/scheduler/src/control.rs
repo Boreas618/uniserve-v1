@@ -105,7 +105,7 @@ impl Scheduler {
         }
         let media = self.media_ids();
         for id in media {
-            self.finish_media(id, DiffusionTerminal::Finished(FinishReason::Aborted));
+            self.finish_media(id, Terminal::finish(FinishReason::Aborted));
         }
 
         let queued: Vec<RequestId> = {
@@ -882,16 +882,19 @@ impl Scheduler {
             return;
         }
         if let Some(state) = self.media_state_mut(id) {
-            state.terminal_intent.finish(if abort {
-                FinishReason::Aborted
-            } else {
-                FinishReason::Cancelled
-            });
+            latch_finish(
+                &mut state.terminal_intent,
+                if abort {
+                    FinishReason::Aborted
+                } else {
+                    FinishReason::Cancelled
+                },
+            );
             let drained = !self.inflight.has_pending_calls(id);
             if drained {
                 self.finish_media(
                     id,
-                    DiffusionTerminal::Finished(if abort {
+                    Terminal::finish(if abort {
                         FinishReason::Aborted
                     } else {
                         FinishReason::Cancelled
@@ -903,9 +906,9 @@ impl Scheduler {
         if let Some(st) = self.running.get_mut(&id) {
             st.output.decoder_boundaries.clear();
             st.terminal_intent = if abort {
-                TerminalIntent::Finish(FinishReason::Aborted)
+                Some(Terminal::finish(FinishReason::Aborted))
             } else {
-                TerminalIntent::Finish(FinishReason::Cancelled)
+                Some(Terminal::finish(FinishReason::Cancelled))
             };
         }
         // A request not yet admitted leaves the waiting queue with its reason.
@@ -995,11 +998,11 @@ impl Scheduler {
         }
         for (id, st) in self.running.iter_mut() {
             if select(*id)
-                && !st.terminal_intent.is_terminal()
+                && !st.terminal_intent.is_some()
                 && !self.inflight.pending_finishes.contains_key(id)
             {
                 st.output.decoder_boundaries.clear();
-                st.terminal_intent = TerminalIntent::Migrate(cause);
+                st.terminal_intent = Some(Terminal::migrate(cause));
             }
         }
     }
@@ -1015,6 +1018,6 @@ impl Scheduler {
             return;
         };
         state.output.decoder_boundaries.clear();
-        state.terminal_intent = TerminalIntent::Finish(FinishReason::Stop);
+        state.terminal_intent = Some(Terminal::finish(FinishReason::Stop));
     }
 }

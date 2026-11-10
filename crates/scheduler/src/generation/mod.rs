@@ -19,7 +19,7 @@
 
 pub(crate) mod continuation;
 
-use super::{EncoderCachePin, GuidancePrefixState, Phase, RequestAllocations, TerminalIntent};
+use super::{EncoderCachePin, GuidancePrefixState, Phase, RequestAllocations, Terminal};
 use crate::completion::CallCompletion;
 use crate::kv_cache::{BlockTable, CacheAllocation};
 
@@ -1611,7 +1611,7 @@ pub(crate) struct RequestState {
     /// request state was created: queue waits are measured on the monotonic
     /// clock, and only the public `Scheduled` event states it as Unix time.
     pub queued_us: u64,
-    pub(crate) terminal_intent: TerminalIntent,
+    pub(crate) terminal_intent: Option<Terminal>,
     /// Cause of the first rejected worker result, which
     /// `Scheduler::fail_after_inflight` reports as the request's terminal
     /// error and its error finish logs.

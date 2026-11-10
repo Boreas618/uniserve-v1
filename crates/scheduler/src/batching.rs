@@ -321,11 +321,11 @@ impl Scheduler {
             let cancelled = self
                 .running
                 .get(&id)
-                .map(|state| state.terminal_intent.is_terminal())
+                .map(|state| state.terminal_intent.is_some())
                 .or_else(|| {
                     self.running_media
                         .get(&id)
-                        .map(|state| state.terminal_intent.is_terminal())
+                        .map(|state| state.terminal_intent.is_some())
                 })
                 .unwrap_or(true);
             if cancelled {

@@ -39,8 +39,9 @@ impl Scheduler {
             .is_some_and(|pending| pending.contains_key(&call_id));
         if !known || duplicate {
             if let Some(state) = self.media_state_mut(id) {
-                state.terminal_intent =
-                    TerminalIntent::Failure("worker returned an unknown media call".to_string());
+                state.terminal_intent = Some(Terminal::Failed(
+                    "worker returned an unknown media call".to_string(),
+                ));
             } else if self.running.contains_key(&id) {
                 self.finish(id, FinishReason::Error);
             }
@@ -109,10 +110,10 @@ impl Scheduler {
             return;
         };
         let mut consumed_products = Vec::new();
-        let already_failed = matches!(
-            state.terminal_intent,
-            TerminalIntent::Failure(_) | TerminalIntent::Rejected(_)
-        );
+        let already_failed = state
+            .terminal_intent
+            .as_ref()
+            .is_some_and(Terminal::is_failure);
 
         // Only the final muxing call, the one that carries no media units,
         // returns the artifact; every other call returns none.
@@ -177,8 +178,8 @@ impl Scheduler {
                     .flatten();
                 if let Some(state) = self.media_state_mut(id) {
                     state.terminal_intent = match refusal {
-                        Some(reason) => TerminalIntent::Rejected(reason),
-                        None => TerminalIntent::Failure("media worker call failed".to_string()),
+                        Some(reason) => Some(Terminal::Rejected(reason)),
+                        None => Some(Terminal::Failed("media worker call failed".to_string())),
                     };
                 }
             } else if let Some(state) = self.media_state_mut(id) {
@@ -249,7 +250,6 @@ impl Scheduler {
                         }
                     }
                     CallKind::Media(MediaCall::AudioEncoding) => {
-                        state.audio_encoded = true;
                         if let Some(product) = state.audio.take() {
                             consumed_products.push(product);
                         }
@@ -258,13 +258,18 @@ impl Scheduler {
                         // The muxer has taken these units into the container,
                         // so the encoded products it consumed retire with the
                         // call; the artifact arrives with the final call.
-                        state.muxing_in_flight = false;
+                        // The final round carried no units, so it leaves
+                        // no inputs to retire.
+                        let final_round = state.muxing_inputs.is_empty();
                         consumed_products.append(&mut state.muxing_inputs);
-                        if media.is_some() {
-                            state.muxed = true;
-                        }
+                        state.graph.land(MediaCall::Muxing, final_round);
                     }
                     _ => {}
+                }
+                if let CallKind::Media(media_call) = call.kind
+                    && media_call != MediaCall::Muxing
+                {
+                    state.graph.land(media_call, true);
                 }
 
                 let phase = match call.kind {
@@ -330,22 +335,18 @@ impl Scheduler {
             if self.inflight.has_pending_calls(id) {
                 return None;
             }
-            if let TerminalIntent::Failure(message) = &state.terminal_intent {
-                Some(DiffusionTerminal::Failed(message.clone()))
-            } else if let TerminalIntent::Rejected(message) = &state.terminal_intent {
-                Some(DiffusionTerminal::Rejected(message.clone()))
-            } else if let TerminalIntent::Finish(reason) = &state.terminal_intent {
-                Some(DiffusionTerminal::Finished(reason.clone()))
-            } else if state.output.is_closed() {
-                Some(DiffusionTerminal::Finished(FinishReason::Cancelled))
-            } else if state.muxed {
-                let event = state.artifact.clone().map_or_else(
-                    || DiffusionTerminal::Failed("media output was not finalized".to_string()),
-                    DiffusionTerminal::Completed,
-                );
-                Some(event)
-            } else {
-                None
+            // A latched migration leaves through `retire_preempted`
+            // (`reap_cancellations`), unless the output closed first.
+            match &state.terminal_intent {
+                Some(terminal) if terminal.migration().is_none() => Some(terminal.clone()),
+                _ if state.output.is_closed() => Some(Terminal::finish(FinishReason::Cancelled)),
+                _ if state.graph.done(MediaCall::Muxing) => {
+                    Some(state.artifact.clone().map_or_else(
+                        || Terminal::Failed("media output was not finalized".to_string()),
+                        Terminal::Completed,
+                    ))
+                }
+                _ => None,
             }
         });
         if let Some(event) = terminal {
@@ -359,7 +360,7 @@ impl Scheduler {
     /// allocations at once. Otherwise a `Finish` command is queued and the
     /// allocations wait in `retiring_requests` until `acknowledge_commands`
     /// sees that command complete.
-    pub(crate) fn finish_media(&mut self, id: RequestId, event: DiffusionTerminal) {
+    pub(crate) fn finish_media(&mut self, id: RequestId, event: Terminal) {
         let Some(mut state) = self.take_media_state(id) else {
             return;
         };
@@ -367,17 +368,7 @@ impl Scheduler {
         // request's end is stated (`retire_token_request`): a media request the
         // policy still holds resident is one it plans work for, and the
         // mechanism refuses that work as naming a request it no longer holds.
-        let end = match &event {
-            DiffusionTerminal::Migrated(..) => scheduling::guest::End::Migratable,
-            DiffusionTerminal::Rejected(_) => scheduling::guest::End::Rejected,
-            DiffusionTerminal::Failed(_) => scheduling::guest::End::Failed,
-            DiffusionTerminal::Completed(_) => scheduling::guest::End::Completed,
-            DiffusionTerminal::Finished(reason) => match reason {
-                FinishReason::Cancelled => scheduling::guest::End::Cancelled,
-                FinishReason::Error => scheduling::guest::End::Failed,
-                _ => scheduling::guest::End::Completed,
-            },
-        };
+        let end = event.end();
         let request = scheduling::guest::RequestId(id.0);
         self.recorder.record(views::finished(request, end));
         self.watchdog.finished(request);
@@ -391,42 +382,12 @@ impl Scheduler {
         if let Some(store) = self.encoder_outputs.as_mut() {
             store.forget(state.admission.request_key);
         }
-        match event {
-            DiffusionTerminal::Completed(artifact) => {
-                let _ = state.output.enqueue(Event::Artifact(artifact));
-                let _ = state.output.enqueue(Event::Finished {
-                    reason: FinishReason::Completed,
-                    stop_reason: None,
-                    prompt_tokens: state.request.prompt_token_ids.len(),
-                    completion_tokens: 0,
-                    images: 0,
-                });
-            }
-            DiffusionTerminal::Failed(message) => {
-                let _ = state.output.enqueue(Event::Error { message });
-            }
-            DiffusionTerminal::Rejected(message) => {
-                let _ = state.output.enqueue(Event::Rejected {
-                    kind: RejectionKind::Invalid,
-                    message,
-                });
-            }
-            DiffusionTerminal::Finished(reason) => {
-                let _ = state.output.enqueue(Event::Finished {
-                    reason,
-                    stop_reason: None,
-                    prompt_tokens: state.request.prompt_token_ids.len(),
-                    completion_tokens: 0,
-                    images: 0,
-                });
-            }
-            DiffusionTerminal::Migrated(cause, denoised_steps, stored_layout) => {
-                let _ = state.output.enqueue(Event::Migratable {
-                    cause,
-                    denoised_steps,
-                    stored_layout,
-                });
-            }
+        let usage = Usage {
+            prompt_tokens: state.request.prompt_token_ids.len(),
+            ..Usage::default()
+        };
+        for event in event.events(usage) {
+            let _ = state.output.enqueue(event);
         }
         self.output.retire(id, state.output);
 
@@ -766,9 +727,9 @@ impl Scheduler {
                 let call_id = record.call_id;
                 let Some((call, input)) = self.pop_inflight(record.request_key, call_id) else {
                     if let Some(state) = self.media_state_mut(id) {
-                        state.terminal_intent = TerminalIntent::Failure(
+                        state.terminal_intent = Some(Terminal::Failed(
                             "worker returned an out-of-order media call".to_string(),
-                        );
+                        ));
                     } else if self.running.contains_key(&id) {
                         self.finish(id, FinishReason::Error);
                     }
@@ -901,7 +862,7 @@ impl Scheduler {
                 // retiring the request: the daemon can carry the completed
                 // image, but those released latent pages cannot be stored.
                 let preempted = self.running.get(&id).is_some_and(|state| {
-                    matches!(state.terminal_intent, TerminalIntent::Migrate(_))
+                    matches!(state.terminal_intent, Some(Terminal::Migrated { .. }))
                 }) && !self.inflight.pending_finishes.contains_key(&id);
                 let completed_image = preempted
                     && call.kind == CallKind::Media(MediaCall::ImageDecoding)
@@ -912,7 +873,7 @@ impl Scheduler {
                 let semantic_blocked = self
                     .running
                     .get(&id)
-                    .is_some_and(|state| state.terminal_intent.is_terminal())
+                    .is_some_and(|state| state.terminal_intent.is_some())
                     && !completed_image
                     || self.inflight.pending_finishes.contains_key(&id);
                 if semantic_blocked {

@@ -9,7 +9,7 @@
 //! or on another:
 //!
 //! 1. **Preempt.** The request offers no further call
-//!    (`TerminalIntent::Migrate`); its calls in flight complete, which ends
+//!    (`Terminal::Migrated`); its calls in flight complete, which ends
 //!    it at a step boundary. A video request whose denoising is scheduled
 //!    whole is not preempted: it finishes, as its remaining work is
 //!    bounded. A token request leaves after every token and image it
@@ -101,7 +101,7 @@ impl Scheduler {
             .iter()
             .filter(|(id, state)| {
                 select(**id)
-                    && !state.terminal_intent.is_terminal()
+                    && !state.terminal_intent.is_some()
                     && self.scheduled_steps(**id, &state.denoising) < state.denoising.steps()
             })
             .map(|(id, _)| *id)
@@ -114,7 +114,7 @@ impl Scheduler {
                     ?cause,
                     "preempting a video request at its next denoising step boundary"
                 );
-                state.terminal_intent = TerminalIntent::Migrate(cause);
+                state.terminal_intent = Some(Terminal::migrate(cause));
             }
         }
     }
@@ -213,7 +213,14 @@ impl Scheduler {
                 if steps > 0 {
                     tracing::info!(request = id.0, steps, "stored a preempted video trajectory");
                 }
-                self.finish_media(id, DiffusionTerminal::Migrated(cause, steps, record));
+                self.finish_media(
+                    id,
+                    Terminal::Migrated {
+                        cause,
+                        denoised_steps: steps,
+                        stored_layout: record,
+                    },
+                );
                 true
             }
             Retirement::Storing => {
@@ -274,7 +281,7 @@ impl Scheduler {
     }
 
     /// Applies the trajectory progress of `call`, an image trajectory call
-    /// of preempted token request `id` (`TerminalIntent::Migrate`) that
+    /// of preempted token request `id` (`Terminal::Migrated`) that
     /// completed with `record`, which takes no other effect: the worker
     /// committed it, so the trajectory a preemption stores continues after
     /// it. A latent preparation opens the trajectory at the step it

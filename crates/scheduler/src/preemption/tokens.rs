@@ -40,7 +40,7 @@ impl Scheduler {
             .iter()
             .filter_map(|&(id, needed)| {
                 let state = self.running.get(&id)?;
-                if state.terminal_intent.is_terminal() {
+                if state.terminal_intent.is_some() {
                     return None;
                 }
                 let held: usize = state
@@ -61,7 +61,10 @@ impl Scheduler {
                  the cache holds"
             );
             if let Some(state) = self.running.get_mut(&id) {
-                state.terminal_intent.finish(FinishReason::CacheCapacity);
+                crate::terminal::latch_finish(
+                    &mut state.terminal_intent,
+                    FinishReason::CacheCapacity,
+                );
             }
         }
     }
@@ -91,7 +94,7 @@ impl Scheduler {
             || self
                 .running
                 .values()
-                .any(|state| state.terminal_intent.is_terminal())
+                .any(|state| state.terminal_intent.is_some())
         {
             return;
         }
@@ -99,7 +102,7 @@ impl Scheduler {
         let live: Vec<(&RequestId, &RequestState)> = self
             .running
             .iter()
-            .filter(|(_, state)| !state.terminal_intent.is_terminal())
+            .filter(|(_, state)| !state.terminal_intent.is_some())
             .collect();
         if live.len() < 2 || live.iter().any(|(id, _)| !starved(id)) {
             return;

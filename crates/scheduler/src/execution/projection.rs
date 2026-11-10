@@ -430,7 +430,7 @@ impl Scheduler {
         // Bound speculation by worker capacity and exclude requests whose
         // terminal or relay state makes the projection unsafe.
         if queue.len() >= self.info.max_unresolved_calls as usize
-            || state.terminal_intent.is_terminal()
+            || state.terminal_intent.is_some()
             || self.inflight.pending_finishes.contains_key(&id)
             || !Self::device_token_relay_eligible(state)
         {

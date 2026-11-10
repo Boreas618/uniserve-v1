@@ -11,6 +11,76 @@
 use super::*;
 use ipc::MediaCall;
 
+/// Scheduler state of one admitted diffusion (media) request, advanced by the
+/// media path in `execution` rather than by `RequestState`.
+pub(crate) struct MediaFlowState {
+    pub(crate) request: DiffusionRequest,
+    /// The calls the request runs, the products connecting them and where
+    /// each call stands (`graph::NodeState`), which readiness is derived from.
+    pub(crate) graph: VideoGraph,
+    pub(crate) output: output::EventJournal,
+    pub(crate) allocations: MediaAllocations,
+    /// Each product the request reserved, by its declared name, with the
+    /// component output it is reserved under.
+    pub(crate) reservations: HashMap<&'static str, (String, u32)>,
+    /// Logical products mapped to their reserved component output and unit slice.
+    pub(crate) buffer_bindings: HashMap<BufferId, (String, u32, u32)>,
+    /// The media reader's products, by name, once its call is scheduled.
+    pub(crate) condition_media: HashMap<&'static str, TensorRef>,
+    /// The vision encoder's token features, once its call is scheduled.
+    pub(crate) vision_features: Option<TensorRef>,
+    /// Visual condition units whose latent encoding is scheduled, and of
+    /// those, the units whose encoding completed.
+    pub(crate) scheduled_condition_units: u32,
+    pub(crate) encoded_condition_units: u32,
+    /// Each visual latent encoding round's rows, in unit order.
+    pub(crate) condition_video_latents: Vec<TensorRef>,
+    /// The audio latent encoding's rows, once its call is scheduled.
+    pub(crate) condition_audio_latents: Option<TensorRef>,
+    pub(crate) conditioning: Option<TensorRef>,
+    pub(crate) latents: Vec<TensorRef>,
+    /// Decoded media units by the cursor of the round that produced them,
+    /// until their encode round retires them.
+    pub(crate) decoded_units: BTreeMap<u32, (u32, TensorRef)>,
+    /// Encoded media units by the cursor of the round that produced them,
+    /// until the muxer is handed them.
+    pub(crate) encoded_units: BTreeMap<u32, (u32, TensorRef)>,
+    /// Media unit count of each encode round that has completed and not yet
+    /// been handed to the muxer, by the round's cursor.
+    pub(crate) encoded_ready: BTreeMap<u32, u32>,
+    /// Media units handed to the muxer so far; the next round it takes
+    /// starts here.
+    pub(crate) handed_units: u32,
+    /// Encoded products carried by the muxing call in flight, retired with it.
+    pub(crate) muxing_inputs: Vec<TensorRef>,
+    pub(crate) audio: Option<TensorRef>,
+    /// Static worker admission, sent as a `BatchCommand::Start` in the batch
+    /// of the request's first scheduled call.
+    pub(crate) admission: NewRequest,
+    pub(crate) admission_state: WorkerRegistration,
+    /// Solver progress of the request's latent trajectory.
+    pub(crate) denoising: Denoising,
+    pub(crate) scheduled_decode_units: u32,
+    pub(crate) scheduled_encode_units: u32,
+    pub(crate) predecessor: CallId,
+    pub(crate) terminal_intent: Option<Terminal>,
+    pub(crate) artifact: Option<ArtifactEvent>,
+    /// The request's trajectory in the host latent pools.
+    pub(crate) host_trajectory: HostTrajectory,
+}
+
+/// A video request waiting for admission, with the graph built when it
+/// was queued.
+pub(crate) struct PendingMedia {
+    pub(crate) request: DiffusionRequest,
+    /// The request's call graph, built when it was queued.
+    pub(crate) graph: VideoGraph,
+    pub(crate) event_tx: EventTx,
+    /// Monotonic microseconds (`clock::now_monotonic_us`) at which the
+    /// request entered the waiting queue.
+    pub(crate) queued_us: u64,
+}
+
 /// Denoising steps one video request keeps in flight: the step its
 /// denoiser runs and the next, queued behind it so that the denoiser never
 /// waits for the host between steps. A preemption (a park, a sleep, a
@@ -192,7 +262,7 @@ impl Scheduler {
         // the denoising steps, are scheduled in full before any later call
         // is offered.
         if graph.reads_media() {
-            if !state.media_reading_scheduled {
+            if graph.pending(MediaCall::MediaReading) {
                 return vec![MediaCall::MediaReading];
             }
             if !state.condition_media.values().all(produced) {
@@ -208,11 +278,11 @@ impl Scheduler {
                 .is_none_or(|store| store.resolved(state.admission.request_key, video_output(name)))
         };
         let mut ready = Vec::new();
-        if graph.encodes_vision() && !state.vision_encoding_scheduled {
+        if graph.encodes_vision() && graph.pending(MediaCall::VisionEncoding) {
             if resolved(product::VISION_FEATURES) {
                 ready.push(MediaCall::VisionEncoding);
             }
-        } else if !state.text_encoding_scheduled
+        } else if graph.pending(MediaCall::TextEncoding)
             && state.vision_features.as_ref().is_none_or(produced)
             && resolved(product::CONDITIONING)
         {
@@ -238,12 +308,12 @@ impl Scheduler {
         // Latent preparation reads the text features and every condition
         // latent, so nothing later is offered while the text encoding waits
         // for its vision features or a latent encoding call for a rank.
-        if !ready.is_empty() || encoding_remains || !state.text_encoding_scheduled {
+        if !ready.is_empty() || encoding_remains || graph.pending(MediaCall::TextEncoding) {
             return ready;
         }
         // A resumed request's preparation waits until its stored
         // trajectory's pages are pinned, or found missing.
-        if !state.latent_preparation_scheduled {
+        if graph.pending(MediaCall::LatentPreparation) {
             if state.host_trajectory.restoring == Restoring::Pinning {
                 return Vec::new();
             }
@@ -276,13 +346,13 @@ impl Scheduler {
         {
             ready.push(MediaCall::VideoEncoding);
         }
-        if !state.audio_encoding_scheduled && state.audio.as_ref().is_some_and(produced) {
+        if graph.pending(MediaCall::AudioEncoding) && state.audio.as_ref().is_some_and(produced) {
             ready.push(MediaCall::AudioEncoding);
         }
         if state.scheduled_decode_units < sampling.video_units {
             ready.push(MediaCall::VideoDecoding);
         }
-        if !state.audio_decoding_scheduled {
+        if graph.pending(MediaCall::AudioDecoding) {
             ready.push(MediaCall::AudioDecoding);
         }
         // The muxer consumes media units as they arrive: a muxing call takes
@@ -290,11 +360,10 @@ impl Scheduler {
         // order, and a final call carrying no units assembles the artifact
         // once every unit and the audio track are in. It waits for completed
         // writes, never just their scheduled counts.
-        if !state.muxing_in_flight && !state.muxed {
+        if graph.pending(MediaCall::Muxing) {
             let next_round_ready = state.encoded_ready.contains_key(&state.handed_units);
-            let everything_in = state.audio_encoded
-                && state.handed_units == sampling.video_units
-                && !state.final_muxing_scheduled;
+            let everything_in =
+                graph.done(MediaCall::AudioEncoding) && state.handed_units == sampling.video_units;
             if next_round_ready || everything_in {
                 ready.push(MediaCall::Muxing);
             }
@@ -508,7 +577,7 @@ impl Scheduler {
         // The vision and text encodings run one after the other on the text
         // encoder's ranks, which are theirs from the start: between the two
         // calls no call of the prompt is in flight there.
-        if !state.text_encoding_scheduled
+        if state.graph.pending(MediaCall::TextEncoding)
             && let Some(name) = self.media_component(MediaCall::TextEncoding)
             && let Some((owner, prompt)) =
                 self.placed_component(request, CallKind::Media(MediaCall::TextEncoding), &name)
@@ -742,7 +811,7 @@ impl Scheduler {
         // trajectory over the first one's. A preempted request keeps it until it leaves, which is
         // after its trajectory was written to the host latent pool.
         for (id, state) in &self.running_media {
-            if state.latent_preparation_scheduled
+            if !state.graph.pending(MediaCall::LatentPreparation)
                 && state.denoising.completed() < state.denoising.steps()
             {
                 occupancy.occupy(
@@ -1140,18 +1209,15 @@ impl Scheduler {
         }
         match media_call {
             MediaCall::MediaReading => {
-                state.media_reading_scheduled = true;
                 for (name, product) in output_names.iter().zip(&call.outputs) {
                     state.condition_media.insert(name, product.clone());
                 }
             }
             MediaCall::VisionEncoding => {
                 state.vision_features = call.outputs.first().cloned();
-                state.vision_encoding_scheduled = true;
             }
             MediaCall::TextEncoding => {
                 state.conditioning = call.outputs.first().cloned();
-                state.text_encoding_scheduled = true;
             }
             MediaCall::LatentEncoding => {
                 let product = call
@@ -1168,7 +1234,6 @@ impl Scheduler {
                 }
             }
             MediaCall::LatentPreparation => {
-                state.latent_preparation_scheduled = true;
                 state.host_trajectory.restoring = Restoring::Planned;
             }
             // Submitted steps are derived from the pending denoising calls.
@@ -1181,7 +1246,6 @@ impl Scheduler {
                     .insert(range.cursor, (range.max_units, call.outputs[0].clone()));
             }
             MediaCall::AudioDecoding => {
-                state.audio_decoding_scheduled = true;
                 state.audio = Some(call.outputs[0].clone());
             }
             MediaCall::VideoEncoding => {
@@ -1191,12 +1255,11 @@ impl Scheduler {
                     .encoded_units
                     .insert(range.cursor, (range.max_units, call.outputs[0].clone()));
             }
-            MediaCall::AudioEncoding => state.audio_encoding_scheduled = true,
+            MediaCall::AudioEncoding => {}
             MediaCall::Muxing => {
+                // The final round carries no media units: it leaves
+                // `muxing_inputs` empty, which its completion reads.
                 let rounds = Self::ready_encode_rounds(state);
-                if rounds.is_empty() {
-                    state.final_muxing_scheduled = true;
-                }
                 for cursor in rounds {
                     let units = state
                         .encoded_ready
@@ -1209,12 +1272,12 @@ impl Scheduler {
                     state.handed_units += units;
                     state.muxing_inputs.push(product);
                 }
-                state.muxing_in_flight = true;
             }
             MediaCall::ImageDecoding => {
                 unreachable!("a video request's graph has no image decoding")
             }
         }
+        state.graph.schedule(media_call);
         if stateful {
             state.predecessor = call_id;
         }

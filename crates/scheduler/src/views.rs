@@ -453,7 +453,7 @@ pub(crate) fn shortage_now(scheduler: &Scheduler) -> Option<Shortage> {
             scheduler
                 .running
                 .get(id)
-                .is_some_and(|state| !state.terminal_intent.is_terminal())
+                .is_some_and(|state| !state.terminal_intent.is_some())
         })
         .map(|(_, units)| u64::try_from(*units).unwrap_or(u64::MAX))
         .fold(0u64, u64::saturating_add);
@@ -465,7 +465,7 @@ pub(crate) fn shortage_now(scheduler: &Scheduler) -> Option<Shortage> {
     let leaving = scheduler
         .running
         .values()
-        .filter(|state| state.terminal_intent.is_terminal())
+        .filter(|state| state.terminal_intent.is_some())
         .filter_map(|state| state.block_tables())
         .flat_map(|tables| tables.iter().map(BlockTable::held_units))
         .map(|units| u64::try_from(units).unwrap_or(u64::MAX))
@@ -711,7 +711,7 @@ pub(crate) fn request(
         // A request already leaving cannot be given up again
         // (`Scheduler::migrate_running` skips it), so a policy does not
         // name it.
-        migratable: !state.terminal_intent.is_terminal(),
+        migratable: !state.terminal_intent.is_some(),
         cache_rank: recorded.cache_rank,
     }
 }

@@ -35,6 +35,7 @@
 
 mod failure;
 mod media;
+pub(crate) use media::{MediaFlowState, PendingMedia};
 mod projection;
 mod results;
 

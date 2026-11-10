@@ -41,10 +41,33 @@ pub(crate) struct GraphProduct {
     pub(crate) extent: Option<u32>,
 }
 
+/// Where one call of a request's graph stands.
+///
+/// A call the request runs once (media reading, vision, text and audio
+/// encoding, latent preparation, audio decoding) moves `Pending` →
+/// `InFlight` when it is scheduled and `InFlight` → `Done` when its valid
+/// result lands. The muxer runs one round at a time: each round moves it to
+/// `InFlight` and back to `Pending`, and the final round, which carries no
+/// media units, to `Done`. The calls that run in unit rounds (latent
+/// encoding of condition units, video decoding and encoding, denoising)
+/// stay `Pending`: their progress is the request's unit cursors and its
+/// `Denoising` trajectory, which name the range of each round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NodeState {
+    /// Not scheduled yet (or, for the muxer, between rounds).
+    Pending,
+    /// Scheduled; its result has not landed.
+    InFlight,
+    /// Its result landed; the call is not offered again.
+    Done,
+}
+
 /// The media calls of one video request and the products connecting them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VideoGraph {
     calls: Vec<MediaCall>,
+    /// Each call's state, by its index in `calls`.
+    states: Vec<NodeState>,
     products: Vec<GraphProduct>,
     /// The generated video's raster.
     canvas: Canvas,
@@ -85,6 +108,18 @@ pub(crate) fn video_calls(conditioned: bool) -> Vec<MediaCall> {
         .chain(GENERATION_CALLS.iter())
         .copied()
         .collect()
+}
+
+/// Whether a call's node moves through [`NodeState`]s; the calls that run
+/// in unit rounds or denoising steps track their progress by cursors.
+const fn staged(call: MediaCall) -> bool {
+    !matches!(
+        call,
+        MediaCall::LatentEncoding
+            | MediaCall::Denoising
+            | MediaCall::VideoDecoding
+            | MediaCall::VideoEncoding
+    )
 }
 
 /// A request whose product extent exceeds the protocol's `u32` dimensions.
@@ -200,6 +235,7 @@ impl VideoGraph {
         produce(MediaCall::AudioDecoding, product::AUDIO_SAMPLES, None);
 
         Ok(Self {
+            states: vec![NodeState::Pending; calls.len()],
             calls,
             products,
             canvas: Canvas {
@@ -222,6 +258,56 @@ impl VideoGraph {
     /// Whether the request runs calls of this kind.
     pub(crate) fn runs(&self, call: MediaCall) -> bool {
         self.calls.contains(&call)
+    }
+
+    /// The state of the request's call of kind `call`; `Pending` for a call
+    /// the request does not run.
+    pub(crate) fn state(&self, call: MediaCall) -> NodeState {
+        self.calls
+            .iter()
+            .position(|candidate| *candidate == call)
+            .map_or(NodeState::Pending, |index| self.states[index])
+    }
+
+    /// Whether the call of kind `call` is still to be scheduled.
+    pub(crate) fn pending(&self, call: MediaCall) -> bool {
+        self.state(call) == NodeState::Pending
+    }
+
+    /// Whether the result of the call of kind `call` has landed for good.
+    pub(crate) fn done(&self, call: MediaCall) -> bool {
+        self.state(call) == NodeState::Done
+    }
+
+    /// Records that a call of kind `call` was scheduled: a call that runs
+    /// once, or a muxing round, is in flight from here on.
+    pub(crate) fn schedule(&mut self, call: MediaCall) {
+        if staged(call) {
+            self.set(call, NodeState::InFlight);
+        }
+    }
+
+    /// Records the valid result of a call of kind `call`: a call that runs
+    /// once is done, and so is the muxer after its `final_round`; an earlier
+    /// muxing round leaves the muxer free for the next.
+    pub(crate) fn land(&mut self, call: MediaCall, final_round: bool) {
+        if !staged(call) {
+            return;
+        }
+        let state = if call == MediaCall::Muxing && !final_round {
+            NodeState::Pending
+        } else {
+            NodeState::Done
+        };
+        self.set(call, state);
+    }
+
+    /// Moves the call of kind `call` to `state`. A call the request does
+    /// not run has no state to move.
+    fn set(&mut self, call: MediaCall, state: NodeState) {
+        if let Some(index) = self.calls.iter().position(|candidate| *candidate == call) {
+            self.states[index] = state;
+        }
     }
 
     /// The calls of this request that read the products of a call of kind
