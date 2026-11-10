@@ -36,7 +36,7 @@ pub(crate) fn run(
         runtime.block_on(async move {
             daemon::restart::take_over(
                 descriptor,
-                crate::catalogue()?,
+                crate::served()?,
                 crate::idle_devices,
                 crate::shutdown_signal(),
             )
@@ -65,7 +65,7 @@ async fn serve(
             config.admin_config,
             config.server_config,
             config.program_config,
-            crate::catalogue()?,
+            crate::served()?,
             crate::idle_devices,
             crate::shutdown_signal(),
         )
@@ -77,7 +77,7 @@ async fn serve(
     daemon::serve(
         config,
         stated,
-        crate::catalogue()?,
+        crate::served()?,
         crate::idle_devices,
         crate::shutdown_signal(),
     )

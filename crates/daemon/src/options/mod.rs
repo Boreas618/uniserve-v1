@@ -32,7 +32,7 @@ pub use proto::request::StandbyStorage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use nn::family::Family;
+use processing::Family;
 use processing::Serving;
 
 pub use args::{Stated, overridden, printed, resolve_text};

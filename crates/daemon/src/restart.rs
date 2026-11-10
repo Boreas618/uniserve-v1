@@ -672,7 +672,7 @@ async fn receive(
 /// Fails when the handoff fails or the deployment's serving fails.
 pub async fn take_over(
     descriptor: i32,
-    catalogue: nn::family::Catalogue,
+    catalogue: processing::Catalogue,
     devices: crate::supervision::DeviceProbe,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
@@ -704,7 +704,7 @@ pub async fn take_over(
 async fn prepared_successor(
     channel: &mut Channel,
     prepare: Prepare,
-    catalogue: &nn::family::Catalogue,
+    catalogue: &processing::Catalogue,
     devices: crate::supervision::DeviceProbe,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {

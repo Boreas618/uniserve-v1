@@ -64,7 +64,7 @@ struct Node {
     /// at.
     program_config: program_server::command::Settings,
     /// The model families the executable serves.
-    catalogue: nn::family::Catalogue,
+    catalogue: processing::Catalogue,
     /// Reads this host's idle devices, for each deployment's daemon.
     devices: crate::supervision::DeviceProbe,
 }
@@ -84,7 +84,7 @@ pub async fn node(
     admin: AdminConfig,
     server: ServerConfig,
     program_config: program_server::command::Settings,
-    catalogue: nn::family::Catalogue,
+    catalogue: processing::Catalogue,
     devices: crate::supervision::DeviceProbe,
     shutdown: CancellationToken,
 ) -> Result<()> {

@@ -35,7 +35,6 @@ minijinja-contrib.workspace = true
 program-server.workspace = true
 prometheus-client.workspace = true
 prost.workspace = true
-nn.workspace = true
 processing.workspace = true
 proto.workspace = true
 service.workspace = true

@@ -23,14 +23,16 @@ use crate::moe::Qwen3Moe;
 
 /// The Qwen3 family.
 pub const FAMILY: Family = Family {
-    id: "qwen3",
-    model_types: &["qwen3", "qwen3_moe"],
-    classes: &["Qwen3MoeForCausalLM"],
+    request: processing::Family {
+        id: "qwen3",
+        model_types: &["qwen3", "qwen3_moe"],
+        classes: &["Qwen3MoeForCausalLM"],
+        serving: Serving::Chat(ChatProfile {
+            reasoning: Some(ReasoningFormat::Qwen3),
+            tool_calls: Some(ToolCallFormat::Qwen3),
+        }),
+    },
     model: Model::Text(&Qwen3MoeFamily),
-    serving: Serving::Chat(ChatProfile {
-        reasoning: Some(ReasoningFormat::Qwen3),
-        tool_calls: Some(ToolCallFormat::Qwen3),
-    }),
 };
 
 /// The family's one value, which [`FAMILY`] refers to.

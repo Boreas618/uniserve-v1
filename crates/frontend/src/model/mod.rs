@@ -24,13 +24,13 @@ pub mod generation;
 //
 // The checkpoint's files are resolved and read here ([`assets`]); which family
 // a checkpoint is, and what that family serves, is the executable's catalogue
-// of families (`nn::family::Catalogue`), whose request processing reads the
+// of families (`processing::Catalogue`), whose request processing reads the
 // checkpoint's tokenizer (`crate::tokenizer`) through `processing::Vocabulary`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-use nn::family::{Catalogue, Family};
+use processing::{Catalogue, Family};
 use processing::{ChatProfile, Serving, VideoFamily};
 
 use crate::model::assets::{
@@ -226,7 +226,7 @@ mod tests {
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
-    use nn::family::{Catalogue, Family, Model};
+    use processing::{Catalogue, Family};
     use processing::{
         ChatProfile, ReasoningFormat, Serving, ToolCallFormat, VideoBinding, VideoFamily,
         VideoProcessor,
@@ -323,7 +323,6 @@ mod tests {
         id: "chat",
         model_types: &["qwen3", "qwen3_moe"],
         classes: &[],
-        model: Model::Text(&crate::test_support::Unloaded),
         serving: Serving::Chat(ChatProfile {
             reasoning: Some(ReasoningFormat::Qwen3),
             tool_calls: Some(ToolCallFormat::Qwen3),
@@ -351,7 +350,6 @@ mod tests {
         id: "video",
         model_types: &["video"],
         classes: &["VideoModularPipeline"],
-        model: Model::Video(&crate::test_support::Unloaded),
         serving: Serving::Video(&Video),
     };
 

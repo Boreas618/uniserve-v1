@@ -85,7 +85,7 @@ const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.
 pub async fn serve(
     config: ServerArgs,
     stated: Stated,
-    catalogue: nn::family::Catalogue,
+    catalogue: processing::Catalogue,
     devices: crate::supervision::DeviceProbe,
     shutdown: CancellationToken,
 ) -> Result<()> {

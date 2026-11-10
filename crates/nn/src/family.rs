@@ -1,10 +1,11 @@
 //! Model families: what a concrete model supplies to execution and to request processing.
 //!
-//! A model crate exports one [`Family`] value, and the executable registers it in one
-//! [`Catalogue`]: execution resolves a checkpoint to the family that claims its declared class and
-//! from then on dispatches by capability alone ([`Family::model`]), and request processing resolves
-//! the same checkpoint to the same value and serves it as its [`processing::Serving`] states. The
-//! two kinds of model differ in what they compute:
+//! A model crate exports one [`Family`] value, and the executable registers it once: execution
+//! resolves a checkpoint to the family that claims its declared class ([`Catalogue`]) and from then
+//! on dispatches by capability alone ([`Family::model`]); request processing reads only the
+//! family's request side ([`Family::request`], a [`processing::Family`]) from a catalogue built of
+//! the same list, and links no numerical crate. The two kinds of model differ in what they
+//! compute:
 //!
 //! - a [`TextFamily`] loads a causal language model ([`TextModel`]), which execution serves with
 //!   prefill and decode forwards over a paged key/value cache;
@@ -33,22 +34,21 @@ use crate::capability::{
 };
 use crate::{Checkpoint, DType, Result, WeightLoader};
 
-/// One model family a build serves: how its checkpoints declare it, what execution loads of them
-/// and what request processing serves.
+/// One model family a build serves: what execution loads of its checkpoints, beside how they
+/// declare it and what request processing serves ([`processing::Family`]).
 #[derive(Clone, Copy)]
 pub struct Family {
-    /// The family's stable identifier, as the daemon reports it.
-    pub id: &'static str,
-    /// The `model_type` values of a root `config.json` that declare this family; empty for a
-    /// family that ships only as a diffusers pipeline.
-    pub model_types: &'static [&'static str],
-    /// The model classes a checkpoint of this family declares: a transformers checkpoint's
-    /// `config.json` `architectures[0]`, or a diffusers pipeline's `_class_name`.
-    pub classes: &'static [&'static str],
+    /// How the family's checkpoints declare it and what request processing serves of it.
+    pub request: processing::Family,
     /// What execution loads of a checkpoint.
     pub model: Model,
-    /// What request processing serves.
-    pub serving: processing::Serving,
+}
+
+impl Family {
+    /// The family's stable identifier, as the daemon reports it.
+    pub fn id(&self) -> &'static str {
+        self.request.id
+    }
 }
 
 /// The model a family's checkpoints load to.
@@ -62,29 +62,28 @@ pub enum Model {
 
 impl std::fmt::Debug for Family {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("Family")
-            .field("id", &self.id)
-            .field("model_types", &self.model_types)
-            .field("classes", &self.classes)
-            .finish_non_exhaustive()
+        self.request.fmt(formatter)
     }
 }
 
 impl PartialEq for Family {
     /// Families are one value each: equal when they are the same family.
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
+        self.request == other.request
     }
 }
 
 impl Eq for Family {}
 
-/// The families an executable serves, each claiming the `model_type`s and classes its checkpoints
+/// The families an executable loads, each claiming the `model_type`s and classes its checkpoints
 /// declare.
+///
+/// The claims are request processing's catalogue ([`processing::Catalogue`]) of the same families,
+/// so both sides resolve a checkpoint by one rule.
 #[derive(Clone, Debug, Default)]
 pub struct Catalogue {
     families: Vec<Family>,
+    claims: processing::Catalogue,
 }
 
 impl Catalogue {
@@ -96,35 +95,19 @@ impl Catalogue {
     /// it would resolve to either.
     pub fn new(families: impl IntoIterator<Item = Family>) -> Result<Self> {
         let families: Vec<Family> = families.into_iter().collect();
-        for (index, family) in families.iter().enumerate() {
-            for class in family.model_types.iter().chain(family.classes) {
-                if families[..index].iter().any(|earlier| {
-                    earlier.model_types.contains(class) || earlier.classes.contains(class)
-                }) {
-                    return Err(crate::Error::Unsupported(format!(
-                        "two model families claim the class {class}"
-                    )));
-                }
-            }
-        }
-        Ok(Self { families })
-    }
-
-    /// The family a root `config.json` declares by its `model_type`.
-    pub fn by_model_type(&self, model_type: &str) -> Option<Family> {
-        self.families
-            .iter()
-            .copied()
-            .find(|family| family.model_types.contains(&model_type))
+        let claims = processing::Catalogue::new(families.iter().map(|family| family.request))
+            .map_err(|error| crate::Error::Unsupported(error.to_string()))?;
+        Ok(Self { families, claims })
     }
 
     /// The family a checkpoint declares by its class: a transformers checkpoint's
     /// `architectures[0]`, or a diffusers pipeline's `_class_name`.
     pub fn by_class(&self, class: &str) -> Option<Family> {
+        let claimed = self.claims.by_class(class)?;
         self.families
             .iter()
             .copied()
-            .find(|family| family.classes.contains(&class))
+            .find(|family| family.request == claimed)
     }
 
     /// Every family, in registration order.
@@ -607,40 +590,37 @@ mod tests {
     }
 
     const CHAT: Family = Family {
-        id: "chat",
-        model_types: &["chat_model"],
-        classes: &["ChatForCausalLM"],
+        request: processing::Family {
+            id: "chat",
+            model_types: &["chat_model"],
+            classes: &["ChatForCausalLM"],
+            serving: Serving::Chat(ChatProfile {
+                reasoning: None,
+                tool_calls: None,
+            }),
+        },
         model: Model::Text(&Unopened),
-        serving: Serving::Chat(ChatProfile {
-            reasoning: None,
-            tool_calls: None,
-        }),
     };
 
-    /// A checkpoint resolves by the `model_type` or the class its own file declares, and one no
-    /// family claims resolves to none.
+    /// A checkpoint resolves to the numerical family whose request side claims its class.
     #[test]
-    fn a_family_is_found_by_what_its_checkpoints_declare() {
+    fn a_family_is_found_by_its_declared_class() {
         let catalogue = Catalogue::new([CHAT]).unwrap();
-        assert_eq!(catalogue.by_model_type("chat_model"), Some(CHAT));
         assert_eq!(catalogue.by_class("ChatForCausalLM"), Some(CHAT));
-        assert_eq!(catalogue.by_model_type("other"), None);
         assert_eq!(catalogue.by_class("chat_model"), None);
     }
 
-    /// Two families that claim one `model_type` or class are refused: a checkpoint of it would
-    /// resolve to either.
+    /// Two families that claim one class are refused, as request processing refuses them.
     #[test]
     fn two_families_may_not_claim_one_class() {
-        let twin = Family { id: "twin", ..CHAT };
-        let error = Catalogue::new([CHAT, twin]).unwrap_err();
-        assert!(error.to_string().contains("chat_model"), "{error}");
-        let class = Family {
-            id: "class",
-            model_types: &[],
+        let twin = Family {
+            request: processing::Family {
+                id: "twin",
+                ..CHAT.request
+            },
             ..CHAT
         };
-        let error = Catalogue::new([CHAT, class]).unwrap_err();
-        assert!(error.to_string().contains("ChatForCausalLM"), "{error}");
+        let error = Catalogue::new([CHAT, twin]).unwrap_err();
+        assert!(error.to_string().contains("chat_model"), "{error}");
     }
 }

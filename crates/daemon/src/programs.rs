@@ -26,7 +26,7 @@ use crate::options::{ServerArgs, Stated};
 /// not resolve, an option of another family was stated, the options do not resolve into an engine
 /// configuration, the replicas are not independent, or a process cannot be placed on this node.
 pub async fn launches(
-    catalogue: &nn::family::Catalogue,
+    catalogue: &processing::Catalogue,
     config: &ServerArgs,
     stated: &Stated,
 ) -> anyhow::Result<Vec<EngineArgs>> {

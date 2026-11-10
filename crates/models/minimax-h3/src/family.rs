@@ -29,11 +29,13 @@ use qwen3::processor::ProcessorConfig;
 /// The MiniMax-H3 family: a diffusers modular pipeline, which request processing serves through its
 /// video processor ([`crate::processing`]).
 pub const FAMILY: Family = Family {
-    id: "minimax_h3",
-    model_types: &[],
-    classes: &["MiniMaxH3ModularPipeline"],
+    request: ::processing::Family {
+        id: "minimax_h3",
+        model_types: &[],
+        classes: &["MiniMaxH3ModularPipeline"],
+        serving: ::processing::Serving::Video(&crate::processing::H3Family),
+    },
     model: Model::Video(&MinimaxH3Family),
-    serving: ::processing::Serving::Video(&crate::processing::H3Family),
 };
 
 /// The family's one value, which [`FAMILY`] refers to.

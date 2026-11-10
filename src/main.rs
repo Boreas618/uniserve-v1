@@ -175,11 +175,19 @@ fn idle_devices() -> std::result::Result<Vec<u32>, String> {
 /// The model families this executable serves: the one place a concrete model is named. Its main
 /// processes load them and its daemon serves requests of them. A model is added with its crate and
 /// one entry here.
+const FAMILIES: [nn::family::Family; 2] = [qwen3::family::FAMILY, minimax_h3::family::FAMILY];
+
+/// The families this executable's main processes load ([`FAMILIES`]).
 pub(crate) fn catalogue() -> Result<nn::family::Catalogue> {
-    Ok(nn::family::Catalogue::new([
-        qwen3::family::FAMILY,
-        minimax_h3::family::FAMILY,
-    ])?)
+    Ok(nn::family::Catalogue::new(FAMILIES)?)
+}
+
+/// What the daemon serves of [`FAMILIES`]: each family's request-processing side, which is all the
+/// daemon reads of a model.
+pub(crate) fn served() -> Result<processing::Catalogue> {
+    Ok(processing::Catalogue::new(
+        FAMILIES.map(|family| family.request),
+    )?)
 }
 
 /// The lifeline this process inherited from the daemon that supervises it

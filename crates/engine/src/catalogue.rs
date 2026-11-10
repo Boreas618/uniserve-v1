@@ -24,7 +24,7 @@ pub fn resolve(catalogue: &Catalogue, checkpoint: &Path) -> Result<Family> {
             catalogue
                 .families()
                 .iter()
-                .flat_map(|family| family.classes.iter().copied())
+                .flat_map(|family| family.request.classes.iter().copied())
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -106,18 +106,22 @@ mod tests {
         });
         Catalogue::new([
             Family {
-                id: "text",
-                model_types: &[],
-                classes: &["TextForCausalLM"],
+                request: processing::Family {
+                    id: "text",
+                    model_types: &[],
+                    classes: &["TextForCausalLM"],
+                    serving: chat,
+                },
                 model: Model::Text(&Unopened),
-                serving: chat,
             },
             Family {
-                id: "video",
-                model_types: &[],
-                classes: &["VideoModularPipeline"],
+                request: processing::Family {
+                    id: "video",
+                    model_types: &[],
+                    classes: &["VideoModularPipeline"],
+                    serving: chat,
+                },
                 model: Model::Video(&Unopened),
-                serving: chat,
             },
         ])
         .unwrap()
@@ -136,14 +140,14 @@ mod tests {
             r#"{"_class_name": "VideoModularPipeline"}"#,
         )
         .unwrap();
-        assert_eq!(resolve(&catalogue, root.path()).unwrap().id, "video");
+        assert_eq!(resolve(&catalogue, root.path()).unwrap().id(), "video");
 
         std::fs::write(
             root.path().join("config.json"),
             r#"{"architectures": ["TextForCausalLM"]}"#,
         )
         .unwrap();
-        assert_eq!(resolve(&catalogue, root.path()).unwrap().id, "text");
+        assert_eq!(resolve(&catalogue, root.path()).unwrap().id(), "text");
     }
 
     /// A class no family claims is refused naming the classes the build serves, and a checkpoint

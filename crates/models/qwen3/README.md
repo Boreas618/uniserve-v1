@@ -13,7 +13,7 @@ The Qwen3 family in Rust, built on `nn` (layers, blocks, weights, capabilities) 
 
 ## Public entry
 
-The crate's entry is its family value, `qwen3::family::FAMILY` (an `nn::family::Family`), which `src/main.rs` registers in the executable's `nn::family::Catalogue`. It claims the `qwen3` and `qwen3_moe` model types and the `Qwen3MoeForCausalLM` class and states both contracts:
+The crate's entry is its family value, `qwen3::family::FAMILY` (an `nn::family::Family`), which `src/main.rs` registers once: its main processes load the family through the `nn::family::Catalogue` and its daemon serves the family's request side (`Family::request`, a `processing::Family`) through the `processing::Catalogue`, both built from that one list. It claims the `qwen3` and `qwen3_moe` model types and the `Qwen3MoeForCausalLM` class and states both contracts:
 
 - to execution, a text family (`nn::family::TextFamily`): `open` reads the checkpoint's configuration and quantization declaration once from its sidecars, and `load` places the model by the deployment's tensor and expert splits (`nn::family::TextPlacement`), returning an `nn::family::TextModel` that states its widths, its key/value cache and its routed experts;
 - to request processing, its chat profile (`processing::ChatProfile`): outputs delimit reasoning between `<think>` and `</think>` and write tool calls as JSON between `<tool_call>` and `</tool_call>`.

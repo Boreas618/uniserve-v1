@@ -43,8 +43,11 @@ pub(crate) fn run(
     );
 
     let catalogue = crate::catalogue()?;
-    let launches =
-        crate::runtime()?.block_on(daemon::programs::launches(&catalogue, &config, &stated))?;
+    let launches = crate::runtime()?.block_on(daemon::programs::launches(
+        &crate::served()?,
+        &config,
+        &stated,
+    ))?;
     let mut recorded = engine::Recorded::new();
     for launch in &launches {
         merge(&mut recorded, engine::record(launch, &catalogue)?);

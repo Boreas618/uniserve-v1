@@ -47,6 +47,8 @@ libc.workspace = true
 mimalloc.workspace = true
 minimax-h3.workspace = true
 nn.workspace = true
+# The request-processing side of the families, which the daemon serves.
+processing.workspace = true
 # The host's devices, whose architectures a Program Server this executable runs builds for.
 platform.workspace = true
 program-server.workspace = true

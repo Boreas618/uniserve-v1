@@ -1,6 +1,6 @@
 //! What a model family serves, as request processing serves it: chat in a family's output formats,
-//! or video through the processor a video family binds. A family states it beside what execution
-//! loads (`nn::family::Family::serving`).
+//! or video through the processor a video family binds. A family states it in its
+//! request-processing description ([`crate::Family::serving`]).
 
 use crate::video::VideoFamily;
 

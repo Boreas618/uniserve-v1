@@ -87,7 +87,7 @@ const SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25 * 
 pub struct Leader {
     /// The model families the executable serves, which every preparation of an epoch resolves
     /// its checkpoint with.
-    pub(crate) catalogue: nn::family::Catalogue,
+    pub(crate) catalogue: processing::Catalogue,
     /// The single model name the API serves.
     served_model_name: String,
     /// The model the request and scheduler metrics are labelled with.
@@ -238,7 +238,7 @@ pub(crate) fn replica_configs(
 
 /// What a leader prepares before it has an engine (`Leader::prepare`).
 pub(crate) struct Prepared {
-    catalogue: nn::family::Catalogue,
+    catalogue: processing::Catalogue,
     model_config: ModelConfig,
     tokenizer: crate::tokenizer::DynTokenizer,
     renderer: LoadedRenderer,
@@ -570,7 +570,7 @@ impl Leader {
     /// start, or when the model cannot be bound to the capabilities its
     /// workers report.
     pub(crate) async fn start(
-        catalogue: &nn::family::Catalogue,
+        catalogue: &processing::Catalogue,
         config: &ServerArgs,
         stated: &Stated,
         daemon: String,
@@ -876,7 +876,7 @@ impl Leader {
     ///
     /// As [`Leader::start`], before the engine starts.
     pub(crate) async fn prepare(
-        catalogue: &nn::family::Catalogue,
+        catalogue: &processing::Catalogue,
         config: &ServerArgs,
         stated: &Stated,
     ) -> anyhow::Result<Prepared> {
@@ -1038,7 +1038,7 @@ impl Leader {
         updates: Arc<crate::updates::driver::Driver>,
     ) -> Self {
         Self::observed(
-            nn::family::Catalogue::default(),
+            processing::Catalogue::default(),
             served_model_name,
             model_name,
             clients,
@@ -1057,7 +1057,7 @@ impl Leader {
         reason = "a leader's model, engine and options, and its statistics' observer"
     )]
     fn observed(
-        catalogue: nn::family::Catalogue,
+        catalogue: processing::Catalogue,
         served_model_name: String,
         model_name: String,
         clients: Vec<Arc<EngineClient>>,
@@ -2077,7 +2077,7 @@ pub(crate) fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_
 pub(crate) struct Replica {
     /// The model families the executable serves, which an update of this replica resolves its
     /// target checkpoint with.
-    pub(crate) catalogue: nn::family::Catalogue,
+    pub(crate) catalogue: processing::Catalogue,
     pub(crate) registry: std::sync::Weak<Replicas>,
     pub(crate) ordinal: usize,
     served_model_name: String,
@@ -2136,7 +2136,7 @@ pub(crate) struct Replica {
 
 impl Replica {
     pub(crate) fn new(
-        catalogue: nn::family::Catalogue,
+        catalogue: processing::Catalogue,
         options: &ServerArgs,
         client: Arc<EngineClient>,
         observer: Arc<crate::observe::Observer>,
