@@ -1,25 +1,23 @@
-//! The deployment's MiniMax-H3 request processor: the model-agnostic request translated into the
-//! model's own terms, held to its rules and planned.
+//! The deployment's MiniMax-H3 request processor: the model-agnostic request held to the model's
+//! rules and planned.
 //!
-//! A request states references and a size; MiniMax-H3 serves three tasks, and the references say
-//! which ([`VideoTask`]): none is `t2va`, image keyframes alone (`frame_index` 0 or -1) are
-//! `fl2va`, and any reference without a frame index is `ref2va`. A size selects one of the canvases
-//! the deployment serves; without one, an `fl2va` request takes the canvas rule over its first
-//! keyframe and every other request the deployment's first canvas's short edge at 16:9. A
-//! duration aligns up to the `17 * n + 5` frame rule, and a frame count must already be one of it.
+//! The processor plans the model-agnostic request (`processing::VideoSpec`) directly with the
+//! model's rules ([`plan`]). A request states references and a size; MiniMax-H3 serves three
+//! tasks, and the references say which ([`VideoTask`]): none is `t2va`, image keyframes alone
+//! (`frame_index` 0 or -1) are `fl2va`, and any reference without a frame index is `ref2va`. A
+//! size selects one of the canvases the deployment serves; without one, an `fl2va` request takes
+//! the canvas rule over its first keyframe and every other request the deployment's first
+//! canvas's short edge at 16:9. A duration aligns up to the `17 * n + 5` frame rule, and a frame
+//! count must already be one of it. Every refusal names the public request parameter at fault.
 
 use processing::{
-    InputError, Length, MediaMetadata, ReferenceKind, VideoBinding, VideoPlan, VideoProcessor,
-    VideoSpec, Vocabulary,
+    InputError, MediaMetadata, VideoBinding, VideoPlan, VideoProcessor, VideoSpec, Vocabulary,
 };
 use proto::video::Canvas;
 use qwen3::processor::ProcessorConfig;
 use serde_json::{Value, json};
 
-use super::plan::{
-    self, ConditionSpec, ConditionType, PlanLimits, ReferenceConfig, RequestField, Role, Target,
-    VideoInputError,
-};
+use super::plan::{self, PlanLimits, ReferenceConfig};
 use super::presentation::{self, VIDEO_TAG};
 use super::{ConditionPacking, DenoiserInfo};
 use crate::VideoTask;
@@ -120,8 +118,9 @@ impl H3Processor {
         })
     }
 
-    /// The request in the model's own terms: its task, its target and its conditions.
-    fn translate(&self, request: &VideoSpec) -> Result<Translated, InputError> {
+    /// Refuses the request options MiniMax-H3 does not take or that this deployment's denoiser
+    /// fixes: guidance, extra parameters, another frame rate or schedule length.
+    fn check_options(&self, request: &VideoSpec) -> Result<(), InputError> {
         if request.negative_prompt.is_some() || request.guidance_scale.is_some() {
             let param = if request.negative_prompt.is_some() {
                 "negative_prompt"
@@ -162,138 +161,7 @@ impl H3Processor {
             ));
         }
 
-        let specs: Vec<ConditionSpec> = request
-            .references
-            .iter()
-            .map(|reference| ConditionSpec {
-                condition_type: match reference.kind {
-                    ReferenceKind::Image => ConditionType::Image,
-                    ReferenceKind::Video => ConditionType::Video,
-                    ReferenceKind::Audio => ConditionType::Audio,
-                },
-                role: if reference.frame_index.is_some() {
-                    Role::Keyframe
-                } else {
-                    Role::Reference
-                },
-                frame_index: reference.frame_index,
-                start_seconds: reference.start_time_seconds,
-            })
-            .collect();
-        let task = if specs.iter().any(|spec| spec.role == Role::Reference) {
-            VideoTask::ReferenceToVideoAudio
-        } else if specs.is_empty() {
-            VideoTask::TextToVideoAudio
-        } else {
-            VideoTask::FirstLastToVideoAudio
-        };
-
-        let (short_edge, aspect_ratio) = match request.size {
-            Some(size) => {
-                let served = self
-                    .denoiser
-                    .canvases
-                    .iter()
-                    .find(|served| served.canvas == size)
-                    .ok_or_else(|| {
-                        InputError::invalid(
-                            "size",
-                            format!(
-                                "{}x{} is not served; this deployment serves {}",
-                                size.width,
-                                size.height,
-                                self.sizes().join(", ")
-                            ),
-                        )
-                    })?;
-                (served.short_edge, served.aspect_ratio.clone())
-            }
-            // Without a size the canvas follows the first keyframe for `fl2va`, and is the
-            // deployment's first short edge at 16:9 otherwise.
-            None => (
-                self.denoiser
-                    .canvases
-                    .first()
-                    .map_or(self.denoiser.canvas_rule.short_edge, |served| {
-                        served.short_edge
-                    }),
-                "auto".to_owned(),
-            ),
-        };
-
-        let duration_seconds = match request.length {
-            None => None,
-            Some(Length::Seconds(seconds)) => Some(seconds),
-            Some(Length::Frames(frames)) => {
-                let rule = self.denoiser.frames;
-                if !rule.is_legal(frames) {
-                    return Err(InputError::invalid(
-                        "num_frames",
-                        format!(
-                            "{frames} is not a frame count MiniMax-H3 generates: {} frames and \
-                             {} more per clip",
-                            rule.min_frames, rule.clip_frames
-                        ),
-                    ));
-                }
-                Some(f64::from(frames) / f64::from(self.denoiser.frame_rate))
-            }
-        };
-
-        Ok(Translated {
-            task,
-            short_edge,
-            aspect_ratio,
-            duration_seconds,
-            specs,
-        })
-    }
-
-    /// The sizes the deployment serves, as a request names them.
-    fn sizes(&self) -> Vec<String> {
-        self.denoiser
-            .canvases
-            .iter()
-            .map(|served| format!("{}x{}", served.canvas.width, served.canvas.height))
-            .collect()
-    }
-}
-
-/// A request in MiniMax-H3's own terms.
-struct Translated {
-    task: VideoTask,
-    short_edge: u32,
-    aspect_ratio: String,
-    duration_seconds: Option<f64>,
-    specs: Vec<ConditionSpec>,
-}
-
-impl Translated {
-    fn target(&self) -> Target<'_> {
-        Target {
-            short_edge: self.short_edge,
-            aspect_ratio: &self.aspect_ratio,
-            duration_seconds: self.duration_seconds,
-        }
-    }
-}
-
-/// A rule's refusal, naming the public request parameter at fault.
-fn refused(error: VideoInputError) -> InputError {
-    match error {
-        VideoInputError::Invalid { field, message } => {
-            let param = match field {
-                RequestField::Prompt => "prompt".to_owned(),
-                RequestField::TargetShortEdge | RequestField::TargetAspectRatio => {
-                    "size".to_owned()
-                }
-                RequestField::TargetDuration => "seconds".to_owned(),
-                RequestField::Task | RequestField::Conditions => "input_references".to_owned(),
-                RequestField::Condition(index) => format!("input_references[{index}]"),
-            };
-            InputError::invalid(param, message)
-        }
-        VideoInputError::Internal(message) => InputError::Internal(message),
+        Ok(())
     }
 }
 
@@ -348,7 +216,7 @@ impl VideoProcessor for H3Processor {
         json!({
             "tasks": limits.tasks.iter().map(|task| task.as_str()).collect::<Vec<_>>(),
             "task_references": task_references,
-            "sizes": self.sizes(),
+            "sizes": plan::served_sizes(limits),
             "canvas_rule": {
                 "short_edge": self.denoiser.canvas_rule.short_edge,
                 "multiple": self.denoiser.canvas_rule.multiple,
@@ -373,14 +241,8 @@ impl VideoProcessor for H3Processor {
     }
 
     fn check(&self, request: &VideoSpec) -> Result<(), InputError> {
-        let translated = self.translate(request)?;
-        plan::check_request(
-            translated.task,
-            &translated.target(),
-            &translated.specs,
-            &self.limits,
-        )
-        .map_err(refused)
+        self.check_options(request)?;
+        plan::check_request(request, &self.limits)
     }
 
     fn plan(
@@ -389,23 +251,13 @@ impl VideoProcessor for H3Processor {
         media: &[MediaMetadata],
         vocabulary: &dyn Vocabulary,
     ) -> Result<VideoPlan, InputError> {
-        let translated = self.translate(request)?;
-        let planned = plan::plan_request(
-            translated.task,
-            &translated.target(),
-            &translated.specs,
-            media,
-            &self.vision,
-            &self.limits,
-        )
-        .map_err(refused)?;
+        self.check_options(request)?;
+        let planned = plan::plan_request(request, media, &self.vision, &self.limits)?;
 
-        let condition_rows = planned
-            .condition_rows(&self.condition_packing)
-            .map_err(refused)?;
+        let condition_rows = planned.condition_rows(&self.condition_packing)?;
         if condition_rows > self.condition_packing.capacity {
             return Err(InputError::invalid(
-                "input_references",
+                plan::REFERENCES,
                 format!(
                     "the references take {condition_rows} denoiser rows, more than the {} this \
                      deployment serves; serve with a larger video_config.max_condition_rows",
@@ -414,8 +266,7 @@ impl VideoProcessor for H3Processor {
             ));
         }
 
-        let presented =
-            presentation::present(vocabulary, &planned, &request.prompt).map_err(refused)?;
+        let presented = presentation::present(vocabulary, &planned, &request.prompt)?;
         let image_bands = planned.image_bands(self.latent_encoding_units);
         let conditions = planned
             .conditions
@@ -444,7 +295,7 @@ impl VideoProcessor for H3Processor {
 
 #[cfg(test)]
 mod tests {
-    use processing::{Reference, VideoBinding};
+    use processing::{Length, Reference, ReferenceKind, VideoBinding};
     use serde_json::Map;
 
     use super::*;

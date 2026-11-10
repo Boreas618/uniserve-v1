@@ -31,8 +31,8 @@ use axum::{Extension, Json, Router};
 use futures::StreamExt as _;
 use serde_json::{Value, json};
 
-use crate::input::video::REQUEST_FIELDS;
 use crate::input::video::VideoGenerationRequest;
+use crate::input::video::{FieldKind, request_field};
 use crate::openai::RequestId;
 use crate::openai::Server;
 use crate::openai::video_jobs::{StageClock, VideoFailure, VideoJob, VideoJobs};
@@ -173,44 +173,20 @@ async fn videos_sync(
 /// `VideoService::process`.
 pub struct VideoBody(pub VideoGenerationRequest);
 
-/// How a multipart text part of the video request becomes a JSON value.
-#[derive(Clone, Copy)]
-enum PartKind {
-    /// The text itself.
-    Text,
-    /// JSON text: an array or object field.
-    Json,
-    /// An unsigned integer.
-    Unsigned,
-    /// A number.
-    Number,
-}
-
-/// The multipart part of each request field.
-fn part_kind(name: &str) -> Option<PartKind> {
-    Some(match name {
-        "model" | "prompt" | "negative_prompt" | "size" => PartKind::Text,
-        "input_references" | "extra_params" => PartKind::Json,
-        "num_frames" | "fps" | "seed" | "num_inference_steps" => PartKind::Unsigned,
-        "seconds" | "guidance_scale" => PartKind::Number,
-        _ => return None,
-    })
-}
-
 /// Converts one multipart text part into the JSON value its field takes.
-fn part_value(name: &'static str, kind: PartKind, text: String) -> Result<Value, ApiError> {
+fn part_value(name: &'static str, kind: FieldKind, text: String) -> Result<Value, ApiError> {
     let invalid =
         |message: &str| ApiError::invalid_request(format!("{name} {message}"), Some(name));
     match kind {
-        PartKind::Text => Ok(Value::String(text)),
-        PartKind::Json => {
+        FieldKind::Text => Ok(Value::String(text)),
+        FieldKind::Json => {
             serde_json::from_str(&text).map_err(|error| invalid(&format!("must be JSON: {error}")))
         }
-        PartKind::Unsigned => text
+        FieldKind::Unsigned => text
             .parse::<u64>()
             .map(Value::from)
             .map_err(|_| invalid("must be an unsigned integer")),
-        PartKind::Number => text
+        FieldKind::Number => text
             .trim()
             .parse::<f64>()
             .ok()
@@ -231,8 +207,7 @@ async fn multipart_fields(mut multipart: Multipart) -> Result<Value, ApiError> {
     let mut fields = serde_json::Map::new();
     while let Some(field) = multipart.next_field().await.map_err(invalid)? {
         let name = field.name().unwrap_or("").to_owned();
-        let schema = REQUEST_FIELDS.iter().copied().find(|known| *known == name);
-        let (Some(name), Some(kind)) = (schema, part_kind(&name)) else {
+        let Some((name, kind)) = request_field(&name) else {
             return Err(ApiError::invalid_request(
                 format!("unknown video field {name:?}"),
                 None,

@@ -34,17 +34,16 @@
 //! - `ref2va` keyframes are fitted to the target canvas like `fl2va` ones
 //!   (the first stretched, a second cover-cropped) and do not enter the
 //!   conditioner;
-//! - without `target.duration_seconds`, a `ref2va` request whose references
+//! - without a stated length, a `ref2va` request whose references
 //!   carry exactly one soundtrack lasts as long as that soundtrack after its
 //!   start offset.
-
-use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
 use processing::{
     AudioMetadata, CanvasError, CanvasRule, ConditionPlan, CoverCrop, FrameClips, ImageMetadata,
-    MediaMetadata, VideoMetadata, cover_crop, requested_frames, resampled_len,
+    InputError, Length, MediaMetadata, Reference, ReferenceKind, VideoMetadata, VideoSpec,
+    cover_crop, requested_frames, resampled_len,
 };
 use proto::video::{Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, VisionGrid};
 
@@ -65,50 +64,6 @@ pub const PLAN_VECTORS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/data/minimax_h3_plan.json"
 );
-
-/// The request field a rejection names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestField {
-    /// `task`.
-    Task,
-    /// `prompt`.
-    Prompt,
-    /// `target.short_edge`.
-    TargetShortEdge,
-    /// `target.aspect_ratio`.
-    TargetAspectRatio,
-    /// `target.duration_seconds`.
-    TargetDuration,
-    /// The condition list as a whole: counts and keyframe order.
-    Conditions,
-    /// One condition, by its position in the request.
-    Condition(usize),
-}
-
-impl RequestField {
-    /// The OpenAI error `param` of the field: the field path, with a
-    /// condition reported as `conditions` (the message names its index).
-    pub const fn param(self) -> &'static str {
-        match self {
-            Self::Task => "task",
-            Self::Prompt => "prompt",
-            Self::TargetShortEdge => "target.short_edge",
-            Self::TargetAspectRatio => "target.aspect_ratio",
-            Self::TargetDuration => "target.duration_seconds",
-            Self::Conditions | Self::Condition(_) => "conditions",
-        }
-    }
-}
-
-impl fmt::Display for RequestField {
-    /// The field path; a condition is `conditions[i]`.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Condition(index) => write!(formatter, "conditions[{index}]"),
-            field => formatter.write_str(field.param()),
-        }
-    }
-}
 
 /// A duration or media fact the rules cannot size.
 ///
@@ -165,80 +120,48 @@ pub enum RuleError {
     VideoCanvas(CanvasError),
 }
 
-/// A video request the rules reject, or a failure while preparing valid
-/// input.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum VideoInputError {
-    /// The request breaks a rule; the same request fails again on retry.
-    #[error("{field}: {message}")]
-    Invalid {
-        /// The field at fault.
-        field: RequestField,
-        /// What is wrong with it.
-        message: String,
-    },
-    /// Preparing valid input failed: for example `ffprobe` could not run,
-    /// scratch storage failed or the tokenizer lacks a vision token.
-    #[error("{0}")]
-    Internal(String),
+/// The public request parameter a refusal of the output size names.
+pub const SIZE: &str = "size";
+/// The public request parameter a refusal of the prompt names.
+pub const PROMPT: &str = "prompt";
+/// The public request parameter a refusal of the references as a whole names; a refusal of one
+/// reference names `input_references[i]` ([`reference`]).
+pub const REFERENCES: &str = "input_references";
+
+/// Refuses the request's reference `index` with `message`.
+pub fn reference(index: usize, message: impl Into<String>) -> InputError {
+    InputError::invalid(format!("{REFERENCES}[{index}]"), message)
 }
 
-impl VideoInputError {
-    /// Rejects `field` with `message`.
-    pub fn invalid(field: RequestField, message: impl Into<String>) -> Self {
-        Self::Invalid {
-            field,
-            message: message.into(),
-        }
-    }
-
-    /// Rejects `conditions[index]` with `message`.
-    pub fn condition(index: usize, message: impl Into<String>) -> Self {
-        Self::invalid(RequestField::Condition(index), message)
-    }
-
-    /// Reports a failure while preparing valid input.
-    pub fn internal(message: impl Into<String>) -> Self {
-        Self::Internal(message.into())
-    }
-
-    /// The field a rejection names; `None` for a failure.
-    pub const fn field(&self) -> Option<RequestField> {
-        match self {
-            Self::Invalid { field, .. } => Some(*field),
-            Self::Internal(_) => None,
-        }
+/// The public request parameter that states the request's length: `num_frames` when it states a
+/// frame count, `seconds` otherwise (a request that states none is refused for want of
+/// `seconds`).
+pub fn length_param(request: &VideoSpec) -> &'static str {
+    match request.length {
+        Some(Length::Frames(_)) => "num_frames",
+        Some(Length::Seconds(_)) | None => "seconds",
     }
 }
 
-/// The media type of a condition, by its request name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConditionType {
-    /// A JPEG, PNG or WEBP image.
-    Image,
-    /// A video; its soundtrack is a condition too when it has one.
-    Video,
-    /// A video that must have a soundtrack.
-    VideoAudio,
-    /// A WAV or MP3 audio file.
-    Audio,
+/// The task a request's references select: none is `t2va`, image keyframes alone (`frame_index`
+/// 0 or -1) are `fl2va`, and any reference without a frame index makes it `ref2va`.
+pub fn task(request: &VideoSpec) -> VideoTask {
+    if request
+        .references
+        .iter()
+        .any(|reference| !is_keyframe(reference))
+    {
+        VideoTask::ReferenceToVideoAudio
+    } else if request.references.is_empty() {
+        VideoTask::TextToVideoAudio
+    } else {
+        VideoTask::FirstLastToVideoAudio
+    }
 }
 
-impl ConditionType {
-    /// Every condition type.
-    pub const ALL: [Self; 4] = [Self::Image, Self::Video, Self::VideoAudio, Self::Audio];
-}
-
-/// Whether a condition anchors a generated frame or is a reference: a
-/// condition's `role` field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Role {
-    /// Anchors the first or last generated frame.
-    Keyframe,
-    /// Conditions the generation as a whole.
-    Reference,
+/// Whether a reference anchors a generated frame: a keyframe states the frame it anchors.
+fn is_keyframe(reference: &Reference) -> bool {
+    reference.frame_index.is_some()
 }
 
 /// The generated frame a keyframe anchors.
@@ -277,31 +200,6 @@ pub fn video_frame_count(
         });
     }
     Ok(frames.align_up(requested_frames(seconds, frame_rate)))
-}
-
-/// The requested output, as the request states it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Target<'a> {
-    /// `target.short_edge`: the resolution class, in pixels, of a canvas the
-    /// deployment serves; the canvas rule's short edge is one.
-    pub short_edge: u32,
-    /// `target.aspect_ratio`: `auto` or `W:H`.
-    pub aspect_ratio: &'a str,
-    /// `target.duration_seconds`, when given.
-    pub duration_seconds: Option<f64>,
-}
-
-/// One condition's request fields other than its URI.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ConditionSpec {
-    /// `conditions[i].type`.
-    pub condition_type: ConditionType,
-    /// `conditions[i].role`.
-    pub role: Role,
-    /// `conditions[i].frame_index`: 0 or -1 for a keyframe.
-    pub frame_index: Option<i64>,
-    /// `conditions[i].start_time_seconds`, for video references.
-    pub start_seconds: Option<f64>,
 }
 
 /// How a deployment sizes the references of a `ref2va` request: the options
@@ -429,8 +327,8 @@ pub struct PlanLimits {
     /// encoded frames and latent units follow from it.
     pub frames: FrameClips,
     /// The only canvases the deployment serves, as its workers declare them
-    /// in their handshake: each with the `target.short_edge` and
-    /// `target.aspect_ratio` that select it, in the order the deployment
+    /// in their handshake: each with its short edge and aspect ratio, in the
+    /// order the deployment
     /// names them.
     pub canvases: Vec<ServedCanvas>,
     /// The references one `ref2va` request may carry, as the denoiser
@@ -440,19 +338,6 @@ pub struct PlanLimits {
     pub references: ReferenceConfig,
 }
 
-impl PlanLimits {
-    /// The `target.short_edge` values the deployment serves, in the order of
-    /// its canvases.
-    pub fn short_edges(&self) -> Vec<u32> {
-        let mut edges = Vec::new();
-        for served in &self.canvases {
-            if !edges.contains(&served.short_edge) {
-                edges.push(served.short_edge);
-            }
-        }
-        edges
-    }
-}
 /// How a keyframe is put on the target canvas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct KeyframeFit {
@@ -755,13 +640,13 @@ pub fn condition_rows(
     conditions: &[ConditionInput],
     canvas: Canvas,
     packing: &ConditionPacking,
-) -> Result<u32, VideoInputError> {
+) -> Result<u32, InputError> {
     let shapes: Vec<crate::packing::Condition> = conditions
         .iter()
         .map(|condition| crate::packing::Condition::of(&condition.shape(canvas)))
         .collect();
     let segments = crate::packing::condition_segments(&shapes, &canvas)
-        .map_err(|error| VideoInputError::internal(format!("packing the conditions: {error}")))?;
+        .map_err(|error| InputError::Internal(format!("packing the conditions: {error}")))?;
     Ok(packing.tiling().condition_rows(&segments))
 }
 
@@ -772,7 +657,7 @@ pub struct VideoParams {
     pub task: VideoTask,
     /// The generated canvas.
     pub canvas: Canvas,
-    /// The requested duration in seconds: `target.duration_seconds`, or the
+    /// The requested duration in seconds: the stated length, or the
     /// soundtrack's length after its start offset when that sets it.
     pub duration_seconds: f64,
     /// Generated frames, a frame count of the denoiser's frame rule.
@@ -791,7 +676,7 @@ impl VideoParams {
     ///
     /// Fails when the packing refuses a planned condition, which the rules
     /// plan none of.
-    pub fn condition_rows(&self, packing: &ConditionPacking) -> Result<u32, VideoInputError> {
+    pub fn condition_rows(&self, packing: &ConditionPacking) -> Result<u32, InputError> {
         condition_rows(&self.conditions, self.canvas, packing)
     }
 
@@ -1008,100 +893,83 @@ pub fn video_reference(
     Ok((clip, seen))
 }
 
-/// Parses `W:H` into positive integers written in canonical decimal form;
-/// `None` when malformed.
-fn parse_aspect_ratio(value: &str) -> Option<(u32, u32)> {
-    let (width, height) = value.split_once(':')?;
-    let side = |text: &str| -> Option<u32> {
-        let parsed: u32 = text.parse().ok()?;
-        (parsed > 0 && parsed.to_string() == text).then_some(parsed)
-    };
-    Some((side(width)?, side(height)?))
-}
-
-/// The canvas a target names without consulting media; `None` for `fl2va`
-/// with `auto`, whose canvas follows the first keyframe.
+/// The canvas a request names without consulting media; `None` for an
+/// `fl2va` request without a size, whose canvas follows its first keyframe.
 ///
-/// `limits.canvases` are the canvases a deployment serves, each with the
-/// `(short_edge, aspect_ratio)` that selects it. `auto` is 16:9 for `t2va`
-/// and `ref2va`. A `W:H` ratio named at the target's short edge selects that
-/// canvas. `fl2va` also takes any ratio within the canvas rule's aspects,
-/// which the rule ([`CanvasRule::canvas`]) resolves at its short edge; a
-/// deployment serves such a canvas only when it is one of the canvases.
+/// A stated size must be one of the canvases the deployment serves
+/// (`limits.canvases`). Without one, a `t2va` or `ref2va` request takes the
+/// 16:9 canvas at the short edge of the deployment's first canvas.
 ///
 /// # Errors
 ///
-/// Returns [`VideoInputError::Invalid`] for `target.aspect_ratio` when no
-/// canvas the ratio names is served at the target's short edge and the
-/// canvas rule does not apply to it.
+/// Refuses `size` when the stated size is not served, or when no 16:9 canvas
+/// is served at the first canvas's short edge for a request that states none.
 pub fn named_canvas(
     task: VideoTask,
-    target: &Target<'_>,
+    size: Option<Canvas>,
     limits: &PlanLimits,
-) -> Result<Option<Canvas>, VideoInputError> {
-    let (canvases, rule) = (&limits.canvases, &limits.canvas_rule);
-    let name = if target.aspect_ratio != "auto" {
-        target.aspect_ratio.to_owned()
-    } else if task == VideoTask::FirstLastToVideoAudio {
-        return Ok(None);
-    } else {
-        format!("{}:{}", DEFAULT_ASPECT_RATIO.0, DEFAULT_ASPECT_RATIO.1)
-    };
-    let at_edge = || {
-        canvases
-            .iter()
-            .filter(|served| served.short_edge == target.short_edge)
-    };
-    if let Some(served) = at_edge().find(|served| served.aspect_ratio == name) {
-        return Ok(Some(served.canvas));
-    }
-
-    let by_rule = task == VideoTask::FirstLastToVideoAudio && target.short_edge == rule.short_edge;
-    if by_rule && let Some((width, height)) = parse_aspect_ratio(&name) {
-        return rule
-            .canvas(f64::from(width), f64::from(height))
-            .map(Some)
-            .map_err(|error| {
-                VideoInputError::invalid(RequestField::TargetAspectRatio, error.to_string())
-            });
-    }
-
-    let served: Vec<&str> = at_edge()
-        .map(|served| served.aspect_ratio.as_str())
-        .collect();
-    if served.is_empty() && !by_rule {
-        return Err(VideoInputError::invalid(
-            RequestField::TargetAspectRatio,
+) -> Result<Option<Canvas>, InputError> {
+    if let Some(size) = size {
+        if limits.canvases.iter().any(|served| served.canvas == size) {
+            return Ok(Some(size));
+        }
+        return Err(InputError::invalid(
+            SIZE,
             format!(
-                "names no canvas: no canvas is served at a {}-pixel short edge, got {:?}",
-                target.short_edge, target.aspect_ratio
+                "{}x{} is not served; this deployment serves {}",
+                size.width,
+                size.height,
+                served_sizes(limits).join(", ")
             ),
         ));
     }
-    let allowed = match (task, by_rule) {
-        (VideoTask::FirstLastToVideoAudio, true) => format!(
-            "auto or W:H within {}:{} to {}:{}",
-            rule.narrowest.0, rule.narrowest.1, rule.widest.0, rule.widest.1
-        ),
-        (VideoTask::FirstLastToVideoAudio, false) => format!("one of {}", served.join(", ")),
-        _ => format!("auto or one of {}", served.join(", ")),
-    };
-    Err(VideoInputError::invalid(
-        RequestField::TargetAspectRatio,
-        format!(
-            "must be {allowed} at a {}-pixel short edge, got {:?}",
-            target.short_edge, target.aspect_ratio
-        ),
-    ))
+    if task == VideoTask::FirstLastToVideoAudio {
+        return Ok(None);
+    }
+    let short_edge = default_short_edge(limits);
+    let ratio = format!("{}:{}", DEFAULT_ASPECT_RATIO.0, DEFAULT_ASPECT_RATIO.1);
+    limits
+        .canvases
+        .iter()
+        .find(|served| served.short_edge == short_edge && served.aspect_ratio == ratio)
+        .map(|served| Some(served.canvas))
+        .ok_or_else(|| {
+            InputError::invalid(
+                SIZE,
+                format!(
+                    "is required: this deployment serves no {ratio} canvas at a \
+                     {short_edge}-pixel short edge; it serves {}",
+                    served_sizes(limits).join(", ")
+                ),
+            )
+        })
+}
+
+/// The short edge a request without a size is generated at: the deployment's
+/// first canvas's, or the canvas rule's when it names none.
+fn default_short_edge(limits: &PlanLimits) -> u32 {
+    limits
+        .canvases
+        .first()
+        .map_or(limits.canvas_rule.short_edge, |served| served.short_edge)
+}
+
+/// The sizes the deployment serves, as a request names them.
+pub fn served_sizes(limits: &PlanLimits) -> Vec<String> {
+    limits
+        .canvases
+        .iter()
+        .map(|served| format!("{}x{}", served.canvas.width, served.canvas.height))
+        .collect()
 }
 
 /// Checks that a canvas is one the deployment's workers prepared.
-fn check_served(size: Canvas, limits: &PlanLimits) -> Result<(), VideoInputError> {
+fn check_served(size: Canvas, limits: &PlanLimits) -> Result<(), InputError> {
     if limits.canvases.iter().any(|served| served.canvas == size) {
         return Ok(());
     }
-    Err(VideoInputError::invalid(
-        RequestField::TargetAspectRatio,
+    Err(InputError::invalid(
+        SIZE,
         format!(
             "resolves to {}x{}, which this deployment does not serve",
             size.width, size.height
@@ -1109,49 +977,63 @@ fn check_served(size: Canvas, limits: &PlanLimits) -> Result<(), VideoInputError
     ))
 }
 
+/// The duration a request states, in seconds: a stated frame count, which
+/// must be one of the frame rule, lasts its frames at the output frame rate.
+///
+/// # Errors
+///
+/// Refuses `num_frames` when it is not a frame count of the denoiser's rule.
+fn stated_seconds(request: &VideoSpec, limits: &PlanLimits) -> Result<Option<f64>, InputError> {
+    Ok(match request.length {
+        None => None,
+        Some(Length::Seconds(seconds)) => Some(seconds),
+        Some(Length::Frames(frames)) => {
+            let rule = limits.frames;
+            if !rule.is_legal(frames) {
+                return Err(InputError::invalid(
+                    "num_frames",
+                    format!(
+                        "{frames} is not a frame count MiniMax-H3 generates: {} frames and {} \
+                         more per clip",
+                        rule.min_frames, rule.clip_frames
+                    ),
+                ));
+            }
+            Some(f64::from(frames) / f64::from(limits.frame_rate))
+        }
+    })
+}
+
 /// Applies every rule that needs no media, in a fixed order: the served task,
-/// the target's short edge and aspect ratio, each condition's fields, the
-/// task's condition counts and keyframe order, then the duration.
+/// the size, each reference's fields, the task's reference counts and
+/// keyframe order, then the length.
 ///
 /// [`plan_request`] applies these rules again; calling this first rejects a
 /// malformed request before its media are fetched.
 ///
 /// # Errors
 ///
-/// Returns [`VideoInputError::Invalid`] naming the first field at fault.
-pub fn check_request(
-    task: VideoTask,
-    target: &Target<'_>,
-    conditions: &[ConditionSpec],
-    limits: &PlanLimits,
-) -> Result<(), VideoInputError> {
+/// Returns [`InputError::Invalid`] naming the first public parameter at
+/// fault.
+pub fn check_request(request: &VideoSpec, limits: &PlanLimits) -> Result<(), InputError> {
+    let task = task(request);
     if !limits.tasks.contains(&task) {
         let served: Vec<&str> = limits.tasks.iter().map(|task| task.as_str()).collect();
-        return Err(VideoInputError::invalid(
-            RequestField::Task,
+        return Err(InputError::invalid(
+            REFERENCES,
             format!(
-                "{} is not served; this deployment serves {}",
+                "select {}, which is not served; this deployment serves {}",
                 task.as_str(),
                 served.join(", ")
             ),
         ));
     }
-    let short_edges = limits.short_edges();
-    if !short_edges.contains(&target.short_edge) {
-        let served: Vec<String> = short_edges.iter().map(u32::to_string).collect();
-        return Err(VideoInputError::invalid(
-            RequestField::TargetShortEdge,
-            format!("must be {}, got {}", served.join(" or "), target.short_edge),
-        ));
-    }
 
-    if let Some(size) = named_canvas(task, target, limits)? {
-        check_served(size, limits)?;
-    }
+    named_canvas(task, request.size, limits)?;
+    check_references(task, &request.references, &limits.reference_limits)?;
 
-    check_conditions(task, conditions, &limits.reference_limits)?;
-
-    match target.duration_seconds {
+    let length = length_param(request);
+    match stated_seconds(request, limits)? {
         Some(seconds) => {
             video_frame_count(
                 seconds,
@@ -1159,18 +1041,17 @@ pub fn check_request(
                 limits.frame_rate,
                 &limits.frames,
             )
-            .map_err(|error| {
-                VideoInputError::invalid(RequestField::TargetDuration, error.to_string())
-            })?;
+            .map_err(|error| InputError::invalid(length, error.to_string()))?;
         }
         None => {
             let may_follow_audio = task == VideoTask::ReferenceToVideoAudio
-                && conditions
+                && request
+                    .references
                     .iter()
-                    .any(|condition| condition.condition_type != ConditionType::Image);
+                    .any(|reference| reference.kind != ReferenceKind::Image);
             if !may_follow_audio {
-                return Err(VideoInputError::invalid(
-                    RequestField::TargetDuration,
+                return Err(InputError::invalid(
+                    length,
                     "is required unless a ref2va request has exactly one reference with audio",
                 ));
             }
@@ -1179,53 +1060,25 @@ pub fn check_request(
     Ok(())
 }
 
-/// Checks each condition's fields, then the task's counts and keyframe
+/// Checks each reference's fields, then the task's counts and keyframe
 /// order.
-fn check_conditions(
+fn check_references(
     task: VideoTask,
-    conditions: &[ConditionSpec],
+    references: &[Reference],
     limits: &ReferenceLimits,
-) -> Result<(), VideoInputError> {
-    if task == VideoTask::TextToVideoAudio {
-        if !conditions.is_empty() {
-            return Err(VideoInputError::invalid(
-                RequestField::Conditions,
-                "t2va takes no conditions",
-            ));
-        }
-        return Ok(());
-    }
-
-    for (index, condition) in conditions.iter().enumerate() {
-        let reject = |message: String| Err(VideoInputError::condition(index, message));
-        match condition.role {
-            Role::Keyframe => {
-                if condition.condition_type != ConditionType::Image {
-                    return reject("a keyframe must be an image".to_owned());
-                }
-                match condition.frame_index {
-                    None => return reject("a keyframe needs frame_index".to_owned()),
-                    Some(0 | -1) => {}
-                    Some(other) => {
-                        return reject(format!("frame_index must be 0 or -1, got {other}"));
-                    }
-                }
+) -> Result<(), InputError> {
+    for (index, reference_) in references.iter().enumerate() {
+        let reject = |message: String| Err(reference(index, message));
+        if let Some(frame_index) = reference_.frame_index {
+            if reference_.kind != ReferenceKind::Image {
+                return reject("a keyframe must be an image".to_owned());
             }
-            Role::Reference => {
-                if task == VideoTask::FirstLastToVideoAudio {
-                    return reject("fl2va takes keyframes only".to_owned());
-                }
-                if condition.frame_index.is_some() {
-                    return reject("only a keyframe takes frame_index".to_owned());
-                }
+            if !matches!(frame_index, 0 | -1) {
+                return reject(format!("frame_index must be 0 or -1, got {frame_index}"));
             }
         }
-        if let Some(start) = condition.start_seconds {
-            let video = matches!(
-                condition.condition_type,
-                ConditionType::Video | ConditionType::VideoAudio
-            );
-            if condition.role == Role::Keyframe || !video {
+        if let Some(start) = reference_.start_time_seconds {
+            if is_keyframe(reference_) || reference_.kind != ReferenceKind::Video {
                 return reject("start_time_seconds applies to video references only".to_owned());
             }
             if !start.is_finite() || start < 0.0 {
@@ -1234,50 +1087,45 @@ fn check_conditions(
         }
     }
 
-    let signature: Vec<i64> = conditions
+    let signature: Vec<i64> = references
         .iter()
-        .filter(|condition| condition.role == Role::Keyframe)
-        .filter_map(|condition| condition.frame_index)
+        .filter_map(|reference| reference.frame_index)
         .collect();
     let keyframes_valid = matches!(signature.as_slice(), [0] | [-1] | [0, -1]);
     if (task == VideoTask::FirstLastToVideoAudio || !signature.is_empty()) && !keyframes_valid {
-        return Err(VideoInputError::invalid(
-            RequestField::Conditions,
+        return Err(InputError::invalid(
+            REFERENCES,
             format!("keyframe frame_index values must be [0], [-1] or [0, -1], got {signature:?}"),
         ));
     }
 
     if task == VideoTask::ReferenceToVideoAudio {
-        let references = || {
-            conditions
+        let count = |kind: ReferenceKind| {
+            references
                 .iter()
-                .filter(|condition| condition.role == Role::Reference)
-        };
-        let count = |kind: fn(ConditionType) -> bool| {
-            references()
-                .filter(|condition| kind(condition.condition_type))
+                .filter(|reference| !is_keyframe(reference) && reference.kind == kind)
                 .count()
         };
-        let images = count(|kind| kind == ConditionType::Image);
-        let audios = count(|kind| kind == ConditionType::Audio);
-        let videos = count(|kind| matches!(kind, ConditionType::Video | ConditionType::VideoAudio));
+        let images = count(ReferenceKind::Image);
+        let audios = count(ReferenceKind::Audio);
+        let videos = count(ReferenceKind::Video);
         // Each limit names what it bounds; the last bounds every kind.
         for (bounded, found, limit) in [
             ("image references", images, limits.images),
             ("video references", videos, limits.videos),
             ("audio references", audios, limits.audios),
-            ("references", references().count(), limits.total),
+            ("references", images + videos + audios, limits.total),
         ] {
             if found > limit as usize {
-                return Err(VideoInputError::invalid(
-                    RequestField::Conditions,
+                return Err(InputError::invalid(
+                    REFERENCES,
                     format!("at most {limit} {bounded}, got {found}"),
                 ));
             }
         }
         if images + videos == 0 {
-            return Err(VideoInputError::invalid(
-                RequestField::Conditions,
+            return Err(InputError::invalid(
+                REFERENCES,
                 "ref2va needs at least one image or video reference",
             ));
         }
@@ -1285,45 +1133,30 @@ fn check_conditions(
     Ok(())
 }
 
-/// Checks that the probed media fits the condition's type.
+/// Checks that the probed media is the reference's kind.
 fn check_media(
     index: usize,
-    condition: &ConditionSpec,
+    reference_: &Reference,
     media: &MediaMetadata,
-) -> Result<(), VideoInputError> {
+) -> Result<(), InputError> {
     let fits = matches!(
-        (condition.condition_type, media),
-        (ConditionType::Image, MediaMetadata::Image(_))
-            | (
-                ConditionType::Video | ConditionType::VideoAudio,
-                MediaMetadata::Video(_)
-            )
-            | (ConditionType::Audio, MediaMetadata::Audio(_))
+        (reference_.kind, media),
+        (ReferenceKind::Image, MediaMetadata::Image(_))
+            | (ReferenceKind::Video, MediaMetadata::Video(_))
+            | (ReferenceKind::Audio, MediaMetadata::Audio(_))
     );
     if !fits {
-        return Err(VideoInputError::condition(
+        return Err(reference(
             index,
-            "the media does not match the condition type",
-        ));
-    }
-    if let (ConditionType::VideoAudio, MediaMetadata::Video(video)) =
-        (condition.condition_type, media)
-        && video.soundtrack.is_none()
-    {
-        return Err(VideoInputError::condition(
-            index,
-            "a video_audio reference needs an audio track",
+            format!("the media is not {}", reference_.kind.name()),
         ));
     }
     Ok(())
 }
 
 /// The soundtrack a reference conditions on, if any.
-fn soundtrack<'a>(
-    condition: &ConditionSpec,
-    media: &'a MediaMetadata,
-) -> Option<&'a AudioMetadata> {
-    if condition.role == Role::Keyframe {
+fn soundtrack<'a>(reference_: &Reference, media: &'a MediaMetadata) -> Option<&'a AudioMetadata> {
+    if is_keyframe(reference_) {
         return None;
     }
     match media {
@@ -1333,13 +1166,15 @@ fn soundtrack<'a>(
     }
 }
 
-/// The generated frame count, from the target or from the one soundtrack.
+/// The generated frame count, from the stated length or from the one
+/// soundtrack.
 fn resolve_frames(
-    target: &Target<'_>,
+    request: &VideoSpec,
     soundtracks: &[(usize, &AudioMetadata, f64)],
     limits: &PlanLimits,
-) -> Result<(f64, u32), VideoInputError> {
-    if let Some(seconds) = target.duration_seconds {
+) -> Result<(f64, u32), InputError> {
+    let length = length_param(request);
+    if let Some(seconds) = stated_seconds(request, limits)? {
         return video_frame_count(
             seconds,
             limits.max_video_seconds,
@@ -1347,13 +1182,11 @@ fn resolve_frames(
             &limits.frames,
         )
         .map(|frames| (seconds, frames))
-        .map_err(|error| {
-            VideoInputError::invalid(RequestField::TargetDuration, error.to_string())
-        });
+        .map_err(|error| InputError::invalid(length, error.to_string()));
     }
     let [(index, track, start_seconds)] = soundtracks else {
-        return Err(VideoInputError::invalid(
-            RequestField::TargetDuration,
+        return Err(InputError::invalid(
+            length,
             format!(
                 "is required unless exactly one reference has audio, got {}",
                 soundtracks.len()
@@ -1363,7 +1196,7 @@ fn resolve_frames(
     let rate = f64::from(track.sample_rate);
     let start_sample = start_offset(*start_seconds, rate);
     if start_sample >= track.samples {
-        return Err(VideoInputError::condition(
+        return Err(reference(
             *index,
             "start_time_seconds lies past the end of the audio track",
         ));
@@ -1377,44 +1210,44 @@ fn resolve_frames(
     )
     .map(|frames| (seconds, frames))
     .map_err(|error| {
-        VideoInputError::condition(
+        reference(
             *index,
             format!("the audio track sets the duration, but {error}"),
         )
     })
 }
 
-/// The generated canvas: from the ratio, or from the first keyframe.
+/// The generated canvas: the one the request names, or the one the first
+/// keyframe sets.
 fn target_canvas(
     task: VideoTask,
-    target: &Target<'_>,
+    request: &VideoSpec,
     media: &[MediaMetadata],
     limits: &PlanLimits,
-) -> Result<Canvas, VideoInputError> {
-    if let Some(size) = named_canvas(task, target, limits)? {
+) -> Result<Canvas, InputError> {
+    if let Some(size) = named_canvas(task, request.size, limits)? {
         return Ok(size);
     }
-    // fl2va with `auto`: the conditions are keyframes and the first one sets
-    // the canvas through the canvas rule, at its short edge.
+    // fl2va without a size: the references are keyframes and the first one
+    // sets the canvas through the canvas rule, at its short edge.
     let rule = &limits.canvas_rule;
-    if target.short_edge != rule.short_edge {
-        return Err(VideoInputError::invalid(
-            RequestField::TargetShortEdge,
+    if default_short_edge(limits) != rule.short_edge {
+        return Err(InputError::invalid(
+            SIZE,
             format!(
-                "must be {} for an auto aspect ratio, got {}",
-                rule.short_edge, target.short_edge
+                "is required: the first keyframe sets a canvas at a {}-pixel short edge, which \
+                 this deployment does not serve; it serves {}",
+                rule.short_edge,
+                served_sizes(limits).join(", ")
             ),
         ));
     }
     let Some(MediaMetadata::Image(first)) = media.first() else {
-        return Err(VideoInputError::condition(
-            0,
-            "the first keyframe is not an image",
-        ));
+        return Err(reference(0, "the first keyframe is not an image"));
     };
     rule.canvas(f64::from(first.width), f64::from(first.height))
         .map_err(|error| {
-            VideoInputError::condition(
+            reference(
                 0,
                 format!("the first keyframe sets the canvas, but its {error}"),
             )
@@ -1423,14 +1256,14 @@ fn target_canvas(
 
 pub(crate) fn plan_keyframe(
     index: usize,
-    condition: &ConditionSpec,
+    reference_: &Reference,
     image: &ImageMetadata,
     size: Canvas,
     order: usize,
     task: VideoTask,
     vision: &ProcessorConfig,
-) -> Result<ConditionInput, VideoInputError> {
-    let position = if condition.frame_index == Some(0) {
+) -> Result<ConditionInput, InputError> {
+    let position = if reference_.frame_index == Some(0) {
         FramePosition::First
     } else {
         FramePosition::Last
@@ -1441,7 +1274,7 @@ pub(crate) fn plan_keyframe(
     let seen = if task == VideoTask::FirstLastToVideoAudio {
         let grid = vision
             .image_grid(size.height, size.width)
-            .map_err(|error| VideoInputError::condition(index, error.to_string()))?;
+            .map_err(|error| reference(index, error.to_string()))?;
         Some(Vision::Image(ImageVision {
             grid,
             tokens: vision.block_tokens(grid),
@@ -1462,13 +1295,13 @@ pub(crate) fn plan_keyframe(
 
 fn plan_reference(
     index: usize,
-    condition: &ConditionSpec,
+    reference_: &Reference,
     media: &MediaMetadata,
     frames: u32,
     vision: &ProcessorConfig,
     limits: &PlanLimits,
-) -> Result<ConditionInput, VideoInputError> {
-    let reject = |error: RuleError| VideoInputError::condition(index, error.to_string());
+) -> Result<ConditionInput, InputError> {
+    let reject = |error: RuleError| reference(index, error.to_string());
     let plan = |prepared, seen, audio_rows| ConditionInput {
         index,
         prepared,
@@ -1498,7 +1331,7 @@ fn plan_reference(
             Ok(plan(Prepared::Audio(clip), None, clip.rows()))
         }
         MediaMetadata::Video(video) => {
-            let start = condition.start_seconds.unwrap_or(0.0);
+            let start = reference_.start_time_seconds.unwrap_or(0.0);
             let (clip, seen) =
                 video_reference(video, start, frames, limits, vision).map_err(reject)?;
             let audio_rows = clip.soundtrack.map_or(0, |track| track.rows());
@@ -1513,60 +1346,53 @@ fn plan_reference(
 
 /// Resolves every size a request implies from the probed media.
 ///
-/// `media` holds the probed facts of each condition, in request order. The
+/// `media` holds the probed facts of each reference, in request order. The
 /// caller applies the request-only rules of [`check_request`] first, which
 /// need no media and so run before it is fetched.
 ///
 /// # Errors
 ///
-/// Returns [`VideoInputError::Invalid`] naming the first field at fault, and
-/// [`VideoInputError::Internal`] when `media` and `conditions` differ in
-/// length.
+/// Returns [`InputError::Invalid`] naming the first public parameter at
+/// fault, and [`InputError::Internal`] when `media` and the references differ
+/// in length.
 pub fn plan_request(
-    task: VideoTask,
-    target: &Target<'_>,
-    conditions: &[ConditionSpec],
+    request: &VideoSpec,
     media: &[MediaMetadata],
     vision: &ProcessorConfig,
     limits: &PlanLimits,
-) -> Result<VideoParams, VideoInputError> {
-    if media.len() != conditions.len() {
-        return Err(VideoInputError::internal(format!(
-            "{} conditions were planned with {} probed media",
-            conditions.len(),
+) -> Result<VideoParams, InputError> {
+    let references = &request.references;
+    if media.len() != references.len() {
+        return Err(InputError::Internal(format!(
+            "{} references were planned with {} probed media",
+            references.len(),
             media.len()
         )));
     }
+    let task = task(request);
 
     let mut soundtracks = Vec::new();
-    for (index, (condition, facts)) in conditions.iter().zip(media).enumerate() {
-        check_media(index, condition, facts)?;
-        if let Some(track) = soundtrack(condition, facts) {
-            soundtracks.push((index, track, condition.start_seconds.unwrap_or(0.0)));
+    for (index, (reference_, facts)) in references.iter().zip(media).enumerate() {
+        check_media(index, reference_, facts)?;
+        if let Some(track) = soundtrack(reference_, facts) {
+            soundtracks.push((index, track, reference_.start_time_seconds.unwrap_or(0.0)));
         }
     }
-    let (duration_seconds, frames) = resolve_frames(target, &soundtracks, limits)?;
+    let (duration_seconds, frames) = resolve_frames(request, &soundtracks, limits)?;
 
-    let size = target_canvas(task, target, media, limits)?;
+    let size = target_canvas(task, request, media, limits)?;
     check_served(size, limits)?;
 
-    let mut plans = Vec::with_capacity(conditions.len());
+    let mut plans = Vec::with_capacity(references.len());
     let mut keyframes = 0;
-    for (index, (condition, facts)) in conditions.iter().zip(media).enumerate() {
-        let plan = match (condition.role, facts) {
-            (Role::Keyframe, MediaMetadata::Image(image)) => {
+    for (index, (reference_, facts)) in references.iter().zip(media).enumerate() {
+        let plan = match (is_keyframe(reference_), facts) {
+            (true, MediaMetadata::Image(image)) => {
                 keyframes += 1;
-                plan_keyframe(index, condition, image, size, keyframes - 1, task, vision)?
+                plan_keyframe(index, reference_, image, size, keyframes - 1, task, vision)?
             }
-            (Role::Keyframe, _) => {
-                return Err(VideoInputError::condition(
-                    index,
-                    "a keyframe must be an image",
-                ));
-            }
-            (Role::Reference, _) => {
-                plan_reference(index, condition, facts, frames, vision, limits)?
-            }
+            (true, _) => return Err(reference(index, "a keyframe must be an image")),
+            (false, _) => plan_reference(index, reference_, facts, frames, vision, limits)?,
         };
         plans.push(plan);
     }
@@ -1588,11 +1414,11 @@ pub(super) mod tests {
     use super::super::presentation::present;
     use super::super::presentation::tests::CharacterTokenizer;
     use super::{
-        AudioClip, AudioMetadata, Canvas, ConditionInput, ConditionSpec, ConditionType,
-        FramePosition, ImageMetadata, KeyframeFit, LatentRaster, MediaMetadata, PlanLimits,
-        Prepared, ReferenceConfig, RequestField, Role, Target, VideoClip, VideoInputError,
-        VideoMetadata, VideoParams, VideoTask, Vision, audio_clip, check_request, cover_crop,
-        plan_request, reference_image_size, video_frame_count, video_reference,
+        AudioClip, AudioMetadata, Canvas, ConditionInput, FramePosition, ImageMetadata, InputError,
+        KeyframeFit, LatentRaster, Length, MediaMetadata, PlanLimits, Prepared, Reference,
+        ReferenceConfig, ReferenceKind, VideoClip, VideoMetadata, VideoParams, VideoSpec,
+        VideoTask, Vision, audio_clip, check_request, cover_crop, plan_request,
+        reference_image_size, video_frame_count, video_reference,
     };
     use crate::config::{AUDIO_HOP, AUDIO_SAMPLE_RATE, CANVAS_RULE, FPS, FRAMES};
     use crate::processing::{ConditionPacking, ReferenceLimits, ServedCanvas};
@@ -1741,48 +1567,77 @@ pub(super) mod tests {
         }
     }
 
-    /// The task, target, conditions and media of a vectors request.
+    /// A size no deployment of the vectors serves: what a request states for a
+    /// target the public schema names no served canvas for.
+    const UNSERVED: Canvas = Canvas {
+        width: 1,
+        height: 1,
+    };
+
+    /// A vectors request as the public API states it, and the media of its
+    /// references.
+    ///
+    /// The vectors are written in the reference pipeline's schema: a task, a
+    /// target of short edge, aspect ratio and duration, and conditions with
+    /// roles. A request states them as references, whose frame indices select
+    /// the task, a size and a duration.
     pub(in crate::processing) struct Request {
-        task: VideoTask,
-        aspect_ratio: String,
-        target: (u32, Option<f64>),
-        conditions: Vec<ConditionSpec>,
+        spec: VideoSpec,
         media: Vec<MediaMetadata>,
     }
 
     impl Request {
-        pub(in crate::processing) fn parse(case: &Value) -> Self {
+        /// The public request of `case`; `None` for a case the public schema
+        /// cannot state: an explicit task its references do not select, or a
+        /// `video_audio` condition's required soundtrack.
+        pub(in crate::processing) fn stated(case: &Value) -> Option<Self> {
             let target = &case["target"];
             let conditions = case["conditions"].as_array().unwrap();
-            Self {
-                task: VideoTask::deserialize(&case["task"]).unwrap(),
-                aspect_ratio: target["aspect_ratio"].as_str().unwrap().to_owned(),
-                target: (
-                    target["short_edge"].as_u64().unwrap() as u32,
-                    target.get("duration_seconds").and_then(Value::as_f64),
-                ),
-                conditions: conditions
+            let references: Vec<Reference> = conditions
+                .iter()
+                .map(|entry| Reference {
+                    kind: match entry["type"].as_str().unwrap() {
+                        "video_audio" => ReferenceKind::Video,
+                        kind => ReferenceKind::named(kind).unwrap(),
+                    },
+                    frame_index: (entry["role"] == "keyframe")
+                        .then(|| entry.get("frame_index").and_then(Value::as_i64))
+                        .flatten(),
+                    start_time_seconds: entry.get("start_time_seconds").and_then(Value::as_f64),
+                })
+                .collect();
+            let spec = VideoSpec {
+                prompt: case["prompt"].as_str().unwrap().to_owned(),
+                negative_prompt: None,
+                size: public_size(case),
+                length: target
+                    .get("duration_seconds")
+                    .and_then(Value::as_f64)
+                    .map(Length::Seconds),
+                fps: None,
+                seed: None,
+                num_inference_steps: None,
+                guidance_scale: None,
+                references,
+                extra_params: serde_json::Map::new(),
+            };
+            let silent_video = case.get("error").is_some()
+                && conditions
                     .iter()
-                    .map(|entry| ConditionSpec {
-                        condition_type: ConditionType::deserialize(&entry["type"]).unwrap(),
-                        role: Role::deserialize(&entry["role"]).unwrap(),
-                        frame_index: entry.get("frame_index").and_then(Value::as_i64),
-                        start_seconds: entry.get("start_time_seconds").and_then(Value::as_f64),
-                    })
-                    .collect(),
+                    .any(|entry| entry["type"] == "video_audio");
+            let selects = super::task(&spec) == VideoTask::deserialize(&case["task"]).unwrap();
+            (selects && !silent_video).then(|| Self {
+                spec,
                 media: conditions
                     .iter()
                     .map(|entry| media(&entry["media"]))
                     .collect(),
-            }
+            })
         }
 
-        fn target(&self) -> Target<'_> {
-            Target {
-                short_edge: self.target.0,
-                aspect_ratio: &self.aspect_ratio,
-                duration_seconds: self.target.1,
-            }
+        /// The public request of an accepted case.
+        pub(in crate::processing) fn parse(case: &Value) -> Self {
+            Self::stated(case).expect("an accepted request is stated in the public schema")
         }
 
         /// The request's plan, its request-only rules applied first as the
@@ -1790,16 +1645,103 @@ pub(super) mod tests {
         pub(in crate::processing) fn plan(
             &self,
             vision: &ProcessorConfig,
-        ) -> Result<VideoParams, VideoInputError> {
-            check_request(self.task, &self.target(), &self.conditions, &limits())?;
-            plan_request(
-                self.task,
-                &self.target(),
-                &self.conditions,
-                &self.media,
-                vision,
-                &limits(),
-            )
+        ) -> Result<VideoParams, InputError> {
+            check_request(&self.spec, &limits())?;
+            plan_request(&self.spec, &self.media, vision, &limits())
+        }
+    }
+
+    /// The size a vectors target states: none for `auto` at the vectors'
+    /// first short edge, the served canvas its ratio names, the canvas the
+    /// canvas rule resolves an `fl2va` ratio to, and otherwise a size no
+    /// deployment serves.
+    fn public_size(case: &Value) -> Option<Canvas> {
+        let target = &case["target"];
+        let short_edge = target["short_edge"].as_u64().unwrap() as u32;
+        let ratio = target["aspect_ratio"].as_str().unwrap();
+        let canvases = vector_canvases();
+        if ratio == "auto" {
+            return (short_edge != canvases[0].short_edge).then_some(UNSERVED);
+        }
+        if let Some(served) = canvases
+            .iter()
+            .find(|served| served.short_edge == short_edge && served.aspect_ratio == ratio)
+        {
+            return Some(served.canvas);
+        }
+        let by_rule = case["task"] == "fl2va" && short_edge == CANVAS_RULE.short_edge;
+        let resolved = ratio
+            .split_once(':')
+            .and_then(|(width, height)| {
+                Some((width.parse::<u32>().ok()?, height.parse::<u32>().ok()?))
+            })
+            .filter(|_| by_rule)
+            .and_then(|(width, height)| {
+                CANVAS_RULE.canvas(f64::from(width), f64::from(height)).ok()
+            });
+        Some(resolved.unwrap_or(UNSERVED))
+    }
+
+    /// The public request parameter a vectors refusal's reference-schema
+    /// field is: the target's short edge and aspect ratio are the size, its
+    /// duration the seconds, the task and the conditions the references.
+    fn public_param(field: &str) -> String {
+        match field {
+            "target.short_edge" | "target.aspect_ratio" => "size".to_owned(),
+            "target.duration_seconds" => "seconds".to_owned(),
+            "task" | "conditions" => "input_references".to_owned(),
+            field => field.replacen("conditions", "input_references", 1),
+        }
+    }
+
+    /// The parameter a refusal names.
+    fn param(error: InputError) -> String {
+        match error {
+            InputError::Invalid { param, .. } => param,
+            InputError::Internal(message) => panic!("not a refusal: {message}"),
+        }
+    }
+
+    /// A text request of `seconds` at `size`.
+    fn text(size: Option<Canvas>, seconds: f64) -> VideoSpec {
+        with_references(size, seconds, Vec::new())
+    }
+
+    /// A request of `seconds` at `size` with `references`.
+    fn with_references(
+        size: Option<Canvas>,
+        seconds: f64,
+        references: Vec<Reference>,
+    ) -> VideoSpec {
+        VideoSpec {
+            prompt: "a river".to_owned(),
+            negative_prompt: None,
+            size,
+            length: Some(Length::Seconds(seconds)),
+            fps: None,
+            seed: None,
+            num_inference_steps: None,
+            guidance_scale: None,
+            references,
+            extra_params: serde_json::Map::new(),
+        }
+    }
+
+    /// A reference of `kind` that conditions the generation as a whole.
+    fn reference(kind: ReferenceKind) -> Reference {
+        Reference {
+            kind,
+            frame_index: None,
+            start_time_seconds: None,
+        }
+    }
+
+    /// An image keyframe anchoring the first generated frame.
+    fn first_keyframe() -> Reference {
+        Reference {
+            kind: ReferenceKind::Image,
+            frame_index: Some(0),
+            start_time_seconds: None,
         }
     }
 
@@ -1886,22 +1828,9 @@ pub(super) mod tests {
         let vision = vision(&fixture);
         for case in fixture["duration_cases"].as_array().unwrap() {
             let seconds = case["seconds"].as_f64().unwrap();
-            let target = Target {
-                short_edge: 768,
-                aspect_ratio: "auto",
-                duration_seconds: Some(seconds),
-            };
-            let plan = plan_request(
-                VideoTask::TextToVideoAudio,
-                &target,
-                &[],
-                &[],
-                &vision,
-                &limits(),
-            );
+            let plan = plan_request(&text(None, seconds), &[], &vision, &limits());
             if case.get("error").is_some() {
-                let field = plan.unwrap_err().field();
-                assert_eq!(field, Some(RequestField::TargetDuration), "{case}");
+                assert_eq!(param(plan.unwrap_err()), "seconds", "{case}");
                 assert!(
                     video_frame_count(seconds, 15.0, FPS, &FRAMES).is_err(),
                     "{case}"
@@ -2389,8 +2318,9 @@ pub(super) mod tests {
         }
     }
 
-    /// Each rejected request names the field the serving contract blames,
-    /// whether planning or the presentation rejects it.
+    /// Each rejected request the public schema states names the public
+    /// parameter of the field the reference blames, whether planning or the
+    /// presentation rejects it.
     #[test]
     fn rejected_requests_name_the_field() {
         let fixture = fixture();
@@ -2399,66 +2329,59 @@ pub(super) mod tests {
             let Some(error) = case.get("error") else {
                 continue;
             };
-            let rejection = match Request::parse(case).plan(&vision) {
+            let Some(request) = Request::stated(case) else {
+                continue;
+            };
+            let rejection = match request.plan(&vision) {
                 Ok(plan) => present(&CharacterTokenizer, &plan, case["prompt"].as_str().unwrap())
                     .expect_err("the request was accepted"),
                 Err(rejection) => rejection,
             };
             assert_eq!(
-                rejection.field().unwrap().to_string(),
-                error["field"],
+                param(rejection),
+                public_param(error["field"].as_str().unwrap()),
                 "{}",
                 case["name"]
             );
         }
     }
 
-    const FIVE_SECONDS: Target<'static> = Target {
-        short_edge: 768,
-        aspect_ratio: "auto",
-        duration_seconds: Some(5.0),
+    const LANDSCAPE: Canvas = Canvas {
+        width: 1344,
+        height: 768,
     };
 
-    /// A deployment serves only the canvases its workers prepare; others are
-    /// rejected on the aspect ratio before any media is needed.
+    /// A deployment serves only the canvases its workers prepare; another
+    /// size is refused before any media is needed.
     #[test]
-    fn prepared_canvases_restrict_the_target() {
+    fn prepared_canvases_restrict_the_size() {
         let fixture = fixture();
         let vision = vision(&fixture);
         let limits = PlanLimits {
             canvases: vec![served(768, "16:9", 1344, 768)],
             ..limits()
         };
-        let plan = plan_request(
-            VideoTask::TextToVideoAudio,
-            &FIVE_SECONDS,
-            &[],
-            &[],
-            &vision,
-            &limits,
-        )
-        .unwrap();
-        assert_eq!((plan.canvas.width, plan.canvas.height), (1344, 768));
+        let plan = plan_request(&text(None, 5.0), &[], &vision, &limits).unwrap();
+        assert_eq!(plan.canvas, LANDSCAPE);
 
-        let portrait = Target {
-            aspect_ratio: "9:16",
-            ..FIVE_SECONDS
+        let portrait = Canvas {
+            width: 768,
+            height: 1344,
         };
-        let error =
-            check_request(VideoTask::TextToVideoAudio, &portrait, &[], &limits).unwrap_err();
-        assert_eq!(error.field(), Some(RequestField::TargetAspectRatio));
+        let error = check_request(&text(Some(portrait), 5.0), &limits).unwrap_err();
+        assert_eq!(param(error), "size");
     }
 
-    /// A deployment that declares 480p canvases accepts their short edge: a
-    /// ratio names the canvas the deployment declares for it rather than a
-    /// rescaled canvas rule, and a short edge or ratio the deployment did not
+    /// A deployment that declares 480p canvases serves them: a stated size
+    /// is the canvas the deployment declares, a request without one takes the
+    /// 16:9 canvas at its first canvas's short edge, and a size it did not
     /// prepare is refused before any media is needed.
     #[test]
-    fn declared_canvases_resolve_each_short_edge() {
+    fn declared_canvases_are_the_sizes_served() {
         let fixture = fixture();
         let vision = vision(&fixture);
         let canvas = |width, height| Canvas { width, height };
-        let served = PlanLimits {
+        let declared = PlanLimits {
             canvases: vec![
                 served(768, "16:9", 1344, 768),
                 served(480, "21:9", 992, 416),
@@ -2466,125 +2389,62 @@ pub(super) mod tests {
             ],
             ..limits()
         };
-        assert_eq!(served.short_edges(), vec![768, 480]);
-        for (short_edge, aspect_ratio, expected) in [
-            (768, "16:9", canvas(1344, 768)),
-            (480, "21:9", canvas(992, 416)),
-            // `auto` is 16:9 for t2va.
-            (480, "auto", canvas(832, 480)),
+        for (size, expected) in [
+            (Some(canvas(992, 416)), canvas(992, 416)),
+            (Some(canvas(832, 480)), canvas(832, 480)),
+            (None, LANDSCAPE),
         ] {
-            let target = Target {
-                short_edge,
-                aspect_ratio,
-                ..FIVE_SECONDS
-            };
-            let plan = plan_request(
-                VideoTask::TextToVideoAudio,
-                &target,
-                &[],
-                &[],
-                &vision,
-                &served,
-            )
-            .unwrap();
-            assert_eq!(plan.canvas, expected, "{short_edge} {aspect_ratio}");
+            let plan = plan_request(&text(size, 5.0), &[], &vision, &declared).unwrap();
+            assert_eq!(plan.canvas, expected, "{size:?}");
         }
-        for (short_edge, aspect_ratio, field) in [
-            (720, "16:9", RequestField::TargetShortEdge),
-            (768, "21:9", RequestField::TargetAspectRatio),
-            (480, "1:1", RequestField::TargetAspectRatio),
-        ] {
-            let target = Target {
-                short_edge,
-                aspect_ratio,
-                ..FIVE_SECONDS
-            };
-            let error =
-                check_request(VideoTask::TextToVideoAudio, &target, &[], &served).unwrap_err();
-            assert_eq!(error.field(), Some(field), "{short_edge} {aspect_ratio}");
+        for size in [canvas(1280, 720), canvas(768, 768)] {
+            let error = check_request(&text(Some(size), 5.0), &declared).unwrap_err();
+            assert!(error.to_string().contains("is not served"), "{error}");
+            assert_eq!(param(error), "size");
         }
 
-        // A deployment that prepares only 768p canvases serves no other
-        // short edge.
-        let target = Target {
-            short_edge: 480,
-            aspect_ratio: "16:9",
-            ..FIVE_SECONDS
+        // A deployment whose first short edge serves no 16:9 canvas has no
+        // default for a text request.
+        let portrait_first = PlanLimits {
+            canvases: vec![served(480, "21:9", 992, 416)],
+            ..limits()
         };
-        let error =
-            check_request(VideoTask::TextToVideoAudio, &target, &[], &limits()).unwrap_err();
-        assert_eq!(error.field(), Some(RequestField::TargetShortEdge));
+        let error = check_request(&text(None, 5.0), &portrait_first).unwrap_err();
+        assert_eq!(param(error), "size");
     }
 
-    /// `fl2va` takes any ratio from 1:4 to 4:1, which the canvas rule
-    /// resolves at its 768-pixel short edge, but only onto a canvas the
-    /// deployment declares; `t2va` takes only a declared ratio.
+    /// An `fl2va` request without a size takes the canvas its first keyframe
+    /// sets through the canvas rule, at its 768-pixel short edge, but only
+    /// onto a canvas the deployment declares.
     #[test]
-    fn free_keyframe_ratios_land_on_a_declared_canvas() {
+    fn a_keyframe_canvas_lands_on_a_declared_canvas() {
+        let fixture = fixture();
+        let vision = vision(&fixture);
         let limits = PlanLimits {
             canvases: vec![served(768, "16:9", 1344, 768)],
             ..limits()
         };
-        let keyframe = ConditionSpec {
-            condition_type: ConditionType::Image,
-            role: Role::Keyframe,
-            frame_index: Some(0),
-            start_seconds: None,
-        };
-        let target = |aspect_ratio| Target {
-            aspect_ratio,
-            ..FIVE_SECONDS
-        };
-        // 7:4 at a 768-pixel short edge is 1344x768, the declared canvas.
-        let fl2va = |aspect_ratio| {
-            check_request(
-                VideoTask::FirstLastToVideoAudio,
-                &target(aspect_ratio),
-                std::slice::from_ref(&keyframe),
-                &limits,
-            )
-        };
-        assert!(fl2va("7:4").is_ok());
-        assert!(fl2va("16:9").is_ok());
-        // 4:3 is 1024x768, which the deployment does not serve.
-        let error = fl2va("4:3").unwrap_err();
-        assert_eq!(error.field(), Some(RequestField::TargetAspectRatio));
-        // t2va names only the declared ratios, and auto names 16:9.
-        assert!(check_request(VideoTask::TextToVideoAudio, &target("auto"), &[], &limits).is_ok());
-        let error =
-            check_request(VideoTask::TextToVideoAudio, &target("7:4"), &[], &limits).unwrap_err();
-        assert_eq!(error.field(), Some(RequestField::TargetAspectRatio));
-        assert!(error.to_string().contains("auto or one of 16:9"), "{error}");
-
-        // A short edge that serves no canvas names none, for any ratio.
-        let narrow = Target {
-            short_edge: 480,
-            ..target("16:9")
-        };
-        let error = super::named_canvas(VideoTask::TextToVideoAudio, &narrow, &limits).unwrap_err();
-        assert_eq!(error.field(), Some(RequestField::TargetAspectRatio));
-        assert!(
-            error
-                .to_string()
-                .contains("no canvas is served at a 480-pixel short edge"),
-            "{error}"
-        );
+        let request = with_references(None, 5.0, vec![first_keyframe()]);
+        assert!(check_request(&request, &limits).is_ok());
+        let keyframe = |width, height| [MediaMetadata::Image(ImageMetadata { width, height })];
+        // A 7:4 keyframe at a 768-pixel short edge is 1344x768, the declared
+        // canvas.
+        let plan = plan_request(&request, &keyframe(1400, 800), &vision, &limits).unwrap();
+        assert_eq!(plan.canvas, LANDSCAPE);
+        // A 4:3 keyframe sets 1024x768, which the deployment does not serve.
+        let error = plan_request(&request, &keyframe(1024, 768), &vision, &limits).unwrap_err();
+        assert_eq!(param(error), "size");
     }
 
     /// The served maximum duration narrows the model's own range.
     #[test]
     fn max_video_seconds_bounds_the_duration() {
-        let ten_seconds = Target {
-            duration_seconds: Some(10.0),
-            ..FIVE_SECONDS
-        };
         let limits = PlanLimits {
             max_video_seconds: 8.0,
             ..limits()
         };
-        let error =
-            check_request(VideoTask::TextToVideoAudio, &ten_seconds, &[], &limits).unwrap_err();
-        assert_eq!(error.field(), Some(RequestField::TargetDuration));
+        let error = check_request(&text(None, 10.0), &limits).unwrap_err();
+        assert_eq!(param(error), "seconds");
     }
 
     /// Each reference-count refusal names what it bounds: nine images, three
@@ -2592,35 +2452,24 @@ pub(super) mod tests {
     /// thirteen references exceed the twelve of every kind together.
     #[test]
     fn reference_limits_name_what_they_bound() {
-        let reference = |condition_type| ConditionSpec {
-            condition_type,
-            role: Role::Reference,
-            frame_index: None,
-            start_seconds: None,
-        };
-        let refusal = |conditions: &[ConditionSpec]| {
-            let checked = check_request(
-                VideoTask::ReferenceToVideoAudio,
-                &FIVE_SECONDS,
-                conditions,
-                &limits(),
-            );
-            match checked {
-                Err(VideoInputError::Invalid { field, message }) => {
-                    assert_eq!(field, RequestField::Conditions);
-                    message
-                }
-                other => panic!("the references were not refused: {other:?}"),
+        let refusal = |references: Vec<Reference>| match check_request(
+            &with_references(None, 5.0, references),
+            &limits(),
+        ) {
+            Err(InputError::Invalid { param, message }) => {
+                assert_eq!(param, "input_references");
+                message
             }
+            other => panic!("the references were not refused: {other:?}"),
         };
 
-        let images = vec![reference(ConditionType::Image); 10];
-        assert_eq!(refusal(&images), "at most 9 image references, got 10");
+        let images = vec![reference(ReferenceKind::Image); 10];
+        assert_eq!(refusal(images), "at most 9 image references, got 10");
 
-        let mut every_kind = vec![reference(ConditionType::Image); 9];
-        every_kind.extend(vec![reference(ConditionType::Video); 3]);
-        every_kind.push(reference(ConditionType::Audio));
-        assert_eq!(refusal(&every_kind), "at most 12 references, got 13");
+        let mut every_kind = vec![reference(ReferenceKind::Image); 9];
+        every_kind.extend(vec![reference(ReferenceKind::Video); 3]);
+        every_kind.push(reference(ReferenceKind::Audio));
+        assert_eq!(refusal(every_kind), "at most 12 references, got 13");
     }
 
     /// A `ref2va` request carries at most the references its denoiser
@@ -2637,89 +2486,35 @@ pub(super) mod tests {
             },
             ..limits()
         };
-        let reference = |condition_type| ConditionSpec {
-            condition_type,
-            role: Role::Reference,
-            frame_index: None,
-            start_seconds: None,
-        };
-        let image = reference(ConditionType::Image);
-        let video = reference(ConditionType::Video);
-        let audio = reference(ConditionType::Audio);
-        let check = |conditions: &[ConditionSpec]| {
-            check_request(
-                VideoTask::ReferenceToVideoAudio,
-                &FIVE_SECONDS,
-                conditions,
-                &limits,
-            )
+        let image = reference(ReferenceKind::Image);
+        let video = reference(ReferenceKind::Video);
+        let audio = reference(ReferenceKind::Audio);
+        let check = |references: Vec<Reference>| {
+            check_request(&with_references(None, 5.0, references), &limits)
         };
 
-        assert!(check(&[image.clone(), image.clone(), video.clone()]).is_ok());
-        for (conditions, bound) in [
-            (vec![image.clone(); 3], "at most 2 image references"),
-            (
-                vec![image.clone(), video.clone(), video.clone()],
-                "at most 1 video references",
-            ),
-            (
-                vec![image.clone(), audio.clone(), audio.clone()],
-                "at most 1 audio references",
-            ),
-            (
-                vec![image.clone(), image.clone(), video.clone(), audio.clone()],
-                "at most 3 references",
-            ),
+        assert!(check(vec![image, image, video]).is_ok());
+        for (references, bound) in [
+            (vec![image; 3], "at most 2 image references"),
+            (vec![image, video, video], "at most 1 video references"),
+            (vec![image, audio, audio], "at most 1 audio references"),
+            (vec![image, image, video, audio], "at most 3 references"),
         ] {
-            let error = check(&conditions).unwrap_err();
-            assert_eq!(error.field(), Some(RequestField::Conditions));
+            let error = check(references).unwrap_err();
             assert!(error.to_string().contains(bound), "{bound}: {error}");
+            assert_eq!(param(error), "input_references");
         }
     }
 
-    /// A task outside the placed denoiser's set is rejected first.
+    /// A task outside the placed denoiser's set is refused first, on the
+    /// references that select it.
     #[test]
     fn only_served_tasks_are_accepted() {
         let limits = PlanLimits {
             tasks: vec![VideoTask::ReferenceToVideoAudio],
             ..limits()
         };
-        let error =
-            check_request(VideoTask::TextToVideoAudio, &FIVE_SECONDS, &[], &limits).unwrap_err();
-        assert_eq!(error.field(), Some(RequestField::Task));
-    }
-
-    /// Aspect ratios are accepted only in canonical `W:H` form.
-    #[test]
-    fn aspect_ratios_must_be_canonical() {
-        for (ratio, accepted) in [
-            ("16:9", true),
-            ("7:4", true),
-            ("016:9", false),
-            ("+16:9", false),
-            ("16:9:1", false),
-            ("16/9", false),
-            ("0:9", false),
-            ("", false),
-        ] {
-            let target = Target {
-                short_edge: 768,
-                aspect_ratio: ratio,
-                duration_seconds: Some(5.0),
-            };
-            let keyframe = ConditionSpec {
-                condition_type: ConditionType::Image,
-                role: Role::Keyframe,
-                frame_index: Some(0),
-                start_seconds: None,
-            };
-            let checked = check_request(
-                VideoTask::FirstLastToVideoAudio,
-                &target,
-                &[keyframe],
-                &limits(),
-            );
-            assert_eq!(checked.is_ok(), accepted, "{ratio:?}");
-        }
+        let error = check_request(&text(None, 5.0), &limits).unwrap_err();
+        assert_eq!(param(error), "input_references");
     }
 }

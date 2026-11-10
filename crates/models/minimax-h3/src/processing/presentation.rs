@@ -18,7 +18,9 @@
 
 use std::borrow::Cow;
 
-use super::plan::{Prepared, RequestField, VideoInputError, VideoParams, Vision};
+use processing::InputError;
+
+use super::plan::{PROMPT, Prepared, VideoParams, Vision};
 use processing::Vocabulary;
 
 /// The AdaLN tag of a vision token.
@@ -119,9 +121,9 @@ pub struct Presentation {
 ///
 /// # Errors
 ///
-/// Returns [`VideoInputError::Invalid`] for `prompt` when the prompt is blank
+/// Returns [`InputError::Invalid`] for `prompt` when the prompt is blank
 /// or contains a vision placeholder or marker, which would misalign the
-/// conditioner's vision inputs, and [`VideoInputError::Internal`] when the
+/// conditioner's vision inputs, and [`InputError::Internal`] when the
 /// tokenizer fails or lacks the vision tokens a vision block needs.
 /// The vocabulary is the checkpoint's tokenizer with the special tokens its
 /// configuration declares, which a prompt may contain.
@@ -129,18 +131,15 @@ pub fn present(
     tokenizer: &dyn Vocabulary,
     plan: &VideoParams,
     prompt: &str,
-) -> Result<Presentation, VideoInputError> {
+) -> Result<Presentation, InputError> {
     if prompt.trim().is_empty() {
-        return Err(VideoInputError::invalid(
-            RequestField::Prompt,
-            "must not be blank",
-        ));
+        return Err(InputError::invalid(PROMPT, "must not be blank"));
     }
     // A vision block needs the vision vocabulary; a prompt can only produce
     // the vision tokens the tokenizer has, which it must not contain.
     let token = |name: &'static str| (name, tokenizer.token_id(name));
     let required = |(name, id): (&str, Option<u32>)| {
-        id.ok_or_else(|| VideoInputError::internal(format!("the tokenizer has no {name} token")))
+        id.ok_or_else(|| InputError::Internal(format!("the tokenizer has no {name} token")))
     };
     let start = token(VISION_START);
     let end = token(VISION_END);
@@ -170,13 +169,11 @@ pub fn present(
             }
             Segment::Text(text) => {
                 let ids = tokenizer.encode(text).map_err(|error| {
-                    VideoInputError::internal(format!(
-                        "tokenizing the presentation failed: {error}"
-                    ))
+                    InputError::Internal(format!("tokenizing the presentation failed: {error}"))
                 })?;
                 if position == last && ids.iter().any(|id| placeholders.contains(id)) {
-                    return Err(VideoInputError::invalid(
-                        RequestField::Prompt,
+                    return Err(InputError::invalid(
+                        PROMPT,
                         "must not contain vision placeholder tokens",
                     ));
                 }
@@ -195,7 +192,6 @@ pub(super) mod tests {
 
     use serde_json::Value;
 
-    use super::super::plan::RequestField;
     use super::super::plan::tests::{Request, fixture, vision};
     use super::{Segment, TEXT_TAG, VIDEO_TAG, VisionPad, present, segments};
     use processing::{Vocabulary, VocabularyError};
@@ -381,7 +377,10 @@ pub(super) mod tests {
             .unwrap();
         for prompt in ["", " \n", "a <|image_pad|> b", "<|vision_start|>"] {
             let error = present(&CharacterTokenizer, &plan, prompt).unwrap_err();
-            assert_eq!(error.field(), Some(RequestField::Prompt), "{prompt:?}");
+            assert!(
+                matches!(&error, processing::InputError::Invalid { param, .. } if param == "prompt"),
+                "{prompt:?}: {error}"
+            );
         }
     }
 }

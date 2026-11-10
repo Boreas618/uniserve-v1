@@ -548,7 +548,7 @@ fn keyframe_openings(
     packing: &ConditionPacking,
     processor: Option<&ProcessorConfig>,
 ) -> nn::Result<Vec<(u32, Vec<nn::ConditionShape>)>> {
-    use crate::processing::plan::{ConditionSpec, ConditionType, Role, plan_keyframe};
+    use crate::processing::plan::plan_keyframe;
 
     let processor = processor.ok_or_else(|| {
         nn::Error::Unsupported(
@@ -580,11 +580,10 @@ fn keyframe_openings(
             .map(|(_, frame_index)| *frame_index)
             .enumerate()
         {
-            let spec = ConditionSpec {
-                condition_type: ConditionType::Image,
-                role: Role::Keyframe,
+            let spec = processing::Reference {
+                kind: processing::ReferenceKind::Image,
                 frame_index: Some(frame_index),
-                start_seconds: None,
+                start_time_seconds: None,
             };
             let plan = plan_keyframe(
                 index,

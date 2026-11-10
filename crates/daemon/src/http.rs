@@ -1258,7 +1258,7 @@ mod tests {
         );
         assert_eq!(
             body["video"]["request_fields"],
-            serde_json::json!(frontend::input::video::REQUEST_FIELDS)
+            serde_json::json!(frontend::input::video::request_field_names())
         );
     }
 }

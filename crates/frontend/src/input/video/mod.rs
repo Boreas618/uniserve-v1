@@ -140,21 +140,50 @@ pub struct VideoGenerationRequest {
     pub extra_params: Map<String, Value>,
 }
 
-/// The fields of the video request body, in schema order.
-pub const REQUEST_FIELDS: [&str; 12] = [
-    "model",
-    "prompt",
-    "negative_prompt",
-    "size",
-    "seconds",
-    "num_frames",
-    "fps",
-    "seed",
-    "num_inference_steps",
-    "guidance_scale",
-    "input_references",
-    "extra_params",
+/// The kind of value a field of the video request takes, which a multipart text part of it is
+/// read as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldKind {
+    /// Text.
+    Text,
+    /// A JSON array or object.
+    Json,
+    /// An unsigned integer.
+    Unsigned,
+    /// A number.
+    Number,
+}
+
+/// The fields of the video request body ([`VideoGenerationRequest`]), in schema order, with the
+/// kind of value each takes: the one list of them, which a multipart body is read by, a refusal
+/// names its parameter from and `GET /v1/capabilities` reports.
+pub const REQUEST_FIELDS: [(&str, FieldKind); 12] = [
+    ("model", FieldKind::Text),
+    ("prompt", FieldKind::Text),
+    ("negative_prompt", FieldKind::Text),
+    ("size", FieldKind::Text),
+    ("seconds", FieldKind::Number),
+    ("num_frames", FieldKind::Unsigned),
+    ("fps", FieldKind::Unsigned),
+    ("seed", FieldKind::Unsigned),
+    ("num_inference_steps", FieldKind::Unsigned),
+    ("guidance_scale", FieldKind::Number),
+    ("input_references", FieldKind::Json),
+    ("extra_params", FieldKind::Json),
 ];
+
+/// The field of the video request body named `name`, with the kind of value it takes.
+pub fn request_field(name: &str) -> Option<(&'static str, FieldKind)> {
+    REQUEST_FIELDS
+        .iter()
+        .copied()
+        .find(|(field, _)| *field == name)
+}
+
+/// The names of the video request body's fields, in schema order.
+pub fn request_field_names() -> Vec<&'static str> {
+    REQUEST_FIELDS.iter().map(|(name, _)| *name).collect()
+}
 
 impl VideoGenerationRequest {
     /// The request as a video model reads it.
@@ -302,7 +331,7 @@ impl VideoService {
                 "file": self.media.directory.is_some(),
                 "max_request_bytes": self.media.max_request_bytes,
             },
-            "request_fields": REQUEST_FIELDS,
+            "request_fields": request_field_names(),
         })
     }
 
@@ -462,6 +491,52 @@ mod tests {
 
     fn request(body: Value) -> VideoGenerationRequest {
         serde_json::from_value(body).unwrap()
+    }
+
+    /// The fields a type's derived `Deserialize` takes, as it states them to its deserializer.
+    fn deserialized_fields<T: serde::de::DeserializeOwned>() -> &'static [&'static str] {
+        use serde::de::value::Error;
+
+        /// A deserializer that records the fields a struct asks for and reads nothing.
+        struct Fields<'a>(&'a mut &'static [&'static str]);
+
+        impl<'de> serde::Deserializer<'de> for Fields<'_> {
+            type Error = Error;
+
+            fn deserialize_any<V: serde::de::Visitor<'de>>(self, _: V) -> Result<V::Value, Error> {
+                Err(serde::de::Error::custom("not a struct"))
+            }
+
+            fn deserialize_struct<V: serde::de::Visitor<'de>>(
+                self,
+                _: &'static str,
+                fields: &'static [&'static str],
+                _: V,
+            ) -> Result<V::Value, Error> {
+                *self.0 = fields;
+                Err(serde::de::Error::custom("fields recorded"))
+            }
+
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+                byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map enum
+                identifier ignored_any
+            }
+        }
+
+        let mut fields: &'static [&'static str] = &[];
+        let _ = T::deserialize(Fields(&mut fields));
+        fields
+    }
+
+    /// The field list a multipart body is read by and the capabilities report is exactly the
+    /// fields the request schema deserializes, in its order.
+    #[test]
+    fn the_field_list_is_the_schemas() {
+        assert_eq!(
+            super::request_field_names(),
+            deserialized_fields::<VideoGenerationRequest>()
+        );
     }
 
     fn png(width: u32, height: u32) -> Vec<u8> {

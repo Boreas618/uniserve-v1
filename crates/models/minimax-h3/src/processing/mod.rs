@@ -49,9 +49,11 @@ impl ::processing::VideoFamily for H3Family {
 /// resolve a target against exactly those.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ServedCanvas {
-    /// `target.short_edge`: the resolution class, in pixels, such as 768.
+    /// The resolution class, in pixels, such as 768: the canvas's short edge as the model names
+    /// it.
     pub short_edge: u32,
-    /// `target.aspect_ratio`: the display ratio as `W:H`, such as `16:9`.
+    /// The display ratio as `W:H`, such as `16:9`; a request without a size takes the 16:9
+    /// canvas at the first canvas's short edge.
     pub aspect_ratio: String,
     /// The raster this pair selects.
     pub canvas: Canvas,
