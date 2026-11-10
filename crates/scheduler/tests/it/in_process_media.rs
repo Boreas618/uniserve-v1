@@ -11,11 +11,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ipc::execution::Batches;
-use ipc::{DiffusionSamplingParams, ImageParams, RequestId, SamplingParams};
+use ipc::{DiffusionSamplingParams, RequestId, SamplingParams};
 use proto::request::DiffusionRequest;
-use scheduler::{
-    BatchCapacity, Event, GenerationConstraint, GenerationRequest, SchedulerHandle, Stage,
-};
+use scheduler::{BatchCapacity, Event, GenerationRequest, SchedulerHandle, Stage};
 
 use crate::support;
 use testkit::FakeBatches;
@@ -74,23 +72,16 @@ fn text_request(id: u64, length: u32) -> GenerationRequest {
     GenerationRequest {
         request_id: RequestId(id),
         prompt_token_ids: vec![7; length as usize],
-        negative_prompt_token_ids: Vec::new(),
         multimodal_inputs: Default::default(),
-        constraint: GenerationConstraint::UndOnly,
         sampling: SamplingParams::default(),
-        image: ImageParams::default(),
-        max_images: 1,
         max_und_tokens: 4,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
         priority: 0,
         cache: Default::default(),
         include_stop_token: false,
-        image_generation: Default::default(),
         generated_token_ids: Vec::new(),
         adapter: 0,
-        generated_images: Vec::new(),
-        trajectory: Default::default(),
     }
 }
 

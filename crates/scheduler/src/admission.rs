@@ -103,22 +103,6 @@ impl Scheduler {
                 return;
             }
         };
-        // A migrated image-generating request rebuilds its context from its
-        // facts, which must describe a request this engine serves.
-        let continuation = if req.is_migrated() && req.generates_images() {
-            match generation::continuation::plan(&req, &self.special_tokens) {
-                Ok(continuation) => Some(continuation),
-                Err(error) => {
-                    let _ = event_tx.send(Event::Rejected {
-                        kind: RejectionKind::Invalid,
-                        message: format!("invalid generation request: {error}"),
-                    });
-                    return;
-                }
-            }
-        } else {
-            None
-        };
         // Backpressure: under overload the new submission is rejected rather
         // than letting queued requests grow without bound and exhaust process
         // storage. The bound covers both waiting queues and retired requests
@@ -142,7 +126,7 @@ impl Scheduler {
                 request_id: req.request_id.0,
             });
         }
-        let st = self.request_state(req, event_tx, max_cache_tokens, continuation);
+        let st = self.request_state(req, event_tx, max_cache_tokens);
 
         // The queue keeps no order of its own: which queued request runs next
         // is the policy's `Plan::admit`, and the mechanism admits in the plan's
@@ -174,18 +158,14 @@ impl Scheduler {
         if let Err(error) = req.validate() {
             return Err(format!("invalid generation request: {error:?}"));
         }
-        // A request the deployment generates in canvases generates text only
-        // and names the seed its draws follow.
+        // A request the deployment generates in canvases names the seed its
+        // draws follow.
         if self.config.canvas.is_some() {
-            let error = if req.generates_images() {
-                Some(GenerationRequestError::CanvasGeneratesTextOnly)
-            } else if req.sampling.seed.is_none() {
-                Some(GenerationRequestError::UnseededCanvas)
-            } else {
-                None
-            };
-            if let Some(error) = error {
-                return Err(format!("invalid generation request: {error:?}"));
+            if req.sampling.seed.is_none() {
+                return Err(format!(
+                    "invalid generation request: {:?}",
+                    GenerationRequestError::UnseededCanvas
+                ));
             }
             // A canvas's committed blocks are tokens, but the denoising state
             // of the block in progress is not.
@@ -223,39 +203,29 @@ impl Scheduler {
                 "generation request requires worker feature `{feature}`, but the worker does not support it"
             ));
         }
-        if let Some(refusal) = self.exceeded_image_step(req) {
-            return Err(refusal);
-        }
-        if let Some(refusal) = self.uncaptured_image(req) {
-            return Err(refusal);
-        }
         if let Some(refusal) = self.uncaptured_latent(req) {
             return Err(refusal);
         }
         // A prefill group hands a request's cache to a decode group once,
         // after its prompt: such a deployment generates text.
-        if self.splits_prefill() && (req.generates_images() || self.config.canvas.is_some()) {
+        if self.splits_prefill() && self.config.canvas.is_some() {
             return Err("a deployment of prefill and decode groups generates text only".into());
         }
         // Resource validation includes the cache bound, so a request that passes
         // it has a worst-case cache token count.
         req.validate_resources(&self.generation_limits)
             .and_then(|()| req.max_cache_tokens(&self.generation_limits))
-            .map(|tokens| tokens.saturating_add(self.image_unconditional_tokens(req)))
             .map_err(|error| format!("invalid generation resource requirements: {error}"))
     }
 
     /// The state of a validated request, at the next request epoch, which
     /// publishes through `event_tx`. `max_cache_tokens` is its worst-case
-    /// cache token count (`validate_submission`), and `continuation` the
-    /// context rebuild of a migrated image-generating request
-    /// (`generation::continuation`).
+    /// cache token count (`validate_submission`).
     pub(super) fn request_state(
         &mut self,
         mut req: GenerationRequest,
         event_tx: EventTx,
         max_cache_tokens: usize,
-        continuation: Option<generation::continuation::Continuation>,
     ) -> RequestState {
         let prompt_tokens = req.prompt_token_ids.len();
         let generated = req.generated_token_ids.len();
@@ -265,80 +235,18 @@ impl Scheduler {
         // They count as generated from the start, so the token limit,
         // `min_tokens`, the penalties and the bad words continue where they
         // were; its usage charges only its own prompt as prompt
-        // (`RequestState::charged_prompt_tokens`). A migrated request that
-        // generates images extends its prompt by the tokens its decodes
-        // wrote instead, writes its images between them, and resumes in the
-        // state it left (`generation::continuation`).
-        // A request that resumes the image it had begun, of which an engine
-        // stored steps within the image's schedule, restores them once the
-        // image's latent preparation is due; every other image starts from
-        // noise.
-        let stored = &req.trajectory;
-        // An image-only request can be preempted before it emits any token:
-        // its prompt already determines the context to rebuild.
-        let resumes_image = req.starts_with_image()
-            || continuation.as_ref().is_some_and(|continuation| {
-                matches!(
-                    continuation.resume,
-                    generation::continuation::Resume::Open { .. }
-                )
-            });
-        let restores = resumes_image
-            && stored.id != 0
-            && stored.denoised_steps > 0
-            && stored.denoised_steps <= u32::from(req.image.steps);
-        let host_trajectory = HostTrajectory {
-            restoring: if restores {
-                Restoring::Due
-            } else {
-                Restoring::Ready(None)
-            },
-            ..HostTrajectory::default()
-        };
-        let (generated_token_ids, round_token_ids, next_token, replay) = match continuation {
-            Some(continuation) => {
-                req.prompt_token_ids
-                    .extend_from_slice(&continuation.written);
-                let (token, round_closing) = match continuation.resume {
-                    generation::continuation::Resume::Decode {
-                        token,
-                        round_closing,
-                    } => (token, round_closing),
-                    generation::continuation::Resume::Open { token } => (token, false),
-                    generation::continuation::Resume::FeedbackSample => (0, false),
-                };
-                let replay = generation::Replay {
-                    images: continuation.images,
-                    resume: continuation.resume,
-                };
-                (
-                    continuation.history,
-                    continuation.round,
-                    (token, round_closing),
-                    Some(replay),
-                )
-            }
-            None => {
-                req.prompt_token_ids
-                    .extend_from_slice(&req.generated_token_ids);
-                (
-                    req.generated_token_ids.clone(),
-                    Vec::new(),
-                    (0, false),
-                    None,
-                )
-            }
-        };
-        let images = req.generated_images.len();
+        // (`RequestState::charged_prompt_tokens`).
+        req.prompt_token_ids
+            .extend_from_slice(&req.generated_token_ids);
+        let generated_token_ids = req.generated_token_ids.clone();
         // Multimodal requests reserve their configured bounded cache envelope at
         // admission so excess concurrency queues instead of exhausting the prefix cache.
-        let reserve_worstcase = !req.multimodal_inputs.images.is_empty() || req.generates_images();
+        let reserve_worstcase = !req.multimodal_inputs.images.is_empty();
         let finish_token_ids = finish_token_ids(&req, &self.special_tokens.eos);
         let st = RequestState {
             finish_token_ids,
             allocations: None,
             state_resident: false,
-            guidance_prefix: None,
             request_epoch: self.next_request_epoch,
             last_state_call_id: CallId::default(),
             latest_token: None,
@@ -354,24 +262,14 @@ impl Scheduler {
             image_encoder_index: 0,
             input_image_features: None,
             context_features: Vec::new(),
-            round_closing: next_token.1,
             logical_position: 0,
             cache_visible_len: 0,
             cache_computed_len: 0,
             // A request draws its first token at position zero of its stream.
             sampling_position: 0,
-            next_token: next_token.0,
+            next_token: 0,
             num_generated_tokens: generated,
-            image_id: u32::try_from(images).unwrap_or(u32::MAX),
-            num_generated_images: images,
-            image_reservation_pending: false,
-            denoising: Denoising::new(u32::from(req.image.steps)),
-            host_trajectory,
-            image_conditioning: None,
             handoff_export: None,
-            feedback_encoder_index: 0,
-            feedback_source: None,
-            feedback_features: None,
             worker_registered: false,
             num_cache_units_sent: 0,
             reserve_worstcase,
@@ -383,9 +281,6 @@ impl Scheduler {
             host_keyed: false,
             offload_boundary: 0,
             generated_token_ids,
-            round_token_ids,
-            feedback_image_b64: None,
-            feedback_digest: None,
             replayable: true,
             encoder_cache_pins: Vec::new(),
             host_encoding: None,
@@ -398,7 +293,6 @@ impl Scheduler {
             terminal_intent: None,
             failure: None,
             prompt_tokens,
-            replay,
             req,
         };
         self.next_request_epoch = self.next_request_epoch.saturating_add(1);
@@ -554,7 +448,6 @@ impl Scheduler {
             | MediaCall::LatentPreparation => 1,
             MediaCall::VideoDecoding | MediaCall::AudioDecoding => 2,
             MediaCall::VideoEncoding | MediaCall::AudioEncoding | MediaCall::Muxing => 3,
-            _ => 4,
         });
         let mut routes = HashMap::new();
         let mut selected_workers = HashSet::new();
@@ -964,91 +857,10 @@ impl Scheduler {
         }
     }
 
-    /// Returns the number of latent positions of an image of `ip`'s size.
-    ///
-    /// Computes `(height / d) * (width / d)` with floor division, where `d` is
-    /// `latent_downsample` (at least 1). Denoising call planning adds
-    /// `commit_marker_tokens` to it for the call's query length.
-    pub(super) fn num_vae(&self, ip: &ipc::ImageParams) -> u64 {
-        let dl = u64::from(self.generation_limits.latent_downsample).max(1);
-        (ip.height as u64 / dl) * (ip.width as u64 / dl)
-    }
-
     /// Whether some worker group prefills only (`WorkerGroupRole::Prefill`),
     /// its requests decoding on decode groups.
     fn splits_prefill(&self) -> bool {
         !self.dispatch.prefill_groups.is_empty()
-    }
-
-    /// Why the image denoiser cannot denoise `req`'s images, if so: under
-    /// CUDA graphs it denoises only the steps it captured
-    /// (`MainProcessInfo::captured_images`), and a request's steps evaluate one
-    /// guidance branch up to its own branch count.
-    fn uncaptured_image(&self, req: &GenerationRequest) -> Option<String> {
-        let captured = self.info.captured_images.as_ref()?;
-        if !req.generates_images() {
-            return None;
-        }
-        let (height, width) = (req.image.height, req.image.width);
-        let branches = req.image.cfg_branch_count();
-        let covered = (1..=branches).all(|branches| {
-            captured.contains(&ipc::CapturedImage {
-                height,
-                width,
-                branches,
-            })
-        });
-        if covered {
-            return None;
-        }
-        let mut sizes: Vec<String> = captured
-            .iter()
-            .filter(|shape| shape.branches == branches)
-            .map(|shape| format!("{}x{}", shape.width, shape.height))
-            .collect();
-        sizes.dedup();
-        Some(format!(
-            "the workers serve {width}x{height} images with {branches} guidance branches \
-             under CUDA graphs only at the sizes they captured: {}; \
-             cuda_graph_config.flow_shapes names the sizes the decoder captures",
-            if sizes.is_empty() {
-                "none".to_owned()
-            } else {
-                sizes.join(", ")
-            }
-        ))
-    }
-
-    /// Why the image denoiser's step cannot hold `req`'s images, if so: a
-    /// step evaluates one framed latent sequence (the image's latent rows
-    /// and its `commit_marker_tokens`) per guidance branch, within the rows
-    /// and tokens the workers' step serves (`MainProcessInfo::image_capacity`).
-    fn exceeded_image_step(&self, req: &GenerationRequest) -> Option<String> {
-        let capacity = self.info.image_capacity.as_ref()?;
-        if !req.generates_images() || capacity.max_step_tokens == 0 {
-            return None;
-        }
-        let (height, width) = (req.image.height, req.image.width);
-        let branches = req.image.cfg_branch_count();
-        if u32::from(branches) > capacity.max_step_rows {
-            return Some(format!(
-                "a {width}x{height} image with {branches} guidance branches exceeds the \
-                 max_step_rows of {} guidance branch rows the workers' denoising step holds",
-                capacity.max_step_rows
-            ));
-        }
-        let sequence = self
-            .num_vae(&req.image)
-            .saturating_add(u64::from(self.generation_limits.commit_marker_tokens));
-        let tokens = sequence.saturating_mul(u64::from(branches));
-        (tokens > capacity.max_step_tokens).then(|| {
-            format!(
-                "a {width}x{height} image with {branches} guidance branches needs {tokens} \
-                 denoising step tokens, beyond the max_step_tokens of {} the workers' \
-                 denoising step holds",
-                capacity.max_step_tokens
-            )
-        })
     }
 
     /// Why the latent encoder cannot encode one of `req`'s input images, if
@@ -1101,144 +913,6 @@ impl Scheduler {
         self.generation_limits.covers(features).err()
     }
 
-    /// Returns whether the worker tracks image-latent capacity.
-    pub(super) fn worker_tracks_image_latent(&self) -> bool {
-        self.info.latent_page_units > 0 && self.info.latent_pages > 1
-    }
-
-    /// Computes image-latent capacity required by a request.
-    ///
-    /// The result counts latent positions: with `d = latent_downsample` (at
-    /// least 1), it is `ceil(height / d) * ceil(width / d)`, each side
-    /// counting at least one position. Unlike `num_vae`, partial positions
-    /// round up.
-    pub(super) fn worker_image_latent_units_for(&self, st: &RequestState) -> u64 {
-        let downsample = (self.generation_limits.latent_downsample as u64).max(1);
-        let (height, width) = (st.req.image.height, st.req.image.width);
-        ceil_div_u64((height as u64).max(1), downsample)
-            * ceil_div_u64((width as u64).max(1), downsample)
-    }
-
-    /// Materializes the cache prefixes multi-branch guidance attends to.
-    ///
-    /// The text-unconditional branch attends to the negative prompt tokens,
-    /// and the image-unconditional branch to the prefix the worker states
-    /// for its model, or to the request's own context when it states none;
-    /// two branches with the same tokens share one prefix. Each prefix gets
-    /// its own request row and cache tables sized to its tokens, stored in
-    /// `RequestState::guidance_prefix`. Returns `true` when the prefixes are
-    /// in place, the request needs none, or the request is not running.
-    /// Returns `false`, holding nothing new, when no request row or cache
-    /// capacity is free, or (after latching engine-fatal) the prefix cache
-    /// is missing; `reserve_generation_resources` then declines the
-    /// denoising call.
-    pub(super) fn ensure_guidance_prefix(&mut self, id: RequestId) -> bool {
-        let Some(state) = self.running.get(&id) else {
-            return true;
-        };
-        if state.guidance_prefix.is_some() {
-            return true;
-        }
-        let negative = &state.req.negative_prompt_token_ids;
-        let text = state.req.image.guides_text().then_some(negative);
-        let image = self
-            .info
-            .image_unconditional_token_ids
-            .as_ref()
-            .filter(|_| state.req.image.guides_image());
-        let mut lengths = Vec::new();
-        if let Some(tokens) = text {
-            lengths.push(tokens.len() as u32);
-        }
-        // An image-unconditional branch whose prefix is the text branch's
-        // shares it.
-        if let Some(tokens) = image
-            && text != Some(tokens)
-        {
-            lengths.push(tokens.len() as u32);
-        }
-        if lengths.is_empty() {
-            return true;
-        }
-
-        let mut prefixes = Vec::with_capacity(lengths.len());
-        for tokens in lengths {
-            match self.allocate_guidance_prefix(tokens) {
-                Some(prefix) => prefixes.push(prefix),
-                None => {
-                    for prefix in prefixes {
-                        prefix.allocations.free(&mut self.storage);
-                    }
-                    return false;
-                }
-            }
-        }
-        let Some(state) = self.running.get_mut(&id) else {
-            for prefix in prefixes {
-                prefix.allocations.free(&mut self.storage);
-            }
-            return false;
-        };
-        state.guidance_prefix = Some(GuidancePrefixState {
-            prefixes,
-            diffusion_finalized: false,
-        });
-        true
-    }
-
-    /// Allocates one guidance prefix of `tokens` tokens: a request row and
-    /// cache tables. `None`, holding nothing, when either is unavailable.
-    fn allocate_guidance_prefix(&mut self, tokens: u32) -> Option<GuidancePrefix> {
-        let request_slot = self.storage.request_pool.allocate().ok()?;
-        let Some(cache) = self.storage.cache() else {
-            self.storage.request_pool.free(request_slot);
-            self.invariant_broken("a running token request has a prefix cache");
-            return None;
-        };
-        let Ok(prefix_cache) = cache.allocate(tokens) else {
-            self.storage.request_pool.free(request_slot);
-            return None;
-        };
-        let new_units = prefix_cache
-            .tables
-            .iter()
-            .map(|table| (table.group_id() as u32, table.unit_ids()))
-            .collect();
-        Some(GuidancePrefix {
-            allocations: RequestAllocations {
-                request_slot,
-                prefix_cache,
-                latent: None,
-                buffers: HashMap::new(),
-            },
-            new_units,
-        })
-    }
-
-    /// The cache tokens a request's image-unconditional guidance prefix
-    /// holds, beside those `GenerationRequest::max_cache_tokens` counts.
-    pub(super) fn image_unconditional_tokens(&self, request: &GenerationRequest) -> usize {
-        self.info
-            .image_unconditional_token_ids
-            .as_ref()
-            .filter(|_| request.generates_images() && request.image.guides_image())
-            .map_or(0, Vec::len)
-    }
-
-    /// Releases the request's guidance-prefix allocations.
-    pub(super) fn free_guidance_prefix(&mut self, id: RequestId) {
-        let prefix = self
-            .running
-            .get_mut(&id)
-            .and_then(|state| state.guidance_prefix.take());
-        for allocations in prefix
-            .into_iter()
-            .flat_map(GuidancePrefixState::into_allocations)
-        {
-            allocations.free(&mut self.storage);
-        }
-    }
-
     /// Reaps terminal requests after all submitted descendants resolve.
     pub(super) fn reap_cancellations(&mut self) {
         // A cancelled request closes only after every submitted descendant has
@@ -1255,11 +929,8 @@ impl Scheduler {
         for (id, intent) in cancelled {
             let reason = match intent {
                 Some(Terminal::Finished { reason, .. }) => reason,
-                // A preempted request is at a step boundary of the image it
-                // generates: the image's trajectory is stored before it
-                // leaves.
                 Some(Terminal::Migrated { cause, .. }) => {
-                    self.retire_preempted_token(id, cause);
+                    self.migrate_request(id, cause);
                     continue;
                 }
                 Some(Terminal::Failed(_) | Terminal::Rejected(_)) => FinishReason::Error,
@@ -1461,10 +1132,8 @@ impl Scheduler {
                     self.admit_running(st, target, reservation);
                     // Grow the tables to the whole worst case now, from token
                     // zero, so later admissions cannot take these units. The
-                    // result is not checked here; when an image branch opens,
-                    // `promote_gen_branch_reservation` finishes the request
-                    // with an error if a table covers fewer than `tokens`
-                    // tokens.
+                    // result is not checked here: a later call that needs
+                    // more units than the tables cover waits for them.
                     self.ensure_request_capacity(id, 0, tokens);
                     continue;
                 }
@@ -1770,7 +1439,6 @@ impl Scheduler {
             .replace(RequestAllocations {
                 request_slot,
                 prefix_cache,
-                latent: None,
                 buffers: HashMap::new(),
             })
             .is_none()
@@ -1841,7 +1509,7 @@ impl Scheduler {
         let Some(state) = self.running.get_mut(&id) else {
             return;
         };
-        if !state.req.cache.read || state.has_context_images() || state.rebuilds_images() {
+        if !state.req.cache.read || state.has_context_images() {
             return;
         }
         state.host_keyed = kv_offload.serves(worker);
@@ -1994,7 +1662,7 @@ fn acquire_cached_prefix(
     source: &ipc::MainProcessEndpoint,
 ) -> Result<(), &'static str> {
     let prompt = state.req.prompt_token_ids.clone();
-    let has_context_images = state.has_context_images() || state.rebuilds_images();
+    let has_context_images = state.has_context_images();
     let cache_read = state.req.cache.read;
     let cache_policy = state.req.cache.clone();
     let scope = PrefixScope::of(&cache_policy);

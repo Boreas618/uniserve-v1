@@ -80,23 +80,16 @@ fn a_reported_stall_names_the_forward_and_the_requests_it_held() {
             .submit(scheduler::GenerationRequest {
                 request_id: ipc::RequestId(9),
                 prompt_token_ids: vec![7; 8],
-                negative_prompt_token_ids: Vec::new(),
                 multimodal_inputs: Default::default(),
-                constraint: scheduler::GenerationConstraint::UndOnly,
                 sampling: Default::default(),
-                image: Default::default(),
-                max_images: 1,
                 max_und_tokens: 4,
                 include_stop_token: false,
                 stop_strings: Vec::new(),
                 stop_token_ids: Vec::new(),
                 priority: 0,
                 cache: Default::default(),
-                image_generation: Default::default(),
                 generated_token_ids: Vec::new(),
                 adapter: 0,
-                generated_images: Vec::new(),
-                trajectory: Default::default(),
             })
             .is_err(),
         "a stopped engine accepted another submission"

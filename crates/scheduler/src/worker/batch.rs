@@ -9,8 +9,7 @@
 
 use super::WorkerGroupId;
 use ipc::{
-    BatchCommand, BufferAllocation, Call, DecodeRange, LatentParams, NewRequest, RequestKey,
-    TensorExport,
+    BatchCommand, BufferAllocation, Call, DecodeRange, NewRequest, RequestKey, TensorExport,
 };
 use std::collections::BTreeMap;
 
@@ -58,7 +57,6 @@ pub struct RequestDispatch {
     /// space. Unset dispatches retain the admission's canonical row;
     /// The worker applies the override to the request's `Start`.
     pub request_pool_idx: Option<u32>,
-    pub latent: Option<LatentParams>,
     pub decode: Option<DecodeRange>,
     /// Persistent spans for the call's buffer inputs and outputs, on each
     /// rank of the worker that backs them. Request retirement retains every
@@ -245,12 +243,6 @@ impl ExecutionBatch {
                 "logical batch repeats a call identity"
             );
 
-            if let Some(latent) = &dispatch.latent {
-                anyhow::ensure!(
-                    (latent.request_key, latent.call_id) == (call.request_key, call.call_id),
-                    "logical call carries another call's latent execution"
-                );
-            }
             if let Some(decode) = &dispatch.decode {
                 anyhow::ensure!(
                     (decode.request_key, decode.call_id) == (call.request_key, call.call_id),

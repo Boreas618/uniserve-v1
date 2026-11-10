@@ -229,7 +229,7 @@ impl Scheduler {
                 continue;
             }
             // A request that publishes no page computes its state again whatever a wait does.
-            if !state.req.cache.write || state.has_context_images() || state.rebuilds_images() {
+            if !state.req.cache.write || state.has_context_images() {
                 continue;
             }
             let offered = state.offload_boundary as u32 / page_tokens * page_tokens;

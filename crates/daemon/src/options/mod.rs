@@ -569,7 +569,6 @@ impl ServerArgs {
                 generation_limits: Default::default(),
                 bos: 0,
                 eos: Vec::new(),
-                end_of_image: 0,
                 canvas_sampling: None,
                 prefill_outputs: true,
             },

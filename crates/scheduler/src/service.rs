@@ -1939,7 +1939,7 @@ mod tests {
     //! the control thread's route instance is told as a request runs (§4.4).
 
     use super::*;
-    use proto::request::{GenerationConstraint, GenerationRequest, ImageParams};
+    use proto::request::GenerationRequest;
     use scheduling::guest::view::RequestState;
 
     fn generation(prompt: Vec<u32>, max_und_tokens: usize) -> GenerationRequest {
@@ -1947,21 +1947,14 @@ mod tests {
             request_id: RequestId(7),
             prompt_token_ids: prompt,
             multimodal_inputs: Default::default(),
-            negative_prompt_token_ids: Vec::new(),
-            constraint: GenerationConstraint::UndOnly,
             sampling: Default::default(),
-            image: ImageParams::default(),
-            max_images: 1,
             max_und_tokens,
             include_stop_token: false,
             stop_strings: Vec::new(),
             stop_token_ids: Vec::new(),
             priority: 3,
             cache: Default::default(),
-            image_generation: Default::default(),
             generated_token_ids: Vec::new(),
-            generated_images: Vec::new(),
-            trajectory: Default::default(),
             adapter: 0,
         }
     }

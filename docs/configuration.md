@@ -133,7 +133,7 @@ A checkpoint that declares its own quantization (ModelOpt's `quantization_config
 | `uds` | Unset | Unix domain socket the application server listens on instead of TCP; a stale socket file is replaced and the socket file is removed at shutdown |
 | `api_key` | Unset | Bearer token every route but `/health` and `/metrics` requires; `UNISERVE_API_KEY` supplies it when unset or blank. Never printed |
 | `request_timeout` | Unset | Time until a response head is sent, answered with 504 when it expires; streamed bodies are not bounded |
-| `max_concurrent_requests` | Unset | In-flight chat, image generation and synchronous video requests above which requests are shed with 503 |
+| `max_concurrent_requests` | Unset | In-flight chat and synchronous video requests above which requests are shed with 503 |
 | `shutdown_timeout` | `"30s"` | Longest drain of in-flight requests at shutdown; `0` stops at once |
 | `request_id_headers` | `false` | Add an `X-Request-Id` response header with the ID the request ran under |
 
@@ -476,7 +476,7 @@ A `[[worker_groups]]` table takes:
 | `queue_depth` | Required | Batches in flight per rank. A rank that keeps video requests resident takes three positions per request, so such a group holds up to `queue_depth / 3` requests at once; a group serving several replicas, such as a shared text encoder, needs positions for all of them |
 | `mem_fraction_static` | Top-level `mem_fraction_static` | Each rank's device-storage share for this group |
 
-A `prefill` group prefills prompts only and a `decode` group decodes only; a deployment configures both or neither, and each places the `model` component alone. A request prefills on a prefill group; once its prompt is complete and its first token sampled, the prefill group exports its KV cache, a decode group installs it into the same cache units (`CacheExport` and `CacheInstall` transfer calls), and the request decodes there. Such a deployment generates text: image generation and canvas requests are refused.
+A `prefill` group prefills prompts only and a `decode` group decodes only; a deployment configures both or neither, and each places the `model` component alone. A request prefills on a prefill group; once its prompt is complete and its first token sampled, the prefill group exports its KV cache, a decode group installs it into the same cache units (`CacheExport` and `CacheInstall` transfer calls), and the request decodes there. Such a deployment generates text: canvas requests are refused.
 
 A `ranks` entry is `[HOST/]DEVICE`. `DEVICE` is one device (`cuda:0`, `cpu`), an inclusive index range (`cuda:0-3`) or a device repeated for CPU workers (`cpu*4`). Without `HOST` the ranks run on the leader's own host, the `host_identity` of the process that reads the file; `rank-1/cuda:0-3` places four ranks on the node whose `uniserve serve` starts with `--host-identity rank-1`.
 

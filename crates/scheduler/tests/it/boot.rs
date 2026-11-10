@@ -15,12 +15,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ipc::SamplingParams;
 use ipc::execution::Batches;
-use ipc::{ImageParams, SamplingParams};
-use scheduler::{
-    BatchCapacity, Event, GenerationConstraint, GenerationRequest, SchedulerConfig,
-    SchedulerHandle, Stage,
-};
+use scheduler::{BatchCapacity, Event, GenerationRequest, SchedulerConfig, SchedulerHandle, Stage};
 use testkit::{Extent, FakeBatches, SAMPLED, Tokens};
 
 /// How long a command answer may take.
@@ -61,22 +58,15 @@ fn text_request(id: u64, prompt: usize, max_tokens: usize) -> GenerationRequest 
         request_id: ipc::RequestId(id),
         prompt_token_ids: vec![7; prompt],
         multimodal_inputs: Default::default(),
-        negative_prompt_token_ids: Vec::new(),
-        constraint: GenerationConstraint::UndOnly,
         sampling: SamplingParams::default(),
-        image: ImageParams::default(),
-        max_images: 1,
         max_und_tokens: max_tokens,
         include_stop_token: false,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
         priority: 0,
         cache: Default::default(),
-        image_generation: Default::default(),
         generated_token_ids: Vec::new(),
         adapter: 0,
-        generated_images: Vec::new(),
-        trajectory: Default::default(),
     }
 }
 

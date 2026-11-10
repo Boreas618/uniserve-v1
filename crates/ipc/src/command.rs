@@ -83,8 +83,6 @@ impl BatchCommand {
 pub struct GenerationParams {
     /// Sampling policy shared by the request's token calls.
     pub sampling: SamplingParams,
-    /// Token identifiers used for negative-conditioning input.
-    pub negative_token_ids: Vec<u32>,
     /// Canonical token identifiers that terminate generation.
     pub finish_token_ids: Vec<u32>,
     /// Logical position assigned to the first request token.
@@ -123,8 +121,6 @@ pub struct NewRequest {
     pub request_pool_idx: u32,
     /// Token-generation parameters, when the request generates tokens.
     pub generation: Option<GenerationParams>,
-    /// Image request parameters, when applicable.
-    pub image: Option<ImageParams>,
     /// Diffusion request parameters, when applicable.
     pub diffusion: Option<DiffusionSamplingParams>,
     /// A video request's task, presentation tags and conditions; present
@@ -139,27 +135,21 @@ pub struct NewRequest {
 }
 
 impl NewRequest {
-    /// Constructs static token-generation or multimodal admission state.
+    /// Constructs static token-generation admission state.
     ///
-    /// Checks only the request-pool index and that `generation` or `image` is present;
-    /// it does not run [`Self::validate`] on the family parameters.
+    /// Checks only the request-pool index; it does not run
+    /// [`Self::validate`] on the generation parameters.
     pub fn new(
         request_key: RequestKey,
         request_pool_idx: u32,
-        generation: Option<GenerationParams>,
-        image: Option<ImageParams>,
+        generation: GenerationParams,
         input_images: u32,
     ) -> ValidationResult<Self> {
         ensure_valid!(request_pool_idx > 0, "request-pool index must be positive");
-        ensure_valid!(
-            generation.is_some() || image.is_some(),
-            "request start must declare token-generation or image parameters"
-        );
         let admission = Self {
             request_key,
             request_pool_idx,
-            generation,
-            image,
+            generation: Some(generation),
             diffusion: None,
             video: None,
             prompt_token_ids: Vec::new(),
@@ -181,7 +171,6 @@ impl NewRequest {
             request_key,
             request_pool_idx,
             generation: None,
-            image: None,
             diffusion: Some(diffusion),
             video: Some(video),
             prompt_token_ids,
@@ -198,7 +187,7 @@ impl NewRequest {
             "request-pool index must be positive"
         );
         ensure_valid!(
-            self.generation.is_some() || self.image.is_some() || self.diffusion.is_some(),
+            self.generation.is_some() || self.diffusion.is_some(),
             "request start must declare one runtime-family parameter set"
         );
         if let Some(generation) = &self.generation {
@@ -210,9 +199,6 @@ impl NewRequest {
                     .all(|pair| pair[0] < pair[1]),
                 "token-generation finish token ids are not canonical"
             );
-        }
-        if let Some(branch) = &self.image {
-            branch.validate()?;
         }
         if let Some(diffusion) = &self.diffusion {
             ensure_valid!(

@@ -27,7 +27,6 @@ use crate::worker::{
     BatchResult, BlockConfig, CallResult, CommandOutcome, CommandResult, ExecutionBatch, Worker,
     WorkerFailure, WorkerGroupId, WorkerInfo, WorkerSubmitError,
 };
-use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
 use ipc::execution::PoolLayout;
 use ipc::philox;
@@ -35,7 +34,7 @@ use ipc::{
     Call, CallKind, CallStatus, ErrorCode, MainProcessInfo, NewRequest, SamplingState, TensorRef,
     TimingCounters,
 };
-use ipc::{ImageParams, RequestId, SamplingParams, TokenLogprob};
+use ipc::{RequestId, SamplingParams, TokenLogprob};
 
 // The simulated worker's completion record: a call's tokens and the stop conditions it observed,
 // its media artifact and products, in the simulator's own terms. The serving path reports
@@ -205,7 +204,6 @@ const SYNTH_VOCAB_SIZE: usize = FAKE_EOS_TOKEN as usize + 1;
 const SIM_MAX_MODEL_LEN: u32 = 32_768;
 
 const DEFAULT_DENOISE_STEPS: u16 = 50;
-const DEFAULT_IMAGE_HW: (u32, u32) = (512, 512);
 
 /// Work sent to the simulator thread.
 #[expect(
@@ -947,8 +945,6 @@ struct SimRequestState {
     /// The token the request's last sampling call sampled, which a decode
     /// that relays its predecessor's token writes.
     last_token: Option<u32>,
-    /// The image index the request's current trajectory was prepared for.
-    image_index: u32,
     /// What each image or feature product the request holds was made from:
     /// the digest of a decoded image's values, and for a feature, the
     /// posterior draw a latent encoder sampled.
@@ -993,7 +989,6 @@ impl SimRequestState {
             state_call_id: ipc::CallId::new(0, 0),
             canvas: ipc::CanvasStep::default(),
             last_token: None,
-            image_index: 0,
             provenance: HashMap::new(),
         }
     }
@@ -1017,11 +1012,6 @@ impl SimRequestState {
     /// Returns shared access to the simulated sampling configuration.
     fn sampling(&self) -> Option<&SamplingParams> {
         self.admission.generation.as_ref().map(|und| &und.sampling)
-    }
-
-    /// Returns shared access to the simulated image configuration.
-    fn image(&self) -> Option<&ImageParams> {
-        self.admission.image.as_ref()
     }
 }
 
@@ -1398,7 +1388,6 @@ impl SimEngine {
         SpecialTokenIds {
             bos: 151_644,
             eos: vec![FAKE_EOS_TOKEN, 151_643],
-            end_of_image: 151_653,
         }
     }
 
@@ -1408,17 +1397,10 @@ impl SimEngine {
     /// simulated worker reports and clamps these limits to its capacities.
     pub fn generation_limits() -> crate::GenerationLimits {
         crate::GenerationLimits {
-            max_latent_units: u64::MAX,
-            latent_downsample: 16,
             max_vae_grid_tokens: u32::MAX,
             max_vit_grid_tokens: u32::MAX,
-            // One latent unit of the simulated image: 256 MiB over the
-            // simulated worker's 65,536 latent units.
-            latent_bytes_per_unit: 4096,
             max_latent_feature_bytes: 256 << 20,
             max_vision_feature_bytes: 256 << 20,
-            commit_marker_tokens: 2,
-            max_cfg_branches: 3,
             encoder_cache_entries: 256,
             ..Default::default()
         }
@@ -1427,13 +1409,10 @@ impl SimEngine {
     /// Constructs a simulator with deterministic text and image capabilities.
     pub fn new() -> Self {
         // Unset fields, including the prefix cache, come from
-        // `MainProcessInfo::default`. One latent page is the reserved sentinel
-        // page that `latent_capacity_units` excludes. The pool starts with a
-        // queue depth of one and no placed components.
+        // `MainProcessInfo::default`. The pool starts with a queue depth of one
+        // and no placed components.
         let info = MainProcessInfo {
             supported_calls: CallKind::ALL.to_vec(),
-            latent_page_units: 64,
-            latent_pages: 1_025,
             buffer_pool_bytes: 257_u64 * (256 << 20),
             encoder_cache_entries: 256,
             encoder_entry_bytes: 256 << 20,
@@ -1798,17 +1777,6 @@ impl SimEngine {
                             .predicate_values
                             .insert(token_product.clone(), continuation);
                     }
-                    let transition = sampling_state.is_some_and(|state| {
-                        state
-                            .transition_token_ids
-                            .binary_search(&output.token)
-                            .is_ok()
-                    });
-                    for completion in call.transition_output.iter() {
-                        request
-                            .predicate_values
-                            .insert(completion.clone(), transition);
-                    }
                     // Positions and cache advance by the query length: the whole
                     // bound for a prefill, one token for decode, and a
                     // verification's committed tokens.
@@ -1968,10 +1936,7 @@ impl SimEngine {
             CallKind::Media(MediaCall::Denoising) => {
                 // A denoising call runs one step.
                 request.step_index = request.step_index.saturating_add(1);
-                let total = request
-                    .image()
-                    .map(|image| image.steps)
-                    .unwrap_or(DEFAULT_DENOISE_STEPS);
+                let total = DEFAULT_DENOISE_STEPS;
                 record.step_index = u32::from(request.step_index);
                 // Denoise completion surfaces as a length finish once the flow has
                 // advanced through every scheduled step.
@@ -2000,43 +1965,10 @@ impl SimEngine {
                     )?);
                 }
             }
-            CallKind::Media(MediaCall::ImageDecoding) => {
-                // A worker's image decoding releases the request's
-                // latent and resets its denoising step to zero.
-                request.step_index = 0;
-                if let Some(image) = request.image().cloned() {
-                    let (height, width) = if image.height > 0 && image.width > 0 {
-                        (image.height, image.width)
-                    } else {
-                        DEFAULT_IMAGE_HW
-                    };
-                    // A decoding that writes the request's feedback image
-                    // product publishes its values after the PNG, as a
-                    // worker does.
-                    let seed = image.seed.unwrap_or(call.request_key.request_id.0);
-                    let mut media =
-                        synthetic_png_b64(width, height, seed, request.image_index)?.into_bytes();
-                    if call.image_output.is_some() {
-                        let values =
-                            synthetic_feedback_values(seed, request.image_index, height, width);
-                        ipc::append_feedback(&mut media, &values, ipc::PixelRange::SignedUnit);
-                    }
-                    record.media_output = Some(publish_media(
-                        "uniserve-image-",
-                        &media,
-                        media_overstatement,
-                    )?);
-                }
-            }
         }
 
-        // Completion and transition outputs the call did not resolve above
-        // resolve true.
-        for completion in call
-            .completion_output
-            .iter()
-            .chain(call.transition_output.iter())
-        {
+        // Completion outputs the call did not resolve above resolve true.
+        for completion in call.completion_output.iter() {
             request
                 .predicate_values
                 .entry(completion.clone())
@@ -2356,25 +2288,6 @@ impl SimEngine {
     }
 }
 
-/// The values of the decoded image product of request `request_id`'s image
-/// `image_index`: BF16 bytes `[3, height, width]` the simulator derives from
-/// the two, so an image restarted from noise decodes to the same values.
-/// The values a generated image's feedback product carries, derived from the
-/// seed the request draws its latent with: one seed yields one image, and the
-/// same seed in another request yields the same one.
-fn synthetic_feedback_values(seed: u64, image_index: u32, height: u32, width: u32) -> Vec<u8> {
-    let bytes = ipc::ImagePixels::value_bytes(height, width) as usize;
-    let mut state = (seed << 32) ^ u64::from(image_index) ^ 0x9e37_79b9_7f4a_7c15;
-    (0..bytes)
-        .map(|_| {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            (state >> 56) as u8
-        })
-        .collect()
-}
-
 /// A digest of image values, which the context log names an image by.
 fn digest(values: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -2446,35 +2359,11 @@ fn context_writes(
                 }
             }
         }
-        CallKind::Media(MediaCall::LatentPreparation) => {
-            if let Some(image_index) = call.image_index {
-                request.image_index = image_index;
-            }
-        }
-        CallKind::Media(MediaCall::ImageDecoding) => {
-            if let (Some(output), Some(image)) = (&call.image_output, request.image()) {
-                let (height, width) = if image.height > 0 && image.width > 0 {
-                    (image.height, image.width)
-                } else {
-                    DEFAULT_IMAGE_HW
-                };
-                let seed = request
-                    .image()
-                    .and_then(|image| image.seed)
-                    .unwrap_or(call.request_key.request_id.0);
-                let values = synthetic_feedback_values(seed, request.image_index, height, width);
-                request
-                    .provenance
-                    .insert(output.clone(), (digest(&values), None));
-            }
-        }
         CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding) => {
-            let source = match (&call.image_input, &call.carried_image, &call.input_image) {
-                (Some(product), _, _) => request.provenance.get(product).map(|(image, _)| *image),
-                (_, Some(carried), _) => Some(digest(&carried.values)),
-                (_, _, Some(payload)) => Some(digest(payload.as_bytes())),
-                _ => None,
-            };
+            let source = call
+                .input_image
+                .as_ref()
+                .map(|payload| digest(payload.as_bytes()));
             if let (Some(output), Some(image)) = (&call.encoder_output, source) {
                 request
                     .provenance
@@ -2537,39 +2426,6 @@ fn publish_media(prefix: &str, bytes: &[u8], extra_bytes: u64) -> anyhow::Result
         handle: ipc::ArtifactHandle::PosixShm { name },
         bytes: bytes.len() as u64 + extra_bytes,
     })
-}
-
-/// Encodes a deterministic RGB gradient as a base64 PNG artifact.
-fn synthetic_png_b64(
-    width: u32,
-    height: u32,
-    seed: u64,
-    image_index: u32,
-) -> anyhow::Result<String> {
-    // The simulated denoiser predicts zero velocity, so an image is its initial
-    // latent decoded: the seed and the image's index decide its pixels, as they
-    // decide its feedback values.
-    let latent =
-        digest(&[seed.to_le_bytes(), u64::from(image_index).to_le_bytes()].concat()).to_le_bytes();
-    let mut bytes = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut bytes, width, height);
-        encoder.set_color(png::ColorType::Rgb);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header()?;
-        let row_bytes = width as usize * 3;
-        let mut image = vec![0; row_bytes * height as usize];
-        for y in 0..height as usize {
-            for x in 0..width as usize {
-                let index = y * row_bytes + x * 3;
-                image[index] = ((x * 255) / width.max(1) as usize) as u8;
-                image[index + 1] = ((y * 255) / height.max(1) as usize) as u8;
-                image[index + 2] = latent[x % latent.len()];
-            }
-        }
-        writer.write_image_data(&image)?;
-    }
-    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 impl Default for SimEngine {
@@ -2847,15 +2703,13 @@ mod tests {
         NewRequest::new(
             request_key(),
             1,
-            Some(GenerationParams {
+            GenerationParams {
                 sampling: SamplingParams::default(),
-                negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),
                 initial_position: 0,
                 generated_token_ids: Vec::new(),
                 adapter: 0,
-            }),
-            None,
+            },
             0,
         )
         .expect("admission")
@@ -2886,12 +2740,7 @@ mod tests {
             vision_inputs: Vec::new(),
             latent_feature_input: None,
             encoder_output: None,
-            latent_input: None,
-            latent_output: None,
-            image_input: None,
-            image_output: None,
             completion_output: None,
-            transition_output: None,
 
             input_image: None,
             draft: Default::default(),
@@ -2911,11 +2760,9 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             predicate: None,
-            image_index: None,
             latent_restore: None,
             host_output: None,
             latent_draw: None,
-            carried_image: None,
         };
         ExecutionBatch::new(
             batch_id,
@@ -2924,7 +2771,6 @@ mod tests {
                 crate::worker::RequestDispatch {
                     worker: WorkerGroupId("sim".into()),
                     request_pool_idx: None,
-                    latent: None,
                     decode: None,
                     buffers: Vec::new(),
                     readers: Default::default(),
@@ -2975,13 +2821,5 @@ mod tests {
         assert_eq!(outputs[1].committed_tokens, vec![1064]);
         assert_eq!(outputs[1].cache_visible_len, 4);
         worker.close().expect("close simulator");
-    }
-
-    #[test]
-    fn default_limits_admit_public_image_geometry() {
-        let engine = SimEngine::new();
-        let info = engine.info();
-        let latent_units = (2_048_u64 / 16) * (1_152_u64 / 16);
-        assert!(latent_units <= info.latent_capacity_units());
     }
 }

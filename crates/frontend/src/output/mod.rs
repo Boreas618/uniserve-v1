@@ -27,8 +27,7 @@ use futures::Stream;
 use crate::events::Events;
 
 pub use events::{
-    FinishReason, GeneratedImage, PromptInfo, RequestOutput, RequestUsage, RuntimeTimings,
-    StopReason,
+    FinishReason, PromptInfo, RequestOutput, RequestUsage, RuntimeTimings, StopReason,
 };
 
 /// Why a submitted request's engine events could not be processed into its

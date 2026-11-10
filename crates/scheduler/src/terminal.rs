@@ -41,7 +41,6 @@ pub(crate) enum Terminal {
 pub(crate) struct Usage {
     pub(crate) prompt_tokens: usize,
     pub(crate) completion_tokens: usize,
-    pub(crate) images: usize,
 }
 
 impl Terminal {
@@ -101,7 +100,6 @@ impl Terminal {
             stop_reason,
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
-            images: usage.images,
         };
         match self {
             Self::Finished {

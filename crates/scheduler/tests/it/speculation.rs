@@ -16,11 +16,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
-use ipc::{CallKind, ForwardMode, ImageParams, RequestId, SamplingParams};
+use ipc::{CallKind, ForwardMode, RequestId, SamplingParams};
+use scheduler::GenerationRequest;
 use scheduler::{
     BatchEvent, CommandSender, Event, SchedulerConfig, SimEngine, SimSpeculation, SimWorker,
 };
-use scheduler::{GenerationConstraint, GenerationRequest, ImageGenerationConfig};
 
 use crate::support;
 
@@ -37,21 +37,14 @@ fn request(id: u64, prompt: Vec<u32>, max_tokens: usize) -> GenerationRequest {
         request_id: RequestId(id),
         prompt_token_ids: prompt,
         multimodal_inputs: Default::default(),
-        negative_prompt_token_ids: Vec::new(),
-        constraint: GenerationConstraint::UndOnly,
         sampling: SamplingParams::default(),
-        image: ImageParams::default(),
-        max_images: 1,
         max_und_tokens: max_tokens,
         include_stop_token: false,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
         priority: 0,
         cache: Default::default(),
-        image_generation: ImageGenerationConfig::default(),
         generated_token_ids: Vec::new(),
-        generated_images: Vec::new(),
-        trajectory: Default::default(),
         adapter: 0,
     }
 }

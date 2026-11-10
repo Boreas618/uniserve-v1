@@ -5,7 +5,7 @@
 //! candidates into decoded strings.
 
 pub use decoded::DecodeStream;
-pub use decoded::{DecodedTextEvent, Finished, ImageEvent, TextDecodeOptions};
+pub use decoded::{DecodedTextEvent, Finished, TextDecodeOptions};
 pub use error::{Error, Result};
 pub use logprobs::{
     DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs, DecodedTokenLogprob,

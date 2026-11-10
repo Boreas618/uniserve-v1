@@ -509,56 +509,12 @@ impl VideoDenoiserInfo {
     }
 }
 
-/// An image shape a rank's image denoiser was prepared for: a raster and
-/// the guidance branches its captured step evaluates.
-///
-/// The engine runs one image request of this shape through its scheduler
-/// before it serves (`warmup`), at guidance scales that realize the branch
-/// count (`ImageParams::guidance_scales`), so the serving path of every
-/// captured branch count has run.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ImageWarmup {
-    /// Output height in pixels.
-    pub height: u32,
-    /// Output width in pixels.
-    pub width: u32,
-    /// Guidance branches one image evaluates per step, one to three.
-    pub branches: u8,
-    /// The model's framing of an empty negative prompt, which the warmup
-    /// request carries as its negative conditioning tokens, as the server
-    /// renders a client's; empty for one branch, which has no alternative
-    /// prefix, and for a model without prompt framing.
-    pub negative_token_ids: Vec<u32>,
-}
-
-impl ImageWarmup {
-    /// Checks that the shape names a raster and one to three branches, and
-    /// carries an alternative prefix only for guided generation.
-    pub fn validate(&self) -> ValidationResult<()> {
-        ensure_valid!(
-            self.height > 0 && self.width > 0,
-            "an image warmup shape is empty"
-        );
-        ensure_valid!(
-            (1..=3).contains(&self.branches)
-                && (self.branches > 1 || self.negative_token_ids.is_empty()),
-            "an image warmup shape has no valid guidance branches"
-        );
-        Ok(())
-    }
-}
-
-/// The extents an image model's forwards serve on a rank: its captured
-/// buckets' largest live rows and tokens, the same under graphs and in eager
-/// execution, which bound what the engine admits. A forward the rank does
-/// not serve has zero tokens and rows.
+/// The extents an image model's input forwards serve on a rank: its
+/// captured buckets' largest live rows and tokens, the same under graphs and
+/// in eager execution, which bound what the engine admits. A forward the
+/// rank does not serve has zero tokens and rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageCapacity {
-    /// Tokens one denoising step evaluates at most: every guidance branch's
-    /// framed latent sequence of every stepping image.
-    pub max_step_tokens: u64,
-    /// Guidance branch rows one denoising step evaluates at most.
-    pub max_step_rows: u32,
     /// Tokens of latent images one text batch writes as conditioning at
     /// most.
     pub max_condition_tokens: u64,
@@ -575,25 +531,12 @@ impl ImageCapacity {
     /// the rank does not serve, or both positive.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
-            (self.max_step_tokens == 0) == (self.max_step_rows == 0)
-                && (self.max_condition_tokens == 0) == (self.max_condition_rows == 0)
+            (self.max_condition_tokens == 0) == (self.max_condition_rows == 0)
                 && (self.max_vision_patch_rows == 0) == (self.max_vision_images == 0),
             "an image capacity states tokens without rows or rows without tokens"
         );
         Ok(())
     }
-}
-
-/// An image denoising step a rank captured: one image of `height` x
-/// `width` pixels evaluating `branches` guidance branches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct CapturedImage {
-    /// Output height in pixels.
-    pub height: u32,
-    /// Output width in pixels.
-    pub width: u32,
-    /// Guidance branches the step evaluates, one to three.
-    pub branches: u8,
 }
 
 /// Post-load worker geometry, limits and supported work.
@@ -609,25 +552,13 @@ pub struct MainProcessInfo {
     pub media_components: std::collections::BTreeMap<MediaCall, String>,
     /// What the deployment's video denoiser serves, when the model has one.
     pub video_denoiser: Option<VideoDenoiserInfo>,
-    /// Image shapes this rank's image denoiser was prepared for, one per
-    /// captured guidance-branch count, each of which the engine warms with a
-    /// real request before serving.
-    pub image_warmups: Vec<ImageWarmup>,
-    /// The image denoising steps this rank captured, which alone it
-    /// denoises under CUDA graphs: the engine admits an image request only
-    /// when its size is captured at every guidance branch count up to its
-    /// own. `None` for a rank that denoises eagerly (graph policy `off`, a
-    /// CPU rank) or holds no image denoiser.
-    #[serde(default)]
-    pub captured_images: Option<Vec<CapturedImage>>,
     /// The `[height, width]` image sizes this rank's latent encoder
     /// captured, which alone it encodes under CUDA graphs: the engine admits
     /// an input image's latent block only at one of them. `None` for a rank
     /// that encodes eagerly or holds no latent encoder.
     #[serde(default)]
     pub captured_latents: Option<Vec<[u32; 2]>>,
-    /// The extents this rank's image forwards serve; the engine admits an
-    /// image request only within them. `None` on a rank without an image
+    /// The extents this rank's image input forwards serve. `None` on a rank without an image
     /// model's forwards.
     #[serde(default)]
     pub image_capacity: Option<ImageCapacity>,
@@ -635,12 +566,6 @@ pub struct MainProcessInfo {
     /// covers, every row count of which the engine warms; zero when the rank
     /// generates no blocks.
     pub diffusion_lm_step_rows: u32,
-    /// The tokens the image-unconditional guidance branch of this rank's
-    /// image denoiser attends to, the model's framing of that branch's
-    /// source, the same for every request; the engine reserves and prefills
-    /// a guidance prefix of them. `None` when that branch attends to the
-    /// request's own context, and on a rank without an image denoiser.
-    pub image_unconditional_token_ids: Option<Vec<u32>>,
     /// Identity of the loaded rank and its host address space.
     pub endpoint: MainProcessEndpoint,
     /// Whether this rank's device exports a fabric allocation handle.
@@ -662,11 +587,6 @@ pub struct MainProcessInfo {
     pub request_slots: u32,
     /// Paged cache geometry when autoregressive work is supported.
     pub prefix_cache: Option<PrefixCacheInfo>,
-    /// Model-defined units stored in one latent page.
-    pub latent_page_units: u32,
-    /// Physical latent pages including the reserved sentinel page, which
-    /// [`MainProcessInfo::latent_capacity_units`] excludes.
-    pub latent_pages: u32,
     /// The host latent pool of a video denoising rank whose host runs a
     /// Storage Server; `None` otherwise, and in the group's aggregate.
     /// Boxed, as it is larger than most of the report.
@@ -701,12 +621,6 @@ pub struct MainProcessInfo {
 }
 
 impl MainProcessInfo {
-    /// Returns total latent capacity in model-defined units.
-    pub fn latent_capacity_units(&self) -> u64 {
-        u64::from(self.latent_pages.saturating_sub(1))
-            .saturating_mul(u64::from(self.latent_page_units))
-    }
-
     /// Returns whether the worker advertises paged cache capacity.
     pub fn uses_cache(&self) -> bool {
         self.prefix_cache.is_some()
@@ -739,7 +653,6 @@ impl MainProcessInfo {
             !self.supported_calls.is_empty()
                 || (self.components.is_empty()
                     && self.prefix_cache.is_none()
-                    && self.latent_pages == 0
                     && self.media_components.is_empty()),
             "a worker without call kinds must own no request call"
         );
@@ -764,18 +677,9 @@ impl MainProcessInfo {
             }),
             "a media call names no component this worker serves"
         );
-        for shape in &self.image_warmups {
-            shape.validate()?;
-        }
         if let Some(capacity) = &self.image_capacity {
             capacity.validate()?;
         }
-        ensure_valid!(
-            self.captured_images.iter().flatten().all(|shape| {
-                shape.height > 0 && shape.width > 0 && (1..=3).contains(&shape.branches)
-            }),
-            "a captured image step is empty or has no valid guidance branches"
-        );
         ensure_valid!(
             self.captured_latents
                 .iter()
@@ -808,15 +712,6 @@ impl MainProcessInfo {
         if let Some(prefix_cache) = &self.prefix_cache {
             prefix_cache.validate()?;
         }
-        // Latent capacity is either absent or at least one usable page beyond
-        // the sentinel.
-        let has_latent_capacity = self.latent_page_units > 0 || self.latent_pages > 0;
-        if has_latent_capacity {
-            ensure_valid!(
-                self.latent_page_units > 0 && self.latent_pages > 1,
-                "worker info declare incomplete latent pool capacity"
-            );
-        }
         Ok(())
     }
 }
@@ -827,12 +722,9 @@ impl Default for MainProcessInfo {
         Self {
             media_components: Default::default(),
             video_denoiser: None,
-            image_warmups: Vec::new(),
-            captured_images: None,
             captured_latents: None,
             image_capacity: None,
             diffusion_lm_step_rows: 0,
-            image_unconditional_token_ids: None,
             fabric_handles: false,
             endpoint: MainProcessEndpoint {
                 host: "simulation".into(),
@@ -872,8 +764,6 @@ impl Default for MainProcessInfo {
                 host_token_bytes: 0,
                 storage_endpoint: None,
             }),
-            latent_page_units: 0,
-            latent_pages: 0,
             latent_pool: None,
             encoder_pool: None,
             image_encoders: Box::default(),

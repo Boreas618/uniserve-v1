@@ -221,7 +221,7 @@ impl Scheduler {
                     CallKind::Media(MediaCall::LatentPreparation) => {
                         // `valid` requires the step to be the restored one,
                         // which a preemption stored short of the schedule.
-                        let opened = state.denoising.open(record.step_index, None);
+                        let opened = state.denoising.open(record.step_index);
                         debug_assert!(opened, "a restored trajectory has a step left");
                         // How each denoising rank holds the request's
                         // samples, which a preemption keys and records the
@@ -236,7 +236,7 @@ impl Scheduler {
                     }
                     // `valid` requires a denoising result to advance the trajectory.
                     CallKind::Media(MediaCall::Denoising) => {
-                        let accepted = state.denoising.accept(record.step_index, None);
+                        let accepted = state.denoising.accept(record.step_index);
                         debug_assert!(accepted, "a valid step advances the trajectory");
                     }
                     CallKind::Media(MediaCall::VideoEncoding) => {
@@ -747,14 +747,6 @@ impl Scheduler {
                     }
                     InflightInput::Generation { image_cache } => image_cache,
                 };
-                // An image's latent preparation read the stored pages its
-                // restore pinned, or failed: either way the pins end, and
-                // the request's later images start from noise.
-                if call.kind == CallKind::Media(MediaCall::LatentPreparation)
-                    && call.latent_restore.is_some()
-                {
-                    self.end_image_restore(id);
-                }
                 // An image encoding that read or wrote its output in the host
                 // encoder pool completed: it succeeded only when it ran.
                 if let Some(store) = self.encoder_outputs.as_mut() {
@@ -843,12 +835,8 @@ impl Scheduler {
                             })
                         });
                     if !completion_has_device_consumer {
-                        let completed_predicates = call
-                            .completion_output
-                            .iter()
-                            .chain(call.transition_output.iter())
-                            .cloned()
-                            .collect::<Vec<_>>();
+                        let completed_predicates =
+                            call.completion_output.iter().cloned().collect::<Vec<_>>();
                         self.free_buffers(
                             completed_predicates
                                 .into_iter()
@@ -857,32 +845,13 @@ impl Scheduler {
                     }
                 }
 
-                // Decoding closes the worker's latent trajectory. If that
-                // call completes during migration, publish its image before
-                // retiring the request: the daemon can carry the completed
-                // image, but those released latent pages cannot be stored.
-                let preempted = self.running.get(&id).is_some_and(|state| {
-                    matches!(state.terminal_intent, Some(Terminal::Migrated { .. }))
-                }) && !self.inflight.pending_finishes.contains_key(&id);
-                let completed_image = preempted
-                    && call.kind == CallKind::Media(MediaCall::ImageDecoding)
-                    && record.status == CallStatus::Ok;
-                // Other terminal requests take no further semantic effect.
-                // A preempted image's denoising progress still follows the
-                // worker's committed trajectory, which its store continues.
+                // Terminal requests take no further semantic effect.
                 let semantic_blocked = self
                     .running
                     .get(&id)
                     .is_some_and(|state| state.terminal_intent.is_some())
-                    && !completed_image
                     || self.inflight.pending_finishes.contains_key(&id);
                 if semantic_blocked {
-                    if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
-                        self.free_request_latent(id);
-                    }
-                    if preempted {
-                        self.accept_preempted_trajectory(id, &call, &record);
-                    }
                     self.finish_pending_if_idle(id);
                     continue;
                 }
@@ -959,44 +928,6 @@ impl Scheduler {
                     };
                 }
 
-                // Reclaim resources whose lifetime ends at this transition before
-                // making its public output eligible for resolution.
-                let free_guidance_prefix = call_variant == CallKind::Media(MediaCall::Denoising)
-                    && record.status == CallStatus::Ok
-                    && self
-                        .running
-                        .get(&id)
-                        .is_some_and(|state| record.step_index >= state.denoising.steps());
-                if call_variant == CallKind::Media(MediaCall::Denoising)
-                    && record.status == CallStatus::Ok
-                    && let Some(prefix) = self
-                        .running
-                        .get_mut(&id)
-                        .and_then(|state| state.guidance_prefix.as_mut())
-                {
-                    prefix.diffusion_finalized = true;
-                }
-                if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
-                    self.free_request_latent(id);
-                }
-                if free_guidance_prefix {
-                    self.free_guidance_prefix(id);
-                }
-                if matches!(
-                    call_variant,
-                    CallKind::Media(MediaCall::Denoising)
-                        | CallKind::Media(MediaCall::ImageDecoding)
-                ) {
-                    let consumed_latents = call.latent_input.iter().cloned().collect::<Vec<_>>();
-                    if !consumed_latents.is_empty() {
-                        self.free_buffers(
-                            consumed_latents
-                                .into_iter()
-                                .map(|product| product.buffer_id()),
-                        );
-                    }
-                }
-
                 let priority = completion_priority(call_variant);
                 let public_tokens_before = self
                     .running
@@ -1033,7 +964,6 @@ impl Scheduler {
                         id,
                         call,
                         record,
-                        media,
                         public_tokens_before,
                     ));
                 }
@@ -1042,8 +972,7 @@ impl Scheduler {
             // Resolve semantic effects in lifecycle priority and stable arrival
             // order, independent of the worker's physical completion order.
             to_resolve.sort_by_key(|(priority, seq_index, ..)| (*priority, *seq_index));
-            for (_priority, _seq_index, id, call, record, media, public_tokens_before) in to_resolve
-            {
+            for (_priority, _seq_index, id, call, record, public_tokens_before) in to_resolve {
                 let token_call = matches!(
                     call.kind,
                     CallKind::Forward(ForwardMode::Prefill)
@@ -1067,7 +996,7 @@ impl Scheduler {
                 if self.running.contains_key(&id)
                     && !self.inflight.pending_finishes.contains_key(&id)
                 {
-                    self.resolve(id, call, record, media.as_deref());
+                    self.resolve(id, call, record);
                 }
                 if awaiting_decoder && let Some(state) = self.running.get_mut(&id) {
                     // Cancellation clears the boundaries while resolving, which

@@ -25,7 +25,6 @@ use std::thread::JoinHandle;
 
 #[cfg(feature = "testing")]
 use crate::DEFAULT_MAX_RUNNING_REQUESTS;
-use crate::guidance_prefix_rows;
 use crate::handle::{CommandSender, EventRx, SubmitError};
 #[cfg(feature = "testing")]
 use crate::worker::Worker;
@@ -83,7 +82,6 @@ pub fn sim_args(model: impl Into<String>) -> EngineArgs {
             // `SimEngine` fabricates this end of text after `text_len` tokens; the
             // scheduler must recognize it to finish a simulated request.
             eos: vec![crate::sim::FAKE_EOS_TOKEN],
-            end_of_image: 0,
             canvas_sampling: None,
             prefill_outputs: true,
         },
@@ -132,7 +130,6 @@ fn control_tokens(model: &proto::config::ModelConfig) -> SpecialTokenIds {
     SpecialTokenIds {
         bos: model.bos,
         eos: model.eos.clone(),
-        end_of_image: model.end_of_image,
     }
 }
 
@@ -249,7 +246,6 @@ impl SchedulerHandle {
             submissions,
             control_tokens(&engine.model),
             limits,
-            engine.model.dtype,
             engine.model.generation_limits.clone(),
         )?;
         let mut scheduler = Self::configured(scheduler, args)?;
@@ -280,7 +276,6 @@ impl SchedulerHandle {
             crate::submissions(worker),
             control_tokens(&engine.model),
             limits,
-            engine.model.dtype,
             engine.model.generation_limits.clone(),
         )?;
         let scheduler = Self::configured(scheduler, args)?;
@@ -291,13 +286,12 @@ impl SchedulerHandle {
     /// `max_running_requests` running requests need.
     ///
     /// A token runtime serves those requests only while its workers hold that
-    /// many rows beyond the guidance prefix's; the scheduler would otherwise
-    /// lower the limit. Workers without a prefix cache fit their request pools
+    /// many rows; the scheduler would otherwise lower the limit. Workers without a prefix cache fit their request pools
     /// to device storage, and the scheduler bounds their requests by the rows
     /// they report.
     fn check_rows(info: &MainProcessInfo, max_running_requests: usize) -> anyhow::Result<()> {
         let request_rows = info.request_slots as usize;
-        let needed_rows = max_running_requests + guidance_prefix_rows(info);
+        let needed_rows = max_running_requests;
         anyhow::ensure!(
             !info.uses_cache() || request_rows >= needed_rows,
             "the workers hold {request_rows} request rows, but {max_running_requests} running \
@@ -384,8 +378,7 @@ impl SchedulerHandle {
                 .context("sizing the epoch's host KV cache")?;
         }
         // Denoising ranks that map host latent pools report them: a
-        // preempted request's trajectory (a video's, or an image's) is
-        // stored there.
+        // preempted video request's trajectory is stored there.
         // Both pools are the deployment's, mapped by its ranks under its claim, so the stores reach
         // them under the deployment's name whether or not this scheduler keeps a host KV tier.
         scheduler.enable_trajectory_store(

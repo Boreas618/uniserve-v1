@@ -1,8 +1,7 @@
 //! Generation lifecycle state and worker-call planning.
 //!
 //! A request advances through context ingestion, then either understanding
-//! decode, image generation and optional feedback, or block-diffusion
-//! canvases of text, and finally terminal export ([`GenerationPhase`]).
+//! decode or block-diffusion canvases of text ([`GenerationPhase`]).
 //! [`RequestState`] holds the accepted progress of one admitted token request.
 //!
 //! Each `plan_*` builder returns one call whose identities are placeholders
@@ -14,12 +13,10 @@
 //! On completion, `validate_generation_result` checks a worker result against
 //! the submitted call and the request's limits, and
 //! `RequestState::process_generation_result` applies its accepted progress.
-//! Token semantics (stop conditions, image-branch triggers, public events)
-//! are resolved afterwards in `output`.
+//! Token semantics (stop conditions, public events) are resolved afterwards
+//! in `output`.
 
-pub(crate) mod continuation;
-
-use super::{EncoderCachePin, GuidancePrefixState, Phase, RequestAllocations, Terminal};
+use super::{EncoderCachePin, Phase, RequestAllocations, Terminal};
 use crate::completion::CallCompletion;
 use crate::kv_cache::{BlockTable, CacheAllocation};
 
@@ -72,23 +69,6 @@ fn dynamic_element_bound(bytes: u64, dtype: DType) -> Result<ShapeBound, Plannin
     Ok(ShapeBound {
         dims: vec![DimBound::Device { max }],
     })
-}
-
-/// Computes the base64 length bound for a generated PNG artifact.
-///
-/// The raw size counts three bytes per pixel plus one byte per row. The bound
-/// doubles it, adds 1 MiB, and applies base64's expansion of three bytes to
-/// four characters. It reaches the worker as part of `max_completion_bytes`,
-/// and the worker's encoder refuses a larger artifact.
-fn png_base64_bound(width: u32, height: u32) -> Result<u64, PlanningError> {
-    let raw = u64::from(height)
-        .checked_mul(u64::from(width).saturating_mul(3).saturating_add(1))
-        .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
-    let png = raw
-        .checked_mul(2)
-        .and_then(|value| value.checked_add(1 << 20))
-        .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
-    Ok(png.div_ceil(3).saturating_mul(4))
 }
 
 /// Serialized size of one ranked logprob entry (`TokenLogprob` in the IPC
@@ -162,24 +142,6 @@ pub(crate) enum GenerationPhase {
     HandOff,
     /// Decode understanding (text) tokens.
     DecodeUnd,
-    /// Write the pending token (`RequestState::next_token`) into the prefix cache without
-    /// sampling, before an image branch publishes the prefix cache.
-    CloseCache,
-    /// Publish the visible cache range as diffusion conditioning.
-    PublishCache,
-    /// Prepare the initial latent of the image.
-    LatentPreparation,
-    /// Run the image's denoising steps.
-    Denoising,
-    /// Decode the final latent into the image. Never stored in
-    /// `RequestState::phase`: `Scheduler::next_generation_phase` projects it
-    /// once every denoising step is scheduled, while the accepted phase stays
-    /// `Denoising`.
-    ImageDecoding,
-    /// Encode the generated image with the next feedback encoder.
-    FeedbackEncode,
-    /// Write the feedback encoder's feature into the prefix cache.
-    FeedbackState,
     /// Run one denoising step of a canvas-generating request's current block
     /// over its context. The step that stops the block reports the block's
     /// tokens.
@@ -189,27 +151,12 @@ pub(crate) enum GenerationPhase {
     CommitCanvas,
 }
 
-/// Image extension writes one image block with a call of its own: a latent
-/// encoder's feature, or a generated image's feedback vision feature, which
-/// declares a completion predicate. The vision blocks of input images are
-/// instead attention blocks of a context prefill (`is_prompt_extend`).
+/// Image extension writes one latent input-image block with a call of its
+/// own, which reads the latent encoder's feature. The vision blocks of input
+/// images are instead attention blocks of a context prefill
+/// (`is_prompt_extend`).
 pub(super) fn consumes_image_features(call: &Call) -> bool {
-    call.kind == CallKind::Forward(ForwardMode::Prefill)
-        && (call.latent_feature_input.is_some()
-            || (!call.vision_inputs.is_empty() && call.completion_output.is_some()))
-}
-
-/// Feedback encoders and cache writes produce a predicate for their device successor.
-/// Input-image encoding has no such successor until its host result is accepted.
-///
-/// `plan_encode` and `plan_image_extend` declare `completion_output` only for
-/// feedback, which is what separates the feedback variants here.
-pub(super) fn is_feedback_call(call: &Call) -> bool {
-    (matches!(
-        call.kind,
-        CallKind::Media(MediaCall::VisionEncoding) | CallKind::Media(MediaCall::LatentEncoding)
-    ) || consumes_image_features(call))
-        && call.completion_output.is_some()
+    call.kind == CallKind::Forward(ForwardMode::Prefill) && call.latent_feature_input.is_some()
 }
 
 /// Returns the forward rows a prefill `call` stages in its numerical call:
@@ -233,16 +180,12 @@ pub(super) fn prefill_rows(call: &Call) -> usize {
 
 /// Prompt extension, a context prefill, writes prompt tokens into the prefix cache together
 /// with the vision blocks of the input images between them
-/// (`Call::vision_inputs`): a prefill with no image extension and no
-/// completion predicate. It samples the next token unless its request
-/// generates canvases, whose prompt only conditions its canvases;
-/// the `CloseCache` write is the prefill that declares a completion instead. A
-/// canvas-generating request's block commit is a prompt extension too, of the
-/// tokens of its stopped block.
+/// (`Call::vision_inputs`): a prefill with no latent image extension. It
+/// samples the next token unless its request generates canvases, whose
+/// prompt only conditions its canvases. A canvas-generating request's block
+/// commit is a prompt extension too, of the tokens of its stopped block.
 pub(super) fn is_prompt_extend(call: &Call) -> bool {
-    call.kind == CallKind::Forward(ForwardMode::Prefill)
-        && !consumes_image_features(call)
-        && call.completion_output.is_none()
+    call.kind == CallKind::Forward(ForwardMode::Prefill) && !consumes_image_features(call)
 }
 
 impl RequestState {
@@ -255,13 +198,12 @@ impl RequestState {
     /// queue, only for a `CallStatus::Ok` result that
     /// `validate_generation_result` accepted, on a request of the call's epoch
     /// whose chain is not invalidated and that has no terminal intent or
-    /// deferred finish. Phase changes that depend on token values (entering
-    /// `CloseCache`, ending a text round) belong to `output`.
+    /// deferred finish. Phase changes that depend on token values belong to
+    /// `output`.
     ///
     /// Returns an error, before changing any state, for a call id with batch
-    /// zero, a latent call without a latent product, or a denoising result
-    /// that `Denoising::accept` rejects. The caller then finishes the request
-    /// with an error.
+    /// zero or a context prefill whose blocks disagree with the request's
+    /// input images. The caller then finishes the request with an error.
     pub(crate) fn process_generation_result(
         &mut self,
         call: &Call,
@@ -317,83 +259,22 @@ impl RequestState {
                 self.context_features.drain(..written);
             }
             CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
-                // The worker reports the cache extent the feature write reached.
-                // Logical positions advance by the image's position count once,
-                // after its last encoder.
+                // A latent input-image block: the worker reports the cache
+                // extent the feature write reached. Logical positions advance
+                // by the image's position count once, after its last encoder;
+                // context ingestion continues with the image's next block, or
+                // after the image.
                 self.cache_visible_len = record.cache_visible_len;
-                if is_feedback_call(call) && self.replay.is_some() {
-                    // A generated image the context rebuild writes: the
-                    // request's context continues with the next one, or the
-                    // prompt tokens after it.
-                    self.feedback_encoder_index = self.feedback_encoder_index.saturating_add(1);
-                    self.feedback_features = None;
-                    let encoders = self.req.image_generation.feedback_encoders.len();
-                    let written = self.feedback_encoder_index == encoders;
-                    if written {
-                        self.logical_position = self
-                            .logical_position
-                            .saturating_add(self.req.image_generation.num_feedback_positions);
-                        self.feedback_encoder_index = 0;
-                    }
-                    let next = self.feedback_encoder_index;
-                    if let Some(replay) = self.replay.as_mut() {
-                        if written {
-                            replay.images.pop_front();
-                        } else if let Some(image) = replay.images.front_mut() {
-                            image.stage = continuation::ReplayStage::Encode(next);
-                        }
-                    }
-                    self.replayable = false;
-                } else if is_feedback_call(call) {
-                    self.feedback_encoder_index = self.feedback_encoder_index.saturating_add(1);
-                    self.feedback_features = None;
-                    if self.feedback_encoder_index
-                        == self.req.image_generation.feedback_encoders.len()
-                    {
-                        self.logical_position = self
-                            .logical_position
-                            .saturating_add(self.req.image_generation.num_feedback_positions);
-                        self.feedback_encoder_index = 0;
-                        self.feedback_source = None;
-                        self.feedback_image_b64 = None;
-                        self.phase = GenerationPhase::DecodeUnd;
-                    } else {
-                        self.phase = GenerationPhase::FeedbackEncode;
-                    }
-                    self.replayable = false;
-                } else {
-                    // A latent input-image block; context ingestion continues
-                    // with the image's next block, or after the image.
-                    let image = &self.req.multimodal_inputs.images[self.num_ingested_images];
-                    self.image_encoder_index = self.image_encoder_index.saturating_add(1);
-                    self.input_image_features = None;
-                    if self.image_encoder_index == image.encoders.len() {
-                        self.logical_position =
-                            self.logical_position.saturating_add(image.num_positions);
-                        self.num_ingested_images = self.num_ingested_images.saturating_add(1);
-                        self.image_encoder_index = 0;
-                    }
-                    self.phase = GenerationPhase::Prefill;
+                let image = &self.req.multimodal_inputs.images[self.num_ingested_images];
+                self.image_encoder_index = self.image_encoder_index.saturating_add(1);
+                self.input_image_features = None;
+                if self.image_encoder_index == image.encoders.len() {
+                    self.logical_position =
+                        self.logical_position.saturating_add(image.num_positions);
+                    self.num_ingested_images = self.num_ingested_images.saturating_add(1);
+                    self.image_encoder_index = 0;
                 }
-            }
-            // A prefill that neither extends the prompt nor reads a feature is
-            // the `CloseCache` write, after which the prefix cache is
-            // published, or, for an image the context rebuild writes, its
-            // feedback encoders read the image.
-            CallKind::Forward(ForwardMode::Prefill) => {
-                self.cache_visible_len = record.cache_visible_len;
-                match self
-                    .replay
-                    .as_mut()
-                    .and_then(|replay| replay.images.front_mut())
-                {
-                    Some(image) => {
-                        image.stage = continuation::ReplayStage::Encode(0);
-                        self.feedback_encoder_index = 0;
-                    }
-                    None => self.phase = GenerationPhase::PublishCache,
-                }
-                self.replayable = false;
+                self.phase = GenerationPhase::Prefill;
             }
             CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
                 // A result that commits no token still consumes one position;
@@ -418,81 +299,11 @@ impl RequestState {
             {
                 self.handoff_export = call.cache_output;
             }
-            CallKind::Transfer(TransferMode::CacheExport) => {
-                self.image_conditioning = call.cache_output;
-                self.phase = GenerationPhase::LatentPreparation;
-            }
             // The decode group holds the request's cache: it decodes from
             // the committed token on.
             CallKind::Transfer(TransferMode::CacheInstall) => {
                 self.handoff_export = None;
                 self.phase = GenerationPhase::DecodeUnd;
-            }
-            CallKind::Media(MediaCall::LatentPreparation)
-            | CallKind::Media(MediaCall::Denoising) => {
-                if call.latent_output.is_none() {
-                    return Err(GenerationResultError::MissingLatentProduct);
-                }
-                if call.kind == CallKind::Media(MediaCall::LatentPreparation) {
-                    // An image trajectory opens at step zero, or at the
-                    // stored step its preparation restored, which a
-                    // preemption stored within the schedule.
-                    let opened = call
-                        .latent_restore
-                        .as_ref()
-                        .map_or(0, |restore| restore.steps);
-                    if record.step_index != opened
-                        || !self.denoising.open(opened, call.latent_output.clone())
-                    {
-                        return Err(GenerationResultError::Progress {
-                            detail: "latent_restore_step_mismatch",
-                        });
-                    }
-                    // How each denoising rank holds the trajectory, which a
-                    // preemption keys and records the stored trajectory by.
-                    self.host_trajectory.layouts = record
-                        .latent_layouts
-                        .iter()
-                        .map(|layout| (layout.rank, layout.layout.clone()))
-                        .collect();
-                    self.phase = GenerationPhase::Denoising;
-                } else {
-                    let accepted = self
-                        .denoising
-                        .accept(record.step_index, call.latent_output.clone());
-                    if !accepted {
-                        return Err(GenerationResultError::Progress {
-                            detail: "denoise_step_mismatch",
-                        });
-                    }
-                    self.replayable = false;
-                }
-            }
-            CallKind::Media(MediaCall::ImageDecoding) => {
-                // Decoding the artifact releases the trajectory, so the request
-                // leaves the flow and its next call enters at step zero.
-                self.denoising.close();
-                self.feedback_source = call.image_output.clone();
-                self.feedback_encoder_index = 0;
-                self.feedback_features = None;
-                self.phase = GenerationPhase::FeedbackEncode;
-                self.replayable = false;
-            }
-            CallKind::Media(MediaCall::VisionEncoding)
-            | CallKind::Media(MediaCall::LatentEncoding)
-                if is_feedback_call(call) =>
-            {
-                self.feedback_features = call.encoder_output.clone();
-                let index = self.feedback_encoder_index;
-                match self
-                    .replay
-                    .as_mut()
-                    .and_then(|replay| replay.images.front_mut())
-                {
-                    Some(image) => image.stage = continuation::ReplayStage::Write(index),
-                    None => self.phase = GenerationPhase::FeedbackState,
-                }
-                self.replayable = false;
             }
             _ => {}
         }
@@ -535,17 +346,6 @@ fn encoder_output(
     ))
 }
 
-/// Builds one immutable image-latent generation. The output remains addressed
-/// by its exact call identity and logical generation until the scheduler frees
-/// it; a denoising or image-decoding completion frees the latent it consumed.
-fn latent_output(output_index: u16, bytes: u64, dtype: DType) -> Result<TensorRef, PlanningError> {
-    Ok(bounded_tensor(
-        output_index,
-        dtype,
-        dynamic_element_bound(bytes, dtype)?,
-    ))
-}
-
 /// Builds a call of `kind` before assigning storage and execution identities.
 ///
 /// Every optional input and output is unset, the call id and the request
@@ -568,8 +368,7 @@ fn new_call(request: &GenerationRequest, kind: CallKind) -> Call {
 /// block of this call. A chunk before the prompt's end
 /// only writes the cache: it draws nothing from the request's stream, so a
 /// prompt split over several batches draws its first token once. A request
-/// samples nothing from its prompt on a deployment that generates canvases, or
-/// while it rebuilds a migrated context, until it resumes.
+/// samples nothing from its prompt on a deployment that generates canvases.
 ///
 /// The prompt of a canvas-generating request only conditions its canvases, so
 /// its prefill samples nothing. A context that ends with an
@@ -610,10 +409,6 @@ pub(super) fn plan_prompt(
         return finish_plan(request, call, 0);
     }
     call.token_output = Some(output_tensor(0, DType::I64));
-    call.transition_output = sampling_state
-        .as_ref()
-        .is_some_and(|state| !state.transition_token_ids.is_empty())
-        .then(|| output_tensor(3, DType::U8));
     call.sampling_state = sampling_state;
     // Prompt position zero reports no logprob, so a chunk starting there
     // covers one position fewer; `validate_generation_result` recovers the
@@ -688,10 +483,6 @@ pub(super) fn plan_decode(
         vec![input_token]
     };
     call.token_output = Some(output_tensor(0, DType::I64));
-    call.transition_output = sampling_state
-        .as_ref()
-        .is_some_and(|state| !state.transition_token_ids.is_empty())
-        .then(|| output_tensor(3, DType::U8));
     call.sampling_state = sampling_state;
     finish_plan(request, call, 0)
 }
@@ -716,10 +507,6 @@ pub(super) fn plan_verify(
         .collect();
     call.draft.proposals = proposals;
     call.token_output = Some(output_tensor(0, DType::I64));
-    call.transition_output = sampling_state
-        .as_ref()
-        .is_some_and(|state| !state.transition_token_ids.is_empty())
-        .then(|| output_tensor(3, DType::U8));
     call.sampling_state = sampling_state;
     finish_plan(request, call, 0)
 }
@@ -758,100 +545,53 @@ pub(super) fn plan_refill(
     finish_plan(request, call, 0)
 }
 
-/// Plans a feature write, retaining an exact token count only when the encoder supplies one.
+/// Plans the cache write of a latent input-image block, retaining an exact
+/// token count only when the encoder supplies one.
 ///
 /// The call is a prefill that reads `feature` and may write up to the
-/// encoder's `cache_token_capacity` cache tokens. `feedback` declares the completion
-/// predicate that feedback writes report. `sample_continuation` declares a
-/// sampled-token output.
+/// encoder's `cache_token_capacity` cache tokens; it samples nothing.
 pub(super) fn plan_image_extend(
     limits: &crate::GenerationLimits,
     request: &GenerationRequest,
     encoder: crate::ImageEncoderInput,
     feature: TensorRef,
-    feedback: bool,
-    sample_continuation: bool,
-    sampling_state: Option<SamplingState>,
 ) -> Result<Call, PlanningError> {
     let capacity = encoder.cache_token_capacity(limits)?;
     let mut call = new_call(request, CallKind::Forward(ForwardMode::Prefill));
     call.bounds.max_tokens = capacity;
-    if encoder.encoder == crate::ImageEncoder::Latent {
-        call.latent_feature_input = Some(feature);
-    } else {
-        call.vision_inputs = vec![VisionInput { offset: 0, feature }];
-    }
-    call.completion_output = feedback.then(|| output_tensor(0, DType::U8));
-    call.token_output = sample_continuation.then(|| output_tensor(1, DType::I64));
-    call.transition_output = (sample_continuation
-        && sampling_state
-            .as_ref()
-            .is_some_and(|state| !state.transition_token_ids.is_empty()))
-    .then(|| output_tensor(3, DType::U8));
-    call.sampling_state = sampling_state;
+    call.latent_feature_input = Some(feature);
     finish_plan(request, call, 0)
 }
 
-/// The image an encoding call reads.
-#[derive(Debug, Clone)]
-pub(super) enum EncodeSource {
-    /// An encoded image in base64: an input image, or a generated image's
-    /// PNG that feedback reads as an artifact.
-    Payload(String),
-    /// A resident image product: the decoded image feedback reads on the
-    /// device.
-    Resident(TensorRef),
-    /// The values of the decoded image product a migrated request generated
-    /// before, which its feedback reads as it read that product.
-    Carried(std::sync::Arc<crate::ImagePixels>),
-}
-
-/// Encodes an image (`source`) into a feature tensor with encoder `step`;
-/// a latent encoding samples its posterior at `draw` (`Call::latent_draw`).
+/// Encodes an input image (`image_base64`) into a feature tensor with
+/// encoder `step`; a latent encoding samples its posterior at `draw`
+/// (`Call::latent_draw`).
 ///
-/// Fails with `FeedbackDisabled` for a feedback encode on a request without
-/// image feedback or a feedback source, and with `MissingImageInput` for an
-/// empty payload.
+/// Fails with `MissingImageInput` for an empty payload.
 pub(super) fn plan_encode(
     limits: &crate::GenerationLimits,
     request: &GenerationRequest,
     step: MediaCall,
-    source: EncodeSource,
-    feedback: bool,
+    image_base64: String,
     draw: Option<u32>,
 ) -> Result<Call, PlanningError> {
-    if feedback
-        && (!request.feeds_back_images() || request.image_generation.feedback_source.is_none())
-    {
-        return Err(PlanningError::FeedbackDisabled);
+    if image_base64.is_empty() {
+        return Err(PlanningError::MissingImageInput);
     }
     let mut call = new_call(request, CallKind::Media(step));
-    match source {
-        EncodeSource::Payload(image_base64) if image_base64.is_empty() => {
-            return Err(PlanningError::MissingImageInput);
-        }
-        EncodeSource::Payload(image_base64) => call.input_image = Some(image_base64.into()),
-        EncodeSource::Resident(product) => call.image_input = Some(product),
-        EncodeSource::Carried(pixels) => call.carried_image = Some(pixels),
-    }
+    call.input_image = Some(image_base64.into());
     call.encoder_output = Some(encoder_output(step, limits)?);
     call.latent_draw = (step == MediaCall::LatentEncoding)
         .then_some(draw)
         .flatten();
-    if feedback {
-        call.completion_output = Some(output_tensor(1, DType::U8));
-    }
     finish_plan(request, call, 0)
 }
 
-/// The posterior draw of a request's latent encoding (`Call::latent_draw`):
-/// its ordinal among the request's latent encodings, which count its input
-/// images' latent encoders in context order, then the feedback latent
-/// encoders of each image it generates, in image order.
-///
-/// `encoding` names the encoding: an input image's block, or the feedback
-/// encoder of index `encoder` of generated image `image_index` (from one).
-pub(super) fn latent_draw(request: &GenerationRequest, encoding: LatentEncoding) -> u32 {
+/// The posterior draw of a request's latent encoding (`Call::latent_draw`)
+/// of the input-image block at `block`: its ordinal among the request's
+/// latent encodings, which count its input images' latent encoders in
+/// context order.
+pub(super) fn latent_draw(request: &GenerationRequest, block: BlockCursor) -> u32 {
     let latent = |inputs: &[ImageEncoderInput]| {
         inputs
             .iter()
@@ -859,57 +599,18 @@ pub(super) fn latent_draw(request: &GenerationRequest, encoding: LatentEncoding)
             .count()
     };
     let images = &request.multimodal_inputs.images;
-    let draw = match encoding {
-        LatentEncoding::Input(block) => {
-            images[..block.image.min(images.len())]
-                .iter()
-                .map(|image| latent(&image.encoders))
-                .sum::<usize>()
-                + images.get(block.image).map_or(0, |image| {
-                    latent(&image.encoders[..block.encoder.min(image.encoders.len())])
-                })
-        }
-        LatentEncoding::Feedback {
-            image_index,
-            encoder,
-        } => {
-            let feedback = &request.image_generation.feedback_encoders;
-            images
-                .iter()
-                .map(|image| latent(&image.encoders))
-                .sum::<usize>()
-                + (image_index.saturating_sub(1) as usize) * latent(feedback)
-                + latent(&feedback[..encoder.min(feedback.len())])
-        }
-    };
+    let draw = images[..block.image.min(images.len())]
+        .iter()
+        .map(|image| latent(&image.encoders))
+        .sum::<usize>()
+        + images.get(block.image).map_or(0, |image| {
+            latent(&image.encoders[..block.encoder.min(image.encoders.len())])
+        });
     u32::try_from(draw).unwrap_or(u32::MAX)
 }
 
-/// A request's latent encoding, by what it encodes (`latent_draw`).
-#[derive(Debug, Clone, Copy)]
-pub(super) enum LatentEncoding {
-    /// An input image's block.
-    Input(BlockCursor),
-    /// Feedback encoder `encoder` of the request's generated image
-    /// `image_index`, from one.
-    Feedback { image_index: u32, encoder: usize },
-}
-
-/// Writes the closing token into the prefix cache before export, without sampling another token.
-pub(super) fn plan_close_cache(
-    request: &GenerationRequest,
-    token: u32,
-    relay_input: bool,
-) -> Result<Call, PlanningError> {
-    let mut call = new_call(request, CallKind::Forward(ForwardMode::Prefill));
-    if !relay_input {
-        call.input_token_ids.push(token);
-    }
-    call.completion_output = Some(output_tensor(0, DType::U8));
-    finish_plan(request, call, 0)
-}
-
-/// Declares the physically visible cache range as a transferable input to diffusion.
+/// Exports the request's visible KV cache from the prefill group that
+/// prefilled it, which a decode group installs (`GenerationPhase::HandOff`).
 ///
 /// `transfer_bytes` bounds the export of the visible extent over
 /// every cache group (`PrefixCacheInfo::transfer_bytes`); it also makes the
@@ -963,92 +664,16 @@ pub(super) fn plan_cache_install(
     finish_plan(request, call, 0)
 }
 
-/// Creates initial noise from the image's deterministic RNG coordinate and conditioning.
-pub(super) fn plan_diffusion_prepare(
-    limits: &crate::GenerationLimits,
-    latent_dtype: Option<DType>,
-    request: &GenerationRequest,
-    image_id: u32,
-    conditioning: BufferId,
-) -> Result<Call, PlanningError> {
-    if !request.generates_images() {
-        return Err(PlanningError::GenerationBranchDisabled);
-    }
-    let mut call = new_call(request, CallKind::Media(MediaCall::LatentPreparation));
-    call.cache_input = Some(conditioning);
-    call.latent_output = Some(latent_output(
-        0,
-        request.image_latent_bytes(limits)?,
-        latent_dtype.ok_or(PlanningError::MissingLatentDType)?,
-    )?);
-    call.completion_output = Some(output_tensor(1, DType::U8));
-    call.image_index = Some(image_id);
-    finish_plan(request, call, 0)
-}
-
-/// Plans one denoising step against its input latent and conditioning tensors.
-pub(super) fn plan_diffusion_step(
-    limits: &crate::GenerationLimits,
-    latent_dtype: Option<DType>,
-    request: &GenerationRequest,
-    conditioning: BufferId,
-    latent: TensorRef,
-) -> Result<Call, PlanningError> {
-    if !request.generates_images() {
-        return Err(PlanningError::GenerationBranchDisabled);
-    }
-    let mut call = new_call(request, CallKind::Media(MediaCall::Denoising));
-    call.cache_input = Some(conditioning);
-    call.latent_input = Some(latent);
-    call.latent_output = Some(latent_output(
-        0,
-        request.image_latent_bytes(limits)?,
-        latent_dtype.ok_or(PlanningError::MissingLatentDType)?,
-    )?);
-    call.completion_output = Some(output_tensor(1, DType::U8));
-    finish_plan(request, call, 0)
-}
-
-/// Decodes the final latent and declares public image bytes and optional feedback data.
-pub(super) fn plan_diffusion_finalize(
-    request: &GenerationRequest,
-    latent: TensorRef,
-) -> Result<Call, PlanningError> {
-    if !request.generates_images() {
-        return Err(PlanningError::GenerationBranchDisabled);
-    }
-    let mut call = new_call(request, CallKind::Media(MediaCall::ImageDecoding));
-    call.latent_input = Some(latent);
-    call.image_output = feedback_image_output(request)?;
-    call.completion_output = Some(output_tensor(2, DType::U8));
-    finish_plan(request, call, 0)
-}
-
 /// Derives storage bounds directly from the call's actual inputs and outputs.
 ///
-/// `max_completion_bytes` covers the logprob payload of a token-producing call
-/// plus, for image decoding, the base64 PNG and the feedback image product's
-/// values it publishes after it. `max_cache_units` starts at zero;
+/// `max_completion_bytes` covers the logprob payload of a token-producing
+/// call. `max_cache_units` starts at zero;
 /// `Scheduler::plan_call` sets it for forward calls.
 fn finish_plan(
     request: &GenerationRequest,
     mut call: Call,
     prompt_positions: u32,
 ) -> Result<Call, PlanningError> {
-    // A decoding that writes the request's feedback image product also
-    // publishes the product's values and their range after the PNG
-    // (`ipc::append_feedback`).
-    let image_completion_bytes = if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
-        let feedback = if call.image_output.is_some() {
-            crate::ImagePixels::value_bytes(request.image.height, request.image.width)
-                .saturating_add(1)
-        } else {
-            0
-        };
-        png_base64_bound(request.image.width, request.image.height)?.saturating_add(feedback)
-    } else {
-        0
-    };
     let logprob_bytes = if call.token_output.is_some() {
         // A verification commits up to its bound of tokens, each reporting
         // its row; every other call reports one.
@@ -1065,31 +690,10 @@ fn finish_plan(
     call.bounds = Bounds {
         max_tokens: call.bounds.max_tokens,
         max_cache_units: 0,
-        max_completion_bytes: logprob_bytes.saturating_add(image_completion_bytes),
+        max_completion_bytes: logprob_bytes,
         max_transfer_bytes,
     };
     Ok(call)
-}
-
-/// Declares the device image retained for a subsequent feedback encoder.
-/// Encoded PNG bytes are delivered separately through the completion media handle.
-fn feedback_image_output(request: &GenerationRequest) -> Result<Option<TensorRef>, PlanningError> {
-    if request.feeds_back_images()
-        && request.image_generation.feedback_source == Some(crate::FeedbackSource::DeviceProduct)
-    {
-        return Ok(Some(bounded_tensor(
-            1,
-            DType::BF16,
-            dynamic_element_bound(
-                u64::from(request.image.height)
-                    .saturating_mul(u64::from(request.image.width))
-                    .saturating_mul(3)
-                    .saturating_mul(DType::BF16.element_bytes()),
-                DType::BF16,
-            )?,
-        )));
-    }
-    Ok(None)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -1105,16 +709,10 @@ pub(crate) enum PlanningError {
     },
     #[error("a canvas commit carries no tokens")]
     EmptyCanvasCommit,
-    #[error("image generation branch is disabled")]
-    GenerationBranchDisabled,
-    #[error("generated-image feedback is disabled")]
-    FeedbackDisabled,
-    #[error("image encoding requires image bytes or a source product")]
+    #[error("image encoding requires image bytes")]
     MissingImageInput,
     #[error("product bound must be nonzero")]
     MissingProductBound,
-    #[error("worker did not report a latent dtype")]
-    MissingLatentDType,
     #[error("product bound {bytes} bytes exceeds the IPC representation")]
     ProductBoundTooLarge { bytes: u64 },
     #[error("product generation counter exhausted")]
@@ -1432,8 +1030,6 @@ pub(crate) fn validate_generation_result(
 pub(crate) enum GenerationResultError {
     #[error("call has no registered identity")]
     MissingCallId,
-    #[error("generation call produced no latent product")]
-    MissingLatentProduct,
     #[error("worker status invalid: {detail}")]
     Status { detail: &'static str },
     #[error("worker identity invalid: {detail}")]
@@ -1453,14 +1049,10 @@ pub(crate) struct RequestState {
     /// module).
     pub(crate) finish_token_ids: Vec<u32>,
     /// Storage the request holds, installed at admission: its request-pool
-    /// slot and per-group cache block tables, plus the latent pages and buffer
-    /// spans its calls reserve later. Each table owns its physical page
+    /// slot and per-group cache block tables, plus the buffer spans its calls
+    /// reserve later. Each table owns its physical page
     /// references and therefore has exactly the request's lifetime.
     pub(super) allocations: Option<RequestAllocations>,
-    /// Negative-prompt cache prefix for multi-branch guidance, allocated for the
-    /// first denoising call and freed once every denoising step completes or
-    /// the request finishes.
-    pub(super) guidance_prefix: Option<GuidancePrefixState>,
     /// Admission generation used to reject results from prior request lifetimes.
     pub(crate) request_epoch: u64,
     /// Most recent accepted state-producing call.
@@ -1493,9 +1085,6 @@ pub(crate) struct RequestState {
     /// results are accepted, so a planned call that is not submitted leaves
     /// its blocks' products in place.
     pub(super) context_features: Vec<TensorRef>,
-    /// A single committed round-close token was deferred: it is the next
-    /// decode's input, and that decode's completion decides the round.
-    pub(super) round_closing: bool,
     /// Model position of the accepted sequence. Tokens advance it by one and
     /// an image by its position count, so it differs from `cache_visible_len`
     /// when image inputs are present.
@@ -1514,34 +1103,12 @@ pub(crate) struct RequestState {
     /// span installs tokens without drawing, nor for a prompt chunk that
     /// samples nothing.
     pub(super) sampling_position: u32,
-    /// Committed token the next decode or `CloseCache` write continues from.
+    /// Committed token the next decode continues from.
     pub(super) next_token: u32,
     pub(super) num_generated_tokens: usize,
-    /// Current image branch; `Scheduler::begin_image` increments it, so the
-    /// first image is 1.
-    pub(super) image_id: u32,
-    pub(super) num_generated_images: usize,
-    /// Set when an image branch opens and cleared once
-    /// `Scheduler::promote_gen_branch_reservation` confirms its cache capacity.
-    pub(super) image_reservation_pending: bool,
-    /// Solver progress of the current image's latent trajectory.
-    pub(super) denoising: super::Denoising,
-    /// The current image's trajectory in the host latent pools: the stored
-    /// steps of the image a migrated request had begun, which its latent
-    /// preparation restores, and the store of a preempted one.
-    pub(super) host_trajectory: super::HostTrajectory,
-    /// Exact generations retained for conditioning, denoising, and feedback.
-    pub(super) image_conditioning: Option<ipc::BufferId>,
     /// The prefill group's export of the request's KV cache during
     /// `HandOff`, which the decode group installs.
     pub(super) handoff_export: Option<ipc::BufferId>,
-    /// Next feedback encoder of the generated image.
-    pub(super) feedback_encoder_index: usize,
-    /// Device image product of the last image decode, when feedback reads
-    /// the device product.
-    pub(super) feedback_source: Option<TensorRef>,
-    /// Feedback encoder feature awaiting its cache write.
-    pub(super) feedback_features: Option<TensorRef>,
     /// Whether the current epoch is registered with its execution workers.
     pub(super) worker_registered: bool,
     /// Whether the request's slot holds the request's recurrent state at its
@@ -1574,19 +1141,8 @@ pub(crate) struct RequestState {
     /// considered for offload: the aligned boundaries after it are still to
     /// come.
     pub(super) offload_boundary: usize,
-    /// Accepted text and control tokens used by penalties and trigger matching.
+    /// Accepted text and control tokens used by penalties.
     pub(super) generated_token_ids: Vec<u32>,
-    /// Tokens since the last model round boundary, used by suffix-trigger matching.
-    pub(super) round_token_ids: Vec<u32>,
-    /// Host image bytes retained only while artifact-based feedback needs them.
-    pub(super) feedback_image_b64: Option<String>,
-    /// The digest of the last image whose decoding the request accepted,
-    /// with the image's identity: what its feedback encoders read, which keys
-    /// their outputs in the host encoder pools
-    /// (`encodings::generated_image`). A feedback encoding queued behind its
-    /// image's decoding, before the decoding's values reach the engine, finds
-    /// the digest of an earlier image here or none, and is keyed by neither.
-    pub(super) feedback_digest: Option<(u32, [u8; 32])>,
     /// False after a completed call creates state unavailable from the input.
     pub(super) replayable: bool,
     /// Encoder-cache entries this request holds; released when the request
@@ -1596,9 +1152,8 @@ pub(crate) struct RequestState {
     /// and plans next (`Scheduler::encoding_ready`), until its call is
     /// registered with the output it reads or writes.
     pub(super) host_encoding: Option<super::encodings::Encoding>,
-    /// Request-local encoder outputs and feedback sources outside the encoder
-    /// cache, freed by `Scheduler::free_transient_products` or when the
-    /// request finishes.
+    /// Request-local encoder outputs outside the encoder cache, freed by
+    /// `Scheduler::free_consumed_products` or when the request finishes.
     pub(super) transient_encoder_products: Vec<TensorRef>,
     /// Blocks a canvas-generating request has committed to its context.
     pub(super) canvas_block: u32,
@@ -1619,21 +1174,6 @@ pub(crate) struct RequestState {
     /// The prompt tokens the request's usage charges: its own prompt, without
     /// the tokens a migrated request extends it with.
     pub(super) prompt_tokens: usize,
-    /// A migrated image-generating request's context rebuild, until it
-    /// resumes (`continuation`): the images still to write and what it does
-    /// once they are written.
-    pub(super) replay: Option<Replay>,
-}
-
-/// The rebuild of a migrated image-generating request's context
-/// (`continuation`). Its calls are planned one at a time, each once the
-/// previous one's result is accepted.
-pub(crate) struct Replay {
-    /// The images still to write, in order; the first is in progress once
-    /// the prompt tokens before it are written.
-    pub(super) images: std::collections::VecDeque<continuation::ReplayImage>,
-    /// What the request does once its context is rebuilt.
-    pub(super) resume: continuation::Resume,
 }
 
 impl RequestState {
@@ -1642,31 +1182,6 @@ impl RequestState {
     /// with (`Scheduler::request_state`) and its usage counts as generated.
     pub(crate) fn charged_prompt_tokens(&self) -> usize {
         self.prompt_tokens
-    }
-
-    /// The image the request's context rebuild writes next, when the prompt
-    /// tokens before it are written: the rebuild's next call is one of the
-    /// image's (`continuation::ReplayStage`).
-    pub(super) fn replay_image_due(
-        &self,
-        scheduled_prompt_tokens: u32,
-    ) -> Option<&continuation::ReplayImage> {
-        self.replay
-            .as_ref()?
-            .images
-            .front()
-            .filter(|image| image.offset <= scheduled_prompt_tokens)
-    }
-
-    /// The prompt tokens the request's next context prefill may write: up to
-    /// the next image its context rebuild writes, or its whole prompt.
-    pub(super) fn context_prompt_end(&self) -> usize {
-        self.replay
-            .as_ref()
-            .and_then(|replay| replay.images.front())
-            .map_or(self.req.prompt_token_ids.len(), |image| {
-                image.offset as usize
-            })
     }
 
     /// Returns the request allocations, which admission installs.
@@ -1700,37 +1215,12 @@ impl RequestState {
         !self.req.multimodal_inputs.images.is_empty()
     }
 
-    /// Returns whether the request's context rebuild writes generated
-    /// images: its context past them is no run of prompt tokens, so, as
-    /// for context images, no page of its prompt is shared through the
-    /// prefix cache.
-    pub(super) fn rebuilds_images(&self) -> bool {
-        self.replay
-            .as_ref()
-            .is_some_and(|replay| !replay.images.is_empty())
-    }
-
     /// Returns whether the request's cache holds its prompt and then the
-    /// tokens it generates, in order: a request that generates text alone
-    /// from a prompt without context images, whose migration resumes from
-    /// its generated tokens and finds their pages as its prompt's.
+    /// tokens it generates, in order: a request from a prompt without
+    /// context images, whose migration resumes from its generated tokens and
+    /// finds their pages as its prompt's.
     pub(super) fn caches_generated_text(&self) -> bool {
-        self.req.generates_text_alone() && !self.has_context_images() && self.replayable
-    }
-
-    /// Returns whether execution continues after committing generation output.
-    pub(super) fn continues_after_gen_commit(&self) -> bool {
-        self.req.continues_after_image()
-    }
-
-    /// Returns whether the request can open a generation branch.
-    pub(super) fn can_open_gen_branch(&self) -> bool {
-        self.req.generates_images() && self.num_generated_images < self.req.max_images as usize
-    }
-
-    /// Returns whether generation starts after context ingestion.
-    pub(super) fn starts_gen_after_context(&self) -> bool {
-        self.req.starts_with_image() && self.can_open_gen_branch()
+        !self.has_context_images() && self.replayable
     }
 
     /// Returns whether the text request can be replayed.
@@ -1847,28 +1337,20 @@ pub(crate) struct ContextAdvance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto::request::{GenerationConstraint, ImageParams};
 
     fn request(prompt: u32) -> GenerationRequest {
         GenerationRequest {
             request_id: RequestId(7),
             prompt_token_ids: (0..prompt).collect(),
             multimodal_inputs: Default::default(),
-            negative_prompt_token_ids: Vec::new(),
-            constraint: GenerationConstraint::UndOnly,
             sampling: Default::default(),
-            image: ImageParams::default(),
-            max_images: 1,
             max_und_tokens: 16,
             include_stop_token: false,
             stop_strings: Vec::new(),
             stop_token_ids: Vec::new(),
             priority: 3,
             cache: Default::default(),
-            image_generation: Default::default(),
             generated_token_ids: Vec::new(),
-            generated_images: Vec::new(),
-            trajectory: Default::default(),
             adapter: 0,
         }
     }

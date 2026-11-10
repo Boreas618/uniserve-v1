@@ -72,7 +72,7 @@ pub(crate) fn image_digest(id: u64) -> [u8; 32] {
 }
 
 use ipc::{CallKind, ForwardMode, MediaCall};
-use scheduler::{GenerationFeatures, GenerationLimits, ModelDtype};
+use scheduler::{GenerationFeatures, GenerationLimits};
 use scheduler::{
     Parameters, PolicyProgram, Scheduler, SchedulerConfig, SimEngine, SpecialTokenIds, Worker,
 };
@@ -105,17 +105,13 @@ pub(crate) fn scheduler_with_stating(
     let limits = if calls.contains(&CallKind::Forward(ForwardMode::TokenDenoising)) && !decodes {
         GenerationLimits {
             features: GenerationFeatures::TOKEN_DENOISING | GenerationFeatures::VISION_ENCODE,
-            latent_downsample: 1,
             max_vit_grid_tokens: u32::MAX,
             max_vision_feature_bytes: 256 << 20,
-            max_cfg_branches: 1,
             encoder_cache_entries: 256,
             ..Default::default()
         }
     } else if calls.contains(&CallKind::Media(MediaCall::LatentPreparation)) && !decodes {
         GenerationLimits {
-            latent_downsample: 1,
-            max_cfg_branches: 1,
             ..Default::default()
         }
     } else if calls.contains(&CallKind::Media(MediaCall::Denoising))
@@ -126,8 +122,6 @@ pub(crate) fn scheduler_with_stating(
     } else {
         GenerationLimits {
             features: GenerationFeatures::UNDERSTANDING,
-            latent_downsample: 1,
-            max_cfg_branches: 1,
             ..Default::default()
         }
     };
@@ -135,7 +129,6 @@ pub(crate) fn scheduler_with_stating(
         scheduler::Submissions::new(worker),
         special_tokens,
         config,
-        ModelDtype::BFloat16,
         limits,
     )?;
     install_policy_stating(&mut scheduler, scheduler::BatchCapacity::of(&info), stated);

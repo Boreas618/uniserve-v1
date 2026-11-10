@@ -186,15 +186,12 @@ pub(crate) fn pool_info(ranks: &[MainProcessInfo]) -> anyhow::Result<MainProcess
         .min()
         .unwrap_or(info.transfer_tickets);
 
-    // A rank states the shapes the engine warms, and the image denoiser's
-    // image-unconditional prefix, only for what it holds: the pool's are those
-    // its stating ranks agree on.
-    let mut image_warmups = Vec::new();
-    let mut captured_images = None;
+    // A rank states the shapes the engine warms and its captured image
+    // extents only for what it holds: the pool's are those its stating ranks
+    // agree on.
     let mut captured_latents = None;
     let mut image_capacity = None;
     let mut diffusion_lm_step_rows = 0;
-    let mut image_unconditional = None;
     let mut image_encoders = BTreeMap::new();
     for (rank, stated) in ranks.iter().enumerate() {
         for (name, output) in stated.image_encoders.iter() {
@@ -204,29 +201,6 @@ pub(crate) fn pool_info(ranks: &[MainProcessInfo]) -> anyhow::Result<MainProcess
                     .is_none_or(|known| known == *output),
                 "rank {rank} states another {name} encoder output than another rank"
             );
-        }
-        if let Some(tokens) = &stated.image_unconditional_token_ids {
-            ensure!(
-                image_unconditional
-                    .as_ref()
-                    .is_none_or(|known| known == tokens),
-                "rank {rank} states another image-unconditional prefix than another denoiser rank"
-            );
-            image_unconditional = Some(tokens.clone());
-        }
-        if !stated.image_warmups.is_empty() {
-            ensure!(
-                image_warmups.is_empty() || image_warmups == stated.image_warmups,
-                "rank {rank} states other image warmup shapes than another denoiser rank"
-            );
-            image_warmups.clone_from(&stated.image_warmups);
-        }
-        if let Some(shapes) = &stated.captured_images {
-            ensure!(
-                captured_images.as_ref().is_none_or(|known| known == shapes),
-                "rank {rank} states other captured image steps than another denoiser rank"
-            );
-            captured_images = Some(shapes.clone());
         }
         if let Some(sizes) = &stated.captured_latents {
             ensure!(
@@ -251,12 +225,9 @@ pub(crate) fn pool_info(ranks: &[MainProcessInfo]) -> anyhow::Result<MainProcess
             diffusion_lm_step_rows = stated.diffusion_lm_step_rows;
         }
     }
-    info.image_warmups = image_warmups;
-    info.captured_images = captured_images;
     info.captured_latents = captured_latents;
     info.image_capacity = image_capacity;
     info.diffusion_lm_step_rows = diffusion_lm_step_rows;
-    info.image_unconditional_token_ids = image_unconditional;
     info.image_encoders = Box::new(image_encoders);
 
     // Every logical cache layer, numbered from zero without a gap, belongs to

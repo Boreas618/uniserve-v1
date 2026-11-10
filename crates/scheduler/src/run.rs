@@ -17,8 +17,8 @@ use ipc::{ForwardMode, MediaCall};
 /// The workers state which generation features are served: a feature is
 /// available when every call kind it needs is in the aggregate
 /// `supported_calls`, whatever the model description lists. Numeric limits
-/// are clamped to the reported latent, batch-token, encoder-entry,
-/// buffer-pool, and encoder-cache capacities.
+/// are clamped to the reported batch-token, encoder-entry, buffer-pool, and
+/// encoder-cache capacities.
 fn resolve_generation_limits(
     mut limits: crate::GenerationLimits,
     info: &MainProcessInfo,
@@ -36,12 +36,6 @@ fn resolve_generation_limits(
     if supports(CallKind::Media(MediaCall::LatentEncoding)) {
         available.insert(crate::GenerationFeatures::LATENT_ENCODE);
     }
-    if supports(CallKind::Media(MediaCall::LatentPreparation))
-        && supports(CallKind::Media(MediaCall::Denoising))
-        && supports(CallKind::Media(MediaCall::ImageDecoding))
-    {
-        available.insert(crate::GenerationFeatures::IMAGE_GENERATION);
-    }
     // A canvas denoises over a prompt the same worker's prefill cached.
     if supports(CallKind::Forward(ForwardMode::Prefill))
         && supports(CallKind::Forward(ForwardMode::TokenDenoising))
@@ -50,9 +44,6 @@ fn resolve_generation_limits(
     }
     limits.features = available;
 
-    limits.max_latent_units = limits.max_latent_units.min(info.latent_capacity_units());
-    let latent_bound = limits.max_latent_units.min(u64::from(u32::MAX)) as u32;
-    limits.max_vae_grid_tokens = limits.max_vae_grid_tokens.min(latent_bound);
     limits.max_vit_grid_tokens = limits.max_vit_grid_tokens.min(info.max_batch_tokens);
     // One encoder product must fit both an encoder-cache entry and the buffer
     // pool.
@@ -67,25 +58,6 @@ fn resolve_generation_limits(
     limits
 }
 
-/// Request-pool rows the runtime keeps outside `max_running_requests`.
-///
-/// A cache runtime with denoising keeps a row for a running request's
-/// text-unconditional guidance prefix, and another for its
-/// image-unconditional prefix when the worker states one for its model
-/// (`MainProcessInfo::image_unconditional_token_ids`): each prefix
-/// (`Scheduler::ensure_guidance_prefix`) allocates its own row from the same
-/// request pool. Other runtimes keep none.
-pub(crate) fn guidance_prefix_rows(info: &MainProcessInfo) -> usize {
-    let denoises = info.uses_cache()
-        && info
-            .supported_calls
-            .contains(&CallKind::Media(MediaCall::Denoising));
-    if !denoises {
-        return 0;
-    }
-    1 + usize::from(info.image_unconditional_token_ids.is_some())
-}
-
 impl Scheduler {
     /// Constructs an engine loop from explicit scheduler and model capabilities.
     ///
@@ -96,12 +68,10 @@ impl Scheduler {
         submissions: super::submission::Submissions,
         special_tokens: SpecialTokenIds,
         mut config: SchedulerConfig,
-        model_dtype: crate::ModelDtype,
         generation_limits: crate::GenerationLimits,
     ) -> anyhow::Result<Self> {
         let info = submissions.info().runtime_info()?;
         let generation_limits = resolve_generation_limits(generation_limits, &info);
-        let latent_dtype = Some(proto::tensor::DType::from(model_dtype));
         let media_storage = submissions
             .info()
             .workers
@@ -151,9 +121,7 @@ impl Scheduler {
         // supplied worker or for ranks that fit their request pools to
         // device storage.
         let request_pool_capacity = info.request_slots as usize;
-        let main_request_capacity = request_pool_capacity
-            .saturating_sub(guidance_prefix_rows(&info))
-            .max(1);
+        let main_request_capacity = request_pool_capacity.max(1);
 
         // A stated bound the worker cannot hold is lowered here, never refused, when nothing
         // checks a decision against it: these three size a batch. A policy's own limits are the
@@ -231,7 +199,6 @@ impl Scheduler {
                 ),
                 reserved_encoder_entries: 0,
                 request_pool: RequestPool::new(info.request_slots as usize),
-                latent_pool: LatentPool::new(info.latent_pages, info.latent_page_units),
                 buffer_pool: BufferPool::new(info.buffer_pool_bytes),
                 media_storage,
                 encoder_buffers: HashMap::new(),
@@ -248,7 +215,6 @@ impl Scheduler {
             retiring_requests: HashMap::new(),
             rows_held: 0,
             transfer_capacity,
-            latent_dtype,
             engine_id: 1,
             epoch: 0,
             next_product_generation: 1,
@@ -331,9 +297,7 @@ impl Scheduler {
     /// step budget no longer holds; the scheduler keeps its limits.
     pub(super) fn reconfigure(&mut self, limits: SchedulerConfig) -> Result<(), String> {
         let info = &self.info;
-        let running = (info.request_slots as usize)
-            .saturating_sub(guidance_prefix_rows(info))
-            .max(1);
+        let running = (info.request_slots as usize).max(1);
         let beyond = |name: &str, value: usize, capacity: usize| {
             format!(
                 "scheduler_config.{name} = {value} exceeds the {capacity} the workers were \

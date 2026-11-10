@@ -1,14 +1,13 @@
-//! Scheduler-owned request slots, cache references, latent pages, and Tensor spans.
+//! Scheduler-owned request slots, cache references, and Tensor spans.
 //!
 //! Each pool allocates its actual backing. Worker addresses are assembled from
 //! these owned allocations when constructing a batch; no region copies persist.
 //!
 //! The backing storage itself is the worker's, which reports its capacity in
-//! `MainProcessInfo`; these pools assign its rows, units, pages, and
-//! byte ranges. Row zero of the request state, unit zero of the cache pool and
-//! page zero of the latent pool are the worker's inactive sentinels, so no
-//! pool ever hands them out, and the worker IPC validation rejects a request
-//! row, cache unit or latent page of zero.
+//! `MainProcessInfo`; these pools assign its rows, units, and byte ranges.
+//! Row zero of the request state and unit zero of the cache pool are the
+//! worker's inactive sentinels, so no pool ever hands them out, and the
+//! worker IPC validation rejects a request row or cache unit of zero.
 //!
 //! An allocation is an owned, non-`Clone` value that the issuing pool's `free`
 //! consumes; the value does not record which pool issued it, so the caller
@@ -43,17 +42,6 @@ impl RequestSlot {
     }
 }
 
-/// Pages and capacity of a latent trajectory.
-#[derive(Debug)]
-pub(crate) struct LatentPages {
-    /// Physical page ids in logical order; never contains page zero.
-    pub(crate) pages: Vec<u32>,
-    /// Logical capacity in model-defined latent units. The pages cover at
-    /// least this many units, and more when the last page is partly used or
-    /// after a narrowing `LatentPool::grow`, which keeps its pages.
-    pub(crate) units: u64,
-}
-
 /// A byte span whose export may outlive its producing request.
 #[derive(Debug)]
 pub(crate) struct BufferSpan {
@@ -72,9 +60,6 @@ pub enum OutOfStorage {
     #[error("KV unit capacity is exhausted")]
     /// The paged cache unit pool cannot satisfy the requested token capacity.
     PrefixCache,
-    #[error("latent page capacity is exhausted")]
-    /// The latent page pool cannot satisfy the requested trajectory capacity.
-    Latent,
     #[error("persistent buffer capacity is exhausted")]
     /// The persistent-buffer arena has no suitable free span.
     Buffer,
@@ -115,63 +100,6 @@ impl RequestPool {
     /// Returns the number of request rows that can still be assigned.
     pub(crate) fn available(&self) -> usize {
         self.free.len()
-    }
-}
-
-/// Fixed-size page allocator for request-owned latent storage.
-pub(crate) struct LatentPool {
-    /// Model-defined latent units stored in one page.
-    page_units: u32,
-    /// Unassigned page ids as a LIFO stack.
-    free: Vec<u32>,
-}
-
-impl LatentPool {
-    /// Creates an allocator with page zero reserved for inactive input.
-    ///
-    /// `num_pages` counts that sentinel page, as `MainProcessInfo::latent_pages`
-    /// does, so pages `1..num_pages` are allocatable.
-    pub(crate) fn new(num_pages: u32, page_units: u32) -> Self {
-        Self {
-            page_units,
-            free: (1..num_pages).rev().collect(),
-        }
-    }
-
-    /// Computes the number of physical pages needed for logical latent units.
-    ///
-    /// Returns `None` when nonzero units meet a zero page size or the page
-    /// count does not fit in `usize`.
-    fn pages_needed(&self, units: u64) -> Option<usize> {
-        if units == 0 {
-            return Some(0);
-        }
-        if self.page_units == 0 {
-            return None;
-        }
-        usize::try_from(units.div_ceil(u64::from(self.page_units))).ok()
-    }
-
-    /// Extends an allocation atomically; narrowing retains its backing pages.
-    ///
-    /// Returns false, leaving `pages` and the free stack unchanged, when the
-    /// page count cannot be computed or too few pages are free.
-    fn reserve(&mut self, pages: &mut Vec<u32>, units: u64) -> bool {
-        let Some(needed) = self.pages_needed(units) else {
-            return false;
-        };
-        let additional = needed.saturating_sub(pages.len());
-        // Pages come from the tail of the free stack, most recently released first.
-        let Some(retained) = self.free.len().checked_sub(additional) else {
-            return false;
-        };
-        pages.extend(self.free.drain(retained..).rev());
-        true
-    }
-
-    /// Returns exclusively owned pages after the allocation retires.
-    fn release(&mut self, pages: Vec<u32>) {
-        self.free.extend(pages.into_iter().rev());
     }
 }
 
@@ -257,40 +185,6 @@ impl RequestPool {
     pub(crate) fn free(&mut self, allocation: RequestSlot) {
         let RequestSlot { index } = allocation;
         self.free.push(index);
-    }
-}
-
-impl LatentPool {
-    /// Reserve the physical pages of one latent trajectory atomically.
-    pub(crate) fn allocate(&mut self, units: u64) -> Result<LatentPages, OutOfStorage> {
-        let mut pages = Vec::new();
-        if !self.reserve(&mut pages, units) {
-            return Err(OutOfStorage::Latent);
-        }
-        Ok(LatentPages { pages, units })
-    }
-
-    /// Grow without moving existing pages; failure leaves the allocation intact.
-    ///
-    /// A `requested` below the current units lowers `units` but keeps every
-    /// page.
-    pub(crate) fn grow(
-        &mut self,
-        allocation: &mut LatentPages,
-        requested: u64,
-    ) -> Result<(), OutOfStorage> {
-        let LatentPages { pages, units, .. } = allocation;
-        if !self.reserve(pages, requested) {
-            return Err(OutOfStorage::Latent);
-        }
-        *units = requested;
-        Ok(())
-    }
-
-    /// Return trajectory pages after their physical consumers have finished.
-    pub(crate) fn free(&mut self, allocation: LatentPages) {
-        let LatentPages { pages, .. } = allocation;
-        self.release(pages);
     }
 }
 
@@ -416,36 +310,5 @@ mod tests {
         pool.free(first);
         pool.free(second);
         assert!(pool.allocate(owner(3), 1024, 256).is_ok());
-    }
-
-    #[test]
-    fn latent_growth_preserves_pages_and_failed_reservations() {
-        // Four pages of four units, one of them the sentinel: two one-page
-        // trajectories leave one page free, so growing the first to three
-        // pages fails until the second releases its page.
-        let mut pool = LatentPool::new(4, 4);
-        let mut first = pool.allocate(4).unwrap();
-        let second = pool.allocate(4).unwrap();
-        let LatentPages { pages, .. } = &first;
-        let held_pages = pages.clone();
-        let LatentPages {
-            pages: other_pages, ..
-        } = &second;
-        assert!(pages.iter().all(|page| !other_pages.contains(page)));
-
-        assert_eq!(pool.grow(&mut first, 12), Err(OutOfStorage::Latent));
-        let LatentPages { pages, units, .. } = &first;
-        assert_eq!(pages, &held_pages);
-        assert_eq!(*units, 4);
-
-        pool.free(second);
-        pool.grow(&mut first, 12).unwrap();
-        let LatentPages { pages, units, .. } = &first;
-        assert!(pages.starts_with(&held_pages));
-        assert_eq!(*units, 12);
-        assert_eq!(pages.len(), 3);
-
-        pool.free(first);
-        assert!(pool.allocate(12).is_ok());
     }
 }

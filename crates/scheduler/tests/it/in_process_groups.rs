@@ -11,10 +11,9 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ipc::{ImageParams, RequestId, SamplingParams};
+use ipc::{RequestId, SamplingParams};
 use scheduler::{
-    CachePolicy, CommandSender, Event, GenerationConstraint, GenerationRequest,
-    ImageGenerationConfig, MultimodalInputs, SimEngine, SimWorker,
+    CachePolicy, CommandSender, Event, GenerationRequest, MultimodalInputs, SimEngine, SimWorker,
 };
 
 use crate::support;
@@ -30,23 +29,16 @@ fn request(id: u64, length: u32, first: u32) -> GenerationRequest {
     GenerationRequest {
         request_id: RequestId(id),
         prompt_token_ids: (0..length).map(|index| first + index).collect(),
-        negative_prompt_token_ids: Vec::new(),
         multimodal_inputs: MultimodalInputs::default(),
-        constraint: GenerationConstraint::UndOnly,
         sampling: SamplingParams::default(),
-        image: ImageParams::default(),
-        max_images: 1,
         max_und_tokens: 8,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
         priority: 0,
         cache: CachePolicy::default(),
         include_stop_token: false,
-        image_generation: ImageGenerationConfig::default(),
         generated_token_ids: Vec::new(),
         adapter: 0,
-        generated_images: Vec::new(),
-        trajectory: Default::default(),
     }
 }
 

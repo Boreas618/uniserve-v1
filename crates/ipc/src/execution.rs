@@ -1276,7 +1276,7 @@ impl Variant {
                 Some(Self::ConditionEncode)
             }
             crate::MediaCall::Denoising => Some(Self::Denoise),
-            crate::MediaCall::ImageDecoding | crate::MediaCall::VideoDecoding => Some(Self::Decode),
+            crate::MediaCall::VideoDecoding => Some(Self::Decode),
             // The audio half of a response: its own bucket, matching the `AudioDecoding` call this
             // file mapped to nothing while the model served video alone.
             crate::MediaCall::AudioDecoding => Some(Self::AudioDecode),

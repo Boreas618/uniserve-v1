@@ -1,18 +1,18 @@
 //! Registering a selected call: its device predicate, the
-//! prefix-cache, forward-row and latent inputs derived from the lengths its
+//! prefix-cache and forward-row inputs derived from the lengths its
 //! in-flight predecessors project, its outputs, and the cache tables a request
 //! grows and activates for it.
 
 use super::*;
-use ipc::{ForwardMode, MediaCall, TransferMode};
+use ipc::{ForwardMode, TransferMode};
 
 use crate::kv_cache::Checkpoint;
 
 impl Scheduler {
     /// Registers one selected call with its allocated physical inputs and outputs.
     ///
-    /// Sets the call's device predicate, derives its prefix cache, forward-row, and
-    /// latent inputs from the lengths its in-flight predecessors project,
+    /// Sets the call's device predicate, derives its prefix cache and
+    /// forward-row inputs from the lengths its in-flight predecessors project,
     /// mints product identities, moves `reserved_buffers` into the request's
     /// allocations, selects the executing worker, registers the call in
     /// flight, and appends it with its `RequestDispatch` to `batch`.
@@ -135,11 +135,7 @@ impl Scheduler {
             // vision blocks' exact cache lengths.
             CallKind::Forward(ForwardMode::Prefill) => Some(CacheLengths {
                 visible,
-                input: if is_prompt_extend(&call) || consumes_image_features(&call) {
-                    call.bounds.max_tokens
-                } else {
-                    1
-                },
+                input: call.bounds.max_tokens,
             }),
             CallKind::Forward(ForwardMode::Decode) => Some(CacheLengths { visible, input: 1 }),
             // A verification evaluates its current token and its drafts.
@@ -148,31 +144,22 @@ impl Scheduler {
                 input: 1 + generation::verify_drafts(&call).len() as u32,
             }),
             CallKind::Forward(ForwardMode::TokenDenoising)
-            | CallKind::Transfer(TransferMode::CacheExport | TransferMode::CacheInstall)
-            | CallKind::Media(MediaCall::LatentPreparation)
-            | CallKind::Media(MediaCall::Denoising) => Some(CacheLengths { visible, input: 0 }),
+            | CallKind::Transfer(TransferMode::CacheExport | TransferMode::CacheInstall) => {
+                Some(CacheLengths { visible, input: 0 })
+            }
             _ => None,
         };
-        // An image-feature extension declares the cache tokens of the encoder
-        // that produced its feature: the scheduled feedback encoder, or the
-        // current input image's encoder.
+        // A latent image extension declares the cache tokens of the current
+        // input image's encoder that produced its feature.
         let num_image_cache_tokens = if consumes_image_features(&call) {
             let state = self.running.get(&request_id)?;
-            let encoder = if is_feedback_call(&call) {
-                state
-                    .req
-                    .image_generation
-                    .feedback_encoders
-                    .get(self.scheduled_feedback(request_id)?.0)
-            } else {
-                state
-                    .req
-                    .multimodal_inputs
-                    .images
-                    .get(state.num_ingested_images)
-                    .and_then(|image| image.encoders.get(state.image_encoder_index))
-            };
-            encoder.and_then(|encoder| encoder.num_cache_tokens)
+            state
+                .req
+                .multimodal_inputs
+                .images
+                .get(state.num_ingested_images)
+                .and_then(|image| image.encoders.get(state.image_encoder_index))
+                .and_then(|encoder| encoder.num_cache_tokens)
         } else {
             None
         };
@@ -373,73 +360,6 @@ impl Scheduler {
             });
         }
 
-        // A denoising call carries its guidance prefixes' tables and fresh
-        // units, resent until a denoising call completes and finalizes them
-        // and whenever a prefix has gained pages. Its guidance branches are
-        // the denoiser's own evaluation, not token rows of the device layout.
-        if call.kind == CallKind::Media(MediaCall::Denoising) {
-            let Some(state) = self.running.get_mut(&request_id) else {
-                self.latch_fatal();
-                return None;
-            };
-            if let Some(state) = state.guidance_prefix.as_mut() {
-                let finalized = state.diffusion_finalized;
-                for prefix in &mut state.prefixes {
-                    if !finalized || !prefix.new_units.is_empty() {
-                        for table in prefix.block_tables() {
-                            layout.block_tables.push(IpcBlockTable {
-                                request_pool_idx: prefix.request_pool_idx(),
-                                group_id: table.group_id() as u32,
-                                start_page: u32::try_from(table.start_page()).unwrap_or(u32::MAX),
-                                unit_ids: table.unit_ids(),
-                                allocated_tokens: u32::try_from(table.capacity_tokens())
-                                    .unwrap_or(u32::MAX),
-                            });
-                        }
-                    }
-                    for (group_id, units) in std::mem::take(&mut prefix.new_units) {
-                        if !units.is_empty() {
-                            layout.cache_units.push(CacheUnitAllocation {
-                                request_pool_idx: prefix.request_pool_idx(),
-                                group_id,
-                                unit_ids: units,
-                                copies: Vec::new(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut latent = None;
-
-        // Latent allocations describe the request-owned page table this call
-        // addresses; the worker's latent pool keeps the trajectory's steps.
-        if call.addresses_latent_pages() {
-            let Some(state) = self.running.get(&request_id) else {
-                self.latch_fatal();
-                return None;
-            };
-            let Some(allocations) = state.allocations() else {
-                self.invariant_broken("a request with latent work is admitted");
-                return None;
-            };
-            let dispatch = LatentDispatch {
-                page_table: allocations
-                    .latent
-                    .as_ref()
-                    .map(|allocation| allocation.pages.clone())
-                    .unwrap_or_default(),
-                latent_units: self
-                    .worker_image_latent_units_for(state)
-                    .max(1)
-                    .min(u64::from(u32::MAX)) as u32,
-                height: state.req.image.height,
-                width: state.req.image.width,
-            };
-            latent = Some(Denoising::params(call.request_key, call.call_id, &dispatch));
-        }
-
         // Worker selection records the request's residency on that worker. A
         // request that has not run this component yet is placed where the
         // policy says (§4.4); one that has goes back to the replica holding its
@@ -487,7 +407,6 @@ impl Scheduler {
             RequestDispatch {
                 worker,
                 request_pool_idx: None,
-                latent,
                 decode: None,
                 buffers,
                 readers: Default::default(),

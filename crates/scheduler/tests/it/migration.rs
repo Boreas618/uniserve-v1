@@ -5,12 +5,12 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ipc::{ImageParams, RequestId, SamplingParams};
+use ipc::{RequestId, SamplingParams};
 use proto::request::MigrationCause;
+use scheduler::GenerationRequest;
 use scheduler::{
     CommandSender, Event, EventRx, FinishReason, SchedulerConfig, SimEngine, SimWorker,
 };
-use scheduler::{GenerationConstraint, GenerationRequest, ImageGenerationConfig};
 
 use crate::support;
 
@@ -26,22 +26,15 @@ fn request(
         request_id: RequestId(id),
         prompt_token_ids: vec![1, 2, 3],
         multimodal_inputs: Default::default(),
-        negative_prompt_token_ids: Vec::new(),
-        constraint: GenerationConstraint::UndOnly,
         sampling,
-        image: ImageParams::default(),
-        max_images: 1,
         max_und_tokens,
         include_stop_token: false,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
         priority: 0,
         cache: Default::default(),
-        image_generation: ImageGenerationConfig::default(),
         generated_token_ids: generated,
         adapter: 0,
-        generated_images: Vec::new(),
-        trajectory: Default::default(),
     }
 }
 
@@ -566,58 +559,6 @@ fn a_scheduler_on_trial_hands_its_requests_back_when_its_workers_are_lost() {
     );
     let failure = failure.expect("the scheduler reports its first error");
     assert!(failure.contains("the worker was lost"), "{failure}");
-}
-
-/// An image-generating request leaves as migratable for a loss when the
-/// workers of an epoch on trial are lost, whatever it was computing, as a
-/// text request does: the daemon submits it again, with its tokens and
-/// images, to the previous epoch.
-#[test]
-fn a_scheduler_on_trial_hands_its_image_requests_back_when_its_workers_are_lost() {
-    let mut image_request = request(1, Vec::new(), SamplingParams::default(), 100_000);
-    image_request.constraint = GenerationConstraint::Default;
-    image_request.max_images = 3;
-    image_request.image = ImageParams {
-        steps: 6,
-        height: 32,
-        width: 32,
-        ..ImageParams::default()
-    };
-    image_request.image_generation = ImageGenerationConfig {
-        trigger: scheduler::ImageTrigger::Token {
-            token_id: scheduler::sim_text_token(RequestId(1), 2),
-        },
-        requires_text_for_image: false,
-        feedback_source: Some(scheduler::FeedbackSource::DeviceProduct),
-        feedback_encoders: vec![scheduler::ImageEncoderInput {
-            encoder: scheduler::ImageEncoder::Vision,
-            num_cache_tokens: None,
-            max_cache_tokens: Some(16),
-            height: None,
-            width: None,
-        }],
-        num_feedback_positions: 2,
-        feedback_next_token: scheduler::FeedbackNextToken::EndOfImage,
-        sample_feedback_continuation: true,
-    };
-    let Faulted {
-        tokens,
-        terminal,
-        stopped,
-        ..
-    } = fail_while_generating(true, Fault::Lost, image_request);
-    assert!(stopped, "a lost worker stops a scheduler on trial");
-    assert!(tokens.len() >= 4, "{tokens:?}");
-    assert!(
-        matches!(
-            terminal,
-            Some(Event::Migratable {
-                cause: MigrationCause::Loss,
-                ..
-            })
-        ),
-        "{terminal:?}"
-    );
 }
 
 /// A worker fault fails an epoch on trial as a whole, and its first error

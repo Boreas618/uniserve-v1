@@ -3,19 +3,17 @@
 //! Each pass selects a batch kind, applies sequence and token budgets, and
 //! emits at most one planned call per eligible request.
 //!
-//! This is the generation path: token requests in `running`, including the
-//! image-generation and feedback phases of unified multimodal requests.
+//! This is the generation path: token requests in `running`.
 //! `Scheduler::schedule_batches` alternates it with the video media path.
 //! A pass plans each request's next call from its accepted state plus the
-//! calls still in flight (`scheduled_token_lengths`,
-//! `num_scheduled_denoise_steps`), so a successor can be planned before its
-//! predecessor resolves. Each planned call then reserves its storage, is
+//! calls still in flight (`scheduled_token_lengths`), so a successor can be
+//! planned before its predecessor resolves. Each planned call then reserves its storage, is
 //! registered as in flight, and joins the pass's batch for its phase and
 //! component: one batch per `(phase, component)`, each a single numerical call
 //! on one component, because a worker's batch carries one phase.
 //!
 //! Token calls and media calls are planned in the same pass: a token call by
-//! the next-call planner, a media call of a video, image, or audio request by
+//! the next-call planner, a media call of a video request by
 //! `plan_media_call`, which owns that flow's numerical extent, decoder ranges,
 //! and worker admission. The plan names both, so one policy decides the whole
 //! step.
@@ -115,47 +113,31 @@ impl Scheduler {
         target.map(dispatch::Choice::Target)
     }
 
-    /// Charges actual token work, including each CFG branch of a denoising step.
+    /// Charges actual token work of a token request's call.
     ///
-    /// A denoising call costs its latent units times its guidance branches;
-    /// it costs nothing once its request has left `running`. A verify call
-    /// costs its input tokens plus one, and every other call its `max_tokens`
-    /// bound.
+    /// A verify call costs its input tokens plus one, and every other call
+    /// its `max_tokens` bound.
     fn call_token_cost(&self, call: &Call) -> usize {
         match call.kind {
-            CallKind::Media(MediaCall::Denoising) => {
-                let Some(state) = self.running.get(&call.request_key.request_id) else {
-                    return 0;
-                };
-                usize::try_from(self.worker_image_latent_units_for(state).max(1))
-                    .unwrap_or(usize::MAX)
-                    .saturating_mul(usize::from(state.req.image.cfg_branch_count().max(1)))
-            }
             CallKind::Forward(ForwardMode::Verify) => 1 + generation::verify_drafts(call).len(),
             _ => call.bounds.max_tokens as usize,
         }
     }
 
-    /// Reserves persistent buffers, latent pages, and transfer capacity for one call.
+    /// Reserves persistent buffers and transfer capacity for one call.
     ///
     /// Returns the call's output buffer spans, in `Call::buffer_outputs`
-    /// order, or `None` when the call cannot run now: the guidance prefix of a
-    /// denoising call cannot be allocated, transfer capacity is exhausted,
-    /// the request is not running, `Dispatch::worker_target` finds no worker,
-    /// a buffer or latent-page allocation fails, or (after latching
-    /// engine-fatal) the request holds no allocations.
+    /// order, or `None` when the call cannot run now: transfer capacity is
+    /// exhausted, the request is not running, `Dispatch::worker_target` finds
+    /// no worker, or a buffer allocation fails.
     ///
     /// Buffer spans reserved before a failure are returned to the pool, but a
-    /// failure is not free of side effects: a guidance prefix already allocated
-    /// stays with the request, and a failed buffer allocation evicts one
-    /// unpinned encoder-cache product, if any, and queues a `Free` for its
+    /// failure is not free of side effects: a failed buffer allocation evicts
+    /// one unpinned encoder-cache product, if any, and queues a `Free` for its
     /// buffer. Only a successful reservation counts against the transfer
     /// capacity.
     fn reserve_generation_resources(&mut self, call: &Call) -> Option<Vec<BufferSpan>> {
         let id = call.request_key.request_id;
-        if call.kind == CallKind::Media(MediaCall::Denoising) && !self.ensure_guidance_prefix(id) {
-            return None;
-        }
         let uses_transfer = call.bounds.max_transfer_bytes > 0;
         if uses_transfer && self.inflight.num_pending_transfers >= self.transfer_capacity {
             return None;
@@ -189,45 +171,6 @@ impl Scheduler {
                 }
             };
             buffer_allocations.push(allocation);
-        }
-
-        // Latent pages are reserved only when the worker advertises a paged
-        // latent pool (`worker_tracks_image_latent`). They grow in place
-        // across the trajectory's calls; a failed grow leaves the existing
-        // pages allocated.
-        if matches!(
-            call.kind,
-            CallKind::Media(MediaCall::LatentPreparation) | CallKind::Media(MediaCall::Denoising)
-        ) && self.worker_tracks_image_latent()
-        {
-            let latent_units = self
-                .running
-                .get(&id)
-                .map(|state| self.worker_image_latent_units_for(state).max(1))?;
-            let state = self.running.get_mut(&id)?;
-            let Some(allocations) = state.allocations_mut() else {
-                for allocation in buffer_allocations {
-                    self.storage.buffer_pool.free(allocation);
-                }
-                self.invariant_broken("a request planning latent storage is admitted");
-                return None;
-            };
-            let result = if let Some(allocation) = allocations.latent.as_mut() {
-                self.storage.latent_pool.grow(allocation, latent_units)
-            } else {
-                self.storage
-                    .latent_pool
-                    .allocate(latent_units)
-                    .map(|allocation| {
-                        allocations.latent = Some(allocation);
-                    })
-            };
-            if result.is_err() {
-                for allocation in buffer_allocations {
-                    self.storage.buffer_pool.free(allocation);
-                }
-                return None;
-            }
         }
 
         if uses_transfer {
@@ -336,8 +279,7 @@ impl Scheduler {
             // different requests are never in flight together, in any pass.
             // Between two steps of one request, another request may take it.
             if kind == CallKind::Media(MediaCall::Denoising)
-                && (self.inflight.denoiser_held_by_other(id)
-                    || !self.guidance_prefix_is_schedulable(id))
+                && self.inflight.denoiser_held_by_other(id)
             {
                 continue;
             }
@@ -347,8 +289,8 @@ impl Scheduler {
             // the call's id names it, and the component is known before
             // planning because a media call's kind fixes it.
             // A media request's call is planned by the media flow. A token
-            // request's own encoder call — an input image's block, a generated
-            // image's feedback encode — is planned by the generation flow
+            // request's own encoder call — an input image's block — is
+            // planned by the generation flow
             // below, which knows the context segment it serves: routing it
             // here found no media state and planned nothing, so the request
             // held the encode phase and never advanced.
@@ -441,7 +383,7 @@ impl Scheduler {
                     continue;
                 }
                 // A generation request's own encoder call — an input image's
-                // block, a generated image's feedback encode — prepares its
+                // block — prepares its
                 // inline bytes on its rank's host task pool and holds those
                 // tasks until the result returns. The pass charges it at the
                 // first such call, as the media flow charges a media request's
@@ -558,15 +500,13 @@ impl Scheduler {
                             NewRequest::new(
                                 request_key,
                                 request_pool_idx,
-                                Some(GenerationParams {
+                                GenerationParams {
                                     sampling: st.req.sampling.clone(),
-                                    negative_token_ids: st.req.negative_prompt_token_ids.clone(),
                                     finish_token_ids,
                                     initial_position: st.num_computed_prompt_tokens,
                                     generated_token_ids,
                                     adapter: st.req.adapter,
-                                }),
-                                st.req.generates_images().then(|| st.req.image.clone()),
+                                },
                                 input_images,
                             )
                         });
@@ -1163,35 +1103,12 @@ impl Scheduler {
     /// next context prefill needs is encoded first
     /// (`Scheduler::next_context_encode`); a block whose product the encoder
     /// cache holds still reports its encoder here. Otherwise the request's
-    /// phase decides. Returns `None` when the request is not running, waits
-    /// on its image-branch reservation, or has no call to issue.
+    /// phase decides. Returns `None` when the request is not running or has
+    /// no call to issue.
     pub(super) fn peek_next_call_variant(&self, id: RequestId) -> Option<CallKind> {
         let st = self.running.get(&id)?;
-        if st.image_reservation_pending {
-            return None;
-        }
         if let Some(variant) = self.pending_successor_code(id) {
             return Some(variant);
-        }
-        // A context rebuild's image calls (`Scheduler::next_replay_call`).
-        if let Some(image) = self
-            .num_scheduled_prompt_tokens(id)
-            .and_then(|scheduled| st.replay_image_due(scheduled))
-        {
-            return Some(match image.stage {
-                generation::continuation::ReplayStage::Encode(index) => CallKind::Media(
-                    st.req
-                        .image_generation
-                        .feedback_encoders
-                        .get(index)?
-                        .encoder
-                        .into(),
-                ),
-                generation::continuation::ReplayStage::Close
-                | generation::continuation::ReplayStage::Write(_) => {
-                    CallKind::Forward(ForwardMode::Prefill)
-                }
-            });
         }
         if st.phase == Phase::Prefill
             && let Some((_, step)) = self.next_context_encode(id)
@@ -1212,26 +1129,6 @@ impl Scheduler {
                 CallKind::Transfer(TransferMode::CacheInstall)
             }
             Phase::HandOff => CallKind::Transfer(TransferMode::CacheExport),
-            Phase::CloseCache => CallKind::Forward(ForwardMode::Prefill),
-            Phase::PublishCache => CallKind::Transfer(TransferMode::CacheExport),
-            Phase::LatentPreparation => CallKind::Media(MediaCall::LatentPreparation),
-            Phase::Denoising if st.denoising.is_complete() => {
-                CallKind::Media(MediaCall::ImageDecoding)
-            }
-            Phase::Denoising => CallKind::Media(MediaCall::Denoising),
-            Phase::ImageDecoding => CallKind::Media(MediaCall::ImageDecoding),
-            Phase::FeedbackEncode => {
-                let feedback = &st.req.image_generation;
-                feedback.feedback_source.as_ref()?;
-                CallKind::Media(
-                    feedback
-                        .feedback_encoders
-                        .get(st.feedback_encoder_index)?
-                        .encoder
-                        .into(),
-                )
-            }
-            Phase::FeedbackState => CallKind::Forward(ForwardMode::Prefill),
             Phase::Canvas => CallKind::Forward(ForwardMode::TokenDenoising),
             Phase::CommitCanvas => CallKind::Forward(ForwardMode::Prefill),
         })
@@ -1314,49 +1211,5 @@ impl Scheduler {
             .store(self.storage.free_units(), Ordering::Relaxed);
         self.inflight.register_pending_batch(&batch, submit_at);
         batch
-    }
-
-    /// Returns whether generated output satisfies the trigger.
-    pub(super) fn generated_trigger_matches(st: &RequestState) -> bool {
-        st.req
-            .image_generation
-            .trigger
-            .matches_generated(&st.generated_token_ids)
-    }
-
-    /// Returns whether direct input satisfies the trigger.
-    pub(super) fn direct_trigger_matches(st: &RequestState, token_id: u32) -> bool {
-        st.req.image_generation.trigger.direct_token() == Some(token_id)
-    }
-
-    /// Returns the next token fed back into generation.
-    pub(super) fn feedback_next_token(&self, id: RequestId) -> Option<u32> {
-        let next = self
-            .running
-            .get(&id)?
-            .req
-            .image_generation
-            .feedback_next_token;
-        match next {
-            crate::FeedbackNextToken::None => None,
-            crate::FeedbackNextToken::Bos => Some(self.special_tokens.bos),
-            crate::FeedbackNextToken::EndOfImage => Some(self.special_tokens.end_of_image),
-            crate::FeedbackNextToken::Token { token_id } => Some(token_id),
-        }
-    }
-
-    /// Returns whether the prompt itself matches the image-generation trigger
-    /// and the request can open an image branch; `false` for a request that
-    /// is not running.
-    pub(super) fn prefilled_gen_trigger(&self, id: RequestId) -> bool {
-        let Some(st) = self.running.get(&id) else {
-            return false;
-        };
-        st.can_open_gen_branch()
-            && st
-                .req
-                .image_generation
-                .trigger
-                .matches_generated(&st.req.prompt_token_ids)
     }
 }

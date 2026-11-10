@@ -2,8 +2,8 @@
 //!
 //! Once the epoch's first policy serves, the engine admits real requests of the
 //! shapes the workers prepared for, so the serving path of every captured row
-//! count, guidance-branch count and diffusion LM step has run before the first
-//! client request that needs it.
+//! count and diffusion LM step has run before the first client request that
+//! needs it.
 //!
 //! It runs after the first policy, not at startup, because it is the serving
 //! path that is warmed and the serving path is the policy's: a scheduler with no
@@ -13,8 +13,8 @@
 //! logged while serving continues — a device that cannot run these shapes fails
 //! the first client request that needs them, in the open. The scheduler and its allocators form every batch
 //! as they form a client's; a rank states only the shapes
-//! (`MainProcessInfo::image_warmups`, `diffusion_lm_step_rows`) and takes no part
-//! in forming them. The ranks warmed their kernels and captured their graphs
+//! (`MainProcessInfo::diffusion_lm_step_rows`) and takes no part in forming
+//! them. The ranks warmed their kernels and captured their graphs
 //! before they reported; these requests warm the serving path around them.
 //!
 //! The requests are ordinary generation requests with a one-token prompt:
@@ -26,35 +26,22 @@
 //!   their prompts in one batch and then step together, so every step of
 //!   the group runs with exactly that many rows. The one-row request
 //!   generates a second block, so its committed block runs the prefill of a
-//!   commit;
-//! - for each image shape, one image request of two denoising steps at the
-//!   guidance scales that realize the shape's branch count, which also
-//!   decodes its image. The scheduler lets one request at a time hold the
-//!   denoiser, so serving never batches denoising calls and one request
-//!   reaches every shape it can run.
+//!   commit.
 //!
 //! No request reads or populates the prefix or encoder caches. A request the
-//! deployment's generation limits would refuse a client, such as a guidance
-//! branch count above the model's bound or a raster above its latent bound,
-//! is not one serving can reach and is left out.
+//! deployment's generation limits would refuse a client is not one serving
+//! can reach and is left out.
 
 use std::time::Duration;
 
-use crate::{
-    CachePolicy, Event, FeedbackNextToken, FinishReason, GenerationConstraint, GenerationRequest,
-    ImageGenerationConfig, ImageTrigger, MultimodalInputs, Request,
-};
+use crate::{CachePolicy, Event, FinishReason, GenerationRequest, MultimodalInputs, Request};
 use anyhow::Context as _;
-use ipc::{CallKind, ForwardMode, MediaCall};
-use ipc::{ImageParams, SamplingParams};
+use ipc::SamplingParams;
+use ipc::{CallKind, ForwardMode};
 
 use crate::core::SchedulerHandle;
 use crate::handle::EventRx;
 use proto::config::EngineArgs;
-
-/// Denoising steps of a warmup image: the fewest that run a step from a
-/// prepared latent and a step from a denoised one.
-const IMAGE_STEPS: u16 = 2;
 
 /// Runs the warmup requests the workers' reports call for on `core`.
 ///
@@ -156,7 +143,7 @@ pub(crate) fn wait_serving(mut serving: tokio::sync::watch::Receiver<bool>) {
 /// submitted together and awaited together.
 pub(crate) struct Group {
     /// What the group warms, for the log: a token model's prefill and decode,
-    /// a diffusion LM's row count, an image shape.
+    /// a diffusion LM's row count.
     pub(crate) what: String,
     /// The requests, submitted in one command so the scheduler queues all of
     /// them before it forms its next batch.
@@ -199,17 +186,7 @@ pub(crate) fn groups(
         }
         kept
     };
-    let mut und = |tokens: usize| {
-        warmup_request(
-            facts.bos,
-            next_id(),
-            GenerationConstraint::UndOnly,
-            tokens,
-            ImageParams::default(),
-            Vec::new(),
-            0,
-        )
-    };
+    let mut und = |tokens: usize| warmup_request(facts.bos, next_id(), tokens);
 
     let mut groups = Vec::new();
 
@@ -254,47 +231,6 @@ pub(crate) fn groups(
         }
     }
 
-    let images = supports(CallKind::Media(MediaCall::LatentPreparation))
-        && supports(CallKind::Media(MediaCall::Denoising));
-    if images {
-        for shape in &info.image_warmups {
-            let (cfg_text_scale, cfg_img_scale) = ImageParams::guidance_scales(shape.branches)
-                .with_context(|| {
-                    format!(
-                        "an image warmup shape has {} guidance branches",
-                        shape.branches
-                    )
-                })?;
-            let image = ImageParams {
-                steps: IMAGE_STEPS,
-                cfg_text_scale,
-                cfg_img_scale,
-                height: shape.height,
-                width: shape.width,
-                seed: Some(0),
-                ..ImageParams::default()
-            };
-            let what = format!(
-                "{}x{} image of {} branches",
-                shape.width, shape.height, shape.branches
-            );
-            let requests = servable(
-                &what,
-                vec![warmup_request(
-                    facts.bos,
-                    next_id(),
-                    GenerationConstraint::GenOnly,
-                    0,
-                    image,
-                    shape.negative_token_ids.clone(),
-                    1,
-                )],
-            );
-            if !requests.is_empty() {
-                groups.push(Group { what, requests });
-            }
-        }
-    }
     Ok(groups)
 }
 
@@ -319,29 +255,12 @@ pub(crate) fn warm(core: &Warm, args: &EngineArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Builds one warmup generation request.
-///
-/// `tokens` is the number of understanding tokens it generates; an image
-/// request generates none and starts its image directly after the prompt.
-/// `negative_token_ids` are the request's negative conditioning tokens: for
-/// a guided image, the rank's framing of an empty negative prompt, so the
-/// request prefills the guidance prefix a client's request without a
-/// negative prompt does.
-fn warmup_request(
-    bos: u32,
-    request_id: ipc::RequestId,
-    constraint: GenerationConstraint,
-    tokens: usize,
-    image: ImageParams,
-    negative_token_ids: Vec<u32>,
-    images: u16,
-) -> GenerationRequest {
+/// Builds one warmup generation request of `tokens` understanding tokens.
+fn warmup_request(bos: u32, request_id: ipc::RequestId, tokens: usize) -> GenerationRequest {
     GenerationRequest {
         request_id,
         prompt_token_ids: vec![bos],
-        negative_prompt_token_ids: negative_token_ids,
         multimodal_inputs: MultimodalInputs::default(),
-        constraint,
         sampling: SamplingParams {
             temperature: 0.0,
             ignore_eos: true,
@@ -349,11 +268,6 @@ fn warmup_request(
             seed: Some(0),
             ..SamplingParams::default()
         },
-        image,
-        // The images the request asks for: one for an image shape, none for a
-        // request that only generates tokens, since a text deployment has no
-        // image path to run and no shape to read.
-        max_images: images,
         max_und_tokens: tokens,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
@@ -366,19 +280,8 @@ fn warmup_request(
             resume: None,
         },
         include_stop_token: false,
-        image_generation: ImageGenerationConfig {
-            trigger: ImageTrigger::Disabled,
-            requires_text_for_image: false,
-            feedback_source: None,
-            feedback_encoders: Vec::new(),
-            num_feedback_positions: 0,
-            feedback_next_token: FeedbackNextToken::None,
-            sample_feedback_continuation: false,
-        },
         generated_token_ids: Vec::new(),
         adapter: 0,
-        generated_images: Vec::new(),
-        trajectory: Default::default(),
     }
 }
 
@@ -431,7 +334,6 @@ fn await_finish(core: &Warm, group: &str, stream: &mut EventRx) -> anyhow::Resul
 mod tests {
     use crate::{GenerationFeatures, GenerationLimits};
     use ipc::CanvasSampling;
-    use ipc::ImageWarmup;
 
     use super::*;
     use crate::sim::{SimEngine, SimWorker};
@@ -468,22 +370,6 @@ mod tests {
         &mut args.engine_config.model
     }
 
-    fn shape(height: u32, width: u32, branches: u8, negative_token_ids: Vec<u32>) -> ImageWarmup {
-        ImageWarmup {
-            height,
-            width,
-            branches,
-            negative_token_ids,
-        }
-    }
-
-    /// A simulated rank that serves images, prepared for `shapes`.
-    fn image_rank(shapes: Vec<ImageWarmup>) -> SimEngine {
-        let mut sim = SimEngine::new();
-        sim.mut_info_for_test().image_warmups = shapes;
-        sim
-    }
-
     #[test]
     fn a_token_deployment_warms_a_prefill_and_a_decode() {
         let groups = groups_of(SimEngine::new(), |_| {});
@@ -496,7 +382,6 @@ mod tests {
         };
         assert_eq!(request.prompt_token_ids.len(), 1);
         assert_eq!(request.max_und_tokens, 2);
-        assert_eq!(request.max_images, 0, "no image in a token request");
     }
 
     #[test]
@@ -514,86 +399,6 @@ mod tests {
         let result = warm(&intent, &args);
         core.shutdown();
         result.expect("a CPU deployment has nothing to warm");
-    }
-
-    #[test]
-    fn each_image_shape_runs_both_denoising_steps_and_decodes_its_image() {
-        let groups = groups_of(
-            image_rank(vec![
-                shape(64, 64, 1, Vec::new()),
-                shape(64, 128, 2, vec![11, 12]),
-                shape(128, 64, 3, vec![11, 12]),
-            ]),
-            |_| {},
-        );
-
-        // The token runtime's group comes first; the shapes follow, one group
-        // each, because the denoiser runs one request at a time.
-        let images: Vec<&Group> = groups
-            .iter()
-            .filter(|group| group.what != "token")
-            .collect();
-        assert_eq!(images.len(), 3, "one group per shape");
-        for group in &images {
-            let [request] = &group.requests[..] else {
-                panic!("an image warm-up group holds one request");
-            };
-            assert_eq!(request.image.steps, IMAGE_STEPS, "every denoising step");
-            assert_eq!(request.max_images, 1, "and one decoded image");
-        }
-        let shapes: Vec<(u32, u32)> = images
-            .iter()
-            .map(|group| {
-                let request = &group.requests[0];
-                (request.image.height, request.image.width)
-            })
-            .collect();
-        assert_eq!(
-            shapes,
-            [(64, 64), (64, 128), (128, 64)],
-            "the rank's prepared shapes, each once, in the order it prepared them"
-        );
-    }
-
-    #[test]
-    fn a_guided_shape_admits_the_negative_tokens_its_rank_frames() {
-        // The rank conditions the text-unconditional branch on exactly the
-        // admitted negative tokens, and the engine sizes that prefix from them,
-        // so the request carries the model's framing of an empty negative
-        // prompt as a client's request does.
-        let groups = groups_of(image_rank(vec![shape(64, 64, 2, vec![11, 12, 13])]), |_| {});
-        let image = groups
-            .iter()
-            .find(|group| group.what == "64x64 image of 2 branches")
-            .expect("the rank's guided shape is warmed");
-        assert_eq!(
-            image.requests[0].negative_prompt_token_ids,
-            [11, 12, 13],
-            "the shape's negative tokens travel in the request"
-        );
-    }
-
-    #[test]
-    fn a_shape_the_limits_refuse_is_not_warmed() {
-        let groups = groups_of(
-            image_rank(vec![
-                shape(64, 64, 1, Vec::new()),
-                shape(64, 64, 3, vec![11]),
-            ]),
-            // At most two guidance branches: no client can submit the
-            // three-branch shape either.
-            |args| facts(args).generation_limits.max_cfg_branches = 2,
-        );
-        let images: Vec<&str> = groups
-            .iter()
-            .map(|group| group.what.as_str())
-            .filter(|what| *what != "token")
-            .collect();
-        assert_eq!(
-            images,
-            ["64x64 image of 1 branches"],
-            "the shape the deployment's limits refuse is left out"
-        );
     }
 
     #[test]

@@ -47,12 +47,7 @@ fn ar_decode_call() -> Call {
         vision_inputs: Vec::new(),
         latent_feature_input: None,
         encoder_output: None,
-        latent_input: None,
-        latent_output: None,
-        image_input: None,
-        image_output: None,
         completion_output: None,
-        transition_output: None,
 
         input_image: None,
         draft: Default::default(),
@@ -72,70 +67,9 @@ fn ar_decode_call() -> Call {
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        image_index: (kind == CallKind::Media(MediaCall::LatentPreparation)).then_some(4),
         latent_restore: None,
         host_output: None,
         latent_draw: (kind == CallKind::Media(MediaCall::LatentEncoding)).then_some(2),
-        carried_image: None,
-    }
-}
-
-fn call_for(kind: CallKind, call_id: CallId) -> Call {
-    let denoises = kind == CallKind::Forward(ForwardMode::TokenDenoising);
-    Call {
-        consumer_slots: Vec::new(),
-        coordinates: CallCoordinates::default(),
-        token_input: None,
-
-        token_output: None,
-        vision_inputs: Vec::new(),
-        latent_feature_input: None,
-        encoder_output: None,
-        latent_input: None,
-        latent_output: None,
-        image_input: None,
-        image_output: None,
-        completion_output: None,
-        transition_output: None,
-
-        input_image: None,
-        draft: Default::default(),
-        cache_input: (kind == CallKind::Transfer(TransferMode::CacheInstall)).then_some(BufferId {
-            owner: request_key(),
-            producer_call_id: CallId::new(1, 0),
-            output_index: 0,
-            generation: 1,
-        }),
-        cache_output: matches!(
-            kind,
-            CallKind::Transfer(TransferMode::CacheExport | TransferMode::CacheInstall)
-        )
-        .then_some(BufferId {
-            owner: request_key(),
-            producer_call_id: call_id,
-            output_index: 0,
-            generation: 2,
-        }),
-        // A token-denoising call steps its request's resident canvas.
-        input_token_ids: Vec::new(),
-        canvas: denoises.then_some(CanvasStep::default()),
-        sampling_state: None,
-        request_key: request_key(),
-        call_id,
-        component: "model".into(),
-        kind,
-        bounds: Bounds {
-            max_tokens: if denoises { 4 } else { 0 },
-            ..Bounds::default()
-        },
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        predicate: None,
-        image_index: None,
-        latent_restore: None,
-        host_output: None,
-        latent_draw: None,
-        carried_image: None,
     }
 }
 
@@ -148,36 +82,6 @@ fn media_sampling() -> DiffusionSamplingParams {
         height: 768,
         condition_rows: 0,
     }
-}
-
-/// A latent preparation names the image whose noise it draws only when it
-/// initializes an image trajectory's latent product; a video denoiser's
-/// latent preparation, whose rank holds the slot's pages, names none.
-#[test]
-fn only_an_image_latent_preparation_names_its_image_index() {
-    let call_id = CallId::new(12, 0);
-    let mut video = call_for(CallKind::Media(MediaCall::LatentPreparation), call_id);
-    video
-        .validate()
-        .expect("a video latent preparation names no image");
-    video.image_index = Some(1);
-    assert!(
-        video.validate().is_err(),
-        "a video preparation draws no image"
-    );
-
-    let mut image = call_for(CallKind::Media(MediaCall::LatentPreparation), call_id);
-    image.latent_output = Some(output_product(call_id));
-    assert!(
-        image.validate().is_err(),
-        "an image preparation names its image"
-    );
-    image.image_index = Some(0);
-    assert!(image.validate().is_err(), "image indices count from one");
-    image.image_index = Some(1);
-    image
-        .validate()
-        .expect("an image latent preparation with its image index");
 }
 
 /// A `[Static(2), Device { max: 4 }]` bound requires rank two, an exact first
@@ -425,8 +329,6 @@ fn cache_free_main_process_info_round_trips() {
             .map(CallKind::Media)
             .collect(),
         prefix_cache: None,
-        latent_page_units: 64,
-        latent_pages: 3,
         ..MainProcessInfo::default()
     };
     let response = MainProcessResponse::info(info.clone());
@@ -660,8 +562,6 @@ fn full_caps() -> MainProcessInfo {
         max_batch_tokens: 4096,
         request_slots: 96,
         max_unresolved_calls: 3,
-        latent_page_units: 64,
-        latent_pages: 17,
         ..MainProcessInfo::default()
     }
 }

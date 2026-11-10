@@ -128,8 +128,6 @@ fn base_info(report: Report, request: &MemoryRequest, slots: usize) -> Result<Ma
         max_batch_tokens: narrow(request.max_batch_tokens, "max batch tokens")?,
         request_slots: narrow(slots, "request slots")?,
         prefix_cache: None,
-        latent_page_units: 0,
-        latent_pages: 0,
         // A video denoising rank maps its host latent pool once its ledger
         // is bound.
         latent_pool: None,
@@ -143,12 +141,9 @@ fn base_info(report: Report, request: &MemoryRequest, slots: usize) -> Result<Ma
         max_unresolved_calls: 0,
         host_task_capacity: 1,
         transfer_tickets: 1,
-        image_warmups: Vec::new(),
-        captured_images: None,
         captured_latents: None,
         image_capacity: None,
         diffusion_lm_step_rows: 0,
-        image_unconditional_token_ids: None,
     })
 }
 
@@ -615,7 +610,6 @@ mod tests {
                 generation_limits: Default::default(),
                 bos: 0,
                 eos: Vec::new(),
-                end_of_image: 0,
                 canvas_sampling: None,
                 prefill_outputs: true,
             },

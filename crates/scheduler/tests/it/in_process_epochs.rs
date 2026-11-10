@@ -17,10 +17,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ipc::execution::Batches;
-use ipc::{ImageParams, RequestId, SamplingParams};
-use scheduler::{
-    BatchCapacity, Event, GenerationConstraint, GenerationRequest, SchedulerHandle, Stage,
-};
+use ipc::{RequestId, SamplingParams};
+use scheduler::{BatchCapacity, Event, GenerationRequest, SchedulerHandle, Stage};
 
 use crate::support;
 use testkit::FakeBatches;
@@ -55,23 +53,16 @@ fn request(id: u64, length: u32, first: u32, generated: Vec<u32>) -> GenerationR
     GenerationRequest {
         request_id: RequestId(id),
         prompt_token_ids: (0..length).map(|index| first + index).collect(),
-        negative_prompt_token_ids: Vec::new(),
         multimodal_inputs: Default::default(),
-        constraint: GenerationConstraint::UndOnly,
         max_und_tokens: generated.len() + GENERATED + CONTINUED,
         sampling: SamplingParams::default(),
-        image: ImageParams::default(),
-        max_images: 1,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
         priority: 0,
         cache: Default::default(),
         include_stop_token: false,
-        image_generation: Default::default(),
         generated_token_ids: generated,
         adapter: 0,
-        generated_images: Vec::new(),
-        trajectory: Default::default(),
     }
 }
 

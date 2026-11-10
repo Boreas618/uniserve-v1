@@ -20,11 +20,8 @@ use crate::model::assets::{PipelineCheckpoint, ResolvedModelFiles};
 use crate::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
 use processing::Catalogue;
 use processing::{ReasoningFormat, Serving, ToolCallFormat, VideoFamily};
-use proto::request::{
-    CachePolicy, GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest,
-    ImageGenerationConfig,
-};
-use proto::request::{ImageParams, RequestId, SamplingParams as EngineSamplingParams};
+use proto::request::{CachePolicy, GenerationFeatures, GenerationLimits, GenerationRequest};
+use proto::request::{RequestId, SamplingParams as EngineSamplingParams};
 use thiserror::Error;
 
 use crate::input::chat::{ChatRequest, HfChatRenderer};
@@ -334,7 +331,7 @@ impl InputProcessor {
         request_id: &str,
         prompt: &Prompt,
         has_input_image: bool,
-        constraint: GenerationConstraint,
+        image_output: bool,
     ) -> Result<()> {
         let reject = |feature| ServeError::UnsupportedFeature {
             request_id: request_id.to_owned(),
@@ -346,7 +343,7 @@ impl InputProcessor {
         if has_input_image && !self.supports_image_input() {
             return Err(reject("image_input"));
         }
-        if constraint != GenerationConstraint::UndOnly {
+        if image_output {
             return Err(reject("image_output"));
         }
         if let Prompt::Chat(chat) = prompt {
@@ -382,7 +379,7 @@ impl InputProcessor {
         let GenerateRequest {
             request_id,
             prompt,
-            constraint,
+            image_output,
             sampling,
             max_tokens,
             stop_token_ids,
@@ -393,17 +390,13 @@ impl InputProcessor {
         } = request;
         let has_input_image =
             !images.is_empty() || matches!(&prompt, Prompt::Chat(chat) if chat.has_multimodal());
-        self.validate_generation_features(&request_id, &prompt, has_input_image, constraint)?;
+        self.validate_generation_features(&request_id, &prompt, has_input_image, image_output)?;
         let mut generation = GenerationRequest {
             // The daemon's submission stamps the engine's identifier for the request.
             request_id: RequestId::default(),
             prompt_token_ids: Vec::new(),
-            negative_prompt_token_ids: Vec::new(),
             multimodal_inputs: Default::default(),
-            constraint,
             sampling,
-            image: ImageParams::default(),
-            max_images: 1,
             max_und_tokens: 0,
             include_stop_token: decode.include_stop_str_in_output,
             stop_strings: decode.stop_strings.clone().unwrap_or_default(),
@@ -416,11 +409,8 @@ impl InputProcessor {
                 ),
                 ..CachePolicy::default()
             },
-            image_generation: ImageGenerationConfig::default(),
             generated_token_ids: Vec::new(),
             adapter: adapter.as_ref().map_or(0, |adapter| adapter.slot),
-            generated_images: Vec::new(),
-            trajectory: Default::default(),
         };
 
         // Each model fills its actual computation inputs in the same request.

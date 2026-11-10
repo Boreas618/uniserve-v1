@@ -15,14 +15,14 @@ use std::time::{Duration, Instant};
 
 use ipc::execution::EpochOperation;
 use ipc::memory::{AdoptCache, ReleaseCache, RestoreCache, Sleep, UpdateWeights, Wake};
-use ipc::{BatchCommand, ImageParams, RequestId, SamplingParams};
+use ipc::{BatchCommand, RequestId, SamplingParams};
 use proto::request::MigrationCause;
+use scheduler::GenerationRequest;
 use scheduler::{
     BatchResult, CacheChange, CommandSender, Event, EventRx, ExecutionBatch, FinishReason,
     SchedulerConfig, SimEngine, SimWorker, WeightsInFlight, Worker, WorkerError, WorkerGroupId,
     WorkerInfo, WorkerSubmitError,
 };
-use scheduler::{GenerationConstraint, GenerationRequest, ImageGenerationConfig};
 use storage::{GpuLedger, Item, LedgerEntry, Scope, Segment};
 
 use crate::support;
@@ -366,22 +366,15 @@ fn request_of(id: u64, prompt: usize, tokens: usize) -> GenerationRequest {
         request_id: RequestId(id),
         prompt_token_ids: vec![7; prompt],
         multimodal_inputs: Default::default(),
-        negative_prompt_token_ids: Vec::new(),
-        constraint: GenerationConstraint::UndOnly,
         sampling: SamplingParams::default(),
-        image: ImageParams::default(),
-        max_images: 1,
         max_und_tokens: tokens,
         include_stop_token: false,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
         priority: 0,
         cache: Default::default(),
-        image_generation: ImageGenerationConfig::default(),
         generated_token_ids: Vec::new(),
         adapter: 0,
-        generated_images: Vec::new(),
-        trajectory: Default::default(),
     }
 }
 

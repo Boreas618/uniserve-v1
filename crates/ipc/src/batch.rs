@@ -1,6 +1,6 @@
 //! What the scheduler allocates for a call: the cache page tables of its
 //! request ([`BlockTable`], with the units newly acquired for them in
-//! [`CacheUnitAllocation`]), latent trajectories ([`LatentParams`]), decode cursors ([`DecodeRange`]),
+//! [`CacheUnitAllocation`]), decode cursors ([`DecodeRange`]),
 //! persistent buffer spans ([`BufferAllocation`]) and the host cache copies
 //! ([`PageCopy`], [`LatentOffload`]).
 //!
@@ -88,8 +88,7 @@ impl PageCopy {
 /// Storage Server ([`LatentOffload`]): page `page` of the trajectory's
 /// pages in the bank holding its committed step goes to the host page,
 /// which the engine reserved. A video trajectory's pages are its request
-/// slot's; an image trajectory's are the pages its calls name, in logical
-/// order. A pool page holds as many bytes as a bank page.
+/// slot's. A pool page holds as many bytes as a bank page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatentPageCopy {
     /// The rank of the worker group that copies the page.
@@ -102,8 +101,7 @@ pub struct LatentPageCopy {
     pub page: u32,
 }
 
-/// A preempted request's trajectory (a video request's, or the image a
-/// token request was denoising), written from the bank holding its
+/// A preempted video request's trajectory, written from the bank holding its
 /// committed step into the host latent pools of its denoising ranks (one
 /// [`LatentPageCopy`] per page of the trajectory and rank). The request's
 /// calls have completed, so the committed step is final; the rank's output
@@ -116,8 +114,8 @@ pub struct LatentOffload {
     pub pages: Vec<LatentPageCopy>,
 }
 
-/// The stored trajectory a resumed request's latent preparation opens at
-/// (a video request's, or the image a token request had begun): the call
+/// The stored trajectory a resumed video request's latent preparation opens
+/// at: the call
 /// prepares the trajectory as for step zero, then each rank copies the
 /// parts of the stored pages its own pages hold into the bank it
 /// initializes, as the copy manifest from the stored ranks' layouts to its
@@ -235,49 +233,6 @@ impl CacheUnitAllocation {
                     && destinations.insert(*destination)
             }),
             "cache-unit copies require distinct new destinations and immutable sources"
-        );
-        Ok(())
-    }
-}
-
-/// Raster geometry and paged storage of one image request's trajectory, for
-/// a call that addresses a latent product ([`Call::addresses_latent_pages`]).
-///
-/// The scheduler's latent allocator assigns the pages, so the rank learns
-/// them here. The rank's latent pool keeps the trajectory's step ledger, so
-/// no step is stated.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LatentParams {
-    /// Request that owns the trajectory.
-    pub request_key: RequestKey,
-    /// Call that addresses the trajectory.
-    pub call_id: CallId,
-    /// Physical latent pages in logical order; empty for request-owned tensors.
-    pub page_table: Vec<u32>,
-    /// Logical units stored in pages; zero when the trajectory uses request tensors.
-    pub latent_units: u32,
-    /// Output height in pixels.
-    pub height: u32,
-    /// Output width in pixels.
-    pub width: u32,
-}
-
-impl LatentParams {
-    /// Validates latent page identities, shape, and byte bounds.
-    pub fn validate(&self) -> ValidationResult<()> {
-        ensure_valid!(
-            self.call_id.batch_id > 0,
-            "latent params call id must be positive"
-        );
-        ensure_valid!(
-            self.height > 0 && self.width > 0,
-            "latent params geometry must be positive"
-        );
-        ensure_valid!(
-            (!self.page_table.is_empty() == (self.latent_units > 0))
-                && self.page_table.iter().all(|page| *page > 0)
-                && self.page_table.iter().collect::<HashSet<_>>().len() == self.page_table.len(),
-            "latent params page table disagrees with its units, repeats a page, or carries page zero"
         );
         Ok(())
     }

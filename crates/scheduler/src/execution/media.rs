@@ -786,7 +786,7 @@ impl Scheduler {
                 let CallKind::Media(media_call) = inflight.call.kind else {
                     continue;
                 };
-                if inflight.call.input_image.is_some() || inflight.call.carried_image.is_some() {
+                if inflight.call.input_image.is_some() {
                     occupancy.occupy(
                         &self.image_demand(inflight.call.request_key, media_call),
                         *id,
@@ -1273,9 +1273,6 @@ impl Scheduler {
                     state.muxing_inputs.push(product);
                 }
             }
-            MediaCall::ImageDecoding => {
-                unreachable!("a video request's graph has no image decoding")
-            }
         }
         state.graph.schedule(media_call);
         if stateful {
@@ -1333,7 +1330,6 @@ impl Scheduler {
         let dispatch = RequestDispatch {
             worker,
             request_pool_idx: Some(request_pool_idx),
-            latent: None,
             decode,
             buffers,
             readers: Some(readers),

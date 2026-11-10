@@ -47,9 +47,7 @@ impl FinishReason {
     ) -> Option<Self> {
         use proto::request::FinishReason as Engine;
         Some(match reason {
-            Engine::Completed | Engine::Eos | Engine::Stop | Engine::ImageDone => {
-                Self::Stop(stop_reason)
-            }
+            Engine::Completed | Engine::Eos | Engine::Stop => Self::Stop(stop_reason),
             Engine::MaxTokens => Self::Length,
             Engine::Cancelled | Engine::Aborted => Self::Abort,
             Engine::Repetition => Self::Repetition,
@@ -93,27 +91,8 @@ pub struct RequestUsage {
     /// Generated tokens, as the engine counts its completion tokens:
     /// visible text and the tokens of internal sections alike.
     pub output_tokens: u32,
-    /// Generated images.
-    pub image_count: u32,
-    /// Image-generation steps completed, over every image.
-    pub image_steps: u32,
     /// Phase durations.
     pub timings: RuntimeTimings,
-}
-
-/// One generated image.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GeneratedImage {
-    /// Request-local image identifier.
-    pub image_id: u32,
-    /// Width in pixels.
-    pub width: u32,
-    /// Height in pixels.
-    pub height: u32,
-    /// Encoded PNG size in bytes.
-    pub bytes: u64,
-    /// The base64-encoded PNG.
-    pub png_base64: String,
 }
 
 /// Event of a serving stream, consumed by the API layer.
@@ -191,13 +170,6 @@ pub enum RequestOutput {
         /// The complete call.
         call: AssistantToolCall,
     },
-    /// One image-generation step completed.
-    ImageStep {
-        /// Request-local image identifier.
-        image_id: u32,
-    },
-    /// One generated image is complete.
-    ImageDone(GeneratedImage),
     /// Latest diffusion progress: the engine-reported phase and the number
     /// of completed denoising steps.
     MediaProgress {

@@ -46,9 +46,8 @@
 //! of the values (`storage::key::latent_content` of the seed, the
 //! trajectory and its steps): the latent seed of what the deployment's denoising computes ([`latent_seed`]: the
 //! weights' values and the function and format identities of the denoising
-//! ranks' models), the trajectory's identity (`Trajectory::id` for a video
-//! request, [`image_trajectory`] for a token request's image) and the steps
-//! it took. The key is injective, since every input that determines a
+//! ranks' models), the trajectory's identity (`Trajectory::id`) and the
+//! steps it took. The key is injective, since every input that determines a
 //! page's values is in it, and minimal, since no input that does not is:
 //! neither the epoch, the mesh, the rank nor the parallel configuration
 //! that wrote the page, so a page two configurations lay out alike is one
@@ -93,7 +92,7 @@ use ipc::{
 };
 use serde::{Deserialize, Serialize};
 use storage::key::latent_content as content;
-pub(crate) use storage::key::{image_trajectory, latent_seed};
+pub(crate) use storage::key::latent_seed;
 use storage::manifest::region::{Span, atoms};
 use storage::manifest::{Storage as PagedStorage, StorageLayout};
 use storage::protocol::{PageSlot, Reply, Request};

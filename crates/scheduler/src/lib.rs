@@ -22,8 +22,8 @@
 //! owner thread.
 //!
 //! Scheduling admits from its waiting queue and chunks prefill against sequence
-//! and token budgets. A token request with context images or image generation
-//! reserves its worst-case cache blocks at admission; a text-only request needs
+//! and token budgets. A token request with context images reserves its
+//! worst-case cache blocks at admission; a text-only request needs
 //! only the blocks of its first prefill chunk. A request larger than the total
 //! cache capacity is rejected. A resident request is never relocated or
 //! preempted: when capacity is short, admission waits.
@@ -49,7 +49,6 @@
 //!   worker dispatch.
 //! - `control`: cancellation and frontend lifecycle commands.
 //! - `config`, `stats`, and `stats_report`: limits and statistics.
-//! - `image_artifact`: metadata of worker-produced PNG artifacts.
 
 /// Scheduler-owned allocation of worker storage; only its `OutOfStorage`
 /// error is public.
@@ -104,12 +103,10 @@ pub use proto::config::DEFAULT_BLOCK;
 pub use proto::report;
 pub use proto::request::{
     ArtifactEvent, ArtifactMedia, CachePolicy, ConditionExtent, DiffusionRequest,
-    DiffusionRequestError, EncoderInputs, Event, FeedbackImage, FeedbackNextToken, FeedbackSource,
-    FinishReason, GeneratedImage, GenerationConstraint, GenerationConstraintParseError,
-    GenerationFeatures, GenerationLimits, GenerationRequest, GenerationRequestError,
-    GenerationResourceError, ImageEncoder, ImageEncoderInput, ImageGenerationConfig, ImageInput,
-    ImagePixels, ImageTrigger, MediaKind, ModelDtype, ModelDtypeParseError, MultimodalInputs,
-    PixelRange, PositionLogprobs, RejectionKind, Request, StopReason, Trajectory,
+    DiffusionRequestError, EncoderInputs, Event, FinishReason, GenerationFeatures,
+    GenerationLimits, GenerationRequest, GenerationRequestError, GenerationResourceError,
+    ImageEncoder, ImageEncoderInput, ImageInput, MediaKind, ModelDtype, ModelDtypeParseError,
+    MultimodalInputs, PositionLogprobs, RejectionKind, Request, StopReason, Trajectory,
 };
 
 /// Lock `mutex`, keeping the state a panicking holder left.
@@ -142,7 +139,6 @@ pub use proto::config::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_RUNNING_REQUESTS, SchedulerConfig,
 };
-pub(crate) use run::guidance_prefix_rows;
 /// The phases the scheduler plans with, and the id each is numbered with: a rank's plan, a policy's
 /// `Plan` and a batch's phase must all use this table, so it is exported from where the scheduler
 /// keeps it rather than restated by whoever needs a phase id.
@@ -165,7 +161,6 @@ mod execution;
 use execution::{MediaFlowState, PendingMedia};
 pub(crate) mod generation;
 pub(crate) mod graph;
-pub(crate) mod image_artifact;
 mod inflight;
 mod ledger;
 mod mechanism;
@@ -204,17 +199,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::generation::{
-    BlockCursor, GenerationPhase as Phase, consumes_image_features, is_feedback_call,
-    is_prompt_extend,
+    BlockCursor, GenerationPhase as Phase, consumes_image_features, is_prompt_extend,
 };
 
-use crate::allocation::{
-    BufferPool, BufferSpan, LatentPages, LatentPool, PrefixCacheManager, RequestPool, RequestSlot,
-};
+use crate::allocation::{BufferPool, BufferSpan, PrefixCacheManager, RequestPool, RequestSlot};
 use crate::kv_cache::{BlockPool, BlockTable, CacheAllocation, PrefixCacheCoordinator};
 use crossbeam_channel::Receiver;
 use ipc::RequestId;
-use ipc::UnitId;
 use ipc::execution::EpochOperation;
 use ipc::{
     BatchCommand, BlockTable as IpcBlockTable, BufferAllocation, CacheUnitAllocation, Call, CallId,
@@ -225,12 +216,11 @@ use ipc::{SharedMedia, TokenLogprob};
 use proto::request::MigrationCause;
 use proto::tensor::DType;
 
-use crate::image_artifact::png_artifact_info;
 use allocation::requests::{
     MediaAllocations, MediaStorage, MediaTensorAllocation, RequestAllocations, RetiringRequest,
     UnknownMediaGroup,
 };
-use denoising::{Denoising, LatentDispatch};
+use denoising::Denoising;
 use generation::RequestState;
 use graph::{VideoGraph, product};
 use inflight::{InflightCall, InflightInput, PendingCompletion, PendingFinish};
@@ -244,8 +234,8 @@ enum BatchKind {
     /// Calls that advance admitted requests without growing their prompt:
     /// token decode, speculative verification, and canvas denoising.
     Decode,
-    /// Latent preparation, denoising, image, video, and audio decoding, video
-    /// and audio encoding, muxing, and transfers.
+    /// Latent preparation, denoising, video and audio decoding, video and
+    /// audio encoding, muxing, and transfers.
     Media,
 }
 
@@ -267,30 +257,8 @@ const KV_OFFLOAD_POLL: Duration = Duration::from_millis(1);
 /// the batches of the remaining offloads.
 const PAGE_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Builds an image-completion event from a base64 PNG payload and, when the
-/// request feeds the image back from the device, the decoded image product's
-/// values (`feedback`).
-///
-/// Reads the dimensions and size through `png_artifact_info`; returns `None`
-/// when the payload has no PNG header with nonzero dimensions.
-fn image_done_event(
-    image_id: u32,
-    pixels_png_b64: String,
-    feedback: Option<Arc<crate::ImagePixels>>,
-) -> Option<Event> {
-    let metadata = png_artifact_info(&pixels_png_b64)?;
-    Some(Event::ImageDone {
-        image_id,
-        height: metadata.height,
-        width: metadata.width,
-        bytes: metadata.bytes,
-        pixels_png_b64,
-        feedback,
-    })
-}
-
 #[derive(Clone)]
-/// Model token identifiers used for sequence and image-content boundaries.
+/// Model token identifiers used for sequence boundaries.
 ///
 /// Serving resolves these from the loaded model's configuration in the server
 /// crate (`special_token_ids`).
@@ -301,8 +269,6 @@ pub struct SpecialTokenIds {
     /// primary EOS, which the output path substitutes for a completion that
     /// commits no token, so the list must not be empty.
     pub eos: Vec<u32>,
-    /// Token identifier that terminates encoded image content.
-    pub end_of_image: u32,
 }
 
 /// Request-held reference to a reusable encoder-cache entry.
@@ -311,59 +277,9 @@ struct EncoderCachePin {
     product: TensorRef,
 }
 
-/// One cache prefix a guidance branch attends to: its own request-pool slot
-/// and cache allocation, separate from the request's main
-/// `RequestAllocations`, sized to the tokens it holds.
-struct GuidancePrefix {
-    allocations: RequestAllocations,
-    /// Units per cache group, as `(group_id, unit_ids)`, not yet declared to the
-    /// worker; the next denoising call drains them as fresh-unit allocations.
-    new_units: Vec<(u32, Vec<UnitId>)>,
-}
-
-impl GuidancePrefix {
-    /// Returns the request-pool index.
-    fn request_pool_idx(&self) -> u32 {
-        self.allocations.request_slot()
-    }
-
-    /// Returns shared access to the request block tables.
-    fn block_tables(&self) -> &[BlockTable] {
-        self.allocations.block_tables()
-    }
-}
-
-/// Guidance prefixes of a token request whose image generation uses more
-/// than one guidance branch (`Scheduler::ensure_guidance_prefix`).
-///
-/// The text-unconditional branch attends to the request's negative prompt
-/// tokens. The image-unconditional branch attends to the prefix the worker
-/// states for its model (`MainProcessInfo::image_unconditional_token_ids`), or to
-/// the request's own context when it states none. Each distinct prefix holds
-/// its own slot until `Scheduler::free_guidance_prefix` releases them after
-/// the last denoising step or the request finishes.
-struct GuidancePrefixState {
-    prefixes: Vec<GuidancePrefix>,
-    /// Set by the first successful denoising completion. Until then every
-    /// denoising call carries the prefixes' block tables and prefills each
-    /// prefix that holds tokens.
-    diffusion_finalized: bool,
-}
-
-impl GuidancePrefixState {
-    /// Every allocation the prefixes hold.
-    fn into_allocations(self) -> impl Iterator<Item = RequestAllocations> {
-        self.prefixes.into_iter().map(|prefix| prefix.allocations)
-    }
-}
-
 /// What a request's latent preparation opens its trajectory from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Restoring {
-    /// A token request resumes the image it had begun, of which it names
-    /// stored steps: the stored trajectory is pinned once the image's
-    /// latent preparation is due, for the replica that runs it.
-    Due,
     /// Its stored trajectory's pages are being pinned in the host latent
     /// pools; the preparation waits for the answers.
     Pinning,
@@ -382,8 +298,7 @@ impl Default for Restoring {
 }
 
 /// A request's latent trajectory in the host latent pools
-/// (`crate::trajectories`): a video request's, or that of the image a token
-/// request is generating.
+/// (`crate::trajectories`).
 #[derive(Debug, Clone, Default)]
 struct HostTrajectory {
     /// Whether the trajectory continues from a stored step, which its
@@ -531,8 +446,6 @@ pub struct Scheduler {
     /// Maximum number of transfer calls holding a reservation at once
     /// (`Inflight::num_pending_transfers`).
     transfer_capacity: usize,
-    /// Element type of image latents: the model dtype's.
-    latent_dtype: Option<DType>,
     /// `engine_id` of every `RequestKey` this scheduler issues.
     engine_id: u64,
     epoch: u64,
@@ -650,25 +563,14 @@ fn add_worker_forward_map(target: &Mutex<BTreeMap<String, u64>>, delta: &BTreeMa
 
 /// Returns tokens that stop a device-relay successor before host semantic resolution.
 ///
-/// The sorted, deduplicated list holds the request's stop token ids, the EOS
-/// ids unless `ignore_eos` is set, and the image-generation trigger when the
-/// request generates images through a direct trigger token. It reaches the
-/// worker in `GenerationParams::finish_token_ids` and bounds verified-draft
-/// prefixes in `validate_generation_result`.
-///
-/// Terminal stop/EOS tokens end the request. A direct Gen trigger instead ends
-/// the current Und continuation window: the sampled trigger remains
-/// host-visible and opens the image branch, while an already registered text
-/// successor resolves as a predicate no-op.
+/// The sorted, deduplicated list holds the request's stop token ids and the
+/// EOS ids unless `ignore_eos` is set. It reaches the worker in
+/// `GenerationParams::finish_token_ids` and bounds verified-draft prefixes in
+/// `validate_generation_result`. Terminal stop/EOS tokens end the request.
 fn finish_token_ids(request: &GenerationRequest, eos: &[u32]) -> Vec<u32> {
     let mut finish_token_ids = request.stop_token_ids.clone();
     if !request.sampling.ignore_eos {
         finish_token_ids.extend(eos.iter().copied());
-    }
-    if request.generates_images()
-        && let Some(trigger) = request.image_generation.trigger.direct_token()
-    {
-        finish_token_ids.push(trigger);
     }
     finish_token_ids.sort_unstable();
     finish_token_ids.dedup();
@@ -699,7 +601,6 @@ fn batch_kind(call_variant: CallKind) -> BatchKind {
             | MediaCall::AudioDecoding
             | MediaCall::Muxing,
         )
-        | CallKind::Media(MediaCall::ImageDecoding)
         | CallKind::Transfer(TransferMode::Tensor)
         | CallKind::Transfer(TransferMode::CacheExport)
         | CallKind::Transfer(TransferMode::CacheInstall) => BatchKind::Media,
@@ -709,14 +610,12 @@ fn batch_kind(call_variant: CallKind) -> BatchKind {
 /// Returns the order in which ready completions are applied; lower values go
 /// first, and equal values keep arrival order.
 ///
-/// Denoising, image decoding, and cache installation completions precede all
+/// Denoising and cache installation completions precede all
 /// other kinds (`Inflight::take_ready_completions` and the resolution pass in
 /// `execution`).
 fn completion_priority(call_variant: CallKind) -> u8 {
     match call_variant {
-        CallKind::Media(MediaCall::Denoising)
-        | CallKind::Media(MediaCall::ImageDecoding)
-        | CallKind::Transfer(TransferMode::CacheInstall) => 0,
+        CallKind::Media(MediaCall::Denoising) | CallKind::Transfer(TransferMode::CacheInstall) => 0,
         _ => 1,
     }
 }
@@ -732,19 +631,12 @@ const OUTPUT_TERMINAL_RESERVE: usize = 2;
 #[derive(Debug, Clone, Copy)]
 struct CacheLengths {
     /// Tokens the call's cache-writing forward row appends: the prompt slice
-    /// length, the feature write's token capacity, or one for other prefills,
-    /// decode, and verify. Zero for cache export, latent preparation, and
-    /// denoising, which only read the request's prefix cache.
+    /// length, the feature write's token capacity, or one for decode and
+    /// verify. Zero for cache export and install, and for a canvas step,
+    /// which only read the request's prefix cache.
     input: u32,
     /// Scheduled visible cache length before the call.
     visible: u32,
-}
-
-/// Computes ceiling division for unsigned values; a zero divisor is treated
-/// as one.
-fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
-    let divisor = divisor.max(1);
-    value.div_ceil(divisor)
 }
 
 /// Output events a call kind with no entry in `output_bound` can add to its
@@ -766,7 +658,7 @@ fn output_bound(kind: CallKind) -> usize {
         CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode) => 4,
         // A verification's tokens each take an event beside a decode's.
         CallKind::Forward(ForwardMode::Verify) => 4 + MAX_VERIFY_DRAFTS,
-        CallKind::Media(MediaCall::Denoising | MediaCall::ImageDecoding) => 3,
+        CallKind::Media(MediaCall::Denoising) => 3,
         _ => DEFAULT_OUTPUT_EVENTS,
     }
 }

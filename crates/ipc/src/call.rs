@@ -86,7 +86,7 @@ pub enum CallKind {
 impl CallKind {
     /// Computations accepted as individual scheduled request items. A rank's
     /// reports list its supported calls in this order.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 18] = [
         Self::Forward(ForwardMode::Prefill),
         Self::Forward(ForwardMode::Decode),
         Self::Forward(ForwardMode::Verify),
@@ -97,7 +97,6 @@ impl CallKind {
         Self::Media(MediaCall::TextEncoding),
         Self::Media(MediaCall::LatentPreparation),
         Self::Media(MediaCall::Denoising),
-        Self::Media(MediaCall::ImageDecoding),
         Self::Media(MediaCall::VideoDecoding),
         Self::Media(MediaCall::AudioDecoding),
         Self::Media(MediaCall::VideoEncoding),
@@ -158,8 +157,6 @@ pub struct SamplingState {
     pub suppressed_token_ids: Vec<u32>,
     /// Token identifiers that terminate generation when selected.
     pub finish_token_ids: Vec<u32>,
-    /// Token identifiers that advance a structured-generation transition.
-    pub transition_token_ids: Vec<u32>,
     /// Whether the current grammar state requires immediate termination.
     pub force_finish: bool,
 }
@@ -289,31 +286,11 @@ pub struct Call {
     pub latent_feature_input: Option<TensorRef>,
     /// Features produced by the selected image encoder.
     pub encoder_output: Option<TensorRef>,
-    /// Diffusion trajectory consumed by this call.
-    pub latent_input: Option<TensorRef>,
-    /// Diffusion trajectory produced by this call.
-    pub latent_output: Option<TensorRef>,
-    /// Resident image consumed by feedback encoding.
-    pub image_input: Option<TensorRef>,
-    /// Decoded image retained for feedback.
-    pub image_output: Option<TensorRef>,
     /// Boolean device completion consumed by a dependent call.
     pub completion_output: Option<TensorRef>,
-    /// Boolean device decision that selects an image transition.
-    pub transition_output: Option<TensorRef>,
     /// Device predicate that enables execution: a U8 flag or a packed I64
     /// continuation scalar. A false predicate yields [`CallStatus::Predicated`].
     pub predicate: Option<TensorRef>,
-    /// Index of the image an image trajectory's latent preparation
-    /// initializes: positive, and present on exactly the latent preparations
-    /// that write a latent product. Only the engine knows how many images a
-    /// request generates; the rank derives the image's noise seed from its
-    /// admitted image seed and this index. A video denoiser's latent
-    /// preparation writes no latent product (its rank holds the slot's pages)
-    /// and draws its noise from the request's own seed, so it names none.
-    /// Token sampling carries no draw coordinates: the rank keys its draws on
-    /// the admitted seed and each sampled row's position.
-    pub image_index: Option<u32>,
     /// Host-side sampler constraints for this call; absent uses admission defaults.
     pub sampling_state: Option<SamplingState>,
     /// Host-known prompt, draft, or decode input tokens in model input order.
@@ -334,28 +311,21 @@ pub struct Call {
     /// a deployment that does not speculate, does nothing.
     pub draft: DraftWork,
     /// The stored trajectory a resumed request's latent preparation opens
-    /// at, instead of step zero: a video request's, or the image a token
-    /// request had begun; absent for every other call.
+    /// at, instead of step zero, a video request's; absent for every other
+    /// call.
     pub latent_restore: Option<LatentRestore>,
     /// The host encoder pool pages an encoder call (a video request's, or
-    /// an image encoding) reads its output from instead of computing it, or
+    /// an input image's encoding) reads its output from instead of computing it, or
     /// writes the output it computed to; absent for every other call.
     pub host_output: Option<HostOutput>,
     /// The posterior draw an image latent encoding samples its latent with:
     /// the encoding's ordinal among its request's latent encodings, its
-    /// input images' latent encoders in context order, then the feedback
-    /// latent encoders of each image it generates, in image order. The
+    /// input images' latent encoders in context order. The
     /// engine derives it from the request alone, so the rank keys the draw on
-    /// the admitted image seed and this ordinal, whichever encodings an
+    /// the request's seed and this ordinal, whichever encodings an
     /// encoder cache spared and whichever engine the request resumed on.
     /// Absent on every other call.
     pub latent_draw: Option<u32>,
-    /// The image a migrated request generated before, which its feedback
-    /// encoding reads in place of a resident image product: the values of the
-    /// decoded image product the image was generated as, which the rank
-    /// prepares for its encoder as it prepares that product. Absent on every
-    /// other call.
-    pub carried_image: Option<std::sync::Arc<proto::request::ImagePixels>>,
 }
 
 /// Where an encoder call's output lies in the host encoder pool
@@ -418,10 +388,10 @@ impl HostOutput {
 
 impl Call {
     /// Element types of the scalar outputs one call relays through a relay
-    /// entry of its request slot: the token (`token_output`), the completion
-    /// and the transition (`completion_output`, `transition_output`), which
-    /// [`Self::validate`] requires of them.
-    pub const RELAY_DTYPES: [DType; 3] = [DType::I64, DType::U8, DType::U8];
+    /// entry of its request slot: the token (`token_output`) and the
+    /// completion (`completion_output`), which [`Self::validate`] requires of
+    /// them.
+    pub const RELAY_DTYPES: [DType; 2] = [DType::I64, DType::U8];
 
     /// Bytes one relay entry of a request slot holds of a call's relayed
     /// scalars.
@@ -453,14 +423,8 @@ impl Call {
             vision_inputs: Vec::new(),
             latent_feature_input: None,
             encoder_output: None,
-            latent_input: None,
-            latent_output: None,
-            image_input: None,
-            image_output: None,
             completion_output: None,
-            transition_output: None,
             predicate: None,
-            image_index: None,
             sampling_state: None,
             input_token_ids: Vec::new(),
             canvas: None,
@@ -471,46 +435,30 @@ impl Call {
             latent_restore: None,
             host_output: None,
             latent_draw: None,
-            carried_image: None,
         }
-    }
-
-    /// Returns whether the call reads or writes a latent product held in the
-    /// scheduler-allocated latent pages of an image trajectory, which its
-    /// batch then describes with [`LatentParams`]. A standalone video
-    /// denoiser's calls address pages their rank fixes per request slot and
-    /// carry no latent product.
-    pub fn addresses_latent_pages(&self) -> bool {
-        self.latent_input.is_some() || self.latent_output.is_some()
     }
 
     /// Tensor dependencies in the call's signature, excluding its predicate.
     ///
-    /// Includes `token_input` and `latent_input`, which [`Self::buffer_inputs`]
-    /// omits.
+    /// Includes `token_input`, which [`Self::buffer_inputs`] omits.
     pub fn tensor_inputs(&self) -> impl Iterator<Item = &TensorRef> {
         self.inputs
             .iter()
             .chain(self.token_input.iter())
             .chain(self.vision_inputs.iter().map(|input| &input.feature))
             .chain(self.latent_feature_input.iter())
-            .chain(self.latent_input.iter())
-            .chain(self.image_input.iter())
     }
 
     /// All tensor declarations owned by this call.
     ///
-    /// Includes the device scalars (token, completion, transition) and
-    /// `latent_output`, which [`Self::buffer_outputs`] omits.
+    /// Includes the device scalars (token, completion), which
+    /// [`Self::buffer_outputs`] omits.
     pub fn tensor_outputs(&self) -> impl Iterator<Item = &TensorRef> {
         self.outputs
             .iter()
             .chain(self.token_output.iter())
             .chain(self.completion_output.iter())
-            .chain(self.transition_output.iter())
             .chain(self.encoder_output.iter())
-            .chain(self.latent_output.iter())
-            .chain(self.image_output.iter())
     }
 
     /// Mutable declarations while assigning call identities before submission.
@@ -519,10 +467,7 @@ impl Call {
             .iter_mut()
             .chain(self.token_output.iter_mut())
             .chain(self.completion_output.iter_mut())
-            .chain(self.transition_output.iter_mut())
             .chain(self.encoder_output.iter_mut())
-            .chain(self.latent_output.iter_mut())
-            .chain(self.image_output.iter_mut())
     }
 
     /// Tensor inputs that require persistent destination storage.
@@ -531,18 +476,13 @@ impl Call {
             .iter()
             .chain(self.vision_inputs.iter().map(|input| &input.feature))
             .chain(self.latent_feature_input.iter())
-            .chain(self.image_input.iter())
     }
 
     /// Tensor outputs backed by scheduler-allocated persistent buffers.
     ///
-    /// Each needs a [`BufferAllocation`] large enough for it. Latent
-    /// trajectories are addressed through [`LatentParams`] instead.
+    /// Each needs a [`BufferAllocation`] large enough for it.
     pub fn buffer_outputs(&self) -> impl Iterator<Item = &TensorRef> {
-        self.outputs
-            .iter()
-            .chain(self.encoder_output.iter())
-            .chain(self.image_output.iter())
+        self.outputs.iter().chain(self.encoder_output.iter())
     }
 
     /// Exact data and predicate dependencies, independent of physical representation.
@@ -570,8 +510,8 @@ impl Call {
     /// Checks identity, component, coordinates, the token bound, canonical
     /// sampling-state sets, the encoded-image source, cache export
     /// identities, product ownership, generations, output indices, dtypes,
-    /// cross-request inputs, the predicate, and the image index
-    /// of a latent preparation. Relationships to other calls and to the
+    /// cross-request inputs, the predicate, and the stored trajectory of a
+    /// latent preparation. Relationships to other calls and to the
     /// batch's allocation tables are the scheduler's to keep.
     pub fn validate(&self) -> ValidationResult<()> {
         // Establish call identity, component, coordinates, and token capacity.
@@ -591,7 +531,6 @@ impl Call {
                 state.allowed_token_ids.as_deref(),
                 Some(state.suppressed_token_ids.as_slice()),
                 Some(state.finish_token_ids.as_slice()),
-                Some(state.transition_token_ids.as_slice()),
             ]
             .into_iter()
             .flatten()
@@ -609,21 +548,8 @@ impl Call {
                     && matches!(
                         self.kind,
                         CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding)
-                    )
-                    && self.image_input.is_none()
-                    && self.carried_image.is_none(),
-                "encoded image requires an image encoder without another image source"
-            );
-        }
-        if let Some(image) = &self.carried_image {
-            ensure_valid!(
-                image.is_complete()
-                    && matches!(
-                        self.kind,
-                        CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding)
-                    )
-                    && self.image_input.is_none(),
-                "a carried image requires an image encoder without another image source"
+                    ),
+                "an encoded image requires an image encoder"
             );
         }
         ensure_valid!(
@@ -640,7 +566,7 @@ impl Call {
             "a token-denoising call carries a canvas step, and no other call does"
         );
         ensure_valid!(
-            !denoises || (self.token_output.is_none() && self.transition_output.is_none()),
+            !denoises || self.token_output.is_none(),
             "token denoising samples no token output"
         );
         if self.canvas.is_some() {
@@ -720,11 +646,7 @@ impl Call {
                 "device token relay requires one int64 element"
             );
         }
-        for tensor in self
-            .completion_output
-            .iter()
-            .chain(self.transition_output.iter())
-        {
+        for tensor in self.completion_output.iter() {
             ensure_valid!(
                 tensor.dtype == DType::U8 && tensor.shape_bound.max_elements() == 1,
                 "device completion requires one uint8 element"
@@ -758,15 +680,6 @@ impl Call {
             );
         }
 
-        // An image trajectory's latent preparation names the image whose
-        // noise it draws; image indices count from one. A video latent
-        // preparation, which writes no latent product, names none.
-        let prepares_image = self.kind == CallKind::Media(MediaCall::LatentPreparation)
-            && self.latent_output.is_some();
-        ensure_valid!(
-            self.image_index.is_some() == prepares_image && self.image_index != Some(0),
-            "exactly an image latent preparation names a positive image index"
-        );
         // Only a latent preparation, which opens a trajectory, opens a
         // stored one.
         if let Some(restore) = &self.latent_restore {
@@ -777,8 +690,8 @@ impl Call {
             );
         }
         // Only an encoder call that writes one output has its output in the
-        // host encoder pool: a video encoder call's one output, or an image
-        // encoding's features.
+        // host encoder pool: a video encoder call's one output, or an input
+        // image encoding's features.
         if let Some(output) = &self.host_output {
             output.validate(None)?;
             let one_output = match self.encoder_output {
@@ -817,7 +730,6 @@ pub enum MediaCall {
     TextEncoding,
     LatentPreparation,
     Denoising,
-    ImageDecoding,
     VideoDecoding,
     AudioDecoding,
     VideoEncoding,
@@ -827,14 +739,13 @@ pub enum MediaCall {
 
 impl MediaCall {
     /// Every media call in declaration order.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 11] = [
         Self::MediaReading,
         Self::VisionEncoding,
         Self::LatentEncoding,
         Self::TextEncoding,
         Self::LatentPreparation,
         Self::Denoising,
-        Self::ImageDecoding,
         Self::VideoDecoding,
         Self::AudioDecoding,
         Self::VideoEncoding,
@@ -861,7 +772,7 @@ impl MediaCall {
             Self::VideoDecoding => &[Self::VideoEncoding],
             Self::VideoEncoding => &[Self::Muxing],
             Self::AudioDecoding => &[Self::AudioEncoding],
-            Self::ImageDecoding | Self::AudioEncoding | Self::Muxing => &[],
+            Self::AudioEncoding | Self::Muxing => &[],
         }
     }
 

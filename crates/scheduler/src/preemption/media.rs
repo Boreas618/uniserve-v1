@@ -1,5 +1,4 @@
-//! Preempting and resuming requests at denoising-step boundaries: video
-//! requests, and the image a token request is generating.
+//! Preempting and resuming video requests at denoising-step boundaries.
 //!
 //! A request's trajectory is derived state: the samples of its committed
 //! step, which the request's facts and the step count determine. Whatever
@@ -12,10 +11,7 @@
 //!    (`Terminal::Migrated`); its calls in flight complete, which ends
 //!    it at a step boundary. A video request whose denoising is scheduled
 //!    whole is not preempted: it finishes, as its remaining work is
-//!    bounded. A token request leaves after every token and image it
-//!    generated; the denoising steps its calls in flight complete advance
-//!    the trajectory of the image it was generating, as its worker commits
-//!    them, and its client reads their progress.
+//!    bounded.
 //! 2. **Store.** At that boundary, a trajectory past its first step and
 //!    not past its last, on a denoiser whose ranks map host latent pools,
 //!    is written to them (`crate::trajectories`); a lost worker's is not.
@@ -23,27 +19,20 @@
 //!    (zero for none) and the record of where their pages lie and how each
 //!    stored rank laid its part out, and the daemon submits it again with
 //!    them, or with the stored steps it named before when it stored none: a
-//!    trajectory's state at a step is the same whenever it is read. The
-//!    daemon forgets a token request's stored steps once the image they
-//!    belong to completes.
+//!    trajectory's state at a step is the same whenever it is read.
 //! 4. **Resume.** A resumed request that names stored steps has the pages
 //!    its record names pinned before its latent preparation, which lays
 //!    them out in its own ranks' pages, whatever parallel configuration
 //!    stored them, and opens the trajectory at that step when every page is
 //!    pinned, and starts from noise otherwise. A video request pins them as
-//!    it is admitted; a token request once it rebuilt its context and the
-//!    preparation of the image it had begun is due, for the replica the
-//!    preparation is placed on. Every other call of the request runs as for
-//!    a new request: a video request's encoders read the outputs the host
-//!    encoder pools hold (`crate::encoder_outputs`) and compute the others,
-//!    and the reading and refining of its conditions are recomputed; a
-//!    token request rebuilds the context its image is conditioned on from
-//!    its facts (`generation::continuation`). Either computes what it
+//!    it is admitted. Every other call of the request runs as for a new
+//!    request: its encoders read the outputs the host encoder pools hold
+//!    (`crate::encoder_outputs`) and compute the others, and the reading and
+//!    refining of its conditions are recomputed, which computes what it
 //!    computed before.
 
 use crate::WorkerGroupId;
-use crate::completion::CallCompletion;
-use crate::trajectories::{Offloaded, Restored, image_trajectory};
+use crate::trajectories::{Offloaded, Restored};
 use crate::*;
 
 /// What [`Scheduler::store_preempted`] reads of a preempted request.
@@ -233,102 +222,6 @@ impl Scheduler {
         }
     }
 
-    /// Ends preempted token request `id`, whose calls completed: the
-    /// trajectory of the image it was generating is stored when it reached
-    /// a step worth storing, keyed by the request's trajectory identity and
-    /// the image's index ([`image_trajectory`]), and the request leaves as
-    /// migratable once the store answered, naming the steps stored.
-    pub(crate) fn retire_preempted_token(&mut self, id: RequestId, cause: MigrationCause) {
-        let Some(state) = self.running.get(&id) else {
-            return;
-        };
-        // An image's trajectory opens at its latent preparation and closes
-        // at its decoding, which leave its progress at step zero between
-        // images.
-        let trajectory = match state.req.trajectory.id {
-            0 => 0,
-            id => image_trajectory(id, state.image_id),
-        };
-        let image = state.image_id;
-        let preempted = Preempted {
-            request_key: RequestKey::new(self.engine_id, id, state.request_epoch),
-            registered: state.worker_registered,
-            trajectory,
-            completed: state.denoising.completed(),
-            steps: state.denoising.steps(),
-        };
-        let offloading = state.host_trajectory.offloading;
-        let layouts = state.host_trajectory.layouts.clone();
-        match self.store_preempted(id, cause, preempted, offloading, &layouts) {
-            Retirement::Leave(steps, record) => {
-                if steps > 0 {
-                    tracing::info!(
-                        request = id.0,
-                        image,
-                        steps,
-                        "stored a preempted image trajectory"
-                    );
-                }
-                self.migrate_stored(id, cause, steps, record);
-            }
-            Retirement::Storing => {
-                if let Some(state) = self.running.get_mut(&id) {
-                    state.host_trajectory.offloading = true;
-                }
-            }
-            Retirement::Waiting => {}
-        }
-    }
-
-    /// Applies the trajectory progress of `call`, an image trajectory call
-    /// of preempted token request `id` (`Terminal::Migrated`) that
-    /// completed with `record`, which takes no other effect: the worker
-    /// committed it, so the trajectory a preemption stores continues after
-    /// it. A latent preparation opens the trajectory at the step it
-    /// restored (or zero) and states how the denoising ranks hold it; a
-    /// denoising step advances it, and the client reads the steps it
-    /// completed.
-    pub(crate) fn accept_preempted_trajectory(
-        &mut self,
-        id: RequestId,
-        call: &Call,
-        record: &CallCompletion,
-    ) {
-        if record.status != CallStatus::Ok || call.latent_output.is_none() {
-            return;
-        }
-        let Some(state) = self.running.get_mut(&id) else {
-            return;
-        };
-        match call.kind {
-            CallKind::Media(MediaCall::LatentPreparation) => {
-                let opened = call
-                    .latent_restore
-                    .as_ref()
-                    .map_or(0, |restore| restore.steps);
-                if record.step_index == opened
-                    && state.denoising.open(opened, call.latent_output.clone())
-                {
-                    state.host_trajectory.layouts = record
-                        .latent_layouts
-                        .iter()
-                        .map(|layout| (layout.rank, layout.layout.clone()))
-                        .collect();
-                }
-            }
-            CallKind::Media(MediaCall::Denoising) => {
-                let previous = state.denoising.completed();
-                if state
-                    .denoising
-                    .accept(record.step_index, call.latent_output.clone())
-                {
-                    self.emit_image_steps(id, previous);
-                }
-            }
-            _ => {}
-        }
-    }
-
     /// Takes the host latent pools' answers: a resumed request's restore
     /// resolves, and the copies of a preempted request's trajectory leave
     /// in a batch of latent offloads alone to its denoiser's worker group.
@@ -343,12 +236,6 @@ impl Scheduler {
             .iter()
             .filter(|(_, state)| state.host_trajectory.restoring == Restoring::Pinning)
             .map(|(id, _)| *id)
-            .chain(
-                self.running
-                    .iter()
-                    .filter(|(_, state)| state.host_trajectory.restoring == Restoring::Pinning)
-                    .map(|(id, _)| *id),
-            )
             .collect();
         for id in pinning {
             let Some(restored) = self
@@ -358,9 +245,8 @@ impl Scheduler {
             else {
                 continue;
             };
-            let image = self.running.get(&id).map(|state| state.image_id);
-            let restore = match (restored, image) {
-                (Restored::Hit(restore), None) => {
+            let restore = match restored {
+                Restored::Hit(restore) => {
                     tracing::info!(
                         request = id.0,
                         steps = restore.steps,
@@ -368,34 +254,15 @@ impl Scheduler {
                     );
                     Some(restore)
                 }
-                (Restored::Hit(restore), Some(image)) => {
-                    tracing::info!(
-                        request = id.0,
-                        image,
-                        steps = restore.steps,
-                        "a resumed image continues from its stored trajectory"
-                    );
-                    Some(restore)
-                }
-                (Restored::Miss, None) => {
+                Restored::Miss => {
                     tracing::info!(
                         request = id.0,
                         "a resumed video request's stored trajectory is missing: it starts from noise"
                     );
                     None
                 }
-                (Restored::Miss, Some(image)) => {
-                    tracing::info!(
-                        request = id.0,
-                        image,
-                        "a resumed image's stored trajectory is missing: it starts from noise"
-                    );
-                    None
-                }
             };
             if let Some(state) = self.media_state_mut(id) {
-                state.host_trajectory.restoring = Restoring::Ready(restore);
-            } else if let Some(state) = self.running.get_mut(&id) {
                 state.host_trajectory.restoring = Restoring::Ready(restore);
             }
         }
@@ -464,67 +331,11 @@ impl Scheduler {
         }
     }
 
-    /// The stored trajectory the latent preparation of token request
-    /// `id`'s current image opens at: `Some(Some(restore))` for the stored
-    /// step of the image it resumes, `Some(None)` from noise, and `None`
-    /// while the stored pages are pinned. A request that resumes the image
-    /// it had begun (`Restoring::Due`) pins them when the preparation is
-    /// first due, for the replica it places the preparation on: the stored
-    /// steps of its trajectory (`GenerationRequest::trajectory`), keyed by
-    /// the image's index ([`image_trajectory`]). A replica that has no room
-    /// for the call yet is chosen at a later step.
-    pub(crate) fn image_restore(&mut self, id: RequestId) -> Option<Option<ipc::LatentRestore>> {
-        let state = self.running.get(&id)?;
-        match &state.host_trajectory.restoring {
-            Restoring::Due => {}
-            Restoring::Pinning => return None,
-            Restoring::Ready(restore) => return Some(restore.clone()),
-            Restoring::Planned => return Some(None),
-        }
-        let request_key = RequestKey::new(self.engine_id, id, state.request_epoch);
-        let stored = state.req.trajectory.clone();
-        let trajectory = image_trajectory(stored.id, state.image_id);
-        let worker = self.dispatch.place(
-            &self.worker,
-            &self.info,
-            request_key,
-            CallKind::Media(MediaCall::LatentPreparation),
-        )?;
-        let pinning = self.trajectories.as_mut().is_some_and(|store| {
-            store.restore(
-                id,
-                &worker,
-                trajectory,
-                stored.denoised_steps,
-                stored.state_seed,
-                &stored.stored_layout,
-            )
-        });
-        let state = self.running.get_mut(&id)?;
-        if pinning {
-            state.host_trajectory.restoring = Restoring::Pinning;
-            None
-        } else {
-            state.host_trajectory.restoring = Restoring::Ready(None);
-            Some(None)
-        }
-    }
-
     /// Ends the restore of request `id`, whose latent preparation resolved
     /// or which left: the pages it pinned are released.
     pub(crate) fn end_restore(&mut self, id: RequestId) {
         if let Some(store) = self.trajectories.as_mut() {
             store.release(id);
-        }
-    }
-
-    /// Ends the restore of token request `id`'s image, whose latent
-    /// preparation completed, as `end_restore` does: the request's later
-    /// images start from noise.
-    pub(crate) fn end_image_restore(&mut self, id: RequestId) {
-        self.end_restore(id);
-        if let Some(state) = self.running.get_mut(&id) {
-            state.host_trajectory.restoring = Restoring::Planned;
         }
     }
 

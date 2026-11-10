@@ -6,20 +6,15 @@
 //! request's encodings of its input images and of the images it generated.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
-use ipc::{
-    CallKind, EncoderPoolInfo, ImageEncoderOutput, ImageParams, MediaCall, RequestId,
-    SamplingParams,
-};
+use ipc::{CallKind, EncoderPoolInfo, ImageEncoderOutput, MediaCall, RequestId, SamplingParams};
 use scheduler::{
     BatchEvent, CachePolicy, CommandSender, EncoderInputs, Event, EventRx, ExecutionBatch,
-    FeedbackImage, FeedbackNextToken, FeedbackSource, GeneratedImage, GenerationConstraint,
-    GenerationRequest, ImageEncoder, ImageEncoderInput, ImageGenerationConfig, ImageInput,
-    ImageTrigger, MultimodalInputs, Request, SchedulerConfig, SimEngine, SimWorker,
+    GenerationRequest, ImageEncoder, ImageEncoderInput, ImageInput, MultimodalInputs, Request,
+    SchedulerConfig, SimEngine, SimWorker,
 };
 
 use crate::support;
@@ -254,43 +249,19 @@ fn image_request(id: u64, image: u8, seed: u64, cache: CachePolicy) -> Generatio
                 ],
             }],
         },
-        negative_prompt_token_ids: Vec::new(),
-        constraint: GenerationConstraint::Default,
         sampling: SamplingParams {
             temperature: 0.0,
             seed: Some(seed),
             ..SamplingParams::default()
         },
-        image: ImageParams {
-            steps: 2,
-            height: 32,
-            width: 32,
-            seed: Some(seed),
-            ..ImageParams::default()
-        },
-        max_images: 1,
         max_und_tokens: 8,
         include_stop_token: false,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
         priority: 0,
         cache,
-        image_generation: ImageGenerationConfig {
-            // The request's second greedy token opens its image.
-            trigger: ImageTrigger::Token {
-                token_id: scheduler::sim_text_token(RequestId(id), 1),
-            },
-            requires_text_for_image: false,
-            feedback_source: Some(FeedbackSource::DeviceProduct),
-            feedback_next_token: FeedbackNextToken::Token { token_id: 7 },
-            num_feedback_positions: 2,
-            feedback_encoders: vec![encoder(ImageEncoder::Latent, 6)],
-            sample_feedback_continuation: false,
-        },
         generated_token_ids: Vec::new(),
         adapter: 0,
-        generated_images: Vec::new(),
-        trajectory: Default::default(),
     }
 }
 
@@ -358,80 +329,5 @@ fn an_image_encoding_is_computed_when_missing_and_read_on_another_epoch() {
         };
         let (_, batches) = run_image(&server, pool, image_request(id, image, seed, cache));
         assert_eq!(input_encodings(&batches, id), expected, "request {id}");
-    }
-}
-
-/// The facts a migration carries of a request that read `events`: every
-/// token it generated, the image-opening tokens among them, and each image
-/// with the values its feedback reads, after the tokens before it.
-fn continuation(mut request: GenerationRequest, events: &[Event]) -> GenerationRequest {
-    for event in events {
-        match event {
-            Event::TextToken { id, .. } | Event::ControlToken { id } => {
-                request.generated_token_ids.push(*id);
-            }
-            Event::TextTokens { ids } => request.generated_token_ids.extend_from_slice(ids),
-            Event::ImageDone { feedback, .. } => request.generated_images.push(GeneratedImage {
-                tokens: u32::try_from(request.generated_token_ids.len()).unwrap(),
-                image: FeedbackImage::Pixels(Arc::clone(
-                    feedback.as_ref().expect("the image's feedback values"),
-                )),
-            }),
-            _ => {}
-        }
-    }
-    request
-}
-
-/// A request's feedback encoding of the image it generated, planned once
-/// the image's values reached the engine (a simulated rank runs one batch
-/// at a time), is computed and written to the pool. The request continued
-/// on another epoch rebuilds its context from its facts: its input image's
-/// encodings and the feedback encoding of the image it carries, at the same
-/// draw, are read from the pool instead of encoded. Continued on an epoch
-/// whose pool holds none of them, it computes and stores them all, and a
-/// further continuation there reads them; every run finishes.
-#[test]
-fn a_continued_image_request_reads_its_images_encodings_on_another_epoch() {
-    let mut server = StorageServer::start(1 << 20);
-    let pool = server.encoder_pool("sim", PAGE_BYTES, 64);
-    let request = image_request(1, 5, 5, CachePolicy::default());
-    let (events, first) = run_image(&server, pool, request.clone());
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, Event::ImageDone { .. })),
-        "the request generated its image: {events:?}"
-    );
-    // The input image's latent encoding, then the feedback encoding of the
-    // generated one.
-    assert_eq!(
-        encodings(&first, MediaCall::LatentEncoding),
-        [(RequestId(1), Some(false)), (RequestId(1), Some(false))]
-    );
-
-    let continued = continuation(request, &events);
-    let (_, second) = run_image(&server, pool, continued.clone());
-    assert_eq!(
-        encodings(&second, MediaCall::LatentEncoding),
-        [(RequestId(1), Some(true)), (RequestId(1), Some(true))]
-    );
-    assert_eq!(
-        encodings(&second, MediaCall::VisionEncoding),
-        [(RequestId(1), Some(true))]
-    );
-
-    let mut elsewhere = StorageServer::start(1 << 20);
-    let other = elsewhere.encoder_pool("sim", PAGE_BYTES, 64);
-    for read in [false, true] {
-        let (_, batches) = run_image(&elsewhere, other, continued.clone());
-        assert_eq!(
-            encodings(&batches, MediaCall::LatentEncoding),
-            [(RequestId(1), Some(read)), (RequestId(1), Some(read))]
-        );
-        assert_eq!(
-            encodings(&batches, MediaCall::VisionEncoding),
-            [(RequestId(1), Some(read))]
-        );
     }
 }

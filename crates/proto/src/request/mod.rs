@@ -11,7 +11,6 @@ mod convert;
 mod dtype;
 mod event;
 mod generation;
-mod image;
 mod sampling;
 mod spec;
 mod values;
@@ -24,12 +23,10 @@ pub use event::{
     Request, StopReason, Trajectory,
 };
 pub use generation::{
-    CachePolicy, CacheResume, FeedbackImage, FeedbackNextToken, FeedbackSource, GeneratedImage,
-    GenerationConstraint, GenerationConstraintParseError, GenerationFeatures, GenerationLimits,
-    GenerationRequest, GenerationRequestError, GenerationResourceError, ImageEncoderInput,
-    ImageGenerationConfig, ImageInput, ImagePixels, ImageTrigger, MultimodalInputs, PixelRange,
+    CachePolicy, CacheResume, GenerationFeatures, GenerationLimits, GenerationRequest,
+    GenerationRequestError, GenerationResourceError, ImageEncoderInput, ImageInput,
+    MultimodalInputs,
 };
-pub use image::{CfgRenorm, CfgRenormParseError, ImageParams, ImageParamsError};
 pub use sampling::{SamplingParams, SamplingParamsError};
 pub use spec::{
     ExpertExchange, FlashInferBackend, FlashInferBackendParseError, LoadFormat, PrefixCacheDtype,

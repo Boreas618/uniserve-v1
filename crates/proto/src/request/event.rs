@@ -22,8 +22,6 @@ pub enum FinishReason {
     MaxTokens,
     /// A configured stop token or string matched.
     Stop,
-    /// The image-only generation objective completed.
-    ImageDone,
     /// The client cancelled the request at a public output boundary.
     Cancelled,
     /// The server aborted the request immediately.
@@ -91,69 +89,6 @@ pub enum Event {
         /// Scored prompt positions in prompt order.
         positions: Vec<PositionLogprobs>,
     },
-    /// Opens the lifecycle of one generated image.
-    ///
-    /// The engine emits it together with the image's first committed
-    /// denoising step, before that step's `ImageStep`.
-    ImageBegin {
-        /// Request-local image identity.
-        image_id: u32,
-        /// Output height in pixels.
-        height: u32,
-        /// Output width in pixels.
-        width: u32,
-        /// Configured denoising step count.
-        steps: u16,
-    },
-    /// Reports one committed diffusion step. Each committed step is reported
-    /// once, in increasing order.
-    ImageStep {
-        /// Request-local image identity.
-        image_id: u32,
-        /// One-based committed step number.
-        step: u16,
-    },
-    /// Marks the transition from denoising to image materialization.
-    ///
-    /// The engine emits it when the image-decoding call returns, before the
-    /// image's `ImageDone`.
-    ImageCommit {
-        /// Request-local image identity.
-        image_id: u32,
-    },
-    /// Publishes a materialized PNG image.
-    ///
-    /// The engine reads `height`, `width`, and `bytes` from the PNG header
-    /// and the payload length; a payload without a PNG header finishes the
-    /// request with [`FinishReason::Error`] instead.
-    ImageDone {
-        /// Request-local image identity.
-        image_id: u32,
-        /// Decoded image height in pixels.
-        height: u32,
-        /// Decoded image width in pixels.
-        width: u32,
-        /// PNG payload size in bytes.
-        bytes: u64,
-        /// Base64-encoded PNG payload.
-        pixels_png_b64: String,
-        /// The decoded image product the request's feedback encoders read,
-        /// when it feeds the image back from the device
-        /// (`FeedbackSource::DeviceProduct`): the image's exact feedback
-        /// input, which the daemon keeps to submit a migrated request again
-        /// with it (`GeneratedImage`).
-        feedback: Option<Arc<super::ImagePixels>>,
-    },
-    /// A generated token the request's text does not include: one that opens
-    /// an image or closes a round, or one of a request that publishes no
-    /// text. It counts as generated. The daemon keeps it, in order with the
-    /// text tokens, to submit a migrated request again with every token it
-    /// generated (`GenerationRequest::generated_token_ids`); no client reads
-    /// it.
-    ControlToken {
-        /// Vocabulary token identity.
-        id: u32,
-    },
     /// Reports actual media computation progress committed by the engine.
     ///
     /// The engine emits it for diffusion media requests after each valid media
@@ -187,8 +122,6 @@ pub enum Event {
         prompt_tokens: usize,
         /// Number of generated tokens charged to the request.
         completion_tokens: usize,
-        /// Number of generated images.
-        images: usize,
     },
     /// Rejects a request before execution begins.
     Rejected {
@@ -205,16 +138,15 @@ pub enum Event {
     /// Ends a request on this engine without finishing it: every token it
     /// generated here was sent before, and the daemon may submit it again
     /// with those tokens (`GenerationRequest::generated_token_ids`) and
-    /// with the trajectory steps the engine stored of the image or video it
-    /// was denoising (`Trajectory::denoised_steps`), to the engine that
+    /// with the trajectory steps the engine stored of the video it was
+    /// denoising (`Trajectory::denoised_steps`), to the engine that
     /// serves next.
     Migratable {
         /// Why the request leaves its engine.
         cause: MigrationCause,
         /// The denoising steps of the trajectory the engine stored in its
         /// host latent pools at the step boundary it preempted the request
-        /// at: a video request's, or the image a token request had begun
-        /// and not finished; zero when it stored none.
+        /// at, a video request's; zero when it stored none.
         denoised_steps: u32,
         /// With stored steps, where the engine put the trajectory's pages
         /// and how each stored rank laid its part out
@@ -354,13 +286,10 @@ pub struct EncoderInputs {
     pub audio: Option<[u8; 32]>,
 }
 
-/// A request's latent trajectory across the engines that serve it: a video
-/// request's, or the trajectory of the image a token request had begun and
-/// not finished when an engine preempted it.
+/// A video request's latent trajectory across the engines that serve it.
 ///
 /// An engine that preempts the request at a denoising-step boundary stores
-/// the trajectory in its host latent pools, each page keyed by `id` (and,
-/// for a token request's image, the image's index among its images), the
+/// the trajectory in its host latent pools, each page keyed by `id`, the
 /// steps it took, the latent seed of what its denoising computes and the
 /// part of the samples the page holds; the daemon submits the request again
 /// with those steps and the engine's record of the stored layout
@@ -378,8 +307,6 @@ pub struct Trajectory {
     pub id: u64,
     /// The denoising steps of the trajectory an engine stored when it
     /// preempted the request; zero for a request that starts from noise.
-    /// A token request names the steps of the image it had begun, which
-    /// the daemon forgets once the image completes.
     pub denoised_steps: u32,
     /// The latent seed of the epoch whose stored trajectory the request
     /// continues although the serving epoch's denoising computes other
@@ -506,8 +433,7 @@ pub enum DiffusionRequestError {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
-    /// Token generation: autoregressive text, interleaved text and images, or
-    /// block-diffusion canvases. Boxed, as it is several times
+    /// Token generation: autoregressive text or block-diffusion canvases. Boxed, as it is several times
     /// the size of a diffusion request.
     Generation(Box<super::GenerationRequest>),
     /// Video diffusion.

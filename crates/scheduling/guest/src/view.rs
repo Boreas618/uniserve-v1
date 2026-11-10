@@ -127,7 +127,7 @@ pub struct RequestView {
     /// times its guidance branches, a verification one token plus its drafts,
     /// any other call its bound). A prefill or refill chunk is charged the
     /// chunk the policy sizes instead, and a prefill with nothing left to
-    /// ingest — a close cache, a feedback state, a block's commit — is charged
+    /// ingest — a close cache, a block's commit — is charged
     /// the one position it writes, since there is no chunk to size.
     #[serde(default)]
     pub next_tokens: u32,
@@ -186,7 +186,6 @@ pub enum PhaseKind {
     Decode,
     Verify,
     TokenDenoise,
-    ImageDecode,
     CacheInstall,
     // Media work.
     MediaRead,
@@ -235,7 +234,6 @@ impl PhaseKind {
             PhaseKind::Decode
             | PhaseKind::Verify
             | PhaseKind::TokenDenoise
-            | PhaseKind::ImageDecode
             | PhaseKind::CacheInstall => PhaseClass::Token,
             PhaseKind::MediaRead
             | PhaseKind::Denoise
@@ -256,7 +254,7 @@ impl PhaseKind {
     /// plan, a policy's `Plan` and a batch's phase are all numbered here, so this is the one table
     /// they can agree on.
     ///
-    /// Id 7 is reserved: it numbered a kind that no longer exists.
+    /// Ids 7 and 8 are reserved: they numbered kinds that no longer exist.
     ///
     /// [`PhaseKind::Other`] is a policy-side placeholder for a kind a policy does not know: it has
     /// no phase of its own, so its id is `u32::MAX`.
@@ -269,7 +267,6 @@ impl PhaseKind {
             Self::Decode => 4,
             Self::Verify => 5,
             Self::TokenDenoise => 6,
-            Self::ImageDecode => 8,
             Self::CacheInstall => 9,
             Self::MediaRead => 10,
             Self::Denoise => 11,

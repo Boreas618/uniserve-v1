@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{Level, debug, trace};
 
 use super::logprobs::{DecodedLogprobs, decode_logprobs, decode_prompt_logprobs};
-use crate::output::events::{FinishReason, GeneratedImage, PromptInfo, StopReason};
+use crate::output::events::{FinishReason, PromptInfo, StopReason};
 use crate::output::text::error::Error;
 use crate::tokenizer::{DynTokenizer, IncrementalDecoder};
 
@@ -62,27 +62,11 @@ pub struct Finished {
     /// which counts the tokens of internal sections it never published as
     /// text; the decoder's own count when a stop string ends the stream.
     pub output_tokens: usize,
-    /// Images the engine reports generating.
-    pub images: usize,
-}
-
-/// An image-generation event of an interleaved text-and-image request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ImageEvent {
-    /// Generation of an image began; the request has visible output.
-    Begin,
-    /// One denoising step of the image completed.
-    Step {
-        /// Request-local image identifier.
-        image_id: u32,
-    },
-    /// The image is complete.
-    Done(GeneratedImage),
 }
 
 /// Decoded output of one generation request.
 ///
-/// A stream yields one `Start`, then `TextDelta` and `Image` events in engine
+/// A stream yields one `Start`, then `TextDelta` events in engine
 /// order, then one terminal event: `Done`, `Rejected`, or `Failed`. An
 /// engine refusal arrives before `Start`.
 #[derive(Debug, Clone, PartialEq)]
@@ -114,10 +98,6 @@ pub enum DecodedTextEvent {
         /// Per-position candidate log-probabilities, when requested.
         logprobs: Option<DecodedLogprobs>,
     },
-    /// An image event, yielded when the engine reports it: a completed
-    /// image follows the text decoded before it and reaches the client
-    /// while the request goes on, ahead of its later tokens and images.
-    Image(ImageEvent),
     /// The request finished.
     Done(Finished),
     /// The engine refused the request before executing it.
@@ -379,47 +359,12 @@ impl DecodeStream {
                     return Ok(Decoded::new(events));
                 }
             }
-            Event::ImageBegin { .. } => {
-                self.ensure_output_ready_from(&events, "an image start")?;
-                events.push(DecodedTextEvent::Image(ImageEvent::Begin));
-            }
-            Event::ImageStep { image_id, .. } => {
-                self.ensure_output_ready_from(&events, "an image step")?;
-                events.push(DecodedTextEvent::Image(ImageEvent::Step { image_id }));
-            }
-            // A commit marks the image's entry into the model context; the
-            // completed image follows it.
-            Event::ImageCommit { .. } => {
-                self.ensure_output_ready_from(&events, "an image commit")?;
-            }
-            Event::ImageDone {
-                image_id,
-                height,
-                width,
-                bytes,
-                pixels_png_b64,
-                ..
-            } => {
-                // Published at once, after the text decoded before it: the
-                // request may generate for long before its next text token,
-                // such as a whole next image, which opens with a control
-                // token and publishes no text.
-                self.ensure_output_ready_from(&events, "a completed image")?;
-                events.push(DecodedTextEvent::Image(ImageEvent::Done(GeneratedImage {
-                    image_id,
-                    width,
-                    height,
-                    bytes,
-                    png_base64: pixels_png_b64,
-                })));
-            }
             // A terminal event flushes decoder holdback only after every pending
             // token/logprob pair and all prompt metadata have resolved.
             Event::Finished {
                 reason,
                 stop_reason,
                 completion_tokens,
-                images,
                 ..
             } => {
                 if let Some(start) = self.start_event(&prompt_token_ids)? {
@@ -454,7 +399,6 @@ impl DecodeStream {
                     reason,
                     prompt_tokens,
                     output_tokens: completion_tokens,
-                    images,
                 }));
                 return Ok(Decoded::new(events));
             }
@@ -467,9 +411,8 @@ impl DecodeStream {
                 return Ok(Decoded::new(events));
             }
             // A request's events migrate with it (`crate::migration`), which
-            // carries a migratable end over to the next engine and keeps the
-            // control tokens a migration submits again.
-            Event::Migratable { .. } | Event::ControlToken { .. } => {
+            // carries a migratable end over to the next engine.
+            Event::Migratable { .. } => {
                 return Err(Error::MalformedOutput {
                     request_id: self.request_id.clone(),
                     message: "a migration's event reached the decoder".to_string(),
@@ -564,7 +507,6 @@ impl DecodeStream {
                 reason: FinishReason::Stop(Some(StopReason::String(stop_string))),
                 prompt_tokens: prompt_token_ids.len(),
                 output_tokens: self.output_tokens,
-                images: 0,
             }));
             return Ok(true);
         }

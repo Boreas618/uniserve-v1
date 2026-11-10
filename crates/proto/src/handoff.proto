@@ -352,9 +352,8 @@ message Assembly {
   optional OpenToolCall tool_call = 3;
   // The next tool call's ordinal among tool calls.
   uint64 next_tool_call_index = 4;
-  // Images that began and completed, and denoising steps seen.
-  uint32 images = 5;
-  uint32 image_steps = 6;
+  reserved 5, 6;
+  reserved "images", "image_steps";
   // Timing of the request's first visible output, in microseconds since
   // `Lowering.started_unix_us`.
   optional uint64 first_visible_output_us = 7;
@@ -381,11 +380,9 @@ message OpenToolCall {
 // The chat-completion chunks and server-sent events of a streamed response.
 message ChatChunks {
   // Whether a tool call was published, which the finish reason follows.
+  reserved 2, 3;
+  reserved "image_steps", "completed_images";
   bool saw_tool_calls = 1;
-  // Denoising steps per image, by image identity.
-  map<uint32, uint32> image_steps = 2;
-  // Completed images, in completion order.
-  repeated uint32 completed_images = 3;
   // Whether a reasoning block is open that the client does not see.
   bool inside_hidden_reasoning = 4;
   // Whether the current update's metadata belongs to hidden reasoning.
@@ -410,10 +407,8 @@ message ChatCollection {
   optional DecodedLogprobs logprobs = 4;
   // Generated token identifiers.
   repeated uint32 token_ids = 5;
-  // Generated images as data URLs, in completion order.
-  repeated string images = 6;
-  // Denoising steps per completed image, in completion order.
-  repeated uint32 image_steps_per_image = 7;
+  reserved 6, 7;
+  reserved "images", "image_steps_per_image";
   // The finish reason, as the response lists it.
   string finish_reason = 8;
   // The usage the terminal event reported.
@@ -442,9 +437,8 @@ message ToolCall {
 message Usage {
   uint32 prompt_tokens = 1;
   uint32 output_tokens = 2;
-  uint32 image_count = 3;
-  uint32 image_steps = 4;
-  repeated uint32 image_steps_per_image = 5;
+  reserved 3, 4, 5;
+  reserved "image_count", "image_steps", "image_steps_per_image";
 }
 
 // Candidate tokens of one scored position, as the engine reported them.

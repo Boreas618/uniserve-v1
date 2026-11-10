@@ -25,10 +25,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ipc::{ImageParams, SamplingParams};
+use ipc::SamplingParams;
 use scheduler::{
-    CommandSender, GenerationConstraint, GenerationRequest, PolicyBytes, PolicyProgram,
-    PolicySource, SimEngine, SimWorker,
+    CommandSender, GenerationRequest, PolicyBytes, PolicyProgram, PolicySource, SimEngine,
+    SimWorker,
 };
 use scheduling::guest::Nanos;
 use scheduling::guest::PhaseId;
@@ -514,22 +514,15 @@ fn text_request(id: u64, prompt: usize, tokens: usize) -> GenerationRequest {
         request_id: ipc::RequestId(id),
         prompt_token_ids: vec![7; prompt],
         multimodal_inputs: Default::default(),
-        negative_prompt_token_ids: Vec::new(),
-        constraint: GenerationConstraint::UndOnly,
         sampling: SamplingParams::default(),
-        image: ImageParams::default(),
-        max_images: 1,
         max_und_tokens: tokens,
         include_stop_token: false,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
         priority: 0,
         cache: Default::default(),
-        image_generation: Default::default(),
         generated_token_ids: Vec::new(),
         adapter: 0,
-        generated_images: Vec::new(),
-        trajectory: Default::default(),
     }
 }
 

@@ -2,26 +2,16 @@
 //! tier) and in the host encoder pools (the host tier,
 //! `crate::encoder_outputs`).
 //!
-//! An encoding is the output of one encoder over one image the request
-//! reads: an input image's block (`next_context_encode`), the feedback
-//! encoding of an image the request generated, and the feedback encoding of
-//! an image a migrated request carries when its context is rebuilt
-//! (`generation::continuation`). Its bytes follow from what the encoder
-//! reads and from what computes it, so both tiers key it by:
+//! An encoding is the output of one encoder over one input image block the
+//! request reads (`next_context_encode`). Its bytes follow from what the
+//! encoder reads and from what computes it, so both tiers key it by:
 //!
-//! - **the image**: an input image's digest (`ImageInput::digest`, which the
+//! - **the image**: the input image's digest (`ImageInput::digest`, which the
 //!   server computed over the image's bytes, a request-dependent
-//!   preprocessing parameter and the request's cache partition), or a
-//!   generated image's digest over the values or the PNG its feedback reads
-//!   and the request's cache partition ([`generated_image`]). The engine
-//!   knows a generated image's values once its decoding resolved: a
-//!   feedback encoding planned before, queued behind the decoding
-//!   (`next_generation_phase`), is computed without the host tier, and the
-//!   continuation that carries the image, which knows its values, looks its
-//!   encoding up and stores it;
+//!   preprocessing parameter and the request's cache partition);
 //! - **the draw**, for an encoder that samples its posterior
-//!   (`ipc::ImageEncoderOutput::draws`): the request's image seed and the
-//!   encoding's draw (`Call::latent_draw`), which its noise follows. An
+//!   (`ipc::ImageEncoderOutput::draws`): the encoding's draw
+//!   (`Call::latent_draw`), which its noise follows. An
 //!   encoder that does not sample is keyed without them, so the requests
 //!   reading one image share its output whatever their seeds;
 //! - **what computes it**: its output's name, and in the host tier the
@@ -53,38 +43,6 @@ pub(super) fn output_name(encoder: crate::ImageEncoder) -> &'static str {
         crate::ImageEncoder::Vision => VISION_FEATURES,
         crate::ImageEncoder::Latent => LATENT_FEATURES,
     }
-}
-
-/// The digest of a generated image as a feedback encoding reads it: the
-/// decoded image product's values, or its PNG for feedback that reads the
-/// artifact, in the cache partition `isolation`, so that requests of other
-/// partitions share no encoding of it.
-pub(super) fn generated_image(image: &crate::FeedbackImage, isolation: Option<u64>) -> [u8; 32] {
-    let mut digest = Digest::new(b"generated-image");
-    match image {
-        crate::FeedbackImage::Pixels(pixels) => {
-            digest.bytes(b"uniserve-generated-image-values/1\0");
-            digest.number(u64::from(pixels.height));
-            digest.number(u64::from(pixels.width));
-            digest.number(match pixels.range {
-                crate::PixelRange::Unit => 0,
-                crate::PixelRange::SignedUnit => 1,
-            });
-            digest.bytes(&pixels.values);
-        }
-        crate::FeedbackImage::Png(png) => {
-            digest.bytes(b"uniserve-generated-image-png/1\0");
-            digest.bytes(png.as_bytes());
-        }
-    }
-    match isolation {
-        Some(key) => {
-            digest.number(1);
-            digest.number(key);
-        }
-        None => digest.number(0),
-    }
-    digest.finish()
 }
 
 /// The digest of what an encoding read: the image's digest and, for an
@@ -132,95 +90,41 @@ impl Encoding {
     }
 }
 
-/// What an encoding encodes, for [`Scheduler::encoding`].
-#[derive(Debug, Clone, Copy)]
-pub(super) enum Encoded<'a> {
-    /// An input image's block.
-    Input(generation::BlockCursor),
-    /// Feedback encoder `encoder` of the request's generated image
-    /// `image_index` (from one), whose digest is `image`.
-    Feedback {
-        image_index: u32,
-        encoder: usize,
-        image: &'a [u8; 32],
-    },
-}
-
 impl Scheduler {
-    /// The encoding of `request`'s image that `encoded` names, keyed as
-    /// the module documentation says. `None` for a block or encoder the
-    /// request does not have, or one whose cache tokens are unbounded.
+    /// The encoding of `request`'s input-image block at `block`, keyed as
+    /// the module documentation says. `None` for a block the request does
+    /// not have, or one whose cache tokens are unbounded.
     pub(super) fn encoding(
         &self,
         request: &GenerationRequest,
-        encoded: Encoded<'_>,
+        block: generation::BlockCursor,
     ) -> Option<Encoding> {
         let images = &request.multimodal_inputs.images;
-        let inputs_before: usize = images.iter().map(|image| image.encoders.len()).sum();
-        let feedback = &request.image_generation.feedback_encoders;
         // The encoding's ordinal among the request's encodings: its input
-        // images' blocks in context order, then the feedback encodings of
-        // each image it generates.
-        let (encoder, image, ordinal, latent) = match encoded {
-            Encoded::Input(block) => {
-                let image = images.get(block.image)?;
-                let encoder = *image.encoders.get(block.encoder)?;
-                let ordinal = images[..block.image]
-                    .iter()
-                    .map(|image| image.encoders.len())
-                    .sum::<usize>()
-                    + block.encoder;
-                (
-                    encoder,
-                    image.digest,
-                    ordinal,
-                    generation::LatentEncoding::Input(block),
-                )
-            }
-            Encoded::Feedback {
-                image_index,
-                encoder: index,
-                image,
-            } => {
-                let encoder = *feedback.get(index)?;
-                let ordinal = inputs_before
-                    + (image_index.saturating_sub(1) as usize) * feedback.len()
-                    + index;
-                (
-                    encoder,
-                    *image,
-                    ordinal,
-                    generation::LatentEncoding::Feedback {
-                        image_index,
-                        encoder: index,
-                    },
-                )
-            }
-        };
+        // images' blocks in context order.
+        let image = images.get(block.image)?;
+        let encoder = *image.encoders.get(block.encoder)?;
+        let ordinal = images[..block.image]
+            .iter()
+            .map(|image| image.encoders.len())
+            .sum::<usize>()
+            + block.encoder;
         let name = output_name(encoder.encoder);
         // An encoder that samples reads the request's draw besides the
-        // image: the seed of the image parameters the request's admission
-        // carries (`NewRequest::image`, none for a request that generates no
-        // image) and the encoding's ordinal among its latent encodings.
+        // image: the encoding's ordinal among its latent encodings, under a
+        // seed of zero.
         let draws = self
             .info
             .image_encoders
             .get(name)
             .is_some_and(|output| output.draws);
-        let draw = draws.then(|| {
-            let seed = if request.generates_images() {
-                request.image.seed.unwrap_or(0)
-            } else {
-                0
-            };
-            (seed, generation::latent_draw(request, latent))
-        });
+        let draw = draws.then(|| (0, generation::latent_draw(request, block)));
         Some(Encoding {
             output: OutputId {
                 name,
                 ordinal: u32::try_from(ordinal).ok()?,
             },
-            inputs: inputs(&image, draw),
+            inputs: inputs(&image.digest, draw),
             rows: encoder.cache_token_capacity(&self.generation_limits).ok()?,
         })
     }

@@ -100,7 +100,6 @@ impl Scheduler {
                 stop_reason: None,
                 prompt_tokens: submission.request.prompt_token_ids.len(),
                 completion_tokens: 0,
-                images: 0,
             });
         }
         let media = self.media_ids();
@@ -117,7 +116,6 @@ impl Scheduler {
                     stop_reason: None,
                     prompt_tokens: st.charged_prompt_tokens(),
                     completion_tokens: 0,
-                    images: 0,
                 });
             }
             ids
@@ -877,7 +875,6 @@ impl Scheduler {
                 stop_reason: None,
                 prompt_tokens: submission.request.prompt_token_ids.len(),
                 completion_tokens: 0,
-                images: 0,
             });
             return;
         }
@@ -924,7 +921,6 @@ impl Scheduler {
                 stop_reason: None,
                 prompt_tokens: st.charged_prompt_tokens(),
                 completion_tokens: 0,
-                images: 0,
             });
         }
     }

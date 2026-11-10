@@ -17,8 +17,7 @@
 //!   unresolved. Depth 1 is the serial oracle that the depth-invariance tests
 //!   compare depth 2 against.
 //! - The cache block size is 64 tokens, one unit per page (`MainProcessInfo::default`),
-//!   unless a test calls `SimEngine::set_block_size` or `set_groups`, and
-//!   generated images default to 512x512 (`ImageParams::default`).
+//!   unless a test calls `SimEngine::set_block_size` or `set_groups`.
 //! - The `general` request gauges and the `prefix_cache` and `encoder` counters in
 //!   `SchedulerStats` are snapshots that `Scheduler::publish_cache_stats`
 //!   refreshes as the loop runs, not when an event is sent, so they can trail
@@ -26,7 +25,7 @@
 
 use crate::support;
 
-use ipc::{Call, CallKind, ForwardMode, MediaCall, TransferMode};
+use ipc::{Call, CallKind, ForwardMode, MediaCall};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,7 +33,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
 
-use ipc::{ImageParams, RequestId, SamplingParams};
+use ipc::{RequestId, SamplingParams};
 use scheduler::{
     BatchEvent, BatchResult, CommandSender, EVENT_BUFFER_CAPACITY, ExecutionBatch, SchedulerConfig,
     SimEngine, SimWorker, SpecialTokenIds, Worker, WorkerError, WorkerGroupId, WorkerInfo,
@@ -42,8 +41,7 @@ use scheduler::{
 };
 use scheduler::{Event, FinishReason};
 use scheduler::{
-    FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
-    ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageTrigger, MultimodalInputs,
+    GenerationLimits, GenerationRequest, ImageEncoderInput, ImageInput, MultimodalInputs,
     RejectionKind,
 };
 
@@ -53,19 +51,13 @@ fn special_tokens() -> SpecialTokenIds {
     SimEngine::special_tokens()
 }
 
-/// Advertised generation features follow the worker's supported calls: image
-/// generation needs the complete latent-preparation, denoising, and
-/// image-decoding path (video decoding does not substitute), and each encoder
-/// call enables only its own feature.
+/// Advertised generation features follow the worker's supported calls: each
+/// encoder call enables only its own feature, and denoising calls enable
+/// none of a token request's.
 #[test]
 fn generation_capabilities_require_complete_paths_and_distinct_encoders() {
     use scheduler::GenerationFeatures;
 
-    let image_path = vec![
-        CallKind::Media(MediaCall::LatentPreparation),
-        CallKind::Media(MediaCall::Denoising),
-        CallKind::Media(MediaCall::ImageDecoding),
-    ];
     let cases = [
         (
             vec![CallKind::Media(MediaCall::VisionEncoding)],
@@ -81,21 +73,6 @@ fn generation_capabilities_require_complete_paths_and_distinct_encoders() {
                 CallKind::Media(MediaCall::LatentEncoding),
             ],
             GenerationFeatures::VISION_ENCODE | GenerationFeatures::LATENT_ENCODE,
-        ),
-        (image_path, GenerationFeatures::IMAGE_GENERATION),
-        (
-            vec![
-                CallKind::Media(MediaCall::Denoising),
-                CallKind::Media(MediaCall::ImageDecoding),
-            ],
-            GenerationFeatures::empty(),
-        ),
-        (
-            vec![
-                CallKind::Media(MediaCall::LatentPreparation),
-                CallKind::Media(MediaCall::ImageDecoding),
-            ],
-            GenerationFeatures::empty(),
         ),
         (
             vec![
@@ -140,68 +117,6 @@ fn encoder_products_obey_worker_entry_capacity() {
     assert_eq!(limits.encoder_cache_entries, 64);
 }
 
-/// A generated image reserves its latent at the model's bytes per latent
-/// unit, whichever worker capacity clamps the latent feature bytes. A worker
-/// whose encoder entries hold a quarter of the simulator's feature bytes
-/// leaves the latent of a 512x512 image (1,024 units of 16x16 pixels) at
-/// 1,024 units of `SimEngine::generation_limits().latent_bytes_per_unit`.
-#[test]
-fn a_generated_image_reserves_its_latent_at_the_model_density() {
-    let mut sim = SimEngine::new();
-    sim.mut_info_for_test().encoder_entry_bytes = 64 << 20;
-    let mut worker = SimWorker::new(sim);
-    let dispatched = worker.observe();
-    let scheduler = support::scheduler(Box::new(worker), special_tokens(), 32).unwrap();
-    assert_eq!(
-        scheduler.generation_limits().max_latent_feature_bytes,
-        64 << 20
-    );
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let scheduler_thread = thread::spawn(move || scheduler.run(rx));
-
-    let mut events = handle
-        .submit(generation_request(
-            RequestId(1),
-            text_input(vec![4, 5, 6]),
-            SamplingParams::default(),
-            ImageParams {
-                steps: 1,
-                ..Default::default()
-            },
-            GenerationConstraint::GenOnly,
-            0,
-        ))
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut finished = None;
-    while finished.is_none() && Instant::now() < deadline {
-        match events.try_recv() {
-            Ok(Event::Finished { reason, .. }) => finished = Some(reason),
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    handle.shutdown();
-    let _ = scheduler_thread.join();
-    assert_eq!(finished, Some(FinishReason::ImageDone));
-
-    let latent_bytes = dispatched
-        .try_iter()
-        .filter_map(|event| match event {
-            BatchEvent::Submitted(batch) => Some(batch),
-            _ => None,
-        })
-        .flat_map(|batch| batch.requests)
-        .filter(|(call, _)| call.kind == CallKind::Media(MediaCall::LatentPreparation))
-        .filter_map(|(call, _)| call.latent_output.map(|latent| latent.max_bytes()))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        latent_bytes,
-        vec![1_024 * SimEngine::generation_limits().latent_bytes_per_unit]
-    );
-}
-
 fn text_input(token_ids: Vec<u32>) -> (Vec<u32>, MultimodalInputs) {
     (token_ids, MultimodalInputs::default())
 }
@@ -242,13 +157,7 @@ fn image_input(
     )
 }
 
-/// Builds a unified generation request with a fixed image-generation policy.
-///
-/// The policy triggers on token 1000, lets image-only requests start image
-/// computation without first generating internal text, and, for
-/// Default-constraint requests, feeds each generated image back through one
-/// ViT encode. Tests that need a different trigger use `with_trigger` or edit
-/// `image_generation` afterwards.
+/// Builds a generation request.
 ///
 /// # Panics
 ///
@@ -259,62 +168,31 @@ fn generation_request(
     request_id: RequestId,
     (prompt_token_ids, multimodal_inputs): (Vec<u32>, MultimodalInputs),
     sampling: SamplingParams,
-    image: ImageParams,
-    constraint: GenerationConstraint,
     max_und_tokens: usize,
 ) -> GenerationRequest {
-    let policy = ImageGenerationConfig {
-        trigger: ImageTrigger::Token { token_id: 1000 },
-        requires_text_for_image: false,
-        feedback_source: Some(FeedbackSource::DeviceProduct),
-        feedback_next_token: FeedbackNextToken::EndOfImage,
-        num_feedback_positions: 2,
-        feedback_encoders: vec![ImageEncoderInput {
-            encoder: scheduler::ImageEncoder::Vision,
-            num_cache_tokens: None,
-            max_cache_tokens: None,
-            height: None,
-            width: None,
-        }],
-        sample_feedback_continuation: true,
-    };
-
     let cache = Default::default();
     let limits = GenerationLimits {
         features: scheduler::GenerationFeatures::UNDERSTANDING
-            | scheduler::GenerationFeatures::VISION_ENCODE
-            | scheduler::GenerationFeatures::IMAGE_GENERATION,
-        max_latent_units: 65_536,
-        latent_downsample: 16,
+            | scheduler::GenerationFeatures::VISION_ENCODE,
         max_vae_grid_tokens: 65_536,
         max_vit_grid_tokens: 8_192,
-        latent_bytes_per_unit: (256 << 20) / 65_536,
         max_latent_feature_bytes: 256 << 20,
         max_vision_feature_bytes: 256 << 20,
-        commit_marker_tokens: 2,
-        max_cfg_branches: 3,
         encoder_cache_entries: 256,
     };
     let request = GenerationRequest {
         request_id,
         prompt_token_ids,
         multimodal_inputs,
-        negative_prompt_token_ids: Vec::new(),
-        constraint,
         sampling,
-        image,
-        max_images: 1,
         max_und_tokens,
         include_stop_token: false,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
         priority: 0,
         cache,
-        image_generation: policy,
         generated_token_ids: Vec::new(),
         adapter: 0,
-        generated_images: Vec::new(),
-        trajectory: Default::default(),
     };
     request
         .validate_resources(&limits)
@@ -322,29 +200,19 @@ fn generation_request(
     request
 }
 
-fn with_trigger(mut request: GenerationRequest, trigger: ImageTrigger) -> GenerationRequest {
-    request.image_generation.trigger = trigger;
-
-    request
-}
-
 struct Collected {
     text: usize,
-    images: usize,
     finished: bool,
     reason: Option<FinishReason>,
 }
 
-/// Runs the given (constraint, count) requests through a fresh scheduler at `depth`,
+/// Runs `count` text requests through a fresh scheduler at `depth`,
 /// returning per-request collected counts.
 ///
 /// Request ids are assigned from 1 in case order. A request that emits no event
 /// before the 20-second deadline has no entry in the result, and one that emits
 /// events but no terminal event has `finished == false`.
-fn batch_requests(
-    depth: u32,
-    cases: &[(GenerationConstraint, usize)],
-) -> HashMap<RequestId, Collected> {
+fn batch_requests(depth: u32, count: usize) -> HashMap<RequestId, Collected> {
     let mut sim = SimEngine::new();
     sim.set_queue_depth(depth);
     let worker = Box::new(SimWorker::new(sim));
@@ -355,17 +223,12 @@ fn batch_requests(
 
     let mut rxs: HashMap<RequestId, scheduler::EventRx> = HashMap::new();
     let mut id = 1u64;
-    for (constraint, n) in cases {
-        for _ in 0..*n {
+    {
+        for _ in 0..count {
             let req = generation_request(
                 RequestId(id),
                 text_input(vec![1, 2, 3, 4, 5]),
                 SamplingParams::default(),
-                ImageParams {
-                    steps: 4,
-                    ..Default::default()
-                },
-                *constraint,
                 16,
             );
             let erx = handle.submit(req).unwrap();
@@ -383,13 +246,11 @@ fn batch_requests(
             while let Ok(ev) = erx.try_recv() {
                 let c = out.entry(*rid).or_insert(Collected {
                     text: 0,
-                    images: 0,
                     finished: false,
                     reason: None,
                 });
                 match ev {
                     Event::TextToken { .. } => c.text += 1,
-                    Event::ImageDone { .. } => c.images += 1,
                     Event::Finished { reason, .. } if !c.finished => {
                         c.finished = true;
                         c.reason = Some(reason);
@@ -407,365 +268,12 @@ fn batch_requests(
 }
 
 #[test]
-fn text_and_image_requests_complete() {
-    let out = batch_requests(
-        2,
-        &[
-            (GenerationConstraint::UndOnly, 3),
-            (GenerationConstraint::GenOnly, 2),
-        ],
-    );
-    assert_eq!(out.len(), 5);
-    for (id, c) in &out {
-        assert!(c.finished, "req {id:?} did not finish");
-        // Ids follow case order, so 1-3 are the Und-only text requests.
-        if id.0 <= 3 {
-            assert!(c.text > 0, "text req {id:?} produced no tokens");
-        } else {
-            assert_eq!(c.images, 1, "image req {id:?} produced {} images", c.images);
-        }
-    }
-}
-
-/// Cancelling a resident image request reports `Cancelled` and releases its
-/// resources, so an image request submitted behind it still completes. The
-/// latent pool (64 usable pages of 64 units) and buffer pool are reduced from
-/// the simulator defaults, and the first request runs a thousand denoising
-/// steps so it is still resident when the second arrives.
-#[test]
-fn cancellation_releases_latent_admission_for_a_waiting_image() {
-    let mut sim = SimEngine::new();
-    sim.set_queue_depth(4);
-    sim.mut_info_for_test().latent_page_units = 64;
-    sim.mut_info_for_test().latent_pages = 65;
-    sim.mut_info_for_test().buffer_pool_bytes = 16 << 20;
-    sim.mut_info_for_test().max_batch_calls = 1024;
-    let scheduler =
-        support::scheduler(Box::new(SimWorker::new(sim)), special_tokens(), 32).unwrap();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let thread = thread::spawn(move || scheduler.run(rx));
-
-    let mut first = handle
-        .submit(generation_request(
-            RequestId(1),
-            text_input(vec![4, 5, 6]),
-            SamplingParams::default(),
-            ImageParams {
-                steps: 1000,
-                ..Default::default()
-            },
-            GenerationConstraint::GenOnly,
-            0,
-        ))
-        .unwrap();
-    let begin_deadline = Instant::now() + Duration::from_secs(10);
-    let mut began = false;
-    while !began && Instant::now() < begin_deadline {
-        match first.try_recv() {
-            Ok(Event::ImageBegin { .. }) => began = true,
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    assert!(began, "resident image did not enter generation");
-
-    let mut second = handle
-        .submit(generation_request(
-            RequestId(2),
-            text_input(vec![4, 5, 6]),
-            SamplingParams::default(),
-            ImageParams {
-                steps: 2,
-                ..Default::default()
-            },
-            GenerationConstraint::GenOnly,
-            0,
-        ))
-        .unwrap();
-    handle.cancel(RequestId(1));
-
-    let mut reasons = HashMap::new();
-    let mut second_images = 0;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while reasons.len() < 2 && Instant::now() < deadline {
-        for (id, receiver) in [(RequestId(1), &mut first), (RequestId(2), &mut second)] {
-            while let Ok(event) = receiver.try_recv() {
-                match event {
-                    Event::ImageDone { .. } if id == RequestId(2) => second_images += 1,
-                    Event::Finished { reason, .. } => {
-                        reasons.insert(id, reason);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    handle.shutdown();
-    let _ = thread.join();
-
-    assert_eq!(reasons.get(&RequestId(1)), Some(&FinishReason::Cancelled));
-    assert!(reasons.contains_key(&RequestId(2)));
-    assert_eq!(second_images, 1);
-}
-
-/// Image requests waiting for the one guidance-prefix request row do not starve
-/// the younger request that holds it.
-///
-/// With four request slots, three requests run and one row is left for a
-/// multi-branch guidance prefix. The younger request 3 has a short prompt, so
-/// it reaches denoising first and takes that row while the older requests 1
-/// and 2 are still prefilling their chunked prompts. When those reach
-/// denoising, neither can allocate a prefix until request 3 finishes and
-/// releases the row. One denoising step costs 1024 latent units times two
-/// guidance branches, so the two waiting requests together cost the whole
-/// pass budget. At queue depth one every step of request 3 resolves before
-/// its next step is planned, so each pass finds the denoiser free and tries
-/// the older requests first.
-#[test]
-fn guidance_prefix_holder_progresses_while_older_images_wait() {
-    const STEPS: u16 = 12;
-
-    let mut sim = SimEngine::new();
-    sim.set_queue_depth(1);
-    sim.mut_info_for_test().request_slots = 4;
-    let scheduler = support::scheduler_with(
-        Box::new(SimWorker::new(sim)),
-        special_tokens(),
-        SchedulerConfig {
-            max_batch: proto::config::positive(32),
-            max_num_batched_tokens: 4096,
-            chunked_prefill_size: std::num::NonZeroUsize::new(64),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(scheduler.config().max_running_requests, 3);
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let thread = thread::spawn(move || scheduler.run(rx));
-
-    let image = ImageParams {
-        steps: STEPS,
-        ..Default::default()
-    };
-    assert_eq!(image.cfg_branch_count(), 2);
-    let long_prompt: Vec<u32> = (0..640).map(|index| 10 + index % 500).collect();
-    let prompts = [
-        (RequestId(1), long_prompt.clone()),
-        (RequestId(2), long_prompt),
-        (RequestId(3), vec![4, 5, 6]),
-    ];
-    let mut receivers = Vec::new();
-    for (id, prompt) in prompts {
-        let events = handle
-            .submit(generation_request(
-                id,
-                text_input(prompt),
-                SamplingParams::default(),
-                image.clone(),
-                GenerationConstraint::GenOnly,
-                0,
-            ))
-            .unwrap();
-        receivers.push((id, events));
-    }
-
-    let mut reasons = HashMap::new();
-    let mut images = HashMap::new();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while reasons.len() < receivers.len() && Instant::now() < deadline {
-        for (id, receiver) in receivers.iter_mut() {
-            while let Ok(event) = receiver.try_recv() {
-                match event {
-                    Event::ImageDone { .. } => *images.entry(*id).or_insert(0) += 1,
-                    Event::Finished { reason, .. } => {
-                        reasons.insert(*id, reason);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    handle.shutdown();
-    let _ = thread.join();
-
-    for (id, _) in &receivers {
-        assert_eq!(
-            reasons.get(id),
-            Some(&FinishReason::ImageDone),
-            "request {id:?} did not finish its image"
-        );
-        assert_eq!(images.get(id), Some(&1));
-    }
-}
-
-/// Image generation exposes every declared denoise step in order before one committed image and terminal completion.
-#[test]
-fn image_events_cover_declared_denoise_steps() {
-    const STEPS: u16 = 3;
-    let scheduler = support::scheduler(
-        Box::new(SimWorker::new(SimEngine::new())),
-        special_tokens(),
-        32,
-    )
-    .unwrap();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let scheduler_thread = thread::spawn(move || scheduler.run(rx));
-
-    let mut events = handle
-        .submit(generation_request(
-            RequestId(1),
-            text_input(vec![4, 5, 6]),
-            SamplingParams::default(),
-            ImageParams {
-                steps: STEPS,
-                ..Default::default()
-            },
-            GenerationConstraint::GenOnly,
-            0,
-        ))
-        .unwrap();
-
-    let mut begin = None;
-    let mut steps = Vec::new();
-    let mut commits = 0;
-    let mut image_done = None;
-    let mut finished = None;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while finished.is_none() && Instant::now() < deadline {
-        match events.try_recv() {
-            Ok(Event::ImageBegin {
-                image_id,
-                height,
-                width,
-                steps,
-            }) => begin = Some((image_id, height, width, steps)),
-            Ok(Event::ImageStep { image_id, step }) => steps.push((image_id, step)),
-            Ok(Event::ImageCommit { image_id }) => {
-                assert_eq!(image_id, 1);
-                commits += 1;
-            }
-            Ok(Event::ImageDone {
-                image_id,
-                height,
-                width,
-                ..
-            }) => image_done = Some((image_id, height, width)),
-            Ok(Event::Finished { reason, images, .. }) => finished = Some((reason, images)),
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    handle.shutdown();
-    let _ = scheduler_thread.join();
-
-    assert_eq!(begin, Some((1, 512, 512, STEPS)));
-    assert_eq!(steps, (1..=STEPS).map(|step| (1, step)).collect::<Vec<_>>());
-    assert_eq!(commits, 1);
-    let (image_id, height, width) = image_done.expect("image completion event");
-    assert_eq!((image_id, height, width), (1, 512, 512));
-    assert_eq!(finished, Some((FinishReason::ImageDone, 1)));
-}
-
-#[test]
 fn scheduler_clamps_max_batch_to_main_process_info() {
     let mut sim = SimEngine::new();
     sim.mut_info_for_test().max_batch_calls = 3;
     let sched = support::scheduler(Box::new(SimWorker::new(sim)), special_tokens(), 32).unwrap();
 
     assert_eq!(sched.config().max_batch, proto::config::positive(3));
-}
-
-/// Serves four concurrent requests that open their image branches on the
-/// same step, on a simulator whose worker reports `transfer_tickets`, and
-/// returns how many cache export calls each submitted batch carried, after
-/// checking that every request finished.
-fn cache_export_batch_calls(transfer_tickets: u32) -> Vec<usize> {
-    let mut sim = SimEngine::new();
-    sim.set_text_len(1_000_000);
-    sim.mut_info_for_test().transfer_tickets = transfer_tickets;
-    let mut worker = SimWorker::new(sim);
-    let dispatched = worker.observe();
-    let sched = support::scheduler(Box::new(worker), special_tokens(), 32).unwrap();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
-
-    let mut receivers = (1..=4u64)
-        .map(|id| {
-            let request = with_trigger(
-                generation_request(
-                    RequestId(id),
-                    text_input(vec![1, 2, 3]),
-                    SamplingParams {
-                        logit_bias: vec![(2222, 1000.0)],
-                        ..Default::default()
-                    },
-                    ImageParams {
-                        steps: 2,
-                        ..Default::default()
-                    },
-                    GenerationConstraint::Default,
-                    12,
-                ),
-                ImageTrigger::Token { token_id: 2222 },
-            );
-            handle.submit(request).unwrap()
-        })
-        .collect::<Vec<_>>();
-    let mut finished = 0;
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while finished < receivers.len() && Instant::now() < deadline {
-        for receiver in &mut receivers {
-            while let Ok(event) = receiver.try_recv() {
-                if let Event::Finished { reason, .. } = event {
-                    assert_ne!(reason, FinishReason::Error);
-                    finished += 1;
-                }
-            }
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    handle.shutdown();
-    let _ = jh.join();
-    assert_eq!(finished, receivers.len(), "every request finishes");
-
-    dispatched
-        .try_iter()
-        .filter_map(|event| match event {
-            BatchEvent::Submitted(batch) => Some(
-                batch
-                    .requests
-                    .iter()
-                    .filter(|(call, _)| call.kind == CallKind::Transfer(TransferMode::CacheExport))
-                    .count(),
-            ),
-            _ => None,
-        })
-        .collect()
-}
-
-/// The scheduler keeps no more transfer calls reserved than the transfer
-/// entries the workers report: with one entry, concurrent requests export
-/// their cache one call at a time and still all finish, while a wider report
-/// lets the same requests share a batch.
-#[test]
-fn transfer_calls_in_flight_stay_within_the_workers_tickets() {
-    let narrow = cache_export_batch_calls(1);
-    assert!(
-        narrow.iter().sum::<usize>() >= 4 && narrow.iter().all(|&calls| calls <= 1),
-        "cache export calls per batch {narrow:?}"
-    );
-
-    let wide = cache_export_batch_calls(1024);
-    assert!(
-        wide.iter().any(|&calls| calls > 1),
-        "cache export calls per batch {wide:?}"
-    );
 }
 
 /// Prefill and decode batches hold at most the calls the workers report one
@@ -789,8 +297,6 @@ fn forward_batches_hold_at_most_the_workers_batch_calls() {
                     RequestId(id),
                     text_input(vec![1, 2, 3, 4, 5]),
                     SamplingParams::default(),
-                    ImageParams::default(),
-                    GenerationConstraint::UndOnly,
                     16,
                 ))
                 .unwrap()
@@ -841,8 +347,8 @@ fn forward_batches_hold_at_most_the_workers_batch_calls() {
 /// the same prompts produce the same per-request token counts at depth 1 and 2.
 #[test]
 fn queue_depth_is_token_identical() {
-    let d1 = batch_requests(1, &[(GenerationConstraint::UndOnly, 4)]);
-    let d2 = batch_requests(2, &[(GenerationConstraint::UndOnly, 4)]);
+    let d1 = batch_requests(1, 4);
+    let d2 = batch_requests(2, 4);
     for id in d1.keys() {
         assert_eq!(
             d1[id].text, d2[id].text,
@@ -869,8 +375,6 @@ fn call_window_metrics_record_the_full_lifecycle() {
         RequestId(1),
         text_input(vec![1, 2, 3, 4, 5]),
         SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
         16,
     );
     let mut events = handle.submit(request).unwrap();
@@ -954,8 +458,6 @@ fn relay_run(
         RequestId(1),
         text_input(vec![1, 2, 3, 4, 5]),
         sampling,
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
         max_und_tokens,
     );
     request.stop_token_ids = stop_token_ids;
@@ -1073,8 +575,6 @@ fn image_context_decode_is_depth_invariant() {
             RequestId(1),
             image_input(vec![1, 2], vec![3, 4], 0xD3C0DE, 4, 1),
             SamplingParams::default(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
             16,
         );
         let mut events = handle.submit(request).unwrap();
@@ -1115,8 +615,6 @@ fn stop_token_terminates_with_stop() {
         RequestId(1),
         text_input(vec![1, 2, 3]),
         SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
         64,
     );
     // 1007 is request 1's first greedy token, so the request stops on its
@@ -1163,8 +661,6 @@ fn run_until_control(abort: bool) -> FinishReason {
         RequestId(1),
         text_input(vec![1, 2, 3]),
         SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
         1024,
     );
     let mut erx = handle.submit(req).unwrap();
@@ -1223,8 +719,6 @@ fn stop_string_cutoff_is_request_local() {
             RequestId(1),
             text_input(vec![1, 2, 3]),
             SamplingParams::default(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
             6,
         ))
         .unwrap();
@@ -1233,8 +727,6 @@ fn stop_string_cutoff_is_request_local() {
         RequestId(2),
         text_input(vec![1, 2, 3]),
         SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
         1024,
     );
     stopping.stop_strings = vec!["boundary".to_string()];
@@ -1345,8 +837,6 @@ fn hybrid_groups_share_one_unit_pool() {
                 RequestId(rid),
                 text_input(prompt.clone()),
                 SamplingParams::default(),
-                ImageParams::default(),
-                GenerationConstraint::UndOnly,
                 16,
             ))
             .unwrap();
@@ -1457,8 +947,6 @@ fn prefix_cache_configuration_controls_reuse() {
                     RequestId(rid),
                     text_input(prompt.clone()),
                     SamplingParams::default(),
-                    ImageParams::default(),
-                    GenerationConstraint::UndOnly,
                     8,
                 ))
                 .unwrap();
@@ -1501,187 +989,6 @@ fn prefix_cache_configuration_controls_reuse() {
     assert_eq!(outputs[0], outputs[1]);
 }
 
-/// Workers that denoise images under CUDA graphs report the steps they
-/// captured; the engine admits an image request only when its size is
-/// captured at every guidance branch count up to its own, and refuses the
-/// others with the sizes it serves.
-#[test]
-fn image_requests_are_admitted_only_at_captured_steps() {
-    let mut sim = SimEngine::new();
-    sim.mut_info_for_test().captured_images = Some(vec![
-        ipc::CapturedImage {
-            height: 512,
-            width: 512,
-            branches: 1,
-        },
-        ipc::CapturedImage {
-            height: 512,
-            width: 512,
-            branches: 2,
-        },
-        ipc::CapturedImage {
-            height: 256,
-            width: 512,
-            branches: 1,
-        },
-    ]);
-    let scheduler =
-        support::scheduler(Box::new(SimWorker::new(sim)), special_tokens(), 32).unwrap();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let scheduler_thread = thread::spawn(move || scheduler.run(rx));
-
-    let terminal = |id: u64, height: u32, cfg_text_scale: f32| {
-        let request = generation_request(
-            RequestId(id),
-            text_input(vec![4, 5, 6]),
-            SamplingParams::default(),
-            ImageParams {
-                steps: 2,
-                cfg_text_scale,
-                height,
-                ..Default::default()
-            },
-            GenerationConstraint::GenOnly,
-            0,
-        );
-        let mut events = handle.submit(request).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline {
-            match events.try_recv() {
-                Ok(event @ (Event::Rejected { .. } | Event::Finished { .. })) => {
-                    return Some(event);
-                }
-                Ok(_) => {}
-                Err(_) => thread::sleep(Duration::from_millis(1)),
-            }
-        }
-        None
-    };
-    // Guided 512x512 steps evaluate one and two branches, both captured.
-    let guided = terminal(1, 512, 4.0);
-    // 256x512 is captured unguided only.
-    let unguided = terminal(2, 256, 1.0);
-    let uncaptured_guidance = terminal(3, 256, 4.0);
-    // 768x512 is not captured at all.
-    let uncaptured_size = terminal(4, 768, 1.0);
-    handle.shutdown();
-    let _ = scheduler_thread.join();
-
-    for admitted in [&guided, &unguided] {
-        assert!(
-            matches!(
-                admitted,
-                Some(Event::Finished {
-                    reason: FinishReason::ImageDone,
-                    ..
-                })
-            ),
-            "{admitted:?}"
-        );
-    }
-    for refused in [&uncaptured_guidance, &uncaptured_size] {
-        let Some(Event::Rejected {
-            kind: RejectionKind::Invalid,
-            message,
-        }) = refused
-        else {
-            panic!("{refused:?}");
-        };
-        assert!(
-            message.contains("only at the sizes they captured"),
-            "{message}"
-        );
-    }
-}
-
-/// Workers report the rows and tokens their image denoising step holds;
-/// the engine admits an image request only when every guidance branch's
-/// framed latent sequence fits them, and refuses the others naming the
-/// exceeded extent.
-#[test]
-fn image_requests_are_admitted_only_within_the_step_capacity() {
-    let mut sim = SimEngine::new();
-    // A 512x512 image is 32x32 latent rows and two markers: two branches
-    // take 2052 tokens.
-    sim.mut_info_for_test().image_capacity = Some(ipc::ImageCapacity {
-        max_step_tokens: 2100,
-        max_step_rows: 2,
-        max_condition_tokens: 4096,
-        max_condition_rows: 2,
-        max_vision_patch_rows: 4096,
-        max_vision_images: 1,
-    });
-    let scheduler =
-        support::scheduler(Box::new(SimWorker::new(sim)), special_tokens(), 32).unwrap();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let scheduler_thread = thread::spawn(move || scheduler.run(rx));
-
-    let terminal = |id: u64, height: u32, cfg_text_scale: f32, cfg_img_scale: f32| {
-        let request = generation_request(
-            RequestId(id),
-            text_input(vec![4, 5, 6]),
-            SamplingParams::default(),
-            ImageParams {
-                steps: 2,
-                cfg_text_scale,
-                cfg_img_scale,
-                height,
-                ..Default::default()
-            },
-            GenerationConstraint::GenOnly,
-            0,
-        );
-        let mut events = handle.submit(request).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline {
-            match events.try_recv() {
-                Ok(event @ (Event::Rejected { .. } | Event::Finished { .. })) => {
-                    return Some(event);
-                }
-                Ok(_) => {}
-                Err(_) => thread::sleep(Duration::from_millis(1)),
-            }
-        }
-        None
-    };
-    let guided = terminal(1, 512, 4.0, 1.0);
-    // 768x512 takes 1538 tokens per branch: one fits, two do not.
-    let unguided = terminal(2, 768, 1.0, 1.0);
-    let too_many_tokens = terminal(3, 768, 4.0, 1.0);
-    // Text and image guidance evaluate three branches.
-    let too_many_rows = terminal(4, 512, 4.0, 2.0);
-    handle.shutdown();
-    let _ = scheduler_thread.join();
-
-    for admitted in [&guided, &unguided] {
-        assert!(
-            matches!(
-                admitted,
-                Some(Event::Finished {
-                    reason: FinishReason::ImageDone,
-                    ..
-                })
-            ),
-            "{admitted:?}"
-        );
-    }
-    for (refused, extent) in [
-        (&too_many_tokens, "max_step_tokens"),
-        (&too_many_rows, "max_step_rows"),
-    ] {
-        let Some(Event::Rejected {
-            kind: RejectionKind::Invalid,
-            message,
-        }) = refused
-        else {
-            panic!("{refused:?}");
-        };
-        assert!(message.contains(extent), "{message}");
-    }
-}
-
 /// Workers that encode latents under CUDA graphs report the image sizes
 /// they captured; the engine admits an input image's latent block only at
 /// one of them, and refuses a block of another size, or of no stated size,
@@ -1702,8 +1009,6 @@ fn latent_blocks_are_admitted_only_at_captured_sizes() {
             RequestId(id),
             image_input(vec![1, 2], vec![3, 4], id, 4, 5),
             SamplingParams::default(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
             4,
         );
         request.multimodal_inputs.images[0].encoders = vec![
@@ -1791,8 +1096,6 @@ fn a_state_group_reuses_prefixes_up_to_a_checkpoint() {
                 RequestId(rid),
                 text_input(prompt.clone()),
                 SamplingParams::default(),
-                ImageParams::default(),
-                GenerationConstraint::UndOnly,
                 8,
             ))
             .unwrap();
@@ -1836,8 +1139,6 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
             RequestId(id),
             text_input(prompt.clone()),
             SamplingParams::default(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
             8,
         );
         request.cache = scheduler::CachePolicy {
@@ -1968,8 +1269,6 @@ fn chunked_prefill_progresses_with_decode() {
             RequestId(1),
             text_input(long_prompt),
             SamplingParams::default(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
             8,
         ))
         .unwrap();
@@ -1978,8 +1277,6 @@ fn chunked_prefill_progresses_with_decode() {
             RequestId(2),
             text_input(vec![1, 2, 3]),
             SamplingParams::default(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
             8,
         ))
         .unwrap();
@@ -2034,8 +1331,6 @@ fn chunked_prefill_progresses_with_decode() {
             RequestId(3),
             text_input(vec![90; 128]),
             SamplingParams::default(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
             1,
         ))
         .unwrap();
@@ -2068,8 +1363,6 @@ fn run_sampling(
         RequestId(1),
         text_input(vec![1, 2, 3]),
         sampling,
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
         max_tokens,
     );
     let mut erx = handle.submit(req).unwrap();
@@ -2152,14 +1445,7 @@ fn first_token_logprobs(sampling: SamplingParams) -> Vec<(u32, f32)> {
     let handle = CommandSender::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let req = generation_request(
-        RequestId(1),
-        text_input(vec![1, 2, 3]),
-        sampling,
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
-        4,
-    );
+    let req = generation_request(RequestId(1), text_input(vec![1, 2, 3]), sampling, 4);
     let mut erx = handle.submit(req).unwrap();
     let mut reported = None;
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -2290,21 +1576,14 @@ fn multimodal_encode_then_cache_hit() {
             RequestId(rid),
             image_input(vec![1, 2, 3], vec![9], 0xCAFE, 4, 1),
             SamplingParams::default(),
-            ImageParams::default(),
-            GenerationConstraint::GenOnly,
             8,
         );
         let mut erx = handle.submit(req).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        let mut images = 0;
         let mut done = false;
         let mut seen = Vec::new();
         while !done && Instant::now() < deadline {
             match erx.try_recv() {
-                Ok(Event::ImageDone { .. }) => {
-                    seen.push("image_done".to_string());
-                    images += 1;
-                }
                 Ok(Event::Finished { reason, .. }) => {
                     seen.push(format!("finished:{reason:?}"));
                     done = true;
@@ -2313,7 +1592,7 @@ fn multimodal_encode_then_cache_hit() {
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
         }
-        (done && images > 0, seen)
+        (done, seen)
     };
 
     let (ok, seen) = run_img(1, &handle);
@@ -2370,8 +1649,6 @@ fn concurrent_same_image_misses_converge_on_one_exact_cached_product() {
             RequestId(request_id),
             image_input(vec![1, 2, 3], vec![9], 0xCAFE, 4, 1),
             SamplingParams::default(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
             12,
         )
     };
@@ -2431,19 +1708,15 @@ fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
         RequestId(81),
         image_input(vec![1, 2], vec![3, 4], 0x81, 4, 17),
         SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
         16,
     );
     let mut events = handle.submit(request).expect("submit request");
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut text_tokens = 0;
-    let mut images = 0;
     let mut finished = false;
     while !finished && Instant::now() < deadline {
         match events.try_recv() {
             Ok(Event::TextToken { .. }) => text_tokens += 1,
-            Ok(Event::ImageDone { .. }) => images += 1,
             Ok(Event::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
@@ -2454,7 +1727,6 @@ fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
     let _ = jh.join();
     assert!(finished, "Und-only image-context request did not finish");
     assert!(text_tokens > 0, "Und-only request emitted no visible text");
-    assert_eq!(images, 0, "Und-only request opened a Gen branch");
     assert!(
         stats.encoder.cached.load(Ordering::Relaxed) >= 1,
         "input image was not encoded and retained in the encoder cache"
@@ -2479,8 +1751,6 @@ fn a_latent_image_block_is_written_by_its_own_call() {
         RequestId(95),
         image_input(vec![1, 2], vec![3, 4], 0x95, 4, 5),
         SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
         4,
     );
     request.multimodal_inputs.images[0].encoders = vec![
@@ -2593,8 +1863,6 @@ fn a_vision_block_beyond_the_step_budget_is_refused() {
             RequestId(request_id),
             image_input(vec![1, 2], vec![3, 4], request_id, 1, block_tokens),
             SamplingParams::default(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
             4,
         );
         let mut events = handle.submit(request).expect("submit request");
@@ -2671,8 +1939,6 @@ fn admission_carries_the_request_input_image_count() {
         RequestId(91),
         (prompt_token_ids, inputs),
         SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
         4,
     );
     let _events = handle.submit(request).expect("submit request");
@@ -2697,909 +1963,14 @@ fn admission_carries_the_request_input_image_count() {
     assert_eq!(admission.input_images, 2);
 }
 
-/// A Default-constraint request triggered by its second greedy token (1008)
-/// realizes all four budgeted images with three denoising steps each, resumes
-/// text, and ends at its 200-token text bound. Its text and image sequence is
-/// identical at queue depths 1 and 2.
-#[test]
-fn gen_branch_round_trip_preserves_export_and_step_invariants() {
-    let mut signatures = Vec::new();
-    for queue_depth in [1, 2] {
-        let mut sim = SimEngine::new();
-        sim.set_text_len(1_000_000);
-        sim.set_queue_depth(queue_depth);
-        let worker = Box::new(SimWorker::new(sim));
-        let sched = support::scheduler(worker, special_tokens(), 32).unwrap();
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let handle = CommandSender::new(tx);
-        let jh = thread::spawn(move || sched.run(rx));
-
-        let mut req = with_trigger(
-            generation_request(
-                RequestId(1),
-                text_input(vec![1, 2, 3]),
-                SamplingParams::default(),
-                ImageParams {
-                    steps: 3,
-                    ..Default::default()
-                },
-                GenerationConstraint::Default,
-                200,
-            ),
-            ImageTrigger::Token { token_id: 1008 },
-        );
-        req.max_images = 4;
-        let mut erx = handle.submit(req).unwrap();
-
-        let mut signature: Vec<(char, u32)> = Vec::new();
-        let mut image_begins = 0;
-        let mut image_steps = 0;
-        let mut image_commits = 0;
-        let mut finish_reason = None;
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while finish_reason.is_none() && Instant::now() < deadline {
-            match erx.try_recv() {
-                Ok(Event::TextToken { id, .. }) => signature.push(('T', id)),
-                Ok(Event::ImageBegin { .. }) => image_begins += 1,
-                Ok(Event::ImageStep { .. }) => image_steps += 1,
-                Ok(Event::ImageCommit { .. }) => image_commits += 1,
-                Ok(Event::ImageDone { image_id, .. }) => signature.push(('I', image_id)),
-                Ok(Event::Finished { reason, .. }) => finish_reason = Some(reason),
-                Ok(_) => {}
-                Err(_) => thread::sleep(Duration::from_millis(1)),
-            }
-        }
-        handle.shutdown();
-        let _ = jh.join();
-
-        assert_eq!(
-            finish_reason,
-            Some(FinishReason::MaxTokens),
-            "generated branch request must finish at its declared text bound"
-        );
-        assert_eq!(
-            signature
-                .iter()
-                .filter(|(modality, _)| *modality == 'I')
-                .count(),
-            4,
-            "request must realize its declared image cap"
-        );
-        assert!(
-            signature.iter().any(|(modality, _)| *modality == 'T'),
-            "request must resume visible Und output"
-        );
-        assert_eq!(image_begins, 4);
-        assert_eq!(image_steps, 12);
-        assert_eq!(image_commits, 4);
-        signatures.push(signature);
-    }
-
-    assert_eq!(
-        signatures[0], signatures[1],
-        "device continuation must preserve the depth-one direct-trigger oracle"
-    );
-}
-
-#[test]
-fn interleave_c4_generated_images_complete() {
-    let (command_tx, commands) = crossbeam_channel::unbounded();
-    let handle = scheduler::CommandSender::new(command_tx);
-
-    let mut sim = SimEngine::new();
-    sim.set_queue_depth(2);
-    sim.set_text_len(1_000_000);
-    let mut scheduler =
-        support::scheduler(Box::new(SimWorker::new(sim)), special_tokens(), 32).unwrap();
-    let mut events = HashMap::new();
-    let mut results = HashMap::new();
-
-    // Each trigger is the request's own greedy token at index `trigger_offset`,
-    // so the four concurrent requests open their image branches at staggered
-    // decode positions.
-    for (raw_id, trigger_offset) in [(1_u64, 0_u32), (2, 1), (3, 2), (4, 3)] {
-        let request_id = RequestId(raw_id);
-        let trigger = 1_000 + raw_id as u32 * 7 + trigger_offset;
-        let request = with_trigger(
-            generation_request(
-                request_id,
-                text_input(vec![1, 2, 3]),
-                SamplingParams::default(),
-                ImageParams {
-                    steps: 2,
-                    ..Default::default()
-                },
-                GenerationConstraint::Default,
-                24,
-            ),
-            ImageTrigger::Token { token_id: trigger },
-        );
-        events.insert(request_id, handle.submit(request).unwrap());
-        results.insert(
-            request_id,
-            Collected {
-                text: 0,
-                images: 0,
-                finished: false,
-                reason: None,
-            },
-        );
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while results.values().any(|result| !result.finished) && Instant::now() < deadline {
-        scheduler.step(&commands);
-        for (id, event_rx) in &mut events {
-            while let Ok(event) = event_rx.try_recv() {
-                let result = results.get_mut(id).expect("request result exists");
-                match event {
-                    Event::TextToken { .. } => result.text += 1,
-                    Event::ImageDone { .. } => result.images += 1,
-                    Event::Finished { reason, .. } if !result.finished => {
-                        result.finished = true;
-                        result.reason = Some(reason);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-
-    assert!(
-        results.values().all(|result| result.finished),
-        "c4 interleave requests did not all finish"
-    );
-    for (id, result) in &results {
-        assert_eq!(
-            result.reason,
-            Some(FinishReason::MaxTokens),
-            "request {id:?} failed"
-        );
-        assert_eq!(result.images, 1, "request {id:?} missed its image branch");
-    }
-}
-
-/// With artifact-sourced feedback and a declared one-token ViT encoder recipe,
-/// the generated image is re-ingested before Und text resumes. The strong bias
-/// on the trigger opens the branch on the first sample.
-#[test]
-fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
-    let mut sim = SimEngine::new();
-    sim.set_text_len(1_000_000);
-    let worker = Box::new(SimWorker::new(sim));
-    let sched = support::scheduler(worker, special_tokens(), 32).unwrap();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
-
-    let mut request = with_trigger(
-        generation_request(
-            RequestId(1),
-            text_input(vec![1, 2, 3]),
-            SamplingParams {
-                logit_bias: vec![(2222, 1000.0)],
-                ..Default::default()
-            },
-            ImageParams {
-                steps: 2,
-                ..Default::default()
-            },
-            GenerationConstraint::Default,
-            12,
-        ),
-        ImageTrigger::Token { token_id: 2222 },
-    );
-    request.image_generation.feedback_source = Some(FeedbackSource::ArtifactProduct);
-    request.image_generation.feedback_next_token = FeedbackNextToken::Bos;
-    request.image_generation.num_feedback_positions = 1;
-    request.image_generation.feedback_encoders = vec![ImageEncoderInput {
-        encoder: scheduler::ImageEncoder::Vision,
-        num_cache_tokens: Some(1),
-        max_cache_tokens: None,
-        height: None,
-        width: None,
-    }];
-    request.image_generation.sample_feedback_continuation = false;
-
-    let mut events = handle.submit(request).unwrap();
-
-    let mut sequence = Vec::new();
-    let mut finished = false;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !finished && Instant::now() < deadline {
-        match events.try_recv() {
-            Ok(Event::TextToken { .. }) => sequence.push('T'),
-            Ok(Event::ImageDone { .. }) => sequence.push('I'),
-            Ok(Event::Finished { .. }) => finished = true,
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    handle.shutdown();
-    let _ = jh.join();
-
-    assert!(finished, "re-ingest request did not finish: {sequence:?}");
-    assert_eq!(sequence.iter().filter(|&&event| event == 'I').count(), 1);
-    let image = sequence.iter().position(|event| *event == 'I').unwrap();
-    assert!(
-        sequence[image + 1..].contains(&'T'),
-        "Und continuation must begin only after feedback ingest: {sequence:?}"
-    );
-}
-
-/// A `max_images` budget permits images but does not schedule them: image starts
-/// must come from the model, not a scheduler-forced cadence. The simulator never
-/// samples the trigger token 2222 here, so the request emits text only, and that
-/// text is identical at queue depths 1 and 2.
-#[test]
-fn gen_branch_waits_for_model_image_starts() {
-    let mut runs = Vec::new();
-    for depth in [1, 2] {
-        let mut sim = SimEngine::new();
-        sim.set_text_len(1_000_000);
-        sim.set_queue_depth(depth);
-        let sched =
-            support::scheduler(Box::new(SimWorker::new(sim)), special_tokens(), 32).unwrap();
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let handle = CommandSender::new(tx);
-        let jh = thread::spawn(move || sched.run(rx));
-        let mut request = with_trigger(
-            generation_request(
-                RequestId(1),
-                text_input(vec![1, 2, 3]),
-                SamplingParams::default(),
-                ImageParams {
-                    steps: 3,
-                    ..Default::default()
-                },
-                GenerationConstraint::Default,
-                40,
-            ),
-            ImageTrigger::Token { token_id: 2222 },
-        );
-        request.max_images = 3;
-        let mut events = handle.submit(request).unwrap();
-        let mut tokens = Vec::new();
-        let mut images = 0;
-        let mut finish_reason = None;
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while finish_reason.is_none() && Instant::now() < deadline {
-            match events.try_recv() {
-                Ok(Event::TextToken { id, .. }) => tokens.push(id),
-                Ok(Event::ImageDone { .. }) => images += 1,
-                Ok(Event::Finished { reason, .. }) => finish_reason = Some(reason),
-                Ok(_) => {}
-                Err(_) => thread::sleep(Duration::from_millis(1)),
-            }
-        }
-        handle.shutdown();
-        let _ = jh.join();
-        assert_eq!(finish_reason, Some(FinishReason::MaxTokens));
-        assert_eq!(images, 0, "a false transition predicate emitted an image");
-        assert!(!tokens.is_empty(), "request emitted no text");
-        runs.push(tokens);
-    }
-    assert_eq!(
-        runs[0], runs[1],
-        "false generation predicates changed the depth-one text result"
-    );
-}
-
-/// A Gen-only request whose model requires text before an image decodes Und
-/// tokens internally until it samples the trigger; the internally decoded
-/// tokens are never emitted, and the discovered trigger opens exactly one
-/// image.
-#[test]
-fn gen_only_can_discover_its_trigger_with_internal_und_decode() {
-    let mut sim = SimEngine::new();
-    sim.set_text_len(1_000_000);
-    let sched = support::scheduler(Box::new(SimWorker::new(sim)), special_tokens(), 32).unwrap();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
-
-    let mut request = generation_request(
-        RequestId(61),
-        text_input(vec![1, 2, 3]),
-        SamplingParams {
-            logit_bias: vec![(2222, 1000.0)],
-            ..SamplingParams::default()
-        },
-        ImageParams {
-            steps: 2,
-            ..ImageParams::default()
-        },
-        GenerationConstraint::GenOnly,
-        8,
-    );
-    request.image_generation.trigger = ImageTrigger::Token { token_id: 2222 };
-    request.image_generation.requires_text_for_image = true;
-
-    let mut events = handle.submit(request).expect("submit request");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut visible_text = 0;
-    let mut images = 0;
-    let mut finished = false;
-    while !finished && Instant::now() < deadline {
-        match events.try_recv() {
-            Ok(Event::TextToken { .. }) => visible_text += 1,
-            Ok(Event::ImageDone { .. }) => images += 1,
-            Ok(Event::Finished { .. }) => finished = true,
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    handle.shutdown();
-    let _ = jh.join();
-
-    assert!(finished, "trigger-discovery request did not finish");
-    assert_eq!(visible_text, 0, "Gen-only control tokens became visible");
-    assert_eq!(images, 1, "the discovered trigger did not open Gen");
-}
-
-#[test]
-fn und_only_round_close_trigger_cannot_open_gen() {
-    let mut sim = SimEngine::new();
-    sim.set_text_len(2);
-    let control = special_tokens();
-    let close_token_ids = control.eos.clone();
-    let sched = support::scheduler(Box::new(SimWorker::new(sim)), control, 32).unwrap();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
-
-    let request = with_trigger(
-        generation_request(
-            RequestId(62),
-            text_input(vec![1, 2, 3]),
-            SamplingParams::default(),
-            ImageParams {
-                steps: 2,
-                ..ImageParams::default()
-            },
-            GenerationConstraint::UndOnly,
-            16,
-        ),
-        ImageTrigger::RoundCloseThenSuffix {
-            close_token_ids,
-            trigger_token_ids: vec![1008],
-        },
-    );
-    let mut events = handle.submit(request).expect("submit request");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut text = 0;
-    let mut images = 0;
-    let mut finished = false;
-    while !finished && Instant::now() < deadline {
-        match events.try_recv() {
-            Ok(Event::TextToken { .. }) => text += 1,
-            Ok(Event::ImageDone { .. }) => images += 1,
-            Ok(Event::Finished { .. }) => finished = true,
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    handle.shutdown();
-    let _ = jh.join();
-
-    assert!(finished, "Und-only round-close request did not finish");
-    assert!(text > 0, "Und-only request emitted no text");
-    assert_eq!(images, 0, "Und-only round-close trigger opened Gen");
-}
-
-/// With the trigger token strongly biased, model-sampled image starts open
-/// branches until the four-image budget is spent, and the first image precedes
-/// any text.
-#[test]
-fn gen_branch_model_image_starts_spend_budget() {
-    let mut sim = SimEngine::new();
-    sim.set_text_len(1_000_000);
-    let worker = Box::new(SimWorker::new(sim));
-    let trig = SpecialTokenIds {
-        ..SimEngine::special_tokens()
-    };
-    let sched = support::scheduler(worker, trig, 32).unwrap();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
-
-    let mut req = with_trigger(
-        generation_request(
-            RequestId(1),
-            text_input(vec![1, 2, 3]),
-            SamplingParams {
-                logit_bias: vec![(2222, 1000.0)],
-                ..Default::default()
-            },
-            ImageParams {
-                steps: 3,
-                ..Default::default()
-            },
-            GenerationConstraint::Default,
-            64,
-        ),
-        ImageTrigger::Token { token_id: 2222 },
-    );
-    req.max_images = 4;
-    let mut erx = handle.submit(req).unwrap();
-
-    let mut seq = Vec::new();
-    let mut finished = false;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !finished && Instant::now() < deadline {
-        match erx.try_recv() {
-            Ok(Event::TextToken { .. }) => seq.push('T'),
-            Ok(Event::ImageDone { .. }) => seq.push('I'),
-            Ok(Event::Finished { .. }) => finished = true,
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    handle.shutdown();
-    let _ = jh.join();
-
-    assert!(finished, "request did not finish (seq={seq:?})");
-    let images = seq.iter().filter(|&&c| c == 'I').count();
-    assert_eq!(
-        images, 4,
-        "biased image starts should spend the image budget"
-    );
-    let first_i = seq.iter().position(|&c| c == 'I').unwrap();
-    let second_i = seq
-        .iter()
-        .enumerate()
-        .filter(|&(_, &c)| c == 'I')
-        .nth(1)
-        .unwrap()
-        .0;
-    assert_eq!(first_i, 0, "model image-start bias should draw before text");
-    assert!(
-        seq[first_i + 1..second_i].contains(&'T') || second_i == first_i + 1,
-        "expected valid stream between model-triggered images (seq={seq:?})",
-    );
-}
-
-/// Image-generating requests reserve their worst-case prefix cache at admission. The
-/// prompt plus the 32,768-token text budget alone exceeds this pool of 128
-/// usable units of one 256-token page each, so the scheduler rejects the
-/// request (a `Rejected` event and no `Finished`) instead of admitting it.
-#[test]
-fn gen_branch_rejects_oversized_worstcase_at_admission() {
-    let mut sim = SimEngine::new();
-    sim.set_text_len(8);
-    sim.set_num_units(129);
-    sim.set_block_size(256);
-    let worker = Box::new(SimWorker::new(sim));
-    let sched = support::scheduler(worker, special_tokens(), 32).unwrap();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
-
-    let req = generation_request(
-        RequestId(1),
-        text_input(vec![1, 2, 3]),
-        SamplingParams::default(),
-        ImageParams {
-            steps: 3,
-            ..Default::default()
-        },
-        GenerationConstraint::Default,
-        32_768,
-    );
-    let mut erx = handle.submit(req).unwrap();
-
-    let mut rejected = false;
-    let mut finished = None;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while finished.is_none() && Instant::now() < deadline {
-        match erx.try_recv() {
-            Ok(Event::Rejected { .. }) => rejected = true,
-            Ok(Event::Finished { reason, .. }) => finished = Some(reason),
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    handle.shutdown();
-    let _ = jh.join();
-
-    assert!(
-        rejected,
-        "oversized generated-branch request must be rejected"
-    );
-    assert_eq!(finished, None);
-}
-
-/// A Gen-only request finishes at its first generated-image commit instead of
-/// spending the remaining image budget on hidden images or the understanding
-/// budget on text filler. Internal Und decode discovers the biased trigger, Gen
-/// opens, one image commits, and because Gen-only requests do not continue
-/// after an image (`GenerationRequest::continues_after_image`), the scheduler
-/// finishes the request with `ImageDone`.
-#[test]
-fn commit_eos_finishes_without_spending_remaining_budget() {
-    let mut sim = SimEngine::new();
-    sim.set_text_len(1_000_000);
-    let worker = Box::new(SimWorker::new(sim));
-    let sched = support::scheduler(worker, special_tokens(), 32).unwrap();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
-
-    let mut req = with_trigger(
-        generation_request(
-            RequestId(1),
-            text_input(vec![1, 2, 3]),
-            SamplingParams {
-                logit_bias: vec![(2222, 1000.0)],
-                ..Default::default()
-            },
-            ImageParams {
-                steps: 3,
-                ..Default::default()
-            },
-            GenerationConstraint::GenOnly,
-            40,
-        ),
-        ImageTrigger::Token { token_id: 2222 },
-    );
-    req.max_images = 3;
-    req.image_generation.requires_text_for_image = true;
-
-    let mut erx = handle.submit(req).unwrap();
-
-    let mut text = 0usize;
-    let mut images = 0usize;
-    let mut finished = None;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while finished.is_none() && Instant::now() < deadline {
-        match erx.try_recv() {
-            Ok(Event::TextToken { .. }) => text += 1,
-            Ok(Event::ImageDone { .. }) => images += 1,
-            Ok(Event::Finished { reason, .. }) => finished = Some(reason),
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    handle.shutdown();
-    let _ = jh.join();
-
-    assert_eq!(finished, Some(FinishReason::ImageDone));
-    assert_eq!(
-        images, 1,
-        "the gen commit should finish instead of spending the remaining image budget"
-    );
-    assert_eq!(
-        text, 0,
-        "the gen commit should not emit hidden Und text filler"
-    );
-}
-
 #[test]
 fn fcfs_policy_completes_text() {
-    let out = batch_requests(2, &[(GenerationConstraint::UndOnly, 3)]);
+    let out = batch_requests(2, 3);
     assert_eq!(out.len(), 3);
     for c in out.values() {
         assert!(c.finished);
         assert!(c.text > 0);
     }
-}
-
-#[test]
-fn gen_branch_literal_trigger_starts_images() {
-    let mut sim = SimEngine::new();
-    sim.set_text_len(1_000_000); // never EOS on its own
-    sim.set_queue_depth(2);
-    let worker = Box::new(SimWorker::new(sim));
-    let sched = support::scheduler(worker, special_tokens(), 32).unwrap();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
-
-    // Request 1 emits 1007, 1008, 1009, ... so the suffix [1008, 1009] matches
-    // on its third token. Once the generated image is fed back into context,
-    // the simulator restarts its sequence from 1007 and the suffix recurs.
-    let mut req = with_trigger(
-        generation_request(
-            RequestId(1),
-            text_input(vec![1, 2, 3]),
-            SamplingParams::default(),
-            ImageParams {
-                steps: 3,
-                ..Default::default()
-            },
-            GenerationConstraint::Default,
-            40,
-        ),
-        ImageTrigger::Suffix {
-            token_ids: vec![1008, 1009],
-        },
-    );
-    req.max_images = 2;
-    let mut erx = handle.submit(req).unwrap();
-
-    let mut seq: Vec<char> = Vec::new();
-    let mut finished = false;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !finished && Instant::now() < deadline {
-        match erx.try_recv() {
-            Ok(Event::TextToken { .. }) => seq.push('T'),
-            Ok(Event::ImageDone { .. }) => seq.push('I'),
-            Ok(Event::Finished { .. }) => finished = true,
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    handle.shutdown();
-    let _ = jh.join();
-
-    assert!(finished, "request did not finish (seq={seq:?})");
-    let images = seq.iter().filter(|&&c| c == 'I').count();
-    assert_eq!(
-        images, 2,
-        "literal trigger must start both images (seq={seq:?})"
-    );
-    // The suffix trigger fires mid-round, so at least the three tokens through
-    // the suffix (1007, 1008, 1009) stream before the first image.
-    let first_i = seq.iter().position(|&c| c == 'I').unwrap();
-    assert!(
-        seq[..first_i].iter().filter(|&&c| c == 'T').count() >= 3,
-        "trigger text must stream before the image (seq={seq:?})"
-    );
-}
-
-/// The image-likelihood knob: a logit bias on the image-start token steers
-/// when generated-branch requests draw. A huge positive bias makes the very first
-/// sampled token the image trigger (image before any text); a huge negative
-/// bias keeps the pathway shut (the sim never EOSes here, so no image can
-/// appear any other way).
-#[test]
-fn image_start_logit_bias_steers_gen_branch() {
-    let run = |bias: f32| -> (usize, usize, bool) {
-        let mut sim = SimEngine::new();
-        sim.set_text_len(1_000_000); // never EOS on its own
-        let worker = Box::new(SimWorker::new(sim));
-        let sched = support::scheduler(worker, special_tokens(), 32).unwrap();
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let handle = CommandSender::new(tx);
-        let jh = thread::spawn(move || sched.run(rx));
-
-        // 2222 is an image-start token inside the simulator's vocabulary that
-        // its greedy sequence does not reach within this request's budget.
-        let mut req = with_trigger(
-            generation_request(
-                RequestId(1),
-                text_input(vec![1, 2, 3]),
-                SamplingParams {
-                    logit_bias: vec![(2222, bias)],
-                    ..Default::default()
-                },
-                ImageParams {
-                    steps: 3,
-                    ..Default::default()
-                },
-                GenerationConstraint::Default,
-                12,
-            ),
-            ImageTrigger::Token { token_id: 2222 },
-        );
-        req.sampling.seed = None;
-        let mut erx = handle.submit(req).unwrap();
-
-        let mut text_before_first_image = 0usize;
-        let mut images = 0usize;
-        let mut finished = false;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !finished && Instant::now() < deadline {
-            match erx.try_recv() {
-                Ok(Event::TextToken { .. }) if images == 0 => text_before_first_image += 1,
-                Ok(Event::ImageDone { .. }) => images += 1,
-                Ok(Event::Finished { .. }) => finished = true,
-                Ok(_) => {}
-                Err(_) => thread::sleep(Duration::from_millis(1)),
-            }
-        }
-        handle.shutdown();
-        let _ = jh.join();
-        (text_before_first_image, images, finished)
-    };
-
-    // Eager: the trigger wins the first step — an image with no leading text.
-    let (text_before, images, finished) = run(1000.0);
-    assert!(finished);
-    assert_eq!(images, 1, "positive bias must produce the image");
-    assert_eq!(text_before, 0, "positive bias must draw before any text");
-
-    // Suppressed: the trigger never wins; no image, terminates on max_tokens.
-    let (_, images, finished) = run(-1000.0);
-    assert!(finished);
-    assert_eq!(images, 0, "negative bias must suppress the image pathway");
-}
-
-/// Native assistant prefixes can end at the image boundary. The generated branch must
-/// honor that prefilled control token immediately after prefill instead of
-/// waiting for the model to sample another image-start token.
-#[test]
-fn gen_branch_prefilled_image_start_begins_without_text() {
-    let mut sim = SimEngine::new();
-    sim.set_text_len(1_000_000);
-    let worker = Box::new(SimWorker::new(sim));
-    let sched = support::scheduler(worker, special_tokens(), 32).unwrap();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
-
-    let req = with_trigger(
-        generation_request(
-            RequestId(1),
-            text_input(vec![10, 11, 2222]),
-            SamplingParams::default(),
-            ImageParams {
-                steps: 3,
-                ..Default::default()
-            },
-            GenerationConstraint::Default,
-            8,
-        ),
-        ImageTrigger::Token { token_id: 2222 },
-    );
-    let mut erx = handle.submit(req).unwrap();
-
-    let mut text_before_first_image = 0usize;
-    let mut images = 0usize;
-    let mut finished = false;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !finished && Instant::now() < deadline {
-        match erx.try_recv() {
-            Ok(Event::TextToken { .. }) if images == 0 => text_before_first_image += 1,
-            Ok(Event::ImageDone { .. }) => images += 1,
-            Ok(Event::Finished { .. }) => finished = true,
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    handle.shutdown();
-    let _ = jh.join();
-
-    assert!(finished, "request did not finish");
-    assert_eq!(images, 1, "prefilled image-start must produce one image");
-    assert_eq!(
-        text_before_first_image, 0,
-        "prefilled image-start should jump straight to image generation",
-    );
-}
-
-/// A request with a context image reasons in text and opens exactly one image
-/// branch when its round closes on EOS right after the trigger suffix. With
-/// `text_len` 2 the simulator's round for request 1 is 1007, 1008, EOS.
-#[test]
-fn context_image_request_commits_existing_image_context_at_round_close() {
-    let mut sim = SimEngine::new();
-    sim.set_text_len(2);
-    let worker = Box::new(SimWorker::new(sim));
-    let control = special_tokens();
-    let close_token_ids = control.eos.clone();
-    let sched = support::scheduler(worker, control, 32).unwrap();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
-
-    let req = with_trigger(
-        generation_request(
-            RequestId(1),
-            image_input(Vec::new(), vec![1, 2, 3], 7, 1, 1),
-            SamplingParams::default(),
-            ImageParams {
-                steps: 2,
-                ..Default::default()
-            },
-            GenerationConstraint::Default,
-            40,
-        ),
-        ImageTrigger::RoundCloseThenSuffix {
-            close_token_ids,
-            trigger_token_ids: vec![1008],
-        },
-    );
-    let mut erx = handle.submit(req).unwrap();
-
-    let mut seq: Vec<char> = Vec::new();
-    let mut finished = false;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !finished && Instant::now() < deadline {
-        match erx.try_recv() {
-            Ok(Event::TextToken { .. }) => seq.push('T'),
-            Ok(Event::ImageDone { .. }) => seq.push('I'),
-            Ok(Event::Finished { .. }) => finished = true,
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    handle.shutdown();
-    let _ = jh.join();
-
-    assert!(finished, "request did not finish (seq={seq:?})");
-    assert!(
-        seq.contains(&'T'),
-        "expected text reasoning with existing image context (seq={seq:?})"
-    );
-    assert_eq!(
-        seq.iter().filter(|&&c| c == 'I').count(),
-        1,
-        "IU image close should spend one image budget (seq={seq:?})"
-    );
-}
-
-/// Image-budget enforcement under a strong image bias: once max_images is
-/// spent, the scheduler adds the image-start token to each call's suppressed
-/// tokens, so a bias that would otherwise force it forever (an invisible
-/// un-actionable token stream) loses to the mask and generation returns to
-/// ordinary text.
-#[test]
-fn image_budget_suppresses_biased_image_start() {
-    let mut sim = SimEngine::new();
-    sim.set_text_len(1_000_000); // never EOS on its own
-    let worker = Box::new(SimWorker::new(sim));
-    let sched = support::scheduler(worker, special_tokens(), 32).unwrap();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
-
-    let mut req = with_trigger(
-        generation_request(
-            RequestId(1),
-            text_input(vec![1, 2, 3]),
-            SamplingParams {
-                logit_bias: vec![(2222, 1000.0)],
-                ..Default::default()
-            },
-            ImageParams {
-                steps: 3,
-                ..Default::default()
-            },
-            GenerationConstraint::Default,
-            24,
-        ),
-        ImageTrigger::Token { token_id: 2222 },
-    );
-    req.max_images = 2;
-    let mut erx = handle.submit(req).unwrap();
-
-    let mut images = 0usize;
-    let mut post_budget_triggers = 0usize;
-    let mut post_budget_text = 0usize;
-    let mut finished = false;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !finished && Instant::now() < deadline {
-        match erx.try_recv() {
-            Ok(Event::TextToken { id, .. }) => {
-                if images >= 2 {
-                    if id == 2222 {
-                        post_budget_triggers += 1;
-                    } else {
-                        post_budget_text += 1;
-                    }
-                }
-            }
-            Ok(Event::ImageDone { .. }) => images += 1,
-            Ok(Event::Finished { .. }) => finished = true,
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    handle.shutdown();
-    let _ = jh.join();
-
-    assert!(finished, "request must terminate");
-    assert_eq!(images, 2, "the bias draws the budgeted images");
-    assert_eq!(
-        post_budget_triggers, 0,
-        "suppression must stop the biased trigger once the budget is spent"
-    );
-    assert!(
-        post_budget_text > 0,
-        "generation must return to ordinary text"
-    );
 }
 
 /// Every logical cache reservation returns to the block pool after completion,
@@ -3615,22 +1986,11 @@ fn cache_resources_return_after_completion() {
 
     // Keep receivers alive — a dropped receiver is treated as a cancellation.
     let mut keep_alive = Vec::new();
-    let cases = [
-        GenerationConstraint::UndOnly,
-        GenerationConstraint::GenOnly,
-        GenerationConstraint::Default,
-        GenerationConstraint::UndOnly,
-    ];
-    for (i, mode) in cases.iter().enumerate() {
+    for i in 0..4 {
         let req = generation_request(
             RequestId(i as u64 + 1),
             text_input(vec![1, 2, 3, 4, 5]),
             SamplingParams::default(),
-            ImageParams {
-                steps: 4,
-                ..Default::default()
-            },
-            *mode,
             16,
         );
         keep_alive.push(handle.submit(req).unwrap());
@@ -3671,8 +2031,6 @@ fn cancellation_storm_retires_every_request() {
                     RequestId(request_id),
                     text_input(vec![1, 2, 3]),
                     SamplingParams::default(),
-                    ImageParams::default(),
-                    GenerationConstraint::UndOnly,
                     8,
                 ))
                 .unwrap()
@@ -3714,8 +2072,6 @@ fn slow_client_releases_execution_slots_before_output_capacity_returns() {
             RequestId(1),
             text_input(vec![1, 2, 3]),
             SamplingParams::default(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
             256,
         ))
         .unwrap();
@@ -3724,8 +2080,6 @@ fn slow_client_releases_execution_slots_before_output_capacity_returns() {
             RequestId(2),
             text_input(vec![1, 2, 3]),
             SamplingParams::default(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
             8,
         ))
         .unwrap();
@@ -3828,8 +2182,6 @@ fn engine_death_delivers_the_terminal_behind_a_full_event_channel() {
             RequestId(1),
             text_input(vec![1, 2, 3]),
             SamplingParams::default(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
             256,
         ))
         .unwrap();
@@ -3917,8 +2269,6 @@ fn scheduler_takes_limits_in_place_within_its_workers_batch() {
             RequestId(id),
             text_input(vec![1, 2, 3, 4, 5]),
             SamplingParams::default(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
             tokens,
         )
     };
@@ -4003,8 +2353,6 @@ fn losing_every_worker_stops_request_admission() {
                 RequestId(2),
                 text_input(vec![7; 8]),
                 SamplingParams::default(),
-                ImageParams::default(),
-                GenerationConstraint::UndOnly,
                 4,
             ))
             .is_err(),

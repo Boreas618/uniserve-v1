@@ -211,17 +211,6 @@ impl Scheduler {
         }
     }
 
-    /// Releases the request latent.
-    fn free_request_latent(&mut self, id: RequestId) {
-        let allocation = self
-            .running
-            .get_mut(&id)
-            .and_then(|state| state.allocations_mut()?.latent.take());
-        if let Some(allocation) = allocation {
-            self.storage.latent_pool.free(allocation);
-        }
-    }
-
     /// Advances scheduler and worker work, blocking only for an outstanding result.
     ///
     /// Serving drives `run`; `step` lets tests and examples advance the

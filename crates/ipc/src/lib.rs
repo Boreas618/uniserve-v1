@@ -48,13 +48,6 @@ impl From<SamplingParamsError> for ValidationError {
     }
 }
 
-impl From<ImageParamsError> for ValidationError {
-    /// Converts image validation failures into worker-protocol failures.
-    fn from(error: ImageParamsError) -> Self {
-        Self::message(error.to_string())
-    }
-}
-
 // The validation macros below are textually scoped: they are visible only in
 // modules declared after them, which is how the message modules use them.
 // Keep them above those `mod` declarations.
@@ -125,7 +118,7 @@ pub use call::*;
 pub use command::*;
 pub use identity::*;
 pub use info::*;
-pub use media::{ImageMedia, SharedMedia, SharedMediaError, append_feedback, parse_image_media};
+pub use media::{SharedMedia, SharedMediaError};
 pub use proto::{MediaLocator, MediaSource, SharedMemory};
 // The request values the engine carries on to its ranks are the request
 // vocabulary's own.
@@ -135,8 +128,7 @@ pub use phase::PhaseId;
 pub use program::ProgramCommand;
 pub use proto::report::{FENCE_BUCKETS_US, FenceHistogram, ForwardStats};
 pub use proto::request::{
-    CanvasSampling, CfgRenorm, CfgRenormParseError, DiffusionSamplingParams, ImageParams,
-    ImageParamsError, ImagePixels, PixelRange, PrefixCacheDtype, PrefixCacheDtypeParseError,
+    CanvasSampling, DiffusionSamplingParams, PrefixCacheDtype, PrefixCacheDtypeParseError,
     RequestId, SamplingParams, SamplingParamsError, StandbyStorage, TokenLogprob,
 };
 pub use request::*;

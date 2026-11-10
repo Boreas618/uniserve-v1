@@ -904,7 +904,6 @@ impl Leader {
         model.generation_limits = model_config.generation_limits(config.dtype);
         model.bos = control_tokens.bos;
         model.eos = control_tokens.eos;
-        model.end_of_image = control_tokens.end_of_image;
         // No model this daemon serves generates canvases: canvas sampling
         // reaches a worker with the request that needs it, and every prefill
         // returns the outputs its caller asked for.
@@ -3747,7 +3746,6 @@ fn elapsed_us(started: Instant) -> u64 {
 struct SpecialTokenIds {
     bos: u32,
     eos: Vec<u32>,
-    end_of_image: u32,
 }
 
 /// The local snapshot of the base release the checkpoint at `model` continues, when it pins one
@@ -3761,8 +3759,8 @@ fn base_release(model: &str) -> anyhow::Result<Option<String>> {
 
 /// Resolves the control tokens the engine uses for the loaded model.
 ///
-/// `bos` and `end_of_image` are each `0`: every profile the daemon serves
-/// states neither, and the engine reads `0` as "no such token". The EOS list
+/// `bos` is `0`: no profile the daemon serves states one, and the engine
+/// reads `0` as "no such token". The EOS list
 /// is the model's complete EOS set with the primary EOS placed first (and
 /// added when the set lacks it). The order matters to the engine scheduler,
 /// which substitutes `eos[0]` for the token of a completion that commits
@@ -3775,11 +3773,7 @@ fn special_token_ids(model: &ModelConfig) -> SpecialTokenIds {
         eos.retain(|value| *value != primary_eos);
         eos.insert(0, primary_eos);
     }
-    SpecialTokenIds {
-        bos: 0,
-        eos,
-        end_of_image: 0,
-    }
+    SpecialTokenIds { bos: 0, eos }
 }
 
 #[cfg(test)]
@@ -3789,10 +3783,8 @@ mod tests {
     use std::time::Duration;
 
     use crate::metrics::METRICS;
-    use proto::request::{
-        Event, GenerationConstraint, GenerationRequest, ImageGenerationConfig, Request,
-    };
-    use proto::request::{ImageParams, SamplingParams};
+    use proto::request::SamplingParams;
+    use proto::request::{Event, GenerationRequest, Request};
     use scheduler::{SchedulerHandle, SimEngine, SimWorker, Worker};
 
     use super::{EngineState, Leader, keeps_standby};
@@ -3858,22 +3850,15 @@ mod tests {
             request_id: Default::default(),
             prompt_token_ids: vec![1, 2, 3, 4],
             multimodal_inputs: Default::default(),
-            negative_prompt_token_ids: Vec::new(),
-            constraint: GenerationConstraint::UndOnly,
             sampling: SamplingParams::default(),
-            image: ImageParams::default(),
-            max_images: 1,
             max_und_tokens: 64,
             include_stop_token: false,
             stop_strings: Vec::new(),
             stop_token_ids: Vec::new(),
             priority: 0,
             cache: Default::default(),
-            image_generation: ImageGenerationConfig::default(),
             generated_token_ids: Vec::new(),
             adapter: 0,
-            generated_images: Vec::new(),
-            trajectory: Default::default(),
         }
         .into()
     }

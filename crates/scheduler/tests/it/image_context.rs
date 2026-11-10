@@ -16,14 +16,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ipc::{Call, CallKind, ComponentInfo, ForwardMode, MediaCall};
-use ipc::{CanvasSampling, ImageParams, RequestId, SamplingParams};
+use ipc::{CanvasSampling, RequestId, SamplingParams};
 use scheduler::{
     BatchEvent, BlockConfig, CommandSender, EventRx, ExecutionBatch, SchedulerConfig, SimEngine,
     SimWorker, sim_text_token,
 };
 use scheduler::{
-    CachePolicy, Event, FinishReason, GenerationConstraint, GenerationRequest, ImageEncoderInput,
-    ImageGenerationConfig, ImageInput, MultimodalInputs,
+    CachePolicy, Event, FinishReason, GenerationRequest, ImageEncoderInput, ImageInput,
+    MultimodalInputs,
 };
 
 /// Tokens of one canvas block.
@@ -74,26 +74,19 @@ fn canvas_request(request_id: u64, prompt_token_ids: Vec<u32>) -> GenerationRequ
     GenerationRequest {
         request_id: RequestId(request_id),
         prompt_token_ids,
-        negative_prompt_token_ids: Vec::new(),
         multimodal_inputs: MultimodalInputs::default(),
-        constraint: GenerationConstraint::Default,
         sampling: SamplingParams {
             seed: Some(7),
             ..SamplingParams::default()
         },
-        image: ImageParams::default(),
-        max_images: 1,
         max_und_tokens: 1_000,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
         priority: 0,
         cache: CachePolicy::default(),
         include_stop_token: false,
-        image_generation: ImageGenerationConfig::default(),
         generated_token_ids: Vec::new(),
         adapter: 0,
-        generated_images: Vec::new(),
-        trajectory: Default::default(),
     }
 }
 

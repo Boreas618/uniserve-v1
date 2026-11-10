@@ -421,20 +421,12 @@ impl WorkerInfo {
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
-        // Latent page geometry is the denoising pool's, zero without one.
+        // The image input extents are the denoising pool's, and the widest
+        // diffusion LM step of any worker is warmed down to one row.
         let flow = routed(CallKind::Media(MediaCall::Denoising));
-        merged.latent_page_units = flow.map_or(0, |info| info.latent_page_units);
-        merged.latent_pages = flow.map_or(0, |info| info.latent_pages);
-        // The denoising pool's image shapes are those its runtime prepared,
-        // and the widest diffusion LM step of any worker is warmed down to
-        // one row.
-        merged.image_warmups = flow.map_or_else(Vec::new, |info| info.image_warmups.clone());
-        merged.captured_images = flow.and_then(|info| info.captured_images.clone());
         merged.image_capacity = flow.and_then(|info| info.image_capacity);
         merged.captured_latents = routed(CallKind::Media(MediaCall::LatentEncoding))
             .and_then(|info| info.captured_latents.clone());
-        merged.image_unconditional_token_ids =
-            flow.and_then(|info| info.image_unconditional_token_ids.clone());
         // Each image encoder's output is the one the worker that serves its
         // encoding states.
         merged.image_encoders.clear();

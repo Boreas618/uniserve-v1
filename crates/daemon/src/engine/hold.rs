@@ -284,10 +284,7 @@ impl RequestHold {
 mod tests {
     use std::time::Duration;
 
-    use proto::request::{
-        Event, GenerationConstraint, GenerationRequest, ImageGenerationConfig, ImageParams,
-        SamplingParams,
-    };
+    use proto::request::{Event, GenerationRequest, SamplingParams};
     use scheduler::SimEngine;
 
     use super::*;
@@ -299,22 +296,15 @@ mod tests {
             request_id: Default::default(),
             prompt_token_ids: vec![1, 2, 3, 4],
             multimodal_inputs: Default::default(),
-            negative_prompt_token_ids: Vec::new(),
-            constraint: GenerationConstraint::UndOnly,
             sampling: SamplingParams::default(),
-            image: ImageParams::default(),
-            max_images: 1,
             max_und_tokens: 64,
             include_stop_token: false,
             stop_strings: Vec::new(),
             stop_token_ids: Vec::new(),
             priority: 0,
             cache: Default::default(),
-            image_generation: ImageGenerationConfig::default(),
             generated_token_ids: Vec::new(),
             adapter: 0,
-            generated_images: Vec::new(),
-            trajectory: Default::default(),
         }
         .into()
     }

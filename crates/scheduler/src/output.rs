@@ -37,7 +37,6 @@ fn usage(state: &RequestState) -> Usage {
     Usage {
         prompt_tokens: state.charged_prompt_tokens(),
         completion_tokens: state.num_generated_tokens,
-        images: state.num_generated_images,
     }
 }
 
@@ -251,32 +250,11 @@ impl Scheduler {
     /// Publishes committed autoregressive tokens and advances text-generation state.
     ///
     /// Tokens are applied in order and resolution stops at the first token that
-    /// finishes the request, opens an image branch, or is a round-close token.
-    /// The sampled log probability and top candidates belong to the last
-    /// committed token only.
+    /// finishes the request. The sampled log probability and top candidates
+    /// belong to the last committed token only.
     pub(super) fn resolve_decode_text(&mut self, id: RequestId, mut record: CallCompletion) {
         self.activate_request_tables(id);
 
-        // A round-close token committed alone by the previous decode became
-        // this decode's input; its completion now decides the round with that
-        // token and ignores the tokens this call committed.
-        if self
-            .running
-            .get(&id)
-            .is_some_and(|state| state.round_closing)
-        {
-            let close_token = self
-                .running
-                .get(&id)
-                .map(|state| state.next_token)
-                .unwrap_or_default();
-            if let Some(state) = self.running.get_mut(&id) {
-                state.round_closing = false;
-            }
-            return self.close_context_round(id, close_token);
-        }
-
-        let burst_result = record.committed_tokens.len() > 1;
         // A completion without committed tokens resolves as the first EOS token.
         let tokens = if record.committed_tokens.is_empty() {
             vec![self.special_tokens.eos[0]]
@@ -288,73 +266,16 @@ impl Scheduler {
             // the request asks for them, a verification's accepted drafts
             // as well as the token after them.
             let (logprob, top_logprobs) = take_token_logprobs(&mut record, idx);
-            let is_round_close = self.running.get(&id).is_some_and(|st| {
-                st.req
-                    .image_generation
-                    .trigger
-                    .round_close_token_ids()
-                    .contains(&tok)
-            });
-            // A round-close token inside a multi-token commit decides the round
-            // immediately. A single committed close token is deferred: it
-            // becomes the next decode's input and `round_closing` makes that
-            // decode's completion decide the round.
-            if is_round_close {
-                if let Some(st) = self.running.get_mut(&id) {
-                    st.num_generated_tokens += 1;
-                }
-                self.emit_control(id, tok);
-                if burst_result {
-                    return self.close_context_round(id, tok);
-                }
-                if let Some(st) = self.running.get_mut(&id) {
-                    st.next_token = tok;
-                    st.round_closing = true;
-                }
+            let Some(st) = self.running.get_mut(&id) else {
                 return;
-            }
-            let (can_open_gen_branch, images_done, max_images) = {
-                let Some(st) = self.running.get_mut(&id) else {
-                    return;
-                };
-                st.num_generated_tokens += 1;
-                (
-                    st.can_open_gen_branch(),
-                    st.num_generated_images,
-                    st.req.max_images as usize,
-                )
             };
-            // A direct trigger token opens the image branch without being
-            // published as text.
-            let direct_trigger = self
-                .running
-                .get(&id)
-                .is_some_and(|st| Self::direct_trigger_matches(st, tok));
-            if direct_trigger && can_open_gen_branch && images_done < max_images {
-                self.emit_control(id, tok);
-                self.begin_image(id);
-                return;
-            }
+            st.num_generated_tokens += 1;
             if self.emit_or_finish_und_token(id, tok, logprob, top_logprobs, true) {
                 return;
             }
             if let Some(st) = self.running.get_mut(&id) {
                 st.next_token = tok;
                 st.phase = Phase::DecodeUnd;
-                st.round_token_ids.push(tok);
-            }
-
-            // A trigger sequence matched against `generated_token_ids` opens the
-            // branch after its last token has been recorded there.
-            if can_open_gen_branch
-                && images_done < max_images
-                && self
-                    .running
-                    .get(&id)
-                    .is_some_and(Self::generated_trigger_matches)
-            {
-                self.begin_image(id);
-                return;
             }
         }
     }
@@ -365,20 +286,12 @@ impl Scheduler {
     /// accepted progress, so the cursors, encoder indices, denoising step count,
     /// and phase read here reflect this completion. Resolution adds the
     /// remaining effects for the call's kind, such as stop conditions,
-    /// image-branch triggers, prefix- and encoder-cache export, feedback
-    /// state, and public events. `media`
-    /// carries the base64 PNG artifact of an image-decoding completion.
+    /// prefix- and encoder-cache export, and public events.
     ///
     /// The caller resolves only a running request, and every path that
     /// finishes it returns; a request that is no longer running has nothing
     /// left to update, so resolution stops there.
-    pub(super) fn resolve(
-        &mut self,
-        id: RequestId,
-        call: Call,
-        mut record: CallCompletion,
-        media: Option<&SharedMedia>,
-    ) {
+    pub(super) fn resolve(&mut self, id: RequestId, call: Call, mut record: CallCompletion) {
         let call_variant = call.kind;
 
         // Prompt scores share the completion but precede its phase transition.
@@ -400,143 +313,37 @@ impl Scheduler {
             CallKind::Forward(ForwardMode::Prefill) => {
                 self.activate_request_tables(id);
 
-                // State-ingest and feedback calls use autoregressive extension
-                // transport while retaining their own completion transitions.
-                match (consumes_image_features(&call), is_feedback_call(&call)) {
-                    // A prefill with neither image features nor a token output
-                    // is the `CloseCache` write. It publishes nothing, and
-                    // `process_generation_result` has already moved the request
-                    // to `PublishCache`.
-                    (false, _) if !is_prompt_extend(&call) => return,
-                    // Latent input-image block ingest. The encoder index wraps
-                    // to zero once the image's last block has been written.
-                    (true, false) => {
-                        self.free_consumed_products(id, &call);
-                        let is_final_step = self
-                            .running
-                            .get(&id)
-                            .is_some_and(|state| state.image_encoder_index == 0);
+                // Latent input-image block ingest. The encoder index wraps to
+                // zero once the image's last block has been written.
+                if consumes_image_features(&call) {
+                    self.free_consumed_products(id, &call);
+                    let is_final_step = self
+                        .running
+                        .get(&id)
+                        .is_some_and(|state| state.image_encoder_index == 0);
 
-                        // Writing the last image of a fully consumed prompt
-                        // starts a canvas-generating request's first block, or
-                        // understanding decode from BOS.
-                        if is_final_step
-                            && self.running.get(&id).is_some_and(|st| {
-                                st.num_ingested_images >= st.req.multimodal_inputs.images.len()
-                                    && st.num_computed_prompt_tokens
-                                        >= st.req.prompt_token_ids.len() as u32
-                            })
-                        {
-                            let bos = self.special_tokens.bos;
-                            let generates_canvases = self.config.canvas.is_some();
-                            if let Some(st) = self.running.get_mut(&id) {
-                                if generates_canvases {
-                                    st.phase = Phase::Canvas;
-                                } else {
-                                    st.next_token = bos;
-                                    st.round_token_ids.clear();
-                                    st.phase = Phase::DecodeUnd;
-                                }
-                            }
-                        }
-                        return;
-                    }
-                    // Generated-image feedback ingest. Only the last feedback
-                    // encoder's completion counts the image and chooses how
-                    // text decode resumes.
-                    (true, true) => {
-                        let is_final_step = self
-                            .running
-                            .get(&id)
-                            .is_some_and(|state| state.feedback_encoder_index == 0);
-                        if !is_final_step {
-                            return;
-                        }
-
-                        self.free_transient_products(id);
-                        let sample_continuation = self
-                            .running
-                            .get(&id)
-                            .is_some_and(|st| st.req.image_generation.sample_feedback_continuation);
-
-                        // An image a context rebuild wrote is counted among
-                        // the request's images already; the rebuild goes on,
-                        // or the request resumes, sampling here when this
-                        // write sampled.
-                        if self.running.get(&id).is_some_and(|st| st.replay.is_some()) {
-                            if !self.resume_after_replay(id) {
-                                return;
-                            }
-                        } else if let Some(st) = self.running.get_mut(&id) {
-                            st.num_generated_images += 1;
-                        }
+                    // Writing the last image of a fully consumed prompt
+                    // starts a canvas-generating request's first block, or
+                    // understanding decode from BOS.
+                    if is_final_step
+                        && self.running.get(&id).is_some_and(|st| {
+                            st.num_ingested_images >= st.req.multimodal_inputs.images.len()
+                                && st.num_computed_prompt_tokens
+                                    >= st.req.prompt_token_ids.len() as u32
+                        })
+                    {
+                        let bos = self.special_tokens.bos;
+                        let generates_canvases = self.config.canvas.is_some();
                         if let Some(st) = self.running.get_mut(&id) {
-                            st.round_token_ids.clear();
-                        }
-
-                        // Without a sampled continuation, the configured
-                        // `feedback_next_token` is the next decode input, and
-                        // its absence is an error; with one, this call's
-                        // sampled token is resolved like any decoded token.
-                        if !sample_continuation {
-                            let Some(next_token) = self.feedback_next_token(id) else {
-                                return self.finish(id, FinishReason::Error);
-                            };
-                            if let Some(st) = self.running.get_mut(&id) {
-                                st.next_token = next_token;
+                            if generates_canvases {
+                                st.phase = Phase::Canvas;
+                            } else {
+                                st.next_token = bos;
                                 st.phase = Phase::DecodeUnd;
                             }
-                            return;
                         }
-
-                        let Some(tok) = record.committed_tokens.last().copied() else {
-                            return self.finish(id, FinishReason::Error);
-                        };
-
-                        let Some(st) = self.running.get_mut(&id) else {
-                            return;
-                        };
-                        st.num_generated_tokens += 1;
-                        let (can_open_gen_branch, images_done, max_images) = (
-                            st.can_open_gen_branch(),
-                            st.num_generated_images,
-                            st.req.max_images as usize,
-                        );
-
-                        let direct_trigger = self
-                            .running
-                            .get(&id)
-                            .is_some_and(|state| Self::direct_trigger_matches(state, tok));
-                        if direct_trigger && can_open_gen_branch && images_done < max_images {
-                            self.emit_control(id, tok);
-                            self.begin_image(id);
-                            return;
-                        }
-
-                        let last = record.committed_tokens.len() - 1;
-                        let (logprob, top_logprobs) = take_token_logprobs(&mut record, last);
-                        if self.emit_or_finish_und_token(id, tok, logprob, top_logprobs, true) {
-                            return;
-                        }
-
-                        if let Some(st) = self.running.get_mut(&id) {
-                            st.next_token = tok;
-                            st.phase = Phase::DecodeUnd;
-                            st.round_token_ids.push(tok);
-                        }
-
-                        if can_open_gen_branch
-                            && images_done < max_images
-                            && self
-                                .running
-                                .get(&id)
-                                .is_some_and(Self::generated_trigger_matches)
-                        {
-                            self.begin_image(id);
-                        }
-                        return;
                     }
-                    _ => {}
+                    return;
                 }
 
                 // Prompt extension. Partial prefill remains in ingest until every
@@ -561,13 +368,6 @@ impl Scheduler {
                     return;
                 }
 
-                // A context rebuild that wrote its last prompt tokens resumes,
-                // unless an image follows them.
-                if self.running.get(&id).is_some_and(|st| st.replay.is_some()) {
-                    self.resume_after_replay(id);
-                    return;
-                }
-
                 // A canvas-generating request's complete prompt samples
                 // nothing, and nor does each of its block commits, which
                 // extend the context the same way; the next block follows.
@@ -585,7 +385,6 @@ impl Scheduler {
                     let bos = self.special_tokens.bos;
                     if let Some(st) = self.running.get_mut(&id) {
                         st.next_token = bos;
-                        st.round_token_ids.clear();
                         st.phase = Phase::DecodeUnd;
                     }
                     return;
@@ -595,8 +394,6 @@ impl Scheduler {
                     return;
                 };
                 st.num_generated_tokens += 1;
-                let (starts_gen_after_context, can_open_gen_branch) =
-                    (st.starts_gen_after_context(), st.can_open_gen_branch());
 
                 // Prompt scoring covers every prompt position after the first;
                 // a complete prompt with unscored positions is an error.
@@ -612,33 +409,6 @@ impl Scheduler {
                     return self.finish(id, FinishReason::Error);
                 }
 
-                // A description-lowered prefix may already end at a branch
-                // trigger, and immediate Gen-only profiles skip Und decode
-                // after context prep: either opens an image, discarding the
-                // sampled token, which still counts as generated.
-                if self.prefilled_gen_trigger(id) || starts_gen_after_context {
-                    if let Some(&tok) = record.committed_tokens.last() {
-                        self.emit_control(id, tok);
-                    }
-                    // The branch's close write needs the token it writes at the
-                    // context's end. A context that sampled its last token
-                    // writes that one; one that sampled nothing (it ends with a
-                    // latent or generated-image block) starts from BOS, as the
-                    // understanding decode after such a context does. Leaving
-                    // `next_token` at its admission value plans the close write
-                    // from a token the request never computed.
-                    let pending = record
-                        .committed_tokens
-                        .last()
-                        .copied()
-                        .unwrap_or(self.special_tokens.bos);
-                    if let Some(st) = self.running.get_mut(&id) {
-                        st.next_token = pending;
-                    }
-                    self.begin_image(id);
-                    return;
-                }
-
                 let tok = record
                     .committed_tokens
                     .last()
@@ -646,24 +416,6 @@ impl Scheduler {
                     .unwrap_or(self.special_tokens.eos[0]);
                 let last = record.committed_tokens.len().saturating_sub(1);
                 let (logprob, top_logprobs) = take_token_logprobs(&mut record, last);
-
-                let Some(st) = self.running.get(&id) else {
-                    return;
-                };
-                let (images_done, max_images) =
-                    (st.num_generated_images, st.req.max_images as usize);
-
-                // A direct trigger token opens the image branch without being
-                // published as text.
-                let direct_trigger = self
-                    .running
-                    .get(&id)
-                    .is_some_and(|st| Self::direct_trigger_matches(st, tok));
-                if direct_trigger && can_open_gen_branch && images_done < max_images {
-                    self.emit_control(id, tok);
-                    self.begin_image(id);
-                    return;
-                }
 
                 if self.emit_or_finish_und_token(id, tok, logprob, top_logprobs, true) {
                     return;
@@ -682,16 +434,6 @@ impl Scheduler {
                         st.phase = Phase::DecodeUnd;
                     }
                 }
-
-                if can_open_gen_branch
-                    && images_done < max_images
-                    && self
-                        .running
-                        .get(&id)
-                        .is_some_and(Self::generated_trigger_matches)
-                {
-                    self.begin_image(id);
-                }
             }
             // A canvas step that stopped its block left the block's tokens
             // for their commit; they are published first, in order, and the
@@ -703,15 +445,6 @@ impl Scheduler {
                 };
                 self.emit_or_finish_block(id, &tokens);
             }
-            CallKind::Media(MediaCall::Denoising) => {
-                // Publish the newly committed step exactly once. A denoising
-                // call covers one step, so the steps completed before it are
-                // one fewer than the reported total.
-                self.emit_image_steps(id, record.step_index.saturating_sub(1));
-
-                // The host planner enters commit after the configured step count;
-                // worker completion flags do not determine diffusion termination.
-            }
             CallKind::Media(
                 MediaCall::MediaReading
                 | MediaCall::VideoDecoding
@@ -719,243 +452,112 @@ impl Scheduler {
                 | MediaCall::AudioEncoding
                 | MediaCall::Muxing,
             ) => {}
-            CallKind::Media(MediaCall::ImageDecoding) => {
-                // Commit becomes visible before optional feedback state is prepared.
-                let Some((image_id, height, width)) = self
-                    .running
-                    .get(&id)
-                    .map(|st| (st.image_id, st.req.image.height, st.req.image.width))
-                else {
-                    return;
-                };
-                self.emit(id, Event::ImageCommit { image_id });
-
-                // A decoding that writes the request's feedback image product
-                // publishes its values after the PNG: the image's exact
-                // feedback input, a fact of the request the daemon keeps.
-                let mut image = None;
-                let mut feedback = None;
-                if let Some(value) = media {
-                    let Some(parsed) = ipc::parse_image_media(
-                        value.as_bytes(),
-                        height,
-                        width,
-                        call.image_output.is_some(),
-                    ) else {
-                        return self.finish(id, FinishReason::Error);
-                    };
-                    image = std::str::from_utf8(parsed.png_b64).ok().map(str::to_owned);
-                    feedback = parsed.feedback.map(Arc::new);
-                }
-                // What the image's feedback encoders read, which keys their
-                // outputs in the host encoder pools: the product's values, or
-                // the PNG for feedback that reads the artifact.
-                let feedback_digest = self.running.get(&id).and_then(|st| {
-                    let isolation = st.req.cache.isolation_key;
-                    let read = match st.req.image_generation.feedback_source.as_ref()? {
-                        crate::FeedbackSource::DeviceProduct => {
-                            crate::FeedbackImage::Pixels(Arc::clone(feedback.as_ref()?))
-                        }
-                        crate::FeedbackSource::ArtifactProduct => {
-                            crate::FeedbackImage::Png(image.as_deref()?.into())
-                        }
-                    };
-                    Some((
-                        image_id,
-                        super::encodings::generated_image(&read, isolation),
-                    ))
-                });
-                if let Some(image_b64) = image.clone() {
-                    let Some(event) = image_done_event(image_id, image_b64, feedback) else {
-                        return self.finish(id, FinishReason::Error);
-                    };
-                    self.emit(id, event);
-                }
-
-                self.activate_request_tables(id);
-                let Some(st) = self.running.get(&id) else {
-                    return;
-                };
-                let (continues_after_gen_commit, feedback_source) = (
-                    st.continues_after_gen_commit(),
-                    st.req.image_generation.feedback_source.clone(),
-                );
-
-                if continues_after_gen_commit {
-                    let Some(feedback_source) = feedback_source else {
-                        return self.finish(id, FinishReason::Error);
-                    };
-
-                    // The configured feedback source must exist: the decoder's
-                    // device image product or the published PNG artifact.
-                    let source_product = call.image_output.clone();
-
-                    if feedback_source == crate::FeedbackSource::DeviceProduct
-                        && source_product.is_none()
-                    {
-                        return self.finish(id, FinishReason::Error);
-                    }
-
-                    if feedback_source == crate::FeedbackSource::ArtifactProduct && image.is_none()
-                    {
-                        return self.finish(id, FinishReason::Error);
-                    }
-
-                    // Feedback retains the configured source representation until
-                    // the encode and state-ingest stages consume it.
-                    if let Some(st) = self.running.get_mut(&id) {
-                        st.feedback_image_b64 = image;
-                        st.feedback_digest = feedback_digest;
-                        st.feedback_encoder_index = 0;
-                        st.feedback_source = source_product;
-                        st.feedback_features = None;
-                        st.phase = Phase::FeedbackEncode;
-                        if let Some(product) = st.feedback_source.clone() {
-                            st.transient_encoder_products.push(product);
-                        }
-                    }
-                } else {
-                    // A request that does not continue after its image commit
-                    // ends with this image.
-                    if let Some(st) = self.running.get_mut(&id) {
-                        st.num_generated_images += 1;
-                    }
-                    self.finish(id, FinishReason::ImageDone);
-                }
-            }
+            // Input-image encoding of the next block the context needs
+            // (`next_context_encode`): the product feeds the call that
+            // writes the block and, when the request writes the encoder
+            // cache, becomes a shared cache entry.
             CallKind::Media(MediaCall::VisionEncoding)
             | CallKind::Media(MediaCall::LatentEncoding) => {
-                match is_feedback_call(&call) {
-                    // Input-image encoding of the next block the context needs
-                    // (`next_context_encode`): the product feeds the call that
-                    // writes the block and, when the request writes the
-                    // encoder cache, becomes a shared cache entry.
-                    false => {
-                        let Some((block, step, block_cache_key)) =
-                            self.next_context_encode(id).and_then(|(block, step)| {
-                                let state = self.running.get(&id)?;
-                                let encoding = self.encoding(
-                                    &state.req,
-                                    super::encodings::Encoded::Input(block),
-                                )?;
-                                let key = state.req.cache.write.then(|| encoding.device_key());
-                                Some((block, step, key))
-                            })
-                        else {
+                let Some((block, step, block_cache_key)) =
+                    self.next_context_encode(id).and_then(|(block, step)| {
+                        let state = self.running.get(&id)?;
+                        let encoding = self.encoding(&state.req, block)?;
+                        let key = state.req.cache.write.then(|| encoding.device_key());
+                        Some((block, step, key))
+                    })
+                else {
+                    return self.finish(id, FinishReason::Error);
+                };
+                let encoder_cache_key = block_cache_key;
+                let Some(feature) = call.encoder_output.clone() else {
+                    return self.finish(id, FinishReason::Error);
+                };
+
+                let mut free_products = Vec::new();
+
+                // Cache ownership transfers the backing allocation out of the
+                // request; uncached products remain request-local transients.
+                let selected_product = if let Some(cache_key) = encoder_cache_key {
+                    // Insertion may return an evicted entry or, when a
+                    // concurrent miss already stored this key, this
+                    // call's redundant product; either is freed once
+                    // the request's product is selected.
+                    if let Some(freed) = self
+                        .storage
+                        .encoder_cache
+                        .insert(cache_key, feature.clone())
+                    {
+                        free_products.push(freed);
+                    }
+                    // The entry is live now, whether created or
+                    // re-activated; the policy's LRU is told.
+                    self.record_encoded(cache_key);
+
+                    let stored =
+                        self.storage.encoder_cache.peek_product(cache_key) == Some(feature.clone());
+
+                    // Only a product the cache now holds moves its
+                    // buffer from the request to encoder retention.
+                    if stored {
+                        let allocation = self.running.get_mut(&id).and_then(|state| {
+                            state.allocations_mut()?.take_buffer(feature.buffer_id())
+                        });
+                        let Some(allocation) = allocation else {
                             return self.finish(id, FinishReason::Error);
                         };
-                        let encoder_cache_key = block_cache_key;
-                        let Some(feature) = call.encoder_output.clone() else {
+                        if let Err(allocation) = self
+                            .storage
+                            .retain_encoder_buffer(feature.buffer_id(), allocation)
+                        {
+                            self.storage
+                                .pending_buffer_frees
+                                .insert(feature.buffer_id(), allocation);
+                            self.inflight
+                                .pending_commands
+                                .push_back(BatchCommand::Free {
+                                    buffer: feature.buffer_id(),
+                                });
                             return self.finish(id, FinishReason::Error);
-                        };
-
-                        let mut free_products = Vec::new();
-
-                        // Cache ownership transfers the backing allocation out of the
-                        // request; uncached products remain request-local transients.
-                        let selected_product = if let Some(cache_key) = encoder_cache_key {
-                            // Insertion may return an evicted entry or, when a
-                            // concurrent miss already stored this key, this
-                            // call's redundant product; either is freed once
-                            // the request's product is selected.
-                            if let Some(freed) = self
-                                .storage
-                                .encoder_cache
-                                .insert(cache_key, feature.clone())
-                            {
-                                free_products.push(freed);
-                            }
-                            // The entry is live now, whether created or
-                            // re-activated; the policy's LRU is told.
-                            self.record_encoded(cache_key);
-
-                            let stored = self.storage.encoder_cache.peek_product(cache_key)
-                                == Some(feature.clone());
-
-                            // Only a product the cache now holds moves its
-                            // buffer from the request to encoder retention.
-                            if stored {
-                                let allocation = self.running.get_mut(&id).and_then(|state| {
-                                    state.allocations_mut()?.take_buffer(feature.buffer_id())
-                                });
-                                let Some(allocation) = allocation else {
-                                    return self.finish(id, FinishReason::Error);
-                                };
-                                if let Err(allocation) = self
-                                    .storage
-                                    .retain_encoder_buffer(feature.buffer_id(), allocation)
-                                {
-                                    self.storage
-                                        .pending_buffer_frees
-                                        .insert(feature.buffer_id(), allocation);
-                                    self.inflight
-                                        .pending_commands
-                                        .push_back(BatchCommand::Free {
-                                            buffer: feature.buffer_id(),
-                                        });
-                                    return self.finish(id, FinishReason::Error);
-                                }
-                            }
-
-                            // The request pins the resident entry, which may be an
-                            // earlier equivalent product rather than this call's.
-                            let Some(product) = self.storage.encoder_cache.acquire(cache_key)
-                            else {
-                                return self.finish(id, FinishReason::Error);
-                            };
-                            if let Some(st) = self.running.get_mut(&id) {
-                                st.encoder_cache_pins.push(EncoderCachePin {
-                                    key: cache_key,
-                                    product: product.clone(),
-                                });
-                            }
-                            // Pinning it is a use: the entry moves in the order
-                            // the policy evicts by.
-                            self.record_encoded(cache_key);
-                            product
-                        } else if let Some(st) = self.running.get_mut(&id) {
-                            st.transient_encoder_products.push(feature.clone());
-                            feature.clone()
-                        } else {
-                            feature.clone()
-                        };
-
-                        // A latent block is written by its own extension; a
-                        // vision block joins the context prefill that reaches
-                        // it. Encodes follow the blocks' context order.
-                        if let Some(st) = self.running.get_mut(&id) {
-                            if step == crate::ImageEncoder::Latent {
-                                st.input_image_features = Some(selected_product);
-                                st.phase = Phase::IngestState;
-                            } else {
-                                debug_assert!(block.image >= st.num_ingested_images);
-                                st.context_features.push(selected_product);
-                            }
-                        }
-
-                        if !free_products.is_empty() {
-                            self.free_buffers(
-                                free_products.into_iter().map(|product| product.buffer_id()),
-                            );
                         }
                     }
-                    // Feedback encoding: the product is request-local and
-                    // released once feedback ingest completes.
-                    true => {
-                        let Some(feature) = call.encoder_output.clone() else {
-                            return self.finish(id, FinishReason::Error);
-                        };
 
-                        if let Some(st) = self.running.get_mut(&id) {
-                            st.transient_encoder_products.push(feature.clone());
-                            st.feedback_features = Some(feature);
-                            // A context rebuild's encoding is written next by
-                            // the rebuild (`ReplayStage::Write`).
-                            if st.replay.is_none() {
-                                st.phase = Phase::FeedbackState;
-                            }
-                        }
+                    // The request pins the resident entry, which may be an
+                    // earlier equivalent product rather than this call's.
+                    let Some(product) = self.storage.encoder_cache.acquire(cache_key) else {
+                        return self.finish(id, FinishReason::Error);
+                    };
+                    if let Some(st) = self.running.get_mut(&id) {
+                        st.encoder_cache_pins.push(EncoderCachePin {
+                            key: cache_key,
+                            product: product.clone(),
+                        });
                     }
+                    // Pinning it is a use: the entry moves in the order
+                    // the policy evicts by.
+                    self.record_encoded(cache_key);
+                    product
+                } else if let Some(st) = self.running.get_mut(&id) {
+                    st.transient_encoder_products.push(feature.clone());
+                    feature.clone()
+                } else {
+                    feature.clone()
+                };
+
+                // A latent block is written by its own extension; a
+                // vision block joins the context prefill that reaches
+                // it. Encodes follow the blocks' context order.
+                if let Some(st) = self.running.get_mut(&id) {
+                    if step == crate::ImageEncoder::Latent {
+                        st.input_image_features = Some(selected_product);
+                        st.phase = Phase::IngestState;
+                    } else {
+                        debug_assert!(block.image >= st.num_ingested_images);
+                        st.context_features.push(selected_product);
+                    }
+                }
+
+                if !free_products.is_empty() {
+                    self.free_buffers(free_products.into_iter().map(|product| product.buffer_id()));
                 }
             }
             // These calls publish nothing and change no state here. `Decode`
@@ -964,6 +566,7 @@ impl Scheduler {
             | CallKind::Forward(ForwardMode::Decode)
             | CallKind::Forward(ForwardMode::Verify)
             | CallKind::Media(MediaCall::LatentPreparation)
+            | CallKind::Media(MediaCall::Denoising)
             | CallKind::Media(MediaCall::VideoEncoding)
             | CallKind::Transfer(TransferMode::Tensor)
             | CallKind::Transfer(TransferMode::CacheExport)
@@ -1033,169 +636,6 @@ impl Scheduler {
         self.free_buffers(freed.into_iter().map(|product| product.buffer_id()));
     }
 
-    /// Frees the request's transient products: uncached encoder outputs,
-    /// feedback encoder outputs, and the device feedback source.
-    pub(super) fn free_transient_products(&mut self, id: RequestId) {
-        let products = self
-            .running
-            .get_mut(&id)
-            .map(|state| std::mem::take(&mut state.transient_encoder_products))
-            .unwrap_or_default();
-        self.free_buffers(products.into_iter().map(|product| product.buffer_id()));
-    }
-
-    /// Appends the direct trigger token to `generated_token_ids` for a request
-    /// that continues after its image commit, when `num_generated_tokens`
-    /// counts more tokens than that list records and the list does not
-    /// already end with the trigger.
-    ///
-    /// A direct trigger opens the image branch without passing through
-    /// `emit_text`. This keeps the trigger in the accepted history that
-    /// bad-word masks (`build_token_masks`) and generated-trigger matching
-    /// read.
-    pub(super) fn record_gen_trigger_for_replay(&mut self, id: RequestId) {
-        let Some(start) = self
-            .running
-            .get(&id)
-            .and_then(|st| st.req.image_generation.trigger.direct_token())
-        else {
-            return;
-        };
-        if let Some(st) = self.running.get_mut(&id)
-            && st.continues_after_gen_commit()
-            && st.num_generated_tokens > st.generated_token_ids.len()
-            && st.generated_token_ids.last().copied() != Some(start)
-        {
-            st.generated_token_ids.push(start);
-        }
-    }
-
-    /// Converts a worst-case cache reservation into concrete generation-branch capacity.
-    ///
-    /// Succeeds, clearing `image_reservation_pending`, when the request reserves
-    /// its worst-case envelope and every block table already covers
-    /// `max_reserved_cache_tokens` tokens. Otherwise finishes the request with
-    /// `FinishReason::Error` and returns `false`; a request that is not running
-    /// also returns `false`.
-    pub(super) fn promote_gen_branch_reservation(&mut self, id: RequestId) -> bool {
-        let Some((required_tokens, reserves_envelope)) = self
-            .running
-            .get(&id)
-            .map(|st| (st.max_reserved_cache_tokens, st.reserve_worstcase))
-        else {
-            return false;
-        };
-        let covered = self
-            .running
-            .get(&id)
-            .and_then(RequestState::block_tables)
-            .is_some_and(|tables| {
-                tables
-                    .iter()
-                    .all(|table| table.capacity_tokens() >= required_tokens)
-            });
-        if !reserves_envelope || !covered {
-            self.finish(id, FinishReason::Error);
-            return false;
-        }
-        if let Some(st) = self.running.get_mut(&id) {
-            st.image_reservation_pending = false;
-        }
-        true
-    }
-
-    /// Ends a migrated request's context rebuild once nothing of it is left
-    /// to write: the request resumes in the state it left
-    /// (`generation::continuation::Resume`). Returns whether the call just
-    /// accepted sampled the request's next token, which its caller resolves
-    /// as the feedback continuation; `false` while the rebuild goes on.
-    pub(super) fn resume_after_replay(&mut self, id: RequestId) -> bool {
-        let Some(st) = self.running.get_mut(&id) else {
-            return false;
-        };
-        let remains = st
-            .replay
-            .as_ref()
-            .is_some_and(|replay| !replay.images.is_empty())
-            || (st.num_computed_prompt_tokens as usize) < st.req.prompt_token_ids.len();
-        if remains {
-            return false;
-        }
-        let Some(replay) = st.replay.take() else {
-            return false;
-        };
-        tracing::info!(
-            request_id = id.0,
-            images = st.num_generated_images,
-            generated_tokens = st.num_generated_tokens,
-            resume = ?replay.resume,
-            "a migrated request rebuilt its context"
-        );
-        match replay.resume {
-            generation::continuation::Resume::Decode { token, .. } => {
-                st.next_token = token;
-                st.phase = Phase::DecodeUnd;
-                false
-            }
-            generation::continuation::Resume::FeedbackSample => true,
-            generation::continuation::Resume::Open { token } => {
-                st.next_token = token;
-                st.phase = Phase::DecodeUnd;
-                self.begin_image(id);
-                false
-            }
-        }
-    }
-
-    /// Publishes the steps of request `id`'s current image its trajectory
-    /// completed after the first `previous`: the image's start when it had
-    /// completed none, then each step. Step numbers saturate at `u16::MAX`
-    /// to fit the event fields.
-    pub(super) fn emit_image_steps(&mut self, id: RequestId, previous: u32) {
-        let Some(st) = self.running.get(&id) else {
-            return;
-        };
-        let image_id = st.image_id;
-        let (height, width, steps) = (st.req.image.height, st.req.image.width, st.req.image.steps);
-        let previous = previous.min(u32::from(u16::MAX)) as u16;
-        let completed = st.denoising.completed().min(u32::from(u16::MAX)) as u16;
-        if previous == 0 && completed >= 1 {
-            self.emit(
-                id,
-                Event::ImageBegin {
-                    image_id,
-                    height,
-                    width,
-                    steps,
-                },
-            );
-        }
-        for step in previous.saturating_add(1)..=completed {
-            self.emit(id, Event::ImageStep { image_id, step });
-        }
-    }
-
-    /// Opens the next image-generation branch.
-    ///
-    /// Moves the request to `Phase::CloseCache` under a new `image_id` and checks
-    /// its cache reservation, which can finish the request with an error. When
-    /// calls of the request are still in flight, its speculative chain is
-    /// marked invalidated: those results are discarded on arrival, and nothing
-    /// new is scheduled for the request until they drain.
-    pub(super) fn begin_image(&mut self, id: RequestId) {
-        self.record_gen_trigger_for_replay(id);
-        let has_unresolved_descendants = self.inflight.has_pending_calls(id);
-        if let Some(st) = self.running.get_mut(&id) {
-            st.speculative_chain_invalidated |= has_unresolved_descendants;
-
-            st.denoising.close();
-            st.image_id += 1;
-            st.phase = Phase::CloseCache;
-            st.image_reservation_pending = true;
-        }
-        self.promote_gen_branch_reservation(id);
-    }
-
     /// Flushes the journals of running token and media requests and of retired
     /// requests. Returns whether any journal changed length.
     ///
@@ -1247,14 +687,6 @@ impl Scheduler {
         accepted
     }
 
-    /// Publishes a generated token the request's text does not include
-    /// (`Event::ControlToken`): it counts as generated, and the daemon keeps
-    /// it with the request's text tokens, in order, to submit a migrated
-    /// request again with every token it generated.
-    pub(super) fn emit_control(&mut self, id: RequestId, tok: u32) {
-        self.emit(id, Event::ControlToken { id: tok });
-    }
-
     /// Records an accepted text token and publishes it when the request emits text.
     ///
     /// A running request always records the token in `generated_token_ids`.
@@ -1266,10 +698,6 @@ impl Scheduler {
             return false;
         };
         st.generated_token_ids.push(tok);
-        if !st.req.emits_text() {
-            self.emit_control(id, tok);
-            return false;
-        }
         let published = self.emit(id, Event::TextToken { id: tok, logprob });
         if published {
             if let Some(state) = self.running.get_mut(&id) {
@@ -1294,7 +722,7 @@ impl Scheduler {
             return;
         };
         st.generated_token_ids.extend_from_slice(&tokens);
-        if !st.req.emits_text() || tokens.is_empty() {
+        if tokens.is_empty() {
             return;
         }
         let count = tokens.len();
@@ -1603,27 +1031,6 @@ impl Scheduler {
         self.retire_token_request(id, Terminal::migrate(cause));
     }
 
-    /// Ends a token request as migratable for `cause`, as `migrate_request`
-    /// does, naming the `steps` of the trajectory of the image it was
-    /// generating that the host latent pools stored and the record of where
-    /// they lie.
-    pub(super) fn migrate_stored(
-        &mut self,
-        id: RequestId,
-        cause: MigrationCause,
-        steps: u32,
-        stored_layout: Vec<u8>,
-    ) {
-        self.retire_token_request(
-            id,
-            Terminal::Migrated {
-                cause,
-                denoised_steps: steps,
-                stored_layout,
-            },
-        );
-    }
-
     /// Publishes `terminal` and releases every resource owned by one token
     /// request; see `finish_with`.
     fn retire_token_request(&mut self, id: RequestId, terminal: Terminal) {
@@ -1664,9 +1071,6 @@ impl Scheduler {
                 cause = state.failure.as_deref().unwrap_or("unrecorded"),
                 phase = ?state.phase,
                 generated_tokens = state.num_generated_tokens,
-                images_done = state.num_generated_images,
-                image_id = state.image_id,
-                denoise_steps_done = state.denoising.completed(),
                 logical_position = state.logical_position,
                 physical_cache_len = state.cache_visible_len,
                 "scheduler request terminated with an internal error"
@@ -1677,7 +1081,6 @@ impl Scheduler {
         // acknowledges the ordered close command.
         let mut awaits_close = false;
         let mut allocations = None;
-        let mut guidance_prefix = None;
         if let Some(mut st) = self.running.remove(&id) {
             if st.allocations.is_some() {
                 // The pool row this request held is free from here on.
@@ -1697,12 +1100,7 @@ impl Scheduler {
                     retained_buffers,
                 };
                 self.inflight.pending_commands.push_back(command);
-                let mut allocations: Vec<RequestAllocations> = st
-                    .guidance_prefix
-                    .take()
-                    .into_iter()
-                    .flat_map(GuidancePrefixState::into_allocations)
-                    .collect();
+                let mut allocations: Vec<RequestAllocations> = Vec::new();
                 let mut buffers = HashMap::new();
                 match st.allocations.take() {
                     Some(mut allocation) => {
@@ -1723,7 +1121,6 @@ impl Scheduler {
                 awaits_close = true;
             } else {
                 allocations = st.allocations.take();
-                guidance_prefix = st.guidance_prefix.take();
             }
 
             // Remove admission reservations before exposing terminal output so
@@ -1735,14 +1132,9 @@ impl Scheduler {
                 .saturating_sub(st.req.num_encoder_cache_entries());
 
             // Its encodings' lookups in the host encoder pools end, those of
-            // its calls in flight once they complete; so do the pins of the
-            // stored trajectory its image restores, and a store of its
-            // image's trajectory not yet carried to its workers is aborted.
+            // its calls in flight once they complete.
             if let Some(store) = self.encoder_outputs.as_mut() {
                 store.forget(RequestKey::new(self.engine_id, id, st.request_epoch));
-            }
-            if let Some(store) = self.trajectories.as_mut() {
-                store.forget(id);
             }
 
             // Releasing the request's encoder pins may make cache products
@@ -1778,16 +1170,8 @@ impl Scheduler {
 
         // Unregistered requests have no outstanding worker reference, so their
         // allocations can return to the scheduler immediately.
-        if !awaits_close {
-            for allocations in guidance_prefix
-                .into_iter()
-                .flat_map(GuidancePrefixState::into_allocations)
-            {
-                allocations.free(&mut self.storage);
-            }
-            if let Some(allocations) = allocations {
-                allocations.free(&mut self.storage);
-            }
+        if !awaits_close && let Some(allocations) = allocations {
+            allocations.free(&mut self.storage);
         }
     }
 }
@@ -1858,8 +1242,7 @@ impl Scheduler {
         let published_before = published.clone();
         let visible = state.cache_visible_len as usize;
         let draft_valid = state.draft.valid as usize;
-        let cache_write =
-            state.req.cache.write && !state.has_context_images() && !state.rebuilds_images();
+        let cache_write = state.req.cache.write && !state.has_context_images();
         let host_keyed = state.host_keyed;
         let cache_policy = state.req.cache.clone();
         let scope = crate::kv_cache::PrefixScope::of(&cache_policy);

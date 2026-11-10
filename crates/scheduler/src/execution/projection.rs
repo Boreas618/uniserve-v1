@@ -4,7 +4,7 @@
 //! successor before its predecessor's result returns.
 
 use super::*;
-use ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode};
+use ipc::{CallCoordinates, ForwardMode, TransferMode};
 
 /// A request's context projected through its in-flight calls
 /// (`Scheduler::scheduled_context`).
@@ -18,27 +18,6 @@ pub(crate) struct ScheduledContext {
 }
 
 impl Scheduler {
-    /// Returns whether a guidance prefix can be scheduled now.
-    ///
-    /// Returns `false` only while the request holds a guidance prefix that no
-    /// successful denoising completion has finalized and a denoising call is
-    /// in flight.
-    pub(crate) fn guidance_prefix_is_schedulable(&self, id: RequestId) -> bool {
-        let prefix_is_pending = self
-            .running
-            .get(&id)
-            .and_then(|state| state.guidance_prefix.as_ref())
-            .is_some_and(|prefix| !prefix.diffusion_finalized);
-        !prefix_is_pending
-            || !self
-                .inflight
-                .pending_calls
-                .get(&id)
-                .into_iter()
-                .flatten()
-                .any(|call| call.call.kind == CallKind::Media(MediaCall::Denoising))
-    }
-
     /// Counts prompt tokens accepted or present in pending forward inputs.
     pub(crate) fn num_scheduled_prompt_tokens(&self, id: RequestId) -> Option<u32> {
         let state = self.running.get(&id)?;
@@ -78,7 +57,6 @@ impl Scheduler {
         let state = self.running.get(&id)?;
         let (mut logical, mut physical) = (state.logical_position, state.cache_visible_len);
         let mut blocks = state.block_cursor();
-        let mut feedback_index = state.feedback_encoder_index;
         for pending in self.inflight.pending_calls.get(&id).into_iter().flatten() {
             let call = &pending.call;
             match call.kind {
@@ -90,33 +68,21 @@ impl Scheduler {
                     physical = physical.saturating_add(advance.prefix_cache);
                     blocks = advance.cursor;
                 }
+                // A latent input-image block.
                 CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
                     physical = physical.saturating_add(call.bounds.max_tokens);
-                    if is_feedback_call(call) {
-                        feedback_index += 1;
-                        if feedback_index == state.req.image_generation.feedback_encoders.len() {
-                            logical = logical
-                                .saturating_add(state.req.image_generation.num_feedback_positions);
-                            feedback_index = 0;
-                        }
-                    } else {
-                        // A latent input-image block.
-                        let image = state.req.multimodal_inputs.images.get(blocks.image)?;
-                        let next = state.next_block(blocks)?;
-                        if next.image != blocks.image {
-                            logical = logical.saturating_add(image.num_positions);
-                        }
-                        blocks = next;
+                    let image = state.req.multimodal_inputs.images.get(blocks.image)?;
+                    let next = state.next_block(blocks)?;
+                    if next.image != blocks.image {
+                        logical = logical.saturating_add(image.num_positions);
                     }
+                    blocks = next;
                 }
-                // A draft refill evaluates tokens the cache holds already.
-                CallKind::Forward(ForwardMode::Prefill) if call.draft.refill.is_some() => {}
-                CallKind::Forward(ForwardMode::Prefill) => physical = physical.saturating_add(1),
                 CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
                     logical = logical.saturating_add(1);
                     physical = physical.saturating_add(1);
                 }
-                CallKind::Media(MediaCall::ImageDecoding) => feedback_index = 0,
+                // A draft refill evaluates tokens the cache holds already.
                 _ => {}
             }
         }
@@ -156,67 +122,6 @@ impl Scheduler {
         })
     }
 
-    /// Denoising steps covered once the submitted calls complete, without
-    /// accepting them.
-    pub(crate) fn num_scheduled_denoise_steps(&self, id: RequestId) -> Option<u32> {
-        let state = self.running.get(&id)?;
-        Some(self.scheduled_steps(id, &state.denoising))
-    }
-
-    /// Returns the next feedback encoder index and number of pending image completions.
-    /// Only actual feature writes advance the ordered encoder inputs.
-    pub(crate) fn scheduled_feedback(&self, id: RequestId) -> Option<(usize, usize)> {
-        let state = self.running.get(&id)?;
-        let mut index = state.feedback_encoder_index;
-        let mut images = 0;
-        for pending in self.inflight.pending_calls.get(&id).into_iter().flatten() {
-            let call = &pending.call;
-            if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
-                index = 0;
-            } else if consumes_image_features(call) && is_feedback_call(call) {
-                index += 1;
-                if index == state.req.image_generation.feedback_encoders.len() {
-                    index = 0;
-                    images += 1;
-                }
-            }
-        }
-        Some((index, images))
-    }
-
-    /// Returns the cache buffer the request's next call is conditioned on: the
-    /// `cache_output` of its latest in-flight call that publishes one, otherwise
-    /// the accepted `image_conditioning` of the running request.
-    pub(crate) fn cache_conditioning(&self, id: RequestId) -> Option<ipc::BufferId> {
-        self.inflight
-            .pending_calls
-            .get(&id)
-            .and_then(|pending| pending.iter().rev().find_map(|item| item.call.cache_output))
-            .or_else(|| {
-                self.running
-                    .get(&id)
-                    .and_then(|request| request.image_conditioning)
-            })
-    }
-
-    /// Returns the product `select` picks from the request's most recently
-    /// submitted in-flight call that has one.
-    ///
-    /// A successor refers to the producer's registered output generation
-    /// directly, before the producer completes.
-    pub(crate) fn pending_output(
-        &self,
-        id: RequestId,
-        select: impl for<'a> Fn(&'a Call) -> Option<&'a TensorRef>,
-    ) -> Option<&TensorRef> {
-        self.inflight
-            .pending_calls
-            .get(&id)?
-            .iter()
-            .rev()
-            .find_map(|pending| select(&pending.call))
-    }
-
     /// Selects the next call from the last pending input, or from accepted
     /// request progress when no call remains. No request state is replayed.
     pub(crate) fn next_generation_phase(&self, id: RequestId) -> Option<Phase> {
@@ -251,35 +156,15 @@ impl Scheduler {
                         Phase::Canvas
                     }
                 }
+                // A latent input-image block: context ingestion continues
+                // after it.
                 CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
-                    if is_feedback_call(call) {
-                        if self.scheduled_feedback(id)?.0 == 0 {
-                            Phase::DecodeUnd
-                        } else {
-                            Phase::FeedbackEncode
-                        }
-                    } else {
-                        // A latent input-image block: context ingestion
-                        // continues after it.
-                        Phase::Prefill
-                    }
+                    Phase::Prefill
                 }
-                CallKind::Forward(ForwardMode::Prefill) => Phase::PublishCache,
                 // A hand-off's export or install leaves the request handing
                 // off until the install is accepted.
-                CallKind::Transfer(TransferMode::CacheExport) if state.phase == Phase::HandOff => {
+                CallKind::Transfer(TransferMode::CacheExport | TransferMode::CacheInstall) => {
                     Phase::HandOff
-                }
-                CallKind::Transfer(TransferMode::CacheInstall) => Phase::HandOff,
-                CallKind::Transfer(TransferMode::CacheExport) => Phase::LatentPreparation,
-                CallKind::Media(MediaCall::LatentPreparation)
-                | CallKind::Media(MediaCall::Denoising) => Phase::Denoising,
-                CallKind::Media(MediaCall::ImageDecoding) => Phase::FeedbackEncode,
-                CallKind::Media(MediaCall::VisionEncoding)
-                | CallKind::Media(MediaCall::LatentEncoding)
-                    if is_feedback_call(call) =>
-                {
-                    Phase::FeedbackState
                 }
                 _ => state.phase,
             },
@@ -303,11 +188,6 @@ impl Scheduler {
                 } else {
                     Phase::DecodeUnd
                 }
-            }
-            Phase::Denoising
-                if self.num_scheduled_denoise_steps(id)? >= state.denoising.steps() =>
-            {
-                Phase::ImageDecoding
             }
             phase => phase,
         })
@@ -441,40 +321,18 @@ impl Scheduler {
         };
 
         // A cache export or install is never queued behind an unresolved
-        // call, and a request with a `RoundCloseThenSuffix` image trigger
-        // queues no successor at all.
+        // call.
         if matches!(
             target,
             CallKind::Transfer(TransferMode::CacheExport | TransferMode::CacheInstall)
         ) {
             return false;
         }
-        if matches!(
-            state.req.image_generation.trigger,
-            crate::ImageTrigger::RoundCloseThenSuffix { .. }
-        ) {
-            return false;
-        }
 
-        // Decode successors support both feedback continuation and ordinary
-        // prompt/decode pipelining, using each predecessor's actual inputs.
+        // Decode successors pipeline behind the prompt and the decodes,
+        // using each predecessor's actual inputs.
         if target == CallKind::Forward(ForwardMode::Decode) {
-            let feedback_continuation = consumes_image_features(&predecessor.call)
-                && is_feedback_call(&predecessor.call)
-                && self
-                    .scheduled_feedback(id)
-                    .is_some_and(|(index, _)| index == 0)
-                && state.req.image_generation.sample_feedback_continuation
-                && predecessor.call.token_output.is_some();
-            if feedback_continuation {
-                return self
-                    .pending_successor_code(id)
-                    .is_some_and(|variant| variant == CallKind::Forward(ForwardMode::Decode))
-                    && state.num_generated_tokens.saturating_add(1) < state.req.max_und_tokens;
-            }
-
             if !matches!(state.phase, Phase::Prefill | Phase::DecodeUnd)
-                || (state.phase == Phase::Prefill && state.starts_gen_after_context())
                 || queue.iter().any(|call| {
                     !matches!(
                         call.call.kind,
@@ -554,41 +412,18 @@ impl Scheduler {
     ///
     /// Returns `None`, among other cases, when the request is not running or
     /// has no call in flight, has not yet submitted its whole prompt or every
-    /// block of its context images, cannot chain from its last in-flight
-    /// call (an image decode whose request does not feed the device image
-    /// product back, or a completed feedback round whose request does not
-    /// sample a feedback continuation), or projects to a latent ingest
-    /// phase.
+    /// block of its context images, or projects to a latent ingest phase.
     pub(crate) fn pending_successor_code(&self, id: RequestId) -> Option<CallKind> {
         if !self.inflight.has_pending_calls(id) {
             return None;
         }
         let state = self.running.get(&id)?;
-        // A context rebuild plans its calls one at a time.
-        if state.replay.is_some() {
-            return None;
-        }
         if self.num_scheduled_prompt_tokens(id)? < state.req.prompt_token_ids.len() as u32
             || self.num_scheduled_images(id)? < state.req.multimodal_inputs.images.len()
         {
             return None;
         }
         let last = &self.inflight.pending_calls.get(&id)?.back()?.call;
-        let chainable = if last.kind == CallKind::Media(MediaCall::ImageDecoding) {
-            state.req.feeds_back_images()
-                && state.req.image_generation.feedback_source
-                    == Some(crate::FeedbackSource::DeviceProduct)
-        } else if consumes_image_features(last)
-            && is_feedback_call(last)
-            && self.scheduled_feedback(id)?.0 == 0
-        {
-            state.req.image_generation.sample_feedback_continuation
-        } else {
-            true
-        };
-        if !chainable {
-            return None;
-        }
         Some(match self.next_generation_phase(id)? {
             Phase::Prefill | Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
             Phase::HandOff
@@ -598,24 +433,8 @@ impl Scheduler {
                 CallKind::Transfer(TransferMode::CacheInstall)
             }
             Phase::HandOff => CallKind::Transfer(TransferMode::CacheExport),
-            Phase::CloseCache | Phase::FeedbackState => CallKind::Forward(ForwardMode::Prefill),
-            Phase::PublishCache => CallKind::Transfer(TransferMode::CacheExport),
-            Phase::LatentPreparation => CallKind::Media(MediaCall::LatentPreparation),
-            Phase::Denoising => CallKind::Media(MediaCall::Denoising),
-            Phase::ImageDecoding => CallKind::Media(MediaCall::ImageDecoding),
             Phase::Canvas => CallKind::Forward(ForwardMode::TokenDenoising),
             Phase::CommitCanvas => CallKind::Forward(ForwardMode::Prefill),
-            Phase::FeedbackEncode => {
-                let feedback = &state.req.image_generation;
-                feedback.feedback_source.as_ref()?;
-                CallKind::Media(
-                    feedback
-                        .feedback_encoders
-                        .get(self.scheduled_feedback(id)?.0)?
-                        .encoder
-                        .into(),
-                )
-            }
             Phase::IngestState => return None,
         })
     }
@@ -624,20 +443,13 @@ impl Scheduler {
     pub(crate) fn device_token_relay_eligible(state: &RequestState) -> bool {
         // A successor may consume the parent's device-selected point before host
         // observation whenever its own sampling state is device-representable
-        // from registered coordinates and device products alone. Two request
-        // shapes keep the request host-paced:
-        // - An image-generating request whose image branch opens on anything
-        //   but one direct token. Only a direct trigger is among the device
-        //   finish tokens (`finish_token_ids`).
-        // - Multi-token bad words, because their next mask depends on the
-        //   not-yet-observed suffix.
-        // Stop strings do not keep a request host-paced: the frontend decoder
-        // matches them after resolution, and the scheduler tracks its pending
-        // decisions in `decoder_boundaries`.
+        // from registered coordinates and device products alone. Multi-token
+        // bad words keep the request host-paced, because their next mask
+        // depends on the not-yet-observed suffix. Stop strings do not: the
+        // frontend decoder matches them after resolution, and the scheduler
+        // tracks its pending decisions in `decoder_boundaries`.
         let sampling = &state.req.sampling;
-        (!state.req.generates_images()
-            || state.req.image_generation.trigger.direct_token().is_some())
-            && sampling.bad_words_ids.iter().all(|word| word.len() == 1)
+        sampling.bad_words_ids.iter().all(|word| word.len() == 1)
     }
 
     /// Returns whether the latest host-resolved token may remain the exact device input
@@ -650,9 +462,6 @@ impl Scheduler {
                 && state.latest_token.as_ref().is_some()
                 && state.is_replayable_text()
                 && state.phase == Phase::DecodeUnd
-                && !state.round_closing
-                && (!state.req.generates_images()
-                    || state.req.image_generation.trigger.direct_token().is_some())
         })
     }
 

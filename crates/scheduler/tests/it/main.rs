@@ -19,7 +19,6 @@ mod in_process;
 mod in_process_completion;
 mod in_process_epochs;
 mod in_process_groups;
-mod in_process_images;
 mod in_process_media;
 mod in_process_stalls;
 mod media_occupancy;

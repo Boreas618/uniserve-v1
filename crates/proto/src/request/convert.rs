@@ -11,13 +11,11 @@ use std::sync::Arc;
 
 use super::wire;
 use super::{
-    ArtifactEvent, ArtifactMedia, CachePolicy, CacheResume, CfgRenorm, ConditionExtent,
-    DiffusionRequest, DiffusionSamplingParams, EncoderInputs, Event, FeedbackImage,
-    FeedbackNextToken, FeedbackSource, FinishReason, GeneratedImage, GenerationConstraint,
-    GenerationFeatures, GenerationLimits, GenerationRequest, ImageEncoder, ImageEncoderInput,
-    ImageGenerationConfig, ImageInput, ImageParams, ImagePixels, ImageTrigger, MediaKind,
-    MigrationCause, MultimodalInputs, PixelRange, PositionLogprobs, RejectionKind, Request,
-    RequestId, SamplingParams, StopReason, TokenLogprob, Trajectory,
+    ArtifactEvent, ArtifactMedia, CachePolicy, CacheResume, ConditionExtent, DiffusionRequest,
+    DiffusionSamplingParams, EncoderInputs, Event, FinishReason, GenerationFeatures,
+    GenerationLimits, GenerationRequest, ImageEncoder, ImageEncoderInput, ImageInput, MediaKind,
+    MigrationCause, MultimodalInputs, PositionLogprobs, RejectionKind, Request, RequestId,
+    SamplingParams, StopReason, TokenLogprob, Trajectory,
 };
 
 /// A message that states no valid value.
@@ -94,17 +92,13 @@ impl From<&GenerationRequest> for wire::GenerationRequest {
     fn from(request: &GenerationRequest) -> Self {
         Self {
             prompt_token_ids: request.prompt_token_ids.clone(),
-            negative_prompt_token_ids: request.negative_prompt_token_ids.clone(),
             images: request
                 .multimodal_inputs
                 .images
                 .iter()
                 .map(Into::into)
                 .collect(),
-            constraint: wire::GenerationConstraint::from(request.constraint) as i32,
             sampling: Some((&request.sampling).into()),
-            image: Some((&request.image).into()),
-            max_images: u32::from(request.max_images),
             max_und_tokens: request.max_und_tokens as u64,
             stop_strings: request.stop_strings.clone(),
             stop_token_ids: request.stop_token_ids.clone(),
@@ -124,78 +118,9 @@ impl From<&GenerationRequest> for wire::GenerationRequest {
                 }),
             }),
             include_stop_token: request.include_stop_token,
-            image_generation: Some((&request.image_generation).into()),
             generated_token_ids: request.generated_token_ids.clone(),
             adapter: request.adapter,
-            generated_images: request
-                .generated_images
-                .iter()
-                .map(|image| wire::GeneratedImage {
-                    tokens: image.tokens,
-                    image: Some(match &image.image {
-                        FeedbackImage::Pixels(pixels) => {
-                            wire::generated_image::Image::Pixels(pixels.as_ref().into())
-                        }
-                        FeedbackImage::Png(png) => {
-                            wire::generated_image::Image::PngB64(png.to_string())
-                        }
-                    }),
-                })
-                .collect(),
-            trajectory: Some((&request.trajectory).into()),
         }
-    }
-}
-
-impl From<&Trajectory> for wire::Trajectory {
-    fn from(trajectory: &Trajectory) -> Self {
-        Self {
-            id: trajectory.id,
-            denoised_steps: trajectory.denoised_steps,
-            state_seed: trajectory.state_seed,
-            stored_layout: trajectory.stored_layout.clone(),
-        }
-    }
-}
-
-impl From<wire::Trajectory> for Trajectory {
-    fn from(trajectory: wire::Trajectory) -> Self {
-        Self {
-            id: trajectory.id,
-            denoised_steps: trajectory.denoised_steps,
-            state_seed: trajectory.state_seed,
-            stored_layout: trajectory.stored_layout,
-        }
-    }
-}
-
-impl From<&ImagePixels> for wire::ImagePixels {
-    fn from(pixels: &ImagePixels) -> Self {
-        Self {
-            height: pixels.height,
-            width: pixels.width,
-            range: match pixels.range {
-                PixelRange::Unit => wire::PixelRange::Unit,
-                PixelRange::SignedUnit => wire::PixelRange::SignedUnit,
-            } as i32,
-            values: pixels.values.clone(),
-        }
-    }
-}
-
-impl TryFrom<wire::ImagePixels> for ImagePixels {
-    type Error = WireError;
-
-    fn try_from(pixels: wire::ImagePixels) -> Result<Self, WireError> {
-        Ok(Self {
-            height: pixels.height,
-            width: pixels.width,
-            range: match known::<wire::PixelRange>(pixels.range, "pixel range")? {
-                wire::PixelRange::Unit => PixelRange::Unit,
-                wire::PixelRange::SignedUnit => PixelRange::SignedUnit,
-            },
-            values: pixels.values,
-        })
     }
 }
 
@@ -209,7 +134,6 @@ impl TryFrom<wire::GenerationRequest> for GenerationRequest {
         Ok(Self {
             request_id: RequestId::default(),
             prompt_token_ids: request.prompt_token_ids,
-            negative_prompt_token_ids: request.negative_prompt_token_ids,
             multimodal_inputs: MultimodalInputs {
                 images: request
                     .images
@@ -217,12 +141,7 @@ impl TryFrom<wire::GenerationRequest> for GenerationRequest {
                     .map(ImageInput::try_from)
                     .collect::<Result<_, _>>()?,
             },
-            constraint: known::<wire::GenerationConstraint>(request.constraint, "constraint")?
-                .into(),
             sampling: present(request.sampling, "sampling parameters")?.try_into()?,
-            image: present(request.image, "image parameters")?.try_into()?,
-            max_images: u16::try_from(request.max_images)
-                .map_err(|_| WireError::new("max_images exceeds 65535"))?,
             max_und_tokens: count(request.max_und_tokens, "max_und_tokens")?,
             stop_strings: request.stop_strings,
             stop_token_ids: request.stop_token_ids,
@@ -243,50 +162,9 @@ impl TryFrom<wire::GenerationRequest> for GenerationRequest {
                 }),
             },
             include_stop_token: request.include_stop_token,
-            image_generation: present(request.image_generation, "image generation")?.try_into()?,
             generated_token_ids: request.generated_token_ids,
             adapter: request.adapter,
-            generated_images: request
-                .generated_images
-                .into_iter()
-                .map(|image| {
-                    Ok(GeneratedImage {
-                        tokens: image.tokens,
-                        image: match present(image.image, "generated image")? {
-                            wire::generated_image::Image::Pixels(pixels) => {
-                                FeedbackImage::Pixels(Arc::new(pixels.try_into()?))
-                            }
-                            wire::generated_image::Image::PngB64(png) => {
-                                FeedbackImage::Png(Arc::from(png))
-                            }
-                        },
-                    })
-                })
-                .collect::<Result<_, WireError>>()?,
-            // A request without a trajectory names none: it starts every
-            // image from noise.
-            trajectory: request.trajectory.map(Into::into).unwrap_or_default(),
         })
-    }
-}
-
-impl From<GenerationConstraint> for wire::GenerationConstraint {
-    fn from(constraint: GenerationConstraint) -> Self {
-        match constraint {
-            GenerationConstraint::Default => Self::Default,
-            GenerationConstraint::UndOnly => Self::UndOnly,
-            GenerationConstraint::GenOnly => Self::GenOnly,
-        }
-    }
-}
-
-impl From<wire::GenerationConstraint> for GenerationConstraint {
-    fn from(constraint: wire::GenerationConstraint) -> Self {
-        match constraint {
-            wire::GenerationConstraint::Default => Self::Default,
-            wire::GenerationConstraint::UndOnly => Self::UndOnly,
-            wire::GenerationConstraint::GenOnly => Self::GenOnly,
-        }
     }
 }
 
@@ -426,154 +304,6 @@ impl TryFrom<wire::SamplingParams> for SamplingParams {
             allowed_token_ids: sampling.allowed_token_ids.map(|sequence| sequence.tokens),
             typical_p: sampling.typical_p,
             forced_token_ids: sampling.forced_token_ids,
-        })
-    }
-}
-
-impl From<&ImageParams> for wire::ImageParams {
-    fn from(image: &ImageParams) -> Self {
-        let renorm = match image.cfg_renorm_type {
-            CfgRenorm::Global => wire::CfgRenorm::Global,
-            CfgRenorm::None => wire::CfgRenorm::None,
-            CfgRenorm::TextChannel => wire::CfgRenorm::TextChannel,
-        };
-        Self {
-            steps: u32::from(image.steps),
-            cfg_text_scale: image.cfg_text_scale,
-            cfg_img_scale: image.cfg_img_scale,
-            cfg_renorm_type: renorm as i32,
-            cfg_renorm_min: image.cfg_renorm_min,
-            cfg_interval_start: image.cfg_interval.0,
-            cfg_interval_end: image.cfg_interval.1,
-            timestep_shift: image.timestep_shift,
-            height: image.height,
-            width: image.width,
-            seed: image.seed,
-        }
-    }
-}
-
-impl TryFrom<wire::ImageParams> for ImageParams {
-    type Error = WireError;
-
-    fn try_from(image: wire::ImageParams) -> Result<Self, WireError> {
-        let cfg_renorm_type = match known::<wire::CfgRenorm>(image.cfg_renorm_type, "cfg renorm")? {
-            wire::CfgRenorm::Global => CfgRenorm::Global,
-            wire::CfgRenorm::None => CfgRenorm::None,
-            wire::CfgRenorm::TextChannel => CfgRenorm::TextChannel,
-        };
-        Ok(Self {
-            steps: u16::try_from(image.steps)
-                .map_err(|_| WireError::new("image steps exceed 65535"))?,
-            cfg_text_scale: image.cfg_text_scale,
-            cfg_img_scale: image.cfg_img_scale,
-            cfg_renorm_type,
-            cfg_renorm_min: image.cfg_renorm_min,
-            cfg_interval: (image.cfg_interval_start, image.cfg_interval_end),
-            timestep_shift: image.timestep_shift,
-            height: image.height,
-            width: image.width,
-            seed: image.seed,
-        })
-    }
-}
-
-impl From<&ImageGenerationConfig> for wire::ImageGenerationConfig {
-    fn from(config: &ImageGenerationConfig) -> Self {
-        let trigger = match &config.trigger {
-            ImageTrigger::Disabled => wire::image_trigger::Kind::Disabled(wire::Disabled {}),
-            ImageTrigger::Token { token_id } => wire::image_trigger::Kind::Token(*token_id),
-            ImageTrigger::Suffix { token_ids } => {
-                wire::image_trigger::Kind::Suffix(wire::TokenSequence {
-                    tokens: token_ids.clone(),
-                })
-            }
-            ImageTrigger::RoundCloseThenSuffix {
-                close_token_ids,
-                trigger_token_ids,
-            } => wire::image_trigger::Kind::RoundCloseThenSuffix(wire::RoundCloseThenSuffix {
-                close_token_ids: close_token_ids.clone(),
-                trigger_token_ids: trigger_token_ids.clone(),
-            }),
-        };
-        let feedback_source = match config.feedback_source {
-            None => wire::FeedbackSource::None,
-            Some(FeedbackSource::DeviceProduct) => wire::FeedbackSource::DeviceProduct,
-            Some(FeedbackSource::ArtifactProduct) => wire::FeedbackSource::ArtifactProduct,
-        };
-        let next = match config.feedback_next_token {
-            FeedbackNextToken::None => wire::feedback_next_token::Kind::None(wire::Disabled {}),
-            FeedbackNextToken::Bos => wire::feedback_next_token::Kind::Bos(wire::Disabled {}),
-            FeedbackNextToken::EndOfImage => {
-                wire::feedback_next_token::Kind::EndOfImage(wire::Disabled {})
-            }
-            FeedbackNextToken::Token { token_id } => {
-                wire::feedback_next_token::Kind::Token(token_id)
-            }
-        };
-        Self {
-            trigger: Some(wire::ImageTrigger {
-                kind: Some(trigger),
-            }),
-            requires_text_for_image: config.requires_text_for_image,
-            feedback_source: feedback_source as i32,
-            feedback_encoders: config.feedback_encoders.iter().map(Into::into).collect(),
-            num_feedback_positions: config.num_feedback_positions,
-            feedback_next_token: Some(wire::FeedbackNextToken { kind: Some(next) }),
-            sample_feedback_continuation: config.sample_feedback_continuation,
-        }
-    }
-}
-
-impl TryFrom<wire::ImageGenerationConfig> for ImageGenerationConfig {
-    type Error = WireError;
-
-    fn try_from(config: wire::ImageGenerationConfig) -> Result<Self, WireError> {
-        let trigger = match present(
-            present(config.trigger, "image trigger")?.kind,
-            "image trigger kind",
-        )? {
-            wire::image_trigger::Kind::Disabled(_) => ImageTrigger::Disabled,
-            wire::image_trigger::Kind::Token(token_id) => ImageTrigger::Token { token_id },
-            wire::image_trigger::Kind::Suffix(sequence) => ImageTrigger::Suffix {
-                token_ids: sequence.tokens,
-            },
-            wire::image_trigger::Kind::RoundCloseThenSuffix(round) => {
-                ImageTrigger::RoundCloseThenSuffix {
-                    close_token_ids: round.close_token_ids,
-                    trigger_token_ids: round.trigger_token_ids,
-                }
-            }
-        };
-        let feedback_source =
-            match known::<wire::FeedbackSource>(config.feedback_source, "feedback source")? {
-                wire::FeedbackSource::None => None,
-                wire::FeedbackSource::DeviceProduct => Some(FeedbackSource::DeviceProduct),
-                wire::FeedbackSource::ArtifactProduct => Some(FeedbackSource::ArtifactProduct),
-            };
-        let feedback_next_token = match present(
-            present(config.feedback_next_token, "feedback next token")?.kind,
-            "feedback next token kind",
-        )? {
-            wire::feedback_next_token::Kind::None(_) => FeedbackNextToken::None,
-            wire::feedback_next_token::Kind::Bos(_) => FeedbackNextToken::Bos,
-            wire::feedback_next_token::Kind::EndOfImage(_) => FeedbackNextToken::EndOfImage,
-            wire::feedback_next_token::Kind::Token(token_id) => {
-                FeedbackNextToken::Token { token_id }
-            }
-        };
-        Ok(Self {
-            trigger,
-            requires_text_for_image: config.requires_text_for_image,
-            feedback_source,
-            feedback_encoders: config
-                .feedback_encoders
-                .into_iter()
-                .map(ImageEncoderInput::try_from)
-                .collect::<Result<_, _>>()?,
-            num_feedback_positions: config.num_feedback_positions,
-            feedback_next_token,
-            sample_feedback_continuation: config.sample_feedback_continuation,
         })
     }
 }
@@ -729,40 +459,6 @@ impl Event {
                     })
                     .collect(),
             }),
-            Self::ImageBegin {
-                image_id,
-                height,
-                width,
-                steps,
-            } => Kind::ImageBegin(wire::ImageBegin {
-                image_id: *image_id,
-                height: *height,
-                width: *width,
-                steps: u32::from(*steps),
-            }),
-            Self::ImageStep { image_id, step } => Kind::ImageStep(wire::ImageStep {
-                image_id: *image_id,
-                step: u32::from(*step),
-            }),
-            Self::ImageCommit { image_id } => Kind::ImageCommit(wire::ImageCommit {
-                image_id: *image_id,
-            }),
-            Self::ImageDone {
-                image_id,
-                height,
-                width,
-                bytes,
-                pixels_png_b64,
-                feedback,
-            } => Kind::ImageDone(wire::ImageDone {
-                image_id: *image_id,
-                height: *height,
-                width: *width,
-                bytes: *bytes,
-                png_b64: pixels_png_b64.clone(),
-                feedback: feedback.as_deref().map(Into::into),
-            }),
-            Self::ControlToken { id } => Kind::ControlToken(wire::ControlToken { id: *id }),
             Self::MediaProgress {
                 phase,
                 completed_steps,
@@ -793,7 +489,6 @@ impl Event {
                 stop_reason,
                 prompt_tokens,
                 completion_tokens,
-                images,
             } => Kind::Finished(wire::Finished {
                 reason: wire::FinishReason::from(reason) as i32,
                 stop_reason: stop_reason.as_ref().map(|stop| wire::StopReason {
@@ -804,7 +499,6 @@ impl Event {
                 }),
                 prompt_tokens: *prompt_tokens as u64,
                 completion_tokens: *completion_tokens as u64,
-                images: *images as u64,
             }),
             Self::Rejected { kind, message } => Kind::Rejected(wire::Rejected {
                 kind: match kind {
@@ -874,33 +568,6 @@ impl Event {
                     })
                     .collect(),
             },
-            Kind::ImageBegin(begin) => Self::ImageBegin {
-                image_id: begin.image_id,
-                height: begin.height,
-                width: begin.width,
-                steps: u16::try_from(begin.steps)
-                    .map_err(|_| WireError::new("image steps exceed 65535"))?,
-            },
-            Kind::ImageStep(step) => Self::ImageStep {
-                image_id: step.image_id,
-                step: u16::try_from(step.step)
-                    .map_err(|_| WireError::new("an image step exceeds 65535"))?,
-            },
-            Kind::ImageCommit(commit) => Self::ImageCommit {
-                image_id: commit.image_id,
-            },
-            Kind::ImageDone(done) => Self::ImageDone {
-                image_id: done.image_id,
-                height: done.height,
-                width: done.width,
-                bytes: done.bytes,
-                pixels_png_b64: done.png_b64,
-                feedback: done
-                    .feedback
-                    .map(|pixels| ImagePixels::try_from(pixels).map(Arc::new))
-                    .transpose()?,
-            },
-            Kind::ControlToken(token) => Self::ControlToken { id: token.id },
             Kind::MediaProgress(progress) => Self::MediaProgress {
                 phase: progress.phase,
                 completed_steps: progress.completed_steps,
@@ -932,7 +599,6 @@ impl Event {
                     .transpose()?,
                 prompt_tokens: count(finished.prompt_tokens, "prompt tokens")?,
                 completion_tokens: count(finished.completion_tokens, "completion tokens")?,
-                images: count(finished.images, "images")?,
             },
             Kind::Rejected(rejected) => Self::Rejected {
                 kind: match known::<wire::RejectionKind>(rejected.kind, "rejection kind")? {
@@ -984,7 +650,6 @@ impl From<&FinishReason> for wire::FinishReason {
             FinishReason::Eos => Self::Eos,
             FinishReason::MaxTokens => Self::MaxTokens,
             FinishReason::Stop => Self::Stop,
-            FinishReason::ImageDone => Self::ImageDone,
             FinishReason::Cancelled => Self::Cancelled,
             FinishReason::Aborted => Self::Aborted,
             FinishReason::Repetition => Self::Repetition,
@@ -1001,7 +666,6 @@ impl From<wire::FinishReason> for FinishReason {
             wire::FinishReason::Eos => Self::Eos,
             wire::FinishReason::MaxTokens => Self::MaxTokens,
             wire::FinishReason::Stop => Self::Stop,
-            wire::FinishReason::ImageDone => Self::ImageDone,
             wire::FinishReason::Cancelled => Self::Cancelled,
             wire::FinishReason::Aborted => Self::Aborted,
             wire::FinishReason::Repetition => Self::Repetition,
@@ -1020,17 +684,11 @@ impl From<&GenerationLimits> for wire::GenerationLimits {
             understanding: features.contains(GenerationFeatures::UNDERSTANDING),
             vision_encode: features.contains(GenerationFeatures::VISION_ENCODE),
             latent_encode: features.contains(GenerationFeatures::LATENT_ENCODE),
-            image_generation: features.contains(GenerationFeatures::IMAGE_GENERATION),
             token_denoising: features.contains(GenerationFeatures::TOKEN_DENOISING),
-            max_latent_units: limits.max_latent_units,
-            latent_downsample: limits.latent_downsample,
             max_vae_grid_tokens: limits.max_vae_grid_tokens,
             max_vit_grid_tokens: limits.max_vit_grid_tokens,
-            latent_bytes_per_unit: limits.latent_bytes_per_unit,
             max_latent_feature_bytes: limits.max_latent_feature_bytes,
             max_vision_feature_bytes: limits.max_vision_feature_bytes,
-            commit_marker_tokens: limits.commit_marker_tokens,
-            max_cfg_branches: limits.max_cfg_branches,
             encoder_cache_entries: limits.encoder_cache_entries,
         }
     }
@@ -1043,25 +701,16 @@ impl From<wire::GenerationLimits> for GenerationLimits {
             (limits.understanding, GenerationFeatures::UNDERSTANDING),
             (limits.vision_encode, GenerationFeatures::VISION_ENCODE),
             (limits.latent_encode, GenerationFeatures::LATENT_ENCODE),
-            (
-                limits.image_generation,
-                GenerationFeatures::IMAGE_GENERATION,
-            ),
             (limits.token_denoising, GenerationFeatures::TOKEN_DENOISING),
         ] {
             features.set(feature, present);
         }
         Self {
             features,
-            max_latent_units: limits.max_latent_units,
-            latent_downsample: limits.latent_downsample,
             max_vae_grid_tokens: limits.max_vae_grid_tokens,
             max_vit_grid_tokens: limits.max_vit_grid_tokens,
-            latent_bytes_per_unit: limits.latent_bytes_per_unit,
             max_latent_feature_bytes: limits.max_latent_feature_bytes,
             max_vision_feature_bytes: limits.max_vision_feature_bytes,
-            commit_marker_tokens: limits.commit_marker_tokens,
-            max_cfg_branches: limits.max_cfg_branches,
             encoder_cache_entries: limits.encoder_cache_entries,
         }
     }

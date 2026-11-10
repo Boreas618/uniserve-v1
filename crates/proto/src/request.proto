@@ -9,9 +9,9 @@
 // the engine's events. Every request has the identity the daemon gave it;
 // each of its events names it.
 //
-// A request's generated media (images inline, videos by descriptor) reaches
-// the daemon with its events: an `Artifact` event passes the shared memory
-// holding the bytes as a file descriptor beside its frame.
+// A request's generated media reaches the daemon with its events: an
+// `Artifact` event passes the shared memory holding the bytes as a file
+// descriptor beside its frame.
 //
 // The interface is versioned across builds: a persistent daemon serves
 // engines of successive builds. Messages change only by additions; the hello
@@ -169,7 +169,7 @@ message EngineInfo {
   repeated bytes prefix_seeds = 11;
   reserved 10;
   // The seed of the keys of the latent trajectories the engine's denoiser
-  // (a video model's, or an image model's) stores at preemption: equal
+  // (a video model's) stores at preemption: equal
   // between epochs whose denoising computes the same, which continue each
   // other's trajectories exactly; zero for an engine that stores none.
   uint64 latent_seed = 9;
@@ -619,21 +619,17 @@ message Stats {
 // ---------------------------------------------------------------- requests
 
 message GenerationRequest {
-  reserved 14;
-  reserved "readout";
+  reserved 2, 4, 6, 7, 13, 14, 17, 18;
+  reserved "negative_prompt_token_ids", "constraint", "image", "max_images",
+      "image_generation", "readout", "generated_images", "trajectory";
   repeated uint32 prompt_token_ids = 1;
-  repeated uint32 negative_prompt_token_ids = 2;
   repeated ImageInput images = 3;
-  GenerationConstraint constraint = 4;
   SamplingParams sampling = 5;
-  ImageParams image = 6;
-  uint32 max_images = 7;
   uint64 max_und_tokens = 8;
   repeated string stop_strings = 9;
   repeated uint32 stop_token_ids = 10;
   CachePolicy cache = 11;
   bool include_stop_token = 12;
-  ImageGenerationConfig image_generation = 13;
   // The tokens a migrated request generated on the engines that served it
   // before, in order; empty for a new request. They continue its prompt, and
   // the engine counts them as generated: against `max_und_tokens` and
@@ -642,73 +638,6 @@ message GenerationRequest {
   // The LoRA adapter the request computes with: the slot of the workers'
   // adapter pool the daemon loaded it into, or 0 for the base model alone.
   uint32 adapter = 16;
-  // The images a migrated request generated on the engines that served it
-  // before, in order, each at its place among `generated_token_ids`; empty
-  // for a new request. The engine writes each into the request's context as
-  // its feedback encoders read it when it was generated.
-  repeated GeneratedImage generated_images = 17;
-  // The latent trajectory of the image a migrated request had begun and not
-  // finished, which an engine stored when it preempted the request; its
-  // identity keys every image trajectory of the request.
-  Trajectory trajectory = 18;
-}
-
-// A request's latent trajectory across the engines that serve it: a video
-// request's, or the image a token request had begun and not finished.
-message Trajectory {
-  // The identity that keys the trajectory an engine stores when it preempts
-  // the request: the daemon gives a request one when it first submits it
-  // and keeps it across its migrations.
-  uint64 id = 1;
-  // The denoising steps of the trajectory an engine stored when it
-  // preempted the request; zero for a request that starts from noise. The
-  // engine that serves it continues from that step when its store holds the
-  // trajectory, and from noise otherwise.
-  uint32 denoised_steps = 2;
-  // The latent seed of the epoch whose stored trajectory the request
-  // continues although the serving epoch's denoising computes other
-  // numerics (an epoch change's `in_flight = keep`); absent, the engine reads
-  // a trajectory of its own latent seed only.
-  optional uint64 state_seed = 3;
-  // Where the engine that stored the trajectory put its pages and how each
-  // stored rank laid its part of the samples out, as that engine recorded
-  // it, which an engine of another parallel configuration finds and lays
-  // the pages out by; empty when `denoised_steps` is zero. The daemon does
-  // not read it.
-  bytes stored_layout = 4;
-}
-
-// An image a migrated request generated before: what its feedback encoders
-// read, after the first `tokens` of the request's generated tokens.
-message GeneratedImage {
-  uint32 tokens = 1;
-  oneof image {
-    // The decoded image product, which feedback reads on the device.
-    ImagePixels pixels = 2;
-    // The image's PNG, base64, which feedback reads as an artifact.
-    string png_b64 = 3;
-  }
-}
-
-// The values of a decoded image product, exported to the host: BF16 values
-// of shape [3, height, width], row-major and little-endian, in `range`.
-message ImagePixels {
-  uint32 height = 1;
-  uint32 width = 2;
-  PixelRange range = 3;
-  bytes values = 4;
-}
-
-// The interval a decoded image product's values lie in.
-enum PixelRange {
-  PIXEL_RANGE_UNIT = 0;
-  PIXEL_RANGE_SIGNED_UNIT = 1;
-}
-
-enum GenerationConstraint {
-  GENERATION_CONSTRAINT_DEFAULT = 0;
-  GENERATION_CONSTRAINT_UND_ONLY = 1;
-  GENERATION_CONSTRAINT_GEN_ONLY = 2;
 }
 
 message ImageInput {
@@ -770,26 +699,6 @@ message TokenSequence {
   repeated uint32 tokens = 1;
 }
 
-message ImageParams {
-  uint32 steps = 1;
-  float cfg_text_scale = 2;
-  float cfg_img_scale = 3;
-  CfgRenorm cfg_renorm_type = 4;
-  float cfg_renorm_min = 5;
-  float cfg_interval_start = 6;
-  float cfg_interval_end = 7;
-  float timestep_shift = 8;
-  uint32 height = 9;
-  uint32 width = 10;
-  optional uint64 seed = 11;
-}
-
-enum CfgRenorm {
-  CFG_RENORM_GLOBAL = 0;
-  CFG_RENORM_NONE = 1;
-  CFG_RENORM_TEXT_CHANNEL = 2;
-}
-
 message CachePolicy {
   bool read = 1;
   bool write = 2;
@@ -804,47 +713,6 @@ message CachePolicy {
 message CacheResume {
   uint64 epoch = 1;
   uint64 request_id = 2;
-}
-
-message ImageGenerationConfig {
-  ImageTrigger trigger = 1;
-  bool requires_text_for_image = 2;
-  FeedbackSource feedback_source = 3;
-  repeated ImageEncoderInput feedback_encoders = 4;
-  uint32 num_feedback_positions = 5;
-  FeedbackNextToken feedback_next_token = 6;
-  bool sample_feedback_continuation = 7;
-}
-
-message ImageTrigger {
-  oneof kind {
-    Disabled disabled = 1;
-    uint32 token = 2;
-    TokenSequence suffix = 3;
-    RoundCloseThenSuffix round_close_then_suffix = 4;
-  }
-}
-
-message Disabled {}
-
-message RoundCloseThenSuffix {
-  repeated uint32 close_token_ids = 1;
-  repeated uint32 trigger_token_ids = 2;
-}
-
-enum FeedbackSource {
-  FEEDBACK_SOURCE_NONE = 0;
-  FEEDBACK_SOURCE_DEVICE_PRODUCT = 1;
-  FEEDBACK_SOURCE_ARTIFACT_PRODUCT = 2;
-}
-
-message FeedbackNextToken {
-  oneof kind {
-    Disabled none = 1;
-    Disabled bos = 2;
-    Disabled end_of_image = 3;
-    uint32 token = 4;
-  }
 }
 
 message DiffusionRequest {
@@ -900,8 +768,9 @@ message DiffusionSamplingParams {
 // ------------------------------------------------------------------ events
 
 message Event {
-  reserved 7;
-  reserved "readout";
+  reserved 7, 8, 9, 10, 11, 19;
+  reserved "readout", "image_begin", "image_step", "image_commit", "image_done",
+      "control_token";
   uint64 request = 1;
   oneof kind {
     Scheduled scheduled = 2;
@@ -909,10 +778,6 @@ message Event {
     TextTokens text_tokens = 4;
     TokenLogprobs token_logprobs = 5;
     PromptLogprobs prompt_logprobs = 6;
-    ImageBegin image_begin = 8;
-    ImageStep image_step = 9;
-    ImageCommit image_commit = 10;
-    ImageDone image_done = 11;
     MediaProgress media_progress = 12;
     Artifact artifact = 13;
     ArtifactUnavailable artifact_unavailable = 14;
@@ -920,16 +785,7 @@ message Event {
     Rejected rejected = 16;
     Failed error = 17;
     Migratable migratable = 18;
-    ControlToken control_token = 19;
   }
-}
-
-// A generated token the request's text does not include: one that opens an
-// image or closes a round, or one a request that publishes no text
-// generated. The daemon keeps it, in order with the text tokens, to submit
-// a migrated request again with every token it generated.
-message ControlToken {
-  uint32 id = 1;
 }
 
 // The request ends on this engine without finishing: every token it
@@ -987,35 +843,6 @@ message PromptLogprobs {
   repeated PositionLogprobs positions = 1;
 }
 
-message ImageBegin {
-  uint32 image_id = 1;
-  uint32 height = 2;
-  uint32 width = 3;
-  uint32 steps = 4;
-}
-
-message ImageStep {
-  uint32 image_id = 1;
-  uint32 step = 2;
-}
-
-message ImageCommit {
-  uint32 image_id = 1;
-}
-
-message ImageDone {
-  uint32 image_id = 1;
-  uint32 height = 2;
-  uint32 width = 3;
-  uint64 bytes = 4;
-  // The PNG payload, base64.
-  string png_b64 = 5;
-  // The decoded image product the request's feedback encoders read, when
-  // the request feeds the image back from the device: the daemon keeps it
-  // to submit a migrated request again with it.
-  optional ImagePixels feedback = 6;
-}
-
 message MediaProgress {
   string phase = 1;
   uint32 completed_steps = 2;
@@ -1051,7 +878,8 @@ message Finished {
   StopReason stop_reason = 2;
   uint64 prompt_tokens = 3;
   uint64 completion_tokens = 4;
-  uint64 images = 5;
+  reserved 5;
+  reserved "images";
 }
 
 enum FinishReason {
@@ -1059,7 +887,8 @@ enum FinishReason {
   FINISH_REASON_EOS = 1;
   FINISH_REASON_MAX_TOKENS = 2;
   FINISH_REASON_STOP = 3;
-  FINISH_REASON_IMAGE_DONE = 4;
+  reserved 4;
+  reserved "FINISH_REASON_IMAGE_DONE";
   FINISH_REASON_CANCELLED = 5;
   FINISH_REASON_ABORTED = 6;
   FINISH_REASON_REPETITION = 7;
@@ -1091,20 +920,17 @@ message Failed {
 // ------------------------------------------------------------ limits
 
 message GenerationLimits {
+  reserved 4, 6, 7, 10, 13, 14;
+  reserved "image_generation", "max_latent_units", "latent_downsample",
+      "latent_bytes_per_unit", "commit_marker_tokens", "max_cfg_branches";
   bool understanding = 1;
   bool vision_encode = 2;
   bool latent_encode = 3;
-  bool image_generation = 4;
   bool token_denoising = 5;
-  uint64 max_latent_units = 6;
-  uint32 latent_downsample = 7;
   uint32 max_vae_grid_tokens = 8;
   uint32 max_vit_grid_tokens = 9;
-  uint64 latent_bytes_per_unit = 10;
   uint64 max_latent_feature_bytes = 11;
   uint64 max_vision_feature_bytes = 12;
-  uint32 commit_marker_tokens = 13;
-  uint32 max_cfg_branches = 14;
   uint32 encoder_cache_entries = 15;
 }
 

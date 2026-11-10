@@ -1337,34 +1337,25 @@ impl CommandSender {
 
 #[cfg(test)]
 mod tests {
-    use crate::{GenerationConstraint, GenerationRequest, ImageGenerationConfig};
-    use ipc::{ImageParams, RequestId, SamplingParams};
+    use crate::GenerationRequest;
+    use ipc::{RequestId, SamplingParams};
 
     use super::*;
 
     fn test_request(request_id: u64) -> GenerationRequest {
-        let constraint = GenerationConstraint::UndOnly;
-        let policy = ImageGenerationConfig::default();
         GenerationRequest {
             request_id: RequestId(request_id),
             prompt_token_ids: vec![1, 2, 3],
             multimodal_inputs: Default::default(),
-            negative_prompt_token_ids: Vec::new(),
-            constraint,
             sampling: SamplingParams::default(),
-            image: ImageParams::default(),
-            max_images: 1,
             max_und_tokens: 32,
             include_stop_token: false,
             stop_strings: Vec::new(),
             stop_token_ids: Vec::new(),
             priority: 0,
             cache: Default::default(),
-            image_generation: policy,
             generated_token_ids: Vec::new(),
             adapter: 0,
-            generated_images: Vec::new(),
-            trajectory: Default::default(),
         }
     }
 
@@ -1549,7 +1540,6 @@ mod tests {
             stop_reason: None,
             prompt_tokens: 3,
             completion_tokens: EVENT_BUFFER_CAPACITY + 1,
-            images: 0,
         };
         event_tx.close_with(VecDeque::from([token(capacity), terminal]));
 

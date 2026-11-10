@@ -134,7 +134,6 @@ pub(crate) fn video_worker_denoising_on(
     let info = sim.mut_info_for_test();
     info.supported_calls = MediaCall::ALL
         .iter()
-        .filter(|call| **call != MediaCall::ImageDecoding)
         .map(|call| CallKind::Media(*call))
         .collect();
     info.video_denoiser = Some(VideoDenoiserInfo {
@@ -142,10 +141,6 @@ pub(crate) fn video_worker_denoising_on(
         denoise_steps: STEPS,
         description: b"{}".to_vec(),
     });
-    // The denoiser's latent pool holds the reserved sentinel page plus two
-    // pages of samples per request slot.
-    info.latent_page_units = 256;
-    info.latent_pages = 2 * info.request_slots + 1;
     info.host_task_capacity = host_task_capacity;
     let components = vec![
         component(

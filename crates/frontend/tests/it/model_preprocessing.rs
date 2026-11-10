@@ -160,15 +160,10 @@ fn try_resolved_model(
 fn runtime_limits() -> GenerationLimits {
     GenerationLimits {
         features: proto::request::GenerationFeatures::all(),
-        max_latent_units: 1_000_000,
-        latent_downsample: 16,
         max_vae_grid_tokens: 1_000_000,
         max_vit_grid_tokens: 1_000_000,
-        latent_bytes_per_unit: u64::MAX.div_ceil(1_000_000),
         max_latent_feature_bytes: u64::MAX,
         max_vision_feature_bytes: u64::MAX,
-        commit_marker_tokens: 2,
-        max_cfg_branches: 3,
         encoder_cache_entries: 32,
     }
 }

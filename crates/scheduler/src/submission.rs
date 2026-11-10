@@ -1094,7 +1094,6 @@ mod tests {
             crate::worker::RequestDispatch {
                 worker: WorkerGroupId("gpu".to_owned()),
                 request_pool_idx: None,
-                latent: None,
                 decode: None,
                 buffers: Vec::new(),
                 readers: None,
@@ -1174,7 +1173,7 @@ mod tests {
             .submit(media_batch(11, MediaCall::Denoising, 1))
             .expect("a media batch is served in process");
         submissions
-            .submit(media_batch(12, MediaCall::ImageDecoding, 1))
+            .submit(media_batch(12, MediaCall::VideoDecoding, 1))
             .expect("a media batch is served in process");
 
         let delivered = delivered.lock().expect("the recorder is not poisoned");
@@ -1188,7 +1187,7 @@ mod tests {
         );
         assert_eq!(
             decoding.phase,
-            phase_of(CallKind::Media(MediaCall::ImageDecoding)),
+            phase_of(CallKind::Media(MediaCall::VideoDecoding)),
             "a decoding call is served at the decode phase"
         );
         assert_ne!(

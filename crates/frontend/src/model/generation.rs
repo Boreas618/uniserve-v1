@@ -10,12 +10,7 @@ impl ModelConfig {
         &self,
         _model_dtype: proto::request::ModelDtype,
     ) -> proto::request::GenerationLimits {
-        // Both lower bounds are divisors and counts that admit nothing at zero;
-        // no family this daemon serves states a capacity before its workers do.
-        proto::request::GenerationLimits {
-            latent_downsample: 1,
-            max_cfg_branches: 1,
-            ..Default::default()
-        }
+        // No family this daemon serves states a capacity before its workers do.
+        proto::request::GenerationLimits::default()
     }
 }

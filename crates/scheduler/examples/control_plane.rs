@@ -1,10 +1,9 @@
-//! Demonstrates concurrent text and image requests through the simulated engine.
+//! Demonstrates concurrent text requests through the simulated engine.
 //!
 //! The example exercises scheduling and lifecycle events without requiring a
-//! model worker or GPU. Three text-only and two image-only requests share one
-//! scheduler thread over `SimWorker`; the run passes when every request
-//! finishes within the deadline, each text request emits at least one text
-//! token, and each image request emits at least one image. The process exits
+//! model worker or GPU. Three text requests share one scheduler thread over
+//! `SimWorker`; the run passes when every request finishes within the
+//! deadline and each text request emits at least one text token. The process exits
 //! with status 1 on failure, and reports an error when the simulation cannot
 //! start or a request is refused.
 
@@ -12,15 +11,12 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 
-use ipc::{ImageParams, RequestId, SamplingParams};
+use ipc::{RequestId, SamplingParams};
 use scheduler::Event;
 use scheduler::{
     CommandWaker, Scheduler, SchedulerConfig, SchedulerHandle, SimEngine, SimWorker, Worker,
 };
-use scheduler::{
-    FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
-    ImageEncoderInput, ImageGenerationConfig, ImageTrigger, ModelDtype,
-};
+use scheduler::{GenerationLimits, GenerationRequest};
 
 fn main() -> anyhow::Result<()> {
     let mut sim = SimEngine::new();
@@ -36,7 +32,6 @@ fn main() -> anyhow::Result<()> {
             max_batch: proto::config::positive(32),
             ..Default::default()
         },
-        ModelDtype::BFloat16,
         SimEngine::generation_limits(),
     )?;
 
@@ -59,68 +54,36 @@ fn main() -> anyhow::Result<()> {
 
     let mut rxs: HashMap<RequestId, (String, scheduler::EventRx)> = HashMap::new();
     let mut next_id = 1u64;
-    let mut mk = |constraint: GenerationConstraint, generated: Vec<u32>, prompt: Vec<u32>| {
+    let mut mk = |generated: Vec<u32>, prompt: Vec<u32>| {
         let id = RequestId(next_id);
         next_id += 1;
-        let policy = ImageGenerationConfig {
-            trigger: ImageTrigger::Token { token_id: 1000 },
-            requires_text_for_image: false,
-            feedback_source: Some(FeedbackSource::DeviceProduct),
-            feedback_next_token: FeedbackNextToken::EndOfImage,
-            num_feedback_positions: 2,
-            feedback_encoders: vec![ImageEncoderInput {
-                encoder: scheduler::ImageEncoder::Vision,
-                num_cache_tokens: None,
-                max_cache_tokens: None,
-                height: None,
-                width: None,
-            }],
-            sample_feedback_continuation: true,
-        };
         let prompt_token_ids = prompt;
 
-        let image = ImageParams {
-            steps: 6,
-            ..Default::default()
-        };
         let cache = Default::default();
         // These limits only check the request locally before submission; the
         // scheduler resolves its limits separately against the worker.
         let limits = GenerationLimits {
             features: scheduler::GenerationFeatures::UNDERSTANDING
-                | scheduler::GenerationFeatures::VISION_ENCODE
-                | scheduler::GenerationFeatures::IMAGE_GENERATION,
-            max_latent_units: 65_536,
-            latent_downsample: 16,
+                | scheduler::GenerationFeatures::VISION_ENCODE,
             max_vae_grid_tokens: 65_536,
             max_vit_grid_tokens: 8_192,
-            latent_bytes_per_unit: (256 << 20) / 65_536,
             max_latent_feature_bytes: 256 << 20,
             max_vision_feature_bytes: 256 << 20,
-            commit_marker_tokens: 2,
-            max_cfg_branches: 3,
             encoder_cache_entries: 256,
         };
         let request = GenerationRequest {
             request_id: id,
             prompt_token_ids,
             multimodal_inputs: Default::default(),
-            negative_prompt_token_ids: Vec::new(),
-            constraint,
             sampling: SamplingParams::default(),
-            image,
-            max_images: 1,
             max_und_tokens: 16,
             include_stop_token: false,
             stop_strings: Vec::new(),
             stop_token_ids: Vec::new(),
             priority: 0,
             cache,
-            image_generation: policy,
             generated_token_ids: generated,
             adapter: 0,
-            generated_images: Vec::new(),
-            trajectory: Default::default(),
         };
         request.validate_resources(&limits)?;
         anyhow::Ok((id, request))
@@ -136,24 +99,9 @@ fn main() -> anyhow::Result<()> {
     };
     if wants("text") {
         for _ in 0..3 {
-            let (id, request) = mk(
-                GenerationConstraint::UndOnly,
-                Vec::new(),
-                vec![1, 2, 3, 4, 5],
-            )?;
+            let (id, request) = mk(Vec::new(), vec![1, 2, 3, 4, 5])?;
             let rx = handle.submit(request)?;
             rxs.insert(id, ("text".to_string(), rx));
-        }
-    }
-    if wants("image") {
-        for _ in 0..2 {
-            let (id, request) = mk(
-                GenerationConstraint::GenOnly,
-                Vec::new(),
-                vec![1, 2, 3, 4, 5],
-            )?;
-            let rx = handle.submit(request)?;
-            rxs.insert(id, ("image".to_string(), rx));
         }
     }
     // A request that resumes a generation: its prompt continues the tokens it
@@ -169,7 +117,7 @@ fn main() -> anyhow::Result<()> {
     if wanted.as_deref() == Some("reuse") {
         let prompt: Vec<u32> = (0..600).map(|index| 2_000 + index % 500).collect();
         for id in 1..=2 {
-            let (_, request) = mk(GenerationConstraint::UndOnly, Vec::new(), prompt.clone())?;
+            let (_, request) = mk(Vec::new(), prompt.clone())?;
             let mut rx = handle.submit(request)?;
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
             let mut finished = false;
@@ -203,34 +151,29 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(0);
     }
     if wants("migrated") {
-        let (id, request) = mk(
-            GenerationConstraint::UndOnly,
-            vec![1_500, 1_501],
-            vec![1, 2, 3, 4, 5],
-        )?;
+        let (id, request) = mk(vec![1_500, 1_501], vec![1, 2, 3, 4, 5])?;
         let rx = handle.submit(request)?;
         rxs.insert(id, ("migrated".to_string(), rx));
     }
 
     // Poll every event receiver until each request has reported `Finished`
     // once, or the deadline passes. After the kind label, the tuple counts
-    // text tokens and images and records whether `Finished` was seen.
+    // text tokens and records whether `Finished` was seen.
     let mut done = 0usize;
     let total = rxs.len();
     anyhow::ensure!(total > 0, "the scenario names no request kind: {wanted:?}");
-    let mut counts: HashMap<RequestId, (String, usize, usize, bool)> = HashMap::new();
+    let mut counts: HashMap<RequestId, (String, usize, bool)> = HashMap::new();
     let mut watched = 0usize;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while done < total && std::time::Instant::now() < deadline {
         for (id, (kind, rx)) in rxs.iter_mut() {
             while let Ok(ev) = rx.try_recv() {
                 watched += 1;
-                let e = counts.entry(*id).or_insert((kind.clone(), 0, 0, false));
+                let e = counts.entry(*id).or_insert((kind.clone(), 0, false));
                 match ev {
                     Event::TextToken { .. } => e.1 += 1,
-                    Event::ImageDone { .. } => e.2 += 1,
-                    Event::Finished { .. } if !e.3 => {
-                        e.3 = true;
+                    Event::Finished { .. } if !e.2 => {
+                        e.2 = true;
                         done += 1;
                     }
                     Event::Rejected { kind, message } => {
@@ -255,15 +198,12 @@ fn main() -> anyhow::Result<()> {
         handle.failure(),
     );
     let mut ok = done == total;
-    for (id, (kind, toks, imgs, fin)) in &counts {
+    for (id, (kind, toks, fin)) in &counts {
         println!(
-            "req {:?} [{}]: text_tokens={} images={} finished={}",
-            id, kind, toks, imgs, fin
+            "req {:?} [{}]: text_tokens={} finished={}",
+            id, kind, toks, fin
         );
         if kind == "text" && *toks == 0 {
-            ok = false;
-        }
-        if kind == "image" && *imgs == 0 {
             ok = false;
         }
         if kind == "migrated" && (*toks == 0 || !*fin) {

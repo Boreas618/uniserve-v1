@@ -62,7 +62,7 @@ pub struct ServerConfig {
     /// expires; streamed bodies are not bounded.
     #[serde(with = "values::optional_duration")]
     pub request_timeout: Option<Duration>,
-    /// In-flight chat, image generation and synchronous video requests above
+    /// In-flight chat and synchronous video requests above
     /// which requests are shed with 503.
     pub max_concurrent_requests: Option<NonZeroU64>,
     /// Longest drain of in-flight requests at shutdown; zero stops at once.
@@ -887,7 +887,6 @@ pub struct ModelConfig {
     pub bos: u32,
     /// Every end-of-sequence token, the primary one first.
     pub eos: Vec<u32>,
-    pub end_of_image: u32,
     /// A block-diffusion model's canvas sampling; absent for other models.
     pub canvas_sampling: Option<crate::request::CanvasSampling>,
     /// Whether a prompt's prefill returns outputs, which only conditioning prefills of
@@ -902,7 +901,6 @@ impl ModelConfig {
         self.generation_limits == other.generation_limits
             && self.bos == other.bos
             && self.eos == other.eos
-            && self.end_of_image == other.end_of_image
             && self.max_model_len == other.max_model_len
             && self.canvas_sampling == other.canvas_sampling
             && self.prefill_outputs == other.prefill_outputs

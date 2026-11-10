@@ -4,12 +4,10 @@
 use std::sync::Arc;
 
 use proto::request::{
-    ArtifactEvent, ArtifactMedia, CachePolicy, CfgRenorm, ConditionExtent, DiffusionRequest,
-    DiffusionSamplingParams, EncoderInputs, Event, FeedbackImage, FeedbackNextToken,
-    FeedbackSource, FinishReason, GeneratedImage, GenerationConstraint, GenerationFeatures,
-    GenerationLimits, GenerationRequest, ImageEncoder, ImageEncoderInput, ImageGenerationConfig,
-    ImageInput, ImageParams, ImagePixels, ImageTrigger, MediaKind, MigrationCause,
-    MultimodalInputs, PixelRange, PositionLogprobs, RejectionKind, Request, RequestId,
+    ArtifactEvent, ArtifactMedia, CachePolicy, ConditionExtent, DiffusionRequest,
+    DiffusionSamplingParams, EncoderInputs, Event, FinishReason, GenerationFeatures,
+    GenerationLimits, GenerationRequest, ImageEncoder, ImageEncoderInput, ImageInput, MediaKind,
+    MigrationCause, MultimodalInputs, PositionLogprobs, RejectionKind, Request, RequestId,
     SamplingParams, StopReason, TokenLogprob, Trajectory, wire,
 };
 
@@ -18,7 +16,6 @@ fn generation() -> GenerationRequest {
     GenerationRequest {
         request_id: RequestId(41),
         prompt_token_ids: vec![1, 2, 3, 4],
-        negative_prompt_token_ids: vec![9],
         multimodal_inputs: MultimodalInputs {
             images: vec![ImageInput {
                 digest: [0xfe; 32],
@@ -43,7 +40,6 @@ fn generation() -> GenerationRequest {
                 ],
             }],
         },
-        constraint: GenerationConstraint::UndOnly,
         sampling: SamplingParams {
             temperature: 0.7,
             top_k: 20,
@@ -65,19 +61,6 @@ fn generation() -> GenerationRequest {
             typical_p: 0.95,
             forced_token_ids: vec![8],
         },
-        image: ImageParams {
-            steps: 12,
-            cfg_text_scale: 4.0,
-            cfg_img_scale: 1.5,
-            cfg_renorm_type: CfgRenorm::TextChannel,
-            cfg_renorm_min: 0.1,
-            cfg_interval: (0.2, 0.8),
-            timestep_shift: 3.0,
-            height: 512,
-            width: 768,
-            seed: Some(11),
-        },
-        max_images: 2,
         max_und_tokens: 128,
         stop_strings: vec!["end".to_owned()],
         stop_token_ids: vec![2],
@@ -93,53 +76,8 @@ fn generation() -> GenerationRequest {
             }),
         },
         include_stop_token: true,
-        image_generation: ImageGenerationConfig {
-            trigger: ImageTrigger::RoundCloseThenSuffix {
-                close_token_ids: vec![10],
-                trigger_token_ids: vec![11, 12],
-            },
-            requires_text_for_image: false,
-            feedback_source: Some(FeedbackSource::ArtifactProduct),
-            feedback_encoders: vec![ImageEncoderInput {
-                encoder: ImageEncoder::Vision,
-                num_cache_tokens: Some(8),
-                max_cache_tokens: Some(8),
-                height: None,
-                width: None,
-            }],
-            num_feedback_positions: 9,
-            feedback_next_token: FeedbackNextToken::Token { token_id: 13 },
-            sample_feedback_continuation: true,
-        },
         generated_token_ids: vec![40, 41, 42],
         adapter: 0,
-        generated_images: vec![
-            GeneratedImage {
-                tokens: 1,
-                image: FeedbackImage::Pixels(Arc::new(pixels())),
-            },
-            GeneratedImage {
-                tokens: 3,
-                image: FeedbackImage::Png(Arc::from("cG5n")),
-            },
-        ],
-        // The image it had begun, which an engine stored at step 4.
-        trajectory: Trajectory {
-            id: 19,
-            denoised_steps: 4,
-            state_seed: Some(23),
-            stored_layout: b"{\"version\":1}".to_vec(),
-        },
-    }
-}
-
-/// The decoded image product of a 2 x 1 image.
-fn pixels() -> ImagePixels {
-    ImagePixels {
-        height: 2,
-        width: 1,
-        range: PixelRange::SignedUnit,
-        values: (0..12).collect(),
     }
 }
 
@@ -191,25 +129,6 @@ fn requests_come_back_from_their_messages_unchanged() {
         let message = request.to_wire();
         assert_eq!(Request::from_wire(message).unwrap(), request);
     }
-
-    // Each image trigger and continuation token comes back.
-    for (trigger, next) in [
-        (ImageTrigger::Disabled, FeedbackNextToken::None),
-        (ImageTrigger::Token { token_id: 3 }, FeedbackNextToken::Bos),
-        (
-            ImageTrigger::Suffix {
-                token_ids: vec![4, 5],
-            },
-            FeedbackNextToken::EndOfImage,
-        ),
-    ] {
-        let mut request = generation();
-        request.image_generation.trigger = trigger;
-        request.image_generation.feedback_next_token = next;
-        request.image_generation.feedback_source = None;
-        let request = Request::from(request);
-        assert_eq!(Request::from_wire(request.to_wire()).unwrap(), request);
-    }
 }
 
 #[test]
@@ -218,9 +137,9 @@ fn a_value_this_build_does_not_know_is_refused() {
     let Some(wire::request::Kind::Generation(generation)) = message.kind.as_mut() else {
         unreachable!("a generation request")
     };
-    generation.constraint = 77;
+    generation.images[0].encoders[0].encoder = 77;
     let error = Request::from_wire(message).unwrap_err();
-    assert!(error.to_string().contains("constraint 77"), "{error}");
+    assert!(error.to_string().contains("image encoder 77"), "{error}");
 }
 
 /// Artifact bytes held in this process.
@@ -263,34 +182,6 @@ fn events_come_back_from_their_messages_unchanged() {
                 entries: vec![candidate],
             }],
         },
-        Event::ImageBegin {
-            image_id: 1,
-            height: 64,
-            width: 32,
-            steps: 6,
-        },
-        Event::ImageStep {
-            image_id: 1,
-            step: 2,
-        },
-        Event::ImageCommit { image_id: 1 },
-        Event::ImageDone {
-            image_id: 1,
-            height: 64,
-            width: 32,
-            bytes: 10,
-            pixels_png_b64: "cG5n".to_owned(),
-            feedback: None,
-        },
-        Event::ImageDone {
-            image_id: 2,
-            height: 2,
-            width: 1,
-            bytes: 10,
-            pixels_png_b64: "cG5n".to_owned(),
-            feedback: Some(Arc::new(pixels())),
-        },
-        Event::ControlToken { id: 151_652 },
         Event::MediaProgress {
             phase: "denoising".to_owned(),
             completed_steps: 4,
@@ -303,14 +194,12 @@ fn events_come_back_from_their_messages_unchanged() {
             stop_reason: Some(StopReason::String("end".to_owned())),
             prompt_tokens: 4,
             completion_tokens: 9,
-            images: 1,
         },
         Event::Finished {
             reason: FinishReason::Eos,
             stop_reason: Some(StopReason::Token(2)),
             prompt_tokens: 4,
             completion_tokens: 9,
-            images: 0,
         },
         Event::Rejected {
             kind: RejectionKind::Overloaded,
@@ -362,15 +251,10 @@ fn events_come_back_from_their_messages_unchanged() {
 fn limits_come_back_from_their_message_unchanged() {
     let limits = GenerationLimits {
         features: GenerationFeatures::UNDERSTANDING | GenerationFeatures::LATENT_ENCODE,
-        max_latent_units: 1,
-        latent_downsample: 2,
         max_vae_grid_tokens: 3,
         max_vit_grid_tokens: 4,
-        latent_bytes_per_unit: 5,
         max_latent_feature_bytes: 6,
         max_vision_feature_bytes: 7,
-        commit_marker_tokens: 8,
-        max_cfg_branches: 9,
         encoder_cache_entries: 10,
     };
     let message = wire::GenerationLimits::from(&limits);

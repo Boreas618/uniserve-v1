@@ -41,7 +41,7 @@ use crate::output::assembly::StreamClock;
 use crate::output::chat::ChatOutputProcessor;
 use crate::output::chat::structured::StructuredEventState;
 use crate::output::text::TextDecodeOptions;
-use crate::output::text::{DecodeStream, DecodedTextEvent, ImageEvent};
+use crate::output::text::{DecodeStream, DecodedTextEvent};
 use crate::output::{OutputError, RequestOutput, RequestUsage};
 use crate::tokenizer::DynTokenizer;
 
@@ -314,8 +314,6 @@ pub struct GenerationRun<S: ResponseSink> {
     clock: StreamClock,
     sink: S,
     events: Box<dyn Events>,
-    image_count: u32,
-    image_steps: u32,
     /// The response's OpenAI fields, which a successor rebuilds the emitter
     /// and the chunks from.
     context: ChatResponseContext,
@@ -378,8 +376,6 @@ impl<S: ResponseSink> GenerationRun<S> {
             events,
             replica: outcome.engine(),
             outcome,
-            image_count: 0,
-            image_steps: 0,
             ended: false,
         })
     }
@@ -462,18 +458,6 @@ impl<S: ResponseSink> GenerationRun<S> {
                 }
                 outputs
             }
-            DecodedTextEvent::Image(ImageEvent::Begin) => {
-                self.clock.visible();
-                Vec::new()
-            }
-            DecodedTextEvent::Image(ImageEvent::Step { image_id }) => {
-                self.image_steps = self.image_steps.saturating_add(1);
-                vec![RequestOutput::ImageStep { image_id }]
-            }
-            DecodedTextEvent::Image(ImageEvent::Done(image)) => {
-                self.image_count = self.image_count.saturating_add(1);
-                vec![RequestOutput::ImageDone(image)]
-            }
             DecodedTextEvent::Done(finished) => {
                 // Release the text the parsers hold back and close the open
                 // block before the terminal event.
@@ -488,8 +472,6 @@ impl<S: ResponseSink> GenerationRun<S> {
                     usage: RequestUsage {
                         prompt_tokens: saturate(finished.prompt_tokens),
                         output_tokens: saturate(finished.output_tokens),
-                        image_count: self.image_count.max(saturate(finished.images)),
-                        image_steps: self.image_steps,
                         timings: self.clock.timings(),
                     },
                 });
@@ -596,8 +578,6 @@ impl<S: ResponseSink> GenerationRun<S> {
             clock: StreamClock::resume(&assembly, lowering.started_unix_us, lowering.compile_us),
             sink,
             events,
-            image_count: assembly.images,
-            image_steps: assembly.image_steps,
             context,
             replica,
             outcome,
@@ -611,8 +591,6 @@ impl<S: ResponseSink> GenerationRun<S> {
         let processor = self.processor.state()?;
         let mut assembly = self.blocks.state();
         self.clock.state(&mut assembly);
-        assembly.images = self.image_count;
-        assembly.image_steps = self.image_steps;
         let (consumed_events, consumed_tokens) = self.events.progress();
         let lowering = handoff::Lowering {
             prompt_token_ids: self.prompt_token_ids.clone(),
@@ -777,7 +755,6 @@ fn is_visible(output: &RequestOutput) -> bool {
             | RequestOutput::ReasoningDelta { .. }
             | RequestOutput::ToolCallStart { .. }
             | RequestOutput::ToolCallArgumentsDelta { .. }
-            | RequestOutput::ImageDone(_)
     )
 }
 
@@ -1061,7 +1038,6 @@ mod tests {
             stop_reason: None,
             prompt_tokens: 1,
             completion_tokens,
-            images: 0,
         }
     }
 

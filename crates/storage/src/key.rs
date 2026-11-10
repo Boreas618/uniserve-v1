@@ -199,17 +199,6 @@ pub fn latent_content(seed: u64, trajectory: u64, steps: u32) -> [u8; 32] {
     digest.finish()
 }
 
-/// The trajectory identity of image `image_index` (from one) of a request
-/// whose trajectory identity is `trajectory`: each image of the request has
-/// a trajectory of its own.
-pub fn image_trajectory(trajectory: u64, image_index: u32) -> u64 {
-    let mut digest = Digest::new(b"uniserve-image-trajectory");
-    digest.number(trajectory);
-    digest.number(u64::from(image_index));
-    let digest = digest.finish();
-    u64::from_le_bytes(digest[..8].try_into().unwrap_or_default())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +267,5 @@ mod tests {
         assert_eq!(latent_seed([]), 0);
         assert_eq!(latent_seed(["a", "b"]), latent_seed(["b", "a", "a"]));
         assert_ne!(latent_seed(["a"]), latent_seed(["b"]));
-        assert_ne!(image_trajectory(5, 1), image_trajectory(5, 2));
     }
 }

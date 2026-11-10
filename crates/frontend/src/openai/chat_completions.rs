@@ -30,7 +30,6 @@ use axum::routing::post;
 use axum::{Extension, Router};
 use itertools::Itertools as _;
 use proto::handoff;
-use proto::request::GenerationConstraint;
 use serde_json::Value;
 use tracing::{debug, error};
 use tracing_futures::Instrument as _;
@@ -43,8 +42,8 @@ use crate::openai::{
     ApiError, AssistantRole, ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest,
     ChatCompletionResponse, ChatCompletionStreamChoice, ChatCompletionStreamResponse, ChatLogProbs,
     ChatLogProbsContent, ChatMessage, ChatMessageDelta, ChatModality, ContentPart,
-    FunctionCallDelta, FunctionCallResponse, ImageUrl, MessageContent, Tool, ToolCall,
-    ToolCallDelta, TopLogProb, Usage, ValidatedJson, check_model_served, convert_logit_bias,
+    FunctionCallDelta, FunctionCallResponse, MessageContent, Tool, ToolCall, ToolCallDelta,
+    TopLogProb, Usage, ValidatedJson, check_model_served, convert_logit_bias,
 };
 use crate::openai::{Generation, Server};
 use crate::output::chat::{AssistantBlockKind, AssistantContentBlock, AssistantMessage};
@@ -328,8 +327,6 @@ pub fn chat_response(
         prompt_logprobs,
         logprobs,
         token_ids,
-        images,
-        image_steps_per_image,
         reason,
         usage,
     } = collected;
@@ -375,13 +372,7 @@ pub fn chat_response(
     } else {
         None
     };
-    let usage = Usage::new(
-        usage.prompt_tokens,
-        usage.output_tokens,
-        usage.image_count,
-        usage.image_steps,
-        image_steps_per_image,
-    );
+    let usage = Usage::new(usage.prompt_tokens, usage.output_tokens);
 
     Ok(ChatCompletionResponse {
         id: request_id,
@@ -395,7 +386,6 @@ pub fn chat_response(
                 content: Some(message.text()).filter(|text| !text.is_empty()),
                 tool_calls: Some(tool_calls).filter(|calls| !calls.is_empty()),
                 reasoning: if include_reasoning { reasoning } else { None },
-                images: Some(images).filter(|images| !images.is_empty()),
             },
             logprobs,
             finish_reason: Some(finish_reason),
@@ -418,10 +408,6 @@ pub struct CollectedChatOutput {
     /// no update carried any.
     logprobs: Option<DecodedLogprobs>,
     token_ids: Vec<u32>,
-    images: Vec<ContentPart>,
-    /// `ImageStep` counts per completed image, in completion order. Images
-    /// that began but never completed are not listed.
-    image_steps_per_image: Vec<u32>,
     reason: FinishReason,
     usage: crate::output::RequestUsage,
 }
@@ -442,11 +428,6 @@ pub struct ChatCollector {
     /// no update carried any.
     logprobs: Option<DecodedLogprobs>,
     token_ids: Vec<u32>,
-    images: Vec<crate::openai::protocol::ContentPart>,
-    /// `ImageStep` counts per completed image, in completion order. Images
-    /// that began but never completed are not listed.
-    image_step_counts: HashMap<u32, u32>,
-    completed_image_ids: Vec<u32>,
     finished: Option<(FinishReason, crate::output::RequestUsage)>,
 }
 
@@ -486,15 +467,6 @@ impl ChatCollector {
                 self.message
                     .push_block(AssistantContentBlock::ToolCall(call.clone()));
             }
-            RequestOutput::ImageStep { image_id } => {
-                *self.image_step_counts.entry(*image_id).or_default() += 1;
-            }
-            RequestOutput::ImageDone(image) => {
-                self.image_step_counts.entry(image.image_id).or_default();
-                self.completed_image_ids.push(image.image_id);
-                self.images
-                    .push(image_content_part(image.png_base64.clone()));
-            }
             RequestOutput::Finished { reason, usage } => {
                 self.finished = Some((reason.clone(), usage.clone()));
             }
@@ -533,17 +505,6 @@ impl ChatCollector {
             prompt_logprobs: self.prompt_logprobs.clone(),
             logprobs: self.logprobs.clone(),
             token_ids: self.token_ids.clone(),
-            images: self.images.clone(),
-            image_steps_per_image: self
-                .completed_image_ids
-                .iter()
-                .map(|image_id| {
-                    self.image_step_counts
-                        .get(image_id)
-                        .copied()
-                        .unwrap_or_default()
-                })
-                .collect(),
             reason,
             usage,
         })
@@ -587,33 +548,10 @@ impl ChatCollector {
             prompt_logprobs: self.prompt_logprobs.as_ref().map(handoff_prompt_logprobs),
             logprobs: self.logprobs.as_ref().map(handoff_logprobs),
             token_ids: self.token_ids.clone(),
-            images: self
-                .images
-                .iter()
-                .map(|part| match part {
-                    crate::openai::protocol::ContentPart::ImageUrl { image_url, .. } => {
-                        image_url.url.clone()
-                    }
-                    other => format!("{other:?}"),
-                })
-                .collect(),
-            image_steps_per_image: self
-                .completed_image_ids
-                .iter()
-                .map(|image_id| {
-                    self.image_step_counts
-                        .get(image_id)
-                        .copied()
-                        .unwrap_or_default()
-                })
-                .collect(),
             finish_reason,
             usage: self.finished.as_ref().map(|(_, usage)| handoff::Usage {
                 prompt_tokens: usage.prompt_tokens,
                 output_tokens: usage.output_tokens,
-                image_count: usage.image_count,
-                image_steps: usage.image_steps,
-                image_steps_per_image: Vec::new(),
             }),
             stop_reason: None,
         }
@@ -647,18 +585,6 @@ impl ChatCollector {
         self.prompt_logprobs = state.prompt_logprobs.as_ref().map(decoded_prompt_logprobs);
         self.logprobs = state.logprobs.as_ref().map(decoded_logprobs);
         self.token_ids.clone_from(&state.token_ids);
-        self.images = state
-            .images
-            .iter()
-            .map(|url| image_content_part(url.clone()))
-            .collect();
-        self.image_step_counts = state
-            .image_steps_per_image
-            .iter()
-            .enumerate()
-            .map(|(index, steps)| (index as u32, *steps))
-            .collect();
-        self.completed_image_ids = (0..state.images.len() as u32).collect();
         self.finished = None;
     }
 }
@@ -759,10 +685,6 @@ pub struct ChatStreamEmitter {
     created: u64,
     /// Whether a tool call was published, which the finish reason follows.
     saw_tool_calls: bool,
-    /// Denoising steps per image, by image identity.
-    image_step_counts: HashMap<u32, u32>,
-    /// Completed images, in completion order.
-    completed_image_ids: Vec<u32>,
     /// Whether a reasoning block is open that the client does not see.
     inside_hidden_reasoning: bool,
     /// Whether the current update's metadata belongs to hidden reasoning.
@@ -787,8 +709,6 @@ impl ChatStreamEmitter {
             context: context.clone(),
             created,
             saw_tool_calls: false,
-            image_step_counts: HashMap::new(),
-            completed_image_ids: Vec::new(),
             inside_hidden_reasoning: false,
             suppress_current_update_metadata: false,
             pending_chunk,
@@ -958,30 +878,6 @@ impl ChatStreamEmitter {
             RequestOutput::ToolCallEnd { .. } => {
                 debug!("ending current tool call");
             }
-            RequestOutput::ImageStep { image_id } => {
-                *self.image_step_counts.entry(*image_id).or_default() += 1;
-            }
-            RequestOutput::ImageDone(image) => {
-                // Flush buffered deltas first so the image chunk keeps its
-                // position after the text generated before it.
-                if let Some(pending_chunk) = self.pending_chunk.as_mut()
-                    && let Some(chunk) = pending_chunk.take_chunk(
-                        &self.context.request_id,
-                        &self.context.response_model,
-                        self.created,
-                    )
-                {
-                    chunks.push(chunk);
-                }
-                chunks.push(image_delta_chunk(
-                    &self.context.request_id,
-                    &self.context.response_model,
-                    self.created,
-                    image.png_base64.clone(),
-                ));
-                self.image_step_counts.entry(image.image_id).or_default();
-                self.completed_image_ids.push(image.image_id);
-            }
             RequestOutput::Finished { reason, usage } => {
                 if let Some(pending_chunk) = self.pending_chunk.as_mut()
                     && let Some(chunk) = pending_chunk.take_chunk(
@@ -1004,21 +900,7 @@ impl ChatStreamEmitter {
                         &self.context.request_id,
                         &self.context.response_model,
                         self.created,
-                        Usage::new(
-                            usage.prompt_tokens,
-                            usage.output_tokens,
-                            usage.image_count,
-                            usage.image_steps,
-                            self.completed_image_ids
-                                .iter()
-                                .map(|image_id| {
-                                    self.image_step_counts
-                                        .get(image_id)
-                                        .copied()
-                                        .unwrap_or_default()
-                                })
-                                .collect(),
-                        ),
+                        Usage::new(usage.prompt_tokens, usage.output_tokens),
                     ));
                 }
                 self.done = true;
@@ -1057,8 +939,6 @@ impl ChatStreamEmitter {
         }
         Some(handoff::ChatChunks {
             saw_tool_calls: self.saw_tool_calls,
-            image_steps: self.image_step_counts.clone().into_iter().collect(),
-            completed_images: self.completed_image_ids.clone(),
             inside_hidden_reasoning: self.inside_hidden_reasoning,
             suppress_current_update_metadata: self.suppress_current_update_metadata,
             frames: self.frames,
@@ -1070,8 +950,6 @@ impl ChatStreamEmitter {
     /// Takes over a state this stage produced.
     pub fn resume(&mut self, state: &handoff::ChatChunks) {
         self.saw_tool_calls = state.saw_tool_calls;
-        self.image_step_counts = state.image_steps.clone().into_iter().collect();
-        self.completed_image_ids.clone_from(&state.completed_images);
         self.inside_hidden_reasoning = state.inside_hidden_reasoning;
         self.suppress_current_update_metadata = state.suppress_current_update_metadata;
         self.frames = state.frames;
@@ -1102,35 +980,6 @@ fn usage_chunk(
     let mut chunk = ChatCompletionStreamResponse::new(request_id, response_model, created);
     chunk.usage = Some(usage);
     chunk
-}
-
-/// Builds a streaming image-delta chunk.
-fn image_delta_chunk(
-    request_id: &str,
-    response_model: &str,
-    created: u64,
-    png_b64: String,
-) -> ChatCompletionStreamResponse {
-    let mut chunk = ChatCompletionStreamResponse::new(request_id, response_model, created);
-    chunk.choices.push(ChatCompletionStreamChoice {
-        delta: ChatMessageDelta {
-            images: Some(vec![image_content_part(png_b64)]),
-            ..Default::default()
-        },
-        ..Default::default()
-    });
-    chunk
-}
-
-/// Builds an image content part for a chat response.
-fn image_content_part(png_b64: String) -> ContentPart {
-    ContentPart::ImageUrl {
-        image_url: ImageUrl {
-            url: format!("data:image/png;base64,{png_b64}"),
-            detail: None,
-        },
-        uuid: None,
-    }
 }
 
 /// One in-flight chat-completions SSE chunk being assembled at the route layer.
@@ -1244,7 +1093,6 @@ impl PendingChatChunk {
             content: self.delta.content.take(),
             tool_calls: self.delta.tool_calls.take(),
             reasoning: self.delta.reasoning.take(),
-            images: self.delta.images.take(),
         }
     }
 }
@@ -1490,7 +1338,7 @@ pub fn lower_chat_request(
                 ..Default::default()
             },
         }),
-        constraint: convert_modalities(&request.modalities),
+        image_output: request.modalities.contains(&ChatModality::Image),
         sampling,
         max_tokens: request.max_completion_tokens,
         stop_token_ids: request.stop_token_ids.unwrap_or_default(),
@@ -1500,21 +1348,6 @@ pub fn lower_chat_request(
         adapter: None,
     };
     Ok((lowered, context))
-}
-
-/// Converts requested response modalities into the generation constraint.
-///
-/// An empty list selects both text and image output, like an explicit request
-/// for both.
-fn convert_modalities(modalities: &[ChatModality]) -> GenerationConstraint {
-    match (
-        modalities.contains(&ChatModality::Text),
-        modalities.contains(&ChatModality::Image),
-    ) {
-        (true, false) => GenerationConstraint::UndOnly,
-        (false, true) => GenerationConstraint::GenOnly,
-        (true, true) | (false, false) => GenerationConstraint::Default,
-    }
 }
 
 /// Validates one wire chat message as the template renders it.

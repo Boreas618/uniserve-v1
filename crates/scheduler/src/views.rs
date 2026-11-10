@@ -85,7 +85,7 @@ use crate::policy::TrialState;
 /// A phase id is the kind's own (`PhaseKind::id`), so it means the same thing
 /// in every epoch: `PhaseKind` appends a kind and never renumbers one, and an
 /// id a removed kind numbered names no phase.
-const PHASES: [PhaseKind; 20] = [
+const PHASES: [PhaseKind; 19] = [
     PhaseKind::TextEncoding,
     PhaseKind::VisionEncoding,
     PhaseKind::LatentEncoding,
@@ -93,7 +93,6 @@ const PHASES: [PhaseKind; 20] = [
     PhaseKind::Decode,
     PhaseKind::Verify,
     PhaseKind::TokenDenoise,
-    PhaseKind::ImageDecode,
     PhaseKind::CacheInstall,
     PhaseKind::MediaRead,
     PhaseKind::Denoise,
@@ -138,7 +137,6 @@ pub(crate) fn call_phase(kind: CallKind) -> PhaseKind {
         CallKind::Media(MediaCall::VisionEncoding) => PhaseKind::VisionEncoding,
         CallKind::Media(MediaCall::LatentEncoding) => PhaseKind::LatentEncoding,
         CallKind::Media(MediaCall::Denoising) => PhaseKind::Denoise,
-        CallKind::Media(MediaCall::ImageDecoding) => PhaseKind::ImageDecode,
         CallKind::Media(MediaCall::VideoDecoding) => PhaseKind::VideoDecode,
         CallKind::Media(MediaCall::AudioDecoding) => PhaseKind::AudioDecode,
         CallKind::Media(MediaCall::VideoEncoding) => PhaseKind::VideoEncode,
@@ -170,7 +168,6 @@ pub(crate) fn phase_call(kind: PhaseKind) -> Option<CallKind> {
         PhaseKind::Decode => CallKind::Forward(ForwardMode::Decode),
         PhaseKind::Verify => CallKind::Forward(ForwardMode::Verify),
         PhaseKind::TokenDenoise => CallKind::Forward(ForwardMode::TokenDenoising),
-        PhaseKind::ImageDecode => CallKind::Media(MediaCall::ImageDecoding),
         PhaseKind::CacheInstall => CallKind::Transfer(TransferMode::CacheInstall),
         PhaseKind::MediaRead => CallKind::Media(MediaCall::MediaReading),
         PhaseKind::Denoise => CallKind::Media(MediaCall::Denoising),
@@ -549,9 +546,8 @@ fn prefill_end(state: &RequestState) -> u32 {
 fn next_tokens(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> u32 {
     match scheduler.peek_next_call_variant(id) {
         // A prompt chunk or a refill is charged the chunk the policy sizes; a
-        // structural write (a close cache, a feedback state, a block's commit,
-        // a publish) writes one position of its own and states it, because
-        // nothing is left to size.
+        // structural write (a block's commit) writes one position of its own
+        // and states it, because nothing is left to size.
         Some(CallKind::Forward(ForwardMode::Prefill)) => u32::from(
             scheduler
                 .num_scheduled_prompt_tokens(id)
@@ -567,23 +563,11 @@ fn next_tokens(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> u3
             u32::try_from(1 + drafts).unwrap_or(u32::MAX)
         }
         // A canvas step spends a whole canvas of a step's token budget, the
-        // same bound the deployment was checked against: it denoises text
-        // tokens on the worker's canvas, not an image of the request's
-        // latent raster, so it is charged neither the image's latent units nor
-        // its guidance branches.
-        Some(CallKind::Forward(ForwardMode::TokenDenoising))
-            if scheduler.config.canvas.is_some() =>
-        {
-            scheduler
-                .config
-                .canvas
-                .map_or(0, |canvas| canvas.canvas_length)
-        }
-        Some(CallKind::Forward(ForwardMode::TokenDenoising)) => {
-            let units = scheduler.worker_image_latent_units_for(state).max(1);
-            let branches = u64::from(state.req.image.cfg_branch_count().max(1));
-            u32::try_from(units.saturating_mul(branches)).unwrap_or(u32::MAX)
-        }
+        // same bound the deployment was checked against.
+        Some(CallKind::Forward(ForwardMode::TokenDenoising)) => scheduler
+            .config
+            .canvas
+            .map_or(0, |canvas| canvas.canvas_length),
         Some(CallKind::Media(_)) => 1,
         Some(CallKind::Transfer(_)) => 0,
     }
@@ -658,15 +642,6 @@ fn waiting_transfer(scheduler: &Scheduler, id: RequestId) -> bool {
         })
 }
 
-/// The class of a request, as scheduling distinguishes it.
-fn request_class(req: &GenerationRequest) -> RequestClass {
-    if req.decodes_text() {
-        RequestClass::Token
-    } else {
-        RequestClass::Media
-    }
-}
-
 /// The view of a token request the scheduler holds.
 pub(crate) fn request(
     scheduler: &Scheduler,
@@ -695,7 +670,7 @@ pub(crate) fn request(
         prefilled_tokens: prefilled,
         cached_pages: cached_pages(state),
         last_emitted_at: recorded.last_emitted_at,
-        class: request_class(&state.req),
+        class: RequestClass::Token,
         waiting_transfer: waiting_transfer(scheduler, id),
         next_tokens: next_tokens(scheduler, state, id),
         reservation_units: reservation_units(scheduler, state),
@@ -1385,7 +1360,6 @@ mod tests {
             CallKind::Media(MediaCall::VisionEncoding),
             CallKind::Media(MediaCall::LatentEncoding),
             CallKind::Media(MediaCall::Denoising),
-            CallKind::Media(MediaCall::ImageDecoding),
             CallKind::Media(MediaCall::VideoDecoding),
             CallKind::Media(MediaCall::AudioDecoding),
             CallKind::Media(MediaCall::VideoEncoding),
@@ -1427,7 +1401,7 @@ mod tests {
         assert!(kinds.contains(&PhaseKind::Decode));
         assert!(kinds.contains(&PhaseKind::Refill));
         assert!(kinds.contains(&PhaseKind::Denoise));
-        assert!(!kinds.contains(&PhaseKind::ImageDecode));
+        assert!(!kinds.contains(&PhaseKind::VideoDecode));
 
         // A phase's id is its kind's, and its block is the component the worker
         // binds for that call.

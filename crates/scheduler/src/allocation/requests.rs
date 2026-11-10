@@ -21,10 +21,9 @@ pub(crate) struct Storage {
     /// against `EncoderCacheManager::budget` only for requests that reserve
     /// their worst case.
     pub(crate) reserved_encoder_entries: usize,
-    /// Request-state rows of token requests and their guidance prefixes, sized by
-    /// the runtime's `request_slots`.
+    /// Request-state rows of token requests, sized by the runtime's
+    /// `request_slots`.
     pub(crate) request_pool: RequestPool,
-    pub(crate) latent_pool: LatentPool,
     /// Byte spans of persistent products in the runtime's buffer pool.
     pub(crate) buffer_pool: BufferPool,
     /// Per-worker row address spaces and per-rank buffer address spaces of
@@ -172,8 +171,7 @@ impl Storage {
 /// acknowledgement names the same `request_key`.
 pub(crate) struct RetiringRequest {
     pub(crate) request_key: RequestKey,
-    /// The token request's own allocations and those of its guidance prefix;
-    /// empty for a media request.
+    /// The token request's allocations; empty for a media request.
     pub(crate) allocations: Vec<RequestAllocations>,
     pub(crate) media_allocations: Option<MediaAllocations>,
     /// Persistent product spans still held by the request. An earlier `Free`
@@ -181,17 +179,11 @@ pub(crate) struct RetiringRequest {
     pub(crate) buffers: HashMap<BufferId, BufferSpan>,
 }
 
-/// Storage one token request, or its guidance prefix, holds in the runtime's
-/// shared pools.
+/// Storage one token request holds in the runtime's shared pools.
 pub(crate) struct RequestAllocations {
     pub(crate) request_slot: RequestSlot,
     /// One block table per cache group.
     pub(crate) prefix_cache: CacheAllocation,
-    /// Latent pages of the current image trajectory, reserved by its latent
-    /// preparation or denoising call on a worker that tracks image latents
-    /// and released when its image decoding completes or with the request's
-    /// other allocations.
-    pub(crate) latent: Option<LatentPages>,
     /// Persistent product spans keyed by the product's buffer identity.
     pub(crate) buffers: HashMap<BufferId, BufferSpan>,
 }
@@ -219,9 +211,6 @@ impl RequestAllocations {
     pub(crate) fn free(self, storage: &mut Storage) {
         for buffer in self.buffers.into_values() {
             storage.buffer_pool.free(buffer);
-        }
-        if let Some(latent) = self.latent {
-            storage.latent_pool.free(latent);
         }
         storage.request_pool.free(self.request_slot);
     }

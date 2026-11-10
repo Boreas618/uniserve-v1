@@ -9,7 +9,7 @@
 //! `OutputParams` (`crate::output`), which the daemon keeps to decode and
 //! parse the output.
 
-use proto::request::{GenerationConstraint, SamplingParams};
+use proto::request::SamplingParams;
 
 use crate::input::chat::ChatRequest;
 use crate::output::text::TextDecodeOptions;
@@ -35,9 +35,9 @@ pub struct GenerateRequest {
     pub request_id: String,
     /// The prompt.
     pub prompt: Prompt,
-    /// What the request generates: text (`UndOnly`), an image (`GenOnly`),
-    /// or both (`Default`).
-    pub constraint: GenerationConstraint,
+    /// Whether the request asks for image output, which no served model
+    /// generates: feature validation refuses it.
+    pub image_output: bool,
     /// How the engine samples text: the request's controls over the model's
     /// defaults, validated.
     pub sampling: SamplingParams,
