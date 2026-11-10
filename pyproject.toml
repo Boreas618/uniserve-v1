@@ -136,6 +136,14 @@ ignore = [
     "N812",
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# The kernel packages' numerical checks are scripts run one per process: they
+# set Triton's interpreter state and their search path before importing the
+# kernel (E402), and their prose, tables and derivations are written at 100
+# columns (E501). The pytest modules beside them follow the full style.
+"tests/python/kernels/*/*_check.py" = ["E402", "E501", "C408", "C416", "F841", "N803"]
+"tests/python/kernels/*/*_mutations.py" = ["E402", "E501"]
+
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 

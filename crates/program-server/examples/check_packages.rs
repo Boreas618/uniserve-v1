@@ -1,7 +1,7 @@
 //! The kernel packages' contract, checked over the directories the caller names: every package
 //! parses as design section 5.2 says, names the operator and backend of its directories, declares
-//! its toolchain version, names an operator the `ops` crate declares, carries element type names
-//! `ops` prints, and keeps the sources its family shares identical.
+//! its toolchain version, names an operator the `ops` crate declares, and carries element type
+//! names `ops` prints.
 //!
 //!     cargo run -p program-server --example check_packages -- \
 //!         --kernels <kernel package root> --fixtures <program fixture root> [--keys <key file>]
@@ -86,14 +86,6 @@ fn main() -> ExitCode {
         (
             "every package names an operator of ops",
             every_package_names_an_operator(&packages),
-        ),
-        (
-            "the convolutions are one source",
-            the_convolutions_are_one_source(&args.kernels),
-        ),
-        (
-            "a family of operators shares one check",
-            a_family_shares_one_check(&args.kernels),
         ),
     ];
     let mut failed = false;
@@ -424,95 +416,6 @@ fn every_package_names_an_operator(packages: &[PathBuf]) -> Result<(), String> {
                 package.display(),
                 manifest.op
             ));
-        }
-    }
-    joined(failures)
-}
-
-/// The three convolution packages carry one source in three places, byte for byte.
-fn the_convolutions_are_one_source(kernels: &Path) -> Result<(), String> {
-    const CONVOLUTIONS: [&str; 3] = ["conv1d", "conv3d", "conv_transpose1d"];
-    const SHARED: [&str; 4] = [
-        "src/conv.cu",
-        "include/uniserve_conv.h",
-        "test/conv_check.py",
-        "test/refusal_check.py",
-    ];
-    let mut failures = Vec::new();
-    for shared in SHARED {
-        let mut sources = Vec::new();
-        for op in CONVOLUTIONS {
-            let path = kernels.join(op).join("cudnn").join(shared);
-            sources.push(
-                std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?,
-            );
-        }
-        if sources[0] != sources[1] || sources[1] != sources[2] {
-            failures.push(format!(
-                "{shared} differs between the three convolution packages"
-            ));
-        }
-    }
-    joined(failures)
-}
-
-/// Operators that are one computation with one difference share one check script, byte for byte,
-/// and the script names each of them on its command line.
-fn a_family_shares_one_check(kernels: &Path) -> Result<(), String> {
-    const FAMILIES: [(&str, &[&str]); 6] = [
-        (
-            "triton/test/row_norm_check.py",
-            &["rms_norm", "add_rms_norm"],
-        ),
-        ("triton/test/softmax_check.py", &["softmax", "log_softmax"]),
-        (
-            "triton/test/swiglu_check.py",
-            &["swiglu", "value_first_swiglu"],
-        ),
-        (
-            "triton/test/modulation_check.py",
-            &["modulated_rms_norm", "gated_residual"],
-        ),
-        (
-            "triton/test/fused_row_norm_check.py",
-            &["scaled_residual_rms_norm", "scaled_residual_layer_norm"],
-        ),
-        (
-            "triton/test/sampling_check.py",
-            &[
-                "logits_gather",
-                "vocab_unpad",
-                "logits_shape",
-                "filter_candidates",
-                "inverse_cdf",
-                "argmax",
-                "logprob_gather",
-                "top_k",
-            ],
-        ),
-    ];
-    let mut failures = Vec::new();
-    for (shared, operators) in FAMILIES {
-        let mut scripts = Vec::new();
-        for op in operators {
-            let path = kernels.join(op).join(shared);
-            scripts.push(
-                std::fs::read_to_string(&path)
-                    .map_err(|error| format!("{}: {error}", path.display()))?,
-            );
-        }
-        for (index, script) in scripts.iter().enumerate().skip(1) {
-            if script != &scripts[0] {
-                failures.push(format!(
-                    "{shared} differs between {} and {}",
-                    operators[0], operators[index]
-                ));
-            }
-        }
-        for op in operators {
-            if !(scripts[0].contains("--op") && scripts[0].contains(op)) {
-                failures.push(format!("{shared} does not name {op} on its command line"));
-            }
         }
     }
     joined(failures)

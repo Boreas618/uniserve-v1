@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Execute the unpatchify_video kernel on the CPU and check it against the operator's formulas.
+
+Triton's interpreter runs the kernel body with numpy-backed tensors, one program at a time, so the
+mapping can be checked here: it is index arithmetic plus, in the affine form, one multiply-add per
+voxel.
+
+    token (t, y, x), element c·pf·ph·pw + pt·ph·pw + ph_i·pw + pw_i
+      -> out[c, t·pf + pt, y·ph + ph_i, x·pw + pw_i]
+    with affine:  out = value · scale[c] + bias[c]
+
+The reference is that mapping written out in torch, once per variant. The check covers both forms
+and two patch shapes, and a block narrower than a raster row so the lane slices are exercised.
+
+    TRITON_INTERPRET=1 python unpatchify_arithmetic.py
+"""
+
+import os
+import pathlib
+import sys
+
+#: The kernel packages' root: this check lives in `tests/python/kernels/<family>/`.
+KERNELS = (
+    pathlib.Path(__file__).resolve().parents[4] / "crates" / "ops" / "kernels"
+)
+#: The package this check covers.
+PACKAGE = KERNELS / "unpatchify_video" / "triton"
+
+os.environ.setdefault("TRITON_INTERPRET", "1")
+
+import torch  # noqa: E402
+
+sys.path.insert(0, str(PACKAGE / "src"))  # noqa: E402
+
+import unpatchify_video as kernels  # noqa: E402
+
+
+def reference(
+    tokens,
+    channels,
+    frames,
+    height,
+    width,
+    patch,
+    affine_scale=None,
+    affine_bias=None,
+):
+    """The operator's mapping, in torch, from the formulas in `crates/ops/src/unpatchify.rs`."""
+    patch_frames, patch_height, patch_width = patch
+    raster = torch.zeros(
+        channels,
+        frames * patch_frames,
+        height * patch_height,
+        width * patch_width,
+        dtype=torch.float32,
+    )
+    for frame in range(frames):
+        for row in range(height):
+            for column in range(width):
+                token = (frame * height + row) * width + column
+                for channel in range(channels):
+                    for inner_frame in range(patch_frames):
+                        for inner_row in range(patch_height):
+                            for inner_column in range(patch_width):
+                                value = tokens[
+                                    token,
+                                    (
+                                        (channel * patch_frames + inner_frame)
+                                        * patch_height
+                                        + inner_row
+                                    )
+                                    * patch_width
+                                    + inner_column,
+                                ]
+                                if affine_scale is not None:
+                                    value = (
+                                        value * affine_scale[channel]
+                                        + affine_bias[channel]
+                                    )
+                                raster[
+                                    channel,
+                                    frame * patch_frames + inner_frame,
+                                    row * patch_height + inner_row,
+                                    column * patch_width + inner_column,
+                                ] = value
+    return raster
+
+
+def one(channels, frames, height, width, patch, affine, block, margin=0):
+    """Check one geometry, in the form the flag names.
+
+    A non-zero ``margin`` places the raster inside a larger one, ``margin`` positions from its top
+    and left on every side, as a decoder's tile sits inside its clip: every position outside the
+    block stays NaN, so a write through a wrong stride reads as an error.
+    """
+    patch_frames, patch_height, patch_width = patch
+    tokens_count = frames * height * width
+    token_width = channels * patch_frames * patch_height * patch_width
+    tokens = torch.rand(tokens_count, token_width, dtype=torch.float32)
+    rows = height * patch_height
+    columns = width * patch_width
+    clip = torch.full(
+        (
+            channels,
+            frames * patch_frames,
+            rows + 2 * margin,
+            columns + 2 * margin,
+        ),
+        float("nan"),
+    )
+    raster = clip[:, :, margin : margin + rows, margin : margin + columns]
+    strides = raster.stride()[:3]
+    grid = ((raster.numel() + block - 1) // block, 1, 1)
+    if affine:
+        scale = torch.rand(channels, dtype=torch.float32) + 0.5
+        bias = torch.rand(channels, dtype=torch.float32) - 0.5
+        kernels._unpatchify_video_affine_kernel[grid](
+            tokens,
+            scale,
+            bias,
+            raster,
+            channels,
+            frames,
+            height,
+            width,
+            patch_frames,
+            patch_height,
+            patch_width,
+            *strides,
+            0,
+            0,
+            BLOCK=block,
+        )
+        expected = reference(
+            tokens, channels, frames, height, width, patch, scale, bias
+        )
+    else:
+        kernels._unpatchify_video_kernel[grid](
+            tokens,
+            raster,
+            channels,
+            frames,
+            height,
+            width,
+            patch_frames,
+            patch_height,
+            patch_width,
+            *strides,
+            0,
+            0,
+            BLOCK=block,
+        )
+        expected = reference(tokens, channels, frames, height, width, patch)
+
+    error = (raster - expected).abs().max().item()
+    tolerance = (
+        4.0
+        * torch.finfo(torch.float32).eps
+        * max(1.0, expected.abs().max().item())
+    )
+    print(
+        f"channels={channels} frames={frames} {height}×{width} patch={patch} "
+        f"affine={affine} block={block}: max |error| = {error:.3e}"
+    )
+    written = torch.zeros_like(clip, dtype=torch.bool)
+    written[:, :, margin : margin + rows, margin : margin + columns] = True
+    outside = clip[~written]
+    return (
+        not torch.isnan(raster).any()
+        and torch.isnan(outside).all()
+        and error <= tolerance
+    )
+
+
+def main() -> int:
+    cases = [
+        (2, 2, 2, 3, (1, 2, 2), False, 8),
+        (2, 2, 2, 3, (1, 2, 2), True, 8),
+        (1, 1, 2, 2, (2, 2, 2), False, 16),
+        (3, 2, 2, 2, (1, 2, 2), True, 1024),
+        (3, 2, 2, 3, (1, 2, 2), False, 8, 3),
+        (3, 2, 2, 3, (1, 2, 2), True, 16, 5),
+    ]
+    return 0 if all(one(*case) for case in cases) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

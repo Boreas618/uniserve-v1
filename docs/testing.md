@@ -2,6 +2,15 @@
 
 The repository's checks run from the `justfile`: `just lint`, `just test-rust`, `just test-python-fast` (no GPU) and the GPU suites `just test-python-gpu` and `just test-python-sanitizer`. This page states what the GPU suites need from the host.
 
+## Kernel package checks
+
+The numerical checks of the kernel packages under `crates/ops/kernels` live in `tests/python/kernels/<family>/`, one copy per family of operators (a check shared by several operators takes the operator with `--op`), and each family's `test_<family>.py` runs every one of them as a subprocess. The ones marked `unit and not gpu` run on Triton's interpreter with no device visible and are part of `just test-python-fast`; the ones marked `gpu` compile and launch their kernel on a device and are skipped on a host without one.
+
+| Variable | What it names | Tests |
+| --- | --- | --- |
+| `UNISERVE_KERNEL_MODULES` | A directory of built modules, `<op>/<backend>/` holding the module of the descriptor the check's defaults describe (a check comparing two builds reads named subdirectories, such as `dense_attention/f32/causal`) | the module checks of the native and cubin packages, among them the `topk_softmax` router's launch |
+| `UNISERVE_KERNEL_KEYS`, `UNISERVE_KERNEL_STORE` | A key fixture and the store built from it | `test_kernel_arguments.py`, which compares every built cell's arguments with its operator's |
+
 ## GPU end-to-end tests
 
 The HTTP tests under `tests/python/e2e` start real servers on the host's GPUs. `just test-python-gpu` runs every test marked `e2e and gpu`; `just test-python-sanitizer` runs those marked `missing_state` with every main process under compute-sanitizer's memcheck. Both call `tools/gpu_e2e.sh`, which the nightly workflows call as well:
