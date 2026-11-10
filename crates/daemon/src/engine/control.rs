@@ -955,13 +955,16 @@ pub fn prepare_epoch(
     Ok(pinned)
 }
 
-/// `filled` with every other operator the leader's store holds.
+/// `filled` with the packages the leader's store holds for every operator the deployment names
+/// nothing for: the generation's full program set.
 ///
-/// A deployment names the operators its configuration selects a backend for, and every other
-/// operator is filled from the store. An update has to name those too: a revision installed for one
-/// of them is what the update exists to serve, and the record states what serves. Each takes its
-/// highest installed revision, ties broken by the backend's name, which is the rule a main process
-/// fills its first generation by.
+/// A deployment names the operators its configuration selects a backend for; for every other
+/// operator the Program Server selects, for each descriptor key, among its packages (`cover`). So
+/// what such an operator runs is decided by the packages the store holds, and the epoch's record
+/// keeps them - each backend's latest installed revision, one slot per backend with that backend
+/// as its part - so a revision installed for one of them is a program change a configuration
+/// comparison sees. These slots are not named to a main process (`ProgramSwitch::precopy`): they
+/// are what the selection chooses among, not a choice.
 ///
 /// # Errors
 ///
@@ -985,7 +988,7 @@ pub fn with_store_programs(
     let listing = client
         .list()
         .with_context(|| format!("reading the store of {}", leader_server.host))?;
-    let mut chosen: BTreeMap<String, (u32, String)> = BTreeMap::new();
+    let mut complete = filled.clone();
     for package in listing.packages {
         if package.op == POLICY_SLOT
             || ops::operator_name(&package.op).is_none()
@@ -993,20 +996,15 @@ pub fn with_store_programs(
         {
             continue;
         }
-        let candidate = (package.revision, package.backend);
-        let wins = chosen.get(&package.op).is_none_or(|held| {
-            candidate.0 > held.0 || (candidate.0 == held.0 && candidate.1 < held.1)
-        });
-        if wins {
-            chosen.insert(package.op, candidate);
-        }
-    }
-    let mut complete = filled.clone();
-    for (op, (_, backend)) in chosen {
+        // Each backend's latest revision: `prepare` selects the same one for the slot.
         complete.kernels.insert(
-            program_server::ProgramSlot::all(op),
+            program_server::ProgramSlot {
+                op: package.op,
+                phase: None,
+                part: Some(package.backend.clone()),
+            },
             program_server::Program {
-                backend,
+                backend: package.backend,
                 revision: 0,
                 arguments: toml::Table::new(),
             },
@@ -1275,10 +1273,14 @@ impl<'a> ProgramSwitch<'a> {
         programs: &BTreeMap<crate::epoch::KernelKey, crate::epoch::Program>,
         policy: &crate::epoch::Program,
     ) -> Result<(), crate::epoch::Failure> {
+        // A slot with a part is a package the store holds for an operator the deployment names
+        // nothing for (`with_store_programs`): the record keeps it, and the main process's
+        // selection chooses among such packages itself, so it is not named.
         let command = process::Command {
             kind: Some(command::Kind::Precopy(process::Precopy {
                 kernels: programs
                     .iter()
+                    .filter(|(slot, _)| slot.part.is_none())
                     .map(|(slot, program)| crate::epoch::kernel_to_wire(slot, program))
                     .collect(),
                 policy: Some(crate::epoch::program_to_wire(policy)),

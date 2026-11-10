@@ -739,10 +739,15 @@ impl Leader {
             let steps = crate::engine::control::PrepareSteps::new();
             let recorded = steps.clone();
             let preparing = tokio::task::spawn_blocking(move || {
+                // The record holds the generation's full program set: the named programs and
+                // the packages the store holds for every other operator, so a later revision of
+                // one of those is a change `route` sees.
+                let complete =
+                    crate::engine::control::with_store_programs(&servers, &leader_host, &filled)?;
                 crate::engine::control::prepare_epoch(
                     &servers,
                     &leader_host,
-                    &filled,
+                    &complete,
                     &[],
                     &recorded,
                 )
@@ -1757,30 +1762,13 @@ impl Leader {
             engine,
             programs: prepared,
         };
-        // Nothing the configuration states and no revision the Program
-        // Servers select differs: the change applies to nothing, and the
-        // epoch-level path answers it as unchanged.
-        if next.programs == filled {
-            return Ok(None);
-        }
-        // What the configuration names is a part of what serves: the rest of an epoch's programs
-        // come from the store. A target that resolves to what the epoch runs changes nothing,
-        // whatever else the same apply changed.
-        //
-        // The epoch's record holds what its configuration named, and the target's resolution holds
-        // the store's programs beside that, so the two are compared over what the epoch named: a
-        // comparison of the whole sets differs for every target, and every change of a limit or a
-        // switch would then replace all of an epoch's programs with themselves.
+        // The epoch's record and the target's resolution both hold the generation's full program
+        // set - the named programs and the store's packages of every other operator, revisions
+        // included - so they are compared whole: a target that resolves to what the epoch runs
+        // changes nothing, and a newly installed revision of any operator's package, named or
+        // not, is a program change.
         if self.epochs().serving().is_some_and(|(_, record)| {
-            record.policy == next.programs.policy
-                && filled
-                    .kernels
-                    .keys()
-                    .all(|key| record.kernels.contains_key(key))
-                && record
-                    .kernels
-                    .iter()
-                    .all(|(key, program)| next.programs.kernels.get(key) == Some(program))
+            record.policy == next.programs.policy && record.kernels == next.programs.kernels
         }) {
             return Ok(None);
         }
