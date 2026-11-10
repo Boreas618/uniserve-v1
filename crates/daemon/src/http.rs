@@ -603,7 +603,7 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::*;
-    use crate::test_support::{SERVED_MODEL, post_json, router, router_with, send, sim_engine};
+    use crate::test_support::{SERVED_MODEL, post_json, router, router_with, send, served_engine};
 
     /// A `GET` request to `path`.
     fn get_request(path: &str) -> Request<Body> {
@@ -635,7 +635,7 @@ mod tests {
     /// generation is paused, and logs what it did.
     #[tokio::test]
     async fn the_admin_api_pauses_generation_and_logs_it() {
-        let app = router(sim_engine(crate::test_support::CHAT));
+        let app = router(served_engine(crate::test_support::CHAT));
         let (status, _, body) = send(&app, get_request("/admin/status")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["deployment"]["deployment"], json!(SERVED_MODEL));
@@ -715,7 +715,7 @@ mod tests {
     /// run through their endpoints alone.
     #[tokio::test]
     async fn a_sleeping_deployment_serves_once_it_wakes() {
-        let app = router(sim_engine(crate::test_support::CHAT));
+        let app = router(served_engine(crate::test_support::CHAT));
         let (status, _, body) = send(&app, post_json("/admin/sleep", &json!({}))).await;
         assert_eq!(
             (status, &body["state"]),
@@ -761,7 +761,7 @@ mod tests {
     /// it ended, why and each worker's file.
     #[tokio::test]
     async fn a_profiling_session_runs_until_the_operator_ends_it() {
-        let app = router(sim_engine(crate::test_support::CHAT));
+        let app = router(served_engine(crate::test_support::CHAT));
         let (status, _, body) = send(&app, get_request("/admin/profile")).await;
         assert_eq!((status, &body["session"]), (StatusCode::OK, &json!(null)));
 
@@ -805,7 +805,7 @@ mod tests {
     /// request that runs no collector or names an unknown option is refused.
     #[tokio::test]
     async fn a_session_ends_after_its_seconds_and_a_faulty_request_is_refused() {
-        let app = router(sim_engine(crate::test_support::CHAT));
+        let app = router(served_engine(crate::test_support::CHAT));
         let output = tempfile::tempdir().expect("a profile directory");
         let (status, _, body) = send(
             &app,
@@ -841,7 +841,7 @@ mod tests {
     /// no adapter's.
     #[tokio::test]
     async fn a_loaded_adapter_is_served_under_its_name_until_unloaded() {
-        let app = router(sim_engine(crate::test_support::CHAT));
+        let app = router(served_engine(crate::test_support::CHAT));
         let adapter = json!({"lora_name": "tuned", "lora_path": "/adapters/tuned"});
         let (status, _, body) = send(&app, post_json("/admin/load_lora_adapter", &adapter)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -892,7 +892,7 @@ mod tests {
     /// resolved is refused before the engine is asked.
     #[tokio::test]
     async fn a_weight_update_from_an_unknown_checkpoint_is_refused() {
-        let app = router(sim_engine(crate::test_support::CHAT));
+        let app = router(served_engine(crate::test_support::CHAT));
         let (status, _, _) = send(
             &app,
             post_json("/admin/update_weights", &json!({"path": "/nowhere"})),
@@ -920,7 +920,7 @@ mod tests {
     async fn routes_follow_the_served_tasks() {
         let not_found = json!({"detail": "Not Found"});
 
-        let chat = router(sim_engine(crate::test_support::CHAT));
+        let chat = router(served_engine(crate::test_support::CHAT));
         let (status, _, _) = send(
             &chat,
             post_json("/v1/chat/completions", &chat_body(2, false)),
@@ -936,7 +936,7 @@ mod tests {
             assert_eq!((status, body), (StatusCode::NOT_FOUND, not_found.clone()));
         }
 
-        let video = router(sim_engine(crate::test_support::VIDEO));
+        let video = router(served_engine(crate::test_support::VIDEO));
         let (status, _, _) = send(&video, get_request("/v1/capabilities")).await;
         assert_eq!(status, StatusCode::OK);
         let (status, _, body) = send(
@@ -952,7 +952,7 @@ mod tests {
     #[tokio::test]
     async fn the_api_key_guards_every_route_but_health_and_metrics() {
         let router = router_with(
-            sim_engine(crate::test_support::CHAT),
+            served_engine(crate::test_support::CHAT),
             &ServerConfig {
                 api_key: Some("secret".to_owned()),
                 request_id_headers: true,
@@ -985,7 +985,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_past_the_timeout_answers_504() {
         let router = router_with(
-            sim_engine(crate::test_support::CHAT),
+            served_engine(crate::test_support::CHAT),
             &ServerConfig {
                 request_timeout: Some(Duration::ZERO),
                 ..ServerConfig::default()
@@ -1007,7 +1007,7 @@ mod tests {
     #[tokio::test]
     async fn a_full_server_sheds_requests_until_a_stream_ends() {
         let router = router_with(
-            sim_engine(crate::test_support::CHAT),
+            served_engine(crate::test_support::CHAT),
             &ServerConfig {
                 max_concurrent_requests: NonZeroU64::new(1),
                 ..ServerConfig::default()
@@ -1045,7 +1045,7 @@ mod tests {
     /// count an extension method under `other`.
     #[tokio::test]
     async fn http_metrics_bound_the_method_label() {
-        let router = router(sim_engine(crate::test_support::CHAT));
+        let router = router(served_engine(crate::test_support::CHAT));
         let request = Request::builder()
             .method("PURGE")
             .uri("/v1/models")
@@ -1085,7 +1085,7 @@ mod tests {
     /// connections, and returns once drained.
     #[tokio::test]
     async fn shutdown_drains_requests_in_flight_and_refuses_new_connections() {
-        let engine = Arc::new(sim_engine(crate::test_support::CHAT));
+        let engine = Arc::new(served_engine(crate::test_support::CHAT));
         let (listener, address) = loopback().await;
         let shutdown = CancellationToken::new();
         let server = tokio::spawn({
@@ -1130,7 +1130,7 @@ mod tests {
     /// shutdown budget runs out.
     #[tokio::test]
     async fn shutdown_stops_waiting_when_its_budget_runs_out() {
-        let engine = Arc::new(sim_engine(crate::test_support::CHAT));
+        let engine = Arc::new(served_engine(crate::test_support::CHAT));
         let (listener, address) = loopback().await;
         let budget = Duration::from_millis(200);
         let mut config = ServerArgs::default();
@@ -1180,7 +1180,7 @@ mod tests {
 
     /// The video routes' fixture: a router over the test video family.
     fn video_router() -> Router {
-        router(sim_engine(crate::test_support::VIDEO))
+        router(served_engine(crate::test_support::VIDEO))
     }
 
     /// A five-second video request of the served model.

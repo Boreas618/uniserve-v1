@@ -285,12 +285,11 @@ mod tests {
     use std::time::Duration;
 
     use proto::request::{Event, GenerationRequest, SamplingParams};
-    use scheduler::SimEngine;
 
     use super::*;
-    use crate::test_support::{SERVED_MODEL, sim_client, sim_core};
+    use crate::test_support::{SERVED_MODEL, fake_client, serving_core};
 
-    /// A text request that generates until the simulator's EOS.
+    /// A text request that generates until the fake's end of text.
     fn request() -> Request {
         GenerationRequest {
             request_id: Default::default(),
@@ -309,12 +308,9 @@ mod tests {
         .into()
     }
 
-    /// A client of one simulated scheduler.
+    /// A client of one scheduler over the default fake.
     fn client() -> Arc<EngineClient> {
-        Arc::new(sim_client(vec![sim_core(
-            scheduler::sim_args(SERVED_MODEL),
-            SimEngine::new(),
-        )]))
+        Arc::new(fake_client(vec![serving_core(SERVED_MODEL)]))
     }
 
     /// A submission waits while no engine serves, and the engine that comes

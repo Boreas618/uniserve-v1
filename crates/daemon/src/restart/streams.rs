@@ -485,12 +485,13 @@ pub(crate) fn finished(request_id: &str) {
 #[cfg(test)]
 mod tests {
     use proto::handoff::stream::Application;
-    use scheduler::SimEngine;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::options::VideoJobConfig;
-    use crate::test_support::{configured_tokenizer, leader_over, sim_client, sim_core, sim_model};
+    use crate::test_support::{
+        configured_tokenizer, fake_client, leader_over, serving_core, test_model,
+    };
 
     /// A pause that ends without answering its responses — the successor gave
     /// up, or the takeover failed before it answered — gives the deployment
@@ -546,10 +547,10 @@ mod tests {
         // The queue of taken-over responses is this process's, so the test
         // starts from what earlier tests left there.
         let _ = take_adopted();
-        let core = sim_core(scheduler::sim_args("refused-handoff"), SimEngine::new());
-        let client = std::sync::Arc::new(sim_client(vec![core]));
+        let core = serving_core("refused-handoff");
+        let client = std::sync::Arc::new(fake_client(vec![core]));
         let leader = std::sync::Arc::new(leader_over(
-            sim_model(crate::test_support::CHAT),
+            test_model(crate::test_support::CHAT),
             configured_tokenizer(),
             "refused-handoff".into(),
             vec![client],
@@ -587,10 +588,10 @@ mod tests {
     #[tokio::test]
     async fn a_response_that_names_no_application_stays_with_the_predecessor() {
         let _ = take_adopted();
-        let core = sim_core(scheduler::sim_args("refused-handoff-2"), SimEngine::new());
-        let client = std::sync::Arc::new(sim_client(vec![core]));
+        let core = serving_core("refused-handoff-2");
+        let client = std::sync::Arc::new(fake_client(vec![core]));
         let leader = std::sync::Arc::new(leader_over(
-            sim_model(crate::test_support::CHAT),
+            test_model(crate::test_support::CHAT),
             configured_tokenizer(),
             "refused-handoff-2".into(),
             vec![client],

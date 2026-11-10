@@ -20,7 +20,7 @@
 //! - how a batch ends: refused at submission ([`FakeBatches::refuse`]), or failed after it was
 //!   accepted, which is a lost device ([`FakeBatches::fail_held`]).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -69,6 +69,9 @@ pub enum Tokens {
     /// [`SAMPLED`] plus the keys the call's last row sees, modulo the window: a function of the
     /// request's history as the mechanism states it, independent of the sampling key.
     Extent,
+    /// This one token for every call: a model whose sampling a request has restricted to it
+    /// (`allowed_token_ids`), which a case reads back as text.
+    Fixed(u32),
 }
 
 /// What a call's row state reports once the call completed.
@@ -116,6 +119,11 @@ pub struct FakeBatches {
     answer: Option<Answer>,
     media: Option<Media>,
     end: Option<EndOfText>,
+    /// How many tokens each request's text holds before it ends ([`FakeBatches::with_text_len`]).
+    text_len: Option<u64>,
+    /// The logical position of the first token the fake sampled on each request's Philox stream,
+    /// by stream key: where its generated text begins.
+    text_starts: Mutex<HashMap<u64, u64>>,
     operate: Option<Operate>,
     /// Every batch submitted, in submission order: what the mechanism asked for is half of what a
     /// case observes.
@@ -152,6 +160,8 @@ impl FakeBatches {
             answer: None,
             media: None,
             end: None,
+            text_len: None,
+            text_starts: Mutex::new(HashMap::new()),
             operate: None,
             submitted: Mutex::new(Vec::new()),
             shadows: Mutex::new(Vec::new()),
@@ -190,6 +200,17 @@ impl FakeBatches {
     #[must_use]
     pub fn with_end(mut self, end: EndOfText) -> Self {
         self.end = Some(end);
+        self
+    }
+
+    /// Ends every request's text after `tokens` sampled tokens with [`crate::EOS`], wherever its
+    /// prompt ends: the fake remembers the position of the first token it sampled on each
+    /// request's Philox stream and samples the end of text `tokens` positions later. A request
+    /// submitted again (a migration) starts a stream of its own, so it ends `tokens` after its
+    /// resumed prompt.
+    #[must_use]
+    pub fn with_text_len(mut self, tokens: u64) -> Self {
+        self.text_len = Some(tokens);
         self
     }
 
@@ -291,7 +312,29 @@ impl FakeBatches {
             return answer(batch);
         }
 
-        Outcome::Success(completed_until(batch, self.tokens, self.extent, self.end))
+        let mut output = completed_until(batch, self.tokens, self.extent, self.end);
+        if let Some(text_len) = self.text_len {
+            self.end_texts(batch, &mut output, text_len);
+        }
+        Outcome::Success(output)
+    }
+
+    /// Replaces each sampled token at or past its request's `text_len`-th generated position with
+    /// [`crate::EOS`] ([`Self::with_text_len`]).
+    fn end_texts(&self, batch: &Batch, output: &mut BatchOutput, text_len: u64) {
+        let mut starts = lock(&self.text_starts);
+        for (index, call) in output.calls.iter_mut().enumerate() {
+            let Some(draw) = batch.columns.draws.get(sampling_row(batch, index)).copied() else {
+                continue;
+            };
+            if call.tokens.is_empty() {
+                continue;
+            }
+            let start = *starts.entry(draw.key).or_insert(draw.position);
+            if draw.position >= start + text_len {
+                call.tokens = vec![crate::EOS];
+            }
+        }
     }
 
     /// Accepts `batch` and answers its submission: completed now, or held.
@@ -352,11 +395,7 @@ fn complete(
     end: Option<EndOfText>,
 ) -> CallOutput {
     let rows = &batch.columns.rows;
-    let row = rows
-        .calls
-        .get(index)
-        .and_then(|call| call.rows.end.checked_sub(1))
-        .map_or(index, |row| row as usize);
+    let row = sampling_row(batch, index);
     let seen = rows.seq_lens.get(row).copied().unwrap_or(0).max(0) as u32;
 
     let token = match tokens {
@@ -368,6 +407,7 @@ fn complete(
             .map_or(SAMPLED + index as u32, draw_token),
         Tokens::Positional => SAMPLED + index as u32,
         Tokens::Extent => SAMPLED + seen % VOCABULARY,
+        Tokens::Fixed(token) => token,
     };
     let ended = end.filter(|end| {
         batch
@@ -467,6 +507,18 @@ impl Batches for FakeBatches {
             Outcome::Success(BatchOutput::default()),
         ))
     }
+}
+
+/// The row of call `index` of `batch` that samples: the last of the rows the call owns
+/// (`BatchRow::rows`), or row `index` when the columns state no rows for it (a media batch).
+fn sampling_row(batch: &Batch, index: usize) -> usize {
+    batch
+        .columns
+        .rows
+        .calls
+        .get(index)
+        .and_then(|call| call.rows.end.checked_sub(1))
+        .map_or(index, |row| row as usize)
 }
 
 #[cfg(test)]

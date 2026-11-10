@@ -18,6 +18,7 @@ pub mod batches;
 pub mod media;
 pub mod policy;
 pub mod pools;
+pub mod service;
 pub mod text;
 
 pub use batches::{
@@ -26,4 +27,5 @@ pub use batches::{
 pub use media::Media;
 pub use policy::{packaged_module, packaged_policy, packaged_program};
 pub use pools::{args, limits, pool, rank};
+pub use service::{EpochPolicy, serve_requests};
 pub use text::{EOS, EndOfText, special_tokens};

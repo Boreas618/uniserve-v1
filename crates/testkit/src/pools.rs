@@ -59,9 +59,90 @@ pub fn pool(group: &str) -> Inventory {
 }
 
 /// The launch arguments of a deployment named `name` on the CPU: one pool of one rank on this
-/// host, with the simulation's generation limits and end of text.
+/// host, named as its worker group ([`proto::config::DEFAULT_BLOCK`]), generation limits without a
+/// model-imposed bound, the fake's end of text ([`crate::EOS`]), two batches in flight, and every
+/// other section's default. Pair them with a fake over [`pool`] of `args.group`.
 pub fn args(name: &str) -> EngineArgs {
-    scheduler::sim_args(name)
+    launch(name)
+}
+
+fn launch(model: impl Into<String>) -> EngineArgs {
+    use std::num::NonZeroUsize;
+    #[expect(
+        clippy::expect_used,
+        reason = "DEFAULT_MAX_RUNNING_REQUESTS is a positive constant"
+    )]
+    let max_running_requests =
+        NonZeroUsize::new(proto::config::DEFAULT_MAX_RUNNING_REQUESTS).expect("a positive default");
+    let group = proto::config::WorkerGroupConfig::placed(
+        &["localhost".to_owned()],
+        "cpu",
+        1,
+        2,
+        proto::config::WorkerGroupConfig::single_component(proto::config::DEFAULT_BLOCK, 1),
+    );
+    let mut args = EngineArgs::new(proto::config::EngineConfig {
+        executable: proto::BUILD.to_owned(),
+        model: proto::config::ModelConfig {
+            model: model.into(),
+            base: None,
+            lora_path: None,
+            max_model_len: 0,
+            dtype: scheduler::ModelDtype::BFloat16,
+            quantization: Default::default(),
+            generation_limits: proto::request::GenerationLimits {
+                max_vae_grid_tokens: u32::MAX,
+                max_vit_grid_tokens: u32::MAX,
+                max_latent_feature_bytes: 256 << 20,
+                max_vision_feature_bytes: 256 << 20,
+                encoder_cache_entries: 256,
+                ..Default::default()
+            },
+            bos: 0,
+            // The end of text a fake samples (`crate::EOS`), which the scheduler must
+            // recognize to finish a request.
+            eos: vec![crate::EOS],
+            canvas_sampling: None,
+            prefill_outputs: true,
+        },
+        parallel: proto::config::ParallelConfig {
+            tensor_parallel_size: NonZeroUsize::MIN,
+            data_parallel_size: NonZeroUsize::MIN,
+            engine_host: "localhost".to_owned(),
+            worker_groups: vec![group.clone()],
+        },
+        deployment: format!("deployment-{}", uuid::Uuid::new_v4().simple()),
+        max_running_requests,
+        max_num_batched_tokens: None,
+        attention_backend: String::new(),
+        prefill_attention_backend: None,
+        decode_attention_backend: None,
+        moe_runner_backend: None,
+        device: Default::default(),
+        scheduler: Default::default(),
+        media: Default::default(),
+        mem_fraction_static: 0.9,
+        load: Default::default(),
+        kv_cache: Default::default(),
+        moe: Default::default(),
+        cuda_graph: Default::default(),
+        worker: Default::default(),
+        speculative: Default::default(),
+        video: Default::default(),
+        profiling: Default::default(),
+    });
+    // A fake keeps no host tier: it has no Storage Server to keep one in.
+    args.engine_config.kv_cache.host_tier = false;
+    args.host = "localhost".to_owned();
+    args.group = group.id.0.clone();
+    #[expect(
+        clippy::expect_used,
+        reason = "the group is placed with one rank, which a u32 holds"
+    )]
+    let world_size = u32::try_from(group.ranks.len()).expect("one rank");
+    args.world_size = world_size;
+    args.queue_depth = 2;
+    args
 }
 
 /// The mechanism's limits for `batches`: as many running requests as its ranks hold request rows.

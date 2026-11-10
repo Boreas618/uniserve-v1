@@ -4235,10 +4235,18 @@ dependencies = [
 name = "testkit"
 version = "2.0.0"
 dependencies = [
+ "anyhow",
+ "crossbeam-channel",
  "ipc",
  "proto",
  "scheduler",
+ "scheduling",
+ "serde_json",
+ "storage",
  "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

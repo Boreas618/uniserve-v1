@@ -11,10 +11,8 @@
 //! `Submissions` (`submission`) to the worker crate's `Batches`.
 //!
 //! The `testing` feature additionally exports `SimWorker`, `SimEngine`, and
-//! `BatchEvent` (`sim`), a GPU-free worker for scheduler and frontend tests,
-//! which plugs in through the `Worker` trait, and `serve_requests`
-//! (`service`), which serves the request interface over simulated schedulers
-//! for the daemon's tests.
+//! `BatchEvent` (`sim`), a GPU-free worker for scheduler tests, which plugs in
+//! through the `Worker` trait.
 //!
 //! The scheduler is the request algorithms and the single-owner control loop.
 //! The loop combines request progress, scheduler policy, storage allocations, and
@@ -60,8 +58,6 @@ mod handle;
 mod host_pages;
 mod kv_cache;
 #[cfg(feature = "testing")]
-mod service;
-#[cfg(feature = "testing")]
 mod sim;
 mod trajectories;
 mod warmup;
@@ -85,8 +81,6 @@ pub use crate::worker::{
 // The engine schedules requests in the request vocabulary its daemon
 // submits them in.
 pub use crate::kv_cache::{HostCacheSize, IndexedPage, prefix_seeds};
-#[cfg(feature = "testing")]
-pub use crate::service::{EpochPolicy, serve_requests};
 pub use crate::submission::Submissions;
 // The simulated engine is test support: `mod sim` is built only with the
 // `testing` feature, so its surface is exported only with it. A production

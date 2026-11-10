@@ -336,7 +336,7 @@ impl<G: Unpin> HttpBody for GuardedBody<G> {
 #[cfg(test)]
 mod tests {
     use crate::options::ServerConfig;
-    use crate::test_support::{SERVED_MODEL, post_json, router_with, send, sim_engine};
+    use crate::test_support::{SERVED_MODEL, post_json, router_with, send, served_engine};
     use axum::http::StatusCode;
 
     /// Sends a two-token chat completion with `request_id` as its
@@ -344,7 +344,7 @@ mod tests {
     /// completion `id`.
     async fn chat(request_id: Option<&str>) -> (String, String) {
         let router = router_with(
-            sim_engine(crate::test_support::CHAT),
+            served_engine(crate::test_support::CHAT),
             &ServerConfig {
                 request_id_headers: true,
                 ..ServerConfig::default()

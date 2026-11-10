@@ -7,15 +7,22 @@ publish = false
 
 # Test support shared by the scheduler's and the daemon's tests: the one test
 # double at the worker's batch interface (`ipc::execution::Batches`), the
-# pools it states, and the policy module a test epoch installs. Never a
+# pools it states, the stand-in of an engine's request interface the daemon's
+# tests serve over it, and the policy module a test epoch installs. Never a
 # dependency of a serving build.
 [dependencies]
+anyhow.workspace = true
+crossbeam-channel.workspace = true
 ipc.workspace = true
+storage.workspace = true
+scheduling.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
 proto.workspace = true
 tempfile.workspace = true
-# `sim_args`, the simulation's launch arguments, is built with the scheduler's
-# `testing` feature until the simulated worker is gone.
-scheduler = { workspace = true, features = ["testing"] }
+scheduler.workspace = true
 
 [lints]
 workspace = true

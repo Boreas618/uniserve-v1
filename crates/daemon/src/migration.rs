@@ -656,11 +656,10 @@ mod tests {
     use std::time::Duration;
 
     use proto::request::{DiffusionSamplingParams, GenerationRequest, SamplingParams, Trajectory};
-    use scheduler::SimEngine;
 
     use super::*;
     use crate::engine::client::EngineClient;
-    use crate::test_support::{SERVED_MODEL, sim_client, sim_core};
+    use crate::test_support::{SERVED_MODEL, fake_client, fake_core, letter_fake};
 
     /// A text request of a four-token prompt that generates `max_tokens`
     /// tokens.
@@ -681,15 +680,12 @@ mod tests {
         }
     }
 
-    /// A client of one simulated scheduler that generates text until a
-    /// request's limit.
+    /// A client of one scheduler over a fake whose text never ends, so a
+    /// request generates until its limit.
     fn client() -> Arc<EngineClient> {
-        let mut sim = SimEngine::new();
-        sim.set_text_len(100_000);
-        Arc::new(sim_client(vec![sim_core(
-            scheduler::sim_args(SERVED_MODEL),
-            sim,
-        )]))
+        let args = testkit::args(SERVED_MODEL);
+        let fake = Arc::new(letter_fake(&args));
+        Arc::new(fake_client(vec![fake_core(args, fake)]))
     }
 
     /// Receives the next event within ten seconds.

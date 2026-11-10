@@ -1,17 +1,20 @@
 //! A stand-in for a main process's request interface, for the daemon's tests.
 //!
 //! The daemon's tests drive a real `Leader` over the request interface. A
-//! serving deployment answers that interface in the `uniserve` binary's main
-//! process, which this library cannot reach, so these tests serve it with
-//! simulated schedulers from here. The module is built only with the `testing`
-//! feature: no serving build holds it.
+//! serving deployment answers that interface in the engine's main process
+//! (`engine::process::requests`), whose construction loads ranks onto devices
+//! from a launch file, so these tests serve it from here instead, over
+//! production schedulers whose worker is the batch-interface fake
+//! ([`crate::FakeBatches`]). This crate is never part of a serving build.
 //!
-//! The daemon submits requests and commands; the engine routes each request
-//! to the live scheduler with the fewest requests in flight (data-parallel
-//! routing, as SGLang's `DataParallelController` and vLLM's data-parallel
-//! client balance by running plus waiting requests), answers it `Accepted`
-//! naming the scheduler, and forwards its events. Each scheduler's
-//! statistics go to the daemon once a second.
+//! The daemon submits requests and commands; the stand-in routes each request
+//! as the engine does, by the routing policy's `route` decision on the control
+//! thread's instance (`scheduler::Router::route`), answers it `Accepted`
+//! naming the scheduler, and forwards its events. A request that resumes a
+//! cache this stand-in recorded goes back to the scheduler that stored it.
+//! Each scheduler's statistics go to the daemon once a second. The storage
+//! ledgers are refused as an engine refuses them: each node's daemon reads
+//! them over its claim.
 //!
 //! A request's events flow under credit: the engine sends at most
 //! [`EVENT_WINDOW`] beyond those the daemon's consumer took (`Consumed`), so
@@ -37,14 +40,19 @@ use proto::Connection;
 use proto::request::wire::{self, Scheduling, from_engine, to_engine};
 use proto::request::{ArtifactMedia, EVENT_WINDOW, Event, MigrationCause, Request, RequestId};
 
-use crate::core::SchedulerHandle;
-use crate::handle::EventRx;
-use crate::{
+use scheduler::EventRx;
+use scheduler::SchedulerHandle;
+use scheduler::{
     Arrival, BatchCapacity, DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     PolicyProgram, PolicySource, PolicyUsage, Router, SchedulerConfig, SchedulerStatsReporter,
     ceilings_of,
 };
 use scheduling::guest::view::RankView;
+
+/// What the stand-in answers a command over the deployment's storage ledgers or transfer budgets,
+/// as an engine process does (`engine::process::requests::LEDGERS`).
+const LEDGERS: &str = "the storage ledgers and transfer budgets are read by each node's daemon over its claim, not \
+     by an epoch's main process";
 
 /// How often each scheduler's statistics are reported.
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
@@ -139,7 +147,7 @@ impl Routing {
     /// `None` when no routing policy serves or the policy failed.
     fn route(&self, arrival: &Arrival) -> Option<usize> {
         let ranks = self.ranks();
-        match crate::lock(&self.route).route(arrival, &ranks) {
+        match lock(&self.route).route(arrival, &ranks) {
             Ok(index) => Some(index),
             Err(refusal) => {
                 tracing::warn!(reason = %refusal.reason, "a request was not routed");
@@ -156,7 +164,7 @@ impl Routing {
         program: PolicyProgram,
     ) -> Result<(), String> {
         let ranks = self.ranks();
-        let mut router = crate::lock(&self.route);
+        let mut router = lock(&self.route);
         let candidate = Router::prepare(source, program, &ranks, &router.ceilings())
             .map_err(|error| error.to_string())?;
         router.adopt(candidate);
@@ -193,7 +201,7 @@ impl Routing {
             reported.push(progress.and_then(|progress| progress.usage));
             let stats = slot.handle.stats();
             metrics.batches += stats.general.steps.load(Ordering::Relaxed);
-            metrics.tokens += crate::lock(&stats.worker.forward_mode_tokens)
+            metrics.tokens += lock(&stats.worker.forward_mode_tokens)
                 .values()
                 .sum::<u64>();
             metrics.queue.push(wire::QueueDepth {
@@ -211,19 +219,19 @@ impl Routing {
     /// §12's cost counters for the control thread's own route instance, which
     /// serves under the same epoch policy as the schedulers'.
     fn route_usage(&self) -> PolicyUsage {
-        crate::lock(&self.route).usage()
+        lock(&self.route).usage()
     }
 
     /// The scheduler that serves `request`, while it is in flight.
     fn of(&self, request: RequestId) -> Option<&SchedulerHandle> {
-        let index = crate::lock(&self.requests).get(&request)?.slot;
+        let index = lock(&self.requests).get(&request)?.slot;
         Some(&self.slots[index].handle)
     }
 
     /// Records that the daemon's consumer took `events` of `request`'s
     /// events in all.
     fn consumed(&self, request: RequestId, events: u64) {
-        if let Some(in_flight) = crate::lock(&self.requests).get(&request) {
+        if let Some(in_flight) = lock(&self.requests).get(&request) {
             in_flight.consumed.send_if_modified(|consumed| {
                 let advanced = events > *consumed;
                 *consumed = (*consumed).max(events);
@@ -237,7 +245,7 @@ impl Routing {
     /// belongs to that connection, so closing another one does not abandon
     /// it.
     fn take_over(&self, request: RequestId, front: usize, consumed: u64) {
-        if let Some(in_flight) = crate::lock(&self.requests).get_mut(&request) {
+        if let Some(in_flight) = lock(&self.requests).get_mut(&request) {
             in_flight.front = front;
             let _ = in_flight.takeover.send(Some(Takeover { front, consumed }));
         }
@@ -245,7 +253,7 @@ impl Routing {
 
     /// Forgets a request that ended.
     fn finish(&self, request: RequestId) {
-        if let Some(in_flight) = crate::lock(&self.requests).remove(&request) {
+        if let Some(in_flight) = lock(&self.requests).remove(&request) {
             self.slots[in_flight.slot]
                 .in_flight
                 .fetch_sub(1, Ordering::Relaxed);
@@ -298,21 +306,21 @@ impl Routing {
 
     /// Queues `frame` for the daemon `front`, while it is connected.
     fn send(&self, front: usize, frame: Frame) {
-        if let Some(Some(frames)) = crate::lock(&self.fronts).get(front) {
+        if let Some(Some(frames)) = lock(&self.fronts).get(front) {
             let _ = frames.send(frame);
         }
     }
 
     /// Queues the frame `make` builds for every connected daemon.
     fn broadcast(&self, make: impl Fn() -> Frame) {
-        for frames in crate::lock(&self.fronts).iter().flatten() {
+        for frames in lock(&self.fronts).iter().flatten() {
             let _ = frames.send(make());
         }
     }
 
     /// The daemons still connected.
     fn connected(&self) -> usize {
-        crate::lock(&self.fronts).iter().flatten().count()
+        lock(&self.fronts).iter().flatten().count()
     }
 }
 
@@ -469,7 +477,7 @@ fn serve(
     SchedulerHandle::shutdown_all(routing.slots.iter().map(|slot| &slot.handle));
     drop(streams);
     let _ = events_thread.join();
-    crate::lock(&routing.fronts).clear();
+    lock(&routing.fronts).clear();
     let mut outcome = opened;
     for (writer, reader) in threads {
         let written = writer
@@ -506,7 +514,7 @@ fn open_front(
 ) -> anyhow::Result<()> {
     let (frames, outgoing) = crossbeam_channel::unbounded::<Frame>();
     let front = {
-        let mut fronts = crate::lock(&routing.fronts);
+        let mut fronts = lock(&routing.fronts);
         fronts.push(Some(frames));
         fronts.len() - 1
     };
@@ -535,10 +543,10 @@ fn open_front(
 /// Forgets the daemon `front`, whose connection closed, and aborts its
 /// requests in flight: no daemon reads their events any more.
 fn close_front(front: usize, routing: &Routing) {
-    if let Some(entry) = crate::lock(&routing.fronts).get_mut(front) {
+    if let Some(entry) = lock(&routing.fronts).get_mut(front) {
         *entry = None;
     }
-    let abandoned: Vec<(RequestId, usize)> = crate::lock(&routing.requests)
+    let abandoned: Vec<(RequestId, usize)> = lock(&routing.requests)
         .iter()
         .filter(|(_, in_flight)| in_flight.front == front)
         .map(|(id, in_flight)| (*id, in_flight.slot))
@@ -614,15 +622,17 @@ fn read_requests(
                     warm_cache(warm, front, routing);
                 }
                 Some(wire::engine_command::Kind::DescribeStorage(describe)) => {
-                    // The deployment's claims cover every node, so the first
-                    // scheduler reads them all.
-                    let answers: Vec<_> = routing
-                        .slots
-                        .first()
-                        .map(|slot| slot.handle.ledgers())
-                        .into_iter()
-                        .collect();
-                    answer_hooked(describe.id, answers, front, routing);
+                    // As an engine process answers it: the storage ledgers and the transfer
+                    // budgets are each node's daemon's, read over its claim, and an epoch's main
+                    // process holds no claim of the deployment's.
+                    routing.send(
+                        front,
+                        Frame::plain(from_engine::Kind::Hooked(wire::Hooked {
+                            id: describe.id,
+                            results: Vec::new(),
+                            error: LEDGERS.to_owned(),
+                        })),
+                    );
                 }
                 Some(wire::engine_command::Kind::FlushCache(_)) => {
                     for slot in &routing.slots {
@@ -636,7 +646,7 @@ fn read_requests(
                         .iter()
                         .map(|(path, order)| (path.clone(), order.experts.clone()))
                         .collect::<std::collections::BTreeMap<_, _>>();
-                    let together = crate::HookBarrier::new(routing.slots.len());
+                    let together = scheduler::HookBarrier::new(routing.slots.len());
                     let answers = routing
                         .slots
                         .iter()
@@ -652,9 +662,11 @@ fn read_requests(
                 }
                 Some(wire::engine_command::Kind::UpdateWeights(update)) => {
                     let in_flight = match wire::WeightsInFlight::try_from(update.in_flight) {
-                        Ok(wire::WeightsInFlight::Keep) => crate::WeightsInFlight::Keep,
-                        Ok(wire::WeightsInFlight::Recompute) => crate::WeightsInFlight::Recompute,
-                        Ok(wire::WeightsInFlight::Abort) => crate::WeightsInFlight::Abort,
+                        Ok(wire::WeightsInFlight::Keep) => scheduler::WeightsInFlight::Keep,
+                        Ok(wire::WeightsInFlight::Recompute) => {
+                            scheduler::WeightsInFlight::Recompute
+                        }
+                        Ok(wire::WeightsInFlight::Abort) => scheduler::WeightsInFlight::Abort,
                         Err(_) => {
                             routing.send(
                                 front,
@@ -729,7 +741,7 @@ fn submit_all(
             Request::Generation(request) => request
                 .cache
                 .resume
-                .and_then(|resume| crate::lock(&routing.cache_routes).remove(&resume)),
+                .and_then(|resume| lock(&routing.cache_routes).remove(&resume)),
             Request::Diffusion(_) => None,
         };
         let arrival = Arrival::of(id, &request, recovered);
@@ -751,7 +763,7 @@ fn submit_all(
             .fetch_add(1, Ordering::Relaxed);
         let (consumed, credit) = tokio::sync::watch::channel(0);
         let (takeover, taken_over) = tokio::sync::watch::channel(None);
-        crate::lock(&routing.requests).insert(
+        lock(&routing.requests).insert(
             id,
             InFlight {
                 slot: index,
@@ -911,7 +923,7 @@ fn warm_cache(warm: wire::CacheWarm, front: usize, routing: &Arc<Routing>) {
             host,
         } => {
             let mut assigned = vec![Vec::new(); routing.slots.len()];
-            let mut routes = crate::lock(&routing.cache_routes);
+            let mut routes = lock(&routing.cache_routes);
             for prefix in prefixes {
                 let resume = proto::request::CacheResume {
                     epoch: prefix.resume.0,
@@ -932,8 +944,8 @@ fn warm_cache(warm: wire::CacheWarm, front: usize, routing: &Arc<Routing>) {
         }
         Operation::Coverage { prefixes, keep } => {
             let mut assigned = vec![Vec::new(); routing.slots.len()];
-            let routes = crate::lock(&routing.cache_routes);
-            let requests = crate::lock(&routing.requests);
+            let routes = lock(&routing.cache_routes);
+            let requests = lock(&routing.requests);
             for prefix in prefixes {
                 let resume = proto::request::CacheResume {
                     epoch: prefix.resume.0,
@@ -956,17 +968,17 @@ fn warm_cache(warm: wire::CacheWarm, front: usize, routing: &Arc<Routing>) {
                 .collect()
         }
         Operation::Discard => {
-            crate::lock(&routing.cache_routes).clear();
+            lock(&routing.cache_routes).clear();
             vec![Operation::Discard; routing.slots.len()]
         }
         Operation::Retain { requests } => {
-            crate::lock(&routing.cache_routes)
+            lock(&routing.cache_routes)
                 .retain(|resume, _| requests.contains(&(resume.epoch, resume.request_id)));
             vec![Operation::Retain { requests }; routing.slots.len()]
         }
         operation => vec![operation; routing.slots.len()],
     };
-    let together = crate::HookBarrier::new(routing.slots.len());
+    let together = scheduler::HookBarrier::new(routing.slots.len());
     let answers = routing
         .slots
         .iter()
@@ -979,7 +991,7 @@ fn warm_cache(warm: wire::CacheWarm, front: usize, routing: &Arc<Routing>) {
 /// Gives back or restores every scheduler's KV cache storage, and answers
 /// the daemon `front` with `Hooked` as `run_hook` does.
 fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>) {
-    let change = match crate::CacheChange::from_wire(resize) {
+    let change = match scheduler::CacheChange::from_wire(resize) {
         Ok(change) => change,
         Err(error) => {
             routing.send(
@@ -1177,7 +1189,7 @@ fn promote_schedulers(promote: wire::Promote, routing: &Arc<Routing>) {
                                     .iter()
                                     .find(|indexed| indexed.worker_group == group)
                             })
-                            .map(|indexed| crate::ParkedCache {
+                            .map(|indexed| scheduler::ParkedCache {
                                 pages: indexed
                                     .pages
                                     .iter()
@@ -1185,7 +1197,7 @@ fn promote_schedulers(promote: wire::Promote, routing: &Arc<Routing>) {
                                     // page of this build's chains: it is not
                                     // imported, and a prompt computes it.
                                     .filter_map(|page| {
-                                        Some(crate::kv_cache::IndexedPage {
+                                        Some(scheduler::IndexedPage {
                                             group: page.group,
                                             hash: storage::Key(
                                                 page.hash.as_slice().try_into().ok()?,
@@ -1213,7 +1225,7 @@ fn promote_schedulers(promote: wire::Promote, routing: &Arc<Routing>) {
                             })
                             .unwrap_or_default();
                         for resume in parked.pages.iter().filter_map(|page| page.resume) {
-                            crate::lock(&routing.cache_routes).insert(resume, slot_index);
+                            lock(&routing.cache_routes).insert(resume, slot_index);
                         }
                         let (recompute, grows) = (promote.recompute, promote.grows);
                         scope.spawn(move || slot.handle.promote(parked, recompute, grows))
@@ -1292,7 +1304,7 @@ fn park_schedulers(id: u64, lend: bool, front: usize, routing: &Arc<Routing>) {
                 match answer.recv() {
                     Ok(Ok(parked)) => {
                         for resume in parked.pages.iter().filter_map(|page| page.resume) {
-                            crate::lock(&routing.cache_routes).insert(resume, slot_index);
+                            lock(&routing.cache_routes).insert(resume, slot_index);
                         }
                         if let Some(group) = group {
                             index.push(wire::GroupIndex {
@@ -1558,7 +1570,7 @@ fn describe_requests(id: u64, front: usize, routing: &Arc<Routing>) {
 }
 
 /// One worker group's KV cache on the wire.
-fn wire_cache(group: crate::GroupCache) -> wire::CacheSegments {
+fn wire_cache(group: scheduler::GroupCache) -> wire::CacheSegments {
     wire::CacheSegments {
         worker_group: group.worker_group,
         segments: group
@@ -1933,6 +1945,14 @@ fn scheduler_limits(scheduling: &Scheduling) -> anyhow::Result<SchedulerConfig> 
     })
 }
 
+/// Locks `mutex`, recovering the data of a thread that panicked holding it: a fixture's state stays
+/// readable for the assertion that reports the panic.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     //! What routing sees of a request before a scheduler holds it, and what
@@ -1988,7 +2008,7 @@ mod tests {
     fn an_arriving_request_is_queued_with_what_it_was_submitted_with() {
         let request = Request::Generation(Box::new(generation(vec![1, 2, 3, 4], 64)));
         let arrival = Arrival::of(RequestId(7), &request, Some(2));
-        let view = crate::arrival_view(&arrival);
+        let view = scheduler::arrival_view(&arrival);
         assert_eq!(view.state, RequestState::Queued);
         assert_eq!(view.class, scheduling::guest::view::RequestClass::Token);
         assert_eq!(view.priority, 3);
@@ -2006,7 +2026,7 @@ mod tests {
         let mut request = generation(vec![1, 2, 3, 4], 64);
         request.generated_token_ids = vec![9, 10];
         let arrival = Arrival::of(RequestId(7), &Request::Generation(Box::new(request)), None);
-        let view = crate::arrival_view(&arrival);
+        let view = scheduler::arrival_view(&arrival);
         assert_eq!(view.generated_tokens, 2);
         assert!(
             view.migratable,

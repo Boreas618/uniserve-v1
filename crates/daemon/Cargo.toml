@@ -48,8 +48,10 @@ uuid.workspace = true
 [dev-dependencies]
 # The application crate's test fixtures, such as the byte tokenizer.
 frontend = { workspace = true, features = ["testing"] }
-scheduler = { workspace = true, features = ["testing"] }
-# The packaged policy a test epoch installs.
+# The schedulers a test engine runs, over the batch-interface fake.
+scheduler.workspace = true
+# The batch-interface fake, the engine's request-interface stand-in and the
+# packaged policy a test epoch installs.
 testkit.workspace = true
 # Tests drive the request interface with in-process schedulers and build
 # their worker values.

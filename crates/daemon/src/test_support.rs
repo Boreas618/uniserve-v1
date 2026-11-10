@@ -1,13 +1,15 @@
-//! Simulated components shared by the crate's tests, one fixture each: the
-//! byte tokenizer, in-storage tokenizer loading, the engine over simulated
-//! schedulers, the video service, and the server's router.
+//! Components shared by the crate's tests, one fixture each: the byte
+//! tokenizer, in-storage tokenizer loading, the engine over schedulers whose
+//! worker is the batch-interface fake, the video service, and the server's
+//! router.
 //!
 //! Requests travel through the server's router (`http::router`) into a real
 //! `Leader`, whose client submits them over the request interface to
-//! schedulers that drive `SimEngine` through `SimWorker`; the schedulers
-//! serve the interface on a thread of this process, as an engine process
-//! serves it. The default simulator provides no video media components, so
-//! the engine refuses every video submission as an invalid request.
+//! production schedulers built over `testkit::FakeBatches` through the
+//! serving door (`SchedulerHandle::over_batches_telling`); the schedulers
+//! serve the interface on a thread of this process (`testkit::serve_requests`),
+//! as an engine process serves it. The default fake serves text alone, so the
+//! engine refuses every video submission as an invalid request.
 
 use std::collections::{BTreeSet, HashMap};
 use std::os::unix::net::UnixStream;
@@ -17,7 +19,8 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
-use scheduler::{SchedulerHandle, SimEngine, SimWorker};
+use scheduler::SchedulerHandle;
+use testkit::FakeBatches;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 
@@ -32,7 +35,7 @@ use frontend::model::{ModelConfig, SamplingDefaults};
 use frontend::openai::video_jobs::VideoJobs;
 use frontend::tokenizer::DynTokenizer;
 
-/// Served model name the simulated engines answer to.
+/// Served model name the test engines answer to.
 pub(crate) const SERVED_MODEL: &str = "sim-model";
 
 /// The application crate's byte tokenizer, which the serving tests decode
@@ -61,29 +64,67 @@ pub(crate) fn router_with(engine: impl Into<Arc<Leader>>, server: &ServerConfig)
     )
 }
 
-/// Builds an engine for a model of `family` over one default
-/// `SimEngine`.
+/// Builds an engine for a model of `family` over one default fake
+/// ([`text_fake`]).
 ///
 /// The tokenizer is [`configured_tokenizer`], whose
 /// `<|im_end|>` (ID 2) is the end-of-sequence token, and the chat template
 /// renders only the first message's content. A MiniMax H3 model serves the
 /// API's longest duration capacity, as a default video deployment does.
-pub(crate) fn sim_engine(family: processing::Family) -> Leader {
-    let model = sim_model(family);
-    let core = sim_core(scheduler::sim_args(SERVED_MODEL), SimEngine::new());
-    engine_over(model, configured_tokenizer(), vec![core])
+pub(crate) fn served_engine(family: processing::Family) -> Leader {
+    let model = test_model(family);
+    engine_over(
+        model,
+        configured_tokenizer(),
+        vec![serving_core(SERVED_MODEL)],
+    )
 }
 
-/// Starts a scheduler under `config` that drives `worker` in process, with the
-/// epoch's policy installed ([`policy_on`]): a scheduler with no policy decides
-/// nothing, and a fixture's engine has no Program Server to give it one.
-pub(crate) fn sim_core(args: proto::config::EngineArgs, worker: SimEngine) -> SchedulerHandle {
-    let core = SchedulerHandle::with_worker(
+/// How many tokens a default fake's request generates before its end of text,
+/// wherever its prompt ends ([`FakeBatches::with_text_len`]).
+pub(crate) const TEXT_LEN: u64 = 8;
+
+/// The token every default fake samples: `a` of [`configured_tokenizer`], which
+/// the serving tests restrict their requests to (`allowed_token_ids`) and read
+/// back as text.
+pub(crate) const LETTER: u32 = b'a' as u32;
+
+/// The default fake of a deployment launched with `args`: one text pool of the
+/// launch's group sampling [`LETTER`], each request's text ending after
+/// [`TEXT_LEN`] tokens.
+pub(crate) fn text_fake(args: &proto::config::EngineArgs) -> Arc<FakeBatches> {
+    Arc::new(letter_fake(args).with_text_len(TEXT_LEN))
+}
+
+/// A fake of the launch `args`'s group sampling [`LETTER`] whose text never
+/// ends: a request generates until its own limit.
+pub(crate) fn letter_fake(args: &proto::config::EngineArgs) -> FakeBatches {
+    FakeBatches::new(vec![testkit::pool(&args.group)]).with_tokens(testkit::Tokens::Fixed(LETTER))
+}
+
+/// A scheduler of a deployment of model `name` over its default fake.
+pub(crate) fn serving_core(name: &str) -> SchedulerHandle {
+    let args = testkit::args(name);
+    let fake = text_fake(&args);
+    fake_core(args, fake)
+}
+
+/// Starts a scheduler of the launch `args` over `fake` through the serving
+/// door, as an engine process starts one per rank, with the epoch's policy
+/// installed ([`policy_on`]): a scheduler with no policy decides nothing, and a
+/// fixture's engine has no Program Server to give it one.
+pub(crate) fn fake_core(
+    args: proto::config::EngineArgs,
+    fake: Arc<FakeBatches>,
+) -> SchedulerHandle {
+    let limits = testkit::limits(fake.as_ref());
+    let core = SchedulerHandle::over_batches_telling(
         &args,
-        scheduler::SchedulerConfig::default(),
-        Box::new(SimWorker::new(worker)),
+        limits,
+        fake as Arc<dyn ipc::execution::Batches>,
+        scheduler::CommandWaker::noop(),
     )
-    .expect("start a sim scheduler");
+    .expect("start a scheduler over the fake");
     policy_on(&core);
     core
 }
@@ -93,7 +134,7 @@ pub(crate) fn sim_core(args: proto::config::EngineArgs, worker: SimEngine) -> Sc
 /// boundary.
 ///
 /// A deployed scheduler takes its policy from the Program Server while its
-/// epoch starts; a simulated one has none, so every fixture that submits a
+/// epoch starts; a fixture's has none, so every fixture that submits a
 /// request needs this. The program is the real module this tree builds, with
 /// the arguments of `core`'s own batch capacity — the limits it declares fit
 /// the ceilings the mechanism checks them against, so the precopy is answered
@@ -119,7 +160,7 @@ pub(crate) fn policy_on(core: &SchedulerHandle) {
     // instantiated on" - a sentence about the wrong subject. Its own reason is here,
     // and standard error is where a test run carries it.
     if let Some(reason) = core.failure() {
-        eprintln!("the simulated scheduler stopped after its policy was installed: {reason}");
+        eprintln!("the scheduler stopped after its policy was installed: {reason}");
     }
 }
 
@@ -158,15 +199,15 @@ pub(crate) fn packaged_policy(
 }
 
 /// Builds an engine for a model of `family` over started schedulers,
-/// one per data-parallel rank; see [`sim_engine`].
-pub(crate) fn sim_engine_over(family: processing::Family, cores: Vec<SchedulerHandle>) -> Leader {
-    engine_over(sim_model(family), configured_tokenizer(), cores)
+/// one per data-parallel rank; see [`served_engine`].
+pub(crate) fn engine_of(family: processing::Family, cores: Vec<SchedulerHandle>) -> Leader {
+    engine_over(test_model(family), configured_tokenizer(), cores)
 }
 
 /// A client of `cores`, which serve the request interface on a thread of
 /// this process over a socket pair, labelling their statistics with their
 /// model.
-pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
+pub(crate) fn fake_client(cores: Vec<SchedulerHandle>) -> EngineClient {
     let state = if cores.iter().any(SchedulerHandle::starts_on_trial) {
         crate::engine::client::EngineState::Standby
     } else {
@@ -197,25 +238,25 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
     // policy to route a request with and refuses every submission.
     let policy = {
         let (program, module) = packaged_policy(scheduler::BatchCapacity::of(first.info()));
-        scheduler::EpochPolicy {
+        testkit::EpochPolicy {
             program,
             module: std::sync::Arc::new(scheduler::PolicyBytes::new(module)),
         }
     };
     let (daemon, engine) = UnixStream::pair().expect("a socket pair");
     std::thread::Builder::new()
-        .name("sim-engine".into())
+        .name("fake-engine".into())
         .spawn(move || {
-            if let Err(error) = scheduler::serve_requests(engine, cores, Some(policy)) {
-                // A simulated engine that ends is the whole of a test's failure and
+            if let Err(error) = testkit::serve_requests(engine, cores, Some(policy)) {
+                // An engine stand-in that ends is the whole of a test's failure and
                 // otherwise leaves no line: the client reports only that its process
                 // ended, and the reason - a frame the engine refused, a scheduler that
                 // did not answer - is lost with the thread. Standard error, so a test
                 // run with `--nocapture` carries it beside the assertion.
-                eprintln!("the simulated engine ended: {error:#}");
+                eprintln!("the engine stand-in ended: {error:#}");
             }
         })
-        .expect("start the simulated engine");
+        .expect("start the engine stand-in");
     EngineClient::new(
         proto::Connection::from_unix(daemon.try_clone().expect("clone the request socket"))
             .expect("a reader"),
@@ -228,8 +269,8 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
     .expect("a client")
 }
 
-/// The simulated model's facts.
-pub(crate) fn sim_model(family: processing::Family) -> ModelConfig {
+/// The test model's facts.
+pub(crate) fn test_model(family: processing::Family) -> ModelConfig {
     ModelConfig {
         family,
         sampling_defaults: SamplingDefaults::default(),
@@ -248,7 +289,7 @@ pub(crate) fn engine_over(
     cores: Vec<SchedulerHandle>,
 ) -> Leader {
     let model_name = cores[0].model_name().to_owned();
-    let client = std::sync::Arc::new(sim_client(cores));
+    let client = std::sync::Arc::new(fake_client(cores));
     leader_over(model, tokenizer, model_name, vec![client])
 }
 

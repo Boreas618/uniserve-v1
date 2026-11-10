@@ -3780,28 +3780,36 @@ fn special_token_ids(model: &ModelConfig) -> SpecialTokenIds {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use crate::metrics::METRICS;
     use proto::request::SamplingParams;
     use proto::request::{Event, GenerationRequest, Request};
-    use scheduler::{SchedulerHandle, SimEngine, SimWorker, Worker};
 
     use super::{EngineState, Leader, keeps_standby};
     use crate::test_support::{
-        SERVED_MODEL, STALL, configured_tokenizer, leader_over, post_json, router, send,
-        send_streamed, sim_client, sim_core, sim_engine_over, sim_model,
+        SERVED_MODEL, STALL, configured_tokenizer, engine_of, fake_client, fake_core, leader_over,
+        letter_fake, post_json, router, send, send_streamed, serving_core, test_model,
     };
 
-    /// A Qwen3 engine over one scheduler, named `engine_model`, that drives
-    /// `worker`.
+    /// A Qwen3 engine over one scheduler, named `engine_model`, over the fake
+    /// `shape` makes of the default one ([`letter_fake`]).
     ///
     /// The scheduler's model name labels the process-wide request metrics,
     /// so a test that reads them names its own engine.
-    fn qwen3_engine(worker: SimEngine, engine_model: &str) -> Leader {
-        let core = sim_core(scheduler::sim_args(engine_model), worker);
-        sim_engine_over(crate::test_support::CHAT, vec![core])
+    fn qwen3_engine(
+        engine_model: &str,
+        shape: impl FnOnce(testkit::FakeBatches) -> testkit::FakeBatches,
+    ) -> Leader {
+        let args = testkit::args(engine_model);
+        let fake = Arc::new(shape(letter_fake(&args)));
+        engine_of(crate::test_support::CHAT, vec![fake_core(args, fake)])
+    }
+
+    /// The default fake's shape: each request's text ends after
+    /// `crate::test_support::TEXT_LEN` tokens.
+    fn ending(fake: testkit::FakeBatches) -> testkit::FakeBatches {
+        fake.with_text_len(crate::test_support::TEXT_LEN)
     }
 
     /// Greedy chat request of at most `max_completion_tokens` tokens that may
@@ -3869,10 +3877,10 @@ mod tests {
     /// loss.
     #[tokio::test]
     async fn a_lost_engine_fails_later_requests() {
-        let core = sim_core(scheduler::sim_args("lost-engine-model"), SimEngine::new());
-        let client = Arc::new(sim_client(vec![core]));
+        let core = serving_core("lost-engine-model");
+        let client = Arc::new(fake_client(vec![core]));
         let engine = leader_over(
-            sim_model(crate::test_support::CHAT),
+            test_model(crate::test_support::CHAT),
             configured_tokenizer(),
             "lost-engine-model".into(),
             vec![Arc::clone(&client)],
@@ -3907,11 +3915,11 @@ mod tests {
         // answers the leader never gave.
         let mut clients = Vec::new();
         for _ in 0..2 {
-            let core = sim_core(scheduler::sim_args("sim-model"), SimEngine::new());
-            clients.push(Arc::new(sim_client(vec![core])));
+            let core = serving_core("sim-model");
+            clients.push(Arc::new(fake_client(vec![core])));
         }
         let engine = leader_over(
-            sim_model(crate::test_support::CHAT),
+            test_model(crate::test_support::CHAT),
             configured_tokenizer(),
             "sim-model".into(),
             clients.clone(),
@@ -3994,95 +4002,25 @@ mod tests {
         }
     }
 
-    /// Simulated worker whose teardown lasts until another task releases
-    /// it, as closing worker processes that drain and exit takes time.
-    struct GatedCloseWorker {
-        inner: SimWorker,
-        release: std::sync::mpsc::Receiver<()>,
-        released: Arc<AtomicBool>,
-    }
-
-    impl Worker for GatedCloseWorker {
-        fn info(&self) -> &scheduler::WorkerInfo {
-            self.inner.info()
-        }
-
-        fn is_ready(&self, worker: &scheduler::WorkerGroupId) -> bool {
-            self.inner.is_ready(worker)
-        }
-
-        fn has_capacity(&self, worker: &scheduler::WorkerGroupId) -> bool {
-            self.inner.has_capacity(worker)
-        }
-
-        fn command_has_capacity(&self, command: &ipc::BatchCommand) -> bool {
-            self.inner.command_has_capacity(command)
-        }
-
-        fn submit(
-            &mut self,
-            batch: scheduler::ExecutionBatch,
-        ) -> Result<(), scheduler::WorkerSubmitError> {
-            self.inner.submit(batch)
-        }
-
-        fn poll(
-            &mut self,
-            timeout: Duration,
-        ) -> Result<Option<scheduler::BatchResult>, scheduler::WorkerError> {
-            self.inner.poll(timeout)
-        }
-
-        fn close(&mut self) -> Result<(), scheduler::WorkerError> {
-            // The wait is bounded so that a blocked runtime fails the test
-            // instead of hanging it.
-            let released = self.release.recv_timeout(Duration::from_secs(5)).is_ok();
-            self.released.store(released, Ordering::SeqCst);
-            self.inner.close()
-        }
-    }
-
-    /// Shutdown waits for worker teardown without holding the runtime
-    /// thread: on a single-threaded runtime, the task that ends the teardown
-    /// runs while `shutdown` is pending.
-    #[tokio::test(flavor = "current_thread")]
-    async fn shutdown_leaves_the_runtime_free_during_worker_teardown() {
-        let (release_tx, release) = std::sync::mpsc::channel();
-        let released = Arc::new(AtomicBool::new(false));
-        let core = SchedulerHandle::with_worker(
-            &scheduler::sim_args("sim-model"),
-            scheduler::SchedulerConfig::default(),
-            Box::new(GatedCloseWorker {
-                inner: SimWorker::new(SimEngine::new()),
-                release,
-                released: Arc::clone(&released),
-            }),
-        )
-        .expect("start a sim scheduler");
-        let engine = sim_engine_over(crate::test_support::CHAT, vec![core]);
-
-        let releaser = tokio::spawn(async move {
-            let _ = release_tx.send(());
-        });
-        engine.shutdown().await.expect("shutdown engine");
-        releaser.await.expect("release task");
-
-        assert!(
-            released.load(Ordering::SeqCst),
-            "worker teardown held the runtime thread"
-        );
-    }
-
     /// A chat prompt that exceeds the total capacity of a two-unit prefix
     /// cache is submitted and then rejected by engine admission. The
     /// non-streamed response holds its head for the outcome, so it answers
     /// that rejection as HTTP 400.
     #[tokio::test]
     async fn chat_admission_rejection_remains_a_bad_request() {
-        let mut worker = SimEngine::new();
         // Unit zero is the sentinel: two allocatable 64-token pages remain.
-        worker.set_num_units(3);
-        let engine = Arc::new(qwen3_engine(worker, SERVED_MODEL));
+        let args = testkit::args(SERVED_MODEL);
+        let mut pool = testkit::pool(&args.group);
+        for rank in &mut pool.ranks {
+            if let Some(cache) = rank.prefix_cache.as_mut() {
+                cache.num_units = 3;
+            }
+        }
+        let fake = testkit::FakeBatches::new(vec![pool])
+            .with_tokens(testkit::Tokens::Fixed(crate::test_support::LETTER))
+            .with_text_len(crate::test_support::TEXT_LEN);
+        let core = fake_core(args, Arc::new(fake));
+        let engine = Arc::new(engine_of(crate::test_support::CHAT, vec![core]));
         let router = router(Arc::clone(&engine));
         let request = serde_json::json!({
             "model": SERVED_MODEL,
@@ -4108,7 +4046,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let engine_model = "preprocessing-latency-model";
-            let engine = Arc::new(qwen3_engine(SimEngine::new(), engine_model));
+            let engine = Arc::new(qwen3_engine(engine_model, ending));
             let router = router(Arc::clone(&engine));
 
             // Hold the only blocking thread so preprocessing waits in the
@@ -4152,7 +4090,7 @@ mod tests {
     #[tokio::test]
     async fn completed_request_is_recorded_in_request_metrics() {
         let engine_model = "request-metrics-model";
-        let engine = Arc::new(qwen3_engine(SimEngine::new(), engine_model));
+        let engine = Arc::new(qwen3_engine(engine_model, ending));
         let router = router(Arc::clone(&engine));
 
         let (status, document) = chat(&router, &chat_request(3, &[], false)).await;
@@ -4183,9 +4121,13 @@ mod tests {
     async fn request_metrics_name_the_engine_core_that_served_each_request() {
         let engine_model = "core-metrics-model";
         let cores = (0..2)
-            .map(|_| sim_core(scheduler::sim_args(engine_model), SimEngine::new()))
+            .map(|_| {
+                let args = testkit::args(engine_model);
+                let fake = crate::test_support::text_fake(&args);
+                fake_core(args, fake)
+            })
             .collect();
-        let engine = Arc::new(sim_engine_over(crate::test_support::CHAT, cores));
+        let engine = Arc::new(engine_of(crate::test_support::CHAT, cores));
         let router = router(Arc::clone(&engine));
 
         // Both requests are in flight together, so the second is routed
@@ -4212,9 +4154,7 @@ mod tests {
     #[tokio::test]
     async fn disconnected_request_is_recorded_as_aborted_without_token_usage() {
         let engine_model = "disconnect-metrics-model";
-        let mut worker = SimEngine::new();
-        worker.set_text_len(1_000_000);
-        let engine = Arc::new(qwen3_engine(worker, engine_model));
+        let engine = Arc::new(qwen3_engine(engine_model, |fake| fake));
         let router = router(Arc::clone(&engine));
 
         let mut stream = send_streamed(

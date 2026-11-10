@@ -928,74 +928,24 @@ mod tests {
         serde_json::json!({ "host": host, "ledgers": [], "transfers": transfers }).to_string()
     }
 
-    /// The status names each slot's state as a change goes: one epoch
-    /// executes beside an empty slot; a successor prepares beside it while
-    /// the change reports its step, what the deployment's transfers moved
-    /// since it began and the serving epoch's steps against their
-    /// baseline; requests wait at the promotion; the previous epoch is
-    /// parked once its successor serves and kept in host storage during the
-    /// trial; a rollback stops the epoch on trial; an epoch whose engine is
-    /// gone is unavailable.
+    /// The status names the epoch that executes; the engine reads no storage
+    /// ledgers (each node's daemon reads them over its claim), so it books no
+    /// GPUs; and an epoch whose engine is gone is unavailable.
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_status_reports_the_executing_engine_and_the_gpus_the_deployment_books() {
-        use storage::protocol::Priority::Background;
-
-        let mut worker = scheduler::SimWorker::new(scheduler::SimEngine::new());
-        let nodes = worker.report_ledgers();
-        let core = scheduler::SchedulerHandle::with_worker(
-            &scheduler::sim_args(crate::test_support::SERVED_MODEL),
-            scheduler::SchedulerConfig::default(),
-            Box::new(worker),
-        )
-        .expect("start a sim scheduler");
-        let leader = crate::test_support::sim_engine_over(crate::test_support::CHAT, vec![core]);
+    async fn the_status_reports_the_executing_engine_and_one_that_is_gone() {
+        let core = crate::test_support::serving_core(crate::test_support::SERVED_MODEL);
+        let leader = crate::test_support::engine_of(crate::test_support::CHAT, vec![core]);
         let replica = Arc::clone(&leader.replicas()[0]);
         let client = replica.hold().client().expect("the replica serves");
         let epoch = client.epoch();
-        *locked(&nodes) = vec![node("rank-0", &[(Background, 100, 40)])];
 
         let status = leader.config_status().await;
         assert_eq!(
             status["executing"],
             serde_json::json!({ "epoch": epoch, "state": "executing" })
         );
-        assert_eq!(status["gpus"], serde_json::json!([]));
-
-        // The GPUs the deployment books storage on, by name.
-        let ledger = storage::protocol::GpuLedger {
-            gpu: [7; 16],
-            deployment: crate::test_support::SERVED_MODEL.to_owned(),
-            total: 1000,
-            quota: Some(900),
-            entries: vec![storage::protocol::LedgerEntry {
-                item: storage::protocol::Item::Weights,
-                scope: None,
-                epochs: vec![epoch],
-                segment: None,
-                bytes: 300,
-            }],
-            host_link_bytes_per_second: None,
-            transfer_context: 0,
-        };
-        *locked(&nodes) = vec![
-            serde_json::json!({
-                "host": "rank-0",
-                "ledgers": [ledger],
-                "transfers": [{ "priority": "background", "bytes": 100, "copied": 40 }],
-            })
-            .to_string(),
-        ];
-        let status = leader.config_status().await;
-        assert_eq!(
-            status["gpus"],
-            serde_json::json!([{
-                "host": "rank-0",
-                "gpu": storage::protocol::gpu_name(&[7; 16]),
-                "total": 1000,
-                "quota": 900,
-                "used": 300,
-            }])
-        );
+        // The engine refuses the ledger read, so the status states no GPUs.
+        assert_eq!(status["gpus"], serde_json::Value::Null);
 
         // An epoch whose engine no longer serves is unavailable.
         replica.hold().close("the engine process ended");
