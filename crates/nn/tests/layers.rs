@@ -6,6 +6,7 @@
 //! cannot compute must fail at load, with the parameter named. The weights here are views of a
 //! region that is never read, because construction only inspects extents and strides.
 
+use nn::layers::Gain;
 use nn::{
     Activation, AdaptiveAvgPool2d, Arena, CausalPad, Conv3d, ConvSpec, DType, DevicePtr, Epilogue,
     Forward, GateBias, GatedActivation, GroupNorm, Halves, KvGroup, KvPlanes, KvView, LayerNorm,
@@ -130,10 +131,10 @@ fn a_normalization_refuses_epilogue_parameters_of_another_width() {
         scale: weight(scale),
         bias: bias.map(weight),
     };
-    assert!(RmsNorm::new(weight(&[16, 8]), 1e-6, Epilogue::None).is_err());
-    assert!(RmsNorm::new(weight(&[16]), 1e-6, scaled(&[8], None)).is_err());
-    assert!(RmsNorm::new(weight(&[16]), 1e-6, scaled(&[16], Some(&[8]))).is_err());
-    assert!(RmsNorm::new(weight(&[16]), 1e-6, scaled(&[16], Some(&[16]))).is_ok());
+    assert!(RmsNorm::new(weight(&[16, 8]), 1e-6, Epilogue::None, Gain::Plain).is_err());
+    assert!(RmsNorm::new(weight(&[16]), 1e-6, scaled(&[8], None), Gain::Plain).is_err());
+    assert!(RmsNorm::new(weight(&[16]), 1e-6, scaled(&[16], Some(&[8])), Gain::Plain).is_err());
+    assert!(RmsNorm::new(weight(&[16]), 1e-6, scaled(&[16], Some(&[16])), Gain::Plain).is_ok());
 
     let modulated = |shift: &[u64], gate: Option<&[u64]>| {
         Epilogue::Modulated(Modulation {
@@ -144,14 +145,22 @@ fn a_normalization_refuses_epilogue_parameters_of_another_width() {
             retained: None,
         })
     };
-    assert!(RmsNorm::new(weight(&[64]), 1e-6, modulated(&[4, 64], None)).is_ok());
-    assert!(RmsNorm::new(weight(&[64]), 1e-6, modulated(&[4, 64], Some(&[4, 64]))).is_ok());
+    assert!(RmsNorm::new(weight(&[64]), 1e-6, modulated(&[4, 64], None), Gain::Plain).is_ok());
     assert!(
-        RmsNorm::new(weight(&[64]), 1e-6, modulated(&[64], None)).is_err(),
+        RmsNorm::new(
+            weight(&[64]),
+            1e-6,
+            modulated(&[4, 64], Some(&[4, 64])),
+            Gain::Plain
+        )
+        .is_ok()
+    );
+    assert!(
+        RmsNorm::new(weight(&[64]), 1e-6, modulated(&[64], None), Gain::Plain).is_err(),
         "a shift table is [parameters, width], not one row"
     );
     assert!(
-        RmsNorm::new(weight(&[64]), 1e-6, modulated(&[4, 32], None)).is_err(),
+        RmsNorm::new(weight(&[64]), 1e-6, modulated(&[4, 32], None), Gain::Plain).is_err(),
         "a table of another width is not this layer's"
     );
 
@@ -184,7 +193,7 @@ fn a_normalization_reads_the_residual_stream_its_epilogue_folds() {
     );
     let gain = held(view(DType::BF16, &[16]));
 
-    let plain = RmsNorm::new(gain, 1e-6, Epilogue::None).unwrap();
+    let plain = RmsNorm::new(gain, 1e-6, Epilogue::None, Gain::Plain).unwrap();
     assert!(plain.forward(&f, x, None, out).is_ok());
     assert!(
         plain
@@ -199,7 +208,7 @@ fn a_normalization_reads_the_residual_stream_its_epilogue_folds() {
 
     let scale = held(view(DType::BF16, &[16]));
     let epilogue = Epilogue::ScaledResidual { scale, bias: None };
-    let scaled = RmsNorm::new(gain, 1e-6, epilogue).unwrap();
+    let scaled = RmsNorm::new(gain, 1e-6, epilogue, Gain::Plain).unwrap();
     assert!(
         scaled
             .forward(&f, x, Some(ResidualStream::in_place(stream)), out)
@@ -217,14 +226,26 @@ fn a_normalization_reads_the_residual_stream_its_epilogue_folds() {
         rows,
         retained: None,
     };
-    let ungated = RmsNorm::new(gain, 1e-6, Epilogue::Modulated(modulation(None))).unwrap();
+    let ungated = RmsNorm::new(
+        gain,
+        1e-6,
+        Epilogue::Modulated(modulation(None)),
+        Gain::Plain,
+    )
+    .unwrap();
     assert!(ungated.forward(&f, x, None, out).is_ok());
     assert!(
         ungated
             .forward(&f, x, Some(ResidualStream::in_place(x)), out)
             .is_err()
     );
-    let gated = RmsNorm::new(gain, 1e-6, Epilogue::Modulated(modulation(Some(table)))).unwrap();
+    let gated = RmsNorm::new(
+        gain,
+        1e-6,
+        Epilogue::Modulated(modulation(Some(table))),
+        Gain::Plain,
+    )
+    .unwrap();
     let into_update = ResidualStream {
         input: stream,
         output: x,
@@ -370,6 +391,7 @@ fn a_group_carries_each_layers_own_page_scales() {
     let view = KvView {
         groups: &groups,
         workspace: TensorView::new(DevicePtr::new(0x40_0000), DType::U8, Shape::new(&[1 << 20])),
+        state: None,
     };
 
     let first = view.planes(0, 0).unwrap();
@@ -466,6 +488,7 @@ fn a_layer_reads_the_planes_its_own_index_names() {
     let cache = KvView {
         groups: &groups,
         workspace: TensorView::new(DevicePtr::new(0x40_0000), DType::U8, Shape::new(&[1 << 20])),
+        state: None,
     };
 
     // Every field of the second layer's planes is the second layer's, not the first's: a reader that

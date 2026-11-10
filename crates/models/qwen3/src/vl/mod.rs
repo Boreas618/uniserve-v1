@@ -233,6 +233,7 @@ impl Qwen3VlModel {
                 &mut language.scope("norm"),
                 text.hidden_size,
                 text.rms_norm_eps,
+                text.rms_norm_gain,
             )?)
         } else {
             None

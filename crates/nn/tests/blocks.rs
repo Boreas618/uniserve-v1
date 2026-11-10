@@ -260,7 +260,13 @@ fn each_qk_norm_form_launches_its_own_programs() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = attention_checkpoint(directory.path());
     let mut loader = WeightLoader::meta(&checkpoint, None, None);
-    let fused = rotary(&mut loader, QkNorm::Fused { epsilon: 1e-6 });
+    let fused = rotary(
+        &mut loader,
+        QkNorm::Fused {
+            epsilon: 1e-6,
+            gain: nn::layers::Gain::Plain,
+        },
+    );
     let bare = rotary(&mut loader, QkNorm::None);
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
@@ -367,7 +373,13 @@ fn a_paged_block_writes_its_layers_planes_then_reads_them() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = attention_checkpoint(directory.path());
     let mut loader = WeightLoader::meta(&checkpoint, None, None);
-    let fused = rotary(&mut loader, QkNorm::Fused { epsilon: 1e-6 });
+    let fused = rotary(
+        &mut loader,
+        QkNorm::Fused {
+            epsilon: 1e-6,
+            gain: nn::layers::Gain::Plain,
+        },
+    );
     let paged = AttentionKind::Paged {
         max_kv_len: 4096,
         window: None,
@@ -413,6 +425,7 @@ fn a_paged_block_writes_its_layers_planes_then_reads_them() {
     let cache = KvView {
         groups: &groups,
         workspace: tensor(DType::U8, &[1 << 20]),
+        state: None,
     };
     let (x, out) = (
         view(&arena, &[tokens, HIDDEN]),

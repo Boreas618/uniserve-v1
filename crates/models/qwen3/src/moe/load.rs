@@ -100,6 +100,7 @@ pub fn load(
         &mut loader.scope("model.norm"),
         text.hidden_size,
         text.rms_norm_eps,
+        text.rms_norm_gain,
     )?;
 
     let (slots, slot_table) = expert_slots(config, order, loader)?;

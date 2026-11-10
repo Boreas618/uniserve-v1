@@ -144,12 +144,18 @@ impl DecoderLayer {
         experts: impl FnOnce(&mut Scope<'_, '_>) -> Result<Option<Moe>>,
     ) -> Result<Self> {
         let eps = text.rms_norm_eps;
-        let input_layernorm =
-            RmsNorm::load(&mut scope.scope("input_layernorm"), text.hidden_size, eps)?;
+        let gain = text.rms_norm_gain;
+        let input_layernorm = RmsNorm::load(
+            &mut scope.scope("input_layernorm"),
+            text.hidden_size,
+            eps,
+            gain,
+        )?;
         let post_attention_layernorm = RmsNorm::load(
             &mut scope.scope("post_attention_layernorm"),
             text.hidden_size,
             eps,
+            gain,
         )?;
         let bias = if text.attention_bias {
             (QkvBias::Present, Bias::Present)
@@ -346,6 +352,7 @@ impl DecoderStack {
                 kv_heads,
                 qk_norm: QkNorm::Fused {
                     epsilon: text.rms_norm_eps,
+                    gain: text.rms_norm_gain,
                 },
             },
         )?;

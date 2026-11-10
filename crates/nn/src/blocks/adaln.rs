@@ -27,7 +27,7 @@ use ops::{DType, DevicePtr, Shape, Strides, TensorView};
 use crate::error::{Error, Result};
 use crate::family::Split;
 use crate::forward::Forward;
-use crate::layers::{Epilogue, Modulation, Residual, ResidualStream, RmsNorm, Scale};
+use crate::layers::{Epilogue, Gain, Modulation, Residual, ResidualStream, RmsNorm, Scale};
 use crate::weights::{Scope, Weight};
 
 use super::{GatedMlp, GatedMlpSpec};
@@ -231,6 +231,7 @@ impl AdaLnBlock {
                 rows,
                 retained: None,
             }),
+            Gain::Plain,
         )?;
         norm.forward(f, hidden, None, out)
     }
@@ -277,6 +278,7 @@ impl AdaLnBlock {
                 rows,
                 retained: Some(residual),
             }),
+            Gain::Plain,
         )?;
         let stream = ResidualStream {
             input: hidden,
@@ -383,6 +385,7 @@ impl AdaLnOut {
                 rows,
                 retained: None,
             }),
+            Gain::Plain,
         )
     }
 }

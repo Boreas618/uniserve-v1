@@ -362,6 +362,10 @@ pub struct QkNormRopeDescriptor {
     /// cost. The form has no learned scale, its outputs are its inputs, and a key names it only
     /// when set.
     pub strided: bool,
+    /// Whether the learned scales are stored zero-centred: each normalized head is multiplied by
+    /// `1 + weight`, the one added in FP32 (Qwen3-Next and Qwen3.5 store their q/k norms so). Only an
+    /// affine form has scales to centre, and a key names it only when set.
+    pub centred: bool,
 }
 
 impl fmt::Display for QkNormRopeDescriptor {
@@ -397,6 +401,11 @@ impl fmt::Display for QkNormRopeDescriptor {
         };
         let key = if self.strided {
             key.field("strided", true)
+        } else {
+            key
+        };
+        let key = if self.centred {
+            key.field("centred", true)
         } else {
             key
         };
@@ -523,6 +532,12 @@ impl Op for QkNormRope {
                     "a rotation of {} channels does not fit a head of {head_dim} with whole pairs",
                     descriptor.rotated
                 ),
+            ));
+        }
+        if descriptor.centred && !descriptor.affine {
+            return Err(Error::argument(
+                Self::NAME,
+                "a zero-centred scale needs the weighted form".to_owned(),
             ));
         }
         let pairs = u64::from(descriptor.rotated) / 2;
@@ -835,6 +850,7 @@ mod tests {
         QkNormRopeDescriptor {
             factors: DType::F32,
             strided: false,
+            centred: false,
             dtype: DType::BF16,
             output: DType::BF16,
             head_dim: 128,

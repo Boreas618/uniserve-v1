@@ -3,11 +3,17 @@
 //! Each of these reduces over the last axis of its input and writes one value per element:
 //!
 //! ```text
-//! rms_norm      out = x · rsqrt(mean(x²) + eps) · weight,  statistics in FP32
-//! add_rms_norm  residual = x + residual; out = rms_norm(residual)
-//! layer_norm    out = (x − mean(x)) · rsqrt(var(x) + eps) · weight + bias
-//! softmax       out = exp(x − max(x)) / Σ exp(x − max(x))
+//! rms_norm         out = x · rsqrt(mean(x²) + eps) · weight,  statistics in FP32
+//! add_rms_norm     residual = x + residual; out = rms_norm(residual)
+//! gated_rms_norm   out = rms_norm(x) · silu(z)
+//! layer_norm       out = (x − mean(x)) · rsqrt(var(x) + eps) · weight + bias
+//! softmax          out = exp(x − max(x)) / Σ exp(x − max(x))
 //! ```
+//!
+//! A checkpoint may store an RMS normalization's weight zero-centred (Gemma, Qwen3-Next and
+//! Qwen3.5 write `x̂ · (1 + w)`): `rms_norm` and `add_rms_norm` read such a weight unchanged and add
+//! the one in FP32 when their descriptor says [`centred`](RmsNormDescriptor::centred), so the
+//! product is the reference's and no rounded `1 + w` is ever stored.
 //!
 //! One program handles one row and loads its whole row before storing, so the output may alias the
 //! input. `add_rms_norm` adds in FP32 and rounds once on the way to the output dtype, which is the
@@ -18,7 +24,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Strides, TensorView};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -33,16 +39,28 @@ pub struct RmsNormDescriptor {
     pub tile: u32,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
+    /// Whether the weight is stored zero-centred: the row is scaled by `1 + weight`.
+    pub centred: bool,
 }
 
 impl fmt::Display for RmsNormDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Key::new()
+        let key = Key::new()
             .field("dtype", self.dtype)
             .field("columns", self.columns)
             .field("tile", self.tile)
-            .field("pdl", self.pdl)
-            .finish(formatter)
+            .field("pdl", self.pdl);
+        // Named only for a zero-centred weight, so every other key stays as it was.
+        centred(key, self.centred).finish(formatter)
+    }
+}
+
+/// `key` with the zero-centred weight named when `centred`.
+fn centred(key: Key, centred: bool) -> Key {
+    if centred {
+        key.field("centred", true)
+    } else {
+        key
     }
 }
 
@@ -131,16 +149,18 @@ pub struct AddRmsNormDescriptor {
     pub tile: u32,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
+    /// Whether the weight is stored zero-centred: the row is scaled by `1 + weight`.
+    pub centred: bool,
 }
 
 impl fmt::Display for AddRmsNormDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Key::new()
+        let key = Key::new()
             .field("dtype", self.dtype)
             .field("columns", self.columns)
             .field("tile", self.tile)
-            .field("pdl", self.pdl)
-            .finish(formatter)
+            .field("pdl", self.pdl);
+        centred(key, self.centred).finish(formatter)
     }
 }
 
@@ -229,6 +249,131 @@ impl Op for AddRmsNorm {
             DType::F32,
             descriptor.dtype,
         )
+    }
+}
+
+/// One compilation of `gated_rms_norm`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct GatedRmsNormDescriptor {
+    /// Element type of the input, the gate, the weight and the output.
+    pub dtype: DType,
+    /// Elements per row.
+    pub columns: u32,
+    /// The tile one program loads at a time; at least `columns` rounds up to the next power of two.
+    pub tile: u32,
+}
+
+impl fmt::Display for GatedRmsNormDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Key::new()
+            .field("dtype", self.dtype)
+            .field("columns", self.columns)
+            .field("tile", self.tile)
+            .finish(formatter)
+    }
+}
+
+/// The arguments of `gated_rms_norm`.
+#[derive(Clone, Copy)]
+pub struct GatedRmsNormArgs {
+    /// `[rows, columns]`, contiguous: the rows normalized.
+    pub x: TensorView,
+    /// `[rows, columns]`, contiguous: the gate each normalized element is multiplied by through a
+    /// SiLU.
+    pub gate: TensorView,
+    /// `[columns]`, the per-channel scale.
+    pub weight: TensorView,
+    /// `[rows, columns]`, contiguous: receives `x · rsqrt(mean(x²) + eps) · weight · silu(gate)`.
+    pub out: TensorView,
+    /// The variance floor.
+    pub eps: f32,
+}
+
+/// RMS normalization gated by the SiLU of a second input, normalized before it is gated: the output
+/// norm of a gated delta network (FLA's `RMSNormGated` with `norm_before_gate`).
+///
+/// One program normalizes one row; the statistics, the scale, the SiLU and the product are FP32 and
+/// the output rounds once.
+pub struct GatedRmsNorm;
+
+impl Op for GatedRmsNorm {
+    const NAME: &'static str = proto::program::operator::GATED_RMS_NORM;
+
+    type Descriptor = GatedRmsNormDescriptor;
+    type Args<'a> = GatedRmsNormArgs;
+
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
+        let columns = u64::from(descriptor.columns);
+        if columns == 0 || descriptor.tile < descriptor.columns {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "a tile of {} elements does not cover rows of {columns}",
+                    descriptor.tile
+                ),
+            ));
+        }
+        for (name, view) in [("x", &args.x), ("gate", &args.gate), ("out", &args.out)] {
+            view.require_row(Self::NAME, descriptor.dtype, columns)
+                .map_err(|error| Error::argument(Self::NAME, format!("{name}: {error}")))?;
+            if view.strides != Strides::row_major(view.shape) {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!("the {name} rows are not contiguous"),
+                ));
+            }
+            if view.rows() != args.x.rows() {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "{} input rows but {} {name} rows",
+                        args.x.rows(),
+                        view.rows()
+                    ),
+                ));
+            }
+        }
+        args.weight
+            .require_shape(Self::NAME, Shape::new(&[columns]))?;
+        args.weight
+            .require_row(Self::NAME, descriptor.dtype, columns)?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let mut arguments = Arguments::new();
+        arguments
+            .view(args.x)
+            .view(args.gate)
+            .view(args.weight)
+            .view(args.out)
+            .u32(descriptor.columns)
+            .f32(args.eps);
+        kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
+    }
+
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+        let _ = stream;
+        GatedRmsNormArgs {
+            out: twins.shadow_of(args.out),
+            ..args
+        }
+    }
+
+    fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
+        // The sum of squares over the row in FP32, then the scale, the SiLU's few ulps and the gate
+        // product, rounded once into the output type.
+        let rounding =
+            Tolerance::rounding(u64::from(descriptor.columns), DType::F32, descriptor.dtype);
+        Tolerance {
+            rtol: rounding.rtol + 3.0 * DType::F32.unit_roundoff() as f32,
+            ..rounding
+        }
     }
 }
 

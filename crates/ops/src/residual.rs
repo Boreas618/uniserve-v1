@@ -706,6 +706,123 @@ fn matches(
 /// The elements one `scaled_add` program walks.
 pub const SCALED_ADD_BLOCK: u32 = 1024;
 
+/// One compilation of `sigmoid_gated_add`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct SigmoidGatedAddDescriptor {
+    /// Element type of the target, the update and the gate.
+    pub dtype: DType,
+    /// Elements per row.
+    pub columns: u32,
+    /// The elements of a row one program walks.
+    pub block: u32,
+}
+
+impl fmt::Display for SigmoidGatedAddDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Key::new()
+            .field("dtype", self.dtype)
+            .field("columns", self.columns)
+            .field("block", self.block)
+            .finish(formatter)
+    }
+}
+
+/// The arguments of `sigmoid_gated_add`.
+#[derive(Clone, Copy)]
+pub struct SigmoidGatedAddArgs {
+    /// `[rows, columns]`, contiguous: the target, updated in place.
+    pub target: TensorView,
+    /// `[rows, columns]`, contiguous: the update the gate scales.
+    pub update: TensorView,
+    /// `[rows, 1]`, contiguous: each row's gate logit.
+    pub gate: TensorView,
+}
+
+/// `target[r] ← target[r] + sigmoid(gate[r]) · update[r]`: a row's update scaled by the sigmoid of
+/// its own scalar logit, as a shared expert joins the routed ones (Qwen2-MoE, Qwen3-Next, Qwen3.5).
+///
+/// The sigmoid, the product and the sum are FP32 and the target rounds once.
+pub struct SigmoidGatedAdd;
+
+impl Op for SigmoidGatedAdd {
+    const NAME: &'static str = proto::program::operator::SIGMOID_GATED_ADD;
+
+    type Descriptor = SigmoidGatedAddDescriptor;
+    type Args<'a> = SigmoidGatedAddArgs;
+
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
+        let columns = u64::from(descriptor.columns);
+        if columns == 0 || descriptor.block == 0 {
+            return Err(Error::argument(
+                Self::NAME,
+                "a row or a block of zero elements adds nothing".to_owned(),
+            ));
+        }
+        args.target.require_rank(Self::NAME, 2)?;
+        let rows = args.target.shape.dim(0);
+        for (name, view, width) in [
+            ("target", &args.target, columns),
+            ("update", &args.update, columns),
+            ("gate", &args.gate, 1),
+        ] {
+            view.require_shape(Self::NAME, Shape::new(&[rows, width]))
+                .map_err(|error| Error::argument(Self::NAME, format!("{name}: {error}")))?;
+            view.require_row(Self::NAME, descriptor.dtype, width)
+                .map_err(|error| Error::argument(Self::NAME, format!("{name}: {error}")))?;
+            if view.strides.get(0) != width {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!("the {name} rows are not contiguous"),
+                ));
+            }
+        }
+        if rows * columns > i32::MAX as u64 {
+            return Err(Error::argument(
+                Self::NAME,
+                "the rows span more elements than the kernel's 32-bit offsets address".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let rows = args.target.shape.dim(0);
+
+        let mut arguments = Arguments::new();
+        arguments
+            .view(args.target)
+            .view(args.update)
+            .view(args.gate)
+            .u32(descriptor.columns);
+        kernel.launch(
+            LaunchGrid::new([
+                u64::from(descriptor.columns).div_ceil(u64::from(descriptor.block)),
+                rows,
+                1,
+            ])?,
+            &mut arguments,
+            stream,
+        )
+    }
+
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+        SigmoidGatedAddArgs {
+            target: twins.in_place(args.target, stream),
+            ..args
+        }
+    }
+
+    fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
+        // The sigmoid's few FP32 ulps, one product and one sum, rounded once into the target type.
+        Tolerance::new(0.0, 2.0 * descriptor.dtype.unit_roundoff() as f32)
+    }
+}
+
 /// One compilation of `scaled_add`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ScaledAddDescriptor {

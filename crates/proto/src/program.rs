@@ -158,6 +158,10 @@ pub mod operator {
     pub const PHILOX_NOISE: &str = "philox_noise";
     pub const RMS_NORM: &str = "rms_norm";
     pub const ADD_RMS_NORM: &str = "add_rms_norm";
+    pub const SIGMOID_GATED_ADD: &str = "sigmoid_gated_add";
+    pub const GATED_DELTA_RULE: &str = "gated_delta_rule";
+    pub const CAUSAL_CONV1D: &str = "causal_conv1d";
+    pub const GATED_RMS_NORM: &str = "gated_rms_norm";
     pub const LAYER_NORM: &str = "layer_norm";
     pub const SOFTMAX: &str = "softmax";
     pub const PAGE_CONVERSION: &str = "page_conversion";
@@ -244,6 +248,10 @@ pub mod operator {
         PHILOX_NOISE,
         RMS_NORM,
         ADD_RMS_NORM,
+        SIGMOID_GATED_ADD,
+        GATED_DELTA_RULE,
+        CAUSAL_CONV1D,
+        GATED_RMS_NORM,
         LAYER_NORM,
         SOFTMAX,
         PAGE_CONVERSION,

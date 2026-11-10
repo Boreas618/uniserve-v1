@@ -197,7 +197,8 @@ pub struct KvGroup<'a> {
     pub layers: &'a [KvPlanes],
 }
 
-/// The paged cache of a whole model: one entry per attention group.
+/// The paged cache of a whole model: one entry per attention group, and the recurrent state of the
+/// layers that keep one per request slot.
 #[derive(Clone, Copy)]
 pub struct KvView<'a> {
     /// The attention groups, in the order the model's attention layers index them.
@@ -206,6 +207,65 @@ pub struct KvView<'a> {
     /// for the forward at the size the loaded program needs. Its head holds the decode's arrival
     /// counters, which the model clears once per forward ([`crate::layers::PagedAttention::zero_counters`]).
     pub workspace: TensorView,
+    /// The recurrent state of a model whose [`crate::family::TextModel::state`] declares one;
+    /// `None` for a model that keeps none.
+    pub state: Option<StateView<'a>>,
+}
+
+/// One recurrent layer's state banks: each field of the layer's [`crate::family::StateShape`],
+/// `[slots, …]` in the field's element type and extents, contiguous.
+///
+/// The live banks hold every slot's state after its request's last computed token; the checkpoint
+/// banks receive the state a row keeps for the prefix cache ([`StateView::checkpoints`]). The
+/// infrastructure allocates both, restores a slot's live state from the cache before a row that
+/// resumes from a cached prefix, and moves a checkpoint into the cache afterwards; a model reads and
+/// writes the banks only through its layers' operators.
+#[derive(Clone, Copy)]
+pub struct StateLayer<'a> {
+    /// The live banks, in the layer's field order.
+    pub live: &'a [TensorView],
+    /// The checkpoint banks, in the same order and extents.
+    pub checkpoint: &'a [TensorView],
+}
+
+/// The recurrent state a batch's rows read and advance.
+#[derive(Clone, Copy)]
+pub struct StateView<'a> {
+    /// `[rows]` i32: each row's request slot in the banks; negative for a padding row, whose state
+    /// is neither read nor written.
+    pub slots: TensorView,
+    /// `[rows]` i32: the absolute token count after which each row's state is kept in the checkpoint
+    /// banks, a page boundary inside the row's tokens or at its end; zero for a row that keeps none.
+    pub checkpoints: TensorView,
+    /// The recurrent layers, in the model's order of them.
+    pub layers: &'a [StateLayer<'a>],
+}
+
+impl<'a> KvView<'a> {
+    /// The recurrent state, refusing a cache that carries none.
+    pub fn state(&self) -> Result<&StateView<'a>> {
+        self.state.as_ref().ok_or_else(|| {
+            Error::shape(
+                "KvView",
+                "a recurrent layer was run over a cache that carries no state".to_owned(),
+            )
+        })
+    }
+}
+
+impl<'a> StateView<'a> {
+    /// The banks of recurrent layer `layer`.
+    pub fn layer(&self, layer: usize) -> Result<&StateLayer<'a>> {
+        self.layers.get(layer).ok_or_else(|| {
+            Error::shape(
+                "StateView",
+                format!(
+                    "recurrent layer {layer} was asked for but the state holds {}",
+                    self.layers.len()
+                ),
+            )
+        })
+    }
 }
 
 impl<'a> KvView<'a> {

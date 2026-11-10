@@ -638,7 +638,10 @@ impl VideoDecoder {
                 head_dim: head,
                 heads,
                 kv_heads: heads,
-                qk_norm: QkNorm::Fused { epsilon },
+                qk_norm: QkNorm::Fused {
+                    epsilon,
+                    gain: nn::layers::Gain::Plain,
+                },
             },
         )?;
         let rows = tile.rows();

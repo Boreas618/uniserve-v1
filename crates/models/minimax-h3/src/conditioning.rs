@@ -165,6 +165,7 @@ impl TokenRefiner {
                 &mut loader.scope("token_refiner.final_norm"),
                 config.hidden_size,
                 config.norm_eps,
+                nn::layers::Gain::Plain,
             )?,
             hidden_size: config.hidden_size,
             text_dim: config.text_dim,

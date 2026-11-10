@@ -39,6 +39,9 @@ pub enum Activation {
     Gelu,
     /// The tanh approximation of GELU.
     GeluTanh,
+    /// The logistic sigmoid alone, `1 / (1 + exp(−x))`: an attention's output gate
+    /// (Qwen3-Next, Qwen3.5), which no checkpoint names as an MLP activation.
+    Sigmoid,
 }
 
 impl Activation {
@@ -48,6 +51,7 @@ impl Activation {
             Self::Silu => "silu",
             Self::Gelu => "gelu",
             Self::GeluTanh => "gelu_tanh",
+            Self::Sigmoid => "sigmoid",
         }
     }
 }
@@ -261,7 +265,7 @@ impl Op for ActAndMul {
         // its product with the gate and the product with the value, three roundings in the output
         // type at most, and no reduction.
         let roundings = match descriptor.activation {
-            Activation::Silu => 3.0,
+            Activation::Silu | Activation::Sigmoid => 3.0,
             Activation::Gelu | Activation::GeluTanh => 4.0,
         };
         Tolerance::new(0.0, roundings * descriptor.dtype.unit_roundoff() as f32)

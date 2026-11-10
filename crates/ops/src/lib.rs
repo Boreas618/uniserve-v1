@@ -115,6 +115,7 @@ pub mod platform;
 pub mod position;
 pub mod posterior;
 pub mod prefix_cache;
+pub mod recurrent;
 pub mod residual;
 pub mod rgb;
 pub mod rope;

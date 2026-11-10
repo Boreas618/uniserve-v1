@@ -52,8 +52,8 @@ pub const ACTIVATION_ENVELOPE: f32 = 8.0;
 fn require_gate(operator: &'static str, activation: Activation) -> Result<()> {
     match activation {
         Activation::Silu | Activation::GeluTanh => Ok(()),
-        Activation::Gelu => Err(Error::Shape(format!(
-            "{operator}: a grouped expert product gates with silu or gelu_tanh, not the exact gelu"
+        Activation::Gelu | Activation::Sigmoid => Err(Error::Shape(format!(
+            "{operator}: a grouped expert product gates with silu or gelu_tanh, not {activation}"
         ))),
     }
 }

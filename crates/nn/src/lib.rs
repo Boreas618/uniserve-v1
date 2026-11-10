@@ -74,8 +74,8 @@ pub use capability::{
     CausalLm, ConditionPiece, ConditionRole, ConditionShape, Conditioning, DecodedMedia, Decoder,
     Denoiser, Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageInput,
     ImageShape, KvGroup, KvPlanes, KvView, Latents, MediaFormat, PatchFormat, PixelNorm, Placed,
-    Seed, Splicer, StateTable, Step, TableValues, TokenBatch, VideoRequest, WarmPrompt,
-    WarmRequest,
+    Seed, Splicer, StateLayer, StateTable, StateView, Step, TableValues, TokenBatch, VideoRequest,
+    WarmPrompt, WarmRequest,
 };
 pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, Reading, TensorLocation};
 pub use error::{Error, Result};

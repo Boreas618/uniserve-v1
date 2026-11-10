@@ -77,7 +77,10 @@ fn plain(dim: u32) -> Spectrum {
     }
 }
 
-const FUSED: QkNorm = QkNorm::Fused { epsilon: 1e-6 };
+const FUSED: QkNorm = QkNorm::Fused {
+    epsilon: 1e-6,
+    gain: nn::layers::Gain::Plain,
+};
 
 /// A rotary's factor tables are one column per rotated pair, and a repeated spectrum reads one
 /// coordinate per axis, axis-major: a flat position list is refused rather than read transposed.

@@ -662,6 +662,7 @@ fn recorded_forward(
     let cache = KvView {
         groups: &groups,
         workspace,
+        state: None,
     };
     let walked = model.forward(&f, &batch, &cache, hidden);
     ops::capture::set_sink(None);

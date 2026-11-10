@@ -193,42 +193,64 @@ fn require_rows(
     Ok(())
 }
 
-/// RMS normalization with a per-channel scale: `norm(s) = s · rsqrt(mean(s²) + eps) · weight`.
+/// How a normalization's stored weight scales the normalized row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gain {
+    /// `x̂ · weight`: the checkpoint stores the scale itself.
+    Plain,
+    /// `x̂ · (1 + weight)`: the checkpoint stores the scale zero-centred (Gemma, Qwen3-Next,
+    /// Qwen3.5), and the kernel adds the one in FP32, so no rounded `1 + weight` is ever stored.
+    Centred,
+}
+
+/// RMS normalization with a per-channel scale: `norm(s) = s · rsqrt(mean(s²) + eps) · gain`, the
+/// gain the weight or one plus it ([`Gain`]).
 pub struct RmsNorm {
     weight: Weight,
     eps: f32,
     columns: u32,
     epilogue: Epilogue,
+    gain: Gain,
 }
 
 impl RmsNorm {
-    /// The normalization of `weight`'s width with variance floor `eps` and `epilogue`.
+    /// The normalization of `weight`'s width with variance floor `eps`, `epilogue` and `gain`.
     ///
     /// # Errors
     ///
-    /// A weight that is not one vector, or epilogue parameters of another width.
-    pub fn new(weight: Weight, eps: f32, epilogue: Epilogue) -> Result<Self> {
+    /// A weight that is not one vector, epilogue parameters of another width, or a zero-centred
+    /// gain under an epilogue other than the plain one (whose operators alone read it).
+    pub fn new(weight: Weight, eps: f32, epilogue: Epilogue, gain: Gain) -> Result<Self> {
         let columns = columns("RmsNorm", &weight)?;
         check_epilogue("RmsNorm", &epilogue, columns)?;
+        if gain == Gain::Centred && !matches!(epilogue, Epilogue::None) {
+            return Err(Error::shape(
+                "RmsNorm",
+                "a zero-centred gain is read by the plain and the residual-add forms alone"
+                    .to_owned(),
+            ));
+        }
         Ok(Self {
             weight,
             eps,
             columns,
             epilogue,
+            gain,
         })
     }
 
     /// The normalization module at `scope`: its `weight` of `width` channels, with variance floor
-    /// `eps` and no epilogue.
+    /// `eps`, the gain `gain` and no epilogue.
     ///
     /// # Errors
     ///
     /// When the checkpoint lacks the weight or holds another width.
-    pub fn load(scope: &mut Scope<'_, '_>, width: u32, eps: f32) -> Result<Self> {
+    pub fn load(scope: &mut Scope<'_, '_>, width: u32, eps: f32, gain: Gain) -> Result<Self> {
         Self::new(
             scope.tensor("weight", &[u64::from(width)])?,
             eps,
             Epilogue::None,
+            gain,
         )
     }
 
@@ -266,6 +288,7 @@ impl RmsNorm {
             require_rows(OWNER, "the residual stream", &stream.output, &x, width)?;
         }
         let tile = row_tile(width);
+        let centred = self.gain == Gain::Centred;
 
         match (&self.epilogue, residual) {
             (Epilogue::None, None) if out.dtype == x.dtype => f.operate::<RmsNormOp>(
@@ -274,6 +297,7 @@ impl RmsNorm {
                     columns: width,
                     tile,
                     pdl: PDL,
+                    centred,
                 },
                 norm::RmsNormArgs {
                     x,
@@ -282,6 +306,10 @@ impl RmsNorm {
                     eps: self.eps,
                 },
             ),
+            (Epilogue::None, None) if centred => Err(Error::shape(
+                OWNER,
+                "a zero-centred gain narrows no output type".to_owned(),
+            )),
             (Epilogue::None, None) => f.operate::<WeightedRmsNorm>(
                 &residual::WeightedRmsNormDescriptor {
                     dtype: x.dtype,
@@ -304,6 +332,7 @@ impl RmsNorm {
                     columns: width,
                     tile,
                     pdl: PDL,
+                    centred,
                 },
                 norm::AddRmsNormArgs {
                     x,

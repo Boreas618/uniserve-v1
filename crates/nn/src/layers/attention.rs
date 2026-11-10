@@ -887,6 +887,7 @@ mod tests {
                 &KvView {
                     groups: &groups,
                     workspace,
+                    state: None,
                 },
                 0,
                 0,

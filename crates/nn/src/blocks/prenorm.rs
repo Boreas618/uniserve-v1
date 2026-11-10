@@ -20,7 +20,7 @@ use ops::{DType, TensorView};
 use crate::error::Result;
 use crate::family::Split;
 use crate::forward::Forward;
-use crate::layers::{Epilogue, Residual, ResidualStream, RmsNorm, Scale};
+use crate::layers::{Epilogue, Gain, Residual, ResidualStream, RmsNorm, Scale};
 use crate::weights::{Scope, Weight};
 
 use super::{GatedMlp, GatedMlpSpec};
@@ -165,7 +165,7 @@ impl PreNormBlock {
         pending: Option<Pending>,
         out: TensorView,
     ) -> Result<()> {
-        let plain = || RmsNorm::new(weight, self.eps, Epilogue::None);
+        let plain = || RmsNorm::new(weight, self.eps, Epilogue::None, Gain::Plain);
         match (pending, self.residual) {
             (None, _) => plain()?.forward(f, stream, None, out),
             (Some(pending), ResidualForm::Separate) => {
@@ -177,7 +177,7 @@ impl PreNormBlock {
                     Some(scale) => Epilogue::ScaledResidual { scale, bias: None },
                     None => Epilogue::None,
                 };
-                RmsNorm::new(weight, self.eps, epilogue)?.forward(
+                RmsNorm::new(weight, self.eps, epilogue, Gain::Plain)?.forward(
                     f,
                     pending.update,
                     Some(ResidualStream::in_place(stream)),

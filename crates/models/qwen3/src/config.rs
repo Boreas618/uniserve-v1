@@ -12,7 +12,7 @@
 
 use nn::config::Fields;
 use nn::family::Split;
-use nn::layers::{Precision, Spectrum};
+use nn::layers::{Gain, Precision, Spectrum};
 use ops::activation::Activation;
 
 use crate::{Error, Result};
@@ -39,6 +39,9 @@ pub struct TextConfig {
     pub hidden_act: Activation,
     /// RMSNorm epsilon of both pre-norms, the Q/K norms and the final norm.
     pub rms_norm_eps: f32,
+    /// How those norms' stored weights scale: Qwen3 and Qwen3-VL store the scale, Qwen3.5 stores it
+    /// zero-centred (`x̂ · (1 + w)`).
+    pub rms_norm_gain: Gain,
     /// The rotary spectrum over every channel of a head.
     pub rope: Spectrum,
     /// The context length the checkpoint was trained for.
@@ -125,6 +128,7 @@ impl TextConfig {
             rms_norm_eps: fields
                 .optional_positive("rms_norm_eps")?
                 .map_or(1e-6, |value| value as f32),
+            rms_norm_gain: Gain::Plain,
             rope,
             max_position_embeddings,
             attention_bias: fields.optional_flag("attention_bias")?.unwrap_or(false),

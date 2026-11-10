@@ -304,8 +304,53 @@ pub trait TextModel: CausalLm + Send + Sync {
     /// The key/value cache its layers read, as this rank holds it.
     fn cache(&self) -> CacheShape;
 
+    /// The recurrent state its layers keep per request slot, as this rank holds it; `None` for a
+    /// model whose every layer attends over the key/value cache.
+    fn state(&self) -> Option<StateShape>;
+
     /// Its routed experts, when it has any.
     fn experts(&self) -> Option<ExpertShape>;
+}
+
+/// The recurrent state a causal language model keeps per request slot, as one rank holds it: every
+/// recurrent layer keeps the same fields, each a `[slots, …]` bank the infrastructure allocates
+/// ([`crate::capability::StateLayer`]).
+///
+/// A layer's state after token `t` summarizes every token up to `t`, so a request that resumes
+/// from a cached prefix resumes from the state its prefix's last token left; the prefix cache keeps
+/// such checkpoints of every field ([`crate::capability::StateView::checkpoints`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateShape {
+    /// Layers that keep a recurrent state.
+    pub layers: u32,
+    /// The fields one layer keeps, in the order its banks are handed to it.
+    pub fields: Vec<StateField>,
+}
+
+/// One field of a recurrent layer's state: its element type and its extents after the slot axis.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateField {
+    /// What the field holds, for diagnostics and the cache's field names.
+    pub name: &'static str,
+    /// The element type of its bank.
+    pub dtype: DType,
+    /// Its extents after the slot axis.
+    pub dims: Vec<u64>,
+}
+
+impl StateField {
+    /// The bytes one slot of the field occupies.
+    pub fn bytes(&self) -> u64 {
+        let elements: u64 = self.dims.iter().product();
+        elements * self.dtype.bytes().unwrap_or(0)
+    }
+}
+
+impl StateShape {
+    /// The bytes one slot of one layer's fields occupies.
+    pub fn layer_bytes(&self) -> u64 {
+        self.fields.iter().map(StateField::bytes).sum()
+    }
 }
 
 /// The paged key/value cache a causal language model reads, as one rank holds it.

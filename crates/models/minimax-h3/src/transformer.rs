@@ -548,6 +548,7 @@ impl Transformer {
                 kv_heads: local_heads,
                 qk_norm: QkNorm::Fused {
                     epsilon: config.qk_norm_eps,
+                    gain: nn::layers::Gain::Plain,
                 },
             },
         )?;

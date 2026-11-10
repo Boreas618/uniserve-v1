@@ -56,7 +56,7 @@ pub use linear::{
 };
 pub use moe::{DispatchViews, ExpertNames, ExpertSlots, Moe, MoeSpec, WEIGHT_SCALE_LAYOUT};
 pub use noise::{Key as NoiseKey, Noise};
-pub use norm::{Epilogue, GroupNorm, LayerNorm, Modulation, ResidualStream, RmsNorm};
+pub use norm::{Epilogue, Gain, GroupNorm, LayerNorm, Modulation, ResidualStream, RmsNorm};
 pub use ops::activation::Activation;
 pub use ops::gemm::WeightOrder;
 pub use pool::AdaptiveAvgPool2d;

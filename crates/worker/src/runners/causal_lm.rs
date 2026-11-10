@@ -1054,6 +1054,10 @@ impl<M: TextModel + ?Sized> TextModel for Shared<M> {
         self.0.cache()
     }
 
+    fn state(&self) -> Option<nn::family::StateShape> {
+        self.0.state()
+    }
+
     fn experts(&self) -> Option<nn::family::ExpertShape> {
         self.0.experts()
     }
@@ -2564,6 +2568,8 @@ impl<M: TextModel> CausalLmRunner<M> {
         operation(&KvView {
             groups: &view,
             workspace,
+            // The recurrent banks are bound once the runner keeps a state group's banks.
+            state: None,
         })
     }
 

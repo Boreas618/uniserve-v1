@@ -50,6 +50,7 @@ use ops::rope::{
 use crate::config::Fields;
 use crate::error::{Error, Result};
 use crate::forward::Forward;
+use crate::layers::Gain;
 use crate::layers::launch::{PDL, QK_NORM_ROWS, ROTARY_BLOCK};
 use crate::weights::{Scope, Weight};
 
@@ -564,8 +565,9 @@ fn yarn(fields: &Fields<'_>, maps: &[Option<&Fields<'_>>], extended: u32) -> Res
 pub enum QkNorm {
     /// The rotation alone (`rope_apply`).
     None,
-    /// A per-head RMS norm with this variance floor, fused into the rotation (`qk_norm_rope`).
-    Fused { epsilon: f32 },
+    /// A per-head RMS norm with this variance floor and gain, fused into the rotation
+    /// (`qk_norm_rope`).
+    Fused { epsilon: f32, gain: Gain },
 }
 
 /// The heads one [`Rotary`] turns.
@@ -683,7 +685,7 @@ impl Rotary {
     /// different program: with one it loads the weight, without one it has no weight ports.
     fn fused_descriptor(
         &self,
-        epsilon: f32,
+        (epsilon, gain): (f32, Gain),
         input: ops::DType,
         output: ops::DType,
         affine: bool,
@@ -704,13 +706,14 @@ impl Rotary {
             pdl: PDL,
             factors: ops::DType::F32,
             strided: false,
+            centred: affine && gain == Gain::Centred,
         }
     }
 
     /// The epsilon of the fused norm, refusing a rotary built without one.
-    fn epsilon(&self, owner: &'static str) -> Result<f32> {
+    fn epsilon(&self, owner: &'static str) -> Result<(f32, Gain)> {
         match self.spec.qk_norm {
-            QkNorm::Fused { epsilon } => Ok(epsilon),
+            QkNorm::Fused { epsilon, gain } => Ok((epsilon, gain)),
             QkNorm::None => Err(Error::shape(
                 owner,
                 "this rotary normalizes no head; its rotation has no fused norm".to_owned(),
@@ -868,9 +871,13 @@ impl Rotary {
         }
 
         match self.spec.qk_norm {
-            QkNorm::Fused { epsilon } => {
-                let descriptor =
-                    self.fused_descriptor(epsilon, query.dtype, q_out.dtype, gains.is_some());
+            QkNorm::Fused { epsilon, gain } => {
+                let descriptor = self.fused_descriptor(
+                    (epsilon, gain),
+                    query.dtype,
+                    q_out.dtype,
+                    gains.is_some(),
+                );
                 let args = QkNormRopeArgs {
                     query,
                     key,

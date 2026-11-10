@@ -10,8 +10,8 @@
 use std::sync::Arc;
 
 use nn::family::{
-    CacheShape, ExpertOrder, ExpertShape, Family, Model, TextCheckpoint, TextFamily, TextModel,
-    TextPlacement,
+    CacheShape, ExpertOrder, ExpertShape, Family, Model, StateShape, TextCheckpoint, TextFamily,
+    TextModel, TextPlacement,
 };
 use nn::{Checkpoint, DType, WeightLoader};
 use processing::{ChatProfile, ReasoningFormat, Serving, ToolCallFormat};
@@ -113,6 +113,11 @@ impl TextModel for Qwen3Moe {
             kv_heads: text.num_key_value_heads / self.tensor().size,
             head_dim: text.head_dim,
         }
+    }
+
+    fn state(&self) -> Option<StateShape> {
+        // Every Qwen3-MoE layer attends over the key/value cache.
+        None
     }
 
     fn experts(&self) -> Option<ExpertShape> {

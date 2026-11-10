@@ -24,8 +24,8 @@ use crate::error::{Error, Result};
 use crate::family::Split;
 use crate::forward::Forward;
 use crate::layers::{
-    Bias, DenseAttention, DenseSpec, Gains, Linear, PagedAttention, PagedSpec, Parallel, QkvBias,
-    QkvLinear, QkvNames, QkvSpec, RmsNorm, Rotary, Varlen,
+    Bias, DenseAttention, DenseSpec, Gain, Gains, Linear, PagedAttention, PagedSpec, Parallel,
+    QkvBias, QkvLinear, QkvNames, QkvSpec, RmsNorm, Rotary, Varlen,
 };
 use crate::weights::{Scope, Weight};
 
@@ -179,8 +179,8 @@ impl QkvAttention {
                 key,
                 epsilon,
             } => QkNorm::Separate {
-                query: RmsNorm::load(&mut scope.scope(query), head_dim, epsilon)?,
-                key: RmsNorm::load(&mut scope.scope(key), head_dim, epsilon)?,
+                query: RmsNorm::load(&mut scope.scope(query), head_dim, epsilon, Gain::Plain)?,
+                key: RmsNorm::load(&mut scope.scope(key), head_dim, epsilon, Gain::Plain)?,
             },
         };
         let attention = match spec.kind {
