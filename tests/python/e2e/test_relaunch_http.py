@@ -51,9 +51,12 @@ import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    ATTENTION_BACKEND,
+    QWEN3_CHECKPOINT,
     dedicated_experts,
     find_free_port,
     granted_devices,
+    host_asset,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -150,9 +153,7 @@ def _stop_storage_server(socket: Path) -> None:
 
 
 def _checkpoint() -> str:
-    checkpoint = os.environ.get("UNISERVE_QWEN3_MODEL", "")
-    if not checkpoint or not Path(checkpoint).is_dir():
-        pytest.fail("UNISERVE_QWEN3_MODEL must name the model checkpoint")
+    checkpoint = str(host_asset("UNISERVE_QWEN3_MODEL", QWEN3_CHECKPOINT))
     return checkpoint
 
 
@@ -204,6 +205,8 @@ def _stream_through_a_kill(
         str(worker_executable()),
         "--set",
         "dtype=bfloat16",
+        "--set",
+        f"attention_backend={ATTENTION_BACKEND}",
         "--set",
         "kv_cache_config.max_tokens=32768",
         "--set",
@@ -311,6 +314,7 @@ def _expert_world(topology: str, tmp_path: Path) -> tuple[str, ...]:
     )
 
 
+@pytest.mark.gpus(2)
 @pytest.mark.parametrize("topology", ["replicas", "dedicated"])
 @pytest.mark.parametrize("standby_storage", ["resident", "suspended"])
 def test_an_expert_world_promotes_its_standby_world_when_a_rank_is_lost(

@@ -40,12 +40,15 @@ from tests.python.e2e.profiling_helpers import Load as _Load
 from tests.python.e2e.profiling_helpers import ended as _ended
 from tests.python.e2e.profiling_helpers import profile as _profile
 from tests.python.e2e.profiling_helpers import start as _start
-from tests.python.e2e.program_server import (
-    program_server as running_program_server,
-)
 from uniserve_eval.profile import ProfileFile, convert
 
-pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.gpu,
+    pytest.mark.model("qwen3"),
+    # The module serves one deployment for all of its cases.
+    pytest.mark.gpus(1),
+]
 
 OPTIONS = (
     "dtype=bfloat16",
@@ -60,14 +63,15 @@ OPTIONS = (
 
 
 @pytest.fixture(scope="module")
-def served(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+def served(
+    tmp_path_factory: pytest.TempPathFactory, program_server: Path
+) -> Iterator[str]:
     """A Qwen3 deployment serving with fence probes on its transformer
     layers, which the module's tests share.
     """  # noqa: D205
-    with (
-        running_program_server(tmp_path_factory) as programs,
-        serve(tmp_path_factory.mktemp("served"), OPTIONS, programs) as base_url,
-    ):
+    with serve(
+        tmp_path_factory.mktemp("served"), OPTIONS, program_server
+    ) as base_url:
         yield base_url
 
 

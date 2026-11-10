@@ -25,11 +25,14 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 
+FFMPEG_SOURCE=<FFmpeg 8.1.2 source> crates/media/native/build.sh /opt/ffmpeg-8.1.2
+export UNISERVE_FFMPEG_DIR=/opt/ffmpeg-8.1.2
+
 uv sync --locked --python /usr/bin/python3.12 --extra gpu
 source .venv/bin/activate
 ```
 
-The sync builds the `uniserve` executable, and the `gpu` extra installs the NCCL and CUPTI libraries serving loads. The Program Server keeps an environment of its own, which `uv sync --locked --python /usr/bin/python3.12 --project crates/program-server/python` creates; it compiles the kernel programs with that environment and the host's CUDA toolkit. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
+The executable links a shared FFmpeg 8.1.2 with libx264, which `crates/media/native/build.sh` builds from the FFmpeg source into the prefix it is given (it needs gcc, make, nasm, pkg-config, zlib and patchelf; [the media crate](crates/media/README.md) describes the runtime), and every build finds it through `UNISERVE_FFMPEG_DIR`. The sync builds the `uniserve` executable, and the `gpu` extra installs the NCCL and CUPTI libraries serving loads. The Program Server keeps an environment of its own, which `uv sync --locked --python /usr/bin/python3.12 --project crates/program-server/python` creates; it compiles the kernel programs with that environment and the host's CUDA toolkit. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
 
 For RDMA transfers between hosts, install the pinned UCX and NIXL builds described in [NIXL transfers](docs/nixl.md).
 
@@ -166,11 +169,12 @@ just test-python-fast
 just test-python-gpu
 ```
 
-`test-python-fast` runs without a CUDA device. The HTTP tests under `tests/python/e2e` start a real server on a GPU, and `test-python-gpu` runs them with `UNISERVE_RUN_GPU_E2E=1`. The FastH3 GPU test loads a complete checkpoint on four GPUs:
+`test-python-fast` runs without a CUDA device. The HTTP tests under `tests/python/e2e` start real servers on the host's GPUs; `test-python-gpu` builds the release executable once and runs them one case per free GPU, and a plain `pytest` skips them unless `UNISERVE_RUN_GPU_E2E=1`. The host's checkpoints come from the environment, and a test whose checkpoint is unset is skipped, naming the variable. [Testing](docs/testing.md) lists the variables; the FastH3 tests, for example, load a complete checkpoint on four GPUs:
 
 ```bash
+export UNISERVE_FFMPEG_DIR=/opt/ffmpeg-8.1.2
 UNISERVE_H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2 \
-  .venv/bin/python -m pytest tests/python/e2e/test_h3_parallel_http.py
+  tools/gpu_e2e.sh -m "e2e and gpu" tests/python/e2e/test_h3_parallel_http.py
 ```
 
 The serving evaluator runs HTTP workloads against serving models, measures performance, validates response correctness, and writes reproducible result bundles. Benchmark points are defined in [`uniserve_eval/profiles.toml`](uniserve_eval/profiles.toml).

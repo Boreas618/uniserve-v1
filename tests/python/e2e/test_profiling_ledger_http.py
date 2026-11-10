@@ -18,11 +18,14 @@ import httpx
 import pytest
 
 from tests.python.e2e.profiling_helpers import ended, serve, start
-from tests.python.e2e.program_server import (
-    program_server as running_program_server,
-)
 
-pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.gpu,
+    pytest.mark.model("qwen3"),
+    # The module serves one deployment for all of its cases.
+    pytest.mark.gpus(1),
+]
 
 # No kv_cache_config.max_tokens: the cache takes the quota's rest beside the
 # share the capacity plan keeps for graphs.
@@ -51,12 +54,13 @@ def _ranges_past(storage: int) -> int:
 
 
 @pytest.fixture(scope="module")
-def served(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+def served(
+    tmp_path_factory: pytest.TempPathFactory, program_server: Path
+) -> Iterator[str]:
     """A Qwen3 deployment whose KV cache is sized by its GPU's quota."""
-    with (
-        running_program_server(tmp_path_factory) as programs,
-        serve(tmp_path_factory.mktemp("served"), OPTIONS, programs) as base_url,
-    ):
+    with serve(
+        tmp_path_factory.mktemp("served"), OPTIONS, program_server
+    ) as base_url:
         yield base_url
 
 

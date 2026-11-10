@@ -16,10 +16,10 @@ installs a variant package into it, and applies the unchanged deployment
 configuration, which is what triggers a program-layer update (5.1). Phases are
 asserted on the daemon's events, never on sleeps.
 
-Inputs, all optional except the model, so the file skips where the fixtures do
-not exist:
+The model is ``UNISERVE_QWEN3_MODEL``'s checkpoint; the module is skipped
+when it is unset. The packages are the tree's fixtures under
+``crates/ops/program-fixtures``, and each variable below names another:
 
-- ``UNISERVE_QWEN3_MOE_MODEL``: the Qwen3-MoE BF16 checkpoint.
 - ``UNISERVE_PROGRAM_REBIND_PACKAGE``: a package of an operator the slice
   launches every step, with the serving descriptor key and the same launch
   structure (a rebind swap).
@@ -29,7 +29,8 @@ not exist:
   parameters differ from the serving one.
 - ``UNISERVE_PROGRAM_WRONG_PACKAGE``: a package of the rebind operator whose
   result is outside ``Op::tolerance``.
-- ``UNISERVE_PROGRAM_TARGET``: the Program Server's target (``sm_100a``).
+- ``UNISERVE_PROGRAM_TARGET``: the Program Server's target, derived from the
+  served device (``sm_100a`` on Blackwell) when unset.
 
 The Program Server's interpreter, its precompiler and the binary are named by
 ``UNISERVE_PROGRAM_SERVER_PYTHON``, ``UNISERVE_SCHEDULING_PRECOMPILE`` and
@@ -57,7 +58,9 @@ import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    QWEN3_CHECKPOINT,
     find_free_port,
+    host_asset,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -65,6 +68,7 @@ from tests.python.e2e.http_helpers import (
 from tests.python.e2e.program_server import (
     program_server as running_program_server,
 )
+from tests.python.e2e.program_server import repository
 
 #: Options every deployment this file serves with. They are the live-update
 #: file's, deliberately: the two files serve the same model on the same host,
@@ -90,7 +94,13 @@ DEPLOYMENT_OPTIONS = (
 #: host memory alike.
 HOST_GIB = 8
 
-pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.gpu,
+    pytest.mark.model("qwen3"),
+    # The module's cases are one deployment's history.
+    pytest.mark.gpus(1),
+]
 
 PROMPTS = [
     "Explain what a KV cache is in two sentences.",
@@ -113,29 +123,28 @@ COMMITTED = ["committed", "purged"]
 REVERTED = ["reverted", "purged"]
 
 
-def _required(name: str) -> Path:
+#: The tree's fixture package each variable stands for when it is unset.
+FIXTURE_PACKAGES = {
+    "UNISERVE_PROGRAM_REBIND_PACKAGE": "rms_norm_rebind",
+    "UNISERVE_PROGRAM_RECAPTURE_PACKAGE": "recapture",
+    "UNISERVE_PROGRAM_POLICY_PACKAGE": "policy",
+    "UNISERVE_PROGRAM_WRONG_PACKAGE": "rms_norm_wrong",
+}
+
+
+def _package(name: str) -> Path:
+    """The package directory `name` names, else the tree's fixture."""
     value = os.environ.get(name)
-    if not value:
-        pytest.skip(f"{name} must name a package directory")
-    path = Path(value)
+    fixtures = repository() / "crates/ops/program-fixtures"
+    path = Path(value) if value else fixtures / FIXTURE_PACKAGES[name]
     if not path.is_dir():
-        pytest.fail(f"{name} names {path}, which is not a directory")
+        pytest.fail(f"{name}: {path} is not a package directory")
     return path
 
 
 @pytest.fixture(scope="module")
 def model() -> Path:
-    value = os.environ.get("UNISERVE_QWEN3_MOE_MODEL")
-    if not value:
-        pytest.skip(
-            "UNISERVE_QWEN3_MOE_MODEL must name the Qwen3-MoE checkpoint"
-        )
-    path = Path(value)
-    if not path.exists():
-        pytest.fail(
-            f"UNISERVE_QWEN3_MOE_MODEL names {path}, which does not exist"
-        )
-    return path
+    return host_asset("UNISERVE_QWEN3_MODEL", QWEN3_CHECKPOINT)
 
 
 @pytest.fixture(scope="module")
@@ -503,7 +512,7 @@ def assert_no_failures(step: str, traffic: Traffic) -> None:
 def test_a_kernel_program_is_swapped_by_rebind_while_requests_stream(
     server: str, program_server, traffic: Traffic
 ) -> None:
-    package = _required("UNISERVE_PROGRAM_REBIND_PACKAGE")
+    package = _package("UNISERVE_PROGRAM_REBIND_PACKAGE")
     before = epoch_record(server)
     revision = install(program_server, package)
 
@@ -531,8 +540,8 @@ def test_a_kernel_program_is_swapped_by_rebind_while_requests_stream(
 def test_the_recapture_swap_and_the_policy_swap_keep_serving(
     server: str, program_server, traffic: Traffic
 ) -> None:
-    package = _required("UNISERVE_PROGRAM_RECAPTURE_PACKAGE")
-    policy = _required("UNISERVE_PROGRAM_POLICY_PACKAGE")
+    package = _package("UNISERVE_PROGRAM_RECAPTURE_PACKAGE")
+    policy = _package("UNISERVE_PROGRAM_POLICY_PACKAGE")
     before = epoch_record(server)
     install(program_server, package)
     install(program_server, policy)
@@ -587,7 +596,7 @@ def test_revert_restores_the_previous_generation(
 def test_a_wrong_kernel_is_refused_by_shadow_execution(
     server: str, program_server, traffic: Traffic
 ) -> None:
-    package = _required("UNISERVE_PROGRAM_WRONG_PACKAGE")
+    package = _package("UNISERVE_PROGRAM_WRONG_PACKAGE")
     before = epoch_record(server)
     install(program_server, package)
 

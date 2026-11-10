@@ -13,7 +13,8 @@ kernel programs import (Triton, CuTe DSL, FlashInfer). The repository's
 development environment holds the development tools and the evaluator, and none
 of those, so a build run with it stops at its first import.
 
-``UNISERVE_PROGRAM_SERVER_PYTHON`` names that environment's interpreter,
+``UNISERVE_PROGRAM_SERVER_PYTHON`` names that environment's interpreter (the
+tree's ``crates/program-server/python/.venv`` when unset),
 ``UNISERVE_SCHEDULING_PRECOMPILE`` the wasm precompiler, and ``UNISERVE_BINARY``
 the ``uniserve`` binary.
 """
@@ -21,7 +22,9 @@ the ``uniserve`` binary.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -58,16 +61,23 @@ def compiler() -> Path:
     """The interpreter of the Program Server's own environment.
 
     It compiles every kernel program, and nothing else provides what the
-    programs import. ``UNISERVE_PROGRAM_SERVER_PYTHON`` names it.
+    programs import. ``UNISERVE_PROGRAM_SERVER_PYTHON`` names it; unset, it
+    is the environment `uv sync --locked --project crates/program-server/python`
+    creates in the tree.
     """
     named = os.environ.get("UNISERVE_PROGRAM_SERVER_PYTHON")
-    if not named:
+    path = (
+        Path(named)
+        if named
+        else repository() / "crates/program-server/python/.venv/bin/python"
+    )
+    if not path.exists():
         pytest.fail(
-            "UNISERVE_PROGRAM_SERVER_PYTHON must name the Program Server's "
-            "interpreter: `uv sync --project crates/program-server/python` "
-            "makes one"
+            f"the Program Server's interpreter {path} does not exist: "
+            "`uv sync --locked --project crates/program-server/python` "
+            "makes one, or UNISERVE_PROGRAM_SERVER_PYTHON names another"
         )
-    return Path(named)
+    return path
 
 
 def precompiler() -> Path:
@@ -149,7 +159,12 @@ def program_server(
     """
     binary = require_uniserve_binary()
     work = tmp_path_factory.mktemp("program-server")
-    socket = work / "program-server.sock"
+    # A Unix socket's path is bounded (`SUN_LEN`, 108 bytes), and the test's
+    # directory may lie deep in a run's artifacts, so the socket lives in a
+    # short directory of its own; the log, packages and store stay with the
+    # test.
+    sockets = Path(tempfile.mkdtemp(prefix="uniserve-programs-"))
+    socket = sockets / "program-server.sock"
     log = work / "program-server.log"
     packages = work / "packages"
     store = work / "modules"
@@ -210,3 +225,4 @@ def program_server(
         yield socket
     finally:
         stop_server(process)
+        shutil.rmtree(sockets, ignore_errors=True)

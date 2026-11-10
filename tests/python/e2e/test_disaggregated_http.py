@@ -12,7 +12,13 @@ from concurrent.futures import ThreadPoolExecutor
 import httpx
 import pytest
 
-pytestmark = [pytest.mark.e2e, pytest.mark.gpu]
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.gpu,
+    # The deployment is the independently launched one; the cases lease no
+    # GPU of their own.
+    pytest.mark.gpus(0),
+]
 
 
 @pytest.fixture(scope="module")
@@ -20,7 +26,10 @@ def served():
     url = os.environ.get("UNISERVE_AFD_URL")
     model = os.environ.get("UNISERVE_AFD_MODEL")
     if not url or not model:
-        pytest.fail("UNISERVE_AFD_URL and UNISERVE_AFD_MODEL are required")
+        pytest.skip(
+            "UNISERVE_AFD_URL and UNISERVE_AFD_MODEL are unset: they name a "
+            "running AFD deployment and its served model"
+        )
     return url.rstrip("/"), model
 
 

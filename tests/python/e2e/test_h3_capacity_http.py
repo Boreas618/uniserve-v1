@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 import time
 from pathlib import Path
@@ -12,7 +11,9 @@ import pytest
 from transformers import AutoTokenizer
 
 from tests.python.e2e.http_helpers import (
+    H3_CHECKPOINT,
     find_free_port,
+    host_asset,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -21,7 +22,13 @@ from tests.python.e2e.test_h3_parallel_http import _assert_media_values_close
 from uniserve_eval.datasets.minimax_h3 import _PROMPT
 from uniserve_eval.transport.video import inspect_video_bytes
 
-pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("minimax_h3")]
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.gpu,
+    pytest.mark.model("minimax_h3"),
+    # Every deployment of the module serves on the host's four GPUs.
+    pytest.mark.gpus(4),
+]
 
 # Every output length the [4, 15] second API range produces at 24 fps.
 FRAME_COUNTS = tuple(107 + 17 * index for index in range(16))
@@ -105,12 +112,7 @@ def test_every_admitted_duration_and_prompt_length_replays(
     of different layouts then run concurrently on the two request slots, and
     each matches its own isolated execution.
     """
-    model = os.environ.get("UNISERVE_H3_MODEL")
-    if not model or not Path(model).is_dir():
-        pytest.fail(
-            "UNISERVE_H3_MODEL must name a supported FastH3 checkpoint "
-            "directory; docs/minimax_h3/minimax_h3.md lists them"
-        )
+    model = str(host_asset("UNISERVE_H3_MODEL", H3_CHECKPOINT))
     deployment = (
         Path(__file__).resolve().parents[3]
         / "configs"

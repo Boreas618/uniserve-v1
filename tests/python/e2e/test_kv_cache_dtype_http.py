@@ -13,15 +13,17 @@ until their first difference, where each output's token is among the other's
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    ATTENTION_BACKEND,
+    QWEN3_CHECKPOINT,
     find_free_port,
     gpu_device,
+    host_asset,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -69,6 +71,8 @@ def _generate(
         str(worker_executable()),
         "--set",
         "dtype=bfloat16",
+        "--set",
+        f"attention_backend={ATTENTION_BACKEND}",
         "--set",
         "kv_cache_config.max_tokens=16384",
         "--max-model-len",
@@ -126,9 +130,7 @@ def _generate(
 
 
 def test_an_fp16_cache_serves_a_bf16_model_like_a_bf16_cache(tmp_path: Path):
-    checkpoint = os.environ.get("UNISERVE_QWEN3_MODEL", "")
-    if not checkpoint or not Path(checkpoint).is_dir():
-        pytest.fail("UNISERVE_QWEN3_MODEL must name the model checkpoint")
+    checkpoint = str(host_asset("UNISERVE_QWEN3_MODEL", QWEN3_CHECKPOINT))
 
     reference = _generate(tmp_path, checkpoint, "bfloat16-cache", [])
     converted = _generate(

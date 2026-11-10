@@ -9,7 +9,6 @@ import shutil
 import signal
 import socket
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -19,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 from PIL import Image
 
 from uniserve_eval.transport.sse import iter_sse_events
@@ -29,6 +29,28 @@ from uniserve_eval.transport.sse import iter_sse_events
 # `kv_cache_config.host_ratio` alone would together commit more host storage
 # than the host has.
 HOST_CACHE_GIB = 16
+
+#: The attention program the suite's Qwen3 deployments serve: trtllm-gen, the
+#: program these deployments' shapes take on Blackwell.
+# Explicit until the Program Server selects a program left at `auto` (W4).
+ATTENTION_BACKEND = "trtllm"
+
+#: What ``UNISERVE_QWEN3_MODEL`` names.
+QWEN3_CHECKPOINT = "a Qwen3-MoE BF16 checkpoint directory (Qwen3-30B-A3B)"
+
+#: What ``UNISERVE_QWEN3_UPDATED_MODEL`` names.
+QWEN3_UPDATED_CHECKPOINT = (
+    "another copy of the Qwen3-MoE checkpoint's files with other weights"
+)
+
+#: What ``UNISERVE_H3_MODEL`` names.
+H3_CHECKPOINT = (
+    "a FastH3 checkpoint directory (FastVideo-FastH3-8-Step-V2; "
+    "docs/minimax_h3/minimax_h3.md lists the supported ones)"
+)
+
+#: What ``UNISERVE_MINIMAX_H3_MODEL`` names.
+MINIMAX_H3_CHECKPOINT = "the MiniMax-H3 diffusers root"
 
 # Options every test server adds to its own, as `PATH=VALUE` assignments
 # separated by whitespace (``UNISERVE_E2E_SET``), and the factor every wait
@@ -121,14 +143,49 @@ def require_uniserve_binary() -> Path:
 def worker_executable() -> Path:
     """The `uniserve` executable a test server's workers run as.
 
-    `UNISERVE_WORKER_EXECUTABLE` names it; otherwise it is the one installed
-    beside the interpreter running the tests, which runs the workers in that
-    environment.
+    `UNISERVE_WORKER_EXECUTABLE` names it, such as the sanitizer's wrapper;
+    otherwise the workers run the binary the daemon runs
+    (:func:`require_uniserve_binary`), so a server never mixes two builds.
     """
     configured = os.environ.get("UNISERVE_WORKER_EXECUTABLE")
     if configured:
         return Path(configured)
-    return Path(sys.executable).parent / "uniserve"
+    return require_uniserve_binary()
+
+
+def host_asset(variable: str, what: str) -> Path:
+    """The path of a host asset that `variable` names.
+
+    Model checkpoints and input sets are facts of the host, which its
+    environment states. A case whose asset is unset is skipped, naming the
+    variable and what it must name, and never passes; a variable that names a
+    path that does not exist is a misconfigured run and fails.
+    """
+    value = os.environ.get(variable, "")
+    if not value:
+        pytest.skip(f"{variable} is unset: it names {what}")
+    path = Path(value)
+    if not path.exists():
+        pytest.fail(f"{variable} names {path}, which does not exist: {what}")
+    return path
+
+
+#: The Program Server every deployment that names none is given
+#: (:func:`programs_from`).
+_PROGRAM_SERVER: Path | None = None
+
+
+@contextmanager
+def programs_from(server: Path) -> Iterator[None]:
+    """Give every deployment started in the block the Program Server whose
+    socket is `server`, unless it names one itself (``program_config.socket``).
+    """  # noqa: D205
+    global _PROGRAM_SERVER
+    previous, _PROGRAM_SERVER = _PROGRAM_SERVER, server
+    try:
+        yield
+    finally:
+        _PROGRAM_SERVER = previous
 
 
 def log_tail(log_path: Path | None, lines: int = 40) -> str:
@@ -199,9 +256,17 @@ def start_server(
     """Start `args` in a session of its own, its output to `log_path`.
 
     A deployment that sizes no host KV cache (``kv_cache_config.host_*``) holds
-    `HOST_CACHE_GIB` of it, and every deployment adds `E2E_SET`.
+    `HOST_CACHE_GIB` of it; one that names no Program Server is given the
+    module's (:func:`programs_from`); and every deployment adds `E2E_SET`.
     """
     if _serves_a_deployment(args):
+        named = any("program_config.socket" in arg for arg in args)
+        if not named and _PROGRAM_SERVER is not None:
+            args = [
+                *args,
+                "--set",
+                f"program_config.socket={_PROGRAM_SERVER}",
+            ]
         sized = any("kv_cache_config.host_" in arg for arg in args)
         if not sized:
             args = [

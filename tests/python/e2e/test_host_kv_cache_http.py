@@ -31,8 +31,11 @@ import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    ATTENTION_BACKEND,
+    QWEN3_CHECKPOINT,
     find_free_port,
     gpu_device,
+    host_asset,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -135,6 +138,8 @@ def _command(checkpoint: str, port: int) -> list[str]:
         "--set",
         "dtype=bfloat16",
         "--set",
+        f"attention_backend={ATTENTION_BACKEND}",
+        "--set",
         "kv_cache_config.max_tokens=32768",
         "--set",
         f"kv_cache_config.block_size={BLOCK_SIZE}",
@@ -152,9 +157,7 @@ def _runtime() -> Path:
 
 
 def _checkpoint() -> str:
-    checkpoint = os.environ.get("UNISERVE_QWEN3_MODEL", "")
-    if not checkpoint or not Path(checkpoint).is_dir():
-        pytest.fail("UNISERVE_QWEN3_MODEL must name the model checkpoint")
+    checkpoint = str(host_asset("UNISERVE_QWEN3_MODEL", QWEN3_CHECKPOINT))
     return checkpoint
 
 

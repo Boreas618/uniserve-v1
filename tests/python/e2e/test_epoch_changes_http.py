@@ -56,8 +56,12 @@ import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    ATTENTION_BACKEND,
+    QWEN3_CHECKPOINT,
+    QWEN3_UPDATED_CHECKPOINT,
     dedicated_experts,
     find_free_port,
+    host_asset,
     require_uniserve_binary,
     scaled,
     server_process,
@@ -82,6 +86,7 @@ TRIAL_PROMPT = "List the colours of the rainbow and what each means. " * 40
 # so that epochs start while the count streams, and a small KV cache.
 OPTIONS = (
     "dtype=bfloat16",
+    f"attention_backend={ATTENTION_BACKEND}",
     "kv_cache_config.max_tokens=32768",
     "chat_config.reasoning_parser=none",
     "cuda_graph_config.prefill_token_sizes=[512]",
@@ -93,9 +98,7 @@ CHANGE = "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8, 16]"
 
 
 def _checkpoint() -> str:
-    checkpoint = os.environ.get("UNISERVE_QWEN3_MODEL", "")
-    if not checkpoint or not Path(checkpoint).is_dir():
-        pytest.fail("UNISERVE_QWEN3_MODEL must name the model checkpoint")
+    checkpoint = str(host_asset("UNISERVE_QWEN3_MODEL", QWEN3_CHECKPOINT))
     return checkpoint
 
 
@@ -471,6 +474,7 @@ def _epochs_of(ledgers: list[dict], item: str) -> set[tuple[int, ...]]:
     }
 
 
+@pytest.mark.gpus(3)
 def test_independent_replicas_roll_on_disjoint_devices(tmp_path: Path):
     """One replica trials at a time while the shared service keeps serving."""
     name = "qwen3-replicas"
@@ -518,6 +522,7 @@ def test_independent_replicas_roll_on_disjoint_devices(tmp_path: Path):
         assert _chat(base_url, name, CACHED_PROMPT) == expected
 
 
+@pytest.mark.gpus(3)
 def test_replica_rollback_and_daemon_restart_preserve_serving(tmp_path: Path):
     """A selected replica rolls back; a hot restart adopts both owners."""
     name = "qwen3-replica-recovery"
@@ -574,6 +579,7 @@ def test_replica_rollback_and_daemon_restart_preserve_serving(tmp_path: Path):
                 )
 
 
+@pytest.mark.gpus(2)
 def test_splitting_an_expert_group_rolls_back_as_one_transaction(
     tmp_path: Path,
 ):
@@ -620,7 +626,14 @@ def test_splitting_an_expert_group_rolls_back_as_one_transaction(
         assert _chat(base_url, name, CACHED_PROMPT) == expected
 
 
-@pytest.mark.parametrize("topology", ["single", "experts", "dedicated"])
+@pytest.mark.parametrize(
+    "topology",
+    [
+        "single",
+        pytest.param("experts", marks=pytest.mark.gpus(2)),
+        pytest.param("dedicated", marks=pytest.mark.gpus(2)),
+    ],
+)
 def test_a_epoch_change_continues_a_streaming_request_and_commits(
     tmp_path: Path, topology: str
 ):
@@ -991,7 +1004,14 @@ def _forwards(base_url: str, mode: str) -> float:
     )
 
 
-@pytest.mark.parametrize("topology", ["single", "experts", "dedicated"])
+@pytest.mark.parametrize(
+    "topology",
+    [
+        "single",
+        pytest.param("experts", marks=pytest.mark.gpus(2)),
+        pytest.param("dedicated", marks=pytest.mark.gpus(2)),
+    ],
+)
 def test_a_serving_epoch_gives_its_graph_storage_to_a_preparing_successor(
     tmp_path: Path, topology: str
 ):
@@ -1076,13 +1096,9 @@ def _updated_checkpoint() -> str:
     """Another checkpoint of the model, of the same files but for other
     weights (``UNISERVE_QWEN3_UPDATED_MODEL``).
     """  # noqa: D205
-    checkpoint = os.environ.get("UNISERVE_QWEN3_UPDATED_MODEL", "")
-    if not checkpoint or not Path(checkpoint).is_dir():
-        pytest.fail(
-            "UNISERVE_QWEN3_UPDATED_MODEL must name another checkpoint of "
-            "the model, with other weights"
-        )
-    return checkpoint
+    return str(
+        host_asset("UNISERVE_QWEN3_UPDATED_MODEL", QWEN3_UPDATED_CHECKPOINT)
+    )
 
 
 # The share of the GPU a deployment whose successor loads every weight

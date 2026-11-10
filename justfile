@@ -30,24 +30,16 @@ lint: fmt clippy
 test-python-fast:
     {{python}} -m pytest -m "unit and not gpu"
 
-# Build the debug binary if missing
-[private]
-build-debug:
-    {{cargo}} build -p uniserve
-
 # The missing-state tests (GPU) with every main process under compute-sanitizer's
-# memcheck; its logs go to $SANITIZER_LOGS
-test-python-sanitizer: build-debug
-    UNISERVE_RUN_GPU_E2E=1 \
-    UNISERVE_WORKER_EXECUTABLE={{justfile_directory()}}/tests/python/sanitizer/memcheck-worker \
-    UNISERVE_MEMCHECK_TARGET=$({{python}} -c 'import os, sys; print(os.path.join(os.path.dirname(sys.executable), "uniserve"))') \
-    UNISERVE_E2E_SET="mem_fraction_static=0.6 worker_config.watchdog_timeout=2h" \
-    UNISERVE_E2E_TIME_SCALE=20 \
-    {{python}} -m pytest -m "e2e and gpu and missing_state"
+# memcheck; the logs go to $SANITIZER_LOGS (the run's artifacts by default).
+# docs/testing.md lists the variables the tests read.
+test-python-sanitizer:
+    PYTHON="{{python}}" CARGO="{{cargo}}" tools/gpu_e2e.sh --memcheck -m "e2e and gpu and missing_state"
 
-# End-to-end Python tests (GPU)
-test-python-gpu: build-debug
-    UNISERVE_RUN_GPU_E2E=1 {{python}} -m pytest -m "e2e and gpu"
+# End-to-end Python tests (GPU), one case per free GPU, from one release
+# build. docs/testing.md lists the variables the tests read.
+test-python-gpu:
+    PYTHON="{{python}}" CARGO="{{cargo}}" tools/gpu_e2e.sh -m "e2e and gpu"
 
 # Run all checks
 test-all: fmt clippy test-rust bench-build test-python-fast

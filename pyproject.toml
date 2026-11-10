@@ -24,6 +24,9 @@ test = [
     "httpx",
     "pytest>=8.1",
     "pytest-timeout>=2.3",
+    # The GPU recipe runs the e2e cases on parallel workers, each case on the
+    # GPUs it leases (tests/python/e2e/conftest.py).
+    "pytest-xdist>=3.6",
     # The HTTP tests compare served tensors, and
     # tokenize with the checkpoint's own tokenizer.
     "numpy",
@@ -98,6 +101,8 @@ markers = [
     "gpu: requires a CUDA device; orthogonal to the unit and e2e layers",
     "slow: excluded from the fast local and presubmit suites",
     "model(name): selects a concrete model backend such as qwen3 or minimax_h3",
+    "gpus(count): the GPUs an e2e case leases (1 when unmarked); on a module, the whole module holds them",
+    "host_wide: an e2e case that observes host-wide state (such as the host's shared memory) and runs alone",
     "missing_state: a serving path without an optional derived state (weights, KV pages and recurrent checkpoints, draft cache, encoder outputs, latents); runs under compute-sanitizer in the sanitizer workflow",
 ]
 

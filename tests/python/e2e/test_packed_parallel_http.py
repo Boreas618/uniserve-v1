@@ -9,7 +9,6 @@ that position.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -18,14 +17,24 @@ import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    ATTENTION_BACKEND,
+    QWEN3_CHECKPOINT,
     find_free_port,
+    granted_devices,
+    host_asset,
     require_uniserve_binary,
     server_process,
     worker_executable,
     written_deployment,
 )
 
-pytestmark = [pytest.mark.e2e, pytest.mark.gpu]
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.gpu,
+    # The one-device reference is served once for the module, so the module
+    # holds both GPUs its cases bind.
+    pytest.mark.gpus(2),
+]
 
 # Candidates each generated position reports for the comparison.
 TOP_LOGPROBS = 5
@@ -56,6 +65,8 @@ def _command(
         str(written_deployment(directory, [worker_config])),
         "--set",
         "dtype=bfloat16",
+        "--set",
+        f"attention_backend={ATTENTION_BACKEND}",
         "--set",
         "kv_cache_config.max_tokens=8192",
         "--max-model-len",
@@ -141,7 +152,7 @@ def one_device(
             base_url = f"http://127.0.0.1:{port}"
             worker_config = {
                 "id": "model",
-                "ranks": ["cuda:3"],
+                "ranks": ["cuda:0"],
                 "blocks": {"model": {"ranks": [0]}},
                 "queue_depth": 2,
             }
@@ -152,7 +163,7 @@ def one_device(
                 base_url,
                 directory / f"{description}.log",
                 timeout_s=300,
-                env={"CUDA_VISIBLE_DEVICES": "0,1,2,3"},
+                env={"CUDA_VISIBLE_DEVICES": granted_devices(1)},
             ):
                 outputs[description] = _ranked(base_url, description)
         return outputs[description]
@@ -176,9 +187,7 @@ def test_ordered_bindings_generate_outputs(
     parallel_axis: str,
     one_device: Callable[[str, str], dict[str, list[Any]]],
 ):
-    checkpoint = os.environ.get(model_env, "")
-    if not checkpoint or not Path(checkpoint).is_dir():
-        pytest.fail(f"{model_env} must name the model checkpoint directory")
+    checkpoint = str(host_asset(model_env, QWEN3_CHECKPOINT))
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     parallel = (
@@ -186,9 +195,10 @@ def test_ordered_bindings_generate_outputs(
         if parallel_axis == "sequence"
         else {f"{parallel_axis}_parallel_size": 2}
     )
+    # The module's two GPUs, listed in descending order.
     worker_config = {
         "id": "model",
-        "ranks": [f"cuda:{device}" for device in (3, 1)],
+        "ranks": ["cuda:1", "cuda:0"],
         "blocks": {"model": {"ranks": [1, 0], **parallel}},
         "queue_depth": 2,
     }
@@ -197,7 +207,7 @@ def test_ordered_bindings_generate_outputs(
         base_url,
         tmp_path / f"{description}-{parallel_axis}.log",
         timeout_s=300,
-        env={"CUDA_VISIBLE_DEVICES": "0,1,2,3"},
+        env={"CUDA_VISIBLE_DEVICES": granted_devices(2)},
     ):
         for name, messages in _chats(description).items():
             response = httpx.post(

@@ -15,22 +15,29 @@ for every prompt token after the first.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
-from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    ATTENTION_BACKEND,
+    QWEN3_CHECKPOINT,
     find_free_port,
+    host_asset,
     require_uniserve_binary,
     server_process,
     worker_executable,
 )
 
-pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.gpu,
+    pytest.mark.model("qwen3"),
+    # The module serves one deployment for all of its cases.
+    pytest.mark.gpus(1),
+]
 
 CHUNK = 256
 # About a thousand tokens of records, then a question about them: four
@@ -45,10 +52,7 @@ PROMPT = (
 
 
 def _checkpoint() -> str:
-    checkpoint = os.environ.get("UNISERVE_QWEN3_MODEL", "")
-    if not checkpoint or not Path(checkpoint).is_dir():
-        pytest.fail("UNISERVE_QWEN3_MODEL must name the model checkpoint")
-    return checkpoint
+    return str(host_asset("UNISERVE_QWEN3_MODEL", QWEN3_CHECKPOINT))
 
 
 @pytest.fixture(scope="module")
@@ -69,6 +73,8 @@ def graphs(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
         str(worker_executable()),
         "--set",
         "dtype=bfloat16",
+        "--set",
+        f"attention_backend={ATTENTION_BACKEND}",
         "--set",
         "kv_cache_config.max_tokens=32768",
         "--set",

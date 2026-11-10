@@ -21,7 +21,6 @@ the size and frame count the request resolves to.
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 from pathlib import Path
@@ -30,14 +29,23 @@ import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    H3_CHECKPOINT,
+    MINIMAX_H3_CHECKPOINT,
     find_free_port,
+    host_asset,
     require_uniserve_binary,
     server_process,
     worker_executable,
 )
 from uniserve_eval.transport.video import inspect_video_bytes
 
-pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("minimax_h3")]
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.gpu,
+    pytest.mark.model("minimax_h3"),
+    # Every deployment of the module serves on the host's four GPUs.
+    pytest.mark.gpus(4),
+]
 
 ROOT = Path(__file__).resolve().parents[3]
 WORKLOADS = ROOT / "uniserve_eval" / "workloads" / "minimax_h3"
@@ -73,22 +81,18 @@ def _request(workload: str, inputs: Path) -> dict:
 
 
 def _root() -> str:
-    model = os.environ.get("UNISERVE_MINIMAX_H3_MODEL")
-    if not model or not Path(model).is_dir():
-        pytest.fail(
-            "UNISERVE_MINIMAX_H3_MODEL must name a MiniMax-H3 diffusers root"
-        )
+    model = str(host_asset("UNISERVE_MINIMAX_H3_MODEL", MINIMAX_H3_CHECKPOINT))
     return model
 
 
 def _inputs() -> Path:
-    inputs = os.environ.get("UNISERVE_MINIMAX_H3_INPUTS")
-    if not inputs or not (Path(inputs) / "media").is_dir():
-        pytest.fail(
-            "UNISERVE_MINIMAX_H3_INPUTS must name the protocol inputs "
-            "directory holding media/"
-        )
-    return Path(inputs).resolve()
+    inputs = host_asset(
+        "UNISERVE_MINIMAX_H3_INPUTS",
+        "the protocol inputs directory holding media/",
+    )
+    if not (inputs / "media").is_dir():
+        pytest.fail(f"UNISERVE_MINIMAX_H3_INPUTS: {inputs} holds no media/")
+    return inputs.resolve()
 
 
 def _command(model, deployment, port, inputs, options) -> list[str]:
@@ -167,12 +171,7 @@ def test_base_first_frame_request(tmp_path: Path) -> None:
 
 def test_fasth3_first_frame_request(tmp_path: Path) -> None:
     """A FastH3 DMD student serves its partition's keyframe requests."""
-    model = os.environ.get("UNISERVE_H3_MODEL")
-    if not model or not Path(model).is_dir():
-        pytest.fail(
-            "UNISERVE_H3_MODEL must name a FastH3 DMD export directory; "
-            "docs/minimax_h3/minimax_h3.md lists them"
-        )
+    model = str(host_asset("UNISERVE_H3_MODEL", H3_CHECKPOINT))
     inputs = _inputs()
     port = find_free_port()
     base = f"http://127.0.0.1:{port}"
@@ -313,12 +312,9 @@ def _omniref() -> str:
     The export reads the components it omits from the Hugging Face cache at
     the base revision it pins.
     """
-    export = os.environ.get("UNISERVE_MINIMAX_H3_OMNIREF")
-    if not export:
-        pytest.fail(
-            "UNISERVE_MINIMAX_H3_OMNIREF must name a FastH3 OmniRef export"
-        )
-    return export
+    return str(
+        host_asset("UNISERVE_MINIMAX_H3_OMNIREF", "a FastH3 OmniRef export")
+    )
 
 
 def test_omniref_reference_requests(tmp_path: Path) -> None:
