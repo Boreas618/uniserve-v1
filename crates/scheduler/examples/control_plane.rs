@@ -1,8 +1,10 @@
-//! Demonstrates concurrent text requests through the simulated engine.
+//! Demonstrates concurrent text requests through the scheduler over a fake
+//! worker.
 //!
 //! The example exercises scheduling and lifecycle events without requiring a
 //! model worker or GPU. Three text requests share one scheduler thread over
-//! `SimWorker`; the run passes when every request finishes within the
+//! the production submission door, with `testkit::FakeBatches` answering its
+//! batches; the run passes when every request finishes within the
 //! deadline and each text request emits at least one text token. The process exits
 //! with status 1 on failure, and reports an error when the simulation cannot
 //! start or a request is refused.
@@ -14,25 +16,37 @@ use std::time::Duration;
 use ipc::{RequestId, SamplingParams};
 use scheduler::Event;
 use scheduler::{
-    CommandWaker, Scheduler, SchedulerConfig, SchedulerHandle, SimEngine, SimWorker, Worker,
+    CommandWaker, Scheduler, SchedulerConfig, SchedulerHandle, SpecialTokenIds, Submissions,
+    WorkerInfo,
 };
 use scheduler::{GenerationLimits, GenerationRequest};
 
 fn main() -> anyhow::Result<()> {
-    let mut sim = SimEngine::new();
-    // Two batches may be in flight at once, so a step never waits on the one
-    // before it to be retired.
-    sim.set_queue_depth(2);
-    let worker = Box::new(SimWorker::new(sim));
-    let capacity = scheduler::BatchCapacity::of(&worker.info().runtime_info()?);
+    // One text pool of one rank. Two batches may be in flight at once, so a
+    // step never waits on the one before it to be retired.
+    let mut pool = testkit::pool("sim");
+    pool.layout.queue_depth = 2;
+    let batches: std::sync::Arc<dyn ipc::execution::Batches> =
+        std::sync::Arc::new(testkit::FakeBatches::new(vec![pool]));
+    let capacity = scheduler::BatchCapacity::of(
+        &WorkerInfo::from_inventory(batches.inventory())?.runtime_info()?,
+    );
     let mut sched = Scheduler::new(
-        scheduler::Submissions::new(worker),
-        SimEngine::special_tokens(),
+        Submissions::over_batches(batches)?,
+        // The fake samples no EOS: every token it samples lies in
+        // `testkit::SAMPLED`'s window, so each request ends at its budget.
+        SpecialTokenIds {
+            bos: 151_644,
+            eos: vec![151_643],
+        },
         SchedulerConfig {
             max_batch: proto::config::positive(32),
             ..Default::default()
         },
-        SimEngine::generation_limits(),
+        GenerationLimits {
+            features: scheduler::GenerationFeatures::UNDERSTANDING,
+            ..Default::default()
+        },
     )?;
 
     // A scheduler with no policy decides nothing — no plan, no admission, no
@@ -147,7 +161,7 @@ fn main() -> anyhow::Result<()> {
                 .load(std::sync::atomic::Ordering::Relaxed),
         );
         handle.shutdown();
-        println!("\nRUST SIM CONTROL-PLANE: PASS");
+        println!("\nRUST CONTROL-PLANE: PASS");
         std::process::exit(0);
     }
     if wants("migrated") {
@@ -172,6 +186,7 @@ fn main() -> anyhow::Result<()> {
                 let e = counts.entry(*id).or_insert((kind.clone(), 0, false));
                 match ev {
                     Event::TextToken { .. } => e.1 += 1,
+                    Event::TextTokens { ids } => e.1 += ids.len(),
                     Event::Finished { .. } if !e.2 => {
                         e.2 = true;
                         done += 1;
@@ -211,9 +226,6 @@ fn main() -> anyhow::Result<()> {
         }
     }
     handle.shutdown();
-    println!(
-        "\nRUST SIM CONTROL-PLANE: {}",
-        if ok { "PASS" } else { "FAIL" }
-    );
+    println!("\nRUST CONTROL-PLANE: {}", if ok { "PASS" } else { "FAIL" });
     std::process::exit(if ok { 0 } else { 1 });
 }

@@ -331,7 +331,8 @@ fn start_split(
             }))
             .with_operate(Arc::new(move |operation| operate(&operated, operation))),
     );
-    let scheduler = fake::scheduler_over(pool, SchedulerConfig::default(), Default::default());
+    let scheduler = fake::scheduler_over(pool, SchedulerConfig::default(), Default::default())
+        .expect("the scheduler is built over the fake");
     let (tx, rx) = crossbeam_channel::unbounded();
     let thread = thread::spawn(move || {
         let _ = scheduler.run(rx);

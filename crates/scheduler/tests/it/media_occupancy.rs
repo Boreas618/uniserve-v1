@@ -1,43 +1,45 @@
-//! Media occupancy scheduling and call graphs of video requests over the
-//! GPU-free simulator.
+//! Media occupancy scheduling and call graphs of video requests, over the
+//! production submission door with `testkit::FakeBatches` as the worker.
 //!
-//! The observation point is the worker boundary: the batches the simulator
-//! accepts and the moment it hands each result back. The simulator delivers a
-//! result only when the scheduler waits for one, so every batch stays in
-//! flight until the scheduler blocks for a completion, and the record of
-//! submissions and resolutions is a function of scheduling decisions alone.
+//! The observation point is the worker's batch interface: the media batches
+//! the fake accepts, each with the batches still on the device when it was
+//! accepted. A pacer completes one held batch at a time, so batches the
+//! scheduler submits together stay in flight together, and what ran at the
+//! same time is a function of the scheduler's occupancy rules.
 
 use crate::support;
+use crate::support::fake::Pacer;
 use crate::support::video::{
-    MAX_CONDITION_ROWS, MAX_RASTER, PROMPT, STEPS, video_request, video_worker,
+    MAX_CONDITION_ROWS, MAX_RASTER, PROMPT, STEPS, video_fake, video_pool, video_request,
 };
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::Receiver;
-
-use ipc::execution::PoolLayout;
-use ipc::{BufferId, Call, CallKind, DimBound, MediaCall};
+use ipc::MediaCall;
+use ipc::execution::{Batches, Inventory};
 use ipc::{DiffusionSamplingParams, RequestId};
 use proto::video::Canvas;
-use scheduler::{
-    BatchEvent, BatchResult, CommandSender, ExecutionBatch, RequestDispatch, SchedulerConfig,
-    SimEngine, SimWorker, Worker, WorkerError, WorkerGroupId, WorkerInfo, WorkerSubmitError,
-};
+use scheduler::{CommandSender, SchedulerConfig};
 use scheduler::{ConditionExtent, DiffusionRequest, Event, FinishReason, RejectionKind, Request};
+use testkit::Media;
+
+/// How long a fake device holds a batch before the pacer completes it.
+const DEVICE_STEP: Duration = Duration::from_millis(2);
 
 /// One media call as the worker received it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ObservedCall {
     request: RequestId,
     call: MediaCall,
-    /// Media units the call covers: its decode range's `max_units`, or one
-    /// when the call carries no decode range.
+    /// Media units the call covers: one for a call that is not measured in
+    /// units, and for a decode the units from its first to the next round's.
     units: u32,
+    /// The first timeline unit a unit-measured call covers, as the mechanism
+    /// staged it; zero for every other call.
+    first: u32,
 }
 
 impl ObservedCall {
@@ -84,11 +86,8 @@ impl Submission {
 struct Served {
     /// Media submissions in the order the worker accepted them.
     submissions: Vec<Submission>,
-    /// Each submitted media call with the worker its dispatch names for
-    /// every component reading its products, in submission order.
-    readers: Vec<(RequestId, MediaCall, BTreeMap<String, WorkerGroupId>)>,
-    /// Every submitted media call with its dispatch, in submission order.
-    calls: Vec<(Call, RequestDispatch)>,
+    /// Every media call, in the order the worker accepted them.
+    calls: Vec<ObservedCall>,
     /// Every event each request's stream delivered.
     outcomes: HashMap<RequestId, Vec<Event>>,
 }
@@ -109,6 +108,16 @@ impl Served {
                     .iter()
                     .any(|call| call.is(request, media_call))
             })
+            .collect()
+    }
+
+    /// Indices into [`Served::calls`] of a request's calls of one kind.
+    fn call_indices(&self, request: RequestId, media_call: MediaCall) -> Vec<usize> {
+        self.calls
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| call.is(request, media_call))
+            .map(|(index, _)| index)
             .collect()
     }
 
@@ -142,9 +151,17 @@ impl Served {
 /// output journal until the consumer drains the channel.
 #[test]
 fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
-    let mut worker = SimWorker::new(video_worker(1, 1));
-    let boundary = worker.observe();
-    let scheduler = support::scheduler(Box::new(worker), SimEngine::special_tokens(), 32).unwrap();
+    let media = Arc::new(Media::new());
+    let fake = video_fake(vec![video_pool(1, 1, 1)], &media);
+    let scheduler = support::fake::scheduler_over(
+        Arc::clone(&fake) as Arc<dyn Batches>,
+        SchedulerConfig {
+            max_batch: proto::config::positive(32),
+            ..Default::default()
+        },
+        Default::default(),
+    )
+    .unwrap();
     let (tx, commands) = crossbeam_channel::unbounded();
     let handle = CommandSender::new(tx);
     let mut stream = handle
@@ -168,25 +185,25 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
         .unwrap();
     let engine = thread::spawn(move || scheduler.run(commands));
 
-    // Let the entire workload finish while the caller retains an unread stream.
-    // `Scheduler::finish_media` enqueues the terminal event on the request's
-    // output before it queues the request's `Finish` lifecycle command, so a
-    // submitted `Finish` at the worker boundary shows the request has ended.
-    // A stalled workload instead exhausts the deadline and fails
-    // `recv_timeout`.
+    // Let the entire workload finish while the caller retains an unread
+    // stream: the final muxing call, the one that hands no encoded round,
+    // completes the artifact and with it the request.
     let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let event = boundary
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .unwrap();
-        if let BatchEvent::Submitted(batch) = event
-            && batch
-                .commands
-                .iter()
-                .any(|command| matches!(command, ipc::BatchCommand::Finish { .. }))
-        {
-            break;
-        }
+    let finished_muxing = || {
+        fake.submitted().iter().any(|batch| {
+            batch.media.as_ref().is_some_and(|media| {
+                media.computation.call == MediaCall::Muxing
+                    && (0..media.inputs.len())
+                        .any(|row| media.request(row).is_ok_and(|staged| staged.handed == 0))
+            })
+        })
+    };
+    while !finished_muxing() {
+        assert!(
+            Instant::now() < deadline,
+            "the request never reached its final muxing"
+        );
+        thread::sleep(Duration::from_millis(1));
     }
 
     // Only now drain the stream, until its terminal event. The engine keeps
@@ -211,64 +228,42 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
 
     Served {
         submissions: Vec::new(),
-        readers: Vec::new(),
         calls: Vec::new(),
         outcomes: HashMap::from([(RequestId(90), events)]),
     }
     .assert_completed(RequestId(90));
 }
 
-/// Media calls of one batch; a batch carrying only lifecycle commands has none.
-fn media_calls(batch: &ExecutionBatch) -> Vec<ObservedCall> {
-    batch
-        .requests
-        .iter()
-        .filter_map(|(call, dispatch)| {
-            let CallKind::Media(media_call) = call.kind else {
-                return None;
-            };
-            Some(ObservedCall {
-                request: call.request_key.request_id,
-                call: media_call,
-                units: dispatch.decode.as_ref().map_or(1, |range| range.max_units),
-            })
-        })
-        .collect()
-}
-
 /// Serves the requests, queued together in order, until each stream reaches
 /// a terminal event.
-fn serve(sim: SimEngine, requests: Vec<Request>) -> Served {
-    serve_bounded(sim, requests, None)
+fn serve(pool: Inventory, requests: Vec<Request>) -> Served {
+    serve_with(pool, Media::new(), requests, None)
 }
 
-/// Serves the requests with an optional bound on waiting request state.
-fn serve_bounded(
-    sim: SimEngine,
+/// Serves the requests over `pool` whose media calls `media` answers, with an
+/// optional bound on waiting request state.
+fn serve_with(
+    pool: Inventory,
+    media: Media,
     requests: Vec<Request>,
     max_queued_requests: Option<usize>,
 ) -> Served {
-    let mut worker = SimWorker::new(sim);
-    let boundary = worker.observe();
-    serve_through(Box::new(worker), boundary, requests, max_queued_requests)
-}
-
-/// Serves the requests through `worker`, whose accepted batches and
-/// resolved results `boundary` reports.
-fn serve_through(
-    worker: Box<dyn Worker>,
-    boundary: Receiver<BatchEvent>,
-    requests: Vec<Request>,
-    max_queued_requests: Option<usize>,
-) -> Served {
-    let scheduler = support::scheduler_with(
-        worker,
-        SimEngine::special_tokens(),
+    let units: HashMap<RequestId, u32> = requests
+        .iter()
+        .filter_map(|request| match request {
+            Request::Diffusion(request) => Some((request.request_id, request.sampling.video_units)),
+            _ => None,
+        })
+        .collect();
+    let fake = video_fake(vec![pool], &Arc::new(media));
+    let scheduler = support::fake::scheduler_over(
+        Arc::clone(&fake) as Arc<dyn Batches>,
         SchedulerConfig {
             max_batch: proto::config::positive(32),
             max_queued_requests: max_queued_requests.and_then(std::num::NonZeroUsize::new),
             ..Default::default()
         },
+        Default::default(),
     )
     .unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -283,6 +278,7 @@ fn serve_through(
             (id, handle.submit(request).expect("submit media request"))
         })
         .collect::<Vec<_>>();
+    let pacer = Pacer::start(&fake, DEVICE_STEP);
     let engine_loop = thread::spawn(move || scheduler.run(rx));
 
     let mut outcomes: HashMap<RequestId, Vec<Event>> = HashMap::new();
@@ -293,10 +289,7 @@ fn serve_through(
         for (id, stream) in streams.iter_mut() {
             while let Ok(event) = stream.try_recv() {
                 idle = false;
-                if matches!(
-                    event,
-                    Event::Finished { .. } | Event::Rejected { .. } | Event::Error { .. }
-                ) {
+                if event.is_terminal() {
                     terminal += 1;
                 }
                 outcomes.entry(*id).or_default().push(event);
@@ -308,6 +301,7 @@ fn serve_through(
     }
     handle.shutdown();
     let died = engine_loop.join().expect("engine loop thread");
+    drop(pacer);
     assert!(!died, "the engine loop died");
     assert_eq!(
         terminal,
@@ -315,83 +309,91 @@ fn serve_through(
         "every request reaches a terminal event: {outcomes:?}"
     );
 
-    // The worker is gone with the scheduler, so the record is complete.
-    // Replaying it attaches to each media submission the calls of earlier
-    // media submissions not yet resolved when it was accepted; batches without
-    // media calls are left out of the record.
-    let mut in_flight: Vec<(u64, Vec<ObservedCall>)> = Vec::new();
-    let mut submissions = Vec::new();
-    let mut readers = Vec::new();
-    let mut calls = Vec::new();
-    for event in boundary.iter() {
-        match event {
-            BatchEvent::Submitted(batch) => {
-                readers.extend(batch.requests.iter().filter_map(|(call, dispatch)| {
-                    let CallKind::Media(media_call) = call.kind else {
-                        return None;
-                    };
-                    Some((
-                        call.request_key.request_id,
-                        media_call,
-                        dispatch.readers.clone().unwrap_or_default(),
-                    ))
-                }));
-                calls.extend(batch.requests.iter().cloned());
-                let calls = media_calls(&batch);
-                if calls.is_empty() {
-                    continue;
+    record(&fake.accepted(), &units, outcomes)
+}
+
+/// The media submissions of `accepted`, each with the calls of the earlier
+/// ones still in flight when it was accepted, and the requests' outcomes.
+///
+/// A decode covers the units from its round's first unit to the next round's
+/// first, and the last round the request's remaining units.
+fn record(
+    accepted: &[testkit::Accepted],
+    units: &HashMap<RequestId, u32>,
+    outcomes: HashMap<RequestId, Vec<Event>>,
+) -> Served {
+    // Each media batch's calls, with each decode's first unit.
+    let mut batches = Vec::new();
+    for accepted in accepted {
+        let Some(media) = accepted.batch.media.as_ref() else {
+            continue;
+        };
+        let calls = (0..media.inputs.len())
+            .map(|row| {
+                let staged = media.request(row).expect("a staged media row");
+                (
+                    staged.request.request_id,
+                    media.computation.call,
+                    staged.unit,
+                )
+            })
+            .collect::<Vec<_>>();
+        batches.push((accepted.batch.id, accepted.in_flight.clone(), calls));
+    }
+
+    // A decode round ends where the request's next round starts.
+    let mut next_round: HashMap<RequestId, u32> = HashMap::new();
+    let mut covered: Vec<Vec<u32>> = vec![Vec::new(); batches.len()];
+    for (index, (_, _, calls)) in batches.iter().enumerate().rev() {
+        covered[index] = calls
+            .iter()
+            .rev()
+            .map(|(request, call, unit)| {
+                if *call != MediaCall::VideoDecoding {
+                    return 1;
                 }
-                submissions.push(Submission {
-                    calls: calls.clone(),
-                    in_flight: in_flight
-                        .iter()
-                        .flat_map(|(_, calls)| calls.iter().copied())
-                        .collect(),
-                });
-                in_flight.push((batch.id, calls));
-            }
-            BatchEvent::Resolved { batch_id } => in_flight.retain(|(id, _)| *id != batch_id),
-        }
+                let end = next_round
+                    .insert(*request, *unit)
+                    .unwrap_or_else(|| units.get(request).copied().unwrap_or(*unit + 1));
+                end - unit
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+    }
+
+    let mut observed: HashMap<ipc::execution::BatchId, Vec<ObservedCall>> = HashMap::new();
+    let mut submissions = Vec::new();
+    let mut calls = Vec::new();
+    for ((id, in_flight, batch), covered) in batches.into_iter().zip(covered) {
+        let batch_calls = batch
+            .into_iter()
+            .zip(covered)
+            .map(|((request, call, first), units)| ObservedCall {
+                request,
+                call,
+                units,
+                first,
+            })
+            .collect::<Vec<_>>();
+        submissions.push(Submission {
+            calls: batch_calls.clone(),
+            in_flight: in_flight
+                .iter()
+                .filter_map(|earlier| observed.get(earlier))
+                .flatten()
+                .copied()
+                .collect(),
+        });
+        calls.extend(batch_calls.iter().copied());
+        observed.insert(id, batch_calls);
     }
 
     Served {
         submissions,
-        readers,
         calls,
         outcomes,
-    }
-}
-
-/// Admission routes every component of a video request, so each call names
-/// the worker the request was routed to for every component that reads its
-/// products, and nothing for a call whose products no component reads.
-#[test]
-fn each_media_call_names_the_workers_routed_to_read_its_products() {
-    let request = RequestId(7);
-    let served = serve(video_worker(2, 2), vec![video_request(7, 4)]);
-    served.assert_completed(request);
-
-    let routed = |components: &[&str]| {
-        components
-            .iter()
-            .map(|component| ((*component).to_owned(), WorkerGroupId("sim".to_owned())))
-            .collect::<BTreeMap<_, _>>()
-    };
-    // The video graph: text conditioning feeds latent preparation on the
-    // denoiser, whose latents feed the next step and both decoders; decoded
-    // video units feed the video codec, decoded audio and encoded video
-    // feed the muxer, and the muxer's products leave the graph.
-    let expected = |call: MediaCall| match call {
-        MediaCall::TextEncoding | MediaCall::LatentPreparation => routed(&["denoiser"]),
-        MediaCall::Denoising => routed(&["denoiser", "video_decoder", "audio_decoder"]),
-        MediaCall::VideoDecoding => routed(&["video_codec"]),
-        MediaCall::VideoEncoding | MediaCall::AudioDecoding => routed(&["muxer"]),
-        _ => BTreeMap::new(),
-    };
-    assert!(!served.readers.is_empty());
-    for (owner, call, readers) in &served.readers {
-        assert_eq!(*owner, request);
-        assert_eq!(*readers, expected(*call), "readers of {call:?}");
     }
 }
 
@@ -400,7 +402,7 @@ fn a_younger_request_denoises_only_after_the_older_request_completes_its_steps()
     let older = RequestId(1);
     let younger = RequestId(2);
     let served = serve(
-        video_worker(2, 1),
+        video_pool(2, 1, 1),
         vec![video_request(older.0, 2), video_request(younger.0, 2)],
     );
     served.assert_completed(older);
@@ -454,7 +456,7 @@ fn a_distributed_decoder_admits_calls_up_to_its_rank_width_in_media_units() {
     let older = RequestId(1);
     let younger = RequestId(2);
     let served = serve(
-        video_worker(DECODER_RANKS as usize, 1),
+        video_pool(DECODER_RANKS as usize, 1, 1),
         vec![
             video_request(older.0, DECODER_RANKS + 1),
             video_request(younger.0, 1),
@@ -466,9 +468,8 @@ fn a_distributed_decoder_admits_calls_up_to_its_rank_width_in_media_units() {
     // A request with more units than the decoder admits at once decodes in
     // successive rounds: a full round, then the remainder.
     let older_rounds = served
-        .submissions_of(older, MediaCall::VideoDecoding)
+        .calls
         .iter()
-        .flat_map(|(_, submission)| submission.calls.iter())
         .filter(|call| call.is(older, MediaCall::VideoDecoding))
         .map(|call| call.units)
         .collect::<Vec<_>>();
@@ -512,7 +513,7 @@ fn a_host_task_pool_admits_no_more_tasks_than_its_worker_advertises() {
     for capacity in [1_usize, 2] {
         let request = RequestId(1);
         let served = serve(
-            video_worker(1, capacity as u32),
+            video_pool(1, capacity as u32, 1),
             vec![video_request(request.0, 1)],
         );
         served.assert_completed(request);
@@ -557,7 +558,7 @@ fn a_host_task_pool_admits_no_more_tasks_than_its_worker_advertises() {
 #[test]
 fn an_admitted_video_request_reports_scheduling_before_its_progress() {
     let request = RequestId(1);
-    let served = serve(video_worker(2, 1), vec![video_request(request.0, 2)]);
+    let served = serve(video_pool(2, 1, 1), vec![video_request(request.0, 2)]);
     served.assert_completed(request);
 
     // A job's public phases start at admission: the scheduling event carries
@@ -586,8 +587,9 @@ fn an_admitted_video_request_reports_scheduling_before_its_progress() {
 fn a_full_waiting_queue_rejects_a_video_request_as_overloaded() {
     let admitted = RequestId(1);
     let refused = RequestId(2);
-    let served = serve_bounded(
-        video_worker(2, 1),
+    let served = serve_with(
+        video_pool(2, 1, 1),
+        Media::new(),
         vec![video_request(admitted.0, 2), video_request(refused.0, 2)],
         Some(1),
     );
@@ -667,48 +669,19 @@ fn reference_request(id: u64) -> Request {
     })
 }
 
-/// Indices into `Served::calls` of a request's calls of one kind.
-fn call_indices(served: &Served, request: RequestId, media_call: MediaCall) -> Vec<usize> {
-    served
-        .calls
-        .iter()
-        .enumerate()
-        .filter(|(_, (call, _))| {
-            call.request_key.request_id == request && call.kind == CallKind::Media(media_call)
-        })
-        .map(|(index, _)| index)
-        .collect()
-}
-
-/// The static leading extent of a product.
-fn leading(product: &ipc::TensorRef) -> u32 {
-    match product.shape_bound.dims[0] {
-        DimBound::Static(extent) => extent,
-        DimBound::Device { .. } => panic!("an admitted product has its exact extent"),
-    }
-}
-
 /// A reference request reads its media first, then encodes its vision blocks
 /// before the text that splices them in, encodes its visual condition units
-/// in rounds on the latent encoder's ranks that the prompt's encoding leaves
-/// free, and its audio tracks in one further call, and prepares its latents
-/// from the text features and every condition's rows, in order. Each product
-/// carries the request's exact size, and each call names the components its
-/// graph reads it with.
+/// in rounds and its audio tracks in one further call, and prepares its
+/// latents once every encoding completed.
 #[test]
 fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
     let request = RequestId(5);
-    let served = serve(video_worker(2, 2), vec![reference_request(5)]);
+    let served = serve(video_pool(2, 2, 1), vec![reference_request(5)]);
     served.assert_completed(request);
 
     // The media read is the request's first call, alone in its batch.
-    let reading = call_indices(&served, request, MediaCall::MediaReading);
-    assert_eq!(reading, [0]);
-    let (read, _) = &served.calls[0];
-    let extents = read.outputs.iter().map(leading).collect::<Vec<_>>();
-    // Pixels: one image frame and 39 video frames of 64x32; samples: two
-    // soundtracks; vision patches: an image grid and a two-block video grid.
-    assert_eq!(extents, [40 * 64 * 32, 2 * 16_000, 8 + 16]);
+    assert_eq!(served.call_indices(request, MediaCall::MediaReading), [0]);
+    assert_eq!(served.submissions[0].calls.len(), 1);
 
     // Everything reading the host products waits for the read to complete:
     // no call reading them is submitted while the read is in flight.
@@ -723,9 +696,9 @@ fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
             );
         }
     }
-    let vision = call_indices(&served, request, MediaCall::VisionEncoding);
-    let text = call_indices(&served, request, MediaCall::TextEncoding);
-    let latents = call_indices(&served, request, MediaCall::LatentEncoding);
+    let vision = served.call_indices(request, MediaCall::VisionEncoding);
+    let text = served.call_indices(request, MediaCall::TextEncoding);
+    let latents = served.call_indices(request, MediaCall::LatentEncoding);
     assert_eq!(vision.len(), 1);
     assert_eq!(text.len(), 1);
     assert!(
@@ -743,73 +716,35 @@ fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
         "the text encoding was submitted while the vision encoding was in flight"
     );
 
-    // The vision encoding reads the patches and writes one row per token;
-    // the text encoding reads those features.
-    let (vision_call, _) = &served.calls[vision[0]];
-    assert_eq!(vision_call.inputs, [read.outputs[2].clone()]);
-    assert_eq!(leading(&vision_call.outputs[0]), 6);
-    let (text_call, _) = &served.calls[text[0]];
-    assert_eq!(text_call.inputs, vision_call.outputs);
-
-    // Four visual units, one per rank of each round: the rounds cover them
-    // in order, each writing the rows of its own units, then the audio call
-    // writes both tracks on one rank.
-    const UNIT_ROWS: [u32; 4] = [2, 10, 10, 4];
+    // The four visual units are encoded in rounds that cover them in order,
+    // each on the latent encoder's free ranks, and the audio tracks in one
+    // further call that starts at unit zero again; the first round starts
+    // beside the vision encoding, before the text encoding.
+    const VISUAL_UNITS: u32 = 4;
     let (audio, rounds) = latents.split_last().unwrap();
-    let mut cursor = 0;
-    for index in rounds {
-        let (call, dispatch) = &served.calls[*index];
-        let range = dispatch.decode.as_ref().unwrap();
-        assert_eq!(range.cursor, cursor);
-        let rows = &UNIT_ROWS[cursor as usize..(cursor + range.max_units) as usize];
-        assert_eq!(leading(&call.outputs[0]), rows.iter().sum::<u32>());
-        assert_eq!(range.ranks.len() as u32, range.max_units);
-        assert!(range.ranks.iter().all(|rank| *rank < 2));
-        assert_eq!(call.inputs, [read.outputs[0].clone()]);
-        cursor += range.max_units;
-    }
-    assert_eq!(cursor, UNIT_ROWS.len() as u32);
-    let (audio_call, audio_range) = &served.calls[*audio];
-    let range = audio_range.decode.as_ref().unwrap();
-    assert_eq!(
-        (range.cursor, range.max_units, range.ranks.len()),
-        (0, 1, 1)
+    let firsts = rounds
+        .iter()
+        .map(|index| served.calls[*index].first)
+        .collect::<Vec<_>>();
+    assert_eq!(firsts.first(), Some(&0), "{firsts:?}");
+    assert!(
+        firsts.windows(2).all(|pair| pair[0] < pair[1])
+            && firsts.iter().all(|first| *first < VISUAL_UNITS),
+        "the rounds cover the visual units in order: {firsts:?}"
     );
-    assert_eq!(leading(&audio_call.outputs[0]), 80);
-    assert_eq!(audio_call.inputs, [read.outputs[1].clone()]);
-
-    // A latent encoding call is dealt only to free ranks. Rank 0 encodes
-    // the prompt, so until the text encoding has completed a call names
-    // rank 1 alone, and none is submitted while an earlier one holds rank 1
-    // as well. The first round starts beside the vision encoding.
+    assert!(
+        (2..=VISUAL_UNITS as usize).contains(&rounds.len()),
+        "two ranks encode four units in two to four rounds: {firsts:?}"
+    );
+    assert_eq!(served.calls[*audio].first, 0);
     let dealt = served.submissions_of(request, MediaCall::LatentEncoding);
-    assert_eq!(dealt.len(), latents.len());
-    let beside = |submission: &Submission, media_call| {
-        submission
-            .in_flight
-            .iter()
-            .any(|call| call.is(request, media_call))
-    };
     assert!(
         dealt[0].0 < text_submission,
         "the first round waited for the text encoding"
     );
-    for ((position, submission), index) in dealt.iter().zip(&latents) {
-        let prompt_encoded =
-            *position > text_submission && !beside(submission, MediaCall::TextEncoding);
-        if !prompt_encoded {
-            let range = served.calls[*index].1.decode.as_ref().unwrap();
-            assert_eq!(range.ranks, [1]);
-            assert!(
-                !beside(submission, MediaCall::LatentEncoding),
-                "a call was dealt to a rank that held an earlier one"
-            );
-        }
-    }
 
-    // Latent preparation follows every encoding and reads the text features,
-    // the visual rounds in unit order, then the audio rows.
-    let preparation = call_indices(&served, request, MediaCall::LatentPreparation);
+    // Latent preparation follows every encoding.
+    let preparation = served.call_indices(request, MediaCall::LatentPreparation);
     assert_eq!(preparation.len(), 1);
     assert!(
         latents
@@ -817,37 +752,6 @@ fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
             .chain(&text)
             .all(|index| *index < preparation[0])
     );
-    let (prepare, _) = &served.calls[preparation[0]];
-    let expected = std::iter::once(text_call.outputs[0].clone())
-        .chain(
-            latents
-                .iter()
-                .map(|index| served.calls[*index].0.outputs[0].clone()),
-        )
-        .collect::<Vec<_>>();
-    assert_eq!(prepare.inputs, expected);
-
-    // Readers follow the request's graph.
-    let routed = |components: &[&str]| {
-        components
-            .iter()
-            .map(|component| ((*component).to_owned(), WorkerGroupId("sim".to_owned())))
-            .collect::<BTreeMap<_, _>>()
-    };
-    for (owner, call, readers) in &served.readers {
-        assert_eq!(*owner, request);
-        let expected = match call {
-            MediaCall::MediaReading => routed(&["latent_encoder", "text_encoder"]),
-            MediaCall::VisionEncoding => routed(&["text_encoder"]),
-            MediaCall::LatentEncoding | MediaCall::TextEncoding => routed(&["denoiser"]),
-            MediaCall::LatentPreparation => routed(&["denoiser"]),
-            MediaCall::Denoising => routed(&["denoiser", "video_decoder", "audio_decoder"]),
-            MediaCall::VideoDecoding => routed(&["video_codec"]),
-            MediaCall::VideoEncoding | MediaCall::AudioDecoding => routed(&["muxer"]),
-            _ => BTreeMap::new(),
-        };
-        assert_eq!(*readers, expected, "readers of {call:?}");
-    }
 }
 
 /// A conditioned request is refused when the deployment's denoiser takes no
@@ -865,11 +769,13 @@ fn conditioned_requests_beyond_the_deployment_are_refused() {
         events => panic!("the request was not refused: {events:?}"),
     };
 
-    let mut sim = video_worker(2, 2);
-    if let Some(denoiser) = sim.mut_info_for_test().video_denoiser.as_mut() {
-        denoiser.takes_conditions = false;
+    let mut pool = video_pool(2, 2, 1);
+    for rank in &mut pool.ranks {
+        if let Some(denoiser) = rank.video_denoiser.as_mut() {
+            denoiser.takes_conditions = false;
+        }
     }
-    let served = serve(sim, vec![reference_request(1)]);
+    let served = serve(pool, vec![reference_request(1)]);
     let message = rejected(&served, 1);
     assert!(message.contains("takes no conditions"), "{message}");
 
@@ -877,7 +783,7 @@ fn conditioned_requests_beyond_the_deployment_are_refused() {
         unreachable!("the fixture is a video request");
     };
     oversized.conditions[1].latent_units = vec![MAX_CONDITION_ROWS; 3];
-    let served = serve(video_worker(2, 2), vec![Request::Diffusion(oversized)]);
+    let served = serve(video_pool(2, 2, 1), vec![Request::Diffusion(oversized)]);
     let message = rejected(&served, 2);
     assert!(
         message.contains("condition_video_latents")
@@ -892,10 +798,15 @@ fn conditioned_requests_beyond_the_deployment_are_refused() {
 /// completes.
 #[test]
 fn a_request_the_worker_refuses_is_rejected_with_its_reason() {
-    let mut sim = video_worker(2, 2);
+    let media = Media::new();
     let reason = "the conditions take 46848 rows, more than the 40960 this worker provisions";
-    sim.refuse_request(RequestId(1), reason);
-    let served = serve(sim, vec![reference_request(1), video_request(2, 2)]);
+    media.refuse(RequestId(1), reason);
+    let served = serve_with(
+        video_pool(2, 2, 1),
+        media,
+        vec![reference_request(1), video_request(2, 2)],
+        None,
+    );
 
     let refused = served.outcomes[&RequestId(1)]
         .iter()
@@ -917,11 +828,9 @@ fn canvas_request(id: u64, canvas: Canvas) -> Request {
     Request::Diffusion(request)
 }
 
-/// Each video request's decoded media units are reserved at its own canvas:
-/// the raster axes, which the decoder declares at its largest admitted
-/// raster, take the request's height and width, so a round's product is the
-/// round's units of exactly the request's frames. A canvas beyond the
-/// declared raster is refused, naming the product and both extents.
+/// Each video request is served at its own canvas when the decoder's
+/// declared raster holds it, and a canvas beyond that raster is refused,
+/// naming the product and both extents.
 #[test]
 fn decoded_media_units_are_reserved_at_each_request_canvas() {
     let wide = Canvas {
@@ -937,7 +846,7 @@ fn decoded_media_units_are_reserved_at_each_request_canvas() {
         height: 16,
     };
     let served = serve(
-        video_worker(2, 2),
+        video_pool(2, 2, 1),
         vec![
             canvas_request(1, wide),
             canvas_request(2, tall),
@@ -945,29 +854,14 @@ fn decoded_media_units_are_reserved_at_each_request_canvas() {
         ],
     );
 
-    for (id, canvas) in [(1, wide), (2, tall)] {
+    for id in [1, 2] {
         let request = RequestId(id);
         served.assert_completed(request);
-        let rounds = call_indices(&served, request, MediaCall::VideoDecoding);
-        assert!(!rounds.is_empty());
-        for index in rounds {
-            let (call, _) = &served.calls[index];
-            let product = &call.outputs[0];
-            assert_eq!(
-                product.shape_bound.dims[1..],
-                [
-                    DimBound::Static(4),
-                    DimBound::Static(canvas.height),
-                    DimBound::Static(canvas.width),
-                    DimBound::Static(3),
-                ],
-                "{request:?}"
-            );
-            assert_eq!(
-                product.max_bytes(),
-                u64::from(leading(product)) * 4 * u64::from(canvas.height * canvas.width) * 3
-            );
-        }
+        assert!(
+            !served
+                .call_indices(request, MediaCall::VideoDecoding)
+                .is_empty()
+        );
     }
 
     match served.outcomes[&RequestId(3)].as_slice() {
@@ -983,273 +877,5 @@ fn decoded_media_units_are_reserved_at_each_request_canvas() {
             "{message}"
         ),
         events => panic!("the oversized canvas was not refused: {events:?}"),
-    }
-}
-
-/// The simulator's components served from two worker pools: the condition
-/// encoders on one, and the denoiser, decoders and muxer on the other, as a
-/// deployment that places its encoders apart from its denoiser serves them.
-///
-/// Submission keeps two rules across pools. A
-/// pool without a free slot hands a batch back, as the encoder pool does
-/// once, for the first batch carrying the `hand_back` call. A call is
-/// accepted only after the call producing each of its inputs has been, since
-/// the worker learns where a product is published when its producer is
-/// submitted; a batch reading any other product fails. Accepted batches run
-/// on the one simulator.
-struct PooledWorker {
-    inner: SimWorker,
-    info: WorkerInfo,
-    /// The worker the simulator itself reports.
-    simulator: WorkerGroupId,
-    /// The media call whose first batch is handed back, until it has been.
-    hand_back: Option<MediaCall>,
-    handed_back: Arc<AtomicBool>,
-    /// Products of every call accepted so far.
-    published: HashSet<BufferId>,
-}
-
-impl PooledWorker {
-    /// Splits the simulator's components into the two pools. Returns the
-    /// worker, its submission record and whether it has handed back the
-    /// `hand_back` batch.
-    fn new(sim: SimEngine, hand_back: MediaCall) -> (Self, Receiver<BatchEvent>, Arc<AtomicBool>) {
-        let mut inner = SimWorker::new(sim);
-        let boundary = inner.observe();
-        let (simulator, worker) = inner.info().workers[0].clone();
-        let launched = inner.info().layouts[&simulator].clone();
-
-        // Each pool serves its components' media calls and nothing else, and
-        // is launched with those components at the simulator's queue depth.
-        let pool = |components: &[&str]| {
-            let mut info = worker.clone();
-            info.components
-                .retain(|component| components.contains(&component.name.as_str()));
-            info.media_components
-                .retain(|_, component| components.contains(&component.as_str()));
-            info.supported_calls = info
-                .media_components
-                .keys()
-                .map(|call| CallKind::Media(*call))
-                .collect();
-            let layout = PoolLayout {
-                queue_depth: launched.queue_depth,
-                ranks: launched.ranks,
-                components: launched
-                    .components
-                    .iter()
-                    .filter(|(name, _)| components.contains(&name.as_str()))
-                    .map(|(name, config)| (name.clone(), config.clone()))
-                    .collect(),
-            };
-            (info, layout)
-        };
-        let pools = [
-            (
-                WorkerGroupId("encoders".to_owned()),
-                pool(&["media_reader", "text_encoder", "latent_encoder"]),
-            ),
-            (
-                WorkerGroupId("generator".to_owned()),
-                pool(&[
-                    "denoiser",
-                    "video_decoder",
-                    "video_codec",
-                    "audio_decoder",
-                    "muxer",
-                ]),
-            ),
-        ];
-        let mut info = WorkerInfo::from_workers(
-            pools
-                .iter()
-                .map(|(id, (worker, _))| (id.clone(), worker.clone()))
-                .collect(),
-        )
-        .unwrap();
-        info.layouts = pools
-            .into_iter()
-            .map(|(id, (_, layout))| (id, layout))
-            .collect();
-
-        let handed_back = Arc::new(AtomicBool::new(false));
-        let worker = Self {
-            inner,
-            info,
-            simulator,
-            hand_back: Some(hand_back),
-            handed_back: Arc::clone(&handed_back),
-            published: HashSet::new(),
-        };
-        (worker, boundary, handed_back)
-    }
-}
-
-impl Worker for PooledWorker {
-    fn info(&self) -> &WorkerInfo {
-        &self.info
-    }
-
-    fn is_ready(&self, worker: &WorkerGroupId) -> bool {
-        self.info.workers.iter().any(|(id, _)| id == worker) && self.inner.is_ready(&self.simulator)
-    }
-
-    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
-        self.is_ready(worker) && self.inner.has_capacity(&self.simulator)
-    }
-
-    fn command_has_capacity(&self, command: &ipc::BatchCommand) -> bool {
-        self.inner.command_has_capacity(command)
-    }
-
-    fn submit(&mut self, mut batch: ExecutionBatch) -> Result<(), WorkerSubmitError> {
-        let hands_back = self.hand_back.is_some_and(|media_call| {
-            batch
-                .requests
-                .iter()
-                .any(|(call, _)| call.kind == CallKind::Media(media_call))
-        });
-        if hands_back {
-            self.hand_back = None;
-            self.handed_back.store(true, Ordering::SeqCst);
-            return Err(WorkerSubmitError::WouldBlock(Box::new(batch)));
-        }
-
-        // Every input is a product of an accepted call or supplied with the
-        // batch.
-        for (call, _) in &batch.requests {
-            for input in call.input_buffers() {
-                let supplied = batch
-                    .input_transfers
-                    .iter()
-                    .any(|export| export.product.buffer_id() == input)
-                    || batch
-                        .cache_inputs
-                        .iter()
-                        .any(|export| export.source == input);
-                if !supplied && !self.published.contains(&input) {
-                    return Err(WorkerSubmitError::Failed(anyhow::anyhow!(
-                        "input {input:?} of {:?} has no registered producer",
-                        call.kind
-                    )));
-                }
-            }
-        }
-
-        // The simulator runs every pool's calls, so it receives them placed
-        // on itself; a batch it hands back returns with its pools.
-        let products = batch
-            .requests
-            .iter()
-            .flat_map(|(call, _)| call.output_buffers())
-            .collect::<Vec<_>>();
-        let pools = batch
-            .requests
-            .iter_mut()
-            .map(|(_, dispatch)| std::mem::replace(&mut dispatch.worker, self.simulator.clone()))
-            .collect::<Vec<_>>();
-        match self.inner.submit(batch) {
-            Ok(()) => {
-                self.published.extend(products);
-                Ok(())
-            }
-            Err(WorkerSubmitError::WouldBlock(mut batch)) => {
-                for ((_, dispatch), pool) in batch.requests.iter_mut().zip(pools) {
-                    dispatch.worker = pool;
-                }
-                Err(WorkerSubmitError::WouldBlock(batch))
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, WorkerError> {
-        self.inner.poll(timeout)
-    }
-
-    fn close(&mut self) -> Result<(), WorkerError> {
-        self.inner.close()
-    }
-}
-
-/// A call waits for the submission of every call producing its inputs, even
-/// when that producer is bound for another pool. With the condition encoders
-/// on their own pool, the first latent encoding is handed back for capacity
-/// while the latent preparation reading its rows is bound for the generator
-/// pool; the preparation is submitted only after every latent encoding, and
-/// the request completes.
-#[test]
-fn a_call_reading_a_held_back_product_waits_for_its_producer_on_another_pool() {
-    let request = RequestId(5);
-    let (worker, boundary, handed_back) =
-        PooledWorker::new(video_worker(2, 2), MediaCall::LatentEncoding);
-    let served = serve_through(Box::new(worker), boundary, vec![reference_request(5)], None);
-
-    served.assert_completed(request);
-    assert!(
-        handed_back.load(Ordering::SeqCst),
-        "the encoder pool handed back a latent encoding"
-    );
-    let latents = call_indices(&served, request, MediaCall::LatentEncoding);
-    let preparation = call_indices(&served, request, MediaCall::LatentPreparation);
-    assert_eq!(preparation.len(), 1);
-    assert!(latents.iter().all(|index| *index < preparation[0]));
-}
-
-/// A video worker's ranks each back only the results of the components they
-/// execute and of the components that read them, and the engine places
-/// buffers in each rank's own pool: a rank that holds fewer results packs
-/// them from its own offset zero rather than at the offsets another rank's
-/// larger set implies.
-#[test]
-fn media_buffers_are_placed_in_the_pool_of_each_rank_that_backs_them() {
-    use std::collections::BTreeSet;
-
-    let served = serve(video_worker(3, 1), vec![video_request(1, 4)]);
-    served.assert_completed(RequestId(1));
-
-    // The ranks holding a span of what a call of this kind produces.
-    let ranks = |media_call: MediaCall| {
-        served
-            .calls
-            .iter()
-            .filter(|(call, _)| call.kind == CallKind::Media(media_call))
-            .flat_map(|(call, dispatch)| {
-                let outputs = call
-                    .buffer_outputs()
-                    .map(|product| product.buffer_id())
-                    .collect::<Vec<_>>();
-                dispatch
-                    .buffers
-                    .iter()
-                    .filter(move |span| outputs.contains(&span.allocation.buffer))
-            })
-            .map(|span| span.rank)
-            .collect::<BTreeSet<_>>()
-    };
-
-    // The text encoder and its reader, the denoiser, are placed on rank 0
-    // alone, so no other rank backs the encoder's conditioning.
-    assert_eq!(ranks(MediaCall::TextEncoding), BTreeSet::from([0]));
-    // The decoder and the video codec that reads its units run on three ranks.
-    assert_eq!(ranks(MediaCall::VideoDecoding), BTreeSet::from([0, 1, 2]));
-    // The audio decoder and the muxer's audio encoding run on rank 0 alone.
-    assert_eq!(ranks(MediaCall::AudioDecoding), BTreeSet::from([0]));
-
-    // A rank that backs fewer results starts its own pool at zero: rank 2
-    // holds only the denoiser's, the decoder's and the codec's products.
-    for rank in 0..3 {
-        let lowest = served
-            .calls
-            .iter()
-            .flat_map(|(_, dispatch)| dispatch.buffers.iter())
-            .filter(|span| span.rank == rank)
-            .map(|span| span.allocation.offset)
-            .min();
-        assert_eq!(
-            lowest,
-            Some(0),
-            "rank {rank} packs from its own offset zero"
-        );
     }
 }

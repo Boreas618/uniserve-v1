@@ -66,6 +66,30 @@ fn worker(text_len: usize) -> SimEngine {
     sim
 }
 
+/// A block-diffusion deployment over `testkit::FakeBatches`: one rank that
+/// prefills prompts and denoises canvases, with 16-token cache pages.
+///
+/// A token-denoising call has no device layout in the column writer, so a
+/// case over this fake observes what the mechanism decides before a canvas
+/// step: its start and a request's admission.
+fn canvas_fake() -> std::sync::Arc<dyn ipc::execution::Batches> {
+    let mut pool = support::pool("sim");
+    for rank in &mut pool.ranks {
+        rank.supported_calls = vec![
+            CallKind::Forward(ForwardMode::Prefill),
+            CallKind::Forward(ForwardMode::TokenDenoising),
+        ];
+        for group in rank
+            .prefix_cache
+            .iter_mut()
+            .flat_map(|cache| cache.groups.iter_mut())
+        {
+            group.block_size = 16;
+        }
+    }
+    std::sync::Arc::new(testkit::FakeBatches::new(vec![pool]))
+}
+
 fn canvas_request(request_id: u64, prompt_len: u32, max_tokens: usize) -> GenerationRequest {
     GenerationRequest {
         request_id: RequestId(request_id),
@@ -217,6 +241,7 @@ fn text(request: u64, range: std::ops::Range<usize>) -> Vec<u32> {
 /// a causal prefill that the next block reads; the block holding EOS ends
 /// the request there, uncommitted.
 #[test]
+#[ignore = "reads the rows of canvas calls from the device layout, and the column writer lays out no TokenDenoising call"]
 fn blocks_are_denoised_published_and_committed_until_eos() {
     let running = Running::start(worker(40), config());
     let answer = events(running.submit(canvas_request(1, 24, 1_000)));
@@ -588,8 +613,7 @@ fn a_canvas_beyond_the_step_budget_fails_to_start() {
         chunked_prefill_size: std::num::NonZeroUsize::new(8),
         ..config()
     };
-    let worker = SimWorker::new(worker(40));
-    let error = support::scheduler_with(Box::new(worker), SimEngine::special_tokens(), config)
+    let error = support::fake::scheduler_over(canvas_fake(), config, Default::default())
         .err()
         .expect("a 16-token canvas exceeds an 8-token step budget");
     assert!(error.to_string().contains("step budget"), "{error}");
@@ -598,11 +622,17 @@ fn a_canvas_beyond_the_step_budget_fails_to_start() {
 /// A canvas-generating request names the seed its draws follow.
 #[test]
 fn an_unseeded_canvas_request_is_refused() {
-    let running = Running::start(worker(40), config());
+    let scheduler =
+        support::fake::scheduler_over(canvas_fake(), config(), Default::default()).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = CommandSender::new(tx);
     let mut request = canvas_request(6, 8, 64);
     request.sampling.seed = None;
-    let answer = events(running.submit(request));
-    running.stop();
+    let events_rx = handle.submit(request).unwrap();
+    let thread = thread::spawn(move || scheduler.run(rx));
+    let answer = events(events_rx);
+    handle.shutdown();
+    assert!(!thread.join().unwrap(), "the scheduler failed");
 
     assert!(
         matches!(

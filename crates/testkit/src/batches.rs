@@ -26,8 +26,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use ipc::TimingCounters;
 use ipc::execution::{
-    Batch, BatchOutput, Batches, CallOutput, Computation, EpochOperation, Extent as MediaExtent,
-    Fault, Inventory, Outcome, RowState, Submission, SubmissionId, SubmissionState,
+    Batch, BatchId, BatchOutput, Batches, CallOutput, Computation, EpochOperation,
+    Extent as MediaExtent, Fault, Inventory, Outcome, RowState, Submission, SubmissionId,
+    SubmissionState,
 };
 use ipc::philox::DrawAddress;
 
@@ -90,9 +91,18 @@ pub type Media = Arc<dyn Fn(&Computation) -> Option<MediaExtent> + Send + Sync>;
 /// The storage operations a fake performs ([`Batches::operate`]): the operation in, each rank's
 /// JSON reply out.
 pub type Operate = Arc<dyn Fn(&EpochOperation) -> Result<Vec<String>, Box<Fault>> + Send + Sync>;
+/// One accepted serving batch and the batches still on the device when it was accepted.
+#[derive(Clone, Debug)]
+pub struct Accepted {
+    /// The batch as the mechanism submitted it.
+    pub batch: Batch,
+    /// The batches accepted earlier and not yet completed.
+    pub in_flight: Vec<BatchId>,
+}
 
 /// A batch accepted and not yet completed, with the outcome it completes with.
 struct Held {
+    batch: BatchId,
     state: Arc<SubmissionState>,
     outcome: Outcome<BatchOutput>,
 }
@@ -112,6 +122,10 @@ pub struct FakeBatches {
     submitted: Mutex<Vec<Batch>>,
     /// Every shadow batch, in submission order.
     shadows: Mutex<Vec<Batch>>,
+    /// Every accepted serving batch with the batches still on the device when it was accepted.
+    accepted: Mutex<Vec<Accepted>>,
+    /// Every trajectory copy to a host latent pool, in submission order.
+    latent_offloads: Mutex<Vec<ipc::LatentOffload>>,
     /// While set, every submission is refused with this message.
     refusal: Mutex<Option<String>>,
     /// While true, accepted batches wait in `held` for the case to release them.
@@ -141,6 +155,8 @@ impl FakeBatches {
             operate: None,
             submitted: Mutex::new(Vec::new()),
             shadows: Mutex::new(Vec::new()),
+            accepted: Mutex::new(Vec::new()),
+            latent_offloads: Mutex::new(Vec::new()),
             refusal: Mutex::new(None),
             holding: Mutex::new(false),
             held: Mutex::new(VecDeque::new()),
@@ -201,6 +217,17 @@ impl FakeBatches {
     /// Every batch submitted so far, in submission order.
     pub fn submitted(&self) -> Vec<Batch> {
         lock(&self.submitted).clone()
+    }
+
+    /// Every serving batch accepted so far, in acceptance order, each with the batches that were
+    /// held on the device when it was accepted: what ran at the same time as it.
+    pub fn accepted(&self) -> Vec<Accepted> {
+        lock(&self.accepted).clone()
+    }
+
+    /// Every trajectory copy to a host latent pool submitted so far, in submission order.
+    pub fn latent_offloads(&self) -> Vec<ipc::LatentOffload> {
+        lock(&self.latent_offloads).clone()
     }
 
     /// Every shadow batch submitted so far, in submission order.
@@ -280,7 +307,11 @@ impl FakeBatches {
         }
 
         let (submission, state) = Submission::pending(id);
-        lock(&self.held).push_back(Held { state, outcome });
+        lock(&self.held).push_back(Held {
+            batch: batch.id,
+            state,
+            outcome,
+        });
         Ok(submission)
     }
 }
@@ -376,7 +407,12 @@ fn complete(
 impl Batches for FakeBatches {
     fn submit(&self, batch: Batch) -> Result<Submission, Box<Fault>> {
         lock(&self.submitted).push(batch.clone());
-        self.serve(&batch)
+        let in_flight = lock(&self.held).iter().map(|held| held.batch).collect();
+        let served = self.serve(&batch);
+        if served.is_ok() {
+            lock(&self.accepted).push(Accepted { batch, in_flight });
+        }
+        served
     }
 
     fn shadow(&self, batch: Batch) -> Result<Submission, Box<Fault>> {
@@ -409,6 +445,27 @@ impl Batches for FakeBatches {
             Some(operate) => operate(operation),
             None => Ok(Vec::new()),
         }
+    }
+
+    /// Records the copies and completes them at once, when a rank of the fake's pools maps a host
+    /// latent pool; refuses them otherwise, as a worker that maps none does. The fake copies no
+    /// bytes: what a case reads is what the mechanism asked to have stored.
+    fn offload_latents(&self, offloads: Vec<ipc::LatentOffload>) -> Result<Submission, Box<Fault>> {
+        let maps_pool = self
+            .inventory
+            .iter()
+            .flat_map(|inventory| &inventory.ranks)
+            .any(|rank| rank.latent_pool.is_some());
+        if !maps_pool {
+            return Err("this worker maps no host latent pool to offload a trajectory to".into());
+        }
+
+        lock(&self.latent_offloads).extend(offloads);
+        let id = SubmissionId(self.next.fetch_add(1, Ordering::Relaxed));
+        Ok(Submission::completed(
+            id,
+            Outcome::Success(BatchOutput::default()),
+        ))
     }
 }
 

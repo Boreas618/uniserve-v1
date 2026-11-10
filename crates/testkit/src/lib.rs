@@ -7,6 +7,7 @@
 //! every completion a test observes travels the serving completion path.
 //!
 //! - [`batches`]: the fake worker and its answer rules.
+//! - [`media`]: the answers of media batches, from each request's staged record.
 //! - [`pools`]: the inventories a fake states, and the limits and arguments a handle over one is
 //!   built with.
 //! - [`text`]: where a fake's text ends, and the control tokens a scheduler over it names.
@@ -14,11 +15,15 @@
 //!   under.
 
 pub mod batches;
+pub mod media;
 pub mod policy;
 pub mod pools;
 pub mod text;
 
-pub use batches::{Answer, Extent, FakeBatches, Operate, SAMPLED, Tokens, completed, draw_token};
+pub use batches::{
+    Accepted, Answer, Extent, FakeBatches, Operate, SAMPLED, Tokens, completed, draw_token,
+};
+pub use media::Media;
 pub use policy::{packaged_module, packaged_policy, packaged_program};
 pub use pools::{args, limits, pool, rank};
 pub use text::{EOS, EndOfText, special_tokens};

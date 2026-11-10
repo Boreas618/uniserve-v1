@@ -44,10 +44,11 @@ fn a_batch_failed_on_the_device_is_the_engines_first_error() {
     let pool = Arc::new(FakeBatches::new(vec![fake::text_pool("model", 8)]));
     pool.hold();
     let scheduler = fake::scheduler_over(
-        Arc::clone(&pool),
+        Arc::<testkit::FakeBatches>::clone(&pool),
         SchedulerConfig::default(),
         Default::default(),
-    );
+    )
+    .expect("the scheduler is built over the fake");
     let failure = scheduler.failure_handle();
     let (commands, scheduler_thread) = fake::spawn(scheduler);
 

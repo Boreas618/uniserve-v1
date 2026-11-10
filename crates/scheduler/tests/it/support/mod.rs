@@ -72,9 +72,6 @@ pub(crate) fn image_digest(id: u64) -> [u8; 32] {
     digest
 }
 
-use std::sync::Arc;
-
-use ipc::execution::Batches;
 use ipc::{CallKind, ForwardMode, MainProcessInfo, MediaCall};
 use scheduler::{GenerationFeatures, GenerationLimits};
 use scheduler::{Parameters, PolicyProgram, Scheduler, SchedulerConfig, SpecialTokenIds, Worker};
@@ -109,38 +106,6 @@ pub(crate) fn scheduler_with_stating(
         special_tokens,
         config,
         stated,
-    )
-}
-
-/// A scheduler over `batches` through the production submission door
-/// (`Submissions::over_batches`), whose model limits follow from the call
-/// kinds its pools serve as [`scheduler_with`]'s do.
-pub(crate) fn scheduler_over(
-    batches: &Arc<FakeBatches>,
-    config: SchedulerConfig,
-) -> anyhow::Result<Scheduler> {
-    let batches: Arc<dyn Batches> = Arc::clone(batches) as Arc<dyn Batches>;
-    let info = scheduler::WorkerInfo::from_inventory(batches.inventory())?.runtime_info()?;
-    build(
-        scheduler::Submissions::over_batches(batches)?,
-        &info,
-        testkit::special_tokens(),
-        config,
-        Parameters::default(),
-    )
-}
-
-/// [`scheduler_over`] batching at most `max_batch` calls per pass.
-pub(crate) fn scheduler_over_batching(
-    batches: &Arc<FakeBatches>,
-    max_batch: usize,
-) -> anyhow::Result<Scheduler> {
-    scheduler_over(
-        batches,
-        SchedulerConfig {
-            max_batch: proto::config::positive(max_batch),
-            ..Default::default()
-        },
     )
 }
 
@@ -197,9 +162,22 @@ fn build(
     config: SchedulerConfig,
     stated: Parameters,
 ) -> anyhow::Result<Scheduler> {
-    let calls = &info.supported_calls;
+    let limits = generation_limits(&info.supported_calls);
+    let mut scheduler = Scheduler::new(submissions, special_tokens, config, limits)?;
+    install_policy_stating(&mut scheduler, scheduler::BatchCapacity::of(info), stated);
+    Ok(scheduler)
+}
+
+/// The model limits a deployment whose workers serve `calls` states.
+///
+/// A token-denoising worker without text decode generates block-diffusion
+/// canvases over prompts that may carry encoded images; one that prepares
+/// latents without decoding text serves video diffusion, which needs no
+/// generation feature. Any other vision- or latent-encoding worker reads
+/// images without bound, and the rest serve text.
+pub(crate) fn generation_limits(calls: &[CallKind]) -> GenerationLimits {
     let decodes = calls.contains(&CallKind::Forward(ForwardMode::Decode));
-    let limits = if calls.contains(&CallKind::Forward(ForwardMode::TokenDenoising)) && !decodes {
+    if calls.contains(&CallKind::Forward(ForwardMode::TokenDenoising)) && !decodes {
         GenerationLimits {
             features: GenerationFeatures::TOKEN_DENOISING | GenerationFeatures::VISION_ENCODE,
             max_vit_grid_tokens: u32::MAX,
@@ -208,15 +186,11 @@ fn build(
             ..Default::default()
         }
     } else if calls.contains(&CallKind::Media(MediaCall::LatentPreparation)) && !decodes {
-        GenerationLimits {
-            ..Default::default()
-        }
+        GenerationLimits::default()
     } else if calls.contains(&CallKind::Media(MediaCall::Denoising))
         || calls.contains(&CallKind::Media(MediaCall::VisionEncoding))
         || calls.contains(&CallKind::Media(MediaCall::LatentEncoding))
     {
-        // Model limits of a deployment without a model-imposed bound: the
-        // scheduler clamps them to the worker's capacities.
         GenerationLimits {
             max_vae_grid_tokens: u32::MAX,
             max_vit_grid_tokens: u32::MAX,
@@ -230,10 +204,7 @@ fn build(
             features: GenerationFeatures::UNDERSTANDING,
             ..Default::default()
         }
-    };
-    let mut scheduler = Scheduler::new(submissions, special_tokens, config, limits)?;
-    install_policy_stating(&mut scheduler, scheduler::BatchCapacity::of(info), stated);
-    Ok(scheduler)
+    }
 }
 
 /// The policy module every integration test's epoch serves with.
@@ -319,22 +290,6 @@ pub(crate) fn install_policy_on(
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("the scheduler answers a switchover")
         .expect("the fcfs policy serves");
-}
-
-/// Builds a scheduler that batches at most `max_batch` calls per pass.
-pub(crate) fn scheduler(
-    worker: Box<dyn Worker>,
-    special_tokens: SpecialTokenIds,
-    max_batch: usize,
-) -> anyhow::Result<Scheduler> {
-    scheduler_with(
-        worker,
-        special_tokens,
-        SchedulerConfig {
-            max_batch: proto::config::positive(max_batch),
-            ..Default::default()
-        },
-    )
 }
 
 /// One call's rows as a batch's device layout states them, column by column.

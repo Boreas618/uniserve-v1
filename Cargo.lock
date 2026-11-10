@@ -4238,6 +4238,7 @@ dependencies = [
  "ipc",
  "proto",
  "scheduler",
+ "tempfile",
 ]
 
 [[package]]

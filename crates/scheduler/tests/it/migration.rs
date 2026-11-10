@@ -51,7 +51,8 @@ fn start(max_running_requests: usize) -> (CommandSender, thread::JoinHandle<()>)
             ..Default::default()
         },
         Default::default(),
-    );
+    )
+    .expect("the scheduler is built over the fake");
     let (tx, rx) = crossbeam_channel::unbounded();
     let thread = thread::spawn(move || {
         let _ = scheduler.run(rx);
@@ -202,7 +203,8 @@ fn a_migration_reuses_the_pages_of_the_tokens_it_generated() {
         }
     }
     let pool = Arc::new(FakeBatches::new(vec![inventory]));
-    let scheduler = fake::scheduler_over(pool, SchedulerConfig::default(), Default::default());
+    let scheduler = fake::scheduler_over(pool, SchedulerConfig::default(), Default::default())
+        .expect("the scheduler is built over the fake");
     let stats = scheduler.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
     let thread = thread::spawn(move || {
@@ -314,10 +316,11 @@ fn fail_while_generating(trial: bool, fault: Fault, request: GenerationRequest) 
             .answering(Arc::new(move |batch| faulting(batch, &answering))),
     );
     let mut scheduler = fake::scheduler_over(
-        Arc::clone(&pool),
+        Arc::<testkit::FakeBatches>::clone(&pool),
         SchedulerConfig::default(),
         Default::default(),
-    );
+    )
+    .expect("the scheduler is built over the fake");
     scheduler.set_trial(trial);
     let failure = scheduler.failure_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -482,7 +485,8 @@ fn a_promotion_refuses_the_requests_its_cache_cannot_hold() {
         }
     }
     let pool = Arc::new(FakeBatches::new(vec![inventory]));
-    let scheduler = fake::scheduler_over(pool, SchedulerConfig::default(), Default::default());
+    let scheduler = fake::scheduler_over(pool, SchedulerConfig::default(), Default::default())
+        .expect("the scheduler is built over the fake");
     let (tx, rx) = crossbeam_channel::unbounded();
     let thread = thread::spawn(move || {
         let _ = scheduler.run(rx);

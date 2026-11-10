@@ -7,27 +7,13 @@
 //! (`BatchReport::from_output`), and the fake is the only thing replaced.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use ipc::execution::{Batches, Inventory};
-use scheduler::{
-    GenerationFeatures, GenerationLimits, Parameters, Scheduler, SchedulerConfig, SpecialTokenIds,
-    Submissions,
-};
+use scheduler::{BatchCapacity, Parameters, Scheduler, SchedulerConfig, Submissions, WorkerInfo};
 use testkit::FakeBatches;
-
-/// The end of text the test launches state (`testkit::args`): the fake
-/// samples in `SAMPLED..SAMPLED + 5000` and never reaches it, so a request
-/// ends at its token budget unless a case answers it.
-pub(crate) const EOS: u32 = 151_645;
-
-/// The control tokens of the test launches: the BOS a prompt opens with and
-/// the end of text a request stops at.
-pub(crate) fn special_tokens() -> SpecialTokenIds {
-    SpecialTokenIds {
-        bos: 151_644,
-        eos: vec![EOS, 151_643],
-    }
-}
 
 /// A text pool named `group` of one rank holding `rows` request rows, with
 /// the batch bounds the sharing cases need: every row of a pass fits one
@@ -54,34 +40,26 @@ pub(crate) fn cache_of(pool: &mut Inventory) -> impl Iterator<Item = &mut ipc::P
 /// The rank `batches` states, as the scheduler reads it: what the policy's
 /// ceilings are derived from.
 pub(crate) fn rank_of(batches: &FakeBatches) -> ipc::MainProcessInfo {
-    scheduler::WorkerInfo::from_inventory(batches.inventory())
+    WorkerInfo::from_inventory(batches.inventory())
         .and_then(|info| info.runtime_info())
         .expect("the fake states a pool")
 }
 
-/// A scheduler over `batches` that serves text with `config`, with `fcfs`
-/// installed under the ceilings its pool advertises and `stated` beside them.
-///
-/// # Panics
-///
-/// Panics when the pool cannot be scheduled against or the policy does not
-/// install: both are the case's setup, not the behaviour under test.
+/// A scheduler over `batches` through the production door, with the model
+/// limits its pools' call kinds imply (`super::generation_limits`), the
+/// launches' control tokens (`testkit::special_tokens`), and `fcfs` installed
+/// under the ceilings its pool advertises with `stated` beside them.
 pub(crate) fn scheduler_over(
-    batches: Arc<FakeBatches>,
+    batches: Arc<dyn Batches>,
     config: SchedulerConfig,
     stated: Parameters,
-) -> Scheduler {
-    let info = rank_of(&batches);
-    let submissions = Submissions::over_batches(batches as Arc<dyn Batches>)
-        .expect("the production door serves the fake");
-    let limits = GenerationLimits {
-        features: GenerationFeatures::UNDERSTANDING,
-        ..Default::default()
-    };
-    let mut scheduler = Scheduler::new(submissions, special_tokens(), config, limits)
-        .expect("the scheduler is built over the fake");
-    super::install_policy_stating(&mut scheduler, scheduler::BatchCapacity::of(&info), stated);
-    scheduler
+) -> anyhow::Result<Scheduler> {
+    let info = WorkerInfo::from_inventory(batches.inventory())?.runtime_info()?;
+    let limits = super::generation_limits(&info.supported_calls);
+    let submissions = Submissions::over_batches(batches)?;
+    let mut scheduler = Scheduler::new(submissions, testkit::special_tokens(), config, limits)?;
+    super::install_policy_stating(&mut scheduler, BatchCapacity::of(&info), stated);
+    Ok(scheduler)
 }
 
 /// The scheduler of [`scheduler_over`] running on a thread of its own, and
@@ -103,4 +81,48 @@ pub(crate) fn token_at(id: u64, position: u64) -> u32 {
         key: ipc::philox::request_sampling_key(None, 1, id, 1),
         position,
     })
+}
+
+/// A device slower than its scheduler: every batch the fake accepts stays on
+/// the device until this pacer completes it, one batch per `interval`, oldest
+/// first. Batches the scheduler submits in one step are then in flight
+/// together, which is what an occupancy rule bounds.
+pub(crate) struct Pacer {
+    fake: Arc<FakeBatches>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Pacer {
+    /// Holds `fake`'s batches and completes one every `interval`.
+    pub(crate) fn start(fake: &Arc<FakeBatches>, interval: Duration) -> Self {
+        fake.hold();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let fake = Arc::clone(fake);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(interval);
+                    fake.release(1);
+                }
+            })
+        };
+        Self {
+            fake: Arc::clone(fake),
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Pacer {
+    /// Completes every held batch and lets later ones complete at once.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        self.fake.resume();
+    }
 }

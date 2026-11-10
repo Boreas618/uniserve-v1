@@ -131,7 +131,8 @@ impl Epoch {
                 ..Default::default()
             },
             Default::default(),
-        );
+        )
+        .expect("the scheduler is built over the fake");
         let (tx, rx) = crossbeam_channel::unbounded();
         // The thread detaches when its handle is dropped, which is what this
         // fixture wants: the scheduler ends when `handle` closes the channel.

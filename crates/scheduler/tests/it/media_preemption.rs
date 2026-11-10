@@ -1,17 +1,18 @@
 //! Video requests preempted at denoising-step boundaries and resumed from
-//! the trajectories stored in the host latent pools, over the GPU-free
-//! simulator and a Storage Server in the test's process.
+//! the trajectories stored in the host latent pools, over the production
+//! submission door with `testkit::FakeBatches` as the worker and a Storage
+//! Server in the test's process.
 //!
-//! The simulator copies no bytes: what the tests observe is what the
-//! scheduler asks of the workers at the worker boundary (the trajectory
-//! offloads a batch carries, the stored pages a latent preparation restores,
+//! The fake copies no bytes: what the tests observe is what the scheduler
+//! asks of the workers at their batch interface (the trajectory offloads it
+//! submits, the stored pages a latent preparation restores,
 //! the denoising calls a request runs) and the events its requests end
 //! with. A preemption in normal serving (a sleep) and an epoch change (a
 //! park, and a successor scheduler that resumes the request) take the same
 //! path, whatever parallel configuration the successor's denoiser has, and
 //! a request whose stored trajectory is missing starts from noise.
 //!
-//! The simulated denoising ranks state how their request slot pages hold a
+//! The fake's denoising ranks state how their request slot pages hold a
 //! request's samples as workers do (`CallOutput::latent_layouts`): one
 //! `[48, 16]` float32 video sample, of which each rank holds a run of rows
 //! from its first page on, three pages for the whole sample.
@@ -21,33 +22,30 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::Receiver;
+use ipc::execution::{Batch, Batches};
 use ipc::{
-    CallKind, LatentPageCopy, LatentPoolInfo, LatentPoolRef, LatentRestore, MediaCall,
+    LatentOffload, LatentPageCopy, LatentPoolInfo, LatentPoolRef, LatentRestore, MediaCall,
     RankLatentLayout, RequestId,
 };
 use proto::request::MigrationCause;
-use scheduler::{
-    BatchEvent, BatchResult, CacheChange, CommandSender, Event, EventRx, ExecutionBatch, Request,
-    SchedulerConfig, SimEngine, SimWorker, Trajectory, Worker, WorkerError, WorkerGroupId,
-    WorkerInfo, WorkerSubmitError,
-};
+use scheduler::{CacheChange, CommandSender, Event, EventRx, Request, SchedulerConfig, Trajectory};
+use testkit::{Accepted, FakeBatches, Media};
 
 use crate::support;
 use crate::support::storage::{DEPLOYMENT, HOST, StorageServer};
-use crate::support::video::{video_request, video_worker_denoising_on};
+use crate::support::video::{video_pool, video_request};
 
-/// Denoising steps of the simulated denoiser: enough that a preemption
+/// Denoising steps of the fixture's denoiser: enough that a preemption
 /// after the second lands short of the last.
 const STEPS: u32 = 6;
 
 /// Latent pages one request slot owns on a denoising rank.
 const SLOT_PAGES: u32 = 4;
 
-/// Float32 values of one latent page (`video_worker`).
+/// Float32 values of one latent page.
 const PAGE_UNITS: u64 = 256;
 
-/// Rows and channels of the simulated video sample: 64 bytes a row, three
+/// Rows and channels of the fixture's video sample: 64 bytes a row, three
 /// pages of 1 KiB for all of them.
 const ROWS: u64 = 48;
 const WIDTH: u64 = 16;
@@ -57,21 +55,22 @@ const WIDTH: u64 = 16;
 const ONE_RANK: &[(u64, u64)] = &[(0, ROWS)];
 const TWO_RANKS: &[(u64, u64)] = &[(0, 26), (26, ROWS - 26)];
 
-/// Denoising batches submitted before the gate closes.
+/// Denoising batches the device runs before the gate holds the next.
 const BEFORE_PREEMPTION: u32 = 2;
 
-/// The identity of what the simulated denoising computes, as a rank reports
+/// The identity of what the fixture's denoising computes, as a rank reports
 /// it in its host latent pool.
 const IDENTITY: &str = "denoiser";
 
 /// The trajectory every test's request carries.
 const TRAJECTORY: u64 = 77;
 
-/// Holds the scheduler's submissions back once it submitted
-/// [`BEFORE_PREEMPTION`] denoising batches, until the test opens it, so that
-/// a preemption the test asks for meanwhile meets the request at a known
-/// boundary: past the steps submitted, short of the last.
-#[derive(Default)]
+/// Holds the device's next denoising batch once it ran
+/// [`BEFORE_PREEMPTION`] of them, until the test opens it, so that a
+/// preemption the test asks for meanwhile meets the request at a known
+/// boundary: past the steps submitted, short of the last. The batch is held
+/// in its submission, so the scheduler submits nothing behind it until the
+/// gate opens.
 struct Gate {
     closed: AtomicBool,
     reached: AtomicBool,
@@ -79,11 +78,19 @@ struct Gate {
 }
 
 impl Gate {
+    fn new() -> Self {
+        Self {
+            closed: AtomicBool::new(true),
+            reached: AtomicBool::new(false),
+            denoising: AtomicU32::new(0),
+        }
+    }
+
     fn open(&self) {
         self.closed.store(false, Ordering::Release);
     }
 
-    /// Waits until the gate closed.
+    /// Waits until the gate holds a batch.
     fn wait_reached(&self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !self.reached.load(Ordering::Acquire) {
@@ -94,64 +101,23 @@ impl Gate {
             thread::sleep(Duration::from_millis(1));
         }
     }
-}
 
-/// The simulator behind a [`Gate`].
-struct GatedWorker {
-    inner: SimWorker,
-    gate: Option<Arc<Gate>>,
-}
-
-impl Worker for GatedWorker {
-    fn info(&self) -> &WorkerInfo {
-        self.inner.info()
-    }
-
-    fn is_ready(&self, worker: &WorkerGroupId) -> bool {
-        self.inner.is_ready(worker)
-    }
-
-    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
-        !self
-            .gate
-            .as_ref()
-            .is_some_and(|gate| gate.closed.load(Ordering::Acquire))
-            && self.inner.has_capacity(worker)
-    }
-
-    fn command_has_capacity(&self, command: &ipc::BatchCommand) -> bool {
-        self.inner.command_has_capacity(command)
-    }
-
-    fn submit(&mut self, batch: ExecutionBatch) -> Result<(), WorkerSubmitError> {
+    /// Lets `batch` through, holding it while the gate is closed when it is
+    /// a denoising batch past the first [`BEFORE_PREEMPTION`].
+    fn pass(&self, batch: &Batch) {
         let denoises = batch
-            .requests
-            .iter()
-            .any(|(call, _)| call.kind == CallKind::Media(MediaCall::Denoising));
-        self.inner.submit(batch)?;
-        if let Some(gate) = &self.gate
-            && denoises
-            && gate.denoising.fetch_add(1, Ordering::AcqRel) + 1 == BEFORE_PREEMPTION
-        {
-            gate.closed.store(true, Ordering::Release);
-            gate.reached.store(true, Ordering::Release);
+            .media
+            .as_ref()
+            .is_some_and(|media| media.computation.call == MediaCall::Denoising);
+        if !denoises || self.denoising.fetch_add(1, Ordering::AcqRel) < BEFORE_PREEMPTION {
+            return;
         }
-        Ok(())
-    }
-
-    fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, WorkerError> {
-        self.inner.poll(timeout)
-    }
-
-    fn close(&mut self) -> Result<(), WorkerError> {
-        self.inner.close()
-    }
-
-    fn operate(
-        &mut self,
-        operation: &ipc::execution::EpochOperation,
-    ) -> Result<Vec<String>, WorkerError> {
-        self.inner.operate(operation)
+        if self.closed.load(Ordering::Acquire) {
+            self.reached.store(true, Ordering::Release);
+        }
+        while self.closed.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -189,13 +155,13 @@ fn pages_of(count: u64) -> u32 {
     (count * WIDTH * 4).div_ceil(PAGE_UNITS * 4) as u32
 }
 
-/// A scheduler of a simulated video denoiser whose ranks hold `shares` of
-/// the sample and map the host latent pool `pool` of `server`, reporting
+/// A scheduler over a fake video denoiser whose ranks hold `shares` of the
+/// sample and map the host latent pool `pool` of `server`, reporting
 /// `identity`, with its loop running.
 struct Denoiser {
     handle: CommandSender,
     thread: thread::JoinHandle<bool>,
-    boundary: Receiver<BatchEvent>,
+    fake: Arc<FakeBatches>,
     /// The latent seed the scheduler keys trajectories by.
     seed: u64,
 }
@@ -224,61 +190,52 @@ impl Denoiser {
         shares: &[(u64, u64)],
         config: SchedulerConfig,
     ) -> Self {
-        let mut sim = video_worker_denoising_on(1, 1, shares.len());
-        let info = sim.mut_info_for_test();
-        if let Some(denoiser) = info.video_denoiser.as_mut() {
-            denoiser.denoise_steps = STEPS;
+        // Every rank runs on the fixture's host and maps the one pool; each
+        // rank's share determines its pages, and its region names the share.
+        let mut inventory = video_pool(1, 1, shares.len());
+        for (rank, &(start, count)) in inventory.ranks.iter_mut().zip(shares) {
+            rank.endpoint.host = HOST.to_owned();
+            if let Some(denoiser) = rank.video_denoiser.as_mut() {
+                denoiser.denoise_steps = STEPS;
+            }
+            rank.latent_pool = Some(Box::new(LatentPoolInfo {
+                pool: pool_ref(pool),
+                trajectory_pages: SLOT_PAGES,
+                region: [start as u8, count as u8, shares.len() as u8, 0]
+                    .repeat(8)
+                    .try_into()
+                    .unwrap(),
+                identity: identity.to_owned(),
+                endpoint: None,
+            }));
         }
-        Self::with_sim(server, pool, identity, gate, shares, config, sim)
-    }
+        let media = Arc::new(
+            Media::new().with_latent_layouts(
+                shares
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, &(start, count))| RankLatentLayout {
+                        rank: rank as u32,
+                        layout: share(start, count),
+                    })
+                    .collect(),
+            ),
+        );
+        let fake = Arc::new(
+            FakeBatches::new(vec![inventory])
+                .answering(Arc::new(move |batch| {
+                    if let Some(gate) = &gate {
+                        gate.pass(batch);
+                    }
+                    media.answer(batch)
+                }))
+                .with_media(Arc::new(Media::serves)),
+        );
 
-    fn with_sim(
-        server: &StorageServer,
-        pool: u64,
-        identity: &str,
-        gate: Option<Arc<Gate>>,
-        shares: &[(u64, u64)],
-        config: SchedulerConfig,
-        mut sim: SimEngine,
-    ) -> Self {
-        // Every rank maps the one pool; each rank's share determines its
-        // pages, and its region names the share.
-        sim.set_latent_pools(
-            shares
-                .iter()
-                .map(|&(start, count)| {
-                    (
-                        HOST.to_owned(),
-                        Some(LatentPoolInfo {
-                            pool: pool_ref(pool),
-                            trajectory_pages: SLOT_PAGES,
-                            region: [start as u8, count as u8, shares.len() as u8, 0]
-                                .repeat(8)
-                                .try_into()
-                                .unwrap(),
-                            identity: identity.to_owned(),
-                            endpoint: None,
-                        }),
-                    )
-                })
-                .collect(),
-        );
-        sim.set_latent_layouts(
-            shares
-                .iter()
-                .enumerate()
-                .map(|(rank, &(start, count))| RankLatentLayout {
-                    rank: rank as u32,
-                    layout: share(start, count),
-                })
-                .collect(),
-        );
-        let mut inner = SimWorker::new(sim);
-        let boundary = inner.observe();
-        let mut scheduler = support::scheduler_with(
-            Box::new(GatedWorker { inner, gate }),
-            SimEngine::special_tokens(),
+        let mut scheduler = support::fake::scheduler_over(
+            Arc::clone(&fake) as Arc<dyn Batches>,
             config,
+            Default::default(),
         )
         .unwrap();
         scheduler.enable_trajectory_store(server.socket(), DEPLOYMENT, 0, HOST);
@@ -289,23 +246,41 @@ impl Denoiser {
         Self {
             handle: CommandSender::new(tx),
             thread,
-            boundary,
+            fake,
             seed,
         }
     }
 
-    /// Shuts the scheduler down and returns every batch it submitted.
-    fn stop(self) -> Vec<ExecutionBatch> {
+    /// Shuts the scheduler down and returns what it asked of the worker:
+    /// every batch the worker accepted and every trajectory it offloaded.
+    fn stop(self) -> Asked {
         self.handle.shutdown();
         assert!(!self.thread.join().unwrap(), "the engine loop died");
-        self.boundary
-            .iter()
-            .filter_map(|event| match event {
-                BatchEvent::Submitted(batch) => Some(batch),
-                BatchEvent::Resolved { .. } => None,
-            })
-            .collect()
+        Asked {
+            batches: self.fake.accepted(),
+            offloads: self.fake.latent_offloads(),
+        }
     }
+}
+
+/// What a scheduler asked of its worker.
+struct Asked {
+    batches: Vec<Accepted>,
+    offloads: Vec<LatentOffload>,
+}
+
+/// The staged rows of `batch`'s media columns: each call's request and the
+/// media call it runs.
+fn media_rows(batch: &Batch) -> Vec<(ipc::RequestKey, MediaCall)> {
+    let Some(media) = batch.media.as_ref() else {
+        return Vec::new();
+    };
+    (0..media.inputs.len())
+        .map(|row| {
+            let staged = media.request(row).expect("a staged media row");
+            (staged.request, media.computation.call)
+        })
+        .collect()
 }
 
 /// The pool the fixture's server mapped as `pool`.
@@ -339,13 +314,17 @@ fn numbered(id: u64, trajectory: Trajectory) -> Request {
     Request::Diffusion(request)
 }
 
-/// The requests `batches` carry calls of, in the order of their first call.
-fn first_calls(batches: &[ExecutionBatch]) -> Vec<RequestId> {
+/// The requests the worker's media batches carry calls of, in the order of
+/// their first call.
+fn first_calls(asked: &Asked) -> Vec<RequestId> {
     let mut order = Vec::new();
-    for (call, _) in batches.iter().flat_map(|batch| &batch.requests) {
-        let id = call.request_key.request_id;
-        if !order.contains(&id) {
-            order.push(id);
+    for (key, _) in asked
+        .batches
+        .iter()
+        .flat_map(|accepted| media_rows(&accepted.batch))
+    {
+        if !order.contains(&key.request_id) {
+            order.push(key.request_id);
         }
     }
     order
@@ -410,12 +389,12 @@ struct Admission {
 }
 
 /// Request 1's admissions.
-fn admissions(batches: &[ExecutionBatch]) -> Vec<Admission> {
-    admissions_of(batches, RequestId(1))
+fn admissions(asked: &Asked) -> Vec<Admission> {
+    admissions_of(asked, RequestId(1))
 }
 
 /// Request `request`'s admissions.
-fn admissions_of(batches: &[ExecutionBatch], request: RequestId) -> Vec<Admission> {
+fn admissions_of(asked: &Asked, request: RequestId) -> Vec<Admission> {
     /// The admission of request epoch `epoch`, recorded from now on when new.
     fn of(epochs: &mut Vec<(u64, Admission)>, epoch: u64) -> &mut Admission {
         let index = match epochs.iter().position(|(known, _)| *known == epoch) {
@@ -429,31 +408,35 @@ fn admissions_of(batches: &[ExecutionBatch], request: RequestId) -> Vec<Admissio
     }
 
     let mut epochs: Vec<(u64, Admission)> = Vec::new();
-    for batch in batches {
-        for (call, _) in &batch.requests {
-            if call.request_key.request_id != request {
+    for accepted in &asked.batches {
+        let batch = &accepted.batch;
+        for (key, call) in media_rows(batch) {
+            if key.request_id != request {
                 continue;
             }
-            let admission = of(&mut epochs, call.request_key.request_epoch);
-            match call.kind {
-                CallKind::Media(MediaCall::LatentPreparation) => {
+            let admission = of(&mut epochs, key.request_epoch);
+            match call {
+                MediaCall::LatentPreparation => {
                     admission.prepared = true;
-                    admission.restored = call.latent_restore.clone();
+                    admission.restored = batch
+                        .latent_restores
+                        .iter()
+                        .find(|(restored, _)| *restored == key)
+                        .map(|(_, restore)| restore.clone());
                 }
-                CallKind::Media(MediaCall::Denoising) => admission.denoising += 1,
+                MediaCall::Denoising => admission.denoising += 1,
                 _ => {}
             }
         }
-        for offload in batch
-            .page_offloads
-            .iter()
-            .flat_map(|offloads| &offloads.latents)
-            .filter(|offload| offload.request_key.request_id == request)
-        {
-            of(&mut epochs, offload.request_key.request_epoch)
-                .offloaded
-                .extend(offload.pages.iter().cloned());
-        }
+    }
+    for offload in asked
+        .offloads
+        .iter()
+        .filter(|offload| offload.request_key.request_id == request)
+    {
+        of(&mut epochs, offload.request_key.request_epoch)
+            .offloaded
+            .extend(offload.pages.iter().cloned());
     }
     epochs.into_iter().map(|(_, admission)| admission).collect()
 }
@@ -490,7 +473,7 @@ fn sources(restore: &LatentRestore) -> Vec<(Vec<u32>, usize)> {
 /// past the first and short of the last, and returns the trajectory it left
 /// with, the parked scheduler's latent seed and its admission.
 fn park(server: &StorageServer, pool: u64, shares: &[(u64, u64)]) -> (Trajectory, u64, Admission) {
-    let gate = Arc::new(Gate::default());
+    let gate = Arc::new(Gate::new());
     let serving = Denoiser::start(server, pool, IDENTITY, Some(Arc::clone(&gate)), shares);
     let started = Trajectory {
         id: TRAJECTORY,
@@ -534,7 +517,7 @@ fn park(server: &StorageServer, pool: u64, shares: &[(u64, u64)]) -> (Trajectory
 #[test]
 fn a_sleep_preempts_a_video_request_which_resumes_from_its_stored_step() {
     let (server, pool) = server();
-    let gate = Arc::new(Gate::default());
+    let gate = Arc::new(Gate::new());
     let denoiser = Denoiser::start(&server, pool, IDENTITY, Some(Arc::clone(&gate)), ONE_RANK);
     let trajectory = Trajectory {
         id: TRAJECTORY,
@@ -613,9 +596,9 @@ fn a_video_request_whose_stored_trajectory_is_missing_starts_from_noise() {
         .unwrap();
     assert!(completed(&until_terminal(&mut unrecorded)));
 
-    let batches = denoiser.stop();
+    let asked = denoiser.stop();
     for request in [RequestId(1), RequestId(2)] {
-        let [admission] = admissions_of(&batches, request)
+        let [admission] = admissions_of(&asked, request)
             .try_into()
             .expect("the request was admitted once");
         assert!(admission.prepared);
@@ -631,7 +614,7 @@ fn a_video_request_whose_stored_trajectory_is_missing_starts_from_noise() {
 #[test]
 fn a_resumed_video_request_is_admitted_before_one_that_starts() {
     let (server, pool) = server();
-    let gate = Arc::new(Gate::default());
+    let gate = Arc::new(Gate::new());
     let config = SchedulerConfig {
         max_batch: proto::config::positive(32),
         max_running_requests: 1,

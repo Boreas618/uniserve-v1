@@ -1,20 +1,24 @@
-//! A simulated video worker and its requests, shared by the tests of video
-//! scheduling: the worker's components, their products and the ranks each
-//! component is launched on.
+//! The video pool and requests shared by the tests of video scheduling: the
+//! pool's components, their products and the ranks each component is
+//! launched on, served by `testkit::FakeBatches` with `testkit::Media`
+//! answering its media calls.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use ipc::execution::{Inventory, PoolLayout};
 use ipc::{
-    CallKind, ComponentInfo, DiffusionSamplingParams, DimBound, MediaCall, OutputInfo, RasterAxes,
-    RequestId, ShapeBound,
+    CallKind, ComponentInfo, DiffusionSamplingParams, DimBound, MainProcessInfo, MediaCall,
+    OutputInfo, RasterAxes, RequestId, ShapeBound,
 };
 use proto::tensor::DType;
 use proto::video::Canvas;
 use scheduler::{
     BlockConfig, BlockDistribution, DiffusionRequest, Request, SimEngine, VideoDenoiserInfo,
 };
+use testkit::{FakeBatches, Media};
 
-/// Denoising steps the simulated model advertises and every request follows.
+/// Denoising steps the model advertises and every request follows.
 pub(crate) const STEPS: u32 = 3;
 
 /// Every request carries the same short prompt.
@@ -106,43 +110,16 @@ pub(crate) fn media_units(name: &str, units: u32) -> OutputInfo {
     }
 }
 
-/// A video worker whose text encoder, denoiser, audio decoder and muxer live on
-/// rank 0 and whose video decoder and video codec are distributed over
-/// `decoder_ranks` ranks, each reconstructing and encoding one media unit per
-/// round.
-///
-/// Calls route to components the way a loaded model reports them: the video
-/// encoder component encodes the media units the decoder produced, and the
-/// muxer encodes audio and assembles the artifact.
-pub(crate) fn video_worker(decoder_ranks: usize, host_task_capacity: u32) -> SimEngine {
-    video_worker_denoising_on(decoder_ranks, host_task_capacity, 1)
-}
-
-/// [`video_worker`] whose denoiser runs on the first `denoising_ranks`
-/// ranks, as a sequence-parallel denoiser does.
-pub(crate) fn video_worker_denoising_on(
+/// The fixture's components: the media reader, text encoder, audio decoder
+/// and muxer on rank 0; the denoiser on the first `denoising_ranks` ranks, as
+/// a sequence-parallel denoiser runs; and the latent encoder, video decoder
+/// and video codec distributed over `decoder_ranks` ranks, each
+/// reconstructing and encoding one media unit per round.
+pub(crate) fn video_components(
     decoder_ranks: usize,
-    host_task_capacity: u32,
     denoising_ranks: usize,
-) -> SimEngine {
-    let mut sim = SimEngine::new();
-    // A deep worker queue keeps queue capacity from bounding which calls
-    // are in flight together, leaving that to the occupancy rules under test.
-    sim.set_queue_depth(64);
-    sim.set_results_on_wait(true);
-
-    let info = sim.mut_info_for_test();
-    info.supported_calls = MediaCall::ALL
-        .iter()
-        .map(|call| CallKind::Media(*call))
-        .collect();
-    info.video_denoiser = Some(VideoDenoiserInfo {
-        takes_conditions: true,
-        denoise_steps: STEPS,
-        description: b"{}".to_vec(),
-    });
-    info.host_task_capacity = host_task_capacity;
-    let components = vec![
+) -> Vec<(ComponentInfo, BlockConfig)> {
+    vec![
         component(
             "media_reader",
             vec![0],
@@ -211,21 +188,103 @@ pub(crate) fn video_worker_denoising_on(
             vec![output("audio_samples", None)],
         ),
         component("muxer", vec![0], false, Vec::new()),
-    ];
-    info.components = components.iter().map(|(info, _)| info.clone()).collect();
-    info.media_components = BTreeMap::from([
-        (MediaCall::MediaReading, "media_reader".to_owned()),
-        (MediaCall::VisionEncoding, "text_encoder".to_owned()),
-        (MediaCall::LatentEncoding, "latent_encoder".to_owned()),
-        (MediaCall::TextEncoding, "text_encoder".to_owned()),
-        (MediaCall::LatentPreparation, "denoiser".to_owned()),
-        (MediaCall::Denoising, "denoiser".to_owned()),
-        (MediaCall::VideoDecoding, "video_decoder".to_owned()),
-        (MediaCall::VideoEncoding, "video_codec".to_owned()),
-        (MediaCall::AudioDecoding, "audio_decoder".to_owned()),
-        (MediaCall::AudioEncoding, "muxer".to_owned()),
-        (MediaCall::Muxing, "muxer".to_owned()),
-    ]);
+    ]
+}
+
+/// What every rank of the fixture's video pool reports: every media call, a
+/// denoiser of [`STEPS`] steps that takes conditions, `host_task_capacity`
+/// host tasks, and `components`.
+///
+/// Calls route to components the way a loaded model reports them: the video
+/// encoder component encodes the media units the decoder produced, and the
+/// muxer encodes audio and assembles the artifact.
+pub(crate) fn video_info(
+    host_task_capacity: u32,
+    components: &[(ComponentInfo, BlockConfig)],
+) -> MainProcessInfo {
+    MainProcessInfo {
+        supported_calls: MediaCall::ALL
+            .iter()
+            .map(|call| CallKind::Media(*call))
+            .collect(),
+        buffer_pool_bytes: 257_u64 * (256 << 20),
+        encoder_cache_entries: 256,
+        encoder_entry_bytes: 256 << 20,
+        max_batch_calls: 1024,
+        max_unresolved_calls: 2,
+        transfer_tickets: 1024,
+        video_denoiser: Some(VideoDenoiserInfo {
+            takes_conditions: true,
+            denoise_steps: STEPS,
+            description: b"{}".to_vec(),
+        }),
+        host_task_capacity,
+        components: components.iter().map(|(info, _)| info.clone()).collect(),
+        media_components: BTreeMap::from([
+            (MediaCall::MediaReading, "media_reader".to_owned()),
+            (MediaCall::VisionEncoding, "text_encoder".to_owned()),
+            (MediaCall::LatentEncoding, "latent_encoder".to_owned()),
+            (MediaCall::TextEncoding, "text_encoder".to_owned()),
+            (MediaCall::LatentPreparation, "denoiser".to_owned()),
+            (MediaCall::Denoising, "denoiser".to_owned()),
+            (MediaCall::VideoDecoding, "video_decoder".to_owned()),
+            (MediaCall::VideoEncoding, "video_codec".to_owned()),
+            (MediaCall::AudioDecoding, "audio_decoder".to_owned()),
+            (MediaCall::AudioEncoding, "muxer".to_owned()),
+            (MediaCall::Muxing, "muxer".to_owned()),
+        ]),
+        ..MainProcessInfo::default()
+    }
+}
+
+/// The fixture's video pool, named `sim`, on one host: [`video_components`]
+/// over as many ranks as they span, each reporting [`video_info`].
+///
+/// A deep queue keeps queue capacity from bounding which calls are in flight
+/// together, leaving that to the occupancy rules under test.
+pub(crate) fn video_pool(
+    decoder_ranks: usize,
+    host_task_capacity: u32,
+    denoising_ranks: usize,
+) -> Inventory {
+    let components = video_components(decoder_ranks, denoising_ranks);
+    let info = video_info(host_task_capacity, &components);
+    let ranks = decoder_ranks.max(denoising_ranks).max(1);
+
+    Inventory {
+        group: "sim".to_owned(),
+        ranks: vec![info; ranks],
+        layout: PoolLayout {
+            queue_depth: 64,
+            ranks,
+            components: components
+                .into_iter()
+                .map(|(info, config)| (info.name, config))
+                .collect(),
+        },
+        max_model_len: 32_768,
+    }
+}
+
+/// A fake worker serving `pools` whose media calls `media` answers.
+pub(crate) fn video_fake(pools: Vec<Inventory>, media: &Arc<Media>) -> Arc<FakeBatches> {
+    Arc::new(
+        FakeBatches::new(pools)
+            .answering(Arc::clone(media).answering())
+            .with_media(Arc::new(Media::serves)),
+    )
+}
+
+/// A simulated video worker over [`video_info`] and [`video_components`],
+/// its denoiser on rank 0, for the cases still written against the
+/// simulator.
+pub(crate) fn video_worker(decoder_ranks: usize, host_task_capacity: u32) -> SimEngine {
+    let mut sim = SimEngine::new();
+    sim.set_queue_depth(64);
+    sim.set_results_on_wait(true);
+
+    let components = video_components(decoder_ranks, 1);
+    *sim.mut_info_for_test() = video_info(host_task_capacity, &components);
     sim.place_components(
         components
             .into_iter()
@@ -248,7 +307,7 @@ pub(crate) fn video_request(id: u64, video_units: u32) -> Request {
             num_frames: 16,
             video_units,
             seed: id,
-            // The fixture decoder's raster (`video_worker`).
+            // The fixture decoder's raster (`video_components`).
             width: 24,
             height: 16,
             condition_rows: 0,

@@ -59,7 +59,15 @@ fn text(depth: usize, end: Option<EndOfText>) -> Arc<FakeBatches> {
 
 /// A scheduler over `pool` batching at most 32 calls a pass.
 fn scheduler_over(pool: &Arc<FakeBatches>) -> scheduler::Scheduler {
-    support::scheduler_over_batching(pool, 32).expect("the scheduler serves the fake pool")
+    support::fake::scheduler_over(
+        Arc::clone(pool) as Arc<dyn ipc::execution::Batches>,
+        SchedulerConfig {
+            max_batch: proto::config::positive(32),
+            ..Default::default()
+        },
+        Default::default(),
+    )
+    .expect("the scheduler is built over the fake")
 }
 
 /// The calls of `batch` and the kind of its first call's rows: a token batch
@@ -816,13 +824,14 @@ fn hybrid_groups_share_one_unit_pool() {
     ];
     let pool = Arc::new(support::text_pool(rank, 2, Some(EndOfText::after(1280, 4))));
     // A 64-token chunk reads at most six sliding pages with the window.
-    let sched = support::scheduler_over(
-        &pool,
+    let sched = support::fake::scheduler_over(
+        Arc::<testkit::FakeBatches>::clone(&pool),
         SchedulerConfig {
             max_batch: proto::config::positive(32),
             chunked_prefill_size: std::num::NonZeroUsize::new(64),
             ..Default::default()
         },
+        Default::default(),
     )
     .unwrap();
     let stats = sched.stats_handle();
@@ -1228,7 +1237,12 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
 /// request, so an epoch switch's warming waits for none of its requests.
 #[test]
 fn a_scheduler_without_a_host_cache_warms_nothing() {
-    let sched = support::scheduler_over(&text(1, None), SchedulerConfig::default()).unwrap();
+    let sched = support::fake::scheduler_over(
+        text(1, None),
+        SchedulerConfig::default(),
+        Default::default(),
+    )
+    .unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = CommandSender::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1255,8 +1269,8 @@ fn a_scheduler_without_a_host_cache_warms_nothing() {
 #[test]
 fn chunked_prefill_progresses_with_decode() {
     let pool = text(2, None);
-    let sched = support::scheduler_over(
-        &pool,
+    let sched = support::fake::scheduler_over(
+        Arc::<testkit::FakeBatches>::clone(&pool),
         SchedulerConfig {
             max_batch: proto::config::positive(32),
             // Caps a prefill chunk at 64 tokens.
@@ -1265,6 +1279,7 @@ fn chunked_prefill_progresses_with_decode() {
             max_num_batched_tokens: 256,
             ..Default::default()
         },
+        Default::default(),
     )
     .unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -1690,13 +1705,14 @@ fn a_latent_image_block_is_written_by_its_own_call() {
 fn a_vision_block_beyond_the_step_budget_is_refused() {
     const STEP_BUDGET: u32 = 16;
 
-    let sched = support::scheduler_over(
-        &text(1, Some(EndOfText::after(5, 2))),
+    let sched = support::fake::scheduler_over(
+        text(1, Some(EndOfText::after(5, 2))),
         SchedulerConfig {
             max_batch: proto::config::positive(32),
             max_num_batched_tokens: STEP_BUDGET as usize,
             ..Default::default()
         },
+        Default::default(),
     )
     .unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -2002,7 +2018,8 @@ fn scheduler_takes_limits_in_place_within_its_workers_batch() {
         max_batch: proto::config::positive(32),
         ..Default::default()
     };
-    let sched = support::scheduler_over(&text(1, None), base.clone()).unwrap();
+    let sched =
+        support::fake::scheduler_over(text(1, None), base.clone(), Default::default()).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = CommandSender::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
