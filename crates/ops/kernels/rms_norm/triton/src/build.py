@@ -39,8 +39,10 @@ def spec(fields, parameters, target):
             "pdl": "i32",
             "BLOCK": "constexpr",
             "PDL": "constexpr",
+            "CENTRED": "constexpr",
         },
-        "constexprs": {"BLOCK": tile, "PDL": pdl},
+        # A key names `centred` only for a zero-centred weight.
+        "constexprs": {"BLOCK": tile, "PDL": pdl, "CENTRED": fields.get("centred", "false") == "true"},
         "options": {"num_warps": warps_of(tile), "launch_pdl": pdl},
     }
 

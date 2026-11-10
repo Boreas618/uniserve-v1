@@ -32,6 +32,7 @@ def _rms_norm_kernel(
     pdl,
     BLOCK: tl.constexpr,
     PDL: tl.constexpr,  # noqa: N803
+    CENTRED: tl.constexpr,  # noqa: N803
 ):
     """Normalize one row per program.
 
@@ -39,6 +40,8 @@ def _rms_norm_kernel(
     row, output row); ``columns`` is the row width, ``eps`` the variance floor
     and ``pdl`` the launch's copy of the descriptor's flag. Every program loads
     its whole row before storing, so the output may alias the input.
+    ``CENTRED`` reads a zero-centred weight: the row is scaled by ``1 + w``,
+    the one added in FP32.
     """
     _pdl_prologue(PDL)
 
@@ -48,6 +51,8 @@ def _rms_norm_kernel(
     row_base = row * columns
     x = tl.load(x_ptr + row_base + offsets, mask=mask, other=0.0).to(tl.float32)
     w = tl.load(w_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    if CENTRED:
+        w = w + 1.0
 
     variance = tl.sum(x * x, axis=0) / columns
     y = x * tl.rsqrt(variance + eps) * w

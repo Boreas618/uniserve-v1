@@ -4,6 +4,7 @@
     python act_and_mul_check.py                          # the fixture's 25600 cell, silu
     python act_and_mul_check.py --interpreter            # the same on the CPU
     python act_and_mul_check.py --value-stride 26112 --rows 3
+    python act_and_mul_check.py --activation sigmoid     # an attention output gate
 
 The operator is `act(gate) · value` over a row of `width` elements, with **each half's
 rows a stride apart**: `gate_stride` and `value_stride` are separate, because the two
@@ -42,7 +43,7 @@ sys.path.insert(0, str(PACKAGE / "src"))
 DTYPES = {"f16": 3, "bf16": 4, "f32": 5}
 
 #: The relative bound's factor per activation, from `activation.rs::tolerance`.
-ROUNDINGS = {"silu": 3.0, "gelu": 4.0, "gelu_tanh": 4.0}
+ROUNDINGS = {"silu": 3.0, "gelu": 4.0, "gelu_tanh": 4.0, "sigmoid": 3.0}
 
 #: `2**-8` for f16, `2**-8` for bf16 and `2**-24` for f32: the output type's unit roundoff,
 #: as `DType::unit_roundoff` gives it.
@@ -57,6 +58,8 @@ TORCH_TYPES = {
 
 def activate(gate, name):
     """The reference activation, evaluated in FP64."""
+    if name == "sigmoid":
+        return torch.sigmoid(gate)
     if name == "silu":
         return gate * torch.sigmoid(gate)
     if name == "gelu_tanh":

@@ -30,6 +30,11 @@ def test_an_activation_matches_its_reference_on_the_interpreter(check):
     interpreted(FAMILY / check)
 
 
+def test_the_sigmoid_gate_matches_its_reference_on_the_interpreter():
+    """An attention's output gate: `act_and_mul` with the plain sigmoid."""
+    interpreted(FAMILY / "act_and_mul_check.py", "--activation", "sigmoid")
+
+
 @pytest.mark.parametrize("op", ["swiglu", "value_first_swiglu"])
 def test_a_gated_activation_matches_its_reference_on_the_interpreter(op):
     interpreted(FAMILY / "swiglu_check.py", "--op", op)

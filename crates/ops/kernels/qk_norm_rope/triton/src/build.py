@@ -98,6 +98,7 @@ def spec(fields, parameters, target):
     signature["INTERLEAVED"] = "constexpr"
     if affine:
         signature["AFFINE"] = "constexpr"
+        signature["CENTRED"] = "constexpr"
     signature["PDL"] = "constexpr"
     if rotated != head_dim:
         # A narrowed program's call names how many channels turn; the module
@@ -116,6 +117,8 @@ def spec(fields, parameters, target):
     }
     if affine:
         constexprs["AFFINE"] = True
+        # A key names `centred` only for a zero-centred scale: the gain is then `1 + w`.
+        constexprs["CENTRED"] = fields.get("centred", "false") == "true"
 
     # The arguments decide the program: weights and a width word are ports.
     if affine:

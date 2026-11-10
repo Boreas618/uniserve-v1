@@ -34,6 +34,7 @@ def _add_rms_norm_kernel(
     pdl,
     BLOCK: tl.constexpr,
     PDL: tl.constexpr,  # noqa: N803
+    CENTRED: tl.constexpr,  # noqa: N803
 ):
     """Add a residual, preserve the sum, and normalize it in one program.
 
@@ -54,6 +55,9 @@ def _add_rms_norm_kernel(
     # Both outputs derive from the same fp32 sum: ``c_ptr`` carries the residual
     # stream and ``y_ptr`` carries its normalized projection.
     w = tl.load(w_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    # A zero-centred weight scales by `1 + w`, the one added in FP32.
+    if CENTRED:
+        w = w + 1.0
     variance = tl.sum(c * c, axis=0) / columns
     y = c * tl.rsqrt(variance + eps) * w
     tl.store(c_ptr + row_base + offsets, c, mask=mask)

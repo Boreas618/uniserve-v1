@@ -139,6 +139,7 @@ def reference(
     interleaved,
     epsilon,
     affine,
+    centred=False,
 ):
     """One side's expected values, and the scale each element's error is measured against.
 
@@ -152,7 +153,8 @@ def reference(
     )
     normalized = values * inverse
     if affine:
-        normalized = normalized * weight.to(torch.float64)
+        # A zero-centred scale is `1 + w`.
+        normalized = normalized * (weight.to(torch.float64) + float(centred))
 
     expected = normalized.clone()
     scale = normalized.abs().clone()
@@ -187,6 +189,7 @@ def build(
     affine=True,
     zeros=False,
     tiny=False,
+    centred=False,
     seed=19,
 ):
     """The case's inputs: distinct in every element, so a row written elsewhere cannot pass."""
@@ -204,8 +207,10 @@ def build(
     return {
         "query": query.to(element),
         "key": key.to(element),
-        "q_weight": torch.rand(head_dim, dtype=torch.float32) + 0.5,
-        "k_weight": torch.rand(head_dim, dtype=torch.float32) + 0.5,
+        # A zero-centred scale is stored around zero, so its gain `1 + w` lies where a
+        # plain one does.
+        "q_weight": torch.rand(head_dim, dtype=torch.float32) + 0.5 - float(centred),
+        "k_weight": torch.rand(head_dim, dtype=torch.float32) + 0.5 - float(centred),
         "cosine": torch.cos(angle),
         "sine": torch.sin(angle),
         "tokens": tokens,
@@ -216,6 +221,7 @@ def build(
         "rotated": rotated,
         "rows": rows,
         "affine": affine,
+        "centred": centred,
     }
 
 
@@ -270,7 +276,7 @@ def launch(module, case, output, interleaved):
         PAIRS=1 << (rotated // 2 - 1).bit_length(),
         ROWS=case["rows"],
         INTERLEAVED=interleaved,
-        AFFINE=affine,
+        **({"AFFINE": True, "CENTRED": case["centred"]} if affine else {}),
         PDL=False,
     )
     return q_out, k_out
@@ -290,6 +296,7 @@ def check(module, what, *, output, interleaved, **case_args):
         interleaved=interleaved,
         epsilon=case["epsilon"],
         affine=case["affine"],
+        centred=case["centred"],
     )
     expected_k, scale_k = reference(
         case["key"],
@@ -301,6 +308,7 @@ def check(module, what, *, output, interleaved, **case_args):
         interleaved=interleaved,
         epsilon=case["epsilon"],
         affine=case["affine"],
+        centred=case["centred"],
     )
     where = (
         f"{what}: {output} out of {case_args['dtype']} in, {case_args['tokens']} tokens, "
@@ -436,6 +444,22 @@ def main():
         zeros=True,
         tiny=True,
     )
+    # A zero-centred scale (Qwen3.5): 16 + 2 heads of 256, a quarter of each head turned.
+    checked += check(
+        module,
+        "a zero-centred scale",
+        output="bf16",
+        interleaved=False,
+        dtype="bf16",
+        head_dim=256,
+        q_heads=16,
+        k_heads=2,
+        rotated=64,
+        rows=16,
+        tokens=5,
+        epsilon=1e-6,
+        centred=True,
+    )
     # The unweighted entry: no learned scale, half of the head turned, f16 out.
     checked += check(
         module,
@@ -453,7 +477,7 @@ def main():
         affine=False,
     )
     print(
-        f"ok: {checked} normalized and rotated values over six cells — the arithmetic at "
+        f"ok: {checked} normalized and rotated values over seven cells — the arithmetic at "
         f"rounding(head_dim)'s factor on its terms, and the narrow store bit for bit "
         f"({', '.join(sorted(STORES))}, as the interpreter does it)"
     )

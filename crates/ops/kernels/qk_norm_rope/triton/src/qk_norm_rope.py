@@ -36,6 +36,16 @@ def _pdl_prologue(PDL: tl.constexpr):
 
 
 @triton.jit
+def _gain(weight, columns, CENTRED: tl.constexpr):  # noqa: N803
+    """The learned scale of ``columns`` in FP32: the weight, or one plus it when the checkpoint
+    stores it zero-centred (the one is added in FP32, so no rounded ``1 + w`` exists)."""
+    gain = tl.load(weight + columns).to(tl.float32)
+    if CENTRED:
+        gain = gain + 1.0
+    return gain
+
+
+@triton.jit
 def _turned_head(
     source,
     weight,
@@ -49,6 +59,7 @@ def _turned_head(
     PAIRS: tl.constexpr,
     INTERLEAVED: tl.constexpr,
     AFFINE: tl.constexpr,
+    CENTRED: tl.constexpr,
     epsilon,
 ):
     """Normalize and rotate one head of every live token of the block.
@@ -64,7 +75,7 @@ def _turned_head(
     ).to(tl.float32)
     inverse = tl.rsqrt(tl.sum(row * row, axis=1) / DIM + epsilon)
     if AFFINE:
-        row = row * inverse[:, None] * tl.load(weight + columns).to(tl.float32)[None, :]
+        row = row * inverse[:, None] * _gain(weight, columns, CENTRED)[None, :]
     else:
         row = row * inverse[:, None]
     if ROTATED != DIM:
@@ -91,12 +102,12 @@ def _turned_head(
         first = (
             first
             * inverse[:, None]
-            * tl.load(weight + first_column).to(tl.float32)[None, :]
+            * _gain(weight, first_column, CENTRED)[None, :]
         )
         second = (
             second
             * inverse[:, None]
-            * tl.load(weight + second_column).to(tl.float32)[None, :]
+            * _gain(weight, second_column, CENTRED)[None, :]
         )
     else:
         first = first * inverse[:, None]
@@ -130,6 +141,7 @@ def _turned_rows(
     ROWS: tl.constexpr,
     INTERLEAVED: tl.constexpr,
     AFFINE: tl.constexpr,  # noqa: N803
+    CENTRED: tl.constexpr,  # noqa: N803
     epsilon,
 ):
     """Normalize and rotate the ``ROWS`` head rows from ``first`` of ``rows``.
@@ -161,6 +173,7 @@ def _turned_rows(
         PAIRS,
         INTERLEAVED,
         AFFINE,
+        CENTRED,
         epsilon,
     )
 
@@ -185,6 +198,7 @@ def _norm_rope(
     ROWS: tl.constexpr,
     INTERLEAVED: tl.constexpr,
     AFFINE: tl.constexpr,  # noqa: N803
+    CENTRED: tl.constexpr,  # noqa: N803
 ):
     """The block's work: ``ROWS`` query head rows, or ``ROWS`` key head rows.
 
@@ -210,6 +224,7 @@ def _norm_rope(
             ROWS,
             INTERLEAVED,
             AFFINE,
+            CENTRED,
             epsilon,
         )
     else:
@@ -228,6 +243,7 @@ def _norm_rope(
             ROWS,
             INTERLEAVED,
             AFFINE,
+            CENTRED,
             epsilon,
         )
 
@@ -327,6 +343,7 @@ def _qk_norm_rope_kernel(
     ROWS: tl.constexpr,
     INTERLEAVED: tl.constexpr,
     AFFINE: tl.constexpr,
+    CENTRED: tl.constexpr,
     PDL: tl.constexpr,
 ):
     """Weighted normalization, full-width rotation."""
@@ -350,6 +367,7 @@ def _qk_norm_rope_kernel(
         ROWS,
         INTERLEAVED,
         AFFINE,
+        CENTRED,
     )
 
 
@@ -375,6 +393,7 @@ def _qk_norm_rope_narrowed_kernel(
     ROWS: tl.constexpr,
     INTERLEAVED: tl.constexpr,
     AFFINE: tl.constexpr,
+    CENTRED: tl.constexpr,
     PDL: tl.constexpr,
 ):
     """Weighted normalization, a rotation narrower than the head."""
@@ -398,6 +417,7 @@ def _qk_norm_rope_narrowed_kernel(
         ROWS,
         INTERLEAVED,
         AFFINE,
+        CENTRED,
     )
 
 
@@ -441,6 +461,7 @@ def _qk_norm_rope_unweighted_kernel(
         PAIRS,
         ROWS,
         INTERLEAVED,
+        False,
         False,
     )
 
@@ -486,6 +507,7 @@ def _qk_norm_rope_unweighted_narrowed_kernel(
         PAIRS,
         ROWS,
         INTERLEAVED,
+        False,
         False,
     )
 

@@ -31,6 +31,9 @@ def _activate(gate, ACTIVATION: tl.constexpr):  # noqa: N803
     """Apply the named gate activation to an FP32 tile."""
     if ACTIVATION == "silu":
         return gate / (1.0 + tl.exp(-gate))
+    elif ACTIVATION == "sigmoid":
+        # An attention's output gate: the logistic sigmoid alone, saturating to exact 0 and 1.
+        return 1.0 / (1.0 + tl.exp(-gate))
     elif ACTIVATION == "gelu_tanh":
         # 0.5 * x * (1 + tanh(u)) equals x * sigmoid(2u) for
         # u = sqrt(2 / pi) * (x + 0.044715 x^3); the sigmoid form needs

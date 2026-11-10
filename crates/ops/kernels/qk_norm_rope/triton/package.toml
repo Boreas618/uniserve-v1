@@ -50,6 +50,14 @@ dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { power_of_two = true }, q_heads = { min = 1 }, k_heads = { min = 1 }, rotation = ["half", "interleaved"], epsilon = { bits = 32 }, rows = { power_of_two = true }, block = { power_of_two = true }, pdl = ["true", "false"], affine = ["false"], rotated = { multiple = 2 } }
 
+# The zero-centred scale (Qwen3-Next, Qwen3.5): each head is multiplied by `1 + w`, the one added in
+# FP32. Named by `centred` and weighted, at full width or narrowed.
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { power_of_two = true }, q_heads = { min = 1 }, k_heads = { min = 1 }, rotation = ["half", "interleaved"], epsilon = { bits = 32 }, rows = { power_of_two = true }, block = { power_of_two = true }, pdl = ["true", "false"], centred = ["true"] }
+
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { power_of_two = true }, q_heads = { min = 1 }, k_heads = { min = 1 }, rotation = ["half", "interleaved"], epsilon = { bits = 32 }, rows = { power_of_two = true }, block = { power_of_two = true }, pdl = ["true", "false"], rotated = { multiple = 2 }, centred = ["true"] }
+
 # The strided form the video VAE's decoder launches: heads read through a row stride, a factor table
 # of the activation's type that repeats per tile. Named by `factors` and `strided`, and weightless:
 # the operator refuses the strided form a learned scale.

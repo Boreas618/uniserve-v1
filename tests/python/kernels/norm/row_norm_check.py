@@ -4,6 +4,7 @@
     python row_norm_check.py --op rms_norm                          # 2048 of a 2048 tile
     python row_norm_check.py --op add_rms_norm --interpreter         # the same on the CPU
     python row_norm_check.py --op rms_norm --columns 5120 --tile 8192
+    python row_norm_check.py --op add_rms_norm --centred true    # a zero-centred weight, 1 + w
 
 One script covers both operators because they are one row reduction with one difference —
 `add_rms_norm` sums `x + residual` first, writes that sum back out as the new residual, and
@@ -145,12 +146,13 @@ def check(operator, case):
             int(case["pdl"]),
             BLOCK=tile,
             PDL=case["pdl"],
+            CENTRED=case["centred"],
         )
         exact_x = x.cpu().double()
         expected_out = exact_x * torch.rsqrt(
             (exact_x * exact_x).sum(dim=-1, keepdim=True) / columns + eps
         )
-        expected_out = expected_out * weight.cpu().double()
+        expected_out = expected_out * (weight.cpu().double() + float(case["centred"]))
         if case["truncate"]:
             expected_out = truncate(expected_out, dtype)
         relative = bound(columns, case["dtype"], OPERATORS[operator])
@@ -183,6 +185,7 @@ def check(operator, case):
             int(case["pdl"]),
             BLOCK=tile,
             PDL=case["pdl"],
+            CENTRED=case["centred"],
         )
         exact_x = x.cpu().double()
         exact_r = residual.cpu().double()
@@ -190,7 +193,7 @@ def check(operator, case):
         expected_out = exact_c * torch.rsqrt(
             (exact_c * exact_c).sum(dim=-1, keepdim=True) / columns + eps
         )
-        expected_out = expected_out * weight.cpu().double()
+        expected_out = expected_out * (weight.cpu().double() + float(case["centred"]))
         expected_residual = exact_c
         if case["truncate"]:
             expected_out = truncate(expected_out, dtype)
@@ -280,6 +283,7 @@ def check_hand(operator, tile):
         0,
         BLOCK=tile,
         PDL=False,
+        CENTRED=False,
     )
     expected = torch.tensor(HAND["expect"], dtype=torch.float64)
     difference = (out.double() - expected).abs()
@@ -299,6 +303,7 @@ def cases(flags):
         "dtype": flags.dtype,
         "eps": flags.eps,
         "pdl": flags.pdl == "true",
+        "centred": flags.centred == "true",
     }
     return [
         {
@@ -346,6 +351,12 @@ def main() -> int:
     parser.add_argument("--rows", type=int, default=4)
     parser.add_argument("--eps", type=float, default=1e-6)
     parser.add_argument("--pdl", choices=["true", "false"], default="false")
+    parser.add_argument(
+        "--centred",
+        choices=["true", "false"],
+        default="false",
+        help="read a zero-centred weight, scaling by 1 + w",
+    )
     parser.add_argument("--expect-key", default=None)
     parser.add_argument(
         "--bound",
