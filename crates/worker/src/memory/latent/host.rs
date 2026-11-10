@@ -245,13 +245,13 @@ impl LatentHostPool {
     /// The host address of the pool slot `copy` names, after checking that
     /// it is this pool's.
     pub(crate) fn address(&self, copy: &LatentPageCopy) -> Result<u64> {
-        if copy.pool != self.pool.pool || copy.slot >= self.slots {
+        if copy.pool != self.pool.pool || copy.host_page >= self.slots {
             return Err(Error::Invalid(format!(
                 "latent pool slot {} of pool {} is not a slot of this rank's pool {} of {} slots",
-                copy.slot, copy.pool, self.pool.pool, self.slots
+                copy.host_page, copy.pool, self.pool.pool, self.slots
             )));
         }
-        Ok(self.storage.address() + copy.slot * self.pool.page_bytes)
+        Ok(self.storage.address() + copy.host_page * self.pool.page_bytes)
     }
 
     /// The bytes of one page of the rank's pool.

@@ -632,7 +632,7 @@ impl TrajectoryStore {
                 reserved.iter().map(move |&(page, slot)| LatentPageCopy {
                     rank: rank.scope.rank,
                     pool: rank.pool.pool,
-                    slot,
+                    host_page: slot,
                     page,
                 })
             })

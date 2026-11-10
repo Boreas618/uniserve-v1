@@ -55,10 +55,10 @@ pub struct CacheUnitAllocation {
 /// page pool.
 ///
 /// A read fills `units` (one page of `group_id`, page-major as in a
-/// [`BlockTable`]) from the slot before the batch's forward; the units are
-/// new units of the batch, which the worker resets first. A write copies
-/// the units of a published page into the slot; the rank's output for the
-/// batch reports the write complete.
+/// [`BlockTable`]) from the host page before the batch's forward; the units
+/// are new units of the batch, which the worker resets first. A write copies
+/// the units of a published page into the host page; the rank's output for
+/// the batch reports the write complete.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageCopy {
     /// The rank of the worker group that copies the page.
@@ -67,8 +67,8 @@ pub struct PageCopy {
     pub pool: u64,
     /// The cache group of the page.
     pub group_id: u32,
-    /// The pool slot.
-    pub slot: u64,
+    /// The page's index in the host page pool.
+    pub host_page: u64,
     /// The page's units.
     pub units: Vec<UnitId>,
 }
@@ -85,9 +85,9 @@ impl PageCopy {
 }
 
 /// One page of a latent trajectory copied from a rank's latent banks to a
-/// slot of the rank's host latent pool, a page pool of the rank's host's
+/// page of the rank's host latent pool, a page pool of the rank's host's
 /// Storage Server ([`LatentOffload`]): page `page` of the trajectory's
-/// pages in the bank holding its committed step goes to the pool slot,
+/// pages in the bank holding its committed step goes to the host page,
 /// which the engine reserved. A video trajectory's pages are its request
 /// slot's; an image trajectory's are the pages its calls name, in logical
 /// order. A pool page holds as many bytes as a bank page.
@@ -97,8 +97,8 @@ pub struct LatentPageCopy {
     pub rank: u32,
     /// The latent pool at the rank's host's Storage Server.
     pub pool: u64,
-    /// The pool slot.
-    pub slot: u64,
+    /// The page's index in the host latent pool.
+    pub host_page: u64,
     /// The page's index among the trajectory's pages, from zero.
     pub page: u32,
 }

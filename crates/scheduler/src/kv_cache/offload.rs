@@ -1282,7 +1282,7 @@ impl KvOffloadManager {
                             rank: rank as u32,
                             pool: pool.pool,
                             group_id: index as u32,
-                            slot: *slot,
+                            host_page: *slot,
                             units,
                         });
                     }
@@ -1777,7 +1777,7 @@ impl KvOffloadManager {
                                         rank: rank as u32,
                                         pool,
                                         group_id: reservation.group as u32,
-                                        slot: *slot,
+                                        host_page: *slot,
                                         units: page.units().to_vec(),
                                     },
                                     key: *key,

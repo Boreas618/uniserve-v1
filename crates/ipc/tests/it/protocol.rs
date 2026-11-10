@@ -822,7 +822,7 @@ fn page_copy(units: &[u32]) -> PageCopy {
         rank: 0,
         pool: 1,
         group_id: 0,
-        slot: 3,
+        host_page: 3,
         units: units.iter().copied().map(UnitId).collect(),
     }
 }

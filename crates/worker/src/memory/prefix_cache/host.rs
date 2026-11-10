@@ -292,10 +292,10 @@ impl HostKvCache {
                     copy.pool, copy.group_id
                 ))
             })?;
-        if copy.slot >= pool.slots {
+        if copy.host_page >= pool.slots {
             return Err(Error::Invalid(format!(
                 "page slot {} is outside the pool of {} slots",
-                copy.slot, pool.slots
+                copy.host_page, pool.slots
             )));
         }
         let plan = planes.plan();
@@ -309,7 +309,7 @@ impl HostKvCache {
             )));
         }
         let plane = plan.plane_bytes;
-        let slot = pool.storage.address() + copy.slot * pool.page_bytes;
+        let slot = pool.storage.address() + copy.host_page * pool.page_bytes;
         let count = u64::from(pool.planes);
         let mut runs = Vec::with_capacity(2 * pool.planes as usize * 2);
         for field in 0..2 {
@@ -356,7 +356,7 @@ impl HostKvCache {
         }
         tracing::debug!(
             pages = loads.len(),
-            first_slot = loads[0].slot,
+            first_slot = loads[0].host_page,
             first_unit = loads[0].units.first().map(|unit| unit.0),
             "loading pages from the host KV cache"
         );
@@ -394,7 +394,7 @@ impl HostKvCache {
         }
         tracing::debug!(
             pages = offloads.len(),
-            first_slot = offloads[0].slot,
+            first_slot = offloads[0].host_page,
             first_unit = offloads[0].units.first().map(|unit| unit.0),
             "offloading pages to the host KV cache"
         );
