@@ -727,7 +727,7 @@ impl Scheduler {
         }
         // A model that keeps a recurrent state per request slot has a state group, whose pages the
         // columns name the checkpoints and restores of.
-        let state = cache
+        let state_pages = cache
             .coordinator
             .groups()
             .iter()
@@ -780,13 +780,16 @@ impl Scheduler {
             // declaration is a delta and not the layout: a decode whose pages
             // did not move declares none, and the batch it travels in still
             // needs the table it writes through.
+            // The declaration names the groups whose table changed, and every group the columns
+            // address keeps its current table: a hybrid model's state group changes on other calls
+            // than its K/V group does.
             let declared = placed.block_tables.clone();
-            let resolved = if declared.is_empty() {
+            let resolved = if declared.is_empty() || state_pages.is_some() {
                 let Some(pool) = state.request_pool_idx() else {
                     tracing::debug!("a batch is dropped: a request holds no pool row");
                     return;
                 };
-                match state.block_tables() {
+                let current: Vec<IpcBlockTable> = match state.block_tables() {
                     Some(tables) => tables
                         .iter()
                         .map(|table| IpcBlockTable {
@@ -799,7 +802,18 @@ impl Scheduler {
                         })
                         .collect(),
                     None => Vec::new(),
-                }
+                };
+                current
+                    .into_iter()
+                    .map(|table| {
+                        declared
+                            .iter()
+                            .rev()
+                            .find(|stated| stated.group_id == table.group_id)
+                            .cloned()
+                            .unwrap_or(table)
+                    })
+                    .collect()
             } else {
                 declared
             };
@@ -817,7 +831,7 @@ impl Scheduler {
             &draws,
             block_size,
             max_kv_len,
-            state,
+            state_pages,
             &resident,
         );
 
