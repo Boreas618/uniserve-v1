@@ -394,7 +394,7 @@ impl Scheduler {
             canvas_step: 0,
             canvas_commit: Vec::new(),
             output: RequestOutput::new(event_tx),
-            queued_at: now(),
+            queued_us: crate::clock::now_monotonic_us(),
             terminal_intent: super::TerminalIntent::None,
             failure: None,
             prompt_tokens,
@@ -630,7 +630,7 @@ impl Scheduler {
         &mut self,
         request: DiffusionRequest,
         event_tx: EventTx,
-        queued_at: f64,
+        queued_us: u64,
     ) {
         let reject = |kind: RejectionKind, message: String| {
             let _ = event_tx.send(Event::Rejected { kind, message });
@@ -698,7 +698,7 @@ impl Scheduler {
             request,
             graph,
             event_tx,
-            queued_at,
+            queued_us,
         });
         // The policy sees a media request as it arrived, exactly as it sees a
         // token request's arrival: nothing has happened to it yet, so every
@@ -940,11 +940,11 @@ impl Scheduler {
             // The interval from receipt to admission is the queue wait. The
             // engine and rank own the preparation that follows, which the
             // request's public phases report from here on.
-            let scheduled_at = now();
-            self.record_queue_wait(submission.queued_at, scheduled_at);
+            let scheduled_us = crate::clock::now_monotonic_us();
+            self.record_queue_wait(submission.queued_us, scheduled_us);
             if !state.output.enqueue(Event::Scheduled {
-                queued_at: submission.queued_at,
-                scheduled_at,
+                queued_at: crate::clock::unix_secs_at(submission.queued_us),
+                scheduled_at: crate::clock::unix_secs_at(scheduled_us),
             }) {
                 state.terminal_intent.finish(FinishReason::Cancelled);
             }
@@ -1692,10 +1692,10 @@ impl Scheduler {
 
     /// Accumulates one request's interval from queue entry to admission.
     ///
-    /// Timestamps are in seconds; the statistics are in microseconds, and a
-    /// negative interval counts as zero.
-    fn record_queue_wait(&self, queued_at: f64, scheduled_at: f64) {
-        let queue_wait_us = ((scheduled_at - queued_at).max(0.0) * 1_000_000.0) as u64;
+    /// Both stamps are monotonic microseconds (`clock::now_monotonic_us`), so
+    /// a wall-clock step does not skew the statistics.
+    fn record_queue_wait(&self, queued_us: u64, scheduled_us: u64) {
+        let queue_wait_us = scheduled_us.saturating_sub(queued_us);
         self.stats
             .timing
             .queue_wait_count
@@ -1799,14 +1799,14 @@ impl Scheduler {
 
         // Queue latency is finalized at the same timestamp exposed through the
         // public scheduling event.
-        let q = st.queued_at;
-        let scheduled_at = now();
-        self.record_queue_wait(q, scheduled_at);
+        let queued_us = st.queued_us;
+        let scheduled_us = crate::clock::now_monotonic_us();
+        self.record_queue_wait(queued_us, scheduled_us);
 
         let encoder_entries = st.req.num_encoder_cache_entries();
         if !st.output.events.enqueue(Event::Scheduled {
-            queued_at: q,
-            scheduled_at,
+            queued_at: crate::clock::unix_secs_at(queued_us),
+            scheduled_at: crate::clock::unix_secs_at(scheduled_us),
         }) {
             st.terminal_intent = TerminalIntent::Finish(FinishReason::Cancelled);
         }

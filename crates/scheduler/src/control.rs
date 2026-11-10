@@ -151,7 +151,9 @@ impl Scheduler {
                 for Submission { request, event_tx } in submissions {
                     match *request {
                         Request::Generation(request) => self.enqueue(*request, event_tx),
-                        Request::Diffusion(request) => self.enqueue_media(request, event_tx, now()),
+                        Request::Diffusion(request) => {
+                            self.enqueue_media(request, event_tx, crate::clock::now_monotonic_us())
+                        }
                     }
                 }
             }

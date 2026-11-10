@@ -108,8 +108,8 @@ impl Scheduler {
         let Some(victim) = live
             .iter()
             .max_by(|(_, a), (_, b)| {
-                (a.req.priority, a.queued_at)
-                    .partial_cmp(&(b.req.priority, b.queued_at))
+                (a.req.priority, a.queued_us)
+                    .partial_cmp(&(b.req.priority, b.queued_us))
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(id, _)| **id)

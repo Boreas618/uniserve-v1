@@ -367,19 +367,10 @@ pub(crate) struct Recorded {
 /// What the recorder observed of each request, by request id.
 pub(crate) type RecordedTable = HashMap<RequestId, Recorded>;
 
-// ---------------------------------------------------------------------------
-// Wall-clock to monotonic time
-// ---------------------------------------------------------------------------
-
-/// The monotonic instant of a wall-clock time in fractional Unix seconds.
-///
-/// Requests carry `queued_at` as Unix time; a policy compares instants of the
-/// mechanism's monotonic clock, which the process fixes at its first use. The
-/// mapping is read once, so a request's arrival is the same instant in every
-/// view of it. Times before this process started clamp to zero.
-pub(crate) fn nanos_at(unix_secs: f64) -> Nanos {
-    let elapsed = unix_secs - crate::clock::monotonic_origin_unix_secs();
-    Nanos((elapsed.max(0.0) * 1e9) as u64)
+/// The policy's instant of a monotonic stamp in microseconds
+/// (`clock::now_monotonic_us`), which is how requests carry their arrival.
+pub(crate) fn nanos_at(monotonic_us: u64) -> Nanos {
+    Nanos(monotonic_us.saturating_mul(1_000))
 }
 
 // ---------------------------------------------------------------------------
@@ -695,7 +686,7 @@ pub(crate) fn request(
         state: standing,
         phase: next_phase(scheduler, state, id),
         priority: state.req.priority,
-        arrived_at: nanos_at(state.queued_at),
+        arrived_at: nanos_at(state.queued_us),
         admitted_at: recorded.admitted_at,
         prompt_tokens: u32::try_from(state.prompt_tokens).unwrap_or(u32::MAX),
         prefill_tokens: prefill_end(state),
@@ -741,7 +732,7 @@ fn media_phase(scheduler: &Scheduler, id: RequestId) -> Option<PhaseId> {
 pub(crate) fn diffusion_request(
     request: &DiffusionRequest,
     standing: Standing,
-    queued_at: f64,
+    queued_us: u64,
     phase: Option<PhaseId>,
     recorded: &Recorded,
 ) -> RequestView {
@@ -750,7 +741,7 @@ pub(crate) fn diffusion_request(
         state: standing,
         phase,
         priority: request.priority,
-        arrived_at: nanos_at(queued_at),
+        arrived_at: nanos_at(queued_us),
         admitted_at: recorded.admitted_at,
         prompt_tokens: u32::try_from(request.prompt_token_ids.len()).unwrap_or(u32::MAX),
         prefill_tokens: u32::try_from(request.prompt_token_ids.len()).unwrap_or(u32::MAX),
@@ -793,7 +784,7 @@ pub(crate) fn requests(scheduler: &Scheduler, recorded: &RecordedTable) -> Vec<R
         views.push(diffusion_request(
             &pending.request,
             Standing::Queued,
-            pending.queued_at,
+            pending.queued_us,
             None,
             &facts,
         ));
@@ -811,7 +802,7 @@ pub(crate) fn requests(scheduler: &Scheduler, recorded: &RecordedTable) -> Vec<R
             views.push(diffusion_request(
                 &flow.request,
                 Standing::Resident,
-                0.0,
+                0,
                 media_phase(scheduler, *id),
                 &facts,
             ));
@@ -829,7 +820,7 @@ pub(crate) fn requests(scheduler: &Scheduler, recorded: &RecordedTable) -> Vec<R
         views.push(diffusion_request(
             &flow.request,
             Standing::Resident,
-            0.0,
+            0,
             media_phase(scheduler, *id),
             &facts,
         ));
@@ -1190,7 +1181,7 @@ pub(crate) fn view_of(
         return Some(diffusion_request(
             &flow.request,
             Standing::Resident,
-            0.0,
+            0,
             media_phase(scheduler, id),
             &facts,
         ));
@@ -1210,7 +1201,7 @@ pub(crate) fn view_of(
             diffusion_request(
                 &pending.request,
                 Standing::Queued,
-                pending.queued_at,
+                pending.queued_us,
                 None,
                 &facts,
             )
@@ -1454,18 +1445,6 @@ mod tests {
             .find(|phase| phase.kind == PhaseKind::Prefill)
             .expect("the worker serves prefill");
         assert_eq!(Some(prefill.block), block_id(&blocks, "model"));
-    }
-
-    #[test]
-    fn a_wall_clock_instant_becomes_a_monotonic_one() {
-        let now = nanos_at(crate::clock::now_unix_secs());
-        let monotonic = Nanos(crate::clock::now_monotonic_us() * 1_000);
-        assert!(
-            now.0.abs_diff(monotonic.0) < 1_000_000_000,
-            "{now:?} is not within a second of {monotonic:?}"
-        );
-        // A time before the process started is the clock's zero, not a wrap.
-        assert_eq!(nanos_at(0.0), Nanos(0));
     }
 
     #[test]

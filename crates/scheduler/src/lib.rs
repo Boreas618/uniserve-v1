@@ -548,8 +548,9 @@ struct PendingMedia {
     /// The request's call graph, built when it was queued.
     graph: VideoGraph,
     event_tx: EventTx,
-    /// Unix timestamp at which the request entered the waiting queue.
-    queued_at: f64,
+    /// Monotonic microseconds (`clock::now_monotonic_us`) at which the
+    /// request entered the waiting queue.
+    queued_us: u64,
 }
 
 /// Single-threaded owner of scheduling, storage, execution, and request state.
@@ -737,15 +738,6 @@ impl Scheduler {
         self.fatal = true;
         let _ = self.failure.set(reason);
     }
-}
-
-/// Returns wall-clock seconds since the Unix epoch.
-///
-/// Uses the shared `crate::clock::now_unix_secs` so scheduler timestamps
-/// match other components'. The clock is not monotonic; a time before the
-/// epoch reads as zero instead of panicking.
-fn now() -> f64 {
-    crate::clock::now_unix_secs()
 }
 
 /// Adds each per-key delta of a worker forward statistic into the shared

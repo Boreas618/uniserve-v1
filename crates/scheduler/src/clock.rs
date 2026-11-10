@@ -31,3 +31,11 @@ pub(crate) fn monotonic_origin_unix_secs() -> f64 {
 }
 
 static ORIGIN_UNIX: OnceLock<f64> = OnceLock::new();
+
+/// The wall-clock time, in fractional Unix seconds, of the monotonic instant
+/// `monotonic_us` ([`now_monotonic_us`]): what a client-visible timestamp
+/// states of an instant the scheduler measures intervals between on the
+/// monotonic clock.
+pub(crate) fn unix_secs_at(monotonic_us: u64) -> f64 {
+    monotonic_origin_unix_secs() + monotonic_us as f64 / 1e6
+}

@@ -1607,8 +1607,10 @@ pub(crate) struct RequestState {
     /// Tokens of the stopped block awaiting their commit
     /// (`GenerationPhase::CommitCanvas`); empty otherwise.
     pub(super) canvas_commit: Vec<u32>,
-    /// Unix time, in seconds, at which the request state was created.
-    pub queued_at: f64,
+    /// Monotonic microseconds (`clock::now_monotonic_us`) at which the
+    /// request state was created: queue waits are measured on the monotonic
+    /// clock, and only the public `Scheduled` event states it as Unix time.
+    pub queued_us: u64,
     pub(crate) terminal_intent: TerminalIntent,
     /// Cause of the first rejected worker result, which
     /// `Scheduler::fail_after_inflight` reports as the request's terminal
