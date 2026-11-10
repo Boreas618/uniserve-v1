@@ -2,7 +2,7 @@
 
 UniServe loads NIXL's C API at runtime for RDMA transfers between Storage Servers. The bindings target NIXL 1.5.1 with the UCX backend. Read-only host storage requires both patches in `crates/nixl/patches/`: NIXL passes the requested read access to UCX, and UCX registers the mapping for remote reads without requesting write access. The patches apply to the revisions below.
 
-The build requires Git, a C/C++ compiler, a CUDA toolkit, Autoconf, Automake, Libtool, pkg-config, Meson, Ninja, patchelf, and the development headers and libraries for verbs, RDMA CM and GDRCopy. Put the CUDA toolkit's `bin` directory on `PATH`. Run these commands from the repository root; sources, build outputs and installed libraries stay under `artifacts/native`.
+The build requires Git, a C/C++ compiler, a CUDA toolkit, Autoconf, Automake, Libtool, pkg-config, Meson, Ninja, patchelf, and the development headers and libraries for verbs, RDMA CM and GDRCopy. UCX's configure links against the unversioned names of the verbs and RDMA CM libraries (`libibverbs.so`, `librdmacm.so`, `libmlx5.so`); a host that ships only their versioned runtime libraries builds UCX without its InfiniBand transports, which `ucx_info -d` then omits. Link names in a directory of their own, passed as `LDFLAGS=-L<directory>` to `configure-release`, provide them. Put the CUDA toolkit's `bin` directory on `PATH`. Run these commands from the repository root; sources, build outputs and installed libraries stay under `artifacts/native`.
 
 ```bash
 export MAX_JOBS=8
@@ -39,6 +39,8 @@ patchelf --set-rpath "$native_root/nixl/lib:$native_root/ucx/lib" \
     "$native_root/nixl/lib/libnixl_capi.so"
 ```
 
-Set `LD_LIBRARY_PATH` to include `artifacts/native/nixl/lib` before starting serving. A separately launched Storage Server can select the library explicitly with `uniserve storage-server serve --nixl-library /absolute/path/to/libnixl_capi.so`. NIXL finds its UCX plugin beside `libnixl.so`; `UCX_NET_DEVICES` can select the host's RDMA ports.
+Set `LD_LIBRARY_PATH` to include `artifacts/native/nixl/lib` before starting serving. A separately launched Storage Server can select the library explicitly with `uniserve storage-server serve --nixl-library /absolute/path/to/libnixl_capi.so`. NIXL finds its UCX plugin beside `libnixl.so`; `UCX_NET_DEVICES` selects the host's RDMA ports, and must name only ports UCX can open (an Ethernet port without a usable GID fails the agent's start with `Address not valid`), such as `mlx5_0:1,mlx5_1:1` for InfiniBand ports `ibv_devinfo` lists as active.
+
+Transfers between hosts read host page pools (peer reads of the host KV cache, `kv_cache_config.peers`) and device storage (a prefill/decode hand-off whose groups live on two hosts). Both hosts' Storage Servers need a TCP endpoint (`--tcp`, which a multi-node deployment's daemons set) and this library. The endpoints are not authenticated: the hosts rely on the isolation of their network (`architecture.md`, Transfers).
 
 The NIXL backend uses pinned registration and disables its registration cache (`REG_NONBLOCK_MEM_TYPES=` and `RCACHE_ENABLE=n`). A released CUDA mapping can be reused at the same virtual address, so registrations must follow the backing allocation's lifetime. On hosts in the same NVLink fabric, the Transfer Server uses imported CUDA fabric handles when available and RDMA otherwise.
