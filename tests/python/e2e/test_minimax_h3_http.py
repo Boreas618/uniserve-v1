@@ -11,14 +11,15 @@ refused.
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    MINIMAX_H3_CHECKPOINT,
     find_free_port,
+    host_asset,
     require_uniserve_binary,
     server_process,
     t2va_request,
@@ -26,15 +27,17 @@ from tests.python.e2e.http_helpers import (
 )
 from uniserve_eval.transport.video import inspect_video_bytes
 
-pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("minimax_h3")]
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.gpu,
+    pytest.mark.model("minimax_h3"),
+    # Every deployment of the module serves on the host's four GPUs.
+    pytest.mark.gpus(4),
+]
 
 
 def test_base_text_to_video_at_every_768p_size(tmp_path: Path) -> None:
-    model = os.environ.get("UNISERVE_MINIMAX_H3_MODEL")
-    if not model or not Path(model).is_dir():
-        pytest.fail(
-            "UNISERVE_MINIMAX_H3_MODEL must name a MiniMax-H3 diffusers root"
-        )
+    model = str(host_asset("UNISERVE_MINIMAX_H3_MODEL", MINIMAX_H3_CHECKPOINT))
     # The 768p canvas of each aspect ratio MiniMax-H3 names: 21:9, 16:9, 4:3,
     # 1:1, 3:4 and 9:16.
     sizes = [
@@ -73,6 +76,10 @@ def test_base_text_to_video_at_every_768p_size(tmp_path: Path) -> None:
         "video_config.max_seconds=5",
         "--max-model-len",
         "1024",
+        # The default prompt-capacity ladder holds capacities below the
+        # admitted length only, so the deployment states its one capacity.
+        "--set",
+        "video_config.text_capacities=1024",
     ]
     prompt = (
         "A red fox trots across a snowy meadow at sunrise, its breath "

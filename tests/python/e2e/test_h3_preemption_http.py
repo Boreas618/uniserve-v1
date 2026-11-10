@@ -1,8 +1,8 @@
 """A FastH3 video request preempted mid-trajectory continues exactly.
 
 Serves a FastH3 checkpoint (``UNISERVE_H3_MODEL``) on the two GPUs the
-GPU locks granted (``UNISERVE_EPOCH_DEVICES``): a Ulysses-2 denoiser and a
-TP2 text encoder beside the decoders, and the CPU media group. One
+module leases (``UNISERVE_WORLD_DEVICES``): a Ulysses-2 denoiser and a TP2
+text encoder beside the decoders and the media components. One
 ``t2va`` request is served uninterrupted as the reference. The same
 request, as a video job, is then preempted at a denoising step boundary:
 
@@ -64,7 +64,10 @@ import numpy as np
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    H3_CHECKPOINT,
     find_free_port,
+    granted_devices,
+    host_asset,
     require_uniserve_binary,
     server_process,
     t2va_request,
@@ -72,7 +75,12 @@ from tests.python.e2e.http_helpers import (
     written_deployment,
 )
 
-pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("minimax_h3")]
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.gpu,
+    pytest.mark.model("minimax_h3"),
+    pytest.mark.gpus(2),
+]
 
 NAME = "FastH3"
 PROMPT = (
@@ -87,35 +95,27 @@ SEED = 4242
 
 
 def _model() -> str:
-    model = os.environ.get("UNISERVE_H3_MODEL")
-    if not model or not Path(model).is_dir():
-        pytest.fail(
-            "UNISERVE_H3_MODEL must name a supported FastH3 checkpoint "
-            "directory; docs/minimax_h3/minimax_h3.md lists them"
-        )
-    return model
+    return str(host_asset("UNISERVE_H3_MODEL", H3_CHECKPOINT))
 
 
 def _devices() -> str:
-    """The two GPUs the deployment serves on, as their locks granted them
-    (``UNISERVE_WORLD_DEVICES``), so that other runs keep the other GPUs.
+    """The two GPUs the deployment serves on, as the module's lease granted
+    them, so that other cases keep the other GPUs.
     """  # noqa: D205
-    devices = os.environ.get("UNISERVE_WORLD_DEVICES", "")
-    if len([device for device in devices.split(",") if device]) != 2:
-        pytest.fail(
-            "UNISERVE_WORLD_DEVICES must name the two GPUs whose locks "
-            "this run holds"
-        )
-    return devices
+    return granted_devices(2)
 
 
 def _deployment(
     directory: Path, denoising_ranks: int = 2, fraction: float | None = None
 ) -> Path:
-    """Two GPUs of the model group and the CPU media group: the denoiser
-    Ulysses-2 on both GPUs, or on the first alone for one denoising rank;
-    `fraction` is the model group's share of each GPU
+    """One group on two GPUs: the denoiser Ulysses-2 on both GPUs, or on the
+    first alone for one denoising rank, beside the encoders, the decoders and
+    the media components; `fraction` is the group's share of each GPU
     (`mem_fraction_static`), the deployment's default without one.
+
+    The media components run on the host inside the main process, which
+    serves CUDA devices only, so they are placed on the group's CUDA ranks as
+    the deployment files of ``configs/minimax_h3`` place them.
     """  # noqa: D205
     directory.mkdir(parents=True, exist_ok=True)
     transformer = (
@@ -133,26 +133,14 @@ def _deployment(
             "video_decoder": {},
             "audio_decoder": {"distribution": "temporal_units"},
             "latent_encoder": {"distribution": "temporal_units"},
+            "video_codec": {},
+            "muxer": {"ranks": [0]},
+            "media_reader": {"ranks": [0]},
         },
     }
     if fraction is not None:
         model["mem_fraction_static"] = fraction
-    return written_deployment(
-        directory,
-        [
-            model,
-            {
-                "id": "media",
-                "ranks": ["cpu*4"],
-                "queue_depth": 6,
-                "blocks": {
-                    "video_codec": {"ranks": [0, 1]},
-                    "muxer": {"ranks": [2]},
-                    "media_reader": {"ranks": [3]},
-                },
-            },
-        ],
-    )
+    return written_deployment(directory, [model])
 
 
 # The model group's share of each GPU while an epoch change of the
@@ -228,6 +216,10 @@ def _serve(
         "1",
         "--max-model-len",
         "1024",
+        # The default prompt-capacity ladder holds capacities below the
+        # admitted length only, so the deployment states its one capacity.
+        "--set",
+        "video_config.text_capacities=1024",
         "--set",
         "video_config.sizes=1344x768",
         "--set",

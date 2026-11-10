@@ -17,7 +17,9 @@ import torch
 from transformers import AutoTokenizer
 
 from tests.python.e2e.http_helpers import (
+    H3_CHECKPOINT,
     find_free_port,
+    host_asset,
     require_uniserve_binary,
     second_host,
     server_process,
@@ -35,7 +37,13 @@ from uniserve_eval.types import (
     VideoConfig,
 )
 
-pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("minimax_h3")]
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.gpu,
+    pytest.mark.model("minimax_h3"),
+    # Every layout addresses up to the host's four GPUs.
+    pytest.mark.gpus(4),
+]
 
 
 def _assert_media_values_close(actual: bytes, expected: bytes) -> None:
@@ -190,12 +198,7 @@ def test_component_bindings_release_cancelled_requests(
     grouping: str,
     max_running_requests: int,
 ) -> None:
-    model_value = os.environ.get("UNISERVE_H3_MODEL")
-    if not model_value or not Path(model_value).is_dir():
-        pytest.fail(
-            "UNISERVE_H3_MODEL must name a supported FastH3 checkpoint "
-            "directory; docs/minimax_h3/minimax_h3.md lists them"
-        )
+    model_value = str(host_asset("UNISERVE_H3_MODEL", H3_CHECKPOINT))
     # A layout that holds the whole denoiser on one device cannot also hold a
     # 15-second activation working set: the single-device warmup exhausts a
     # 184 GiB device with 178 GB allocated. That layout is qualified at a
@@ -256,7 +259,10 @@ def test_component_bindings_release_cancelled_requests(
     }
     devices = worker_config.pop("devices")
     visible_devices = max(devices) + 1
-    local_devices = torch.cuda.device_count()
+    # The layout's device indices address the GPUs the module leased, in
+    # their order.
+    leased = os.environ["UNISERVE_WORLD_DEVICES"].split(",")
+    local_devices = len(leased)
     two_hosts = (
         local_devices < visible_devices <= 2 * local_devices
         and FOLLOWER is not None
@@ -279,10 +285,26 @@ def test_component_bindings_release_cancelled_requests(
     # device products between ranks that fall in different pairs, and there the
     # host mechanism is the one those edges admit.
     device_products = not two_hosts and all(
-        first == second or torch.cuda.can_device_access_peer(first, second)
+        first == second
+        or torch.cuda.can_device_access_peer(
+            int(leased[first]), int(leased[second])
+        )
         for first in devices
         for second in devices
     )
+    # The media components encode and assemble on the host inside the main
+    # process, which serves CUDA devices only, so they are placed on CUDA
+    # ranks as the deployment files of `configs/minimax_h3` place them: each
+    # decoded unit's codec slot on its decoder's rank, and the muxer and the
+    # media reader on one rank of the leader's host.
+    leader_rank = next(
+        rank for rank, device in enumerate(devices) if device < local_devices
+    )
+    worker_config["video_codec"] = {
+        "ranks": worker_config["video_decoder"]["ranks"],
+    }
+    worker_config["muxer"] = {"ranks": [leader_rank]}
+    worker_config["media_reader"] = {"ranks": [leader_rank]}
     groups = {
         "whole": [tuple(worker_config)],
         "split": [(name,) for name in worker_config],
@@ -312,39 +334,6 @@ def test_component_bindings_release_cancelled_requests(
             }
         )
         owners.update(dict.fromkeys(names, worker_id))
-    # Media units are encoded and the artifact assembled on the CPU workers
-    # of the media group, as in the shipped deployments: each CPU worker is
-    # one codec slot encoding one unit of a round, a further worker muxes and
-    # the last reads condition media. On two hosts each unit's codec slot is
-    # on its decoder's host.
-    decoder_ranks = worker_config["video_decoder"]["ranks"]
-    decoder_units = len(decoder_ranks)
-    media_ranks = (
-        [
-            place(devices[rank]).split("cuda:")[0] + "cpu"
-            for rank in decoder_ranks
-        ]
-        + ["cpu", "cpu"]
-        if two_hosts
-        else [f"cpu*{decoder_units + 2}"]
-    )
-    workers.append(
-        {
-            "id": "media",
-            "ranks": media_ranks,
-            "queue_depth": 6,
-            "blocks": {
-                "video_codec": {
-                    "ranks": list(range(decoder_units)),
-                },
-                "muxer": {"ranks": [decoder_units]},
-                "media_reader": {"ranks": [decoder_units + 1]},
-            },
-        }
-    )
-    owners.update(
-        dict.fromkeys(("video_codec", "muxer", "media_reader"), "media")
-    )
     edges = {
         (owners[source], owners[destination])
         for source, destination in (
@@ -412,15 +401,10 @@ def test_component_bindings_release_cancelled_requests(
             "device_config.transfer="
             + ",".join(
                 # Device products cross workers over VMM handles where the
-                # devices can map one another; the media group's CPU workers
-                # have no device, so their edges carry host products over
-                # shared storage only.
+                # devices can map one another, and host products over shared
+                # storage.
                 f"{source}->{destination}="
-                + (
-                    "posix_shm"
-                    if "media" in (source, destination) or not device_products
-                    else "cuda_vmm+posix_shm"
-                )
+                + ("cuda_vmm+posix_shm" if device_products else "posix_shm")
                 for source, destination in sorted(edges)
             ),
         ]
@@ -445,7 +429,7 @@ def test_component_bindings_release_cancelled_requests(
     log = tmp_path / "h3-components.log"
     environment = {
         "CUDA_VISIBLE_DEVICES": ",".join(
-            str(index) for index in range(min(visible_devices, local_devices))
+            leased[: min(visible_devices, local_devices)]
         )
     }
     follower = (
@@ -512,18 +496,12 @@ def test_video_jobs_retain_content_and_cancel_active_work(
 ) -> None:
     """Exercise async ownership and reuse through the HTTP contract.
 
-    The exercise runs on the documented four-device deployment, whose numerical
-    components share one worker group and whose media units are encoded and
-    muxed on the CPU workers of the media group.
+    The exercise runs on the documented four-device deployment, whose
+    components, the media ones included, share one worker group.
     """
     import time
 
-    model = os.environ.get("UNISERVE_H3_MODEL")
-    if not model or not Path(model).is_dir():
-        pytest.fail(
-            "UNISERVE_H3_MODEL must name a supported FastH3 checkpoint "
-            "directory; docs/minimax_h3/minimax_h3.md lists them"
-        )
+    model = str(host_asset("UNISERVE_H3_MODEL", H3_CHECKPOINT))
     inference = json.loads(
         (Path(model) / "fastvideo_inference.json").read_text()
     )
@@ -548,8 +526,11 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         "FastH3",
         "--port",
         str(port),
-        # Two text capacities bound the startup capture of every admitted
-        # duration.
+        # A media deployment states the prompt length it admits; one text
+        # capacity of that length bounds the startup capture of every
+        # admitted duration.
+        "--max-model-len",
+        "1024",
         "--set",
         "video_config.text_capacities=1024",
         # Full-duration decoder graphs need a larger static grant on H200

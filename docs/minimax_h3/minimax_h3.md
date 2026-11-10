@@ -97,7 +97,7 @@ uniserve serve "$OMNIREF_EXPORT" \
   --set media_config.directory=/srv/media
 ```
 
-The options can also be kept in a TOML file passed with `--config` ([Configuration](../configuration.md#configuration-file)). A deployment file places each component on devices. These four-GPU files run four-way Ulysses denoising, TP4 text encoding, the latent encoder and one video and audio decoding unit per rank in a `model` worker, and a CPU `media` worker group that holds the H.264 encoders, the muxer and the media reader, which decodes condition media. The media reader runs on a rank of the leader's host. On a CPU rank its decoded pixels are host data, which reach another host only through the engine's rank channel, whose frames are bounded far below a reference video's pixels; on a GPU rank they lie in that GPU's storage, which condition encoders on every host read through the device transport, so a deployment whose condition encoders span hosts places the reader on a GPU of the leader's host. Check a running server with:
+The options can also be kept in a TOML file passed with `--config` ([Configuration](../configuration.md#configuration-file)). A deployment file places each component on devices. These four-GPU files run four-way Ulysses denoising, TP4 text encoding, the latent encoder and one video and audio decoding unit per rank in a `model` worker, and the H.264 encoders, the muxer and the media reader, which decodes condition media. The media components run on the host inside the main process, which serves CUDA devices only, so a deployment places them on CUDA ranks; a rank on `cpu` is refused when the node is launched. The media reader runs on a GPU rank of the leader's host: its decoded pixels lie in that GPU's storage, which condition encoders on every host read through the device transport. Check a running server with:
 
 ```bash
 curl --fail-with-body http://127.0.0.1:8000/health
@@ -108,7 +108,7 @@ curl --fail-with-body http://127.0.0.1:8000/v1/capabilities | python -m json.too
 
 ### Deployments
 
-The deployment files are in `configs/minimax_h3/`, in the TOML format [Configuration](../configuration.md#deployment-files) describes: each `[[worker_groups]]` group lists its ranks, such as `cuda:0-3` or `rank-1/cpu*4`, and the components placed on them, and `replicas` copies a group over equal blocks of its ranks. Each file places the condition encoders and the media reader that keyframe and reference requests use; the `fasth3-` files split each GPU's storage between workers by FastH3's sizes.
+The deployment files are in `configs/minimax_h3/`, in the TOML format [Configuration](../configuration.md#deployment-files) describes: each `[[worker_groups]]` group lists its ranks, such as `cuda:0-3` or `rank-1/cuda:0-3`, and the components placed on them, and `replicas` copies a group over equal blocks of its ranks. Each file places the condition encoders and the media reader that keyframe and reference requests use; the `fasth3-` files split each GPU's storage between workers by FastH3's sizes.
 
 | File | GPUs | Denoiser | Text encoder |
 | --- | --- | --- | --- |
