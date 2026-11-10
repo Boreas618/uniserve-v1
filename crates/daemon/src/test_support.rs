@@ -427,51 +427,18 @@ pub(crate) fn post_json(path: &str, body: &serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
-/// A driver over fresh epoch records and a roster that commands nothing: the
-/// leaders the crate's tests build never run a switch, and the adapter's own
-/// tests drive the real one.
+/// A driver over fresh epoch records and the real roster over stand-in
+/// nodes: the leaders the crate's tests build never run a switch, and
+/// `updates::tests` drives one.
 pub(crate) fn test_updates() -> std::sync::Arc<crate::updates::driver::Driver> {
+    use crate::supervision::stand_in;
+
+    let epochs = std::sync::Arc::new(crate::epoch::Epochs::new());
+    // The main processes' ends are dropped: nothing is commanded and nothing
+    // reports, while the nodes still answer what the roster asks.
+    let (_processes, roster) = stand_in::roster(&epochs, stand_in::Refusals::default());
     std::sync::Arc::new(crate::updates::driver::Driver::new(
-        std::sync::Arc::new(crate::epoch::Epochs::new()),
-        Box::new(Uncommanded),
+        epochs,
+        Box::new(roster),
     ))
-}
-
-/// A roster that answers every command and reports nothing: the switch is not
-/// the subject of a leader test.
-struct Uncommanded;
-
-impl crate::updates::switch::Roster for Uncommanded {
-    fn claim(
-        &mut self,
-        _host: &str,
-        _epoch: u64,
-        _scopes: &[proto::process::Scope],
-        _retire: &[u64],
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn spawn(
-        &mut self,
-        _spawn: proto::process::Spawn,
-        _launch: &proto::config::EngineArgs,
-    ) -> Result<crate::updates::switch::Spawned, String> {
-        Ok(crate::updates::switch::Spawned {
-            generation: _spawn.generation,
-            pid: 1,
-        })
-    }
-
-    fn stop(&mut self, _host: &str, _group: &str, _generation: Option<u64>) {}
-
-    fn command(&mut self, _host: &str, _generation: u64, _command: proto::process::Command) {}
-
-    fn serve(&mut self, _epoch: u64, _requests: &str) {}
-
-    fn resume(&mut self, _host: &str, _generation: u64, _reason: &str) {}
-
-    fn events(&mut self) -> Vec<crate::updates::switch::Event> {
-        Vec::new()
-    }
 }

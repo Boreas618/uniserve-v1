@@ -553,82 +553,10 @@ impl Roster for ProcessRoster {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc::{Receiver, Sender};
-
     use super::*;
     use crate::epoch::ProcessState;
-    use proto::process::report;
-
-    /// A fake leader service: it answers every request the way a node's
-    /// daemon would, and the test holds the peers' ends.
-    struct Service {
-        commands: Receiver<(u64, Command)>,
-        reports: Sender<(u64, Report)>,
-        exits: Sender<Exit>,
-        greetings: Sender<(u64, Greeting)>,
-    }
-
-    fn service(info: Arc<Epochs>) -> (Service, EpochLink) {
-        let (requests, incoming) = std::sync::mpsc::channel::<(Request, Sender<process::Reply>)>();
-        let (exits, exited) = std::sync::mpsc::channel();
-        let (greetings, greeted) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            while let Ok((request, answer)) = incoming.recv() {
-                let reply = match request.kind {
-                    Some(process::request::Kind::Spawn(_)) => {
-                        process::reply::Kind::Spawned(process::Spawned { pid: 4242 })
-                    }
-                    Some(process::request::Kind::Claim(claim)) => {
-                        assert_eq!(claim.deployment, "deployment");
-                        process::reply::Kind::Claimed(process::Claimed {
-                            socket: "/run/storage.sock".to_owned(),
-                            claim: Vec::new(),
-                            tcp: String::new(),
-                        })
-                    }
-                    Some(process::request::Kind::Stop(_)) => {
-                        process::reply::Kind::Stopped(process::Stopped {})
-                    }
-                    _ => {
-                        answer
-                            .send(process::Reply {
-                                id: request.id,
-                                error: "unexpected request".to_owned(),
-                                kind: None,
-                            })
-                            .expect("the epoch layer waits");
-                        continue;
-                    }
-                };
-                answer
-                    .send(process::Reply {
-                        id: request.id,
-                        kind: Some(reply),
-                        ..process::Reply::default()
-                    })
-                    .expect("the epoch layer waits");
-            }
-            drop(info);
-        });
-        // The adapter's downward end and the test's two ends of the one
-        // channel the daemon commands its main processes on: the commands the
-        // adapter sends, and the reports a test plays back up. Keeping a
-        // different pair here reads as an adapter that commands nothing.
-        let (processes, sent, reports) = ProcessCommands::pair();
-        let link = EpochLink {
-            requests,
-            greetings: greeted,
-            exits: exited,
-            commands: processes,
-        };
-        let service = Service {
-            commands: sent,
-            reports,
-            exits,
-            greetings,
-        };
-        (service, link)
-    }
+    use crate::supervision::stand_in::{self, Refusals};
+    use proto::process::{command, report};
 
     fn spawn(host: &str, generation: u64) -> Spawn {
         Spawn {
@@ -670,20 +598,10 @@ mod tests {
         }
     }
 
-    fn roster(epochs: &Arc<Epochs>, link: EpochLink) -> ProcessRoster {
-        ProcessRoster::new(
-            Arc::clone(epochs),
-            "deployment".to_owned(),
-            Vec::new(),
-            link,
-        )
-    }
-
     #[test]
     fn a_child_is_bound_by_the_launch_generation_it_reports_and_its_row_follows() {
         let epochs = Arc::new(Epochs::new());
-        let (service, link) = service(Arc::clone(&epochs));
-        let mut roster = roster(&epochs, link);
+        let (nodes, mut roster) = stand_in::roster(&epochs, Refusals::default());
         // A row of another node's process is not the adapter's to replace.
         epochs.set_processes(vec![ManagedProcess {
             group: String::new(),
@@ -698,34 +616,17 @@ mod tests {
         let spawned = roster
             .spawn(spawn("n0", 7), &launch())
             .expect("the node starts it");
-        assert_eq!(spawned.pid, 4242);
+        assert_eq!(spawned.pid, stand_in::pid(7));
         let rows = epochs.processes();
         assert_eq!(rows.len(), 2, "the frontend's row survives the write");
         assert_eq!(rows[1].state, ProcessState::Starting);
         assert_eq!(rows[1].generation, 7);
-        assert_eq!(rows[1].pid, Some(4242));
+        assert_eq!(rows[1].pid, Some(stand_in::pid(7)));
 
         // The child greets, then parks: the greeting becomes the switch's
         // `Hello` once the report names the launch.
-        service
-            .greetings
-            .send((
-                5,
-                Greeting {
-                    build: "2.0.0+new".to_owned(),
-                    frontend: false,
-                },
-            ))
-            .expect("the link reads greetings");
-        service
-            .reports
-            .send((
-                5,
-                Report {
-                    kind: Some(report::Kind::Parked(process::Parked { generation: 7 })),
-                },
-            ))
-            .expect("the link reads reports");
+        nodes.greet(5, "2.0.0+new");
+        nodes.report(5, report::Kind::Parked(process::Parked { generation: 7 }));
         let events = roster.events();
         assert_eq!(
             events,
@@ -752,76 +653,49 @@ mod tests {
             "n0",
             7,
             Command {
-                kind: Some(process::command::Kind::Promote(process::Promote {})),
+                kind: Some(command::Kind::Promote(process::Promote {})),
             },
         );
-        let (engine, command) = service.commands.try_recv().expect("the command went down");
-        assert_eq!(engine, 5);
-        assert!(matches!(
-            command.kind,
-            Some(process::command::Kind::Promote(_))
-        ));
+        assert_eq!(
+            nodes.sent(),
+            vec![(5, command::Kind::Promote(process::Promote {}))]
+        );
     }
 
     #[test]
     fn a_drained_process_serves_again_for_a_resume() {
         let epochs = Arc::new(Epochs::new());
-        let (service, link) = service(Arc::clone(&epochs));
-        let mut roster = roster(&epochs, link);
+        let (nodes, mut roster) = stand_in::roster(&epochs, Refusals::default());
         roster
             .spawn(spawn("n0", 7), &launch())
             .expect("the node starts it");
-        service
-            .greetings
-            .send((
-                5,
-                Greeting {
-                    build: "2.0.0+new".to_owned(),
-                    frontend: false,
-                },
-            ))
-            .unwrap();
+        nodes.greet(5, "2.0.0+new");
         // The process parked before it served, which is the report that binds
         // its connection to the launch: `Drained` names no launch generation,
         // so a process drains under the binding it already has.
-        service
-            .reports
-            .send((
-                5,
-                Report {
-                    kind: Some(report::Kind::Parked(process::Parked { generation: 7 })),
-                },
-            ))
-            .unwrap();
-        service
-            .reports
-            .send((
-                5,
-                Report {
-                    kind: Some(report::Kind::Drained(process::Drained { epoch: 11 })),
-                },
-            ))
-            .unwrap();
+        nodes.report(5, report::Kind::Parked(process::Parked { generation: 7 }));
+        nodes.report(5, report::Kind::Drained(process::Drained { epoch: 11 }));
         let _ = roster.events();
 
         // The previous epoch's process drained and is still alive: the
         // restore serves it again instead of starting another.
         roster.resume("n0", 7, "revert");
-        let (engine, command) = service.commands.try_recv().expect("a serve went down");
-        assert_eq!(engine, 5);
-        match command.kind {
-            Some(process::command::Kind::Serve(serve)) => {
-                assert_eq!(serve.epoch, 11);
-            }
-            other => panic!("a resume serves the drained epoch, not {other:?}"),
-        }
+        assert_eq!(
+            nodes.sent(),
+            vec![(
+                5,
+                command::Kind::Serve(process::Serve {
+                    epoch: 11,
+                    requests: String::new(),
+                })
+            )]
+        );
     }
 
     #[test]
     fn a_stop_the_epoch_layer_asked_for_is_stopped_and_an_unasked_exit_failed() {
         let epochs = Arc::new(Epochs::new());
-        let (service, link) = service(Arc::clone(&epochs));
-        let mut roster = roster(&epochs, link);
+        let (nodes, mut roster) = stand_in::roster(&epochs, Refusals::default());
         roster
             .spawn(spawn("n0", 7), &launch())
             .expect("the node starts it");
@@ -830,16 +704,9 @@ mod tests {
             .expect("the node starts it");
 
         roster.stop("n0", "engine", Some(7));
-        let exit = |generation: u64, status: &str| Exit {
-            host: "n0".to_owned(),
-            group: "engine".to_owned(),
-            rank: 0,
-            generation,
-            status: status.to_owned(),
-            last_line: String::new(),
-        };
-        service.exits.send(exit(7, "exit status: 0")).unwrap();
-        service.exits.send(exit(8, "signal: 11")).unwrap();
+        assert_eq!(nodes.stops(), vec![Some(7)]);
+        nodes.exit("n0", 7, "exit status: 0");
+        nodes.exit("n0", 8, "signal: 11");
         let events = roster.events();
         assert!(events.contains(&Event::Exit {
             host: "n0".to_owned(),
@@ -854,36 +721,27 @@ mod tests {
     #[test]
     fn the_frontend_is_served_the_epoch_the_switch_names() {
         let epochs = Arc::new(Epochs::new());
-        let (service, link) = service(Arc::clone(&epochs));
-        let mut roster = roster(&epochs, link);
-        service
-            .greetings
-            .send((
-                9,
-                Greeting {
-                    build: "2.0.0+new".to_owned(),
-                    frontend: true,
-                },
-            ))
-            .unwrap();
+        let (nodes, mut roster) = stand_in::roster(&epochs, Refusals::default());
+        nodes.greet_frontend(9);
         let _ = roster.events();
         roster.serve(12, "unix:/run/requests.sock");
-        let (engine, command) = service.commands.try_recv().expect("the frontend is told");
-        assert_eq!(engine, 9);
-        match command.kind {
-            Some(process::command::Kind::Serve(serve)) => {
-                assert_eq!(serve.epoch, 12);
-                assert_eq!(serve.requests, "unix:/run/requests.sock");
-            }
-            other => panic!("the frontend serves an epoch, not {other:?}"),
-        }
+        assert_eq!(
+            nodes.sent(),
+            vec![(
+                9,
+                command::Kind::Serve(process::Serve {
+                    epoch: 12,
+                    requests: "unix:/run/requests.sock".to_owned(),
+                })
+            )]
+        );
+        assert_eq!(*epochs.served().borrow(), 12);
     }
 
     #[test]
     fn a_claim_names_the_deployment_the_epoch_and_the_retirement() {
         let epochs = Arc::new(Epochs::new());
-        let (_service, link) = service(Arc::clone(&epochs));
-        let mut roster = roster(&epochs, link);
+        let (nodes, mut roster) = stand_in::roster(&epochs, Refusals::default());
         let scopes = vec![process::Scope {
             group: "engine".to_owned(),
             rank: 0,
@@ -891,5 +749,12 @@ mod tests {
         roster
             .claim("n0", 12, &scopes, &[11])
             .expect("the node claims the epoch");
+        let claims = nodes.claims();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].host, "n0");
+        assert_eq!(claims[0].deployment, "deployment");
+        assert_eq!(claims[0].epoch, 12);
+        assert_eq!(claims[0].scopes, scopes);
+        assert_eq!(claims[0].retire, vec![11]);
     }
 }

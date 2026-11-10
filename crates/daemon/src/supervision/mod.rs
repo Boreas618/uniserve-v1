@@ -20,6 +20,8 @@ mod claims;
 
 pub(crate) mod roster;
 mod service;
+#[cfg(test)]
+pub(crate) mod stand_in;
 mod supervisor;
 
 pub(crate) use service::HandedService;
