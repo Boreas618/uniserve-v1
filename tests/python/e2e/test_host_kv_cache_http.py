@@ -20,10 +20,6 @@ there is stopped at the end.
 
 from __future__ import annotations
 
-import os
-import shutil
-import signal
-import tempfile
 import time
 from pathlib import Path
 
@@ -32,11 +28,12 @@ import pytest
 
 from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
-    QWEN3_CHECKPOINT,
     find_free_port,
-    gpu_device,
-    host_asset,
+    granted_devices,
+    metric,
+    qwen3_checkpoint,
     require_uniserve_binary,
+    runtime_directory,
     server_process,
     worker_executable,
 )
@@ -59,12 +56,7 @@ PROMPT = (
 
 def _prefix_hits(base_url: str) -> float:
     """The prefix cache's cumulative hit tokens."""
-    text = httpx.get(f"{base_url}/metrics", timeout=10).text
-    return sum(
-        float(line.rsplit(" ", 1)[1])
-        for line in text.splitlines()
-        if line.startswith("uniserve:prefix_cache_hits")
-    )
+    return metric(base_url, "uniserve:prefix_cache_hits")
 
 
 def _ask(
@@ -105,23 +97,6 @@ def _ask(
     return reply["usage"]["prompt_tokens"], tokens, hits
 
 
-def _stop_storage_server(socket: Path) -> None:
-    """Stop the Storage Server serving `socket`.
-
-    The server detached from the daemon that started it, so it is found by
-    its command line.
-    """
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            command = (entry / "cmdline").read_bytes().split(b"\0")
-        except OSError:
-            continue
-        if b"serve" in command and str(socket).encode() in command:
-            os.kill(int(entry.name), signal.SIGTERM)
-
-
 def _command(checkpoint: str, port: int) -> list[str]:
     return [
         str(require_uniserve_binary()),
@@ -148,31 +123,17 @@ def _command(checkpoint: str, port: int) -> list[str]:
     ]
 
 
-def _runtime() -> Path:
-    """A new runtime directory for the daemons' sockets.
-
-    A socket path holds at most 107 bytes, so the directory is short.
-    """
-    return Path(tempfile.mkdtemp(prefix="uniserve-"))
-
-
-def _checkpoint() -> str:
-    checkpoint = str(host_asset("UNISERVE_QWEN3_MODEL", QWEN3_CHECKPOINT))
-    return checkpoint
-
-
 def test_a_restarted_engine_loads_a_prompts_pages_from_the_host_kv_cache(
     tmp_path: Path,
 ):
-    runtime = _runtime()
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
-    command = _command(_checkpoint(), port)
-    env = {
-        "CUDA_VISIBLE_DEVICES": gpu_device(),
-        "XDG_RUNTIME_DIR": str(runtime),
-    }
-    try:
+    command = _command(qwen3_checkpoint(), port)
+    with runtime_directory() as runtime:
+        env = {
+            "CUDA_VISIBLE_DEVICES": granted_devices(1),
+            "XDG_RUNTIME_DIR": str(runtime),
+        }
         with server_process(
             command, base_url, tmp_path / "first.log", timeout_s=900, env=env
         ):
@@ -183,9 +144,6 @@ def test_a_restarted_engine_loads_a_prompts_pages_from_the_host_kv_cache(
             command, base_url, restarted, timeout_s=900, env=env
         ):
             _, host, host_hits = _ask(base_url)
-    finally:
-        _stop_storage_server(runtime / "uniserve" / "storage-server.sock")
-        shutil.rmtree(runtime, ignore_errors=True)
 
     # Reusable pages leave one prompt token to compute.
     reusable = (prompt_tokens - 1) // BLOCK_SIZE * BLOCK_SIZE
@@ -199,15 +157,14 @@ def test_a_closing_engine_offloads_its_last_pages_to_the_host_kv_cache(
     # Another prompt than the other test's, whose pages a shared server
     # might still hold.
     prompt = "Closing. " + PROMPT
-    runtime = _runtime()
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
-    command = _command(_checkpoint(), port)
-    env = {
-        "CUDA_VISIBLE_DEVICES": gpu_device(),
-        "XDG_RUNTIME_DIR": str(runtime),
-    }
-    try:
+    command = _command(qwen3_checkpoint(), port)
+    with runtime_directory() as runtime:
+        env = {
+            "CUDA_VISIBLE_DEVICES": granted_devices(1),
+            "XDG_RUNTIME_DIR": str(runtime),
+        }
         with server_process(
             command, base_url, tmp_path / "first.log", timeout_s=900, env=env
         ):
@@ -220,9 +177,6 @@ def test_a_closing_engine_offloads_its_last_pages_to_the_host_kv_cache(
             env=env,
         ):
             _, host, host_hits = _ask(base_url, prompt, 1)
-    finally:
-        _stop_storage_server(runtime / "uniserve" / "storage-server.sock")
-        shutil.rmtree(runtime, ignore_errors=True)
 
     reusable = (prompt_tokens - 1) // BLOCK_SIZE * BLOCK_SIZE
     assert (cold_hits, host_hits) == (0, reusable)

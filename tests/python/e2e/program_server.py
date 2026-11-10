@@ -34,6 +34,7 @@ from pathlib import Path
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    granted_devices,
     require_uniserve_binary,
     start_server,
     stop_server,
@@ -103,15 +104,15 @@ def program_target() -> str:
     The engine derives it from the device it serves — ``sm_{major}{minor}a``
     (``src/model_runner.rs``) — and a store built for another target describes
     nothing to overlay: the precopy then fails at the module lane rather than
-    the build. So the default is the served device's own compute capability,
-    read the way this file already reads that device; the environment's
-    ``UNISERVE_PROGRAM_TARGET`` names a target instead, for a host whose store
-    is provisioned elsewhere.
+    the build. So the default is the compute capability of the first GPU the
+    lease granted (:func:`granted_devices`), which the module serves on; the
+    environment's ``UNISERVE_PROGRAM_TARGET`` names a target instead, for a
+    host whose store is provisioned elsewhere.
     """
     named = os.environ.get("UNISERVE_PROGRAM_TARGET")
     if named:
         return named
-    device = os.environ.get("UNISERVE_LIVE_DEVICE", "0")
+    device = granted_devices(1)
     reported = subprocess.run(
         [
             "nvidia-smi",

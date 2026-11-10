@@ -1,16 +1,12 @@
 """Helpers of the profiling end-to-end tests.
 
-A Qwen3 deployment on one GPU (``UNISERVE_WORLD_DEVICE``, default 0)
+A Qwen3 deployment on the GPU the lease granted (``granted_devices``)
 with a Storage Server of the test's own, decode load from streaming
 requests, and the session calls of ``/admin/profile``.
 """
 
 from __future__ import annotations
 
-import os
-import shutil
-import signal
-import tempfile
 import threading
 import time
 from collections.abc import Iterator, Sequence
@@ -20,11 +16,11 @@ from pathlib import Path
 import httpx
 
 from tests.python.e2e.http_helpers import (
-    QWEN3_CHECKPOINT,
     find_free_port,
-    gpu_device,
-    host_asset,
+    granted_devices,
+    qwen3_checkpoint,
     require_uniserve_binary,
+    runtime_directory,
     server_process,
     worker_executable,
 )
@@ -41,23 +37,6 @@ PROMPT = (
 )
 
 
-def checkpoint() -> str:
-    return str(host_asset("UNISERVE_QWEN3_MODEL", QWEN3_CHECKPOINT))
-
-
-def stop_storage_server(socket: Path) -> None:
-    """Stop the Storage Server serving `socket`, found by its command line."""
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            command = (entry / "cmdline").read_bytes().split(b"\0")
-        except OSError:
-            continue
-        if b"serve" in command and str(socket).encode() in command:
-            os.kill(int(entry.name), signal.SIGTERM)
-
-
 @contextmanager
 def serve(
     tmp_path: Path, options: Sequence[str], program_server: Path
@@ -65,13 +44,12 @@ def serve(
     """Serve Qwen3 under ``options`` (``--set`` assignments), its programs from
     the host's ``program_server``, until the block ends; yields the base URL.
     """  # noqa: D205
-    runtime = Path(tempfile.mkdtemp(prefix="uniserve-"))
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     command = [
         str(require_uniserve_binary()),
         "serve",
-        checkpoint(),
+        qwen3_checkpoint(),
         "--served-model-name",
         NAME,
         "--host",
@@ -85,18 +63,15 @@ def serve(
     ]
     for option in options:
         command += ["--set", option]
-    environment = {
-        "CUDA_VISIBLE_DEVICES": gpu_device(),
-        "XDG_RUNTIME_DIR": str(runtime),
-    }
-    try:
+    with runtime_directory() as runtime:
+        environment = {
+            "CUDA_VISIBLE_DEVICES": granted_devices(1),
+            "XDG_RUNTIME_DIR": str(runtime),
+        }
         with server_process(
             command, base_url, tmp_path / "server.log", 900, environment
         ):
             yield base_url
-    finally:
-        stop_storage_server(runtime / "uniserve" / "storage-server.sock")
-        shutil.rmtree(runtime, ignore_errors=True)
 
 
 def _stream(base_url: str, stop: threading.Event) -> None:

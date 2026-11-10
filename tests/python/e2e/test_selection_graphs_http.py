@@ -24,9 +24,8 @@ import tokenizers
 
 from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
-    QWEN3_CHECKPOINT,
     find_free_port,
-    host_asset,
+    qwen3_checkpoint,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -52,10 +51,6 @@ PROMPT = (
 )
 
 
-def _checkpoint() -> str:
-    return str(host_asset("UNISERVE_QWEN3_MODEL", QWEN3_CHECKPOINT))
-
-
 @pytest.fixture(scope="module")
 def graphs(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     port = find_free_port()
@@ -63,7 +58,7 @@ def graphs(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     args = [
         str(require_uniserve_binary()),
         "serve",
-        _checkpoint(),
+        qwen3_checkpoint(),
         "--served-model-name",
         "qwen3-selection",
         "--host",
@@ -208,7 +203,7 @@ def test_constraints_hold_under_graphs(graphs: str) -> None:
 
 def test_greedy_constraints_hold_under_graphs(graphs: str) -> None:
     tokenizer = tokenizers.Tokenizer.from_file(
-        f"{_checkpoint()}/tokenizer.json"
+        f"{qwen3_checkpoint()}/tokenizer.json"
     )
     special = set(tokenizer.get_added_tokens_decoder())
     greedy = _ids(_chat(graphs, **SELECTED, ignore_eos=True))

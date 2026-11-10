@@ -49,9 +49,7 @@ from __future__ import annotations
 import functools
 import io
 import os
-import shutil
 import signal
-import tempfile
 import time
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -65,10 +63,12 @@ import pytest
 
 from tests.python.e2e.http_helpers import (
     H3_CHECKPOINT,
+    admin,
     find_free_port,
     granted_devices,
     host_asset,
     require_uniserve_binary,
+    runtime_directory,
     server_process,
     t2va_request,
     worker_executable,
@@ -96,13 +96,6 @@ SEED = 4242
 
 def _model() -> str:
     return str(host_asset("UNISERVE_H3_MODEL", H3_CHECKPOINT))
-
-
-def _devices() -> str:
-    """The two GPUs the deployment serves on, as the module's lease granted
-    them, so that other cases keep the other GPUs.
-    """  # noqa: D205
-    return granted_devices(2)
 
 
 def _deployment(
@@ -152,19 +145,6 @@ def _deployment(
 CHANGE_FRACTION = 0.85
 
 
-def _stop_storage_server(socket: Path) -> None:
-    """Stop the Storage Server serving `socket`, found by its command line."""
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            command = (entry / "cmdline").read_bytes().split(b"\0")
-        except OSError:
-            continue
-        if b"serve" in command and str(socket).encode() in command:
-            os.kill(int(entry.name), signal.SIGTERM)
-
-
 def _group_workers(runtime: Path, group: str) -> list[int]:
     """The worker processes of worker group `group` the deployment serving
     from `runtime` runs now, found by their command line and environment.
@@ -195,7 +175,6 @@ def _serve(
     """The deployment `deployment` writes, with a Storage Server of its own;
     its URL, log and runtime directory.
     """  # noqa: D205
-    runtime = Path(tempfile.mkdtemp(prefix="uniserve-"))
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     command = [
@@ -226,18 +205,17 @@ def _serve(
         f"video_config.max_seconds={SECONDS:g}",
     ]
     log = tmp_path / "server.log"
-    environment = {
-        "CUDA_VISIBLE_DEVICES": _devices(),
-        "XDG_RUNTIME_DIR": str(runtime),
-    }
-    try:
+    with runtime_directory() as runtime:
+        environment = {
+            # The two GPUs the module's lease granted, so that other cases
+            # keep the other GPUs.
+            "CUDA_VISIBLE_DEVICES": granted_devices(2),
+            "XDG_RUNTIME_DIR": str(runtime),
+        }
         with server_process(
             command, base_url, log, timeout_s=3600, env=environment
         ):
             yield base_url, log, runtime
-    finally:
-        _stop_storage_server(runtime / "uniserve" / "storage-server.sock")
-        shutil.rmtree(runtime, ignore_errors=True)
 
 
 def _decoded(video: bytes) -> tuple[list[np.ndarray], list[np.ndarray]]:
@@ -359,12 +337,6 @@ def _content(base_url: str, job: str) -> bytes:
     return response.content
 
 
-def _admin(
-    base_url: str, path: str, body: dict | None = None
-) -> httpx.Response:
-    return httpx.post(f"{base_url}/admin/{path}", json=body or {}, timeout=1800)
-
-
 def test_a_preempted_video_request_continues_its_trajectory_exactly(
     tmp_path: Path,
 ) -> None:
@@ -386,10 +358,10 @@ def test_a_preempted_video_request_continues_its_trajectory_exactly(
         # it from the stored step.
         job = _start_job(base_url)
         _wait_denoising(base_url, job, 2)
-        slept = _admin(base_url, "sleep")
+        slept = admin(base_url, "sleep")
         assert slept.status_code == 200, slept.text
         assert _job(base_url, job)["status"] not in ("failed", "completed")
-        woke = _admin(base_url, "wake_up")
+        woke = admin(base_url, "wake_up")
         assert woke.status_code == 200, woke.text
         _assert_same_video(_content(base_url, job), reference)
 
@@ -431,7 +403,7 @@ def test_a_preempted_video_request_continues_its_trajectory_exactly(
         assert result["change"] == "epoch", result
         assert result["epoch"]["numerics"] == "unchanged", result
         _assert_same_video(_content(base_url, job), reference)
-        committed = _admin(base_url, "config/commit")
+        committed = admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
 
 
@@ -500,5 +472,5 @@ def test_a_video_request_continues_under_another_parallel_configuration(
             frame.shape == wanted.shape
             for frame, wanted in zip(frames, reference_frames, strict=True)
         )
-        committed = _admin(base_url, "config/commit")
+        committed = admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text

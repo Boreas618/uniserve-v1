@@ -59,7 +59,7 @@ These name the checkpoints and inputs of the host. Set the ones the host has; th
 | `UNISERVE_PROGRAM_REBIND_PACKAGE`, `UNISERVE_PROGRAM_RECAPTURE_PACKAGE`, `UNISERVE_PROGRAM_POLICY_PACKAGE`, `UNISERVE_PROGRAM_WRONG_PACKAGE` | the packages under `crates/ops/program-fixtures` | The packages `test_program_update_http.py` installs |
 | `SANITIZER_LOGS`, `COMPUTE_SANITIZER` | the run's `memcheck/`, `compute-sanitizer` | Where memcheck writes and which sanitizer runs (`just test-python-sanitizer`) |
 
-`tools/gpu_e2e.sh` sets `UNISERVE_RUN_GPU_E2E`, `UNISERVE_BINARY`, `UNISERVE_WORKER_EXECUTABLE`, `UNISERVE_SCHEDULING_PRECOMPILE`, `UNISERVE_MEMCHECK_TARGET` and `VIRTUAL_ENV` itself. A case's lease sets `UNISERVE_WORLD_DEVICE`, `UNISERVE_WORLD_DEVICES`, `UNISERVE_LIVE_DEVICE`, `UNISERVE_SECOND_DEVICE`, `UNISERVE_EPOCH_DEVICE` and `UNISERVE_EPOCH_DEVICES` to the GPUs it holds.
+`tools/gpu_e2e.sh` sets `UNISERVE_RUN_GPU_E2E`, `UNISERVE_BINARY`, `UNISERVE_WORKER_EXECUTABLE`, `UNISERVE_SCHEDULING_PRECOMPILE`, `UNISERVE_MEMCHECK_TARGET` and `VIRTUAL_ENV` itself. A case's lease sets `UNISERVE_WORLD_DEVICES` to the GPUs it holds, comma-separated, and every test takes its devices from it (`http_helpers.granted_devices`); `cuda:N` ranks in a test's deployment index those GPUs.
 
 ### Two hosts
 

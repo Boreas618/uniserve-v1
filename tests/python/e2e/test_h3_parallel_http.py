@@ -18,6 +18,7 @@ from transformers import AutoTokenizer
 from tests.python.e2e.http_helpers import (
     H3_CHECKPOINT,
     find_free_port,
+    granted_devices,
     host_asset,
     require_uniserve_binary,
     second_host,
@@ -260,7 +261,7 @@ def test_component_bindings_release_cancelled_requests(
     visible_devices = max(devices) + 1
     # The layout's device indices address the GPUs the module leased, in
     # their order.
-    leased = os.environ["UNISERVE_WORLD_DEVICES"].split(",")
+    leased = granted_devices(4).split(",")
     local_devices = len(leased)
     two_hosts = (
         local_devices < visible_devices <= 2 * local_devices
@@ -389,9 +390,7 @@ def test_component_bindings_release_cancelled_requests(
         )
     }
     follower = (
-        second_host(
-            FOLLOWER, tmp_path / "h3-follower.log", address, leader_log=log
-        )
+        second_host(FOLLOWER, tmp_path / "h3-follower.log", address)
         if two_hosts
         else contextlib.nullcontext()
     )

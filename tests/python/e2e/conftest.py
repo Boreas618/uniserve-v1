@@ -14,11 +14,9 @@ GPU:
 - a case marked ``host_wide`` observes state of the whole host, such as its
   shared memory, and runs alone, holding every GPU.
 
-A lease exports the devices it holds in the variables the tests read:
-``UNISERVE_WORLD_DEVICE``, ``UNISERVE_LIVE_DEVICE`` and
-``UNISERVE_EPOCH_DEVICE`` (the first), ``UNISERVE_SECOND_DEVICE`` (the
-second), and ``UNISERVE_WORLD_DEVICES`` and ``UNISERVE_EPOCH_DEVICES`` (all
-of them, comma-separated). The GPUs come from ``UNISERVE_E2E_DEVICES`` (a
+A lease exports the devices it holds, comma-separated, in
+``UNISERVE_WORLD_DEVICES``, which the tests read through
+``http_helpers.granted_devices``. The GPUs come from ``UNISERVE_E2E_DEVICES`` (a
 comma-separated list of device ordinals), else every GPU ``nvidia-smi``
 lists. A case that needs more GPUs than that is skipped, naming both counts.
 
@@ -120,17 +118,7 @@ def lease(count: int, host_wide: bool) -> Iterator[list[str]]:
         granted = [device for device, _ in held]
         with pytest.MonkeyPatch.context() as patch:
             if granted:
-                every = ",".join(granted)
-                for name in (
-                    "UNISERVE_WORLD_DEVICE",
-                    "UNISERVE_LIVE_DEVICE",
-                    "UNISERVE_EPOCH_DEVICE",
-                ):
-                    patch.setenv(name, granted[0])
-                patch.setenv("UNISERVE_WORLD_DEVICES", every)
-                patch.setenv("UNISERVE_EPOCH_DEVICES", every)
-                if len(granted) > 1:
-                    patch.setenv("UNISERVE_SECOND_DEVICE", granted[1])
+                patch.setenv("UNISERVE_WORLD_DEVICES", ",".join(granted))
             yield granted
 
 

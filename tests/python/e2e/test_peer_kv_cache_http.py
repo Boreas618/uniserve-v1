@@ -43,10 +43,10 @@ import pytest
 
 from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
-    QWEN3_CHECKPOINT,
     find_free_port,
     granted_devices,
-    host_asset,
+    metric,
+    qwen3_checkpoint,
     require_uniserve_binary,
     server_process,
     stop_storage_server,
@@ -67,6 +67,8 @@ BLOCK_SIZE = 64
 MAX_TOKENS = 32
 # Pages a prompt must fill for its peer hit to count.
 PEER_PAGES = 16
+# The prompt tokens a deployment loaded from another host's pools.
+PEER_HITS = "uniserve:prefix_cache_peer_hits"
 
 
 def _records(label: str, count: int = 260) -> str:
@@ -79,16 +81,6 @@ def _records(label: str, count: int = 260) -> str:
             for i in range(count)
         )
         + " Summarize the first three records in one sentence."
-    )
-
-
-def _metric(base_url: str, name: str) -> float:
-    """The sum of the counter `name` over its labels."""
-    text = httpx.get(f"{base_url}/metrics", timeout=10).text
-    return sum(
-        float(line.rsplit(" ", 1)[1])
-        for line in text.splitlines()
-        if line.startswith(f"uniserve:{name}")
     )
 
 
@@ -122,13 +114,13 @@ def _settled(base_url: str, name: str, before: float) -> float:
     statistics, which reach the metrics every ten seconds, report it.
     """  # noqa: D205
     deadline = time.monotonic() + 30
-    grown = _metric(base_url, name) - before
+    grown = metric(base_url, name) - before
     while grown == 0 and time.monotonic() < deadline:
         time.sleep(1)
-        grown = _metric(base_url, name) - before
+        grown = metric(base_url, name) - before
     # One more report, so a growth spread over two is counted whole.
     time.sleep(11)
-    return _metric(base_url, name) - before
+    return metric(base_url, name) - before
 
 
 def _serve_command(checkpoint: str, port: int, host: str) -> list[str]:
@@ -155,10 +147,6 @@ def _serve_command(checkpoint: str, port: int, host: str) -> list[str]:
         "--set",
         "chat_config.reasoning_parser=none",
     ]
-
-
-def _checkpoint() -> str:
-    return str(host_asset("UNISERVE_QWEN3_MODEL", QWEN3_CHECKPOINT))
 
 
 def _storage_command(socket: str, tcp: str) -> list[str]:
@@ -233,7 +221,7 @@ def _follower_deployment(
         + shlex.join(_storage_command(socket, f"{address}:0"))
     )
     with remote_program_server(FOLLOWER) as programs:
-        command = _serve_command(_checkpoint(), port, "0.0.0.0") + [
+        command = _serve_command(qwen3_checkpoint(), port, "0.0.0.0") + [
             "--set",
             f"program_config.socket={programs}",
             *extra,
@@ -316,7 +304,7 @@ def test_a_host_loads_a_prompts_pages_from_a_peer_hosts_host_kv_cache(
     listing = ""
     try:
         with server_process(
-            _serve_command(_checkpoint(), port, "127.0.0.1"),
+            _serve_command(qwen3_checkpoint(), port, "127.0.0.1"),
             base_url,
             tmp_path / "a.log",
             timeout_s=1800,
@@ -358,11 +346,9 @@ def test_a_host_loads_a_prompts_pages_from_a_peer_hosts_host_kv_cache(
                 ["--set", f"kv_cache_config.peers={peer}"],
             ) as (b_url, b_runtime):
                 # B reads the shared prompt's pages from A.
-                peer_before = _metric(b_url, "prefix_cache_peer_hits")
+                peer_before = metric(b_url, PEER_HITS)
                 _, b_shared = _ask(b_url, shared)
-                peer_hits = _settled(
-                    b_url, "prefix_cache_peer_hits", peer_before
-                )
+                peer_hits = _settled(b_url, PEER_HITS, peer_before)
                 libraries = shlex.quote(os.environ.get("LD_LIBRARY_PATH", ""))
                 listing = _on_follower(
                     f"env XDG_RUNTIME_DIR={b_runtime} "
@@ -374,19 +360,15 @@ def test_a_host_loads_a_prompts_pages_from_a_peer_hosts_host_kv_cache(
                 # A prompt A never saw reads nothing from A, and B's answer
                 # is A's.
                 unseen = _records("Unseen")
-                unseen_before = _metric(b_url, "prefix_cache_peer_hits")
+                unseen_before = metric(b_url, PEER_HITS)
                 _, b_unseen = _ask(b_url, unseen)
-                unseen_hits = _settled(
-                    b_url, "prefix_cache_peer_hits", unseen_before
-                )
+                unseen_hits = _settled(b_url, PEER_HITS, unseen_before)
                 _, a_unseen = _ask(base_url, unseen)
                 # A's Storage Server is gone: B computes what A served.
                 stop_storage_server(runtime)
-                dropped_before = _metric(b_url, "prefix_cache_peer_hits")
+                dropped_before = metric(b_url, PEER_HITS)
                 _, b_dropped = _ask(b_url, dropped)
-                dropped_hits = _settled(
-                    b_url, "prefix_cache_peer_hits", dropped_before
-                )
+                dropped_hits = _settled(b_url, PEER_HITS, dropped_before)
     finally:
         stop_storage_server(runtime)
         storage_log = runtime / "uniserve" / "storage-server.log"

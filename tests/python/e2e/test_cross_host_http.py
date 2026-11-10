@@ -204,7 +204,6 @@ def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
                 FOLLOWER,
                 tmp_path / "follower.log",
                 address,
-                leader_log=log,
                 arguments=(
                     "--set",
                     f"program_config.socket={follower_programs}",

@@ -22,7 +22,7 @@ from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
     QWEN3_CHECKPOINT,
     find_free_port,
-    gpu_device,
+    granted_devices,
     host_asset,
     require_uniserve_binary,
     server_process,
@@ -91,7 +91,7 @@ def _generate(
         base_url,
         tmp_path / f"{label}.log",
         timeout_s=900,
-        env={"CUDA_VISIBLE_DEVICES": gpu_device()},
+        env={"CUDA_VISIBLE_DEVICES": granted_devices(1)},
     ):
         for prompt in PROMPTS:
             response = httpx.post(

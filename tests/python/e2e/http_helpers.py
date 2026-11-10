@@ -10,10 +10,9 @@ import signal
 import socket
 import subprocess
 import tempfile
-import threading
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -114,13 +113,6 @@ def granted_devices(count: int) -> str:
     return ",".join(devices[:count])
 
 
-def gpu_device() -> str:
-    """The GPU a one-GPU server runs on (``UNISERVE_WORLD_DEVICE``, 0 by
-    default), so that one-GPU cases run beside each other on other GPUs.
-    """  # noqa: D205
-    return os.environ.get("UNISERVE_WORLD_DEVICE", "0")
-
-
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -159,6 +151,37 @@ def worker_executable() -> Path:
     return require_uniserve_binary()
 
 
+def wait_until(
+    predicate: Callable[[], object],
+    timeout_s: float,
+    what: str,
+    interval_s: float = 1.0,
+) -> None:
+    """Wait until `predicate` holds, for at most `timeout_s` seconds stretched
+    by `TIME_SCALE`; raise :class:`TimeoutError` naming `what` otherwise.
+    """  # noqa: D205
+    deadline = time.monotonic() + scaled(timeout_s)
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(interval_s)
+    raise TimeoutError(f"{what} within {scaled(timeout_s):.0f} s")
+
+
+def runs(pid: int) -> bool:
+    """Whether process `pid` runs.
+
+    A child of the test that exited and that no one waited for yet (a
+    zombie) still has its entry in ``/proc``; it does not run.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    # The state follows the parenthesized command name.
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
+
 def host_asset(variable: str, what: str) -> Path:
     """The path of a host asset that `variable` names.
 
@@ -174,6 +197,11 @@ def host_asset(variable: str, what: str) -> Path:
     if not path.exists():
         pytest.fail(f"{variable} names {path}, which does not exist: {what}")
     return path
+
+
+def qwen3_checkpoint() -> str:
+    """The Qwen3-MoE checkpoint ``UNISERVE_QWEN3_MODEL`` names."""
+    return str(host_asset("UNISERVE_QWEN3_MODEL", QWEN3_CHECKPOINT))
 
 
 #: The Program Server every deployment that names none is given
@@ -327,8 +355,27 @@ def stop_storage_server(runtime: Path) -> None:
             os.kill(int(entry.name), signal.SIGTERM)
 
 
-# What a deployment's leader logs while it awaits the nodes below `--nnodes`.
-AWAITING_NODES = "awaiting the deployment's other nodes"
+@contextmanager
+def runtime_directory(kept_log: Path | None = None) -> Iterator[Path]:
+    """A runtime directory (``XDG_RUNTIME_DIR``) of the caller's own, whose
+    Storage Server is stopped when the block ends.
+
+    A server started under it starts its Storage Server there, which
+    outlives the server; the block's end stops it, keeps its log at
+    `kept_log` when one is named, and removes the directory. A socket path
+    holds at most 107 bytes, so the directory lies in the system's short
+    temporary directory.
+    """  # noqa: D205
+    runtime = Path(tempfile.mkdtemp(prefix="uniserve-"))
+    try:
+        yield runtime
+    finally:
+        stop_storage_server(runtime)
+        log = runtime / "uniserve" / "storage-server.log"
+        if kept_log is not None and log.is_file():
+            shutil.copy(log, kept_log)
+        shutil.rmtree(runtime, ignore_errors=True)
+
 
 # Stops the Storage Server serving the socket given as its argument, found by
 # its command line, as `stop_storage_server` does on this host.
@@ -369,9 +416,8 @@ def second_host(
     *,
     devices: str | None = None,
     env: dict[str, str] | None = None,
-    leader_log: Path | None = None,
     arguments: tuple[str, ...] = (),
-) -> Iterator[Callable[[], None]]:
+) -> Iterator[None]:
     """The daemon of a deployment's second host, joining the leader at
     `address` as node `rank-1`, with `arguments` after its own options.
 
@@ -381,11 +427,13 @@ def second_host(
     may use), with `env` beside it and on `devices` (all of the host's
     without them), under a runtime directory of its own: the Storage Server
     it starts serves this deployment alone, in that environment. It starts
-    once `leader_log` shows the leader awaits it, or when the test calls the
-    callable this yields. On exit, which follows the leader's, it waits
-    until the daemon ended, which it does when the leader's connection
-    closes, keeps the Storage Server's log beside `log` and stops that
-    server. A daemon that outlives its leader fails the test.
+    when the block begins: a member retries its join until the leader binds
+    `address`, which the leader does first when it starts, within the join
+    timeout (300 s), so the caller starts the leader in the block. On exit,
+    which follows the leader's, it waits until the daemon ended, which it
+    does when the leader's connection closes, keeps the Storage Server's
+    log beside `log` and stops that server. A daemon that outlives its
+    leader fails the test.
     """  # noqa: D205
     runtime = os.path.join(
         tempfile.gettempdir(),
@@ -422,58 +470,32 @@ def second_host(
     )
     if arguments:
         remote += " " + shlex.join(arguments)
-    started: list[subprocess.Popen[str]] = []
-    leaving = threading.Event()
-
-    def start() -> None:
-        if not started:
-            started.append(
-                subprocess.Popen(
-                    ["ssh", "-o", "BatchMode=yes", host, remote],
-                    stdout=log.open("w", encoding="utf-8"),
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                )
-            )
-
-    def start_when_awaited() -> None:
-        while not leaving.is_set():
-            if (
-                leader_log is not None
-                and leader_log.exists()
-                and AWAITING_NODES in leader_log.read_text(errors="replace")
-            ):
-                start()
-                return
-            time.sleep(1)
-
-    starter = threading.Thread(target=start_when_awaited, daemon=True)
-    if leader_log is not None:
-        starter.start()
+    process = subprocess.Popen(
+        ["ssh", "-o", "BatchMode=yes", host, remote],
+        stdout=log.open("w", encoding="utf-8"),
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
     try:
-        yield start
+        yield
     finally:
-        leaving.set()
-        if leader_log is not None:
-            starter.join()
         outlived = False
-        for process in started:
-            try:
-                process.wait(timeout=120)
-            except subprocess.TimeoutExpired:
-                pid = log.read_text().split("follower pid ")[1].split()[0]
-                _on_host(host, f"kill {pid}")
-                process.wait(timeout=120)
-                outlived = True
-        if started:
-            storage_socket = f"{runtime}/uniserve/storage-server.sock"
-            kept = shlex.quote(str(log.with_suffix(".storage.log")))
-            _on_host(
-                host,
-                f"python3 -c {shlex.quote(_STOP_STORAGE)} {storage_socket}; "
-                f"cp {runtime}/uniserve/storage-server.log {kept} 2>/dev/null; "
-                f"rm -rf {runtime}",
-            )
+        try:
+            process.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            # The remote shell echoed its pid before it became the daemon.
+            pid = log.read_text().split("follower pid ")[1].split()[0]
+            _on_host(host, f"kill {pid}")
+            process.wait(timeout=120)
+            outlived = True
+        storage_socket = f"{runtime}/uniserve/storage-server.sock"
+        kept = shlex.quote(str(log.with_suffix(".storage.log")))
+        _on_host(
+            host,
+            f"python3 -c {shlex.quote(_STOP_STORAGE)} {storage_socket}; "
+            f"cp {runtime}/uniserve/storage-server.log {kept} 2>/dev/null; "
+            f"rm -rf {runtime}",
+        )
         if outlived:
             raise AssertionError("the second host's daemon outlived its leader")
 
@@ -495,22 +517,92 @@ def server_process(
     end. A caller that names its runtime directory owns that Storage Server.
     """
     env = dict(env or {})
-    runtime = None
-    if "XDG_RUNTIME_DIR" not in env:
-        runtime = Path(tempfile.mkdtemp(prefix="uniserve-"))
-        env["XDG_RUNTIME_DIR"] = str(runtime)
     granted = os.environ.get("UNISERVE_WORLD_DEVICES")
     if granted and "CUDA_VISIBLE_DEVICES" not in env:
         env["CUDA_VISIBLE_DEVICES"] = granted
-    process = start_server(args, log_path, env)
-    try:
-        wait_health(base_url, process, timeout_s, log_path)
-        yield process
-    finally:
-        stop_server(process)
-        if runtime is not None:
-            stop_storage_server(runtime)
-            shutil.rmtree(runtime, ignore_errors=True)
+    with ExitStack() as owned:
+        if "XDG_RUNTIME_DIR" not in env:
+            env["XDG_RUNTIME_DIR"] = str(
+                owned.enter_context(runtime_directory())
+            )
+        process = start_server(args, log_path, env)
+        try:
+            wait_health(base_url, process, timeout_s, log_path)
+            yield process
+        finally:
+            stop_server(process)
+
+
+def admin(
+    base_url: str, path: str, body: dict[str, Any] | None = None
+) -> httpx.Response:
+    """``POST /admin/<path>`` with `body`, answered once the operation ends."""
+    return httpx.post(
+        f"{base_url}/admin/{path}", json=body or {}, timeout=scaled(1800)
+    )
+
+
+def admin_status(base_url: str) -> dict[str, Any]:
+    """``GET /admin/status``: what the deployment serves and its operations."""
+    response = httpx.get(f"{base_url}/admin/status", timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
+def admin_config(base_url: str) -> dict[str, Any]:
+    """``GET /admin/config``: the configuration, the epoch that executes
+    (``executing``), the update in flight or the last one (``update``), the
+    epoch records (``epochs``), the node's processes (``processes``) and the
+    storage ledgers (``ledgers``).
+    """  # noqa: D205
+    response = httpx.get(f"{base_url}/admin/config", timeout=60)
+    response.raise_for_status()
+    return response.json()
+
+
+def engine_processes(base_url: str) -> list[dict[str, Any]]:
+    """The deployment's main processes on the leader's node: the rows of
+    ``GET /admin/config``'s ``processes`` of group ``engine``, each with its
+    ``pid``, launch ``generation`` and ``state``.
+    """  # noqa: D205
+    return [
+        process
+        for process in admin_config(base_url)["processes"]
+        if process["group"] == "engine"
+    ]
+
+
+def serving_engine(base_url: str) -> dict[str, Any]:
+    """The main process that serves: the row of :func:`engine_processes`
+    whose launch generation ``GET /admin/status`` names.
+    """  # noqa: D205
+    generation = admin_status(base_url)["deployment"]["generation"]
+    assert generation is not None, "no main process serves"
+    (serving,) = [
+        process
+        for process in engine_processes(base_url)
+        if process["generation"] == generation
+    ]
+    return serving
+
+
+def metric(base_url: str, name: str, label: str | None = None) -> float:
+    """The sum of metric `name` from ``/metrics`` (a counter's ``_total``
+    samples) over its label sets, or over those holding `label`, such as
+    ``mode="eager"``.
+    """  # noqa: D205
+    text = httpx.get(f"{base_url}/metrics", timeout=10).text
+    total = 0.0
+    for line in text.splitlines():
+        if line.startswith("#"):
+            continue
+        sample = line.split("{", 1)[0].split(" ", 1)[0]
+        if sample not in (name, f"{name}_total"):
+            continue
+        if label is not None and label not in line:
+            continue
+        total += float(line.rsplit(" ", 1)[1])
+    return total
 
 
 def post_sse(
