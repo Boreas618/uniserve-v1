@@ -37,18 +37,14 @@ use proto::Connection;
 use proto::request::wire::{self, Scheduling, from_engine, to_engine};
 use proto::request::{ArtifactMedia, EVENT_WINDOW, Event, MigrationCause, Request, RequestId};
 
-use crate::Validators;
 use crate::core::SchedulerHandle;
 use crate::handle::EventRx;
 use crate::{
-    Arrival, BatchCapacity, Candidate, DEFAULT_CHUNKED_PREFILL_SIZE,
-    DEFAULT_MAX_NUM_BATCHED_TOKENS, PolicyProgram, PolicySource, PolicyUsage, RoutePolicy,
-    RouteTrial, SchedulerConfig, SchedulerStatsReporter, TrialState, arrival_view, ceilings_of,
+    Arrival, BatchCapacity, DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_NUM_BATCHED_TOKENS,
+    PolicyProgram, PolicySource, PolicyUsage, Router, SchedulerConfig, SchedulerStatsReporter,
+    ceilings_of,
 };
-use scheduling::PolicyError;
-use scheduling::guest::event::{End, Event as PolicyEvent};
-use scheduling::guest::ids::RequestId as PolicyRequestId;
-use scheduling::guest::view::{RankView, RequestClass};
+use scheduling::guest::view::RankView;
 
 /// How often each scheduler's statistics are reported.
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
@@ -119,27 +115,8 @@ struct Routing {
     /// engine fails once any scheduler stops, not every one, since the
     /// daemon rolls a failing trial back rather than serving on.
     trial: AtomicBool,
-    /// The control thread's own policy instance, which answers `route`, and
-    /// the successor its precopy prepared (§4.4, §7.3).
-    route: Mutex<RouteState>,
-}
-
-/// The control thread's policy state: its route instance, the candidate a
-/// precopy prepared for the next switchover, and the events it has not been
-/// told yet.
-#[derive(Default)]
-struct RouteState {
-    /// Where a candidate was prepared, for the switchover that installs it
-    /// when the epoch has no route instance yet.
-    engine: Option<scheduling::Engine>,
-    /// The ceilings the instance was instantiated under.
-    ceilings: scheduling::guest::limits::Limits,
-    /// The instance that answers `route`.
-    instance: Option<RoutePolicy>,
-    /// The next program's instance, prepared but not switched in.
-    candidate: Option<Candidate>,
-    /// The events the next `observe` carries.
-    pending: Vec<PolicyEvent>,
+    /// The control thread's routing policy (§4.4, §7.3).
+    route: Mutex<Router>,
 }
 
 impl Routing {
@@ -158,178 +135,32 @@ impl Routing {
             .collect()
     }
 
-    /// The ceilings a policy is instantiated under, from the batch the loaded
-    /// workers were built for (§4.4); `None` on a main process that holds no
-    /// scheduler and therefore instantiates no policy.
-    fn ceilings(&self) -> Option<scheduling::guest::limits::Limits> {
-        self.slots
-            .first()
-            .map(|slot| ceilings_of(BatchCapacity::of(slot.handle.info())))
-    }
-
-    /// The state a policy is instantiated with, as the first live scheduler
-    /// holds it and with the ranks the control thread knows (§7.3).
-    ///
-    /// The error names which of the three ways there was no state it was: no
-    /// scheduler at all, every scheduler stopped (with the reason one of them
-    /// gave), or a live scheduler that did not answer in time. A hollow state is
-    /// never used in its place, and a stopped scheduler's own fatal reason is
-    /// preferred to a sentence about the absence.
-    fn policy_state(&self, ranks: &[RankView]) -> Result<TrialState, String> {
-        // Three ways to have no state, and they are three different sentences because they are
-        // three different defects: a process with no scheduler, every scheduler stopped (whose own
-        // fatal reason is what a reader needs), and a live scheduler that did not answer. A single
-        // sentence for all three is what let a stopped fixture read as a silent one.
-        if self.slots.is_empty() {
-            return Err("this main process runs no scheduler".to_owned());
-        }
-        let Some(slot) = self.slots.iter().find(|slot| !slot.handle.is_dead()) else {
-            let reason = self
-                .slots
-                .iter()
-                .find_map(|slot| slot.handle.failure())
-                .unwrap_or_else(|| "it stopped without stating why".to_owned());
-            let stopped = self.slots.len();
-            return Err(format!(
-                "every scheduler of this main process stopped ({stopped} of {stopped}): {reason}"
-            ));
-        };
-        slot.handle.policy_state(ranks.to_vec()).ok_or_else(|| {
-            "a live scheduler did not answer the state the route policy is instantiated on"
-                .to_owned()
-        })
-    }
-
-    /// `route`: the rank that serves a request that has just arrived (§4.4).
-    ///
-    /// `None` when the epoch has no route instance — the engine is not
-    /// serving, and the submission is refused as unavailable.
+    /// `route`: the rank that serves a request that has just arrived (§4.4);
+    /// `None` when no routing policy serves or the policy failed.
     fn route(&self, arrival: &Arrival) -> Option<usize> {
-        let mut state = crate::lock(&self.route);
-        let request = arrival_view(arrival);
-        state.pending.push(PolicyEvent::Arrived {
-            request: request.clone(),
-        });
-        let events = std::mem::take(&mut state.pending);
-        let policy = state.instance.as_mut()?;
         let ranks = self.ranks();
-        // Every decision is validated by the mechanism before it is executed,
-        // the control thread's as much as a scheduler thread's (§4.4).
-        let outcome = policy
-            .observe(&events)
-            .and_then(|()| policy.route(&request, &ranks))
-            .and_then(|index| {
-                Validators::route(&RouteTrial, &request, &ranks, index).map(|()| index)
-            });
-        match outcome {
+        match crate::lock(&self.route).route(arrival, &ranks) {
             Ok(index) => Some(index),
-            Err(error) => {
-                self.policy_failed(&mut state, error);
+            Err(refusal) => {
+                tracing::warn!(reason = %refusal.reason, "a request was not routed");
                 None
             }
         }
     }
 
-    /// `Emitted` and `Finished`, as the daemon's events show them: the route
-    /// instance sees the usage the scheduler threads' instances see (§4.4).
-    ///
-    /// Delivered when they happen rather than kept for the next arrival: a
-    /// policy's per-tenant usage is what `route` orders by, and an engine that
-    /// admits nothing for a while must not grow a backlog of events no arrival
-    /// drains. The cost is one `observe` per event, which is what the events
-    /// themselves cost — proportional to state changes, not to the requests
-    /// resident.
-    fn observe_route(&self, events: Vec<PolicyEvent>) {
-        if events.is_empty() {
-            return;
-        }
-        let mut state = crate::lock(&self.route);
-        let outcome = match state.instance.as_mut() {
-            Some(policy) => policy.observe(&events),
-            // No instance: the epoch has no policy to tell, and the next one
-            // is instantiated on a snapshot that already carries these facts.
-            None => return,
-        };
-        if let Err(error) = outcome {
-            self.policy_failed(&mut state, error);
-        }
-    }
-
-    /// A failed route instance: the previous policy, instantiated on the state
-    /// the schedulers hold now (§7.3), answers instead.
-    fn policy_failed(&self, state: &mut RouteState, error: PolicyError) {
-        let Some(policy) = state.instance.as_mut() else {
-            return;
-        };
-        let ranks = self.ranks();
-        let report = match self.policy_state(&ranks) {
-            Ok(current) => policy.fail(&error, &current),
-            // Without a state to instantiate on, the previous policy cannot
-            // answer either: the epoch fails, as a scheduler's failure does.
-            Err(_) => Err(error),
-        };
-        match report {
-            Ok(report) => {
-                tracing::warn!(reason = %report.reason, "a route policy failed; serving on under the previous one");
-            }
-            Err(error) => {
-                state.instance = None;
-                tracing::error!(%error, "a route policy failed and no previous policy could take over");
-            }
-        }
-    }
-
-    /// §7.3 step 2 on the control thread: prepares the route instance of
-    /// `program` on the state the schedulers hold, without putting it in.
-    ///
-    /// The state is the mechanism's rather than a serving policy's, so an
-    /// epoch's first precopy prepares on the state the schedulers hold before
-    /// any policy serves.
-    fn precopy_route(
+    /// §7.3 steps 2 and 3 on the control thread for the epoch's starting
+    /// policy: prepares the route instance of `program` and puts it in.
+    fn install_route(
         &self,
         source: &dyn PolicySource,
         program: PolicyProgram,
     ) -> Result<(), String> {
-        let engine = crate::process_engine().map_err(|error| error.to_string())?;
-        let ceilings = self.ceilings().ok_or_else(|| {
-            "this main process holds no scheduler to instantiate the route policy against"
-                .to_owned()
-        })?;
         let ranks = self.ranks();
-        let state = self.policy_state(&ranks)?;
-        let candidate =
-            RoutePolicy::prepare(engine, source, program, &state, &ceilings, &RouteTrial)
-                .map_err(|error| error.to_string())?;
-        let mut route = crate::lock(&self.route);
-        route.engine = Some(engine.clone());
-        route.ceilings = ceilings;
-        route.candidate = Some(candidate);
-        Ok(())
-    }
-
-    /// §7.3 step 3 on the control thread: the prepared instance answers.
-    fn switchover_route(&self) -> Result<(), String> {
-        let mut state = crate::lock(&self.route);
-        let Some(candidate) = state.candidate.take() else {
-            return Err("a route policy switchover arrived without a prepared instance".to_owned());
-        };
-        match state.instance.as_mut() {
-            Some(policy) => {
-                policy.adopt(candidate);
-                policy.switchover();
-            }
-            None => {
-                let engine = state.engine.clone().ok_or_else(|| {
-                    "a route policy switchover arrived before its program was loaded".to_owned()
-                })?;
-                state.instance = Some(RoutePolicy::from_candidate(
-                    &engine,
-                    state.ceilings,
-                    candidate,
-                ));
-            }
-        }
-        Ok(())
+        let mut router = crate::lock(&self.route);
+        let candidate = Router::prepare(source, program, &ranks, &router.ceilings())
+            .map_err(|error| error.to_string())?;
+        router.adopt(candidate);
+        router.switchover(&ranks).map_err(|error| error.to_string())
     }
 
     /// The epoch's counters for the daemons' `/metrics` (`wire::Metrics`),
@@ -380,10 +211,7 @@ impl Routing {
     /// §12's cost counters for the control thread's own route instance, which
     /// serves under the same epoch policy as the schedulers'.
     fn route_usage(&self) -> PolicyUsage {
-        match crate::lock(&self.route).instance.as_ref() {
-            Some(route) => route.usage(),
-            None => PolicyUsage::default(),
-        }
+        crate::lock(&self.route).usage()
     }
 
     /// The scheduler that serves `request`, while it is in flight.
@@ -553,6 +381,10 @@ fn serve(
     start: Option<EpochPolicy>,
 ) -> anyhow::Result<()> {
     let prepared = schedulers.iter().any(SchedulerHandle::starts_on_trial);
+    let ceilings = schedulers
+        .first()
+        .map(|handle| ceilings_of(BatchCapacity::of(handle.info())))
+        .unwrap_or_default();
     let routing = Arc::new(Routing {
         slots: schedulers
             .into_iter()
@@ -571,7 +403,7 @@ fn serve(
         } as i32),
         failed: AtomicBool::new(false),
         trial: AtomicBool::new(false),
-        route: Mutex::default(),
+        route: Mutex::new(Router::new(ceilings)),
     });
     routing.trial.store(
         routing
@@ -586,8 +418,7 @@ fn serve(
     // from it, and without one every request is refused as unroutable.
     if let Some(policy) = start {
         routing
-            .precopy_route(policy.module.as_ref(), policy.program)
-            .and_then(|()| routing.switchover_route())
+            .install_route(policy.module.as_ref(), policy.program)
             .map_err(|reason| {
                 anyhow::anyhow!("the epoch's starting policy was not installed: {reason}")
             })?;
@@ -870,81 +701,6 @@ fn read_requests(
     }
 }
 
-/// Routes and submits one submission's requests, the daemon `front`'s.
-/// What routing orders a request that has just arrived by (§4.4): the features
-/// the policy sees before any scheduler holds it.
-fn arrival_of(id: RequestId, request: &Request, recovered: Option<usize>) -> Arrival {
-    let prompt_tokens = match request {
-        Request::Generation(request) => request.prompt_token_ids.len(),
-        Request::Diffusion(request) => request.prompt_token_ids.len(),
-    };
-    let (class, generated_tokens, remaining_tokens, migratable) = match request {
-        Request::Generation(request) => (
-            RequestClass::Token,
-            request.generated_token_ids.len(),
-            u32::try_from(request.max_und_tokens).unwrap_or(u32::MAX),
-            !request.generated_token_ids.is_empty(),
-        ),
-        Request::Diffusion(request) => (
-            RequestClass::Media,
-            0,
-            0,
-            request.trajectory.denoised_steps > 0,
-        ),
-    };
-    Arrival {
-        id,
-        priority: request.priority(),
-        class,
-        prompt_tokens: u32::try_from(prompt_tokens).unwrap_or(u32::MAX),
-        generated_tokens: u32::try_from(generated_tokens).unwrap_or(u32::MAX),
-        remaining_tokens,
-        migratable,
-        cache_rank: recovered,
-        arrived_at: scheduling::guest::Nanos(crate::clock::now_monotonic_us() * 1_000),
-    }
-}
-
-/// The policy's view of one event of a request's stream, when it moves that
-/// request's usage or ends it: what the control thread's route instance is
-/// told (§4.4).
-fn policy_event(
-    id: RequestId,
-    event: &Event,
-    now: scheduling::guest::Nanos,
-) -> Option<PolicyEvent> {
-    let request = PolicyRequestId(id.0);
-    match event {
-        Event::TextToken { .. } | Event::ControlToken { .. } => Some(PolicyEvent::Emitted {
-            request,
-            tokens: 1,
-            at: now,
-        }),
-        Event::TextTokens { ids } => Some(PolicyEvent::Emitted {
-            request,
-            tokens: u32::try_from(ids.len()).unwrap_or(u32::MAX),
-            at: now,
-        }),
-        Event::Finished { .. } => Some(PolicyEvent::Finished {
-            request,
-            end: End::Completed,
-        }),
-        Event::Rejected { .. } => Some(PolicyEvent::Finished {
-            request,
-            end: End::Rejected,
-        }),
-        Event::Error { .. } => Some(PolicyEvent::Finished {
-            request,
-            end: End::Failed,
-        }),
-        Event::Migratable { .. } => Some(PolicyEvent::Finished {
-            request,
-            end: End::Migratable,
-        }),
-        _ => None,
-    }
-}
-
 /// Requests routed to one scheduler are submitted to it together, so it
 /// queues all of them before it forms its next batch.
 fn submit_all(
@@ -976,7 +732,7 @@ fn submit_all(
                 .and_then(|resume| crate::lock(&routing.cache_routes).remove(&resume)),
             Request::Diffusion(_) => None,
         };
-        let arrival = arrival_of(id, &request, recovered);
+        let arrival = Arrival::of(id, &request, recovered);
         let Some(index) = recovered.or_else(|| routing.route(&arrival)) else {
             // The route policy could not answer — it failed and no previous
             // policy could take over, or no rank is alive to serve — so the
@@ -2065,13 +1821,6 @@ async fn forward(stream: Stream, routing: &Routing) {
         };
         sent += 1;
         let terminal = event.is_terminal();
-        if let Some(moved) = policy_event(
-            id,
-            &event,
-            scheduling::guest::Nanos(crate::clock::now_monotonic_us() * 1_000),
-        ) {
-            routing.observe_route(vec![moved]);
-        }
         // A failed engine's daemon learns of the failure before the request
         // ends, as migratable for one: it then submits the request to the
         // engine that serves next, never to this one.
@@ -2190,7 +1939,7 @@ mod tests {
     //! the control thread's route instance is told as a request runs (§4.4).
 
     use super::*;
-    use proto::request::{FinishReason, GenerationConstraint, GenerationRequest, ImageParams};
+    use proto::request::{GenerationConstraint, GenerationRequest, ImageParams};
     use scheduling::guest::view::RequestState;
 
     fn generation(prompt: Vec<u32>, max_und_tokens: usize) -> GenerationRequest {
@@ -2243,89 +1992,12 @@ mod tests {
     }
 
     #[test]
-    fn the_route_instance_is_fed_every_event_batch_the_control_thread_translates() {
-        // §4.4's route row: the control thread's own instance is what answers
-        // `route`, and it is told what the schedulers report - one `observe` per
-        // batch of events, whatever the batch carries, and nothing for an empty
-        // one. The translation itself is `the_route_instance_hears_emissions_and_ends`;
-        // this states that the translated events reach the instance.
-        let engine = crate::process_engine().expect("the policy engine loads");
-        let toy = crate::testing::Toy::default();
-        let ceilings = toy.limits;
-        let program = PolicyProgram {
-            backend: "toy".to_owned(),
-            revision: 1,
-            arguments: Default::default(),
-            stated: Default::default(),
-        };
-        let policy = RoutePolicy::install(
-            engine,
-            &crate::PolicyBytes::new(crate::testing::toy_module(&toy)),
-            program,
-            &TrialState::default(),
-            &ceilings,
-        )
-        .expect("the route instance installs on an empty state");
-        let routing = Routing {
-            slots: Vec::new(),
-            requests: Mutex::default(),
-            cache_routes: Mutex::default(),
-            fronts: Mutex::default(),
-            state: AtomicI32::new(proto::request::wire::EngineState::Ready as i32),
-            failed: AtomicBool::new(false),
-            trial: AtomicBool::new(false),
-            route: Mutex::new(RouteState {
-                engine: None,
-                ceilings,
-                instance: Some(policy),
-                candidate: None,
-                pending: Vec::new(),
-            }),
-        };
-        let observes = || {
-            let state = crate::lock(&routing.route);
-            let policy = state.instance.as_ref().expect("the instance serves");
-            policy.usage().decisions.calls(scheduling::Call::Observe)
-        };
-
-        let now = scheduling::guest::Nanos(1_000);
-        let emitted = policy_event(
-            RequestId(7),
-            &Event::TextToken {
-                id: 1,
-                logprob: None,
-            },
-            now,
-        )
-        .expect("a token is an emission");
-        let finished = policy_event(
-            RequestId(7),
-            &Event::Finished {
-                reason: FinishReason::Stop,
-                stop_reason: None,
-                prompt_tokens: 4,
-                completion_tokens: 2,
-                images: 0,
-            },
-            now,
-        )
-        .expect("an end is a finish");
-
-        routing.observe_route(vec![emitted.clone()]);
-        assert_eq!(observes(), 1, "one batch of events is one observe");
-        routing.observe_route(vec![finished, emitted]);
-        assert_eq!(observes(), 2, "a batch is one observe whatever it carries");
-        routing.observe_route(Vec::new());
-        assert_eq!(observes(), 2, "an empty batch asks the policy nothing");
-    }
-
-    #[test]
     fn an_arriving_request_is_queued_with_what_it_was_submitted_with() {
         let request = Request::Generation(Box::new(generation(vec![1, 2, 3, 4], 64)));
-        let arrival = arrival_of(RequestId(7), &request, Some(2));
-        let view = arrival_view(&arrival);
+        let arrival = Arrival::of(RequestId(7), &request, Some(2));
+        let view = crate::arrival_view(&arrival);
         assert_eq!(view.state, RequestState::Queued);
-        assert_eq!(view.class, RequestClass::Token);
+        assert_eq!(view.class, scheduling::guest::view::RequestClass::Token);
         assert_eq!(view.priority, 3);
         assert_eq!(view.prompt_tokens, 4);
         assert_eq!(view.generated_tokens, 0);
@@ -2340,89 +2012,13 @@ mod tests {
     fn a_migrated_request_arrives_with_the_tokens_it_generated_elsewhere() {
         let mut request = generation(vec![1, 2, 3, 4], 64);
         request.generated_token_ids = vec![9, 10];
-        let arrival = arrival_of(RequestId(7), &Request::Generation(Box::new(request)), None);
-        let view = arrival_view(&arrival);
+        let arrival = Arrival::of(RequestId(7), &Request::Generation(Box::new(request)), None);
+        let view = crate::arrival_view(&arrival);
         assert_eq!(view.generated_tokens, 2);
         assert!(
             view.migratable,
             "a resumed request is ordered as migratable"
         );
         assert_eq!(view.cache_rank, None);
-    }
-
-    #[test]
-    fn the_route_instance_hears_emissions_and_ends() {
-        let now = scheduling::guest::Nanos(1_000);
-        let emitted = policy_event(
-            RequestId(7),
-            &Event::TextToken {
-                id: 1,
-                logprob: None,
-            },
-            now,
-        );
-        match emitted {
-            Some(PolicyEvent::Emitted {
-                request,
-                tokens,
-                at,
-            }) => {
-                assert_eq!(request.0, 7);
-                assert_eq!(tokens, 1);
-                assert_eq!(at, now);
-            }
-            other => panic!("a token is an emission, got {other:?}"),
-        }
-        let batch = policy_event(RequestId(7), &Event::TextTokens { ids: vec![1, 2, 3] }, now);
-        assert!(matches!(
-            batch,
-            Some(PolicyEvent::Emitted { tokens: 3, .. })
-        ));
-        let finished = policy_event(
-            RequestId(7),
-            &Event::Finished {
-                reason: FinishReason::Stop,
-                stop_reason: None,
-                prompt_tokens: 4,
-                completion_tokens: 2,
-                images: 0,
-            },
-            now,
-        );
-        assert!(matches!(
-            finished,
-            Some(PolicyEvent::Finished {
-                end: End::Completed,
-                ..
-            })
-        ));
-        let migrated = policy_event(
-            RequestId(7),
-            &Event::Migratable {
-                cause: MigrationCause::Drain,
-                denoised_steps: 0,
-                stored_layout: Vec::new(),
-            },
-            now,
-        );
-        assert!(matches!(
-            migrated,
-            Some(PolicyEvent::Finished {
-                end: End::Migratable,
-                ..
-            })
-        ));
-        assert!(
-            policy_event(
-                RequestId(7),
-                &Event::ImageStep {
-                    image_id: 0,
-                    step: 1
-                },
-                now
-            )
-            .is_none(),
-            "a media step is not a text emission"
-        );
     }
 }

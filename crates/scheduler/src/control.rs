@@ -223,15 +223,6 @@ impl Scheduler {
                 };
                 let _ = answer.send(progress);
             }
-            Command::DescribePolicyState { ranks, answer } => {
-                // The state is the mechanism's, not the serving policy's: an
-                // epoch's first precopy instantiates the epoch's policy on the
-                // state the mechanism holds before any policy serves (§7.3
-                // step 2).
-                let state =
-                    views::trial_state_with_ranks(self, self.step, self.recorder.recorded(), ranks);
-                let _ = answer.send(Some(state));
-            }
             Command::CacheWarm {
                 operation,
                 together,

@@ -49,6 +49,8 @@ pub(crate) struct Toy {
     pub(crate) trap: Option<Call>,
     /// The call whose export never returns.
     pub(crate) spin: Option<Call>,
+    /// The rank index `route` answers.
+    pub(crate) route: u32,
 }
 
 #[cfg(test)]
@@ -60,6 +62,7 @@ impl Default for Toy {
             victims: Vec::new(),
             trap: None,
             spin: None,
+            route: 0,
         }
     }
 }
@@ -93,7 +96,7 @@ pub(crate) fn toy_module(toy: &Toy) -> Vec<u8> {
         "(data (i32.const {LIMITS}) \"{}\")",
         escape(&json(&toy.limits))
     ));
-    for (call, index) in [(Call::Route, 0), (Call::Place, 0)] {
+    for (call, index) in [(Call::Route, toy.route), (Call::Place, 0)] {
         functions.push(indexed(call, index, toy));
     }
     let source = format!(

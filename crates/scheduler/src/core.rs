@@ -760,30 +760,6 @@ impl SchedulerHandle {
         self.commands.take_policy_report()
     }
 
-    /// The state the epoch's policy is instantiated with, as this scheduler
-    /// holds it and with `ranks` as the control thread knows them (§7.3);
-    /// `None` when the scheduler does not answer in time.
-    ///
-    /// The state is the mechanism's, not a serving policy's, so an epoch's
-    /// first precopy instantiates its policy on it before any policy serves.
-    ///
-    /// The control thread instantiates its route instance on it and reverts
-    /// there after a `route` failure, so a failure costs one boundary, not the
-    /// epoch.
-    pub fn policy_state(
-        &self,
-        ranks: Vec<scheduling::guest::view::RankView>,
-    ) -> Option<crate::TrialState> {
-        // A scheduler answers at its next command boundary, and one whose worker has no wake
-        // reaches it when its park ends, which is `IDLE_LIVENESS_POLL` away at most.
-        const POLICY_STATE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-        self.commands
-            .policy_state(ranks)
-            .recv_timeout(POLICY_STATE_WAIT)
-            .ok()
-            .flatten()
-    }
-
     /// Publishes the committed epoch's immutable pages on every claimed node.
     pub fn publish_epoch(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
         self.commands.publish_epoch()

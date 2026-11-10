@@ -177,23 +177,69 @@ pub(super) fn engine_command_name(
 }
 
 impl MainProcess {
-    /// Routes a request to the scheduler that serves it (`route`).
-    pub(super) fn route(&self, _request: &proto::request::Request) -> usize {
-        // The routing policy runs on the scheduler node; a request submitted to
-        // a node that holds no scheduler belongs to this node's single rank.
-        if self.schedulers.len() <= 1 {
-            return 0;
-        }
-        // Several DP ranks on one node: the mechanism's policy instance picks the rank.
-        // Until that call is published the rank holding the fewest requests takes it, because a
-        // rank the requests never reach leaves its share of the batch empty.
-        let mut held = vec![0_usize; self.schedulers.len()];
+    /// The data-parallel ranks a request may be routed to: every scheduler of this node, the
+    /// requests the control thread routed to it and still serves, and whether it lives.
+    pub(super) fn ranks(&self) -> Vec<scheduler::RankView> {
+        let mut held = vec![0_u32; self.schedulers.len()];
         for served in &self.streams {
             if let Some(count) = held.get_mut(served.rank) {
-                *count += 1;
+                *count = count.saturating_add(1);
             }
         }
-        (0..held.len()).min_by_key(|rank| held[*rank]).unwrap_or(0)
+        self.schedulers
+            .iter()
+            .zip(held)
+            .enumerate()
+            .map(|(index, (handle, in_flight))| scheduler::RankView {
+                index,
+                in_flight,
+                alive: !handle.is_dead(),
+            })
+            .collect()
+    }
+
+    /// Routes a request to the scheduler that serves it: the rank the routing policy's `route`
+    /// decision names (`scheduler::Router`, whose documentation states which instance decides).
+    ///
+    /// A node with one scheduler serves every request it is submitted on that rank and asks no
+    /// policy. A decision that names a rank this node does not hold, or one whose scheduler
+    /// stopped, is the policy's failure: the previous program routes the request instead, and when
+    /// none can the request is refused and the failure is the update's (`Err` carries both).
+    pub(super) fn route(
+        &mut self,
+        id: u64,
+        request: &proto::request::Request,
+    ) -> std::result::Result<usize, (String, Option<UpdateFailure>)> {
+        if self.schedulers.len() <= 1 {
+            return Ok(0);
+        }
+        let arrival = scheduler::Arrival::of(ipc::RequestId(id), request, None);
+        let ranks = self.ranks();
+        let refusal = match self.router.route(&arrival, &ranks) {
+            Ok(rank) => return Ok(rank),
+            Err(refusal) => refusal,
+        };
+        match refusal.reverted {
+            // The previous program serves again: it routes this request.
+            Some(reverted) if !reverted.fatal => {
+                tracing::warn!(
+                    backend = %reverted.program.backend,
+                    revision = reverted.program.revision,
+                    reason = %reverted.reason,
+                    "the routing policy failed and the previous policy routes again"
+                );
+                self.router
+                    .route(&arrival, &ranks)
+                    .map_err(|refusal| (refusal.reason, None))
+            }
+            Some(reverted) => Err((
+                refusal.reason,
+                Some(UpdateFailure::Policy {
+                    error: format!("the routing policy failed: {}", reverted.reason),
+                }),
+            )),
+            None => Err((refusal.reason, None)),
+        }
     }
 
     /// Routes a per-request command to the scheduler that holds the request.

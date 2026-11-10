@@ -79,6 +79,9 @@ impl MainProcess {
             proto::request::wire::to_engine::Kind::Submit(submit) => {
                 // Every request of one submission is queued before the next
                 // batch is formed.
+                // A routing policy that failed with no previous policy to take over fails the
+                // update once the submission's requests are answered.
+                let mut routing_failure = None;
                 for wire in submit.requests {
                     let id = wire.id;
                     // A drained epoch and a held gate admit nothing: the refusal is retryable
@@ -132,7 +135,21 @@ impl MainProcess {
                         );
                         continue;
                     }
-                    let rank = self.route(&request);
+                    let rank = match self.route(id, &request) {
+                        Ok(rank) => rank,
+                        Err((reason, failure)) => {
+                            self.reject(
+                                front,
+                                id,
+                                proto::request::RejectionKind::Overloaded,
+                                reason,
+                            );
+                            if let Some(failure) = failure {
+                                routing_failure.get_or_insert(failure);
+                            }
+                            continue;
+                        }
+                    };
                     let Some(scheduler) = self.schedulers.get(rank) else {
                         bail!("a request was routed to rank {rank}, which holds no scheduler");
                     };
@@ -166,7 +183,10 @@ impl MainProcess {
                         }
                     }
                 }
-                Ok(None)
+                match routing_failure {
+                    Some(failure) => self.failure(failure),
+                    None => Ok(None),
+                }
             }
             proto::request::wire::to_engine::Kind::Command(command) => {
                 self.request_command(front, command)?;

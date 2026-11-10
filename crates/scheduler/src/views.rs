@@ -39,10 +39,9 @@
 //!   builds with none. (`Room::warming` is read here, from the claimed precopy
 //!   pages.)
 //! - `Snapshot::ranks` and a trial's `arrival` need the ranks' load, which the
-//!   routing table on the control thread holds and a scheduler does not: a
-//!   scheduler knows one rank's load, its own. [`trial_state`] therefore trips
-//!   `place` and not `route`; [`trial_state_with_ranks`] takes the ranks and
-//!   trips both.
+//!   control thread's router holds and a scheduler does not: a scheduler knows
+//!   one rank's load, its own, and is never asked `route`. [`trial_state`]
+//!   therefore trips `place` and not `route`.
 //! - `PageView::last_used` is informational: the block pool keeps an allocation
 //!   order, not use timestamps. A policy keeps its own LRU from `Cached`, `Hit`
 //!   and `Freed`.
@@ -67,7 +66,7 @@ use scheduling::guest::ids::{
 };
 use scheduling::guest::time::Nanos;
 use scheduling::guest::view::{
-    CallView, EncodingView, PageView, PhaseKind, PhaseView, RankView, ReplicaView, RequestClass,
+    CallView, EncodingView, PageView, PhaseKind, PhaseView, ReplicaView, RequestClass,
     RequestState as Standing, RequestView, Snapshot,
 };
 
@@ -1169,20 +1168,6 @@ pub(crate) fn snapshot(scheduler: &Scheduler, step: u64, recorded: &RecordedTabl
     }
 }
 
-/// The first request the mechanism is still to admit.
-fn first_queued(scheduler: &Scheduler) -> Option<RequestId> {
-    scheduler
-        .waiting
-        .front()
-        .map(|state| state.req.request_id)
-        .or_else(|| {
-            scheduler
-                .waiting_media
-                .front()
-                .map(|pending| pending.request.request_id)
-        })
-}
-
 /// The view of one request the scheduler holds, by id, with the facts the
 /// recorder observed of it; `None` for a request the scheduler no longer
 /// holds.
@@ -1268,17 +1253,6 @@ pub(crate) fn live(scheduler: &Scheduler, step: u64, recorded: &RecordedTable) -
     live
 }
 
-/// A queued request and the ranks, for `route`: the first request the
-/// mechanism is still to admit, and the ranks it may be routed to.
-pub(crate) fn arrival(
-    scheduler: &Scheduler,
-    ranks: Vec<RankView>,
-) -> Option<(RequestView, Vec<RankView>)> {
-    let id = first_queued(scheduler)?;
-    let view = view_of(scheduler, id, scheduler.recorder.recorded())?;
-    Some((view, ranks))
-}
-
 /// A resident request's next call on a block and the replicas that may run it,
 /// for `place`: the first resident request that has a next call and a replica.
 pub(crate) fn dispatch(scheduler: &Scheduler) -> Option<(CallView, Vec<ReplicaView>)> {
@@ -1315,27 +1289,6 @@ pub(crate) fn trial_state(
         shortage: shortage_now(scheduler),
         arrival: None,
         call: dispatch(scheduler),
-    }
-}
-
-/// The trial state of this moment, with the ranks the routing table holds: the
-/// state routing is decided on, for the trial that asks `route` too (§7.3).
-pub(crate) fn trial_state_with_ranks(
-    scheduler: &Scheduler,
-    step: u64,
-    recorded: &RecordedTable,
-    ranks: Vec<RankView>,
-) -> TrialState {
-    let call = dispatch(scheduler);
-    let arrival = arrival(scheduler, ranks.clone());
-    let mut snapshot = snapshot(scheduler, step, recorded);
-    snapshot.ranks = ranks;
-    TrialState {
-        snapshot,
-        room: room(scheduler, step),
-        shortage: shortage_now(scheduler),
-        arrival,
-        call,
     }
 }
 

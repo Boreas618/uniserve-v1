@@ -100,7 +100,7 @@ impl MainProcess {
     /// The build runs on the scheduler's own blocking thread, never here: a policy's module is
     /// compiled the first time it is asked for, and the control thread never waits on a job.
     pub(super) fn request_policy(
-        &self,
+        &mut self,
         policy: &Program,
     ) -> Result<Vec<crossbeam_channel::Receiver<std::result::Result<(), String>>>> {
         let program = PolicyProgram::from_arguments(
@@ -115,6 +115,33 @@ impl MainProcess {
         .map_err(|error| anyhow::anyhow!("the update's policy program: {error}"))?;
         let source = Arc::new(ProgramSource::connect(&self.program_server));
         let source: Arc<dyn PolicySource + Send + Sync> = source;
+        let mut answers = Vec::with_capacity(self.schedulers.len() + 1);
+        // A node with several schedulers routes by the policy, so the control thread's route
+        // instance is prepared beside theirs, on a thread of its own: the module compiles there.
+        self.route_prepared = None;
+        if self.schedulers.len() > 1 {
+            let (answer, answered) = crossbeam_channel::bounded(1);
+            let (prepared, candidate) = crossbeam_channel::bounded(1);
+            let ranks = self.ranks();
+            let ceilings = self.router.ceilings();
+            let program = program.clone();
+            let source = Arc::clone(&source);
+            std::thread::Builder::new()
+                .name("route-precopy".to_owned())
+                .spawn(move || {
+                    let built =
+                        scheduler::Router::prepare(source.as_ref(), program, &ranks, &ceilings);
+                    let _ = match built {
+                        Ok(built) => {
+                            let _ = prepared.send(built);
+                            answer.send(Ok(()))
+                        }
+                        Err(error) => answer.send(Err(format!("the route policy: {error}"))),
+                    };
+                })?;
+            self.route_prepared = Some(candidate);
+            answers.push(answered);
+        }
         // The start marker of the precopy's policy half: the resolve that follows runs on a
         // scheduler's blocking thread and prints its own target and spans, and without this line a
         // log cannot tell a precopy that began from one whose command was never sent.
@@ -125,11 +152,12 @@ impl MainProcess {
             socket = %self.program_server.display(),
             "this precopy's policy preparation has begun"
         );
-        Ok(self
-            .schedulers
-            .iter()
-            .map(|scheduler| scheduler.precopy_policy(program.clone(), Arc::clone(&source)))
-            .collect())
+        answers.extend(
+            self.schedulers
+                .iter()
+                .map(|scheduler| scheduler.precopy_policy(program.clone(), Arc::clone(&source))),
+        );
+        Ok(answers)
     }
 
     /// The switchover's policy half: every scheduler's next batch boundary answers from the prepared
@@ -174,6 +202,26 @@ impl MainProcess {
             .map(|scheduler| (scheduler.switchover_policy(), deadline))
             .collect();
         self.policy_answers.extend(answers);
+        // The control thread's route instance switches here and now, and its answer joins the
+        // schedulers': a node that routes by the policy and holds no prepared route instance
+        // fails the switchover as a scheduler without a prepared policy does.
+        if self.schedulers.len() > 1 {
+            if let Some(candidate) = self
+                .route_prepared
+                .take()
+                .and_then(|prepared| prepared.try_recv().ok())
+            {
+                self.router.adopt(candidate);
+            }
+            let ranks = self.ranks();
+            let (answer, answered) = crossbeam_channel::bounded(1);
+            let _ = answer.send(
+                self.router
+                    .switchover(&ranks)
+                    .map_err(|error| format!("the route policy: {error}")),
+            );
+            self.policy_answers.push((answered, deadline));
+        }
     }
 
     /// Reads the schedulers' answers to the last policy switchover that have arrived: one that
@@ -213,15 +261,20 @@ impl MainProcess {
 
     /// The commit's policy half: probation ended in a commit, so the prepared policy is the serving
     /// one and the previous module is gone.
-    pub(super) fn commit_policy(&self, _generation: u64) {
+    pub(super) fn commit_policy(&mut self, _generation: u64) {
         for scheduler in &self.schedulers {
             scheduler.commit_policy();
         }
+        self.router.commit();
     }
 
     /// The revert's policy half: the previous policy module answers again from the next boundary,
     /// and the candidate is dropped at it.
-    pub(super) fn revert_policy(&self, _generation: u64) {
+    pub(super) fn revert_policy(&mut self, _generation: u64) {
+        let ranks = self.ranks();
+        if let Err(error) = self.router.revert(&ranks) {
+            tracing::error!(%error, "the route policy revert failed");
+        }
         for scheduler in &self.schedulers {
             report_policy_answer(
                 scheduler.revert_policy(),
@@ -233,7 +286,9 @@ impl MainProcess {
 
     /// A precopy that failed discards its policy candidate, so the next update's program is the only
     /// one that can serve.
-    pub(super) fn discard_policy(&self) {
+    pub(super) fn discard_policy(&mut self) {
+        self.router.discard();
+        self.route_prepared = None;
         // The candidate is dropped by the revert every scheduler applies; a scheduler that never
         // switched has nothing to drop, and the stage it is asked for is the one that says so.
         for scheduler in &self.schedulers {

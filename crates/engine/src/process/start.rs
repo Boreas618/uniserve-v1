@@ -372,6 +372,14 @@ impl MainProcess {
             .map(|_| scheduler::SchedulerStatsReporter::default())
             .collect();
         update.generations = generations;
+        // The route instance is held to the ceilings of the batch the schedulers were built for,
+        // as theirs are.
+        let router = scheduler::Router::new(
+            schedulers
+                .first()
+                .map(|handle| scheduler::ceilings_of(scheduler::BatchCapacity::of(handle.info())))
+                .unwrap_or_default(),
+        );
         let mut process = Self {
             control: control
                 .take()
@@ -404,6 +412,8 @@ impl MainProcess {
             warming_since: None,
             warming_steps: Vec::new(),
             policy_answers: Vec::new(),
+            router,
+            route_prepared: None,
             targets: model_runner.targets().to_vec(),
             program_server: model_runner.program_server().to_path_buf(),
             process,

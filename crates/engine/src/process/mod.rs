@@ -208,6 +208,13 @@ pub(crate) struct MainProcess {
     /// owns the instance, so every call the control thread makes goes through the handle and the
     /// command channel carries the mutation.
     schedulers: Vec<scheduler::SchedulerHandle>,
+    /// The routing policy that names the scheduler of every request when this node holds several
+    /// (`requests::route`): the control thread's instance of the epoch's policy program, switched
+    /// with the schedulers' instances.
+    router: scheduler::Router,
+    /// The route instance the running precopy prepares on a thread of its own, taken by the
+    /// switchover.
+    route_prepared: Option<crossbeam_channel::Receiver<scheduler::Candidate>>,
     /// The expert union of this node's ranks, ended before their device threads are.
     union: Option<Arc<worker::runners::experts::Union>>,
     /// One statistics reporter per scheduler, in the schedulers' order.

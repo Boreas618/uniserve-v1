@@ -18,11 +18,10 @@
 //! [`PolicyReverted`]; the control thread forwards the report to the daemons,
 //! which record the previous policy as the epoch's current one.
 //!
-//! Both instances — each scheduler thread's and the control thread's — come
-//! from one program and switch together (§4.4: "两者是同一个 program，一起换代").
-//! The control thread's instance is told every rank's `Arrived`, `Emitted` and
-//! `Finished` as the control thread sees them, so a policy that tracks
-//! per-tenant usage routes on what each rank actually served.
+//! Both instances — each scheduler thread's and the control thread's
+//! [`Router`] — come from one program and switch together (§4.4: "两者是同一个
+//! program，一起换代"). The router's instance answers `route` from the arriving
+//! request's view and the ranks' views alone; it is told no events.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -695,6 +694,51 @@ pub struct Arrival {
     pub arrived_at: scheduling::guest::time::Nanos,
 }
 
+impl Arrival {
+    /// The features of a submitted request, arriving now; `cache_rank` is the
+    /// rank its stored cache was resumed from, when it resumes one.
+    pub fn of(
+        id: ipc::RequestId,
+        request: &proto::request::Request,
+        cache_rank: Option<usize>,
+    ) -> Self {
+        use proto::request::Request;
+        use scheduling::guest::view::RequestClass;
+
+        let prompt_tokens = match request {
+            Request::Generation(request) => request.prompt_token_ids.len(),
+            Request::Diffusion(request) => request.prompt_token_ids.len(),
+        };
+        let (class, generated_tokens, remaining_tokens, migratable) = match request {
+            Request::Generation(request) => (
+                RequestClass::Token,
+                request.generated_token_ids.len(),
+                u32::try_from(request.max_und_tokens).unwrap_or(u32::MAX),
+                !request.generated_token_ids.is_empty(),
+            ),
+            Request::Diffusion(request) => (
+                RequestClass::Media,
+                0,
+                0,
+                request.trajectory.denoised_steps > 0,
+            ),
+        };
+        Self {
+            id,
+            priority: request.priority(),
+            class,
+            prompt_tokens: u32::try_from(prompt_tokens).unwrap_or(u32::MAX),
+            generated_tokens: u32::try_from(generated_tokens).unwrap_or(u32::MAX),
+            remaining_tokens,
+            migratable,
+            cache_rank,
+            arrived_at: scheduling::guest::Nanos(
+                crate::clock::now_monotonic_us().saturating_mul(1_000),
+            ),
+        }
+    }
+}
+
 /// The view of a request that has just arrived (`Event::Arrived`): nothing has
 /// happened to it yet, so every feature but the submitted ones is empty.
 pub fn arrival_view(arrival: &Arrival) -> RequestView {
@@ -843,6 +887,17 @@ impl PolicySlot {
     pub fn reclaim(&mut self, shortage: &Shortage) -> Result<Vec<Victim>, PolicyError> {
         let (instance, cost) = (&mut self.instance, &mut self.cost);
         cost.call(instance, |instance| instance.reclaim(shortage))
+    }
+
+    /// `route`: the rank that serves a request that has just arrived (§4.4).
+    /// Only the [`Router`]'s slot is asked.
+    pub fn route(
+        &mut self,
+        request: &RequestView,
+        ranks: &[RankView],
+    ) -> Result<usize, PolicyError> {
+        let (instance, cost) = (&mut self.instance, &mut self.cost);
+        cost.call(instance, |instance| instance.route(request, ranks))
     }
 
     /// `place`: which replica runs a request's first call on a block (§4.4).
@@ -1125,7 +1180,8 @@ fn init_of(program: &PolicyProgram, state: &TrialState) -> Instantiation {
 /// The mechanism's validation of the control thread's only decision.
 ///
 /// The route instance answers `route` alone: a plan, victims and a placement
-/// are a scheduler thread's decisions, judged there. A route decision must name a rank that is alive.
+/// are a scheduler thread's decisions, judged there. A route decision must name
+/// a rank that was offered and is alive.
 pub struct RouteTrial;
 
 impl Validators for RouteTrial {
@@ -1139,21 +1195,11 @@ impl Validators for RouteTrial {
 
     fn route(
         &self,
-        _request: &RequestView,
+        request: &RequestView,
         ranks: &[RankView],
         index: usize,
     ) -> Result<(), PolicyError> {
-        match ranks.get(index) {
-            Some(rank) if rank.alive => Ok(()),
-            Some(_) => Err(PolicyError::invalid(
-                Call::Route,
-                format!("route chose rank {index}, which is not alive"),
-            )),
-            None => Err(PolicyError::invalid(
-                Call::Route,
-                format!("route chose rank {index} of {} ranks", ranks.len()),
-            )),
-        }
+        crate::mechanism::validate_route(request, ranks, index)
     }
 
     fn place(
@@ -1166,217 +1212,205 @@ impl Validators for RouteTrial {
     }
 }
 
-/// The control thread's own policy instance, which answers `route` (§4.4).
+/// The policy instance that answers `route` for every data-parallel rank of a
+/// main process (§4.4).
 ///
-/// It is the same program as the scheduler threads' instances and changes with
-/// them: a precopy prepares it on the same state, a switchover puts it in, and a
-/// revert instantiates the previous program again.
-pub struct RoutePolicy {
-    engine: Engine,
-    ceilings: Limits,
-    program: PolicyProgram,
-    module: PolicyModule,
-    instance: PolicyInstance,
-    previous: Option<(PolicyProgram, PolicyModule)>,
+/// # Which instance routes
+///
+/// Routing is decided on the engine's control thread, before any scheduler
+/// holds the request, so the instance that answers it is the control thread's
+/// own: an instance of the epoch's policy program, prepared, switched over,
+/// committed and reverted with the schedulers' instances, so all of them run
+/// one program (§4.4: "两者是同一个 program，一起换代"). It is the only
+/// instance asked `route`; a scheduler's instance never is.
+///
+/// The route instance is instantiated on the ranks alone and told no events:
+/// it decides from the arriving request's view and each rank's view (the
+/// requests the rank holds and whether its scheduler lives), which the control
+/// thread counts from the requests it routed. A decision that names a rank
+/// outside the ranks offered, or one whose scheduler stopped, is refused as the
+/// policy's failure (`mechanism::validate_route`); the previous program then
+/// routes, and the request is refused when none can.
+pub struct Router {
+    /// The serving instance, `None` until the epoch's first switchover.
+    slot: Option<PolicySlot>,
+    /// The instance a precopy prepared for the next switchover.
     candidate: Option<Candidate>,
-    /// The snapshot the serving instance was instantiated on: the state its own
-    /// knowledge starts from (§4.4).
-    state: Snapshot,
-    /// What the control thread's policy has cost (§12).
-    cost: Cost,
+    /// The build config's ceilings the instances are instantiated under.
+    ceilings: Limits,
 }
 
-impl RoutePolicy {
-    /// Instantiates `program` on `state`, which is the state routing is decided
-    /// on: every rank, and every request the epoch already holds.
-    pub fn install(
-        engine: &Engine,
-        source: &dyn PolicySource,
-        program: PolicyProgram,
-        state: &TrialState,
-        ceilings: &Limits,
-    ) -> Result<Self, PolicyError> {
-        let init = init_of(&program, state);
-        let module = PolicyModule::load(engine, &source.bytes(&program)?)?;
-        let instance = module.instantiate(&init.state, &init.parameters, ceilings)?;
-        Ok(Self {
-            engine: engine.clone(),
-            ceilings: *ceilings,
-            program,
-            module,
-            instance,
-            previous: None,
-            candidate: None,
-            state: init.state,
-            cost: Cost::default(),
-        })
-    }
+/// Why `route` named no rank for a request.
+#[derive(Debug)]
+pub struct RouteRefusal {
+    /// Why no rank was named.
+    pub reason: String,
+    /// The policy failure the refusal reverted, when a serving policy failed;
+    /// `fatal` when no previous program could take over.
+    pub reverted: Option<Box<PolicyReverted>>,
+}
 
-    /// The route instance an epoch's first switchover installs from the
-    /// candidate its precopy prepared.
-    pub fn from_candidate(engine: &Engine, ceilings: Limits, candidate: Candidate) -> Self {
-        // Its trial's calls are the epoch's policy's, as a scheduler's first
-        // policy counts them (§12).
-        let mut cost = Cost::default();
-        cost.trial(candidate.trial, &candidate.instance);
+impl Router {
+    /// A router with no policy, which routes nothing until a switchover puts
+    /// in the instance a precopy prepared.
+    pub fn new(ceilings: Limits) -> Self {
         Self {
-            engine: engine.clone(),
-            ceilings,
-            program: candidate.program,
-            module: candidate.module,
-            instance: candidate.instance,
-            previous: None,
+            slot: None,
             candidate: None,
-            state: candidate.state,
-            cost,
+            ceilings,
         }
     }
 
-    /// The program the route instance runs.
-    pub fn program(&self) -> &PolicyProgram {
-        &self.program
-    }
-
-    /// `observe`: every event the control thread saw since the last call, in
-    /// the order it happened.
-    pub fn observe(&mut self, events: &[Event]) -> Result<(), PolicyError> {
-        if events.is_empty() {
-            return Ok(());
+    /// The state a route instance is instantiated on: the ranks it routes
+    /// among, and nothing else (the type documentation says why).
+    fn state(ranks: &[RankView]) -> TrialState {
+        TrialState {
+            snapshot: Snapshot {
+                ranks: ranks.to_vec(),
+                ..Snapshot::default()
+            },
+            ..TrialState::default()
         }
-        let (instance, cost) = (&mut self.instance, &mut self.cost);
-        cost.call(instance, |instance| instance.observe(events))
     }
 
-    /// `route`: the index in `ranks` of the rank that serves a new request.
-    pub fn route(
-        &mut self,
-        request: &RequestView,
-        ranks: &[RankView],
-    ) -> Result<usize, PolicyError> {
-        let (instance, cost) = (&mut self.instance, &mut self.cost);
-        cost.call(instance, |instance| instance.route(request, ranks))
-    }
-
-    /// The calls this instance has made and the fuel they consumed (§12's cost
-    /// counters, for `Metrics.policy_fuel`/`policy_calls`).
-    pub fn usage(&self) -> PolicyUsage {
-        self.cost.usage(&self.instance)
-    }
-
-    /// §7.3 step 2 for the control thread's instance: instantiate `program` on
-    /// `state` and, when the state names a request arriving, ask it one `route`
-    /// decision, executing nothing.
+    /// §7.3 step 2 for the route instance: loads `program` and instantiates
+    /// it on `ranks`, executing nothing.
     ///
-    /// A precopy at a batch boundary may have no request arriving — routing is
-    /// decided when one does — so the trial skips `route` then rather than fail:
-    /// the decision is tried by the next precopy that has an arrival, and the
-    /// instance is installed either way. `validators` are the mechanism's own
-    /// validation of a route decision.
+    /// A static function, so the module's compilation runs on a thread of
+    /// the caller's choosing; [`Self::adopt`] keeps the answer.
     pub fn prepare(
-        engine: &Engine,
         source: &dyn PolicySource,
         program: PolicyProgram,
-        state: &TrialState,
+        ranks: &[RankView],
         ceilings: &Limits,
-        validators: &dyn Validators,
     ) -> Result<Candidate, PolicyError> {
-        let init = init_of(&program, state);
-        let module = PolicyModule::load(engine, &source.bytes(&program)?)?;
-        let mut instance = module.instantiate(&init.state, &init.parameters, ceilings)?;
-        if let Some((request, ranks)) = &state.arrival {
-            let index = instance.route(request, ranks)?;
-            validators.route(request, ranks, index)?;
-        }
-        // The trial's calls are the epoch's policy's once the candidate is
-        // adopted, and serving starts on a second instance so the trial leaves
-        // the program as it found it (§7.3).
-        let trial = TrialCost {
-            decisions: instance.cost(),
-            fuel: instance.fuel_consumed(),
-        };
-        let instance = module.instantiate(&init.state, &init.parameters, ceilings)?;
-        Ok(Candidate {
+        let engine = process_engine()?;
+        PolicySlot::prepare(
+            engine,
+            source,
             program,
-            module,
-            instance,
-            trial,
-            state: init.state,
-        })
+            Self::state(ranks),
+            ceilings,
+            &RouteTrial,
+        )
     }
 
-    /// Keeps a candidate a precopy prepared, for the switchover to put in.
+    /// The ceilings this router instantiates under.
+    pub fn ceilings(&self) -> Limits {
+        self.ceilings
+    }
+
+    /// Keeps the candidate a precopy prepared for the next switchover.
     pub fn adopt(&mut self, candidate: Candidate) {
-        self.cost.trial(candidate.trial, &candidate.instance);
         self.candidate = Some(candidate);
     }
 
-    /// A precopy on the calling thread: [`Self::prepare`] and [`Self::adopt`].
-    pub fn precopy(
-        &mut self,
-        source: &dyn PolicySource,
-        program: PolicyProgram,
-        state: &TrialState,
-        validators: &dyn Validators,
-    ) -> Result<(), PolicyError> {
-        let candidate = Self::prepare(
-            &self.engine,
-            source,
-            program,
-            state,
-            &self.ceilings,
-            validators,
-        )?;
-        self.adopt(candidate);
-        Ok(())
-    }
-
-    /// §7.3 step 3 for the control thread's instance.
-    pub fn switchover(&mut self) {
-        let Some(candidate) = self.candidate.take() else {
-            tracing::warn!("a route policy switchover arrived without a prepared instance");
-            return;
-        };
-        let replaced_program = std::mem::replace(&mut self.program, candidate.program);
-        let replaced_module = std::mem::replace(&mut self.module, candidate.module);
-        let replaced = std::mem::replace(&mut self.instance, candidate.instance);
-        self.state = candidate.state;
-        self.cost.replace(&replaced);
-        self.previous = Some((replaced_program, replaced_module));
-    }
-
-    /// §7.3 step 4 for the control thread's instance, on `state`.
-    pub fn revert(&mut self, state: &TrialState) -> Result<(), PolicyError> {
+    /// Drops the candidate a failed or abandoned precopy prepared.
+    pub fn discard(&mut self) {
         self.candidate = None;
-        let Some((program, module)) = self.previous.take() else {
+    }
+
+    /// §7.3 step 3: the prepared instance routes from now on. A switchover
+    /// with no prepared instance fails rather than leaving the epoch without
+    /// a router.
+    pub fn switchover(&mut self, ranks: &[RankView]) -> Result<(), PolicyError> {
+        let Some(candidate) = self.candidate.take() else {
             return Err(PolicyError::invalid(
                 Call::Init,
-                "the failed route policy has no previous policy module to revert to",
+                "a route policy switchover arrived without a policy prepared by a precopy",
             ));
         };
-        let init = init_of(&program, state);
-        let instance = module.instantiate(&init.state, &init.parameters, &self.ceilings)?;
-        let _ = std::mem::replace(&mut self.program, program);
-        let _ = std::mem::replace(&mut self.module, module);
-        let replaced = std::mem::replace(&mut self.instance, instance);
-        self.cost.replace(&replaced);
-        Ok(())
+        match self.slot.as_mut() {
+            Some(slot) => {
+                slot.adopt(candidate);
+                slot.request(Stage::Switchover);
+                slot.boundary(&Self::state(ranks)).map(|_| ())
+            }
+            None => {
+                self.slot = Some(PolicySlot::from_candidate(
+                    process_engine()?,
+                    self.ceilings,
+                    candidate,
+                ));
+                Ok(())
+            }
+        }
     }
 
-    /// A `route` failure: revert on `state` and answer the report the control
-    /// thread forwards like a scheduler's.
-    pub fn fail(
-        &mut self,
-        error: &PolicyError,
-        state: &TrialState,
-    ) -> Result<PolicyReverted, PolicyError> {
-        let report = PolicyReverted {
-            scheduler: None,
-            program: self.program.clone(),
-            reason: error.to_string(),
-            fatal: false,
+    /// §7.3 step 5: the update is committed.
+    pub fn commit(&mut self) {
+        if let Some(slot) = self.slot.as_mut() {
+            slot.request(Stage::Commit);
+            let _ = slot.boundary(&TrialState::default());
+        }
+    }
+
+    /// §7.3 step 4: the previous program routes again, instantiated on
+    /// `ranks`; a prepared candidate is dropped.
+    pub fn revert(&mut self, ranks: &[RankView]) -> Result<(), PolicyError> {
+        self.candidate = None;
+        let Some(slot) = self.slot.as_mut() else {
+            return Ok(());
         };
-        self.revert(state)?;
-        Ok(report)
+        slot.request(Stage::Revert);
+        slot.boundary(&Self::state(ranks)).map(|_| ())
+    }
+
+    /// The calls the serving instance made and the fuel they consumed (§12).
+    pub fn usage(&self) -> PolicyUsage {
+        self.slot
+            .as_ref()
+            .map_or_else(PolicyUsage::default, PolicySlot::usage)
+    }
+
+    /// The program the serving instance runs, `None` before the first
+    /// switchover.
+    pub fn program(&self) -> Option<&PolicyProgram> {
+        self.slot.as_ref().map(PolicySlot::program)
+    }
+
+    /// `route`: the index of the rank in `ranks` that serves `arrival`.
+    ///
+    /// A request that resumes a stored cache is routed to the rank recorded
+    /// for it by the policy itself (`RequestView::cache_rank`), and the answer
+    /// is checked like any other. An answer that names no live rank offered
+    /// fails the policy: the previous program is instantiated on `ranks` and
+    /// routes later requests, and this one is refused.
+    pub fn route(&mut self, arrival: &Arrival, ranks: &[RankView]) -> Result<usize, RouteRefusal> {
+        let Some(slot) = self.slot.as_mut() else {
+            return Err(RouteRefusal {
+                reason: "no routing policy serves: the epoch's first switchover has not put \
+                         one in"
+                    .to_owned(),
+                reverted: None,
+            });
+        };
+        let request = arrival_view(arrival);
+        let answer = slot
+            .route(&request, ranks)
+            .and_then(|index| RouteTrial.route(&request, ranks, index).map(|()| index));
+        let error = match answer {
+            Ok(index) => return Ok(index),
+            Err(error) => error,
+        };
+        let reverted = match slot.fail(&error, &Self::state(ranks)) {
+            Ok(report) => report,
+            Err(fatal) => {
+                // No previous program can route: the epoch has no router.
+                let program = slot.program().clone();
+                self.slot = None;
+                PolicyReverted {
+                    scheduler: None,
+                    program,
+                    reason: format!("{error}; no previous policy can take over: {fatal}"),
+                    fatal: true,
+                }
+            }
+        };
+        Err(RouteRefusal {
+            reason: format!("the routing policy failed: {error}"),
+            reverted: Some(Box::new(reverted)),
+        })
     }
 }
 
@@ -1912,34 +1946,64 @@ mod tests {
     }
 
     #[test]
-    fn the_route_instance_prepares_switches_and_reverts_like_a_scheduler_slot() {
-        let engine = Engine::new().expect("an engine");
-        let mut route = RoutePolicy::install(
-            &engine,
-            &source(&Toy::default()),
-            program("a", 1),
-            &state(),
-            &ceilings(),
-        )
-        .expect("the toy policy installs");
-        let (request, ranks) = state().arrival.expect("a request");
-        assert_eq!(route.route(&request, &ranks).expect("a route"), 0);
+    fn the_router_routes_switches_reverts_and_refuses_a_rank_it_was_not_offered() {
+        let ranks = vec![
+            RankView {
+                index: 0,
+                in_flight: 0,
+                alive: true,
+            },
+            RankView {
+                index: 1,
+                in_flight: 0,
+                alive: true,
+            },
+        ];
+        let arrival = Arrival {
+            id: ipc::RequestId(7),
+            priority: 0,
+            class: RequestClass::Token,
+            prompt_tokens: 8,
+            generated_tokens: 0,
+            remaining_tokens: 8,
+            migratable: false,
+            cache_rank: None,
+            arrived_at: Nanos(0),
+        };
+        let mut router = Router::new(ceilings());
+        assert!(
+            router.route(&arrival, &ranks).is_err(),
+            "no policy routes yet"
+        );
+        assert!(router.switchover(&ranks).is_err(), "nothing was prepared");
 
-        route
-            .precopy(
-                &source(&Toy::default()),
-                program("b", 2),
-                &state(),
-                &Checks::default(),
-            )
-            .expect("the candidate passes");
-        route.switchover();
-        assert_eq!(route.program().backend, "b");
-        let report = route
-            .fail(&PolicyError::invalid(Call::Route, "refused"), &state())
-            .expect("the previous policy is kept");
-        assert!(report.scheduler.is_none());
-        assert_eq!(route.program().backend, "a");
+        let toy = |route: u32| Toy {
+            route,
+            ..Toy::default()
+        };
+        let prepared = Router::prepare(&source(&toy(1)), program("a", 1), &ranks, &ceilings())
+            .expect("the candidate prepares");
+        router.adopt(prepared);
+        router
+            .switchover(&ranks)
+            .expect("the switchover installs it");
+        assert_eq!(router.route(&arrival, &ranks).expect("a rank"), 1);
+
+        // A program that names a rank it was not offered fails, and the
+        // program before it routes again.
+        let prepared = Router::prepare(&source(&toy(5)), program("b", 2), &ranks, &ceilings())
+            .expect("the candidate prepares");
+        router.adopt(prepared);
+        router
+            .switchover(&ranks)
+            .expect("the switchover installs it");
+        let refusal = router
+            .route(&arrival, &ranks)
+            .expect_err("rank 5 is not offered");
+        let reverted = refusal.reverted.expect("the failing program is reported");
+        assert!(!reverted.fatal);
+        assert_eq!(router.program().map(|p| p.backend.as_str()), Some("a"));
+        assert_eq!(router.route(&arrival, &ranks).expect("a rank"), 1);
     }
 
     #[test]

@@ -135,12 +135,10 @@ pub(crate) mod stats_report;
 
 pub use epoch::{GroupCache, ParkedCache};
 use ipc::{ForwardMode, TransferMode};
-#[cfg(feature = "testing")]
-pub(crate) use policy::process_engine;
 pub use policy::{
     Arrival, BatchCapacity, Candidate, Limits, PREFETCH_FLOOR_TOKENS, Parameters, PolicyBytes,
     PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyUsage, ProgramSource, Progress,
-    RoutePolicy, RouteTrial, Stage, TrialState, Validators, arrival_view, ceilings_of,
+    RouteRefusal, RouteTrial, Router, Stage, TrialState, Validators, arrival_view, ceilings_of,
 };
 pub use proto::config::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
@@ -150,7 +148,7 @@ pub(crate) use run::guidance_prefix_rows;
 /// The phases the scheduler plans with, and the id each is numbered with: a rank's plan, a policy's
 /// `Plan` and a batch's phase must all use this table, so it is exported from where the scheduler
 /// keeps it rather than restated by whoever needs a phase id.
-pub use scheduling::guest::view::PhaseKind;
+pub use scheduling::guest::view::{PhaseKind, RankView};
 pub use stats::{
     DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats, PrefixCacheUsage, PrefixStats,
     SchedulerStats, TimingStats, WorkerStats,
