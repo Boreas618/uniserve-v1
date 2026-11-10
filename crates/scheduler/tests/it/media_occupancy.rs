@@ -20,13 +20,13 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 
+use ipc::execution::PoolLayout;
 use ipc::{BufferId, Call, CallKind, DimBound, MediaCall};
 use ipc::{DiffusionSamplingParams, RequestId};
 use proto::video::Canvas;
 use scheduler::{
-    BatchEvent, BatchResult, CommandSender, ExecutionBatch, PoolLayout, RequestDispatch,
-    SchedulerConfig, SimEngine, SimWorker, Worker, WorkerError, WorkerGroupId, WorkerInfo,
-    WorkerSubmitError,
+    BatchEvent, BatchResult, CommandSender, ExecutionBatch, RequestDispatch, SchedulerConfig,
+    SimEngine, SimWorker, Worker, WorkerError, WorkerGroupId, WorkerInfo, WorkerSubmitError,
 };
 use scheduler::{ConditionExtent, DiffusionRequest, Event, FinishReason, RejectionKind, Request};
 

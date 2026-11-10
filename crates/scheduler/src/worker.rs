@@ -35,22 +35,7 @@ mod codecs;
 pub(crate) mod inventory;
 
 pub use batch::{ExecutionBatch, PageOffloads, RankBuffer, RequestDispatch};
-
-/// How one pool is placed.
-///
-/// The deployment decides these values, so the ranks' reports do not carry
-/// them.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct PoolLayout {
-    /// Unresolved physical batches the pool admits at once, counted as at
-    /// least one.
-    pub queue_depth: usize,
-    /// Ranks the pool holds, counted as at least one.
-    pub ranks: usize,
-    /// The pool's components by name, each with its member ranks, parallel
-    /// degrees and distribution.
-    pub components: BTreeMap<String, BlockConfig>,
-}
+use ipc::execution::PoolLayout;
 
 /// Concrete pool information reported through the execution boundary.
 #[derive(Debug, Clone, Default)]

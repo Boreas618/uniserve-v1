@@ -24,11 +24,12 @@ use std::time::Duration;
 use crate::CommandWaker;
 use crate::SpecialTokenIds;
 use crate::worker::{
-    BatchResult, BlockConfig, CallResult, CommandOutcome, CommandResult, ExecutionBatch,
-    PoolLayout, Worker, WorkerFailure, WorkerGroupId, WorkerInfo, WorkerSubmitError,
+    BatchResult, BlockConfig, CallResult, CommandOutcome, CommandResult, ExecutionBatch, Worker,
+    WorkerFailure, WorkerGroupId, WorkerInfo, WorkerSubmitError,
 };
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
+use ipc::execution::PoolLayout;
 use ipc::philox;
 use ipc::{
     Call, CallKind, CallStatus, ErrorCode, MainProcessInfo, NewRequest, SamplingState, TensorRef,

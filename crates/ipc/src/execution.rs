@@ -1477,8 +1477,9 @@ pub struct Inventory {
     pub max_model_len: u32,
 }
 
-/// What a deployment launched one pool with (4.2).
-#[derive(Clone, Debug, Default)]
+/// What a deployment launched one pool with (4.2): the values the deployment decides, which the
+/// ranks' reports do not carry back.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PoolLayout {
     /// Unresolved physical batches the pool admits at once, counted as at least one.
     pub queue_depth: usize,
