@@ -18,7 +18,6 @@ use std::sync::Arc;
 use nn::weights::WeightLayout;
 use nn::{Backing, DType, DevicePtr, RetainedWeights, Shape, WeightKey};
 
-use crate::memory::allocation::Backing as _;
 use crate::memory::retained::Retained;
 use crate::memory::weights::{LoadedWeight, WeightStore, retained_key};
 use crate::{Error, Result};
@@ -268,10 +267,27 @@ impl<'a> Reloading<'a> {
     }
 
     /// What the load reached, how many weights it published, and how many stacks the device
-    /// rearranged.
-    pub fn finish(mut self) -> (Vec<LoadedWeight>, usize, usize) {
+    /// rearranged, once the granules of its packed weights are published.
+    ///
+    /// # Errors
+    ///
+    /// When the storage refuses a granule.
+    pub fn finish(mut self) -> Result<(Vec<LoadedWeight>, usize, usize)> {
         let published = self.store.published();
-        (self.store.take_log(), published, self.gathered)
+        Ok((self.store.finish()?, published, self.gathered))
+    }
+
+    /// Where the weight the load reaches next is published: where the serving weight it replaces
+    /// lies, so that the update maps it at that weight's address (§7.6); `None` when no serving
+    /// weight is at its position, and the store places it as a first load would.
+    fn placement(&self) -> Result<Option<crate::memory::weights::Placement>> {
+        let Some(old) = self.serving.get(self.store.logged()) else {
+            return Ok(None);
+        };
+        Ok(self
+            .storage
+            .mapped_weight(self.device, &retained_key(&old.key))?
+            .map(|mapped| mapped.placement()))
     }
 
     /// Publishes `key`'s stack from the serving one, when it is that stack in another slot order.
@@ -299,17 +315,17 @@ impl<'a> Reloading<'a> {
             .map_err(|_| Error::Invalid("a stack larger than this host addresses".into()))?;
         let slot = length / slots.len();
         let base = source.address();
-        let allocation = source.bytes();
         let backing = self.storage.store_on_device(
             self.device,
             &retained_key(key),
             length,
-            allocation,
+            source.placement(),
             |target, stream| {
                 for (to, from) in slots.iter().enumerate() {
-                    // SAFETY: both ranges lie inside live device allocations `length` long or
-                    // longer, the source mapped read-only and the destination this call's own
-                    // staging, and the caller synchronizes before either can go.
+                    // SAFETY: both ranges lie inside live device allocations, `length` bytes from
+                    // the weights' first bytes or longer, the source mapped read-only and the
+                    // destination this call's own staging, and the caller synchronizes before
+                    // either can go.
                     unsafe {
                         platform::memcpy_async(
                             target + (to * slot) as u64,
@@ -344,7 +360,13 @@ impl RetainedWeights for Reloading<'_> {
         shape: Shape,
         bytes: &[u8],
     ) -> nn::Result<Backing> {
-        self.store.publish(key, dtype, shape, bytes)
+        match self
+            .placement()
+            .map_err(|error| nn::Error::Unsupported(error.to_string()))?
+        {
+            Some(placement) => self.store.publish_at(key, dtype, shape, bytes, placement),
+            None => self.store.publish(key, dtype, shape, bytes),
+        }
     }
 
     /// The serving table stays: its address is what the captured graphs read, and the model

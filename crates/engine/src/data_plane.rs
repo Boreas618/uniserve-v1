@@ -539,14 +539,20 @@ impl DataPlane {
                     target.checkpoint.display()
                 ))
             })?;
+            // A replacement of a weight of its own takes an allocation of its length, and one of a
+            // packed weight its share of a granule: the granules hold them back to back.
             let mut bytes = 0;
             for pair in &pairs {
-                let storage = storage
+                let mapped = storage
                     .mapped_weight(device, &retained_key(&pair.old))?
                     .ok_or_else(|| {
                         Error::Invariant(format!("the rank maps no weight {}", pair.old))
                     })?;
-                bytes += storage.bytes() as u64;
+                bytes += if mapped.packed {
+                    mapped.length
+                } else {
+                    mapped.storage.bytes() as u64
+                };
             }
             ranks.push(RankLoad { pairs, log, bytes });
         }
@@ -598,7 +604,8 @@ impl DataPlane {
                             let mut store =
                                 Reloading::new(Arc::clone(storage), *device, serving);
                             model.load(target, &mut store)?;
-                            let (log, published, gathered) = store.finish();
+                            let (log, published, gathered) =
+                                store.finish().map_err(|error| error.to_string())?;
                             tracing::info!(
                                 device = device.0,
                                 published,
@@ -1085,11 +1092,17 @@ impl DataPlane {
                 Ok(())
             };
             let loaded = loading();
-            let keys: Vec<[u8; 32]> = store
-                .take_log()
-                .iter()
-                .map(|weight| retained_key(&weight.key))
-                .collect();
+            // A load that failed publishes none of the granules it packed: their weights are
+            // forgotten below.
+            let log = match &loaded {
+                Ok(()) => store.finish(),
+                Err(_) => Ok(store.abandon()),
+            };
+            let (log, loaded) = match log {
+                Ok(log) => (log, loaded),
+                Err(error) => (store.abandon(), Err(error)),
+            };
+            let keys: Vec<[u8; 32]> = log.iter().map(|weight| retained_key(&weight.key)).collect();
             if let Err(error) = loaded {
                 if let Err(cleanup) = storage.forget_weights(device, &keys) {
                     tracing::warn!(%cleanup, "a partial adapter load's storage was not released");

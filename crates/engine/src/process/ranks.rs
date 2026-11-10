@@ -322,7 +322,10 @@ fn load_rank(
                     &epoch.experts,
                 )
                 .context("loading the epoch's model")?;
-            (loaded, weights.take_log())
+            let log = weights
+                .finish()
+                .context("publishing the granules of the epoch's packed weights")?;
+            (loaded, log)
         }
         // No weight is mapped, so the plan sees the whole device: a recorded start sizes its cache
         // larger than a served one wherever the deployment does not bound it.

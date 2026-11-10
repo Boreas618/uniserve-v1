@@ -17,12 +17,31 @@
 //! The bytes themselves live at the Storage Server, under the rank's claim, inside the GPU's
 //! `budget` (§8's first operation table). This module owns the key and the store; how a key becomes
 //! a mapped region is [`WeightStorage`], which the rank's `Retained` client implements.
+//!
+//! The Storage Server imports a retained allocation in whole granules of the device's VMM
+//! granularity (2 MiB), so a weight of its own allocation takes its length rounded up to one. A
+//! weight smaller than a granule - a norm, a bias, a quantization scale - is packed instead: the
+//! store places it in a granule shared with other small weights ([`Placement::Packed`]), and the
+//! granule is published as one storage whose tensors lie at their offsets ([`WeightStorage::seal`]).
+//! A load that replaces such a weight places its successor at the same offset of a granule of its
+//! own, so the update maps the new granule at the old one's address (§7.6).
 
 use std::collections::BTreeMap;
 
 use nn::{Backing, DType, RetainedWeights, Shape, WeightKey};
 
 use crate::{Error, Result};
+
+/// Where a weight's bytes are retained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// An allocation of the weight's own, of `allocation` bytes: its true length rounded up to
+    /// whole granules.
+    Own { allocation: usize },
+    /// A granule shared with other weights smaller than one: at the first free offset when `at` is
+    /// `None`, else at byte `at` of a granule, as the weight it replaces lies in its own.
+    Packed { at: Option<usize> },
+}
 
 /// Where a rank's retained weights live: the Storage Server, behind the rank's client (§8).
 ///
@@ -39,14 +58,15 @@ pub trait WeightStorage: Send + Sync {
     /// `device`: the length it retains must be a positive multiple of it (§8).
     fn granularity(&self, device: platform::DeviceId) -> Result<usize>;
 
-    /// Retain `bytes` under `key` in an allocation of `allocation` bytes and answer the read-only
-    /// region they are mapped at.
+    /// Retain `bytes` under `key` where `placement` says and answer the read-only region they are
+    /// mapped at.
     ///
-    /// `bytes.len()` is the weight's true length, which is its shape's and is rarely a granule;
-    /// `allocation` is that length rounded up, and is what the server imports. The bytes past
-    /// `bytes.len()` are a tail nothing reads. A store that publishes the true length instead is
-    /// refused by the server's import, which is why the rounding happens in [`WeightStore::publish`]
-    /// rather than in the store.
+    /// `bytes.len()` is the weight's true length, which is its shape's and is rarely a granule. A
+    /// weight of its own allocation is retained in `allocation` bytes, that length rounded up,
+    /// which is what the server imports: the bytes past `bytes.len()` are a tail nothing reads. A
+    /// store that publishes the true length instead is refused by the server's import, which is
+    /// why the rounding happens in [`WeightStore::publish`] rather than in the store. A packed
+    /// weight is mapped at once and published with its granule at the next [`Self::seal`].
     ///
     /// Storing a key twice is the caller's error; a store may publish it again or answer the region
     /// it already holds.
@@ -55,8 +75,14 @@ pub trait WeightStorage: Send + Sync {
         device: platform::DeviceId,
         key: &[u8; 32],
         bytes: &[u8],
-        allocation: usize,
+        placement: Placement,
     ) -> Result<Backing>;
+
+    /// Publishes the granules of the weights packed on `device` since the last seal, each one
+    /// storage whose tensors lie at their offsets, and answers how many it published. A packed
+    /// weight is retained only once its granule is sealed: until then a reader of another process
+    /// misses it.
+    fn seal(&self, device: platform::DeviceId) -> Result<usize>;
 
     /// `bytes` in a region of `allocation` bytes that kernels may write, held by this process.
     ///
@@ -69,7 +95,7 @@ pub trait WeightStorage: Send + Sync {
         bytes: &[u8],
         allocation: usize,
     ) -> Result<Backing> {
-        self.store(device, key, bytes, allocation)
+        self.store(device, key, bytes, Placement::Own { allocation })
     }
 }
 
@@ -99,9 +125,13 @@ impl<S: WeightStorage + ?Sized> WeightStorage for std::sync::Arc<S> {
         device: platform::DeviceId,
         key: &[u8; 32],
         bytes: &[u8],
-        allocation: usize,
+        placement: Placement,
     ) -> Result<Backing> {
-        (**self).store(device, key, bytes, allocation)
+        (**self).store(device, key, bytes, placement)
+    }
+
+    fn seal(&self, device: platform::DeviceId) -> Result<usize> {
+        (**self).seal(device)
     }
 }
 
@@ -148,6 +178,13 @@ pub struct WeightStore<S: WeightStorage> {
     published: usize,
     /// Every weight the load reached, in its order, for the updates of §7.6.
     log: Vec<LoadedWeight>,
+    /// Of the weights published, how many were packed, the bytes their own allocations would have
+    /// taken, and the shared granules the seals published.
+    packed: usize,
+    unpacked_bytes: u64,
+    packed_granules: usize,
+    /// The granularity the storage imports in, once asked.
+    granularity: Option<usize>,
 }
 
 impl<S: WeightStorage> WeightStore<S> {
@@ -160,12 +197,36 @@ impl<S: WeightStorage> WeightStore<S> {
             from_store: 0,
             published: 0,
             log: Vec::new(),
+            packed: 0,
+            unpacked_bytes: 0,
+            packed_granules: 0,
+            granularity: None,
         }
     }
 
-    /// The weights the load reached, in its order, leaving the log empty.
-    pub fn take_log(&mut self) -> Vec<LoadedWeight> {
+    /// Ends the load: publishes the granules of the weights packed since the last seal and answers
+    /// the weights the load reached, in its order, leaving the log empty.
+    ///
+    /// # Errors
+    ///
+    /// When the storage refuses a granule: its weights are not retained, and the load fails.
+    pub fn finish(&mut self) -> Result<Vec<LoadedWeight>> {
+        self.packed_granules += self.storage.seal(self.device)?;
+        Ok(std::mem::take(&mut self.log))
+    }
+
+    /// Ends a load that will not serve: answers the weights it reached, whose granules are not
+    /// published, for the caller to forget.
+    pub fn abandon(&mut self) -> Vec<LoadedWeight> {
         std::mem::take(&mut self.log)
+    }
+
+    /// The device bytes packing saved: what the packed weights' own allocations would have taken,
+    /// less the shared granules sealed so far.
+    pub fn packing_saved(&self) -> u64 {
+        let granule = self.granularity.unwrap_or(0) as u64;
+        self.unpacked_bytes
+            .saturating_sub(self.packed_granules as u64 * granule)
     }
 
     /// How many weights the load reached so far: the position of the next one.
@@ -222,15 +283,8 @@ impl<S: WeightStorage> WeightStore<S> {
     /// embedding of 622329856 bytes against a 2097152-byte granule is refused by the import. The
     /// rounded length is what the store allocates and publishes; the tensor keeps `bytes`, and a
     /// reader maps the allocation and reads only the weight.
-    fn allocation_length(&self, bytes: usize) -> Result<usize> {
-        let granularity = self.storage.granularity(self.device).map_err(|error| {
-            Error::State(format!("the granularity of {}: {error}", self.device).leak())
-        })?;
-        if granularity == 0 {
-            return Err(Error::Invariant(
-                "the storage states a zero allocation granularity".into(),
-            ));
-        }
+    fn allocation_length(&mut self, bytes: usize) -> Result<usize> {
+        let granularity = self.granularity()?;
         bytes
             .div_ceil(granularity)
             .checked_mul(granularity)
@@ -239,6 +293,120 @@ impl<S: WeightStorage> WeightStore<S> {
                     "a weight of {bytes} bytes has no whole-granule allocation"
                 ))
             })
+    }
+
+    /// The granularity the storage imports a retained allocation in, on the store's device.
+    fn granularity(&mut self) -> Result<usize> {
+        if let Some(granularity) = self.granularity {
+            return Ok(granularity);
+        }
+        let granularity = self.storage.granularity(self.device).map_err(|error| {
+            Error::State(format!("the granularity of {}: {error}", self.device).leak())
+        })?;
+        if granularity == 0 {
+            return Err(Error::Invariant(
+                "the storage states a zero allocation granularity".into(),
+            ));
+        }
+        self.granularity = Some(granularity);
+        Ok(granularity)
+    }
+
+    /// Where a weight of `bytes` bytes is retained when nothing places it: packed when it is
+    /// smaller than a granule, else in an allocation of its own.
+    fn placement(&mut self, bytes: usize) -> Result<Placement> {
+        if bytes < self.granularity()? {
+            return Ok(Placement::Packed { at: None });
+        }
+        Ok(Placement::Own {
+            allocation: self.allocation_length(bytes)?,
+        })
+    }
+
+    /// Publishes `bytes` under `key` as [`RetainedWeights::publish`] does, at `placement` rather
+    /// than where the store places a weight of its length: a load that replaces a serving weight
+    /// places its successor as the serving one lies (§7.6).
+    ///
+    /// # Errors
+    ///
+    /// As [`RetainedWeights::publish`].
+    pub fn publish_at(
+        &mut self,
+        key: &WeightKey,
+        dtype: DType,
+        shape: Shape,
+        bytes: &[u8],
+        placement: Placement,
+    ) -> nn::Result<Backing> {
+        self.publish_placed(key, dtype, shape, bytes, Some(placement))
+    }
+
+    fn publish_placed(
+        &mut self,
+        key: &WeightKey,
+        dtype: DType,
+        shape: Shape,
+        bytes: &[u8],
+        placement: Option<Placement>,
+    ) -> nn::Result<Backing> {
+        // The key already states the element type the bytes are in; a caller that publishes under
+        // a key of another type would make the next load read the bytes as the wrong numbers.
+        if dtype != key.dtype {
+            return Err(nn::Error::Unsupported(format!(
+                "a weight keyed as {} cannot be published as {dtype:?}",
+                key.dtype
+            )));
+        }
+        let expected = shape
+            .numel()
+            .checked_mul(dtype.bytes().unwrap_or_default())
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or_else(|| {
+                nn::Error::Unsupported(format!(
+                    "a weight of shape {} in {dtype:?} has no byte length",
+                    shape
+                ))
+            })?;
+        if bytes.len() != expected {
+            return Err(nn::Error::Unsupported(format!(
+                "a weight of shape {} in {dtype:?} is {expected} bytes, not {}",
+                shape,
+                bytes.len()
+            )));
+        }
+
+        let storage_key = retained_key(key);
+        self.log.push(LoadedWeight {
+            key: key.clone(),
+            writable: false,
+        });
+        // Publishing a key this rank already mapped answers the region it holds: the bytes are the
+        // same weight, and the second publication would be the caller's error (§8, `publish`).
+        if let Some(backing) = self.mapped.get(&storage_key) {
+            return Ok(*backing);
+        }
+        let placement = match placement {
+            Some(placement) => placement,
+            None => self
+                .placement(bytes.len())
+                .map_err(|error| nn::Error::Unsupported(format!("sizing weight {key}: {error}")))?,
+        };
+        let backing = self
+            .storage
+            .store(self.device, &storage_key, bytes, placement)
+            .map_err(|error| {
+                nn::Error::Unsupported(format!("publishing weight {key}: {}", with_causes(&error)))
+            })?;
+        if let Placement::Packed { .. } = placement {
+            let rounded = self
+                .allocation_length(bytes.len())
+                .map_err(|error| nn::Error::Unsupported(format!("sizing weight {key}: {error}")))?;
+            self.packed += 1;
+            self.unpacked_bytes += rounded as u64;
+        }
+        self.mapped.insert(storage_key, backing);
+        self.published += 1;
+        Ok(backing)
     }
 
     /// The backing of `key`, mapped if this rank has not mapped it yet.
@@ -279,6 +447,9 @@ impl<S: WeightStorage> Drop for WeightStore<S> {
             mapped = self.mapped.len(),
             from_store = self.from_store,
             published = self.published,
+            packed = self.packed,
+            packed_granules = self.packed_granules,
+            packing_saved_bytes = self.packing_saved(),
             "the epoch's retained weights: what this rank mapped, read back and published"
         );
     }
@@ -305,54 +476,7 @@ impl<S: WeightStorage> RetainedWeights for WeightStore<S> {
         shape: Shape,
         bytes: &[u8],
     ) -> nn::Result<Backing> {
-        // The key already states the element type the bytes are in; a caller that publishes under
-        // a key of another type would make the next load read the bytes as the wrong numbers.
-        if dtype != key.dtype {
-            return Err(nn::Error::Unsupported(format!(
-                "a weight keyed as {} cannot be published as {dtype:?}",
-                key.dtype
-            )));
-        }
-        let expected = shape
-            .numel()
-            .checked_mul(dtype.bytes().unwrap_or_default())
-            .and_then(|bytes| usize::try_from(bytes).ok())
-            .ok_or_else(|| {
-                nn::Error::Unsupported(format!(
-                    "a weight of shape {} in {dtype:?} has no byte length",
-                    shape
-                ))
-            })?;
-        if bytes.len() != expected {
-            return Err(nn::Error::Unsupported(format!(
-                "a weight of shape {} in {dtype:?} is {expected} bytes, not {}",
-                shape,
-                bytes.len()
-            )));
-        }
-
-        let storage_key = retained_key(key);
-        self.log.push(LoadedWeight {
-            key: key.clone(),
-            writable: false,
-        });
-        // Publishing a key this rank already mapped answers the region it holds: the bytes are the
-        // same weight, and the second publication would be the caller's error (§8, `publish`).
-        if let Some(backing) = self.mapped.get(&storage_key) {
-            return Ok(*backing);
-        }
-        let allocation = self
-            .allocation_length(bytes.len())
-            .map_err(|error| nn::Error::Unsupported(format!("sizing weight {key}: {error}")))?;
-        let backing = self
-            .storage
-            .store(self.device, &storage_key, bytes, allocation)
-            .map_err(|error| {
-                nn::Error::Unsupported(format!("publishing weight {key}: {}", with_causes(&error)))
-            })?;
-        self.mapped.insert(storage_key, backing);
-        self.published += 1;
-        Ok(backing)
+        self.publish_placed(key, dtype, shape, bytes, None)
     }
 
     fn writable(
@@ -408,8 +532,11 @@ mod tests {
         /// The granule the driver imports a retained allocation in. One byte unless a test states
         /// otherwise, so a test that is not about rounding is not about rounding.
         granularity: usize,
-        /// What the last store was handed: the weight's true length and its allocation.
-        handed: Mutex<Option<(usize, usize)>>,
+        /// What the last store was handed: the weight's true length and its placement.
+        handed: Mutex<Option<(usize, Placement)>>,
+        /// The packed weights not sealed yet, and the granules each seal published.
+        unsealed: Mutex<Vec<[u8; 32]>>,
+        seals: Mutex<Vec<usize>>,
     }
 
     impl Default for FakeStorage {
@@ -421,6 +548,8 @@ mod tests {
                 next_address: AtomicUsize::new(0),
                 granularity: 1,
                 handed: Mutex::new(None),
+                unsealed: Mutex::new(Vec::new()),
+                seals: Mutex::new(Vec::new()),
             }
         }
     }
@@ -459,22 +588,43 @@ mod tests {
             _device: platform::DeviceId,
             key: &[u8; 32],
             bytes: &[u8],
-            allocation: usize,
+            placement: Placement,
         ) -> Result<Backing> {
             self.stores.fetch_add(1, Ordering::Relaxed);
-            *self.handed.lock().unwrap() = Some((bytes.len(), allocation));
-            if allocation < bytes.len() || !allocation.is_multiple_of(self.granularity) {
-                return Err(Error::Invalid(format!(
-                    "a retained allocation of {allocation} bytes is not a positive multiple of \
-                     the {}-byte granularity",
-                    self.granularity
-                )));
+            *self.handed.lock().unwrap() = Some((bytes.len(), placement));
+            match placement {
+                Placement::Own { allocation } => {
+                    if allocation < bytes.len() || !allocation.is_multiple_of(self.granularity) {
+                        return Err(Error::Invalid(format!(
+                            "a retained allocation of {allocation} bytes is not a positive \
+                             multiple of the {}-byte granularity",
+                            self.granularity
+                        )));
+                    }
+                    self.published.lock().unwrap().insert(*key, bytes.to_vec());
+                    Ok(Backing::new(
+                        ops::DevicePtr::new(self.address()),
+                        allocation as u64,
+                    ))
+                }
+                Placement::Packed { .. } => {
+                    // A packed weight is retained once its granule is sealed.
+                    self.unsealed.lock().unwrap().push(*key);
+                    self.published.lock().unwrap().insert(*key, bytes.to_vec());
+                    Ok(Backing::new(
+                        ops::DevicePtr::new(self.address()),
+                        bytes.len() as u64,
+                    ))
+                }
             }
-            self.published.lock().unwrap().insert(*key, bytes.to_vec());
-            Ok(Backing::new(
-                ops::DevicePtr::new(self.address()),
-                allocation as u64,
-            ))
+        }
+
+        fn seal(&self, _device: platform::DeviceId) -> Result<usize> {
+            let packed = std::mem::take(&mut *self.unsealed.lock().unwrap()).len();
+            // The fake packs every weight of a seal in one granule.
+            let granules = usize::from(packed > 0);
+            self.seals.lock().unwrap().push(granules);
+            Ok(granules)
         }
     }
 
@@ -696,38 +846,97 @@ mod tests {
     /// the Storage Server imports a retained allocation in whole granules and refuses the rest.
     #[test]
     fn a_weight_whose_length_is_not_a_granule_is_retained_in_a_rounded_allocation() {
-        const GRANULE: usize = 1 << 21;
+        const GRANULE: usize = 64;
         let storage = std::sync::Arc::new(FakeStorage::with_granularity(GRANULE));
         let mut store = WeightStore::new(
             Shared(std::sync::Arc::clone(&storage)),
             platform::DeviceId(0),
         );
         // The embedding that ended the epoch's model load is 622329856 bytes against a 2097152-byte
-        // granule, which is 296 granule and 190210304 bytes over; this is the same shape, small.
-        let bytes = vec![3_u8; 30];
+        // granule, which is 296 granules and 190210304 bytes over; this is the same shape, small.
+        let bytes = vec![3_u8; 2 * GRANULE + 2];
         let published = store
             .publish(
                 &key("blob:aaa", DType::BF16, "model.embed_tokens"),
                 DType::BF16,
-                ops::Shape::new(&[3, 5]),
+                ops::Shape::new(&[5, 13]),
                 &bytes,
             )
             .expect("a weight retained in a rounded allocation");
-        // What the store was handed: the true length to state, and the granule to import.
-        let (length, allocation) = storage.handed.lock().unwrap().expect("a store");
-        assert_eq!(length, 30);
-        assert_eq!(allocation, GRANULE);
-        assert_eq!(published.bytes(), GRANULE as u64);
+        // What the store was handed: the true length to state, and the granules to import.
+        let (length, placement) = storage.handed.lock().unwrap().expect("a store");
+        assert_eq!(length, 130);
+        assert_eq!(
+            placement,
+            Placement::Own {
+                allocation: 3 * GRANULE
+            }
+        );
+        assert_eq!(published.bytes(), 3 * GRANULE as u64);
         // A reader maps the allocation, and a second publication answers the same region.
         let again = store
             .publish(
                 &key("blob:aaa", DType::BF16, "model.embed_tokens"),
                 DType::BF16,
-                ops::Shape::new(&[3, 5]),
+                ops::Shape::new(&[5, 13]),
                 &bytes,
             )
             .expect("the region it holds");
         assert_eq!(published.address(), again.address());
+    }
+
+    /// Weights smaller than a granule share one, which the end of the load publishes: a reader
+    /// addresses each weight's own bytes, and the store counts the granules the packing saved.
+    #[test]
+    fn weights_smaller_than_a_granule_are_packed_and_published_when_the_load_ends() {
+        const GRANULE: usize = 1 << 21;
+        let storage = std::sync::Arc::new(FakeStorage::with_granularity(GRANULE));
+        let mut store = WeightStore::new(
+            Shared(std::sync::Arc::clone(&storage)),
+            platform::DeviceId(0),
+        );
+        let norms = ["model.layers.0.input_norm", "model.layers.0.post_norm"];
+        for norm in norms {
+            let published = store
+                .publish(
+                    &key("blob:aaa", DType::BF16, norm),
+                    DType::BF16,
+                    ops::Shape::new(&[4, 8]),
+                    &[0_u8; 64],
+                )
+                .expect("a packed weight");
+            assert_eq!(published.bytes(), 64);
+            let (_, placement) = storage.handed.lock().unwrap().expect("a store");
+            assert_eq!(placement, Placement::Packed { at: None });
+        }
+        assert!(storage.seals.lock().unwrap().is_empty());
+
+        let log = store.finish().expect("the granule is published");
+        assert_eq!(log.len(), 2);
+        assert_eq!(*storage.seals.lock().unwrap(), [1]);
+        // Two weights of their own would have taken two granules; they share one.
+        assert_eq!(store.packing_saved(), GRANULE as u64);
+    }
+
+    /// A load that replaces a packed weight places its successor where the serving one lies.
+    #[test]
+    fn a_placed_publication_keeps_its_placement() {
+        let storage = std::sync::Arc::new(FakeStorage::with_granularity(1 << 21));
+        let mut store = WeightStore::new(
+            Shared(std::sync::Arc::clone(&storage)),
+            platform::DeviceId(0),
+        );
+        let at = Placement::Packed { at: Some(512) };
+        store
+            .publish_at(
+                &key("blob:bbb", DType::BF16, "model.layers.0.input_norm"),
+                DType::BF16,
+                ops::Shape::new(&[4, 8]),
+                &[0_u8; 64],
+                at,
+            )
+            .expect("a placed weight");
+        assert_eq!(storage.handed.lock().unwrap().expect("a store").1, at);
     }
 
     /// A storage shared by two stores, as two ranks of one deployment share the Storage Server.
@@ -747,9 +956,13 @@ mod tests {
             _device: platform::DeviceId,
             key: &[u8; 32],
             bytes: &[u8],
-            allocation: usize,
+            placement: Placement,
         ) -> Result<Backing> {
-            self.0.store(platform::DeviceId(0), key, bytes, allocation)
+            self.0.store(platform::DeviceId(0), key, bytes, placement)
+        }
+
+        fn seal(&self, _device: platform::DeviceId) -> Result<usize> {
+            self.0.seal(platform::DeviceId(0))
         }
     }
 }

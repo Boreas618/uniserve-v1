@@ -257,7 +257,10 @@ struct State {
     /// The weights this rank has mapped, by device and key: a repeated fetch
     /// answers the mapping it already holds rather than mapping the region
     /// twice.
-    weights: BTreeMap<(i32, Key), Arc<Storage>>,
+    weights: BTreeMap<(i32, Key), MappedWeight>,
+    /// The granules this rank packs small weights into and has not
+    /// published yet ([`crate::memory::weights::WeightStorage::seal`]).
+    packs: Vec<OpenPack>,
     /// The tables a model writes after its load, which live as long as this process.
     tables: Vec<Arc<Storage>>,
     /// A standby worker's exclusive storages, until it is promoted; `None`
@@ -267,6 +270,91 @@ struct State {
     /// the predecessor lent them, until the worker takes them at its
     /// epoch's commit.
     inherited: Vec<InheritedPart>,
+}
+
+/// The alignment of a packed weight's first byte in its granule: what a device allocation
+/// guarantees, so a kernel reads a packed weight as it reads one of its own.
+const PACKED_ALIGNMENT: usize = 256;
+
+/// A retained weight a rank maps: the mapping of its allocation, where in it the weight lies, and
+/// the length a reader may address.
+///
+/// Every weight has a mapping of its own, a packed one included: its granule is mapped once per
+/// weight, so an update rebinds one weight's address without moving the others of its granule
+/// (§7.6). The mappings of a granule share its physical memory.
+#[derive(Clone)]
+pub struct MappedWeight {
+    pub storage: Arc<Storage>,
+    /// The weight's first byte in the allocation.
+    pub offset: u64,
+    /// The bytes a reader may address from the weight's first byte: a packed weight's own length,
+    /// the whole allocation of a weight of its own.
+    pub length: u64,
+    /// Whether the weight lies in a granule shared with other weights, smaller than one.
+    pub packed: bool,
+}
+
+impl MappedWeight {
+    /// The weight's first byte on the device.
+    pub fn address(&self) -> u64 {
+        self.storage.address() + self.offset
+    }
+
+    fn backing(&self) -> nn::Backing {
+        nn::Backing::new(ops::DevicePtr::new(self.address()), self.length)
+    }
+
+    /// Where a weight that replaces this one is placed, so that the update maps its allocation at
+    /// this one's address: at the same offset of a granule, or in an allocation of this length.
+    pub fn placement(&self) -> crate::memory::weights::Placement {
+        if self.packed {
+            crate::memory::weights::Placement::Packed {
+                at: Some(self.offset as usize),
+            }
+        } else {
+            crate::memory::weights::Placement::Own {
+                allocation: self.storage.bytes(),
+            }
+        }
+    }
+}
+
+/// A granule small weights are packed into, until its one storage record and their tensor
+/// records are published.
+struct OpenPack {
+    device: i32,
+    gpu: [u8; 16],
+    /// The granule's writable mapping, which the weights are copied in through.
+    staging: Arc<Storage>,
+    /// The descriptor the granule is published with, and each weight's mapping imports.
+    descriptor: std::os::fd::OwnedFd,
+    /// The byte ranges its weights take.
+    taken: Vec<std::ops::Range<usize>>,
+    tensors: Vec<::storage::TensorRecord>,
+}
+
+impl OpenPack {
+    /// Where a weight of `length` bytes goes in the granule of `granule` bytes: at `at` when that
+    /// range is free, else at the aligned end of what it holds; `None` when it does not fit.
+    fn offset(&self, length: usize, at: Option<usize>, granule: usize) -> Option<usize> {
+        let offset = match at {
+            Some(at) => at,
+            None => self
+                .taken
+                .iter()
+                .map(|range| range.end)
+                .max()
+                .unwrap_or(0)
+                .next_multiple_of(PACKED_ALIGNMENT),
+        };
+        let range = offset..offset.checked_add(length)?;
+        (range.end <= granule
+            && self
+                .taken
+                .iter()
+                .all(|taken| taken.end <= range.start || range.end <= taken.start))
+        .then_some(offset)
+    }
 }
 
 /// A key's bytes as hex, for the names a record and a refusal state.
@@ -346,6 +434,7 @@ impl Retained {
                 written: BTreeSet::new(),
                 used: BTreeSet::new(),
                 weights: BTreeMap::new(),
+                packs: Vec::new(),
                 tables: Vec::new(),
                 standby: launch.standby.then(Standby::default),
                 inherited: Vec::new(),
@@ -438,10 +527,10 @@ impl Retained {
     /// One mapping per (device, key): a repeated fetch answers the region the
     /// first one mapped, so a rank that serves two GPUs maps a shared weight
     /// once on each and never twice on one.
-    pub(crate) fn weight(&self, device: DeviceId, key: Key) -> Result<Option<Arc<Storage>>> {
+    pub(crate) fn weight(&self, device: DeviceId, key: Key) -> Result<Option<MappedWeight>> {
         let mut state = lock(&self.state);
-        if let Some(storage) = state.weights.get(&(device.0, key)) {
-            return Ok(Some(Arc::clone(storage)));
+        if let Some(mapped) = state.weights.get(&(device.0, key)) {
+            return Ok(Some(mapped.clone()));
         }
         let got = state
             .client
@@ -451,6 +540,7 @@ impl Retained {
             return Ok(None);
         };
         let index = tensor.storage as usize;
+        let (offset, length) = (tensor.offset, tensor.shape.iter().product::<u64>());
         let (record, descriptor) = got
             .storages
             .into_iter()
@@ -481,9 +571,138 @@ impl Retained {
                 Protection::ReadOnly,
             )?,
         };
+        // A weight smaller than a granule shares one with others, or (published by a build that
+        // packed nothing) holds one alone at its start: either way its successor is placed at its
+        // offset of a granule, and it addresses its own bytes alone.
+        let granularity = platform::HandleType::Descriptor.granularity(device)? as u64;
+        let packed = length < granularity;
+        let mapped = MappedWeight {
+            length: if packed {
+                length
+            } else {
+                storage.bytes() as u64 - offset
+            },
+            storage,
+            offset,
+            packed,
+        };
         state.used.insert(key);
-        state.weights.insert((device.0, key), Arc::clone(&storage));
-        Ok(Some(storage))
+        state.weights.insert((device.0, key), mapped.clone());
+        Ok(Some(mapped))
+    }
+
+    /// Places `length` bytes under `key` in a granule shared with other weights smaller than one,
+    /// at `at` or the first free offset, copies them in with `fill` (handed the address of the
+    /// weight's first byte, on a stream of the device's, synchronized before the weight is mapped)
+    /// and maps the weight read-only. The granule is published at [`Self::seal_packs`].
+    fn place_packed(
+        &self,
+        device: DeviceId,
+        key: Key,
+        length: usize,
+        at: Option<usize>,
+        fill: impl FnOnce(u64, &platform::Stream) -> Result<()>,
+    ) -> Result<MappedWeight> {
+        let granule = platform::HandleType::Descriptor.granularity(device)?;
+        if length == 0 || length >= granule {
+            return Err(Error::Invariant(format!(
+                "a weight of {length} bytes is not packed in a granule of {granule} bytes"
+            )));
+        }
+        let mut state = lock(&self.state);
+        if let Some(mapped) = state.weights.get(&(device.0, key)) {
+            return Ok(mapped.clone());
+        }
+        let gpu = state.gpu(device)?;
+        let found = state.packs.iter().enumerate().find_map(|(index, pack)| {
+            (pack.device == device.0)
+                .then(|| pack.offset(length, at, granule))
+                .flatten()
+                .map(|offset| (index, offset))
+        });
+        let (index, offset) = match found {
+            Some(found) => found,
+            None => {
+                let (staging, descriptor) = Storage::retainable(device, granule, &[])?;
+                let pack = OpenPack {
+                    device: device.0,
+                    gpu,
+                    staging,
+                    descriptor,
+                    taken: Vec::new(),
+                    tensors: Vec::new(),
+                };
+                let offset = pack.offset(length, at, granule).ok_or_else(|| {
+                    Error::Invariant(format!(
+                        "a weight of {length} bytes at {at:?} does not fit an empty granule"
+                    ))
+                })?;
+                state.packs.push(pack);
+                (state.packs.len() - 1, offset)
+            }
+        };
+        let pack = &mut state.packs[index];
+        let stream = platform::Stream::new(device)?;
+        fill(pack.staging.address() + offset as u64, &stream)?;
+        stream.synchronize()?;
+        // The weight's own read-only mapping of the granule: the writable one is the pack's until
+        // it is published, and an update rebinds this one alone.
+        let descriptor = pack
+            .descriptor
+            .try_clone()
+            .map_err(|error| Error::transport_source("duplicating a descriptor", error))?;
+        let storage = Storage::import(descriptor, granule, device, &[], Protection::ReadOnly)?;
+        pack.taken.push(offset..offset + length);
+        pack.tensors.push(::storage::TensorRecord {
+            key,
+            name: format!("weight-{}", hex_key(&key.0)),
+            storage: 0,
+            offset: offset as u64,
+            dtype: "uint8".into(),
+            shape: vec![length as u64],
+            strides: vec![1],
+            access: Access::ReadOnly,
+        });
+        let mapped = MappedWeight {
+            storage,
+            offset: offset as u64,
+            length: length as u64,
+            packed: true,
+        };
+        state.used.insert(key);
+        state.weights.insert((device.0, key), mapped.clone());
+        Ok(mapped)
+    }
+
+    /// Publishes the open granules of `device`: one `put` each, of the granule's storage and the
+    /// tensor records of the weights packed in it. Answers how many granules it published.
+    fn seal_packs(&self, device: DeviceId) -> Result<usize> {
+        let mut state = lock(&self.state);
+        let (sealing, open): (Vec<OpenPack>, Vec<OpenPack>) = std::mem::take(&mut state.packs)
+            .into_iter()
+            .partition(|pack| pack.device == device.0);
+        state.packs = open;
+        let mut sealed = 0;
+        for pack in sealing {
+            if pack.tensors.is_empty() {
+                continue;
+            }
+            let record = StorageRecord {
+                location: Location::Device { gpu: pack.gpu },
+                segment: None,
+                bytes: pack.staging.bytes() as u64,
+                fabric: None,
+            };
+            state
+                .client
+                .put(
+                    pack.tensors,
+                    &[(record, std::os::fd::AsFd::as_fd(&pack.descriptor))],
+                )
+                .map_err(|error| storage_error("publishing a granule of packed weights", error))?;
+            sealed += 1;
+        }
+        Ok(sealed)
     }
 
     /// The scope's retained device bytes on `device`, which NVML attributes
@@ -858,13 +1077,7 @@ impl crate::memory::weights::WeightStorage for Retained {
     /// holds nothing under `key`.
     fn fetch(&self, device: DeviceId, key: &[u8; 32]) -> Result<Option<nn::Backing>> {
         let key = Self::device_key(key, &lock(&self.state).gpu(device)?);
-        let Some(storage) = self.weight(device, key)? else {
-            return Ok(None);
-        };
-        Ok(Some(nn::Backing::new(
-            ops::DevicePtr::new(storage.address()),
-            storage.bytes() as u64,
-        )))
+        Ok(self.weight(device, key)?.map(|mapped| mapped.backing()))
     }
 
     /// Publish `bytes` under `key` and answer the region they are mapped at.
@@ -908,11 +1121,32 @@ impl crate::memory::weights::WeightStorage for Retained {
         device: DeviceId,
         key: &[u8; 32],
         bytes: &[u8],
-        allocation: usize,
+        placement: crate::memory::weights::Placement,
     ) -> Result<nn::Backing> {
         if bytes.is_empty() {
             return Err(Error::Invalid("a weight holds no bytes".into()));
         }
+        let allocation = match placement {
+            crate::memory::weights::Placement::Own { allocation } => allocation,
+            crate::memory::weights::Placement::Packed { at } => {
+                let key = Self::device_key(key, &lock(&self.state).gpu(device)?);
+                let mapped =
+                    self.place_packed(device, key, bytes.len(), at, |target, stream| {
+                        // SAFETY: the granule holds `bytes.len()` writable bytes from `target`, and the
+                        // copy is synchronized before the weight is mapped.
+                        unsafe {
+                            platform::memcpy_async(
+                                target,
+                                bytes.as_ptr() as u64,
+                                bytes.len(),
+                                stream,
+                            )?;
+                        }
+                        Ok(())
+                    })?;
+                return Ok(mapped.backing());
+            }
+        };
         // The store rounds a weight's true length up to the granule the import needs; a length that
         // is not such a multiple would be refused by the driver, so it is refused here by name.
         let granularity = platform::HandleType::Descriptor.granularity(device)?;
@@ -973,15 +1207,16 @@ impl crate::memory::weights::WeightStorage for Retained {
             )
             .map_err(|error| storage_error("publishing a retained weight", error))?;
         drop(state);
-        let Some(storage) = self.weight(device, key)? else {
+        let Some(mapped) = self.weight(device, key)? else {
             return Err(Error::Interface(
                 "a published weight was not found under its own key".into(),
             ));
         };
-        Ok(nn::Backing::new(
-            ops::DevicePtr::new(storage.address()),
-            storage.bytes() as u64,
-        ))
+        Ok(mapped.backing())
+    }
+
+    fn seal(&self, device: DeviceId) -> Result<usize> {
+        self.seal_packs(device)
     }
 }
 
@@ -995,30 +1230,39 @@ impl Retained {
         ::storage::key::device_weight(&Key(*key), gpu)
     }
 
-    /// The mapped storage of the weight retained under `key` on `device`, when the server holds it.
-    pub fn mapped_weight(&self, device: DeviceId, key: &[u8; 32]) -> Result<Option<Arc<Storage>>> {
+    /// The mapping of the weight retained under `key` on `device`, when the server holds it.
+    pub fn mapped_weight(&self, device: DeviceId, key: &[u8; 32]) -> Result<Option<MappedWeight>> {
         let key = Self::device_key(key, &lock(&self.state).gpu(device)?);
         self.weight(device, key)
     }
 
     /// Publishes a weight of `length` bytes whose bytes `fill` writes on the device, under `key`,
-    /// and answers the read-only region they are mapped at.
+    /// where `placement` says, and answers the read-only region they are mapped at.
     ///
     /// [`WeightStorage::store`] is this with the bytes coming from the host. A rearrangement of
     /// weights the device already holds has no host bytes to hand over: `fill` copies from the
-    /// region the rank serves from into the writable staging mapping, on a stream of its own
-    /// beside the serving one, and the record is published once the copy completed, so a reader
-    /// never maps a half-written weight.
+    /// region the rank serves from into the writable staging mapping (handed the address of the
+    /// weight's first byte), on a stream of its own beside the serving one, and the record is
+    /// published once the copy completed, so a reader never maps a half-written weight. A packed
+    /// weight's record is published with its granule ([`WeightStorage::seal`]).
     ///
     /// [`WeightStorage::store`]: crate::memory::weights::WeightStorage::store
+    /// [`WeightStorage::seal`]: crate::memory::weights::WeightStorage::seal
     pub fn store_on_device(
         &self,
         device: DeviceId,
         key: &[u8; 32],
         length: usize,
-        allocation: usize,
+        placement: crate::memory::weights::Placement,
         fill: impl FnOnce(u64, &platform::Stream) -> Result<()>,
     ) -> Result<nn::Backing> {
+        let allocation = match placement {
+            crate::memory::weights::Placement::Own { allocation } => allocation,
+            crate::memory::weights::Placement::Packed { at } => {
+                let key = Self::device_key(key, &lock(&self.state).gpu(device)?);
+                return Ok(self.place_packed(device, key, length, at, fill)?.backing());
+            }
+        };
         let granularity = platform::HandleType::Descriptor.granularity(device)?;
         if length == 0 || allocation < length || !allocation.is_multiple_of(granularity) {
             return Err(Error::Invariant(format!(
@@ -1059,15 +1303,12 @@ impl Retained {
             )
             .map_err(|error| storage_error("publishing a retained weight", error))?;
         drop(state);
-        let Some(storage) = self.weight(device, key)? else {
+        let Some(mapped) = self.weight(device, key)? else {
             return Err(Error::Interface(
                 "a published weight was not found under its own key".into(),
             ));
         };
-        Ok(nn::Backing::new(
-            ops::DevicePtr::new(storage.address()),
-            storage.bytes() as u64,
-        ))
+        Ok(mapped.backing())
     }
 
     /// Puts each pair's new weight at the old weight's address on `device`, and ends the rank's
@@ -1105,8 +1346,27 @@ impl Retained {
                     hex_key(&new.0)
                 ))
             })?;
-            target.rebind_retained(&source)?;
-            state.weights.insert((device.0, new), target);
+            // The new allocation is mapped over the old one's whole: a packed weight's successor lies
+            // at its offset of a granule (`MappedWeight::placement`), so the address the rank's
+            // views and graphs hold is the new weight's first byte.
+            if (target.offset, target.storage.bytes()) != (source.offset, source.storage.bytes()) {
+                return Err(Error::Invariant(format!(
+                    "the weight {} lies at byte {} of {} and its replacement at byte {} of {}",
+                    hex_key(&new.0),
+                    target.offset,
+                    target.storage.bytes(),
+                    source.offset,
+                    source.storage.bytes()
+                )));
+            }
+            target.storage.rebind_retained(&source.storage)?;
+            state.weights.insert(
+                (device.0, new),
+                MappedWeight {
+                    length: source.length,
+                    ..target
+                },
+            );
             state.used.remove(&old);
             released.insert(old);
             // The new key's second mapping ends with `source`: the address the load published at
@@ -1132,6 +1392,11 @@ impl Retained {
             state.weights.remove(&(device.0, key));
             state.used.remove(&key);
             released.insert(key);
+        }
+        // A weight packed in a granule not published yet is not published with it.
+        for pack in &mut state.packs {
+            pack.tensors
+                .retain(|tensor| !released.contains(&tensor.key));
         }
         self.release_keys(&mut state, &released, "releasing an abandoned weight load")
     }
