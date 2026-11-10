@@ -7,9 +7,9 @@
 //! [`HfChatRenderer::render`] and tokenizes the rendered prompt (the
 //! multimodal path first resolves its image placeholders in it).
 //!
-//! Rendering converts each `ChatMessage` into a `TemplateMessage`, the
-//! OpenAI-compatible JSON shape that Hugging Face templates inspect: assistant
-//! messages split into visible `content`, `reasoning_content`, and
+//! Rendering converts each wire `ChatMessage` (`crate::openai`) into a
+//! `TemplateMessage`, the JSON shape that Hugging Face templates inspect:
+//! assistant messages split into visible `content`, `reasoning_content`, and
 //! `tool_calls`, and message content takes the shape selected by
 //! `ChatTemplateContentFormat` (configured, or detected in `format` under
 //! `Auto`). Request tools reach the template only when
@@ -28,10 +28,8 @@ use tracing::{info, trace, warn};
 use self::format::ChatTemplateContentFormat;
 use self::jinja::{CompiledChatTemplate, TemplateContext};
 use self::value::{TemplateValue, to_template_value};
-use crate::input::chat::{
-    ChatConfig as RequestChatOptions, ChatContent, ChatContentPart, ChatMessage, ChatRequest,
-    ChatRole, ChatToolChoice,
-};
+use crate::input::chat::{ChatConfig as RequestChatOptions, ChatRequest, ChatToolChoice};
+use crate::openai::{ChatMessage, ContentPart, MessageContent};
 use crate::output::chat::Error;
 use crate::output::chat::Result;
 use crate::output::tools::Tool;
@@ -332,76 +330,86 @@ fn to_template_messages(
         .collect()
 }
 
-/// Converts one structured message into the renderer's template value model.
+/// Converts one wire message into the renderer's template value model.
+///
+/// An assistant message's visible text is its text content, its reasoning a
+/// non-empty `reasoning`, and its tool calls carry their arguments as parsed
+/// JSON (`{}` when absent); a developer message's tools reach the template
+/// as request tools do, an empty list as none.
 fn to_template_message(
     message: &ChatMessage,
     content_format: ChatTemplateContentFormat,
     multimodal: Option<&MultimodalRenderInfo>,
 ) -> Result<TemplateMessage> {
+    let message_of = |role, content: &MessageContent| -> Result<TemplateMessage> {
+        Ok(TemplateMessage {
+            role,
+            content: to_template_content(content, content_format, multimodal)?,
+            tools: None,
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        })
+    };
     Ok(match message {
-        ChatMessage::System { content } => TemplateMessage {
-            role: "system",
-            content: to_template_content(content, content_format, multimodal)?,
-            tools: None,
-            reasoning_content: None,
-            tool_calls: None,
-            tool_call_id: None,
+        ChatMessage::System { content, .. } => message_of("system", content)?,
+        ChatMessage::Developer { content, tools, .. } => TemplateMessage {
+            tools: tools
+                .as_deref()
+                .filter(|tools| !tools.is_empty())
+                .map(|tools| {
+                    let tools: Vec<Tool> = tools.iter().map(Tool::from).collect();
+                    to_template_tools(&tools)
+                }),
+            ..message_of("developer", content)?
         },
-        ChatMessage::Developer { content, tools } => TemplateMessage {
-            role: "developer",
-            content: to_template_content(content, content_format, multimodal)?,
-            tools: tools.as_deref().map(to_template_tools),
-            reasoning_content: None,
-            tool_calls: None,
-            tool_call_id: None,
-        },
-        ChatMessage::User { content } => TemplateMessage {
-            role: "user",
-            content: to_template_content(content, content_format, multimodal)?,
-            tools: None,
-            reasoning_content: None,
-            tool_calls: None,
-            tool_call_id: None,
-        },
-        ChatMessage::Assistant { content } => {
-            let text = content.text();
-            let reasoning = content.reasoning();
-            let tool_calls = to_template_tool_calls(content)?;
-            let content =
-                to_template_content(&ChatContent::Text(text), content_format, multimodal)?;
+        ChatMessage::User { content, .. } => message_of("user", content)?,
+        ChatMessage::Assistant {
+            content,
+            tool_calls,
+            reasoning,
+            ..
+        } => {
+            let text = match content {
+                None => String::new(),
+                Some(MessageContent::Text(text)) => text.clone(),
+                Some(MessageContent::Parts(parts)) => parts
+                    .iter()
+                    .map(|part| match part {
+                        ContentPart::Text { text } => Ok(text.as_str()),
+                        ContentPart::ImageUrl { .. } => {
+                            Err(Error::UnsupportedMultimodalContent("image_url"))
+                        }
+                    })
+                    .collect::<Result<String>>()?,
+            };
             TemplateMessage {
-                role: "assistant",
-                content,
-                tools: None,
-                reasoning_content: reasoning.clone(),
-                tool_calls,
-                tool_call_id: None,
+                reasoning_content: reasoning.clone().filter(|text| !text.is_empty()),
+                tool_calls: to_template_tool_calls(tool_calls.as_deref().unwrap_or_default())?,
+                ..message_of("assistant", &MessageContent::Text(text))?
             }
         }
-        ChatMessage::ToolResponse {
+        ChatMessage::Tool {
             content,
             tool_call_id,
         } => TemplateMessage {
-            role: "tool",
-            content: to_template_content(content, content_format, multimodal)?,
-            tools: None,
-            reasoning_content: None,
-            tool_calls: None,
             tool_call_id: Some(tool_call_id.clone()),
+            ..message_of("tool", content)?
         },
     })
 }
 
 /// Parses assistant tool arguments and converts complete calls into template values.
 fn to_template_tool_calls(
-    content: &crate::output::chat::AssistantMessage,
+    calls: &[crate::openai::ToolCall],
 ) -> Result<Option<Vec<TemplateToolCall>>> {
     let mut tool_calls = Vec::new();
 
     // Arguments reach the template as a parsed JSON value rather than JSON
     // text, so templates can index or iterate them (`arguments.items()`).
-    for tool_call in content.tool_calls() {
-        let arguments = serde_json::from_str(&tool_call.arguments).map_err(|error| {
+    for tool_call in calls {
+        let arguments = tool_call.function.arguments.as_deref().unwrap_or("{}");
+        let arguments = serde_json::from_str(arguments).map_err(|error| {
             Error::ChatTemplate(format!(
                 "assistant tool call `{}` has invalid JSON arguments: {}",
                 tool_call.id,
@@ -414,7 +422,7 @@ fn to_template_tool_calls(
             id: tool_call.id.clone(),
             r#type: "function",
             function: TemplateToolFunction {
-                name: tool_call.name.clone(),
+                name: tool_call.function.name.clone(),
                 arguments,
             },
         });
@@ -428,7 +436,7 @@ fn to_template_tool_calls(
 /// Under `Preserve`, plain text stays a string and part lists stay lists, so
 /// templates that branch on `content is string` see the caller's shape.
 fn to_template_content(
-    content: &ChatContent,
+    content: &MessageContent,
     content_format: ChatTemplateContentFormat,
     multimodal: Option<&MultimodalRenderInfo>,
 ) -> Result<TemplateContent> {
@@ -440,8 +448,8 @@ fn to_template_content(
             TemplateContent::OpenAi(to_template_openai_content(content, multimodal)?)
         }
         ChatTemplateContentFormat::Preserve => match content {
-            ChatContent::Text(text) => TemplateContent::String(text.clone()),
-            ChatContent::Parts(_) => {
+            MessageContent::Text(text) => TemplateContent::String(text.clone()),
+            MessageContent::Parts(_) => {
                 TemplateContent::OpenAi(to_template_openai_content(content, multimodal)?)
             }
         },
@@ -450,20 +458,18 @@ fn to_template_content(
 
 /// Converts message content into an OpenAI-style list of typed parts.
 fn to_template_openai_content(
-    content: &ChatContent,
+    content: &MessageContent,
     multimodal: Option<&MultimodalRenderInfo>,
 ) -> Result<Vec<TemplateContentPart>> {
     match content {
-        ChatContent::Text(text) => Ok(vec![TemplateContentPart::Text { text: text.clone() }]),
-        ChatContent::Parts(parts) => parts
+        MessageContent::Text(text) => Ok(vec![TemplateContentPart::Text { text: text.clone() }]),
+        MessageContent::Parts(parts) => parts
             .iter()
             .map(|part| match part {
-                ChatContentPart::Text { text } => {
-                    Ok(TemplateContentPart::Text { text: text.clone() })
-                }
+                ContentPart::Text { text } => Ok(TemplateContentPart::Text { text: text.clone() }),
                 // Image parts reach the template as `{"type": "image"}`; the
                 // image payload itself is not exposed to the template.
-                ChatContentPart::ImageUrl { .. } => {
+                ContentPart::ImageUrl { .. } => {
                     multimodal.ok_or(Error::UnsupportedMultimodalContent("image_url"))?;
                     Ok(TemplateContentPart::Image)
                 }
@@ -474,17 +480,17 @@ fn to_template_openai_content(
 
 /// Flattens content into a string while substituting multimodal placeholder tokens.
 fn to_template_string_content(
-    content: &ChatContent,
+    content: &MessageContent,
     multimodal: Option<&MultimodalRenderInfo>,
 ) -> Result<String> {
     match content {
-        ChatContent::Text(text) => Ok(text.clone()),
-        ChatContent::Parts(parts) => {
+        MessageContent::Text(text) => Ok(text.clone()),
+        MessageContent::Parts(parts) => {
             let mut out = String::new();
             for part in parts {
                 match part {
-                    ChatContentPart::Text { text } => out.push_str(text),
-                    ChatContentPart::ImageUrl { .. } => {
+                    ContentPart::Text { text } => out.push_str(text),
+                    ContentPart::ImageUrl { .. } => {
                         let multimodal =
                             multimodal.ok_or(Error::UnsupportedMultimodalContent("image_url"))?;
                         out.push_str(&multimodal.placeholder_token);
@@ -529,7 +535,10 @@ const JSON_CALL_INSTRUCTION: &str =
 /// instructs no format.
 pub fn template_instructs_json_tool_calls(renderer: &HfChatRenderer) -> bool {
     let probe = ChatRequest {
-        messages: vec![ChatMessage::text(ChatRole::User, "probe")],
+        messages: vec![ChatMessage::User {
+            content: MessageContent::Text("probe".to_owned()),
+            name: None,
+        }],
         tools: vec![Tool {
             name: "probe".to_owned(),
             description: None,
@@ -553,12 +562,11 @@ mod tests {
     use serde_json::Value;
 
     use super::{ChatTemplateContentFormat, HfChatRenderer, MultimodalRenderInfo};
-    use crate::input::chat::{
-        ChatContentPart, ChatMessage, ChatRequest, ChatRole, ChatToolChoice, GenerationPromptMode,
-        ReasoningEffort,
-    };
+    use crate::input::chat::{ChatRequest, ChatToolChoice, GenerationPromptMode, ReasoningEffort};
+    use crate::openai::ChatMessage;
     use crate::output::chat::{AssistantContentBlock, Error, Result};
     use crate::output::tools::Tool;
+    use crate::test_support::chat;
 
     const QWEN3_TEMPLATE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -568,7 +576,7 @@ mod tests {
     fn sample_request(messages: Vec<ChatMessage>) -> ChatRequest {
         ChatRequest {
             messages,
-            ..ChatRequest::for_test()
+            ..chat::request(vec![chat::user("test")])
         }
     }
 
@@ -589,10 +597,10 @@ mod tests {
     }
 
     fn image_request() -> ChatRequest {
-        sample_request(vec![ChatMessage::user(vec![
-            ChatContentPart::text("a"),
-            ChatContentPart::image_url("data:image/png;base64,test"),
-            ChatContentPart::text("b"),
+        sample_request(vec![chat::user_parts(vec![
+            chat::text_part("a"),
+            chat::image_part("data:image/png;base64,test"),
+            chat::text_part("b"),
         ])])
     }
 
@@ -626,11 +634,11 @@ mod tests {
         // string`, so `Auto` selects `Preserve`: the system string still
         // supports `+` concatenation while the user parts stay a list.
         let request = sample_request(vec![
-            ChatMessage::system("policy"),
-            ChatMessage::user(vec![
-                ChatContentPart::text("a"),
-                ChatContentPart::image_url("data:image/png;base64,test"),
-                ChatContentPart::text("b"),
+            chat::system("policy"),
+            chat::user_parts(vec![
+                chat::text_part("a"),
+                chat::image_part("data:image/png;base64,test"),
+                chat::text_part("b"),
             ]),
         ]);
         let rendered = render_mm(
@@ -645,7 +653,7 @@ mod tests {
 
     #[test]
     fn chat_template_supports_pycompat_templates() {
-        let request = sample_request(vec![ChatMessage::text(ChatRole::User, "<think>hello")]);
+        let request = sample_request(vec![chat::user("<think>hello")]);
 
         let rendered = render(
             Some(
@@ -660,10 +668,7 @@ mod tests {
 
     #[test]
     fn chat_template_passes_continue_final_message_to_template() {
-        let mut request = sample_request(vec![ChatMessage::text(
-            ChatRole::Assistant,
-            "The capital of",
-        )]);
+        let mut request = sample_request(vec![chat::assistant("The capital of")]);
 
         assert_eq!(
             render(
@@ -688,9 +693,9 @@ mod tests {
 
     #[test]
     fn chat_template_flattens_text_parts_for_string_templates() {
-        let request = sample_request(vec![ChatMessage::user(vec![
-            ChatContentPart::text("hello"),
-            ChatContentPart::text(" world"),
+        let request = sample_request(vec![chat::user_parts(vec![
+            chat::text_part("hello"),
+            chat::text_part(" world"),
         ])]);
 
         let rendered = render(Some("{{ messages[0].content }}"), &request).unwrap();
@@ -700,7 +705,7 @@ mod tests {
 
     #[test]
     fn chat_template_exposes_developer_tools() {
-        let request = sample_request(vec![ChatMessage::developer(
+        let request = sample_request(vec![chat::developer(
             "policy",
             Some(vec![Tool {
                 name: "get_weather".to_string(),
@@ -727,7 +732,7 @@ mod tests {
     fn chat_template_keeps_string_text_for_openai_detected_templates() {
         // The template tests `content is string` without looping over content
         // items, so `Auto` selects `String` and plain text arrives as a string.
-        let request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
+        let request = sample_request(vec![chat::user("hello")]);
 
         let rendered = render(
             Some(
@@ -742,9 +747,9 @@ mod tests {
 
     #[test]
     fn chat_template_emits_openai_text_blocks_for_structured_templates() {
-        let request = sample_request(vec![ChatMessage::user(vec![
-            ChatContentPart::text("hello"),
-            ChatContentPart::text("world"),
+        let request = sample_request(vec![chat::user_parts(vec![
+            chat::text_part("hello"),
+            chat::text_part("world"),
         ])]);
 
         let rendered = render(
@@ -760,7 +765,7 @@ mod tests {
 
     #[test]
     fn chat_template_requires_a_template() {
-        let request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
+        let request = sample_request(vec![chat::user("hello")]);
         let error = render(None, &request).unwrap_err();
 
         assert!(matches!(error, Error::MissingChatTemplate));
@@ -768,7 +773,7 @@ mod tests {
 
     #[test]
     fn chat_template_injects_special_tokens_into_context() {
-        let request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
+        let request = sample_request(vec![chat::user("hello")]);
         let special_tokens = HfSpecialTokens {
             bos_token: Some(NamedSpecialToken::Text("<bos>".to_string())),
             ..Default::default()
@@ -791,7 +796,7 @@ mod tests {
 
     #[test]
     fn chat_template_exposes_assistant_reasoning_separately() {
-        let request = sample_request(vec![ChatMessage::assistant_blocks(vec![
+        let request = sample_request(vec![chat::assistant_blocks(vec![
             AssistantContentBlock::Reasoning {
                 text: "inner".to_string(),
             },
@@ -811,9 +816,9 @@ mod tests {
 
     #[test]
     fn chat_template_forces_string_content_format_when_configured() {
-        let request = sample_request(vec![ChatMessage::user(vec![
-            ChatContentPart::text("hello"),
-            ChatContentPart::text(" world"),
+        let request = sample_request(vec![chat::user_parts(vec![
+            chat::text_part("hello"),
+            chat::text_part(" world"),
         ])]);
 
         let rendered = HfChatRenderer::new(
@@ -832,9 +837,9 @@ mod tests {
 
     #[test]
     fn chat_template_forces_openai_content_format_when_configured() {
-        let request = sample_request(vec![ChatMessage::user(vec![
-            ChatContentPart::text("hello"),
-            ChatContentPart::text(" world"),
+        let request = sample_request(vec![chat::user_parts(vec![
+            chat::text_part("hello"),
+            chat::text_part(" world"),
         ])]);
 
         let rendered = HfChatRenderer::new(
@@ -851,7 +856,7 @@ mod tests {
 
     #[test]
     fn chat_template_exposes_default_template_kwargs() {
-        let request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
+        let request = sample_request(vec![chat::user("hello")]);
         let renderer = HfChatRenderer::new(
             Some("{{ enable_thinking }}|{{ default_only }}".to_string()),
             HashMap::from([
@@ -871,7 +876,7 @@ mod tests {
     /// their own; the others keep their default values.
     #[test]
     fn request_template_kwargs_override_default_template_kwargs() {
-        let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
+        let mut request = sample_request(vec![chat::user("hello")]);
         request.chat_options.template_kwargs = HashMap::from([
             ("enable_thinking".to_string(), Value::Bool(true)),
             ("request_only".to_string(), Value::String("y".to_string())),
@@ -893,7 +898,7 @@ mod tests {
 
     #[test]
     fn chat_template_reasoning_effort_overrides_default_template_kwargs() {
-        let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
+        let mut request = sample_request(vec![chat::user("hello")]);
         request.chat_options.reasoning_effort = Some(ReasoningEffort::Max);
 
         let renderer = HfChatRenderer::new(
@@ -914,11 +919,8 @@ mod tests {
     #[test]
     fn qwen3_template_omits_reasoning_for_prior_assistant_messages() {
         let request = sample_request(vec![
-            ChatMessage::text(
-                ChatRole::User,
-                "Hi. Tell me about the capital of France in short",
-            ),
-            ChatMessage::assistant_blocks(vec![
+            chat::user("Hi. Tell me about the capital of France in short"),
+            chat::assistant_blocks(vec![
                 AssistantContentBlock::Reasoning {
                     text: "\nOkay, the user is asking... I think that's all.\n".to_string(),
                 },
@@ -926,7 +928,7 @@ mod tests {
                     text: "Paris is the capital of France.".to_string(),
                 },
             ]),
-            ChatMessage::text(ChatRole::User, "Tell me about Paris more."),
+            chat::user("Tell me about Paris more."),
         ]);
 
         let rendered = render(Some(QWEN3_TEMPLATE), &request).unwrap();
@@ -945,7 +947,7 @@ mod tests {
 
     #[test]
     fn qwen3_template_renders_single_user_prompt() {
-        let request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
+        let request = sample_request(vec![chat::user("hello")]);
 
         let rendered = render(Some(QWEN3_TEMPLATE), &request).unwrap();
 
@@ -959,10 +961,7 @@ mod tests {
 
     #[test]
     fn qwen3_template_renders_system_user_prompt() {
-        let request = sample_request(vec![
-            ChatMessage::text(ChatRole::System, "be brief"),
-            ChatMessage::text(ChatRole::User, "hello"),
-        ]);
+        let request = sample_request(vec![chat::system("be brief"), chat::user("hello")]);
 
         let rendered = render(Some(QWEN3_TEMPLATE), &request).unwrap();
 
@@ -981,7 +980,7 @@ mod tests {
         // The Qwen3 template emits content only when it is a string. A forced
         // `OpenAi` format still wins over detection, so the part list renders
         // as empty user content.
-        let request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
+        let request = sample_request(vec![chat::user("hello")]);
 
         let rendered = HfChatRenderer::new(
             Some(QWEN3_TEMPLATE.to_string()),
@@ -1003,8 +1002,8 @@ mod tests {
     #[test]
     fn qwen3_template_keeps_reasoning_after_the_last_user_query() {
         let mut request = sample_request(vec![
-            ChatMessage::text(ChatRole::User, "What is 1 + 1?"),
-            ChatMessage::assistant_blocks(vec![
+            chat::user("What is 1 + 1?"),
+            chat::assistant_blocks(vec![
                 AssistantContentBlock::Reasoning {
                     text: "need simple arithmetic".to_string(),
                 },
@@ -1032,7 +1031,7 @@ mod tests {
 
     #[test]
     fn chat_template_exposes_tools_to_templates_when_auto_enabled() {
-        let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
+        let mut request = sample_request(vec![chat::user("hello")]);
         request.tools = vec![Tool {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
@@ -1062,7 +1061,7 @@ mod tests {
             "type": "object",
             "properties": {"city": {"type": "string"}},
         });
-        let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
+        let mut request = sample_request(vec![chat::user("hello")]);
         request.tools = vec![
             Tool {
                 name: "get_weather".to_string(),
@@ -1104,14 +1103,14 @@ mod tests {
     #[test]
     fn chat_template_exposes_assistant_tool_calls_and_tool_messages() {
         let request = sample_request(vec![
-            ChatMessage::assistant_blocks(vec![AssistantContentBlock::ToolCall(
+            chat::assistant_blocks(vec![AssistantContentBlock::ToolCall(
                 crate::output::chat::AssistantToolCall {
                     id: "call_1".to_string(),
                     name: "get_weather".to_string(),
                     arguments: r#"{"city":"Paris"}"#.to_string(),
                 },
             )]),
-            ChatMessage::tool_response("Sunny", "call_1"),
+            chat::tool_response("Sunny", "call_1"),
         ]);
 
         let rendered = render(
@@ -1130,7 +1129,7 @@ mod tests {
         // An `items` key in tool arguments must not shadow the dict `items()`
         // method (see `TemplateMap`), and iteration follows the key order of
         // the arguments JSON.
-        let request = sample_request(vec![ChatMessage::assistant_blocks(vec![
+        let request = sample_request(vec![chat::assistant_blocks(vec![
             AssistantContentBlock::ToolCall(crate::output::chat::AssistantToolCall {
                 id: "call_1".to_string(),
                 name: "add".to_string(),

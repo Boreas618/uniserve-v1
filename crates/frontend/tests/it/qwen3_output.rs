@@ -6,6 +6,7 @@ use frontend::input::chat::{ChatRequest, ChatToolChoice};
 use frontend::output::chat::AssistantEvent;
 use frontend::output::chat::{AssistantBlockKind, ChatOutputProcessor};
 use frontend::output::tools::Tool;
+use frontend::test_support::chat;
 use frontend::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 use tokenizers::models::bpe::BPE;
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
@@ -32,7 +33,7 @@ fn qwen_tokenizer() -> Result<DynTokenizer, Box<dyn std::error::Error + Send + S
 /// A chat request that declares the `lookup` tool with `Auto` tool choice,
 /// which enables tool-call parsing.
 fn request_with_lookup() -> ChatRequest {
-    let mut request = ChatRequest::for_test();
+    let mut request = chat::request(vec![chat::user("test")]);
     request.tools = vec![Tool {
         name: "lookup".to_string(),
         description: None,

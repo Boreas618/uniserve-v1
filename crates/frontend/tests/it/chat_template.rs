@@ -7,10 +7,10 @@
 
 use std::collections::HashMap;
 
-use frontend::input::chat::{
-    ChatContentPart, ChatMessage, ChatRequest, ChatRole, GenerationPromptMode, HfChatRenderer,
-};
+use frontend::input::chat::{ChatRequest, GenerationPromptMode, HfChatRenderer};
+use frontend::openai::ChatMessage;
 use frontend::output::chat::{AssistantContentBlock, AssistantToolCall};
+use frontend::test_support::chat;
 use proto::config::ChatTemplateContentFormat;
 
 const QWEN3_TEMPLATE: &str = include_str!(concat!(
@@ -32,7 +32,7 @@ fn hf_render(
 fn base_request(messages: Vec<ChatMessage>) -> ChatRequest {
     ChatRequest {
         messages,
-        ..ChatRequest::for_test()
+        ..chat::request(vec![chat::user("test")])
     }
 }
 
@@ -41,9 +41,9 @@ fn base_request(messages: Vec<ChatMessage>) -> ChatRequest {
 /// Flattened to a string, the content reads `"ab"`; in the OpenAI format it is
 /// a list of two text-part objects.
 fn multipart_user() -> ChatRequest {
-    let mut request = base_request(vec![ChatMessage::user(vec![
-        ChatContentPart::text("a"),
-        ChatContentPart::text("b"),
+    let mut request = base_request(vec![chat::user_parts(vec![
+        chat::text_part("a"),
+        chat::text_part("b"),
     ])]);
     request.chat_options.generation_prompt_mode = GenerationPromptMode::NoGenerationPrompt;
     request
@@ -82,9 +82,9 @@ fn auto_detection_treats_direct_content_loop_template_as_openai() {
 
 fn qwen_history() -> ChatRequest {
     base_request(vec![
-        ChatMessage::text(ChatRole::User, "What is the capital of France?"),
-        ChatMessage::assistant_text("The capital of France is Paris."),
-        ChatMessage::text(ChatRole::User, "And of Italy?"),
+        chat::user("What is the capital of France?"),
+        chat::assistant("The capital of France is Paris."),
+        chat::user("And of Italy?"),
     ])
 }
 
@@ -110,13 +110,13 @@ const MIXED_ARGS: &str = r#"{"zulu":2,"alpha":1.00,"mike":"hi","delta":[3,4]}"#;
 
 fn assistant_tool_call_history(arguments: &str) -> Vec<ChatMessage> {
     vec![
-        ChatMessage::user("Run the tool."),
-        ChatMessage::assistant_blocks(vec![AssistantContentBlock::ToolCall(AssistantToolCall {
+        chat::user("Run the tool."),
+        chat::assistant_blocks(vec![AssistantContentBlock::ToolCall(AssistantToolCall {
             id: "call-1".to_string(),
             name: "do_thing".to_string(),
             arguments: arguments.to_string(),
         })]),
-        ChatMessage::tool_response("{\"ok\":true}", "call-1"),
+        chat::tool_response("{\"ok\":true}", "call-1"),
     ]
 }
 

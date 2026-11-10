@@ -350,19 +350,7 @@ impl InputProcessor {
             return Err(reject("image_output"));
         }
         if let Prompt::Chat(chat) = prompt {
-            // Tool definitions, prior assistant tool calls, and tool responses all require a
-            // model that parses tool calls.
-            let uses_tools = !chat.tools.is_empty()
-                || chat.messages.iter().any(|message| match message {
-                    crate::input::chat::ChatMessage::Developer { tools, .. } => {
-                        tools.as_ref().is_some_and(|tools| !tools.is_empty())
-                    }
-                    crate::input::chat::ChatMessage::Assistant { content } => {
-                        content.has_tool_calls()
-                    }
-                    crate::input::chat::ChatMessage::ToolResponse { .. } => true,
-                    _ => false,
-                });
+            let uses_tools = chat.uses_tools();
             if uses_tools && !self.supports_tool_calling() {
                 return Err(reject("tool_calling"));
             }

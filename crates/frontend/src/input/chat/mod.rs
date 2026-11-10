@@ -4,13 +4,10 @@
 //!
 //! The template comes from the model files or `chat_config.template`.
 
-pub use request::{
-    ChatConfig, ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatRole, ChatToolChoice,
-    GenerationPromptMode, ReasoningEffort,
-};
+pub use request::{ChatConfig, ChatRequest, ChatToolChoice, GenerationPromptMode, ReasoningEffort};
 pub use template::HfChatRenderer;
 
-/// Chat messages, options, tools, and validation.
+/// Chat requests: the wire messages, options, tools, and validation.
 pub mod request;
 /// Chat-template loading and rendering.
 pub mod template;

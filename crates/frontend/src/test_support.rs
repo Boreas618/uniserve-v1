@@ -289,3 +289,128 @@ impl crate::events::Outcome for Unrecorded {
 
     fn abandoned(&mut self) {}
 }
+
+/// Wire chat messages and requests for the tests that render or lower chat:
+/// each message as a client sends it.
+pub mod chat {
+    use crate::input::chat::{ChatConfig, ChatRequest, ChatToolChoice};
+    use crate::openai::{
+        ChatMessage, ContentPart, FunctionCallResponse, ImageUrl, MessageContent, ToolCall,
+    };
+    use crate::output::chat::AssistantContentBlock;
+    use crate::output::tools::Tool;
+
+    /// A request of `messages` with default render options and no tools.
+    pub fn request(messages: Vec<ChatMessage>) -> ChatRequest {
+        ChatRequest {
+            messages,
+            chat_options: ChatConfig::default(),
+            tools: Vec::new(),
+            tool_choice: ChatToolChoice::None,
+        }
+    }
+
+    /// A system message of `text`.
+    pub fn system(text: impl Into<String>) -> ChatMessage {
+        ChatMessage::System {
+            content: MessageContent::Text(text.into()),
+            name: None,
+        }
+    }
+
+    /// A user message of `text`.
+    pub fn user(text: impl Into<String>) -> ChatMessage {
+        ChatMessage::User {
+            content: MessageContent::Text(text.into()),
+            name: None,
+        }
+    }
+
+    /// A user message of content `parts`.
+    pub fn user_parts(parts: Vec<ContentPart>) -> ChatMessage {
+        ChatMessage::User {
+            content: MessageContent::Parts(parts),
+            name: None,
+        }
+    }
+
+    /// A text content part.
+    pub fn text_part(text: impl Into<String>) -> ContentPart {
+        ContentPart::Text { text: text.into() }
+    }
+
+    /// An image content part of `url`.
+    pub fn image_part(url: impl Into<String>) -> ContentPart {
+        ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: url.into(),
+                detail: None,
+            },
+            uuid: None,
+        }
+    }
+
+    /// A developer message of `text`, declaring `tools`.
+    pub fn developer(text: impl Into<String>, tools: Option<Vec<Tool>>) -> ChatMessage {
+        ChatMessage::Developer {
+            content: MessageContent::Text(text.into()),
+            tools: tools.map(|tools| {
+                tools
+                    .into_iter()
+                    .map(|tool| crate::openai::Tool::Function {
+                        function: crate::openai::Function {
+                            name: tool.name,
+                            description: tool.description,
+                            parameters: tool.parameters,
+                        },
+                    })
+                    .collect()
+            }),
+            name: None,
+        }
+    }
+
+    /// An assistant message of `text`.
+    pub fn assistant(text: impl Into<String>) -> ChatMessage {
+        assistant_blocks(vec![AssistantContentBlock::Text { text: text.into() }])
+    }
+
+    /// The assistant message a client sends back for a turn whose output
+    /// was `blocks`: its reasoning, its text and its tool calls.
+    pub fn assistant_blocks(blocks: Vec<AssistantContentBlock>) -> ChatMessage {
+        let mut reasoning = String::new();
+        let mut text = String::new();
+        let mut tool_calls = Vec::new();
+        for block in blocks {
+            match block {
+                AssistantContentBlock::Reasoning { text: part } => reasoning.push_str(&part),
+                AssistantContentBlock::Text { text: part } => text.push_str(&part),
+                AssistantContentBlock::ToolCall(call) => tool_calls.push(ToolCall {
+                    id: call.id,
+                    tool_type: "function".to_owned(),
+                    function: FunctionCallResponse {
+                        name: call.name,
+                        arguments: Some(call.arguments),
+                    },
+                }),
+            }
+        }
+        ChatMessage::Assistant {
+            content: (!text.is_empty()).then_some(MessageContent::Text(text)),
+            name: None,
+            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+            reasoning: (!reasoning.is_empty()).then_some(reasoning),
+        }
+    }
+
+    /// A tool's response of `content` to the call `tool_call_id`.
+    pub fn tool_response(
+        content: impl Into<String>,
+        tool_call_id: impl Into<String>,
+    ) -> ChatMessage {
+        ChatMessage::Tool {
+            content: MessageContent::Text(content.into()),
+            tool_call_id: tool_call_id.into(),
+        }
+    }
+}

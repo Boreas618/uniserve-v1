@@ -35,9 +35,7 @@ use serde_json::Value;
 use tracing::{debug, error};
 use tracing_futures::Instrument as _;
 
-use crate::input::chat::{
-    ChatContent, ChatContentPart, ChatMessage as ServingChatMessage, ChatRequest, ChatToolChoice,
-};
+use crate::input::chat::{ChatRequest, ChatToolChoice};
 use crate::input::{GenerateRequest, InputProcessor, Prompt, ServeError};
 use crate::openai::RequestId;
 use crate::openai::error::{bail_invalid_request, bail_server_error, server_error};
@@ -49,9 +47,7 @@ use crate::openai::{
     ToolCallDelta, TopLogProb, Usage, ValidatedJson, check_model_served, convert_logit_bias,
 };
 use crate::openai::{Generation, Server};
-use crate::output::chat::{
-    AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantToolCall,
-};
+use crate::output::chat::{AssistantBlockKind, AssistantContentBlock, AssistantMessage};
 use crate::output::text::TextDecodeOptions;
 use crate::output::text::{
     DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs, DecodedTokenLogprob,
@@ -1477,17 +1473,15 @@ pub fn lower_chat_request(
             "chat_template_kwargs may not set `{name}`, which the request itself determines."
         );
     }
-    let messages = request
-        .messages
-        .into_iter()
-        .map(convert_message)
-        .try_collect()?;
+    for message in &request.messages {
+        validate_message(message)?;
+    }
 
     let lowered = GenerateRequest {
         request_id,
         prompt: Prompt::Chat(ChatRequest {
-            messages,
-            tools: convert_tools(request.tools)?,
+            messages: request.messages,
+            tools: convert_tools(request.tools),
             // An absent choice lets the model decide, as OpenAI's default does.
             tool_choice: request.tool_choice.unwrap_or(ChatToolChoice::Auto),
             chat_options: crate::input::chat::ChatConfig {
@@ -1523,140 +1517,62 @@ fn convert_modalities(modalities: &[ChatModality]) -> GenerationConstraint {
     }
 }
 
-/// Converts one wire chat message into the serving layer's structured message model.
-///
-/// Assistant content becomes ordered blocks: non-empty reasoning first, then
-/// text content, then tool calls.
+/// Validates one wire chat message as the template renders it.
 ///
 /// # Errors
 ///
 /// Rejects an assistant message with no reasoning, content, or tool calls, an
 /// assistant message with image content, and a non-function tool call.
-fn convert_message(message: ChatMessage) -> Result<ServingChatMessage, ApiError> {
-    match message {
-        ChatMessage::System { content, .. } => {
-            Ok(ServingChatMessage::system(convert_content(content)?))
-        }
-        ChatMessage::User { content, .. } => {
-            Ok(ServingChatMessage::user(convert_content(content)?))
-        }
-        ChatMessage::Assistant {
-            content,
-            tool_calls,
-            reasoning,
-            ..
-        } => {
-            let mut blocks = Vec::new();
-            if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
-                blocks.push(AssistantContentBlock::Reasoning { text: reasoning });
-            }
-            if let Some(content) = content {
-                blocks.extend(convert_assistant_content(content)?);
-            }
-            if let Some(tool_calls) = tool_calls {
-                blocks.extend(convert_assistant_tool_calls(tool_calls)?);
-            }
-            if blocks.is_empty() {
-                bail_invalid_request!("Assistant messages must contain content or tool_calls.");
-            }
-            Ok(ServingChatMessage::assistant_blocks(blocks))
-        }
-        ChatMessage::Tool {
-            content,
-            tool_call_id,
-        } => Ok(ServingChatMessage::tool_response(
-            convert_content(content)?,
-            tool_call_id,
-        )),
-        ChatMessage::Developer { content, tools, .. } => Ok(ServingChatMessage::developer(
-            convert_content(content)?,
-            convert_message_tools(tools)?,
-        )),
+fn validate_message(message: &ChatMessage) -> Result<(), ApiError> {
+    let ChatMessage::Assistant {
+        content,
+        tool_calls,
+        reasoning,
+        ..
+    } = message
+    else {
+        return Ok(());
+    };
+    if let Some(MessageContent::Parts(parts)) = content
+        && parts
+            .iter()
+            .any(|part| matches!(part, ContentPart::ImageUrl { .. }))
+    {
+        bail_invalid_request!("Assistant message content must be text.");
     }
+    let tool_calls = tool_calls.as_deref().unwrap_or_default();
+    if tool_calls.iter().any(|call| call.tool_type != "function") {
+        bail_invalid_request!("Only function tool calls are supported.");
+    }
+    let has_reasoning = reasoning.as_ref().is_some_and(|text| !text.is_empty());
+    let has_content = match content {
+        None => false,
+        Some(MessageContent::Text(_)) => true,
+        Some(MessageContent::Parts(parts)) => !parts.is_empty(),
+    };
+    if !has_reasoning && !has_content && tool_calls.is_empty() {
+        bail_invalid_request!("Assistant messages must contain content or tool_calls.");
+    }
+    Ok(())
 }
 
-/// Converts OpenAI message content into serving chat content.
-fn convert_content(content: MessageContent) -> Result<ChatContent, ApiError> {
-    match content {
-        MessageContent::Text(text) => Ok(ChatContent::Text(text)),
-        MessageContent::Parts(parts) => parts
-            .into_iter()
-            .map(|part| match part {
-                ContentPart::Text { text } => Ok(ChatContentPart::text(text)),
-                ContentPart::ImageUrl { image_url, uuid } => Ok(ChatContentPart::ImageUrl {
-                    image_url: image_url.url,
-                    detail: image_url.detail,
-                    uuid,
-                }),
-            })
-            .try_collect()
-            .map(ChatContent::Parts),
+impl From<&Tool> for tools::Tool {
+    /// The function a wire tool declares, as the template presents it and
+    /// the tool parser reads calls of it.
+    fn from(tool: &Tool) -> Self {
+        let Tool::Function { function } = tool;
+        Self {
+            name: function.name.clone(),
+            description: function.description.clone(),
+            parameters: function.parameters.clone(),
+            strict: None,
+        }
     }
-}
-
-/// Converts assistant message content into text blocks, rejecting image parts.
-fn convert_assistant_content(
-    content: MessageContent,
-) -> Result<Vec<AssistantContentBlock>, ApiError> {
-    match content {
-        MessageContent::Text(text) => Ok(vec![AssistantContentBlock::Text { text }]),
-        MessageContent::Parts(parts) => parts
-            .into_iter()
-            .map(|part| match part {
-                ContentPart::Text { text } => Ok(AssistantContentBlock::Text { text }),
-                ContentPart::ImageUrl { .. } => {
-                    bail_invalid_request!("Assistant message content must be text.")
-                }
-            })
-            .collect(),
-    }
-}
-
-/// Validates and converts assistant function calls into structured content blocks.
-///
-/// Missing arguments become the empty JSON object `{}`.
-fn convert_assistant_tool_calls(
-    tool_calls: Vec<ToolCall>,
-) -> Result<Vec<AssistantContentBlock>, ApiError> {
-    tool_calls
-        .into_iter()
-        .map(|tool_call| {
-            if tool_call.tool_type != "function" {
-                bail_invalid_request!("Only function tool calls are supported.");
-            }
-            Ok(AssistantContentBlock::ToolCall(AssistantToolCall {
-                id: tool_call.id,
-                name: tool_call.function.name,
-                arguments: tool_call
-                    .function
-                    .arguments
-                    .unwrap_or_else(|| "{}".to_string()),
-            }))
-        })
-        .collect()
 }
 
 /// Converts OpenAI function tools into serving tool definitions.
-fn convert_tools(tools: Option<Vec<Tool>>) -> Result<Vec<tools::Tool>, ApiError> {
-    tools
-        .unwrap_or_default()
-        .into_iter()
-        .map(|tool| {
-            let Tool::Function { function } = tool;
-            Ok(tools::Tool {
-                name: function.name,
-                description: function.description,
-                parameters: function.parameters,
-                strict: None,
-            })
-        })
-        .collect()
-}
-
-/// Converts developer-message tools, mapping an absent or empty list to `None`.
-fn convert_message_tools(tools: Option<Vec<Tool>>) -> Result<Option<Vec<tools::Tool>>, ApiError> {
-    let tools = convert_tools(tools)?;
-    Ok((!tools.is_empty()).then_some(tools))
+fn convert_tools(tools: Option<Vec<Tool>>) -> Vec<tools::Tool> {
+    tools.iter().flatten().map(tools::Tool::from).collect()
 }
 
 // Logprob values: the text layer's decoded candidates, where each position

@@ -112,7 +112,7 @@ pub struct StreamOptions {
 }
 
 /// A tool definition accepted by chat-completion requests.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Tool {
     /// Function tool callable by the assistant.
@@ -123,7 +123,7 @@ pub enum Tool {
 }
 
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 /// Function-tool name, description, and JSON parameter schema.
 pub struct Function {
@@ -135,7 +135,7 @@ pub struct Function {
     pub parameters: Value,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 /// Completed assistant tool call.
 pub struct ToolCall {
@@ -148,7 +148,7 @@ pub struct ToolCall {
     pub function: FunctionCallResponse,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 /// Completed function name and serialized arguments.
 pub struct FunctionCallResponse {
@@ -186,7 +186,7 @@ pub struct FunctionCallDelta {
 
 /// A role-tagged OpenAI-compatible chat message.
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "role")]
 #[serde(deny_unknown_fields)]
 pub enum ChatMessage {
