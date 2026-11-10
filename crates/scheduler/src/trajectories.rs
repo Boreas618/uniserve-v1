@@ -98,7 +98,7 @@ use storage::manifest::{Storage as PagedStorage, StorageLayout};
 use storage::protocol::{PageSlot, Reply, Request};
 use storage::{Key, Scope};
 
-use crate::host_pages::Servers;
+use crate::host_pages::{Purpose, Servers};
 use crate::worker::WorkerGroupId;
 
 /// The version of [`Record`]: a record of another version names no pages.
@@ -259,22 +259,14 @@ fn hold_every_sample(stored: &[&StoredRank], all: &[StoredRank]) -> bool {
         .all(|(shape, held)| !held.is_empty() && covers(shape, held))
 }
 
-/// What a submitted request is for.
-enum Purpose {
+/// What the store asked the pools for, whose answer it reads.
+enum Asked {
     /// The reservation of an offload's pages on one rank.
     Reserve { request: RequestId, rank: usize },
     /// The commit of an offload's pages on one rank.
     Commit { request: RequestId },
     /// The pin of a restore's pages of one stored rank.
     Pin { request: RequestId, source: usize },
-    /// A pin answered for a restore that ended meanwhile: whatever it
-    /// pinned is released.
-    Orphan { pin: Pinned, keys: Vec<Key> },
-    /// A reservation answered for an offload that ended meanwhile: whatever
-    /// it reserved is aborted.
-    Abandoned { rank: RankPool, keys: Vec<Key> },
-    /// An abort or an unpin, whose answer only reports failures.
-    Settle,
 }
 
 /// Where an offload stands.
@@ -373,7 +365,7 @@ pub(crate) enum Restored {
 pub(crate) struct TrajectoryStore {
     /// The connections to the pools' servers, with the purpose of every
     /// request not yet answered.
-    servers: Servers<Purpose>,
+    servers: Servers<Asked>,
     /// The engine's host.
     host: String,
     /// The denoising ranks of each worker group the store serves, in rank
@@ -528,7 +520,7 @@ impl TrajectoryStore {
                 &rank.scope,
                 keys.clone(),
                 None,
-                Purpose::Reserve {
+                Asked::Reserve {
                     request,
                     rank: index,
                 },
@@ -630,7 +622,10 @@ impl TrajectoryStore {
     /// Whether a reservation of `request`'s offload has not been answered.
     fn answering(&self, request: RequestId) -> bool {
         self.servers.pending().any(|purpose| {
-            matches!(purpose, Purpose::Reserve { request: owner, .. } if *owner == request)
+            matches!(
+                purpose,
+                Purpose::Store(Asked::Reserve { request: owner, .. }) if *owner == request
+            )
         })
     }
 
@@ -709,7 +704,7 @@ impl TrajectoryStore {
         for (client, commit) in commits {
             if self
                 .servers
-                .submit(client, &commit, Purpose::Commit { request })
+                .submit(client, &commit, Purpose::Store(Asked::Commit { request }))
             {
                 answering += 1;
             }
@@ -743,13 +738,8 @@ impl TrajectoryStore {
                 .iter()
                 .map(|&(page, _)| keys[page as usize])
                 .collect();
-            self.servers.settle(
-                rank.client,
-                rank.pool.pool,
-                reserved,
-                false,
-                Purpose::Settle,
-            );
+            self.servers
+                .settle(rank.client, rank.pool.pool, reserved, false);
         }
     }
 
@@ -845,7 +835,7 @@ impl TrajectoryStore {
                 source.pinned.pool,
                 &source.pinned.reader,
                 source.keys.clone(),
-                Purpose::Pin {
+                Asked::Pin {
                     request,
                     source: index,
                 },
@@ -982,14 +972,17 @@ impl TrajectoryStore {
     /// what they pinned when they are answered.
     fn orphan_pins(&mut self, request: RequestId, sources: &[Source]) {
         for purpose in self.servers.pending_mut() {
-            if let Purpose::Pin {
+            if let Purpose::Store(Asked::Pin {
                 request: owner,
                 source,
-            } = purpose
+            }) = purpose
                 && *owner == request
             {
+                let pin = &sources[*source].pinned;
                 *purpose = Purpose::Orphan {
-                    pin: sources[*source].pinned.clone(),
+                    client: pin.client,
+                    pool: pin.pool,
+                    reader: pin.reader.clone(),
                     keys: sources[*source].keys.clone(),
                 };
             }
@@ -1021,14 +1014,15 @@ impl TrajectoryStore {
             };
             let keys = offload.keys.clone();
             for purpose in self.servers.pending_mut() {
-                if let Purpose::Reserve {
+                if let Purpose::Store(Asked::Reserve {
                     request: owner,
                     rank,
-                } = purpose
+                }) = purpose
                     && *owner == request
                 {
                     *purpose = Purpose::Abandoned {
-                        rank: ranks[*rank].clone(),
+                        client: ranks[*rank].client,
+                        pool: ranks[*rank].pool.pool,
                         keys: keys[*rank].clone(),
                     };
                 }
@@ -1042,8 +1036,7 @@ impl TrajectoryStore {
         if keys.is_empty() {
             return;
         }
-        self.servers
-            .unpin(pin.client, pin.pool, &pin.reader, keys, Purpose::Settle);
+        self.servers.unpin(pin.client, pin.pool, &pin.reader, keys);
     }
 
     /// Source `source` answered `request`'s pin with `slots`: once every
@@ -1100,7 +1093,7 @@ impl TrajectoryStore {
         for (purpose, reply) in self.servers.answers() {
             moved = true;
             match (purpose, reply) {
-                (Purpose::Reserve { request, rank }, reply) => {
+                (Asked::Reserve { request, rank }, reply) => {
                     let slots = match reply {
                         Reply::Reserved { slots } => slots,
                         other => {
@@ -1110,7 +1103,7 @@ impl TrajectoryStore {
                     };
                     self.reserved(request, rank, slots);
                 }
-                (Purpose::Commit { request }, reply) => {
+                (Asked::Commit { request }, reply) => {
                     let committed = matches!(reply, Reply::Committed);
                     if !committed {
                         tracing::warn!(?reply, "a host latent pool commit failed");
@@ -1126,7 +1119,7 @@ impl TrajectoryStore {
                         }
                     }
                 }
-                (Purpose::Pin { request, source }, reply) => {
+                (Asked::Pin { request, source }, reply) => {
                     let slots = match reply {
                         Reply::Pinned { slots } => slots,
                         other => {
@@ -1136,32 +1129,6 @@ impl TrajectoryStore {
                     };
                     self.pinned(request, source, slots);
                 }
-                (Purpose::Orphan { pin, keys }, reply) => {
-                    if let Reply::Pinned { slots } = reply {
-                        self.unpin(&pin, pinned(&keys, &slots));
-                    }
-                }
-                (Purpose::Abandoned { rank, keys }, reply) => {
-                    if let Reply::Reserved { slots } = reply {
-                        let reserved: Vec<Key> = keys
-                            .iter()
-                            .zip(&slots)
-                            .filter(|(_, slot)| matches!(slot, PageSlot::Reserved { .. }))
-                            .map(|(key, _)| *key)
-                            .collect();
-                        self.servers.settle(
-                            rank.client,
-                            rank.pool.pool,
-                            reserved,
-                            false,
-                            Purpose::Settle,
-                        );
-                    }
-                }
-                (Purpose::Settle, Reply::Error { kind, message }) => {
-                    tracing::warn!(?kind, message, "a host latent pool request failed");
-                }
-                (Purpose::Settle, _) => {}
             }
         }
         self.sweep();

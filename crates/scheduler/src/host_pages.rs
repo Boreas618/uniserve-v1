@@ -5,12 +5,16 @@
 //! Each store that keeps derived state in the pools (the host KV cache and
 //! KV storage, `kv_cache::offload`; latent trajectories, `trajectories`;
 //! encoder outputs, `encoder_outputs`) states only its keys, which pages it
-//! stores and when, and what each answer means to it (its purpose `P`).
+//! stores and when, and what each answer means to it (its own purpose `S`).
 //! The page lifecycle is the same for all of them and is stated here once:
 //! a reader pins the pages it reads ([`Servers::pin`]) and unpins them when
 //! done ([`Servers::unpin`]); a writer reserves slots for the pages it
 //! writes ([`Servers::reserve`]), copies into them, and commits them, or
-//! aborts them when its copy failed ([`Servers::settle`]).
+//! aborts them when its copy failed ([`Servers::settle`]). A reader or a
+//! writer that ends before its pins or reservation are answered turns them
+//! into [`Purpose::Orphan`] or [`Purpose::Abandoned`] ([`Servers::pending_mut`]),
+//! and the client releases whatever they took once they are answered, so
+//! a store reads only the answers of its own purposes.
 //!
 //! The scheduler connects as a head of its engine's epoch, so what an epoch
 //! on trial commits stays its own until its commit.
@@ -36,7 +40,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use storage::protocol::{
-    ErrorKind, Event, PageShape, PageWindow, Priority, Region, Reply, Request, Span,
+    ErrorKind, Event, PageShape, PageSlot, PageWindow, Priority, Region, Reply, Request, Span,
 };
 use storage::{Client, Key, Role, Scope};
 
@@ -107,12 +111,51 @@ impl PoolRead {
 }
 
 /// What [`Servers::take`] takes: the events, each with the connection it
-/// arrived on, and the answers, each with its purpose.
-pub(crate) type Arrivals<P> = (Vec<(usize, Event)>, Vec<(P, Reply)>);
+/// arrived on, and the answers of the store's own purposes.
+pub(crate) type Arrivals<S> = (Vec<(usize, Event)>, Vec<(S, Reply)>);
+
+/// What a request to the host page pools is for: one of the store's own
+/// (`S`), whose answer the store reads, or an end of the page lifecycle,
+/// whose answer the client settles itself ([`Servers::take`]).
+pub(crate) enum Purpose<S> {
+    /// A request whose answer the store reads.
+    Store(S),
+    /// Pins of `keys` in `pool` for `reader`, answered after the reader
+    /// ended: the pages they pinned are unpinned. A pool counts pins per
+    /// reader, so only the pages the answer names as pinned are.
+    Orphan {
+        client: usize,
+        pool: u64,
+        reader: Scope,
+        keys: Vec<Key>,
+    },
+    /// Pins of `keys` at the peer of connection `peer`, answered after their
+    /// reader ended: every page they pinned is unpinned at the peer.
+    PeerOrphan { peer: usize, keys: Vec<Key> },
+    /// A reservation of `keys` in `pool`, answered after its writer ended:
+    /// the slots it reserved are aborted.
+    Abandoned {
+        client: usize,
+        pool: u64,
+        keys: Vec<Key>,
+    },
+    /// A request whose answer only reports a failure: an unpin, a commit,
+    /// an abort, a cancel or a prefetch.
+    Settle,
+}
+
+/// The keys of `keys` whose pages a pin's answer `slots` pinned.
+fn pinned(keys: &[Key], slots: &[Option<u64>]) -> Vec<Key> {
+    keys.iter()
+        .zip(slots)
+        .filter(|(_, slot)| slot.is_some())
+        .map(|(key, _)| *key)
+        .collect()
+}
 
 /// The connections to the servers of the pools one store uses, with the
 /// purpose of every request they have not answered.
-pub(crate) struct Servers<P> {
+pub(crate) struct Servers<S> {
     deployment: String,
     epoch: u64,
     /// What the store keeps, for its logs.
@@ -125,10 +168,10 @@ pub(crate) struct Servers<P> {
     /// endpoint.
     peers: HashMap<String, usize>,
     /// Requests submitted and not yet answered, by connection and request.
-    pending: HashMap<(usize, u64), P>,
+    pending: HashMap<(usize, u64), Purpose<S>>,
 }
 
-impl<P> Servers<P> {
+impl<S> Servers<S> {
     /// Connect to this host's Storage Server, at `socket`, as a head of
     /// `deployment` in `epoch`, for a store keeping `what`.
     pub(crate) fn connect(
@@ -244,29 +287,23 @@ impl<P> Servers<P> {
         peer: usize,
         layouts: Vec<Key>,
         keys: Vec<Key>,
-        purpose: P,
+        purpose: S,
     ) -> bool {
         let request = Request::PeerPin {
             deployment: self.deployment.clone(),
             layouts,
             keys,
         };
-        self.submit(peer, &request, purpose)
+        self.submit(peer, &request, Purpose::Store(purpose))
     }
 
     /// End the pins of `keys` in the peer's `pool` this connection holds;
     /// nothing for no key.
-    pub(crate) fn peer_unpin(
-        &mut self,
-        peer: usize,
-        pool: u64,
-        keys: Vec<Key>,
-        purpose: P,
-    ) -> bool {
+    pub(crate) fn peer_unpin(&mut self, peer: usize, pool: u64, keys: Vec<Key>) -> bool {
         if keys.is_empty() {
             return true;
         }
-        self.submit(peer, &Request::PeerUnpin { pool, keys }, purpose)
+        self.submit(peer, &Request::PeerUnpin { pool, keys }, Purpose::Settle)
     }
 
     /// Reserve slots for `keys` in `pool` for the head's own transfer task,
@@ -276,7 +313,7 @@ impl<P> Servers<P> {
         client: usize,
         pool: u64,
         keys: Vec<Key>,
-        purpose: P,
+        purpose: S,
     ) -> bool {
         let reserve = Request::Reserve {
             pool,
@@ -284,44 +321,44 @@ impl<P> Servers<P> {
             keys,
             window: None,
         };
-        self.submit(client, &reserve, purpose)
+        self.submit(client, &reserve, Purpose::Store(purpose))
     }
 
     /// Submit the transfer task of `read` to its local server, at the
     /// priority of what a request waits for, answered (`Reply::Transferring`)
     /// for `purpose`; its end arrives as an [`Event::Transferred`] on that
     /// connection.
-    pub(crate) fn read_pages(&mut self, read: &PoolRead, purpose: P) -> bool {
+    pub(crate) fn read_pages(&mut self, read: &PoolRead, purpose: S) -> bool {
         let request = Request::Transfer {
             spans: read.spans(),
             priority: Priority::Request,
             update: 0,
         };
-        self.submit(read.client, &request, purpose)
+        self.submit(read.client, &request, Purpose::Store(purpose))
     }
 
     /// Cancel the transfer task `task` of connection `client`; its
     /// [`Event::Transferred`] follows once it copies nothing any more.
-    pub(crate) fn cancel_read(&mut self, client: usize, task: u64, purpose: P) -> bool {
+    pub(crate) fn cancel_read(&mut self, client: usize, task: u64) -> bool {
         let cancel = Request::Cancel {
             tasks: vec![task],
             update: None,
         };
-        self.submit(client, &cancel, purpose)
+        self.submit(client, &cancel, Purpose::Settle)
     }
 
     /// Settle `read` once its task ended: commit the local slots when every
     /// page landed (`complete`), abort them otherwise, and end the pins at
-    /// the peer either way. Every answer goes to a `purpose()`.
-    pub(crate) fn settle_read(&mut self, read: &PoolRead, complete: bool, purpose: impl Fn() -> P) {
+    /// the peer either way.
+    pub(crate) fn settle_read(&mut self, read: &PoolRead, complete: bool) {
         let keys = read.keys();
-        self.settle(read.client, read.pool, keys.clone(), complete, purpose());
-        self.peer_unpin(read.peer, read.peer_pool, keys, purpose());
+        self.settle(read.client, read.pool, keys.clone(), complete);
+        self.peer_unpin(read.peer, read.peer_pool, keys);
     }
 
     /// Submit `request` on connection `client`, answered for `purpose`.
     /// Returns whether it was sent.
-    pub(crate) fn submit(&mut self, client: usize, request: &Request, purpose: P) -> bool {
+    pub(crate) fn submit(&mut self, client: usize, request: &Request, purpose: Purpose<S>) -> bool {
         let Some(connection) = self.clients[client].as_mut() else {
             return false;
         };
@@ -346,14 +383,14 @@ impl<P> Servers<P> {
         pool: u64,
         reader: &Scope,
         keys: Vec<Key>,
-        purpose: P,
+        purpose: S,
     ) -> bool {
         let pin = Request::Pin {
             pool,
             reader: reader.clone(),
             keys,
         };
-        self.submit(client, &pin, purpose)
+        self.submit(client, &pin, Purpose::Store(purpose))
     }
 
     /// End `reader`'s pins of `keys` in `pool`; nothing for no key.
@@ -363,7 +400,6 @@ impl<P> Servers<P> {
         pool: u64,
         reader: &Scope,
         keys: Vec<Key>,
-        purpose: P,
     ) -> bool {
         if keys.is_empty() {
             return true;
@@ -373,7 +409,7 @@ impl<P> Servers<P> {
             reader: reader.clone(),
             keys,
         };
-        self.submit(client, &unpin, purpose)
+        self.submit(client, &unpin, Purpose::Settle)
     }
 
     /// Reserve slots for `keys` in `pool` for `writer`, the pages of one
@@ -386,7 +422,7 @@ impl<P> Servers<P> {
         writer: &Scope,
         keys: Vec<Key>,
         window: Option<PageWindow>,
-        purpose: P,
+        purpose: S,
     ) -> bool {
         let reserve = Request::Reserve {
             pool,
@@ -394,7 +430,7 @@ impl<P> Servers<P> {
             keys,
             window,
         };
-        self.submit(client, &reserve, purpose)
+        self.submit(client, &reserve, Purpose::Store(purpose))
     }
 
     /// Commit the reserved `keys` in `pool` once their copies landed, or
@@ -405,7 +441,6 @@ impl<P> Servers<P> {
         pool: u64,
         keys: Vec<Key>,
         written: bool,
-        purpose: P,
     ) -> bool {
         if keys.is_empty() {
             return true;
@@ -415,27 +450,71 @@ impl<P> Servers<P> {
         } else {
             Request::Abort { pool, keys }
         };
-        self.submit(client, &request, purpose)
+        self.submit(client, &request, Purpose::Settle)
     }
 
     /// The purposes of the requests not yet answered.
-    pub(crate) fn pending(&self) -> impl Iterator<Item = &P> {
+    pub(crate) fn pending(&self) -> impl Iterator<Item = &Purpose<S>> {
         self.pending.values()
     }
 
     /// The purposes of the requests not yet answered, to be changed when
-    /// what asked for them ended.
-    pub(crate) fn pending_mut(&mut self) -> impl Iterator<Item = &mut P> {
+    /// what asked for them ended: a store's pins become an
+    /// [`Purpose::Orphan`], its reservation an [`Purpose::Abandoned`].
+    pub(crate) fn pending_mut(&mut self) -> impl Iterator<Item = &mut Purpose<S>> {
         self.pending.values_mut()
     }
 
+    /// Settles the answer of a lifecycle end: releases what an orphaned pin
+    /// or an abandoned reservation took, and reports a failure.
+    fn settle_answer(&mut self, purpose: Purpose<S>, reply: Reply) {
+        match (purpose, reply) {
+            (Purpose::Store(_), _) => {}
+            (
+                Purpose::Orphan {
+                    client,
+                    pool,
+                    reader,
+                    keys,
+                },
+                Reply::Pinned { slots },
+            ) => {
+                self.unpin(client, pool, &reader, pinned(&keys, &slots));
+            }
+            (Purpose::PeerOrphan { peer, keys }, Reply::PeerPinned { pools }) => {
+                for pool in pools {
+                    self.peer_unpin(peer, pool.pool, pinned(&keys, &pool.slots));
+                }
+            }
+            (Purpose::Abandoned { client, pool, keys }, Reply::Reserved { slots }) => {
+                let reserved = keys
+                    .into_iter()
+                    .zip(&slots)
+                    .filter(|(_, slot)| matches!(slot, PageSlot::Reserved { .. }))
+                    .map(|(key, _)| key)
+                    .collect();
+                self.settle(client, pool, reserved, false);
+            }
+            (_, Reply::Error { kind, message }) => {
+                tracing::warn!(
+                    ?kind,
+                    message,
+                    what = self.what,
+                    "a host page pool request failed"
+                );
+            }
+            _ => {}
+        }
+    }
+
     /// The events, each with the connection it arrived on, and the answers
-    /// that arrived since the last call, each answer with its purpose.
+    /// of the store's own purposes that arrived since the last call, each
+    /// with its purpose; the answers of lifecycle ends are settled here.
     ///
     /// A peer connection that failed is dropped, and each request it will
     /// not answer is answered with [`Reply::Error`]; the connections to the
     /// deployment's own hosts stay, as their failures are their ranks'.
-    pub(crate) fn take(&mut self) -> Arrivals<P> {
+    pub(crate) fn take(&mut self) -> Arrivals<S> {
         let mut events = Vec::new();
         let mut failed = Vec::new();
         for (index, client) in self.clients.iter_mut().enumerate() {
@@ -484,12 +563,19 @@ impl<P> Servers<P> {
                 answers.push((purpose, answer.reply));
             }
         }
-        (events, answers)
+        let mut own = Vec::with_capacity(answers.len());
+        for (purpose, reply) in answers {
+            match purpose {
+                Purpose::Store(purpose) => own.push((purpose, reply)),
+                lifecycle => self.settle_answer(lifecycle, reply),
+            }
+        }
+        (events, own)
     }
 
     /// The answers that arrived since the last call, each with its purpose,
     /// for a store that awaits no event.
-    pub(crate) fn answers(&mut self) -> Vec<(P, Reply)> {
+    pub(crate) fn answers(&mut self) -> Vec<(S, Reply)> {
         self.take().1
     }
 

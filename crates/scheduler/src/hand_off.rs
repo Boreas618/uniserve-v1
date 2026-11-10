@@ -29,7 +29,7 @@ use std::time::Instant;
 use ipc::{CachePlaneRun, PrefixCacheInfo, RequestId};
 use storage::protocol::{Event, Priority, Region, Reply, Request, Span, TransferEnd};
 
-use crate::host_pages::Servers;
+use crate::host_pages::{Purpose, Servers};
 use crate::worker::WorkerGroupId;
 use crate::{CallKind, ForwardMode, RequestKey, Scheduler};
 
@@ -45,7 +45,7 @@ struct RankPlanes {
 }
 
 /// What a request to a server was for.
-enum Purpose {
+enum Asked {
     /// The transfer task of `request`'s hand-off, submitted on connection
     /// `client`.
     Transfer { request: RequestId, client: usize },
@@ -82,7 +82,7 @@ pub(crate) enum HandOffEnd {
 
 /// The scheduler's hand-offs between its prefill and decode groups.
 pub(crate) struct HandOffs {
-    servers: Servers<Purpose>,
+    servers: Servers<Asked>,
     ranks: HashMap<WorkerGroupId, Vec<RankPlanes>>,
     copies: HashMap<RequestId, Copy>,
     /// The request of each task in flight, by connection and task.
@@ -146,7 +146,7 @@ impl HandOffs {
             let open = Request::OpenTransfer {
                 gpus: gpus.into_iter().collect(),
             };
-            servers.submit(client, &open, Purpose::Session);
+            servers.submit(client, &open, Purpose::Store(Asked::Session));
         }
         Ok(Self {
             servers,
@@ -211,10 +211,11 @@ impl HandOffs {
                 priority: Priority::Request,
                 update: 0,
             };
-            if !self
-                .servers
-                .submit(client, &transfer, Purpose::Transfer { request, client })
-            {
+            if !self.servers.submit(
+                client,
+                &transfer,
+                Purpose::Store(Asked::Transfer { request, client }),
+            ) {
                 copy.failed = Some("a hand-off's transfer could not be submitted".to_owned());
                 break;
             }
@@ -249,17 +250,17 @@ impl HandOffs {
         let (events, answers) = self.servers.take();
         for (purpose, reply) in answers {
             match (purpose, reply) {
-                (Purpose::Transfer { request, client }, Reply::Transferring { task }) => {
+                (Asked::Transfer { request, client }, Reply::Transferring { task }) => {
                     self.tasks.insert((client, task), request);
                 }
-                (Purpose::Transfer { request, .. }, other) => {
+                (Asked::Transfer { request, .. }, other) => {
                     self.task_ended(
                         request,
                         Some(format!("the hand-off's transfer was refused: {other:?}")),
                     );
                 }
-                (Purpose::Session, Reply::TransferOpened { .. }) => {}
-                (Purpose::Session, other) => {
+                (Asked::Session, Reply::TransferOpened { .. }) => {}
+                (Asked::Session, other) => {
                     tracing::warn!(?other, "a host refused to hold its GPUs' transfer contexts");
                 }
             }

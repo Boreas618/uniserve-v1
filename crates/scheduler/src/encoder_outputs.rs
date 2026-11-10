@@ -48,7 +48,7 @@ use storage::key::{encoder_output as content, encoder_page as page_key};
 use storage::protocol::{PageSlot, Reply};
 use storage::{Key, Scope};
 
-use crate::host_pages::Servers;
+use crate::host_pages::{Purpose, Servers};
 use crate::worker::WorkerGroupId;
 
 /// One encoder output of a request: its name (the product an encoder
@@ -130,7 +130,8 @@ struct Output {
     failed: bool,
 }
 
-enum Purpose {
+/// What the store asked the pools for, whose answer it reads.
+enum Asked {
     /// The pins of an output's pages.
     Pin {
         request: RequestKey,
@@ -141,19 +142,11 @@ enum Purpose {
         request: RequestKey,
         output: OutputId,
     },
-    /// Pins answered for a lookup that ended meanwhile: whatever they pinned
-    /// is released.
-    Orphan { pool: GroupPool, keys: Vec<Key> },
-    /// A reservation answered for a lookup that ended meanwhile: whatever it
-    /// reserved is aborted.
-    Abandoned { pool: GroupPool, keys: Vec<Key> },
-    /// An unpin, a commit or an abort, whose answer only reports failures.
-    Settle,
 }
 
 /// The scheduler's side of the host encoder pools.
 pub(crate) struct EncoderStore {
-    servers: Servers<Purpose>,
+    servers: Servers<Asked>,
     /// The pool of each worker group the store serves.
     workers: HashMap<WorkerGroupId, GroupPool>,
     /// Each admission's outputs.
@@ -294,14 +287,14 @@ impl EncoderStore {
         let pool = pool.clone();
         // A request that reads no stored output stores its own at once.
         let (submitted, stage) = if access.read {
-            let purpose = Purpose::Pin { request, output };
+            let purpose = Asked::Pin { request, output };
             (
                 self.servers
                     .pin(pool.client, pool.pool, &pool.scope, keys.clone(), purpose),
                 Stage::Pinning,
             )
         } else {
-            let purpose = Purpose::Reserve { request, output };
+            let purpose = Asked::Reserve { request, output };
             (
                 self.servers.reserve(
                     pool.client,
@@ -438,7 +431,7 @@ impl EncoderStore {
                 // Pages its calls wrote only in part are aborted.
                 let written = !failed && planned;
                 self.servers
-                    .settle(pool.client, pool.pool, reserved, written, Purpose::Settle);
+                    .settle(pool.client, pool.pool, reserved, written);
             }
             Stage::Pinning | Stage::Reserving | Stage::Compute => {}
         }
@@ -480,23 +473,27 @@ impl EncoderStore {
     fn end(&mut self, request: RequestKey, output: OutputId, stored: Output) {
         match stored.stage {
             Stage::Pinning | Stage::Reserving => {
+                let pool = &stored.pool;
                 for purpose in self.servers.pending_mut() {
                     match purpose {
-                        Purpose::Pin {
+                        Purpose::Store(Asked::Pin {
                             request: owner,
                             output: owned,
-                        } if *owner == request && *owned == output => {
+                        }) if *owner == request && *owned == output => {
                             *purpose = Purpose::Orphan {
-                                pool: stored.pool.clone(),
+                                client: pool.client,
+                                pool: pool.pool,
+                                reader: pool.scope.clone(),
                                 keys: stored.keys.clone(),
                             };
                         }
-                        Purpose::Reserve {
+                        Purpose::Store(Asked::Reserve {
                             request: owner,
                             output: owned,
-                        } if *owner == request && *owned == output => {
+                        }) if *owner == request && *owned == output => {
                             *purpose = Purpose::Abandoned {
-                                pool: stored.pool.clone(),
+                                client: pool.client,
+                                pool: pool.pool,
                                 keys: stored.keys.clone(),
                             };
                         }
@@ -559,15 +556,14 @@ impl EncoderStore {
             return;
         }
         self.servers
-            .unpin(pool.client, pool.pool, &pool.scope, keys, Purpose::Settle);
+            .unpin(pool.client, pool.pool, &pool.scope, keys);
     }
 
     fn abort(&mut self, pool: &GroupPool, keys: Vec<Key>) {
         if keys.is_empty() {
             return;
         }
-        self.servers
-            .settle(pool.client, pool.pool, keys, false, Purpose::Settle);
+        self.servers.settle(pool.client, pool.pool, keys, false);
     }
 
     /// An output's pins answered `slots`: every page pinned is imported;
@@ -607,7 +603,7 @@ impl EncoderStore {
                 &pool.scope,
                 keys,
                 None,
-                Purpose::Reserve { request, output },
+                Asked::Reserve { request, output },
             )
         };
         if let Some(stored) = self
@@ -679,7 +675,7 @@ impl EncoderStore {
         let mut moved = false;
         for (purpose, reply) in self.servers.answers() {
             match (purpose, reply) {
-                (Purpose::Pin { request, output }, reply) => {
+                (Asked::Pin { request, output }, reply) => {
                     moved = true;
                     let slots = match reply {
                         Reply::Pinned { slots } => slots,
@@ -690,7 +686,7 @@ impl EncoderStore {
                     };
                     self.pinned(request, output, slots);
                 }
-                (Purpose::Reserve { request, output }, reply) => {
+                (Asked::Reserve { request, output }, reply) => {
                     moved = true;
                     let slots = match reply {
                         Reply::Reserved { slots } => slots,
@@ -701,32 +697,6 @@ impl EncoderStore {
                     };
                     self.reserved(request, output, slots);
                 }
-                (Purpose::Orphan { pool, keys }, reply) => {
-                    if let Reply::Pinned { slots } = reply {
-                        let pinned = keys
-                            .into_iter()
-                            .zip(&slots)
-                            .filter(|(_, slot)| slot.is_some())
-                            .map(|(key, _)| key)
-                            .collect();
-                        self.unpin(&pool, pinned);
-                    }
-                }
-                (Purpose::Abandoned { pool, keys }, reply) => {
-                    if let Reply::Reserved { slots } = reply {
-                        let reserved = keys
-                            .into_iter()
-                            .zip(&slots)
-                            .filter(|(_, slot)| matches!(slot, PageSlot::Reserved { .. }))
-                            .map(|(key, _)| key)
-                            .collect();
-                        self.abort(&pool, reserved);
-                    }
-                }
-                (Purpose::Settle, Reply::Error { kind, message }) => {
-                    tracing::warn!(?kind, message, "a host encoder pool request failed");
-                }
-                (Purpose::Settle, _) => {}
             }
         }
         moved

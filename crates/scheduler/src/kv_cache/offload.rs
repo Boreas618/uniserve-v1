@@ -114,7 +114,7 @@ use storage::{Key, Scope};
 
 use super::manager::{self, AttentionManager};
 use super::{GroupShape, PageRef};
-use crate::host_pages::{PageRead, PoolRead, Servers};
+use crate::host_pages::{PageRead, PoolRead, Purpose, Servers};
 use crate::worker::WorkerGroupId;
 
 /// The fewest tokens an L3 hit must add to the pools' hit to be prefetched:
@@ -290,8 +290,8 @@ impl GroupCachePools {
     }
 }
 
-/// What a submitted request was for.
-enum Purpose {
+/// What the store asked the pools for, whose answer it reads.
+enum Asked {
     /// Admission pins of `request`'s pages of `group` in `rank`'s pool.
     Pin {
         request: RequestId,
@@ -312,9 +312,6 @@ enum Purpose {
         rank: usize,
         positions: Vec<usize>,
     },
-    /// Pins of `keys` in `pool` for a request that no longer wants them:
-    /// the pages they pinned are unpinned when the answer arrives.
-    Orphan { pool: RankPool, keys: Vec<Key> },
     /// The reservation of offload `offload` in `rank`'s pool.
     Reserve { offload: u64, rank: usize },
     /// The pins of `request`'s keys of `group` at the peer `peer` (an index
@@ -324,10 +321,6 @@ enum Purpose {
         group: usize,
         peer: usize,
     },
-    /// Pins of `keys` at a peer, on connection `client`, for a request that
-    /// no longer wants them: every page they pinned is unpinned when the
-    /// answer arrives.
-    PeerOrphan { client: usize, keys: Vec<Key> },
     /// The reservation of slots in `pool`, a rank's pool of one of
     /// `request`'s cache groups, for the pages of `keys`, read from
     /// `sources`.
@@ -339,9 +332,6 @@ enum Purpose {
     },
     /// The transfer task of peer read `read` (`KvOffloadManager::reads`).
     PeerRead { read: u64 },
-    /// A request whose answer changes nothing here: commit, abort, unpin,
-    /// prefetch.
-    Settle,
 }
 
 /// Where a request's admission stands.
@@ -601,7 +591,7 @@ pub(crate) struct KvOffloadManager {
     boundary_interval: usize,
     /// The connections to the servers, as a head of the engine's epoch,
     /// which publishes the pages it commits, and the requests in flight.
-    servers: Servers<Purpose>,
+    servers: Servers<Asked>,
     workers: HashMap<WorkerGroupId, GroupCachePools>,
     pins: HashMap<RequestId, Pins>,
     /// The request each prefetch in flight is for, by tag.
@@ -840,7 +830,7 @@ impl KvOffloadManager {
             .collect()
     }
 
-    fn submit(&mut self, client: usize, request: &Request, purpose: Purpose) -> bool {
+    fn submit(&mut self, client: usize, request: &Request, purpose: Purpose<Asked>) -> bool {
         self.servers.submit(client, request, purpose)
     }
 
@@ -912,7 +902,7 @@ impl KvOffloadManager {
                     pool.pool,
                     &pool.scope,
                     wanted.clone(),
-                    Purpose::Pin {
+                    Asked::Pin {
                         request,
                         group: index,
                         rank,
@@ -929,11 +919,11 @@ impl KvOffloadManager {
                             pool: pool.pool,
                             keys: wanted.clone(),
                         },
-                        Purpose::Lookup {
+                        Purpose::Store(Asked::Lookup {
                             request,
                             group: index,
                             rank,
-                        },
+                        }),
                     );
                     if !looked {
                         pins.levels[rank] = Some(Vec::new());
@@ -1153,7 +1143,7 @@ impl KvOffloadManager {
                 pool.pool,
                 &pool.scope,
                 keys,
-                Purpose::Repin {
+                Asked::Repin {
                     request,
                     group,
                     rank,
@@ -1207,7 +1197,7 @@ impl KvOffloadManager {
                 if keys.is_empty() {
                     continue;
                 }
-                let purpose = Purpose::PeerPin {
+                let purpose = Asked::PeerPin {
                     request,
                     group,
                     peer,
@@ -1304,7 +1294,7 @@ impl KvOffloadManager {
         }
         for ((peer, pool), keys) in unpins {
             if let Some(client) = self.peer_client(peer) {
-                self.servers.peer_unpin(client, pool, keys, Purpose::Settle);
+                self.servers.peer_unpin(client, pool, keys);
             }
         }
 
@@ -1312,7 +1302,7 @@ impl KvOffloadManager {
         let mut fetching: Vec<Vec<usize>> = vec![Vec::new(); pools.groups.len()];
         for (pool, keys, group, positions, sources) in reserves {
             fetching[group].extend(positions.iter().copied());
-            let purpose = Purpose::PeerReserve {
+            let purpose = Asked::PeerReserve {
                 request,
                 pool: pool.clone(),
                 keys: keys.clone(),
@@ -1359,7 +1349,7 @@ impl KvOffloadManager {
         }
         for ((peer, pool), keys) in unpins {
             if let Some(client) = self.peer_client(peer) {
-                self.servers.peer_unpin(client, pool, keys, Purpose::Settle);
+                self.servers.peer_unpin(client, pool, keys);
             }
         }
     }
@@ -1388,8 +1378,7 @@ impl KvOffloadManager {
                 .filter(|(_, slot)| matches!(slot, PageSlot::Reserved { .. }))
                 .map(|(key, _)| *key)
                 .collect();
-            self.servers
-                .settle(pool.client, pool.pool, reserved, false, Purpose::Settle);
+            self.servers.settle(pool.client, pool.pool, reserved, false);
             self.unpin_sources(keys, sources);
             return;
         }
@@ -1419,8 +1408,7 @@ impl KvOffloadManager {
             let (Some(client), Some(endpoint)) = (self.peer_client(peer), self.peers.get(peer))
             else {
                 let keys: Vec<Key> = pages.iter().map(|page| page.key).collect();
-                self.servers
-                    .settle(pool.client, pool.pool, keys, false, Purpose::Settle);
+                self.servers.settle(pool.client, pool.pool, keys, false);
                 continue;
             };
             let read = PoolRead {
@@ -1436,7 +1424,7 @@ impl KvOffloadManager {
             self.next_read += 1;
             if self
                 .servers
-                .read_pages(&read, Purpose::PeerRead { read: number })
+                .read_pages(&read, Asked::PeerRead { read: number })
             {
                 self.reads.insert(
                     number,
@@ -1449,7 +1437,7 @@ impl KvOffloadManager {
                 );
                 submitted += 1;
             } else {
-                self.servers.settle_read(&read, false, || Purpose::Settle);
+                self.servers.settle_read(&read, false);
             }
         }
         if let Some(pins) = self.pins.get_mut(&request) {
@@ -1474,7 +1462,7 @@ impl KvOffloadManager {
             }
         }
         for (client, task) in cancels {
-            self.servers.cancel_read(client, task, Purpose::Settle);
+            self.servers.cancel_read(client, task);
         }
     }
 
@@ -1488,8 +1476,7 @@ impl KvOffloadManager {
         if let Some(task) = read.task {
             self.tasks.remove(&(read.read.client, task));
         }
-        self.servers
-            .settle_read(&read.read, complete, || Purpose::Settle);
+        self.servers.settle_read(&read.read, complete);
         let micros = read.submitted.elapsed().as_micros() as u64;
         if complete {
             tracing::info!(
@@ -1607,17 +1594,17 @@ impl KvOffloadManager {
         // request's pin.
         for purpose in self.servers.pending_mut() {
             let orphan = match purpose {
-                Purpose::Pin {
+                Purpose::Store(Asked::Pin {
                     request: pinned,
                     group,
                     rank,
-                } if *pinned == request => Some((*group, *rank, pins.groups[*group].keys.clone())),
-                Purpose::Repin {
+                }) if *pinned == request => Some((*group, *rank, pins.groups[*group].keys.clone())),
+                Purpose::Store(Asked::Repin {
                     request: pinned,
                     group,
                     rank,
                     positions,
-                } if *pinned == request => Some((
+                }) if *pinned == request => Some((
                     *group,
                     *rank,
                     positions
@@ -1625,20 +1612,20 @@ impl KvOffloadManager {
                         .map(|position| pins.groups[*group].keys[*position])
                         .collect(),
                 )),
-                Purpose::Lookup {
+                Purpose::Store(Asked::Lookup {
                     request: looked, ..
-                } if *looked == request => {
+                }) if *looked == request => {
                     *purpose = Purpose::Settle;
                     None
                 }
-                Purpose::PeerPin {
+                Purpose::Store(Asked::PeerPin {
                     request: pinned,
                     group,
                     peer,
-                } if *pinned == request => {
+                }) if *pinned == request => {
                     if let Some(Some(client)) = pins.peers.get(*peer) {
                         *purpose = Purpose::PeerOrphan {
-                            client: *client,
+                            peer: *client,
                             keys: pins.groups[*group].keys.clone(),
                         };
                     }
@@ -1653,7 +1640,9 @@ impl KvOffloadManager {
                     .and_then(|group| group.ranks.get(rank))
             {
                 *purpose = Purpose::Orphan {
-                    pool: pool.clone(),
+                    client: pool.client,
+                    pool: pool.pool,
+                    reader: pool.scope.clone(),
                     keys,
                 };
             }
@@ -1672,8 +1661,7 @@ impl KvOffloadManager {
                 };
                 for pool in pools_of.iter().flatten() {
                     let keys = Self::pinned(&pins_of.keys, Some(&pool.slots));
-                    self.servers
-                        .peer_unpin(*client, pool.pool, keys, Purpose::Settle);
+                    self.servers.peer_unpin(*client, pool.pool, keys);
                 }
             }
         }
@@ -1691,7 +1679,7 @@ impl KvOffloadManager {
 
     fn unpin(&mut self, pool: &RankPool, keys: Vec<Key>) {
         self.servers
-            .unpin(pool.client, pool.pool, &pool.scope, keys, Purpose::Settle);
+            .unpin(pool.client, pool.pool, &pool.scope, keys);
     }
 
     /// The page loads of `request`'s hit, once: `units(group, page)` names
@@ -1843,7 +1831,7 @@ impl KvOffloadManager {
                 &pool.scope,
                 keys.clone(),
                 window,
-                Purpose::Reserve { offload: id, rank },
+                Asked::Reserve { offload: id, rank },
             ) {
                 submitted += 1;
             }
@@ -1873,10 +1861,12 @@ impl KvOffloadManager {
             || !self.deferred.is_empty()
             || self.queued.values().any(|offloads| !offloads.is_empty())
             || !self.carried.is_empty()
-            || self
-                .servers
-                .pending()
-                .any(|purpose| matches!(purpose, Purpose::Reserve { .. } | Purpose::Settle))
+            || self.servers.pending().any(|purpose| {
+                matches!(
+                    purpose,
+                    Purpose::Store(Asked::Reserve { .. }) | Purpose::Settle
+                )
+            })
     }
 
     /// The worker groups whose reserved page offloads wait for a batch.
@@ -1930,8 +1920,7 @@ impl KvOffloadManager {
                 .push(offload.key);
         }
         for ((client, pool), keys) in by_pool {
-            self.servers
-                .settle(client, pool, keys, succeeded, Purpose::Settle);
+            self.servers.settle(client, pool, keys, succeeded);
         }
     }
 
@@ -2003,7 +1992,7 @@ impl KvOffloadManager {
         for (purpose, reply) in answers {
             match (purpose, reply) {
                 (
-                    Purpose::Pin {
+                    Asked::Pin {
                         request,
                         group,
                         rank,
@@ -2023,7 +2012,7 @@ impl KvOffloadManager {
                     }
                 }
                 (
-                    Purpose::Lookup {
+                    Asked::Lookup {
                         request,
                         group,
                         rank,
@@ -2043,7 +2032,7 @@ impl KvOffloadManager {
                     }
                 }
                 (
-                    Purpose::Repin {
+                    Asked::Repin {
                         request,
                         group,
                         rank,
@@ -2072,15 +2061,7 @@ impl KvOffloadManager {
                         admissions = true;
                     }
                 }
-                (Purpose::Orphan { pool, keys }, reply) => {
-                    if let Reply::Pinned { slots } = reply {
-                        let pinned = Self::pinned(&keys, Some(&slots));
-                        if !pinned.is_empty() {
-                            self.unpin(&pool, pinned);
-                        }
-                    }
-                }
-                (Purpose::Reserve { offload, rank }, reply) => {
+                (Asked::Reserve { offload, rank }, reply) => {
                     let slots = match reply {
                         Reply::Reserved { slots } => slots,
                         other => {
@@ -2091,7 +2072,7 @@ impl KvOffloadManager {
                     self.reserved(offload, rank, &slots);
                 }
                 (
-                    Purpose::PeerPin {
+                    Asked::PeerPin {
                         request,
                         group,
                         peer,
@@ -2114,16 +2095,8 @@ impl KvOffloadManager {
                         admissions = true;
                     }
                 }
-                (Purpose::PeerOrphan { client, keys }, Reply::PeerPinned { pools }) => {
-                    for pool in pools {
-                        let pinned = Self::pinned(&keys, Some(&pool.slots));
-                        self.servers
-                            .peer_unpin(client, pool.pool, pinned, Purpose::Settle);
-                    }
-                }
-                (Purpose::PeerOrphan { .. }, _) => {}
                 (
-                    Purpose::PeerReserve {
+                    Asked::PeerReserve {
                         request,
                         pool,
                         keys,
@@ -2145,14 +2118,14 @@ impl KvOffloadManager {
                     self.peer_reserved(request, &pool, &keys, &sources, &slots);
                     admissions = true;
                 }
-                (Purpose::PeerRead { read }, reply) => match reply {
+                (Asked::PeerRead { read }, reply) => match reply {
                     Reply::Transferring { task } => {
                         if let Some(entry) = self.reads.get_mut(&read) {
                             entry.task = Some(task);
                             let client = entry.read.client;
                             self.tasks.insert((client, task), read);
                             if entry.request.is_none() {
-                                self.servers.cancel_read(client, task, Purpose::Settle);
+                                self.servers.cancel_read(client, task);
                             }
                         }
                     }
@@ -2165,10 +2138,6 @@ impl KvOffloadManager {
                         admissions = true;
                     }
                 },
-                (Purpose::Settle, Reply::Error { kind, message }) => {
-                    tracing::warn!(?kind, message, "a host KV cache request failed");
-                }
-                (Purpose::Settle, _) => {}
             }
         }
         self.retry_deferred();
@@ -2207,7 +2176,7 @@ impl KvOffloadManager {
             };
             let id = self.next_reservation;
             self.next_reservation += 1;
-            let purpose = Purpose::Reserve {
+            let purpose = Asked::Reserve {
                 offload: id,
                 rank: deferred.rank,
             };
@@ -2332,8 +2301,7 @@ impl KvOffloadManager {
             self.reservations.remove(&id);
         }
         if let Some((client, pool, keys)) = aborted {
-            self.servers
-                .settle(client, pool, keys, false, Purpose::Settle);
+            self.servers.settle(client, pool, keys, false);
         }
     }
 }
@@ -2795,6 +2763,69 @@ mod tests {
                 && listed(&local.socket, pools[0]).reserved == 0
         });
         assert_eq!(listed(&peer.socket, peer_pool).ready, 8);
+    }
+
+    /// An admission that leaves before its pins are answered holds none of
+    /// the pages they pin once the answers arrive, and the pages stay.
+    #[test]
+    fn pins_answered_after_their_admission_left_are_released() {
+        let server = Running::start();
+        let (_worker, pools) = worker_pools(&server, &[3]);
+        let cache = report(vec![cache_group(None)], &pools, &[3]);
+        let prompt: Vec<u32> = (0..8 * 64 + 1).collect();
+        let keys = page_keys(&cache, &prompt[..512]);
+
+        // The pool holds the prompt's eight pages.
+        let mut head = Client::connect(
+            &server.socket,
+            Role::Head {
+                deployment: "model".into(),
+                epoch: 0,
+            },
+        )
+        .unwrap();
+        let writer = Scope {
+            deployment: "model".into(),
+            group: "text".into(),
+            rank: 0,
+        };
+        let reserve = Request::Reserve {
+            pool: pools[0],
+            writer: Some(writer),
+            keys: keys[0].clone(),
+            window: None,
+        };
+        head.call(&reserve, &[]).unwrap();
+        let commit = Request::Commit {
+            pool: pools[0],
+            keys: keys[0].clone(),
+        };
+        head.call(&commit, &[]).unwrap();
+        assert_eq!(listed(&server.socket, pools[0]).ready, 8);
+
+        let mut kv_offload =
+            KvOffloadManager::connect(&server.socket, "model", 0, DEFAULT_BOUNDARY_INTERVAL, false)
+                .unwrap();
+        let text = WorkerGroupId("text".into());
+        assert!(kv_offload.add_worker(
+            &text,
+            &[RankCache {
+                local: true,
+                cache: &cache,
+            }]
+        ));
+        // The admission's pins are submitted, and it leaves at once.
+        assert_eq!(
+            kv_offload.admission(RequestId(1), &text, &keys, 0, 512, 0),
+            None
+        );
+        kv_offload.release(RequestId(1));
+
+        // Every request on the connection is answered in order, the unpins
+        // of what the pins took included.
+        poll_until(&mut kv_offload, |kv_offload| !kv_offload.servers.waiting());
+        let pool = listed(&server.socket, pools[0]);
+        assert_eq!((pool.pinned, pool.ready), (0, 8));
     }
 
     /// A hybrid worker's hit ends at the deepest boundary whose sliding
