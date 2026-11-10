@@ -214,8 +214,10 @@ def compare(args: argparse.Namespace) -> None:
     """Compare a candidate GSM8K run against its reference run.
 
     Prints the comparison report as JSON. Exits with status 0 when the
-    candidate is accepted, 2 when the difference is outside the confidence
-    interval, and 1 when a bundle is missing or the two runs are not
+    candidate is accepted; 2 when it is rejected, because its accuracy
+    differs beyond the confidence interval (the report's `change` names a
+    regression or an improvement) or it failed a validation check such as a
+    failed request; and 1 when a bundle is missing or the two runs are not
     comparable.
     """
     try:

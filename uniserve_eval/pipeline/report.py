@@ -176,16 +176,20 @@ def render_markdown(summary: dict[str, Any]) -> str:
 def _metric_validation(
     definitions: tuple[MetricDefinition, ...], metrics: dict[str, Any]
 ) -> ValidationResult:
-    """Check that every protected metric is finite and positive.
+    """Check that the run measured every metric the point declares.
 
-    A metric that is missing, non-numeric, non-finite, zero, or negative
-    fails its check. The `metric:` prefix keeps these names apart from task
-    check names, which `ValidationResult.merged` requires to be disjoint.
+    A metric that is missing, non-numeric, or non-finite fails its check:
+    the run did not produce the value its point is compared on. Any finite
+    value passes, zero and negative ones included. How good a value is
+    follows from comparing it with a reference run in the metric's declared
+    direction, so a zero accuracy is a measured regression, not an invalid
+    run. The `metric:` prefix keeps these names apart from task check names,
+    which `ValidationResult.merged` requires to be disjoint.
     """
     checks = {}
     for definition in definitions:
         value = metric_value(metrics, definition)
-        checks[f"metric:{definition.name}"] = value is not None and value > 0
+        checks[f"metric:{definition.name}"] = value is not None
     return ValidationResult(checks=checks)
 
 

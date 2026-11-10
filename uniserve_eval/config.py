@@ -662,8 +662,10 @@ def _metrics(raw: Any, context: str) -> tuple[MetricDefinition, ...]:
     """Parse protected metric paths and optimization directions.
 
     Each key is a dotted path into the `metrics` mapping of the run summary
-    and each value is `higher` or `lower`. Run validation in `pipeline.report`
-    requires every listed metric to be finite and positive.
+    and each value is `higher` or `lower`, the direction in which the metric
+    improves. Run validation in `pipeline.report` requires every listed
+    metric to be measured as a finite number; `pipeline.compare` reads the
+    direction to tell a regression from an improvement.
     """
     table = _mapping(raw, f"{context}.metrics")
     metrics: list[MetricDefinition] = []

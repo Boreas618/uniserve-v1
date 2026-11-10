@@ -6,11 +6,21 @@ reference implementation and once against the candidate -- and accepting the
 candidate when the two accuracies' difference lies within the 95% confidence
 interval of the difference of two binomial proportions at that sample size.
 ``compare_runs`` enforces the premises before computing the interval: both
-bundles must be completed, valid GSM8K runs over the same selected rows with
-the same sampling settings, served model and benchmark cell (the point's
-provenance), and both must have scored every selected row. A bundle that
-fails a premise is not comparable, so the command reports the mismatch
-instead of a verdict.
+bundles must be completed GSM8K runs over the same selected rows with the
+same sampling settings, served model, benchmark cell (the point's
+provenance) and declared accuracy direction, and both must have scored
+every selected row against a gold answer. The reference must also be a
+valid run, since it is the baseline. A pair that fails a premise is not
+comparable, so the command reports the mismatch instead of a verdict.
+
+The candidate's own failures are outcomes of the comparison, not premises.
+A request the candidate failed is scored as an incorrect answer, as every
+GSM8K run scores it, and a candidate that failed any validation check is
+rejected even when its accuracy lies within the interval. The report states
+the accuracy change in the profile's declared direction: ``regression``
+when the candidate is worse beyond the interval, ``improvement`` when it is
+better beyond it, ``none`` within it. Only a candidate within the interval
+and without a failed check is accepted, the protocol's two-sided rule.
 
 The comparison itself is :func:`uniserve_eval.accuracy.difference_interval`.
 """
@@ -31,6 +41,11 @@ GSM8K_TASK = "gsm8k"
 # size are not the confirmation the design defines, since the acceptance
 # interval's width is a function of this count.
 GSM8K_ROWS = 1319
+
+# The metric the comparison decides on, as the point's `metrics` table names
+# it, and the task check without which a row cannot be scored at all.
+ACCURACY_METRIC = "accuracy"
+GOLD_ANSWERS_CHECK = "gold_answers"
 
 
 @dataclass(frozen=True)
@@ -87,24 +102,48 @@ def compare_runs(
         confidence: Two-sided confidence level of the difference interval.
 
     Returns:
-        A JSON-compatible report with both runs' accuracies and provenance,
-        the difference, its standard error, the interval and the verdict.
+        A JSON-compatible report with both runs' accuracies, failed checks
+        and provenance; the difference, its standard error, the interval and
+        the accuracy `change`; the `verdict`; and the `reasons` for a
+        rejection (`regression`, `improvement`, `failed_checks`).
 
     Raises:
         FileNotFoundError: If either bundle's records are missing.
-        ValueError: If a bundle is not a completed, valid GSM8K run, or the
-            two runs do not share the same sample set, sampling settings,
-            served model or benchmark cell.
+        ValueError: If a run is not a completed GSM8K run that scored every
+            selected row, the reference is not a valid run, or the two runs
+            do not share the same sample set, sampling settings, served
+            model, benchmark cell or accuracy direction.
     """
     reference = read_bundle(reference_dir)
     candidate = read_bundle(candidate_dir)
     _require_comparable(reference, candidate)
+    direction = _accuracy_direction(reference)
 
     interval = difference_interval(
         _proportion(reference),
         _proportion(candidate),
         confidence=confidence,
     )
+
+    # Outside the interval, the sign of the difference in the declared
+    # direction separates a regression from an improvement; the two-sided
+    # rule rejects both.
+    better = (
+        interval.difference > 0
+        if direction == "higher"
+        else interval.difference < 0
+    )
+    if interval.accepted:
+        change = "none"
+    else:
+        change = "improvement" if better else "regression"
+    reasons = [] if change == "none" else [change]
+    if _failed_checks(candidate):
+        reasons.append("failed_checks")
+
+    difference = _describe_interval(interval)
+    difference["direction"] = direction
+    difference["change"] = change
     return {
         "confidence": confidence,
         "method": (
@@ -113,8 +152,9 @@ def compare_runs(
         ),
         "reference": _describe(reference),
         "candidate": _describe(candidate),
-        "difference": _describe_interval(interval),
-        "verdict": "accepted" if interval.accepted else "rejected",
+        "difference": difference,
+        "verdict": "rejected" if reasons else "accepted",
+        "reasons": reasons,
     }
 
 
@@ -130,6 +170,8 @@ def _describe(bundle: Bundle) -> dict[str, Any]:
         "accuracy": proportion.value,
         "correct": proportion.correct,
         "total": proportion.total,
+        "failed_requests": bundle.summary.get("failed_count"),
+        "failed_checks": _failed_checks(bundle),
         "selected_rows": bundle.summary.get("selected_rows"),
         "command": launch.get("command"),
         "git_head": launch.get("git_head"),
@@ -165,6 +207,39 @@ def _proportion(bundle: Bundle) -> Proportion:
     return Proportion(correct, total)
 
 
+def _failed_checks(bundle: Bundle) -> list[str]:
+    """Return the names of the bundle's failed validation checks, sorted."""
+    validation = _mapping(bundle.summary.get("validation"), "validation")
+    checks = validation.get("checks")
+    if not isinstance(checks, dict):
+        raise ValueError(
+            f"{bundle.directory}: summary.validation.checks missing"
+        )
+    return sorted(name for name, passed in checks.items() if passed is not True)
+
+
+def _accuracy_direction(bundle: Bundle) -> str:
+    """Return the direction the bundle's point declares for its accuracy.
+
+    Raises:
+        ValueError: If the point declares no `accuracy` metric, or declares
+            it with a direction other than `higher` or `lower`.
+    """
+    definitions = bundle.summary.get("metric_definitions")
+    if isinstance(definitions, list):
+        for definition in definitions:
+            if (
+                isinstance(definition, dict)
+                and definition.get("path") == ACCURACY_METRIC
+                and definition.get("direction") in {"higher", "lower"}
+            ):
+                return str(definition["direction"])
+    raise ValueError(
+        f"{bundle.directory}: the point declares no {ACCURACY_METRIC} metric "
+        "direction"
+    )
+
+
 def _require_comparable(reference: Bundle, candidate: Bundle) -> None:
     """Reject runs that do not share the comparison's premises.
 
@@ -185,11 +260,22 @@ def _require_comparable(reference: Bundle, candidate: Bundle) -> None:
             raise ValueError(
                 f"{role} run {bundle.directory} did not score {GSM8K_TASK}"
             )
-        validation = _mapping(bundle.summary.get("validation"), "validation")
-        if validation.get("valid") is not True:
+        # A row without a gold answer cannot be scored by either run, so
+        # the two accuracies would not be over the same denominator.
+        if GOLD_ANSWERS_CHECK in _failed_checks(bundle):
             raise ValueError(
-                f"{role} run {bundle.directory} is not a valid run"
+                f"{role} run {bundle.directory} has rows without a gold answer"
             )
+
+    # The baseline must itself meet the protocol; a candidate's failed
+    # checks are its outcome and reject it instead.
+    validation = _mapping(reference.summary.get("validation"), "validation")
+    if validation.get("valid") is not True:
+        raise ValueError(
+            f"reference run {reference.directory} is not a valid run"
+        )
+    if _accuracy_direction(reference) != _accuracy_direction(candidate):
+        raise ValueError("the runs declare different accuracy directions")
 
     reference_rows = reference.summary.get("selected_rows")
     candidate_rows = candidate.summary.get("selected_rows")

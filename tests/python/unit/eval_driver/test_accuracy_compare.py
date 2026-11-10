@@ -1,8 +1,10 @@
 """Tests the accuracy comparison rule and the GSM8K bundle comparison.
 
-The expected values come from the protocol in the swarm map: the interval of
-the difference of two binomial proportions at the runs' sample sizes, and the
-premises a pair of GSM8K runs must share to be comparable.
+The expected values come from the quality protocol: the interval of the
+difference of two binomial proportions at the runs' sample sizes, the
+premises a pair of GSM8K runs must share to be comparable, and the
+two-sided acceptance rule, under which a regression and a failed candidate
+are rejected verdicts rather than incomparable runs.
 """
 
 from __future__ import annotations
@@ -115,6 +117,9 @@ class _BundleWriter:
         model: str = "Qwen3-30B-A3B",
         command: list[str] | None = None,
         valid: bool = True,
+        checks: dict[str, bool] | None = None,
+        failed_count: int = 0,
+        direction: str = "higher",
         status: str = "completed",
         task: str = "gsm8k",
         dataset: str = "gsm8k",
@@ -144,7 +149,11 @@ class _BundleWriter:
                 or {"checkpoint": "Qwen3-30B-A3B", "precision": "bfloat16"},
                 "load": {"num_prompts": count},
             },
-            "validation": {"valid": valid, "checks": {}},
+            "metric_definitions": [
+                {"path": "accuracy", "direction": direction}
+            ],
+            "failed_count": failed_count,
+            "validation": {"valid": valid, "checks": checks or {}},
             "launch": {
                 "command": command
                 or [
@@ -191,6 +200,84 @@ def test_an_accuracy_gap_beyond_the_interval_is_rejected(
 
     assert report["verdict"] == "rejected"
     assert report["difference"]["within_interval"] is False
+    # Higher accuracy is better, so a gain beyond the interval is an
+    # improvement, which the two-sided rule still rejects.
+    assert report["difference"]["change"] == "improvement"
+    assert report["reasons"] == ["improvement"]
+
+
+@pytest.mark.parametrize(
+    ("direction", "candidate_correct", "change"),
+    [
+        ("higher", 1000, "regression"),
+        ("higher", 0, "regression"),
+        ("lower", 1000, "improvement"),
+        ("higher", 1188, "none"),
+    ],
+)
+def test_the_change_follows_the_declared_direction(
+    tmp_path: Path, direction: str, candidate_correct: int, change: str
+) -> None:
+    """A worse candidate beyond the interval is reported as a regression."""
+    reference = _BundleWriter(tmp_path / "reference").write(
+        correct=1186, direction=direction
+    )
+    candidate = _BundleWriter(tmp_path / "candidate").write(
+        correct=candidate_correct, direction=direction
+    )
+
+    report = compare_runs(reference, candidate)
+
+    assert report["difference"]["change"] == change
+    assert report["verdict"] == ("accepted" if change == "none" else "rejected")
+
+
+def test_a_candidate_with_failed_requests_is_rejected_not_incomparable(
+    tmp_path: Path,
+) -> None:
+    """Failed requests score as wrong answers and reject the candidate."""
+    reference = _BundleWriter(tmp_path / "reference").write(correct=1186)
+    # Three failed requests are among the 1319 scored rows; the accuracy
+    # is still within the interval of the reference's.
+    candidate = _BundleWriter(tmp_path / "candidate").write(
+        correct=1183,
+        valid=False,
+        checks={"all_requests_succeeded": False, "gold_answers": True},
+        failed_count=3,
+    )
+
+    report = compare_runs(reference, candidate)
+
+    assert report["verdict"] == "rejected"
+    assert report["reasons"] == ["failed_checks"]
+    assert report["difference"]["change"] == "none"
+    assert report["candidate"]["failed_requests"] == 3
+    assert report["candidate"]["failed_checks"] == ["all_requests_succeeded"]
+    assert report["candidate"]["total"] == 1319
+
+
+def test_a_candidate_with_unscorable_rows_is_not_comparable(
+    tmp_path: Path,
+) -> None:
+    """A row without a gold answer leaves no common denominator."""
+    reference = _BundleWriter(tmp_path / "reference").write()
+    candidate = _BundleWriter(tmp_path / "candidate").write(
+        valid=False, checks={"gold_answers": False}
+    )
+
+    with pytest.raises(ValueError, match="gold answer"):
+        compare_runs(reference, candidate)
+
+
+def test_runs_declaring_different_accuracy_directions_are_not_comparable(
+    tmp_path: Path,
+) -> None:
+    """The direction that names a regression must be the same for both."""
+    reference = _BundleWriter(tmp_path / "reference").write()
+    candidate = _BundleWriter(tmp_path / "candidate").write(direction="lower")
+
+    with pytest.raises(ValueError, match="accuracy directions"):
+        compare_runs(reference, candidate)
 
 
 def test_different_sample_sets_are_not_comparable(tmp_path: Path) -> None:
@@ -325,9 +412,16 @@ def test_command_exit_status_reports_the_verdict(tmp_path: Path) -> None:
     reference = _BundleWriter(tmp_path / "reference").write(correct=1186)
     accepted = _BundleWriter(tmp_path / "accepted").write(correct=1190)
     rejected = _BundleWriter(tmp_path / "rejected").write(correct=1000)
+    failed = _BundleWriter(tmp_path / "failed").write(
+        correct=1185,
+        valid=False,
+        checks={"all_requests_succeeded": False},
+        failed_count=1,
+    )
 
     assert _run_compare(["compare", str(reference), str(accepted)]) == 0
     assert _run_compare(["compare", str(reference), str(rejected)]) == 2
+    assert _run_compare(["compare", str(reference), str(failed)]) == 2
     assert (
         _run_compare(["compare", str(reference), str(tmp_path / "absent")]) == 1
     )

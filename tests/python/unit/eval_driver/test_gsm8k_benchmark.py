@@ -23,6 +23,7 @@ from uniserve_eval.datasets.gsm8k import (
     GSM8K_REPO_ID,
     GSM8KDataset,
 )
+from uniserve_eval.pipeline.report import build_summary
 from uniserve_eval.tasks.gsm8k import (
     SYSTEM_PROMPT,
     GSM8KTask,
@@ -428,6 +429,25 @@ def test_the_summary_metrics_are_accuracy_correct_and_total() -> None:
     metrics = GSM8KTask(_point(None, num_prompts=2)).summary_metrics(records)
 
     assert metrics == {"accuracy": 0.5, "correct": 1, "total": 2}
+
+
+def test_a_run_that_answers_nothing_correctly_is_a_valid_measurement() -> None:
+    """Zero accuracy is a measured outcome, not an invalid run."""
+    point = _point(None, num_prompts=2)
+    records = [_record(0, "#### 19"), _record(1, "#### 20")]
+
+    summary = build_summary(
+        point,
+        ["http://127.0.0.1:1"],
+        records,
+        1.0,
+        task=GSM8KTask(point),
+        selected_rows={"count": 2},
+    )
+
+    assert summary["metrics"]["accuracy"] == 0.0
+    assert summary["validation"]["checks"]["metric:accuracy"] is True
+    assert summary["validation"]["valid"] is True
 
 
 def test_a_failed_request_is_incorrect_whatever_its_text() -> None:

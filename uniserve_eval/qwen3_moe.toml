@@ -8,10 +8,10 @@
 # in the implementation and nothing else. Each cell is compared with itself;
 # two cells are not comparable, because they differ in the checkpoint or the
 # KV cache dtype and the evaluator requires both runs to share their
-# provenance (`uniserve_eval/pipeline/compare.py:213`). A BF16 accuracy
-# measured at another commit is history, not a denominator, because the two
-# runs then differ by whatever else changed between the commits and the
-# interval would answer a question nobody asked.
+# provenance (`uniserve_eval.pipeline.compare._require_comparable`). A BF16
+# accuracy measured at another commit is history, not a denominator, because
+# the two runs then differ by whatever else changed between the commits and
+# the interval would answer a question nobody asked.
 #
 # A server command names no `--worker-executable`: today's default worker
 # binary is the daemon's own executable, so `run --executable <new binary>`
