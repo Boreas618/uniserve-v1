@@ -212,14 +212,17 @@ def _paged_attention_prefill_kernel(
     # route computed from them indexes a table nothing can serve (an illegal address inside the
     # MoE gather, one kernel later). The inert value is written instead.
     if position >= length:
-        # ...and only a token the bucket has room for. Every padded row of a packed batch starts
-        # where the live tokens end, so `first + position` runs past the buffer's token axis for all
-        # but the first - and a store there lands in whatever the arena holds next, silently, which
-        # would trade one illegal address for a corrupted tensor. `tl.num_programs(0)` is the
-        # launch's token count: the host passes the same number as `tokens`, and at prefill
-        # `max_q_len` is that number too ("the packed token count, which bounds every row"), so one
-        # bound holds the row and the buffer at once.
-        if token < tl.num_programs(0):
+        # ...by the batch's last row alone, and only at a token the bucket has room for. In a packed
+        # batch the tokens past a row's length are the next row's live tokens, which that row's own
+        # programs write: a padding store from any other row would race them and could overwrite a
+        # computed output with zeros. The tokens no live row owns are those past the last row's end
+        # (the padded rows of a bucket have length 0 and start where the live tokens end), so the
+        # last row's tiles cover each of them exactly once. `tl.num_programs(0)` is the launch's
+        # token count: the host passes the same number as `tokens`, and at prefill `max_q_len` is
+        # that number too ("the packed token count, which bounds every row"), so one bound holds
+        # the row and the buffer at once.
+        last = row == tl.num_programs(2) - 1
+        if last and token < tl.num_programs(0):
             padded = (
                 tl.zeros((HEAD_DIM,), tl.bfloat16)
                 if OUT_BF16

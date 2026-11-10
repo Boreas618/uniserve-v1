@@ -8,7 +8,9 @@ the decode one in exactly two ways, and each is a case here:
   first row's answer is the answer over one key whatever the rest of the cache holds;
 * **a batch's rows are not all the same length** — a packed batch states each row's first query token
   in `cum_seq_lens_q`, an unpacked one gives every row `max_q_len`, and the two statements of the same
-  data must produce the same answer.
+  data must produce the same answer. The launch is the operator's: `max_q_len` and the grid's query
+  rows are the packed token count, so a shorter row's tiles past its length must leave the next
+  row's tokens alone, and the tokens of a padded bucket that no row owns must read zero.
 
 The reference is the composition the contract states, written in torch:
 
@@ -98,18 +100,25 @@ def cache(rows, generator):
     }
 
 
-def operands(rows, generator, out_dtype=torch.float32):
-    """The query, the cache and the output buffer, in the layouts the operator states."""
+def operands(rows, generator, out_dtype=torch.float32, padding=0):
+    """The query, the cache and the output buffer, in the layouts the operator states.
+
+    `padding` tokens follow the live ones, as a bucket larger than its batch holds them. The output
+    starts as `nan` everywhere, so a token the kernel failed to write cannot pass as a zero.
+    """
+    total = sum(rows) + padding
     tokens = (
-        torch.rand((sum(rows), Q_HEADS, HEAD_DIM), generator=generator) * 2.0
-        - 1.0
+        torch.rand((total, Q_HEADS, HEAD_DIM), generator=generator) * 2.0 - 1.0
     )
-    out = torch.zeros((sum(rows), Q_HEADS, HEAD_DIM), dtype=out_dtype)
+    out = torch.full((total, Q_HEADS, HEAD_DIM), float("nan"), dtype=out_dtype)
     state = cache(rows, generator)
+    # At prefill the operator passes the packed token count as `max_q_len` and launches that many
+    # query rows per batch row (`crates/ops/src/attention/mod.rs`), so a shorter row's tiles past
+    # its length are the padding path.
     return {
         "query": tokens,
         "out": out,
-        "max_q_len": max(rows),
+        "max_q_len": total,
         "packed": True,
         **state,
     }
@@ -125,6 +134,7 @@ def reference(operands_of, dtype=torch.float32):
     table = operands_of["page_table"]
     lengths = operands_of["seq_lens"].tolist()
     first = operands_of["cum_seq_lens_q"].tolist()
+    # A token no row owns is padding, and the kernel writes it as zero.
     out = torch.zeros_like(query)
     for row, seq_len in enumerate(lengths):
         live = (seq_len + PAGE - 1) // PAGE
@@ -211,9 +221,10 @@ def compare(
     out_dtype=torch.float32,
     packed=True,
     output_roundoff=OUTPUT_ROUNDOFF,
+    padding=0,
 ):
     """Compare one case against the reference within the operator's declared bound."""
-    operands_of = operands(rows, generator, out_dtype)
+    operands_of = operands(rows, generator, out_dtype, padding)
     expected = reference(operands_of).to(torch.float32)
     got = launch(kernel, operands_of, packed)[0].to(torch.float32)
     reduction = max(rows)
@@ -276,11 +287,22 @@ def main():
     failures += compare(
         "a partial last page under the mask", kernel, [70], generator
     )
+    # The shorter row comes first, so its tiles past its length fall on the second row's live
+    # tokens: only the batch's last row may write padding.
     failures += compare(
         "a batch of two rows with different lengths",
         kernel,
         [24, 40],
         generator,
+    )
+    # A bucket larger than its batch: a padded row of length 0 and tokens no row owns, which the
+    # kernel must write as zero rather than leave as whatever the buffer held.
+    failures += compare(
+        "a padded bucket",
+        kernel,
+        [24, 16, 0],
+        generator,
+        padding=8,
     )
     # The narrowed store, as its own case: the interpreter truncates a BF16 store where a device
     # rounds (measured in `decode_check.py`: 2072 of 4096 values, up to two steps), so its bound
