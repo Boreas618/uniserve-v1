@@ -29,7 +29,8 @@ dependencies = [
     # package links with the dialect runtime into a native module (design
     # section 5.3).
     "nvidia-cutlass-dsl[cu13]==4.6.2",
-    # The CuTe DSL kernels of FlashInfer 0.6.18 (MoE sort and unpermute) and
+    # FlashInfer 0.6.18 (its trtllm-gen launch code, MoE sort and unpermute
+    # sources, and the MegaMoE CuTe DSL kernel the `megamoe` pin reads) and
     # FlashAttention-4 4.0.0b30 are the sources of the packages that import
     # them; they are pinned here, not in the serving environment.
     "flashinfer-python==0.6.18",
@@ -46,9 +47,10 @@ module-root = "src"
 
 [tool.uv]
 # The environment holds the compilers and the packages a kernel program imports,
-# and one module of our own: `uniserve_program_server`, the fetch of the
-# trtllm-gen artifact (design section 9's native attention package). The
-# compile drivers themselves are the kernel packages' own `src/build.py`
+# and one package of our own: `uniserve_program_server`, what the compile drivers
+# share — the pinned third-party sources (`fetch`, with its manifests under
+# `pins/`) and the trtllm-gen build. The compile drivers themselves are the kernel
+# packages' own `src/build.py`
 # (design 5.2: a revision fixes the rule that picks its kernel), which this
 # environment's interpreter runs.
 package = true

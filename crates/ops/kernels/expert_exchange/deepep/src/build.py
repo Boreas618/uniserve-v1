@@ -1,19 +1,24 @@
 """The deepep package's compile script: one descriptor -> one module.
 
-The descriptor fixes every template argument of DeepEP's kernels, so this compiles
-them here, and a serving host compiles nothing. The Program Server runs this script
-with its working directory the package root and `UNISERVE_DESCRIPTOR`,
-`UNISERVE_TARGET`, `UNISERVE_PACKAGE` and `UNISERVE_OUT` in the environment.
+The descriptor fixes every template argument of DeepEP's kernels, so this
+compiles them here, and a serving host compiles nothing. The Program Server runs
+this script with its working directory the package root and
+`UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`, `UNISERVE_PACKAGE` and `UNISERVE_OUT`
+in the environment.
+
+DeepEP's kernels and the NCCL device API they are built against are pinned
+sources (`uniserve_program_server.fetch`'s `deepep` and `nccl` pins): the
+compile includes them from their verified cache directories.
 """
 
-import argparse
 import json
-import os
 import pathlib
 import re
 import subprocess
 import sys
 import sysconfig
+
+from uniserve_program_server import fetch, package
 
 SOURCES = ["src/exchange.cu"]
 
@@ -26,31 +31,6 @@ ENTRIES = [
     "uniserve_expert_exchange_release",
     "uniserve_expert_exchange_info",
 ]
-
-
-def arguments():
-    """The package, descriptor, target and output directory of one build."""
-    reader = argparse.ArgumentParser(description=__doc__)
-    reader.add_argument("--package")
-    reader.add_argument("--descriptor")
-    reader.add_argument("--target")
-    reader.add_argument("--out")
-    known = reader.parse_args()
-    values = {
-        "package": known.package or os.environ.get("UNISERVE_PACKAGE"),
-        "descriptor": known.descriptor or os.environ.get("UNISERVE_DESCRIPTOR"),
-        "target": known.target or os.environ.get("UNISERVE_TARGET"),
-        "out": known.out or os.environ.get("UNISERVE_OUT"),
-    }
-    missing = [name for name, value in values.items() if not value]
-    if missing:
-        raise SystemExit(f"missing {', '.join(missing)}")
-    return (
-        pathlib.Path(values["package"]).resolve(),
-        values["descriptor"],
-        values["target"],
-        pathlib.Path(values["out"]),
-    )
 
 
 def constants(descriptor):
@@ -77,8 +57,8 @@ def nccl_library():
     """The directory of a `libnccl.so.2` to name in the module's needed list.
 
     The module takes the serving process's NCCL at run time, which
-    `tools/check_nccl.sh` holds to the project's version; this one only states the
-    library's name to the linker.
+    `tools/check_nccl.sh` holds to the project's version; this one only states
+    the library's name to the linker.
     """
     site = pathlib.Path(sysconfig.get_paths()["purelib"])
     directory = site / "nvidia" / "nccl" / "lib"
@@ -89,11 +69,17 @@ def nccl_library():
 
 def main():
     """Compile the exchange for one descriptor into ``module.so``."""
-    package, descriptor, target, out = arguments()
+    root, descriptor, target, out = package.arguments()
     out.mkdir(parents=True, exist_ok=True)
-    # The nvcc the Program Server checked against this package's declared version.
-    compiler = os.environ["UNISERVE_NVCC"]
-    defines = [f"-D{name}={value}" for name, value in constants(descriptor).items()]
+    try:
+        deepep = fetch.fetch(fetch.pin("deepep"))
+        nccl = fetch.fetch(fetch.pin("nccl"))
+    except fetch.FetchError as error:
+        raise SystemExit(str(error)) from error
+    compiler, _ = package.nvcc()
+    defines = [
+        f"-D{name}={value}" for name, value in constants(descriptor).items()
+    ]
     command = [
         compiler,
         "-O3",
@@ -108,10 +94,10 @@ def main():
         "--ptxas-options=--register-usage-level=10",
         "-DDISABLE_AGGRESSIVE_PTX_INSTRS",
         *defines,
-        f"-I{package / 'include'}",
-        f"-I{package / 'vendor'}",
-        f"-I{package / 'vendor' / 'nccl'}",
-        *[str(package / source) for source in SOURCES],
+        f"-I{root / 'include'}",
+        f"-I{deepep / 'deep_ep' / 'include'}",
+        f"-I{nccl / 'nvidia' / 'nccl' / 'include'}",
+        *[str(root / source) for source in SOURCES],
         "-lcudart",
         "-lcuda",
         f"-L{nccl_library()}",
@@ -124,18 +110,15 @@ def main():
     print(" ".join(command), file=sys.stderr)
     built = subprocess.run(command, capture_output=True, text=True, check=False)
     if built.returncode != 0:
-        raise SystemExit(f"nvcc failed with {built.returncode}:\n{built.stderr[-6000:]}")
-    exported = subprocess.run(
-        ["nm", "-D", "--defined-only", str(out / "module.so")],
-        capture_output=True,
-        text=True,
-        check=True,
+        raise SystemExit(
+            f"nvcc failed with {built.returncode}:\n{built.stderr[-6000:]}"
+        )
+    package.require_exports(out / "module.so", ENTRIES)
+    print(
+        json.dumps(
+            {"descriptor": descriptor, "target": target, "entries": ENTRIES}
+        )
     )
-    symbols = {line.split()[-1] for line in exported.stdout.splitlines() if line.split()}
-    missing = [entry for entry in ENTRIES if entry not in symbols]
-    if missing:
-        raise SystemExit(f"module.so does not export {', '.join(missing)}")
-    print(json.dumps({"descriptor": descriptor, "target": target, "entries": ENTRIES}))
 
 
 if __name__ == "__main__":

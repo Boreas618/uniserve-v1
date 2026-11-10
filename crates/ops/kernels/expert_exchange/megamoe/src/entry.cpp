@@ -3,7 +3,7 @@
 // The megamoe backend of expert_exchange: one launch per layer exchanges the tokens,
 // runs the experts and combines.
 //
-// The kernels are FlashInfer's MegaMoE (`vendor/`), compiled here by the CuTe DSL. The
+// The kernels are FlashInfer's MegaMoE (pinned, patched), compiled here by the CuTe DSL. The
 // Python deployment placed their buffers on an NVSHMEM symmetric heap, and NVSHMEM
 // serves one rank per process, which a main process is not. The kernels ask for less
 // than a heap: they reach a peer's buffer by adding that peer's offset to the local

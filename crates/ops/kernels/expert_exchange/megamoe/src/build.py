@@ -1,14 +1,15 @@
 """The megamoe package's compile script: one descriptor -> one module.
 
-The Program Server runs this script with its working directory the package root and
-`UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`, `UNISERVE_PACKAGE` and `UNISERVE_OUT` in the
-environment. It compiles FlashInfer's MegaMoE kernel (`vendor/megamoe`) for one group
-and one shape with the CuTe DSL, exports the kernel with its host launcher, and links
-them with `src/entry.cpp` and `src/stage.cu` into `module.so`. No device is read: the
-target names the architecture, and the kernel's tuning is the table below.
+The Program Server runs this script with its working directory the package root
+and `UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`, `UNISERVE_PACKAGE` and
+`UNISERVE_OUT` in the environment. It compiles FlashInfer's MegaMoE kernel (the
+pinned `megamoe` source with `patches/megamoe.patch`, see `kernel_sources`) for
+one group and one shape with the CuTe DSL, exports the kernel with its host
+launcher, and links them with `src/entry.cpp` and `src/stage.cu` into
+`module.so`. No device is read: the target names the architecture, and the
+kernel's tuning is the table below.
 """
 
-import argparse
 import json
 import os
 import pathlib
@@ -16,6 +17,9 @@ import re
 import subprocess
 import sys
 import tempfile
+
+from uniserve_program_server import fetch
+from uniserve_program_server import package as build
 
 ENTRIES = [
     "uniserve_expert_exchange_launch",
@@ -27,13 +31,15 @@ ENTRIES = [
     "uniserve_expert_exchange_info",
 ]
 
-#: The SMs the launch's clusters are sized for. A persistent cluster that does not fit
-#: on the device would wait for one that never starts, so this is the smallest SM100
-#: part's count, and a larger part leaves SMs idle rather than hanging.
+#: The SMs the launch's clusters are sized for. A persistent cluster that does
+#: not fit on the device would wait for one that never starts, so this is the
+#: smallest SM100 part's count, and a larger part leaves SMs idle rather than
+#: hanging.
 SM_COUNT = 148
 
-#: The kernel's measured profiles by the largest step's token count: design 5.4 keeps
-#: tuning data in the program package. These are FlashInfer's built-in table.
+#: The kernel's measured profiles by the largest step's token count: design 5.4
+#: keeps tuning data in the program package. These are FlashInfer's built-in
+#: table.
 MID_TOKENS = {
     "mma_tiler_mnk": (256, 128, 256),
     "cluster_shape_mnk": (2, 1, 1),
@@ -45,7 +51,9 @@ MID_TOKENS = {
 }
 SMALL_TOKENS = dict(MID_TOKENS, token_back_mode="epi_warps")
 MID_LARGE_TOKENS = dict(
-    MID_TOKENS, mma_tiler_mnk=(256, 256, 256), token_back_mode="standalone_warps"
+    MID_TOKENS,
+    mma_tiler_mnk=(256, 256, 256),
+    token_back_mode="standalone_warps",
 )
 LARGE_TOKENS = dict(MID_TOKENS, mma_tiler_mnk=(256, 256, 256), flag_batch=8)
 
@@ -61,31 +69,6 @@ def knobs_for(tokens):
     return LARGE_TOKENS
 
 
-def arguments():
-    """The package, descriptor, target and output directory of one build."""
-    reader = argparse.ArgumentParser(description=__doc__)
-    reader.add_argument("--package")
-    reader.add_argument("--descriptor")
-    reader.add_argument("--target")
-    reader.add_argument("--out")
-    known = reader.parse_args()
-    values = {
-        "package": known.package or os.environ.get("UNISERVE_PACKAGE"),
-        "descriptor": known.descriptor or os.environ.get("UNISERVE_DESCRIPTOR"),
-        "target": known.target or os.environ.get("UNISERVE_TARGET"),
-        "out": known.out or os.environ.get("UNISERVE_OUT"),
-    }
-    missing = [name for name, value in values.items() if not value]
-    if missing:
-        raise SystemExit(f"missing {', '.join(missing)}")
-    return (
-        pathlib.Path(values["package"]).resolve(),
-        values["descriptor"],
-        values["target"],
-        pathlib.Path(values["out"]),
-    )
-
-
 def shape_of(descriptor):
     """The extents a descriptor states."""
     found = re.fullmatch(
@@ -99,8 +82,8 @@ def shape_of(descriptor):
     return hidden, intermediate, top, experts, tokens, ranks
 
 
-#: The kernel's entry, spelled per group size: the exported launcher takes scalars, so a
-#: peer's offset is a parameter of its own.
+#: The kernel's entry, spelled per group size: the exported launcher takes
+#: scalars, so a peer's offset is a parameter of its own.
 EXPORT = """
 class Export:
     def __init__(self, kernel, clusters):
@@ -157,12 +140,38 @@ class Export:
 """
 
 
+#: Where the kernel's sources sit in FlashInfer's distribution, and so in the
+#: staged tree.
+KERNEL_SOURCES = "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src"
+
+
+def kernel_sources(package, staging):
+    """The kernel's sources, staged as this package compiles them.
+
+    They are the pinned FlashInfer copy (`uniserve_program_server.fetch`'s
+    `megamoe` pin) with `patches/megamoe.patch` applied, which adds the
+    tanh-approximated GELU gate and fixes the peer-metadata stride of the token
+    exchange. The patch is applied to copies in the build's staging directory,
+    so neither the distribution nor the verified cache is changed.
+    """
+    pinned = fetch.pin("megamoe")
+    staged = staging / "megamoe"
+    patch = package / "patches" / "megamoe.patch"
+    try:
+        names = list(fetch.manifest(pinned))
+        fetch.fetch(pinned, names)
+        fetch.stage(pinned, staged, names, copy=True)
+        fetch.apply_patch(staged / KERNEL_SOURCES, patch)
+    except fetch.FetchError as error:
+        raise SystemExit(str(error)) from error
+    return staged / KERNEL_SOURCES
+
+
 def compile_kernel(package, target, shape, staging):
     """Compile and export the kernel; answers its two workspace sizes."""
     hidden, intermediate, top, experts, tokens, ranks = shape
     os.environ["CUTE_DSL_ARCH"] = target
-    sys.path.insert(0, str(package / "vendor" / "megamoe"))
-    import cuda.bindings.driver as cuda  # noqa: PLC0415
+    sys.path.insert(0, str(kernel_sources(package, staging)))
     import cutlass  # noqa: PLC0415
     import cutlass.cute as cute  # noqa: PLC0415
     import torch  # noqa: PLC0415
@@ -173,12 +182,13 @@ def compile_kernel(package, target, shape, staging):
     from moe_nvfp4_swapab.epilogue_refactor import (  # noqa: PLC0415
         SwapABSwigluFp4Epilogue,
     )
-    from moe_nvfp4_swapab.megamoe_kernel import Sm100MegaMoEKernel  # noqa: PLC0415
+    from moe_nvfp4_swapab.megamoe_kernel import (
+        Sm100MegaMoEKernel,  # noqa: PLC0415
+    )
     from moe_nvfp4_swapab.runner_common import (  # noqa: PLC0415
         _DataDtype,
         _ScaleDtype,
     )
-    from src.sym_buffer import SymBufferHost  # noqa: PLC0415
     from src.token_comm import CombineFormat  # noqa: PLC0415
 
     knobs = knobs_for(tokens)
@@ -215,30 +225,43 @@ def compile_kernel(package, target, shape, staging):
     )
 
     def described(tensor, align=16):
-        """The tensor's description: every extent and stride a run-time value."""
+        """The tensor's description: every extent and stride at run time."""
         wrapped = cutlass_torch.from_dlpack(tensor, assumed_align=align)
-        return wrapped.mark_layout_dynamic(leading_dim=cutlass_torch.get_leading_dim(tensor))
+        return wrapped.mark_layout_dynamic(
+            leading_dim=cutlass_torch.get_leading_dim(tensor)
+        )
 
     scale_columns = (hidden // 16 + 3) // 4 * 4
-    packed = torch.zeros((tokens, hidden // 2), dtype=torch.uint8).view(_DataDtype)
-    scales = torch.zeros((tokens, scale_columns), dtype=torch.uint8).view(_ScaleDtype)
+    packed = torch.zeros((tokens, hidden // 2), dtype=torch.uint8).view(
+        _DataDtype
+    )
+    scales = torch.zeros((tokens, scale_columns), dtype=torch.uint8).view(
+        _ScaleDtype
+    )
     routes = torch.zeros((tokens, top), dtype=torch.int64)
     weights = torch.zeros((tokens, top), dtype=torch.float32)
     first = torch.zeros((local, width, hidden // 2), dtype=torch.uint8)
     first = first.transpose(1, 2).view(_DataDtype)
     second = torch.zeros((local, hidden, intermediate // 2), dtype=torch.uint8)
     second = second.transpose(1, 2).view(_DataDtype)
-    first_scales = torch.zeros((local, width * (hidden // 16)), dtype=torch.uint8)
+    first_scales = torch.zeros(
+        (local, width * (hidden // 16)), dtype=torch.uint8
+    )
     first_scales = first_scales.view(_ScaleDtype)
-    second_scales = torch.zeros((local, hidden * (intermediate // 16)), dtype=torch.uint8)
+    second_scales = torch.zeros(
+        (local, hidden * (intermediate // 16)), dtype=torch.uint8
+    )
     second_scales = second_scales.view(_ScaleDtype)
     alpha = torch.zeros((local,), dtype=torch.float32)
     output = torch.zeros((tokens, hidden), dtype=torch.bfloat16)
 
     names = ", ".join(f"off{rank}" for rank in range(ranks))
-    parameters = "\n        ".join(f"off{rank}: cutlass.Int64," for rank in range(ranks))
+    parameters = "\n        ".join(
+        f"off{rank}: cutlass.Int64," for rank in range(ranks)
+    )
     source = EXPORT.format(parameters=parameters, offsets=names, ranks=ranks)
-    # `cute.jit` reads the function's source, so the entry is a real file on the path.
+    # `cute.jit` reads the function's source, so the entry is a real file on the
+    # path.
     module_path = staging / "mega_export.py"
     module_path.write_text(
         "import cuda.bindings.driver as cuda\n"
@@ -285,20 +308,30 @@ def cutlass_library():
     found = importlib.util.find_spec("nvidia_cutlass_dsl")
     locations = list(getattr(found, "submodule_search_locations", None) or ())
     if not locations:
-        raise SystemExit("the CuTe DSL package nvidia_cutlass_dsl is not installed")
+        raise SystemExit(
+            "the CuTe DSL package nvidia_cutlass_dsl is not installed"
+        )
     root = pathlib.Path(locations[0])
     for major in ("cu13", "cu12"):
         archive = root / major / "lib" / "libcuda_dialect_runtime_static.a"
         if archive.exists():
             return archive
-    raise SystemExit("no libcuda_dialect_runtime_static.a in nvidia_cutlass_dsl")
+    raise SystemExit(
+        "no libcuda_dialect_runtime_static.a in nvidia_cutlass_dsl"
+    )
 
 
 def cuda_home():
-    """The CUDA toolkit's directory, which `CUDA_HOME` names: the runtime's headers and library."""
+    """The CUDA toolkit's directory, which `CUDA_HOME` names.
+
+    It holds the runtime's headers and library.
+    """
     home = os.environ.get("CUDA_HOME")
     if not home:
-        raise SystemExit("CUDA_HOME names the CUDA toolkit whose runtime the module links against")
+        raise SystemExit(
+            "CUDA_HOME names the CUDA toolkit whose runtime the module links "
+            "against"
+        )
     return pathlib.Path(home)
 
 
@@ -311,13 +344,15 @@ def run(command, what):
 
 def main():
     """Compile the fused exchange for one descriptor into ``module.so``."""
-    package, descriptor, target, out = arguments()
+    package, descriptor, target, out = build.arguments()
     out.mkdir(parents=True, exist_ok=True)
     shape = shape_of(descriptor)
     hidden, intermediate, top, experts, tokens, ranks = shape
     with tempfile.TemporaryDirectory() as directory:
         staging = pathlib.Path(directory)
-        local_bytes, shared_bytes = compile_kernel(package, target, shape, staging)
+        local_bytes, shared_bytes = compile_kernel(
+            package, target, shape, staging
+        )
         offsets = ", ".join(f"offsets[{rank}]" for rank in range(ranks))
         defines = [
             f"-DUNISERVE_RANKS={ranks}",
@@ -348,8 +383,8 @@ def main():
             ],
             "compiling the staging kernel",
         )
-        # The stage's fatbin registers itself through a device link, so it is linked
-        # by nvcc into one object the host linker takes.
+        # The stage's fatbin registers itself through a device link, so it is
+        # linked by nvcc into one object the host linker takes.
         stage_link = staging / "stage_link.o"
         run(
             [
@@ -405,17 +440,12 @@ def main():
             ],
             "linking module.so",
         )
-    listed = subprocess.run(
-        ["nm", "-D", "--defined-only", str(out / "module.so")],
-        capture_output=True,
-        text=True,
-        check=True,
+    build.require_exports(out / "module.so", ENTRIES)
+    print(
+        json.dumps(
+            {"descriptor": descriptor, "target": target, "entries": ENTRIES}
+        )
     )
-    symbols = {line.split()[-1] for line in listed.stdout.splitlines() if line.split()}
-    missing = [entry for entry in ENTRIES if entry not in symbols]
-    if missing:
-        raise SystemExit(f"module.so does not export {', '.join(missing)}")
-    print(json.dumps({"descriptor": descriptor, "target": target, "entries": ENTRIES}))
 
 
 if __name__ == "__main__":

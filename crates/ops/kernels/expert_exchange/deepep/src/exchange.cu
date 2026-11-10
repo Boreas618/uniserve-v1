@@ -3,7 +3,7 @@
 // The deepep backend of expert_exchange: DeepEP's elastic dispatch and combine,
 // without its Python extension.
 //
-// The kernels are DeepEP's (`vendor/deep_ep`), unchanged. DeepEP specializes them at
+// The kernels are DeepEP's (the build's pinned `deepep` source), unchanged. DeepEP specializes them at
 // run time through a compiler it carries; here the descriptor fixes every template
 // argument, so the build compiles them once and nothing compiles on a serving host.
 // The rest of this file is what DeepEP's `ElasticBuffer` did around them for the one
