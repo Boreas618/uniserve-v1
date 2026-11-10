@@ -39,7 +39,8 @@
 //! because an empty region is a step that runs on zeros.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use ipc::RequestKey;
 use ops::TensorView;
@@ -216,6 +217,11 @@ pub trait Products: Send + Sync {
     /// otherwise refuse every denoising step with "nothing produced it".
     fn holds(&self, request: RequestKey, kind: Product) -> bool;
 
+    /// Blocks until `request` has a `kind` product or `timeout` passed, and answers whether it has
+    /// one: a reader whose producer runs on another rank waits for the publication, woken by it
+    /// rather than polling.
+    fn await_published(&self, request: RequestKey, kind: Product, timeout: Duration) -> bool;
+
     /// What `request`'s `kind` product states to a reader that must place its bytes, or `None` when
     /// no call produced it.
     ///
@@ -377,6 +383,8 @@ pub fn absent(request: RequestKey, kind: Product) -> crate::Error {
 /// request ends it here; the entries are views, so what leaks is bookkeeping and not memory.
 pub struct Held {
     entries: Mutex<HashMap<(RequestKey, Product), Placed>>,
+    /// Notified on every publication, for a reader waiting in [`Products::await_published`].
+    published: Condvar,
 }
 
 /// The products of a group of ranks: each rank's own, and the ones a rank makes for another.
@@ -469,6 +477,10 @@ impl Products for RankProducts {
 
     fn holds(&self, request: RequestKey, kind: Product) -> bool {
         self.store(kind).holds(request, kind)
+    }
+
+    fn await_published(&self, request: RequestKey, kind: Product, timeout: Duration) -> bool {
+        self.store(kind).await_published(request, kind, timeout)
     }
 
     fn product(&self, request: RequestKey, kind: Product) -> Result<Option<Published>> {
@@ -606,6 +618,7 @@ impl Held {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            published: Condvar::new(),
         }
     }
 
@@ -641,6 +654,7 @@ impl Products for Held {
                 written,
             },
         );
+        self.published.notify_all();
         Ok(())
     }
 
@@ -720,6 +734,17 @@ impl Products for Held {
 
     fn holds(&self, request: RequestKey, kind: Product) -> bool {
         crate::lock(&self.entries).contains_key(&(request, kind))
+    }
+
+    fn await_published(&self, request: RequestKey, kind: Product, timeout: Duration) -> bool {
+        let entries = crate::lock(&self.entries);
+        let (entries, _) = self
+            .published
+            .wait_timeout_while(entries, timeout, |entries| {
+                !entries.contains_key(&(request, kind))
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.contains_key(&(request, kind))
     }
 
     fn product(&self, request: RequestKey, kind: Product) -> Result<Option<Published>> {
@@ -1165,6 +1190,30 @@ mod tests {
             None,
             "a product belongs to the request that wrote it"
         );
+    }
+
+    /// A reader waiting for another rank's product is woken by its publication, and a wait for a
+    /// product nobody publishes ends at its bound.
+    #[test]
+    fn a_waiting_reader_is_woken_by_the_publication() {
+        let store = Arc::new(Held::new());
+        let publisher = Arc::clone(&store);
+        let published = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            publisher
+                .publish(
+                    request(1),
+                    Product::Tail(0),
+                    DeviceId(0),
+                    StreamId(1),
+                    None,
+                    &view(64, 2),
+                )
+                .expect("the tail");
+        });
+        assert!(store.await_published(request(1), Product::Tail(0), Duration::from_secs(30)));
+        published.join().expect("the publisher");
+        assert!(!store.await_published(request(2), Product::Tail(0), Duration::from_millis(1)));
     }
 
     /// A trajectory is published at every step, so the second write replaces the first: a reader

@@ -2679,6 +2679,15 @@ mod product_tests {
             self.held.contains(&kind)
         }
 
+        fn await_published(
+            &self,
+            request: ipc::RequestKey,
+            kind: Product,
+            _timeout: std::time::Duration,
+        ) -> bool {
+            self.holds(request, kind)
+        }
+
         fn product(
             &self,
             _request: ipc::RequestKey,

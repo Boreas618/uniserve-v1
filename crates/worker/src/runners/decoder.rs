@@ -1090,17 +1090,14 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
             .as_ref()
             .ok_or_else(|| crate::runners::products::no_store(request))?;
         let kind = Product::Tail(index - 1);
-        let deadline = std::time::Instant::now() + TAIL_WAIT;
-        while !store.holds(request, kind) {
-            if std::time::Instant::now() >= deadline {
-                return Err(Error::Invalid(format!(
-                    "request {} waited {} s for the tail of clip {} and its rank published none",
-                    request.request_id.0,
-                    TAIL_WAIT.as_secs(),
-                    index - 1
-                )));
-            }
-            std::thread::sleep(std::time::Duration::from_micros(200));
+        // The publication wakes this wait; the bound only names a rank that never publishes.
+        if !store.await_published(request, kind, TAIL_WAIT) {
+            return Err(Error::Invalid(format!(
+                "request {} waited {} s for the tail of clip {} and its rank published none",
+                request.request_id.0,
+                TAIL_WAIT.as_secs(),
+                index - 1
+            )));
         }
         // The tail lies in pinned host storage, which every device reads, so the splice reads it
         // where its rank left it: a copy between two pinned regions is the driver's host copy, which
