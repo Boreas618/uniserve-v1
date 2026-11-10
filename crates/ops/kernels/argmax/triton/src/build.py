@@ -25,12 +25,14 @@ def spec(fields, parameters, target):
             "rows": "i64",
             "WIDTH": "constexpr",
             "BLOCK": "constexpr",
+            "PDL": "constexpr",
         },
         "constexprs": {
             "WIDTH": int(fields["width"]),
             # The tile a row is walked in: 1024 f32 values fill one program's registers comfortably,
             # and a block that divides no width wastes nothing because every load is masked.
             "BLOCK": 1024,
+            "PDL": pdl,
         },
         "options": {"num_warps": 8 if int(fields["width"]) >= 2048 else 4, "launch_pdl": pdl},
     }

@@ -55,3 +55,13 @@ def test_the_fp8_gemm_matches_its_reference_on_the_device():
     The product is therefore checked here.
     """
     on_device(FAMILY / "fp8_gemm_check.py")
+
+
+#: The operators whose dependent launch `pdl_chain_check.py` checks.
+DEPENDENT = ("nvfp4_quantize",)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("op", DEPENDENT)
+def test_a_dependent_launch_reads_what_its_producer_wrote(op):
+    on_device(FAMILY / "pdl_chain_check.py", "--op", op)

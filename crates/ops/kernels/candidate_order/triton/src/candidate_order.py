@@ -28,6 +28,14 @@ import triton
 import triton.language as tl
 
 
+@triton.jit
+def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
+    """Wait for the preceding grid, then release the next one."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
 @triton.jit(do_not_specialize=["rows", "width", "vocabulary"])
 def _candidate_order_kernel(
     values_ptr,
@@ -39,6 +47,7 @@ def _candidate_order_kernel(
     width,
     vocabulary,
     BLOCK: tl.constexpr,  # noqa: N803
+    PDL: tl.constexpr,  # noqa: N803
 ):
     """Order one row's candidates by token id.
 
@@ -47,6 +56,8 @@ def _candidate_order_kernel(
     for the duration of the launch: it holds one count per token id, then that id's rank. ``rows`` is
     unused beyond naming the grid's extent and is kept because the operator packs it. Grid: (rows,).
     """
+    _pdl_prologue(PDL)
+
     row = tl.program_id(0).to(tl.int64)
     base = row * width
     counts = counts_ptr + row * vocabulary

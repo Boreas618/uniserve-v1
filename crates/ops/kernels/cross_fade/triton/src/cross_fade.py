@@ -43,6 +43,14 @@ import triton.language as tl
 
 
 @triton.jit
+def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
+    """Wait for the preceding grid, then release the next one."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@triton.jit
 def _cross_fade_kernel(
     previous_ptr,
     current_ptr,
@@ -66,6 +74,7 @@ def _cross_fade_kernel(
     pdl,
     AXIS: tl.constexpr,
     BLOCK: tl.constexpr,
+    PDL: tl.constexpr,  # noqa: N803
 ):
     """Blend one block of the destination.
 
@@ -77,6 +86,8 @@ def _cross_fade_kernel(
     ``frames``, ``rows``, ``columns``, each view's three outer strides, ``block`` and ``pdl`` are the
     launch's words.
     """
+    _pdl_prologue(PDL)
+
     dtype = out_ptr.dtype.element_ty
     columns = columns.to(tl.int64)
     rows = rows.to(tl.int64)

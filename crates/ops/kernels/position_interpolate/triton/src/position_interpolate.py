@@ -30,6 +30,14 @@ TAPS = tl.constexpr(4)
 
 
 @triton.jit
+def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
+    """Wait for the preceding grid, then release the next one."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@triton.jit
 def _position_interpolate_kernel(
     table_ptr,
     indices_ptr,
@@ -41,6 +49,7 @@ def _position_interpolate_kernel(
     pdl,
     CHANNELS: tl.constexpr,
     BLOCK: tl.constexpr,
+    PDL: tl.constexpr,  # noqa: N803
 ):
     """Gather four table rows and write one block of one output point.
 
@@ -48,6 +57,8 @@ def _position_interpolate_kernel(
     descriptor's. ``points``, ``channels``, ``block`` and ``pdl`` are the launch's words: the grid
     names the output point and the channel slice.
     """
+    _pdl_prologue(PDL)
+
     point = tl.program_id(0).to(tl.int64)
     lanes = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
     live = lanes < CHANNELS

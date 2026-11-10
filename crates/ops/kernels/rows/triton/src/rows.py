@@ -33,6 +33,14 @@ import triton.language as tl
 
 
 @triton.jit
+def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
+    """Wait for the preceding grid, then release the next one."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@triton.jit
 def _rows_kernel(
     source_ptr,
     destination_ptr,
@@ -44,6 +52,7 @@ def _rows_kernel(
     COLUMNS: tl.constexpr,
     REPLACE: tl.constexpr,
     BLOCK: tl.constexpr,
+    PDL: tl.constexpr,  # noqa: N803
 ):
     """Place one source row's block of columns at the row its index names.
 
@@ -51,6 +60,8 @@ def _rows_kernel(
     program covers. ``count``, ``columns``, ``block`` and ``pdl`` are the launch's words: the grid
     names the source row and the column slice.
     """
+    _pdl_prologue(PDL)
+
     row = tl.program_id(0).to(tl.int64)
     lanes = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
     live = lanes < COLUMNS

@@ -26,6 +26,7 @@ def warps_of(block):
 
 def spec(fields, parameters, target):
     """The compilation of one vsa_scores descriptor."""
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     block = int(fields["block"])
     return {
         "kernel": kernels._vsa_scores_kernel,
@@ -40,6 +41,7 @@ def spec(fields, parameters, target):
             "BLOCK": "constexpr",
             "KEY_TILES": "constexpr",
             "QUERIES": "constexpr",
+            "PDL": "constexpr",
         },
         # `QUERIES` is the launch's grid divisor as well: `POOLED_QUERIES` in
         # `crates/ops/src/segments.rs`.
@@ -48,10 +50,11 @@ def spec(fields, parameters, target):
             "BLOCK": block,
             "KEY_TILES": 32,
             "QUERIES": 16,
+            "PDL": pdl,
         },
         "options": {
             "num_warps": warps_of(block),
-            "launch_pdl": fields["pdl"] == "true",
+            "launch_pdl": pdl,
         },
     }
 

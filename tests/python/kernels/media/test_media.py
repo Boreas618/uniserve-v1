@@ -44,3 +44,17 @@ def test_a_layout_kernel_matches_its_reference_on_the_interpreter(check):
 @pytest.mark.parametrize("check", DEVICE)
 def test_a_layout_kernel_matches_its_reference_on_the_device(check):
     on_device(FAMILY / check)
+
+
+#: The operators whose dependent launch `pdl_chain_check.py` checks.
+DEPENDENT = (
+    "adaptive_pool",
+    "cross_fade",
+    "rgb_bytes",
+)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("op", DEPENDENT)
+def test_a_dependent_launch_reads_what_its_producer_wrote(op):
+    on_device(FAMILY / "pdl_chain_check.py", "--op", op)

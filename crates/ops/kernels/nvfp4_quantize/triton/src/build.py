@@ -57,6 +57,7 @@ def spec(fields, parameters, target):
             "SWIZZLED": "constexpr",
             "PADDED_COLUMNS": "constexpr",
             "PADDED_TILE": "constexpr",
+            "PDL": "constexpr",
         },
         "constexprs": {
             "COLUMNS": columns,
@@ -67,6 +68,7 @@ def spec(fields, parameters, target):
             # One program writes a whole padded row of zeros; the tile is the
             # padded width rounded up to the power of two arange needs.
             "PADDED_TILE": triton.next_power_of_2(max(padded_columns, 1)),
+            "PDL": pdl,
         },
         "options": {"num_warps": warps_of(block), "launch_pdl": pdl},
     }

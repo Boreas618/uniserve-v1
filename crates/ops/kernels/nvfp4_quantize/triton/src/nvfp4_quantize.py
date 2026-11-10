@@ -118,6 +118,14 @@ def _swizzled_offset(rows, columns, PADDED_COLUMNS: tl.constexpr):
 
 
 @triton.jit
+def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
+    """Wait for the preceding grid, then release the next one."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@triton.jit
 def _nvfp4_quantize_kernel(
     input_ptr,
     values_ptr,
@@ -131,6 +139,7 @@ def _nvfp4_quantize_kernel(
     SWIZZLED: tl.constexpr,
     PADDED_COLUMNS: tl.constexpr,
     PADDED_TILE: tl.constexpr,
+    PDL: tl.constexpr,  # noqa: N803
 ):
     """Encode one row: its per-token factor, its packed values and its E4M3 block scales.
 
@@ -140,6 +149,8 @@ def _nvfp4_quantize_kernel(
     swizzled. ``global_scale`` is the address of a one-element FP32 tensor holding the reciprocal
     of the matrix's FP32 tensor scale.
     """
+    _pdl_prologue(PDL)
+
     # The tensor scale is a device operand: the loader publishes a calibrated
     # checkpoint's value as one FP32 word, and every program reads it from there,
     # so the number the kernel scales by is the checkpoint's and not a host copy.

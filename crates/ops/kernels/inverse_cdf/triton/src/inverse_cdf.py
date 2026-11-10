@@ -26,6 +26,14 @@ import triton.language as tl
 MAX_COLUMN = tl.constexpr(1 << 30)
 
 
+@triton.jit
+def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
+    """Wait for the preceding grid, then release the next one."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
 @triton.jit(do_not_specialize=["rows", "width"])
 def _inverse_cdf_kernel(
     probabilities_ptr,
@@ -35,6 +43,7 @@ def _inverse_cdf_kernel(
     rows,
     width,
     BLOCK: tl.constexpr,
+    PDL: tl.constexpr,  # noqa: N803
 ):
     """Draw one token per program from one row's candidates.
 
@@ -43,6 +52,8 @@ def _inverse_cdf_kernel(
     in ``[0, 1)`` and ``tokens`` ``[rows]`` the drawn ids in the descriptor's
     token dtype. Grid: (rows,). ``BLOCK`` is the width of one tile of the row.
     """
+    _pdl_prologue(PDL)
+
     row = tl.program_id(0).to(tl.int64)
     width = width.to(tl.int64)
     lanes = tl.arange(0, BLOCK)

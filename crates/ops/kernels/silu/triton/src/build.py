@@ -24,6 +24,7 @@ def warps_of(block):
 
 def spec(fields, parameters, target):
     """The compilation of one silu descriptor."""
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     block = int(fields["block"])
     dtype = "*" + DTYPES[fields["dtype"]]
     return {
@@ -35,11 +36,12 @@ def spec(fields, parameters, target):
             "columns": "i32",
             "pdl": "i32",
             "BLOCK": "constexpr",
+            "PDL": "constexpr",
         },
-        "constexprs": {"BLOCK": block},
+        "constexprs": {"BLOCK": block, "PDL": pdl},
         "options": {
             "num_warps": warps_of(block),
-            "launch_pdl": fields["pdl"] == "true",
+            "launch_pdl": pdl,
         },
     }
 

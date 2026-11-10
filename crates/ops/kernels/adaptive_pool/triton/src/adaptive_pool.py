@@ -25,6 +25,14 @@ import triton.language as tl
 
 
 @triton.jit
+def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
+    """Wait for the preceding grid, then release the next one."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@triton.jit
 def _adaptive_pool_kernel(
     x,
     out,
@@ -49,6 +57,8 @@ def _adaptive_pool_kernel(
     roundings can add a position that the quotient alone does not allow (24 pooled to
     7 gives windows of four and of five). A shorter window is masked out term by term.
     """
+    _pdl_prologue(PDL)
+
     program = tl.program_id(0)
     index = (program * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
     total = rows * output

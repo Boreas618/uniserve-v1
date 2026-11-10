@@ -10,6 +10,14 @@ import triton
 import triton.language as tl
 
 
+@triton.jit
+def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
+    """Wait for the preceding grid, then release the next one."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
 @triton.jit(do_not_specialize=["count", "columns"])
 def _logits_gather_kernel(
     hidden_ptr,
@@ -18,6 +26,7 @@ def _logits_gather_kernel(
     count,
     columns,
     BLOCK: tl.constexpr,
+    PDL: tl.constexpr,  # noqa: N803
 ):
     """Copy the selected rows of ``hidden`` into dense rows of ``out``.
 
@@ -25,6 +34,8 @@ def _logits_gather_kernel(
     ``hidden`` is ``[tokens, columns]`` and ``out`` ``[count, columns]``. Grid:
     ``ceil(count * columns / BLOCK)``.
     """
+    _pdl_prologue(PDL)
+
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < count * columns
     row = offsets // columns

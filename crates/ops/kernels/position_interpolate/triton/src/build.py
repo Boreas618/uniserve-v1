@@ -24,6 +24,7 @@ def warps_of(block):
 
 def spec(fields, parameters, target):
     """The compilation of one position_interpolate descriptor."""
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     block = int(fields["block"])
     return {
         "kernel": kernels._position_interpolate_kernel,
@@ -38,11 +39,16 @@ def spec(fields, parameters, target):
             "pdl": "i32",
             "CHANNELS": "constexpr",
             "BLOCK": "constexpr",
+            "PDL": "constexpr",
         },
-        "constexprs": {"CHANNELS": int(fields["channels"]), "BLOCK": block},
+        "constexprs": {
+            "CHANNELS": int(fields["channels"]),
+            "BLOCK": block,
+            "PDL": pdl,
+        },
         "options": {
             "num_warps": warps_of(block),
-            "launch_pdl": fields["pdl"] == "true",
+            "launch_pdl": pdl,
         },
     }
 

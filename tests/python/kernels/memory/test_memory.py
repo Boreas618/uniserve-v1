@@ -31,3 +31,16 @@ def test_a_movement_kernel_matches_its_reference_on_the_interpreter(check):
 def test_the_page_conversion_rounds_every_narrow_case_on_the_device():
     """The cases that decode E4M3 or round into a narrow type need a device."""
     on_device(FAMILY / "page_conversion_check.py", "--device")
+
+
+#: The operators whose dependent launch `pdl_chain_check.py` checks.
+DEPENDENT = (
+    "rows",
+    "cache_copy_region",
+)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("op", DEPENDENT)
+def test_a_dependent_launch_reads_what_its_producer_wrote(op):
+    on_device(FAMILY / "pdl_chain_check.py", "--op", op)

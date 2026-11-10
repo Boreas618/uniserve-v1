@@ -31,6 +31,14 @@ import triton.language as tl
 PARAMETER_COLUMNS = tl.constexpr(8)
 
 
+@triton.jit
+def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
+    """Wait for the preceding grid, then release the next one."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
 @triton.jit(do_not_specialize=["rows", "width"])
 def _filter_candidates_kernel(
     values_ptr,
@@ -40,6 +48,7 @@ def _filter_candidates_kernel(
     rows,
     width,
     BLOCK: tl.constexpr,
+    PDL: tl.constexpr,  # noqa: N803
 ):
     """Filter one row of candidates in place and report its validity.
 
@@ -48,6 +57,8 @@ def _filter_candidates_kernel(
     top-k width at 1, the nucleus threshold at 2 and the min-p threshold at 3, and
     ``valid`` ``[rows]`` i32. Grid: (rows,). ``BLOCK`` is the width of one tile of the row.
     """
+    _pdl_prologue(PDL)
+
     row = tl.program_id(0).to(tl.int64)
     width = width.to(tl.int64)
     lanes = tl.arange(0, BLOCK)

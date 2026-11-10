@@ -46,7 +46,9 @@ def run(rows, columns, block):
     ) * VALUE_ENVELOPE
     out = torch.full_like(x, float("nan"))
     grid = ((x.numel() + block - 1) // block, 1, 1)
-    kernels._silu_kernel[grid](x, out, x.numel(), columns, 0, BLOCK=block)
+    kernels._silu_kernel[grid](
+        x, out, x.numel(), columns, 0, BLOCK=block, PDL=False
+    )
     expected = x / (1.0 + torch.exp(-x))
     error = (out - expected).abs().max().item()
     tolerance = (

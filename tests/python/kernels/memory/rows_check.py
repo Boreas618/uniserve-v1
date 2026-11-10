@@ -96,6 +96,7 @@ def run(module, *, dtype, mode, columns, rows, count, indices, seed=17):
         COLUMNS=columns,
         REPLACE=mode == "replace",
         BLOCK=BLOCK,
+        PDL=False,
     )
 
     # The reference is the operator's text, walked in the index order the call gives.

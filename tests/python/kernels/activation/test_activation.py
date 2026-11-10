@@ -9,7 +9,7 @@ import pathlib
 
 import pytest
 
-from tests.python.kernels.checks import interpreted
+from tests.python.kernels.checks import interpreted, on_device
 
 pytestmark = pytest.mark.unit
 
@@ -38,3 +38,13 @@ def test_the_sigmoid_gate_matches_its_reference_on_the_interpreter():
 @pytest.mark.parametrize("op", ["swiglu", "value_first_swiglu"])
 def test_a_gated_activation_matches_its_reference_on_the_interpreter(op):
     interpreted(FAMILY / "swiglu_check.py", "--op", op)
+
+
+#: The operators whose dependent launch `pdl_chain_check.py` checks.
+DEPENDENT = ("silu",)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("op", DEPENDENT)
+def test_a_dependent_launch_reads_what_its_producer_wrote(op):
+    on_device(FAMILY / "pdl_chain_check.py", "--op", op)

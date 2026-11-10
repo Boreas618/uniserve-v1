@@ -23,6 +23,7 @@ def warps_of(block):
 
 def spec(fields, parameters, target):
     """The compilation of one rows descriptor."""
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     block = int(fields["block"])
     return {
         "kernel": kernels._rows_kernel,
@@ -37,15 +38,17 @@ def spec(fields, parameters, target):
             "COLUMNS": "constexpr",
             "REPLACE": "constexpr",
             "BLOCK": "constexpr",
+            "PDL": "constexpr",
         },
         "constexprs": {
             "COLUMNS": int(fields["columns"]),
             "REPLACE": fields["mode"] == "replace",
             "BLOCK": block,
+            "PDL": pdl,
         },
         "options": {
             "num_warps": warps_of(block),
-            "launch_pdl": fields["pdl"] == "true",
+            "launch_pdl": pdl,
         },
     }
 

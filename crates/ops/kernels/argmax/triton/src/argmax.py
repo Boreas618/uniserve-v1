@@ -13,6 +13,14 @@ import triton
 import triton.language as tl
 
 
+@triton.jit
+def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
+    """Wait for the preceding grid, then release the next one."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
 @triton.jit(do_not_specialize=["rows"])
 def _argmax_kernel(
     values_ptr,
@@ -20,11 +28,14 @@ def _argmax_kernel(
     rows,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
+    PDL: tl.constexpr,  # noqa: N803
 ):
     """Store the index of one row's largest value.
 
     ``values`` is ``[rows, WIDTH]`` and ``out`` ``[rows]`` in the descriptor's id dtype. Grid: (rows,).
     """
+    _pdl_prologue(PDL)
+
     row = tl.program_id(0).to(tl.int64)
     base = row * WIDTH
     best_value = tl.full([1], float("-inf"), tl.float32)

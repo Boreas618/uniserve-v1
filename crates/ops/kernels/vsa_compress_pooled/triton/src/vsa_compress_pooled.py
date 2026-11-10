@@ -31,6 +31,14 @@ import triton.language as tl
 
 
 @triton.jit
+def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
+    """Wait for the preceding grid, then release the next one."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@triton.jit
 def _vsa_compress_pooled_kernel(
     scores_ptr,
     values_ptr,
@@ -44,6 +52,7 @@ def _vsa_compress_pooled_kernel(
     BLOCK: tl.constexpr,
     QUERIES: tl.constexpr,
     KEYS: tl.constexpr,
+    PDL: tl.constexpr,  # noqa: N803
 ):
     """Write ``QUERIES`` (head, query tile) rows of the compression.
 
@@ -52,6 +61,8 @@ def _vsa_compress_pooled_kernel(
     one step reads. ``query_tiles`` and ``tiles`` are the launch's words, and ``pdl`` is a launching
     decision.
     """
+    _pdl_prologue(PDL)
+
     head = tl.program_id(1).to(tl.int64)
     query_tiles = query_tiles.to(tl.int64)
     tiles = tiles.to(tl.int64)

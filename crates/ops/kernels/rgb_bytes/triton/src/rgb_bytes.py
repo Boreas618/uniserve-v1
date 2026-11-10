@@ -42,6 +42,14 @@ MAGNITUDE = tl.constexpr(8388608.0)
 
 
 @triton.jit
+def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
+    """Wait for the preceding grid, then release the next one."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@triton.jit
 def _rgb_bytes_kernel(
     input,
     mean,
@@ -66,9 +74,11 @@ def _rgb_bytes_kernel(
 
     Grid: ``ceil(frames · rows · columns · channels / BLOCK)`` programs. ``pdl`` is
     the operator's own flag and the compiled ``PDL`` says what this module was
-    built for; the kernel does not branch on either, because a dependent launch is
-    expressed in how the module is launched, not in what it computes.
+    built for: a module launched as a dependent waits for the grid before it
+    before reading anything, and then lets the grid after it launch.
     """
+    _pdl_prologue(PDL)
+
     program = tl.program_id(0)
     # The extents and strides arrive as 64-bit scalars, so the index is widened to
     # match them once: a frame count times a raster's sides outgrows 32 bits on a

@@ -109,6 +109,7 @@ def launch(kernel, sizes, dtype=torch.float32):
         QUERIES=16,
         KEYS=4,
         BLOCK=BLOCK,
+        PDL=False,
     )
     return scores, values, sizes_tensor, out
 

@@ -30,6 +30,14 @@ KEY_BLOCK = tl.constexpr(16)
 
 
 @triton.jit
+def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
+    """Wait for the preceding grid, then release the next one."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@triton.jit
 def _vsa_scores_kernel(
     query_ptr,
     key_ptr,
@@ -41,6 +49,7 @@ def _vsa_scores_kernel(
     BLOCK: tl.constexpr,
     KEY_TILES: tl.constexpr,
     QUERIES: tl.constexpr,
+    PDL: tl.constexpr,  # noqa: N803
 ):
     """Write ``QUERIES`` (head, query tile) rows of scores.
 
@@ -49,6 +58,8 @@ def _vsa_scores_kernel(
     ``query_tiles`` and ``key_tiles`` are the launch's words - the grid names the block of query tiles
     and the head - and ``pdl`` is a launching decision.
     """
+    _pdl_prologue(PDL)
+
     head = tl.program_id(1).to(tl.int64)
     heads = tl.num_programs(1).to(tl.int64)
     lanes = tl.arange(0, BLOCK)

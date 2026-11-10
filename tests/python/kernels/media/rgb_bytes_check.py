@@ -188,6 +188,10 @@ def main() -> int:
             arguments.dtype, arguments.block, arguments.pdl, raster, canvas
         )
         expected, near_half = reference(rounded, MEAN, STD)
+        # The raster is channel-major and the bytes are packed pixels:
+        # `[channels, frames, rows, columns]` -> `[frames, rows, columns, channels]`.
+        expected = expected.transpose(1, 2, 3, 0)
+        near_half = near_half.transpose(1, 2, 3, 0)
         difference = np.abs(got.astype(np.int32) - expected)
         allowed = near_half & (difference <= 1)
         wrong = (difference > 0) & ~allowed

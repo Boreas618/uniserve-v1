@@ -106,6 +106,7 @@ def run(module, *, dtype, channels, in_side, block, indices, weights, seed=31):
         0,
         CHANNELS=channels,
         BLOCK=block,
+        PDL=False,
     )
 
     # The reference: the same four taps, in FP64, rounded once into the output's dtype.

@@ -39,3 +39,16 @@ def test_a_vsa_kernel_matches_its_reference_on_the_interpreter(check):
 @pytest.mark.parametrize("check", DEVICE)
 def test_a_vsa_kernel_rounds_as_its_reference_on_the_device(check):
     on_device(FAMILY / check)
+
+
+#: The operators whose dependent launch `pdl_chain_check.py` checks.
+DEPENDENT = (
+    "vsa_scores",
+    "vsa_compress_pooled",
+)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("op", DEPENDENT)
+def test_a_dependent_launch_reads_what_its_producer_wrote(op):
+    on_device(FAMILY / "pdl_chain_check.py", "--op", op)

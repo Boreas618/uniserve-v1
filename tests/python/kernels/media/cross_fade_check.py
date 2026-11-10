@@ -197,6 +197,7 @@ def run(
         0,
         AXIS=axis,
         BLOCK=block,
+        PDL=False,
     )
 
     if dtype == "bf16":
@@ -318,6 +319,7 @@ def run_seam(module, *, channels, frames, rows, columns, extent, axis, dtype):
         0,
         AXIS=axis,
         BLOCK=block,
+        PDL=False,
     )
     if dtype == "bf16":
         expected = blend_narrowed_to_bf16(

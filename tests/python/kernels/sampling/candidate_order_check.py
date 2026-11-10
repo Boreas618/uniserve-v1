@@ -171,6 +171,7 @@ def run_interpreter(package, key, seed):
             width,
             width,
             BLOCK=128,
+            PDL=False,
         )
         for fault in difference(
             got_values.numpy(), got_ids.numpy(), want_values, want_ids

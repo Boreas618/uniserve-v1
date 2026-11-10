@@ -31,8 +31,9 @@ def spec(fields, parameters, target):
             "rows": "i64",
             "width": "i32",
             "BLOCK": "constexpr",
+            "PDL": "constexpr",
         },
-        "constexprs": {"BLOCK": tile},
+        "constexprs": {"BLOCK": tile, "PDL": pdl},
         "options": {"num_warps": 8 if tile >= 2048 else 4, "launch_pdl": pdl},
     }
 

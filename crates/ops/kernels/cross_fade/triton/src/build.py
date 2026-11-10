@@ -24,6 +24,7 @@ def warps_of(block):
 
 def spec(fields, parameters, target):
     """The compilation of one cross_fade descriptor."""
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     block = int(fields["block"])
     dtype = DTYPES[fields["dtype"]]
     return {
@@ -51,11 +52,12 @@ def spec(fields, parameters, target):
             "pdl": "i32",
             "AXIS": "constexpr",
             "BLOCK": "constexpr",
+            "PDL": "constexpr",
         },
-        "constexprs": {"AXIS": int(fields["axis"]), "BLOCK": block},
+        "constexprs": {"AXIS": int(fields["axis"]), "BLOCK": block, "PDL": pdl},
         "options": {
             "num_warps": warps_of(block),
-            "launch_pdl": fields["pdl"] == "true",
+            "launch_pdl": pdl,
         },
     }
 

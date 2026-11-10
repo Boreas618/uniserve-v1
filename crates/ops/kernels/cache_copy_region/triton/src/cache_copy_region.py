@@ -113,6 +113,14 @@ def _decode_fp8(byte):
 
 
 @triton.jit
+def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
+    """Wait for the preceding grid, then release the next one."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@triton.jit
 def _cache_copy_region_kernel(
     values_ptr,
     scale_ptr,
@@ -143,6 +151,8 @@ def _cache_copy_region_kernel(
     address arithmetic: a plane's index is a product of extents and a 32-bit product would wrap into
     another unit's bytes with no shape to complain about.
     """
+    _pdl_prologue(PDL)
+
     column = tl.program_id(0)
     slot = tl.program_id(1)
     unit = tl.load(units_ptr + slot)

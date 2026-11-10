@@ -29,8 +29,9 @@ def spec(fields, parameters, target):
             "vocabulary": "i32",
             "ranks": "i32",
             "BLOCK": "constexpr",
+            "PDL": "constexpr",
         },
-        "constexprs": {"BLOCK": int(fields["block"])},
+        "constexprs": {"BLOCK": int(fields["block"]), "PDL": pdl},
         "options": {"num_warps": 4, "launch_pdl": pdl},
     }
 

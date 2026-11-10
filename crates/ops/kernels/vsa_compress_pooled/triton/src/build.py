@@ -30,6 +30,7 @@ KEYS = 64
 
 def spec(fields, parameters, target):
     """The compilation of one vsa_compress_pooled descriptor."""
+    pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
     block = int(fields["block"])
     return {
         "kernel": kernels._vsa_compress_pooled_kernel,
@@ -46,6 +47,7 @@ def spec(fields, parameters, target):
             "BLOCK": "constexpr",
             "QUERIES": "constexpr",
             "KEYS": "constexpr",
+            "PDL": "constexpr",
         },
         "constexprs": {
             "HEADS": int(fields["heads"]),
@@ -53,10 +55,11 @@ def spec(fields, parameters, target):
             "BLOCK": block,
             "QUERIES": QUERIES,
             "KEYS": KEYS,
+            "PDL": pdl,
         },
         "options": {
             "num_warps": 4,
-            "launch_pdl": fields["pdl"] == "true",
+            "launch_pdl": pdl,
         },
     }
 

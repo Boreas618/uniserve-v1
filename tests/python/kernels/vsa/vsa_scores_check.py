@@ -88,6 +88,7 @@ def run(module, *, heads, width, block, query_tiles, key_tiles, seed=23):
         BLOCK=block,
         KEY_TILES=16,
         QUERIES=16,
+        PDL=False,
     )
 
     # The reference: the same operands in FP64, rounded once into FP32.

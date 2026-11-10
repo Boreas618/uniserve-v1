@@ -60,6 +60,14 @@ def _value_of(keys):
     return bits.to(tl.float32, bitcast=True)
 
 
+@triton.jit
+def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
+    """Wait for the preceding grid, then release the next one."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
 @triton.jit(do_not_specialize=["rows", "vocabulary", "width"])
 def _top_k_kernel(
     logits_ptr,
@@ -70,6 +78,7 @@ def _top_k_kernel(
     vocabulary,
     width,
     TILE: tl.constexpr,
+    PDL: tl.constexpr,  # noqa: N803
 ):
     """Keep the ``width`` largest logits of one row, sorted, with their ids.
 
@@ -81,6 +90,8 @@ def _top_k_kernel(
     ``TILE`` is the only size compiled in: the row is walked in ``TILE``-lane chunks, and every
     buffer is addressed with the live width, so the module serves any vocabulary and any kept count.
     """
+    _pdl_prologue(PDL)
+
     row = tl.program_id(0).to(tl.int64)
     base = row * vocabulary
     # `taken` is the quota the selected prefix's equal keys still hold, and it starts as the width;

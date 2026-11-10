@@ -46,8 +46,9 @@ def spec(fields, parameters, target):
             "vocabulary": "i32",
             "width": "i32",
             "TILE": "constexpr",
+            "PDL": "constexpr",
         },
-        "constexprs": {"TILE": tile},
+        "constexprs": {"TILE": tile, "PDL": pdl},
         "options": {"num_warps": 8, "launch_pdl": pdl},
     }
 

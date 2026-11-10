@@ -9,6 +9,14 @@ import triton
 import triton.language as tl
 
 
+@triton.jit
+def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
+    """Wait for the preceding grid, then release the next one."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
 @triton.jit(do_not_specialize=["rows", "padded", "vocabulary", "ranks"])
 def _vocab_unpad_kernel(
     gathered_ptr,
@@ -18,6 +26,7 @@ def _vocab_unpad_kernel(
     vocabulary,
     ranks,
     BLOCK: tl.constexpr,
+    PDL: tl.constexpr,  # noqa: N803
 ):
     """Copy every row's vocabulary out of the ranks' gathered shards.
 
@@ -27,6 +36,8 @@ def _vocab_unpad_kernel(
     in shard ``c / shard``. One rank is one block, which is the row-major ``[rows, padded]``.
     ``out`` is ``[rows, vocabulary]``. Grid: ``ceil(rows · vocabulary / BLOCK)``.
     """
+    _pdl_prologue(PDL)
+
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < rows * vocabulary
     row = offsets // vocabulary

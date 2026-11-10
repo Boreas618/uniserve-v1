@@ -36,6 +36,14 @@ CLAMP_MAX = tl.constexpr(20.0)
 
 
 @triton.jit
+def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
+    """Wait for the preceding grid, then release the next one."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@triton.jit
 def _posterior_kernel(
     mean_ptr,
     log_variance_ptr,
@@ -64,6 +72,8 @@ def _posterior_kernel(
     unsigned and the index is signed, and Triton refuses the modulo across two signednesses rather
     than guessing.
     """
+    _pdl_prologue(PDL)
+
     index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
     live = index < total
     channels = channels.to(tl.int64)

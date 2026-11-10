@@ -863,7 +863,11 @@ def launch(kernel, grid, *arguments, **constants):
 
     The cases build their tensors on the host and read their results there, so a run on a device
     copies each tensor over, launches, and copies each one back: Triton refuses a host pointer.
+    These cases launch as the operator does without a dependent launch, so a kernel's `PDL` is
+    `False` unless the case states it.
     """
+    if "PDL" in kernel.arg_names:
+        constants.setdefault("PDL", False)
     if os.environ.get("TRITON_INTERPRET") == "1":
         kernel[grid](*arguments, **constants)
         return

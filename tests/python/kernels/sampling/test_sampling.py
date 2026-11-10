@@ -53,3 +53,24 @@ def test_a_sampling_kernel_matches_its_reference_on_the_interpreter(check):
 @pytest.mark.parametrize("op", SAMPLING)
 def test_a_sampling_step_matches_its_reference_on_the_device(op):
     on_device(FAMILY / "sampling_check.py", "--op", op)
+
+
+#: The operators whose dependent launch `pdl_chain_check.py` checks.
+DEPENDENT = (
+    "logits_gather",
+    "vocab_unpad",
+    "filter_candidates",
+    "inverse_cdf",
+    "argmax",
+    "logprob_gather",
+    "top_logprobs",
+    "top_k",
+    "candidate_order",
+    "posterior",
+)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("op", DEPENDENT)
+def test_a_dependent_launch_reads_what_its_producer_wrote(op):
+    on_device(FAMILY / "pdl_chain_check.py", "--op", op)
