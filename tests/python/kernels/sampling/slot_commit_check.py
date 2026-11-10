@@ -117,7 +117,13 @@ def reference(state, rows, tokens, valid, active, continuation, points, vocab):
         if mode == COUNT:
             # A verification's accepted draft: its penalty weight, and nothing else moves.
             token = int(tokens[task]) & TOKEN_VALUE_MASK
-            if sampled and token < vocab and row[PENALTIES] != 0 and valid[task] and active[task]:
+            if (
+                sampled
+                and token < vocab
+                and row[PENALTIES] != 0
+                and valid[task]
+                and active[task]
+            ):
                 expected["penalties"][slot, token] += 1
             continue
         if mode == DECODE:

@@ -33,7 +33,9 @@ import pathlib
 import sys
 
 #: The kernel packages' root: this check lives in `tests/python/kernels/<family>/`.
-KERNELS = pathlib.Path(__file__).resolve().parents[4] / "crates" / "ops" / "kernels"
+KERNELS = (
+    pathlib.Path(__file__).resolve().parents[4] / "crates" / "ops" / "kernels"
+)
 #: The package this check covers.
 PACKAGE = KERNELS / "gated_delta_rule" / "triton"
 sys.path.insert(0, str(PACKAGE / "src"))
@@ -41,7 +43,9 @@ sys.path.insert(0, str(PACKAGE / "src"))
 
 def parse():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--interpreter", action="store_true", help="run on Triton's interpreter")
+    parser.add_argument(
+        "--interpreter", action="store_true", help="run on Triton's interpreter"
+    )
     parser.add_argument("--dtype", choices=["bf16", "f32"], default="bf16")
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args()
@@ -49,13 +53,14 @@ def parse():
 
 FLAGS = parse()
 # The family suite's interpreter run states it in the environment, with no device visible.
-FLAGS.interpreter = FLAGS.interpreter or os.environ.get("TRITON_INTERPRET") == "1"
+FLAGS.interpreter = (
+    FLAGS.interpreter or os.environ.get("TRITON_INTERPRET") == "1"
+)
 if FLAGS.interpreter:
     os.environ["TRITON_INTERPRET"] = "1"
 
-import torch  # noqa: E402
-
 import gated_delta_rule as kernels  # noqa: E402
+import torch  # noqa: E402
 
 TORCH_TYPES = {"bf16": torch.bfloat16, "f32": torch.float32}
 UNIT_ROUNDOFF = {"bf16": 2.0**-8, "f32": 2.0**-24}
@@ -67,9 +72,14 @@ def bound(key_dim, dtype):
     return 2.0 * (2.0 * gamma * math.sqrt(key_dim) + UNIT_ROUNDOFF[dtype])
 
 
-def reference_row(q, k, v, a, b, a_log, dt_bias, state, scale, start, checkpoint):
-    """The recurrence over one row in FP64: outputs, final state, checkpoint state (or None) and
-    the state after every token."""
+def reference_row(
+    q, k, v, a, b, a_log, dt_bias, state, scale, start, checkpoint
+):
+    """The recurrence over one row in FP64.
+
+    Answers the outputs, the final state, the checkpoint state (or None) and
+    the state after every token.
+    """
     tokens, value_heads, _ = v.shape
     group = value_heads // q.shape[1]
     q = q.double().repeat_interleave(group, dim=1)
@@ -109,8 +119,10 @@ def compare(name, got, expected, relative, failures):
     outside = int((~(error <= relative * peak)).sum())
     worst = float((error / peak.clamp(min=1e-30)).max())
     absolute = float(error.max())
-    print(f"  {name}: max abs {absolute:.3e}, max rel-to-peak {worst:.3e}, "
-          f"bound {relative:.3e}, {outside} of {got.numel()} outside")
+    print(
+        f"  {name}: max abs {absolute:.3e}, max rel-to-peak {worst:.3e}, "
+        f"bound {relative:.3e}, {outside} of {got.numel()} outside"
+    )
     failures.append(outside)
     return worst, absolute
 
@@ -118,20 +130,30 @@ def compare(name, got, expected, relative, failures):
 def run(case, device, failures, report):
     """Launch both requested forms over one batch and compare everything they write."""
     torch.manual_seed(case["seed"])
-    kh, vh, dk, dv = case["key_heads"], case["value_heads"], case["key_dim"], case["value_dim"]
+    kh, vh, dk, dv = (
+        case["key_heads"],
+        case["value_heads"],
+        case["key_dim"],
+        case["value_dim"],
+    )
     dtype = TORCH_TYPES[case["dtype"]]
-    lengths, starts, slots, checkpoints = (case[name] for name in ("lengths", "starts", "slots",
-                                                                    "checkpoints"))
+    lengths, starts, slots, checkpoints = (
+        case[name] for name in ("lengths", "starts", "slots", "checkpoints")
+    )
     rows = len(lengths)
     tokens = sum(lengths)
     offsets = [0]
     for length in lengths:
         offsets.append(offsets[-1] + length)
     width = 2 * kh * dk + vh * dv
-    merged = torch.randn(tokens, width + 16).to(dtype)  # a wider row than the three views
+    merged = torch.randn(tokens, width + 16).to(
+        dtype
+    )  # a wider row than the three views
     query = merged.as_strided((tokens, kh, dk), (width + 16, dk, 1), 0)
     key = merged.as_strided((tokens, kh, dk), (width + 16, dk, 1), kh * dk)
-    value = merged.as_strided((tokens, vh, dv), (width + 16, dv, 1), 2 * kh * dk)
+    value = merged.as_strided(
+        (tokens, vh, dv), (width + 16, dv, 1), 2 * kh * dk
+    )
     gates = (torch.randn(tokens, 2 * vh) * 2.0).to(dtype)
     b = gates[:, :vh]
     a = gates[:, vh:]
@@ -149,8 +171,18 @@ def run(case, device, failures, report):
         lo, hi = offsets[r], offsets[r + 1]
         state = initial[slots[r]] if starts[r] > 0 else torch.zeros(vh, dk, dv)
         out, final, checkpoint, trail = reference_row(
-            query[lo:hi], key[lo:hi], value[lo:hi], a[lo:hi], b[lo:hi], a_log, dt_bias, state,
-            scale, starts[r], checkpoints[r])
+            query[lo:hi],
+            key[lo:hi],
+            value[lo:hi],
+            a[lo:hi],
+            b[lo:hi],
+            a_log,
+            dt_bias,
+            state,
+            scale,
+            starts[r],
+            checkpoints[r],
+        )
         expected[lo:hi] = out
         finals[slots[r]] = final
         for index, after in enumerate(trail):
@@ -169,49 +201,124 @@ def run(case, device, failures, report):
         trailing = case.get("trailing", False) and chunk == 1
         state = initial.clone().to(device)
         checkpoint_bank = torch.full_like(state, float("nan"))
-        trail_bank = torch.full((tokens, vh, dk, dv), float("nan"), dtype=torch.float32,
-                                device=device)
-        out = torch.full((tokens, vh, dv), float("nan"), dtype=dtype, device=device)
+        trail_bank = torch.full(
+            (tokens, vh, dk, dv),
+            float("nan"),
+            dtype=torch.float32,
+            device=device,
+        )
+        out = torch.full(
+            (tokens, vh, dv), float("nan"), dtype=dtype, device=device
+        )
         on = [t.to(device) for t in (merged, gates)]
         merged_d, gates_d = on
         query_d = merged_d.as_strided((tokens, kh, dk), (width + 16, dk, 1), 0)
-        key_d = merged_d.as_strided((tokens, kh, dk), (width + 16, dk, 1), kh * dk)
-        value_d = merged_d.as_strided((tokens, vh, dv), (width + 16, dv, 1), 2 * kh * dk)
-        kernels._gated_delta_rule_kernel[(dv // case["block"], vh, rows)](
-            query_d, key_d, value_d, gates_d[:, vh:], gates_d[:, :vh], a_log.to(device),
-            dt_bias.to(device), column(offsets), column(seq_lens), column(slots),
-            column(checkpoints), state, checkpoint_bank, trail_bank, out, width + 16, 2 * vh,
-            scale, int(trailing),
-            KEY_HEADS=kh, VALUE_HEADS=vh, KEY_DIM=dk, VALUE_DIM=dv, BLOCK=case["block"],
-            CHUNK=chunk, LEVELS=chunk.bit_length() - 1, num_warps=8 if chunk > 1 else 4,
+        key_d = merged_d.as_strided(
+            (tokens, kh, dk), (width + 16, dk, 1), kh * dk
         )
-        print(f"{case['label']}, {form} (chunk {chunk}), {case['dtype']}: rows {lengths} from "
-              f"{starts}, slots {slots}, checkpoints {checkpoints}")
-        live = torch.tensor([s >= 0 for r, s in enumerate(slots)
-                             for _ in range(lengths[r])], dtype=torch.bool)
-        worst, absolute = compare("output", out.cpu()[live], expected[live], relative, failures)
-        report.append((f"{case['label']} {form}", "output", absolute, worst, relative))
+        value_d = merged_d.as_strided(
+            (tokens, vh, dv), (width + 16, dv, 1), 2 * kh * dk
+        )
+        kernels._gated_delta_rule_kernel[(dv // case["block"], vh, rows)](
+            query_d,
+            key_d,
+            value_d,
+            gates_d[:, vh:],
+            gates_d[:, :vh],
+            a_log.to(device),
+            dt_bias.to(device),
+            column(offsets),
+            column(seq_lens),
+            column(slots),
+            column(checkpoints),
+            state,
+            checkpoint_bank,
+            trail_bank,
+            out,
+            width + 16,
+            2 * vh,
+            scale,
+            int(trailing),
+            KEY_HEADS=kh,
+            VALUE_HEADS=vh,
+            KEY_DIM=dk,
+            VALUE_DIM=dv,
+            BLOCK=case["block"],
+            CHUNK=chunk,
+            LEVELS=chunk.bit_length() - 1,
+            num_warps=8 if chunk > 1 else 4,
+        )
+        print(
+            f"{case['label']}, {form} (chunk {chunk}), {case['dtype']}: rows {lengths} from "
+            f"{starts}, slots {slots}, checkpoints {checkpoints}"
+        )
+        live = torch.tensor(
+            [s >= 0 for r, s in enumerate(slots) for _ in range(lengths[r])],
+            dtype=torch.bool,
+        )
+        worst, absolute = compare(
+            "output", out.cpu()[live], expected[live], relative, failures
+        )
+        report.append(
+            (f"{case['label']} {form}", "output", absolute, worst, relative)
+        )
         padding = ~live
         if padding.any():
             zeros = int((out.cpu()[padding] != 0).sum())
             print(f"  padding rows: {zeros} nonzero outputs")
             failures.append(zeros)
         for slot, final in finals.items():
-            worst, absolute = compare(f"state of slot {slot}", state[slot].cpu(), final,
-                                      state_relative, failures)
-            report.append((f"{case['label']} {form}", f"state {slot}", absolute, worst,
-                           state_relative))
+            worst, absolute = compare(
+                f"state of slot {slot}",
+                state[slot].cpu(),
+                final,
+                state_relative,
+                failures,
+            )
+            report.append(
+                (
+                    f"{case['label']} {form}",
+                    f"state {slot}",
+                    absolute,
+                    worst,
+                    state_relative,
+                )
+            )
         for slot, checkpoint in kept.items():
-            worst, absolute = compare(f"checkpoint of slot {slot}", checkpoint_bank[slot].cpu(),
-                                      checkpoint, state_relative, failures)
-            report.append((f"{case['label']} {form}", f"checkpoint {slot}", absolute, worst,
-                           state_relative))
+            worst, absolute = compare(
+                f"checkpoint of slot {slot}",
+                checkpoint_bank[slot].cpu(),
+                checkpoint,
+                state_relative,
+                failures,
+            )
+            report.append(
+                (
+                    f"{case['label']} {form}",
+                    f"checkpoint {slot}",
+                    absolute,
+                    worst,
+                    state_relative,
+                )
+            )
         if trailing:
             for token, after in trails.items():
-                worst, absolute = compare(f"trail of token {token}", trail_bank[token].cpu(),
-                                          after, state_relative, failures)
-                report.append((f"{case['label']} {form}", f"trail {token}", absolute, worst,
-                               state_relative))
+                worst, absolute = compare(
+                    f"trail of token {token}",
+                    trail_bank[token].cpu(),
+                    after,
+                    state_relative,
+                    failures,
+                )
+                report.append(
+                    (
+                        f"{case['label']} {form}",
+                        f"trail {token}",
+                        absolute,
+                        worst,
+                        state_relative,
+                    )
+                )
         untouched = [s for s in range(slot_count) if s not in finals]
         for slot in untouched:
             changed = int((state[slot].cpu() != initial[slot]).sum())
@@ -223,35 +330,87 @@ def run(case, device, failures, report):
 def main():
     device = "cpu" if FLAGS.interpreter else "cuda"
     if FLAGS.interpreter:
-        widths = {"key_heads": 2, "value_heads": 4, "key_dim": 16, "value_dim": 32, "block": 16}
+        widths = {
+            "key_heads": 2,
+            "value_heads": 4,
+            "key_dim": 16,
+            "value_dim": 32,
+            "block": 16,
+        }
         chunk = 16
         lengths, starts = [1, 5, 20, 37], [0, 9, 0, 13]
         slots, checkpoints = [2, -1, 0, 1], [0, 0, 16, 48]
     else:
-        widths = {"key_heads": 16, "value_heads": 32, "key_dim": 128, "value_dim": 128,
-                  "block": 64}
+        widths = {
+            "key_heads": 16,
+            "value_heads": 32,
+            "key_dim": 128,
+            "value_dim": 128,
+            "block": 64,
+        }
         chunk = 64
         lengths, starts = [1, 7, 130, 300, 64, 129], [0, 0, 37, 0, 64, 1000]
         slots, checkpoints = [3, -1, 0, 2, 1, 4], [0, 0, 128, 256, 128, 1129]
     forms = [("recurrent", 1), ("chunked", chunk)]
     failures, report = [], []
-    run({"label": "prompt rows", "dtype": FLAGS.dtype, "seed": FLAGS.seed, **widths,
-         "lengths": lengths, "starts": starts, "slots": slots, "checkpoints": checkpoints,
-         "forms": forms}, device, failures, report)
+    run(
+        {
+            "label": "prompt rows",
+            "dtype": FLAGS.dtype,
+            "seed": FLAGS.seed,
+            **widths,
+            "lengths": lengths,
+            "starts": starts,
+            "slots": slots,
+            "checkpoints": checkpoints,
+            "forms": forms,
+        },
+        device,
+        failures,
+        report,
+    )
     decode = 6 if FLAGS.interpreter else 48
-    run({"label": "decode rows", "dtype": FLAGS.dtype, "seed": FLAGS.seed + 1, **widths,
-         "lengths": [1] * decode, "starts": [5 + 17 * r for r in range(decode)],
-         "slots": [r if r % 5 else -1 for r in range(decode)],
-         "checkpoints": [5 + 17 * r + 1 if r % 3 == 0 else 0 for r in range(decode)],
-         "forms": forms}, device, failures, report)
+    run(
+        {
+            "label": "decode rows",
+            "dtype": FLAGS.dtype,
+            "seed": FLAGS.seed + 1,
+            **widths,
+            "lengths": [1] * decode,
+            "starts": [5 + 17 * r for r in range(decode)],
+            "slots": [r if r % 5 else -1 for r in range(decode)],
+            "checkpoints": [
+                5 + 17 * r + 1 if r % 3 == 0 else 0 for r in range(decode)
+            ],
+            "forms": forms,
+        },
+        device,
+        failures,
+        report,
+    )
     # A verification's rows: a few tokens each from their slots' states, the state after every
     # token kept in the trail.
-    run({"label": "verification rows", "dtype": FLAGS.dtype, "seed": FLAGS.seed + 2, **widths,
-         "lengths": [4, 1, 3, 4], "starts": [9, 30, 61, 2], "slots": [1, 3, -1, 0],
-         "checkpoints": [0, 0, 0, 4], "forms": [("recurrent", 1)], "trailing": True},
-        device, failures, report)
+    run(
+        {
+            "label": "verification rows",
+            "dtype": FLAGS.dtype,
+            "seed": FLAGS.seed + 2,
+            **widths,
+            "lengths": [4, 1, 3, 4],
+            "starts": [9, 30, 61, 2],
+            "slots": [1, 3, -1, 0],
+            "checkpoints": [0, 0, 0, 4],
+            "forms": [("recurrent", 1)],
+            "trailing": True,
+        },
+        device,
+        failures,
+        report,
+    )
     outside = sum(failures)
-    print(f"{'ok' if outside == 0 else 'FAIL'}: {outside} values outside their bounds")
+    print(
+        f"{'ok' if outside == 0 else 'FAIL'}: {outside} values outside their bounds"
+    )
     return 0 if outside == 0 else 1
 
 

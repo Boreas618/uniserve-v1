@@ -50,5 +50,8 @@ def test_the_nvfp4_quantization_feeds_the_nvfp4_gemm():
 
 @pytest.mark.gpu
 def test_the_fp8_gemm_matches_its_reference_on_the_device():
-    """The interpreter does not store E4M3 as a device does, so the product is checked here."""
+    """The interpreter does not store E4M3 as a device does.
+
+    The product is therefore checked here.
+    """
     on_device(FAMILY / "fp8_gemm_check.py")

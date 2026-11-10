@@ -26,7 +26,9 @@ import pathlib
 import sys
 
 #: The kernel packages' root: this check lives in `tests/python/kernels/<family>/`.
-KERNELS = pathlib.Path(__file__).resolve().parents[4] / "crates" / "ops" / "kernels"
+KERNELS = (
+    pathlib.Path(__file__).resolve().parents[4] / "crates" / "ops" / "kernels"
+)
 #: The package this check covers.
 PACKAGE = KERNELS / "causal_conv1d" / "triton"
 sys.path.insert(0, str(PACKAGE / "src"))
@@ -34,7 +36,9 @@ sys.path.insert(0, str(PACKAGE / "src"))
 
 def parse():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--interpreter", action="store_true", help="run on Triton's interpreter")
+    parser.add_argument(
+        "--interpreter", action="store_true", help="run on Triton's interpreter"
+    )
     parser.add_argument("--dtype", choices=["bf16", "f32"], default="bf16")
     parser.add_argument("--seed", type=int, default=3)
     return parser.parse_args()
@@ -42,13 +46,14 @@ def parse():
 
 FLAGS = parse()
 # The family suite's interpreter run states it in the environment, with no device visible.
-FLAGS.interpreter = FLAGS.interpreter or os.environ.get("TRITON_INTERPRET") == "1"
+FLAGS.interpreter = (
+    FLAGS.interpreter or os.environ.get("TRITON_INTERPRET") == "1"
+)
 if FLAGS.interpreter:
     os.environ["TRITON_INTERPRET"] = "1"
 
-import torch  # noqa: E402
-
 import causal_conv1d as kernels  # noqa: E402
+import torch  # noqa: E402
 
 TORCH_TYPES = {"bf16": torch.bfloat16, "f32": torch.float32}
 UNIT_ROUNDOFF = {"bf16": 2.0**-8, "f32": 2.0**-24}
@@ -59,8 +64,9 @@ def run(case, device):
     torch.manual_seed(case["seed"])
     dtype = TORCH_TYPES[case["dtype"]]
     channels, width, block = case["channels"], case["width"], case["block"]
-    lengths, starts, slots, checkpoints = (case[name] for name in ("lengths", "starts", "slots",
-                                                                    "checkpoints"))
+    lengths, starts, slots, checkpoints = (
+        case[name] for name in ("lengths", "starts", "slots", "checkpoints")
+    )
     rows, tokens = len(lengths), sum(lengths)
     offsets = [0]
     for length in lengths:
@@ -81,18 +87,30 @@ def run(case, device):
         if slots[r] < 0:
             continue
         lo, hi = offsets[r], offsets[r + 1]
-        history = (initial[slots[r]] if starts[r] > 0 else torch.zeros(width - 1, channels))
-        extended = torch.cat([history.double(), x[lo:hi].double()], dim=0)  # [K-1+n, C]
+        history = (
+            initial[slots[r]]
+            if starts[r] > 0
+            else torch.zeros(width - 1, channels)
+        )
+        extended = torch.cat(
+            [history.double(), x[lo:hi].double()], dim=0
+        )  # [K-1+n, C]
         signal = extended.t()[None]  # [1, C, K-1+n]
         taps = weight.double()[:, None, :]
-        summed = torch.nn.functional.conv1d(signal, taps, groups=channels)[0].t()
-        magnitude = torch.nn.functional.conv1d(signal.abs(), taps.abs(), groups=channels)[0].t()
+        summed = torch.nn.functional.conv1d(signal, taps, groups=channels)[
+            0
+        ].t()
+        magnitude = torch.nn.functional.conv1d(
+            signal.abs(), taps.abs(), groups=channels
+        )[0].t()
         expected[lo:hi] = summed * torch.sigmoid(summed)
         terms[lo:hi] = magnitude
-        finals[slots[r]] = extended[-(width - 1):]
+        finals[slots[r]] = extended[-(width - 1) :]
         for index in range(hi - lo):
             trailed[lo + index] = extended[index + 1 : index + width]
-        point = checkpoints[r] - starts[r]  # the checkpoint's place among the row's new tokens
+        point = (
+            checkpoints[r] - starts[r]
+        )  # the checkpoint's place among the row's new tokens
         if 0 < point <= lengths[r]:
             kept[slots[r]] = extended[point : point + width - 1]
 
@@ -102,19 +120,39 @@ def run(case, device):
     seq_lens = [start + length for start, length in zip(starts, lengths)]
     state = initial.clone().to(device)
     checkpoint = torch.full_like(state, float("nan"))
-    out = torch.full((tokens, channels), float("nan"), dtype=dtype, device=device)
+    out = torch.full(
+        (tokens, channels), float("nan"), dtype=dtype, device=device
+    )
     trailing = case.get("trailing", False)
-    trail = torch.full((tokens, width - 1, channels), float("nan"), dtype=dtype, device=device)
+    trail = torch.full(
+        (tokens, width - 1, channels), float("nan"), dtype=dtype, device=device
+    )
     wide_d = wide.to(device)
     kernels._causal_conv1d_kernel[((channels + block - 1) // block, rows)](
-        wide_d[:, 16 : 16 + channels], weight.to(device), out, column(offsets), column(seq_lens),
-        column(slots), column(checkpoints), state, checkpoint, trail, stride, int(trailing),
-        CHANNELS=channels, WIDTH=width, KEPT=1 << (width - 2).bit_length(), BLOCK=block,
-        TOKENS=16, num_warps=4,
+        wide_d[:, 16 : 16 + channels],
+        weight.to(device),
+        out,
+        column(offsets),
+        column(seq_lens),
+        column(slots),
+        column(checkpoints),
+        state,
+        checkpoint,
+        trail,
+        stride,
+        int(trailing),
+        CHANNELS=channels,
+        WIDTH=width,
+        KEPT=1 << (width - 2).bit_length(),
+        BLOCK=block,
+        TOKENS=16,
+        num_warps=4,
     )
 
     outside = 0
-    live = torch.tensor([slots[r] >= 0 for r in range(rows) for _ in range(lengths[r])])
+    live = torch.tensor(
+        [slots[r] >= 0 for r in range(rows) for _ in range(lengths[r])]
+    )
     got = out.cpu().double()
     # The FP32 sum of K products and the SiLU, then one rounding: of the products' magnitudes.
     allowed = (UNIT_ROUNDOFF[case["dtype"]] + (width + 4) * 2.0**-24) * (
@@ -124,10 +162,14 @@ def run(case, device):
     bad = int((~(error[live] <= allowed[live])).sum())
     outside += bad
     relative = float((error[live] / terms[live].clamp(min=1e-30)).max())
-    print(f"{case['label']}, {case['dtype']}: rows {lengths} from {starts}, slots {slots}, "
-          f"checkpoints {checkpoints}")
-    print(f"  output: max abs {float(error[live].max()):.3e}, max relative to its terms "
-          f"{relative:.3e}, {bad} of {int(live.sum()) * channels} outside")
+    print(
+        f"{case['label']}, {case['dtype']}: rows {lengths} from {starts}, slots {slots}, "
+        f"checkpoints {checkpoints}"
+    )
+    print(
+        f"  output: max abs {float(error[live].max()):.3e}, max relative to its terms "
+        f"{relative:.3e}, {bad} of {int(live.sum()) * channels} outside"
+    )
     zeros = int((got[~live] != 0).sum())
     outside += zeros
     for slot, final in finals.items():
@@ -139,8 +181,12 @@ def run(case, device):
         outside += differ
         print(f"  checkpoint of slot {slot}: {differ} elements differ")
     if trailing:
-        live_rows = torch.tensor([slots[r] >= 0 for r in range(rows) for _ in range(lengths[r])])
-        differ = int((trail.cpu().double()[live_rows] != trailed[live_rows]).sum())
+        live_rows = torch.tensor(
+            [slots[r] >= 0 for r in range(rows) for _ in range(lengths[r])]
+        )
+        differ = int(
+            (trail.cpu().double()[live_rows] != trailed[live_rows]).sum()
+        )
         outside += differ
         print(f"  trail of every live token: {differ} elements differ")
     for slot in range(slot_count):
@@ -158,19 +204,38 @@ def main():
         shape = {"channels": 8192, "width": 4, "block": 256}
     outside = 0
     for case in (
-        {"label": "prompt rows", "lengths": [1, 2, 7, 40, 130, 33], "starts": [0, 5, 0, 37, 64, 2],
-         "slots": [3, 0, -1, 1, 2, 4], "checkpoints": [0, 6, 0, 64, 192, 3]},
-        {"label": "decode rows", "lengths": [1] * 9, "starts": [3 * r + 1 for r in range(9)],
-         "slots": [r if r % 4 else -1 for r in range(9)],
-         "checkpoints": [3 * r + 2 if r % 2 else 0 for r in range(9)]},
+        {
+            "label": "prompt rows",
+            "lengths": [1, 2, 7, 40, 130, 33],
+            "starts": [0, 5, 0, 37, 64, 2],
+            "slots": [3, 0, -1, 1, 2, 4],
+            "checkpoints": [0, 6, 0, 64, 192, 3],
+        },
+        {
+            "label": "decode rows",
+            "lengths": [1] * 9,
+            "starts": [3 * r + 1 for r in range(9)],
+            "slots": [r if r % 4 else -1 for r in range(9)],
+            "checkpoints": [3 * r + 2 if r % 2 else 0 for r in range(9)],
+        },
         # A verification's rows: a few tokens each, continuing from their slots, with the window
         # after every token kept in the trail.
-        {"label": "verification rows", "lengths": [4, 1, 3, 4], "starts": [9, 30, 61, 2],
-         "slots": [1, 3, -1, 0], "checkpoints": [0, 0, 0, 4], "trailing": True},
+        {
+            "label": "verification rows",
+            "lengths": [4, 1, 3, 4],
+            "starts": [9, 30, 61, 2],
+            "slots": [1, 3, -1, 0],
+            "checkpoints": [0, 0, 0, 4],
+            "trailing": True,
+        },
     ):
-        bad, _, _ = run({**case, **shape, "dtype": FLAGS.dtype, "seed": FLAGS.seed}, device)
+        bad, _, _ = run(
+            {**case, **shape, "dtype": FLAGS.dtype, "seed": FLAGS.seed}, device
+        )
         outside += bad
-    print(f"{'ok' if outside == 0 else 'FAIL'}: {outside} values outside their bounds")
+    print(
+        f"{'ok' if outside == 0 else 'FAIL'}: {outside} values outside their bounds"
+    )
     return 0 if outside == 0 else 1
 
 

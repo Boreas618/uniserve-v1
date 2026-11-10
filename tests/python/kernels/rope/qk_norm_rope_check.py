@@ -209,8 +209,12 @@ def build(
         "key": key.to(element),
         # A zero-centred scale is stored around zero, so its gain `1 + w` lies where a
         # plain one does.
-        "q_weight": torch.rand(head_dim, dtype=torch.float32) + 0.5 - float(centred),
-        "k_weight": torch.rand(head_dim, dtype=torch.float32) + 0.5 - float(centred),
+        "q_weight": torch.rand(head_dim, dtype=torch.float32)
+        + 0.5
+        - float(centred),
+        "k_weight": torch.rand(head_dim, dtype=torch.float32)
+        + 0.5
+        - float(centred),
         "cosine": torch.cos(angle),
         "sine": torch.sin(angle),
         "tokens": tokens,

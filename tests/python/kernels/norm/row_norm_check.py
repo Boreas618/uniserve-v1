@@ -152,7 +152,9 @@ def check(operator, case):
         expected_out = exact_x * torch.rsqrt(
             (exact_x * exact_x).sum(dim=-1, keepdim=True) / columns + eps
         )
-        expected_out = expected_out * (weight.cpu().double() + float(case["centred"]))
+        expected_out = expected_out * (
+            weight.cpu().double() + float(case["centred"])
+        )
         if case["truncate"]:
             expected_out = truncate(expected_out, dtype)
         relative = bound(columns, case["dtype"], OPERATORS[operator])
@@ -193,7 +195,9 @@ def check(operator, case):
         expected_out = exact_c * torch.rsqrt(
             (exact_c * exact_c).sum(dim=-1, keepdim=True) / columns + eps
         )
-        expected_out = expected_out * (weight.cpu().double() + float(case["centred"]))
+        expected_out = expected_out * (
+            weight.cpu().double() + float(case["centred"])
+        )
         expected_residual = exact_c
         if case["truncate"]:
             expected_out = truncate(expected_out, dtype)

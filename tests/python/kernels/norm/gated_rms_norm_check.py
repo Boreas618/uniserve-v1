@@ -21,7 +21,9 @@ import pathlib
 import sys
 
 #: The kernel packages' root: this check lives in `tests/python/kernels/<family>/`.
-KERNELS = pathlib.Path(__file__).resolve().parents[4] / "crates" / "ops" / "kernels"
+KERNELS = (
+    pathlib.Path(__file__).resolve().parents[4] / "crates" / "ops" / "kernels"
+)
 #: The package this check covers.
 PACKAGE = KERNELS / "gated_rms_norm" / "triton"
 sys.path.insert(0, str(PACKAGE / "src"))
@@ -29,20 +31,23 @@ sys.path.insert(0, str(PACKAGE / "src"))
 
 def parse():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--interpreter", action="store_true", help="run on Triton's interpreter")
+    parser.add_argument(
+        "--interpreter", action="store_true", help="run on Triton's interpreter"
+    )
     parser.add_argument("--dtype", choices=["bf16", "f32"], default="bf16")
     return parser.parse_args()
 
 
 FLAGS = parse()
 # The family suite's interpreter run states it in the environment, with no device visible.
-FLAGS.interpreter = FLAGS.interpreter or os.environ.get("TRITON_INTERPRET") == "1"
+FLAGS.interpreter = (
+    FLAGS.interpreter or os.environ.get("TRITON_INTERPRET") == "1"
+)
 if FLAGS.interpreter:
     os.environ["TRITON_INTERPRET"] = "1"
 
-import torch  # noqa: E402
-
 import gated_rms_norm as kernels  # noqa: E402
+import torch  # noqa: E402
 
 TORCH_TYPES = {"bf16": torch.bfloat16, "f32": torch.float32}
 UNIT_ROUNDOFF = {"bf16": 2.0**-8, "f32": 2.0**-24}
@@ -53,7 +58,9 @@ def bound(columns, dtype):
     unit = 2.0**-24
     gamma = columns * unit / (1 - columns * unit)
     # Triton's interpreter truncates a narrow store (one ulp) where a device rounds (half of one).
-    store = UNIT_ROUNDOFF[dtype] * (2 if FLAGS.interpreter and dtype != "f32" else 1)
+    store = UNIT_ROUNDOFF[dtype] * (
+        2 if FLAGS.interpreter and dtype != "f32" else 1
+    )
     return 2 * gamma + store + 3 * unit
 
 
@@ -67,19 +74,29 @@ def check(label, rows, columns, tile, device, seed):
     eps = 1e-6
     out = torch.full((rows, columns), float("nan"), dtype=dtype, device=device)
     kernels._gated_rms_norm_kernel[(rows,)](
-        x.to(device), gate.to(device), weight.to(device), out, columns, eps, BLOCK=tile,
+        x.to(device),
+        gate.to(device),
+        weight.to(device),
+        out,
+        columns,
+        eps,
+        BLOCK=tile,
         num_warps=4,
     )
     exact = x.double()
-    normalized = exact * torch.rsqrt((exact * exact).mean(-1, keepdim=True) + eps)
+    normalized = exact * torch.rsqrt(
+        (exact * exact).mean(-1, keepdim=True) + eps
+    )
     z = gate.double()
     expected = normalized * weight.double() * z * torch.sigmoid(z)
     error = (out.cpu().double() - expected).abs()
     relative = bound(columns, FLAGS.dtype)
     outside = int((~(error <= relative * expected.abs())).sum())
-    print(f"{'exact' if outside == 0 else 'FAIL'}: {label}, {rows} x {columns} of tile {tile}, "
-          f"{FLAGS.dtype} — max abs {float(error.max()):.3e}, bound {relative:.3e} relative, "
-          f"{outside} outside")
+    print(
+        f"{'exact' if outside == 0 else 'FAIL'}: {label}, {rows} x {columns} of tile {tile}, "
+        f"{FLAGS.dtype} — max abs {float(error.max()):.3e}, bound {relative:.3e} relative, "
+        f"{outside} outside"
+    )
     return outside
 
 
@@ -89,7 +106,9 @@ def main():
     outside += check("the model's head rows", 32 * 7, 128, 128, device, 1)
     outside += check("a row far below its tile", 5, 100, 256, device, 2)
     outside += check("a wider row", 3, 2048, 2048, device, 3)
-    print(f"{'ok' if outside == 0 else 'FAIL'}: {outside} values outside the bound")
+    print(
+        f"{'ok' if outside == 0 else 'FAIL'}: {outside} values outside the bound"
+    )
     return 0 if outside == 0 else 1
 
 

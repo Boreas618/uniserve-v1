@@ -35,7 +35,8 @@ INTERPRETED = (
     "sigmoid_gated_add_check.py",
 )
 
-#: The checks that also run on a device, where stores round and exponentials are approximate.
+#: The checks that also run on a device, where stores round and exponentials
+#: are approximate.
 ON_DEVICE = ("gated_rms_norm_check.py", "sigmoid_gated_add_check.py")
 
 #: The native frame norms: their host half needs no module and no device.
