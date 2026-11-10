@@ -26,8 +26,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use ipc::TimingCounters;
 use ipc::execution::{
-    Batch, BatchOutput, Batches, CallOutput, Computation, Extent as MediaExtent, Fault, Inventory,
-    Outcome, RowState, Submission, SubmissionId, SubmissionState,
+    Batch, BatchOutput, Batches, CallOutput, Computation, EpochOperation, Extent as MediaExtent,
+    Fault, Inventory, Outcome, RowState, Submission, SubmissionId, SubmissionState,
 };
 use ipc::philox::DrawAddress;
 
@@ -87,6 +87,10 @@ pub type Answer = Arc<dyn Fn(&Batch) -> Outcome<BatchOutput> + Send + Sync>;
 /// The media capability a fake states: the bucket it serves a computation in, or `None`.
 pub type Media = Arc<dyn Fn(&Computation) -> Option<MediaExtent> + Send + Sync>;
 
+/// The storage operations a fake performs ([`Batches::operate`]): the operation in, each rank's
+/// JSON reply out.
+pub type Operate = Arc<dyn Fn(&EpochOperation) -> Result<Vec<String>, Box<Fault>> + Send + Sync>;
+
 /// A batch accepted and not yet completed, with the outcome it completes with.
 struct Held {
     state: Arc<SubmissionState>,
@@ -102,6 +106,7 @@ pub struct FakeBatches {
     answer: Option<Answer>,
     media: Option<Media>,
     end: Option<EndOfText>,
+    operate: Option<Operate>,
     /// Every batch submitted, in submission order: what the mechanism asked for is half of what a
     /// case observes.
     submitted: Mutex<Vec<Batch>>,
@@ -133,6 +138,7 @@ impl FakeBatches {
             answer: None,
             media: None,
             end: None,
+            operate: None,
             submitted: Mutex::new(Vec::new()),
             shadows: Mutex::new(Vec::new()),
             refusal: Mutex::new(None),
@@ -182,6 +188,13 @@ impl FakeBatches {
     #[must_use]
     pub fn with_media(mut self, media: Media) -> Self {
         self.media = Some(media);
+        self
+    }
+
+    /// Performs the storage operations the mechanism asks for with `operate`, as the ranks of a
+    /// worker with storage of its own answer them; without one, every operation answers nothing.
+    pub fn with_operate(mut self, operate: Operate) -> Self {
+        self.operate = Some(operate);
         self
     }
 
@@ -251,72 +264,7 @@ impl FakeBatches {
             return answer(batch);
         }
 
-        let calls = (0..batch.calls.len())
-            .map(|index| self.complete(batch, index))
-            .collect();
-        Outcome::Success(BatchOutput {
-            calls,
-            timing: TimingCounters::default(),
-            forward_stats: None,
-        })
-    }
-
-    /// Call `index` of `batch`, completed with one sampled token.
-    ///
-    /// The call's last row is the one that samples: a call's rows span `BatchRow::rows`, and a
-    /// batch whose columns state no rows for the call (a media batch) reads row `index`.
-    fn complete(&self, batch: &Batch, index: usize) -> CallOutput {
-        let rows = &batch.columns.rows;
-        let row = rows
-            .calls
-            .get(index)
-            .and_then(|call| call.rows.end.checked_sub(1))
-            .map_or(index, |row| row as usize);
-        let seen = rows.seq_lens.get(row).copied().unwrap_or(0).max(0) as u32;
-
-        let token = match self.tokens {
-            Tokens::Draw => batch
-                .columns
-                .draws
-                .get(row)
-                .copied()
-                .map_or(SAMPLED + index as u32, draw_token),
-            Tokens::Positional => SAMPLED + index as u32,
-            Tokens::Extent => SAMPLED + seen % VOCABULARY,
-        };
-        let ended = self.end.filter(|end| {
-            batch
-                .columns
-                .draws
-                .get(row)
-                .is_some_and(|draw| draw.position >= end.position)
-        });
-        let token = ended.map_or(token, |end| end.token);
-        let state = match self.extent {
-            // A text call carries no denoising trajectory: its step index stays at zero.
-            Extent::Stated => RowState {
-                step_index: 0,
-                cache_computed_len: seen,
-                cache_visible_len: seen,
-            },
-            Extent::OnePast => RowState {
-                step_index: seen + 1,
-                cache_computed_len: seen + 1,
-                cache_visible_len: seen + 1,
-            },
-        };
-
-        // A causal-LM step reports the raw log-probability of every token it samples, asked for or
-        // not (`CallOutput::token_logprobs`); the scheduler keeps them for the requests that ask.
-        // A row whose logits the mechanism did not ask for (`logits_rows` states -1 for it: a chunk
-        // that ends no prompt) samples nothing, as a device's projection skips it.
-        let samples = rows.logits_rows.get(row).is_none_or(|&logits| logits >= 0);
-        if !samples {
-            return CallOutput::completed(batch.calls[index], Vec::new(), state);
-        }
-        let mut output = CallOutput::completed(batch.calls[index], vec![token], state);
-        output.token_logprobs = vec![crate::text::LOGPROB];
-        output
+        Outcome::Success(completed_until(batch, self.tokens, self.extent, self.end))
     }
 
     /// Accepts `batch` and answers its submission: completed now, or held.
@@ -335,6 +283,94 @@ impl FakeBatches {
         lock(&self.held).push_back(Held { state, outcome });
         Ok(submission)
     }
+}
+
+/// `batch` completed as the fake completes it by `tokens` and `extent`: each call samples one
+/// token and leaves the extent its last row states. A case's own [`Answer`] starts from this to
+/// change some calls and keep the rest.
+pub fn completed(batch: &Batch, tokens: Tokens, extent: Extent) -> BatchOutput {
+    completed_until(batch, tokens, extent, None)
+}
+
+/// [`completed`], with every row at or past `end`'s logical position sampling `end`'s token.
+fn completed_until(
+    batch: &Batch,
+    tokens: Tokens,
+    extent: Extent,
+    end: Option<EndOfText>,
+) -> BatchOutput {
+    let calls = (0..batch.calls.len())
+        .map(|index| complete(batch, index, tokens, extent, end))
+        .collect();
+    BatchOutput {
+        calls,
+        timing: TimingCounters::default(),
+        forward_stats: None,
+    }
+}
+
+/// Call `index` of `batch`, completed with one sampled token.
+///
+/// The call's last row is the one that samples: a call's rows span `BatchRow::rows`, and a
+/// batch whose columns state no rows for the call (a media batch) reads row `index`.
+fn complete(
+    batch: &Batch,
+    index: usize,
+    tokens: Tokens,
+    extent: Extent,
+    end: Option<EndOfText>,
+) -> CallOutput {
+    let rows = &batch.columns.rows;
+    let row = rows
+        .calls
+        .get(index)
+        .and_then(|call| call.rows.end.checked_sub(1))
+        .map_or(index, |row| row as usize);
+    let seen = rows.seq_lens.get(row).copied().unwrap_or(0).max(0) as u32;
+
+    let token = match tokens {
+        Tokens::Draw => batch
+            .columns
+            .draws
+            .get(row)
+            .copied()
+            .map_or(SAMPLED + index as u32, draw_token),
+        Tokens::Positional => SAMPLED + index as u32,
+        Tokens::Extent => SAMPLED + seen % VOCABULARY,
+    };
+    let ended = end.filter(|end| {
+        batch
+            .columns
+            .draws
+            .get(row)
+            .is_some_and(|draw| draw.position >= end.position)
+    });
+    let token = ended.map_or(token, |end| end.token);
+    let state = match extent {
+        // A text call carries no denoising trajectory: its step index stays at zero.
+        Extent::Stated => RowState {
+            step_index: 0,
+            cache_computed_len: seen,
+            cache_visible_len: seen,
+        },
+        Extent::OnePast => RowState {
+            step_index: seen + 1,
+            cache_computed_len: seen + 1,
+            cache_visible_len: seen + 1,
+        },
+    };
+
+    // A causal-LM step reports the raw log-probability of every token it samples, asked for or
+    // not (`CallOutput::token_logprobs`); the scheduler keeps them for the requests that ask. A
+    // row whose logits the mechanism did not ask for (`logits_rows` states -1 for it: a chunk that
+    // ends no prompt) samples nothing, as a device's projection skips it.
+    let samples = rows.logits_rows.get(row).is_none_or(|&logits| logits >= 0);
+    if !samples {
+        return CallOutput::completed(batch.calls[index], Vec::new(), state);
+    }
+    let mut output = CallOutput::completed(batch.calls[index], vec![token], state);
+    output.token_logprobs = vec![crate::text::LOGPROB];
+    output
 }
 
 impl Batches for FakeBatches {
@@ -366,6 +402,13 @@ impl Batches for FakeBatches {
 
     fn inventory(&self) -> &[Inventory] {
         &self.inventory
+    }
+
+    fn operate(&self, operation: &EpochOperation) -> Result<Vec<String>, Box<Fault>> {
+        match &self.operate {
+            Some(operate) => operate(operation),
+            None => Ok(Vec::new()),
+        }
     }
 }
 

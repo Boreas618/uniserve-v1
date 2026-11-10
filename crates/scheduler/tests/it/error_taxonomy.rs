@@ -27,8 +27,7 @@ use std::time::{Duration, Instant};
 
 use ipc::SamplingParams;
 use scheduler::{
-    CommandSender, GenerationRequest, PolicyBytes, PolicyProgram, PolicySource, SimEngine,
-    SimWorker,
+    CommandSender, GenerationRequest, PolicyBytes, PolicyProgram, PolicySource, SchedulerConfig,
 };
 use scheduling::guest::Nanos;
 use scheduling::guest::PhaseId;
@@ -221,14 +220,17 @@ impl Epoch {
     /// A scheduler serving `good`, committed: the program that serves on when
     /// a candidate is refused or a live failure reverts one.
     fn serving(good: Toy) -> Self {
-        let mut sim = SimEngine::new();
-        sim.set_text_len(16);
-        let scheduler = support::scheduler(
-            Box::new(SimWorker::new(sim)),
-            SimEngine::special_tokens(),
-            8,
-        )
-        .expect("the simulated scheduler starts");
+        let pool = Arc::new(testkit::FakeBatches::new(vec![support::fake::text_pool(
+            "model", 8,
+        )]));
+        let scheduler = support::fake::scheduler_over(
+            pool,
+            SchedulerConfig {
+                max_batch: proto::config::positive(8),
+                ..Default::default()
+            },
+            Default::default(),
+        );
         let (tx, rx) = crossbeam_channel::unbounded();
         // The thread detaches when its handle is dropped, which is what this
         // fixture wants: the scheduler ends when `handle` closes the channel.

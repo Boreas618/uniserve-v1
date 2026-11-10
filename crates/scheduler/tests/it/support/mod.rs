@@ -4,6 +4,7 @@
 //! these tests have no model, so a simulated worker's limits follow from the
 //! call kinds it serves.
 
+pub(crate) mod fake;
 pub(crate) mod storage;
 pub(crate) mod video;
 

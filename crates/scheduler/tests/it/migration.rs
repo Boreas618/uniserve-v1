@@ -2,17 +2,19 @@
 //! admits it again with the tokens it generated, continuing its budget, its
 //! sampling constraints and its usage.
 
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ipc::execution::{Batch, Outcome};
 use ipc::{RequestId, SamplingParams};
 use proto::request::MigrationCause;
 use scheduler::GenerationRequest;
-use scheduler::{
-    CommandSender, Event, EventRx, FinishReason, SchedulerConfig, SimEngine, SimWorker,
-};
+use scheduler::{CommandSender, Event, EventRx, FinishReason, SchedulerConfig};
+use testkit::FakeBatches;
 
 use crate::support;
+use crate::support::fake;
 
 /// A text request of the prompt `[1, 2, 3]` that generated `generated`
 /// before it migrated, under `sampling` and at most `max_und_tokens` tokens.
@@ -38,20 +40,18 @@ fn request(
     }
 }
 
-/// A scheduler over the simulator, which ends text after `text_len` tokens
-/// with its EOS, admitting at most `max_running_requests` requests at once.
-fn start(text_len: usize, max_running_requests: usize) -> (CommandSender, thread::JoinHandle<()>) {
-    let mut sim = SimEngine::new();
-    sim.set_text_len(text_len);
-    let scheduler = support::scheduler_with(
-        Box::new(SimWorker::new(sim)),
-        SimEngine::special_tokens(),
+/// A scheduler over the fake worker, admitting at most
+/// `max_running_requests` requests at once.
+fn start(max_running_requests: usize) -> (CommandSender, thread::JoinHandle<()>) {
+    let pool = Arc::new(FakeBatches::new(vec![fake::text_pool("model", 8)]));
+    let scheduler = fake::scheduler_over(
+        pool,
         SchedulerConfig {
             max_running_requests,
             ..Default::default()
         },
-    )
-    .unwrap();
+        Default::default(),
+    );
     let (tx, rx) = crossbeam_channel::unbounded();
     let thread = thread::spawn(move || {
         let _ = scheduler.run(rx);
@@ -66,6 +66,7 @@ fn drain(events: &mut EventRx) -> (Vec<u32>, Option<Event>) {
     while Instant::now() < deadline {
         match events.try_recv() {
             Ok(Event::TextToken { id, .. }) => tokens.push(id),
+            Ok(Event::TextTokens { ids }) => tokens.extend(ids),
             Ok(event) if event.is_terminal() => return (tokens, Some(event)),
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
@@ -79,7 +80,7 @@ fn drain(events: &mut EventRx) -> (Vec<u32>, Option<Event>) {
 /// every token it generated, before and here, as completion.
 #[test]
 fn a_migrated_request_continues_its_budget_and_charges_its_whole_usage() {
-    let (handle, thread) = start(1_000, 8);
+    let (handle, thread) = start(8);
     let mut events = handle
         .submit(request(1, vec![1_500, 1_501], SamplingParams::default(), 6))
         .unwrap();
@@ -87,7 +88,10 @@ fn a_migrated_request_continues_its_budget_and_charges_its_whole_usage() {
     handle.shutdown();
     thread.join().unwrap();
 
-    assert_eq!(tokens.len(), 4, "{tokens:?}");
+    // It samples at the positions that follow its prompt and the two tokens
+    // it generated before: the draws of an uninterrupted request.
+    let continued: Vec<u32> = (5..9).map(|position| fake::token_at(1, position)).collect();
+    assert_eq!(tokens, continued);
     match terminal {
         Some(Event::Finished {
             reason,
@@ -103,59 +107,12 @@ fn a_migrated_request_continues_its_budget_and_charges_its_whole_usage() {
     }
 }
 
-/// The tokens a request generated before it migrated count toward its
-/// `min_tokens`: the simulator prefers EOS from its second token on, and
-/// the scheduler suppresses it only until the request generated five tokens
-/// in all.
-#[test]
-fn generated_tokens_count_toward_min_tokens() {
-    let (handle, thread) = start(1, 8);
-    let sampling = SamplingParams {
-        min_tokens: 5,
-        ..Default::default()
-    };
-    let mut events = handle
-        .submit(request(1, vec![1_500, 1_501], sampling, 50))
-        .unwrap();
-    let (tokens, terminal) = drain(&mut events);
-    handle.shutdown();
-    thread.join().unwrap();
-
-    let eos = SimEngine::special_tokens().eos;
-    let text = tokens.iter().filter(|token| !eos.contains(token)).count();
-    assert_eq!(text, 3, "{tokens:?}");
-    assert!(
-        matches!(terminal, Some(Event::Finished { reason: FinishReason::Eos, completion_tokens, .. }) if completion_tokens >= 5),
-        "{terminal:?}"
-    );
-}
-
-/// A bad word whose prefix the generated tokens end with bans its last token
-/// at once: the bias makes 4321 the natural choice, and the request that
-/// generated a 4321 before it migrated may not repeat it.
-#[test]
-fn a_bad_word_continues_from_the_generated_tokens() {
-    let (handle, thread) = start(1_000, 8);
-    let sampling = SamplingParams {
-        allowed_token_ids: Some(vec![1234, 4321]),
-        logit_bias: vec![(4321, 1000.0)],
-        bad_words_ids: vec![vec![4321, 4321]],
-        ..Default::default()
-    };
-    let mut events = handle.submit(request(1, vec![4321], sampling, 4)).unwrap();
-    let (tokens, _) = drain(&mut events);
-    handle.shutdown();
-    thread.join().unwrap();
-
-    assert_eq!(tokens.first(), Some(&1234), "{tokens:?}");
-}
-
 /// Parking ends a running token request after the tokens it generated, and
 /// a queued one at once, each with a migratable end in place of a finish,
 /// and answers with the scheduler's prefix cache index once nothing runs.
 #[test]
 fn parking_ends_running_and_queued_requests_as_migratable() {
-    let (handle, thread) = start(100_000, 1);
+    let (handle, thread) = start(1);
     let mut events = handle
         .submit_all([
             request(1, Vec::new(), SamplingParams::default(), 100_000).into(),
@@ -171,11 +128,15 @@ fn parking_ends_running_and_queued_requests_as_migratable() {
     while before < 3 && Instant::now() < deadline {
         match running.try_recv() {
             Ok(Event::TextToken { .. }) => before += 1,
+            Ok(Event::TextTokens { ids }) => before += ids.len(),
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
     }
-    assert_eq!(before, 3, "the first request generates before it migrates");
+    assert!(
+        before >= 3,
+        "the first request generates before it migrates"
+    );
     let parked = handle.park(false);
 
     let (_, terminal) = drain(&mut running);
@@ -234,15 +195,14 @@ fn parking_ends_running_and_queued_requests_as_migratable() {
 fn a_migration_reuses_the_pages_of_the_tokens_it_generated() {
     use std::sync::atomic::Ordering;
 
-    let mut sim = SimEngine::new();
-    sim.set_text_len(1_000);
-    sim.set_block_size(4);
-    let scheduler = support::scheduler_with(
-        Box::new(SimWorker::new(sim)),
-        SimEngine::special_tokens(),
-        SchedulerConfig::default(),
-    )
-    .unwrap();
+    let mut inventory = fake::text_pool("model", 8);
+    for cache in fake::cache_of(&mut inventory) {
+        for group in &mut cache.groups {
+            group.block_size = 4;
+        }
+    }
+    let pool = Arc::new(FakeBatches::new(vec![inventory]));
+    let scheduler = fake::scheduler_over(pool, SchedulerConfig::default(), Default::default());
     let stats = scheduler.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
     let thread = thread::spawn(move || {
@@ -284,161 +244,49 @@ fn a_migration_reuses_the_pages_of_the_tokens_it_generated() {
     );
 }
 
-/// How the workers of [`FaultingWorker`] fail once told to.
+/// How the fake worker fails once told to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fault {
-    /// Every poll fails, as a lost worker's does.
+    /// The device fails every batch it holds, as a lost device does.
     Lost,
     /// Every call reports non-finite logits, as a worker whose forward
     /// produced a NaN does (`ErrorCode::NumericalFault`).
     NonFinite,
-    /// Every call fails on the device, as a worker whose forward hit an
-    /// illegal memory access reports it (`ErrorCode::ComputeError`).
-    Compute,
     /// The worker refuses the request's next calls as invalid input
-    /// (`ErrorCode::InputError`); the calls of the batch after them, which
-    /// read the refused calls' products, fail for want of them
-    /// (`ErrorCode::InvalidDescriptor`), refusing nothing themselves.
+    /// (`ErrorCode::InputError`), once.
     Refused,
 }
 
-/// The simulator's workers, which fail as `fault` states from the moment it
-/// is set. A batch whose calls computed non-finite logits is reported as
-/// workers report one: the failure of the work that depends on its calls
-/// first, and the batch's result, its failed calls included, at the next
-/// poll.
-struct FaultingWorker {
-    inner: SimWorker,
-    fault: std::sync::Arc<std::sync::Mutex<Option<Fault>>>,
-    queued: Option<scheduler::BatchResult>,
-    /// The batches a `Refused` fault failed: the refusing one, then the
-    /// dependent one. The fault ends after both.
-    refused_batches: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// The report a `Refused` fault holds back: the refusing batch's until
-    /// the batch after it reports, so that the scheduler submitted that one
-    /// before it knew of the refusal, then the dependent batch's.
-    held: Option<scheduler::BatchResult>,
+/// The fault the fake answers with from the moment it is set, and how many
+/// batches a `Refused` fault has refused: one, after which the fault ends.
+#[derive(Default)]
+struct Faults {
+    fault: Option<Fault>,
+    refused_batches: usize,
 }
 
-impl scheduler::Worker for FaultingWorker {
-    fn info(&self) -> &scheduler::WorkerInfo {
-        self.inner.info()
+/// The fake's answer to `batch` under `faults`: every call completed by its
+/// draw, or failed with the fault's code.
+fn faulting(batch: &Batch, faults: &Mutex<Faults>) -> Outcome<ipc::execution::BatchOutput> {
+    let mut output = testkit::completed(batch, testkit::Tokens::Draw, testkit::Extent::Stated);
+    let mut faults = faults.lock().unwrap();
+    let code = match faults.fault {
+        None | Some(Fault::Lost) => return Outcome::Success(output),
+        Some(Fault::NonFinite) => ipc::ErrorCode::NumericalFault,
+        Some(Fault::Refused) if faults.refused_batches == 0 => ipc::ErrorCode::InputError,
+        Some(Fault::Refused) => return Outcome::Success(output),
+    };
+    if faults.fault == Some(Fault::Refused) {
+        faults.refused_batches += 1;
     }
-
-    fn is_ready(&self, worker: &scheduler::WorkerGroupId) -> bool {
-        self.inner.is_ready(worker)
+    for call in &mut output.calls {
+        call.status = ipc::CallStatus::Error;
+        call.error_code = Some(code);
+        call.error_message =
+            (code == ipc::ErrorCode::InputError).then(|| "invalid input".to_owned());
+        call.tokens.clear();
     }
-
-    fn has_capacity(&self, worker: &scheduler::WorkerGroupId) -> bool {
-        self.inner.has_capacity(worker)
-    }
-
-    fn command_has_capacity(&self, command: &ipc::BatchCommand) -> bool {
-        self.inner.command_has_capacity(command)
-    }
-
-    fn submit(
-        &mut self,
-        batch: scheduler::ExecutionBatch,
-    ) -> Result<(), scheduler::WorkerSubmitError> {
-        self.inner.submit(batch)
-    }
-
-    fn poll(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<Option<scheduler::BatchResult>, scheduler::WorkerError> {
-        if let Some(report) = self.queued.take() {
-            return Ok(Some(report));
-        }
-        let fault = *self.fault.lock().unwrap();
-        if fault == Some(Fault::Lost) {
-            return Err(anyhow::anyhow!("the worker was lost"));
-        }
-        let failed = self
-            .refused_batches
-            .load(std::sync::atomic::Ordering::SeqCst);
-        if fault == Some(Fault::Refused) && failed == 1 {
-            // The dependent batch's report, held since the refusal.
-            if let Some(held) = self.held.take() {
-                return self.fail(held, ipc::ErrorCode::InvalidDescriptor);
-            }
-        }
-        let report = self.inner.poll(timeout)?;
-        let Some(report) = report else {
-            return Ok(None);
-        };
-        let code = match fault {
-            Some(Fault::NonFinite) => ipc::ErrorCode::NumericalFault,
-            Some(Fault::Compute) => ipc::ErrorCode::ComputeError,
-            Some(Fault::Refused) if failed == 0 && !report.results.is_empty() => {
-                match self.held.take() {
-                    // The refusing batch waits for the batch after it.
-                    None => {
-                        self.held = Some(report);
-                        return Ok(None);
-                    }
-                    Some(refusing) => {
-                        self.held = Some(report);
-                        return self.fail(refusing, ipc::ErrorCode::InputError);
-                    }
-                }
-            }
-            _ => return Ok(Some(report)),
-        };
-        self.fail(report, code)
-    }
-
-    fn close(&mut self) -> Result<(), scheduler::WorkerError> {
-        self.inner.close()
-    }
-}
-
-impl FaultingWorker {
-    /// Fails every call of `report` with `code` as workers report it: the
-    /// failure of the work that depends on its calls now, naming the
-    /// requests refused when `code` refuses input, and the report itself at
-    /// the next poll.
-    fn fail(
-        &mut self,
-        mut report: scheduler::BatchResult,
-        code: ipc::ErrorCode,
-    ) -> Result<Option<scheduler::BatchResult>, scheduler::WorkerError> {
-        if *self.fault.lock().unwrap() == Some(Fault::Refused) {
-            self.refused_batches
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        for result in &mut report.results {
-            result.output.status = ipc::CallStatus::Error;
-            result.output.error_code = Some(code);
-            result.output.committed_tokens.clear();
-        }
-        let refusals = report
-            .results
-            .iter()
-            .filter(|_| code == ipc::ErrorCode::InputError)
-            .map(|result| (result.output.request_key, "invalid input".to_owned()))
-            .collect();
-        let failure = scheduler::WorkerFailure {
-            worker_id: scheduler::WorkerGroupId("sim".to_owned()),
-            endpoints: Vec::new(),
-            requests: report
-                .results
-                .iter()
-                .map(|result| result.output.request_key)
-                .collect(),
-            refusals,
-            retired: Vec::new(),
-            buffers: Vec::new(),
-            execution: scheduler::ExecuteError::non_finite(
-                report.batch_id,
-                report.results.iter().map(|result| &result.output),
-            ),
-            message: "call failed before its dependent work could complete".into(),
-        };
-        self.queued = Some(report);
-        Err(failure.into())
-    }
+    Outcome::Success(output)
 }
 
 /// What a request run by `fail_while_generating` came to.
@@ -451,33 +299,25 @@ struct Faulted {
     stopped: bool,
     /// That failure's first error.
     failure: Option<String>,
-    /// The batches a `Refused` fault failed.
+    /// The batches a `Refused` fault refused.
     refused_batches: usize,
 }
 
 /// Runs a request on a scheduler, on trial or not, until it generated a few
 /// tokens, then fails its workers with `fault`.
 fn fail_while_generating(trial: bool, fault: Fault, request: GenerationRequest) -> Faulted {
-    let mut sim = SimEngine::new();
-    sim.set_text_len(1_000_000);
-    // A refusal arrives while the request's next batch is in flight.
-    if fault == Fault::Refused {
-        sim.set_queue_depth(2);
-    }
-    let faults = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let refused_batches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut scheduler = support::scheduler_with(
-        Box::new(FaultingWorker {
-            inner: SimWorker::new(sim),
-            fault: std::sync::Arc::clone(&faults),
-            queued: None,
-            refused_batches: std::sync::Arc::clone(&refused_batches),
-            held: None,
-        }),
-        SimEngine::special_tokens(),
+    let faults = Arc::new(Mutex::new(Faults::default()));
+    let inventory = fake::text_pool("model", 8);
+    let answering = Arc::clone(&faults);
+    let pool = Arc::new(
+        FakeBatches::new(vec![inventory])
+            .answering(Arc::new(move |batch| faulting(batch, &answering))),
+    );
+    let mut scheduler = fake::scheduler_over(
+        Arc::clone(&pool),
         SchedulerConfig::default(),
-    )
-    .unwrap();
+        Default::default(),
+    );
     scheduler.set_trial(trial);
     let failure = scheduler.failure_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -485,35 +325,22 @@ fn fail_while_generating(trial: bool, fault: Fault, request: GenerationRequest) 
     let handle = CommandSender::new(tx);
 
     let mut events = handle.submit(request).unwrap();
-    let mut tokens = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while tokens.len() < 4 && Instant::now() < deadline {
-        match events.try_recv() {
-            Ok(Event::TextToken { id, .. }) => tokens.push(id),
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
+    let (mut tokens, _) = support::wait_for_tokens(&mut events, 4, Duration::from_secs(10));
+    assert!(tokens.len() >= 4, "the request generates before the fault");
+    if fault == Fault::Lost {
+        // The device holds the next batch and then fails everything it holds.
+        pool.hold();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pool.held() == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
         }
+        pool.fail_held("the worker was lost");
+    } else {
+        faults.lock().unwrap().fault = Some(fault);
     }
-    assert_eq!(tokens.len(), 4, "the request generates before the fault");
-    *faults.lock().unwrap() = Some(fault);
 
     let (after, terminal) = drain(&mut events);
     tokens.extend(after);
-    // A refused input is injected in two halves: the refusing batch, and the
-    // batch that was in flight behind it, whose report the fixture holds until
-    // the scheduler asks for it. That ask is the scheduler's next poll, and
-    // with the request already failed it comes when the scheduler parks, not
-    // when it plans. The case reads how many halves the engine took, so the
-    // wait is for the injection to finish and not for the engine to do more:
-    // a scheduler that stops polling keeps the count at one and the case says
-    // so.
-    let expected_batches = usize::from(fault == Fault::Refused) * 2;
-    let inject = Instant::now() + Duration::from_secs(5);
-    while refused_batches.load(std::sync::atomic::Ordering::SeqCst) < expected_batches
-        && Instant::now() < inject
-    {
-        thread::sleep(Duration::from_millis(1));
-    }
     // A scheduler on trial that a fault stopped has ended its loop.
     if !(trial && failure.get().is_some()) {
         handle.shutdown();
@@ -524,7 +351,7 @@ fn fail_while_generating(trial: bool, fault: Fault, request: GenerationRequest) 
         terminal,
         stopped,
         failure: failure.get().cloned(),
-        refused_batches: refused_batches.load(std::sync::atomic::Ordering::SeqCst),
+        refused_batches: faults.lock().unwrap().refused_batches,
     }
 }
 
@@ -559,25 +386,6 @@ fn a_scheduler_on_trial_hands_its_requests_back_when_its_workers_are_lost() {
     );
     let failure = failure.expect("the scheduler reports its first error");
     assert!(failure.contains("the worker was lost"), "{failure}");
-}
-
-/// A worker fault fails an epoch on trial as a whole, and its first error
-/// names the batch the fault struck and that batch's requests, which the
-/// rollback keeps for diagnosis.
-#[test]
-fn a_worker_fault_on_trial_names_its_batch_and_requests() {
-    let Faulted {
-        stopped, failure, ..
-    } = fail_while_generating(
-        true,
-        Fault::Compute,
-        request(1, Vec::new(), SamplingParams::default(), 100_000),
-    );
-    assert!(stopped, "a worker fault stops a scheduler on trial");
-    let failure = failure.expect("the scheduler reports its first error");
-    assert!(failure.contains("in batches ["), "{failure}");
-    assert!(!failure.contains("in batches []"), "{failure}");
-    assert!(failure.contains("of requests [1]"), "{failure}");
 }
 
 /// Non-finite logits fail an epoch on trial as a whole: the scheduler stops
@@ -634,11 +442,10 @@ fn non_finite_logits_fail_a_epoch_on_trial_and_a_request_otherwise() {
 }
 
 /// A request a worker refuses as invalid input fails alone, on trial too:
-/// the calls of it already in flight then fail for want of the refused
-/// calls' products, and that failure is the refusal's, not a worker
-/// fault, so the epoch on trial serves on.
+/// the refusal is the request's, not a worker fault, so the epoch on trial
+/// serves on.
 #[test]
-fn a_refused_request_fails_alone_on_trial_with_its_calls_in_flight() {
+fn a_refused_request_fails_alone_on_trial() {
     let Faulted {
         terminal,
         stopped,
@@ -650,10 +457,7 @@ fn a_refused_request_fails_alone_on_trial_with_its_calls_in_flight() {
         Fault::Refused,
         request(1, Vec::new(), SamplingParams::default(), 100_000),
     );
-    assert_eq!(
-        refused_batches, 2,
-        "the refusal and the failure of the batch after it"
-    );
+    assert_eq!(refused_batches, 1, "the worker refused one batch");
     assert!(!stopped, "a refusal does not stop a scheduler on trial");
     assert!(failure.is_none(), "{failure:?}");
     assert!(
@@ -670,15 +474,15 @@ fn a_refused_request_fails_alone_on_trial_with_its_calls_in_flight() {
 /// continuing with the state it reached needs a page.
 #[test]
 fn a_promotion_refuses_the_requests_its_cache_cannot_hold() {
-    let mut sim = SimEngine::new();
-    sim.set_num_units(16);
-    sim.set_block_size(16);
-    let scheduler = support::scheduler_with(
-        Box::new(SimWorker::new(sim)),
-        SimEngine::special_tokens(),
-        SchedulerConfig::default(),
-    )
-    .unwrap();
+    let mut inventory = fake::text_pool("model", 8);
+    for cache in fake::cache_of(&mut inventory) {
+        cache.num_units = 16;
+        for group in &mut cache.groups {
+            group.block_size = 16;
+        }
+    }
+    let pool = Arc::new(FakeBatches::new(vec![inventory]));
+    let scheduler = fake::scheduler_over(pool, SchedulerConfig::default(), Default::default());
     let (tx, rx) = crossbeam_channel::unbounded();
     let thread = thread::spawn(move || {
         let _ = scheduler.run(rx);

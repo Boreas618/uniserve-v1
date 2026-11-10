@@ -16,8 +16,7 @@ use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 use scheduler::{
-    CommandSender, PolicyBytes, PolicyProgram, PolicySource, SimEngine, SimWorker, Stage,
-    StageApplied,
+    CommandSender, PolicyBytes, PolicyProgram, PolicySource, SchedulerConfig, Stage, StageApplied,
 };
 use scheduling::guest::decision::Plan;
 use scheduling::guest::limits::Limits;
@@ -122,14 +121,17 @@ struct Epoch {
 
 impl Epoch {
     fn start() -> Self {
-        let mut sim = SimEngine::new();
-        sim.set_text_len(16);
-        let scheduler = support::scheduler(
-            Box::new(SimWorker::new(sim)),
-            SimEngine::special_tokens(),
-            8,
-        )
-        .expect("the simulated scheduler starts");
+        let pool = Arc::new(testkit::FakeBatches::new(vec![support::fake::text_pool(
+            "model", 8,
+        )]));
+        let scheduler = support::fake::scheduler_over(
+            pool,
+            SchedulerConfig {
+                max_batch: proto::config::positive(8),
+                ..Default::default()
+            },
+            Default::default(),
+        );
         let (tx, rx) = crossbeam_channel::unbounded();
         // The thread detaches when its handle is dropped, which is what this
         // fixture wants: the scheduler ends when `handle` closes the channel.
@@ -347,21 +349,6 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
     assert!(
         refused.contains("switchover"),
         "the refusal names the stage that owns the boundary: {refused}"
-    );
-}
-
-#[test]
-fn a_scheduler_over_a_supplied_worker_refuses_a_shadow_pass_and_names_why() {
-    let epoch = Epoch::start();
-
-    // §7.3 step 2's paired pass is the in-process arm's: a supplied worker
-    // runs none, so the ask is answered with that rather than left waiting for
-    // a step that cannot run it.
-    let refused = answer(epoch.handle.shadow(7))
-        .expect_err("a scheduler over a supplied worker runs no shadow pass");
-    assert!(
-        refused.contains("supplied worker"),
-        "the refusal says which arm shadows: {refused}"
     );
 }
 

@@ -18,7 +18,7 @@ pub mod policy;
 pub mod pools;
 pub mod text;
 
-pub use batches::{Answer, Extent, FakeBatches, SAMPLED, Tokens, draw_token};
+pub use batches::{Answer, Extent, FakeBatches, Operate, SAMPLED, Tokens, completed, draw_token};
 pub use policy::{packaged_module, packaged_policy, packaged_program};
 pub use pools::{args, limits, pool, rank};
 pub use text::{EOS, EndOfText, special_tokens};

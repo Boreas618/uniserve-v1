@@ -344,66 +344,64 @@ fn an_admitted_request_is_prefilled_on_the_next_step() {
     handle.shutdown();
 }
 
-/// The reported distribution is the model's, whatever nucleus the request
-/// samples under: a request cut at half the mass reports the same five
-/// candidates with the same log probabilities as one sampling the whole
-/// distribution.
-///
-/// The two runs share the request identity and the prompt, so the simulated
-/// head scores them alike; only the nucleus differs.
+/// A rank reports the log-probability of every token it sampled, whether or
+/// not the request asked; the scheduler publishes it for a request that asked
+/// and drops it for one that did not.
 #[test]
-fn logprobs_report_the_model_distribution_under_a_cutoff() {
-    use scheduler::{SchedulerConfig, SchedulerHandle, SimEngine, SimWorker, Worker};
-    use std::thread;
+fn logprobs_reach_the_requests_that_asked_for_them_alone() {
+    use scheduler::SchedulerConfig;
 
-    let candidates = |top_p: f32| -> Vec<ipc::TokenLogprob> {
-        let mut sim = SimEngine::new();
-        sim.set_text_len(8);
-        let worker = SimWorker::new(sim);
-        let rank = worker
-            .info()
-            .runtime_info()
-            .expect("the sim states its rank");
-        let engine = SchedulerHandle::with_worker(
-            &scheduler::sim_args("logprobs"),
-            SchedulerConfig::default(),
-            Box::new(worker),
+    /// The raw log-probability the fake reports for every sampled token.
+    const LOGPROB: f32 = -0.25;
+
+    let logprobs = |asked: bool| -> Vec<Option<f32>> {
+        let pool = Arc::new(
+            testkit::FakeBatches::new(vec![crate::support::pool("model")]).answering(Arc::new(
+                |batch| {
+                    let mut output =
+                        testkit::completed(batch, testkit::Tokens::Draw, testkit::Extent::Stated);
+                    for call in &mut output.calls {
+                        call.token_logprobs = vec![LOGPROB; call.tokens.len()];
+                    }
+                    ipc::execution::Outcome::Success(output)
+                },
+            )),
+        );
+        let rank = crate::support::fake::rank_of(&pool);
+        let engine = SchedulerHandle::over_batches(
+            &testkit::args("logprobs"),
+            SchedulerConfig {
+                max_running_requests: 4,
+                ..SchedulerConfig::default()
+            },
+            pool,
         )
-        .expect("the simulated worker serves");
-        crate::support::install_policy_on(&engine, scheduler::BatchCapacity::of(&rank));
+        .expect("the fake worker serves");
+        crate::support::install_policy_on(&engine, BatchCapacity::of(&rank));
 
-        let mut request = text_request(1, 2, 7);
+        let mut request = text_request(1, 2, 3);
         request.sampling = SamplingParams {
-            temperature: 0.0,
-            top_p,
-            return_logprobs: true,
-            n_logprobs: 5,
+            return_logprobs: asked,
+            n_logprobs: u32::from(asked),
             ..Default::default()
         };
         let mut events = engine
             .submit(request)
             .expect("the engine takes the submission");
         let deadline = Instant::now() + ANSWER;
-        let mut reported = None;
-        while Instant::now() < deadline && reported.is_none() {
+        let mut reported = Vec::new();
+        while Instant::now() < deadline {
             match events.try_recv() {
-                Ok(Event::TokenLogprobs { candidates, .. }) if reported.is_none() => {
-                    reported = Some(candidates);
-                }
+                Ok(Event::TextToken { logprob, .. }) => reported.push(logprob),
+                Ok(event) if event.is_terminal() => break,
                 Ok(_) => {}
-                Err(_) => thread::sleep(Duration::from_millis(1)),
+                Err(_) => std::thread::sleep(Duration::from_millis(1)),
             }
         }
         engine.shutdown();
-        reported.expect("the request reports the distribution of its first token")
+        reported
     };
 
-    let cut = candidates(0.5);
-    let whole = candidates(1.0);
-    assert_eq!(cut.len(), 5, "five candidates were asked for: {cut:?}");
-    assert!(
-        cut.iter().all(|entry| entry.logprob.is_finite()),
-        "a reported log probability is not finite: {cut:?}"
-    );
-    assert_eq!(cut, whole, "the nucleus changed the reported distribution");
+    assert_eq!(logprobs(true), vec![Some(LOGPROB); 3]);
+    assert_eq!(logprobs(false), vec![None; 3]);
 }

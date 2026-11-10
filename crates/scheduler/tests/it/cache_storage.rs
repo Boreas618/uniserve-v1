@@ -13,19 +13,18 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ipc::execution::EpochOperation;
+use ipc::execution::{EpochOperation, Fault};
 use ipc::memory::{AdoptCache, ReleaseCache, RestoreCache, Sleep, UpdateWeights, Wake};
-use ipc::{BatchCommand, RequestId, SamplingParams};
+use ipc::{RequestId, SamplingParams};
 use proto::request::MigrationCause;
 use scheduler::GenerationRequest;
 use scheduler::{
-    BatchResult, CacheChange, CommandSender, Event, EventRx, ExecutionBatch, FinishReason,
-    SchedulerConfig, SimEngine, SimWorker, WeightsInFlight, Worker, WorkerError, WorkerGroupId,
-    WorkerInfo, WorkerSubmitError,
+    CacheChange, CommandSender, Event, EventRx, FinishReason, SchedulerConfig, WeightsInFlight,
 };
 use storage::{GpuLedger, Item, LedgerEntry, Scope, Segment};
+use testkit::FakeBatches;
 
-use crate::support;
+use crate::support::fake;
 
 /// Segments of the simulated planes, and the units of each: a pool of 32
 /// units, the sentinel included.
@@ -42,7 +41,7 @@ const SEGMENT_BYTES: u64 = SEGMENT_UNITS as u64 * UNIT_BYTES;
 /// The serving epoch of the simulated workers.
 const EPOCH: u64 = 1;
 
-/// What the simulated workers report and the storage operations they performed.
+/// What the fake workers report and the storage operations they performed.
 #[derive(Default)]
 struct SimWorkers {
     /// The quota of the worker's GPU.
@@ -76,7 +75,7 @@ struct SimWorkers {
     /// quota is 1000 bytes; `None` for an expert worker that reports no
     /// ledger.
     expert_process: Option<u64>,
-    /// Each hook run, with its payload.
+    /// Each storage operation performed, in order.
     operations: Vec<EpochOperation>,
     /// The graph share a successor's warmup takes on the GPU, and whether
     /// the worker's model can be captured at all.
@@ -178,136 +177,102 @@ impl SimWorkers {
     }
 }
 
-/// The simulator, whose workers answer the engine's storage operations as workers
-/// with segmented planes do and whose results take `STEP` each.
-struct Segmented {
-    inner: SimWorker,
-    workers: Arc<Mutex<SimWorkers>>,
-}
-
-/// How long each batch result takes.
+/// How long each batch takes on the fake device, so a case acts while a
+/// request is still running.
 const STEP: Duration = Duration::from_millis(10);
 
-impl Worker for Segmented {
-    fn info(&self) -> &WorkerInfo {
-        self.inner.info()
-    }
-
-    fn is_ready(&self, worker: &WorkerGroupId) -> bool {
-        self.inner.is_ready(worker)
-    }
-
-    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
-        self.inner.has_capacity(worker)
-    }
-
-    fn command_has_capacity(&self, command: &BatchCommand) -> bool {
-        self.inner.command_has_capacity(command)
-    }
-
-    fn submit(&mut self, batch: ExecutionBatch) -> Result<(), WorkerSubmitError> {
-        self.inner.submit(batch)
-    }
-
-    fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, WorkerError> {
-        thread::sleep(STEP.min(timeout));
-        self.inner.poll(timeout)
-    }
-
-    fn close(&mut self) -> Result<(), WorkerError> {
-        self.inner.close()
-    }
-
-    fn operate(&mut self, operation: &EpochOperation) -> Result<Vec<String>, WorkerError> {
-        let mut workers = self.workers.lock().unwrap();
-        workers.operations.push(operation.clone());
-        let result = match operation {
-            EpochOperation::CacheStorage(_) => serde_json::json!({
-                "segments": (0..SEGMENTS)
-                    .map(|ordinal| ipc::CacheSegment {
-                        epoch: EPOCH,
-                        ordinal,
-                        units: SEGMENT_UNITS,
-                    })
-                    .collect::<Vec<_>>(),
-                "held": workers.held,
-                "unit_bytes": UNIT_BYTES,
-                "head_bytes": workers.head_bytes,
-                "capacity_units": workers.capacity_units,
-                "scratch_units": 0,
-                "free_bytes": workers.free_bytes,
-                "graph_share_bytes": workers.graph_share_bytes,
-                "capturable": workers.capturable,
-                "host": "node0",
-                "scope": {"deployment": "model", "group": "model", "rank": 0},
-                "epoch": EPOCH,
-                "ledger": workers.ledger(),
-                "host_storage": {"available": 1u64 << 40, "reserve": 10u64 << 30, "unallocated": 0},
-            }),
-            EpochOperation::ReleaseCache(ReleaseCache { from }) => {
-                workers.held = *from;
-                serde_json::Value::Null
-            }
-            EpochOperation::RestoreCache(RestoreCache { segments }) => {
-                workers.held = match segments {
-                    Some(count) => (workers.held + count).min(SEGMENTS),
-                    None => SEGMENTS,
-                };
-                serde_json::Value::Null
-            }
-            EpochOperation::Wake(_) => {
-                workers.held = SEGMENTS;
-                serde_json::Value::Null
-            }
-            EpochOperation::Sleep(_) => {
-                workers.held = 0;
-                serde_json::Value::Null
-            }
-            EpochOperation::UpdateWeights(_) => {
-                serde_json::json!({ "group": null })
-            }
-            EpochOperation::AdoptCache(_) => serde_json::json!({ "inherited": 0 }),
-            other => anyhow::bail!("no storage operation {other:?}"),
-        };
-        let mut results = vec![result.to_string()];
-        if workers.experts && matches!(operation, EpochOperation::CacheStorage(_)) {
-            let ledger = workers.expert_process.map(|process| GpuLedger {
-                gpu: [8; 16],
-                deployment: "model".into(),
-                total: 2_000,
-                quota: Some(1_000),
-                host_link_bytes_per_second: None,
-                entries: vec![LedgerEntry {
-                    item: Item::Process,
-                    scope: Some(Scope {
-                        deployment: "model".into(),
-                        group: "experts".into(),
-                        rank: 0,
-                    }),
-                    epochs: vec![EPOCH],
-                    segment: None,
-                    bytes: process,
-                }],
-                transfer_context: 0,
-            });
-            // The device has free what its total leaves beside the process.
-            let free = workers.expert_process.map_or(0, |process| 2_000 - process);
-            results.push(
-                serde_json::json!({
-                    "free_bytes": free,
-                    "host": "node1",
-                    "scope": {"deployment": "model", "group": "experts", "rank": 0},
-                    "epoch": EPOCH,
-                    "ledger": ledger,
+/// The engine's own storage operations as `workers`, whose planes are
+/// segmented, answer them.
+fn operate(
+    workers: &Mutex<SimWorkers>,
+    operation: &EpochOperation,
+) -> Result<Vec<String>, Box<Fault>> {
+    let mut workers = workers.lock().unwrap();
+    workers.operations.push(operation.clone());
+    let result = match operation {
+        EpochOperation::CacheStorage(_) => serde_json::json!({
+            "segments": (0..SEGMENTS)
+                .map(|ordinal| ipc::CacheSegment {
+                    epoch: EPOCH,
+                    ordinal,
+                    units: SEGMENT_UNITS,
                 })
-                .to_string(),
-            );
+                .collect::<Vec<_>>(),
+            "held": workers.held,
+            "unit_bytes": UNIT_BYTES,
+            "head_bytes": workers.head_bytes,
+            "capacity_units": workers.capacity_units,
+            "scratch_units": 0,
+            "free_bytes": workers.free_bytes,
+            "graph_share_bytes": workers.graph_share_bytes,
+            "capturable": workers.capturable,
+            "host": "node0",
+            "scope": {"deployment": "model", "group": "model", "rank": 0},
+            "epoch": EPOCH,
+            "ledger": workers.ledger(),
+            "host_storage": {"available": 1u64 << 40, "reserve": 10u64 << 30, "unallocated": 0},
+        }),
+        EpochOperation::ReleaseCache(ReleaseCache { from }) => {
+            workers.held = *from;
+            serde_json::Value::Null
         }
-        Ok(results)
+        EpochOperation::RestoreCache(RestoreCache { segments }) => {
+            workers.held = match segments {
+                Some(count) => (workers.held + count).min(SEGMENTS),
+                None => SEGMENTS,
+            };
+            serde_json::Value::Null
+        }
+        EpochOperation::Wake(_) => {
+            workers.held = SEGMENTS;
+            serde_json::Value::Null
+        }
+        EpochOperation::Sleep(_) => {
+            workers.held = 0;
+            serde_json::Value::Null
+        }
+        EpochOperation::UpdateWeights(_) => serde_json::json!({ "group": null }),
+        EpochOperation::AdoptCache(_) => serde_json::json!({ "inherited": 0 }),
+        other => return Err(format!("no storage operation {other:?}").into()),
+    };
+    let mut results = vec![result.to_string()];
+    if workers.experts && matches!(operation, EpochOperation::CacheStorage(_)) {
+        let ledger = workers.expert_process.map(|process| GpuLedger {
+            gpu: [8; 16],
+            deployment: "model".into(),
+            total: 2_000,
+            quota: Some(1_000),
+            host_link_bytes_per_second: None,
+            entries: vec![LedgerEntry {
+                item: Item::Process,
+                scope: Some(Scope {
+                    deployment: "model".into(),
+                    group: "experts".into(),
+                    rank: 0,
+                }),
+                epochs: vec![EPOCH],
+                segment: None,
+                bytes: process,
+            }],
+            transfer_context: 0,
+        });
+        // The device has free what its total leaves beside the process.
+        let free = workers.expert_process.map_or(0, |process| 2_000 - process);
+        results.push(
+            serde_json::json!({
+                "free_bytes": free,
+                "host": "node1",
+                "scope": {"deployment": "model", "group": "experts", "rank": 0},
+                "epoch": EPOCH,
+                "ledger": ledger,
+            })
+            .to_string(),
+        );
     }
+    Ok(results)
 }
 
-/// A scheduler over the simulator whose `workers` serve a cache of
+/// A scheduler over the fake worker whose `workers` serve a cache of
 /// segmented planes of 32 units of `BLOCK` tokens.
 fn start(
     workers: SimWorkers,
@@ -329,23 +294,44 @@ fn start_split(
     Arc<Mutex<SimWorkers>>,
     thread::JoinHandle<()>,
 ) {
-    let mut sim = SimEngine::new();
-    sim.set_text_len(10_000);
-    sim.set_num_units(SEGMENTS * SEGMENT_UNITS);
-    sim.set_block_size(BLOCK);
-    if let Some(inherited) = split {
-        sim.set_segments(SEGMENTS, SEGMENT_UNITS, inherited);
+    let mut inventory = fake::text_pool("model", 8);
+    for cache in fake::cache_of(&mut inventory) {
+        cache.num_units = SEGMENTS * SEGMENT_UNITS;
+        for group in &mut cache.groups {
+            group.block_size = BLOCK;
+        }
+        if let Some(inherited) = split {
+            cache.segments = (0..SEGMENTS)
+                .map(|ordinal| ipc::CacheSegment {
+                    epoch: if (1..=inherited).contains(&ordinal) {
+                        1
+                    } else {
+                        2
+                    },
+                    ordinal,
+                    units: SEGMENT_UNITS,
+                })
+                .collect();
+            cache.held_segments = SEGMENTS;
+            cache.inherited_start = if inherited > 0 { SEGMENT_UNITS } else { 0 };
+            cache.inherited_units = inherited * SEGMENT_UNITS;
+        }
     }
     let workers = Arc::new(Mutex::new(workers));
-    let scheduler = support::scheduler_with(
-        Box::new(Segmented {
-            inner: SimWorker::new(sim),
-            workers: Arc::clone(&workers),
-        }),
-        SimEngine::special_tokens(),
-        SchedulerConfig::default(),
-    )
-    .unwrap();
+    let operated = Arc::clone(&workers);
+    let pool = Arc::new(
+        FakeBatches::new(vec![inventory])
+            .answering(Arc::new(|batch| {
+                thread::sleep(STEP);
+                ipc::execution::Outcome::Success(testkit::completed(
+                    batch,
+                    testkit::Tokens::Draw,
+                    testkit::Extent::Stated,
+                ))
+            }))
+            .with_operate(Arc::new(move |operation| operate(&operated, operation))),
+    );
+    let scheduler = fake::scheduler_over(pool, SchedulerConfig::default(), Default::default());
     let (tx, rx) = crossbeam_channel::unbounded();
     let thread = thread::spawn(move || {
         let _ = scheduler.run(rx);
@@ -384,6 +370,7 @@ fn next_token(events: &mut EventRx, wait: Duration) -> Option<u32> {
     while Instant::now() < deadline {
         match events.try_recv() {
             Ok(Event::TextToken { id, .. }) => return Some(id),
+            Ok(Event::TextTokens { ids }) if !ids.is_empty() => return ids.first().copied(),
             Ok(event) if event.is_terminal() => panic!("the request ended: {event:?}"),
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
@@ -654,9 +641,8 @@ fn requests_that_wait_for_each_others_units_recompute_the_last_admitted() {
 }
 
 /// A request alone whose sequence grows past the whole cache ends where the
-/// cache is full, with the cache-capacity finish rather than its token
-/// limit's: giving up any request would not let it grow, so it is not left to
-/// starve until the watchdog fails it.
+/// cache is full, as it would at its token limit: giving up any request would
+/// not let it grow, so it is not left to starve until the watchdog fails it.
 #[test]
 fn a_request_longer_than_the_cache_ends_at_the_length_the_cache_holds() {
     let (handle, _workers, thread) = start(SimWorkers::filling(0));
@@ -881,7 +867,7 @@ fn an_aborting_sleep_ends_every_request_before_the_workers_sleep() {
     assert!(resize(&handle, CacheChange::Wake).is_ok());
     assert_eq!(
         workers.lock().unwrap().operations,
-        vec![Sleep.into(), UpdateWeights.into(), Wake.into(),]
+        vec![Sleep.into(), UpdateWeights.into(), Wake.into()]
     );
 
     handle.shutdown();
@@ -942,7 +928,7 @@ fn a_weight_update_recomputing_the_requests_in_flight_runs_while_the_workers_sle
     ));
     assert_eq!(
         workers.lock().unwrap().operations,
-        vec![Sleep.into(), UpdateWeights.into(), Wake.into(),]
+        vec![Sleep.into(), UpdateWeights.into(), Wake.into()]
     );
     let mut served = handle.submit(request(2, 2, 4)).unwrap();
     assert!(matches!(
