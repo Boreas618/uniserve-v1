@@ -6,8 +6,9 @@ process, one scheduler per replica, each on its own GPU. The control thread
 asks the epoch's scheduling policy where each request goes (its ``route``),
 and the policy the deployment serves names the live replica with the fewest
 requests in flight, rotating among equally loaded ones
-(``docs/architecture.md``, Routing). Each replica's scheduler reports its
-admissions under its own ``engine`` label (``uniserve:num_requests_admitted``).
+(``docs/architecture.md``, The request interface). Each replica's scheduler
+reports its admissions under its own ``engine`` label
+(``uniserve:num_requests_admitted``).
 
 Requests sent one at a time find both replicas idle, so the policy alternates
 between them and each admits half. While one replica holds a long streaming
