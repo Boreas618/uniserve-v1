@@ -191,6 +191,35 @@ impl Bench {
         Ok(())
     }
 
+    /// A kernel generation numbered `number` holding exactly the programs `keys` names, by
+    /// operator name and descriptor key: each one the bench has not installed yet is prepared and
+    /// resolved at the Program Server first.
+    pub(crate) fn generation(
+        &mut self,
+        number: u64,
+        keys: &BTreeMap<String, BTreeSet<String>>,
+    ) -> Outcome<Generation> {
+        let mut missing: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
+        let mut wanted = Vec::new();
+        for (operator, keys) in keys {
+            let operator = proto::program::operator::named(operator)
+                .ok_or_else(|| format!("{operator} is no operator of this build"))?;
+            for key in keys {
+                if !self.kernels.contains_key(&(operator, key.clone())) {
+                    missing.entry(operator).or_default().insert(key.clone());
+                }
+                wanted.push((operator, key.clone()));
+            }
+        }
+        if !missing.is_empty() {
+            self.install(&missing)?;
+        }
+        Ok(Generation::new(
+            number,
+            wanted.iter().map(|wanted| self.kernels[wanted].clone()),
+        ))
+    }
+
     /// Prepares every missing program and installs each key's module into this device.
     fn install(&mut self, missing: &BTreeMap<&'static str, BTreeSet<String>>) -> Outcome {
         let mut programs = Vec::new();

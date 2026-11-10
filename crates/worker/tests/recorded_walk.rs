@@ -54,12 +54,13 @@ impl Budget for Allowance {
 /// The device's pools, as a worker attaches them before it walks its runners.
 fn pools() -> Arc<Mutex<Pools>> {
     let device = Device::new(DEVICE).expect("a CUDA device");
-    // An allowance the device can reserve address space for; the walks book a few KiB.
+    // An allowance the device can reserve address space for; the walks book a few KiB, and a
+    // capture maps its graph's storage and its state tables (the resident pool) for real.
     let totals = Arc::new(Pools::totals_of(1 << 30));
     let allocator = Allocator::new(&device, Arc::new(Allowance::default()) as Arc<dyn Budget>)
         .expect("an allocator over the device");
     Arc::new(Mutex::new(
-        Pools::new(allocator, totals, 1 << 20, 0, 0, 2).expect("the device's pools"),
+        Pools::new(allocator, totals, 1 << 20, 0, 1 << 20, 2).expect("the device's pools"),
     ))
 }
 
@@ -598,5 +599,221 @@ fn a_denoiser_records_the_openings_its_conditions_admit() {
     assert_eq!(
         footprint.widest,
         Some(Bucket::denoise(1, model.layout(&warm.view()).unwrap()).serving(1, 16, 16))
+    );
+}
+
+/// The device bench of nn's integration tests: one GPU and the Program Server that builds the
+/// kernels a generation holds.
+#[path = "../../nn/tests/support/mod.rs"]
+mod support;
+
+/// One fake forward that a device can run: copy a `[1, 1, rows, columns]` block of `dtype` between
+/// two regions it reserves in the arena, with the wide program when `wide`. Each call site names a
+/// distinct `(dtype, wide)`, so its key says which forward launched it.
+fn copy(f: &Forward<'_>, dtype: DType, rows: u64, columns: u64, wide: bool) -> Result<()> {
+    let shape = Shape::new(&[1, 1, rows, columns]);
+    let source = f.arena().tensor(dtype, shape)?;
+    let out = f.arena().tensor(dtype, shape)?;
+    let plane = (rows * columns) as i64;
+    f.operate::<ops::copy_block::CopyBlock>(
+        &ops::copy_block::Descriptor {
+            source: dtype,
+            out: dtype,
+            wide,
+        },
+        ops::copy_block::Args {
+            source,
+            out,
+            out_strides: &[plane, plane, columns as i64, 1],
+        },
+    )
+}
+
+/// The key of the copy a fake forward of `dtype` and `wide` launches.
+fn copy_key(dtype: DType, wide: bool) -> (String, String) {
+    (
+        ops::copy_block::CopyBlock::NAME.to_owned(),
+        ops::descriptor::key(&ops::copy_block::Descriptor {
+            source: dtype,
+            out: dtype,
+            wide,
+        }),
+    )
+}
+
+/// The keys `pairs` names, as a footprint states them.
+fn key_set(pairs: &[(String, String)]) -> BTreeMap<String, BTreeSet<String>> {
+    let mut keys: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (operator, key) in pairs {
+        keys.entry(operator.clone())
+            .or_default()
+            .insert(key.clone());
+    }
+    keys
+}
+
+/// A denoiser whose every forward copies a block, so a device runs each of them: its constants and
+/// opening are eager forwards, its step the forward a bucket's graph captures.
+struct Copying;
+
+impl Copying {
+    /// The programs of the forwards a denoiser runner issues eagerly: the constants, filled once
+    /// per load, and a request's opening (its noise, its conditioning and its latents).
+    fn eager() -> Vec<(String, String)> {
+        vec![
+            copy_key(DType::F32, false),
+            copy_key(DType::F16, false),
+            copy_key(DType::BF16, false),
+            copy_key(DType::F32, true),
+        ]
+    }
+
+    /// The program of the step a bucket's graph captures.
+    fn captured() -> Vec<(String, String)> {
+        vec![copy_key(DType::BF16, true)]
+    }
+}
+
+impl Denoiser for Copying {
+    fn layout(&self, request: &VideoRequest<'_>) -> Result<Layout> {
+        Stepping.layout(request)
+    }
+
+    fn schedule(&self, request: &VideoRequest<'_>) -> Result<Vec<Step>> {
+        Stepping.schedule(request)
+    }
+
+    fn draw_noise(&self, f: &Forward, _: Seed, _: Layout, _: Latents) -> Result<()> {
+        copy(f, DType::F16, 4, 24, false)
+    }
+
+    fn prepare_conditioning(&self, f: &Forward, _: Conditioning<'_>) -> Result<()> {
+        copy(f, DType::BF16, 4, 24, false)
+    }
+
+    fn prepare_latents(&self, f: &Forward, _: Conditioning<'_>, _: Latents) -> Result<()> {
+        copy(f, DType::F32, 4, 32, true)
+    }
+
+    fn denoise(&self, f: &Forward, _: Step, _: Latents, _: Conditioning<'_>) -> Result<()> {
+        copy(f, DType::BF16, 8, 64, true)
+    }
+
+    fn evaluations(&self) -> u32 {
+        1
+    }
+
+    fn constant_tables(&self) -> Vec<StateTable> {
+        Vec::new()
+    }
+
+    fn prepare_constants(&self, f: &Forward, _: &[TensorView]) -> Result<()> {
+        copy(f, DType::F32, 2, 24, false)
+    }
+
+    fn layout_tables(&self, layout: &Layout) -> Result<Vec<StateTable>> {
+        Stepping.layout_tables(layout)
+    }
+
+    fn prepare_layout(&self, layout: &Layout, values: &mut [TableValues]) -> Result<()> {
+        Stepping.prepare_layout(layout, values)
+    }
+
+    fn state_tables(&self, layout: &Layout) -> Result<Vec<StateTable>> {
+        Stepping.state_tables(layout)
+    }
+
+    fn prepare_state(
+        &self,
+        request: &VideoRequest<'_>,
+        layout: &Layout,
+        values: &mut [TableValues],
+    ) -> Result<()> {
+        Stepping.prepare_state(request, layout, values)
+    }
+
+    fn prepare_evaluation(&self, evaluation: u32, values: &mut [TableValues]) -> Result<()> {
+        Stepping.prepare_evaluation(evaluation, values)
+    }
+}
+
+/// A denoiser runner's recorded walk states the programs its real capture launches: a generation
+/// holding exactly the recorded keys captures every bucket (a captured launch outside the walk
+/// would find no kernel), and the captured graphs' launches are the recorded keys less those of the
+/// forwards the runner issues eagerly, which no graph holds.
+#[test]
+#[ignore = "requires a CUDA device and a Program Server (UNISERVE_PROGRAM_SERVER_SOCKET)"]
+fn a_denoiser_captures_exactly_the_programs_its_walk_records() {
+    let shape = DenoiserShape {
+        stack: DType::BF16,
+        sample: DType::F32,
+        width: 16,
+        text_width: 16,
+    };
+    let model = Arc::new(Copying);
+    let mut recording = DenoiserRunner::new(
+        binding(),
+        Arc::clone(&model),
+        vec![warm()],
+        shape,
+        Arc::new(ops::Generation::new(0, [])),
+    )
+    .expect("a runner of one bucket");
+    recording.attach_pools(pools());
+    let footprint = recording.record_walk().expect("a recorded walk");
+    drop(recording);
+
+    assert_eq!(
+        footprint.keys,
+        key_set(&[Copying::eager(), Copying::captured()].concat()),
+        "the walk records every forward the runner issues, eager and captured"
+    );
+
+    // The generation the engine installs from the walk: its keys and nothing else.
+    let mut bench = support::device::Bench::open().expect("a device bench");
+    let generation = bench
+        .generation(1, &footprint.keys)
+        .expect("the recorded programs build and load");
+    let mut runner = DenoiserRunner::new(
+        binding(),
+        Arc::clone(&model),
+        vec![warm()],
+        shape,
+        Arc::new(generation),
+    )
+    .expect("a runner of one bucket");
+    runner.attach_pools(pools());
+
+    let jobs = runner.warmup().expect("the warmup's captures");
+    assert!(jobs.iter().next().is_some(), "the runner captures a bucket");
+    for job in jobs.iter() {
+        runner
+            .serve(job)
+            .expect("a capture launches only programs the walk recorded");
+    }
+
+    let lifecycle = runner.lifecycle_mut().expect("a capturing runner");
+    let graphs = lifecycle.graphs();
+    let mut launched: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for bucket in graphs.buckets(1) {
+        let captured = graphs.captured(bucket, 1).expect("a captured bucket");
+        for (operator, key, _) in captured.nodes() {
+            launched
+                .entry((*operator).to_owned())
+                .or_default()
+                .insert(key.clone());
+        }
+    }
+    let mut recorded_less_eager = footprint.keys.clone();
+    for (operator, keys) in &key_set(&Copying::eager()) {
+        if let Some(recorded) = recorded_less_eager.get_mut(operator) {
+            recorded.retain(|key| !keys.contains(key));
+        }
+    }
+    recorded_less_eager.retain(|_, keys| !keys.is_empty());
+    assert_eq!(
+        launched, recorded_less_eager,
+        "every recorded program the runner does not issue eagerly is launched by a captured graph, \
+         and no other"
     );
 }

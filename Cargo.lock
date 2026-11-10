@@ -5707,6 +5707,7 @@ dependencies = [
  "nvtx",
  "ops",
  "platform",
+ "program-server",
  "proto",
  "rusqlite",
  "rustix",

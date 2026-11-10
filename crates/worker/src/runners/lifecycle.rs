@@ -44,6 +44,12 @@ pub struct Lifecycle {
 }
 
 impl Lifecycle {
+    /// The graphs captured for every generation this runner holds: which buckets each generation
+    /// captured and, per graph, the programs its launches name (`Captured::nodes`).
+    pub fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
+
     /// A lifecycle serving `generation` with no other generation held.
     pub(crate) fn new(
         id: RunnerId,
