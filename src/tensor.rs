@@ -2134,13 +2134,16 @@ impl Tensor {
             ),
         };
 
-        // Both copies keep every element at its position, so the layout still applies.
+        // Both copies keep every element at its position, so the layout still applies. The
+        // tensor is on the device its storage reports: a backend may place the storage on another
+        // device than the one it was asked through.
+        let device = storage.device();
         let tensor_ = Tensor_ {
             id: TensorId::new(),
             storage: Arc::new(RwLock::new(storage)),
             layout: self.layout.clone(),
             dtype: self.dtype,
-            device: device.clone(),
+            device,
         };
         Ok(Tensor(Arc::new(tensor_)))
     }

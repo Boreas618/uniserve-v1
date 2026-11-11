@@ -101,7 +101,7 @@ impl Tensor {
                 }
                 .bt())?
             }
-            if arg.device().location() != device.location() {
+            if !arg.device().same_device(device) {
                 Err(Error::DeviceMismatchBinaryOp {
                     lhs: device.location(),
                     rhs: arg.device().location(),
@@ -174,7 +174,7 @@ impl Tensor {
                 }
                 .bt())?
             }
-            if arg.device().location() != device.location() {
+            if !arg.device().same_device(device) {
                 Err(Error::DeviceMismatchBinaryOp {
                     lhs: device.location(),
                     rhs: arg.device().location(),
