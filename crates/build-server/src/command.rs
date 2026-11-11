@@ -8,7 +8,7 @@
 //!   (`service::ensure`).
 //! - `install <package>`: installs one package on the upstream
 //!   Build Server and prints its revision. Only the upstream accepts it;
-//!   another server answers where the upstream is.
+//!   another server names where the upstream is.
 //! - `list`: prints the installed packages, their revisions and their
 //!   modules.
 //! - `resolve <op> <backend> <revision>`: prints where the store holds one
@@ -501,7 +501,7 @@ fn run_build(args: BuildArgs, host: HostTargets<'_>) -> Result<()> {
     }
 
     // The store's two directories are the roots a `serve` is given; the
-    // build's own server answers on a socket inside the store while it runs.
+    // build's own server listens on a socket inside the store while it runs.
     let store = absolute(args.store);
     std::fs::create_dir_all(&store)?;
     let settings = Settings {

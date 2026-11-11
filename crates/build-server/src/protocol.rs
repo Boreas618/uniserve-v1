@@ -1,15 +1,15 @@
 //! The Build Server's protocol and its client (design section 6.3).
 //!
 //! A connection to the Build Server speaks length-delimited Protobuf
-//! frames: the client sends one [`wire::Request`], the server answers with
-//! [`wire::ServerMessage`] frames until the one that answers the request.
+//! frames: the client sends one [`wire::Request`], the server responds with
+//! [`wire::ServerMessage`] frames until the one that responds to the request.
 //! AOT builds report themselves as [`Progress`] frames while `prepare` runs;
-//! `resolve` reports JIT builds the same way. A `resolve` answer's module
+//! `resolve` reports JIT builds the same way. A `resolve` response's module
 //! files travel as descriptors with `SCM_RIGHTS`, attached to the frame that
 //! names them, in the order it lists them.
 //!
 //! The schema is append-only and lives in `proto/build_server.proto`: a
-//! field is never renumbered, retyped or removed, and a new request or answer
+//! field is never renumbered, retyped or removed, and a new request or response
 //! is a new field of its oneof. The daemon and the main process therefore
 //! keep speaking a Build Server of a later build.
 //!
@@ -51,7 +51,7 @@ pub struct Package {
     pub revision: u32,
 }
 
-/// The answer to `install`.
+/// The response to `install`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Installed {
     pub package: Package,
@@ -102,7 +102,7 @@ pub struct Chosen {
     pub package: PackageRevision,
 }
 
-/// The answer to `prepare`: the selected package revisions, with their revisions.
+/// The response to `prepare`: the selected package revisions, with their revisions.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prepared {
     pub packages: Vec<Chosen>,
@@ -174,7 +174,7 @@ pub struct ListedPackage {
     pub modules: Vec<ListedModule>,
 }
 
-/// The answer to `list`.
+/// The response to `list`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Listing {
     pub packages: Vec<ListedPackage>,
@@ -218,7 +218,7 @@ pub struct Covered {
     pub keys: Vec<String>,
 }
 
-/// The answer to `cover`: each requested key once, either under the package
+/// The response to `cover`: each requested key once, either under the package
 /// selected for it or in `uncovered`. `covered` is in the server's selection
 /// order, and each package's keys in the order the request named them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -433,7 +433,7 @@ pub struct Connection {
 const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 const WAIT_BETWEEN: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Pauses before the next attempt, and answers whether there is time left.
+/// Pauses before the next attempt, and returns whether there is time left.
 fn pause_until(deadline: std::time::Instant) -> bool {
     let now = std::time::Instant::now();
     if now >= deadline {
@@ -443,12 +443,12 @@ fn pause_until(deadline: std::time::Instant) -> bool {
     true
 }
 
-/// Reads one answer frame on `connection`.
-fn answer_on(connection: &mut Connection) -> Result<wire::server_message::Message> {
+/// Reads one response frame on `connection`.
+fn response_on(connection: &mut Connection) -> Result<wire::server_message::Message> {
     let (message, descriptors) = connection.receive::<wire::ServerMessage>()?;
-    let answer = message.message.ok_or_else(|| unexpected(None))?;
+    let response = message.message.ok_or_else(|| unexpected(None))?;
     connection.hold(descriptors);
-    Ok(answer)
+    Ok(response)
 }
 
 impl Connection {
@@ -542,7 +542,7 @@ impl Client {
         }
     }
 
-    /// Installs a package and answers its revision.
+    /// Installs a package and returns its revision.
     ///
     /// Only the upstream Build Server installs; another one refuses and
     /// names the upstream, which the error carries.
@@ -562,7 +562,7 @@ impl Client {
             },
             &[],
         )?;
-        match self.answer()? {
+        match self.response()? {
             wire::server_message::Message::Installed(installed) => Ok(Installed {
                 package: installed
                     .package
@@ -604,7 +604,7 @@ impl Client {
             &[],
         )?;
         loop {
-            match answer_on(connection)? {
+            match response_on(connection)? {
                 wire::server_message::Message::Progress(step) => progress(step.into()),
                 wire::server_message::Message::Prepared(prepared) => {
                     let mut chosen = Vec::with_capacity(prepared.packages.len());
@@ -664,7 +664,7 @@ impl Client {
             &[],
         )?;
         loop {
-            match answer_on(connection)? {
+            match response_on(connection)? {
                 wire::server_message::Message::Progress(step) => progress(step.into()),
                 wire::server_message::Message::Resolved(resolved) => {
                     let form = wire::ModuleForm::try_from(resolved.form)
@@ -715,7 +715,7 @@ impl Client {
             },
             &[],
         )?;
-        match self.answer()? {
+        match self.response()? {
             wire::server_message::Message::Listing(listing) => {
                 let mut packages = Vec::with_capacity(listing.packages.len());
                 for package in listing.packages {
@@ -750,7 +750,7 @@ impl Client {
         }
     }
 
-    /// Answers which installed package covers each of an operator's
+    /// Returns which installed package covers each of an operator's
     /// descriptor keys for `request.targets`; nothing is built.
     pub fn cover(&mut self, request: &CoverRequest) -> Result<Coverage> {
         self.connection.send(
@@ -780,7 +780,7 @@ impl Client {
             },
             &[],
         )?;
-        match self.answer()? {
+        match self.response()? {
             wire::server_message::Message::Coverage(coverage) => {
                 let mut covered = Vec::with_capacity(coverage.covered.len());
                 for entry in coverage.covered {
@@ -816,7 +816,7 @@ impl Client {
     }
 
     /// The next frame, with the descriptors that rode on it held for the
-    /// answer it belongs to.
+    /// response it belongs to.
     ///
     /// Progress reports are frames like any other: the requests that report
     /// builds read them in their own loop, so dropping them here would lose
@@ -852,7 +852,7 @@ impl Client {
         // of the budget rather than a fixed step.
         loop {
             match attempt(&mut self.connection) {
-                Ok(answer) => return Ok(answer),
+                Ok(response) => return Ok(response),
                 Err(error) if error.away() => {
                     if !pause_until(deadline) {
                         return Err(restarted());
@@ -877,22 +877,22 @@ impl Client {
         }
     }
 
-    fn answer(&mut self) -> Result<wire::server_message::Message> {
-        answer_on(&mut self.connection)
+    fn response(&mut self) -> Result<wire::server_message::Message> {
+        response_on(&mut self.connection)
     }
 }
 
 impl Connection {
-    /// Holds the descriptors of a frame just read, for the answer that names
+    /// Holds the descriptors of a frame just read, for the response that names
     /// them.
     fn hold(&mut self, descriptors: Vec<OwnedFd>) {
         self.descriptors.extend(descriptors);
     }
 
-    /// The descriptors the answer just read came with.
+    /// The descriptors the response just read came with.
     ///
-    /// A `resolve` answer's files ride on its frame, so they are taken after
-    /// the frame is read; the client pairs them with the names in the answer.
+    /// A `resolve` response's files ride on its frame, so they are taken after
+    /// the frame is read; the client pairs them with the names in the response.
     pub fn take_descriptors(&mut self) -> Vec<OwnedFd> {
         std::mem::take(&mut self.descriptors).into()
     }
@@ -906,5 +906,5 @@ fn refused_error(refused: wire::Refused) -> Error {
 }
 
 fn unexpected(message: Option<wire::server_message::Message>) -> Error {
-    Error::Protocol(format!("unexpected answer {message:?}"))
+    Error::Protocol(format!("unexpected response {message:?}"))
 }

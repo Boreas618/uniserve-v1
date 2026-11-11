@@ -48,12 +48,6 @@ pub const MODULE_WASM: &str = "module.wasm";
 /// workspace. It is not part of the module; [`collect`] leaves it out.
 const BUILD_LOG: &str = ".build.log";
 
-/// The files a build wrote, relative to its [`Workspace`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Built {
-    pub files: Vec<String>,
-}
-
 /// The directory one build writes into. It is private to the build and is
 /// deleted when the build ends, after the store has published the module.
 #[derive(Debug)]
@@ -84,8 +78,8 @@ pub trait Source: Send + Sync {
     /// section 5.3): the operator, the descriptor key and what the module is
     /// compiled for — an architecture such as `sm_100a`, or a GPU model for a
     /// package whose code reads the device. `dir` is the workspace to write
-    /// into. The returned file names, and the module's form from the
-    /// manifest, are what the store publishes.
+    /// into. The names of the files it wrote, relative to the workspace, and
+    /// the module's form from the manifest are what the store publishes.
     fn build(
         &self,
         op: &str,
@@ -93,7 +87,7 @@ pub trait Source: Send + Sync {
         target: &Target,
         toolchain: &dyn Toolchain,
         dir: &Workspace,
-    ) -> Result<Built>;
+    ) -> Result<Vec<String>>;
 }
 
 /// Makes the source a package's manifest names.
@@ -376,7 +370,7 @@ fn copy_file(source: &Path, destination: &Path) -> Result<()> {
 /// Copies the package's tuning data into the build's workspace (design section
 /// 5.4): tuning data is part of the revision and travels with the module it
 /// was measured for, so the main process gets it from the same `resolve`.
-/// Answers the names it copied, relative to the workspace.
+/// Returns the names it copied, relative to the workspace.
 fn copy_tuning(
     package: &PackageSource,
     key: &str,
@@ -441,7 +435,7 @@ impl Source for CudaSource {
         target: &Target,
         toolchain: &dyn Toolchain,
         dir: &Workspace,
-    ) -> Result<Built> {
+    ) -> Result<Vec<String>> {
         let package = &self.package;
         let log = build_log(dir);
         // A package may state its command line in its own compile script, for
@@ -485,9 +479,7 @@ impl Source for CudaSource {
         }
         package.check_module(key, target, dir, &log)?;
         copy_tuning(package, key, target, dir)?;
-        Ok(Built {
-            files: collect(dir.path())?,
-        })
+        collect(dir.path())
     }
 }
 
@@ -681,7 +673,7 @@ impl Source for TritonSource {
         target: &Target,
         toolchain: &dyn Toolchain,
         dir: &Workspace,
-    ) -> Result<Built> {
+    ) -> Result<Vec<String>> {
         let package = &self.package;
         let log = build_log(dir);
         // The package states how its kernel is compiled in its own script: the
@@ -728,7 +720,7 @@ impl Source for TritonSource {
         package.check_module(key, target, dir, &log)?;
         copy_tuning(package, key, target, dir)?;
         let files = collect(dir.path())?;
-        Ok(Built { files })
+        Ok(files)
     }
 }
 
@@ -759,7 +751,7 @@ impl Source for CuteDslSource {
         target: &Target,
         toolchain: &dyn Toolchain,
         dir: &Workspace,
-    ) -> Result<Built> {
+    ) -> Result<Vec<String>> {
         let package = &self.package;
         let log = build_log(dir);
         // A CuTe DSL kernel is a Python kernel: it is traced, exported to a
@@ -801,9 +793,7 @@ impl Source for CuteDslSource {
             .map_err(|error| package.failure_with_log(key, target, error, &log))?;
         package.check_module(key, target, dir, &log)?;
         copy_tuning(package, key, target, dir)?;
-        Ok(Built {
-            files: collect(dir.path())?,
-        })
+        collect(dir.path())
     }
 }
 
@@ -834,7 +824,7 @@ impl Source for CubinSource {
         target: &Target,
         _toolchain: &dyn Toolchain,
         dir: &Workspace,
-    ) -> Result<Built> {
+    ) -> Result<Vec<String>> {
         let package = &self.package;
         // A vendor package carries one cubin and one metadata JSON per
         // descriptor (their names hold `{descriptor}`); copying them is the
@@ -882,9 +872,7 @@ impl Source for CubinSource {
         check_metadata_symbol(&package.manifest.op, &dir.path().join(&metadata))
             .map_err(|message| package.failure(key, target, message))?;
         copy_tuning(package, key, target, dir)?;
-        Ok(Built {
-            files: collect(dir.path())?,
-        })
+        collect(dir.path())
     }
 }
 
@@ -923,7 +911,7 @@ impl Source for WasmSource {
         target: &Target,
         toolchain: &dyn Toolchain,
         dir: &Workspace,
-    ) -> Result<Built> {
+    ) -> Result<Vec<String>> {
         let package = &self.package;
         let log = build_log(dir);
         let missing = |what: &str| Error::Toolchain {
@@ -998,7 +986,7 @@ impl Source for WasmSource {
         }
         let mut files = vec![MODULE_WASM.to_owned()];
         files.extend(copy_tuning(package, key, target, dir)?);
-        Ok(Built { files })
+        Ok(files)
     }
 }
 
@@ -1070,7 +1058,7 @@ impl Source for ExecutableSource {
         target: &Target,
         _toolchain: &dyn Toolchain,
         dir: &Workspace,
-    ) -> Result<Built> {
+    ) -> Result<Vec<String>> {
         let package = &self.package;
         // An executable is stored as it is (design section 5.1): the
         // package revision was built with its own toolchain, outside the Build
@@ -1088,9 +1076,7 @@ impl Source for ExecutableSource {
             copy_file(&source, &dir.path().join(&relative))?;
         }
         copy_tuning(package, key, target, dir)?;
-        Ok(Built {
-            files: collect(dir.path())?,
-        })
+        collect(dir.path())
     }
 }
 
@@ -1129,7 +1115,7 @@ impl Source for CargoSource {
         target: &Target,
         toolchain: &dyn Toolchain,
         dir: &Workspace,
-    ) -> Result<Built> {
+    ) -> Result<Vec<String>> {
         let package = &self.package;
         let log = build_log(dir);
         let missing = |what: &str| Error::Toolchain {
@@ -1174,9 +1160,7 @@ impl Source for CargoSource {
         // `fs::copy` keeps the mode, so the module's file is executable as built.
         copy_file(&built, &dir.path().join(binary))?;
         copy_tuning(package, key, target, dir)?;
-        Ok(Built {
-            files: collect(dir.path())?,
-        })
+        collect(dir.path())
     }
 }
 
@@ -1294,7 +1278,7 @@ dimensions = {{ dtype = ["bf16"] }}
             )
             .unwrap();
 
-        assert_eq!(built.files, vec!["launch.json", "module.cubin"]);
+        assert_eq!(built, vec!["launch.json", "module.cubin"]);
         assert_eq!(
             std::fs::read(workspace.path().join("module.cubin")).unwrap(),
             b"a cubin"

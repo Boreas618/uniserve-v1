@@ -1,4 +1,4 @@
-//! The kernel packages' contract, checked over the directories the caller names: every package
+//! The kernel packages' rules, checked over the directories the caller names: every package
 //! parses as design section 5.2 says, names the operator and backend of its directories, declares
 //! its toolchain version, names an operator the `ops` crate declares, and carries element type
 //! names `ops` prints.

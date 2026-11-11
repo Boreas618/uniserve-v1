@@ -5,7 +5,7 @@
 //! service (the `service` crate) on [`default_socket`], started as
 //! `uniserve build-server serve`, and by a daemon whose host has none. It
 //! does three things: compile a package
-//! into the modules of its descriptors, keep those modules, and answer
+//! into the modules of its descriptors, keep those modules, and response
 //! `install`, `prepare`, `resolve`, `list` and `cover` on its Unix socket. It launches
 //! no kernel and allocates no device memory, and it is not on the serving
 //! path: a main process asks it for modules when it starts and when a package revision
@@ -18,7 +18,7 @@
 //! The pieces of the design:
 //!
 //! - [`server`]: the object model of section 6.2, and `install`, `prepare`,
-//!   `resolve`, `list` (section 6.3) and `cover`, which answers the package
+//!   `resolve`, `list` (section 6.3) and `cover`, which returns the package
 //!   whose manifest covers each of an operator's descriptor keys.
 //! - [`store`]: the module store of section 5.3, whose paths are made of the
 //!   operator's and backend's names, the revision, the digest of its build
@@ -95,12 +95,12 @@ pub enum Error {
         /// Where the upstream Build Server is, when the request needed it.
         upstream: Option<String>,
     },
-    /// The peer answered something this build does not expect.
-    #[error("the build server answered out of protocol: {0}")]
+    /// The peer sent something this build does not expect.
+    #[error("the build server responded out of protocol: {0}")]
     Protocol(String),
     /// The Build Server was away for the whole of the wait (design section
     /// 7.5): the client reconnected `attempts` times without a server
-    /// answering, so preparation is told a restart outlasted it.
+    /// responding, so preparation is told a restart outlasted it.
     #[error("the build server at {socket} was away for the whole {waited:?} wait")]
     Restarted {
         /// The socket that stayed unanswered.
@@ -160,7 +160,7 @@ pub enum Error {
     },
 }
 
-/// What an operation of the Build Server answers.
+/// What an operation of the Build Server returns.
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
@@ -170,7 +170,7 @@ impl Error {
     ///
     /// Only the transport's own failures count. Everything the server decided
     /// — a refusal, a build failure, an unknown revision — is the server
-    /// having answered, and retrying it would repeat the decision.
+    /// having responded, and retrying it would repeat the decision.
     pub fn away(&self) -> bool {
         matches!(
             self,

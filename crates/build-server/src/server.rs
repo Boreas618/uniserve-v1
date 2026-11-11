@@ -83,7 +83,7 @@ impl Package {
 /// How to serve: what `uniserve build-server serve` takes.
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
-    /// The socket to answer on.
+    /// The socket to response on.
     pub socket: PathBuf,
     /// The package root. It is writable on the upstream Build Server, which
     /// accepts `install`, and a read-only mount of the upstream's root on
@@ -171,7 +171,7 @@ impl BuildServer {
         })
     }
 
-    /// Serves until the process ends: binds the socket, answers every client
+    /// Serves until the process ends: binds the socket, serves every client
     /// on its own thread, and drives the compile queue.
     ///
     /// # Errors
@@ -192,7 +192,7 @@ impl BuildServer {
         let Some((listener, lock)) = service::bind(&self.socket)? else {
             return Err(Error::Io(io::Error::new(
                 io::ErrorKind::AddrInUse,
-                format!("a build server answers on {}", self.socket.display()),
+                format!("a build server serves on {}", self.socket.display()),
             )));
         };
         self.serve_on(listener, lock, stop)
@@ -257,7 +257,7 @@ impl BuildServer {
         Ok(())
     }
 
-    /// Answers one client's connection until it closes.
+    /// Serves one client's connection until it closes.
     fn serve_connection(&self, stream: std::os::unix::net::UnixStream) -> Result<()> {
         let mut connection = Connection::new(stream);
         loop {
@@ -265,10 +265,10 @@ impl BuildServer {
             let Some(request) = request.request else {
                 return Err(Error::Protocol("a request carries no request".into()));
             };
-            let answered = self.answer(&mut connection, request);
-            if let Err(error) = answered {
+            let responded = self.respond(&mut connection, request);
+            if let Err(error) = responded {
                 // The client's request failed; it is told why in the frame
-                // that would have answered it.
+                // that would have returned it.
                 let refused = refusal(&error);
                 connection.send(
                     &wire::ServerMessage {
@@ -280,8 +280,8 @@ impl BuildServer {
         }
     }
 
-    /// Answers one request, sending its answer on `connection`.
-    fn answer(&self, connection: &mut Connection, request: wire::request::Request) -> Result<()> {
+    /// Responds to one request, sending its response on `connection`.
+    fn respond(&self, connection: &mut Connection, request: wire::request::Request) -> Result<()> {
         match request {
             wire::request::Request::Install(install) => {
                 let installed = self.install(Path::new(&install.package))?;
@@ -453,7 +453,7 @@ impl BuildServer {
         }
     }
 
-    /// Installs a package and answers its revision (design section
+    /// Installs a package and returns its revision (design section
     /// 6.3).
     ///
     /// Only the upstream Build Server installs; every other one refuses and
@@ -714,7 +714,7 @@ impl BuildServer {
 
         for (path, receiver) in builds {
             let state = receiver.recv().unwrap_or(BuildState::Failed(
-                "the build's queue ended without an answer".into(),
+                "the build's queue ended without a response".into(),
             ));
             progress(Progress {
                 path: path.clone(),
@@ -804,7 +804,7 @@ impl BuildServer {
                 .queue
                 .submit(Arc::clone(&package), &path, Urgency::Waiting);
             let state = receiver.recv().unwrap_or(BuildState::Failed(
-                "the build's queue ended without an answer".into(),
+                "the build's queue ended without a response".into(),
             ));
             progress(Progress {
                 path: path.clone(),
@@ -915,15 +915,15 @@ impl BuildServer {
     /// The candidates are the packages a module set fixed for the operator,
     /// when the request states them, and otherwise each backend's latest
     /// installed revision - or the revision a named backend states; of those,
-    /// the ones that build for every requested target. The answer lists them
+    /// the ones that build for every requested target. The response lists them
     /// in selection order, which is what the daemon fixes a module set from. A key goes to the first candidate whose manifest
     /// covers it, in the selection order: a backend the request names for the
     /// key's phase ([`proto::module::PhaseKind::of_key`]) first, then the manifest's
     /// `priority`, highest first, then the backend whose name sorts first. A
     /// named backend that does not cover a key leaves it to the next candidate,
     /// so a deployment that names its attention backend still serves the keys
-    /// only another package declares. A key no candidate covers is answered in
-    /// `uncovered`. Nothing is built, and the answer does not depend on what
+    /// only another package declares. A key no candidate covers is returned in
+    /// `uncovered`. Nothing is built, and the response does not depend on what
     /// the store has built: every host selects alike.
     ///
     /// # Errors
@@ -1191,7 +1191,7 @@ impl BuildServer {
 /// `[module.entries]`, overridden by each role the module's entries file names
 /// (design section 4.2). The file is part of the module, written by the build
 /// for this descriptor, so a package whose modules each launch through their
-/// own C entry answers the entries of the module it resolved.
+/// own C entry returns the entries of the module it resolved.
 fn entries_of(package: &Package, directory: &Path) -> Result<BTreeMap<String, String>> {
     let mut entries = package.manifest.module.entries.clone();
     let Some(name) = package.manifest.module.entries_file.as_deref() else {
@@ -1257,7 +1257,7 @@ impl Queue {
     }
 
     /// Submits a build for a module path, or joins the one queued or running
-    /// for it and raises its urgency. Answers when the build ends.
+    /// for it and raises its urgency. Returns when the build ends.
     fn submit(
         &self,
         package: Arc<Package>,
@@ -1344,7 +1344,7 @@ impl Queue {
     /// A build that panics fails like one that returned an error: the
     /// failure is the build's log, and the queue keeps its slot.
     fn build(self: Arc<Self>, job: Arc<BuildJob>) {
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.compile(&job)))
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.compile(&job)))
             .unwrap_or_else(|panic| {
                 let message = panic
                     .downcast_ref::<&str>()
@@ -1362,7 +1362,7 @@ impl Queue {
             })
             .map_err(|error| error.to_string());
         let mut state = self.lock();
-        let ended: Option<Build> = state.builder.finish(&job.path, outcome);
+        let ended: Option<Build> = state.builder.finish(&job.path, result);
         state.jobs.remove(&job.path);
         if let Some(build) = ended {
             for waiter in &build.waiters {
@@ -1438,7 +1438,7 @@ impl Queue {
             toolchain,
             &workspace,
         )?;
-        if built.files.is_empty() {
+        if built.is_empty() {
             return Err(Error::Build {
                 op: job.path.op.clone(),
                 backend: job.path.backend.clone(),
@@ -1451,7 +1451,7 @@ impl Queue {
         self.store.publish(
             &job.path,
             workspace.path(),
-            &built.files,
+            &built,
             package.manifest.interface_version,
         )?;
         Ok(())
@@ -1473,7 +1473,7 @@ fn peak(toolchains: &Toolchains, job: &BuildJob) -> u64 {
         .unwrap_or(0)
 }
 
-/// The answers a request sends on its connection while it runs.
+/// The responses a request sends on its connection while it runs.
 struct Replies<'a> {
     connection: &'a mut Connection,
     failure: Option<Error>,

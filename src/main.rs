@@ -150,7 +150,7 @@ fn host_targets() -> std::result::Result<Vec<build_server::Target>, String> {
 }
 
 /// The ordinals of this host's idle devices, read through the driver and NVML: what the daemon
-/// answers a deployment's planning with (`daemon::DeviceProbe`).
+/// places a deployment's processes with (`daemon::DeviceProbe`).
 fn idle_devices() -> std::result::Result<Vec<u32>, String> {
     let nvml = platform::Nvml::init().map_err(|error| format!("opening NVML: {error}"))?;
     let count = platform::DeviceId::count()

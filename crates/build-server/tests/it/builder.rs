@@ -26,9 +26,8 @@ fn path(key: &str) -> ModulePath {
 #[test]
 fn one_path_is_one_build_however_many_ask_for_it() {
     let mut builder = Builder::new(limits(4, 0));
-    let first = builder.submit(&path("dtype_bf16"), Urgency::Waiting, 1);
-    let second = builder.submit(&path("dtype_bf16"), Urgency::Waiting, 2);
-    assert_eq!(first.path, second.path);
+    builder.submit(&path("dtype_bf16"), Urgency::Waiting, 1);
+    builder.submit(&path("dtype_bf16"), Urgency::Waiting, 2);
     assert_eq!(builder.pending(), 1);
 
     let started = builder.start(u64::MAX, |_| 1);

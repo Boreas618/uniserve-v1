@@ -2,12 +2,12 @@
 //
 // A connection speaks one length-delimited Protobuf frame at a time, in both
 // directions: a `Request` from the client, then the server's `ServerMessage`
-// frames for it, ending with the one that answers it. A `resolve` answer
+// frames for it, ending with the one that responds to it. A `resolve` response
 // carries its module files as descriptors with `SCM_RIGHTS`, attached to the
 // frame that names them, in the order the frame lists them.
 //
 // The schema is append-only: a field is never renumbered, retyped or removed,
-// and a new kind of request or answer is a new field of `Request` or
+// and a new kind of request or response is a new field of `Request` or
 // `ServerMessage`. A client and a server of different builds therefore speak
 // every message they share.
 
@@ -15,7 +15,7 @@ syntax = "proto3";
 
 package uniserve.build_server;
 
-// One request of a client. The server answers each request on its connection
+// One request of a client. The server responds to each request on its connection
 // in the order it received it.
 message Request {
   oneof request {
@@ -135,7 +135,7 @@ message List {}
 // those, the ones that build for every target. A key goes to the first candidate whose manifest
 // covers it, in this order: the backend the deployment names for the key's
 // phase, then the manifest's `priority`, highest first, then the backend whose
-// name sorts first. The server answers with `Coverage`; nothing is built.
+// name sorts first. The server responds with `Coverage`; nothing is built.
 message Cover {
   string op = 1;
   // The targets the keys' modules are built for, such as `sm_100a`.
@@ -269,7 +269,7 @@ message Covered {
   repeated string keys = 2;
 }
 
-// The answer to `Cover`: every requested key appears exactly once, either in
+// The response to `Cover`: every requested key appears exactly once, either in
 // the package chosen for it or in `uncovered`. Packages are listed in the
 // server's selection order.
 message Coverage {
@@ -281,7 +281,7 @@ message Coverage {
   repeated Package candidates = 3;
 }
 
-// The server does not answer the request. `upstream` is set when the request
+// The server does not response the request. `upstream` is set when the request
 // needed the upstream Build Server this one is not.
 message Refused {
   string reason = 1;

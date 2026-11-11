@@ -21,7 +21,7 @@ use crate::leader::{Leader, replica_configs};
 use crate::options::{ServerArgs, Stated};
 
 /// The launch of every main process the deployment `config` starts on this node, in replica
-/// order; `stated` holds the option paths the operator set, and `catalogue` the families whose
+/// order; `stated` holds the option paths the operator set, and `families` the families whose
 /// requests this build processes.
 ///
 /// # Errors
@@ -30,11 +30,11 @@ use crate::options::{ServerArgs, Stated};
 /// not resolve, an option of another family was stated, the options do not resolve into an engine
 /// configuration, the replicas are not independent, or a process cannot be placed on this node.
 pub async fn launches(
-    catalogue: &processing::Catalogue,
+    families: &processing::Catalogue,
     config: &ServerArgs,
     stated: &Stated,
 ) -> anyhow::Result<Vec<EngineArgs>> {
-    let prepared = Leader::prepare(catalogue, config, stated).await?;
+    let prepared = Leader::prepare(families, config, stated).await?;
     replica_configs(&prepared.engine)?
         .into_iter()
         .zip(1..)
@@ -66,11 +66,11 @@ pub async fn launches(
 /// Fails as [`launches`] does, when the engine package cannot be selected or resolved, and when
 /// a recording process fails or prints a line that is no `operator<TAB>key`.
 pub async fn record(
-    catalogue: &processing::Catalogue,
+    families: &processing::Catalogue,
     config: &ServerArgs,
     stated: &Stated,
 ) -> anyhow::Result<BTreeMap<String, BTreeSet<String>>> {
-    let launches = launches(catalogue, config, stated).await?;
+    let launches = launches(families, config, stated).await?;
     let config = config.clone();
     tokio::task::spawn_blocking(move || {
         let socket = ensure_build_server(&config.build_config)?;

@@ -29,10 +29,10 @@ pub(crate) struct Cli {
 #[derive(Debug, Clone, Args)]
 #[command(next_help_heading = "Logging")]
 pub(crate) struct LogLevels {
-    /// Log level of UniServe components, such as `info` or `debug`.
+    /// Log level of UniServe's own code, such as `info` or `debug`.
     #[arg(long, global = true)]
     pub log_level: Option<String>,
-    /// Log level of the HTTP server components.
+    /// Log level of the HTTP server libraries.
     #[arg(long, global = true)]
     pub log_level_http: Option<String>,
 }

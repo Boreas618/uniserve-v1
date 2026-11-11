@@ -114,7 +114,7 @@ pub trait Toolchain: Send + Sync {
     /// The compiler's version, such as nvcc's `13.0.48`, Triton's `3.7.1` or
     /// CuTe DSL's `4.6.2`. A package declares the version it is written for;
     /// a mismatch refuses the build (design section 6.2). A toolchain that
-    /// compiles nothing answers the empty string, which such a package
+    /// compiles nothing returns the empty string, which such a package
     /// declares.
     fn version(&self) -> &str;
 
@@ -230,7 +230,7 @@ impl Toolchains {
     /// What builds a package of toolchain `kind` on this host, as one line: the toolchain's kind
     /// and version and, for a toolchain that runs a package's Python compile script, the digest of
     /// the compile driver's files, read now. Two hosts, or one host before and after an upgrade or
-    /// an edit of the driver or of a pin, answer the same line only when they build the same bytes
+    /// an edit of the driver or of a pin, response the same line only when they build the same bytes
     /// from the same package (`crate::inputs`).
     ///
     /// # Errors
@@ -332,7 +332,7 @@ impl Toolchains {
     }
 
     /// The toolchain's version, for `list` and the logs; a missing toolchain
-    /// answers its reason.
+    /// returns its reason.
     pub fn version(&self, kind: ToolchainKind) -> std::result::Result<&str, &str> {
         match kind {
             ToolchainKind::Nvcc => self
@@ -1036,7 +1036,7 @@ mod tests {
         std::fs::create_dir_all(driver.join("pins")).unwrap();
         std::fs::write(driver.join("triton.py"), "# the driver\n").unwrap();
         std::fs::write(driver.join("pins/artifact.sha256"), "ab  file\n").unwrap();
-        // The Python environment is outside the server: a script answers the questions discovery
+        // The Python environment is outside the server: a script returns the questions discovery
         // asks an interpreter (the driver's directory, a version, the distributions).
         let python = temporary.path().join("python");
         std::fs::write(
@@ -1089,7 +1089,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temporary);
     }
 
-    /// A relative toolchain path is answered absolute, against the directory it is resolved in: a
+    /// A relative toolchain path is returned absolute, against the directory it is resolved in: a
     /// build runs with its working directory set to the store's copy of a package, so a path that
     /// stayed relative would name that copy instead of the executable the caller named.
     #[test]

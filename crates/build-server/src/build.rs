@@ -62,7 +62,7 @@ pub const PACKAGES: &str = "packages";
 pub const MODULES: &str = "modules";
 
 /// Reads key lists: `operator<TAB>key` per line, blank lines and `#` comments
-/// skipped. Answers each line's operator and key.
+/// skipped. Returns each line's operator and key.
 ///
 /// # Errors
 ///
@@ -140,12 +140,12 @@ pub fn key_list(keys: &BTreeMap<String, BTreeSet<String>>) -> Result<String> {
 /// and the one module of each package directory in `single`. Each key is
 /// reported to `built` once its package is done, as the operator, the key and
 /// the backends that built it with the number of files each module holds; no
-/// backend means the key did not build. Answers one line per failure: a
+/// backend means the key did not build. Returns one line per failure: a
 /// failed prepare or resolve, and each key no backend built.
 ///
 /// `config` is a Build Server's configuration whose package root and first
 /// store root are the store's, and whose devices include `target`; its socket
-/// is where the build's own server answers while it runs. `packages` holds one
+/// is where the build's own server listens while it runs. `packages` holds one
 /// directory per operator, with one package directory per backend. Every path
 /// must be absolute: a build runs in the installed copy of its package.
 ///
@@ -163,20 +163,20 @@ pub fn build(
     built: &mut Report<'_>,
 ) -> Result<Vec<String>> {
     // The socket is bound before anything is installed, so a second build or
-    // a server already answering for this store stops this one before it
+    // a server already responding for this store stops this one before it
     // writes a revision.
     let Some((listener, lock)) = service::bind(&config.socket)? else {
         return Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
             format!(
-                "a build server answers on {}: the store is in use",
+                "a build server serves on {}: the store is in use",
                 config.socket.display()
             ),
         )));
     };
     let server = Arc::new(BuildServer::open(config)?);
 
-    // The compile queue is driven while the server answers, so the server runs
+    // The compile queue is driven while the server serves, so the server runs
     // as its own process would: one thread serving, this one asking it for
     // modules.
     let stop = Arc::new(AtomicBool::new(false));
@@ -306,7 +306,7 @@ fn build_single(
 }
 
 /// Prepares `keys` of the latest revision of `op`'s `backend` for `target` and
-/// resolves each one: answers the keys that resolved, each with the number of
+/// resolves each one: returns the keys that resolved, each with the number of
 /// files its module holds, and adds a line to `failures` for what did not.
 fn build_package(
     server: &BuildServer,
@@ -351,7 +351,7 @@ fn build_package(
     resolved
 }
 
-/// Makes every package of one operator installed, and answers each one's
+/// Makes every package of one operator installed, and returns each one's
 /// backend and manifest.
 ///
 /// A package whose files are those of its latest installed revision keeps that
@@ -390,7 +390,7 @@ fn install(server: &BuildServer, directory: &Path) -> Result<Vec<(String, Manife
 }
 
 /// Makes the package in `directory` installed, at its latest revision when
-/// that one was installed from the same build inputs, and answers its backend
+/// that one was installed from the same build inputs, and returns its backend
 /// and manifest.
 fn install_package(server: &BuildServer, directory: &Path) -> Result<(String, Manifest)> {
     let installed = match server.installed(directory)? {

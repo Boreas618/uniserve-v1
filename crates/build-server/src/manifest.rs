@@ -379,7 +379,7 @@ impl Descriptors {
     /// declared by a constraint, the text up to the next `_` when it meets
     /// the constraint: no integer, extent tuple or bit pattern holds one. A
     /// declared dimension the key leaves out is not refused: the package's
-    /// compilation answers for a field it needs and the key lacks.
+    /// compilation accounts for a field it needs and the key lacks.
     pub fn fields(&self, key: &str) -> Option<Vec<(String, String)>> {
         if self.dimensions.is_empty() {
             return None;

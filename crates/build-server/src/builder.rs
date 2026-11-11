@@ -100,24 +100,10 @@ impl Builder {
         }
     }
 
-    /// Submits a build for a module path, or raises the urgency of the build
-    /// already queued for it.
-    ///
-    /// Returns the identity of the caller's wait, which the build carries
-    /// until it ends.
-    pub fn submit(&mut self, path: &ModulePath, urgency: Urgency, waiter: u64) -> BuildTicket {
-        self.submit_with(path, urgency, waiter, |_| {})
-    }
-
-    /// Submits a build, or joins the one already queued for its path,
-    /// reporting through `joined` whether it joined an existing build.
-    pub fn submit_with(
-        &mut self,
-        path: &ModulePath,
-        urgency: Urgency,
-        waiter: u64,
-        joined: impl FnOnce(bool),
-    ) -> BuildTicket {
+    /// Submits a build for a module path on behalf of `waiter`, or joins the
+    /// build already queued or running for it and raises its urgency. The
+    /// build carries the waiter until it ends ([`Self::finish`]).
+    pub fn submit(&mut self, path: &ModulePath, urgency: Urgency, waiter: u64) {
         let key = path.relative();
         if let Some(build) = self
             .queued
@@ -136,23 +122,18 @@ impl Builder {
                     self.enqueue(build);
                 }
             }
-            joined(true);
-        } else {
-            // A path built again (a resolve retrying a failed build) replaces
-            // what the queue knew about it.
-            self.finished.retain(|build| build.key() != key);
-            self.enqueue(Build {
-                path: path.clone(),
-                urgency,
-                state: BuildState::Queued,
-                waiters: vec![waiter],
-            });
-            joined(false);
+            return;
         }
-        BuildTicket {
+
+        // A path built again (a resolve retrying a failed build) replaces
+        // what the queue knew about it.
+        self.finished.retain(|build| build.key() != key);
+        self.enqueue(Build {
             path: path.clone(),
-            waiter,
-        }
+            urgency,
+            state: BuildState::Queued,
+            waiters: vec![waiter],
+        });
     }
 
     /// Puts a build where its urgency belongs: ahead of every build of a
@@ -203,10 +184,10 @@ impl Builder {
 
     /// Records that a running build ended, and returns the builds whose
     /// waiters must be told.
-    pub fn finish(&mut self, path: &ModulePath, outcome: Result<(), String>) -> Option<Build> {
+    pub fn finish(&mut self, path: &ModulePath, result: Result<(), String>) -> Option<Build> {
         let position = self.running.iter().position(|build| &build.path == path)?;
         let mut build = self.running.remove(position);
-        build.state = match outcome {
+        build.state = match result {
             Ok(()) => BuildState::Committed,
             Err(log) => BuildState::Failed(log),
         };
@@ -228,11 +209,4 @@ impl Builder {
     pub fn pending(&self) -> usize {
         self.queued.len() + self.running.len()
     }
-}
-
-/// A submitted build's identity, with which its waiter collects the outcome.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BuildTicket {
-    pub path: ModulePath,
-    pub waiter: u64,
 }

@@ -76,7 +76,7 @@ pub struct ModulePath {
 
 impl ModulePath {
     /// A module path, checked: every name but the revision is one path
-    /// component, so no name can point outside its root.
+    /// segment, so no name can point outside its root.
     pub fn new(
         op: impl Into<String>,
         backend: impl Into<String>,
@@ -103,7 +103,7 @@ impl ModulePath {
             if !is_name(value) {
                 return Err(Error::Io(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("{name} {value:?} is not one path component"),
+                    format!("{name} {value:?} is not one path segment"),
                 )));
             }
         }
@@ -377,12 +377,12 @@ fn recorded_version(directory: &Path) -> Option<u32> {
 }
 
 /// Whether a build's file name is a path inside the module directory:
-/// relative, and every component a name.
+/// relative, and every segment a name.
 fn is_relative_name(name: &str) -> bool {
     !name.is_empty() && !name.starts_with('/') && name.split('/').all(is_name)
 }
 
-/// Whether a store name is one path component: non-empty, no separator, and
+/// Whether a store name is one path segment: non-empty, no separator, and
 /// neither `.` nor `..`.
 fn is_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
@@ -453,7 +453,7 @@ fn sweep_other_staging(parent: &Path) -> Result<()> {
     // Whether a process is alive is a fact this only knows how to ask for on a
     // host with `/proc`. Without one, every other staging directory looks dead,
     // and sweeping a live peer's would corrupt its publish — so a host that
-    // cannot answer the question keeps the leftovers instead.
+    // cannot response the question keeps the leftovers instead.
     if !Path::new("/proc").is_dir() {
         return Ok(());
     }
