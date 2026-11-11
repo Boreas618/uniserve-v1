@@ -1,5 +1,5 @@
 //! What a calibrated checkpoint declares about its own numeric representation, and the method
-//! each layer reads a weight with.
+//! each module reads a weight with.
 //!
 //! A quantized checkpoint states it in its metadata, not in its tensors: ModelOpt writes
 //! `quantization_config` into `config.json` (as an algorithm name, or as a compressed-tensors
@@ -14,7 +14,7 @@
 //! differ — an exclusion list that names a module the export then packed, or a declaration that
 //! quantizes a vocabulary matrix the shard holds in BF16 — and the tensor is the fact.
 //! [`Declaration::resolve`] records which weights the shards store packed (a `weight_scale` beside
-//! the weight), and [`Declaration::scheme`] answers from that record, falling back to the
+//! the weight), and [`Declaration::scheme`] reads that record, falling back to the
 //! declaration only when no shard was consulted.
 //!
 //! ## Mixed precision
@@ -25,15 +25,17 @@
 //! ([`Scheme::Nvfp4Weights`], ModelOpt's `W4A16_NVFP4`). The per-module statement wins over the
 //! file's `config_groups`, which summarize it.
 //!
-//! ## The method follows the layer
+//! ## The method follows the module
 //!
-//! There is no table of roles: a layer asks for its weight through [`crate::weights::Scope`], and
-//! the layer's type decides what a packed weight means. A [`crate::layers::Linear`] reads an NVFP4
+//! There is no table of roles: a module asks for its weight through its
+//! [`VarBuilder`](crate::VarBuilder), and the module's type decides what a packed weight means. A
+//! [`Linear`](crate::modules::Linear) reads an NVFP4
 //! weight as an activation encoder and a packed product, and an FP8 weight as a product that
 //! encodes its activations by their static scale. A weight-only NVFP4 weight is read by every
-//! layer as the dense matrix its codes and scales state, decoded once at load
-//! ([`crate::weights::Scope`]), so its products are the 16-bit products the declaration states.
-//! Every other packed tensor reaching a layer is refused by name rather than read as a matrix.
+//! module as the dense matrix its codes and scales state, decoded once at load
+//! ([`VarBuilder::load`](crate::VarBuilder::load)), so its products are the 16-bit products the
+//! declaration states. Every other packed tensor reaching a module is refused by name instead of
+//! being read as a matrix.
 
 use std::collections::BTreeSet;
 
@@ -43,10 +45,14 @@ use crate::checkpoint::Checkpoint;
 use crate::config::Fields;
 use crate::error::{Error, Result};
 
+mod nvfp4;
+
+pub use nvfp4::{Nvfp4Names, Nvfp4Stack, Nvfp4Weight, ValueLayout};
+
 /// The declaration's own file, when the export writes one beside `config.json`.
 const DECLARATION_FILE: &str = "hf_quant_config.json";
 
-/// How one weight is stored, and so how the layer that owns it reads it.
+/// How one weight is stored, and so how the module that owns it reads it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Scheme {
     /// The checkpoint's own floating-point representation.
@@ -64,7 +70,7 @@ pub enum Scheme {
 
 /// The scheme a checkpoint's key/value cache scales follow.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum KvCache {
+pub enum KvCacheScheme {
     /// The cache is stored at the activations' own type; no scale is calibrated.
     Unquantized,
     /// FP8 E4M3 with calibrated per-layer key and value scales.
@@ -79,9 +85,9 @@ pub struct Declaration {
     /// The modules the calibration left in their source dtype, as `config.json` writes them.
     excluded: Vec<String>,
     /// The scheme the key/value cache scales follow.
-    kv_cache: KvCache,
+    kv_cache: KvCacheScheme,
     /// The weights whose shards store a block scale beside them, once [`Self::resolve`] has read
-    /// the shards; `None` before, when the declaration alone answers.
+    /// the shards; `None` before, when the declaration alone decides.
     packed: Option<BTreeSet<String>>,
     /// A mixed-precision export's scheme per module, longest name first; `None` when one scheme
     /// covers every packed weight.
@@ -94,7 +100,7 @@ impl Declaration {
         Self {
             scheme: Scheme::Dense,
             excluded: Vec::new(),
-            kv_cache: KvCache::Unquantized,
+            kv_cache: KvCacheScheme::Unquantized,
             packed: None,
             layers: None,
         }
@@ -114,10 +120,10 @@ impl Declaration {
     pub fn read(checkpoint: &Checkpoint) -> Result<Self> {
         let from_config = match checkpoint.sidecar("config.json")? {
             Some(config) => match config.get("quantization_config") {
-                Some(value) if !value.is_null() => Some(Declared::of(&Fields::of(
-                    "config.json.quantization_config",
-                    value,
-                )?)?),
+                Some(value) if !value.is_null() => Some(stated(
+                    &Fields::of("config.json.quantization_config", value)?,
+                    None,
+                )?),
                 _ => None,
             },
             None => None,
@@ -129,41 +135,35 @@ impl Declaration {
                 let nested = side.get("quantization").unwrap_or(&side);
                 let fields = Fields::of(format!("{DECLARATION_FILE}.quantization"), nested)?;
                 if fields.contains("quant_algo") || fields.contains("quant_method") {
-                    let mut declared = Declared::of(&fields)?;
-                    // ModelOpt names itself as the producer rather than as a method.
-                    if declared.method.is_none() {
-                        declared.method = side
-                            .get("producer")
-                            .and_then(|producer| producer.get("name"))
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                    }
-                    Some(declared)
+                    // ModelOpt names itself as the producer, not as a method.
+                    let producer = side
+                        .get("producer")
+                        .and_then(|producer| producer.get("name"))
+                        .and_then(Value::as_str);
+                    Some(stated(&fields, producer)?)
                 } else {
                     None
                 }
             }
             None => None,
         };
-        let declared = match (from_config, from_side) {
-            (None, None) => return Ok(Self::dense()),
-            (Some(declared), None) | (None, Some(declared)) => declared,
-            (Some(config), Some(side)) => {
-                if config.algorithm != side.algorithm {
+        match (from_config, from_side) {
+            (None, None) => Ok(Self::dense()),
+            (Some((_, declaration)), None) | (None, Some((_, declaration))) => declaration,
+            (Some((config, declaration)), Some((side, _))) => {
+                if config != side {
                     return Err(refuse(
                         "the checkpoint",
                         format!(
-                            "declares two different quantizations: `config.json` says {} and \
-                             `{DECLARATION_FILE}` says {}; a checkpoint written by two tools is \
-                             one neither of them owns",
-                            config.algorithm, side.algorithm
+                            "declares two different quantizations: `config.json` says {config} \
+                             and `{DECLARATION_FILE}` says {side}; a checkpoint written by two \
+                             tools is one neither of them owns"
                         ),
                     ));
                 }
-                config
+                declaration
             }
-        };
-        declared.declaration()
+        }
     }
 
     /// This declaration with every weight's packing taken from what `checkpoint`'s shards hold: a
@@ -186,7 +186,7 @@ impl Declaration {
 
     /// How the checkpoint stores `weight`, a weight's full checkpoint name.
     ///
-    /// The shards' answer once [`Self::resolve`] has read them; the declaration's intent (packed
+    /// What the shards hold once [`Self::resolve`] has read them; the declaration's intent (packed
     /// unless an excluded module owns it) before.
     pub fn scheme(&self, weight: &str) -> Scheme {
         if let Some(layers) = &self.layers {
@@ -216,7 +216,7 @@ impl Declaration {
         if packed { self.scheme } else { Scheme::Dense }
     }
 
-    /// Whether any weight is declared packed: whether the encoded programs are the ones that run.
+    /// Whether any weight is declared packed: whether the encoded kernels are the ones that run.
     pub fn is_encoded(&self) -> bool {
         self.scheme == Scheme::Nvfp4
             || self
@@ -227,7 +227,7 @@ impl Declaration {
     }
 
     /// The scheme the key/value cache scales follow.
-    pub fn kv_cache(&self) -> KvCache {
+    pub fn kv_cache(&self) -> KvCacheScheme {
         self.kv_cache
     }
 }
@@ -316,7 +316,8 @@ fn layer_scheme(owner: &str, module: &str, layer: &Fields<'_>) -> Result<Scheme>
             return Err(refuse(
                 owner,
                 format!(
-                    "states `{other}` for {module}, and the per-module algorithms served are FP8,                      NVFP4 and W4A16_NVFP4"
+                    "states `{other}` for {module}, and the per-module algorithms served are FP8, \
+                     NVFP4 and W4A16_NVFP4"
                 ),
             ));
         }
@@ -342,168 +343,178 @@ fn refuse(what: &str, problem: impl Into<String>) -> Error {
     }
 }
 
-/// One file's declaration fields, before they are checked as a whole.
-struct Declared {
-    /// `quant_algo`, or the algorithm a compressed-tensors group states.
-    algorithm: String,
-    /// `quant_method` (`modelopt`, `compressed-tensors`, …), or the producing tool's name.
-    method: Option<String>,
-    /// The modules the calibration left in their source dtype.
-    excluded: Vec<String>,
-    /// The key/value cache scheme the file states.
-    kv_cache: KvCache,
-    /// A mixed-precision export's per-module schemes.
-    layers: Option<Vec<(String, Scheme)>>,
-    /// Where the fields were read, for refusals.
-    owner: String,
-}
+/// What one file states: the algorithm it names, and the declaration that algorithm and the
+/// file's other fields make, or why this library cannot serve it.
+///
+/// The two are returned apart because a checkpoint may state its quantization in two files:
+/// [`Declaration::read`] compares the two algorithms before it takes either file's declaration,
+/// so two files that disagree are refused as a disagreement and not as whichever one is unserved.
+/// `producer` is the tool the file says wrote it, which names the method when the file states no
+/// `quant_method`.
+///
+/// # Errors
+///
+/// When a field is of another JSON type than its reader takes, or states a cache scheme, a group
+/// or a per-module algorithm that is not served.
+fn stated(fields: &Fields<'_>, producer: Option<&str>) -> Result<(String, Result<Declaration>)> {
+    let excluded: Vec<String> = fields
+        .optional_texts("exclude_modules")?
+        .unwrap_or_default()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
 
-impl Declared {
-    /// The fields `fields` states.
-    fn of(fields: &Fields<'_>) -> Result<Self> {
-        let excluded: Vec<String> = fields
-            .optional_texts("exclude_modules")?
-            .unwrap_or_default()
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        // The compressed-tensors spelling states the same quantization as a group instead of an
-        // algorithm name, its excluded modules under `ignore`, and the cache under
-        // `kv_cache_scheme`.
-        let (algorithm, ignored) = match fields.optional_text("quant_algo")? {
-            Some(algorithm) => (algorithm.to_owned(), Vec::new()),
-            None => match fields.optional_object("config_groups")? {
-                Some(groups) => (
-                    group_algorithm(&groups)?,
-                    fields
-                        .optional_texts("ignore")?
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(str::to_owned)
-                        .collect(),
-                ),
-                None => (String::new(), Vec::new()),
-            },
-        };
-        if !ignored.is_empty() && !excluded.is_empty() {
-            return Err(fields.refuse(
-                "ignore",
-                "is stated beside `exclude_modules`, and a file that says the same thing twice in \
-                 two spellings is one this loader cannot trust",
-            ));
-        }
-        let kv_cache = match fields.optional_text("kv_cache_quant_algo")? {
-            None => match fields.optional_object("kv_cache_scheme")? {
-                None => KvCache::Unquantized,
-                Some(scheme) => match (
-                    scheme.optional_index("num_bits")?,
-                    scheme.optional_text("type")?,
-                ) {
-                    (Some(8), Some("float")) => KvCache::Fp8,
-                    (bits, kind) => {
-                        return Err(fields.refuse(
-                            "kv_cache_scheme",
-                            format!(
-                                "states {bits:?} bits of {kind:?}, and the cache scales served \
-                                 are FP8"
-                            ),
-                        ));
-                    }
-                },
-            },
-            Some(algorithm) if algorithm.eq_ignore_ascii_case("FP8") => KvCache::Fp8,
-            Some(other) => {
-                return Err(fields.refuse(
-                    "kv_cache_quant_algo",
-                    format!("names `{other}`, and the cache scales served are FP8"),
-                ));
-            }
-        };
-        let layers = match fields.optional_object("quantized_layers")? {
-            None => None,
-            Some(map) => {
-                let mut layers = Vec::new();
-                for module in map.keys() {
-                    let layer = map.object(module)?;
-                    layers.push((
-                        module.to_owned(),
-                        layer_scheme(map.owner(), module, &layer)?,
-                    ));
-                }
-                // The longest module first, so a module nested in another takes its own entry.
-                layers.sort_by_key(|(module, _)| std::cmp::Reverse(module.len()));
-                Some(layers)
-            }
-        };
-        Ok(Self {
-            layers,
-            algorithm,
-            method: fields.optional_text("quant_method")?.map(str::to_owned),
-            excluded: if excluded.is_empty() {
-                ignored
-            } else {
-                excluded
-            },
-            kv_cache,
-            owner: fields.owner().to_owned(),
-        })
+    // The compressed-tensors spelling states the same quantization as a group instead of an
+    // algorithm name, its excluded modules under `ignore`, and the cache under
+    // `kv_cache_scheme`.
+    let (algorithm, ignored) = match fields.optional_text("quant_algo")? {
+        Some(algorithm) => (algorithm.to_owned(), Vec::new()),
+        None => match fields.optional_object("config_groups")? {
+            Some(groups) => (
+                group_algorithm(&groups)?,
+                fields
+                    .optional_texts("ignore")?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+            None => (String::new(), Vec::new()),
+        },
+    };
+    if !ignored.is_empty() && !excluded.is_empty() {
+        return Err(fields.refuse(
+            "ignore",
+            "is stated beside `exclude_modules`, and a file that says the same thing twice in \
+             two spellings is one this loader cannot trust",
+        ));
     }
 
-    /// The declaration these fields state, refused when this library cannot serve it.
-    fn declaration(self) -> Result<Declaration> {
-        let scheme = match self.algorithm.to_ascii_uppercase().as_str() {
-            // Absent, empty or an explicit "none" is a dense checkpoint that wrote the field anyway.
-            "" | "NONE" | "BF16" => Scheme::Dense,
-            // Each module states its own algorithm; a weight takes its module's.
-            "MIXED_PRECISION" => {
-                if self.layers.as_ref().is_none_or(Vec::is_empty) {
-                    return Err(refuse(
-                        &self.owner,
-                        "declares MIXED_PRECISION and no `quantized_layers`: a mixed export                          states each module's algorithm",
-                    ));
-                }
-                Scheme::Dense
-            }
-            "NVFP4" => {
-                if let Some(method) = &self.method
-                    && !method.eq_ignore_ascii_case("modelopt")
-                {
-                    return Err(refuse(
-                        &self.owner,
+    let kv_cache = match fields.optional_text("kv_cache_quant_algo")? {
+        None => match fields.optional_object("kv_cache_scheme")? {
+            None => KvCacheScheme::Unquantized,
+            Some(scheme) => match (
+                scheme.optional_index("num_bits")?,
+                scheme.optional_text("type")?,
+            ) {
+                (Some(8), Some("float")) => KvCacheScheme::Fp8,
+                (bits, kind) => {
+                    return Err(fields.refuse(
+                        "kv_cache_scheme",
                         format!(
-                            "states the quantization method `{method}`, and NVFP4 is served in \
-                             ModelOpt's `weight`, `weight_scale`, `weight_scale_2` and \
-                             `input_scale` spelling; a `{method}` export states the same numbers \
-                             under names this loader would not find"
+                            "states {bits:?} bits of {kind:?}, and the cache scales served are FP8"
                         ),
                     ));
                 }
-                Scheme::Nvfp4
+            },
+        },
+        Some(algorithm) if algorithm.eq_ignore_ascii_case("FP8") => KvCacheScheme::Fp8,
+        Some(other) => {
+            return Err(fields.refuse(
+                "kv_cache_quant_algo",
+                format!("names `{other}`, and the cache scales served are FP8"),
+            ));
+        }
+    };
+
+    let layers = match fields.optional_object("quantized_layers")? {
+        None => None,
+        Some(map) => {
+            let mut layers = Vec::new();
+            for module in map.keys() {
+                let layer = map.object(module)?;
+                layers.push((
+                    module.to_owned(),
+                    layer_scheme(map.owner(), module, &layer)?,
+                ));
             }
-            other => {
+            // The longest module first, so a module nested in another takes its own entry.
+            layers.sort_by_key(|(module, _)| std::cmp::Reverse(module.len()));
+            Some(layers)
+        }
+    };
+
+    let method = fields.optional_text("quant_method")?.or(producer);
+    let excluded = if excluded.is_empty() {
+        ignored
+    } else {
+        excluded
+    };
+    let declaration = declaration(
+        fields.owner(),
+        &algorithm,
+        method,
+        excluded,
+        kv_cache,
+        layers,
+    );
+    Ok((algorithm, declaration))
+}
+
+/// The declaration the file `owner` makes by naming `algorithm`, refused when this library cannot
+/// serve the algorithm or the `method` it was written by.
+fn declaration(
+    owner: &str,
+    algorithm: &str,
+    method: Option<&str>,
+    excluded: Vec<String>,
+    kv_cache: KvCacheScheme,
+    layers: Option<Vec<(String, Scheme)>>,
+) -> Result<Declaration> {
+    let scheme = match algorithm.to_ascii_uppercase().as_str() {
+        // Absent, empty or an explicit "none" is a dense checkpoint that wrote the field anyway.
+        "" | "NONE" | "BF16" => Scheme::Dense,
+        // Each module states its own algorithm; a weight takes its module's.
+        "MIXED_PRECISION" => {
+            if layers.as_ref().is_none_or(Vec::is_empty) {
                 return Err(refuse(
-                    &self.owner,
+                    owner,
+                    "declares MIXED_PRECISION and no `quantized_layers`: a mixed export states \
+                     each module's algorithm",
+                ));
+            }
+            Scheme::Dense
+        }
+        "NVFP4" => {
+            if let Some(method) = method
+                && !method.eq_ignore_ascii_case("modelopt")
+            {
+                return Err(refuse(
+                    owner,
                     format!(
-                        "declares quantization `{other}`, which is not served: NVFP4 (ModelOpt's \
-                         spelling) and an unquantized checkpoint are. Loading `{other}` as if it \
-                         were dense would read quantized storage as a matrix"
+                        "states the quantization method `{method}`, and NVFP4 is served in \
+                         ModelOpt's `weight`, `weight_scale`, `weight_scale_2` and `input_scale` \
+                         spelling; a `{method}` export states the same numbers under names this \
+                         loader would not find"
                     ),
                 ));
             }
-        };
-        let layers = if self.algorithm.eq_ignore_ascii_case("MIXED_PRECISION") {
-            self.layers
-        } else {
-            None
-        };
-        Ok(Declaration {
-            scheme,
-            excluded: self.excluded,
-            kv_cache: self.kv_cache,
-            packed: None,
-            layers,
-        })
-    }
+            Scheme::Nvfp4
+        }
+        other => {
+            return Err(refuse(
+                owner,
+                format!(
+                    "declares quantization `{other}`, which is not served: NVFP4 (ModelOpt's \
+                     spelling) and an unquantized checkpoint are. Loading `{other}` as if it \
+                     were dense would read quantized storage as a matrix"
+                ),
+            ));
+        }
+    };
+
+    let layers = if algorithm.eq_ignore_ascii_case("MIXED_PRECISION") {
+        layers
+    } else {
+        None
+    };
+    Ok(Declaration {
+        scheme,
+        excluded,
+        kv_cache,
+        packed: None,
+        layers,
+    })
 }
 
 /// The algorithm a compressed-tensors `config_groups` block states, refused when it is not served.
@@ -580,7 +591,7 @@ fn matches_module(entry: &str, weight: &str) -> bool {
     if !entry.contains('*') {
         return false;
     }
-    // A glob is matched by splitting on `*` and walking the pieces in order: the first piece anchors
+    // A glob is matched by splitting on `*` and taking the pieces in order: the first piece anchors
     // the front, the last anchors the back, and the middle pieces are found in sequence.
     let pieces: Vec<&str> = entry.split('*').collect();
     let (first, rest) = (pieces[0], &pieces[1..]);
@@ -660,10 +671,9 @@ mod tests {
                 "lm_head": {"quant_algo": "NVFP4", "group_size": 16},
             }
         });
-        let declaration = Declared::of(&Fields::of("q", &value).unwrap())
-            .unwrap()
-            .declaration()
-            .unwrap();
+        let (algorithm, declaration) = stated(&Fields::of("q", &value).unwrap(), None).unwrap();
+        assert_eq!(algorithm, "MIXED_PRECISION");
+        let declaration = declaration.unwrap();
         assert_eq!(
             declaration.scheme("m.layers.0.linear_attn.in_proj_qkv.weight"),
             Scheme::Fp8
@@ -686,14 +696,14 @@ mod tests {
             "quant_algo": "MIXED_PRECISION",
             "quantized_layers": {"m.q_proj": {"quant_algo": "INT4_AWQ"}}
         });
-        let error = Declared::of(&Fields::of("q", &value).unwrap())
-            .and_then(Declared::declaration)
+        let error = stated(&Fields::of("q", &value).unwrap(), None)
+            .and_then(|(_, declaration)| declaration)
             .expect_err("an unserved per-module algorithm");
         assert!(error.to_string().contains("INT4_AWQ"), "{error}");
         let empty = serde_json::json!({"quant_algo": "MIXED_PRECISION"});
         assert!(
-            Declared::of(&Fields::of("q", &empty).unwrap())
-                .and_then(Declared::declaration)
+            stated(&Fields::of("q", &empty).unwrap(), None)
+                .and_then(|(_, declaration)| declaration)
                 .is_err()
         );
     }

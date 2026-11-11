@@ -1,21 +1,25 @@
 [package]
 name = "nn"
-description = "Tensor views, layers, capability traits, models and checkpoints"
+description = "Modules, fused operators, weight loading and capability traits over the tensor library"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
 
-# The shared computation library: layers call `ops` operators and nothing below them. The stream,
-# the kernels and the communicator a forward borrows are `ops` names, so the dependency stays
-# `nn → ops → platform`.
+# The neural-network library: `nn → backend → ops → platform`, beside the tensor library. A model
+# crate depends on `nn`, `uniserve-tensor` and `processing` only; what it may name of the crates
+# below is re-exported here.
 [dependencies]
-ops = { path = "../ops" }
-# The element type of a kernel operand (`DType`).
+# Tensors, views and the CPU device every fused operator states its formula on.
 uniserve-tensor.workspace = true
+# Tensors over retained and allocated device storage, the one dispatch point, collectives and
+# profiler ranges.
+backend.workspace = true
+# The operators a fused function launches: descriptors, arguments and keys.
+ops.workspace = true
 # A family states what request processing serves of it beside what execution loads.
 processing.workspace = true
-# The phase vocabulary of a program's selection key (`proto::module::PhaseKind`).
+# The phase vocabulary of a kernel's selection key (`proto::module::PhaseKind`).
 proto.workspace = true
 thiserror.workspace = true
 serde.workspace = true
@@ -28,11 +32,6 @@ safetensors = "0.8.0"
 
 [dev-dependencies]
 tempfile.workspace = true
-# The device cases (`tests/reference.rs`, `tests/support/device.rs`) run layers on a device: they
-# allocate and copy through `platform` and ask a running Build Server for the kernels their
-# forwards name.
-platform.workspace = true
-build-server.workspace = true
 
 [lints]
 workspace = true

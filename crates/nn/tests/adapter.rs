@@ -1,65 +1,39 @@
-//! An adapter fused at the loading boundary: every read of a tensor it edits answers the fused
-//! value, a tensor it assigns joins the checkpoint, every other tensor reads as without it, and a
-//! fused weight is retained under a key of its own.
+//! An adapter fused at the loading boundary: every read of a tensor it edits returns the fused
+//! value, a tensor it assigns joins the checkpoint, every other tensor reads as without it, and
+//! a fused weight is retained under a key of its own.
 //!
 //! The shards are written here, header and payload, so no checkpoint and no device is needed.
 
+// The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
+
+mod support;
+
 use std::path::Path;
 
-use nn::weights::{RetainedWeights, WeightRequest};
-use nn::{Adapter, Checkpoint, DType, DevicePtr, Shape, WeightKey, WeightLoader};
+use nn::{Adapter, Checkpoint, CpuWeights, DType, Shape, WeightLayout, WeightLoader, WeightSource};
+use support::{encode, shard_stating, values};
 
-/// The bytes of `values` as BF16; every value here is exactly representable.
-fn bf16(values: &[f32]) -> Vec<u8> {
-    values
+/// Writes the BF16 shard `name` of `tensors` in `directory`, stating `metadata`; every value
+/// here is exactly representable.
+fn shard(
+    directory: &Path,
+    name: &str,
+    metadata: &[(&str, &str)],
+    tensors: &[(&str, &[usize], &[f32])],
+) {
+    let typed: Vec<(&str, DType, Vec<usize>, Vec<u8>)> = tensors
         .iter()
-        .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
-        .collect()
-}
-
-fn from_bf16(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| f32::from_bits(u32::from(u16::from_le_bytes(*pair)) << 16))
-        .collect()
-}
-
-/// Write one BF16 shard of `tensors` with the header metadata `metadata`.
-fn shard(path: &Path, metadata: &[(&str, &str)], tensors: &[(&str, &[u64], &[f32])]) {
-    let mut header = String::from("{");
-    if !metadata.is_empty() {
-        let entries = metadata
-            .iter()
-            .map(|(key, value)| format!(r#""{key}":"{value}""#))
-            .collect::<Vec<_>>()
-            .join(",");
-        header.push_str(&format!(r#""__metadata__":{{{entries}}},"#));
-    }
-    let mut payload = Vec::new();
-    for (name, shape, values) in tensors {
-        let start = payload.len();
-        payload.extend(bf16(values));
-        let extents = shape
-            .iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        header.push_str(&format!(
-            r#""{name}":{{"dtype":"BF16","shape":[{extents}],"data_offsets":[{start},{}]}},"#,
-            payload.len()
-        ));
-    }
-    header.pop();
-    header.push('}');
-    let padded = header.len().div_ceil(8) * 8;
-    header.push_str(&" ".repeat(padded - header.len()));
-    let mut file = (header.len() as u64).to_le_bytes().to_vec();
-    file.extend_from_slice(header.as_bytes());
-    file.extend_from_slice(&payload);
-    std::fs::write(path, file).unwrap();
+        .map(|(name, shape, values)| {
+            (
+                *name,
+                DType::BF16,
+                shape.to_vec(),
+                encode(DType::BF16, values),
+            )
+        })
+        .collect();
+    shard_stating(directory, name, metadata, &typed);
 }
 
 /// A pipeline root whose `transformer` holds a projection, its bias, a norm and an untouched
@@ -68,7 +42,8 @@ fn base(root: &Path) {
     let transformer = root.join("transformer");
     std::fs::create_dir_all(&transformer).unwrap();
     shard(
-        &transformer.join("model.safetensors"),
+        &transformer,
+        "model.safetensors",
         &[],
         &[
             ("proj.weight", &[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
@@ -88,9 +63,10 @@ const COUNTS: [(&str, &str); 5] = [
 ];
 
 /// A rank-one adapter of `proj`, deltas of its bias and of the norm, and an assigned gate.
-fn adapter(path: &Path, metadata: &[(&str, &str)]) {
+fn adapter(directory: &Path, metadata: &[(&str, &str)]) {
     shard(
-        path,
+        directory,
+        "adapter_model.safetensors",
         metadata,
         &[
             ("proj.lora_A.weight", &[1, 3], &[1.0, 2.0, 3.0]),
@@ -102,38 +78,9 @@ fn adapter(path: &Path, metadata: &[(&str, &str)]) {
     );
 }
 
-#[derive(Default)]
-struct Recording {
-    published: Vec<(WeightKey, Vec<u8>)>,
-}
-
-impl RetainedWeights for Recording {
-    fn retained(&mut self, key: &WeightKey) -> nn::Result<Option<nn::Backing>> {
-        Ok(self
-            .published
-            .iter()
-            .position(|(published, _)| published == key)
-            .map(|index| {
-                nn::Backing::new(
-                    DevicePtr::new(0x1_0000 * (index as u64 + 1)),
-                    self.published[index].1.len() as u64,
-                )
-            }))
-    }
-
-    fn publish(
-        &mut self,
-        key: &WeightKey,
-        _dtype: DType,
-        _shape: Shape,
-        bytes: &[u8],
-    ) -> nn::Result<nn::Backing> {
-        self.published.push((key.clone(), bytes.to_vec()));
-        Ok(nn::Backing::new(
-            DevicePtr::new(0x1_0000 * self.published.len() as u64),
-            bytes.len() as u64,
-        ))
-    }
+/// The BF16 values of the tensor `name` of `checkpoint`, as a read returns them.
+fn read(checkpoint: &Checkpoint, name: &str) -> Vec<f32> {
+    ops::values::decode(DType::BF16, &checkpoint.read(name).unwrap()).unwrap()
 }
 
 #[test]
@@ -141,7 +88,7 @@ fn an_adapter_is_fused_into_every_read_of_what_it_edits() {
     let root = tempfile::tempdir().unwrap();
     base(root.path());
     let adapters = tempfile::tempdir().unwrap();
-    adapter(&adapters.path().join("adapter_model.safetensors"), &COUNTS);
+    adapter(adapters.path(), &COUNTS);
 
     let plain = Checkpoint::open(root.path()).unwrap();
     let adapted = Checkpoint::open(root.path())
@@ -154,57 +101,77 @@ fn an_adapter_is_fused_into_every_read_of_what_it_edits() {
     assert!(fusion.assigns("gate.weight") && !fusion.edits("other.weight"));
 
     // `W + lora_B @ lora_A`: rows scaled by 0.5 and -1 of [1, 2, 3].
-    let read = |name: &str| from_bf16(&transformer.read(name).unwrap().bytes);
-    assert_eq!(read("proj.weight"), vec![1.5, 3.0, 4.5, 3.0, 3.0, 3.0]);
-    assert_eq!(read("proj.bias"), vec![1.25, 1.25]);
-    assert_eq!(read("norm.weight"), vec![1.5, 1.0, 0.5]);
-    assert_eq!(read("gate.weight"), vec![9.0, 10.0, 11.0, 12.0]);
-    assert_eq!(read("other.weight"), vec![7.0, 8.0]);
+    assert_eq!(
+        read(transformer, "proj.weight"),
+        [1.5, 3.0, 4.5, 3.0, 3.0, 3.0]
+    );
+    assert_eq!(read(transformer, "proj.bias"), [1.25, 1.25]);
+    assert_eq!(read(transformer, "norm.weight"), [1.5, 1.0, 0.5]);
+    assert_eq!(read(transformer, "gate.weight"), [9.0, 10.0, 11.0, 12.0]);
+    assert_eq!(read(transformer, "other.weight"), [7.0, 8.0]);
 
     // A row-parallel shard gathers its columns of the fused value, one span a row.
-    let mut store = Recording::default();
-    let column = WeightRequest::strided("proj.weight", 1, Shape::new(&[2, 2]), 3);
-    let other = WeightRequest::region("other.weight", 0, Shape::new(&[2]));
-    {
-        let mut loader = WeightLoader::new(transformer, &mut store, None, None);
-        loader.load(&column).unwrap();
-        loader.load(&other).unwrap();
-        // A pinned read converts the fused value as it would a stored one.
-        let wide = loader.load(&column.clone().pinned(DType::F32)).unwrap();
-        assert_eq!(wide.dtype(), DType::F32);
-    }
-    assert_eq!(from_bf16(&store.published[0].1), vec![3.0, 4.5, 3.0, 3.0]);
-    let wide = store.published[2]
-        .1
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|chunk| f32::from_le_bytes(*chunk))
-        .collect::<Vec<_>>();
-    assert_eq!(wide, vec![3.0, 4.5, 3.0, 3.0]);
+    let column = WeightSource::Strided {
+        tensor: "proj.weight".to_owned(),
+        start: 1,
+        shape: Shape::from((2, 2)),
+        row_stride: 3,
+    };
+    let other = WeightSource::Region {
+        tensor: "other.weight".to_owned(),
+        start: 0,
+        shape: Shape::from(2),
+    };
+    let load = |loader: &WeightLoader<'_>, source: &WeightSource, shape, pinned| {
+        loader
+            .load(
+                "weight",
+                source,
+                WeightLayout::ROW_MAJOR,
+                &Shape::from(shape),
+                pinned,
+                false,
+            )
+            .unwrap()
+    };
 
-    // The fused weight is retained under a key of its own; an untouched one under the base's.
-    let mut base_store = Recording::default();
-    {
-        let mut loader = WeightLoader::new(
-            plain.stage("transformer").unwrap(),
-            &mut base_store,
-            None,
-            None,
-        );
-        loader.load(&column).unwrap();
-        loader.load(&other).unwrap();
-    }
+    let store = CpuWeights::new();
+    let loader = WeightLoader::new(transformer, &store, None, None);
+    let fused = load(&loader, &column, vec![2, 2], None);
+    assert_eq!(values(&fused), [3.0, 4.5, 3.0, 3.0]);
+    let untouched = load(&loader, &other, vec![2], None);
+
+    // A pinned read converts the fused value as it would a stored one.
+    let wide = load(&loader, &column, vec![2, 2], Some(DType::F32));
     assert_eq!(
-        from_bf16(&base_store.published[0].1),
-        vec![2.0, 3.0, 5.0, 6.0]
+        (wide.dtype(), values(&wide)),
+        (DType::F32, vec![3.0, 4.5, 3.0, 3.0])
     );
-    // The base shard's identity is its own read's here (the fixture was written a moment ago),
-    // so the keys are compared within the adapted checkpoint.
+
+    // The base checkpoint's own columns, for comparison.
+    let base_store = CpuWeights::new();
+    let base_loader =
+        WeightLoader::new(plain.stage("transformer").unwrap(), &base_store, None, None);
+    assert_eq!(
+        values(&load(&base_loader, &column, vec![2, 2], None)),
+        [2.0, 3.0, 5.0, 6.0]
+    );
+    assert_eq!(
+        values(&load(&base_loader, &other, vec![2], None)),
+        values(&untouched)
+    );
+
+    // The fused weight is retained under a key that names both files, the base shard's and the
+    // adapter's; an untouched one under the base shard's alone.
     let shard = transformer.files()[0].identity().clone();
-    assert_eq!(store.published[1].0.files, vec![shard.clone()]);
-    assert_eq!(store.published[1].1, base_store.published[1].1);
-    assert_ne!(store.published[0].0.files, vec![shard]);
+    let keys = store.keys();
+    let key = |tensor: &str| {
+        keys.iter()
+            .find(|key| key.tensors == [tensor] && key.dtype == DType::BF16)
+            .unwrap()
+    };
+    assert_eq!(key("other.weight").files, vec![shard.clone()]);
+    assert_ne!(key("proj.weight").files, vec![shard]);
 }
 
 #[test]
@@ -214,27 +181,28 @@ fn an_adapter_is_held_to_its_own_statement_and_to_the_checkpoint() {
     let adapters = tempfile::tempdir().unwrap();
     let file = adapters.path().join("adapter_model.safetensors");
 
-    // One low-rank tensor fewer stated than carried: a truncated file is not served.
+    // One low-rank tensor fewer stated than the file holds: a truncated file is not served.
     let mut short = COUNTS;
     short[2] = ("low_rank_tensors", "1");
-    adapter(&file, &short);
+    adapter(adapters.path(), &short);
     let error = Adapter::open(&file).unwrap_err().to_string();
     assert!(error.contains("low_rank_tensors"), "{error}");
 
     // Another container is not read as this one.
     let mut foreign = COUNTS;
     foreign[0] = ("format", "peft");
-    adapter(&file, &foreign);
+    adapter(adapters.path(), &foreign);
     let error = Adapter::open(&file).unwrap_err().to_string();
     assert!(error.contains("peft"), "{error}");
 
     // An adapter of another network edits what this one does not hold.
-    adapter(&file, &COUNTS);
+    adapter(adapters.path(), &COUNTS);
     let other = tempfile::tempdir().unwrap();
     let transformer = other.path().join("transformer");
     std::fs::create_dir_all(&transformer).unwrap();
     shard(
-        &transformer.join("model.safetensors"),
+        &transformer,
+        "model.safetensors",
         &[],
         &[("unrelated.weight", &[2], &[1.0, 2.0])],
     );
@@ -248,7 +216,8 @@ fn an_adapter_is_held_to_its_own_statement_and_to_the_checkpoint() {
 
     // An assigned parameter the checkpoint already holds is not overwritten.
     shard(
-        &transformer.join("model.safetensors"),
+        &transformer,
+        "model.safetensors",
         &[],
         &[
             ("proj.weight", &[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),

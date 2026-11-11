@@ -1,13 +1,13 @@
 //! Strict reading of a checkpoint's JSON configuration into typed values.
 //!
-//! A model family normalizes its configuration once, at the loading boundary, and every layer below
+//! A model family normalizes its configuration once, at the loading boundary, and every module below
 //! it consumes typed fields. [`Fields`] is the one reader every family uses for that: it wraps one
-//! JSON object with the name of the document it came from, and each accessor answers a typed value
+//! JSON object with the name of the document it came from, and each accessor returns a typed value
 //! or an [`Error::Config`] naming the document, the field and what the reader requires of it.
 //!
 //! The reading is strict: a required field that is absent, `null` or of another JSON type is an
 //! error, never a default. A field a family may omit is read with an `optional_*` accessor, which
-//! answers `None` for an absent or `null` value and still refuses a present value of the wrong
+//! returns `None` for an absent or `null` value and still refuses a present value of the wrong
 //! type; the family states its own default beside the call, where the rule it follows is visible.
 
 use ops::activation::Activation;
