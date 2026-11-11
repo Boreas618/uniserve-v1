@@ -36,7 +36,7 @@ use crate::input::sampling::resolve_max_tokens;
 use crate::input::video::VideoService;
 use crate::input::{Result, ServeError, TokenizeError};
 use crate::protocol::{
-    ChatCompletionRequest, ChatMessage, ChatModality, ContentPart, MessageContent,
+    ChatCompletionRequest, ChatMessage, ChatModality, ChatToolChoice, ContentPart, MessageContent,
 };
 
 /// The deployment's input processing: the tokenizer and template resources that turn a parsed
@@ -579,7 +579,8 @@ fn response_options(
 /// # Errors
 ///
 /// Refuses a `prompt_logprobs` value below `-1` or a positive or `-1` value on a streamed
-/// request, template arguments that set a variable the request itself determines, an assistant
+/// request, a `tool_choice` that makes the model call a tool, template arguments that set a
+/// variable the request itself determines, an assistant
 /// message with no reasoning, content, or tool calls or with image content, and a non-function
 /// tool call.
 fn validate_request(request: &ChatCompletionRequest) -> std::result::Result<(), TokenizeError> {
@@ -607,6 +608,24 @@ fn validate_request(request: &ChatCompletionRequest) -> std::result::Result<(), 
                 "prompt_logprobs are not available when stream=true.",
             ));
         }
+    }
+
+    // Holding a model to a tool call takes constrained decoding, as vLLM serves both of these
+    // choices, and this server has none: a model left free would answer in text under a
+    // response that promised a call.
+    let unserved = match &request.tool_choice {
+        Some(ChatToolChoice::Required) => Some("`required`".to_owned()),
+        Some(ChatToolChoice::Function(name)) => Some(format!("the function `{name}`")),
+        Some(ChatToolChoice::Auto | ChatToolChoice::None) | None => None,
+    };
+    if let Some(choice) = unserved {
+        return Err(invalid(
+            "tool_choice",
+            &format!(
+                "tool_choice {choice} is not served: it needs constrained decoding, which this \
+                 server does not provide. Use `auto` or `none`."
+            ),
+        ));
     }
 
     // Template arguments may not replace the variables the renderer derives from the request
@@ -706,7 +725,7 @@ impl Processor {
             .sum();
         let prompt_len = prompt_token_ids.len() as u32 + image_tokens;
         let max_tokens =
-            self.resolve_length(generation, request.max_completion_tokens, prompt_len)?;
+            self.resolve_length(generation, request.max_output_tokens(), prompt_len)?;
 
         generation.prompt_token_ids = prompt_token_ids;
         generation.max_und_tokens = max_tokens as usize;

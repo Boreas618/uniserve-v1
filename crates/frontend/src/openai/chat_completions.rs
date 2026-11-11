@@ -747,9 +747,12 @@ impl PendingChatChunk {
                 index,
                 id: Some(id),
                 tool_type: Some("function".to_string()),
+                // The call opens with its name and empty arguments, as OpenAI's first
+                // chunk of a call does, so a client that concatenates `arguments` has
+                // a string to start from.
                 function: Some(FunctionCallDelta {
                     name: Some(name),
-                    arguments: None,
+                    arguments: Some(String::new()),
                 }),
             });
     }
@@ -887,9 +890,12 @@ fn tool_call_start_chunk(
                 index: tool_index,
                 id: Some(id),
                 tool_type: Some("function".to_string()),
+                // The call opens with its name and empty arguments, as OpenAI's first
+                // chunk of a call does, so a client that concatenates `arguments` has
+                // a string to start from.
                 function: Some(FunctionCallDelta {
                     name: Some(name),
-                    arguments: None,
+                    arguments: Some(String::new()),
                 }),
             }]),
             ..Default::default()

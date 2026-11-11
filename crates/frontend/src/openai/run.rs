@@ -757,7 +757,7 @@ mod tests {
     }
 
     /// An engine rejection of a non-streamed request is the status of its
-    /// document: its head waits for the outcome.
+    /// document: its head waits for the request's result.
     #[tokio::test]
     async fn a_rejected_document_states_its_rejection_in_the_head() {
         let events = engine_events([Event::Rejected {
@@ -805,6 +805,144 @@ mod tests {
         assert_eq!(document["choices"][0]["stop_reason"], "END");
         // The first block and the second through the `D` that completes `END`.
         assert_eq!(document["usage"]["completion_tokens"], 28);
+    }
+
+    /// The parsers of a request that may call the tool `lookup`, written as
+    /// function and parameter tags.
+    fn lookup_parser() -> handoff::Parser {
+        handoff::Parser {
+            kind: handoff::parser::Kind::ParserKindXml as i32,
+            parse_reasoning: false,
+            parse_tools: true,
+            tools: serde_json::json!([{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"q": {"type": "string"}, "limit": {"type": "integer"}},
+                    },
+                },
+            }])
+            .to_string(),
+        }
+    }
+
+    /// The engine events of a model that writes `text` one token a character
+    /// and then stops.
+    fn generated(text: &str) -> Box<dyn Events> {
+        let tokens = text.bytes().map(text_token);
+        let finish = finished(proto::request::FinishReason::Eos, text.len());
+        engine_events(tokens.chain(std::iter::once(finish)))
+    }
+
+    /// A response of text and two tool calls, as a model writes them.
+    const TWO_CALLS: &str = "On it.<tool_call>\n<function=lookup>\n<parameter=q>\nrust\n</parameter>\n\
+                             <parameter=limit>\n2\n</parameter>\n</function>\n</tool_call>\
+                             <tool_call>\n<function=lookup>\n<parameter=q>\ngo\n</parameter>\n\
+                             </function>\n</tool_call>";
+
+    /// A streamed response carries each tool call in the OpenAI chunk shape:
+    /// the call's index on every delta, its id, type and function name once
+    /// with empty arguments, then its arguments in increments; several calls
+    /// follow one another by index, and the stream finishes with
+    /// `tool_calls`.
+    #[tokio::test]
+    async fn a_stream_carries_tool_calls_as_openai_deltas() {
+        let sink = ChatStreamEmitter::new(&response(false));
+        let mut body = run(lookup_parser(), decode(), false, generated(TWO_CALLS), sink);
+        let (bytes, failed) = answered(&mut body).await;
+        assert!(failed.is_none());
+
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+        let chunks: Vec<Value> = text
+            .split("\n\n")
+            .filter_map(|event| event.strip_prefix("data: "))
+            .filter(|payload| *payload != "[DONE]")
+            .map(|payload| serde_json::from_str(payload).unwrap())
+            .collect();
+
+        let mut content = String::new();
+        // Per call index: the ids, the names, and the concatenated arguments.
+        let mut calls: Vec<(Vec<String>, Vec<String>, String)> = Vec::new();
+        let mut finish_reason = None;
+        for chunk in &chunks {
+            let choice = &chunk["choices"][0];
+            if let Some(text) = choice["delta"]["content"].as_str() {
+                content.push_str(text);
+            }
+            if let Some(reason) = choice["finish_reason"].as_str() {
+                finish_reason = Some(reason.to_owned());
+            }
+            for delta in choice["delta"]["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                let index = delta["index"]
+                    .as_u64()
+                    .expect("every delta states its index") as usize;
+                if calls.len() <= index {
+                    calls.resize_with(index + 1, Default::default);
+                }
+                let (ids, names, arguments) = &mut calls[index];
+                if let Some(id) = delta["id"].as_str() {
+                    assert_eq!(delta["type"], "function");
+                    ids.push(id.to_owned());
+                }
+                if let Some(name) = delta["function"]["name"].as_str() {
+                    // The delta that names the call opens its arguments empty.
+                    assert_eq!(delta["function"]["arguments"], "");
+                    names.push(name.to_owned());
+                }
+                arguments.push_str(delta["function"]["arguments"].as_str().unwrap_or_default());
+            }
+        }
+
+        assert_eq!(content, "On it.");
+        assert_eq!(finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(calls.len(), 2);
+        for (ids, names, _) in &calls {
+            assert_eq!(ids.len(), 1, "a call states its id once");
+            assert!(ids[0].starts_with("call_"));
+            assert_eq!(names, &["lookup"], "a call states its name once");
+        }
+        assert_ne!(calls[0].0, calls[1].0);
+        assert_eq!(
+            serde_json::from_str::<Value>(&calls[0].2).unwrap(),
+            serde_json::json!({"q": "rust", "limit": 2})
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&calls[1].2).unwrap(),
+            serde_json::json!({"q": "go"})
+        );
+    }
+
+    /// The same response answered as one document lists both calls in its
+    /// message, with their arguments as JSON text, beside the text before
+    /// them.
+    #[tokio::test]
+    async fn a_document_lists_every_tool_call() {
+        let document = document(lookup_parser(), decode(), false, generated(TWO_CALLS))
+            .await
+            .unwrap();
+
+        let choice = &document["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls");
+        assert_eq!(choice["message"]["content"], "On it.");
+        let calls = choice["message"]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        let arguments = |call: &Value| -> Value {
+            serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap()
+        };
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "lookup");
+        assert_eq!(
+            arguments(&calls[0]),
+            serde_json::json!({"q": "rust", "limit": 2})
+        );
+        assert_eq!(arguments(&calls[1]), serde_json::json!({"q": "go"}));
     }
 
     /// Polls a body to its end and answers the bytes it wrote.

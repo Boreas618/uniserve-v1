@@ -538,6 +538,123 @@ fn tool_calling_follows_the_familys_declared_format() {
     assert!(parser.parse_tools);
 }
 
+/// What an agent harness sends turn after turn is lowered as it sends it: tool
+/// definitions with OpenAI's `strict`, `tool_choice: auto`, `max_tokens`, an
+/// assistant turn sent back as it was received (`reasoning_content`, null
+/// content, tool calls) and the tools' results. Each turn's prompt begins with
+/// the prompt of the turn before it, under the same cache salt and so in the
+/// same cache partition, which is what lets the prefix cache serve it.
+#[test]
+fn a_harness_conversation_grows_by_its_new_turns() {
+    let processor = with_template("qwen3", QWEN3_TEMPLATE);
+    let turn = |messages: serde_json::Value| {
+        let request = serde_json::json!({
+            "model": SERVED_MODEL,
+            "messages": messages,
+            "tools": [{"type": "function", "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            }}],
+            "tool_choice": "auto",
+            "max_tokens": 64,
+            "cache_salt": "harness-session",
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        });
+        preprocess_chat(
+            &processor,
+            String::from("harness"),
+            serde_json::from_value(request).unwrap(),
+            Vec::new(),
+        )
+        .unwrap()
+    };
+
+    let first = serde_json::json!([
+        {"role": "system", "content": "You improve the server."},
+        {"role": "user", "content": "Read the scheduler."},
+    ]);
+    let mut second = first.clone();
+    second.as_array_mut().unwrap().extend([
+        serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "reasoning_content": "I need the file first.",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{\"path\": \"a.rs\"}"},
+            }],
+        }),
+        serde_json::json!({"role": "tool", "tool_call_id": "call_1", "content": "fn main() {}"}),
+    ]);
+
+    let (first_turn, first_lowering) = turn(first);
+    let (second_turn, _) = turn(second);
+
+    assert_eq!(first_turn.max_und_tokens, 64);
+    assert!(first_lowering.parser.unwrap().parse_tools);
+    assert!(first_lowering.response.unwrap().include_usage);
+    assert!(first_turn.cache.isolation_key.is_some());
+    assert_eq!(
+        first_turn.cache.isolation_key,
+        second_turn.cache.isolation_key
+    );
+    assert!(second_turn.cache.read && second_turn.cache.write);
+    assert!(
+        second_turn.prompt_token_ids.len() > first_turn.prompt_token_ids.len()
+            && second_turn
+                .prompt_token_ids
+                .starts_with(&first_turn.prompt_token_ids),
+        "the second turn's prompt does not begin with the first turn's"
+    );
+}
+
+/// A `tool_choice` that makes the model call a tool, `required` or one named
+/// function, is refused by name: vLLM serves both through guided decoding,
+/// which a deployment here does not have.
+#[test]
+fn a_tool_choice_that_needs_constrained_decoding_is_refused() {
+    let processor = with_template("qwen3", QWEN3_TEMPLATE);
+    for choice in [
+        serde_json::json!("required"),
+        serde_json::json!({"type": "function", "function": {"name": "weather"}}),
+    ] {
+        let request = serde_json::json!({
+            "model": SERVED_MODEL,
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [{"type": "function", "function": {
+                "name": "weather",
+                "parameters": {"type": "object", "properties": {}}
+            }}],
+            "tool_choice": choice,
+        });
+        let error = preprocess_chat(
+            &processor,
+            String::from("forced"),
+            serde_json::from_value(request).unwrap(),
+            Vec::new(),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("tool_choice {choice} was admitted"));
+
+        assert_eq!(error.status_code().as_u16(), 400, "{choice}");
+        let response = error.to_error_response().error;
+        assert_eq!(response.param.as_deref(), Some("tool_choice"), "{choice}");
+        assert!(
+            response.message.contains("constrained decoding"),
+            "{}",
+            response.message
+        );
+    }
+}
+
 /// Negative seeds are accepted and reinterpreted as their two's-complement
 /// `u64` value.
 #[test]
