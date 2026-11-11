@@ -18,18 +18,20 @@
 //! The forms are distinct operators because they read distinct operands, and the layer launches the
 //! one its epilogue and call name: `rms_norm`, `add_rms_norm`, `weighted_rms_norm` (an RMS
 //! normalization that narrows into a smaller element type), `scaled_residual_rms_norm`,
-//! `modulated_rms_norm`; `layer_norm` and `scaled_residual_layer_norm`.
+//! `modulated_rms_norm`; `layer_norm` and `scaled_residual_layer_norm`. Every form writes a fresh
+//! output reserved from the forward's arena: an [`RmsNorm`]'s in the element type it was built
+//! with, a [`LayerNorm`]'s in its input's.
 //!
 //! [`GroupNorm`] normalizes a frame's channel groups for a causal video convolution, so its fused
 //! stage is that convolution's pre-activation: SiLU and the causal pad (`frame_moments`, then
 //! `frame_norm_pad`).
 
-use ops::TensorView;
 use ops::descriptor::Float;
 use ops::frame::{self, FrameMoments, FrameNormPad};
 use ops::modulation::{self, ModulatedRmsNorm};
 use ops::norm::{self, AddRmsNorm, LayerNorm as LayerNormOp, RmsNorm as RmsNormOp};
 use ops::residual::{self, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm};
+use ops::{DType, Shape, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -204,23 +206,33 @@ pub enum Gain {
 }
 
 /// RMS normalization with a per-channel scale: `norm(s) = s · rsqrt(mean(s²) + eps) · gain`, the
-/// gain the weight or one plus it ([`Gain`]).
+/// gain the weight or one plus it ([`Gain`]), written in the element type the normalization was
+/// built with: the activation type the rows that read it are computed in, which may be narrower
+/// than a stream it normalizes.
 pub struct RmsNorm {
     weight: Weight,
     eps: f32,
     columns: u32,
     epilogue: Epilogue,
     gain: Gain,
+    output: DType,
 }
 
 impl RmsNorm {
-    /// The normalization of `weight`'s width with variance floor `eps`, `epilogue` and `gain`.
+    /// The normalization of `weight`'s width with variance floor `eps`, `epilogue` and `gain`,
+    /// writing `output` elements.
     ///
     /// # Errors
     ///
     /// A weight that is not one vector, epilogue parameters of another width, or a zero-centred
     /// gain under an epilogue other than the plain one (whose operators alone read it).
-    pub fn new(weight: Weight, eps: f32, epilogue: Epilogue, gain: Gain) -> Result<Self> {
+    pub fn new(
+        weight: Weight,
+        eps: f32,
+        epilogue: Epilogue,
+        gain: Gain,
+        output: DType,
+    ) -> Result<Self> {
         let columns = columns("RmsNorm", &weight)?;
         check_epilogue("RmsNorm", &epilogue, columns)?;
         if gain == Gain::Centred && !matches!(epilogue, Epilogue::None) {
@@ -236,21 +248,29 @@ impl RmsNorm {
             columns,
             epilogue,
             gain,
+            output,
         })
     }
 
     /// The normalization module at `scope`: its `weight` of `width` channels, with variance floor
-    /// `eps`, the gain `gain` and no epilogue.
+    /// `eps`, the gain `gain` and no epilogue, writing `output` elements.
     ///
     /// # Errors
     ///
     /// When the checkpoint lacks the weight or holds another width.
-    pub fn load(scope: &mut Scope<'_, '_>, width: u32, eps: f32, gain: Gain) -> Result<Self> {
+    pub fn load(
+        scope: &mut Scope<'_, '_>,
+        width: u32,
+        eps: f32,
+        gain: Gain,
+        output: DType,
+    ) -> Result<Self> {
         Self::new(
             scope.tensor("weight", &[u64::from(width)])?,
             eps,
             Epilogue::None,
             gain,
+            output,
         )
     }
 
@@ -259,20 +279,39 @@ impl RmsNorm {
         self.weight.view()
     }
 
-    /// Normalize `x`, `[rows, columns]`, into `out`, after adding it into `residual` when given.
+    /// `x`, `[rows, columns]`, normalized into a fresh tensor of the normalization's output type,
+    /// after adding it into `residual` when given.
     ///
-    /// Under [`Epilogue::None`] the add is plain and `out` may alias `x` or the stream: the operator
-    /// loads its whole row before storing. Under [`Epilogue::ScaledResidual`] the stream is required
-    /// and updated in place. Under [`Epilogue::Modulated`] a stream is passed exactly when the
-    /// modulation has a gate, and its output is `x` itself, which receives the sum. An `out` of a
-    /// narrower element type than `x` is written by the narrowing RMS operator; every other form
-    /// writes `x`'s element type.
+    /// Under [`Epilogue::None`] the add is plain and the stream is updated as [`ResidualStream`]
+    /// states; without a stream an output narrower than `x` is written by the narrowing operator,
+    /// and with one the output is `x`'s type. Under [`Epilogue::ScaledResidual`] the stream is
+    /// required and updated in place, and the output is `x`'s (the update's) type. Under
+    /// [`Epilogue::Modulated`] a stream is passed exactly when the modulation has a gate, and its
+    /// output is `x` itself, which receives the sum.
     ///
     /// # Errors
     ///
     /// Shapes or element types the epilogue's operator does not take, a stream the epilogue does
-    /// not read, or the operator's refusal.
+    /// not read, an arena that cannot hold the output, or the operator's refusal.
     pub fn forward(
+        &self,
+        f: &Forward,
+        x: TensorView,
+        residual: Option<ResidualStream>,
+    ) -> Result<TensorView> {
+        let out = f.empty(self.output, x.shape)?;
+        self.forward_into(f, x, residual, out)?;
+        Ok(out)
+    }
+
+    /// [`Self::forward`] into `out`, `[rows, columns]` of the normalization's output type, a
+    /// location of the caller's: the block of a whole sequence whose gather starts as soon as the
+    /// rows are normalized.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::forward`], or an `out` of another shape or element type.
+    pub fn forward_into(
         &self,
         f: &Forward,
         x: TensorView,
@@ -282,7 +321,31 @@ impl RmsNorm {
         const OWNER: &str = "RmsNorm";
         let width = self.columns;
         require_rows(OWNER, "x", &x, &x, width)?;
-        require_rows(OWNER, "out", &out, &x, width)?;
+        if out.shape != x.shape || out.dtype != self.output {
+            return Err(Error::shape(
+                OWNER,
+                format!(
+                    "an output of {} {:?} for {:?} rows of {}",
+                    out.dtype,
+                    out.shape.dims(),
+                    x.shape.dims(),
+                    self.output
+                ),
+            ));
+        }
+        let narrowed = matches!(
+            (&self.epilogue, &residual),
+            (Epilogue::None, None) | (Epilogue::Modulated(_), _)
+        );
+        if !narrowed && self.output != x.dtype {
+            return Err(Error::shape(
+                OWNER,
+                format!(
+                    "this form writes its input's {} and the normalization was built for {}",
+                    x.dtype, self.output
+                ),
+            ));
+        }
         if let Some(stream) = &residual {
             require_rows(OWNER, "the residual stream", &stream.input, &x, width)?;
             require_rows(OWNER, "the residual stream", &stream.output, &x, width)?;
@@ -375,23 +438,6 @@ impl RmsNorm {
                 self.modulated(f, modulation, x, stream, out)
             }
         }
-    }
-
-    /// Normalize `x` into a fresh `[rows, columns]` buffer of `x`'s element type reserved from the
-    /// arena, after adding it into `residual` when given; see [`Self::forward`].
-    ///
-    /// # Errors
-    ///
-    /// An arena too small for the buffer, or [`Self::forward`]'s refusals.
-    pub fn apply(
-        &self,
-        f: &Forward,
-        x: TensorView,
-        residual: Option<ResidualStream>,
-    ) -> Result<TensorView> {
-        let out = f.arena().tensor(x.dtype, x.shape)?;
-        self.forward(f, x, residual, out)?;
-        Ok(out)
     }
 
     /// The `modulated_rms_norm` launch: the optional gated update of the stream, the normalization
@@ -488,18 +534,13 @@ impl GatedRmsNorm {
         })
     }
 
-    /// Normalize `x [rows, columns]`, gated by `gate [rows, columns]`, into `out`.
+    /// `x [rows, columns]` normalized and gated by `gate [rows, columns]`, in `x`'s element type.
     ///
     /// # Errors
     ///
-    /// What the operator refuses.
-    pub fn forward(
-        &self,
-        f: &Forward,
-        x: TensorView,
-        gate: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
+    /// What the operator refuses, or an arena that cannot hold the output.
+    pub fn forward(&self, f: &Forward, x: TensorView, gate: TensorView) -> Result<TensorView> {
+        let out = f.empty(x.dtype, x.shape)?;
         f.operate::<norm::GatedRmsNorm>(
             &norm::GatedRmsNormDescriptor {
                 dtype: x.dtype,
@@ -513,7 +554,8 @@ impl GatedRmsNorm {
                 out,
                 eps: self.eps,
             },
-        )
+        )?;
+        Ok(out)
     }
 }
 
@@ -586,24 +628,23 @@ impl LayerNorm {
         })
     }
 
-    /// Normalize `x`, `[rows, columns]`, into `out`, after folding it into `residual` under a
-    /// scaled-residual epilogue (which updates the stream in place).
+    /// `x`, `[rows, columns]`, normalized into a fresh tensor of `x`'s element type, after folding
+    /// it into `residual` under a scaled-residual epilogue (which updates the stream in place).
     ///
     /// # Errors
     ///
     /// Shapes the operator does not take, a stream passed without a scaled-residual epilogue or
-    /// missing under one, or the operator's refusal.
+    /// missing under one, an arena that cannot hold the output, or the operator's refusal.
     pub fn forward(
         &self,
         f: &Forward,
         x: TensorView,
         residual: Option<ResidualStream>,
-        out: TensorView,
-    ) -> Result<()> {
+    ) -> Result<TensorView> {
         const OWNER: &str = "LayerNorm";
         let width = self.columns;
         require_rows(OWNER, "x", &x, &x, width)?;
-        require_rows(OWNER, "out", &out, &x, width)?;
+        let out = f.empty(x.dtype, x.shape)?;
         let tile = row_tile(width);
 
         match (&self.epilogue, residual) {
@@ -661,7 +702,8 @@ impl LayerNorm {
                 "a layer normalization takes a residual stream exactly under a scaled residual"
                     .to_owned(),
             )),
-        }
+        }?;
+        Ok(out)
     }
 }
 
@@ -719,55 +761,30 @@ impl GroupNorm {
         })
     }
 
-    /// Normalize `values`, activate them and pad them into `out`.
+    /// `values` normalized, activated and padded by the normalization's causal pad, in `values`'
+    /// element type and storage order.
     ///
-    /// `values` is `[batch, channels, frames, height, width]` FP32 with each frame's pixels
-    /// contiguous; `mean` and `rstd` are the `[batch · frames, groups]` FP32 statistics buffers the
-    /// call fills; `out` is the padded frame in the activation's element type, in either storage
-    /// order — its strides state which, and they select the compiled variant.
+    /// `values` is `[batch, channels, frames, height, width]` with each frame's pixels contiguous.
+    /// The `[batch · frames, groups]` FP32 statistics are reserved for the call.
     ///
     /// # Errors
     ///
-    /// An output of another rank or channel count, one smaller than the source, or the operators'
-    /// refusals.
-    pub fn forward(
-        &self,
-        f: &Forward,
-        values: TensorView,
-        mean: TensorView,
-        rstd: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
-        const OWNER: &str = "GroupNorm";
-        if out.shape.rank() != 5 || values.shape.rank() != 5 {
+    /// Values of another rank, an arena that cannot hold the output, or the operators' refusals.
+    pub fn forward(&self, f: &Forward, values: TensorView) -> Result<TensorView> {
+        if values.shape.rank() != 5 {
             return Err(Error::shape(
-                OWNER,
-                format!(
-                    "a frame is rank 5, not {:?} into {:?}",
-                    values.shape.dims(),
-                    out.shape.dims()
-                ),
+                "GroupNorm",
+                format!("a frame is rank 5, not {:?}", values.shape.dims()),
             ));
         }
-        // The axes are logical in either storage order — `[batch, channels, frames, height, width]`
-        // — and the order lives in the strides.
+        let out = self.pad.reserve(f, values)?;
         let channels = values.shape.dim(1);
-        if out.shape.dim(1) != channels {
-            return Err(Error::shape(
-                OWNER,
-                format!(
-                    "an output of {} channels for a source of {channels}",
-                    out.shape.dim(1)
-                ),
-            ));
-        }
-        if (2..5).any(|axis| out.shape.dim(axis) < values.shape.dim(axis)) {
-            return Err(Error::shape(
-                OWNER,
-                "the output's frames, rows and columns cannot be smaller than the source's"
-                    .to_owned(),
-            ));
-        }
+        let statistics = Shape::new(&[
+            values.shape.dim(0) * values.shape.dim(2),
+            u64::from(self.groups),
+        ]);
+        let mean = f.empty(DType::F32, statistics)?;
+        let rstd = f.empty(DType::F32, statistics)?;
         // Both launches take the same reduction: `channels_per_group · pixels`, padded to the power
         // of two the compiled program is bounded by.
         let pixels = values.shape.dim(3) * values.shape.dim(4);
@@ -809,6 +826,7 @@ impl GroupNorm {
                 front: u64::from(self.pad.front),
                 reflect: self.pad.reflect(),
             },
-        )
+        )?;
+        Ok(out)
     }
 }

@@ -36,12 +36,6 @@ impl Transpose {
         Ok(Self { dtype })
     }
 
-    /// Write `source [rows, columns]` into `out [columns, rows]`.
-    ///
-    /// Both views are contiguous row-major matrices of the layer's type. A caller that has a batch
-    /// axis folds it into the rows — `[1, channels, frames]` is the `[channels, frames]` matrix this
-    /// takes, because the batch is the caller's and not the transpose's. A rank that is not two is
-    /// refused with the shape in the message rather than reinterpreted.
     /// The descriptor this layer's launch takes.
     ///
     /// No caller's element type: a transpose is typed by the matrix it was built for, and both
@@ -54,41 +48,42 @@ impl Transpose {
         }
     }
 
-    pub fn forward(&self, f: &Forward, source: TensorView, out: TensorView) -> Result<()> {
-        for (name, view) in [("source", source), ("out", out)] {
-            if view.shape.rank() != 2 {
-                return Err(Error::shape(
-                    "Transpose",
-                    format!(
-                        "the {name} is {:?}, a [rows, columns] matrix expected: a batch axis is \
-                         the caller's to fold into the rows",
-                        view.shape.dims()
-                    ),
-                ));
-            }
-            if view.dtype != self.dtype {
-                return Err(Error::shape(
-                    "Transpose",
-                    format!(
-                        "the {name} is {}, the layer was built for {}",
-                        view.dtype, self.dtype
-                    ),
-                ));
-            }
-        }
-        let (rows, columns) = (source.shape.dim(0), source.shape.dim(1));
-        if out.shape.dims() != [columns, rows] {
+    /// `source [rows, columns]` transposed into a fresh `[columns, rows]` matrix.
+    ///
+    /// `source` is a contiguous row-major matrix of the layer's type. A caller that has a batch
+    /// axis folds it into the rows — `[1, channels, frames]` is the `[channels, frames]` matrix this
+    /// takes, because the batch is the caller's and not the transpose's. A rank that is not two is
+    /// refused with the shape in the message rather than reinterpreted.
+    ///
+    /// # Errors
+    ///
+    /// A source of another rank or element type, an arena that cannot hold the output, or the
+    /// operator's refusal.
+    pub fn forward(&self, f: &Forward, source: TensorView) -> Result<TensorView> {
+        if source.shape.rank() != 2 {
             return Err(Error::shape(
                 "Transpose",
                 format!(
-                    "{:?} is not the transpose of {:?}",
-                    out.shape.dims(),
+                    "the source is {:?}, a [rows, columns] matrix expected: a batch axis is the \
+                     caller's to fold into the rows",
                     source.shape.dims()
                 ),
             ));
         }
+        if source.dtype != self.dtype {
+            return Err(Error::shape(
+                "Transpose",
+                format!(
+                    "the source is {}, the layer was built for {}",
+                    source.dtype, self.dtype
+                ),
+            ));
+        }
+        let (rows, columns) = (source.shape.dim(0), source.shape.dim(1));
+        let out = f.empty(self.dtype, ops::Shape::new(&[columns, rows]))?;
         let descriptor = self.descriptor();
-        f.operate::<TransposeOp>(&descriptor, transpose::Args { input: source, out })
+        f.operate::<TransposeOp>(&descriptor, transpose::Args { input: source, out })?;
+        Ok(out)
     }
 }
 

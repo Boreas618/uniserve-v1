@@ -11,19 +11,19 @@
 //! **What the runner owns and what the model owns.** The schedule is the model's:
 //! `Denoiser::schedule(task)` states the steps a request of a task runs, with the sigmas and the step
 //! count the solver checks itself against. This runner passes a `Step` through without reading a
-//! sigma, computing a delta, or counting a step. The coefficient a step reads reaches the device in
-//! `Conditioning::step` - a `[1]` `i64` the runner writes before each replay - and the update is the
-//! model's, inside `denoise`, because the trait's contract for that call is that it updates the
-//! latents in place.
+//! sigma, computing a delta, or counting a step. The model computes the coefficients a step reads
+//! from the `Step` and the request inside its `forward` and uploads them, and the update is the
+//! model's, because the trait's contract for that call is that it updates the latents in place.
 //!
 //! **One arena per bucket, never rewound.** The arena is the graph pool's: mapped whole, never a
 //! bucket at a time (4.5). The first walk of a bucket records what it used, so the pool's figure is
 //! measured from the model's own launches rather than estimated beside them.
 //!
-//! **The tables are per layout.** `state_tables` is deterministic for a layout by the trait's own
-//! rule, so the store keys them by the bucket's layout name and two requests of one shape share one
-//! set. They are filled from the binder's warm request for the bucket - a request whose counts match
-//! the layout it was derived from, which is why the bucket and the warm request are one object here.
+//! **Host values are the forward's.** The packing indices, rotary positions and step coefficients
+//! a step reads are computed by the model's `forward` from the request and the step and uploaded
+//! through the runner's staging region ([`crate::staging`]). A graph is captured from the bucket's
+//! warm request, and before each replay the same forward runs in staging mode with the served
+//! request, writing its values where the captured copies read them ([`Lifecycle::replay`]).
 //!
 //! **The seam from the mechanism.** A media batch's columns state, per request, what the mechanism
 //! owns: the request's conditioning exactly as the model family planned it, and the step, seed and
@@ -44,7 +44,7 @@
 use std::sync::{Arc, Mutex};
 
 use ipc::TimingCounters;
-use nn::capability::{Conditioning, Denoiser, Latents, Step, WarmRequest};
+use nn::capability::{Conditioning, Denoiser, Latents, Step, VideoRequest, WarmRequest};
 use ops::{DType, Shape, TensorView};
 use platform::DeviceId;
 use proto::video::{LatentShape, Layout};
@@ -61,7 +61,6 @@ use crate::runners::columns::Column;
 use crate::runners::lifecycle::{Lifecycle, RunnerLifecycle};
 use crate::runners::products::{self, Product, Products};
 use crate::runners::recording::{Footprint, Walk};
-use crate::runners::tables::Tables;
 use crate::{Error, Result};
 use ipc::execution::{Batch, BatchOutput, CallId, CallOutput, RowState};
 use ipc::execution::{Extent, Variant};
@@ -142,7 +141,6 @@ fn latent_bytes(latent: &LatentShape, dtype: DType) -> Result<u64> {
 struct Staged {
     video: Vec<u8>,
     audio: Vec<u8>,
-    step: Vec<u8>,
 }
 
 impl Staged {
@@ -187,8 +185,6 @@ struct DenoiseColumns {
     /// packed rows were gathered, as `out is [rows, 5376], [rows, 5120] expected`. The model states
     /// the second width (`Denoiser::text_width`); `None` is one width.
     text_width: u64,
-    /// `[1]` `i64`: the step index the coefficients are selected by (`Conditioning::step`).
-    step: Column,
     /// The host side of each column.
     staged: Staged,
 }
@@ -222,7 +218,6 @@ impl DenoiseColumns {
             audio: Column::new(device, shape.sample, rows * audio)?,
             text,
             source,
-            step: Column::new(device, DType::I64, 1)?,
             staged: Staged::default(),
             source_width,
             text_width,
@@ -241,7 +236,6 @@ impl DenoiseColumns {
             None => shape.sample.bytes().unwrap_or(1),
         };
         Staged::zero(&mut self.staged.audio, rows * audio)?;
-        self.staged.step = vec![0u8; 8];
         Ok(())
     }
 }
@@ -280,14 +274,24 @@ fn step_products(_layout: &proto::video::Layout) -> &'static [Product] {
     STEP_PRODUCTS
 }
 
-/// `forward` over `group`, when the runner's rank is in one.
+/// `forward` over `group`, when the runner's rank is in one: a launching forward issues its
+/// collectives through the group, and a staging or recording forward follows the group's split.
+///
+/// # Errors
+///
+/// When the group's rank is not a member of it.
 pub(crate) fn grouped<'a>(
     forward: nn::Forward<'a>,
     group: Option<&'a nn::Group>,
-) -> nn::Forward<'a> {
+) -> Result<nn::Forward<'a>> {
     match group {
-        Some(group) => forward.with_group(group),
-        None => forward,
+        Some(group) if forward.launches() => Ok(forward.with_group(group)),
+        Some(group) => {
+            // NCCL reports a member's rank as a non-negative `int`, as `nn::Forward::split` reads it.
+            let rank = u64::try_from(group.rank()).unwrap_or(0);
+            Ok(forward.with_split(rank, group.ranks())?)
+        }
+        None => Ok(forward),
     }
 }
 
@@ -396,7 +400,7 @@ struct Pending {
     index: u32,
     /// The request's noise seed: the draw is addressed by it and the element's index.
     seed: nn::capability::Seed,
-    /// The request as its first step reads it: its own prompt length and its own conditions.
+    /// The request as its steps read it: its own prompt length and its own conditions.
     stated: Arc<WarmRequest>,
 }
 
@@ -430,9 +434,9 @@ fn elements(extents: &[u64]) -> u64 {
 
 /// The request a staged row states, within the bucket `warm` plans.
 ///
-/// A graph is captured for a bucket's capacity, and a request's state tables say how much of that
-/// capacity it fills: the refiner's keys stop at its prompt, and every packed row takes its place on
-/// the rotary clock from that length. So the task, the canvas and the frames stay the plan's, and
+/// A graph is captured for a bucket's capacity, and the values a request's forward uploads say how
+/// much of that capacity it fills: the refiner's keys stop at its prompt, and every packed row
+/// takes its place on the rotary clock from that length. So the task, the canvas and the frames stay the plan's, and
 /// everything the request itself states replaces the plan's figures.
 fn stated_request(warm: &WarmRequest, conditioning: &[u8]) -> Result<WarmRequest> {
     use proto::video::{ConditionRole, Conditions};
@@ -513,7 +517,7 @@ fn opened(
 pub struct BucketPlan {
     /// The bucket: one step over one request of the warm request's layout.
     pub bucket: Bucket,
-    /// The request the bucket's layout, tables and schedule are stated by.
+    /// The request the bucket's layout and schedule are stated by, and its graph is captured from.
     pub warm: WarmRequest,
 }
 
@@ -530,25 +534,22 @@ pub struct DenoiserRunner<M: Denoiser + Send + Sync + ?Sized> {
     stream: platform::Stream,
     shape: DenoiserShape,
     counters: Option<Arc<crate::device::SharedCounters>>,
-    tables: Tables,
     columns: DenoiseColumns,
     /// The epoch's product store: what a call of this request produced for this one to read.
     ///
     /// `None` until the worker attaches it, and a step that needs a product without one refuses by
     /// name rather than staging zeros.
     products: Option<Arc<dyn Products>>,
-    /// The step of the schedule the staged batch is: the index its step column holds.
-    staged_step: Option<u32>,
+    /// The step of the schedule the staged batch is.
+    staged_step: Option<Step>,
     /// The rows of the batch being served: what a replay seeds from the store, what it publishes
     /// its trajectory back to, and the seed its first step's draw is addressed by.
     ///
     /// A batch is one step, so this is filled by `submit` and consumed by the replay that follows;
     /// a second `submit` before a replay would be a second batch, which the worker does not do.
     pending: Vec<Pending>,
-    /// The model's constant tables, allocated once per load ([`Constants`]).
-    constants: Constants,
-    /// Whether this load's constants are written.
-    constants_filled: bool,
+    /// Whether the model's writable constants of this load are filled ([`Denoiser::initialize`]).
+    initialized: bool,
     /// The sequence group this runner's rank exchanges over, absent at one rank.
     group: Option<Arc<nn::Group>>,
     /// The calls of the batch staged last, which its replay answers.
@@ -615,8 +616,8 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             let bucket =
                 Bucket::denoise(1, layout).serving(request.frames, request.width, request.height);
             if buckets.iter().any(|plan| plan.bucket == bucket) {
-                // Two served tasks of one layout share one graph and one table set: the bucket is
-                // the layout, so a second entry would capture the same extent twice.
+                // Two served tasks of one layout share one graph: the bucket is the layout, so a
+                // second entry would capture the same extent twice.
                 continue;
             }
             buckets.push(BucketPlan {
@@ -645,13 +646,11 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             stream: binding.stream,
             shape,
             counters: None,
-            tables: Tables::new(),
             columns,
             products: None,
             staged_step: None,
             pending: Vec::new(),
-            constants: Constants::default(),
-            constants_filled: false,
+            initialized: false,
             group: None,
             calls: Vec::new(),
             steps_completed: 0,
@@ -733,52 +732,6 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         self.model.schedule(&plan.warm.view()).map_err(Error::from)
     }
 
-    /// The key a bucket's tables are held under.
-    ///
-    /// The layout is the key because the layout is the extent (`Bucket::denoise`): two tasks of one
-    /// extent share one table set, and a table filled from one task's request describes the other's
-    /// shape just as well, which is the trait's "deterministic for a layout" rule.
-    fn key(bucket: Bucket) -> String {
-        match bucket.extent {
-            Extent::Latents(layout) => format!(
-                "denoise-{}-{}-{}-{}-{}x{}x{}",
-                layout.video.channels,
-                layout.video.frames,
-                layout.text_rows,
-                layout.condition_rows,
-                layout.video.height,
-                layout.video.width,
-                bucket.rows.max(1),
-            ),
-            _ => format!("denoise-{}", bucket.rows.max(1)),
-        }
-    }
-
-    /// Allocates and fills `bucket`'s layout tables, on the device thread, outside any step.
-    fn fill(&mut self, bucket: Bucket) -> Result<()> {
-        let layout = layout_of(bucket)?;
-        let tables = self.model.state_tables(&layout).map_err(Error::from)?;
-        if tables.is_empty() {
-            return Ok(());
-        }
-        let key = Self::key(bucket);
-        let model = Arc::clone(&self.model);
-        let warm = self.plan_of(bucket)?.warm.clone();
-        self.tables.fill(
-            self.device,
-            &self.stream,
-            self.lifecycle.generation.number(),
-            &key,
-            &tables,
-            |host| {
-                let request = warm.view();
-                model
-                    .prepare_state(&request, &layout, host)
-                    .map_err(Error::from)
-            },
-        )
-    }
-
     /// The video latents of request `index` of `bucket`, as a view of the runner's own column.
     fn video_latents(&self, bucket: Bucket, index: u32) -> Result<TensorView> {
         let layout = layout_of(bucket)?;
@@ -820,7 +773,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         (rows, self.columns.source_width, self.columns.text_width)
     }
 
-    /// The conditioning of request `index` of `bucket`, over the tables of its layout.
+    /// The conditioning of request `index` of `bucket`.
     ///
     /// `text` and `source` are two views of **two widths**: a conditioner may widen what the
     /// denoiser reads, so a step that handed the model one width for both would address the wrong
@@ -829,8 +782,6 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         &self,
         bucket: Bucket,
         index: u32,
-        state: &'a [TensorView],
-        constants: &'a [TensorView],
         media: &'a [nn::capability::MediaInput],
     ) -> Result<Conditioning<'a>> {
         let layout = layout_of(bucket)?;
@@ -849,9 +800,6 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             media,
             images: None,
             audio: None,
-            state,
-            constants,
-            step: Some(self.columns.step.shaped(&[1])),
         })
     }
 
@@ -989,7 +937,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             let start = usize::try_from(u64::from(pending.index) * stride + zero)
                 .map_err(|_| Error::Invalid("a row is larger than memory".into()))?;
             let end = start + row as usize;
-            // SAFETY: the row lies inside this request's block of the column, and `upload_step`
+            // SAFETY: the row lies inside this request's block of the column, and `settle_opening`
             // waited out the launches of the previous request, which are the column's only readers.
             unsafe {
                 self.columns.text.host.as_mut_slice()[start..end].fill(0);
@@ -1022,8 +970,8 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
     /// **This runs for the step that opens a request on this runner**, which is step zero for a
     /// request that starts here and the stored step for one a latent preparation restored. A
     /// restored request's columns already hold its trajectory at that step, so it draws no noise
-    /// and starts no schedule; its conditioner, its condition draws and its state tables are
-    /// computed again from the request, which is all they depend on.
+    /// and starts no schedule; its conditioner and its condition draws are computed again from the
+    /// request, which is all they depend on.
     fn first_step(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         if !self.opens() {
             return Ok(());
@@ -1034,30 +982,23 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             _ => None,
         };
         let stands = restored.unwrap_or(0);
-        if self.staged_step != Some(stands) {
+        if self.staged_step.map(|step| step.index) != Some(stands) {
             return Err(Error::Invalid(format!(
                 "request {request:?} opens on this denoiser at step {:?} and its trajectory here \
                  stands at step {stands}: a request that continues past its first step on another \
                  runner has nothing to continue from unless its latent preparation restored it",
-                self.staged_step
+                self.staged_step.map(|step| step.index)
             )));
         }
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
-        self.fill(bucket)?;
-        self.state_of_request(bucket)?;
         let arena = self.lifecycle.arena()?;
         let group = self.group.clone();
+        let staging = self.lifecycle.staging.slot()?;
         let forward = grouped(
-            nn::Forward::new(&stream, &kernels, &arena),
+            nn::Forward::new(&stream, &kernels, &arena).with_staging(staging),
             group.as_deref(),
-        );
-        let layout = layout_of(bucket)?;
-        let tables = self.model.state_tables(&layout).map_err(Error::from)?;
-        let key = Self::key(bucket);
-        let state = self
-            .tables
-            .views(self.lifecycle.generation.number(), &key, &tables)?;
+        )?;
         for row in &self.pending {
             let pieces = self
                 .model
@@ -1073,15 +1014,16 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
                 samples,
                 restored: restored.is_some(),
             };
-            self.open(&forward, bucket, &opening, &state, &self.constants.views)?;
+            self.open(&forward, bucket, &opening)?;
         }
+        self.lifecycle.staging.release(&stream)?;
         self.opened = Some((request, bucket));
         self.restored = None;
         Ok(())
     }
 
     /// Whether the pending request's step opens it on this runner: the step whose host work folds
-    /// its conditioning and writes its state tables before the graph runs.
+    /// its conditioning before the graph runs.
     fn opens(&self) -> bool {
         match self.pending.as_slice() {
             [row] => self
@@ -1351,9 +1293,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             let (pixel_at, sample_at) = offsets[piece.condition as usize];
             let noise = match piece.draw {
                 Some(draw) => {
-                    let view = forward
-                        .arena()
-                        .tensor(self.shape.sample, latent_shape(&draw))?;
+                    let view = forward.empty(self.shape.sample, latent_shape(&draw))?;
                     self.model
                         .draw_condition_noise(forward, opening.seed, piece, view)
                         .map_err(Error::from)?;
@@ -1387,20 +1327,13 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
     ///
     /// The replay that opens a request and the recorded walk both run this, so the forwards a
     /// request's opening launches are the ones the walk records.
-    fn open(
-        &self,
-        forward: &nn::Forward<'_>,
-        bucket: Bucket,
-        opening: &Opening<'_>,
-        state: &[TensorView],
-        constants: &[TensorView],
-    ) -> Result<()> {
+    fn open(&self, forward: &nn::Forward<'_>, bucket: Bucket, opening: &Opening<'_>) -> Result<()> {
         let layout = layout_of(bucket)?;
         let latents = self.latents(bucket, opening.index)?;
         // The raw media a conditioner encodes, each visual piece with its anchoring draw: the
         // request's first step is the one forward that reads them.
         let media = self.media(forward, opening)?;
-        let cond = self.conditioning(bucket, opening.index, state, constants, &media)?;
+        let cond = self.conditioning(bucket, opening.index, &media)?;
         // The stream's first elements are the conditions' draws, so the trajectory's offsets
         // are the request's own and not the warm request's the bucket was captured from.
         let drawn = Layout {
@@ -1420,7 +1353,8 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         // because a graph replays once per *step* while this runs once per *request* - a
         // refinement inside the captured graph would compound over the schedule, and `text` is
         // written in place.
-        self.model.prepare_conditioning(forward, cond)?;
+        self.model
+            .prepare_conditioning(forward, &opening.stated.view(), cond)?;
         if !opening.restored {
             self.model.prepare_latents(forward, cond, latents)?;
         }
@@ -1433,39 +1367,29 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
     /// Each opening and the step start at the stream region's first address, as the replay's eager
     /// opening and the captured graph do. A condition set ([`WarmRequest::openings`]) is opened as
     /// a served request presenting it is ([`opened`]), so the conditioning encode of its media is
-    /// walked with the opening. The state tables are placeholders of the layout's.
+    /// walked with the opening.
     fn walk_recorded(&self, walk: &Walk, bucket: Bucket) -> Result<()> {
         let warm = &self.plan_of(bucket)?.warm;
-        let layout = layout_of(bucket)?;
-        let state = walk.tables(&self.model.state_tables(&layout).map_err(Error::from)?)?;
-        let constants = walk.tables(&self.model.constant_tables())?;
         let group = self.group.as_deref();
-        self.walk_opening(walk, bucket, warm, &state, &constants)?;
+        self.walk_opening(walk, bucket, warm)?;
         for conditions in &warm.openings {
-            walk.arena().reset();
+            walk.reset();
             let stated = opened(warm, conditions.clone(), warm.text_tokens, Vec::new());
-            self.walk_opening(walk, bucket, &stated, &state, &constants)?;
+            self.walk_opening(walk, bucket, &stated)?;
         }
-        walk.arena().reset();
+        walk.reset();
         let step = self
             .schedule(bucket)?
             .first()
             .copied()
             .ok_or_else(|| self.no_step(bucket))?;
-        self.step(&walk.forward(group)?, bucket, step, &state, &constants)
+        self.step(&walk.forward(group)?, bucket, step, &warm.view())
     }
 
     /// Opens `stated` in `bucket` on a recording forward of `walk`, through the opening a replay
     /// runs ([`Self::open`]): its condition media regions are placeholders of the extents the
-    /// request's own pieces would have, and `state` the layout's placeholder tables.
-    fn walk_opening(
-        &self,
-        walk: &Walk,
-        bucket: Bucket,
-        stated: &WarmRequest,
-        state: &[TensorView],
-        constants: &[TensorView],
-    ) -> Result<()> {
+    /// request's own pieces would have.
+    fn walk_opening(&self, walk: &Walk, bucket: Bucket, stated: &WarmRequest) -> Result<()> {
         let pieces = self
             .model
             .condition_pieces(&stated.view())
@@ -1501,43 +1425,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             samples,
             restored: false,
         };
-        self.open(
-            &walk.forward(self.group.as_deref())?,
-            bucket,
-            &opening,
-            state,
-            constants,
-        )
-    }
-
-    /// Writes the pending request's own state tables over the ones the capture read.
-    ///
-    /// A bucket's tables are one set, so a bucket serves one request at a time.
-    fn state_of_request(&mut self, bucket: Bucket) -> Result<()> {
-        let [row] = self.pending.as_slice() else {
-            return Err(Error::Invalid(format!(
-                "a first step of {} requests reached bucket {bucket}, whose state tables hold one",
-                self.pending.len()
-            )));
-        };
-        let layout = layout_of(bucket)?;
-        let tables = self.model.state_tables(&layout).map_err(Error::from)?;
-        if tables.is_empty() {
-            return Ok(());
-        }
-        let stated = Arc::clone(&row.stated);
-        let model = Arc::clone(&self.model);
-        self.tables.rewrite(
-            &self.stream,
-            self.lifecycle.generation.number(),
-            &Self::key(bucket),
-            &tables,
-            |host| {
-                model
-                    .prepare_state(&stated.view(), &layout, host)
-                    .map_err(Error::from)
-            },
-        )
+        self.open(&walk.forward(self.group.as_deref())?, bucket, &opening)
     }
 
     /// Publishes each pending row's trajectory as this runner's columns hold it.
@@ -1599,17 +1487,10 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         }
     }
 
-    /// Writes the coefficient index the step reads, before a walk or a replay, and records it as
-    /// the staged step.
-    ///
-    /// Little-endian is the **device's** convention for the `[1]` `i64` table a kernel reads, not the
-    /// host's: the column is device memory a launch addresses, so the bytes are the device's byte
-    /// order and every GPU this tree runs on is little-endian. A big-endian device would need this
-    /// line changed, which is why it says whose order it is rather than leaving it to be assumed.
-    fn stage_step(&mut self, step: &Step) -> Result<()> {
-        self.columns.staged.step = step.index.to_le_bytes().to_vec();
-        self.staged_step = Some(step.index);
-        Ok(())
+    /// Records the step a walk or a replay evaluates: its forward computes the step's coefficients
+    /// from it.
+    fn stage_step(&mut self, step: &Step) {
+        self.staged_step = Some(*step);
     }
 
     /// The refusal for a bucket whose request the model states no schedule for.
@@ -1647,7 +1528,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             .first()
             .copied()
             .ok_or_else(|| self.no_step(bucket))?;
-        self.stage_step(&step)?;
+        self.stage_step(&step);
         Ok(())
     }
 
@@ -1662,142 +1543,86 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         let DenoiseColumns {
             video,
             audio,
-            step,
             staged,
             ..
         } = &mut self.columns;
         video.write(&staged.video)?;
         audio.write(&staged.audio)?;
-        step.write(&staged.step)?;
         self.columns.video.upload(&stream)?;
         self.columns.audio.upload(&stream)?;
-        self.columns.step.upload(&stream)?;
         Ok(())
     }
 
-    /// Copies the column a **replay** writes from the host: the step's index.
+    /// Waits out the previous request's launches before a first step writes the conditioning
+    /// columns from the host ([`Self::seed`], [`Self::zero_rows`]).
     ///
-    /// **The trajectory is not one of them.** The captured graph advances the latents *in place* —
-    /// that is the whole of a diffusion step — while the staged buffer holds a warm capture's zeros,
-    /// so uploading it before every replay would restart the trajectory at zero whenever a step
-    /// began. Nothing refused: step one would advance zeros, and the clip would be the draw plus one
-    /// step rather than the schedule. The draw at step zero writes the whole block itself
-    /// (`first_step`), so the column never needs this path for its initial values.
-    fn upload_step(&mut self) -> Result<()> {
-        let stream = self.stream.clone();
-        // The refined rows are the request's for its whole schedule: `first_step` folds them once,
-        // and every later step reads them where they are. Only a first step writes the conditioning
-        // columns from the host (`seed`), so the previous request's last launch is waited out first.
-        if self.staged_step == Some(0) {
-            stream.synchronize()?;
+    /// The refined rows are the request's for its whole schedule: `first_step` folds them once, and
+    /// every later step reads them where they are, so only a step that opens a request writes them.
+    /// **The trajectory is not written here**: the captured graph advances the latents in place,
+    /// and the draw at the opening writes the whole block itself.
+    fn settle_opening(&self) -> Result<()> {
+        if self.opens() {
+            self.stream.synchronize()?;
         }
-        let DenoiseColumns { step, staged, .. } = &mut self.columns;
-        step.write(&staged.step)?;
-        self.columns.step.upload(&stream)?;
         Ok(())
     }
 
-    /// Fills the model's constants, once per load and ahead of every capture.
-    ///
-    /// They are values folded from the weights, such as an AdaLN cache, and every step reads them.
-    /// A model's region left unwritten is zeros, so its gates close and the stack passes its input
-    /// through unchanged, with nothing refusing.
-    fn fill_constants(&mut self, kernels: &Arc<ops::Generation>) -> Result<()> {
-        if self.constants_filled {
+    /// Fills the model's writable constants once per load and ahead of every capture
+    /// ([`Denoiser::initialize`]): values folded from the weights, such as an AdaLN cache, which
+    /// every step reads. Left unwritten they are zeros, so the stack's gates close and it passes its
+    /// input through unchanged, with nothing refusing.
+    fn initialize(&mut self, kernels: &Arc<ops::Generation>) -> Result<()> {
+        if self.initialized {
             return Ok(());
-        }
-        if self.constants.views.is_empty() {
-            let tables = self.model.constant_tables();
-            let allocated =
-                Constants::allocate(&mut *self.lifecycle.pool()?, &tables, &self.stream)?;
-            self.constants = allocated;
         }
         let stream = self.stream.clone();
         let arena = self.lifecycle.arena()?;
-        self.constants(
-            &nn::Forward::new(&stream, kernels, &arena),
-            &self.constants.views,
-        )?;
-        self.constants_filled = true;
-        Ok(())
-    }
-
-    /// Runs the model's constant fold on `forward` into `tables`, at the stream region's first
-    /// address: what [`Self::fill_constants`] launches once per load and the recorded walk records.
-    fn constants(&self, forward: &nn::Forward<'_>, tables: &[TensorView]) -> Result<()> {
+        let staging = self.lifecycle.staging.slot()?;
         self.model
-            .prepare_constants(forward, tables)
-            .map_err(Error::from)
-    }
-
-    /// Writes the staged step's index into the `step` state table a replay reads.
-    ///
-    /// The graph selects its modulation and its solver coefficient on the device from this word, so
-    /// one capture serves every evaluation. The copy is stream-ordered, so a step queued behind a
-    /// running one changes nothing the running one reads.
-    fn write_step(&mut self, bucket: Bucket) -> Result<()> {
-        let layout = layout_of(bucket)?;
-        let tables = self.model.state_tables(&layout).map_err(Error::from)?;
-        let Some(position) = tables.iter().position(|table| table.name == "step") else {
-            return Ok(());
-        };
-        let state = self.tables.views(
-            self.lifecycle.generation.number(),
-            &Self::key(bucket),
-            &tables,
-        )?;
-        let index = self.staged_step.unwrap_or(0).to_le_bytes();
-        // SAFETY: the destination is the four-byte table and the source four live bytes, staged by
-        // the driver before the call returns.
-        unsafe {
-            platform::memcpy_async(
-                state[position].ptr.address(),
-                index.as_ptr() as u64,
-                index.len(),
-                &self.stream,
-            )?;
-        }
+            .initialize(&nn::Forward::new(&stream, kernels, &arena).with_staging(staging))
+            .map_err(Error::from)?;
+        self.lifecycle.staging.release(&stream)?;
+        self.initialized = true;
         Ok(())
     }
 
-    /// One step of request zero of `bucket` on `forward`, over the layout's state tables `state`:
-    /// the model call a capture walk and the recorded walk record.
+    /// One step of `request`, request zero of `bucket`, on `forward`: the model call a capture
+    /// walk, the staging walk before each replay and the recorded walk all make.
     fn step(
         &self,
         forward: &nn::Forward<'_>,
         bucket: Bucket,
         step: Step,
-        state: &[TensorView],
-        constants: &[TensorView],
+        request: &VideoRequest<'_>,
     ) -> Result<()> {
         let media: [nn::capability::MediaInput; 0] = [];
         let latents = self.latents(bucket, 0)?;
-        let cond = self.conditioning(bucket, 0, state, constants, &media)?;
+        let cond = self.conditioning(bucket, 0, &media)?;
         self.model
-            .denoise(forward, step, latents, cond)
+            .forward(forward, step, request, latents, cond)
             .map_err(Error::from)
     }
 }
 
 impl<M: Denoiser + Send + Sync + ?Sized> Runner for DenoiserRunner<M> {
-    /// The constants are folded from the weights, so they are folded again from the new ones. A
-    /// runner that has not filled them yet does so before its first capture anyway.
+    /// The writable constants are folded from the weights, so they are folded again from the new
+    /// ones. A runner that has not filled them yet does so before its first capture anyway.
     fn weights_changed(&mut self) -> Result<()> {
-        if !self.constants_filled {
+        if !self.initialized {
             return Ok(());
         }
-        self.constants_filled = false;
+        self.initialized = false;
         let generation = self.lifecycle.generation.number();
         let kernels = self.lifecycle.generation_named(generation)?;
-        self.fill_constants(&kernels)
+        self.initialize(&kernels)
     }
 
     fn phases(&self) -> &[ipc::PhaseId] {
         &self.phases
     }
 
-    /// A step's graph reads the step's index from a state table the stream writes in order, so the
-    /// next step can be launched behind it.
+    /// A step's values reach its graph through the staging region, which a replay reuses only once
+    /// the stream consumed the previous one, so the next step can be issued behind it.
     fn overlaps_replays(&self) -> bool {
         true
     }
@@ -1904,7 +1729,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> Runner for DenoiserRunner<M> {
             }
         }
         let step = step.ok_or_else(|| Error::Invalid("a denoise batch of no request".into()))?;
-        self.stage_step(&step)?;
+        self.stage_step(&step);
         self.calls.clone_from(&batch.calls);
         self.steps_completed = step.index + 1;
         Ok(Jobs::new([Job::Replay {
@@ -1942,23 +1767,20 @@ impl<M: Denoiser + Send + Sync + ?Sized> Runner for DenoiserRunner<M> {
 
     fn purge(&mut self, generation: u64) {
         self.lifecycle.purge(generation);
-        // A generation's tables are charged to resident and retire with it, the same rule as its
-        // weights, so the release is here beside the graphs rather than on a second path (4.3).
-        self.tables.release(generation);
     }
 
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
-        self.tables.attach(Arc::clone(&pools));
         self.lifecycle.attach_pools(pools);
     }
 
-    /// The model's constants once, then for every bucket the opening of its warm request and the
-    /// step its graph captures.
+    /// The model's initialization once, then for every bucket the opening of its warm request and
+    /// the step its graph captures.
     fn record_walk(&mut self) -> Result<Footprint> {
         let mut footprint = Footprint::default();
         footprint.walk(None, |walk| {
-            let tables = walk.tables(&self.model.constant_tables())?;
-            self.constants(&walk.forward(None)?, &tables)
+            self.model
+                .initialize(&walk.forward(None)?)
+                .map_err(Error::from)
         })?;
         for bucket in self.capture_order() {
             footprint.walk(Some(bucket), |walk| self.walk_recorded(walk, bucket))?;
@@ -1979,18 +1801,14 @@ impl<M: Denoiser + Send + Sync + ?Sized> Runner for DenoiserRunner<M> {
             Job::Replay {
                 bucket, generation, ..
             } => {
-                let stream = self.stream.clone();
-                // What a replay writes from the host: the conditioning rows and the step index. The
-                // trajectory is the column's own, advanced in place by the previous step.
-                self.upload_step()?;
-                // The conditioning is the store's, and it overwrites the rows the upload just wrote:
-                // that order is why one upload covers every column it writes.
+                // What a replay writes from the host is the conditioning rows of a request it opens;
+                // the trajectory is the column's own, advanced in place by the previous step.
+                self.settle_opening()?;
                 self.seed(*bucket)?;
                 // The first step's trajectory is drawn and folded here, on the arena the graph
                 // below addresses, so the graph advances a trajectory rather than a warm capture's
                 // zeros (4.5, section 9).
                 self.first_step(*bucket, *generation)?;
-                self.write_step(*bucket)?;
                 let (served, _) = self
                     .lifecycle
                     .graphs
@@ -2019,7 +1837,15 @@ impl<M: Denoiser + Send + Sync + ?Sized> Runner for DenoiserRunner<M> {
                             "no graph of bucket {bucket} at generation {generation}"
                         ))
                     })?;
-                captured.launch(&stream)?;
+                // The staging walk runs the step the graph was captured from with this request and
+                // this step, so the values the captured copies read are this replay's.
+                let step = self.staged_step.ok_or_else(|| self.no_step(*bucket))?;
+                let stated = Arc::clone(&self.pending[0].stated);
+                let group = self.group.clone();
+                self.lifecycle.replay(captured, |arena, staging| {
+                    let forward = grouped(nn::Forward::staging(arena, staging), group.as_deref())?;
+                    self.step(&forward, *bucket, step, &stated.view())
+                })?;
                 // The graph advanced the trajectory in place; what a decode reads next is this
                 // column, and the store records that view rather than a copy of it.
                 self.publish(*bucket)?;
@@ -2241,12 +2067,11 @@ impl<M: Denoiser + Send + Sync + ?Sized> RunnerLifecycle for DenoiserRunner<M> {
     /// and this runner walks request zero of it, the rest of the bucket being the same graph over
     /// another block of the columns.
     fn walk(&mut self, bucket: Bucket, generation: &Arc<ops::Generation>) -> Result<()> {
-        // The model's constants are filled once per load, ahead of the first walk that reads them;
-        // a later walk finds them filled and launches nothing for them.
-        self.fill_constants(generation)?;
+        // The model's writable constants are filled once per load, ahead of the first walk that
+        // reads them; a later walk finds them filled and launches nothing for them.
+        self.initialize(generation)?;
         let stream = self.stream.clone();
         self.stage_warm(bucket)?;
-        self.fill(bucket)?;
         let first = self
             .lifecycle
             .pool()?
@@ -2255,74 +2080,28 @@ impl<M: Denoiser + Send + Sync + ?Sized> RunnerLifecycle for DenoiserRunner<M> {
         let arena = self.lifecycle.arena()?;
         let group = self.group.clone();
         let probes = crate::profiling::fences::capturing(&stream);
+        // A capture's uploads are copies from the staging region that every replay reads again;
+        // the warm walk's eager copies are drained before the capture begins (`warmed_capture`).
+        let staging = self.lifecycle.staging.captured(&stream)?;
         let forward = grouped(
             nn::Forward::new(&stream, generation, &arena)
+                .with_staging(staging)
                 .with_fence(probes.as_ref().map(|probes| probes as &dyn nn::Fence)),
             group.as_deref(),
-        );
-        let layout = layout_of(bucket)?;
-        let tables = self.model.state_tables(&layout).map_err(Error::from)?;
-        let key = Self::key(bucket);
-        let state = self
-            .tables
-            .views(self.lifecycle.generation.number(), &key, &tables)?;
+        )?;
         let step = self
             .schedule(bucket)?
             .first()
             .copied()
             .ok_or_else(|| self.no_step(bucket))?;
-        self.step(&forward, bucket, step, &state, &self.constants.views)?;
+        let warm = self.plan_of(bucket)?.warm.clone();
+        self.step(&forward, bucket, step, &warm.view())?;
         if first {
             self.lifecycle
                 .pool()?
                 .record(self.lifecycle.stream_id(), bucket, arena.peak())?;
         }
         Ok(())
-    }
-}
-
-/// The model's constant tables ([`Denoiser::constant_tables`]) as this runner holds them.
-///
-/// Allocated once per load from the device's resident pool, before the first capture, so every
-/// captured step addresses them where they stand; the model fills them once
-/// ([`Denoiser::prepare_constants`]) and every step reads them.
-#[derive(Default)]
-struct Constants {
-    /// The allocations, kept for the addresses the graphs hold.
-    _storage: Vec<platform::Buffer>,
-    /// One view per table, in the model's order.
-    views: Vec<TensorView>,
-}
-
-impl Constants {
-    /// One resident allocation per table of `tables`, zeroed on `stream`.
-    fn allocate(
-        pools: &mut Pools,
-        tables: &[nn::StateTable],
-        stream: &platform::Stream,
-    ) -> Result<Self> {
-        let mut storage = Vec::with_capacity(tables.len());
-        let mut views = Vec::with_capacity(tables.len());
-        for table in tables {
-            let bytes = table
-                .dtype
-                .bytes()
-                .and_then(|width| width.checked_mul(table.shape.numel()))
-                .ok_or_else(|| {
-                    Error::Invalid(format!("constant table {} has no byte extent", table.name))
-                })?;
-            let buffer = pools.allocate(platform::PoolKind::Resident, bytes)?;
-            let ptr = ops::DevicePtr::new(buffer.address());
-            // SAFETY: the buffer is `bytes` of device storage just allocated for this table, and
-            // the fill that writes it is issued after this on the same stream.
-            unsafe { ops::zero_bytes(ptr, bytes, stream)? };
-            views.push(TensorView::new(ptr, table.dtype, table.shape));
-            storage.push(buffer);
-        }
-        Ok(Self {
-            _storage: storage,
-            views,
-        })
     }
 }
 
@@ -2339,7 +2118,6 @@ fn layout_of(bucket: Bucket) -> Result<Layout> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nn::capability::{Seed, StateTable, TableValues, VideoRequest};
 
     /// A trajectory's bytes lie back to back over the video and the audio column, so a range that
     /// straddles the two is two pieces, and a range past the trajectory is refused.
@@ -2500,24 +2278,6 @@ mod tests {
     }
 
     #[test]
-    fn a_key_names_the_layout_so_two_extents_never_share_tables() {
-        let first = Bucket::denoise(1, layout(16, 2, 3, 4, 8));
-        let other = Bucket::denoise(1, layout(16, 2, 3, 4, 9));
-        assert_ne!(
-            DenoiserRunner::<NoModel>::key(first),
-            DenoiserRunner::<NoModel>::key(other)
-        );
-    }
-
-    #[test]
-    fn two_requests_of_one_layout_share_a_key() {
-        assert_eq!(
-            DenoiserRunner::<NoModel>::key(Bucket::denoise(1, layout(16, 2, 3, 4, 8))),
-            DenoiserRunner::<NoModel>::key(Bucket::denoise(1, layout(16, 2, 3, 4, 8)))
-        );
-    }
-
-    #[test]
     fn a_latent_block_is_its_channels_by_its_extents() {
         let shape = LatentShape {
             channels: 16,
@@ -2534,91 +2294,6 @@ mod tests {
     fn a_bucket_that_is_not_a_denoise_states_what_it_is() {
         let error = layout_of(Bucket::prefill(1, 16, Variant::Encode)).unwrap_err();
         assert!(format!("{error}").contains("serves a denoising bucket"));
-    }
-
-    /// A denoiser that states nothing: the tests above exercise the runner's own arithmetic, which
-    /// needs no model.
-    struct NoModel;
-
-    impl Denoiser for NoModel {
-        fn layout(&self, _request: &VideoRequest<'_>) -> nn::Result<Layout> {
-            Ok(layout(1, 1, 1, 1, 1))
-        }
-
-        fn prepare_conditioning(
-            &self,
-            _f: &nn::Forward,
-            _cond: Conditioning<'_>,
-        ) -> nn::Result<()> {
-            // The fixture has no conditioner: its denoiser reads the request's text rows alone.
-            Ok(())
-        }
-
-        fn draw_noise(
-            &self,
-            _f: &nn::Forward,
-            _seed: Seed,
-            _layout: Layout,
-            _out: Latents,
-        ) -> nn::Result<()> {
-            Ok(())
-        }
-
-        fn prepare_latents<'a>(
-            &self,
-            _f: &nn::Forward,
-            _cond: Conditioning<'a>,
-            _out: Latents,
-        ) -> nn::Result<()> {
-            Ok(())
-        }
-
-        fn denoise<'a>(
-            &self,
-            _f: &nn::Forward,
-            _step: Step,
-            _latents: Latents,
-            _cond: Conditioning<'a>,
-        ) -> nn::Result<()> {
-            Ok(())
-        }
-
-        fn evaluations(&self) -> u32 {
-            0
-        }
-
-        fn constant_tables(&self) -> Vec<StateTable> {
-            Vec::new()
-        }
-
-        fn prepare_constants(&self, _f: &nn::Forward, _out: &[TensorView]) -> nn::Result<()> {
-            Ok(())
-        }
-
-        fn layout_tables(&self, _layout: &Layout) -> nn::Result<Vec<StateTable>> {
-            Ok(Vec::new())
-        }
-
-        fn prepare_layout(&self, _layout: &Layout, _out: &mut [TableValues]) -> nn::Result<()> {
-            Ok(())
-        }
-
-        fn state_tables(&self, _layout: &Layout) -> nn::Result<Vec<StateTable>> {
-            Ok(Vec::new())
-        }
-
-        fn prepare_state(
-            &self,
-            _request: &VideoRequest<'_>,
-            _layout: &Layout,
-            _out: &mut [TableValues],
-        ) -> nn::Result<()> {
-            Ok(())
-        }
-
-        fn prepare_evaluation(&self, _index: u32, _out: &mut [TableValues]) -> nn::Result<()> {
-            Ok(())
-        }
     }
 }
 

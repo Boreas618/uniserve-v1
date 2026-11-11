@@ -66,38 +66,31 @@ impl StepIndexed {
         self.weight.shape().dim(0)
     }
 
-    /// Project `input` `[rows, in]` into `out` `[rows, out]` with the weights of the step `step`
-    /// (`[1]` i32) names.
+    /// `input` `[rows, in]` projected to `[rows, out]` in `input`'s element type, with the weights
+    /// of the step `step` (`[1]` i32) names.
     ///
-    /// The gathered row is reserved from the arena in the tables' element type, which is the
-    /// projection's; it is dead once the product is enqueued and released before return.
+    /// The step's weight and bias rows are gathered in the tables' element type, which is the
+    /// projection's, after the output, and handed back once the product is enqueued.
     ///
     /// # Errors
     ///
     /// A step view the gather refuses, views the projection refuses, or an arena that cannot hold
-    /// the row.
-    pub fn forward(
-        &self,
-        f: &Forward,
-        step: TensorView,
-        input: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
-        let arena = f.arena();
-        let mark = arena.mark();
-        let dtype = self.weight.dtype();
+    /// the rows.
+    pub fn forward(&self, f: &Forward, step: TensorView, input: TensorView) -> Result<TensorView> {
         let (inputs, outputs) = (u64::from(self.inputs), u64::from(self.outputs));
-        let wide = arena.tensor(dtype, Shape::new(&[1, outputs * inputs]))?;
-        IndexRows.gather(f, self.weight.view(), step, wide)?;
-        let narrow = arena.tensor(dtype, Shape::new(&[1, outputs]))?;
-        IndexRows.gather(f, self.bias.view(), step, narrow)?;
-        let projection = Linear::new(
-            Weight::borrowed(wide.reshape(Shape::new(&[outputs, inputs])))?,
-            Some(Weight::borrowed(narrow.reshape(Shape::new(&[outputs])))?),
-            WeightOrder::NxK,
-        )?;
-        projection.forward(f, input, out)?;
-        arena.release(mark);
-        Ok(())
+        let out = f.empty(input.dtype, Shape::new(&[input.rows(), outputs]))?;
+        // The gathered rows are dead once the product is enqueued, so they live in a scope after
+        // the output.
+        f.scoped(|f| {
+            let wide = IndexRows.gather(f, self.weight.view(), step)?;
+            let narrow = IndexRows.gather(f, self.bias.view(), step)?;
+            let projection = Linear::new(
+                Weight::borrowed(wide.reshape(Shape::new(&[outputs, inputs])))?,
+                Some(Weight::borrowed(narrow.reshape(Shape::new(&[outputs])))?),
+                WeightOrder::NxK,
+            )?;
+            projection.launch(f, input, out)
+        })?;
+        Ok(out)
     }
 }

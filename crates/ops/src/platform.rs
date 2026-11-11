@@ -164,6 +164,26 @@ pub fn collective_type(dtype: DType) -> Option<CollectiveType> {
     })
 }
 
+/// Copies `bytes` bytes of host memory at `source` to `destination`, in stream order.
+///
+/// # Safety
+/// `source` is page-locked host memory holding `bytes` bytes that nothing overwrites until the copy
+/// completes, and `destination` holds `bytes` bytes on the stream's device and stays valid until
+/// then. A copy issued while the stream is captured reads `source` on every replay of the graph.
+pub unsafe fn copy_from_host(
+    destination: DevicePtr,
+    source: u64,
+    bytes: u64,
+    stream: &Stream,
+) -> crate::Result<()> {
+    let bytes = usize::try_from(bytes).map_err(|_| {
+        crate::Error::Shape(format!("a {bytes}-byte upload is larger than usize::MAX"))
+    })?;
+    // SAFETY: forwarded from the caller.
+    unsafe { platform::memcpy_async(destination.address(), source, bytes, stream) }
+        .map_err(crate::Error::from)
+}
+
 /// Fills `bytes` bytes at `destination` with zero, in stream order.
 ///
 /// # Safety

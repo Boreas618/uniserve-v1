@@ -1,30 +1,16 @@
-//! An encoded (NVFP4) expert stack: the loader joins it expert-major from the fields a checkpoint
-//! carries, and refuses a stack whose geometry or dtypes do not agree.
+//! A calibrated (NVFP4) Qwen3-MoE checkpoint through the family's real loading boundary: its
+//! projections load packed and its router dense, and a row-parallel packed projection reads its own
+//! rank's columns.
 //!
-//! The shard is written here, by hand, rather than through the `safetensors` crate's writer: the
-//! format is a header JSON plus a payload, which is exactly what our loader reads, while the crate's
-//! `Dtype` vocabulary is its writer's and (at the pinned 0.3) has no FP8 element at all. Writing the
-//! header ourselves keeps the workspace's pin untouched and lets a fixture state exactly the bytes a
-//! real NVFP4 checkpoint holds.
+//! The shard is written here, by hand: the format is a header JSON plus a payload, which is exactly
+//! what the loader reads, and a fixture states exactly the bytes a calibrated export holds (FP8
+//! scales among them, which the `safetensors` crate's writer cannot state).
 
 use std::path::Path;
 
-use nn::weights::{Nvfp4Names, RetainedWeights, WeightKey};
+use nn::weights::{RetainedWeights, WeightKey};
 use nn::{Backing, Checkpoint, DType, DevicePtr, Shape, WeightLoader};
-use ops::fp4::ScaleLayout;
 use tempfile::TempDir;
-
-/// Two experts, a `32 × 32` contraction: two E2M1 codes a byte along the contraction (a 16-byte
-/// packed row) and two scale blocks of sixteen per row.
-///
-/// The rows are a whole shuffle block on purpose. A deployment arranges the values in the product's
-/// row order, and that arrangement permutes blocks of thirty-two rows, so a fixture with fewer rows
-/// than one block cannot be published in the deployment's own layout — the loader refuses it, which
-/// is the check `a_stack_smaller_than_one_shuffle_block_is_refused` states.
-const EXPERTS: u32 = 2;
-const ROWS: u64 = 32;
-const CONTRACTION: u64 = 32;
-const BLOCK_ELEMENTS: u64 = 16;
 
 /// One tensor of the hand-written shard: name, extents, element type, payload.
 struct Tensor<'a> {
@@ -89,79 +75,6 @@ fn write_shard(dir: &Path, tensors: &[Tensor<'_>]) -> std::path::PathBuf {
     path
 }
 
-fn packed(seed: u8) -> Vec<u8> {
-    let count = (ROWS * (CONTRACTION / 2)) as usize;
-    (0..count)
-        .map(|index| seed.wrapping_add((index as u8).wrapping_mul(37)))
-        .collect()
-}
-
-fn scales(seed: u8) -> Vec<u8> {
-    // One E4M3 scale per sixteen contraction elements, one row per output row.
-    let count = (ROWS * (CONTRACTION / BLOCK_ELEMENTS)) as usize;
-    (0..count)
-        .map(|index| seed.wrapping_add(index as u8))
-        .collect()
-}
-
-/// One expert's tensor scale: a scalar in the checkpoint, one f32, which the loader turns into a
-/// `[experts]` reciprocal table — a weight, so no layer reads a device scalar to build a launch.
-fn tensor_scale(seed: u8) -> Vec<u8> {
-    f32::from(seed).to_le_bytes().to_vec()
-}
-
-/// A shard holding `projections` of every expert of `layers.0.mlp.experts`, in both encodings, with
-/// one scale element type for every expert.
-fn encoded_shard(projections: &[&str], packed_dtype: &str, scale_dtype: &str) -> TempDir {
-    encoded_shard_with(projections, packed_dtype, |_| scale_dtype.to_owned())
-}
-
-/// The same shard, with the block-scale element type chosen per expert: a checkpoint whose experts
-/// disagree is a misread stack, and one case below needs to write exactly that.
-fn encoded_shard_with(
-    projections: &[&str],
-    packed_dtype: &str,
-    scale_dtype: impl Fn(usize) -> String,
-) -> TempDir {
-    let dir = TempDir::new().unwrap_or_else(|error| panic!("a temporary directory: {error}"));
-    let mut owned: Vec<(String, Vec<u64>, String, Vec<u8>)> = Vec::new();
-    for expert in 0..EXPERTS {
-        for (index, projection) in projections.iter().enumerate() {
-            let stem = format!("model.layers.0.mlp.experts.{expert}.{projection}_proj");
-            let seed = 1 + (expert as u8) * 16 + index as u8;
-            owned.push((
-                format!("{stem}.weight"),
-                vec![ROWS, CONTRACTION / 2],
-                packed_dtype.to_owned(),
-                packed(seed),
-            ));
-            owned.push((
-                format!("{stem}.weight_scale"),
-                vec![ROWS, CONTRACTION / BLOCK_ELEMENTS],
-                scale_dtype(expert as usize),
-                scales(seed),
-            ));
-            owned.push((
-                format!("{stem}.weight_scale_2"),
-                Vec::new(),
-                "F32".to_owned(),
-                tensor_scale(seed),
-            ));
-        }
-    }
-    let borrowed: Vec<Tensor<'_>> = owned
-        .iter()
-        .map(|(name, shape, dtype, bytes)| Tensor {
-            name,
-            shape: shape.clone(),
-            dtype,
-            bytes: bytes.clone(),
-        })
-        .collect();
-    write_shard(dir.path(), &borrowed);
-    dir
-}
-
 /// A store that keeps what it was given, in host memory, the way a layer's store does.
 #[derive(Default)]
 struct Retaining {
@@ -195,158 +108,12 @@ impl RetainedWeights for Retaining {
     }
 }
 
-#[test]
-fn a_two_expert_encoded_stack_is_joined_expert_major_with_its_three_fields() {
-    let dir = encoded_shard(&["up", "gate"], "U8", "F8_E4M3");
-    let checkpoint = Checkpoint::open(dir.path()).expect("the shard opens");
-    let mut store = Retaining::default();
-    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
-
-    let stack = loader
-        .nvfp4_stack(
-            "layers.0.mlp.experts.up",
-            "model.layers.0.mlp.experts",
-            &["up_proj", "gate_proj"],
-            &(0..EXPERTS).collect::<Vec<u32>>(),
-            EXPERTS,
-            Nvfp4Names::vllm(),
-            nn::weights::ValueLayout::Shuffled {
-                epilogue_tile_m: 128,
-            },
-            ScaleLayout::Linear,
-            false,
-        )
-        .map(|(stack, _)| stack)
-        .expect("a two-expert encoded stack loads");
-
-    // The packed field: every expert's every projection, expert-major, `[experts · projections ·
-    // rows, columns/2]` — the row order the routed product reads.
-    assert_eq!(stack.values.view.dtype, DType::U8);
-    assert_eq!(
-        stack.values.view.shape.dims(),
-        &[u64::from(EXPERTS), 2 * ROWS, CONTRACTION / 2]
-    );
-    // The block scales keep the layout the loader was told to read, and one reciprocal per expert.
-    assert_eq!(stack.layout, ScaleLayout::Linear);
-    // The block-scale field is the shard's own element type and is published unchanged: a real
-    // ModelOpt export stores it as E4M3, and a loader that relabelled it U8 would hide which byte
-    // the kernel decodes.
-    assert_eq!(stack.scales.view.dtype, DType::F8E4M3);
-    // One tensor scale per (projection, expert). A checkpoint carries one `weight_scale_2` per
-    // projection tensor, so the two halves of `up_gate` generally differ and a kernel that used one
-    // for both would be wrong by their ratio; the published table is projection-major because the
-    // batched entry reads one packed row per projection.
-    assert_eq!(
-        stack.global_scale.view.shape.dims(),
-        &[2, u64::from(EXPERTS)]
-    );
-    let published = store
-        .published
-        .iter()
-        .find(|(_, _, dtype, shape, _)| *dtype == DType::F32 && shape.rank() == 2)
-        .expect("the loader publishes the tensor scale table");
-    let scales: Vec<f32> = published
-        .1
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|word| f32::from_le_bytes(*word))
-        .collect();
-    // The shard states the tensor scales in its own reading order — 1 and 2 for expert 0's up and
-    // gate, then 17 and 18 for expert 1's — and the published table is those scales, the factor the
-    // product multiplies by, projection-major: up's two experts, then gate's.
-    assert_eq!(scales, [1.0_f32, 17.0, 2.0, 18.0]);
-}
-
-#[test]
-fn a_packed_field_that_is_not_u8_is_refused_by_name() {
-    // The packed values declared as F32: the field holds codes, so this is a misread checkpoint.
-    let dir = encoded_shard(&["up"], "F32", "U8");
-    let checkpoint = Checkpoint::open(dir.path()).expect("the shard opens");
-    let mut store = Retaining::default();
-    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
-    let error = loader
-        .nvfp4_stack(
-            "layers.0.mlp.experts.up",
-            "model.layers.0.mlp.experts",
-            &["up_proj"],
-            &(0..EXPERTS).collect::<Vec<u32>>(),
-            EXPERTS,
-            Nvfp4Names::vllm(),
-            nn::weights::ValueLayout::Shuffled {
-                epilogue_tile_m: 128,
-            },
-            ScaleLayout::Linear,
-            false,
-        )
-        .map(|(stack, _)| stack)
-        .unwrap_err();
-    assert!(format!("{error}").contains("up_proj.weight"), "{error}");
-}
-
-#[test]
-fn a_stack_whose_experts_declare_different_scale_types_is_refused() {
-    // One set of views serves every expert, so the block-scale element type is the stack's, not the
-    // projection's: a checkpoint where one expert says E4M3 and the next says U8 is a misread stack,
-    // and reading it would decode one expert's scales with the other's rule.
-    let dir = encoded_shard_with(&["up"], "U8", |expert| match expert {
-        0 => "F8_E4M3".to_owned(),
-        _ => "U8".to_owned(),
-    });
-    let checkpoint = Checkpoint::open(dir.path()).expect("the shard opens");
-    let mut store = Retaining::default();
-    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
-    let error = loader
-        .nvfp4_stack(
-            "layers.0.mlp.experts.up",
-            "model.layers.0.mlp.experts",
-            &["up_proj"],
-            &(0..EXPERTS).collect::<Vec<u32>>(),
-            EXPERTS,
-            Nvfp4Names::vllm(),
-            nn::weights::ValueLayout::Shuffled {
-                epilogue_tile_m: 128,
-            },
-            ScaleLayout::Linear,
-            false,
-        )
-        .map(|(stack, _)| stack)
-        .unwrap_err();
-    let message = format!("{error}");
-    assert!(message.contains("weight_scale"), "{message}");
-}
-
-#[test]
-fn a_projection_the_shard_does_not_hold_is_refused_by_name() {
-    let dir = encoded_shard(&["up"], "U8", "U8");
-    let checkpoint = Checkpoint::open(dir.path()).expect("the shard opens");
-    let mut store = Retaining::default();
-    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
-    let error = loader
-        .nvfp4_stack(
-            "layers.0.mlp.experts.down",
-            "model.layers.0.mlp.experts",
-            &["down_proj"],
-            &(0..EXPERTS).collect::<Vec<u32>>(),
-            EXPERTS,
-            Nvfp4Names::vllm(),
-            nn::weights::ValueLayout::Shuffled {
-                epilogue_tile_m: 128,
-            },
-            ScaleLayout::Linear,
-            false,
-        )
-        .map(|(stack, _)| stack)
-        .unwrap_err();
-    assert!(format!("{error}").contains("down"), "{error}");
-}
-
 /// A whole tiny model whose **attention projections are packed** and whose router, norms and
 /// vocabulary are not — the checkpoint a calibrated export of this architecture states, one layer
 /// deep and small enough to write by hand.
 ///
 /// The expert stacks need 128 rows to be published in the product's own arrangement, and a packed
-/// projection needs its contraction whole sixteen-element blocks, so the smallest geometry that can
+/// projection reduces over whole sixteen-element blocks, so the smallest geometry that can
 /// carry both is 128 wide with 128 experts' worth of intermediate.
 const PACKED_HIDDEN: u64 = 128;
 const PACKED_VOCABULARY: u64 = 256;
@@ -438,8 +205,8 @@ fn packed_model_shard() -> TempDir {
         bf16(PACKED_EXPERTS * PACKED_HIDDEN),
     ));
 
-    // The four attention projections, packed: `q` and `o` contract over the hidden width, `k` and `v`
-    // over it too, and every one of them is a whole number of sixteen-element blocks.
+    // The four attention projections, packed: `q`, `k` and `v` reduce over the hidden width, `o` over
+    // the query width, and every one of them is a whole number of sixteen-element blocks.
     let mut packed_tensor = |name: String, rows: u64, columns: u64, seed: u8| {
         owned.push((
             format!("{name}.weight"),
@@ -739,16 +506,4 @@ fn a_rank_one_packed_projection_reads_its_own_columns() {
         );
     }
     assert_ne!(tables[0], tables[1], "the two ranks read different columns");
-}
-
-/// The permutation's test data is one-based on purpose, and this is where that is stated: the table
-/// is zero-padded, so a value of zero means a hole rather than a scale, and every value is shifted by
-/// one so that no genuine scale can be mistaken for padding.
-#[test]
-fn the_permutation_test_data_starts_at_one() {
-    assert_eq!(scale_byte(0), 1, "the first scale is one, not zero");
-    assert!(
-        scale_byte(254) != 0 && scale_byte(255) == 1,
-        "the pattern wraps away from zero"
-    );
 }

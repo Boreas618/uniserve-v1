@@ -181,54 +181,50 @@ impl<A> UlyssesAttention<A> {
         self.output.weight().dtype
     }
 
-    /// The rows the projections read: this member's own, or the whole sequence's gathered into
-    /// `gathered` when the deployment gathers.
+    /// The rows the projections read: this member's own `normalized` rows, or the whole sequence's
+    /// gathered into a fresh `[members · rows, hidden]` tensor when the deployment gathers.
     ///
     /// # Errors
     ///
-    /// When the gather refuses its views or the forward carries no split.
-    pub fn rows(
-        &self,
-        f: &Forward,
-        normalized: TensorView,
-        gathered: TensorView,
-    ) -> Result<TensorView> {
+    /// When the gather refuses its views, the arena cannot hold them or the forward carries no
+    /// split.
+    pub fn rows(&self, f: &Forward, normalized: TensorView) -> Result<TensorView> {
         if self.exchanges() && self.projection == Projection::Gather {
             self.require_split(f)?;
-            if gathered.numel() != normalized.numel() * u64::from(self.split.size) {
-                return Err(Error::shape(
-                    "UlyssesAttention",
-                    format!(
-                        "{} members gather {} elements each into {}",
-                        self.split.size,
-                        normalized.numel(),
-                        gathered.numel()
-                    ),
-                ));
-            }
+            let gathered = f.empty(
+                normalized.dtype,
+                Shape::new(&[
+                    normalized.rows() * u64::from(self.split.size),
+                    normalized.last(),
+                ]),
+            )?;
             f.all_gather(normalized, gathered)?;
             return Ok(gathered);
         }
         Ok(normalized)
     }
 
-    /// Projection `index` of `rows` for every member's heads, one member's `[rows, local]` block
-    /// after another in `staging`.
-    fn project_members(
-        &self,
-        f: &Forward,
-        index: usize,
-        rows: TensorView,
-        staging: TensorView,
-        local: u64,
-    ) -> Result<()> {
+    /// The width of this member's heads of one projection: `local heads · head_dim`.
+    fn local_width(&self) -> u64 {
+        u64::from(self.local_heads()) * u64::from(self.head_dim)
+    }
+
+    /// Projection `index` of `rows` for every member's heads: one member's `[rows, local]` block
+    /// after another in a fresh staging tensor, the exchange's send buffer.
+    fn project_members(&self, f: &Forward, index: usize, rows: TensorView) -> Result<TensorView> {
+        let local = self.local_width();
+        let members = self.input(index)?.members.as_slice();
+        let staging = f.empty(
+            rows.dtype,
+            Shape::new(&[members.len() as u64 * rows.rows(), local]),
+        )?;
         let shape = Shape::new(&[rows.rows(), local]);
         let block = rows.rows() * local;
-        for (member, projection) in self.input(index)?.members.iter().enumerate() {
+        for (member, projection) in members.iter().enumerate() {
             let at = staging.offset_elements(member as u64 * block);
-            projection.forward(f, rows, staging.at(at).reshape(shape))?;
+            projection.launch(f, rows, staging.at(at).reshape(shape))?;
         }
-        Ok(())
+        Ok(staging)
     }
 
     /// Input projection `index`.
@@ -241,33 +237,27 @@ impl<A> UlyssesAttention<A> {
         })
     }
 
-    /// Projection `index` of `rows` ([`Self::rows`]) as this member's heads of the whole sequence,
-    /// written into `out` `[sequence rows, local heads · head_dim]`; `staging` is the exchange's
-    /// send buffer.
+    /// Projection `index` of `rows` ([`Self::rows`]) as this member's heads of the whole sequence:
+    /// a fresh `[sequence rows, local heads · head_dim]` tensor.
     ///
     /// # Errors
     ///
-    /// When a projection or the exchange refuses its views.
-    pub fn project(
-        &self,
-        f: &Forward,
-        index: usize,
-        rows: TensorView,
-        staging: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
+    /// When a projection or the exchange refuses its views, or the arena cannot hold them.
+    pub fn project(&self, f: &Forward, index: usize, rows: TensorView) -> Result<TensorView> {
         match self.input(index)?.members.as_slice() {
-            [only] => only.forward(f, rows, out),
+            [only] => only.forward(f, rows),
             _ => {
-                self.project_members(f, index, rows, staging, out.shape.last())?;
-                self.exchange(f, staging, out)
+                let staging = self.project_members(f, index, rows)?;
+                let out = f.empty(staging.dtype, staging.shape)?;
+                self.exchange(f, staging, out)?;
+                Ok(out)
             }
         }
     }
 
     /// [`Self::project`] in the exchange mode, with the exchange started beside the forward's stream
-    /// rather than waited for: `out` is readable after [`Self::finish`] took the transfer up, and
-    /// `staging` belongs to the transfer until then.
+    /// rather than waited for: the answered tensor is readable after [`Self::finish`] took the
+    /// transfer up, and the send buffer belongs to the transfer until then.
     ///
     /// # Errors
     ///
@@ -277,13 +267,12 @@ impl<A> UlyssesAttention<A> {
         f: &Forward,
         index: usize,
         rows: TensorView,
-        staging: TensorView,
-        out: TensorView,
-    ) -> Result<Transfer> {
-        self.project_members(f, index, rows, staging, out.shape.last())?;
-        self.check_blocks(staging, out)?;
+    ) -> Result<(TensorView, Transfer)> {
+        let staging = self.project_members(f, index, rows)?;
+        let out = f.empty(staging.dtype, staging.shape)?;
         self.require_split(f)?;
-        f.start_all_to_all(staging, out)
+        let transfer = f.start_all_to_all(staging, out)?;
+        Ok((out, transfer))
     }
 
     /// Orders the forward's stream after `transfer`: what it received is readable from here on.
@@ -297,7 +286,8 @@ impl<A> UlyssesAttention<A> {
     }
 
     /// Starts delivering rows `first..first + count` of this member's `own` rows to every member,
-    /// and theirs here, in place in the whole sequence `gathered`.
+    /// and theirs here, in place in the whole sequence `gathered`, whose own block already holds
+    /// this member's rows.
     ///
     /// # Errors
     ///
@@ -314,66 +304,58 @@ impl<A> UlyssesAttention<A> {
         f.start_gather_rows(gathered, own, first, count)
     }
 
-    /// Returns `attended` `[sequence rows, local heads · head_dim]` to each member's rows and
-    /// projects this member's rows of every head into `out` `[own rows, hidden]`.
+    /// `attended` `[sequence rows, local heads · head_dim]` returned to each member's rows and this
+    /// member's rows of every head projected: a fresh `[own rows, hidden]` tensor.
     ///
-    /// With one member the attended rows are this member's and only the projection runs. `staging`
-    /// receives the members' blocks and `merged` holds them side by side, `[own rows, heads ·
-    /// head_dim]`.
+    /// With one member the attended rows are this member's and only the projection runs.
     ///
     /// # Errors
     ///
-    /// When the exchange, the merge or the projection refuses its views.
-    pub fn return_rows(
-        &self,
-        f: &Forward,
-        attended: TensorView,
-        staging: TensorView,
-        merged: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
+    /// When the exchange, the merge or the projection refuses its views, or the arena cannot hold
+    /// them.
+    pub fn return_rows(&self, f: &Forward, attended: TensorView) -> Result<TensorView> {
         if !self.exchanges() {
-            return self.output.forward(f, attended, out);
+            return self.output.forward(f, attended);
         }
+        let staging = f.empty(attended.dtype, attended.shape)?;
         self.exchange(f, attended, staging)?;
-        self.merge(f, staging, merged)?;
-        self.output.forward(f, merged, out)
+        let merged = self.merge(f, staging)?;
+        self.output.forward(f, merged)
     }
 
     /// Starts returning one interval's payload: block `m` of `payload` is member `m`'s rows of this
-    /// member's heads, and block `m` of `landed` will be this member's rows of member `m`'s heads.
+    /// member's heads, and block `m` of the answered tensor will be this member's rows of member
+    /// `m`'s heads once [`Self::receive`] took the transfer up.
     ///
     /// # Errors
     ///
-    /// When the blocks are unequal or the forward carries no split.
-    pub fn start_return(
-        &self,
-        f: &Forward,
-        payload: TensorView,
-        landed: TensorView,
-    ) -> Result<Transfer> {
+    /// When the payload is not equal blocks, the arena cannot hold the landing, or the forward
+    /// carries no split.
+    pub fn start_return(&self, f: &Forward, payload: TensorView) -> Result<(TensorView, Transfer)> {
+        let landed = f.empty(payload.dtype, payload.shape)?;
         self.check_blocks(payload, landed)?;
         self.require_split(f)?;
-        f.start_all_to_all(payload, landed)
+        let transfer = f.start_all_to_all(payload, landed)?;
+        Ok((landed, transfer))
     }
 
     /// Takes up a returning interval: waits for `transfer`, sets the `landed` blocks side by side
-    /// into `merged` `[count, heads · head_dim]` and projects them into `out` `[count, hidden]`.
+    /// into `[count, heads · head_dim]` and projects them into `destination`, the interval's
+    /// `[count, hidden]` rows of the layer's output, in place.
     ///
     /// # Errors
     ///
-    /// When the merge or the projection refuses its views.
+    /// When the merge or the projection refuses its views, or the arena cannot hold the merge.
     pub fn receive(
         &self,
         f: &Forward,
         transfer: Transfer,
         landed: TensorView,
-        merged: TensorView,
-        out: TensorView,
+        destination: TensorView,
     ) -> Result<()> {
         self.finish(f, transfer)?;
-        self.merge(f, landed, merged)?;
-        self.output.forward(f, merged, out)
+        let merged = self.merge(f, landed)?;
+        self.output.launch(f, merged, destination)
     }
 
     /// The intervals `own` rows return in: [`RETURN_SHARES`] of them, each ending on a multiple of
@@ -406,12 +388,13 @@ impl<A> UlyssesAttention<A> {
         f.all_to_all(send, recv)
     }
 
-    /// Sets the blocks of `received`, one per member, side by side in `out`
-    /// `[rows, members · local]`.
-    fn merge(&self, f: &Forward, received: TensorView, out: TensorView) -> Result<()> {
+    /// The blocks of `received`, one per member, set side by side in a fresh
+    /// `[rows, members · local]` tensor.
+    fn merge(&self, f: &Forward, received: TensorView) -> Result<TensorView> {
         let members = u64::from(self.split.size);
-        let rows = out.rows();
-        let local = out.shape.last() / members;
+        let local = self.local_width();
+        let rows = received.numel() / (members * local);
+        let out = f.empty(received.dtype, Shape::new(&[rows, members * local]))?;
         let block = [members, rows, 1, local];
         let source = received.reshape(Shape::new(&block));
         let destination = TensorView::with_strides(
@@ -421,7 +404,8 @@ impl<A> UlyssesAttention<A> {
             Strides::new(&[local, members * local, local, 1]),
         );
         let strides = [local as i64, (members * local) as i64, local as i64, 1];
-        Copy::new(out.dtype, Access::Vector)?.forward(f, source, destination, &strides)
+        Copy::new(out.dtype, Access::Vector)?.forward(f, source, destination, &strides)?;
+        Ok(out)
     }
 
     /// Refuses two buffers that are not the group's equal blocks of one element type.

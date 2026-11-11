@@ -321,7 +321,7 @@ impl StateBanks {
                 self.rows
             )));
         }
-        if f.is_recording() {
+        if !f.launches() {
             return Ok(());
         }
         for (live, trail) in self.live.iter().zip(&self.trail) {
@@ -458,7 +458,7 @@ impl StateBanks {
                 }
             }
         }
-        if !f.is_recording() {
+        if f.launches() {
             let fence = platform::Event::new(platform::EventFlags::default());
             fence.record(stream)?;
             self.fences[self.turn] = Some(fence);

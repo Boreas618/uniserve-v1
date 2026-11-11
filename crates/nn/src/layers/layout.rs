@@ -177,13 +177,14 @@ impl Patchify {
         Ok(grid)
     }
 
-    /// Pack `latent` `[channels, frames, rows, columns]` into `tokens` `[tokens, token_width]`.
+    /// `latent` `[channels, frames, rows, columns]` packed into fresh `[tokens, token_width]`
+    /// tokens of its element type, in raster order over the patch grid.
     ///
     /// # Errors
     ///
     /// A latent that is not whole patches, a patch other than `1 × 2 × 2` (the one the `patch`
-    /// operator packs), or the operator's refusal.
-    pub fn forward(&self, f: &Forward, latent: TensorView, tokens: TensorView) -> Result<()> {
+    /// operator packs), an arena that cannot hold the tokens, or the operator's refusal.
+    pub fn forward(&self, f: &Forward, latent: TensorView) -> Result<TensorView> {
         if (self.temporal, self.spatial) != (1, 2) {
             return Err(Error::shape(
                 "Patchify",
@@ -193,7 +194,9 @@ impl Patchify {
                 ),
             ));
         }
-        let [frames, _, _] = self.grid(latent.shape)?;
+        let [frames, height, width] = self.grid(latent.shape)?;
+        let count = u64::from(frames) * u64::from(height) * u64::from(width);
+        let tokens = f.empty(latent.dtype, ops::Shape::new(&[count, self.token_width()]))?;
         let narrow = |value: u64| {
             u32::try_from(value)
                 .map_err(|_| Error::shape("Patchify", format!("{value} overflows a kernel word")))
@@ -211,18 +214,25 @@ impl Patchify {
             height: narrow(latent.shape.dim(2))?,
             width: narrow(latent.shape.dim(3))?,
         };
-        f.operate::<Patch>(&descriptor, args)
+        f.operate::<Patch>(&descriptor, args)?;
+        Ok(tokens)
     }
 
-    /// Unpack `tokens` `[tokens, token_width]` into the raster `out` `[channels, frames, rows,
-    /// columns]`, whose extents state the patch grid; tokens past the grid are not read.
+    /// `tokens` `[tokens, token_width]` unpacked into a fresh planar raster of `raster`
+    /// `[channels, frames, rows, columns]` extents, which state the patch grid, in the tokens'
+    /// element type; tokens past the grid are not read.
     ///
     /// # Errors
     ///
-    /// A raster that is not whole patches, too few tokens or tokens of another width, or the
-    /// operator's refusal.
-    pub fn inverse(&self, f: &Forward, tokens: TensorView, out: TensorView) -> Result<()> {
-        let [frames, height, width] = self.grid(out.shape)?;
+    /// A raster that is not whole patches, too few tokens or tokens of another width, an arena that
+    /// cannot hold the raster, or the operator's refusal.
+    pub fn inverse(
+        &self,
+        f: &Forward,
+        tokens: TensorView,
+        raster: ops::Shape,
+    ) -> Result<TensorView> {
+        let [frames, height, width] = self.grid(raster)?;
         let count = u64::from(frames) * u64::from(height) * u64::from(width);
         if tokens.shape.rank() != 2
             || tokens.shape.dim(1) != self.token_width()
@@ -237,6 +247,7 @@ impl Patchify {
                 ),
             ));
         }
+        let out = f.empty(tokens.dtype, raster)?;
         // The affine form adds a per-channel scale and bias in the same pass; no consumer folds
         // one here, so the plain unpacking is the program.
         let descriptor = unpatchify::Descriptor {
@@ -258,7 +269,8 @@ impl Patchify {
             patch_height: self.spatial,
             patch_width: self.spatial,
         };
-        f.operate::<Unpatchify>(&descriptor, args)
+        f.operate::<Unpatchify>(&descriptor, args)?;
+        Ok(out)
     }
 }
 
@@ -288,22 +300,20 @@ mod tests {
         let view = |dims: &[u64]| arena.tensor(DType::F32, Shape::new(dims)).unwrap();
         let patchify = Patchify::new(16, 1, 2).unwrap();
         assert_eq!(patchify.token_width(), 64);
-        let latent = view(&[16, 3, 4, 6]);
-        let tokens = view(&[3 * 2 * 3, 64]);
-        assert!(patchify.forward(&f, latent, tokens).is_ok());
-        assert!(patchify.inverse(&f, tokens, latent).is_ok());
-        assert!(patchify.forward(&f, view(&[16, 3, 5, 6]), tokens).is_err());
-        assert!(patchify.forward(&f, view(&[8, 3, 4, 6]), tokens).is_err());
-        assert!(patchify.inverse(&f, view(&[17, 64]), latent).is_err());
-        assert!(patchify.inverse(&f, view(&[18, 32]), latent).is_err());
+        let raster = Shape::new(&[16, 3, 4, 6]);
+        let tokens = patchify.forward(&f, view(raster.dims())).unwrap();
+        assert_eq!(tokens.shape.dims(), [3 * 2 * 3, 64]);
+        let restored = patchify.inverse(&f, tokens, raster).unwrap();
+        assert_eq!(restored.shape, raster);
+        assert!(patchify.forward(&f, view(&[16, 3, 5, 6])).is_err());
+        assert!(patchify.forward(&f, view(&[8, 3, 4, 6])).is_err());
+        assert!(patchify.inverse(&f, view(&[17, 64]), raster).is_err());
+        assert!(patchify.inverse(&f, view(&[18, 32]), raster).is_err());
 
         let wide = Patchify::new(16, 2, 4).unwrap();
+        assert!(wide.forward(&f, view(&[16, 2, 4, 4])).is_err());
         assert!(
-            wide.forward(&f, view(&[16, 2, 4, 4]), view(&[1, 512]))
-                .is_err()
-        );
-        assert!(
-            wide.inverse(&f, view(&[1, 512]), view(&[16, 2, 4, 4]))
+            wide.inverse(&f, view(&[1, 512]), Shape::new(&[16, 2, 4, 4]))
                 .is_ok()
         );
     }

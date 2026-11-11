@@ -53,10 +53,8 @@ pub fn distinct<M: Denoiser + ?Sized>(
 mod tests {
     use super::*;
 
-    use nn::capability::{
-        ConditionShape, Conditioning, Seed, StateTable, Step, TableValues, VideoRequest,
-    };
-    use nn::{Error, Forward, Latents, Result};
+    use nn::capability::{ConditionShape, Conditioning, Seed, Step, VideoRequest};
+    use nn::{Forward, Latents, Result};
     use proto::video::{LatentShape, Layout};
 
     /// A denoiser whose layout is the only behaviour the collapse reads.
@@ -90,7 +88,12 @@ mod tests {
             unreachable!("the collapse draws nothing")
         }
 
-        fn prepare_conditioning(&self, _: &Forward, _: Conditioning<'_>) -> Result<()> {
+        fn prepare_conditioning(
+            &self,
+            _: &Forward,
+            _: &VideoRequest<'_>,
+            _: Conditioning<'_>,
+        ) -> Result<()> {
             // The collapse reads no conditioning: it is a shape probe, not a generation.
             Ok(())
         }
@@ -99,44 +102,18 @@ mod tests {
             unreachable!("the collapse prepares nothing")
         }
 
-        fn denoise(&self, _: &Forward, _: Step, _: Latents, _: Conditioning<'_>) -> Result<()> {
+        fn forward(
+            &self,
+            _: &Forward,
+            _: Step,
+            _: &VideoRequest<'_>,
+            _: Latents,
+            _: Conditioning<'_>,
+        ) -> Result<()> {
             unreachable!("the collapse denoises nothing")
         }
 
-        fn evaluations(&self) -> u32 {
-            1
-        }
-
-        fn constant_tables(&self) -> Vec<StateTable> {
-            Vec::new()
-        }
-
-        fn prepare_constants(&self, _: &Forward, _: &[ops::TensorView]) -> Result<()> {
-            Err(Error::Unsupported("no constants".into()))
-        }
-
-        fn layout_tables(&self, _: &Layout) -> Result<Vec<StateTable>> {
-            Ok(Vec::new())
-        }
-
-        fn prepare_layout(&self, _: &Layout, _: &mut [TableValues]) -> Result<()> {
-            Ok(())
-        }
-
-        fn state_tables(&self, _: &Layout) -> Result<Vec<StateTable>> {
-            Ok(Vec::new())
-        }
-
-        fn prepare_state(
-            &self,
-            _: &VideoRequest<'_>,
-            _: &Layout,
-            _: &mut [TableValues],
-        ) -> Result<()> {
-            Ok(())
-        }
-
-        fn prepare_evaluation(&self, _: u32, _: &mut [TableValues]) -> Result<()> {
+        fn initialize(&self, _: &Forward) -> Result<()> {
             Ok(())
         }
     }
@@ -184,7 +161,7 @@ mod tests {
 
     /// A caller's order decides which request represents a layout, so the collapse preserves it
     /// rather than sorting by the layout - a map's order would choose a different representative
-    /// and the chosen one writes the bucket's tables.
+    /// and the chosen one is the request the bucket is captured from.
     #[test]
     fn the_callers_order_decides_the_representative() {
         let model = Padding { tile: 4 };

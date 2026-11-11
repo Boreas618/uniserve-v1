@@ -47,6 +47,40 @@ use crate::forward::ALIGNMENT;
 use crate::quantization::{Declaration, Scheme};
 use crate::tensor::{Backing, DevicePtr};
 
+/// The two arrangements of an NVFP4 weight's block scales: the one the checkpoint stores them in,
+/// and the one the deployment's product reads. They are named apart so that a caller cannot pass
+/// one for the other; when they differ the loader permutes the table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScaleLayouts {
+    /// The checkpoint's arrangement.
+    pub file: ScaleLayout,
+    /// The product's arrangement.
+    pub product: ScaleLayout,
+}
+
+/// The experts a packed stack reads: expert `slots[s]`'s `projections` under `prefix`
+/// (`<prefix>.<expert>.<projection>`), of a router's `vocabulary` of experts.
+#[derive(Clone, Copy, Debug)]
+pub struct ExpertStack<'a> {
+    /// The module list holding the experts.
+    pub prefix: &'a str,
+    /// The projections stacked per expert, in the order the product reads them.
+    pub projections: &'a [&'a str],
+    /// The expert each slot of the stack holds.
+    pub slots: &'a [u32],
+    /// The router's whole vocabulary of experts.
+    pub vocabulary: u32,
+}
+
+/// The arrangements a packed stack is published in: its values' and its block scales'.
+#[derive(Clone, Copy, Debug)]
+pub struct StackLayout {
+    /// How the packed values are arranged.
+    pub values: ValueLayout,
+    /// How the block scales are arranged.
+    pub scales: ScaleLayout,
+}
+
 /// The suffix one export spells each field of a calibrated NVFP4 projection with.
 ///
 /// A calibrated checkpoint states a projection's fields as four tensor names that differ only in
@@ -94,8 +128,8 @@ impl Nvfp4Names {
     /// The diffusers/ModelOpt spelling: `weight_packed`, `weight_scale`, `weight_tensor_scale`,
     /// `input_scale`.
     ///
-    /// This is what a multi-component diffusers NVFP4 export states, in every component it
-    /// quantizes (e.g. a `transformer` and a `vae`), and a component may add `scale1`/`scale2`
+    /// This is what a multi-stage diffusers NVFP4 export states, in every stage it
+    /// quantizes (e.g. a `transformer` and a `vae`), and a stage may add `scale1`/`scale2`
     /// beside them for the layers ModelOpt calibrated in a second scheme.
     pub const fn diffusers() -> Self {
         Self {
@@ -917,7 +951,7 @@ const META_BASE: u64 = 1 << 48;
 /// The next address a meta loader hands out.
 ///
 /// Every meta loader of the process draws from this one cursor, so two loaders of one walk (one per
-/// pipeline component, say) never answer one address for two different weights.
+/// pipeline stage, say) never answer one address for two different weights.
 static META_CURSOR: AtomicU64 = AtomicU64::new(META_BASE);
 
 /// The tensor scale a meta loader answers for every calibrated scale it is asked for.
@@ -981,7 +1015,7 @@ enum Retention<'a> {
 
 /// One contiguous byte range of a checkpoint tensor that a weight's bytes are gathered from.
 ///
-/// A load plans its spans from the shard headers alone, so every bound a device load checks is
+/// A load computes its spans from the shard headers alone, so every bound a device load checks is
 /// checked by a meta load too, without a payload byte read; a device load then copies the spans in
 /// order.
 struct Span<'c> {
@@ -1340,7 +1374,7 @@ impl<'a> WeightLoader<'a> {
             return Ok(weight);
         }
 
-        // The bytes the request names, planned from the headers: every bound below is checked on
+        // The bytes the request names, computed from the headers: every bound below is checked on
         // a meta load as on a device load, and only the copy waits for the publish.
         let spans = self.spans(&request.source, &key)?;
         if source_dtype != dtype {
@@ -1496,15 +1530,15 @@ impl<'a> WeightLoader<'a> {
     /// Borrow this loader for another checkpoint: the same store, the same element-type and
     /// quantization policy, a different shard set.
     ///
-    /// A pipeline root holds one component per subdirectory (`transformer/`, `vae/`,
+    /// A pipeline root holds one stage per subdirectory (`transformer/`, `vae/`,
     /// `text_encoder/`, …), each with its own index and its own file identities, so a model crate
-    /// opens the root once and reads every component through one store: a weight converted once for
-    /// one component is reused for another and never converted twice. A meta loader's reborrow is a
+    /// opens the root once and reads every stage through one store: a weight converted once for
+    /// one stage is reused for another and never converted twice. A meta loader's reborrow is a
     /// meta loader over the same synthetic regions.
     ///
-    /// The policy is the loader's, not the component's, so a component that its policy does not
-    /// describe is refused here: an FP8-policy loader over a BF16 component, or a float policy over
-    /// a component whose weights are an FP8 or NVFP4 encoding, would read weights as something they
+    /// The policy is the loader's, not the stage's, so a stage that its policy does not
+    /// describe is refused here: an FP8-policy loader over a BF16 stage, or a float policy over
+    /// a stage whose weights are an FP8 or NVFP4 encoding, would read weights as something they
     /// are not, which is a wrong answer rather than a convenience. A model that needs two policies
     /// builds two loaders over the same store.
     pub fn reborrow<'b>(&'b mut self, checkpoint: &'b Checkpoint) -> Result<WeightLoader<'b>> {
@@ -1582,19 +1616,16 @@ impl<'a> WeightLoader<'a> {
     /// reciprocal of the checkpoint's FP32 tensor
     /// scale, the scalar `nvfp4_quantize` takes. The product op's `alpha` is the two tensor
     /// scales' product, which the runner copies into one device scalar once at load.
-    // The two arrangements are separate arguments on purpose: one is the file's statement, the other
-    // the deployment's, and naming both is what keeps a caller from passing one for the other.
-    #[allow(clippy::too_many_arguments)]
     pub fn nvfp4(
         &mut self,
         values: &WeightRequest,
         scales: &WeightRequest,
         input_scale: Option<&WeightRequest>,
         names: Nvfp4Names,
-        file: ScaleLayout,
-        product: ScaleLayout,
+        layouts: ScaleLayouts,
         global_scale: f32,
     ) -> Result<QuantizedWeight> {
+        let ScaleLayouts { file, product } = layouts;
         // The requests name the fields, so their absence is where a wrong vocabulary shows up: a
         // checkpoint opened as the other export's spelling has a `weight_packed` where this asked
         // for a `weight`, and the refusal says which spelling was expected and why.
@@ -1921,23 +1952,24 @@ impl<'a> WeightLoader<'a> {
     /// weight needs its own name. A block-scale layout whose per-expert entry is padded, or a row
     /// count that would break the shuffle's blocks, is refused here rather than read as a table no
     /// program expects.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the stack is named by its parts: its name, the experts' module, the projections, \
-                  the slots, the vocabulary, the export's spelling and the two layouts"
-    )]
     pub fn nvfp4_stack(
         &mut self,
         name: &str,
-        prefix: &str,
-        projections: &[&str],
-        slots: &[u32],
-        vocabulary: u32,
+        stack: ExpertStack<'_>,
         names: Nvfp4Names,
-        values_layout: ValueLayout,
-        layout: ScaleLayout,
+        layout: StackLayout,
         input_scale: bool,
     ) -> Result<(QuantizedStack, Vec<f32>)> {
+        let ExpertStack {
+            prefix,
+            projections,
+            slots,
+            vocabulary,
+        } = stack;
+        let StackLayout {
+            values: values_layout,
+            scales: layout,
+        } = layout;
         let calibrated = input_scale;
         let experts = u32::try_from(slots.len())
             .map_err(|_| Error::weight(name, "more slots than a stack holds".to_owned()))?;
@@ -2437,7 +2469,7 @@ impl<'a> WeightLoader<'a> {
         Ok(dtype)
     }
 
-    /// The byte ranges a source names, in the source's logical order, planned from the headers.
+    /// The byte ranges a source names, in the source's logical order, computed from the headers.
     ///
     /// Every bound is checked against the length the header states for each tensor, which is the
     /// length of the payload slice a device load copies from.

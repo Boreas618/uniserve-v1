@@ -32,7 +32,6 @@
 
 use ops::{DType, Shape, Strides, TensorView};
 
-use crate::capability::StateTable;
 use crate::error::{Error, Result};
 use crate::forward::Forward;
 use crate::layers::{Axpby, IndexRows, Residual, Scale};
@@ -198,8 +197,8 @@ impl Euler {
 
     /// Advance `sample` in place by `velocity` over the step `step` names.
     ///
-    /// `step` is the caller's `[1]` i32 step index on the device and `gathered` one FP32 word the
-    /// step's coefficient is gathered into; `sample` and `velocity` are contiguous views of one
+    /// `step` is the caller's `[1]` i32 step index on the device; the step's FP32 coefficient is
+    /// gathered into the forward's arena. `sample` and `velocity` are contiguous views of one
     /// element count and one element type.
     ///
     /// # Errors
@@ -211,7 +210,6 @@ impl Euler {
         sample: TensorView,
         velocity: TensorView,
         step: TensorView,
-        gathered: TensorView,
     ) -> Result<()> {
         let (sample, velocity) = (elements(sample)?, elements(velocity)?);
         if sample.shape != velocity.shape || sample.dtype != velocity.dtype {
@@ -226,13 +224,14 @@ impl Euler {
                 ),
             ));
         }
-        IndexRows.gather(f, self.coefficients.view(), step, gathered)?;
+        let gathered = IndexRows.gather(f, self.coefficients.view(), step)?;
         let scale = Weight {
             backing: crate::Backing::new(gathered.ptr, 4),
             view: gathered.reshape(Shape::new(&[1])),
         };
         // A one-channel scale: every element of the sample's single column reads it.
-        Residual::new(Scale::Channel(scale), None)?.forward(f, sample, velocity, None, sample)
+        Residual::new(Scale::Channel(scale), None)?.forward(f, sample, velocity, None)?;
+        Ok(())
     }
 
     /// Scale a fresh draw `sample` in place to the schedule's first level.
@@ -247,7 +246,8 @@ impl Euler {
             return Ok(());
         };
         let sample = elements(sample)?;
-        start.forward(f, sample, sample, None, sample)
+        start.forward(f, sample, sample, None)?;
+        Ok(())
     }
 }
 
@@ -304,7 +304,11 @@ pub struct TimestepTableSpec {
 pub struct TimestepTable {
     frequencies: Weight,
     entries: Weight,
-    spec: TimestepTableSpec,
+    /// `[layers, entries, layer_columns]`: each block's modulation at each entry, written once by
+    /// the model's projections after the load ([`Scope::writable_zeros`]).
+    layers: Weight,
+    /// `[entries, output_columns]`: the final norm's modulation at each entry, written likewise.
+    output: Weight,
 }
 
 impl TimestepTable {
@@ -352,8 +356,9 @@ impl TimestepTable {
 
     /// The table of `levels` (step-major, `groups` per step) under `scope`.
     ///
-    /// Publishes `frequencies` and `entries` as constants; the modulation tables are the runtime's
-    /// ([`Self::tables`]).
+    /// Publishes `frequencies` and `entries` as constants, and reserves the modulation tables as
+    /// this module's writable constants, which the model's projections fill once after the load
+    /// ([`Self::layer_table`], [`Self::output_table`]).
     ///
     /// # Errors
     ///
@@ -375,77 +380,17 @@ impl TimestepTable {
         // One row per step of the levels, which may be more rows than distinct entries.
         let steps = (table.len() / groups as usize) as u64;
         let entry_table = scope.constant_i32("entries", &[steps, u64::from(groups)], &table)?;
+        let layers = scope.writable_zeros(
+            "layers",
+            spec.dtype,
+            &[u64::from(spec.layers), entries, spec.layer_columns],
+        )?;
+        let output = scope.writable_zeros("output", spec.dtype, &[entries, spec.output_columns])?;
         Ok(Self {
             frequencies,
             entries: entry_table,
-            spec,
-        })
-    }
-
-    /// The distinct levels the table holds a row of.
-    fn rows(&self) -> u64 {
-        self.frequencies.shape().dim(0)
-    }
-
-    /// The modulation tables the runtime allocates for this table, in [`Self::bind`]'s order:
-    /// `[layers, entries, layer_columns]` and `[entries, output_columns]`, of the spec's element
-    /// type. Their extents follow from the schedule and the stack's widths alone.
-    pub fn tables(&self) -> Vec<StateTable> {
-        let entries = self.rows();
-        vec![
-            StateTable {
-                name: "timestep_layers",
-                dtype: self.spec.dtype,
-                shape: Shape::new(&[
-                    u64::from(self.spec.layers),
-                    entries,
-                    self.spec.layer_columns,
-                ]),
-            },
-            StateTable {
-                name: "timestep_output",
-                dtype: self.spec.dtype,
-                shape: Shape::new(&[entries, self.spec.output_columns]),
-            },
-        ]
-    }
-
-    /// This table over the runtime's `tables`, the views of [`Self::tables`] in its order.
-    ///
-    /// # Errors
-    ///
-    /// Views of another count, element type or extent than the tables state.
-    pub fn bind<'t>(&'t self, tables: &[TensorView]) -> Result<TimestepRows<'t>> {
-        let stated = self.tables();
-        if tables.len() != stated.len() {
-            return Err(Error::shape(
-                "TimestepTable",
-                format!(
-                    "{} tables were bound, {} are stated",
-                    tables.len(),
-                    stated.len()
-                ),
-            ));
-        }
-        for (view, table) in tables.iter().zip(&stated) {
-            if view.dtype != table.dtype || view.shape != table.shape {
-                return Err(Error::shape(
-                    "TimestepTable",
-                    format!(
-                        "{} is {} {:?}, {} {:?} is stated",
-                        table.name,
-                        view.dtype,
-                        view.shape.dims(),
-                        table.dtype,
-                        table.shape.dims()
-                    ),
-                ));
-            }
-        }
-        Ok(TimestepRows {
-            table: self,
-            layers: tables[0],
-            output: tables[1],
+            layers,
+            output,
         })
     }
 
@@ -464,86 +409,66 @@ impl TimestepTable {
         self.frequencies.view()
     }
 
-    /// The entries step `step` reads: `step` is `[1]` i32 on the device and `out` `[1, groups]`
-    /// i32.
+    /// The entries step `step` reads: `step` is `[1]` i32 on the device, and the answer a fresh
+    /// `[1, groups]` i32 tensor.
     ///
     /// # Errors
     ///
-    /// The gather's refusal.
-    pub fn entries_of(&self, f: &Forward, step: TensorView, out: TensorView) -> Result<()> {
-        IndexRows.gather(f, self.entries.view(), step, out)
+    /// The gather's refusal, or an arena that cannot hold the entries.
+    pub fn entries_of(&self, f: &Forward, step: TensorView) -> Result<TensorView> {
+        IndexRows.gather(f, self.entries.view(), step)
     }
 }
 
-/// A [`TimestepTable`] bound to the runtime's modulation tables: what the model fills once and
-/// every step gathers from.
-#[derive(Clone, Copy)]
-pub struct TimestepRows<'t> {
-    table: &'t TimestepTable,
-    /// `[layers, entries, layer_columns]`.
-    layers: TensorView,
-    /// `[entries, output_columns]`.
-    output: TensorView,
-}
-
-impl TimestepRows<'_> {
-    /// The table these rows belong to.
-    pub fn table(&self) -> &TimestepTable {
-        self.table
-    }
-
-    /// Block `layer`'s `[entries, layer_columns]` table.
+impl TimestepTable {
+    /// Block `layer`'s `[entries, layer_columns]` table, which the model writes once after the load
+    /// and every step gathers from.
     ///
     /// # Errors
     ///
     /// A block the table does not hold.
     pub fn layer_table(&self, layer: usize) -> Result<TensorView> {
-        let layers = self.layers.shape.dim(0);
-        if layer as u64 >= layers {
+        let layers = self.layers.view();
+        let count = layers.shape.dim(0);
+        if layer as u64 >= count {
             return Err(Error::shape(
                 "TimestepTable",
-                format!("{layers} block tables, not block {layer}"),
+                format!("{count} block tables, not block {layer}"),
             ));
         }
-        let shape = Shape::new(&[self.layers.shape.dim(1), self.layers.shape.dim(2)]);
-        Ok(self.layers.narrow(0, layer as u64, 1)?.reshape(shape))
+        let shape = Shape::new(&[layers.shape.dim(1), layers.shape.dim(2)]);
+        Ok(layers.narrow(0, layer as u64, 1)?.reshape(shape))
     }
 
-    /// The final norm's `[entries, output_columns]` table.
+    /// The final norm's `[entries, output_columns]` table, written once after the load.
     pub fn output_table(&self) -> TensorView {
-        self.output
+        self.output.view()
     }
 
     /// Block `layer`'s modulation rows at `entries` (the `[1, groups]` view
-    /// [`TimestepTable::entries_of`] wrote), into `out` `[groups, layer_columns]`.
+    /// [`Self::entries_of`] answered): a fresh `[groups, layer_columns]` tensor.
     ///
     /// # Errors
     ///
-    /// A block the table does not hold, or the gather's refusal.
-    pub fn layer(
-        &self,
-        f: &Forward,
-        layer: usize,
-        entries: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
-        IndexRows.gather(f, self.layer_table(layer)?, flat(entries), out)
+    /// A block the table does not hold, the gather's refusal, or an arena that cannot hold the rows.
+    pub fn layer(&self, f: &Forward, layer: usize, entries: TensorView) -> Result<TensorView> {
+        IndexRows.gather(f, self.layer_table(layer)?, flat(entries))
     }
 
-    /// The final norm's modulation rows at `entries`, into `out` `[groups, output_columns]`.
+    /// The final norm's modulation rows at `entries`: a fresh `[groups, output_columns]` tensor.
     ///
     /// # Errors
     ///
-    /// The gather's refusal.
-    pub fn output(&self, f: &Forward, entries: TensorView, out: TensorView) -> Result<()> {
-        IndexRows.gather(f, self.output, flat(entries), out)
+    /// The gather's refusal, or an arena that cannot hold the rows.
+    pub fn output(&self, f: &Forward, entries: TensorView) -> Result<TensorView> {
+        IndexRows.gather(f, self.output.view(), flat(entries))
     }
 }
 
 /// A `[1, groups]` entry list as the one-axis index list a gather takes.
 ///
-/// [`TimestepTable::entries_of`] writes `[1, groups]` because the gather derives its output rows
-/// from `out`; the block and output gathers read the same bytes as `[groups]` indices.
+/// [`TimestepTable::entries_of`] answers `[1, groups]`, one row of the entry table; the block and
+/// output gathers read the same bytes as `[groups]` indices.
 fn flat(entries: TensorView) -> TensorView {
     entries.reshape(Shape::new(&[entries.shape.numel()]))
 }

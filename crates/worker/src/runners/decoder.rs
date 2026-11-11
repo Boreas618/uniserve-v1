@@ -7,8 +7,8 @@
 //! runs through - and it differs in two ways that belong here rather than in the model:
 //!
 //! **Its extent is a raster and its graphs are keyed by latents.** A decode bucket states the frames,
-//! rows and columns of the media a clip decodes *to*; the tables, the arena and the captured graph
-//! belong to the latents it decodes *from*. The ratios between the two are the checkpoint's, so the
+//! rows and columns of the media a clip decodes *to*; the arena and the captured graph belong to
+//! the latents it decodes *from*. The ratios between the two are the checkpoint's, so the
 //! model states the map ([`nn::capability::Decoder::layout_of`]) and this file never divides by a
 //! temporal or spatial compression.
 //!
@@ -17,16 +17,11 @@
 //! products instead, which is why that runner allocates its output from the arena and this one does
 //! not.
 //!
-//! Its inputs are the model's own buffers. A media batch's columns are opaque bytes
-//! (`batch::MediaColumns`): the model prepared them per request, in the order
-//! [`nn::capability::Decoder::decode`] reads them, and this file copies them to device storage without
-//! interpreting one of them. The order is stated once, by the model, in `prepare_layout`'s doc and in
-//! the capability's: the first buffer is the clip's latents, and the rest are the tables
-//! `layout_tables` names, in that order.
-//!
-//! **The tables are the model's and the clip is the denoiser's.** A layout's tables are prepared
-//! here, from `prepare_layout`, because a batch that carried them would state the model's layout
-//! arithmetic a second time. The trajectory is not this runner's to compute either: a denoise step
+//! **The decode's values are the model's and the clip is the denoiser's.** What a decode reads
+//! beyond its latents (copy-block offsets, rotary positions) the model computes inside
+//! [`nn::capability::Decoder::decode`] from the layout and uploads through the runner's staging
+//! regions; before each replay the same decode runs in staging mode. The trajectory is not this
+//! runner's to compute either: a denoise step
 //! publishes it under the request's name, so `stage` copies it from the product store - ordered on
 //! this runner's stream, which also works when the denoiser ran on another device - and reads a
 //! batch buffer as the clip only when the store holds none.
@@ -48,7 +43,7 @@ use crate::runners::lifecycle::{Lifecycle, RunnerLifecycle};
 use crate::runners::output::RgbBytes;
 use crate::runners::products::{Product, Products};
 use crate::runners::recording::{Footprint, Walk};
-use crate::runners::tables::Tables;
+use crate::staging::StagingRegion;
 use crate::{Error, Result};
 use ipc::execution::{Batch, BatchOutput, CallId};
 use ipc::execution::{Extent, Variant};
@@ -80,10 +75,7 @@ struct DecoderColumns {
 }
 
 impl DecoderColumns {
-    /// The clip's own two columns. **The tables are not here:** `Tables` holds them by
-    /// `(layout, name)` and `fill` puts the model's bytes in the cache the graph addresses
-    /// (`walk` reads `self.tables.views`), so a host column per table would be a second copy that
-    /// nothing reads — and the second copy is what let a staged buffer land in a table's place.
+    /// The clip's own two columns.
     fn new(
         device: DeviceId,
         layout: &Layout,
@@ -132,7 +124,6 @@ pub struct DecoderRunner<M: Decoder + Send + Sync + ?Sized> {
     device: DeviceId,
     stream: platform::Stream,
     counters: Option<Arc<crate::device::SharedCounters>>,
-    tables: Tables,
     /// The model's own map from each bucket's raster to the latents its graph is keyed by, asked once
     /// at bind: a bucket the model refuses is a plan that names a canvas its decoder does not serve,
     /// and the refusal belongs at load rather than at a capture.
@@ -293,7 +284,6 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
             device: binding.device,
             stream: binding.stream,
             counters: None,
-            tables: Tables::new(),
             layouts,
             dtype,
             latent,
@@ -374,41 +364,6 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
                 "no latent layout was mapped for the decode bucket of {bucket}"
             ))
         })
-    }
-
-    /// The key a layout's tables are held under.
-    ///
-    /// The bucket's extent states the raster and its layout states the latents, and the tables are
-    /// keyed by the second: two canvases of one decoder are two table sets, and a canvas never reads
-    /// another's.
-    fn key(bucket: Bucket) -> String {
-        format!("decode-{:?}-{}", bucket.extent, bucket.rows)
-    }
-
-    /// The bytes `bucket`'s tables need, as the plan books them before admission (4.3).
-    pub fn table_bytes(model: &M, bucket: Bucket) -> Result<u64> {
-        let layout = Self::layout_of(model, bucket)?;
-        let tables = model.layout_tables(&layout).map_err(Error::from)?;
-        Tables::plan_bytes(&tables)
-    }
-
-    /// Allocates and fills `bucket`'s layout tables, on the device thread, outside any step.
-    fn fill(&mut self, bucket: Bucket) -> Result<()> {
-        let layout = self.layout(bucket)?;
-        let tables = self.model.layout_tables(&layout).map_err(Error::from)?;
-        if tables.is_empty() {
-            return Ok(());
-        }
-        let key = Self::key(bucket);
-        let model = Arc::clone(&self.model);
-        self.tables.fill(
-            self.device,
-            &self.stream,
-            self.lifecycle.generation.number(),
-            &key,
-            &tables,
-            |host| model.prepare_layout(&layout, host).map_err(Error::from),
-        )
     }
 
     /// Sizes this runner's raster column for `bucket`'s clip, the first time a bucket is staged.
@@ -498,21 +453,10 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
         Ok(buffers)
     }
 
-    /// Stages `bucket`'s latents, and the model's own tables where the cache does not hold them.
+    /// Stages `bucket`'s latents.
     ///
-    /// **Every table is the model's and every table lives in `Tables`.** `prepare_layout` writes the
-    /// bytes from the layout and `fill` puts them in the cache the captured graph addresses, keyed
-    /// by `(layout, name)` - so this function stages the clip's latents and nothing else. A batch
-    /// that carried tables would state the model's layout arithmetic a second time, which
-    /// `MediaColumns::staged` already rules out: "It does not own what the model prepares on the
-    /// device - the encoded conditioning rows, the latent trajectory".
-    ///
-    /// A warm capture passes no latents, and **the model supplies no clip for one**: `prepare_layout`
-    /// stages this decoder's *tables* (`video_vae`'s is one `video_positions` table), not a latent
-    /// trajectory, so the column is zeroed - defined values in its own element type, which is what a
-    /// capture needs and all it needs. Reading `prepare_layout`'s first buffer as a clip was wrong in
-    /// the direction that does not fail: a table's bytes are shorter than the clip, so they were
-    /// written over the front of the column and the capture read a clip made of rotary positions.
+    /// A warm capture passes no latents, so the column is zeroed - defined values in its own element
+    /// type, which is what a capture needs and all it needs.
     ///
     /// A replay passes the batch's buffer - a staged row is the request's conditioning blob and its
     /// parameter record - but `stage` reaches this only when the product store holds no trajectory
@@ -520,9 +464,6 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
     fn stage_columns(&mut self, bucket: Bucket, latents: Option<&[u8]>) -> Result<()> {
         self.size_raster(bucket)?;
         self.layout(bucket)?;
-        // The tables the graph addresses, in the cache they are keyed in. `prepare_layout` is asked
-        // exactly once per layout, here, and its bytes never touch the latents column.
-        self.fill(bucket)?;
         match latents {
             Some(bytes) => {
                 // The column is the model's extent for this layout, so a blob of another length is
@@ -613,7 +554,6 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
         store: &dyn Products,
     ) -> Result<()> {
         self.size_raster(bucket)?;
-        self.fill(bucket)?;
         let Some(published) = store.product(request, Product::VideoLatents)? else {
             return Err(crate::runners::products::absent(
                 request,
@@ -663,7 +603,8 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
         let arena = self.lifecycle.arena()?;
-        let forward = nn::Forward::new(&stream, &kernels, &arena);
+        let staging = self.lifecycle.staging.slot()?;
+        let forward = nn::Forward::new(&stream, &kernels, &arena).with_staging(staging);
         let column = self
             .trajectory
             .as_ref()
@@ -673,7 +614,8 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
             self.latent,
             Shape::new(&[self.trajectory_elements]),
         );
-        self.gather(&forward, bucket, trajectory, first)
+        self.gather(&forward, bucket, trajectory, first)?;
+        self.lifecycle.staging.release(&stream)
     }
 
     /// Gathers the clip starting at latent frame `first` of `trajectory` into the latents column:
@@ -794,21 +736,15 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
         Ok(())
     }
 
-    /// Decodes the staged clip of `layout` into `raster` on `forward`, over the layout's tables
-    /// `state`: the model call a capture walk records and the recorded walk records.
-    fn decode(
-        &self,
-        forward: &nn::Forward<'_>,
-        layout: &Layout,
-        state: &[TensorView],
-        raster: TensorView,
-    ) -> Result<()> {
+    /// Decodes the staged clip of `layout` into `raster` on `forward`: the model call a capture
+    /// walk records, the staging walk before each replay repeats, and the recorded walk records.
+    fn decode(&self, forward: &nn::Forward<'_>, layout: &Layout, raster: TensorView) -> Result<()> {
         let latents = self.latents(layout)?;
         self.model
             .decode(
                 forward,
+                layout,
                 latents,
-                state,
                 DecodedMedia {
                     video: Some(raster),
                     // A video decoder writes frames; a bucket that states a clip states no audio, so
@@ -837,11 +773,10 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
             trajectory,
             self.model.clip_start(0),
         )?;
-        walk.arena().reset();
-        let state = walk.tables(&self.model.layout_tables(&layout).map_err(Error::from)?)?;
+        walk.reset();
         let raster = self.raster_shape(bucket)?;
         let raster = walk.placeholder(self.dtype, raster)?;
-        self.decode(&walk.forward(None)?, &layout, &state, raster)?;
+        self.decode(&walk.forward(None)?, &layout, raster)?;
         let Some(postprocessor) = self.postprocessor.as_deref() else {
             return Ok(());
         };
@@ -855,7 +790,7 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
             let clips = u32::try_from(schedule.len())
                 .map_err(|_| Error::Invalid("a timeline of more clips than a u32 counts".into()))?;
             for (index, splice) in (0..clips).zip(schedule.iter().copied()) {
-                walk.arena().reset();
+                walk.reset();
                 let successor = tail_for_successor(&schedule, index);
                 let previous = (splice.overlap > 0)
                     .then(|| {
@@ -907,9 +842,17 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
         let arena = self.lifecycle.arena()?;
-        let forward = nn::Forward::new(&stream, &kernels, &arena);
         self.layout(bucket)?;
-        self.splice_clip(&forward, bucket)
+        // The splice updates this runner's tail bookkeeping, so the staging regions are held apart
+        // from it for the call: moving them moves their handles, not the memory graphs address.
+        let regions = std::mem::replace(&mut self.lifecycle.staging, StagingRegion::empty());
+        let spliced = regions.slot().and_then(|staging| {
+            let forward = nn::Forward::new(&stream, &kernels, &arena).with_staging(staging);
+            self.splice_clip(&forward, bucket)?;
+            regions.release(&stream)
+        });
+        self.lifecycle.staging = regions;
+        spliced
     }
 
     /// Writes the clip a replay just decoded into its request's timeline.
@@ -1329,9 +1272,6 @@ impl<M: Decoder + Send + Sync + ?Sized> Runner for DecoderRunner<M> {
 
     fn purge(&mut self, generation: u64) {
         self.lifecycle.purge(generation);
-        // A generation's tables are charged to resident and retire with it, the same rule as its
-        // weights, so the release is here beside the graphs rather than on a second path (4.3).
-        self.tables.release(generation);
     }
 
     fn attach_products(&mut self, products: Arc<dyn Products>) {
@@ -1349,7 +1289,6 @@ impl<M: Decoder + Send + Sync + ?Sized> Runner for DecoderRunner<M> {
     }
 
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
-        self.tables.attach(Arc::clone(&pools));
         self.lifecycle.attach_pools(pools);
     }
 
@@ -1362,7 +1301,6 @@ impl<M: Decoder + Send + Sync + ?Sized> Runner for DecoderRunner<M> {
             Job::Replay {
                 bucket, generation, ..
             } => {
-                let stream = self.stream.clone();
                 match self.gather.take() {
                     Some(first) => self.gather_replayed(*bucket, *generation, first)?,
                     None => self.upload()?,
@@ -1386,7 +1324,13 @@ impl<M: Decoder + Send + Sync + ?Sized> Runner for DecoderRunner<M> {
                     );
                 }
                 let launched = std::time::Instant::now();
-                captured.launch(&stream)?;
+                // The staging walk runs the decode the graph was captured from, so the values its
+                // captured copies read are this layout's.
+                let layout = self.layout(*bucket)?;
+                let raster = self.raster(*bucket)?;
+                self.lifecycle.replay(captured, |arena, staging| {
+                    self.decode(&nn::Forward::staging(arena, staging), &layout, raster)
+                })?;
                 if let Some(counters) = &self.counters {
                     counters.launches(captured.kernel_nodes());
                 }
@@ -1455,18 +1399,11 @@ impl<M: Decoder + Send + Sync + ?Sized> RunnerLifecycle for DecoderRunner<M> {
             .begin(self.lifecycle.stream_id(), bucket)?;
         self.upload()?;
         let arena = self.lifecycle.arena()?;
-        let forward = nn::Forward::new(&stream, generation, &arena);
+        let staging = self.lifecycle.staging.captured(&stream)?;
+        let forward = nn::Forward::new(&stream, generation, &arena).with_staging(staging);
         let layout = self.layout(bucket)?;
-        let tables = self.model.layout_tables(&layout).map_err(Error::from)?;
-        let key = Self::key(bucket);
-        if !tables.is_empty() {
-            self.fill(bucket)?;
-        }
-        let state = self
-            .tables
-            .views(self.lifecycle.generation.number(), &key, &tables)?;
         let raster = self.raster(bucket)?;
-        self.decode(&forward, &layout, &state, raster)?;
+        self.decode(&forward, &layout, raster)?;
         if first {
             self.lifecycle
                 .pool()?
@@ -1551,7 +1488,6 @@ mod tests {
         }
     }
     use super::*;
-    use nn::capability::{StateTable, TableValues};
 
     /// The clip the stub decoder serves, and the layout it decodes it from.
     const SERVED: (u32, u32, u32) = (2, 3, 4);
@@ -1571,30 +1507,10 @@ mod tests {
         }
     }
 
-    /// A decoder that serves one canvas and refuses every other, with two tables of known sizes.
+    /// A decoder that serves one canvas and refuses every other.
     struct Fixed;
 
     impl Decoder for Fixed {
-        fn layout_tables(&self, _layout: &Layout) -> nn::Result<Vec<StateTable>> {
-            Ok(vec![
-                StateTable {
-                    name: "positions",
-                    dtype: DType::F32,
-                    shape: Shape::new(&[6]),
-                },
-                StateTable {
-                    name: "offsets",
-                    dtype: DType::I32,
-                    shape: Shape::new(&[2, 3]),
-                },
-            ])
-        }
-
-        fn prepare_layout(&self, _layout: &Layout, _out: &mut [TableValues]) -> nn::Result<()> {
-            // The tables arrive zeroed, which is what this decoder states for them.
-            Ok(())
-        }
-
         fn element_type(&self) -> DType {
             DType::F16
         }
@@ -1612,8 +1528,8 @@ mod tests {
         fn decode(
             &self,
             _f: &nn::Forward,
+            _layout: &Layout,
             _latents: TensorView,
-            _state: &[TensorView],
             _out: DecodedMedia,
         ) -> nn::Result<()> {
             Ok(())
@@ -1621,21 +1537,11 @@ mod tests {
     }
 
     #[test]
-    fn the_plan_is_told_what_every_bucket_of_a_canvas_needs() {
-        // The two tables are six f32 and six i32: one number the mechanism books before admission,
-        // derived from the model's declaration rather than from a runner's own constant.
-        let bytes =
-            DecoderRunner::<Fixed>::table_bytes(&Fixed, Bucket::clip(SERVED.0, SERVED.1, SERVED.2))
-                .expect("the tables' bytes");
-        assert_eq!(bytes, 6 * 4 + 6 * 4);
-    }
-
-    #[test]
     fn a_bucket_that_is_not_a_decode_states_what_it_is() {
         // A prefill bucket has no clip, and a decoder asked for its layout must say so by name rather
         // than answer with a layout that reads as one.
         let error =
-            DecoderRunner::<Fixed>::table_bytes(&Fixed, Bucket::prefill(1, 16, Variant::Encode))
+            DecoderRunner::<Fixed>::layout_of(&Fixed, Bucket::prefill(1, 16, Variant::Encode))
                 .expect_err("a prefill bucket is not a decode");
         assert!(
             format!("{error}").contains("is not a decode bucket"),
@@ -1645,9 +1551,9 @@ mod tests {
 
     #[test]
     fn a_canvas_the_decoder_cannot_serve_is_refused_by_name() {
-        // The bound is the decoder's, not the plan's: a canvas it was not built for is refused where
-        // the plan asks for its tables - before a capture, and never mid-clip.
-        let error = DecoderRunner::<Fixed>::table_bytes(&Fixed, Bucket::clip(2, 3, 5))
+        // The bound is the decoder's: a canvas it was not built for is refused where the runner
+        // maps its buckets at bind - before a capture, and never mid-clip.
+        let error = DecoderRunner::<Fixed>::layout_of(&Fixed, Bucket::clip(2, 3, 5))
             .expect_err("a canvas the decoder does not serve");
         let message = format!("{error}");
         assert!(

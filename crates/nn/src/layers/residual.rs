@@ -2,9 +2,9 @@
 //! with, and the element-type conversion.
 //!
 //! ```text
-//! Residual   out = residual + (update + bias) · scale     scale: none, per channel or per row
-//! Axpby      y   = β · y + α · x                          two host coefficients
-//! Cast       out = x                                      converted to out's element type
+//! Residual   s = residual + (update + bias) · scale       in place; scale: none, per channel or per row
+//! Axpby      y = β · y + α · x                            in place; two host coefficients
+//! Cast       out = x                                      a fresh tensor of the requested element type
 //! ```
 //!
 //! Each form computes in FP32 and rounds once into the written operand's element type. The three
@@ -24,11 +24,6 @@ use crate::weights::Weight;
 
 /// The elements one program of `scaled_add` and `scaled_residual` walks.
 const BLOCK: u32 = residual::RESIDUAL_BLOCK;
-
-/// Whether two views name the same elements: one address, element type, shape and strides.
-fn same(a: &TensorView, b: &TensorView) -> bool {
-    a.ptr == b.ptr && a.dtype == b.dtype && a.shape == b.shape && a.strides == b.strides
-}
 
 /// The width of a `[columns]` parameter vector, checked once.
 fn channels(owner: &'static str, weight: &Weight) -> Result<u32> {
@@ -57,14 +52,14 @@ pub enum Scale {
     Row(Weight),
 }
 
-/// The residual add: `out = residual + (update + bias) · scale`.
+/// The residual add `residual + (update + bias) · scale`, in place.
 ///
-/// The sum is formed in FP32 and rounded once into `out`'s element type. Which operand `out` may be
-/// follows the scale, because each operator writes one of its inputs in place:
+/// The sum is formed in FP32 and rounded once into the written operand's element type. Which
+/// operand receives it follows the scale, because each operator writes one of its inputs:
 ///
-/// | scale | `out` |
+/// | scale | written |
 /// | --- | --- |
-/// | [`Scale::None`] | `residual` or `update` (the add is symmetric) |
+/// | [`Scale::None`] | `residual` (the add is symmetric, so a caller names the operand to keep as `residual`) |
 /// | [`Scale::Channel`] | `residual` |
 /// | [`Scale::Row`] | `update` |
 ///
@@ -123,23 +118,22 @@ impl Residual {
         Ok(Self { scale, bias })
     }
 
-    /// `out = residual + (update + bias) · scale` over `[rows, columns]`.
+    /// `residual + (update + bias) · scale` over `[rows, columns]`, written in place into the
+    /// operand the type documentation names, which the call answers.
     ///
     /// `rows` is the `[rows]` index of each activation row's scale row, present exactly under
-    /// [`Scale::Row`]. `out` aliases `residual` or `update` as the type documentation states.
+    /// [`Scale::Row`].
     ///
     /// # Errors
     ///
-    /// Views whose shapes disagree, a missing or superfluous row index, an `out` the scale's
-    /// operator cannot write, or the operator's refusal.
+    /// Views whose shapes disagree, a missing or superfluous row index, or the operator's refusal.
     pub fn forward(
         &self,
         f: &Forward,
         residual: TensorView,
         update: TensorView,
         rows: Option<TensorView>,
-        out: TensorView,
-    ) -> Result<()> {
+    ) -> Result<TensorView> {
         if rows.is_some() != matches!(self.scale, Scale::Row(_)) {
             return Err(Error::shape(
                 "Residual",
@@ -148,27 +142,11 @@ impl Residual {
         }
         match (self.scale, rows) {
             (Scale::None, _) => {
-                // The add is symmetric, so the written operand is the target and the other the
-                // source; both coefficients are one, so the FP32 sum is the plain one.
-                let (target, source) = if same(&out, &residual) {
-                    (residual, update)
-                } else if same(&out, &update) {
-                    (update, residual)
-                } else {
-                    return Err(Error::shape(
-                        "Residual",
-                        "an unscaled add writes its residual or its update in place".to_owned(),
-                    ));
-                };
-                Axpby.forward(f, target, source, 1.0, 1.0)
+                // Both coefficients are one, so the FP32 sum is the plain one.
+                Axpby.forward(f, residual, update, 1.0, 1.0)?;
+                Ok(residual)
             }
             (Scale::Channel(scale), _) => {
-                if !same(&out, &residual) {
-                    return Err(Error::shape(
-                        "Residual",
-                        "a channel-scaled add writes its residual in place".to_owned(),
-                    ));
-                }
                 let descriptor = residual::ScaledResidualDescriptor {
                     dtype: residual.dtype,
                     columns: channels("Residual", &scale)?,
@@ -181,15 +159,10 @@ impl Residual {
                     update_bias: self.bias.as_ref().map(Weight::view),
                     scale: scale.view(),
                 };
-                f.operate::<ScaledResidual>(&descriptor, args)
+                f.operate::<ScaledResidual>(&descriptor, args)?;
+                Ok(residual)
             }
             (Scale::Row(gate), Some(rows)) => {
-                if !same(&out, &update) {
-                    return Err(Error::shape(
-                        "Residual",
-                        "a row-scaled add writes its update in place".to_owned(),
-                    ));
-                }
                 let width = gate.shape().last();
                 if residual.shape.rank() != 2
                     || residual.shape.last() != width
@@ -221,7 +194,8 @@ impl Residual {
                     gate: gate.view(),
                     row_indices: rows,
                 };
-                f.operate::<GatedResidualOp>(&descriptor, args)
+                f.operate::<GatedResidualOp>(&descriptor, args)?;
+                Ok(update)
             }
             (Scale::Row(_), None) => unreachable!("the row index presence is checked above"),
         }
@@ -229,7 +203,7 @@ impl Residual {
 }
 
 impl Default for Residual {
-    /// The plain add `out = residual + update`: no scale, no bias.
+    /// The plain add `residual + update`: no scale, no bias.
     fn default() -> Self {
         Self {
             scale: Scale::None,
@@ -281,7 +255,7 @@ impl Axpby {
     }
 }
 
-/// The element-type conversion `out = x`, rounded once into `out`'s element type.
+/// The element-type conversion of `x` into a fresh tensor, rounded once.
 ///
 /// It is the solver update with `α = 1`, `β = 0` — the target's old value is multiplied by zero and
 /// never contributes — so one conversion is one `scaled_add` launch between any two floating
@@ -289,23 +263,14 @@ impl Axpby {
 pub struct Cast;
 
 impl Cast {
-    /// Convert `x` into `out`, two `[rows, columns]` views of one shape.
+    /// `x`, a `[rows, columns]` view, converted into a fresh tensor of `dtype`.
     ///
     /// # Errors
     ///
-    /// Views of another rank or of different shapes, or the operator's refusal.
-    pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
-        Axpby.forward(f, out, x, 1.0, 0.0)
-    }
-
-    /// Convert `x` into a fresh `[rows, columns]` buffer of `dtype` reserved from the arena.
-    ///
-    /// # Errors
-    ///
-    /// An arena too small for the buffer, or [`Self::forward`]'s refusals.
-    pub fn apply(&self, f: &Forward, x: TensorView, dtype: DType) -> Result<TensorView> {
-        let out = f.arena().tensor(dtype, x.shape)?;
-        self.forward(f, x, out)?;
+    /// A view of another rank, an arena that cannot hold the output, or the operator's refusal.
+    pub fn forward(&self, f: &Forward, x: TensorView, dtype: DType) -> Result<TensorView> {
+        let out = f.empty(dtype, x.shape)?;
+        Axpby.forward(f, out, x, 1.0, 0.0)?;
         Ok(out)
     }
 }

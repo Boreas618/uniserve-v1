@@ -1,26 +1,22 @@
-//! The Qwen-VL processor: how an image or a video becomes the vision tower's patch grid and patch
-//! rows.
+//! The Qwen-VL image and video processor rules: how an image or a video is sized to the vision
+//! tower's patch grid, how a clip is sampled, and the context block an image takes.
 //!
 //! - [`ProcessorConfig`] is the checkpoint's image and video processor geometry, with the
 //!   `smart_resize` of each ([`ProcessorConfig::image_grid`], [`ProcessorConfig::video_grid`]) and
 //!   the tokens one temporal block of a grid presents ([`ProcessorConfig::block_tokens`]);
 //! - [`sample_frames`] samples a clip at the video processor's 2 fps and labels its blocks;
-//! - [`patch_format`] states how a clip's pixels become the tower's patch rows: normalized by the
-//!   processor's mean and deviation, one channel-major tubelet per row, rows over merge blocks, and
-//!   rounded once to the tower's element type; the runtime writes them.
+//! - [`position_span`] is how far an image block advances the rotary position of the text after it.
 //!
-//! The arithmetic reproduces the transformers processors operation for operation, in `f64` where
-//! they compute in Python floats and in `f32` where they compute in tensors, so that every rounding
-//! lands on the same side.
+//! The arithmetic follows transformers' `Qwen2VLImageProcessor` and `Qwen3VLVideoProcessor`
+//! operation for operation, in `f64` where they compute in Python floats, so that every rounding
+//! lands on the same side. How the sized pixels become the tower's patch rows is the model's
+//! (`qwen3::vision::patch_format`).
 
-use nn::DType;
-use nn::capability::PixelNorm;
-use nn::config::Fields;
 use proto::video::VisionGrid;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use crate::config::VisionConfig;
-use crate::{Error, Result};
+use crate::image::{ImageBlock, ImageProcessor};
 
 /// The rate the video processor samples a clip at, in frames per second.
 pub const SAMPLE_FPS: f64 = 2.0;
@@ -28,19 +24,12 @@ pub const SAMPLE_FPS: f64 = 2.0;
 /// The widest aspect a processor resizes: 200:1.
 const MAX_ASPECT: f64 = 200.0;
 
-/// A checkpoint's processor files that [`ProcessorConfig::parse`] cannot use.
-#[derive(Debug, thiserror::Error)]
-pub enum ConfigError {
-    /// The image processor config is not a processor config.
-    #[error("parsing the image processor config")]
-    Image(#[source] serde_json::Error),
-    /// The video processor config is not a processor config.
-    #[error("parsing the video processor config")]
-    Video(#[source] serde_json::Error),
-    /// The image and video processors patch differently.
-    #[error("the image and video processors disagree on the patch geometry")]
-    Patching,
-}
+/// The token text Qwen chat templates write for one image, which request processing replaces by
+/// the image's block.
+pub const PLACEHOLDER: &str = "<|image_pad|>";
+
+/// The markup Qwen chat templates write for one image part.
+pub const MARKUP: &str = "<|vision_start|><|image_pad|><|vision_end|>";
 
 /// Media the processor cannot size, named in request terms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -71,11 +60,8 @@ pub enum VisionError {
     },
 }
 
-/// The patch geometry and pixel budgets a Qwen-VL processor sizes media by.
-///
-/// It is the image and video processors' configuration, as transformers and SGLang name it (their
-/// `VisionConfig` is the vision tower's model configuration). Read from the checkpoint's
-/// `preprocessor_config.json` and `video_preprocessor_config.json` with [`ProcessorConfig::parse`].
+/// The patch geometry and pixel budgets a Qwen-VL processor sizes media by: the checkpoint's
+/// `preprocessor_config.json` and `video_preprocessor_config.json` ([`ProcessorConfig::FILES`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessorConfig {
     /// Pixels per patch side.
@@ -94,70 +80,56 @@ pub struct ProcessorConfig {
     pub video_max_pixels: u64,
 }
 
-#[derive(Deserialize)]
-struct ProcessorFile {
-    patch_size: u32,
-    temporal_patch_size: u32,
-    merge_size: u32,
-    size: ProcessorSize,
-}
-
-#[derive(Deserialize)]
-struct ProcessorSize {
-    shortest_edge: u64,
-    longest_edge: u64,
-}
-
 impl ProcessorConfig {
-    /// Parses a checkpoint's image processor config (`preprocessor_config.json`) and video
-    /// processor config (`video_preprocessor_config.json`), given as their texts.
+    /// The image and video processor files a checkpoint names, relative to the directory that
+    /// holds them.
+    pub const FILES: [&'static str; 2] =
+        ["preprocessor_config.json", "video_preprocessor_config.json"];
+
+    /// Parses the image processor config and the video processor config, given as their texts in
+    /// [`Self::FILES`]' order.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] when a text is not a processor config, or when the two configs
-    /// disagree on the patch geometry.
-    pub fn parse(image: &str, video: &str) -> std::result::Result<Self, ConfigError> {
-        Self::of_files(
-            serde_json::from_str(image).map_err(ConfigError::Image)?,
-            serde_json::from_str(video).map_err(ConfigError::Video)?,
+    /// A text that is not a processor config, or two configs that patch differently.
+    pub fn parse(image: &str, video: &str) -> Result<Self, String> {
+        let parse = |name: &str, text: &str| {
+            serde_json::from_str::<Value>(text).map_err(|error| format!("{name}: {error}"))
+        };
+        Self::from_values(
+            &parse(Self::FILES[0], image)?,
+            &parse(Self::FILES[1], video)?,
         )
     }
 
-    /// [`Self::parse`] over the two configs already read as JSON values, as the model's loading
-    /// boundary holds its sidecars.
+    /// [`Self::parse`] over the two configs already read as JSON values.
     ///
     /// # Errors
     ///
     /// As [`Self::parse`].
-    pub fn from_values(
-        image: &serde_json::Value,
-        video: &serde_json::Value,
-    ) -> std::result::Result<Self, ConfigError> {
-        Self::of_files(
-            ProcessorFile::deserialize(image).map_err(ConfigError::Image)?,
-            ProcessorFile::deserialize(video).map_err(ConfigError::Video)?,
-        )
-    }
-
-    /// The patching and pixel bounds the image and video processor files state, which must patch
-    /// alike.
-    fn of_files(
-        image: ProcessorFile,
-        video: ProcessorFile,
-    ) -> std::result::Result<Self, ConfigError> {
-        let patching =
-            |file: &ProcessorFile| (file.patch_size, file.temporal_patch_size, file.merge_size);
-        if patching(&image) != patching(&video) {
-            return Err(ConfigError::Patching);
+    pub fn from_values(image: &Value, video: &Value) -> Result<Self, String> {
+        let [image_file, video_file] = Self::FILES;
+        let patching = |file: &str, config: &Value| -> Result<(u32, u32, u32), String> {
+            Ok((
+                count(file, config, "patch_size")?,
+                count(file, config, "temporal_patch_size")?,
+                count(file, config, "merge_size")?,
+            ))
+        };
+        let (patch_size, temporal_patch_size, merge_size) = patching(image_file, image)?;
+        if patching(video_file, video)? != (patch_size, temporal_patch_size, merge_size) {
+            return Err("the image and video processors disagree on the patch geometry".to_owned());
         }
+        let (image_min_pixels, image_max_pixels) = budget(image_file, image)?;
+        let (video_min_pixels, video_max_pixels) = budget(video_file, video)?;
         Ok(Self {
-            patch_size: image.patch_size,
-            temporal_patch_size: image.temporal_patch_size,
-            merge_size: image.merge_size,
-            image_min_pixels: image.size.shortest_edge,
-            image_max_pixels: image.size.longest_edge,
-            video_min_pixels: video.size.shortest_edge,
-            video_max_pixels: video.size.longest_edge,
+            patch_size,
+            temporal_patch_size,
+            merge_size,
+            image_min_pixels,
+            image_max_pixels,
+            video_min_pixels,
+            video_max_pixels,
         })
     }
 
@@ -174,11 +146,7 @@ impl ProcessorConfig {
     /// # Errors
     ///
     /// Returns [`VisionError::Aspect`] for an aspect beyond 200:1.
-    pub fn image_grid(
-        &self,
-        height: u32,
-        width: u32,
-    ) -> std::result::Result<VisionGrid, VisionError> {
+    pub fn image_grid(&self, height: u32, width: u32) -> Result<VisionGrid, VisionError> {
         check_aspect(height, width)?;
         let factor = f64::from(self.factor());
         let (height, width) = (f64::from(height), f64::from(width));
@@ -210,7 +178,7 @@ impl ProcessorConfig {
         frames: u32,
         height: u32,
         width: u32,
-    ) -> std::result::Result<VisionGrid, VisionError> {
+    ) -> Result<VisionGrid, VisionError> {
         let factor = self.factor();
         if height < factor || width < factor {
             return Err(VisionError::Frames { width, height });
@@ -236,7 +204,7 @@ impl ProcessorConfig {
         Ok(self.grid(padded_frames / temporal, resized_height, resized_width))
     }
 
-    /// Vision tokens of one temporal block of `grid`.
+    /// Vision tokens of one temporal block of `grid`: its patches over one merge block's.
     pub const fn block_tokens(&self, grid: VisionGrid) -> u32 {
         grid.h * grid.w / (self.merge_size * self.merge_size)
     }
@@ -251,13 +219,34 @@ impl ProcessorConfig {
     }
 }
 
-/// Refuse an image or frame whose sides differ by more than 200 times.
-fn check_aspect(height: u32, width: u32) -> std::result::Result<(), VisionError> {
-    let (long, short) = (height.max(width), height.min(width));
-    if f64::from(long) / f64::from(short) > MAX_ASPECT {
-        return Err(VisionError::Aspect { width, height });
+impl ImageProcessor for ProcessorConfig {
+    fn placeholder(&self) -> &str {
+        PLACEHOLDER
     }
-    Ok(())
+
+    fn markup(&self) -> &str {
+        MARKUP
+    }
+
+    /// The block an image takes in a context: its merged rows, and the positions the text after
+    /// it advances by ([`position_span`]).
+    fn block(&self, width: u32, height: u32) -> Result<ImageBlock, String> {
+        let grid = self
+            .image_grid(height, width)
+            .map_err(|error| error.to_string())?;
+        Ok(ImageBlock {
+            tokens: grid.t * self.block_tokens(grid),
+            positions: position_span(grid, self.merge_size),
+        })
+    }
+}
+
+/// The positions one vision block of `grid` (patches, whole `merge` blocks) advances the text
+/// after it by: the larger of its merged spatial sides, as Qwen3-VL's `get_rope_index` advances
+/// its origin past a vision block.
+pub const fn position_span(grid: VisionGrid, merge: u32) -> u32 {
+    let side = if grid.h > grid.w { grid.h } else { grid.w };
+    side / merge
 }
 
 /// Samples a clip of `frames` frames at `frame_rate` frames per second at [`SAMPLE_FPS`], and labels
@@ -275,7 +264,7 @@ pub fn sample_frames(
     frames: u32,
     temporal_patch: u32,
     frame_rate: u32,
-) -> std::result::Result<(Vec<u32>, Vec<f64>), VisionError> {
+) -> Result<(Vec<u32>, Vec<f64>), VisionError> {
     let stride = f64::from(frame_rate) / SAMPLE_FPS;
     let mut indices: Vec<u32> = Vec::new();
     let mut cursor = 0.0_f64;
@@ -290,6 +279,7 @@ pub fn sample_frames(
         }
         cursor += stride;
     }
+
     let temporal_patch = temporal_patch as usize;
     if indices.len() < temporal_patch {
         return Err(VisionError::Sampled {
@@ -297,6 +287,8 @@ pub fn sample_frames(
             sampled: indices.len(),
         });
     }
+
+    // Pad the timestamps to whole groups with the last one, as the tower pads the samples.
     let mut timestamps: Vec<f64> = (0..indices.len())
         .map(|index| index as f64 / SAMPLE_FPS)
         .collect();
@@ -312,47 +304,38 @@ pub fn sample_frames(
     Ok((indices, blocks))
 }
 
-/// The pixel normalization a processor's `image_mean` and `image_std` state: each RGB channel maps
-/// `x` in `[0, 255]` to `(x / 255 - mean) / std` ([`nn::capability::PixelNorm`]).
-///
-/// # Errors
-///
-/// Fields of the wrong type or length, or a deviation that is not positive.
-pub fn pixel_norm(values: &Fields<'_>) -> Result<PixelNorm> {
-    let owner = values.owner();
-    let mean = values.fixed_numbers("image_mean", 3)?;
-    let std = values.fixed_numbers("image_std", 3)?;
-    let mean: [f32; 3] = [mean[0] as f32, mean[1] as f32, mean[2] as f32];
-    let std: [f32; 3] = [std[0] as f32, std[1] as f32, std[2] as f32];
-    if std.iter().any(|value| *value <= 0.0) {
-        return Err(Error::Config(format!(
-            "{owner}.image_std must be positive, got {std:?}"
-        )));
+/// Refuse an image or frame whose sides differ by more than 200 times.
+fn check_aspect(height: u32, width: u32) -> Result<(), VisionError> {
+    let (long, short) = (height.max(width), height.min(width));
+    if f64::from(long) / f64::from(short) > MAX_ASPECT {
+        return Err(VisionError::Aspect { width, height });
     }
-    Ok(PixelNorm { mean, std })
+    Ok(())
 }
 
-/// How the processor lays a clip's pixels out as the vision tower's patch rows, which the runtime
-/// writes ([`nn::capability::PatchFormat`]).
-///
-/// A row is one tubelet, channel-major (`channels · temporal · patch²`, the layout Qwen-VL
-/// processors emit), each element `(byte - 255 · mean) / (255 · std)` in FP32 rounded once to the
-/// tower's element type `dtype` (`TubeletEmbed`: `tubelets.to(self.weight.dtype)`). The rows run
-/// over each temporal patch in merge-block order, and a temporal patch short of frames repeats the
-/// clip's last frame: an image is one frame repeated.
-pub fn patch_format(
-    vision: &VisionConfig,
-    norm: PixelNorm,
-    dtype: DType,
-) -> nn::capability::PatchFormat {
-    nn::capability::PatchFormat {
-        side: vision.patch_size,
-        temporal: vision.temporal_patch_size,
-        merge: vision.spatial_merge_size,
-        channels: vision.in_channels,
-        norm,
-        dtype,
-    }
+/// The positive integer `key` of the processor config `file`.
+fn count(file: &str, config: &Value, key: &str) -> Result<u32, String> {
+    config
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("{file}: `{key}` must be a positive integer"))
+}
+
+/// The `(shortest_edge, longest_edge)` pixel budget of the processor config `file`'s `size`.
+fn budget(file: &str, config: &Value) -> Result<(u64, u64), String> {
+    let edge = |key: &str| {
+        config
+            .get("size")
+            .and_then(|size| size.get(key))
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            // Pixel budgets are whole numbers; a JSON float states one exactly below 2^53.
+            .map(|value| value as u64)
+            .ok_or_else(|| format!("{file}: `size.{key}` must be a non-negative number"))
+    };
+    Ok((edge("shortest_edge")?, edge("longest_edge")?))
 }
 
 #[cfg(test)]
@@ -380,7 +363,10 @@ mod tests {
                 "size": {"shortest_edge": 1, "longest_edge": 2}}"#,
         )
         .expect_err("two patch sizes");
-        assert!(matches!(error, ConfigError::Patching), "{error}");
+        assert!(error.contains("patch geometry"), "{error}");
+
+        let missing = ProcessorConfig::parse(r#"{"patch_size": 16}"#, "{}").unwrap_err();
+        assert!(missing.contains("temporal_patch_size"), "{missing}");
     }
 
     #[test]
@@ -405,6 +391,14 @@ mod tests {
                 height: 1
             })
         ));
+    }
+
+    #[test]
+    fn an_image_block_takes_its_merged_rows_and_spans_its_longer_side() {
+        let block = processor().block(1344, 768).expect("a keyframe");
+        assert_eq!(block.tokens, 24 * 42);
+        assert_eq!(block.positions, 42);
+        assert!(processor().block(201, 1).is_err());
     }
 
     #[test]
@@ -434,19 +428,6 @@ mod tests {
                 required: 2,
                 sampled: 1
             })
-        );
-    }
-
-    #[test]
-    fn a_processor_states_three_positive_deviations() {
-        let fields =
-            serde_json::json!({"image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.0, 0.5]});
-        let error =
-            pixel_norm(&Fields::of("preprocessor_config.json", &fields).expect("an object"))
-                .expect_err("a zero deviation is refused");
-        assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("image_std")),
-            "{error}"
         );
     }
 }

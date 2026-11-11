@@ -166,8 +166,10 @@ impl Bench {
     }
 
     /// Runs `walk` on the device: a recording forward names its programs, the Program Server
-    /// prepares and resolves the ones not yet installed, and a launching forward runs it.
-    pub(crate) fn run(&mut self, walk: &dyn Fn(&Forward<'_>) -> nn::Result<()>) -> Outcome {
+    /// prepares and resolves the ones not yet installed, and a launching forward runs it. Answers
+    /// what the launching walk answered: tensors it reserved from the bench's arena, which no later
+    /// run overwrites.
+    pub(crate) fn run<T>(&mut self, walk: &dyn Fn(&Forward<'_>) -> nn::Result<T>) -> Outcome<T> {
         let counting = Arena::counting();
         let mut launches = Launches::default();
         ops::capture::set_sink(Some(&mut launches));
@@ -186,9 +188,9 @@ impl Bench {
         }
 
         let generation = Generation::new(1, self.kernels.values().cloned());
-        walk(&Forward::new(&self.stream, &generation, &self.arena))?;
+        let answer = walk(&Forward::new(&self.stream, &generation, &self.arena))?;
         self.stream.synchronize()?;
-        Ok(())
+        Ok(answer)
     }
 
     /// A kernel generation numbered `number` holding exactly the programs `keys` names, by

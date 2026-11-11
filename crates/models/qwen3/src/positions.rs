@@ -1,17 +1,17 @@
 //! The host-side position tables of the Qwen3-VL language model and its vision tower.
 //!
-//! Every table here is a function of the *request*, not of a step: the prompt's token ids and the
-//! grids of its media decide them once, before the encode is captured or replayed. The worker's
-//! encoder runner calls these functions when it prepares a request and uploads the results into the
-//! views [`crate::vl::Qwen3VlModel`] reads; the model crate itself owns no device storage and
-//! copies nothing (`AGENTS.md`, Model Library Boundary).
+//! Every table here is a function of the *request*: the prompt's token ids and the grids of its
+//! media. The models compute them inside their forwards and place them with `nn::Forward::upload`
+//! ([`crate::vl::Qwen3VlModel`], [`crate::vision::VisionTower`]); their shapes follow from the
+//! counts of the request's layout alone.
 //!
 //! Four kinds of table are derived:
 //!
 //! - the language layers' interleaved M-RoPE coordinates ([`rope_index`]), whose factors the device
 //!   computes from the uploaded positions under the language model's sectioned spectrum;
 //! - the vision tower's 2-D rotary coordinates of a patch grid in merge-block order
-//!   ([`rotary_coordinates`]) and their factors ([`VisionRotary::factors`]);
+//!   ([`rotary_coordinates`]), whose factors the device computes under the tower's repeated
+//!   spectrum;
 //! - the learned position table's bilinear sample of each merged patch ([`position_samples`]), the
 //!   indices and FP32 weights of the four table rows a merged row blends;
 //! - the vision tower's attention lengths ([`vision_lengths`]: one bidirectional sequence per
@@ -23,89 +23,19 @@
 //! step is computed in FP32 (`torch.linspace` over a float32 scalar type).
 
 use nn::{Error, Result};
+use processing::qwen_vl::position_span;
+use proto::video::VisionGrid;
 
 /// The table rows one bilinear sample reads: four, the corners of one cell.
 pub const POSITION_TAPS: u64 = 4;
 
-/// One merged row's bilinear sample: the four learned-table rows it blends, and their weights.
+/// The grids [`rope_index`] reads: the image grids and the single-step video grids, in prompt
+/// order.
+pub type GridRuns = (Vec<[u32; 3]>, Vec<[u32; 3]>);
+
+/// Every patch's bilinear sample of the learned table: the four table rows it blends and their
+/// weights.
 pub type PositionSamples = (Vec<[i32; 4]>, Vec<[f32; 4]>);
-
-/// The vision tower's 2-D rotary embedding: half of each head by the patch row, half by its column.
-///
-/// The reference builds one `RotaryEmbedding` of `head_dim / 2` **without sections** and calls it
-/// with two coordinates per patch, so the embedding
-/// evaluates the whole `head_dim / 4`-frequency spectrum at each coordinate:
-/// `cos[p, a · (head_dim / 4) + f] = cos(coordinate(a) · inv_freq(f))`
-/// over a `[patches, 2]` position. Each axis
-/// therefore repeats the same frequency band rather than owning a distinct one, which is why a
-/// sectioned `rotary_factors` call cannot produce these tables: its `sections` give every axis its
-/// own band (the contiguous cut) or interleave one band per axis (`_interleaved_axes`), and neither
-/// is this arrangement. The tables are therefore computed here, on the host, in the reference's
-/// FP32 formulas, and reach the device as the encoder layout's `cosine`/`sine`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct VisionRotary {
-    head_dim: u32,
-}
-
-impl VisionRotary {
-    /// The 2-D rotation of a `head_dim`-element head.
-    pub fn new(head_dim: u32) -> Result<Self> {
-        if !head_dim.is_multiple_of(4) {
-            return Err(Error::shape(
-                "VisionRotary",
-                format!("a {head_dim}-element head does not split into two even rotary halves"),
-            ));
-        }
-        Ok(Self { head_dim })
-    }
-
-    /// The compact frequencies one axis repeats: `head_dim / 4`.
-    pub const fn per_axis(self) -> u32 {
-        self.head_dim / 4
-    }
-
-    /// The FP32 factors of `coordinates`, written into `cosine` and `sine`.
-    ///
-    /// `coordinates` holds each patch's `(row, column)` in merge-block order, `frequencies` the
-    /// tower's repeated spectrum (`nn::layers::Spectrum::Repeated`, one block of `head_dim / 4`
-    /// frequencies per axis, `head_dim / 2` in all), and both tables are `[patches, head_dim / 2]`.
-    pub fn factors(
-        self,
-        coordinates: &[[i64; 2]],
-        frequencies: &[f32],
-        cosine: &mut [f32],
-        sine: &mut [f32],
-    ) -> Result<()> {
-        let columns = (self.head_dim / 2) as usize;
-        let per_axis = columns / 2;
-        if frequencies.len() != columns {
-            return Err(Error::shape(
-                "VisionRotary::factors",
-                format!(
-                    "{} frequencies for the {columns} rotated pairs of a {}-element head",
-                    frequencies.len(),
-                    self.head_dim
-                ),
-            ));
-        }
-        check_len(
-            "VisionRotary::factors",
-            coordinates.len(),
-            columns,
-            cosine,
-            sine,
-        )?;
-        for (patch, coordinate) in coordinates.iter().enumerate() {
-            for frequency in 0..columns {
-                let axis = if frequency < per_axis { 0 } else { 1 };
-                let angle = coordinate[axis] as f32 * frequencies[frequency];
-                cosine[patch * columns + frequency] = angle.cos();
-                sine[patch * columns + frequency] = angle.sin();
-            }
-        }
-        Ok(())
-    }
-}
 
 /// The `[temporal, height, width]` M-RoPE coordinates of one prompt's tokens.
 ///
@@ -219,7 +149,8 @@ pub fn rope_index(
                     }
                 }
             }
-            origin += i64::from(span(grid, merge));
+            let [t, h, w] = grid;
+            origin += i64::from(position_span(VisionGrid { t, h, w }, merge));
         }
         index = stop;
     }
@@ -231,17 +162,6 @@ pub fn rope_index(
     }
     Ok(positions)
 }
-
-/// The positions one vision block of `grid` (patches, whole `merge` blocks) advances the text
-/// after it by: the larger of its merged sides, as [`rope_index`] advances its origin.
-pub const fn span(grid: [u32; 3], merge: u32) -> u32 {
-    let [_, height, width] = grid;
-    let side = if height > width { height } else { width };
-    side / merge
-}
-
-/// The grids [`rope_index`] reads: one list per placeholder kind, in prompt order.
-pub type GridRuns = (Vec<[u32; 3]>, Vec<[u32; 3]>);
 
 /// The two grid lists [`rope_index`] reads, one entry per vision placeholder run of `ids`.
 ///
@@ -507,28 +427,6 @@ pub fn vision_lengths(time: u32, height: u32, width: u32) -> Result<Vec<i32>> {
     Ok(offsets)
 }
 
-/// Check that a factor table holds `rows * columns` values.
-fn check_len(
-    owner: &'static str,
-    rows: usize,
-    columns: usize,
-    cosine: &[f32],
-    sine: &[f32],
-) -> Result<()> {
-    let expected = rows * columns;
-    if cosine.len() != expected || sine.len() != expected {
-        return Err(Error::shape(
-            owner,
-            format!(
-                "{} and {} factor values for {rows} rows of {columns} columns",
-                cosine.len(),
-                sine.len()
-            ),
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,35 +644,6 @@ mod tests {
                 [2303, 2303, 2303, 2303],
             ]
         );
-    }
-
-    #[test]
-    fn vision_rotary_pairs_rows_then_columns() {
-        let rotary = VisionRotary::new(72).expect("head width");
-        assert_eq!(rotary.per_axis(), 18);
-        // The tower's spectrum: 18 frequencies of a 36-channel embedding, once per axis.
-        let frequencies = nn::layers::Spectrum::Repeated {
-            theta: 10_000.0,
-            pairs: 18,
-            axes: 2,
-            precision: nn::layers::Precision::F32,
-        }
-        .inverse_frequencies()
-        .expect("frequencies");
-        // One patch at (0, 0) and one at (0, 2).
-        let coordinates = [[0, 0], [0, 2]];
-        let mut cosine = vec![0.0; 72];
-        let mut sine = vec![0.0; 72];
-        rotary
-            .factors(&coordinates, &frequencies, &mut cosine, &mut sine)
-            .expect("factors");
-        // At the corner every factor is one and zero; the column coordinate only moves the second
-        // half of the compact table.
-        assert_eq!(cosine[0], 1.0);
-        assert_eq!(sine[0], 0.0);
-        assert_eq!(cosine[18], 1.0);
-        let expected = (2.0 * frequencies[0]).cos();
-        assert!((cosine[36 + 18] - expected).abs() < 1e-7);
     }
 
     #[test]

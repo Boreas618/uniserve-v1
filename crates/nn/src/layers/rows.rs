@@ -1,7 +1,7 @@
 //! Row indexing: rows picked out of a `[rows, columns]` sequence by index, and rows written into one.
 //!
 //! ```text
-//! IndexRows::gather        out[j] = source[indices[j]]
+//! IndexRows::gather        out[j] = source[indices[j]]                 a fresh tensor
 //! IndexRows::scatter       destination[indices[j]] = source[j]
 //! IndexRows::scatter_add   destination[indices[j]] += source[j]      one rounding into destination's type
 //! ```
@@ -9,7 +9,8 @@
 //! A gather and a scatter move whole rows and are exact. `indices` is a flat `[count]` int32 view
 //! and may repeat: a scatter writes a repeated index more than once in the order it appears, so the
 //! caller controls a sum's order and repeated launches agree bit for bit. The layer holds nothing:
-//! the views are the caller's, and the element type and the row width are read from them.
+//! a gather reserves its rows from the forward's arena, a scatter writes the caller's destination
+//! in place, and the element type and the row width are read from the views.
 //!
 //! # The caller's obligation
 //!
@@ -20,9 +21,9 @@
 //! caller's to guarantee: it must be computed for the same canvas as the view it is launched
 //! against.
 
-use ops::TensorView;
 use ops::logits::{self, LogitsGather};
 use ops::rows::{self, Mode, Rows};
+use ops::{Shape, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -63,27 +64,21 @@ fn flat(owner: &'static str, indices: &TensorView) -> Result<u64> {
 pub struct IndexRows;
 
 impl IndexRows {
-    /// `out[j] = source[indices[j]]`: `out` is `[count, columns]` for `count` indices.
+    /// `source[indices[j]]` for each index: a fresh `[count, columns]` tensor of `source`'s
+    /// element type.
     ///
     /// # Errors
     ///
-    /// Indices of another rank, an `out` of another shape, or the operator's refusal.
+    /// Indices of another rank, an arena that cannot hold the output, or the operator's refusal.
     pub fn gather(
         &self,
         f: &Forward,
         source: TensorView,
         indices: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
+    ) -> Result<TensorView> {
         const OWNER: &str = "IndexRows::gather";
         let count = flat(OWNER, &indices)?;
-        let width = source.last();
-        if out.shape.rank() != 2 || out.shape.dim(0) != count || out.shape.dim(1) != width {
-            return Err(Error::shape(
-                OWNER,
-                format!("out is {:?}, [{count}, {width}] expected", out.shape.dims()),
-            ));
-        }
+        let out = f.empty(source.dtype, Shape::new(&[count, source.last()]))?;
         let descriptor = logits::GatherDescriptor {
             dtype: source.dtype,
             columns: columns(OWNER, &source)?,
@@ -95,7 +90,8 @@ impl IndexRows {
             rows: indices,
             out,
         };
-        f.operate::<LogitsGather>(&descriptor, args)
+        f.operate::<LogitsGather>(&descriptor, args)?;
+        Ok(out)
     }
 
     /// `destination[indices[j]] = source[j]`, in place on `destination`.
@@ -156,7 +152,7 @@ impl IndexRows {
 mod tests {
     use super::*;
     use crate::Arena;
-    use ops::{DType, Shape};
+    use ops::DType;
 
     /// A gather reads a flat index view and writes one row per index of the source's width.
     #[test]
@@ -165,26 +161,14 @@ mod tests {
         let f = Forward::recording(&arena);
         let view = |dtype, dims: &[u64]| arena.tensor(dtype, Shape::new(dims)).unwrap();
         let source = view(DType::BF16, &[8, 32]);
-        let indices = view(DType::I32, &[3]);
+        let gathered = IndexRows
+            .gather(&f, source, view(DType::I32, &[3]))
+            .unwrap();
+        assert_eq!(gathered.shape.dims(), [3, 32]);
+        assert_eq!(gathered.dtype, DType::BF16);
         assert!(
             IndexRows
-                .gather(&f, source, indices, view(DType::BF16, &[3, 32]))
-                .is_ok()
-        );
-        assert!(
-            IndexRows
-                .gather(&f, source, indices, view(DType::BF16, &[4, 32]))
-                .is_err()
-        );
-        assert!(
-            IndexRows
-                .gather(&f, source, indices, view(DType::BF16, &[3, 16]))
-                .is_err()
-        );
-        let nested = view(DType::I32, &[1, 3]);
-        assert!(
-            IndexRows
-                .gather(&f, source, nested, view(DType::BF16, &[3, 32]))
+                .gather(&f, source, view(DType::I32, &[1, 3]))
                 .is_err()
         );
     }

@@ -26,8 +26,9 @@ safetensors = "0.8.0"
 
 [dev-dependencies]
 tempfile.workspace = true
-# The equivalence harness (`tests/equivalence.rs`) runs layers on a device: it allocates and copies
-# through `platform` and asks a running Program Server for the kernels its forwards name.
+# The device cases (`tests/reference.rs`, `tests/support/device.rs`) run layers on a device: they
+# allocate and copy through `platform` and ask a running Program Server for the kernels their
+# forwards name.
 platform.workspace = true
 program-server.workspace = true
 

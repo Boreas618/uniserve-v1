@@ -170,7 +170,7 @@ fn a_column_rank_reads_its_rows_and_a_row_rank_its_columns() {
     // Rank 1 of 2 computes output channels 2..4 of the up projection: rows 2..4 of its matrix.
     assert_eq!((up.k(), up.n()), (6, 2));
     assert_eq!(store.values(up.weight()), expected(2..4, 0..6));
-    // And contracts columns 2..4 of every row of the down projection.
+    // And reads columns 2..4 of every row of the down projection.
     assert_eq!((down.k(), down.n()), (2, 6));
     assert_eq!(store.values(down.weight()), expected(0..6, 2..4));
 
@@ -581,14 +581,14 @@ fn a_routed_block_loads_its_window_and_reduces_its_split() {
     assert_eq!(split.local_experts(), 2);
     let arena = nn::Arena::counting();
     let hidden = arena.tensor(DType::BF16, Shape::new(&[4, 8])).unwrap();
-    let out = arena.tensor(DType::BF16, Shape::new(&[4, 8])).unwrap();
     let alone = nn::Forward::recording(&arena);
-    let refused = split.forward(&alone, hidden, out).unwrap_err().to_string();
+    let refused = split.forward(&alone, hidden).unwrap_err().to_string();
     assert!(refused.contains("no group"), "{refused}");
     let grouped = nn::Forward::recording(&arena).with_split(0, 2).unwrap();
-    split
-        .forward(&grouped, hidden, out)
+    let out = split
+        .forward(&grouped, hidden)
         .expect("a split forward reduces");
+    assert_eq!(out.shape, hidden.shape);
 
     // A tensor group that does not divide the width, and slots that are not every expert, are
     // refused by the block's name.

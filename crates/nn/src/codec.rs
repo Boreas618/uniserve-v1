@@ -53,8 +53,8 @@ impl Activation {
         })
     }
 
-    fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
-        self.snake.forward(f, x, self.alpha.view(), out)
+    fn forward(&self, f: &Forward, x: TensorView) -> Result<TensorView> {
+        self.snake.forward(f, x, self.alpha.view())
     }
 }
 
@@ -67,7 +67,6 @@ struct Unit {
 /// One strided stage: three residual units at the incoming width, a Snake and the widening
 /// convolution.
 struct Stage {
-    channels: u32,
     stride: u32,
     units: Vec<Unit>,
     activation: Activation,
@@ -80,7 +79,6 @@ pub struct DacEncoder {
     stages: Vec<Stage>,
     tail: Activation,
     output: Conv1d,
-    channels: u32,
 }
 
 /// A weight-normalized 1-d convolution spec with torch's other defaults.
@@ -148,7 +146,6 @@ impl DacEncoder {
                 },
             )?;
             stages.push(Stage {
-                channels: inner,
                 stride,
                 units,
                 activation,
@@ -166,7 +163,6 @@ impl DacEncoder {
             stages,
             tail,
             output,
-            channels: spec.channels,
         })
     }
 
@@ -178,68 +174,57 @@ impl DacEncoder {
             .product()
     }
 
-    /// Encode `samples` `[batch, 1, length]` into `out` `[batch, latent_channels, length / hop]`.
+    /// `samples` `[batch, 1, length]` encoded: a fresh `[batch, latent_channels, length / hop]`
+    /// tensor of their element type.
     ///
-    /// `length` is a whole number of hops; every intermediate is reserved from the arena in the
-    /// input's element type.
+    /// `length` is a whole number of hops. Each stage's stream is reserved before the stage and
+    /// every unit's intermediates are handed back when the unit's residual add is enqueued.
     ///
     /// # Errors
     ///
-    /// A length that is not a whole number of hops, operands of another shape, or an operator's
+    /// A length that is not a whole number of hops, samples of another shape, or an operator's
     /// refusal.
-    pub fn forward(&self, f: &Forward, samples: TensorView, out: TensorView) -> Result<()> {
-        let (batch, length) = (samples.shape.dim(0), samples.shape.dim(2));
+    pub fn forward(&self, f: &Forward, samples: TensorView) -> Result<TensorView> {
+        let length = samples.shape.dim(2);
         let hop = self.hop();
-        if samples.shape.rank() != 3
-            || samples.shape.dim(1) != 1
-            || !length.is_multiple_of(hop)
-            || out.shape.rank() != 3
-            || out.shape.dim(0) != batch
-            || out.shape.dim(2) != length / hop
-        {
+        if samples.shape.rank() != 3 || samples.shape.dim(1) != 1 || !length.is_multiple_of(hop) {
             return Err(Error::shape(
                 "DacEncoder",
                 format!(
-                    "{:?} into {:?}: a [batch, 1, samples] track of whole {hop}-sample hops",
-                    samples.shape.dims(),
-                    out.shape.dims()
+                    "{:?}: a [batch, 1, samples] track of whole {hop}-sample hops",
+                    samples.shape.dims()
                 ),
             ));
         }
-        let dtype = samples.dtype;
-        let buffer = |channels: u32, length: u64| {
-            f.arena()
-                .tensor(dtype, Shape::new(&[batch, u64::from(channels), length]))
-        };
-        let mut hidden = buffer(self.channels, length)?;
-        self.input.forward(f, samples, hidden)?;
+        let mut hidden = self.input.forward(f, samples)?;
 
-        // A stage's three units take turns with the stage's two buffers - the two its
-        // convolutions write, since the second Snake reads what the first convolution wrote - and
-        // add into the residual stream `hidden`, which no unit otherwise writes.
-        let mut extent = length;
+        // A stage's units add into the residual stream `hidden` in place; their own activations
+        // and convolutions live only until the add is enqueued.
         for stage in &self.stages {
-            let first = buffer(stage.channels, extent)?;
-            let second = buffer(stage.channels, extent)?;
             for unit in &stage.units {
-                unit.activations[0].forward(f, hidden, first)?;
-                unit.convs[0].forward(f, first, second)?;
-                unit.activations[1].forward(f, second, first)?;
-                unit.convs[1].forward(f, first, second)?;
-                let residual = matrix(hidden);
-                Residual::default().forward(f, residual, matrix(second), None, residual)?;
+                f.scoped(|f| {
+                    let first =
+                        unit.convs[0].forward(f, unit.activations[0].forward(f, hidden)?)?;
+                    let second =
+                        unit.convs[1].forward(f, unit.activations[1].forward(f, first)?)?;
+                    Residual::default().forward(f, matrix(hidden), matrix(second), None)?;
+                    Ok::<_, Error>(())
+                })?;
             }
-            let widened = extent / u64::from(stage.stride);
-            let next = buffer(2 * stage.channels, widened)?;
-            let scratch = buffer(stage.channels, extent)?;
-            stage.activation.forward(f, hidden, scratch)?;
-            stage.widen.forward(f, scratch, next)?;
+            // The widened stream outlives the stage's activation, so it is reserved first.
+            let next = stage.widen.reserve(f, hidden)?;
+            f.scoped(|f| {
+                let activated = stage.activation.forward(f, hidden)?;
+                stage.widen.launch(f, activated, next)
+            })?;
             hidden = next;
-            extent = widened;
         }
-        let activated = f.arena().tensor(dtype, hidden.shape)?;
-        self.tail.forward(f, hidden, activated)?;
-        self.output.forward(f, activated, out)
+        let out = self.output.reserve(f, hidden)?;
+        f.scoped(|f| {
+            let activated = self.tail.forward(f, hidden)?;
+            self.output.launch(f, activated, out)
+        })?;
+        Ok(out)
     }
 }
 

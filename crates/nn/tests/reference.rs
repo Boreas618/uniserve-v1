@@ -9,10 +9,14 @@
 //! either lies inside it.
 //!
 //! The cases need one GPU (`CUDA_VISIBLE_DEVICES`) and a running Program Server whose socket
-//! `UNISERVE_PROGRAM_SERVER_SOCKET` names (`crates/nn/tests/equivalence.rs` shows how to start
-//! one); the server builds any module its store lacks on first use:
+//! `UNISERVE_PROGRAM_SERVER_SOCKET` names; the server builds any module its store lacks on first
+//! use:
 //!
 //! ```text
+//! uniserve program-server serve --daemon --socket <socket> \
+//!     --package-root <store>/packages --store-root <store>/modules --target sm_100a \
+//!     --wasm <bin>/scheduling-precompile --python crates/program-server/python/.venv/bin/python \
+//!     --max-jobs 16
 //! UNISERVE_PROGRAM_SERVER_SOCKET=<socket> CUDA_VISIBLE_DEVICES=0 \
 //!     cargo test -p nn --test reference -- --ignored --test-threads=1
 //! ```
@@ -99,8 +103,7 @@ fn a_linear_layer_matches_the_host_product() -> Outcome {
         WeightOrder::NxK,
     )?;
     let input = bench.values(dtype, &[rows as u64, k as u64], &x)?;
-    let out = bench.tensor(dtype, &[rows as u64, n as u64])?;
-    bench.run(&|f| layer.forward(f, input, out))?;
+    let out = bench.run(&|f| layer.forward(f, input))?;
 
     let mut reference = vec![0.0_f64; rows * n];
     for row in 0..rows {
@@ -176,10 +179,10 @@ fn an_rms_norm_matches_the_host_normalization() -> Outcome {
             eps,
             Epilogue::None,
             gain,
+            dtype,
         )?;
         let input = bench.values(dtype, &[rows as u64, width as u64], &x)?;
-        let out = bench.tensor(dtype, &[rows as u64, width as u64])?;
-        bench.run(&|f| norm.forward(f, input, None, out))?;
+        let out = bench.run(&|f| norm.forward(f, input, None))?;
 
         compare(
             &format!("rms_norm {gain:?}"),
@@ -213,13 +216,13 @@ fn a_residual_rms_norm_matches_the_host_add_and_normalization() -> Outcome {
         eps,
         Epilogue::None,
         Gain::Plain,
+        dtype,
     )?;
     let dims = [rows as u64, width as u64];
     let input = bench.values(dtype, &dims, &x)?;
     let stream_in = bench.values(dtype, &dims, &residual)?;
     let stream_out = bench.tensor(dtype, &dims)?;
-    let out = bench.tensor(dtype, &dims)?;
-    bench.run(&|f| {
+    let out = bench.run(&|f| {
         norm.forward(
             f,
             input,
@@ -227,7 +230,6 @@ fn a_residual_rms_norm_matches_the_host_add_and_normalization() -> Outcome {
                 input: stream_in,
                 output: stream_out,
             }),
-            out,
         )
     })?;
 
@@ -292,15 +294,13 @@ fn a_gated_silu_matches_the_host_product_in_every_rounding_order() -> Outcome {
         let layer = GatedActivation::new(Activation::Silu, rounding, GateBias::None)?;
         let gate_view: TensorView = bench.values(dtype, &dims, &gate)?;
         let value_view = bench.values(dtype, &dims, &value)?;
-        let out = bench.tensor(dtype, &dims)?;
-        bench.run(&|f| {
+        let out = bench.run(&|f| {
             layer.forward(
                 f,
                 Halves::Split {
                     gate: gate_view,
                     value: value_view,
                 },
-                out,
             )
         })?;
         compare(

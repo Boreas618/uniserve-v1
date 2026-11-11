@@ -1,4 +1,4 @@
-//! The probed facts of a request's media, which a model plans its conditions from.
+//! The probed facts of a request's media, which a model prepares its conditions from.
 
 /// The probed facts of one condition's media.
 #[derive(Debug, Clone, PartialEq, Eq)]

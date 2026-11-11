@@ -45,8 +45,8 @@ use crate::forward::Forward;
 use crate::layers::linear::{ENCODE_CHUNK, Linear, encode_block};
 use crate::quantization::Scheme;
 use crate::weights::{
-    Nvfp4Names, PartBlock, QuantizedStack, Scope, ValueLayout, Weight, WeightLayout, WeightLoader,
-    WeightRequest,
+    ExpertStack, Nvfp4Names, PartBlock, QuantizedStack, Scope, StackLayout, ValueLayout, Weight,
+    WeightLayout, WeightLoader, WeightRequest,
 };
 use ops::gemm::WeightOrder;
 
@@ -188,6 +188,35 @@ pub struct ExpertSlots<'s> {
     /// one allocation.
     pub map: Weight,
 }
+/// The experts of a router's vocabulary a block holds: `local` of the `experts`, from `offset`.
+#[derive(Clone, Copy, Debug)]
+struct Window {
+    experts: u32,
+    local: u32,
+    offset: u32,
+}
+
+/// The experts one rank of a block holds: their slots' experts in slot order, the slot table a
+/// route reads, and the expert group the window is this rank's share of.
+#[derive(Clone, Copy)]
+struct Resident<'s> {
+    slots: &'s [u32],
+    map: Weight,
+    exchange: Split,
+}
+
+impl Resident<'_> {
+    /// The window of `experts` these slots are.
+    fn window(&self, experts: u32) -> Window {
+        let local = u32::try_from(self.slots.len()).unwrap_or(u32::MAX);
+        Window {
+            experts,
+            local,
+            offset: self.exchange.rank * local,
+        }
+    }
+}
+
 /// The per-expert scalars a fused exchange's kernel multiplies in, one table per use.
 #[derive(Clone)]
 pub(crate) struct FusedTables {
@@ -298,104 +327,27 @@ impl Moe {
     /// a row no argmax could read.
     pub const GATED_TOKEN_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Linear;
 
-    /// A block whose router is `router` and whose experts are `up_gate` and `down`.
+    /// The block over the resident `window` of the router's vocabulary.
     ///
-    /// `up_gate` is `[experts, 2 · intermediate, hidden]` with the up projection first, `down` is
-    /// `[experts, hidden, intermediate]`, and `router` has one output per expert. `map` is the
-    /// expert-parallel map when the layout reorders experts; with every expert colocated it is
-    /// absent and a route's logical id is its weight row.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "every argument is a geometry or weight the design states separately; a \
-                  configuration struct would restate them"
-    )]
-    fn new(
-        router: Linear,
-        up_gate: Weight,
-        down: Weight,
-        map: Option<Weight>,
-        experts: u32,
-        top: u32,
-        activation: Activation,
-        renormalize: bool,
-        scale: Option<Weight>,
-    ) -> Result<Self> {
-        // The colocated case: every expert of the vocabulary is resident here.
-        Self::build(
-            router,
-            ExpertStacks::Dense { up_gate, down },
-            map,
-            experts,
-            experts,
-            0,
-            top,
-            activation,
-            renormalize,
-            scale,
-        )
-    }
-
-    /// A block whose experts are a calibrated NVFP4 checkpoint's encoded fields.
-    ///
-    /// Each stack is `[experts, 2·intermediate, hidden/2]` (up first, gate second) or
-    /// `[experts, hidden, intermediate/2]` packed two E2M1 codes a byte, with its block scales and
-    /// its per-expert tensor reciprocals — what [`WeightLoader::nvfp4_stack`] publishes. The block
-    /// routes, sorts and combines exactly as the dense one does; only the two multiplies read
-    /// packed weights, and both stay in FP32 until the store.
-    ///
-    /// [`WeightLoader::nvfp4_stack`]: crate::WeightLoader::nvfp4_stack
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the same arguments as the dense constructor, with the encoded stacks in place \
-                  of the dense weights"
-    )]
-    fn quantized(
-        router: Linear,
-        up_gate: QuantizedStack,
-        down: QuantizedStack,
-        map: Option<Weight>,
-        experts: u32,
-        top: u32,
-        activation: Activation,
-        renormalize: bool,
-        scale: Option<Weight>,
-    ) -> Result<Self> {
-        // A quantized block is colocated: the encoded stacks hold every expert the router names.
-        Self::build(
-            router,
-            ExpertStacks::Encoded {
-                up_gate: Box::new(up_gate),
-                down: Box::new(down),
-            },
-            map,
-            experts,
-            experts,
-            0,
-            top,
-            activation,
-            renormalize,
-            scale,
-        )
-    }
-
-    /// The block over `local` experts of the vocabulary starting at `local_offset`.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the block is named by its parts: the router, the two expert stacks, the map, \
-                  the vocabulary, the resident window and the routing"
-    )]
+    /// `stacks` hold the window's experts: dense, up `[local, 2 · intermediate, hidden]` (up rows
+    /// first) and down `[local, hidden, intermediate]`, or their encoded fields. `router` has one
+    /// output per expert of the vocabulary. `map` is the slot table when the layout reorders
+    /// experts; absent, a route's logical id is its weight row. `routing` states the top, the
+    /// gate's activation and the renormalization; `scale` is a router's per-expert scale.
     fn build(
         router: Linear,
         stacks: ExpertStacks,
         map: Option<Weight>,
-        experts: u32,
-        local: u32,
-        local_offset: u32,
-        top: u32,
-        activation: Activation,
-        renormalize: bool,
+        window: Window,
+        routing: &MoeSpec,
         scale: Option<Weight>,
     ) -> Result<Self> {
+        let Window {
+            experts,
+            local,
+            offset: local_offset,
+        } = window;
+        let (top, activation, renormalize) = (routing.top, routing.activation, routing.renormalize);
         if top == 0 || top > ops::moe::routing::MAX_TOP {
             return Err(Error::shape(
                 "Moe",
@@ -539,7 +491,7 @@ impl Moe {
             return Err(Error::shape(
                 "Moe",
                 format!(
-                    "the router contracts {} elements and the experts' rows are {hidden} wide",
+                    "the router reduces over {} elements and the experts' rows are {hidden} wide",
                     router.k()
                 ),
             ));
@@ -583,84 +535,6 @@ impl Moe {
             local,
             local_offset,
         })
-    }
-
-    /// An encoded block placed on one rank of a group whose exchange runs the experts in one launch.
-    ///
-    /// `up_gate` and `down` hold this rank's `[local, ...]` experts, in the layouts the fused kernel
-    /// reads; `tables` are its per-expert scalars.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the block is named by its parts, as `expert_parallel` names them"
-    )]
-    fn fused_expert_parallel(
-        router: Linear,
-        up_gate: QuantizedStack,
-        down: QuantizedStack,
-        tables: FusedTables,
-        map: Option<Weight>,
-        experts: u32,
-        local: u32,
-        local_offset: u32,
-        top: u32,
-        activation: Activation,
-        renormalize: bool,
-    ) -> Result<Self> {
-        let mut block = Self::build(
-            router,
-            ExpertStacks::Encoded {
-                up_gate: Box::new(up_gate),
-                down: Box::new(down),
-            },
-            map,
-            experts,
-            local,
-            local_offset,
-            top,
-            activation,
-            renormalize,
-            None,
-        )?;
-        block.fused = Some(tables);
-        Ok(block)
-    }
-
-    /// The same block placed on one rank of an expert-parallel group.
-    ///
-    /// `up_gate` and `down` hold this rank's `[local, ...]` experts only and `experts` is the
-    /// router's whole vocabulary (the router is replicated, as the model's routing is). `local` is
-    /// the number of experts the rank holds and `local_offset` the first of them in the router's
-    /// order; the pair must tile the vocabulary across the group.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the block is named by its parts: the router, the two expert stacks, the map, \
-                  the vocabulary, the resident window and the routing"
-    )]
-    fn expert_parallel(
-        router: Linear,
-        up_gate: Weight,
-        down: Weight,
-        map: Option<Weight>,
-        experts: u32,
-        local: u32,
-        local_offset: u32,
-        top: u32,
-        activation: Activation,
-        renormalize: bool,
-        scale: Option<Weight>,
-    ) -> Result<Self> {
-        Self::build(
-            router,
-            ExpertStacks::Dense { up_gate, down },
-            map,
-            experts,
-            local,
-            local_offset,
-            top,
-            activation,
-            renormalize,
-            scale,
-        )
     }
 
     /// The routed block the module at `scope` states.
@@ -739,16 +613,18 @@ impl Moe {
             .scheme(&format!("{stem}.{}.{}.weight", window[0], names.up))
             == Scheme::Nvfp4;
 
+        let resident = Resident {
+            slots: window,
+            map: slots.map,
+            exchange,
+        };
         let mut block = if encoded {
             Self::load_encoded(
                 experts_scope.loader(),
-                &path,
-                stem,
-                spec,
+                (&path, stem),
+                &spec,
                 names,
-                window,
-                slots.map,
-                exchange,
+                resident,
                 router,
             )?
         } else if let Some(stacked) = names
@@ -763,8 +639,13 @@ impl Moe {
                 intermediate,
                 tensor,
             )?;
-            Self::dense_block(
-                router, up_gate, down, slots.map, experts, local, offset, spec, exchange,
+            Self::build(
+                router,
+                ExpertStacks::Dense { up_gate, down },
+                Some(resident.map),
+                resident.window(experts),
+                &spec,
+                None,
             )?
         } else {
             let mut up_gate_parts = Vec::with_capacity(window.len() * 2);
@@ -811,57 +692,17 @@ impl Moe {
                     row_stride: intermediate,
                 },
             ))?;
-            Self::dense_block(
-                router, up_gate, down, slots.map, experts, local, offset, spec, exchange,
+            Self::build(
+                router,
+                ExpertStacks::Dense { up_gate, down },
+                Some(resident.map),
+                resident.window(experts),
+                &spec,
+                None,
             )?
         };
         block.reduce = tensor.size;
         Ok(block)
-    }
-
-    /// The block over dense stacks, on one rank or over an expert group.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the block's parts as `load` resolved them"
-    )]
-    fn dense_block(
-        router: Linear,
-        up_gate: Weight,
-        down: Weight,
-        map: Weight,
-        experts: u32,
-        local: u32,
-        offset: u32,
-        spec: MoeSpec,
-        exchange: Split,
-    ) -> Result<Self> {
-        if exchange.size == 1 {
-            Self::new(
-                router,
-                up_gate,
-                down,
-                Some(map),
-                local,
-                spec.top,
-                spec.activation,
-                spec.renormalize,
-                None,
-            )
-        } else {
-            Self::expert_parallel(
-                router,
-                up_gate,
-                down,
-                Some(map),
-                experts,
-                local,
-                offset,
-                spec.top,
-                spec.activation,
-                spec.renormalize,
-                None,
-            )
-        }
     }
 
     /// The dense stacks of `window` read from a checkpoint's stacked expert tensors, in the
@@ -920,25 +761,18 @@ impl Moe {
         Ok((up_gate, down))
     }
 
-    /// The packed experts of `window`, as [`Self::load`] reads a calibrated checkpoint's.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the block's parts as `load` resolved them: the loader, the block's path, the \
-                  experts' module, the spec, the names, the window, the slot map, the expert group \
-                  and the router"
-    )]
+    /// The packed experts `resident` holds, as [`Self::load`] reads a calibrated checkpoint's:
+    /// `path` is the block's module path and `stem` the path of its experts' module list.
     fn load_encoded(
         loader: &mut WeightLoader<'_>,
-        path: &str,
-        stem: &str,
-        spec: MoeSpec,
+        (path, stem): (&str, &str),
+        spec: &MoeSpec,
         names: ExpertNames<'_>,
-        window: &[u32],
-        map: Weight,
-        exchange: Split,
+        resident: Resident<'_>,
         router: Linear,
     ) -> Result<Self> {
         let experts = spec.experts;
+        let (window, exchange) = (resident.slots, resident.exchange);
         let local = u32::try_from(window.len()).unwrap_or(u32::MAX);
         let spelling = Nvfp4Names::vllm();
         if exchange.size > 1 {
@@ -947,24 +781,32 @@ impl Moe {
             // block scales in the swizzled table.
             let (up_gate, up_scales) = loader.nvfp4_stack(
                 &format!("{path}.experts.up_gate"),
-                stem,
-                &[names.up, names.gate],
-                window,
-                experts,
+                ExpertStack {
+                    prefix: stem,
+                    projections: &[names.up, names.gate],
+                    slots: window,
+                    vocabulary: experts,
+                },
                 spelling,
-                ValueLayout::GateFirst,
-                WEIGHT_SCALE_LAYOUT,
+                StackLayout {
+                    values: ValueLayout::GateFirst,
+                    scales: WEIGHT_SCALE_LAYOUT,
+                },
                 true,
             )?;
             let (down, down_scales) = loader.nvfp4_stack(
                 &format!("{path}.experts.down"),
-                stem,
-                &[names.down],
-                window,
-                experts,
+                ExpertStack {
+                    prefix: stem,
+                    projections: &[names.down],
+                    slots: window,
+                    vocabulary: experts,
+                },
                 spelling,
-                ValueLayout::Plain,
-                WEIGHT_SCALE_LAYOUT,
+                StackLayout {
+                    values: ValueLayout::Plain,
+                    scales: WEIGHT_SCALE_LAYOUT,
+                },
                 true,
             )?;
             // The kernel's three scalars per expert: each product dequantizes with the weight's
@@ -998,58 +840,71 @@ impl Moe {
                 down_alpha: table("down_alpha", down_alpha)?,
                 gated_scale: table("gated_scale", gated)?,
             };
-            return Self::fused_expert_parallel(
+            let mut block = Self::build(
                 router,
-                up_gate,
-                down,
-                tables,
-                Some(map),
-                experts,
-                local,
-                exchange.rank * local,
-                spec.top,
-                spec.activation,
-                spec.renormalize,
-            );
+                ExpertStacks::Encoded {
+                    up_gate: Box::new(up_gate),
+                    down: Box::new(down),
+                },
+                Some(resident.map),
+                resident.window(experts),
+                spec,
+                None,
+            )?;
+            block.fused = Some(tables);
+            return Ok(block);
         }
         // On one rank the products read their A operand shuffled: the gated stack interleaves its
         // halves first. The shard's block scales are linear, and the published table is built from
         // them once here.
         let (up_gate, _) = loader.nvfp4_stack(
             &format!("{path}.experts.up_gate"),
-            stem,
-            &[names.up, names.gate],
-            window,
-            experts,
-            spelling,
-            ValueLayout::InterleavedShuffled {
-                epilogue_tile_m: 128,
+            ExpertStack {
+                prefix: stem,
+                projections: &[names.up, names.gate],
+                slots: window,
+                vocabulary: experts,
             },
-            WEIGHT_SCALE_LAYOUT,
+            spelling,
+            StackLayout {
+                values: ValueLayout::InterleavedShuffled {
+                    epilogue_tile_m: 128,
+                },
+                scales: WEIGHT_SCALE_LAYOUT,
+            },
             true,
         )?;
         let (down, _) = loader.nvfp4_stack(
             &format!("{path}.experts.down"),
-            stem,
-            &[names.down],
-            window,
-            experts,
-            spelling,
-            ValueLayout::Shuffled {
-                epilogue_tile_m: 128,
+            ExpertStack {
+                prefix: stem,
+                projections: &[names.down],
+                slots: window,
+                vocabulary: experts,
             },
-            WEIGHT_SCALE_LAYOUT,
+            spelling,
+            StackLayout {
+                values: ValueLayout::Shuffled {
+                    epilogue_tile_m: 128,
+                },
+                scales: WEIGHT_SCALE_LAYOUT,
+            },
             true,
         )?;
-        Self::quantized(
+        // A block on one rank holds every expert the router names.
+        Self::build(
             router,
-            up_gate,
-            down,
-            Some(map),
-            experts,
-            spec.top,
-            spec.activation,
-            spec.renormalize,
+            ExpertStacks::Encoded {
+                up_gate: Box::new(up_gate),
+                down: Box::new(down),
+            },
+            Some(resident.map),
+            Window {
+                experts,
+                local: experts,
+                offset: 0,
+            },
+            spec,
             None,
         )
     }
@@ -1094,14 +949,8 @@ impl Moe {
         self.experts
     }
 
-    /// The routing prefix: the router, its top-k, the expert map, and the sort that groups the
-    /// routes into the tiles a grouped product reads.
-    ///
-    /// Every expert product a block can run starts here and differs only in the two multiplies, so
-    /// the prefix is one path: a variant that multiplies something else still routes, sorts and
-    /// combines identically, and a heavy quantized product cannot drift from the dense one.
     /// The router's choice for `hidden`, and nothing else: the top-k expert ids and their
-    /// weights, `[tokens, top]` i32 and F32, written into the caller's own buffers.
+    /// weights, fresh `[tokens, top]` i32 and F32 tensors.
     ///
     /// The ids are the checkpoint's expert indices, *before* the expert map, so they are exactly
     /// what a reference's router names and a comparison of routing is an integer comparison. That
@@ -1109,48 +958,22 @@ impl Moe {
     /// a right id with a wrong product (the experts), and a right id with a wrong weight (the
     /// top-k's renormalization).
     ///
-    /// No expert runs, so this costs one router row per token and the scores it needs, which are
-    /// scratch inside `f`'s arena: nothing outlives the call but the two buffers written here. A
-    /// caller that wants ids on the host passes views of its own memory; one that wants them in a
-    /// capture's graph passes arena tensors, as the prefix does.
-    pub fn route(
-        &self,
-        f: &Forward,
-        hidden: TensorView,
-        ids: TensorView,
-        weights: TensorView,
-    ) -> Result<()> {
+    /// No expert runs, so this costs one router row per token and the scores it needs, reserved
+    /// from the forward's arena before the ids and weights.
+    ///
+    /// # Errors
+    ///
+    /// Rows of another width, an arena that cannot hold the tensors, or an operator's refusal.
+    pub fn route(&self, f: &Forward, hidden: TensorView) -> Result<(TensorView, TensorView)> {
         hidden
             .require_row("Moe::route", hidden.dtype, u64::from(self.hidden))
             .map_err(Error::from)?;
 
         let tokens = hidden.rows();
         let top = u64::from(self.top);
-        let expected = Shape::new(&[tokens, top]);
-        for (name, tensor, dtype) in [("ids", ids, DType::I32), ("weights", weights, DType::F32)] {
-            if tensor.dtype != dtype {
-                return Err(Error::shape(
-                    "Moe::route",
-                    format!("the {name} are {dtype}, not {}", tensor.dtype),
-                ));
-            }
-            if tensor.shape != expected {
-                return Err(Error::shape(
-                    "Moe::route",
-                    format!(
-                        "the {name} are {expected:?} for {tokens} rows of top {top}, not {:?}",
-                        tensor.shape
-                    ),
-                ));
-            }
-        }
-
-        let experts = u64::from(self.experts);
-        let scores = f
-            .arena()
-            .tensor(hidden.dtype, Shape::new(&[tokens, experts]))?;
-
-        self.router.forward(f, hidden, scores)?;
+        let scores = self.router.forward(f, hidden)?;
+        let ids = f.empty(DType::I32, Shape::new(&[tokens, top]))?;
+        let weights = f.empty(DType::F32, Shape::new(&[tokens, top]))?;
 
         let routing = self.topk_descriptor(scores.dtype);
         let args = TopkArgs {
@@ -1163,31 +986,33 @@ impl Moe {
 
         f.operate::<TopkSoftmax>(&routing, args)?;
 
-        Ok(())
+        Ok((ids, weights))
     }
 
+    /// The routing prefix: the router, its top-k, the expert map, and the sort that groups the
+    /// routes into the tiles a grouped product reads.
+    ///
+    /// Every expert product a block can run starts here and differs only in the two multiplies, so
+    /// the prefix is one path: a variant that multiplies something else still routes, sorts and
+    /// combines identically, and a heavy quantized product cannot drift from the dense one.
     fn routed(&self, f: &Forward, hidden: TensorView) -> Result<Routes> {
         let tokens = hidden.rows();
         let top = u64::from(self.top);
         let experts = u64::from(self.experts);
-        let arena = f.arena();
 
-        let ids = arena.tensor(DType::I32, Shape::new(&[tokens, top]))?;
-        let weights = arena.tensor(DType::F32, Shape::new(&[tokens, top]))?;
         // The top-k writes each route's weight row: logical ids stop there.
-        self.route(f, hidden, ids, weights)?;
-        let local_ids = ids;
+        let (local_ids, weights) = self.route(f, hidden)?;
 
         // Group the routes by expert into the tiles the products read.
         let tiles = ops::moe::max_tiles(tokens, top, experts, u64::from(self.tile));
         let rows = ops::moe::max_permuted_rows(tokens, top, experts, u64::from(self.tile));
-        let tile_to_expert = arena.tensor(DType::I32, Shape::new(&[tiles]))?;
-        let tile_to_limit = arena.tensor(DType::I32, Shape::new(&[tiles]))?;
-        let expanded_to_permuted = arena.tensor(DType::I32, Shape::new(&[tokens, top]))?;
-        let permuted_to_expanded = arena.tensor(DType::I32, Shape::new(&[rows]))?;
-        let permuted_to_token = arena.tensor(DType::I32, Shape::new(&[rows]))?;
-        let total_padded_tokens = arena.tensor(DType::I32, Shape::new(&[1]))?;
-        let num_non_exiting_tiles = arena.tensor(DType::I32, Shape::new(&[1]))?;
+        let tile_to_expert = f.empty(DType::I32, Shape::new(&[tiles]))?;
+        let tile_to_limit = f.empty(DType::I32, Shape::new(&[tiles]))?;
+        let expanded_to_permuted = f.empty(DType::I32, Shape::new(&[tokens, top]))?;
+        let permuted_to_expanded = f.empty(DType::I32, Shape::new(&[rows]))?;
+        let permuted_to_token = f.empty(DType::I32, Shape::new(&[rows]))?;
+        let total_padded_tokens = f.empty(DType::I32, Shape::new(&[1]))?;
+        let num_non_exiting_tiles = f.empty(DType::I32, Shape::new(&[1]))?;
         let sort = self.sort_descriptor(self.experts);
         let args = SortArgs {
             ids: local_ids,
@@ -1218,19 +1043,37 @@ impl Moe {
         })
     }
 
-    /// `out = Σ_routes weight · expert(hidden)`, summed over the tensor group.
+    /// `Σ_routes weight · expert(hidden)`, summed over the tensor group: a fresh `[tokens, hidden]`
+    /// tensor of `hidden`'s element type, reserved first, then written by [`Self::forward_into`].
     ///
-    /// `hidden` and `out` are `[tokens, hidden]`. A block whose experts the tensor group splits by
-    /// their intermediate width holds one rank's block of every expert, so its output is a partial
-    /// sum: it is reduced over the group here, once after the experts, and a forward that carries no
-    /// group is refused. An expert group's exchange returns the whole sum.
+    /// # Errors
+    ///
+    /// As [`Self::forward_into`], or an arena that cannot hold the output.
+    pub fn forward(&self, f: &Forward, hidden: TensorView) -> Result<TensorView> {
+        let out = f.empty(
+            hidden.dtype,
+            Shape::new(&[hidden.rows(), u64::from(self.hidden)]),
+        )?;
+        self.forward_into(f, hidden, out)?;
+        Ok(out)
+    }
+
+    /// `Σ_routes weight · expert(hidden)`, summed over the tensor group, written into `update`,
+    /// `[tokens, hidden]` of `hidden`'s element type: the caller's buffer the output must land in,
+    /// such as a stack's update carried across its layers' scopes.
+    ///
+    /// A block whose experts the tensor group splits by their intermediate width holds one rank's
+    /// block of every expert, so its output is a partial sum: it is reduced over the group here,
+    /// once after the experts, and a forward that carries no group is refused. A block whose experts
+    /// are split over an expert group, or whose forward borrows the group's exchange views, routes
+    /// through the exchange, which returns the whole sum.
     ///
     /// # Errors
     ///
     /// When a view does not fit the block, an operator refuses, or a split block runs on a forward
     /// without a group.
-    pub fn forward(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
-        self.combine(f, hidden, out)?;
+    pub fn forward_into(&self, f: &Forward, hidden: TensorView, update: TensorView) -> Result<()> {
+        self.combine(f, hidden, update)?;
         if self.reduce > 1 {
             if f.split().is_none() {
                 return Err(Error::shape(
@@ -1242,7 +1085,7 @@ impl Moe {
                     ),
                 ));
             }
-            f.all_reduce(out)?;
+            f.all_reduce(update)?;
         }
         Ok(())
     }
@@ -1250,7 +1093,7 @@ impl Moe {
     /// `out = Σ_routes weight · expert(hidden)` over this rank's experts and block.
     fn combine(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
         if self.local != self.experts || f.dispatch().is_some() {
-            return self.forward_expert_parallel(f, hidden, out);
+            return self.exchanged(f, hidden, out);
         }
         let hidden_width = u64::from(self.hidden);
         hidden
@@ -1273,13 +1116,12 @@ impl Moe {
             return self.forward_encoded(f, hidden, out);
         };
         let intermediate = u64::from(self.intermediate);
-        let arena = f.arena();
 
         // 1-3. The router, its top-k, the map and the sort: the prefix every expert product shares.
         let routes = self.routed(f, hidden)?;
 
         // 4. FC1: the gated product of each permuted row, then FC2.
-        let gated = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, intermediate]))?;
+        let gated = f.empty(hidden.dtype, Shape::new(&[routes.rows, intermediate]))?;
         let first = self.gather_descriptor(hidden.dtype);
         let args = GatherGemmArgs {
             hidden,
@@ -1300,7 +1142,7 @@ impl Moe {
         // The combine indexes this buffer in the **permuted** row space, so it is permuted-height on
         // every path however few rows are live: FC2 writes only the rows it has, but it writes them
         // where the map says they are, not packed from zero.
-        let products = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, hidden_width]))?;
+        let products = f.empty(hidden.dtype, Shape::new(&[routes.rows, hidden_width]))?;
         let second = self.route_descriptor(hidden.dtype);
         let args = RouteGemmArgs {
             rows: gated,
@@ -1507,7 +1349,6 @@ impl Moe {
 
         // 1-3. The router, its top-k, the map and the sort: the prefix every expert product shares.
         let routes = self.routed(f, hidden)?;
-        let arena = f.arena();
 
         // 4. The activation's encoding: the same pass computes the block scales and the row factor
         //    the product multiplies by, and its global scale is the stack's neutral.
@@ -1521,9 +1362,9 @@ impl Moe {
         let gated_layout = Self::ACTIVATION_SCALE_LAYOUT;
         // The activation's packed codes, a byte per two codes, one block scale per sixteen and one
         // FP32 factor per token.
-        let values = arena.tensor(DType::U8, Shape::new(&[tokens, hidden_width / 2]))?;
-        let scales = arena.tensor(DType::U8, input_layout.shape(tokens, hidden_width))?;
-        let token_scale = arena.tensor(DType::F32, Shape::new(&[tokens]))?;
+        let values = f.empty(DType::U8, Shape::new(&[tokens, hidden_width / 2]))?;
+        let scales = f.empty(DType::U8, input_layout.shape(tokens, hidden_width))?;
+        let token_scale = f.empty(DType::F32, Shape::new(&[tokens]))?;
         let first = self.quantize_descriptor(
             hidden.dtype,
             u32::try_from(hidden_width)
@@ -1542,9 +1383,9 @@ impl Moe {
         // 5. FC1: the token-major gather product, one gated row per permuted route.
         // The gated rows are permuted-height: the combine indexes the products in the permuted row
         // space. One scratch serves both products in turn, each entry's preamble included.
-        let gated = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, intermediate]))?;
+        let gated = f.empty(hidden.dtype, Shape::new(&[routes.rows, intermediate]))?;
         let scratch = encoded_scratch_bytes(routes.rows, hidden_width, intermediate);
-        let workspace = arena.tensor(DType::U8, Shape::new(&[scratch.max(1)]))?;
+        let workspace = f.empty(DType::U8, Shape::new(&[scratch.max(1)]))?;
         // The scale's element type is the **checkpoint's**, read off the stack it belongs to; the
         // layout the product states is the **tokens plane's**, because that is the plane it reads
         // and the one this encoding wrote. The weights' own form is not in the descriptor: it is a
@@ -1572,10 +1413,9 @@ impl Moe {
 
         // 6. The gated rows' own encoding: FC1's epilogue is a BF16 row, so this is a program of its
         //    own rather than a wider operand of the second product.
-        let gated_values = arena.tensor(DType::U8, Shape::new(&[routes.rows, intermediate / 2]))?;
-        let gated_scales =
-            arena.tensor(DType::U8, gated_layout.shape(routes.rows, intermediate))?;
-        let gated_token_scale = arena.tensor(DType::F32, Shape::new(&[routes.rows]))?;
+        let gated_values = f.empty(DType::U8, Shape::new(&[routes.rows, intermediate / 2]))?;
+        let gated_scales = f.empty(DType::U8, gated_layout.shape(routes.rows, intermediate))?;
+        let gated_token_scale = f.empty(DType::F32, Shape::new(&[routes.rows]))?;
         let second = self.quantize_descriptor(
             hidden.dtype,
             u32::try_from(intermediate).map_err(|_| {
@@ -1593,7 +1433,7 @@ impl Moe {
         f.operate::<Nvfp4Quantize>(&second, args)?;
 
         // 7. FC2: one row per permuted route, the `top` repeats still separate.
-        let products = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, hidden_width]))?;
+        let products = f.empty(hidden.dtype, Shape::new(&[routes.rows, hidden_width]))?;
         let descriptor = self.route_nvfp4_descriptor(
             hidden.dtype,
             down.scales.dtype(),
@@ -1638,12 +1478,7 @@ impl Moe {
     ///
     /// Every buffer holds the most rows a rank may exchange, so a captured graph replays over
     /// the same addresses however the router routes a later batch.
-    pub fn forward_expert_parallel(
-        &self,
-        f: &Forward,
-        hidden: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
+    fn exchanged(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
         let exchange = f.dispatch().ok_or_else(|| {
             Error::shape(
                 "Moe",
@@ -1717,14 +1552,10 @@ impl Moe {
             ));
         }
 
-        let experts = u64::from(self.experts);
-        let arena = f.arena();
-
         // 1. The replicated router and its top-k: every rank routes whole tokens the same way.
-        let scores = arena.tensor(hidden.dtype, Shape::new(&[tokens, experts]))?;
-        let ids = arena.tensor(DType::I32, Shape::new(&[tokens, top]))?;
-        let weights = arena.tensor(DType::F32, Shape::new(&[tokens, top]))?;
-        self.router.forward(f, hidden, scores)?;
+        let scores = self.router.forward(f, hidden)?;
+        let ids = f.empty(DType::I32, Shape::new(&[tokens, top]))?;
+        let weights = f.empty(DType::F32, Shape::new(&[tokens, top]))?;
         let routing = self.topk_descriptor(scores.dtype);
         // 2. The top-k writes weight rows, so logical ids stop before anything leaves the rank and
         //    a peer sorts by the same physical order the weights are stacked in.
@@ -1780,7 +1611,7 @@ impl Moe {
         }
         let ExpertStacks::Dense { up_gate, down } = &self.stacks else {
             return Err(Error::Unsupported(
-                "Moe::forward_expert_parallel: an encoded stack has no exchange path yet; the \
+                "Moe: an encoded stack has no exchange path yet; the \
                  quantized block is colocated"
                     .to_owned(),
             ));
@@ -1794,7 +1625,6 @@ impl Moe {
         let local = u64::from(self.local);
         let intermediate = u64::from(self.intermediate);
         let received = u64::from(exchange.ranks) * u64::from(exchange.step_rows);
-        let arena = f.arena();
         let launch_tokens = u32::try_from(tokens)
             .map_err(|_| Error::shape("Moe", format!("{tokens} tokens exceed u32")))?;
         let empty = TensorView::new(DevicePtr::new(0), DType::U8, Shape::new(&[0]));
@@ -1837,13 +1667,13 @@ impl Moe {
         // 4. The rows this rank was sent, grouped by its own experts.
         let tiles = ops::moe::max_tiles(received, top, local, u64::from(self.tile));
         let rows = ops::moe::max_permuted_rows(received, top, local, u64::from(self.tile));
-        let tile_to_expert = arena.tensor(DType::I32, Shape::new(&[tiles]))?;
-        let tile_to_limit = arena.tensor(DType::I32, Shape::new(&[tiles]))?;
-        let expanded_to_permuted = arena.tensor(DType::I32, Shape::new(&[received, top]))?;
-        let permuted_to_expanded = arena.tensor(DType::I32, Shape::new(&[rows]))?;
-        let permuted_to_token = arena.tensor(DType::I32, Shape::new(&[rows]))?;
-        let total_padded_tokens = arena.tensor(DType::I32, Shape::new(&[1]))?;
-        let num_non_exiting_tiles = arena.tensor(DType::I32, Shape::new(&[1]))?;
+        let tile_to_expert = f.empty(DType::I32, Shape::new(&[tiles]))?;
+        let tile_to_limit = f.empty(DType::I32, Shape::new(&[tiles]))?;
+        let expanded_to_permuted = f.empty(DType::I32, Shape::new(&[received, top]))?;
+        let permuted_to_expanded = f.empty(DType::I32, Shape::new(&[rows]))?;
+        let permuted_to_token = f.empty(DType::I32, Shape::new(&[rows]))?;
+        let total_padded_tokens = f.empty(DType::I32, Shape::new(&[1]))?;
+        let num_non_exiting_tiles = f.empty(DType::I32, Shape::new(&[1]))?;
         let sort = self.sort_descriptor(self.local);
         let args = SortArgs {
             ids: exchange.ids,
@@ -1870,7 +1700,7 @@ impl Moe {
         // `down` hold `local` experts, and the sort rebased every received route into that window
         // with `local_offset`, so the vocabulary count would name a stack this rank does not hold
         // (and the operator's shape check would refuse the launch).
-        let gated = arena.tensor(exchange.states.dtype, Shape::new(&[rows, intermediate]))?;
+        let gated = f.empty(exchange.states.dtype, Shape::new(&[rows, intermediate]))?;
         let first = GatherGemmDescriptor {
             hidden: self.hidden,
             intermediate: self.intermediate,
@@ -1897,7 +1727,7 @@ impl Moe {
 
         // Permuted-height for the reason the dense path's is: the combine below indexes it through
         // `expanded_to_permuted`.
-        let products = arena.tensor(exchange.states.dtype, Shape::new(&[rows, hidden_width]))?;
+        let products = f.empty(exchange.states.dtype, Shape::new(&[rows, hidden_width]))?;
         let second = RouteGemmDescriptor {
             hidden: self.hidden,
             intermediate: self.intermediate,
@@ -1971,7 +1801,7 @@ impl Moe {
         let launch_tokens = u32::try_from(tokens)
             .map_err(|_| Error::shape("Moe", format!("{tokens} tokens exceed u32")))?;
         if tokens > 0 {
-            let token_scale = f.arena().tensor(DType::F32, Shape::new(&[tokens]))?;
+            let token_scale = f.empty(DType::F32, Shape::new(&[tokens]))?;
             let descriptor =
                 self.quantize_descriptor(hidden.dtype, self.hidden, ScaleLayout::Linear);
             let args = QuantizeArgs {
@@ -2079,6 +1909,27 @@ pub(super) mod tests {
     use ops::gemm::WeightOrder;
     use ops::{DevicePtr, Shape};
 
+    /// The routing every test block uses: `top` of `experts` under SiLU, renormalized.
+    fn routing(experts: u32, top: u32) -> MoeSpec {
+        MoeSpec {
+            experts,
+            top,
+            hidden: 0,
+            intermediate: 0,
+            activation: Activation::Silu,
+            renormalize: true,
+        }
+    }
+
+    /// Every expert of a vocabulary of `experts` resident.
+    fn colocated(experts: u32) -> Window {
+        Window {
+            experts,
+            local: experts,
+            offset: 0,
+        }
+    }
+
     /// A weight over a fake region: the constructor only reads its shape and dtype.
     fn weight(dtype: DType, shape: &[u64]) -> Weight {
         Weight {
@@ -2093,15 +1944,15 @@ pub(super) mod tests {
             None,
             WeightOrder::NxK,
         )?;
-        Moe::new(
+        Moe::build(
             router,
-            weight(DType::BF16, &[u64::from(experts), 2 * intermediate, hidden]),
-            weight(DType::BF16, &[u64::from(experts), hidden, intermediate]),
+            ExpertStacks::Dense {
+                up_gate: weight(DType::BF16, &[u64::from(experts), 2 * intermediate, hidden]),
+                down: weight(DType::BF16, &[u64::from(experts), hidden, intermediate]),
+            },
             None,
-            experts,
-            top,
-            Activation::Silu,
-            true,
+            colocated(experts),
+            &routing(experts, top),
             None,
         )
     }
@@ -2113,17 +1964,19 @@ pub(super) mod tests {
             None,
             WeightOrder::NxK,
         )?;
-        Moe::expert_parallel(
+        Moe::build(
             router,
-            weight(DType::BF16, &[u64::from(local), 1536, 2048]),
-            weight(DType::BF16, &[u64::from(local), 2048, 768]),
+            ExpertStacks::Dense {
+                up_gate: weight(DType::BF16, &[u64::from(local), 1536, 2048]),
+                down: weight(DType::BF16, &[u64::from(local), 2048, 768]),
+            },
             None,
-            experts,
-            local,
-            offset,
-            8,
-            Activation::Silu,
-            true,
+            Window {
+                experts,
+                local,
+                offset,
+            },
+            &routing(experts, 8),
             None,
         )
     }
@@ -2146,15 +1999,15 @@ pub(super) mod tests {
             input_scale: None,
             activation_scale: 1.0,
         };
-        Moe::quantized(
+        Moe::build(
             router,
-            stack(2 * intermediate, hidden, 2),
-            stack(hidden, intermediate, 1),
+            ExpertStacks::Encoded {
+                up_gate: Box::new(stack(2 * intermediate, hidden, 2)),
+                down: Box::new(stack(hidden, intermediate, 1)),
+            },
             None,
-            experts,
-            8,
-            Activation::Silu,
-            true,
+            colocated(experts),
+            &routing(experts, 8),
             None,
         )
     }
@@ -2199,11 +2052,8 @@ pub(super) mod tests {
         let hidden = arena
             .tensor(DType::BF16, Shape::new(&[15, 2048]))
             .expect("a counting arena");
-        let out = arena
-            .tensor(DType::BF16, Shape::new(&[15, 2048]))
-            .expect("a counting arena");
 
-        let (walked, launches) = crate::forward::recorded(|| moe.forward(&f, hidden, out));
+        let (walked, launches) = crate::forward::recorded(|| moe.forward(&f, hidden));
         walked.expect("the recorded forward");
 
         let keys = |operator: &str| -> Vec<&str> {
@@ -2268,15 +2118,15 @@ pub(super) mod tests {
         };
         // Down's contraction is the gated width, so 512 experts' contraction does not fit 768.
         assert!(
-            Moe::quantized(
+            Moe::build(
                 router,
-                stack(1536, 2048, 2),
-                stack(2048, 512, 1),
+                ExpertStacks::Encoded {
+                    up_gate: Box::new(stack(1536, 2048, 2)),
+                    down: Box::new(stack(2048, 512, 1)),
+                },
                 None,
-                experts,
-                8,
-                Activation::Silu,
-                true,
+                colocated(experts),
+                &routing(experts, 8),
                 None,
             )
             .is_err()
@@ -2297,16 +2147,13 @@ pub(super) mod tests {
         let up_gate = weight(DType::BF16, &[128, 1536, 2048]);
         let down = weight(DType::BF16, &[128, 2048, 768]);
         assert!(
-            Moe::new(
+            Moe::build(
                 router,
-                up_gate,
-                down,
+                ExpertStacks::Dense { up_gate, down },
                 None,
-                128,
-                8,
-                Activation::Silu,
-                true,
-                None
+                colocated(128),
+                &routing(128, 8),
+                None,
             )
             .is_err(),
             "a router of 64 outputs cannot route over 128 experts"
@@ -2317,15 +2164,15 @@ pub(super) mod tests {
         let router =
             Linear::new(weight(DType::BF16, &[128, 2048]), None, WeightOrder::NxK).unwrap();
         assert!(
-            Moe::new(
+            Moe::build(
                 router,
-                weight(DType::BF16, &[128, 1536, 2048]),
-                wrong_down,
+                ExpertStacks::Dense {
+                    up_gate: weight(DType::BF16, &[128, 1536, 2048]),
+                    down: wrong_down,
+                },
                 None,
-                128,
-                8,
-                Activation::Silu,
-                true,
+                colocated(128),
+                &routing(128, 8),
                 None,
             )
             .is_err()
@@ -2347,16 +2194,13 @@ pub(super) mod tests {
         let down = weight(DType::BF16, &[8, 64, 32]);
         let short_map = weight(DType::I32, &[4]);
         assert!(
-            Moe::new(
+            Moe::build(
                 router,
-                up_gate,
-                down,
+                ExpertStacks::Dense { up_gate, down },
                 Some(short_map),
-                8,
-                2,
-                Activation::Silu,
-                true,
-                None
+                colocated(8),
+                &routing(8, 2),
+                None,
             )
             .is_err(),
             "a map of four entries cannot route eight experts"

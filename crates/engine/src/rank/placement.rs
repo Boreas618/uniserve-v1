@@ -50,9 +50,9 @@ impl ModelRunner {
         };
         let adapter = nn::Adapter::open(std::path::Path::new(path))
             .with_context(|| format!("reading the adapter {path}"))?;
-        let component = family.adapter_component(&checkpoint, &adapter)?;
+        let stage = family.adapter_stage(&checkpoint, &adapter)?;
         checkpoint
-            .attach(component, adapter)
+            .attach(stage, adapter)
             .with_context(|| format!("fusing the adapter {path}"))
     }
 

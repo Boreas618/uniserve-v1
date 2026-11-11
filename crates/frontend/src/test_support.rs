@@ -4,7 +4,7 @@
 //! tests decode with: every printable ASCII character is one token whose ID is
 //! its code point, and the chat, vision and thinking special tokens encode
 //! atomically. [`CHAT`] and [`VIDEO`] are the families those tests serve, and
-//! [`TestProcessor`] plans the video family's requests. It is compiled for the
+//! [`TestProcessor`] processes the video family's requests. It is compiled for the
 //! crate's own tests and, through the `testing` feature, for the tests of the
 //! crates that serve over it.
 
@@ -113,7 +113,7 @@ impl processing::VideoFamily for TestVideo {
     }
 }
 
-/// A video model of one rule and plain plans, for request processing's own behavior: a request shorter
+/// A video model of one rule and plain inputs, for request processing's own behavior: a request shorter
 /// than a second is refused before its media is fetched, and every image reference is one
 /// condition whose rows are its height.
 pub struct TestProcessor;
@@ -136,12 +136,12 @@ impl processing::VideoProcessor for TestProcessor {
         }
     }
 
-    fn plan(
+    fn process(
         &self,
         request: &processing::VideoSpec,
         media: &[processing::MediaMetadata],
         vocabulary: &dyn processing::Vocabulary,
-    ) -> Result<processing::VideoPlan, processing::InputError> {
+    ) -> Result<processing::VideoInput, processing::InputError> {
         use proto::video::{Canvas, ConditionMedia, ConditionRole, ImageFit};
 
         let conditions = request
@@ -151,14 +151,14 @@ impl processing::VideoProcessor for TestProcessor {
             .map(|(reference, media)| {
                 let processing::MediaMetadata::Image(image) = media else {
                     return Err(processing::InputError::Internal(
-                        "the test processor plans images".to_owned(),
+                        "the test processor processes images".to_owned(),
                     ));
                 };
                 let canvas = Canvas {
                     width: image.width,
                     height: image.height,
                 };
-                Ok(processing::ConditionPlan {
+                Ok(processing::ConditionInput {
                     role: match reference.frame_index {
                         Some(0) => ConditionRole::FirstFrame,
                         Some(_) => ConditionRole::LastFrame,
@@ -179,7 +179,7 @@ impl processing::VideoProcessor for TestProcessor {
         let prompt_token_ids = vocabulary
             .encode(&request.prompt)
             .map_err(|error| processing::InputError::Internal(error.to_string()))?;
-        Ok(processing::VideoPlan {
+        Ok(processing::VideoInput {
             size: request.size.unwrap_or(Canvas {
                 width: 64,
                 height: 64,

@@ -1092,9 +1092,8 @@ impl<M: CausalLm + ?Sized> CausalLm for Shared<M> {
         &self,
         f: &nn::Forward,
         ids: ops::TensorView,
-        out: ops::TensorView,
-    ) -> nn::Result<()> {
-        self.0.embed_input_ids(f, ids, out)
+    ) -> nn::Result<ops::TensorView> {
+        self.0.embed_input_ids(f, ids)
     }
 
     fn forward(
@@ -1103,7 +1102,7 @@ impl<M: CausalLm + ?Sized> CausalLm for Shared<M> {
         batch: &nn::TokenBatch,
         cache: &nn::KvView<'_>,
         hidden: ops::TensorView,
-    ) -> nn::Result<()> {
+    ) -> nn::Result<ops::TensorView> {
         self.0.forward(f, batch, cache, hidden)
     }
 
@@ -1111,9 +1110,8 @@ impl<M: CausalLm + ?Sized> CausalLm for Shared<M> {
         &self,
         f: &nn::Forward,
         hidden: ops::TensorView,
-        out: ops::TensorView,
-    ) -> nn::Result<()> {
-        self.0.compute_logits(f, hidden, out)
+    ) -> nn::Result<ops::TensorView> {
+        self.0.compute_logits(f, hidden)
     }
 
     fn join_expert_step(&self, f: &nn::Forward) -> nn::Result<()> {
@@ -1498,7 +1496,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             vision,
             index,
             &self.stream,
-            &arena,
+            (&arena, &self.lifecycle.staging),
             &kernels,
             self.tensor.as_deref(),
         )?;
@@ -1906,7 +1904,6 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
                     format.dtype,
                     ops::Shape::new(&[patches, u64::from(format.width())]),
                 )?;
-                let tables = walk.tables(&vision.image_tables(grid).map_err(Error::from)?)?;
                 let rows = vision.image_rows(grid).map_err(Error::from)?;
                 let out = walk.placeholder(
                     self.model.dtype(),
@@ -1914,7 +1911,7 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
                 )?;
                 let forward = walk.forward(group.as_deref())?;
                 vision
-                    .encode_image(&forward, grid, pixels, &tables, out)
+                    .encode_image(&forward, grid, pixels, out)
                     .map_err(Error::from)
             })?;
         }
@@ -1990,7 +1987,18 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
                                 "no join graph in generation {generation} or one it replaces"
                             ))
                         })?;
-                    captured.launch(&stream)?;
+                    let views = self
+                        .experts
+                        .as_ref()
+                        .and_then(super::experts::Member::views)
+                        .map(|views| views.at_rows(join.capacity));
+                    self.lifecycle.replay(captured, |arena, staging| {
+                        let mut forward = Forward::staging(arena, staging);
+                        if let Some(views) = views.as_ref() {
+                            forward = forward.with_dispatch(views);
+                        }
+                        self.model.join_expert_step(&forward).map_err(Error::from)
+                    })?;
                 }
                 Ok(BatchOutput::default())
             }
@@ -2101,7 +2109,25 @@ impl<M: TextModel> Runner for CausalLmRunner<M> {
                 }
                 let nodes = captured.kernel_nodes();
                 if !eager {
-                    captured.launch(&stream)?;
+                    // The staging walk runs the step the graph was captured from over this batch's
+                    // columns, so the values its captured copies read are this batch's.
+                    let views = self
+                        .experts
+                        .as_ref()
+                        .and_then(super::experts::Member::views)
+                        .map(|views| views.at_rows(bucket.capacity));
+                    let tensor = self.tensor.clone();
+                    self.lifecycle.replay(captured, |arena, staging| {
+                        let mut forward = super::denoiser::grouped(
+                            Forward::staging(arena, staging)
+                                .with_live_tokens(self.columns.live_tokens.device),
+                            tensor.as_deref(),
+                        )?;
+                        if let Some(views) = views.as_ref() {
+                            forward = forward.with_dispatch(views);
+                        }
+                        self.step(&forward, *bucket)
+                    })?;
                 }
                 // The rows' checkpoints move into the state pages the mechanism allocated for them,
                 // behind the forward that wrote them.
@@ -2620,26 +2646,27 @@ impl<M: TextModel> CausalLmRunner<M> {
         // The count bounds the MoE sort's padded rows: the paired forward gets the same column as
         // the served one, so the comparison sees one count (7.3).
         let tensor = self.tensor.clone();
+        // The paired forward runs eagerly, so its uploads are copied from a staging slot.
+        let staging = self.lifecycle.staging.slot()?;
         let mut forward = Forward::new(&stream, next, &arena)
+            .with_staging(staging)
             .with_route(&pairing)
             .with_live_tokens(self.columns.live_tokens.device);
         if let Some(group) = tensor.as_deref() {
             forward = forward.with_group(group);
         }
-        let hidden = arena.tensor(
-            self.model.dtype(),
-            ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.model.hidden())]),
-        )?;
         let slots: Vec<i32> = self.staging.slots(rows).to_vec();
         let ids = self.input_ids(bucket);
-        self.with_kv(&arena, &slots, Some((pages, &lengths)), false, |cache| {
-            self.model
-                .embed_input_ids(&forward, ids, hidden)
+        self.with_kv(&forward, &slots, Some((pages, &lengths)), false, |cache| {
+            let embedded = self
+                .model
+                .embed_input_ids(&forward, ids)
                 .map_err(Error::from)?;
             self.model
-                .forward(&forward, &batch, cache, hidden)
+                .forward(&forward, &batch, cache, embedded)
                 .map_err(Error::from)
         })?;
+        self.lifecycle.staging.release(&stream)?;
         Ok(None)
     }
 
@@ -3188,13 +3215,13 @@ impl<M: TextModel> CausalLmRunner<M> {
     /// replay finds it at the address its capture used.
     fn with_kv<R>(
         &self,
-        arena: &nn::Arena,
+        forward: &Forward<'_>,
         slots: &[i32],
         scratch_pages: Option<(u32, &[i32])>,
         quiet: bool,
         operation: impl FnOnce(&KvView<'_>) -> Result<R>,
     ) -> Result<R> {
-        let workspace = arena.tensor(DType::U8, ops::Shape::new(&[ATTENTION_WORKSPACE_BYTES]))?;
+        let workspace = forward.empty(DType::U8, ops::Shape::new(&[ATTENTION_WORKSPACE_BYTES]))?;
         self.with_kv_over(workspace, slots, scratch_pages, quiet, None, operation)
     }
 
@@ -3311,7 +3338,9 @@ impl<M: TextModel> CausalLmRunner<M> {
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let probes = crate::profiling::fences::capturing(&stream);
         let tensor = self.tensor.clone();
+        let staging = self.lifecycle.staging.captured(&stream)?;
         let mut forward = Forward::new(&stream, generation, &arena)
+            .with_staging(staging)
             .with_live_tokens(self.columns.live_tokens.device)
             .with_fence(probes.as_ref().map(|probes| probes as &dyn nn::Fence));
         if let Some(group) = tensor.as_deref() {
@@ -3341,27 +3370,25 @@ impl<M: TextModel> CausalLmRunner<M> {
     /// recording forward over a counting arena reaches the extent the launching one does.
     fn step(&self, forward: &Forward<'_>, bucket: Bucket) -> Result<()> {
         let batch = self.token_batch(bucket)?;
-        let hidden = forward.arena().tensor(
-            self.model.dtype(),
-            ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.model.hidden())]),
-        )?;
         let slots: Vec<i32> = self.staging.slots(bucket.rows as usize).to_vec();
         let ids = self.input_ids(bucket);
         self.gather_step(forward, bucket)?;
         // A recording or a capture issues no table copy of its own: the tables are read where they
         // stand, which is what a replay addresses.
-        let quiet = self.capturing || forward.is_recording();
-        self.with_kv(forward.arena(), &slots, None, quiet, |cache| {
-            self.model
-                .embed_input_ids(forward, ids, hidden)
+        let quiet = self.capturing || !forward.launches();
+        self.with_kv(forward, &slots, None, quiet, |cache| {
+            let embedded = self
+                .model
+                .embed_input_ids(forward, ids)
                 .map_err(Error::from)?;
             // An image block's hidden rows are its features, written over the placeholder rows'
             // embeddings on this stream; a recording launches nothing.
-            if !forward.is_recording() {
-                self.write_image_rows(hidden)?;
+            if forward.launches() {
+                self.write_image_rows(embedded)?;
             }
-            self.model
-                .forward(forward, &batch, cache, hidden)
+            let hidden = self
+                .model
+                .forward(forward, &batch, cache, embedded)
                 .map_err(Error::from)?;
             if bucket.variant.samples() {
                 self.sample(forward, bucket, hidden)?;
@@ -3482,7 +3509,10 @@ impl<M: TextModel> CausalLmRunner<M> {
             .and_then(super::experts::Member::views)
             .ok_or_else(|| Error::Invariant("a join walked with no expert transport".into()))?
             .at_rows(bucket.capacity);
-        let forward = Forward::new(&stream, generation, &arena).with_dispatch(&views);
+        let staging = self.lifecycle.staging.captured(&stream)?;
+        let forward = Forward::new(&stream, generation, &arena)
+            .with_staging(staging)
+            .with_dispatch(&views);
         self.model.join_expert_step(&forward).map_err(Error::from)?;
         if first {
             self.pool()?
@@ -3497,7 +3527,6 @@ impl<M: TextModel> CausalLmRunner<M> {
     /// row through the model's sampler; its working set comes from the bucket's arena, so a replay
     /// samples without a host round trip.
     fn sample(&self, forward: &Forward<'_>, bucket: Bucket, hidden: TensorView) -> Result<()> {
-        let arena = forward.arena();
         let Some(sampling) = &self.sampling else {
             return Err(Error::State(
                 "the runner has no sampler but the bucket samples",
@@ -3507,27 +3536,14 @@ impl<M: TextModel> CausalLmRunner<M> {
         // The batch is checked where a real one is staged (`submit`, `shadow`): a capture has no
         // batch contents - its warm pose states a zeroed parameter column, which reads as a greedy
         // row - so the check here would refuse a sampled bucket its own capture.
-        let gathered = arena.tensor(
-            self.model.dtype(),
-            ops::Shape::new(&[rows, u64::from(self.model.hidden())]),
-        )?;
-        // The indices are the same defect one operator earlier: `IndexRows::gather` takes a flat `[count]`
-        // view and derives `count` from the gathered rows, so the column's own extent - the largest
-        // bucket's - is refused for every bucket narrower than it, before the sampler is reached.
-        nn::IndexRows
-            .gather(
-                forward,
-                hidden,
-                self.columns.indices.shaped(&[rows]),
-                gathered,
-            )
+        // `IndexRows::gather` takes a flat `[count]` index view and answers `count` rows, so the
+        // indices are this bucket's rows of the column rather than the column's own extent.
+        let gathered = nn::IndexRows
+            .gather(forward, hidden, self.columns.indices.shaped(&[rows]))
             .map_err(Error::from)?;
-        let logits = arena.tensor(
-            LOGITS_DTYPE,
-            ops::Shape::new(&[rows, u64::from(self.model.vocabulary())]),
-        )?;
-        self.model
-            .compute_logits(forward, gathered, logits)
+        let logits = self
+            .model
+            .compute_logits(forward, gathered)
             .map_err(Error::from)?;
         // The sampler reads its request state per row: `parameters` is `[rows, PARAMETER_COLUMNS]`
         // and `slots` is `[rows]`. A bucket narrower than the largest reads its own rows from the
@@ -3554,7 +3570,7 @@ impl<M: TextModel> CausalLmRunner<M> {
         // is a few words a row. The scheduler keeps them for the requests that asked, as many
         // alternatives as each asked for.
         let samples = Samples::reserve(
-            arena,
+            forward,
             DType::I32,
             rows,
             self.model.vocabulary(),
@@ -3578,7 +3594,7 @@ impl<M: TextModel> CausalLmRunner<M> {
         let prompt = self.score_prompt(forward, bucket, hidden)?;
         // A recording's views address no memory, so only a launching walk names where a replay's
         // tokens land.
-        if !forward.is_recording() {
+        if forward.launches() {
             self.bucket_samples.borrow_mut().insert(
                 bucket,
                 Sampled {
@@ -3622,30 +3638,36 @@ impl<M: TextModel> CausalLmRunner<M> {
             .as_ref()
             .ok_or(Error::State("a scoring bucket has no sampler"))?
             .sampler;
-        let arena = forward.arena();
         let tokens = u64::from(bucket.tokens);
         let vocabulary = u64::from(self.model.vocabulary());
-        let scores = Scores::reserve(arena, tokens, self.model.vocabulary(), sampler.candidates())?;
+        let scores = Scores::reserve(
+            forward,
+            tokens,
+            self.model.vocabulary(),
+            sampler.candidates(),
+        )?;
         let chunk = SCORE_ROWS.min(tokens);
-        let logits = arena.tensor(LOGITS_DTYPE, ops::Shape::new(&[chunk, vocabulary]))?;
-        let logprobs = arena.tensor(DType::F32, ops::Shape::new(&[chunk, vocabulary]))?;
         let targets = self.columns.targets.shaped(&[tokens]);
         let mut start = 0;
         while start < tokens {
             let count = chunk.min(tokens - start);
             let rows = hidden.narrow(0, start, count).map_err(Error::from)?;
-            let logits = logits.narrow(0, 0, count).map_err(Error::from)?;
-            let logprobs = logprobs.narrow(0, 0, count).map_err(Error::from)?;
-            self.model
-                .compute_logits(forward, rows, logits)
-                .map_err(Error::from)?;
-            sampler.log_softmax(forward, logits, logprobs)?;
-            sampler.score(
-                forward,
-                logprobs,
-                targets.narrow(0, start, count).map_err(Error::from)?,
-                &scores.rows(start, count)?,
-            )?;
+            // A chunk's logits and log-probabilities are dead once its scores are written, so the
+            // next chunk is handed the same addresses.
+            forward.scoped(|forward| -> Result<()> {
+                let logits = self
+                    .model
+                    .compute_logits(forward, rows)
+                    .map_err(Error::from)?;
+                let logprobs = forward.empty(DType::F32, ops::Shape::new(&[count, vocabulary]))?;
+                sampler.log_softmax(forward, logits, logprobs)?;
+                sampler.score(
+                    forward,
+                    logprobs,
+                    targets.narrow(0, start, count).map_err(Error::from)?,
+                    &scores.rows(start, count)?,
+                )
+            })?;
             start += count;
         }
         Ok(Some(scores))

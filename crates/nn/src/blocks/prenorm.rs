@@ -11,7 +11,7 @@
 //!
 //! A block's last update is not joined by the block itself: it is returned as a [`Pending`] update,
 //! and the next block's first norm - or the stack's final norm - joins it. That is the residual
-//! contract of the references' decoder layers, and it lets the join and the norm be one launch.
+//! convention of the references' decoder layers, and it lets the join and the norm be one launch.
 //! Whether they are is the block's [`ResidualForm`], because the two forms round differently: a
 //! fused join normalizes the unrounded FP32 sum, a separate join normalizes the stream it stored.
 
@@ -54,7 +54,8 @@ impl Pending {
     /// Views of another shape, or the operator's refusal.
     pub fn join(&self, f: &Forward, stream: TensorView) -> Result<()> {
         let scale = self.scale.map_or(Scale::None, Scale::Channel);
-        Residual::new(scale, None)?.forward(f, stream, self.update, None, stream)
+        Residual::new(scale, None)?.forward(f, stream, self.update, None)?;
+        Ok(())
     }
 }
 
@@ -65,6 +66,9 @@ pub struct PreNormSpec<'n> {
     pub hidden: u32,
     /// The norms' variance floor.
     pub eps: f32,
+    /// The element type the norms write: the projections' activation type, which may be narrower
+    /// than the stream's.
+    pub activation: DType,
     /// The attention input's norm module.
     pub norm1: &'n str,
     /// The MLP input's norm module.
@@ -87,6 +91,7 @@ pub struct PreNormBlock {
     norm1: Weight,
     norm2: Weight,
     eps: f32,
+    activation: DType,
     layer_scale: Option<[Weight; 2]>,
     residual: ResidualForm,
     mlp: GatedMlp,
@@ -117,18 +122,22 @@ impl PreNormBlock {
             norm1,
             norm2,
             eps: spec.eps,
+            activation: spec.activation,
             layer_scale,
             residual: spec.residual,
             mlp: GatedMlp::load(scope, spec.mlp, split)?,
         })
     }
 
-    /// The block over `stream` `[rows, width]`, with `attend(normalized, update)` the attention.
+    /// The block over `stream` `[rows, width]`, updated in place, with `attend(normalized)` the
+    /// attention answering its update.
     ///
     /// `pending` is the previous block's update, joined by this block's first norm; `None` for the
-    /// first block, whose norm reads the stream alone. `normalized` and `update` are caller-held
-    /// `[rows, width]` intermediates of the projections' element type, which may be narrower than
-    /// the stream's. The returned update is the MLP's output in `update`, not yet joined.
+    /// first block, whose norm reads the stream alone. `carried` is the stack's `[rows, width]`
+    /// buffer of the activation type that holds a block's last update until the next block joins
+    /// it: it may be `pending`'s own buffer, which the first norm has consumed before the MLP
+    /// writes it again. The returned update is the MLP's output in `carried`, not yet joined. The
+    /// block's other intermediates are handed back before return.
     ///
     /// # Errors
     ///
@@ -138,50 +147,57 @@ impl PreNormBlock {
         f: &Forward,
         stream: TensorView,
         pending: Option<Pending>,
-        normalized: TensorView,
-        update: TensorView,
-        attend: impl FnOnce(TensorView, TensorView) -> Result<()>,
+        carried: TensorView,
+        attend: impl FnOnce(TensorView) -> Result<TensorView>,
     ) -> Result<Pending> {
-        self.normalize(f, self.norm1, stream, pending, normalized)?;
-        attend(normalized, update)?;
-        let attended = Pending {
-            update,
-            scale: self.layer_scale.map(|[first, _]| first),
-        };
-        self.normalize(f, self.norm2, stream, Some(attended), normalized)?;
-        self.mlp.forward(f, normalized, update)?;
+        f.scoped(|f| {
+            let normalized = self.normalize(f, self.norm1, stream, pending)?;
+            let attended = Pending {
+                update: attend(normalized)?,
+                scale: self.layer_scale.map(|[first, _]| first),
+            };
+            let normalized = self.normalize(f, self.norm2, stream, Some(attended))?;
+            self.mlp.forward_into(f, normalized, carried)
+        })?;
         Ok(Pending {
-            update,
+            update: carried,
             scale: self.layer_scale.map(|[_, second]| second),
         })
     }
 
-    /// `out = norm(stream)` after joining `pending` into the stream in the block's form.
+    /// `norm(stream)` after joining `pending` into the stream in the block's form, in the block's
+    /// activation type.
     fn normalize(
         &self,
         f: &Forward,
         weight: Weight,
         stream: TensorView,
         pending: Option<Pending>,
-        out: TensorView,
-    ) -> Result<()> {
-        let plain = || RmsNorm::new(weight, self.eps, Epilogue::None, Gain::Plain);
+    ) -> Result<TensorView> {
+        let plain = || {
+            RmsNorm::new(
+                weight,
+                self.eps,
+                Epilogue::None,
+                Gain::Plain,
+                self.activation,
+            )
+        };
         match (pending, self.residual) {
-            (None, _) => plain()?.forward(f, stream, None, out),
+            (None, _) => plain()?.forward(f, stream, None),
             (Some(pending), ResidualForm::Separate) => {
                 pending.join(f, stream)?;
-                plain()?.forward(f, stream, None, out)
+                plain()?.forward(f, stream, None)
             }
             (Some(pending), ResidualForm::Fused) => {
                 let epilogue = match pending.scale {
                     Some(scale) => Epilogue::ScaledResidual { scale, bias: None },
                     None => Epilogue::None,
                 };
-                RmsNorm::new(weight, self.eps, epilogue, Gain::Plain)?.forward(
+                RmsNorm::new(weight, self.eps, epilogue, Gain::Plain, self.activation)?.forward(
                     f,
                     pending.update,
                     Some(ResidualStream::in_place(stream)),
-                    out,
                 )
             }
         }

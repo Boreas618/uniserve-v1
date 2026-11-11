@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use nn::capability::{PatchFormat, TableValues, Vision};
+use nn::capability::{PatchFormat, Vision};
 use ops::{DType, TensorView};
 use platform::DeviceId;
 
@@ -360,13 +360,14 @@ impl Images {
     }
 
     /// Performs the staged encoding of call `index` on `stream` with `kernels`: the read's patches
-    /// encoded into the product's slot, or the stored encoding copied in.
+    /// encoded into the product's slot, or the stored encoding copied in. The tower's grid values
+    /// are uploaded through a slot of `staging`, the runner's staging regions.
     pub(crate) fn encode(
         &mut self,
         vision: &dyn Vision,
         index: usize,
         stream: &platform::Stream,
-        arena: &nn::Arena,
+        (arena, staging): (&nn::Arena, &crate::staging::StagingRegion),
         kernels: &Arc<ops::Generation>,
         group: Option<&nn::Group>,
     ) -> Result<()> {
@@ -409,27 +410,15 @@ impl Images {
             self.format.dtype,
             ops::Shape::new(&[patch_rows, u64::from(self.format.width())]),
         );
-        let specs = vision.image_tables(grid).map_err(Error::from)?;
-        let mut values = specs
-            .iter()
-            .map(|table| TableValues::zeroed(table).map_err(Error::from))
-            .collect::<Result<Vec<_>>>()?;
+        let slot = staging.slot()?;
+        let forward = super::denoiser::grouped(
+            nn::Forward::new(stream, kernels, arena).with_staging(slot),
+            group,
+        )?;
         vision
-            .prepare_image(grid, &mut values)
+            .encode_image(&forward, grid, pixels, out)
             .map_err(Error::from)?;
-        let mut tables = Vec::with_capacity(specs.len());
-        for (table, values) in specs.iter().zip(&values) {
-            let address = self.pinned(&values.to_bytes(), &mut held)?;
-            tables.push(TensorView::new(
-                ops::DevicePtr::new(address),
-                table.dtype,
-                table.shape,
-            ));
-        }
-        let forward = super::denoiser::grouped(nn::Forward::new(stream, kernels, arena), group);
-        vision
-            .encode_image(&forward, grid, pixels, &tables, out)
-            .map_err(Error::from)?;
+        staging.release(stream)?;
         let read = platform::Event::new(platform::EventFlags::default());
         read.record(stream)?;
         self.retained.push((read, held));

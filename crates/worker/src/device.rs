@@ -129,6 +129,7 @@ fn recorded_walks(
     for named in runners.iter_mut() {
         let footprint = named.runner.record_walk()?;
         keys.union(&footprint);
+        named.runner.size_staging(device, footprint.staging)?;
         let Some(stream) = named.runner.stream().map(|stream| StreamId(stream.raw())) else {
             continue;
         };

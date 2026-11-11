@@ -801,7 +801,7 @@ impl ModelRunner {
                 // block they split.
                 let (sequence, tensor) = self.video_split(&*checkpoint)?;
                 let placement = VideoPlacement {
-                    components: self.capability_groups().map(|groups| {
+                    stages: self.capability_groups().map(|groups| {
                         groups
                             .iter()
                             .flat_map(|group| group.blocks.keys().cloned())

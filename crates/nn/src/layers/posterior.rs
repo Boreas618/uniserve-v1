@@ -24,35 +24,34 @@ use crate::forward::Forward;
 pub struct Posterior;
 
 impl Posterior {
-    /// Draw `out` from `moments` and the caller's standard-normal `noise`.
+    /// A sample drawn from `moments` and the caller's standard-normal `noise`: a fresh packed FP32
+    /// `[channels, ...]` raster.
     ///
-    /// `moments` is `[2 · channels, ...]`, the mean's channels then the log-variance's; `noise` and
-    /// `out` are `[channels, ...]` of the same trailing extents. All three are packed FP32, and
-    /// `out` may not alias the others.
+    /// `moments` is `[2 · channels, ...]`, the mean's channels then the log-variance's; `noise` is
+    /// `[channels, ...]` of the same trailing extents. Both are packed FP32.
     ///
     /// # Errors
     ///
     /// Rasters of another element type, rank, channel count or trailing extent, a strided raster,
-    /// or the operator's refusal.
+    /// an arena that cannot hold the sample, or the operator's refusal.
     pub fn sample(
         &self,
         f: &Forward,
         moments: TensorView,
         noise: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
+    ) -> Result<TensorView> {
         const OWNER: &str = "Posterior";
-        let channels = out.shape.dims().first().copied().unwrap_or(0);
+        let channels = noise.shape.dims().first().copied().unwrap_or(0);
         if channels == 0 {
             return Err(Error::shape(
                 OWNER,
-                format!("a sample of {:?} has no channels", out.shape.dims()),
+                format!("a sample of {:?} has no channels", noise.shape.dims()),
             ));
         }
+        let out = f.empty(DType::F32, noise.shape)?;
         for (name, view, expected) in [
             ("moments", moments, 2 * channels),
             ("noise", noise, channels),
-            ("out", out, channels),
         ] {
             if view.dtype != DType::F32 {
                 return Err(Error::shape(
@@ -112,6 +111,7 @@ impl Posterior {
                 noise: view(noise.ptr),
                 out: view(out.ptr),
             },
-        )
+        )?;
+        Ok(out)
     }
 }

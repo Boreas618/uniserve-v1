@@ -2,26 +2,12 @@
 //! boundary and immutable afterwards.
 //!
 //! A checkpoint is normalized into one configuration before any module is built, for the fields
-//! the model reads. A
-//! checkpoint is the base release (a pipeline index over the DiT partitions, text encoder, video
-//! VAE and audio VAE it holds) or a FastH3 export (one DiT partition and schedulers, with a
-//! contract naming the base revision it reads the rest from).
-//!
-//! ## What is a fact of the checkpoint and what is a fact of the request
-//!
-//! The dimensions, the schedule, the attention kind and the latent statistics are the checkpoint's
-//! and are read here. The values the family-neutral request rules of `crates/processing` are
-//! parameterized by - the frame rule ([`FRAMES`]), the canvas rule ([`CANVAS_RULE`]) and the
-//! durations a request may ask for - are stated here once, and every component of the crate and
-//! its request processing reads them from here.
-//!
-//! ## Timeline
-//!
-//! H3 counts video in frames at [`FPS`], by the frame rule [`FRAMES`] (`17n + 5` frames, clips of 17
-//! frames that the video VAE encodes to 5 latent frames, the final clip keeping 2), and audio in
-//! latent steps of [`AUDIO_HOP`] samples at [`AUDIO_SAMPLE_RATE`]. The checkpoint's own VAE
-//! configuration must agree with these, which [`Config::normalize`] checks: a checkpoint whose
-//! compression differs is one this crate's packing and reconstruction cannot serve.
+//! the model reads: the base release (a pipeline index over the DiT partitions, text encoder,
+//! video VAE and audio VAE it holds), or a FastH3 export or adapter (one DiT partition whose
+//! schedule and attention its `fastvideo_inference.json`, or the release it was extracted from,
+//! states). The request-level values the family-neutral request rules are parameterized by -
+//! the frame rule, the canvas rule, the durations and the audio clock - are request processing's
+//! ([`processing::minimax_h3`]); this configuration checks that the checkpoint agrees with them.
 
 mod audio_vae;
 mod denoiser;
@@ -31,94 +17,47 @@ mod video_vae;
 use std::collections::BTreeMap;
 
 use nn::config::Fields;
-use processing::{CanvasRule, FrameClips};
-use proto::video::Canvas;
+use serde_json::Value;
 
-use crate::VideoTask;
+use crate::checkpoint::PIPELINE_CLASS;
+use crate::packing::LATENT_COMPRESSION;
+use crate::{Error, Result, VideoTask};
+use nn::family::Stage;
 
 pub use audio_vae::AudioVaeConfig;
 pub use denoiser::{
     AttentionKind, DenoiserConfig, SPARSE_TILE_ROWS, ScheduleGrid, ScheduleSpec, Shifts,
     TransformerConfig,
 };
+pub use processing::minimax_h3::{
+    AUDIO_CHANNELS, AUDIO_HOP, AUDIO_LATENTS_PER_SECOND, AUDIO_SAMPLE_RATE, CANVAS_RULE, FPS,
+    FRAMES, MAX_SECONDS, MIN_SECONDS, NAMED_ASPECT_RATIOS,
+};
 pub use text::RETAINED_LAYERS;
 pub use video_vae::VideoVaeConfig;
-
-use crate::checkpoint::{ContractSchedule, Dit, Layout, Sidecars};
-use crate::packing::{LATENT_COMPRESSION, PATCH_SIDE};
-use crate::{Error, Result};
-use qwen3::processor::ProcessorConfig;
-
-/// Frames per second of a generated video.
-pub const FPS: u32 = 24;
-
-/// The frame rule of every video H3 generates and every condition it encodes.
-///
-/// A generated video is `17n + 5` frames: the video VAE encodes each 17-frame clip to 5 latent frames
-/// and the 5-frame tail past the whole clips to 2, the final clip dropping 3 latent frames that the
-/// next clip's overlap repeats. The packing, the rotary coordinates and the decoder's clip splice are
-/// written for this timeline, so a checkpoint whose video VAE states another is refused
-/// ([`Config::normalize`]).
-pub const FRAMES: FrameClips = FrameClips {
-    min_frames: 22,
-    clip_frames: 17,
-    clip_latent_frames: 5,
-    tail_latent_frames: 2,
-};
 
 /// The video VAE's temporal compression: one latent frame covers this many video frames.
 pub const TEMPORAL_COMPRESSION: u32 = 4;
 
-/// The shortest output a request may ask for, in seconds.
-pub const MIN_SECONDS: f64 = 4.0;
-
-/// The longest output a request may ask for, in seconds: the most a deployment may serve.
-pub const MAX_SECONDS: f64 = 15.0;
-
 /// The longest generated clip a deployment's bounds are taken over, in frames.
 ///
-/// One number serves video and the audio that accompanies it: every capacity a deployment sizes -
-/// the packed row bound, a decoder's canvas extent, the audio encoder's attention - is taken over a
-/// request no longer than this, so a track longer than it is refused rather than read past a bound.
+/// Every capacity a deployment sizes - the packed row bound, a decoder's canvas extent, the audio
+/// encoder's attention - is taken over a request no longer than this.
 pub const MAX_FRAMES: u32 = 1024;
 
-/// Samples per second of the generated audio track.
-pub const AUDIO_SAMPLE_RATE: u32 = 32_000;
+/// Steps of the training schedule a DMD student's rungs are stated on.
+pub const NUM_TRAIN_TIMESTEPS: f32 = 1000.0;
 
-/// Audio latent steps per second: the generated audio stream's latent rate.
-pub const AUDIO_LATENTS_PER_SECOND: u32 = 40;
-
-/// Samples one audio latent step covers.
-pub const AUDIO_HOP: u32 = AUDIO_SAMPLE_RATE / AUDIO_LATENTS_PER_SECOND;
-
-/// Channels of the generated audio: interleaved stereo.
-pub const AUDIO_CHANNELS: u32 = 2;
-
-/// The canvas rule H3 generates by (diffusers' `adapt_shape_v1`): a 768-pixel short edge, an area
-/// cap of `768 * 1344` pixels, aspects from 1:4 to 4:1, and sides on a 32-pixel grid, so a side
-/// survives the video VAE's 16x spatial compression on a whole number of 2x2 transformer patches.
-pub const CANVAS_RULE: CanvasRule = CanvasRule {
-    short_edge: 768,
-    max_pixels: 768 * 1344,
-    multiple: LATENT_COMPRESSION * PATCH_SIDE,
-    narrowest: (1, 4),
-    widest: (4, 1),
-};
-
-/// The aspect ratios a request names a canvas by besides `auto`, landscape first. Every H3
-/// checkpoint generates the canvas rule's canvas of each at its short edge, and a deployment
-/// serves a subset of them (`docs/minimax_h3/minimax_h3.md`).
-pub const NAMED_ASPECT_RATIOS: [(u32, u32); 6] =
-    [(21, 9), (16, 9), (4, 3), (1, 1), (3, 4), (9, 16)];
+/// Sigma points of the released full-step grid, the clean endpoint included.
+pub const UNIFORM_GRID_POINTS: u32 = 50;
 
 /// The canvases every H3 checkpoint generates: the canvas rule's canvas of each named aspect ratio,
 /// with the ratio, in [`NAMED_ASPECT_RATIOS`]' order (1536x672 for 21:9 to 768x1344 for 9:16).
 ///
 /// # Errors
 ///
-/// Fails when the rule refuses a named ratio, which a rule that states the named ratios' range does
-/// not.
-pub fn named_canvases() -> Result<Vec<((u32, u32), Canvas)>> {
+/// Fails when the rule refuses a named ratio.
+pub fn named_canvases() -> Result<Vec<((u32, u32), proto::video::Canvas)>> {
     NAMED_ASPECT_RATIOS
         .iter()
         .map(|&(width, height)| {
@@ -130,124 +69,133 @@ pub fn named_canvases() -> Result<Vec<((u32, u32), Canvas)>> {
         .collect()
 }
 
-/// Steps of the training schedule a DMD student's rungs are stated on.
-pub const NUM_TRAIN_TIMESTEPS: f32 = 1000.0;
-
-/// Sigma points of the released full-step grid, the clean endpoint included.
-pub const UNIFORM_GRID_POINTS: u32 = 50;
+/// The FastH3 rungs and attention a fused adapter's student was distilled with: the four DMD
+/// rungs of the `t2av` partition at the base release's shifts, and VSA at 64-row tiles and 0.9
+/// sparsity when the adapter assigns the layers' compression gates
+/// (`FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`).
+const ADAPTER_RUNGS: [u32; 4] = [999, 749, 500, 250];
 
 /// A checkpoint's typed configuration.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Config {
     /// The Qwen3-VL text encoder that conditions a request.
-    pub text_encoder: qwen3::VlConfig,
+    pub text_encoder: qwen3::Config,
     /// The pixel normalization the text encoder's processor applies.
     pub pixels: nn::capability::PixelNorm,
     /// Each DiT partition the checkpoint holds, by network.
-    pub denoisers: BTreeMap<Dit, DenoiserConfig>,
+    pub denoisers: BTreeMap<Stage, DenoiserConfig>,
     /// The video VAE: the decoder every task uses and the encoder `ref2va` uses.
     pub video_vae: VideoVaeConfig,
     /// The audio VAE: the BigVGAN decoder every task uses and the encoder `ref2va` uses.
     pub audio_vae: AudioVaeConfig,
-    /// The conditioner's Qwen3-VL processor geometry: how a condition image is resized to the
-    /// vision grid the text encoder reads. Read from the two processor files the request processing
-    /// reads it from, and `None` when the checkpoint states no video processor file.
-    pub processor: Option<ProcessorConfig>,
+    /// The text encoder's Qwen-VL processor geometry, `None` when the checkpoint states no
+    /// `processor/video_preprocessor_config.json`.
+    pub processor: Option<processing::qwen_vl::ProcessorConfig>,
 }
 
 impl Config {
     /// Read and normalize the configuration of `checkpoint`, once.
     ///
-    /// A FastH3 export is opened together with the base revision it pins
-    /// ([`crate::checkpoint::Contract::base_revision`]), and every sidecar the export omits is read
-    /// from the base: the checkpoint answers each document from the first root that holds it.
+    /// Each sidecar is read from the first root of the checkpoint that holds it, so an export that
+    /// continues a base release reads what it omits from the base. A FastH3 adapter fused into the
+    /// base `transformer` reads as the student it was extracted from.
     pub fn open(checkpoint: &nn::Checkpoint) -> Result<Self> {
-        let layout = Layout::detect(checkpoint)?;
-        let sidecars = Sidecars::read(checkpoint, &layout)?;
-        Self::normalize(&layout, &sidecars)
+        let adapter = checkpoint
+            .stage(Stage::Transformer.name())
+            .ok()
+            .and_then(nn::Checkpoint::adapter)
+            .map(|fusion| {
+                fusion
+                    .assigned()
+                    .any(|name| name.ends_with(".attn.to_gate_compress.weight"))
+            });
+        let root = checkpoint.root().display().to_string();
+        Self::read(|relative| Ok(checkpoint.sidecar(relative)?), adapter, &root)
     }
 
-    /// Build the configuration from a recognized layout and its parsed sidecars.
+    /// Build the configuration from `sidecar`, which answers a checkpoint-relative sidecar or
+    /// `None`. `adapter` is whether a fused FastH3 adapter assigns compression gates, `None` when
+    /// none is fused; `root` names the checkpoint in refusals.
     ///
     /// This is the whole of the loading boundary's reading: everything is checked here - the
-    /// language layers against the DiT's conditioning width, the VAEs' compression against the
-    /// timeline the packing assumes, the sparse attention against its tile shapes - so no layer
+    /// text encoder against the DiT's conditioning width, the VAEs' compression against the
+    /// timeline the packing assumes, the student's statement against its schedulers - so no layer
     /// below sees a value it cannot use.
-    pub fn normalize(layout: &Layout, sidecars: &Sidecars) -> Result<Self> {
-        let text_encoder = text::text_encoder(&sidecars.text_encoder)?;
-        let pixels = qwen3::processor::pixel_norm(&Fields::of(
+    pub(crate) fn read(
+        sidecar: impl Fn(&str) -> Result<Option<Value>>,
+        adapter: Option<bool>,
+        root: &str,
+    ) -> Result<Self> {
+        let require = |relative: &str| -> Result<Value> {
+            sidecar(relative)?.ok_or_else(|| {
+                Error::checkpoint(format!(
+                    "no root of the checkpoint at {root} holds {relative}"
+                ))
+            })
+        };
+        let text_encoder = text::text_encoder(&require("text_encoder/config.json")?)?;
+        let image_processor = require("processor/preprocessor_config.json")?;
+        let pixels = qwen3::vision::pixel_norm(&Fields::of(
             "processor/preprocessor_config.json",
-            &sidecars.processor,
+            &image_processor,
         )?)?;
-        let processor = sidecars
-            .video_processor
-            .as_ref()
-            .map(|video| ProcessorConfig::from_values(&sidecars.processor, video))
+        let processor = sidecar("processor/video_preprocessor_config.json")?
+            .map(|video| {
+                processing::qwen_vl::ProcessorConfig::from_values(&image_processor, &video)
+            })
             .transpose()
             .map_err(|error| Error::config(format!("the checkpoint's processor: {error}")))?;
-        let video_vae = VideoVaeConfig::parse(&sidecars.video_vae)?;
-        let audio_vae = AudioVaeConfig::parse(&sidecars.audio_vae)?;
+        let video_vae = VideoVaeConfig::parse(&require("vae/config.json")?)?;
+        let audio_vae = AudioVaeConfig::parse(&require("audio_vae/config.json")?)?;
         let shifts = Shifts {
-            video: shift(&sidecars.scheduler, "scheduler/scheduler_config.json")?,
+            video: shift(
+                &require("scheduler/scheduler_config.json")?,
+                "scheduler/scheduler_config.json",
+            )?,
             audio: shift(
-                &sidecars.audio_scheduler,
+                &require("audio_scheduler/scheduler_config.json")?,
                 "audio_scheduler/scheduler_config.json",
             )?,
         };
-        // A student's contract states the same two shifts next to its scheduler sidecars; a
-        // checkpoint whose two statements disagree is refused rather than resolved silently.
-        if let Some(contract) = &layout.contract
-            && (contract.video_shift != shifts.video || contract.audio_shift != shifts.audio)
-        {
-            return Err(Error::config(format!(
-                "fastvideo_inference.json shifts ({}, {}) disagree with the scheduler \
-                     sidecars ({}, {})",
-                contract.video_shift, contract.audio_shift, shifts.video, shifts.audio
-            )));
-        }
+
+        let student = sidecar("fastvideo_inference.json")?;
+        let student = student
+            .as_ref()
+            .map(|value| Fields::of("fastvideo_inference.json", value))
+            .transpose()?;
+        let dits = match (&student, adapter) {
+            (Some(student), _) => vec![student_dit(student)?],
+            (None, Some(_)) => vec![Stage::Transformer],
+            (None, None) => released_dits(&sidecar, root)?,
+        };
 
         let mut denoisers = BTreeMap::new();
-        for (dit, tasks) in &layout.dits {
-            let values = sidecars.dits.get(dit).ok_or_else(|| {
-                Error::config(format!(
-                    "the checkpoint holds no {}/config.json",
-                    dit.directory()
-                ))
-            })?;
-            let transformer = TransformerConfig::parse(&Fields::of(
-                format!("{}/config.json", dit.directory()),
-                values,
-            )?)?;
-            let (schedule, attention) = match &layout.contract {
-                None => (
+        for dit in dits {
+            let relative = format!("{}/config.json", dit.name());
+            let transformer =
+                TransformerConfig::parse(&Fields::of(&relative, &require(&relative)?)?)?;
+            let (schedule, attention) = match (&student, adapter) {
+                (Some(student), _) => student_denoising(student, &transformer, shifts)?,
+                (None, Some(gated)) => (
+                    ScheduleSpec::dmd(ADAPTER_RUNGS.to_vec(), NUM_TRAIN_TIMESTEPS, shifts)?,
+                    if gated {
+                        AttentionKind::sparse(64, 0.9, None)?
+                    } else {
+                        AttentionKind::Dense
+                    },
+                ),
+                (None, None) => (
                     ScheduleSpec::uniform(UNIFORM_GRID_POINTS, shifts)?,
                     AttentionKind::Dense,
                 ),
-                Some(contract) => (
-                    match &contract.schedule {
-                        ContractSchedule::Rungs(rungs) => {
-                            ScheduleSpec::dmd(rungs.clone(), NUM_TRAIN_TIMESTEPS, shifts)?
-                        }
-                        ContractSchedule::Nodes { nodes, max_t } => ScheduleSpec::blocks(
-                            transformer.output_heads,
-                            nodes.clone(),
-                            *max_t,
-                            shifts,
-                        )?,
-                    },
-                    // The export names its backend; the sparse parameters exist exactly when it does.
-                    match contract.attention {
-                        None => AttentionKind::Dense,
-                        Some(sparse) => AttentionKind::sparse(
-                            sparse.tile,
-                            sparse.sparsity,
-                            sparse.reference_keep,
-                        )?,
-                    },
-                ),
             };
-            let denoiser = DenoiserConfig::new(transformer, schedule, attention, tasks.clone())?;
-            denoisers.insert(*dit, denoiser);
+            let denoiser = DenoiserConfig::new(
+                transformer,
+                schedule,
+                attention,
+                crate::checkpoint::dit_tasks(dit),
+            )?;
+            denoisers.insert(dit, denoiser);
         }
 
         let config = Self {
@@ -264,21 +212,21 @@ impl Config {
 
     /// The tasks the checkpoint can serve: each DiT's, in canonical order.
     pub fn tasks(&self) -> Vec<VideoTask> {
-        let mut tasks = Vec::new();
-        for task in [
-            VideoTask::TextToVideoAudio,
-            VideoTask::FirstLastToVideoAudio,
-            VideoTask::ReferenceToVideoAudio,
-        ] {
-            if self
-                .denoisers
-                .values()
-                .any(|denoiser| denoiser.tasks.contains(&task))
-            {
-                tasks.push(task);
-            }
-        }
-        tasks
+        VideoTask::ALL
+            .into_iter()
+            .filter(|task| self.denoisers.contains_key(&crate::checkpoint::dit(*task)))
+            .collect()
+    }
+
+    /// The text encoder's vision tower, which every H3 text encoder carries.
+    ///
+    /// # Errors
+    ///
+    /// A configuration built without one, which the reader refuses.
+    pub fn vision(&self) -> Result<&qwen3::config::VisionConfig> {
+        self.text_encoder.vision.as_ref().ok_or_else(|| {
+            Error::config("H3's text encoder is a Qwen3-VL model with a vision tower".to_owned())
+        })
     }
 
     /// Check the components against each other and against the timeline.
@@ -339,7 +287,7 @@ impl Config {
                 return Err(Error::config(format!(
                     "H3 text features are {} wide and the {} DiT conditions on {}",
                     self.text_encoder.text.hidden_size,
-                    dit.directory(),
+                    dit.name(),
                     transformer.text_dim
                 )));
             }
@@ -347,7 +295,7 @@ impl Config {
                 return Err(Error::config(format!(
                     "H3 video latents have {} channels and the {} DiT reads {}",
                     video.latent_channels,
-                    dit.directory(),
+                    dit.name(),
                     transformer.video_channels
                 )));
             }
@@ -355,13 +303,131 @@ impl Config {
                 return Err(Error::config(format!(
                     "H3 audio latents have {} channels and the {} DiT reads {}",
                     audio.latent_channels,
-                    dit.directory(),
+                    dit.name(),
                     transformer.audio_channels
                 )));
             }
         }
         Ok(())
     }
+}
+
+/// The DiT partitions a base release holds: those its pipeline index names and whose
+/// configuration the checkpoint holds.
+fn released_dits(
+    sidecar: &impl Fn(&str) -> Result<Option<Value>>,
+    root: &str,
+) -> Result<Vec<Stage>> {
+    let index = sidecar("model_index.json")?.ok_or_else(|| {
+        Error::checkpoint(format!(
+            "{root} holds neither fastvideo_inference.json nor model_index.json"
+        ))
+    })?;
+    let index = Fields::of("model_index.json", &index)?;
+    if let Some(class) = index.optional_text("_class_name")?
+        && class != PIPELINE_CLASS
+    {
+        return Err(Error::checkpoint(format!(
+            "{root} is a {class} checkpoint, not a {PIPELINE_CLASS} pipeline root; the task \
+             exports under FL2VA/ are not pipeline roots"
+        )));
+    }
+    let mut dits = Vec::new();
+    for dit in crate::checkpoint::DITS {
+        if index.contains(dit.name()) && sidecar(&format!("{}/config.json", dit.name()))?.is_some()
+        {
+            dits.push(dit);
+        }
+    }
+    if dits.is_empty() {
+        return Err(Error::checkpoint(format!(
+            "{root}/model_index.json names no DiT partition the checkpoint holds"
+        )));
+    }
+    Ok(dits)
+}
+
+/// The DiT partition a FastH3 export distils: the base network of the task it states (`task`, or
+/// `model_type` in the OmniRef exports).
+fn student_dit(student: &Fields<'_>) -> Result<Stage> {
+    let stated = match student.optional_text("task")? {
+        Some(task) => task,
+        None => student.optional_text("model_type")?.ok_or_else(|| {
+            Error::checkpoint("fastvideo_inference.json states no task or model_type".to_owned())
+        })?,
+    };
+    match stated {
+        "t2av" => Ok(crate::checkpoint::dit(VideoTask::TextToVideoAudio)),
+        "ref2va" => Ok(crate::checkpoint::dit(VideoTask::ReferenceToVideoAudio)),
+        other => Err(Error::checkpoint(format!(
+            "unsupported FastH3 checkpoint: its task must be t2av or ref2va, got {other:?}"
+        ))),
+    }
+}
+
+/// A FastH3 export's schedule and attention, from its `fastvideo_inference.json`.
+///
+/// The export states the same two shifts as its scheduler sidecars, and a checkpoint whose two
+/// statements disagree is refused. Its schedule is a DMD ladder (`dmd_denoising_steps`) or a
+/// parallel-decoding block grid (`pdd_step_indices` with `grid_max_t`), exactly one of them; its
+/// attention backend is `DENSE` (or unstated) or `VIDEO_SPARSE_ATTN_H3` with the `vsa_*` knobs,
+/// whose sparsity stays FP64 because `ceil((1 - sparsity) · tiles)` is a tile count.
+fn student_denoising(
+    student: &Fields<'_>,
+    transformer: &TransformerConfig,
+    shifts: Shifts,
+) -> Result<(ScheduleSpec, AttentionKind)> {
+    let stated = (
+        student.number("video_scheduler_shift")? as f32,
+        student.number("audio_scheduler_shift")? as f32,
+    );
+    if stated != (shifts.video, shifts.audio) {
+        return Err(Error::config(format!(
+            "fastvideo_inference.json shifts {stated:?} disagree with the scheduler sidecars \
+             ({}, {})",
+            shifts.video, shifts.audio
+        )));
+    }
+    let schedule = match (
+        student.optional_indices("dmd_denoising_steps")?,
+        student.optional_indices("pdd_step_indices")?,
+    ) {
+        (Some(rungs), None) => ScheduleSpec::dmd(rungs, NUM_TRAIN_TIMESTEPS, shifts)?,
+        (None, Some(nodes)) => ScheduleSpec::blocks(
+            transformer.output_heads,
+            nodes,
+            student.number("grid_max_t")? as f32,
+            shifts,
+        )?,
+        (Some(_), Some(_)) => {
+            return Err(Error::checkpoint(
+                "fastvideo_inference.json states both dmd_denoising_steps and pdd_step_indices"
+                    .to_owned(),
+            ));
+        }
+        (None, None) => {
+            return Err(Error::checkpoint(
+                "unsupported FastH3 checkpoint: fastvideo_inference.json states neither \
+                 dmd_denoising_steps nor pdd_step_indices"
+                    .to_owned(),
+            ));
+        }
+    };
+    let attention = match student.optional_text("attention_backend")? {
+        None | Some("DENSE") => AttentionKind::Dense,
+        Some("VIDEO_SPARSE_ATTN_H3") => AttentionKind::sparse(
+            student.index("vsa_tile_size")?,
+            student.number("vsa_sparsity")?,
+            student.optional_number("vsa_ref_keep_rate")?,
+        )?,
+        Some(other) => {
+            return Err(Error::checkpoint(format!(
+                "fastvideo_inference.json states the attention backend {other:?}, which this \
+                 build does not serve: it serves DENSE and VIDEO_SPARSE_ATTN_H3"
+            )));
+        }
+    };
+    Ok((schedule, attention))
 }
 
 /// The noise level shift a scheduler sidecar states.
@@ -387,11 +453,9 @@ fn statistics(values: &Fields<'_>, key: &str, channels: u32) -> Result<Vec<f32>>
 pub(crate) mod tests_support {
     use std::collections::BTreeMap;
 
-    use crate::VideoTask;
     use serde_json::Value;
 
     use super::*;
-    use crate::checkpoint::{AttentionBackend, Contract, Layout, Sidecars, SparseContract};
 
     /// Parse a fixture's JSON.
     pub(crate) fn json(body: &str) -> Value {
@@ -402,6 +466,7 @@ pub(crate) mod tests_support {
     pub(crate) fn text_encoder() -> Value {
         json(
             r#"{
+                "architectures": ["Qwen3VLForConditionalGeneration"],
                 "image_token_id": 151655,
                 "video_token_id": 151656,
                 "tie_word_embeddings": false,
@@ -517,91 +582,92 @@ pub(crate) mod tests_support {
         )
     }
 
-    /// The base release's layout: both DiT partitions, no contract.
-    pub(crate) fn base_layout() -> Layout {
-        Layout {
-            dits: vec![
-                (
-                    Dit::Base,
-                    vec![
-                        VideoTask::TextToVideoAudio,
-                        VideoTask::FirstLastToVideoAudio,
-                    ],
+    /// The base release's sidecars, by checkpoint-relative path: a pipeline index over both DiT
+    /// partitions.
+    pub(crate) fn release() -> BTreeMap<String, Value> {
+        let mut files = BTreeMap::new();
+        for (path, value) in [
+            (
+                "model_index.json",
+                json(
+                    r#"{"_class_name": "MiniMaxH3ModularPipeline",
+                        "transformer": [], "transformer_ref": []}"#,
                 ),
-                (Dit::Reference, vec![VideoTask::ReferenceToVideoAudio]),
-            ],
-            contract: None,
+            ),
+            ("text_encoder/config.json", text_encoder()),
+            ("processor/preprocessor_config.json", processor()),
+            ("vae/config.json", video_vae()),
+            ("audio_vae/config.json", audio_vae()),
+            (
+                "scheduler/scheduler_config.json",
+                json(r#"{"shift": 12.0}"#),
+            ),
+            (
+                "audio_scheduler/scheduler_config.json",
+                json(r#"{"shift": 3.0}"#),
+            ),
+            ("transformer/config.json", transformer()),
+            ("transformer_ref/config.json", transformer()),
+        ] {
+            files.insert(path.to_owned(), value);
         }
+        files
     }
 
-    /// The base release's sidecars.
-    pub(crate) fn sidecars(layout: &Layout) -> Sidecars {
-        let mut dits = BTreeMap::new();
-        for (dit, _) in &layout.dits {
-            dits.insert(*dit, transformer());
-        }
-        Sidecars {
-            text_encoder: text_encoder(),
-            processor: processor(),
-            video_processor: None,
-            video_vae: video_vae(),
-            audio_vae: audio_vae(),
-            scheduler: json(r#"{"shift": 12.0}"#),
-            audio_scheduler: json(r#"{"shift": 3.0}"#),
-            dits,
-        }
-    }
-
-    /// A FastH3 DMD contract for the base partition.
-    pub(crate) fn dmd_contract() -> Contract {
-        Contract {
-            task: VideoTask::TextToVideoAudio,
-            dit: Dit::Base,
-            base_revision: None,
-            video_shift: 10.0,
-            audio_shift: 3.0,
-            schedule: ContractSchedule::Rungs(vec![999, 874, 749, 624, 500, 375, 250, 125]),
-            backend: AttentionBackend::VideoSparseH3,
-            attention: Some(SparseContract {
-                tile: 64,
-                sparsity: 0.8,
-                reference_keep: None,
+    /// A FastH3 DMD export of the base partition over `files`: its inference file, its scheduler's
+    /// shift and no reference partition.
+    pub(crate) fn dmd_export(
+        mut files: BTreeMap<String, Value>,
+        backend: &str,
+    ) -> BTreeMap<String, Value> {
+        files.remove("model_index.json");
+        files.remove("transformer_ref/config.json");
+        files.insert(
+            "scheduler/scheduler_config.json".to_owned(),
+            json(r#"{"shift": 10.0}"#),
+        );
+        files.insert(
+            "fastvideo_inference.json".to_owned(),
+            serde_json::json!({
+                "task": "t2av",
+                "video_scheduler_shift": 10.0,
+                "audio_scheduler_shift": 3.0,
+                "dmd_denoising_steps": [999, 874, 749, 624, 500, 375, 250, 125],
+                "attention_backend": backend,
+                "vsa_tile_size": 64,
+                "vsa_sparsity": 0.8,
             }),
-        }
+        );
+        files
+    }
+
+    /// The configuration of `files`, with a fused adapter's gating when one is stated.
+    pub(crate) fn read(files: &BTreeMap<String, Value>, adapter: Option<bool>) -> Result<Config> {
+        Config::read(
+            |relative| Ok(files.get(relative).cloned()),
+            adapter,
+            "fixture",
+        )
     }
 
     /// The released base configuration.
     pub(crate) fn released_config() -> Config {
-        let layout = base_layout();
-        Config::normalize(&layout, &sidecars(&layout)).expect("the released configuration")
+        read(&release(), None).expect("the released configuration")
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::VideoTask;
-
     use super::tests_support::*;
     use super::*;
 
-    /// A distilled export serves the task its contract states; a release serves every task its
-    /// partitions serve.
-    ///
     #[test]
     fn a_base_release_reads_both_partitions_with_the_uniform_grid() {
-        let layout = base_layout();
-        let config = Config::normalize(&layout, &sidecars(&layout)).expect("a base release");
+        let config = released_config();
         assert_eq!(config.denoisers.len(), 2);
-        assert_eq!(
-            config.tasks(),
-            vec![
-                VideoTask::TextToVideoAudio,
-                VideoTask::FirstLastToVideoAudio,
-                VideoTask::ReferenceToVideoAudio,
-            ]
-        );
-        let denoiser = &config.denoisers[&Dit::Reference];
-        assert!(denoiser.tasks.contains(&VideoTask::ReferenceToVideoAudio));
+        assert_eq!(config.tasks(), VideoTask::ALL.to_vec());
+        let denoiser = &config.denoisers[&Stage::TransformerRef];
+        assert_eq!(denoiser.tasks, vec![VideoTask::ReferenceToVideoAudio]);
         assert_eq!(denoiser.attention, AttentionKind::Dense);
         assert_eq!(
             denoiser.schedule,
@@ -614,26 +680,48 @@ mod tests {
             )
             .expect("the grid")
         );
-        assert_eq!(config.denoisers.len(), 2);
+    }
+
+    #[test]
+    fn a_task_export_or_an_empty_root_is_not_a_pipeline_root() {
+        let mut export = release();
+        export.insert(
+            "model_index.json".to_owned(),
+            json(r#"{"_class_name": "MiniMaxH3Pipeline", "transformer": []}"#),
+        );
+        let error = read(&export, None).expect_err("a task export is refused");
+        assert!(
+            error.to_string().contains("not a MiniMaxH3ModularPipeline"),
+            "{error}"
+        );
+
+        let mut empty = release();
+        empty.remove("model_index.json");
+        let error = read(&empty, None).expect_err("no index and no student");
+        assert!(error.to_string().contains("model_index.json"), "{error}");
+    }
+
+    #[test]
+    fn a_release_holds_the_partitions_its_index_names_and_its_root_holds() {
+        let mut files = release();
+        files.remove("transformer_ref/config.json");
+        let config = read(&files, None).expect("the base partition alone");
+        assert_eq!(
+            config.denoisers.keys().collect::<Vec<_>>(),
+            [&Stage::Transformer]
+        );
+        files.remove("transformer/config.json");
+        assert!(read(&files, None).is_err(), "no partition is held");
     }
 
     #[test]
     fn a_dmd_export_reads_its_ladder_and_its_sparse_attention() {
-        let layout = Layout {
-            dits: vec![(
-                Dit::Base,
-                vec![
-                    VideoTask::TextToVideoAudio,
-                    VideoTask::FirstLastToVideoAudio,
-                ],
-            )],
-            contract: Some(dmd_contract()),
-        };
-        let mut sidecars = sidecars(&layout);
-        sidecars.scheduler = json(r#"{"shift": 10.0}"#);
-        let config = Config::normalize(&layout, &sidecars).expect("a DMD export");
-        assert_eq!(config.denoisers.keys().collect::<Vec<_>>(), [&Dit::Base]);
-        let denoiser = &config.denoisers[&Dit::Base];
+        let config = read(&dmd_export(release(), "VIDEO_SPARSE_ATTN_H3"), None).expect("an export");
+        assert_eq!(
+            config.denoisers.keys().collect::<Vec<_>>(),
+            [&Stage::Transformer]
+        );
+        let denoiser = &config.denoisers[&Stage::Transformer];
         assert_eq!(denoiser.schedule.steps(), 8);
         assert_eq!(
             denoiser.attention,
@@ -641,51 +729,72 @@ mod tests {
         );
     }
 
+    /// The export states its backend, and the statement decides: a student that kept its
+    /// distillation's sparse knobs while naming dense attention attends densely, and an unknown
+    /// backend is refused by name.
     #[test]
-    fn a_contract_that_states_dense_attention_attends_densely() {
-        // The export states its backend, and the statement decides: a student that kept its
-        // distillation's sparse knobs while naming dense attention must not be read as sparse, because
-        // the inference would be invisible until a device disagreed with it.
-        let mut contract = dmd_contract();
-        contract.backend = crate::checkpoint::AttentionBackend::Dense;
-        contract.attention = None;
-        let layout = Layout {
-            dits: vec![(
-                Dit::Base,
-                vec![
-                    VideoTask::TextToVideoAudio,
-                    VideoTask::FirstLastToVideoAudio,
-                ],
-            )],
-            contract: Some(contract),
-        };
-        let mut sidecars = sidecars(&layout);
-        sidecars.scheduler = json(r#"{"shift": 10.0}"#);
-        let config = Config::normalize(&layout, &sidecars).expect("a dense export");
-        assert_eq!(config.denoisers[&Dit::Base].attention, AttentionKind::Dense);
+    fn an_export_attends_with_the_backend_it_states() {
+        let config = read(&dmd_export(release(), "DENSE"), None).expect("a dense export");
+        assert_eq!(
+            config.denoisers[&Stage::Transformer].attention,
+            AttentionKind::Dense
+        );
+        let error = read(&dmd_export(release(), "FLASH"), None).expect_err("unknown backend");
+        assert!(error.to_string().contains("FLASH"), "{error}");
+    }
+
+    #[test]
+    fn an_export_states_one_schedule_of_a_served_task() {
+        let mut files = dmd_export(release(), "DENSE");
+        files.get_mut("fastvideo_inference.json").expect("the file")["task"] = json(r#""t2v""#);
+        assert!(read(&files, None).is_err(), "t2v is not served");
+
+        let mut files = dmd_export(release(), "DENSE");
+        let student = files.get_mut("fastvideo_inference.json").expect("the file");
+        student["pdd_step_indices"] = json("[0, 8, 16, 32]");
+        assert!(read(&files, None).is_err(), "two schedules");
+    }
+
+    #[test]
+    fn a_fused_adapter_is_the_four_rung_student_it_was_extracted_from() {
+        for (gated, attention) in [
+            (true, AttentionKind::sparse(64, 0.9, None).expect("sparse")),
+            (false, AttentionKind::Dense),
+        ] {
+            let config = read(&release(), Some(gated)).expect("the student");
+            assert_eq!(
+                config.denoisers.keys().collect::<Vec<_>>(),
+                [&Stage::Transformer]
+            );
+            let denoiser = &config.denoisers[&Stage::Transformer];
+            assert_eq!(denoiser.schedule.steps(), 4);
+            assert_eq!(denoiser.attention, attention);
+        }
     }
 
     #[test]
     fn a_configuration_refuses_components_that_disagree_with_each_other() {
-        let layout = base_layout();
-
-        let mut widths = sidecars(&layout);
-        widths.text_encoder["text_config"]["hidden_size"] = json("4096");
-        widths.text_encoder["vision_config"]["out_hidden_size"] = json("4096");
-        let error = Config::normalize(&layout, &widths).expect_err("the DiT conditioning width");
+        let mut widths = release();
+        let encoder = widths
+            .get_mut("text_encoder/config.json")
+            .expect("the encoder");
+        encoder["text_config"]["hidden_size"] = json("4096");
+        encoder["vision_config"]["out_hidden_size"] = json("4096");
+        let error = read(&widths, None).expect_err("the DiT conditioning width");
         assert!(
             matches!(error, Error::Config(ref problem) if problem.contains("conditions on")),
             "{error}"
         );
 
-        let mut channels = sidecars(&layout);
+        let mut channels = release();
         let statistics = |value: f64| {
             serde_json::Value::Array((0..16).map(|_| serde_json::Value::from(value)).collect())
         };
-        channels.video_vae["latent_channels"] = json("16");
-        channels.video_vae["latents_mean"] = statistics(0.0);
-        channels.video_vae["latents_std"] = statistics(1.0);
-        let error = Config::normalize(&layout, &channels).expect_err("the latent channels");
+        let vae = channels.get_mut("vae/config.json").expect("the VAE");
+        vae["latent_channels"] = json("16");
+        vae["latents_mean"] = statistics(0.0);
+        vae["latents_std"] = statistics(1.0);
+        let error = read(&channels, None).expect_err("the latent channels");
         assert!(
             matches!(error, Error::Config(ref problem) if problem.contains("channels")),
             "{error}"
@@ -694,41 +803,34 @@ mod tests {
 
     #[test]
     fn a_configuration_refuses_a_vae_timeline_the_packing_cannot_serve() {
-        let layout = base_layout();
-        let mut timeline = sidecars(&layout);
-        timeline.video_vae["temporal_downsample_factors"] = json("[1, 2, 1, 1, 1, 1]");
-        let error = Config::normalize(&layout, &timeline).expect_err("a different compression");
+        let mut timeline = release();
+        timeline.get_mut("vae/config.json").expect("the VAE")["temporal_downsample_factors"] =
+            json("[1, 2, 1, 1, 1, 1]");
+        let error = read(&timeline, None).expect_err("a different compression");
         assert!(
             matches!(error, Error::Config(ref problem) if problem.contains("temporal")),
             "{error}"
         );
 
-        let mut clock = sidecars(&layout);
-        clock.audio_vae["sampling_rate"] = json("44100");
-        let error = Config::normalize(&layout, &clock).expect_err("a different sample clock");
+        let mut clock = release();
+        clock.get_mut("audio_vae/config.json").expect("the VAE")["sampling_rate"] = json("44100");
+        let error = read(&clock, None).expect_err("a different sample clock");
         assert!(
             matches!(error, Error::Config(ref problem)
                 if problem.contains("44100") && problem.contains("32000 Hz")),
             "{error}"
         );
-
-        let mut hop = sidecars(&layout);
-        hop.audio_vae["decoder_rates"] = json("[5, 5, 2, 2, 2, 2, 1]");
-        let error = Config::normalize(&layout, &hop).expect_err("a different hop");
-        assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("hop")),
-            "{error}"
-        );
     }
 
     #[test]
-    fn a_contract_whose_shifts_disagree_with_its_schedulers_is_refused() {
-        let layout = Layout {
-            dits: vec![(Dit::Base, vec![VideoTask::TextToVideoAudio])],
-            contract: Some(dmd_contract()),
-        };
-        // The sidecars state the base release's video shift of 12, not the student's 10.
-        let error = Config::normalize(&layout, &sidecars(&layout)).expect_err("shift mismatch");
+    fn an_export_whose_shifts_disagree_with_its_schedulers_is_refused() {
+        let mut files = dmd_export(release(), "DENSE");
+        // The scheduler states the base release's video shift of 12, not the student's 10.
+        files.insert(
+            "scheduler/scheduler_config.json".to_owned(),
+            json(r#"{"shift": 12.0}"#),
+        );
+        let error = read(&files, None).expect_err("shift mismatch");
         assert!(
             matches!(error, Error::Config(ref problem) if problem.contains("disagree")),
             "{error}"

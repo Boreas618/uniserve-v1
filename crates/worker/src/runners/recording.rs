@@ -11,12 +11,11 @@
 //! the peak and the engine installs exactly the recorded keys.
 //!
 //! Nothing a recorded walk does reaches the device: no copy, no launch, no collective. Views of
-//! memory the walk does not reserve in the stream's arena (state tables, staged regions) are
+//! memory the walk does not reserve in the stream's arena (staged columns, product regions) are
 //! [`Walk::placeholder`]s at synthetic addresses that nothing reads.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use nn::capability::StateTable;
 use ops::{DType, Shape, TensorView};
 
 use crate::plan::Bucket;
@@ -34,6 +33,9 @@ pub struct Footprint {
     /// The bucket whose walk reached [`Self::peak`], or `None` when a forward that belongs to no
     /// bucket (a model's constants, filled once per load) reached it or nothing was reserved.
     pub widest: Option<Bucket>,
+    /// The furthest byte any walked forward's uploads reached in a staging region: the extent of
+    /// the runner's [`crate::staging::StagingRegion`]; zero when no forward uploads.
+    pub staging: u64,
 }
 
 impl Footprint {
@@ -62,6 +64,7 @@ impl Footprint {
         }
         let walk = Walk {
             arena: nn::Arena::counting(),
+            staging: nn::forward::Staging::counting(),
             placeholders: nn::Arena::counting(),
         };
         let mut launches = Launches::default();
@@ -76,6 +79,7 @@ impl Footprint {
         for (operator, keys) in launches.0 {
             self.keys.entry(operator).or_default().extend(keys);
         }
+        self.staging = self.staging.max(walk.staging.peak());
         let peak = walk.arena.peak();
         if peak > self.peak {
             self.peak = peak;
@@ -99,6 +103,8 @@ impl Footprint {
 pub struct Walk {
     /// The stream's arena region, counted: unbounded, at synthetic addresses.
     arena: nn::Arena,
+    /// The runner's staging region, counted: what the walked forwards upload.
+    staging: nn::forward::Staging,
     /// Where the walk's placeholders live: counted apart from [`Self::arena`], because the memory
     /// they stand for is not the stream's arena region.
     placeholders: nn::Arena,
@@ -110,6 +116,13 @@ impl Walk {
         &self.arena
     }
 
+    /// Starts the next walked forward at the region's first address and the staging region's
+    /// first byte, as each of the runner's forwards starts on the device.
+    pub fn reset(&self) {
+        self.arena.reset();
+        self.staging.reset();
+    }
+
     /// A recording forward over the stream's region, split as `group`'s rank when the runner's
     /// forwards carry one: every layer answers the shapes that rank launches with, and every
     /// collective checks its views and issues nothing.
@@ -118,7 +131,7 @@ impl Walk {
     ///
     /// When the group's rank is not a member of it.
     pub fn forward(&self, group: Option<&nn::Group>) -> Result<nn::Forward<'_>> {
-        let forward = nn::Forward::recording(&self.arena);
+        let forward = nn::Forward::recording(&self.arena).with_staging(&self.staging);
         let Some(group) = group else {
             return Ok(forward);
         };
@@ -128,26 +141,13 @@ impl Walk {
     }
 
     /// A view of `shape` elements of `dtype` that stands for memory outside the stream's arena: a
-    /// state table, a staged column, a product region. Nothing reads or writes it.
+    /// staged column, a product region. Nothing reads or writes it.
     ///
     /// # Errors
     ///
     /// When `dtype` has no whole-byte size or the extent overflows.
     pub fn placeholder(&self, dtype: DType, shape: Shape) -> Result<TensorView> {
         Ok(self.placeholders.tensor(dtype, shape)?)
-    }
-
-    /// One placeholder per table, in the tables' order: what `Tables::views` answers once the
-    /// tables are filled.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::placeholder`].
-    pub fn tables(&self, tables: &[StateTable]) -> Result<Vec<TensorView>> {
-        tables
-            .iter()
-            .map(|table| self.placeholder(table.dtype, table.shape))
-            .collect()
     }
 }
 
@@ -192,24 +192,22 @@ mod tests {
 
     /// One forward that reserves `bytes` and launches a gather of `columns`.
     fn forward(f: &nn::Forward<'_>, bytes: u64, columns: u32) -> Result<()> {
-        let rows = f.arena().tensor(DType::I32, Shape::new(&[bytes / 4]))?;
-        let mark = f.arena().mark();
-        let scratch = f
-            .arena()
-            .tensor(DType::I32, Shape::new(&[8, u64::from(columns)]))?;
-        f.operate::<LogitsGather>(
-            &gather(columns),
-            GatherArgs {
-                hidden: scratch,
-                // The gather reads the first eight row indices of the region's leading buffer, one
-                // per scratch row.
-                rows: nn::TensorView::new(rows.ptr, DType::I32, Shape::new(&[8])),
-                out: scratch,
-            },
-        )?;
-        // Scratch handed back still counts: the peak is what the region must map.
-        f.arena().release(mark);
-        Ok(())
+        let rows = f.empty(DType::I32, Shape::new(&[bytes / 4]))?;
+        // Scratch handed back at the scope's end still counts: the peak is what the region maps.
+        f.scoped(|f| -> Result<()> {
+            let scratch = f.empty(DType::I32, Shape::new(&[8, u64::from(columns)]))?;
+            f.operate::<LogitsGather>(
+                &gather(columns),
+                GatherArgs {
+                    hidden: scratch,
+                    // The gather reads the first eight row indices of the region's leading
+                    // buffer, one per scratch row.
+                    rows: nn::TensorView::new(rows.ptr, DType::I32, Shape::new(&[8])),
+                    out: scratch,
+                },
+            )?;
+            Ok(())
+        })
     }
 
     fn key(columns: u32) -> String {
@@ -289,17 +287,34 @@ mod tests {
         footprint
             .walk(None, |walk| {
                 walk.placeholder(DType::F32, Shape::new(&[1 << 20]))?;
-                walk.tables(&[StateTable {
-                    name: "positions",
-                    dtype: DType::I32,
-                    shape: Shape::new(&[64, 3]),
-                }])?;
                 Ok(())
             })
             .unwrap();
 
         assert_eq!(footprint.peak, 0);
         assert!(footprint.keys.is_empty());
+    }
+
+    /// The values a walked forward uploads are measured as the staging region's extent, the
+    /// furthest any one forward reached: a reset starts the next forward at the region's start.
+    #[test]
+    fn uploads_are_measured_as_the_staging_extent() {
+        let mut footprint = Footprint::default();
+        footprint
+            .walk(None, |walk| {
+                walk.forward(None)?
+                    .upload(&[0_i32; 64], Shape::new(&[64]))?;
+                walk.reset();
+                let forward = walk.forward(None)?;
+                forward.upload(&[0_f32; 8], Shape::new(&[8]))?;
+                forward.upload(&[0_i64; 4], Shape::new(&[4]))?;
+                Ok(())
+            })
+            .unwrap();
+
+        // 256 bytes in the first forward; 32 bytes, then 32 more at the next 256-byte boundary.
+        assert_eq!(footprint.staging, 288);
+        assert_eq!(footprint.peak, 288);
     }
 
     /// A walk that fails leaves the thread without a sink, so the next capture or walk on it starts

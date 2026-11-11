@@ -59,11 +59,11 @@ fn a_residual_refuses_parameters_its_scale_does_not_read() {
     assert!(Residual::new(Scale::Row(weight(&[4, 0])), None).is_err());
 }
 
-/// Each scale writes one operand in place: the unscaled add either input, a channel scale the
-/// residual, a row scale the update. Another output, or row indices the scale does not read, is
-/// refused before anything launches.
+/// Each scale writes one operand in place and answers it: the unscaled add and a channel scale the
+/// residual, a row scale the update. Row indices the scale does not read, or a row scale without
+/// them, are refused before anything launches.
 #[test]
-fn a_residual_writes_only_the_operand_its_scale_updates() {
+fn a_residual_writes_the_operand_its_scale_updates() {
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
     let rows = |columns| {
@@ -71,18 +71,15 @@ fn a_residual_writes_only_the_operand_its_scale_updates() {
             .tensor(DType::BF16, Shape::new(&[3, columns]))
             .unwrap()
     };
-    let (residual, update, other) = (rows(16), rows(16), rows(16));
+    let (residual, update) = (rows(16), rows(16));
     let indices = arena.tensor(DType::I32, Shape::new(&[3])).unwrap();
 
     let plain = Residual::default();
-    assert!(plain.forward(&f, residual, update, None, residual).is_ok());
-    assert!(plain.forward(&f, residual, update, None, update).is_ok());
-    assert!(plain.forward(&f, residual, update, None, other).is_err());
-    assert!(
-        plain
-            .forward(&f, residual, update, Some(indices), residual)
-            .is_err()
+    assert_eq!(
+        plain.forward(&f, residual, update, None).unwrap().ptr,
+        residual.ptr
     );
+    assert!(plain.forward(&f, residual, update, Some(indices)).is_err());
 
     let gains = arena.tensor(DType::BF16, Shape::new(&[16])).unwrap();
     let channel = Residual::new(
@@ -93,12 +90,10 @@ fn a_residual_writes_only_the_operand_its_scale_updates() {
         None,
     )
     .unwrap();
-    assert!(
-        channel
-            .forward(&f, residual, update, None, residual)
-            .is_ok()
+    assert_eq!(
+        channel.forward(&f, residual, update, None).unwrap().ptr,
+        residual.ptr
     );
-    assert!(channel.forward(&f, residual, update, None, update).is_err());
 
     let table = arena.tensor(DType::BF16, Shape::new(&[4, 16])).unwrap();
     let gated = Residual::new(
@@ -109,17 +104,14 @@ fn a_residual_writes_only_the_operand_its_scale_updates() {
         None,
     )
     .unwrap();
-    assert!(
+    assert_eq!(
         gated
-            .forward(&f, residual, update, Some(indices), update)
-            .is_ok()
+            .forward(&f, residual, update, Some(indices))
+            .unwrap()
+            .ptr,
+        update.ptr
     );
-    assert!(
-        gated
-            .forward(&f, residual, update, Some(indices), residual)
-            .is_err()
-    );
-    assert!(gated.forward(&f, residual, update, None, update).is_err());
+    assert!(gated.forward(&f, residual, update, None).is_err());
 }
 
 /// A normalization's epilogue parameters are the normalization's width: a scaled residual's scale
@@ -131,10 +123,46 @@ fn a_normalization_refuses_epilogue_parameters_of_another_width() {
         scale: weight(scale),
         bias: bias.map(weight),
     };
-    assert!(RmsNorm::new(weight(&[16, 8]), 1e-6, Epilogue::None, Gain::Plain).is_err());
-    assert!(RmsNorm::new(weight(&[16]), 1e-6, scaled(&[8], None), Gain::Plain).is_err());
-    assert!(RmsNorm::new(weight(&[16]), 1e-6, scaled(&[16], Some(&[8])), Gain::Plain).is_err());
-    assert!(RmsNorm::new(weight(&[16]), 1e-6, scaled(&[16], Some(&[16])), Gain::Plain).is_ok());
+    assert!(
+        RmsNorm::new(
+            weight(&[16, 8]),
+            1e-6,
+            Epilogue::None,
+            Gain::Plain,
+            DType::BF16
+        )
+        .is_err()
+    );
+    assert!(
+        RmsNorm::new(
+            weight(&[16]),
+            1e-6,
+            scaled(&[8], None),
+            Gain::Plain,
+            DType::BF16
+        )
+        .is_err()
+    );
+    assert!(
+        RmsNorm::new(
+            weight(&[16]),
+            1e-6,
+            scaled(&[16], Some(&[8])),
+            Gain::Plain,
+            DType::BF16
+        )
+        .is_err()
+    );
+    assert!(
+        RmsNorm::new(
+            weight(&[16]),
+            1e-6,
+            scaled(&[16], Some(&[16])),
+            Gain::Plain,
+            DType::BF16
+        )
+        .is_ok()
+    );
 
     let modulated = |shift: &[u64], gate: Option<&[u64]>| {
         Epilogue::Modulated(Modulation {
@@ -145,22 +173,46 @@ fn a_normalization_refuses_epilogue_parameters_of_another_width() {
             retained: None,
         })
     };
-    assert!(RmsNorm::new(weight(&[64]), 1e-6, modulated(&[4, 64], None), Gain::Plain).is_ok());
+    assert!(
+        RmsNorm::new(
+            weight(&[64]),
+            1e-6,
+            modulated(&[4, 64], None),
+            Gain::Plain,
+            DType::BF16
+        )
+        .is_ok()
+    );
     assert!(
         RmsNorm::new(
             weight(&[64]),
             1e-6,
             modulated(&[4, 64], Some(&[4, 64])),
-            Gain::Plain
+            Gain::Plain,
+            DType::BF16,
         )
         .is_ok()
     );
     assert!(
-        RmsNorm::new(weight(&[64]), 1e-6, modulated(&[64], None), Gain::Plain).is_err(),
+        RmsNorm::new(
+            weight(&[64]),
+            1e-6,
+            modulated(&[64], None),
+            Gain::Plain,
+            DType::BF16
+        )
+        .is_err(),
         "a shift table is [parameters, width], not one row"
     );
     assert!(
-        RmsNorm::new(weight(&[64]), 1e-6, modulated(&[4, 32], None), Gain::Plain).is_err(),
+        RmsNorm::new(
+            weight(&[64]),
+            1e-6,
+            modulated(&[4, 32], None),
+            Gain::Plain,
+            DType::BF16
+        )
+        .is_err(),
         "a table of another width is not this layer's"
     );
 
@@ -185,37 +237,36 @@ fn a_normalization_reads_the_residual_stream_its_epilogue_folds() {
         backing: nn::Backing::new(view.ptr, view.numel() * 2),
         view,
     };
-    let (x, out, stream, other) = (
-        view(DType::BF16, &[3, 16]),
+    let (x, stream, other) = (
         view(DType::BF16, &[3, 16]),
         view(DType::BF16, &[3, 16]),
         view(DType::BF16, &[3, 16]),
     );
     let gain = held(view(DType::BF16, &[16]));
 
-    let plain = RmsNorm::new(gain, 1e-6, Epilogue::None, Gain::Plain).unwrap();
-    assert!(plain.forward(&f, x, None, out).is_ok());
+    let plain = RmsNorm::new(gain, 1e-6, Epilogue::None, Gain::Plain, DType::BF16).unwrap();
+    assert!(plain.forward(&f, x, None).is_ok());
     assert!(
         plain
-            .forward(&f, x, Some(ResidualStream::in_place(stream)), out)
+            .forward(&f, x, Some(ResidualStream::in_place(stream)))
             .is_ok()
     );
     let moved = ResidualStream {
         input: other,
         output: stream,
     };
-    assert!(plain.forward(&f, x, Some(moved), out).is_ok());
+    assert!(plain.forward(&f, x, Some(moved)).is_ok());
 
     let scale = held(view(DType::BF16, &[16]));
     let epilogue = Epilogue::ScaledResidual { scale, bias: None };
-    let scaled = RmsNorm::new(gain, 1e-6, epilogue, Gain::Plain).unwrap();
+    let scaled = RmsNorm::new(gain, 1e-6, epilogue, Gain::Plain, DType::BF16).unwrap();
     assert!(
         scaled
-            .forward(&f, x, Some(ResidualStream::in_place(stream)), out)
+            .forward(&f, x, Some(ResidualStream::in_place(stream)))
             .is_ok()
     );
-    assert!(scaled.forward(&f, x, None, out).is_err());
-    assert!(scaled.forward(&f, x, Some(moved), out).is_err());
+    assert!(scaled.forward(&f, x, None).is_err());
+    assert!(scaled.forward(&f, x, Some(moved)).is_err());
 
     let table = held(view(DType::BF16, &[4, 16]));
     let rows = view(DType::I32, &[3]);
@@ -231,12 +282,13 @@ fn a_normalization_reads_the_residual_stream_its_epilogue_folds() {
         1e-6,
         Epilogue::Modulated(modulation(None)),
         Gain::Plain,
+        DType::BF16,
     )
     .unwrap();
-    assert!(ungated.forward(&f, x, None, out).is_ok());
+    assert!(ungated.forward(&f, x, None).is_ok());
     assert!(
         ungated
-            .forward(&f, x, Some(ResidualStream::in_place(x)), out)
+            .forward(&f, x, Some(ResidualStream::in_place(x)))
             .is_err()
     );
     let gated = RmsNorm::new(
@@ -244,27 +296,28 @@ fn a_normalization_reads_the_residual_stream_its_epilogue_folds() {
         1e-6,
         Epilogue::Modulated(modulation(Some(table))),
         Gain::Plain,
+        DType::BF16,
     )
     .unwrap();
     let into_update = ResidualStream {
         input: stream,
         output: x,
     };
-    assert!(gated.forward(&f, x, Some(into_update), out).is_ok());
-    assert!(gated.forward(&f, x, None, out).is_err());
+    assert!(gated.forward(&f, x, Some(into_update)).is_ok());
+    assert!(gated.forward(&f, x, None).is_err());
     assert!(
         gated
-            .forward(&f, x, Some(ResidualStream::in_place(stream)), out)
+            .forward(&f, x, Some(ResidualStream::in_place(stream)))
             .is_err()
     );
 }
 
 #[test]
-fn a_gated_product_reads_halves_and_biases_of_its_output_width() {
+fn a_gated_product_writes_half_a_packed_row_and_reads_biases_of_that_width() {
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
     let view = |dims: &[u64]| arena.tensor(DType::BF16, Shape::new(dims)).unwrap();
-    let (gate, value, out) = (view(&[3, 64]), view(&[3, 64]), view(&[3, 64]));
+    let (gate, value) = (view(&[3, 64]), view(&[3, 64]));
     let bias = |width| {
         let view = view(&[width]);
         Weight {
@@ -281,9 +334,9 @@ fn a_gated_product_reads_halves_and_biases_of_its_output_width() {
         )
         .unwrap()
     };
-    assert!(swiglu(None).forward(&f, halves, out).is_ok());
-    assert!(swiglu(Some(bias(64))).forward(&f, halves, out).is_ok());
-    assert!(swiglu(Some(bias(32))).forward(&f, halves, out).is_err());
+    assert!(swiglu(None).forward(&f, halves).is_ok());
+    assert!(swiglu(Some(bias(64))).forward(&f, halves).is_ok());
+    assert!(swiglu(Some(bias(32))).forward(&f, halves).is_err());
     assert!(
         GatedActivation::new(
             Activation::Silu,
@@ -299,15 +352,11 @@ fn a_gated_product_reads_halves_and_biases_of_its_output_width() {
     // A packed projection is twice the output's width, and its bias is the packed one.
     let packed = view(&[3, 128]);
     let fused = GatedActivation::new(Activation::Silu, Rounding::Fused, GateBias::None).unwrap();
-    assert!(fused.forward(&f, Halves::ValueFirst(packed), out).is_ok());
-    assert!(
-        fused
-            .forward(&f, Halves::ValueFirst(view(&[3, 96])), out)
-            .is_err()
-    );
+    let gated = fused.forward(&f, Halves::ValueFirst(packed)).unwrap();
+    assert_eq!(gated.shape.dims(), [3, 64]);
     assert!(
         swiglu(Some(bias(64)))
-            .forward(&f, Halves::ValueFirst(packed), out)
+            .forward(&f, Halves::ValueFirst(packed))
             .is_err()
     );
 }
@@ -316,7 +365,9 @@ fn a_gated_product_reads_halves_and_biases_of_its_output_width() {
 fn a_group_normalization_states_its_groups_and_its_affine_pair() {
     let pad = CausalPad {
         top: 1,
+        bottom: 1,
         left: 1,
+        right: 1,
         front: 2,
         padding: nn::Padding::Replicate,
     };
@@ -329,38 +380,26 @@ fn a_group_normalization_states_its_groups_and_its_affine_pair() {
     assert!(GroupNorm::new(0, 1e-6, None, None, pad).is_err());
 }
 
-/// The frame a normalization writes holds the source's channels and is at least its extent on
-/// every padded axis.
+/// The frame a normalization writes is its source padded by the causal pad, in the source's
+/// element type: zero frames in front and the stated rows and columns around it.
 #[test]
-fn a_group_normalization_writes_a_frame_no_smaller_than_its_source() {
+fn a_group_normalization_writes_its_source_padded() {
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
     let view = |dims: &[u64]| arena.tensor(DType::F32, Shape::new(dims)).unwrap();
     let pad = CausalPad {
         top: 1,
+        bottom: 1,
         left: 1,
+        right: 0,
         front: 2,
         padding: nn::Padding::Reflect,
     };
     let norm = GroupNorm::new(4, 1e-6, None, None, pad).unwrap();
-    let values = view(&[1, 8, 3, 6, 6]);
-    let (mean, rstd) = (view(&[3, 4]), view(&[3, 4]));
-    assert!(
-        norm.forward(&f, values, mean, rstd, view(&[1, 8, 5, 8, 8]))
-            .is_ok()
-    );
-    assert!(
-        norm.forward(&f, values, mean, rstd, view(&[1, 4, 5, 8, 8]))
-            .is_err()
-    );
-    assert!(
-        norm.forward(&f, values, mean, rstd, view(&[1, 8, 5, 4, 8]))
-            .is_err()
-    );
-    assert!(
-        norm.forward(&f, values, mean, rstd, view(&[8, 5, 8, 8]))
-            .is_err()
-    );
+    let padded = norm.forward(&f, view(&[1, 8, 3, 6, 6])).unwrap();
+    assert_eq!(padded.shape.dims(), [1, 8, 5, 8, 7]);
+    assert_eq!(padded.dtype, DType::F32);
+    assert!(norm.forward(&f, view(&[8, 3, 6, 6])).is_err());
 }
 
 /// The page scales belong to the layer, not the group: two layers of one FP8 group keep their own
@@ -411,7 +450,7 @@ fn the_audio_layers_hold_their_channels() {
 }
 
 /// An adaptive pool reduces every input row to one output row of its columns, the torch output
-/// size `(1, columns)`; an input and output of other extents are refused before a launch.
+/// size `(1, columns)`; an input of another rank is refused before a launch.
 #[test]
 fn an_adaptive_pool_reduces_its_rows_to_one_row_of_columns() {
     assert!(AdaptiveAvgPool2d::new([2, 32]).is_err());
@@ -421,29 +460,17 @@ fn an_adaptive_pool_reduces_its_rows_to_one_row_of_columns() {
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
     let view = |dims: &[u64]| arena.tensor(DType::F32, Shape::new(dims)).unwrap();
-    assert!(
-        pool.forward(&f, view(&[5, 8, 256]), view(&[5, 1, 32]))
-            .is_ok()
-    );
-    assert!(
-        pool.forward(&f, view(&[5, 8, 256]), view(&[5, 32]))
-            .is_err()
-    );
-    assert!(
-        pool.forward(&f, view(&[5, 8, 256]), view(&[4, 1, 32]))
-            .is_err()
-    );
-    assert!(
-        pool.forward(&f, view(&[5, 0, 256]), view(&[5, 1, 32]))
-            .is_err()
-    );
+    let pooled = pool.forward(&f, view(&[5, 8, 256])).unwrap();
+    assert_eq!(pooled.shape.dims(), [5, 1, 32]);
+    assert!(pool.forward(&f, view(&[5, 256])).is_err());
+    assert!(pool.forward(&f, view(&[5, 0, 256])).is_err());
 }
 
 /// A layer's planes are the ones its own index names, and the refusal for an index the cache has not
 /// got names the count.
 ///
-/// This is the seam the paged attention reads through: `Attention::forward` writes
-/// `cache.planes(group, layer)` and `Attention::attend` reads the same. A reader that took the
+/// This is the seam the paged attention reads through: `PagedAttention::forward` writes the planes
+/// `cache.layer(group, layer)` selects and reads the same. A reader that took the
 /// group's first layer instead would answer another layer's keys and values — the defect that made
 /// every layer above the first attend over layer 0's cache — and no shape or dtype check can see it,
 /// because both answers are planes of the same geometry. A cache of one layer cannot tell the two
@@ -545,7 +572,6 @@ impl ops::capture::Sink for Launches {
 fn a_channels_last_convolution_launches_the_channels_first_program() {
     let spatial_weight = weight(&[8, 4, 2, 2, 2]);
     let input = Shape::new(&[1, 4, 3, 3, 3]);
-    let output = Shape::new(&[1, 8, 2, 2, 2]);
     // `NDHWC` storage viewed as the logical `[n, c, d, h, w]` shape: channel fastest.
     let ndhwc = |shape: Shape| {
         let [c, d, h, w] = [1, 2, 3, 4].map(|axis| shape.dim(axis));
@@ -563,7 +589,7 @@ fn a_channels_last_convolution_launches_the_channels_first_program() {
                 reserved
             }
         };
-        let (x, out) = (view(input), view(output));
+        let x = view(input);
         let spec = ConvSpec {
             bias: nn::layers::Bias::Absent,
             channels_last,
@@ -572,7 +598,7 @@ fn a_channels_last_convolution_launches_the_channels_first_program() {
         let conv = Conv3d::new(spatial_weight, None, spec).unwrap();
         let mut launches = Launches(Vec::new());
         ops::capture::set_sink(Some(&mut launches));
-        let walked = conv.forward(&f, x, out);
+        let walked = conv.forward(&f, x);
         ops::capture::set_sink(None);
         walked.unwrap();
         launches.0

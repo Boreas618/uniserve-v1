@@ -6,85 +6,37 @@
 //! the tiles among the forward's ranks, gathers them and stitches the moments: vertical seams, then
 //! horizontal ones, each tile's neighbours read as encoded. What stays here is the checkpoint's
 //! geometry (its [`TILE_PIXELS`] tiles with at least [`MINIMUM_OVERLAP`] shared, compressed
-//! [`LATENT_COMPRESSION`]-fold), the encoder's buffers, and the copy that packs a tile cut from a wider
-//! raster before the encoder reads it.
+//! [`LATENT_COMPRESSION`]-fold) and the copy that packs a tile cut from a wider raster before the
+//! encoder reads it.
 
-use crate::encoding::{EncoderScratch, Extent, VideoEncoder};
+use crate::encoding::VideoEncoder;
 use crate::packing::LATENT_COMPRESSION;
 use crate::video_vae::{MINIMUM_OVERLAP, TILE_PIXELS};
 use crate::{Error, Result};
-use nn::tiling::{Tile, TileBlocks, TiledEncode};
-use nn::{DType, Forward, Shape, Strides, TensorView};
+use nn::tiling::{Tile, TiledEncode};
+use nn::{DType, Forward, Shape, TensorView};
 
-/// The device views one tiled encoding reads and writes, as the caller uploaded and reserved them.
-#[derive(Clone, Copy, Debug)]
-pub struct Scene<'a> {
-    /// Tile `i`'s pixels, in tile order.
-    ///
-    /// Without [`Self::packed`] each view is `[1, in_channels, frames, tile_height, tile_width]` and
-    /// **packed**: `nn::layers::CausalPad` pads a frame's rows in place of the source's own, so it
-    /// requires a frame's rows to be contiguous in the view it reads. With it, each view is the
-    /// tile's block of a wider raster, `[in_channels, frames, tile_height, tile_width]` at the
-    /// raster's strides.
-    pub pixels: &'a [TensorView],
-    /// The one buffer a tile cut from a wider raster is packed into, just before it is encoded.
-    ///
-    /// One buffer serves every tile because a tile is copied only once the tile before it was
-    /// encoded.
-    pub packed: Option<TensorView>,
-    /// The stitched moments, `[channels, frames, latent_rows, latent_columns]` FP32.
-    pub blended: TensorView,
-}
-
-/// What the clips of one raster encode in: the encoder's buffers and the tiles' blocks.
+/// A tile's block of a wider raster, `[channels, frames, height, width]` at the raster's strides,
+/// copied into a fresh packed `[1, channels, frames, height, width]` sample.
 ///
-/// Reserved once ([`ClipEncoder::reserve`]) and used by each clip of the raster in turn.
-pub struct ClipRun {
-    scratch: EncoderScratch,
-    blocks: TileBlocks,
-}
-
-/// Copies a tile's block of a wider raster into `buffer` and answers it as the encoder reads it.
-fn pack_tile(f: &Forward, block: TensorView, buffer: TensorView) -> Result<TensorView> {
-    let (channels, frames, height, width) = (
-        block.shape.dim(0),
-        block.shape.dim(1),
-        block.shape.dim(2),
-        block.shape.dim(3),
-    );
-    let packed = [frames * height * width, height * width, width, 1];
-    let mut destination_strides = [0_i64; ops::copy_block::RANK];
-    for (axis, stride) in packed.iter().enumerate() {
-        destination_strides[axis] = i64::try_from(*stride).map_err(|_| {
+/// The encoder's first pad reads each frame's rows in place, so it needs the tile's own row stride,
+/// and a block of a wider raster has the raster's.
+fn pack_tile(f: &Forward, block: TensorView) -> Result<TensorView> {
+    let dims = block.shape.dims();
+    let (channels, frames, height, width) = (dims[0], dims[1], dims[2], dims[3]);
+    let packed = f.empty(DType::F32, Shape::new(&[channels, frames, height, width]))?;
+    let mut strides = [0_i64; ops::copy_block::RANK];
+    for (axis, stride) in [frames * height * width, height * width, width, 1]
+        .into_iter()
+        .enumerate()
+    {
+        strides[axis] = i64::try_from(stride).map_err(|_| {
             Error::config("a condition tile is larger than i64 strides address".to_owned())
         })?;
     }
-    let destination = TensorView::with_strides(
-        buffer.offset_elements(0),
-        DType::F32,
-        Shape::new(&[channels, frames, height, width]),
-        Strides::new(&packed),
-    );
-    nn::layers::Copy::new(DType::F32, nn::layers::Access::Element)?.forward(
-        f,
-        block,
-        destination,
-        &destination_strides,
-    )?;
-    // The encoder's tile view is the packed copy at the shape it pads from, with the batch axis the
-    // scene's contract asks for.
-    Ok(TensorView::with_strides(
-        buffer.offset_elements(0),
-        DType::F32,
-        Shape::new(&[1, channels, frames, height, width]),
-        Strides::new(&[
-            channels * frames * height * width,
-            frames * height * width,
-            height * width,
-            width,
-            1,
-        ]),
-    ))
+    nn::layers::Copy::new(DType::F32, nn::layers::Access::Element)?
+        .forward(f, block, packed, &strides)?;
+    Ok(packed.reshape(Shape::new(&[1, channels, frames, height, width])))
 }
 
 /// The tiled encoding of one raster through the checkpoint's video encoder.
@@ -119,75 +71,35 @@ impl ClipEncoder {
         self.tiling.latent()
     }
 
-    /// One reservation for clips of `frames` frames each, whose stitched moments are `raster`'s
-    /// channels and at most its latent frames.
+    /// Encode one clip of `raster` `[in_channels, frames, height, width]` FP32 into its stitched
+    /// moments `[moment channels, latent frames, latent rows, latent columns]`.
     ///
-    /// The arena never rewinds inside a forward, so the encoder's buffers are reserved once for the
-    /// whole run - one set per distinct tile extent, and a split's tiles are one extent per clip
-    /// length.
-    pub fn reserve(
-        &self,
-        f: &Forward,
-        encoder: &VideoEncoder,
-        frames: &[u32],
-        raster: TensorView,
-    ) -> Result<ClipRun> {
-        let extents: Vec<Extent> = frames
-            .iter()
-            .flat_map(|frames| {
-                self.tiles().iter().map(move |tile| Extent {
-                    frames: *frames,
-                    height: tile.rows.1 * LATENT_COMPRESSION,
-                    width: tile.columns.1 * LATENT_COMPRESSION,
-                })
-            })
-            .collect();
-        let scratch = encoder.reserve(f, &extents)?;
-        let blocks =
-            self.tiling
-                .reserve(f, DType::F32, raster.shape.dim(0), raster.shape.dim(1))?;
-        Ok(ClipRun { scratch, blocks })
-    }
-
-    /// Encode one clip's tiles into its stitched moments, `scene.blended`, in a reservation of
-    /// [`Self::reserve`].
+    /// Each tile's block is packed and encoded alone; the shared driver shares the tiles among the
+    /// forward's ranks, gathers them and blends the seams.
     pub fn encode(
         &self,
         f: &Forward,
         encoder: &VideoEncoder,
-        scene: Scene<'_>,
-        run: &ClipRun,
-    ) -> Result<()> {
-        let Scene {
-            pixels,
-            packed,
-            blended,
-        } = scene;
-        if pixels.len() != self.tiles().len() {
-            return Err(Error::config(format!(
-                "{} pixel views for {} tiles",
-                pixels.len(),
-                self.tiles().len()
-            )));
-        }
-        let encode = |index: usize, decoded: TensorView| -> nn::Result<()> {
-            // The encoder reads `[1, channels, frames, rows, columns]`; the block is that, batched by
-            // one.
-            let strides = decoded.strides.as_slice();
-            let dims = decoded.shape.dims();
-            let out = TensorView::with_strides(
-                decoded.element(&[0, 0, 0, 0]),
-                DType::F32,
-                Shape::new(&[1, dims[0], dims[1], dims[2], dims[3]]),
-                Strides::new(&[strides[0], strides[0], strides[1], strides[2], strides[3]]),
-            );
-            let tile_pixels = match packed {
-                Some(buffer) => pack_tile(f, pixels[index], buffer)?,
-                None => pixels[index],
-            };
-            Ok(encoder.encode_tile(f, &run.scratch, tile_pixels, out)?)
+        raster: TensorView,
+        moments: (u64, u64),
+    ) -> Result<TensorView> {
+        let compression = u64::from(LATENT_COMPRESSION);
+        let encode = |index: usize| -> nn::Result<TensorView> {
+            let tile = &self.tiles()[index];
+            let block = raster
+                .narrow(
+                    2,
+                    u64::from(tile.rows.0) * compression,
+                    u64::from(tile.rows.1) * compression,
+                )?
+                .narrow(
+                    3,
+                    u64::from(tile.columns.0) * compression,
+                    u64::from(tile.columns.1) * compression,
+                )?;
+            Ok(encoder.encode_tile(f, pack_tile(f, block)?)?)
         };
-        Ok(self.tiling.forward(f, &run.blocks, encode, blended)?)
+        Ok(self.tiling.forward(f, moments, encode)?)
     }
 }
 

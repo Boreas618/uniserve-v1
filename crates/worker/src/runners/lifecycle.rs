@@ -17,6 +17,7 @@ use crate::error::{Error, Result};
 use crate::graph::Graphs;
 use crate::plan::Bucket;
 use crate::runner::RunnerId;
+use crate::staging::StagingRegion;
 
 /// The generations one runner holds: the one that serves, the one being prepared, and the one kept
 /// for a revert (7.3).
@@ -41,6 +42,9 @@ pub struct Lifecycle {
     /// Attached once the device has opened them: a runner is built before the pool set is complete,
     /// and a purge before that attachment would have nothing to release.
     pub(crate) pools: Option<Arc<std::sync::Mutex<Pools>>>,
+    /// The page-locked region every forward on [`Self::stream`] uploads its host values through:
+    /// eager forwards, captures, and the staging walk before each replay ([`crate::staging`]).
+    pub(crate) staging: StagingRegion,
 }
 
 impl Lifecycle {
@@ -64,7 +68,51 @@ impl Lifecycle {
             previous: None,
             stream,
             pools: None,
+            staging: StagingRegion::empty(),
         }
+    }
+
+    /// Replaces the staging region with one of `bytes` page-locked bytes on `device`.
+    ///
+    /// Called once, after the recorded walk and before the first capture: a graph captured over a
+    /// region reads that region's addresses on every replay, so it is never replaced afterwards.
+    ///
+    /// # Errors
+    ///
+    /// When the allocation fails, or a graph has already been captured over the current region.
+    pub(crate) fn size_staging(&mut self, device: platform::DeviceId, bytes: u64) -> Result<()> {
+        if !self.graphs.is_empty() {
+            return Err(Error::Invariant(
+                "a runner's staging region is sized before its first capture".into(),
+            ));
+        }
+        self.staging = StagingRegion::new(device, bytes)?;
+        Ok(())
+    }
+
+    /// Replays `captured` on the runner's stream after its staging walk.
+    ///
+    /// `stage` runs the bucket's forward on a staging forward over the runner's arena and a staging
+    /// slot (`nn::Forward::staging`): it writes this replay's uploaded values and launches nothing.
+    /// A host function then moves them into the region the graph's captured copies read, in stream
+    /// order ([`StagingRegion::publish`]), and the graph launches. A runner whose forwards upload
+    /// nothing runs no staging walk.
+    ///
+    /// # Errors
+    ///
+    /// What `stage` answers, or the launch's failure.
+    pub(crate) fn replay(
+        &self,
+        captured: &Captured,
+        stage: impl FnOnce(&nn::Arena, &nn::forward::Staging) -> Result<()>,
+    ) -> Result<()> {
+        if self.staging.is_used() {
+            let staging = self.staging.slot()?;
+            let arena = self.arena()?;
+            stage(&arena, staging)?;
+            self.staging.publish(&self.stream)?;
+        }
+        captured.launch(&self.stream)
     }
 
     /// The device's pools, or a refusal naming what is missing.
@@ -592,6 +640,11 @@ pub(crate) trait RunnerLifecycle {
         self.lifecycle().served_for_rebind(bucket, generation)?;
         let kernels = self.lifecycle().generation_named(generation)?;
         let stream = self.lifecycle().stream.clone();
+        // The capture walk writes the region the captured copies read, which a publishing host
+        // function of a replay still queued on the stream would write too.
+        if self.lifecycle().staging.is_used() {
+            stream.synchronize()?;
+        }
         let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
         self.lifecycle()
             .rebind(bucket, generation, walked, &kernels)

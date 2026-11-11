@@ -106,55 +106,49 @@ impl GatedMlp {
         })
     }
 
-    /// `out = down(act(gate(x)) · up(x))` over `x [rows, hidden]` into `out [rows, hidden]`.
+    /// `down(act(gate(x)) · up(x))` over `x [rows, hidden]`: a fresh `[rows, hidden]` tensor of
+    /// `x`'s element type, reserved first, then written by [`Self::forward_into`].
     ///
-    /// The projections' outputs are reserved in `x`'s element type and released before return;
-    /// the gated product of two split halves is written over the gate's own buffer, which the
-    /// activation reads element by element before it writes. `out` may be `x`, which is read only
-    /// by the input projections.
+    /// # Errors
+    ///
+    /// As [`Self::forward_into`], or an arena that cannot hold the output.
+    pub fn forward(&self, f: &Forward, x: TensorView) -> Result<TensorView> {
+        // The down projection reserves its own output: a packed product's region holds the row
+        // class it writes whole.
+        let out = self.down.reserve(f, x)?;
+        self.forward_into(f, x, out)?;
+        Ok(out)
+    }
+
+    /// The block over `x` written into `update`, `[rows, hidden]` of `x`'s element type: the
+    /// caller's buffer the output must land in, such as a stack's update carried across its
+    /// layers' scopes. The projections' intermediates are handed back before return.
+    ///
+    /// When the down projection is packed ([`Self::is_packed`]) its product writes whole row
+    /// classes ([`ops::fp4::packed_rows`]), so `update` must lie at the start of a region that
+    /// holds the class of its rows.
     ///
     /// # Errors
     ///
     /// A view the projections refuse, or an arena that cannot hold the intermediates.
-    pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
-        let arena = f.arena();
-        let mark = arena.mark();
-        let gated = match &self.inputs {
-            Inputs::Split { gate, up } => {
-                let gate = gate.apply(f, x, x.dtype)?;
-                let up = up.apply(f, x, x.dtype)?;
-                let halves = Halves::Split { gate, value: up };
-                self.activation.forward(f, halves, gate)?;
-                gate
-            }
-            Inputs::ValueFirst(projection) => {
-                let packed = projection.apply(f, x, x.dtype)?;
-                let gated = arena.tensor(
-                    x.dtype,
-                    ops::Shape::new(&[x.rows(), packed.shape.last() / 2]),
-                )?;
-                self.activation
-                    .forward(f, Halves::ValueFirst(packed), gated)?;
-                gated
-            }
-        };
-        self.down.forward(f, gated, out)?;
-        arena.release(mark);
-        Ok(())
+    pub fn forward_into(&self, f: &Forward, x: TensorView, update: TensorView) -> Result<()> {
+        f.scoped(|f| {
+            let halves = match &self.inputs {
+                Inputs::Split { gate, up } => Halves::Split {
+                    gate: gate.forward(f, x)?,
+                    value: up.forward(f, x)?,
+                },
+                Inputs::ValueFirst(projection) => Halves::ValueFirst(projection.forward(f, x)?),
+            };
+            let gated = self.activation.forward(f, halves)?;
+            self.down.launch(f, gated, update)
+        })
     }
 
-    /// [`Self::forward`] into an output of `x`'s shape and element type reserved from the arena.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::forward`].
-    pub fn apply(&self, f: &Forward, x: TensorView) -> Result<TensorView> {
-        let out = f.arena().tensor(
-            x.dtype,
-            ops::Shape::new(&[x.rows(), u64::from(self.down.n())]),
-        )?;
-        self.forward(f, x, out)?;
-        Ok(out)
+    /// Whether the down projection is packed, so [`Self::forward_into`]'s `update` must lie in a
+    /// region of its rows' packed class.
+    pub const fn is_packed(&self) -> bool {
+        self.down.is_packed()
     }
 }
 
@@ -209,31 +203,30 @@ impl SharedExpert {
         })
     }
 
-    /// Add the shared expert's gated output of `x [rows, hidden]` into `out [rows, hidden]`.
+    /// Add the shared expert's gated output of `x [rows, hidden]` into `inout [rows, hidden]`, in
+    /// place: the routed block's output it sits beside.
     ///
     /// # Errors
     ///
     /// A view a layer refuses, or an arena that cannot hold the intermediates.
-    pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
+    pub fn forward(&self, f: &Forward, x: TensorView, inout: TensorView) -> Result<()> {
         use ops::residual::{SigmoidGatedAdd, SigmoidGatedAddArgs, SigmoidGatedAddDescriptor};
 
-        let arena = f.arena();
-        let mark = arena.mark();
-        let update = self.mlp.apply(f, x)?;
-        let gate = self.gate.apply(f, x, x.dtype)?;
-        f.operate::<SigmoidGatedAdd>(
-            &SigmoidGatedAddDescriptor {
-                dtype: out.dtype,
-                columns: self.hidden,
-                block: crate::layers::launch::row_tile(self.hidden).min(1024),
-            },
-            SigmoidGatedAddArgs {
-                target: out,
-                update,
-                gate,
-            },
-        )?;
-        arena.release(mark);
-        Ok(())
+        f.scoped(|f| {
+            let update = self.mlp.forward(f, x)?;
+            let gate = self.gate.forward(f, x)?;
+            f.operate::<SigmoidGatedAdd>(
+                &SigmoidGatedAddDescriptor {
+                    dtype: inout.dtype,
+                    columns: self.hidden,
+                    block: crate::layers::launch::row_tile(self.hidden).min(1024),
+                },
+                SigmoidGatedAddArgs {
+                    target: inout,
+                    update,
+                    gate,
+                },
+            )
+        })
     }
 }

@@ -16,7 +16,8 @@
 //! compose     the member-major payload of one row interval from several members' heads
 //! ```
 //!
-//! [`VsaAttention::attend`] runs the first five in order over a [`VsaScratch`]; the gated fold is
+//! [`VsaAttention::attend`] runs the first five in order and answers the two [`Branches`], every
+//! intermediate reserved from the forward's arena; the gated fold is
 //! the model's to place, because under sequence parallelism it happens on the return path, interval
 //! by interval, as [`VsaAttention::compose`], and on one rank in place as
 //! [`VsaAttention::add_gated`]. A compressed row is broadcast over every row of its query tile, so
@@ -35,7 +36,8 @@ use ops::vsa::{self, MAX_MEMBERS, VsaZeroPadding};
 use ops::{DType, Shape, TensorView};
 
 use crate::error::{Error, Result};
-use crate::forward::{Arena, Forward};
+use crate::forward::Forward;
+use crate::layers::Factors;
 use crate::weights::Weight;
 
 /// The fewest lanes a selection is compiled with, however few tiles a layout holds.
@@ -76,56 +78,20 @@ pub struct VsaTables {
     pub keep: TensorView,
 }
 
-/// The device views one [`VsaAttention::attend`] writes, for a sequence of `tiles` tiles.
+/// The two branches [`VsaAttention::attend`] answers, which the gated fold combines.
 #[derive(Clone, Copy)]
-pub struct VsaScratch {
-    /// `[tiles, heads, head_dim]` FP32: each tile's pooled query, key and value means.
-    pub pooled_query: TensorView,
-    pub pooled_key: TensorView,
-    pub pooled_value: TensorView,
-    /// `[heads, tiles, tiles]` FP32: the pooled scores.
-    pub scores: TensorView,
-    /// `[heads, tiles, tiles]` i32: each query tile's key tiles, kept ones first.
-    pub indices: TensorView,
-    /// `[heads, tiles]` i32: how many of each row's tiles are read.
-    pub counts: TensorView,
-    /// `[rows, heads · head_dim]`: the fine attention's rows.
+pub struct Branches {
+    /// `[rows, heads · head_dim]`: the fine attention's rows, in the layer's output type.
     pub fine: TensorView,
-    /// `[heads, tiles, head_dim]`: one compressed row per (head, query tile).
+    /// `[heads, tiles, head_dim]`: one compressed row per (head, query tile), in the output type.
     pub compressed: TensorView,
 }
 
-impl VsaScratch {
-    /// Reserve the views of a sequence of `rows` rows whose attended rows are `dtype`, in the
-    /// order [`VsaAttention::attend`] writes them.
-    ///
-    /// # Errors
-    ///
-    /// Rows that are not whole tiles, or an arena that cannot hold the views.
-    pub fn reserve(arena: &Arena, layer: &VsaAttention, rows: u64, dtype: DType) -> Result<Self> {
-        let tile = u64::from(layer.tile_rows);
-        if !rows.is_multiple_of(tile) {
-            return Err(Error::shape(
-                "VsaScratch",
-                format!("{rows} rows are not whole {tile}-row tiles"),
-            ));
-        }
-        let tiles = rows / tile;
-        let (heads, width) = (u64::from(layer.heads), u64::from(layer.width));
-        let pooled = || arena.tensor(DType::F32, Shape::new(&[tiles, heads, width]));
-        Ok(Self {
-            pooled_query: pooled()?,
-            pooled_key: pooled()?,
-            pooled_value: pooled()?,
-            scores: arena.tensor(DType::F32, Shape::new(&[heads, tiles, tiles]))?,
-            // The selection is as wide as the scores it comes from, one entry per key tile with
-            // the kept ones first.
-            indices: arena.tensor(DType::I32, Shape::new(&[heads, tiles, tiles]))?,
-            counts: arena.tensor(DType::I32, Shape::new(&[heads, tiles]))?,
-            fine: arena.tensor(dtype, Shape::new(&[rows, heads * width]))?,
-            compressed: arena.tensor(dtype, Shape::new(&[heads, tiles, width]))?,
-        })
-    }
+/// Each tile's pooled query, key and value means, `[tiles, heads, head_dim]` FP32.
+struct Pooled {
+    query: TensorView,
+    key: TensorView,
+    value: TensorView,
 }
 
 /// One layer's video sparse attention.
@@ -216,78 +182,44 @@ impl VsaAttention {
     }
 
     /// Prepare, score, select, attend and compress `query`, `key` and `value`
-    /// `[tiles · tile_rows, heads, head_dim]`, writing `scratch.fine` and `scratch.compressed`.
+    /// `[tiles · tile_rows, heads, head_dim]`: the fine and compressed [`Branches`].
     ///
     /// The projections are normalized and rotated in place; `gains` and `factors` are present
     /// exactly when the layer normalizes and rotates. The selection reads `tables`, and every query
-    /// tile starts at sequence tile zero.
+    /// tile starts at sequence tile zero. The pooled means, scores and selection are reserved from
+    /// the forward's arena before the branches.
     ///
     /// # Errors
     ///
-    /// Views or tables a stage refuses.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the three projections, the layer's gains, the stack's factors, the packing's \\
-                  tables and the stage views are the attention's argument list"
-    )]
+    /// Rows that are not whole tiles, views or tables a stage refuses, or an arena that cannot hold
+    /// the stages' views.
     pub fn attend(
         &self,
         f: &Forward,
-        query: TensorView,
-        key: TensorView,
-        value: TensorView,
+        (query, key, value): (TensorView, TensorView, TensorView),
         gains: Option<(&Weight, &Weight)>,
-        factors: Option<(TensorView, TensorView)>,
+        factors: Option<Factors>,
         tables: &VsaTables,
-        scratch: &VsaScratch,
-    ) -> Result<()> {
-        self.prepare(
-            f,
-            query,
-            key,
-            value,
-            gains.map(|(query, _)| query),
-            gains.map(|(_, key)| key),
-            factors.map(|(cosine, _)| cosine),
-            factors.map(|(_, sine)| sine),
-            tables.sizes,
-            scratch.pooled_query,
-            scratch.pooled_key,
-            scratch.pooled_value,
-        )?;
+    ) -> Result<Branches> {
+        let rows = query.shape.dim(0);
+        let tile = u64::from(self.tile_rows);
+        if !rows.is_multiple_of(tile) {
+            return Err(Error::shape(
+                "VsaAttention",
+                format!("{rows} rows are not whole {tile}-row tiles"),
+            ));
+        }
+        let pooled = self.prepare(f, (query, key, value), gains, factors, tables.sizes)?;
         // The preparation already stored zeros past each tile's valid size in all three
         // projections, so the fine attention reads the same zeroed rows without a second pass.
-        self.scores(f, scratch.pooled_query, scratch.pooled_key, scratch.scores)?;
-        self.select(
-            f,
-            scratch.scores,
-            tables.segments,
-            tables.sizes,
-            tables.keep,
-            scratch.indices,
-            scratch.counts,
-            0,
-        )?;
-        self.fine(
-            f,
-            query,
-            key,
-            value,
-            scratch.indices,
-            scratch.counts,
-            tables.sizes,
-            scratch.fine.reshape(query.shape),
-        )?;
+        let scores = self.scores(f, pooled.query, pooled.key)?;
+        let selection = self.select(f, scores, tables, 0)?;
+        let fine = self.fine(f, (query, key, value), selection, tables.sizes)?;
         // One compression per (head, query tile): a dense FP32 softmax over every live key tile,
         // rounded once into the rows' type. A tile whose rows are all invalid is masked out of the
         // softmax rather than zeroed.
-        self.compress(
-            f,
-            scratch.scores,
-            scratch.pooled_value,
-            tables.sizes,
-            scratch.compressed,
-        )
+        let compressed = self.compress(f, scores, pooled.value, tables.sizes)?;
+        Ok(Branches { fine, compressed })
     }
 
     /// The fine attention's descriptor, from the tile geometry and the query's element type.
@@ -313,23 +245,22 @@ impl VsaAttention {
         }
     }
 
-    /// Attend `query` against the tiles `indices` and `counts` name, writing zeroed padding rows for
-    /// the rest; the softmax scale is `1/sqrt(head_dim)`.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the three projections, the selection's two tables, the sizes and the output"
-    )]
+    /// `query` attended against the tiles the selection's `indices` and `counts` name, padding rows
+    /// zeroed: a fresh `[rows, heads · head_dim]` tensor of the output type. The softmax scale is
+    /// `1/sqrt(head_dim)`.
     fn fine(
         &self,
         f: &Forward,
-        query: TensorView,
-        key: TensorView,
-        value: TensorView,
-        indices: TensorView,
-        counts: TensorView,
+        (query, key, value): (TensorView, TensorView, TensorView),
+        (indices, counts): (TensorView, TensorView),
         sizes: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
+    ) -> Result<TensorView> {
+        let rows = query.shape.dim(0);
+        let fine = f.empty(
+            self.output,
+            Shape::new(&[rows, u64::from(self.heads) * u64::from(self.width)]),
+        )?;
+        let out = fine.reshape(query.shape);
         let head_dim = f64::from(self.width);
         f.operate::<SparseAttention>(
             &self.fine_descriptor(query.dtype),
@@ -350,7 +281,8 @@ impl VsaAttention {
         f.operate::<VsaZeroPadding>(
             &self.zero_descriptor(),
             vsa::ZeroPaddingArgs { values: out, sizes },
-        )
+        )?;
+        Ok(fine)
     }
 
     /// Rows of one tile.
@@ -467,29 +399,32 @@ impl VsaAttention {
         }
     }
 
-    /// Normalize, rotate, zero and pool whole tiles of projected Q/K/V rows.
+    /// Normalize, rotate, zero and pool whole tiles of projected Q/K/V rows: the pooled means.
     ///
     /// `query`, `key` and `value` are `[tiles · tile_rows, heads, width]` and are modified in place;
-    /// `sizes` is `[tiles]` i32; the three pooled views are `[tiles, heads, width]` FP32. The
-    /// normalization weights and the factor tables are present exactly when the layer normalizes and
-    /// rotates.
-    #[allow(clippy::too_many_arguments)]
+    /// `sizes` is `[tiles]` i32. The normalization weights and the factor tables are present exactly
+    /// when the layer normalizes and rotates.
     fn prepare(
         &self,
         f: &Forward,
-        query: TensorView,
-        key: TensorView,
-        value: TensorView,
-        query_weight: Option<&Weight>,
-        key_weight: Option<&Weight>,
-        cosine: Option<TensorView>,
-        sine: Option<TensorView>,
+        (query, key, value): (TensorView, TensorView, TensorView),
+        gains: Option<(&Weight, &Weight)>,
+        factors: Option<Factors>,
         sizes: TensorView,
-        pooled_query: TensorView,
-        pooled_key: TensorView,
-        pooled_value: TensorView,
-    ) -> Result<()> {
+    ) -> Result<Pooled> {
+        let (query_weight, key_weight) = (gains.map(|(query, _)| query), gains.map(|(_, key)| key));
+        let (cosine, sine) = (
+            factors.map(|table| table.cosine),
+            factors.map(|table| table.sine),
+        );
         self.check_prepare(query_weight.is_some(), key_weight.is_some(), cosine, sine)?;
+        let tiles = query.shape.dim(0) / u64::from(self.tile_rows);
+        let pooled_shape = Shape::new(&[tiles, u64::from(self.heads), u64::from(self.width)]);
+        let pooled = Pooled {
+            query: f.empty(DType::F32, pooled_shape)?,
+            key: f.empty(DType::F32, pooled_shape)?,
+            value: f.empty(DType::F32, pooled_shape)?,
+        };
         let descriptor = Self::prepare_descriptor(
             query.dtype,
             [
@@ -520,29 +455,35 @@ impl VsaAttention {
             cosine,
             sine,
             sizes,
-            pooled_query,
-            pooled_key,
-            pooled_value,
+            pooled_query: pooled.query,
+            pooled_key: pooled.key,
+            pooled_value: pooled.value,
         };
-        f.operate::<vsa::VsaPrepareTiles>(&descriptor, args)
+        f.operate::<vsa::VsaPrepareTiles>(&descriptor, args)?;
+        Ok(pooled)
     }
 
-    /// Fold the compressed branch's gated rows into each tile's rows, in place.
+    /// Fold the compressed branch's gated rows into each tile's rows of `inout` (the fine branch),
+    /// in place.
+    ///
+    /// # Errors
+    ///
+    /// The operator's refusal.
     pub fn add_gated(
         &self,
         f: &Forward,
-        output: TensorView,
+        inout: TensorView,
         compressed: TensorView,
         gate: TensorView,
     ) -> Result<()> {
         let descriptor = vsa::AddGatedTilesDescriptor {
-            dtype: output.dtype,
+            dtype: inout.dtype,
             tile_rows: self.tile_rows,
             width: self.width,
             block_rows: self.block_rows,
         };
         let args = vsa::AddGatedTilesArgs {
-            output,
+            output: inout,
             compressed,
             gate,
         };
@@ -565,28 +506,33 @@ impl VsaAttention {
         Ok(())
     }
 
-    /// Write one row interval of every member's gated rows, member-major.
+    /// Write one row interval of every member's gated rows, member-major, into `payload`, the
+    /// interval's send buffer of a sequence-parallel return.
     ///
-    /// `slots` names the payload slot of each member, in member order; a tensor-parallel group has
-    /// one member per rank.
-    #[allow(clippy::too_many_arguments)]
+    /// `branches.fine` holds every member's rows of this member's heads, `members · owner rows`
+    /// rows, so each member owns `fine rows / members` of them; `interval` is the rows of each
+    /// owner this payload carries. `slots` names the payload slot of each member, in member order;
+    /// a sequence-parallel group has one member per rank.
+    ///
+    /// # Errors
+    ///
+    /// No member or more than the operator's table, or the operator's refusal.
     pub fn compose(
         &self,
         f: &Forward,
-        output: TensorView,
-        fine: TensorView,
-        compressed: TensorView,
+        payload: TensorView,
+        branches: Branches,
         gate: TensorView,
-        owner_rows: u64,
-        start: u64,
-        count: u64,
+        interval: crate::layers::Interval,
         slots: &[u32],
     ) -> Result<()> {
         self.check_members(slots.len())?;
+        let Branches { fine, compressed } = branches;
+        let owner_rows = fine.shape.dim(0) / slots.len() as u64;
         let mut table = [0_u32; MAX_MEMBERS];
         table[..slots.len()].copy_from_slice(slots);
         let descriptor = vsa::ComposeGatedRowsDescriptor {
-            dtype: output.dtype,
+            dtype: payload.dtype,
             heads: self.heads,
             tile_rows: self.tile_rows,
             width: self.width,
@@ -595,24 +541,17 @@ impl VsaAttention {
             members: slots.len() as u32,
         };
         let args = vsa::ComposeGatedRowsArgs {
-            output,
+            output: payload,
             fine,
             compressed,
             gate,
             owner_rows,
-            start,
-            count,
+            start: interval.first,
+            count: interval.count,
         };
         f.operate::<vsa::VsaComposeGatedRows>(&descriptor, args)
     }
 
-    /// Contract the pooled query and key tiles into the scores `select` ranks.
-    ///
-    /// `pooled_query` is `[query tiles, heads, width]` and `pooled_key` `[tiles, heads, width]`, both
-    /// FP32 — the layout and the type [`Self::prepare`] writes; `scores` is
-    /// `[heads, query tiles, tiles]` FP32, contiguous, written here and read by [`Self::select`]. One
-    /// dot product per (query tile, key tile) and head — no scale and no softmax, because the
-    /// selection only compares and the attention scales its own products.
     /// The descriptor one score launch takes: the head count, the features per head and the bound on
     /// the dot product's length. A walk states it from the layer's own geometry.
     fn scores_descriptor(&self) -> vsa::ScoresDescriptor {
@@ -637,13 +576,19 @@ impl VsaAttention {
         )
     }
 
+    /// Multiply the pooled query and key tiles into the scores `select` ranks.
+    ///
+    /// `pooled_query` is `[query tiles, heads, width]` and `pooled_key` `[tiles, heads, width]`, both
+    /// FP32 — the layout and the type [`Self::prepare`] writes; the scores are a fresh
+    /// `[heads, query tiles, tiles]` FP32 tensor read by [`Self::select`]. One dot product per
+    /// (query tile, key tile) and head — no scale and no softmax, because the selection only
+    /// compares and the attention scales its own products.
     fn scores(
         &self,
         f: &Forward,
         pooled_query: TensorView,
         pooled_key: TensorView,
-        scores: TensorView,
-    ) -> Result<()> {
+    ) -> Result<TensorView> {
         if pooled_query.shape.rank() != 3 {
             return Err(Error::shape(
                 "VsaAttention",
@@ -665,13 +610,22 @@ impl VsaAttention {
                 ),
             ));
         }
+        let scores = f.empty(
+            DType::F32,
+            Shape::new(&[
+                u64::from(self.heads),
+                pooled_query.shape.dim(0),
+                pooled_key.shape.dim(0),
+            ]),
+        )?;
         let descriptor = self.scores_descriptor();
         let args = vsa::ScoresArgs {
             pooled_query,
             pooled_key,
             out: scores,
         };
-        f.operate::<vsa::VsaScores>(&descriptor, args)
+        f.operate::<vsa::VsaScores>(&descriptor, args)?;
+        Ok(scores)
     }
 
     /// Each query tile's softmax over the live key tiles weights their pooled values.
@@ -682,18 +636,25 @@ impl VsaAttention {
     /// rather than zeroed, because a zeroed pooled value under a live score would still take weight
     /// and scale the others down.
     ///
-    /// `out` is `[heads, query tiles, width]` in the attention's own element type — the layout the
-    /// gate step reads, and one row per (head, query tile) rather than one per row, because every
-    /// row of a query tile compresses to the same vector.
+    /// The answer is a fresh `[heads, query tiles, width]` tensor in the attention's own element
+    /// type — the layout the gate step reads, and one row per (head, query tile) rather than one
+    /// per row, because every row of a query tile compresses to the same vector.
     fn compress(
         &self,
         f: &Forward,
         scores: TensorView,
         values: TensorView,
         sizes: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
-        self.check_compress(scores, values, sizes, out)?;
+    ) -> Result<TensorView> {
+        self.check_compress(scores, values, sizes)?;
+        let out = f.empty(
+            self.output,
+            Shape::new(&[
+                u64::from(self.heads),
+                scores.shape.dim(1),
+                u64::from(self.width),
+            ]),
+        )?;
         let descriptor = self.compress_descriptor(out.dtype);
         let args = vsa::CompressPooledArgs {
             scores,
@@ -701,7 +662,8 @@ impl VsaAttention {
             sizes,
             out,
         };
-        f.operate::<vsa::VsaCompressPooled>(&descriptor, args)
+        f.operate::<vsa::VsaCompressPooled>(&descriptor, args)?;
+        Ok(out)
     }
 
     /// The checks [`Self::compress`] makes before it launches, reachable without a device.
@@ -714,7 +676,6 @@ impl VsaAttention {
         scores: TensorView,
         values: TensorView,
         sizes: TensorView,
-        out: TensorView,
     ) -> Result<()> {
         if self.max_tiles == 0 {
             return Err(Error::shape(
@@ -766,43 +727,22 @@ impl VsaAttention {
                 ),
             ));
         }
-        if out.shape.rank() != 3
-            || out.shape.dim(0) != u64::from(self.heads)
-            || out.shape.dim(1) != scores.shape.dim(1)
-            || out.shape.dim(2) != u64::from(self.width)
-        {
-            return Err(Error::shape(
-                "VsaAttention",
-                format!(
-                    "the compression is [heads, query tiles, width] = [{}, {}, {}], not {:?}",
-                    self.heads,
-                    scores.shape.dim(1),
-                    self.width,
-                    out.shape.dims()
-                ),
-            ));
-        }
         Ok(())
     }
 
     /// Choose each query tile's key tiles from its pooled scores.
     ///
-    /// `scores` is `[heads, query tiles, tiles]` FP32 contiguous; `segments` and `sizes` are
-    /// `[tiles]` i32; `keep` is `[segments]` i32. The layer writes `indices`
+    /// `scores` is `[heads, query tiles, tiles]` FP32 contiguous; the tables' `segments` and
+    /// `sizes` are `[tiles]` i32 and `keep` `[segments]` i32. The answer is the fresh `indices`
     /// `[heads, query tiles, tiles]` i32 (kept tiles first, in ascending order) and `counts`
     /// `[heads, query tiles]` i32. `query_offset` is the sequence tile of the first query tile.
-    #[allow(clippy::too_many_arguments)]
     fn select(
         &self,
         f: &Forward,
         scores: TensorView,
-        segments: TensorView,
-        sizes: TensorView,
-        keep: TensorView,
-        indices: TensorView,
-        counts: TensorView,
+        tables: &VsaTables,
         query_offset: u64,
-    ) -> Result<()> {
+    ) -> Result<(TensorView, TensorView)> {
         if scores.shape.rank() != 3 {
             return Err(Error::shape(
                 "VsaAttention",
@@ -834,16 +774,24 @@ impl VsaAttention {
         // one layout, and a program over the bound's lanes ranks and masks them all for every query
         // tile of every head.
         let descriptor = self.select_descriptor(tiles.max(u64::from(SELECT_FLOOR)))?;
+        // The selection is as wide as the scores it comes from, one entry per key tile with the
+        // kept ones first.
+        let indices = f.empty(DType::I32, scores.shape)?;
+        let counts = f.empty(
+            DType::I32,
+            Shape::new(&[scores.shape.dim(0), scores.shape.dim(1)]),
+        )?;
         let args = vsa::SelectTilesArgs {
             scores,
-            segments,
-            sizes,
-            keep,
+            segments: tables.segments,
+            sizes: tables.sizes,
+            keep: tables.keep,
             indices,
             counts,
             query_offset,
         };
-        f.operate::<vsa::VsaSelectTiles>(&descriptor, args)
+        f.operate::<vsa::VsaSelectTiles>(&descriptor, args)?;
+        Ok((indices, counts))
     }
 }
 
@@ -891,15 +839,17 @@ mod tests {
         let block = |tiles: u64| {
             let arena = crate::Arena::counting();
             let f = Forward::recording(&arena);
-            let table = |shape: &[u64]| arena.tensor(DType::I32, Shape::new(shape)).unwrap();
+            let table = || arena.tensor(DType::I32, Shape::new(&[tiles])).unwrap();
             let scores = arena
                 .tensor(DType::F32, Shape::new(&[4, 1, tiles]))
                 .unwrap();
-            let (segments, sizes, keep) = (table(&[tiles]), table(&[tiles]), table(&[tiles]));
-            let (indices, counts) = (table(&[4, 1, tiles]), table(&[4, 1]));
-            let (walked, launches) = crate::forward::recorded(|| {
-                layer.select(&f, scores, segments, sizes, keep, indices, counts, 0)
-            });
+            let tables = VsaTables {
+                sizes: table(),
+                segments: table(),
+                keep: table(),
+            };
+            let (walked, launches) =
+                crate::forward::recorded(|| layer.select(&f, scores, &tables, 0));
             walked.unwrap();
             assert_eq!(launches.len(), 1, "{launches:?}");
             launches[0].1.clone()
@@ -914,11 +864,12 @@ mod tests {
             .tensor(DType::F32, Shape::new(&[4, 1, 5_401]))
             .unwrap();
         let table = arena.tensor(DType::I32, Shape::new(&[5_401])).unwrap();
-        assert!(
-            layer
-                .select(&f, past, table, table, table, table, table, 0)
-                .is_err()
-        );
+        let tables = VsaTables {
+            sizes: table,
+            segments: table,
+            keep: table,
+        };
+        assert!(layer.select(&f, past, &tables, 0).is_err());
     }
 
     #[test]
@@ -1039,48 +990,39 @@ mod tests {
         let scores = view(DType::F32, &[4, 8, 16]);
         let values = view(DType::F32, &[16, 4, 64]);
         let sizes = view(DType::I32, &[16]);
-        let out = view(DType::BF16, &[4, 8, 64]);
-        assert!(tiles.check_compress(scores, values, sizes, out).is_ok());
+        assert!(tiles.check_compress(scores, values, sizes).is_ok());
         // Another head count on either side would weight another block's rows.
         assert!(
             tiles
-                .check_compress(view(DType::F32, &[2, 8, 16]), values, sizes, out)
+                .check_compress(view(DType::F32, &[2, 8, 16]), values, sizes)
                 .is_err()
         );
         assert!(
             tiles
-                .check_compress(scores, view(DType::F32, &[16, 2, 64]), sizes, out)
+                .check_compress(scores, view(DType::F32, &[16, 2, 64]), sizes)
                 .is_err()
         );
         // Another feature width is another head's arithmetic.
         assert!(
             tiles
-                .check_compress(scores, view(DType::F32, &[16, 4, 32]), sizes, out)
+                .check_compress(scores, view(DType::F32, &[16, 4, 32]), sizes)
                 .is_err()
         );
         // The live sizes are one per key tile.
         assert!(
             tiles
-                .check_compress(scores, values, view(DType::I32, &[12]), out)
-                .is_err()
-        );
-        // The result is one row per (head, query tile) of the block's width.
-        assert!(
-            tiles
-                .check_compress(scores, values, sizes, view(DType::BF16, &[4, 8, 32]))
+                .check_compress(scores, values, view(DType::I32, &[12]))
                 .is_err()
         );
     }
 
-    /// One attend launches the five stages in order, over the scratch its reservation sized.
+    /// One attend launches the five stages in order and refuses rows that are not whole tiles.
     #[test]
     fn an_attend_prepares_scores_selects_attends_and_compresses() {
         let layer = VsaAttention::new(spec(64, 4, 128, true, 96)).unwrap();
         let arena = crate::Arena::counting();
         let f = Forward::recording(&arena);
         let rows = 4 * 64;
-        let scratch = VsaScratch::reserve(&arena, &layer, rows, DType::BF16).unwrap();
-        assert!(VsaScratch::reserve(&arena, &layer, rows + 1, DType::BF16).is_err());
         let tensor = |dtype: DType, dims: &[u64]| arena.tensor(dtype, Shape::new(dims)).unwrap();
         let projection = || tensor(DType::BF16, &[rows, 4, 128]);
         let (query, key, value) = (projection(), projection(), projection());
@@ -1089,10 +1031,10 @@ mod tests {
             view: TensorView::new(DevicePtr::new(0x8000), DType::BF16, Shape::new(&[128])),
         };
         let (query_gain, key_gain) = (gain(), gain());
-        let factors = (
-            tensor(DType::F32, &[rows, 48]),
-            tensor(DType::F32, &[rows, 48]),
-        );
+        let factors = Factors {
+            cosine: tensor(DType::F32, &[rows, 48]),
+            sine: tensor(DType::F32, &[rows, 48]),
+        };
         let tables = VsaTables {
             sizes: tensor(DType::I32, &[4]),
             segments: tensor(DType::I32, &[4]),
@@ -1101,16 +1043,25 @@ mod tests {
         let (walked, launches) = crate::forward::recorded(|| {
             layer.attend(
                 &f,
-                query,
-                key,
-                value,
+                (query, key, value),
                 Some((&query_gain, &key_gain)),
                 Some(factors),
                 &tables,
-                &scratch,
             )
         });
         walked.unwrap();
+        let ragged = tensor(DType::BF16, &[rows + 1, 4, 128]);
+        assert!(
+            layer
+                .attend(
+                    &f,
+                    (ragged, ragged, ragged),
+                    Some((&query_gain, &key_gain)),
+                    Some(factors),
+                    &tables
+                )
+                .is_err()
+        );
         let operators: Vec<&str> = launches.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
             operators,

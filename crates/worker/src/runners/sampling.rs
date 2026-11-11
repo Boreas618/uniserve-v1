@@ -108,8 +108,8 @@ use ops::sampler::{
 use ops::{DType, Shape, TensorView};
 use proto::program::sampler::PARAMETER_COLUMNS;
 
+use nn::Forward;
 use nn::layers::launch;
-use nn::{Arena, Forward};
 
 use platform::DeviceId;
 
@@ -183,18 +183,19 @@ pub struct Candidates {
 }
 
 impl Candidates {
-    /// Reserve the working set of `rows` rows from `arena`, in the order the operators read it.
-    pub fn reserve(arena: &Arena, rows: u64, vocabulary: u64, width: u64) -> Result<Self> {
+    /// Reserve the working set of `rows` rows from `f`'s arena, in the order the operators read
+    /// it.
+    pub fn reserve(f: &Forward, rows: u64, vocabulary: u64, width: u64) -> Result<Self> {
         Ok(Self {
-            shaped: arena.tensor(DType::F32, Shape::new(&[rows, vocabulary]))?,
-            values: arena.tensor(DType::F32, Shape::new(&[rows, width]))?,
-            ids: arena.tensor(DType::I32, Shape::new(&[rows, width]))?,
-            probabilities: arena.tensor(DType::F32, Shape::new(&[rows, width]))?,
-            ordered_values: arena.tensor(DType::F32, Shape::new(&[rows, width]))?,
-            ordered_ids: arena.tensor(DType::I32, Shape::new(&[rows, width]))?,
-            valid: arena.tensor(DType::I32, Shape::new(&[rows]))?,
-            scratch: arena.tensor(DType::I32, ops::sampler::top_k_workspace(rows, width))?,
-            counts: arena.tensor(DType::I32, Shape::new(&[rows, vocabulary]))?,
+            shaped: f.empty(DType::F32, Shape::new(&[rows, vocabulary]))?,
+            values: f.empty(DType::F32, Shape::new(&[rows, width]))?,
+            ids: f.empty(DType::I32, Shape::new(&[rows, width]))?,
+            probabilities: f.empty(DType::F32, Shape::new(&[rows, width]))?,
+            ordered_values: f.empty(DType::F32, Shape::new(&[rows, width]))?,
+            ordered_ids: f.empty(DType::I32, Shape::new(&[rows, width]))?,
+            valid: f.empty(DType::I32, Shape::new(&[rows]))?,
+            scratch: f.empty(DType::I32, ops::sampler::top_k_workspace(rows, width))?,
+            counts: f.empty(DType::I32, Shape::new(&[rows, vocabulary]))?,
         })
     }
 }
@@ -208,19 +209,19 @@ pub struct Samples {
 }
 
 impl Samples {
-    /// Reserve the step's outputs from `arena`: the tokens, and their scores with `candidates`
-    /// top tokens of a `vocabulary`-wide row when `candidates` is stated.
+    /// Reserve the step's outputs from `f`'s arena: the tokens, and their scores with
+    /// `candidates` top tokens of a `vocabulary`-wide row when `candidates` is stated.
     pub fn reserve(
-        arena: &Arena,
+        f: &Forward,
         tokens: DType,
         rows: u64,
         vocabulary: u32,
         candidates: Option<u32>,
     ) -> Result<Self> {
         Ok(Self {
-            tokens: arena.tensor(tokens, Shape::new(&[rows]))?,
+            tokens: f.empty(tokens, Shape::new(&[rows]))?,
             scores: match candidates {
-                Some(candidates) => Some(Scores::reserve(arena, rows, vocabulary, candidates)?),
+                Some(candidates) => Some(Scores::reserve(f, rows, vocabulary, candidates)?),
                 None => None,
             },
         })
@@ -258,7 +259,7 @@ impl TopLogprobs {
     /// The candidates of `rows` rows of a `vocabulary`-wide distribution, `candidates` a row, with
     /// their chunks' views beside them, from `values` and `ids` and `arena`.
     pub fn with_chunks(
-        arena: &Arena,
+        f: &Forward,
         values: TensorView,
         ids: TensorView,
         rows: u64,
@@ -269,8 +270,8 @@ impl TopLogprobs {
         Ok(Self {
             values,
             ids,
-            chunk_values: arena.tensor(DType::F32, Shape::new(&[rows, chunks]))?,
-            chunk_ids: arena.tensor(DType::I32, Shape::new(&[rows, chunks]))?,
+            chunk_values: f.empty(DType::F32, Shape::new(&[rows, chunks]))?,
+            chunk_ids: f.empty(DType::I32, Shape::new(&[rows, chunks]))?,
         })
     }
 }
@@ -281,19 +282,19 @@ fn chunk_candidates(vocabulary: u32, candidates: u32) -> u64 {
 }
 
 impl Scores {
-    /// Reserve the scores of `rows` rows of a `vocabulary`-wide distribution from `arena`, with
-    /// `candidates` top tokens a row when it is above zero.
-    pub fn reserve(arena: &Arena, rows: u64, vocabulary: u32, candidates: u32) -> Result<Self> {
-        let logprobs = arena.tensor(DType::F32, Shape::new(&[rows]))?;
-        let ranks = arena.tensor(DType::I32, Shape::new(&[rows]))?;
+    /// Reserve the scores of `rows` rows of a `vocabulary`-wide distribution from `f`'s arena,
+    /// with `candidates` top tokens a row when it is above zero.
+    pub fn reserve(f: &Forward, rows: u64, vocabulary: u32, candidates: u32) -> Result<Self> {
+        let logprobs = f.empty(DType::F32, Shape::new(&[rows]))?;
+        let ranks = f.empty(DType::I32, Shape::new(&[rows]))?;
         let top = match candidates {
             0 => None,
             candidates => {
                 let width = u64::from(candidates);
                 Some(TopLogprobs::with_chunks(
-                    arena,
-                    arena.tensor(DType::F32, Shape::new(&[rows, width]))?,
-                    arena.tensor(DType::I32, Shape::new(&[rows, width]))?,
+                    f,
+                    f.empty(DType::F32, Shape::new(&[rows, width]))?,
+                    f.empty(DType::I32, Shape::new(&[rows, width]))?,
                     rows,
                     vocabulary,
                     candidates,
@@ -500,8 +501,7 @@ impl Sampler {
             ));
         }
 
-        let arena = f.arena();
-        let candidates = Candidates::reserve(arena, rows, vocabulary, width)?;
+        let candidates = Candidates::reserve(f, rows, vocabulary, width)?;
 
         // 1. Logit adjustments, penalties and temperature.
         self.shape(f, logits, state, candidates.shaped)?;
@@ -982,8 +982,7 @@ impl Sampler {
     ) -> Result<()> {
         let rows = self.check(logits, state, samples)?;
         let vocabulary = u64::from(self.vocabulary);
-        let arena = f.arena();
-        let shaped = arena.tensor(DType::F32, Shape::new(&[rows, vocabulary]))?;
+        let shaped = f.empty(DType::F32, Shape::new(&[rows, vocabulary]))?;
 
         self.shape(f, logits, state, shaped)?;
 
@@ -1768,6 +1767,7 @@ impl Sampling {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nn::Arena;
     use ops::DevicePtr;
 
     /// A view of `shape` at a host address: these tests never launch, so the address is a marker.
@@ -1799,8 +1799,9 @@ mod tests {
     fn the_working_set_is_reserved_in_the_order_the_step_reads_it() {
         let arena = Arena::new(DevicePtr::new(0x10_0000), 1 << 20);
         let rows = 4;
-        let candidates = Candidates::reserve(&arena, rows, 1_024, 32).unwrap();
-        let samples = Samples::reserve(&arena, DType::I32, rows, 1_024, Some(4)).unwrap();
+        let f = Forward::recording(&arena);
+        let candidates = Candidates::reserve(&f, rows, 1_024, 32).unwrap();
+        let samples = Samples::reserve(&f, DType::I32, rows, 1_024, Some(4)).unwrap();
         let scores = samples.scores.unwrap();
         let top = scores.top.unwrap();
         let order = [
@@ -1836,10 +1837,11 @@ mod tests {
         // Without scores the step reserves none of them; scores without candidates reserve no top
         // tokens.
         let arena = Arena::new(DevicePtr::new(0x10_0000), 1 << 20);
-        let _ = Candidates::reserve(&arena, rows, 1_024, 32).unwrap();
-        let samples = Samples::reserve(&arena, DType::I32, rows, 1_024, None).unwrap();
+        let f = Forward::recording(&arena);
+        let _ = Candidates::reserve(&f, rows, 1_024, 32).unwrap();
+        let samples = Samples::reserve(&f, DType::I32, rows, 1_024, None).unwrap();
         assert!(samples.scores.is_none());
-        let samples = Samples::reserve(&arena, DType::I32, rows, 1_024, Some(0)).unwrap();
+        let samples = Samples::reserve(&f, DType::I32, rows, 1_024, Some(0)).unwrap();
         assert!(samples.scores.unwrap().top.is_none());
     }
 

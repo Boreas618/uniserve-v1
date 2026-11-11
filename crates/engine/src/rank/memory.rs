@@ -279,7 +279,7 @@ impl ModelRunner {
                 };
                 (
                     request,
-                    media_rank_report(device, host, bounds, pipeline.denoiser_component())?,
+                    media_rank_report(device, host, bounds, pipeline.denoiser_stage())?,
                 )
             }
         };

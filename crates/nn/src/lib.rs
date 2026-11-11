@@ -73,13 +73,13 @@ pub use adapter::{Adapter, Fusion};
 pub use capability::{
     CausalLm, ConditionPiece, ConditionRole, ConditionShape, Conditioning, DecodedMedia, Decoder,
     Denoiser, Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageInput,
-    ImageShape, KvGroup, KvPlanes, KvView, Latents, MediaFormat, PatchFormat, PixelNorm, Placed,
-    Seed, Splicer, StateLayer, StateTable, StateView, Step, TableValues, TokenBatch, VideoRequest,
-    WarmPrompt, WarmRequest,
+    ImageShape, KvGroup, KvLayer, KvPlanes, KvView, Latents, MediaFormat, PatchFormat, PixelNorm,
+    Placed, Seed, Splicer, StateLayer, StateView, Step, TokenBatch, VideoRequest, WarmPrompt,
+    WarmRequest,
 };
 pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, Reading, TensorLocation};
 pub use error::{Error, Result};
-pub use forward::{Arena, Fence, Forward, Split};
+pub use forward::{Arena, Fence, Forward, HostValue, Split, Staging};
 pub use group::{Group, Transfer};
 pub use layers::{
     Activation, AdaptiveAvgPool2d, Axpby, Cast, CausalPad, Conv1d, Conv3d, ConvSpec,
@@ -91,6 +91,6 @@ pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};
 pub use proto::program::PhaseKind;
 pub use tensor::Backing;
 pub use weights::{
-    Quantization, QuantizedStack, QuantizedWeight, RetainedWeights, Scope, ValueLayout, Weight,
-    WeightKey, WeightLayout, WeightLoader,
+    ExpertStack, Quantization, QuantizedStack, QuantizedWeight, RetainedWeights, ScaleLayouts,
+    Scope, StackLayout, ValueLayout, Weight, WeightKey, WeightLayout, WeightLoader,
 };

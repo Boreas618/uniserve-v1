@@ -569,7 +569,7 @@ fn group_algorithm(groups: &Fields<'_>) -> Result<String> {
 /// it, or matches it with `*` standing for any run of characters.
 fn matches_module(entry: &str, weight: &str) -> bool {
     // An entry names a *module*, and a module owns every weight under it, so the comparison is
-    // against the weight's module path — the weight without its final component.
+    // against the weight's module path — the weight without its final segment.
     if entry == weight {
         return true;
     }

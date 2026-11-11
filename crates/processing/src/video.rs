@@ -1,5 +1,5 @@
-//! The video request contract: a model-agnostic request, the processor a video family binds, and
-//! the plan it returns.
+//! Video requests: a model-agnostic request, the processor a video family binds, and the engine
+//! input it processes a request into.
 
 use proto::video::{
     Canvas, Condition, ConditionMedia, ConditionRole, ConditionVision, MediaLocator,
@@ -88,7 +88,7 @@ impl ReferenceKind {
     }
 }
 
-/// A request a processor refuses, or a failure while planning a valid one.
+/// A request a processor refuses, or a failure while processing a valid one.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InputError {
     /// The request breaks a rule of the model; the same request fails again on retry.
@@ -100,7 +100,7 @@ pub enum InputError {
         /// What is wrong with it.
         message: String,
     },
-    /// Planning valid input failed, for example because the tokenizer lacks a token the model
+    /// Processing valid input failed, for example because the tokenizer lacks a token the model
     /// presents.
     #[error("{0}")]
     Internal(String),
@@ -116,10 +116,10 @@ impl InputError {
     }
 }
 
-/// A planned condition, before its media is published: everything the workers read of it but
+/// A processed condition, before its media is published: everything the workers read of it but
 /// where its bytes are.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConditionPlan {
+pub struct ConditionInput {
     /// Anchor or reference.
     pub role: ConditionRole,
     /// What the media reader decodes its bytes into.
@@ -132,7 +132,7 @@ pub struct ConditionPlan {
     pub audio_rows: u32,
 }
 
-impl ConditionPlan {
+impl ConditionInput {
     /// The condition with its media published at `source`.
     pub fn at(self, source: MediaLocator) -> Condition {
         Condition {
@@ -146,10 +146,10 @@ impl ConditionPlan {
     }
 }
 
-/// A planned video request: what it generates and everything the engine and the workers read of
+/// A processed video request: what it generates and everything the engine and the workers read of
 /// it.
 #[derive(Debug, Clone, PartialEq)]
-pub struct VideoPlan {
+pub struct VideoInput {
     /// The output raster.
     pub size: Canvas,
     /// The frames it generates.
@@ -163,7 +163,7 @@ pub struct VideoPlan {
     /// The prompt rows each block of vision content occupies, as `(first row, rows)`.
     pub vision_spans: Vec<(u32, u32)>,
     /// The conditions, one per reference in request order.
-    pub conditions: Vec<ConditionPlan>,
+    pub conditions: Vec<ConditionInput>,
     /// The decode units of the output.
     pub video_units: u32,
     /// The denoiser rows the conditions take, by which the engine selects the smallest graph
@@ -187,19 +187,19 @@ pub trait VideoProcessor: Send + Sync {
     /// Refuses the request, naming the parameter at fault.
     fn check(&self, request: &VideoSpec) -> Result<(), InputError>;
 
-    /// Plans `request`, whose references' media were probed as `media` in request order, with the
-    /// checkpoint's `vocabulary`.
+    /// Processes `request`, whose references' media were probed as `media` in request order, with
+    /// the checkpoint's `vocabulary`.
     ///
     /// # Errors
     ///
     /// Refuses the request, naming the parameter at fault, or fails when valid input cannot be
-    /// planned.
-    fn plan(
+    /// processed.
+    fn process(
         &self,
         request: &VideoSpec,
         media: &[MediaMetadata],
         vocabulary: &dyn Vocabulary,
-    ) -> Result<VideoPlan, InputError>;
+    ) -> Result<VideoInput, InputError>;
 }
 
 /// What a deployment binds a video family's processor with.
@@ -221,7 +221,8 @@ pub struct VideoBinding<'a> {
 
 /// A video family, as request processing serves it.
 pub trait VideoFamily: Send + Sync {
-    /// The checkpoint files the processor reads, as `(component, file)` of the pipeline.
+    /// The checkpoint files the processor reads, as `(stage, file)` of the pipeline: the stage's
+    /// directory and the file in it.
     fn processor_files(&self) -> &'static [(&'static str, &'static str)];
 
     /// Binds the deployment's processor.

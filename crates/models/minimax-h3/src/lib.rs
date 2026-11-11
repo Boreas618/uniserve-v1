@@ -1,36 +1,18 @@
-//! MiniMax-H3 with FastH3: the checkpoint configuration read once at the loading boundary, the
-//! mathematical partition of a deployment, and the model's blocks.
+//! MiniMax-H3 with FastH3: the checkpoint configuration read once at the loading boundary and the
+//! numerical pipeline.
 //!
-//! The crate holds one pipeline: the Qwen3-VL text encoder that conditions
-//! a request, one or two diffusion transformer (DiT) partitions of the checkpoint, the video and
-//! audio latent encoders `ref2va` uses, and the video and audio decoders. Each is a named block
-//! implementing an [`nn`] capability, and a deployment places a subset of them per worker group
-//! under the component names of the deployment files: `text_encoder`, `transformer`,
-//! `transformer_ref`, `video_decoder`, `audio_decoder`, `latent_encoder`.
-//!
-//! ## What the loading boundary owns
+//! The crate holds one pipeline: the Qwen3-VL text encoder that conditions a request
+//! ([`qwen3::Qwen3VlModel`], truncated to [`config::RETAINED_LAYERS`] with no final norm), one or two
+//! diffusion transformer (DiT) partitions of the checkpoint ([`denoiser`]), the video and audio
+//! latent encoders a conditioned task reads ([`encoding`]), and the video and audio decoders. Each
+//! is a stage implementing an [`nn`] capability, and a deployment places a subset of them per worker
+//! group under the stage names of the deployment files: `text_encoder`, `transformer`,
+//! `transformer_ref`, `video_decoder`, `audio_decoder`, `latent_encoder`, `video_postprocessor`
+//! ([`family`]).
 //!
 //! A checkpoint's JSON sidecars are read and validated once, into [`config::Config`]; every layer
-//! below consumes typed fields and borrowed views, and nothing reparses a dictionary or applies a
-//! dynamic default (`AGENTS.md`, Model Library Boundary). [`checkpoint`] classifies the checkpoint:
-//! which DiT partitions it holds, which tasks each serves, and - for a FastH3 export - the contract
-//! that states its schedule and its sparse attention.
-//!
-//! The checkpoint's own numerical representation is used as it is: each tensor keeps the element
-//! type it was stored in, every layer declares the precision it computes in, and nothing is
-//! converted at load unless the deployment asks for it with `dtype` or `quantization`.
-//!
-//! ## What the partition owns
-//!
-//! [`partition::Partition`] is the deployment's *mathematical* split - the denoiser's Ulysses
-//! sequence degree and the text encoder's tensor-parallel position - not a runner, a communicator
-//! or a rank layout. The layers apply it; the worker owns every runtime object.
-//!
-//! ## The model
-//!
-//! [`load`](fn@crate::load) composes the blocks the checkpoint holds into `nn::Model`; `uniserve engine` is the one
-//! place a model class is named, and it hands the model to the worker, which serves each block by
-//! the capability it implements.
+//! below consumes typed fields and borrowed views. Request processing - the request rules, the
+//! canvas and frame rules, prompt presentation - is [`processing::minimax_h3`]'s.
 
 pub mod attention;
 pub mod attention_sparse;
@@ -41,33 +23,23 @@ pub mod config;
 pub mod denoiser;
 pub mod encoding;
 pub mod family;
-pub mod load;
 pub mod modulation;
 pub mod output;
 pub mod packing;
-pub mod partition;
-pub mod processing;
 pub mod schedule;
 pub mod solver;
-pub mod task;
-pub mod text_encoder;
 pub mod tiled_encode;
 pub mod transformer;
 pub mod video_vae;
 
-pub use checkpoint::{
-    AttentionBackend, Contract, ContractSchedule, Dit, Layout, Sidecars, SparseContract,
-};
 pub use config::{
     AUDIO_CHANNELS, AUDIO_HOP, AUDIO_LATENTS_PER_SECOND, AUDIO_SAMPLE_RATE, AttentionKind,
     AudioVaeConfig, CANVAS_RULE, Config, DenoiserConfig, FPS, FRAMES, MAX_SECONDS, MIN_SECONDS,
     NAMED_ASPECT_RATIOS, NUM_TRAIN_TIMESTEPS, RETAINED_LAYERS, SPARSE_TILE_ROWS, ScheduleGrid,
     ScheduleSpec, Shifts, TransformerConfig, UNIFORM_GRID_POINTS, VideoVaeConfig,
 };
-
-pub use load::load;
-pub use partition::Partition;
-pub use task::VideoTask;
+pub use family::MinimaxH3;
+pub use processing::minimax_h3::VideoTask;
 
 /// What this crate can fail with.
 #[derive(Debug, thiserror::Error)]
@@ -79,9 +51,9 @@ pub enum Error {
     #[error("configuration: {0}")]
     Config(String),
 
-    /// The checkpoint is not a MiniMax-H3 or FastH3 checkpoint this crate can open: a sidecar a
-    /// layout needs is missing, a component directory holds no shard set, or the contract names a
-    /// task no partition serves. The message names the file.
+    /// The checkpoint is not a MiniMax-H3 or FastH3 checkpoint this crate can open: a sidecar is
+    /// missing, a stage directory holds no shard set, or the export names a task no partition
+    /// serves. The message names the file.
     #[error("checkpoint: {0}")]
     Checkpoint(String),
 
@@ -89,7 +61,7 @@ pub enum Error {
     #[error("unsupported: {0}")]
     Unsupported(String),
 
-    /// A component's checkpoint could not be opened, or a weight could not be read or converted.
+    /// A stage's checkpoint could not be opened, or a weight could not be read or converted.
     #[error(transparent)]
     Nn(#[from] nn::Error),
 }
@@ -127,7 +99,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 const MODEL: &str = "minimax-h3";
 
 impl From<Error> for nn::Error {
-    /// A failure as the capability and family contracts report it: a shared-library failure is
+    /// A failure as the capability and family traits report it: a shared-library failure is
     /// already one and passes through unchanged, and every refusal of this crate's own is
     /// [`nn::Error::Model`] naming the family.
     fn from(error: Error) -> Self {

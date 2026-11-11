@@ -93,22 +93,23 @@ impl CausalConv1d {
         ]
     }
 
-    /// Convolve `x [tokens, channels]` (rows any stride apart) into `out [tokens, channels]`,
-    /// continuing from and advancing `banks.live`, keeping `banks.checkpoint` where the view asks
-    /// and every token's window in `banks.trail` when the batch keeps one.
+    /// `x [tokens, channels]` (rows any stride apart) convolved into a fresh packed
+    /// `[tokens, channels]` tensor of its element type, continuing from and advancing
+    /// `banks.live` in place, keeping `banks.checkpoint` where the view asks and every token's
+    /// window in `banks.trail` when the batch keeps one.
     ///
     /// # Errors
     ///
-    /// What the operator refuses.
+    /// An arena that cannot hold the output, or what the operator refuses.
     pub fn forward(
         &self,
         f: &Forward,
         view: &StateView<'_>,
         banks: FieldBanks,
         x: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
+    ) -> Result<TensorView> {
         let channels = u64::from(self.spec.channels);
+        let out = f.empty(x.dtype, Shape::new(&[x.shape.dim(0), channels]))?;
         let width = u64::from(self.spec.width);
         let weight = self.weight.view().reshape(Shape::new(&[channels, width]));
         f.operate::<CausalConv1dOp>(
@@ -127,7 +128,8 @@ impl CausalConv1d {
                 checkpoint: banks.checkpoint,
                 trail: banks.trail.map(|bank| Trail { bank }),
             },
-        )
+        )?;
+        Ok(out)
     }
 }
 
@@ -185,20 +187,17 @@ impl GatedDeltaRule {
         ]
     }
 
-    /// Run the rule over `query`, `key`, `value` (`[tokens, heads, dim]`, rows one stride apart),
-    /// with the decay and step inputs `a` and `b` (`[tokens, value_heads]`), into
-    /// `out [tokens, value_heads, value_dim]`.
-    ///
-    /// # Errors
-    ///
-    /// What the operator refuses.
+    /// The rule over `query`, `key`, `value` (`[tokens, heads, dim]`, rows one stride apart), with
+    /// the decay and step inputs `a` and `b` (`[tokens, value_heads]`): a fresh
+    /// `[tokens, value_heads, value_dim]` tensor of the query's element type, the banks advanced
+    /// in place.
     ///
     /// A decode-phase batch (a decode, or a verification) walks its state rows one token at a
     /// time and keeps the trail `banks` carries; any other walks them in chunks.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the rule's five inputs, its batch, its banks and its output"
-    )]
+    ///
+    /// # Errors
+    ///
+    /// An arena that cannot hold the output, or what the operator refuses.
     pub fn forward(
         &self,
         f: &Forward,
@@ -207,8 +206,7 @@ impl GatedDeltaRule {
         banks: FieldBanks,
         (query, key, value): (TensorView, TensorView, TensorView),
         (a, b): (TensorView, TensorView),
-        out: TensorView,
-    ) -> Result<()> {
+    ) -> Result<TensorView> {
         let (form, chunk) = match batch.phase {
             PhaseKind::Decode => (Form::Recurrent, 1),
             _ => (Form::Chunked, DELTA_RULE_CHUNK),
@@ -224,6 +222,14 @@ impl GatedDeltaRule {
             ));
         }
         let spec = self.spec;
+        let out = f.empty(
+            query.dtype,
+            Shape::new(&[
+                query.shape.dim(0),
+                u64::from(spec.value_heads),
+                u64::from(spec.value_dim),
+            ]),
+        )?;
         f.operate::<GatedDeltaRuleOp>(
             &GatedDeltaRuleDescriptor {
                 dtype: query.dtype,
@@ -249,6 +255,7 @@ impl GatedDeltaRule {
                 trail: banks.trail.map(|bank| Trail { bank }),
                 out,
             },
-        )
+        )?;
+        Ok(out)
     }
 }

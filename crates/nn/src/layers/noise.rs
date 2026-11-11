@@ -70,21 +70,8 @@ impl Noise {
         }
     }
 
-    /// Draw `out` `[rows, elements]` in its own element type.
-    ///
-    /// `key` is the request's, in whichever of the two forms the caller holds: per-row keys for a
-    /// batch, or one seed for a buffer whose values must depend on their flat position alone.
-    /// `stage` and `draw` place the draw within the request's schedule so that two draws never
-    /// coincide; under [`Key::Scalar`] they keep the values a pure function of `(seed, element)`
-    /// for the request, since they are fixed for the launch.
-    ///
-    /// `offset` is the element of the request's stream this draw starts at. The reference draws
-    /// every condition, the video latent and the audio latent through one Philox stream, so a
-    /// caller that draws part of it — a rank's shard of the latent, or the audio after the video —
-    /// passes the global flat index it begins at, and two draws at adjacent offsets reproduce one
-    /// longer draw. An odd offset is legal and takes the high half of a word first; a caller with a
-    /// whole buffer of its own passes 0.
-    /// The descriptor one draw takes: the element type, the distribution and the key source. The keys, the stage, the draw's index and its offset travel with the call.
+    /// The descriptor one draw takes: the element type, the distribution and the key source. The
+    /// keys, the stage, the draw's index and its offset travel with the call.
     fn descriptor(
         dtype: ops::DType,
         kind: ops::noise::NoiseKind,
@@ -98,10 +85,28 @@ impl Noise {
         }
     }
 
+    /// Draw into `latents` `[rows, elements]`, in place and in their own element type.
+    ///
+    /// `key` is the request's, in whichever of the two forms the caller holds: per-row keys for a
+    /// batch, or one seed for a buffer whose values must depend on their flat position alone.
+    /// `stage` and `draw` place the draw within the request's schedule so that two draws never
+    /// coincide; under [`Key::Scalar`] they keep the values a pure function of `(seed, element)`
+    /// for the request, since they are fixed for the launch.
+    ///
+    /// `offset` is the element of the request's stream this draw starts at. The reference draws
+    /// every condition, the video latent and the audio latent through one Philox stream, so a
+    /// caller that draws part of it — a rank's shard of the latent, or the audio after the video —
+    /// passes the global flat index it begins at, and two draws at adjacent offsets reproduce one
+    /// longer draw. An odd offset is legal and takes the high half of a word first; a caller with a
+    /// whole buffer of its own passes 0.
+    ///
+    /// # Errors
+    ///
+    /// Row keys of another count than the rows, or the operator's refusal.
     pub fn draw(
         &self,
         f: &Forward,
-        mut out: TensorView,
+        mut latents: TensorView,
         key: Key,
         stage: u32,
         draw: u32,
@@ -109,13 +114,13 @@ impl Noise {
     ) -> Result<()> {
         let (source, keys, seed) = match key {
             Key::Rows(keys) => {
-                if keys.shape.rank() != 1 || keys.shape.dim(0) != out.shape.dim(0) {
+                if keys.shape.rank() != 1 || keys.shape.dim(0) != latents.shape.dim(0) {
                     return Err(Error::shape(
                         "Noise",
                         format!(
                             "{} sampling keys for {} rows",
                             keys.shape.numel(),
-                            out.shape.dim(0)
+                            latents.shape.dim(0)
                         ),
                     ));
                 }
@@ -124,13 +129,13 @@ impl Noise {
             Key::Scalar(seed) => {
                 // The scalar form addresses the buffer flattened, so the view the operator reads is
                 // the two-axis one whatever rank the caller's buffer has.
-                out = out.reshape(flat_shape(out.shape));
+                latents = latents.reshape(flat_shape(latents.shape));
                 (KeySource::Scalar, None, seed)
             }
         };
-        let descriptor = Self::descriptor(out.dtype, self.kind, source);
+        let descriptor = Self::descriptor(latents.dtype, self.kind, source);
         let args = noise::NoiseArgs {
-            out,
+            out: latents,
             keys,
             key: seed,
             stage,

@@ -2,7 +2,7 @@
 //!
 //! A processor resolves control tokens by their text and encodes the prompt
 //! text it frames; the daemon supplies its tokenizer through [`Vocabulary`],
-//! so planning stays a pure function over its answers.
+//! so request processing stays a pure function over its answers.
 
 /// A model's tokenizer as family rules read it.
 pub trait Vocabulary {

@@ -4,7 +4,7 @@
 //! an output size and length, and reference media, each anchoring a generated frame or
 //! conditioning the generation as a whole. What a model makes of it is the model's: its
 //! processor (`processing::VideoProcessor`), which the deployment's family bound from what its
-//! workers described, holds the request to the model's rules and plans it.
+//! workers described, holds the request to the model's rules and processes it.
 //!
 //! [`VideoService::process`] runs one request through five stages in order:
 //!
@@ -13,12 +13,12 @@
 //! 2. The service's [`MediaConnector`] resolves each `input_references[i].url` under the server's
 //!    media policy (`data:`, `file://` under the media directory, `http(s)://` with size, time and
 //!    address limits) into an owned buffer, the media of one request sharing one total.
-//! 3. [`probe::MediaProber`] reads the facts a plan needs through the decoders the worker's media
+//! 3. [`probe::MediaProber`] reads the facts processing needs through the decoders the worker's media
 //!    reader decodes them with (`media::probe`): an image's displayed size, its EXIF orientation
 //!    applied; a video's display aspect, frame rate, decoded frame count and soundtrack, and an
 //!    audio file's sample rate and decoded sample count.
-//! 4. The processor plans the request from the probed media with the checkpoint's tokenizer
-//!    ([`VideoProcessor::plan`]): its size and frames, how each reference is decoded and encoded,
+//! 4. The processor processes the request from the probed media with the checkpoint's tokenizer
+//!    ([`VideoProcessor::process`]): its size and frames, how each reference is decoded and encoded,
 //!    the prompt as the text encoder encodes it, and the denoiser rows the references take.
 //! 5. Each reference's media is published to shared memory for the worker's media reader, and the
 //!    request becomes one `DiffusionRequest` describing every condition and stating the rows they
@@ -270,7 +270,7 @@ impl ProcessedVideo {
     }
 }
 
-/// The reference media of one planned request, published to shared memory.
+/// The reference media of one processed request, published to shared memory.
 ///
 /// The workers read each by name while the request runs, so whoever submits the request holds
 /// them until it ends; dropping them unlinks the names.
@@ -335,10 +335,10 @@ impl VideoService {
         })
     }
 
-    /// Validates, fetches, probes and plans one video request into its engine request and what
+    /// Validates, fetches, probes and processes one video request into its engine request and what
     /// it generates.
     ///
-    /// The request-only rules run before any fetch. The planned prompt must fit the prompt
+    /// The request-only rules run before any fetch. The processed prompt must fit the prompt
     /// capacity (`--max-model-len`). Each reference's fetched media is then copied to shared
     /// memory, which the request holds until the engine retires it. the daemon's submission stamps the
     /// engine's identifier on the request.
@@ -381,33 +381,33 @@ impl VideoService {
         let tokenizer = Arc::clone(&self.tokenizer);
         let request_id = request_id.to_owned();
         tokio::task::spawn_blocking(move || {
-            let plan = processor.plan(&spec, &probes, &*tokenizer)?;
-            if plan.prompt_token_ids.len() > max_prompt_tokens as usize {
+            let input = processor.process(&spec, &probes, &*tokenizer)?;
+            if input.prompt_token_ids.len() > max_prompt_tokens as usize {
                 return Err(ServeError::ContextLengthExceeded {
                     request_id,
-                    prompt_tokens: plan.prompt_token_ids.len(),
+                    prompt_tokens: input.prompt_token_ids.len(),
                     max_tokens: max_prompt_tokens,
                 });
             }
-            submission(plan, &media)
+            submission(input, &media)
         })
         .await
         .unwrap_or_else(|error| {
-            Err(InputError::Internal(format!("planning the request failed: {error}")).into())
+            Err(InputError::Internal(format!("processing the request failed: {error}")).into())
         })
     }
 }
 
-/// The engine request of `plan`, its references' media published to shared memory.
+/// The engine request of `input`, its references' media published to shared memory.
 fn submission(
-    plan: processing::VideoPlan,
+    input: processing::VideoInput,
     media: &[FetchedMedia],
 ) -> Result<(DiffusionRequest, ProcessedVideo, PublishedMedia), ServeError> {
     // Each reference's media reaches the worker's media reader through shared memory on this
     // host.
     let mut sources = Vec::with_capacity(media.len());
     let mut conditions = Vec::with_capacity(media.len());
-    for (index, (condition, fetched)) in plan.conditions.into_iter().zip(media).enumerate() {
+    for (index, (condition, fetched)) in input.conditions.into_iter().zip(media).enumerate() {
         let source = MediaSource::publish(&fetched.bytes).map_err(|error| {
             InputError::Internal(format!(
                 "publishing input_references[{index}] for the worker failed: {error}"
@@ -422,14 +422,14 @@ fn submission(
     }
     let conditions = Conditions {
         conditions,
-        prompt_tokens: u32::try_from(plan.prompt_token_ids.len()).map_err(|_| {
+        prompt_tokens: u32::try_from(input.prompt_token_ids.len()).map_err(|_| {
             InputError::Internal("a prompt of more tokens than a u32 counts".into())
         })?,
-        vision_spans: plan.vision_spans,
+        vision_spans: input.vision_spans,
     };
     conditions
         .validate()
-        .map_err(|reason| InputError::Internal(format!("the planned conditions: {reason}")))?;
+        .map_err(|reason| InputError::Internal(format!("the processed conditions: {reason}")))?;
 
     // What the request's encoders read, keyed by the content of each reference's media, so that
     // engines find the encoder outputs of requests that read the same.
@@ -441,14 +441,14 @@ fn submission(
             key.finish()
         })
         .collect();
-    let encoder_inputs = encodings::encoder_inputs(&conditions, &plan.prompt_token_ids, &contents)
+    let encoder_inputs = encodings::encoder_inputs(&conditions, &input.prompt_token_ids, &contents)
         .map_err(|error| {
             InputError::Internal(format!("digesting the conditions failed: {error}"))
         })?;
 
     let request = DiffusionRequest {
         request_id: RequestId::default(),
-        prompt_token_ids: plan.prompt_token_ids,
+        prompt_token_ids: input.prompt_token_ids,
         conditions: conditions
             .conditions
             .iter()
@@ -459,21 +459,21 @@ fn submission(
         })?,
         priority: 0,
         sampling: DiffusionSamplingParams {
-            num_frames: plan.num_frames,
-            video_units: plan.video_units,
-            seed: plan.seed,
-            width: plan.size.width,
-            height: plan.size.height,
-            condition_rows: plan.condition_rows,
+            num_frames: input.num_frames,
+            video_units: input.video_units,
+            seed: input.seed,
+            width: input.size.width,
+            height: input.size.height,
+            condition_rows: input.condition_rows,
         },
         // The migrator gives the request its trajectory's identity when it first submits it.
         trajectory: Trajectory::default(),
         encoder_inputs: Some(Box::new(encoder_inputs)),
     };
     let video = ProcessedVideo {
-        size: plan.size,
-        num_frames: plan.num_frames,
-        fps: plan.fps,
+        size: input.size,
+        num_frames: input.num_frames,
+        fps: input.fps,
     };
     Ok((request, video, PublishedMedia { _sources: sources }))
 }
@@ -653,12 +653,12 @@ mod tests {
         assert_eq!(param, "seconds");
     }
 
-    /// The planning vectors MiniMax-H3's request rules are tested against, generated from the
+    /// The request vectors MiniMax-H3's request rules are tested against, generated from the
     /// diffusers reference.
     fn vectors() -> Value {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../models/minimax-h3/tests/data/minimax_h3_plan.json"
+            "/../processing/tests/data/minimax_h3_requests.json"
         );
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
     }

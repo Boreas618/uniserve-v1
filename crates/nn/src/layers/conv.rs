@@ -15,8 +15,8 @@
 use ops::conv::{
     Args, Conv1d as Conv1dOp, Conv3d as Conv3dOp, ConvTranspose1d as ConvTranspose1dOp, Descriptor,
 };
-use ops::frame;
-use ops::{Shape, Strides, TensorView};
+use ops::frame::{self, channels_last_strides};
+use ops::{Shape, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -33,17 +33,21 @@ pub enum Padding {
 }
 
 /// The causal padding of a video convolution's input: `top` rows, `left` columns and `front` zero
-/// frames before the source, the border filled as `padding` states.
+/// frames before the source, `bottom` rows and `right` columns after it, the border filled as
+/// `padding` states.
 ///
-/// The output view's own extents give the padding after the source. The frames in front are zeros,
-/// so no output frame of the convolution that reads the padded input depends on a later input
-/// frame.
+/// The frames in front are zeros and none follow the source, so no output frame of the convolution
+/// that reads the padded input depends on a later input frame.
 #[derive(Clone, Copy, Debug)]
 pub struct CausalPad {
     /// Rows before the source.
     pub top: u32,
+    /// Rows after the source.
+    pub bottom: u32,
     /// Columns before the source.
     pub left: u32,
+    /// Columns after the source.
+    pub right: u32,
     /// Zero frames before the source.
     pub front: u32,
     /// How the rows and columns beyond the edge are filled.
@@ -56,17 +60,35 @@ impl CausalPad {
         self.padding == Padding::Reflect
     }
 
-    /// Pad `values` `[batch, channels, frames, height, width]` into `out`, whose extra frames are
-    /// zeros and whose extra rows and columns follow [`Self::padding`].
-    ///
-    /// Both operands may be stored channel-first or channels-last: the logical axes keep their
-    /// meaning and the strides state the order (`ops::conv`'s rule).
+    /// The padded extent of `values` `[batch, channels, frames, height, width]`, reserved in
+    /// `values`' element type and storage order.
+    pub(crate) fn reserve(&self, f: &Forward, values: TensorView) -> Result<TensorView> {
+        if values.shape.rank() != 5 {
+            return Err(Error::shape(
+                "CausalPad",
+                format!("a frame is rank 5, not {:?}", values.shape.dims()),
+            ));
+        }
+        let dims = values.shape.dims();
+        let shape = Shape::new(&[
+            dims[0],
+            dims[1],
+            dims[2] + u64::from(self.front),
+            dims[3] + u64::from(self.top) + u64::from(self.bottom),
+            dims[4] + u64::from(self.left) + u64::from(self.right),
+        ]);
+        frame(f, values.dtype, shape, frame::is_channels_last(&values))
+    }
+
+    /// `values` `[batch, channels, frames, height, width]` padded: zero frames in front, the extra
+    /// rows and columns following [`Self::padding`], in `values`' element type and storage order
+    /// (channel-first or channels-last; the strides state which, `ops::conv`'s rule).
     ///
     /// # Errors
     ///
-    /// The operator's refusal: operands of another rank or channel count, or an output smaller than
-    /// the source and its leading padding.
-    pub fn forward(&self, f: &Forward, values: TensorView, out: TensorView) -> Result<()> {
+    /// Operands of another rank, an arena that cannot hold the output, or the operator's refusal.
+    pub fn forward(&self, f: &Forward, values: TensorView) -> Result<TensorView> {
+        let out = self.reserve(f, values)?;
         // The block tiles are the operator's own split of the values' and the output's extents.
         let (block_pixels, block_channels) = frame::FramePadDescriptor::tiles(&values, &out);
         let descriptor = frame::FramePadDescriptor {
@@ -84,8 +106,24 @@ impl CausalPad {
                 left: u64::from(self.left),
                 front: u64::from(self.front),
             },
-        )
+        )?;
+        Ok(out)
     }
+}
+
+/// A `[n, c, d, h, w]` tensor of `dtype` from the forward's arena, stored channels-last when
+/// `channels_last` holds and packed channel-first otherwise.
+pub(crate) fn frame(
+    f: &Forward,
+    dtype: ops::DType,
+    shape: Shape,
+    channels_last: bool,
+) -> Result<TensorView> {
+    let packed = f.empty(dtype, shape)?;
+    Ok(match channels_last {
+        true => TensorView::with_strides(packed.ptr, dtype, shape, channels_last_strides(shape)),
+        false => packed,
+    })
 }
 
 /// A convolution's torch arguments over `N` spatial axes.
@@ -229,6 +267,49 @@ impl<const N: usize> Convolution<N> {
         Ok(Self { weight, bias, spec })
     }
 
+    /// The output extent of `input` `[n, c, spatial…]` along the `N` spatial axes, torch's rule:
+    /// `(l + 2p − d(k − 1) − 1) / s + 1` for a convolution and `(l − 1)s − 2p + d(k − 1) + 1` for a
+    /// transposed one.
+    fn output_shape(
+        &self,
+        owner: &'static str,
+        input: TensorView,
+        transposed: bool,
+    ) -> Result<Shape> {
+        let dims = input.shape.dims();
+        if dims.len() != N + 2 || dims[1] != u64::from(self.spec.in_channels) {
+            return Err(Error::shape(
+                owner,
+                format!(
+                    "an input of {:?} for a convolution of {} input channels over {N} axes",
+                    dims, self.spec.in_channels
+                ),
+            ));
+        }
+        let mut out = vec![dims[0], u64::from(self.spec.out_channels)];
+        for axis in 0..N {
+            let length = dims[axis + 2];
+            let kernel = u64::from(self.spec.kernel[axis]);
+            let stride = u64::from(self.spec.stride[axis]);
+            let padding = u64::from(self.spec.padding[axis]);
+            let span = u64::from(self.spec.dilation[axis]) * (kernel - 1);
+            let extent = match transposed {
+                true => ((length.max(1) - 1) * stride + span + 1).checked_sub(2 * padding),
+                false => (length + 2 * padding)
+                    .checked_sub(span + 1)
+                    .map(|reach| reach / stride + 1),
+            };
+            let extent = extent.filter(|extent| *extent > 0).ok_or_else(|| {
+                Error::shape(
+                    owner,
+                    format!("an input of {length} along axis {axis} leaves no output"),
+                )
+            })?;
+            out.push(extent);
+        }
+        Ok(Shape::new(&out))
+    }
+
     /// One launch of `Op` over `input` into `out`.
     fn launch(
         &self,
@@ -298,18 +379,6 @@ pub struct Conv3d {
     inner: Convolution<3>,
 }
 
-/// The strides of a channels-last (`NDHWC`) buffer read as its logical `[n, c, d, h, w]` shape.
-///
-/// The channel axis runs fastest, then the spatial axes from the innermost out, then the batch —
-/// the same order `conv3d`'s kernel derives from the descriptor's flag.
-fn channels_last_strides(shape: Shape) -> Strides {
-    let (channels, depth) = (shape.dim(1), shape.dim(2));
-    let (rows, columns) = (shape.dim(3), shape.dim(4));
-    let plane = columns * channels;
-    let body = rows * plane;
-    Strides::new(&[depth * body, 1, body, plane, channels])
-}
-
 /// Refuse a channels-last convolution whose operand is not stored channels-last.
 ///
 /// The kernel derives every operand's strides from the descriptor's `channels_last` flag alone, so
@@ -371,20 +440,25 @@ impl Conv3d {
         Ok(Self { inner })
     }
 
-    /// `out = conv3d(input)`: `input` `[n, c, d, h, w]` into `out` `[n, k, d', h', w']`.
+    /// `conv3d(input)`: `input` `[n, c, d, h, w]` to `[n, k, d', h', w']` in `input`'s element
+    /// type.
     ///
-    /// A convolution built channels-last takes both operands **stored** channels-last, which a
-    /// caller states by viewing an `NDHWC` buffer as its logical shape.
+    /// A convolution built channels-last takes its input **stored** channels-last, which a caller
+    /// states by viewing an `NDHWC` buffer as its logical shape, and answers its output stored the
+    /// same way.
     ///
     /// # Errors
     ///
-    /// An operand not stored as the spec states, or the operator's refusal.
-    pub fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
+    /// An input not stored as the spec states, an arena that cannot hold the output, or the
+    /// operator's refusal.
+    pub fn forward(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
         if self.inner.spec.channels_last {
             channels_last_storage("Conv3d", "input", input)?;
-            channels_last_storage("Conv3d", "out", out)?;
         }
-        self.inner.launch(f, "Conv3d", input, out, 3, false)
+        let shape = self.inner.output_shape("Conv3d", input, false)?;
+        let out = frame(f, input.dtype, shape, self.inner.spec.channels_last)?;
+        self.inner.launch(f, "Conv3d", input, out, 3, false)?;
+        Ok(out)
     }
 }
 
@@ -415,12 +489,28 @@ impl Conv1d {
         Ok(Self { inner })
     }
 
-    /// `out = conv1d(input)` on `[n, c, l]` sequences.
+    /// `conv1d(input)` on `[n, c, l]` sequences, in `input`'s element type.
     ///
     /// # Errors
     ///
-    /// The operator's refusal.
-    pub fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
+    /// An arena that cannot hold the output, or the operator's refusal.
+    pub fn forward(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
+        let out = self.reserve(f, input)?;
+        self.launch(f, input, out)?;
+        Ok(out)
+    }
+
+    /// The output [`Self::forward`] writes for an input of `input`'s extents and element type,
+    /// reserved without launching: a stack that keeps it across a scope reserves it first.
+    pub(crate) fn reserve(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
+        f.empty(
+            input.dtype,
+            self.inner.output_shape("Conv1d", input, false)?,
+        )
+    }
+
+    /// The convolution of `input` into the reserved `out`.
+    pub(crate) fn launch(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
         self.inner.launch(f, "Conv1d", input, out, 1, false)
     }
 }
@@ -442,13 +532,17 @@ impl ConvTranspose1d {
         Ok(Self { inner })
     }
 
-    /// `out = conv_transpose1d(input)` on `[n, c, l]` sequences.
+    /// `conv_transpose1d(input)` on `[n, c, l]` sequences, in `input`'s element type.
     ///
     /// # Errors
     ///
-    /// The operator's refusal.
-    pub fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
-        self.inner.launch(f, "ConvTranspose1d", input, out, 1, true)
+    /// An arena that cannot hold the output, or the operator's refusal.
+    pub fn forward(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
+        let shape = self.inner.output_shape("ConvTranspose1d", input, true)?;
+        let out = f.empty(input.dtype, shape)?;
+        self.inner
+            .launch(f, "ConvTranspose1d", input, out, 1, true)?;
+        Ok(out)
     }
 }
 
@@ -463,8 +557,8 @@ pub struct ResnetSpec {
     pub groups: u32,
     /// Group-normalization variance floor.
     pub eps: f32,
-    /// The causal pad each normalization writes its activated frame into; the spatial padding after
-    /// the source is the padding before it, so a convolution of `2 · top + 1` taps keeps the extent.
+    /// The causal pad each normalization writes its activated frame into; a convolution of
+    /// `top + bottom + 1` taps keeps the extent.
     pub pad: CausalPad,
     /// The convolutions' taps along each axis.
     pub kernel: u32,
@@ -538,81 +632,52 @@ impl ResnetBlock3d {
         })
     }
 
-    /// The block's output for `input` `[1, in_channels, frames, height, width]` into `out`
-    /// `[1, out_channels, frames, height, width]`, both FP32 and packed; `input` is never written.
+    /// The block's output for `input` `[1, in_channels, frames, height, width]`:
+    /// `[1, out_channels, frames, height, width]`, FP32 and packed; `input` is never written.
     ///
     /// The padded frames, the normalizations' statistics, the first stage's output and the
-    /// projection are reserved for the call and released at its end.
+    /// projection are reserved inside the call and handed back at its end; only the output stays.
     ///
     /// # Errors
     ///
     /// Operands of another shape, or an operator's refusal.
-    pub fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
+    pub fn forward(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
         let dims = input.shape.dims();
         let spec = &self.spec;
-        if dims.len() != 5
-            || dims[0] != 1
-            || dims[1] != u64::from(spec.in_channels)
-            || out.shape.dims() != [1, u64::from(spec.out_channels), dims[2], dims[3], dims[4]]
-        {
+        if dims.len() != 5 || dims[0] != 1 || dims[1] != u64::from(spec.in_channels) {
             return Err(Error::shape(
                 "ResnetBlock3d",
                 format!(
-                    "{:?} into {:?} for a block of {} to {} channels",
-                    dims,
-                    out.shape.dims(),
-                    spec.in_channels,
-                    spec.out_channels
+                    "{dims:?} for a block of {} to {} channels",
+                    spec.in_channels, spec.out_channels
                 ),
             ));
         }
-        let mark = f.arena().mark();
-        let result = self.stages(f, input, out);
-        f.arena().release(mark);
-        result
-    }
-
-    fn stages(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
-        let spec = &self.spec;
-        let dims = input.shape.dims();
-        let (frames, height, width) = (dims[2], dims[3], dims[4]);
-        let pad = |channels: u32| {
-            f.arena().tensor(
-                input.dtype,
-                Shape::new(&[
-                    1,
-                    u64::from(channels),
-                    frames + u64::from(spec.pad.front),
-                    height + 2 * u64::from(spec.pad.top),
-                    width + 2 * u64::from(spec.pad.left),
-                ]),
-            )
-        };
-        let statistics = Shape::new(&[frames, u64::from(spec.groups)]);
-        let (mean, rstd) = (
-            f.arena().tensor(ops::DType::F32, statistics)?,
-            f.arena().tensor(ops::DType::F32, statistics)?,
-        );
-        let first = pad(spec.in_channels)?;
-        let working = f.arena().tensor(out.dtype, out.shape)?;
-        self.norm1.forward(f, input, mean, rstd, first)?;
-        self.conv1.forward(f, first, working)?;
-        let second = pad(spec.out_channels)?;
-        self.norm2.forward(f, working, mean, rstd, second)?;
-        self.conv2.forward(f, second, out)?;
-        let residual = match &self.shortcut {
-            Some(shortcut) => {
-                let projected = f.arena().tensor(out.dtype, out.shape)?;
-                shortcut.forward(f, input, projected)?;
-                projected
-            }
-            None => input,
-        };
-        // `(conv2 + bias) + residual`: the reference adds the convolution's bias in a pass of its
-        // own and then the residual, and IEEE addition commutes, so this is the same rounded sum.
-        let rows =
-            |view: TensorView| view.reshape(Shape::new(&[view.shape.numel() / width, width]));
-        crate::layers::Residual::default().forward(f, rows(out), rows(residual), None, rows(out))
+        let out = f.empty(
+            input.dtype,
+            Shape::new(&[1, u64::from(spec.out_channels), dims[2], dims[3], dims[4]]),
+        )?;
+        // The output is reserved before the scope, so the second convolution and the residual
+        // add write it while every intermediate is handed back when the scope ends.
+        f.scoped(|f| {
+            let working = self.conv1.forward(f, self.norm1.forward(f, input)?)?;
+            let padded = self.norm2.forward(f, working)?;
+            self.conv2
+                .inner
+                .launch(f, "Conv3d", padded, out, 3, false)?;
+            let residual = match &self.shortcut {
+                Some(shortcut) => shortcut.forward(f, input)?,
+                None => input,
+            };
+            // `(conv2 + bias) + residual`: the reference adds the convolution's bias in a pass of
+            // its own and then the residual, and IEEE addition commutes, so this is the same
+            // rounded sum.
+            let width = dims[4];
+            let rows =
+                |view: TensorView| view.reshape(Shape::new(&[view.shape.numel() / width, width]));
+            crate::layers::Residual::default().forward(f, rows(out), rows(residual), None)
+        })?;
+        Ok(out)
     }
 }
 
@@ -645,7 +710,9 @@ mod tests {
     fn a_channels_first_buffer_is_refused_by_a_channels_last_convolution() {
         let shape = Shape::new(&[1, 3, 19, 258, 258]);
         let error = channels_last_storage("Conv3d", "input", operand(Strides::row_major(shape)))
-            .expect_err("a channels-first buffer read channels-last is wrong numbers, not a plan");
+            .expect_err(
+                "a channels-first buffer read channels-last is wrong numbers, so it is refused",
+            );
         assert!(format!("{error}").contains("must be stored NDHWC"));
         channels_last_storage("Conv3d", "input", operand(channels_last_strides(shape)))
             .expect("the packed channels-last layout is what the descriptor promises");

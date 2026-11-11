@@ -23,6 +23,8 @@ use std::ops::Range;
 
 use proto::video::Canvas;
 
+use processing::minimax_h3::{ConditionPacking, VisualRows, condition_tiles};
+
 use crate::config::{
     AUDIO_CHANNELS, AUDIO_HOP, AttentionKind, CANVAS_RULE, FPS, FRAMES, SPARSE_TILE_ROWS,
 };
@@ -60,11 +62,9 @@ pub enum Group {
     AudioCondition = 3,
 }
 
-/// The VAE's spatial compression: one latent cell per `16 x 16` output pixels.
-pub const LATENT_COMPRESSION: u32 = 16;
-
-/// The DiT's patch side in latent cells: one token per `2 x 2` patch of a latent frame.
-pub const PATCH_SIDE: u32 = 2;
+/// The video VAE's spatial compression and the DiT's patch side in latent cells, as request
+/// processing states them for the canvas rule.
+pub use processing::minimax_h3::{LATENT_COMPRESSION, PATCH_SIDE};
 
 /// The `(height, width)` latent raster of a canvas.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -140,7 +140,7 @@ pub fn timeline_latents(num_frames: u32) -> Result<u32> {
 /// latents, `142400` against `142666.67`). **So a request's track may be shorter than its video**, and
 /// whoever muxes them states each stream's own length rather than deriving either from the duration.
 ///
-/// [`crate::encoding::audio_latent_frames`] is the other direction - samples to latents, `ceil` - and
+/// [`processing::minimax_h3::audio_latents`] is the other direction - samples to latents, `ceil` - and
 /// it is the one that can never be short, because its input is a sample count rather than a frame
 /// count. The two keep distinct-looking names for that reason: one answers "what does this request
 /// need", the other "what does this track encode to".
@@ -155,52 +155,32 @@ pub fn audio_rows(num_frames: u32) -> u32 {
     track_rows(audio_latent_frames(num_frames))
 }
 
-/// Packed rows of a stereo track of `latent_frames` latent frames: channel-major, one row per
-/// channel per latent frame. A generated track and a condition's alike.
-pub const fn track_rows(latent_frames: u32) -> u32 {
-    AUDIO_CHANNELS * latent_frames
-}
+pub use processing::minimax_h3::track_rows;
 
 /// Samples of one generated frame count's soundtrack.
 pub fn audio_samples(num_frames: u32) -> u32 {
     audio_latent_frames(num_frames) * AUDIO_HOP
 }
 
-/// Rows of one condition's contribution to the packed sequence.
+/// What one condition contributes to the packed sequence.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SegmentKind {
-    /// One latent frame of the target canvas anchoring a generated frame.
-    Keyframe,
+    /// One latent frame of the target canvas anchoring the first generated frame.
+    FirstFrame,
+    /// One latent frame of the target canvas anchoring the last generated frame.
+    LastFrame,
     /// One latent frame of a reference image at its own raster.
     Image,
-    /// A reference video's latent frames.
+    /// A reference video's latent frames, with its soundtrack when it has one.
     Video,
     /// A reference track's stereo audio rows.
     Audio,
 }
 
-/// The generated frame a keyframe anchors.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Anchor {
-    /// The first generated frame.
-    FirstFrame,
-    /// The last generated frame.
-    LastFrame,
-}
-
-/// The visual half of a condition: its latent frames and their raster.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Visual {
-    /// Latent frames: one for a still, `5n + 2` for a generated-length clip.
-    pub frames: u32,
-    /// The latent raster of one frame.
-    pub raster: LatentRaster,
-}
-
-impl Visual {
-    /// Packed rows: one per 2x2 patch of every latent frame.
-    pub fn rows(&self) -> u32 {
-        self.frames * self.raster.patch_rows()
+impl SegmentKind {
+    /// Whether the condition anchors a generated frame.
+    pub const fn is_keyframe(self) -> bool {
+        matches!(self, Self::FirstFrame | Self::LastFrame)
     }
 }
 
@@ -211,10 +191,10 @@ pub struct Segment {
     pub kind: SegmentKind,
     /// The condition's position in request order.
     pub condition: u32,
-    /// The generated frame a keyframe anchors; `None` for every other kind.
-    pub anchor: Option<Anchor>,
-    /// The condition's pixels, absent for an audio-only reference.
-    pub visual: Option<Visual>,
+    /// Latent frames of its pixels: one for a still, none for an audio-only reference.
+    pub frames: u32,
+    /// The latent raster of one of its frames; empty for an audio-only reference.
+    pub raster: LatentRaster,
     /// Audio latent steps the condition carries.
     pub audio_frames: u32,
 }
@@ -222,12 +202,26 @@ pub struct Segment {
 impl Segment {
     /// Visual rows: one per 2x2 patch of every latent frame.
     pub fn video_rows(&self) -> u32 {
-        self.visual.map_or(0, |visual| visual.rows())
+        self.frames * self.raster.patch_rows()
     }
 
     /// Audio rows: channel-major stereo ([`track_rows`]).
     pub fn audio_rows(&self) -> u32 {
         track_rows(self.audio_frames)
+    }
+
+    /// The condition's visual rows as the tiling counts them ([`condition_tiles`]).
+    fn visual(&self) -> VisualRows {
+        match self.kind {
+            SegmentKind::FirstFrame | SegmentKind::LastFrame | SegmentKind::Image => {
+                VisualRows::Patches(self.video_rows())
+            }
+            SegmentKind::Video => {
+                let (frames, rows, columns) = video_grid(self.frames, self.raster);
+                VisualRows::Grid([frames, rows, columns])
+            }
+            SegmentKind::Audio => VisualRows::None,
+        }
     }
 }
 
@@ -248,70 +242,35 @@ pub fn tile_shape(tile: u32) -> Result<(u32, u32, u32)> {
         })
 }
 
-/// How a layout's condition region holds a request's conditions: in whole tiles of `rows` rows, a
-/// reference video's token grid in tiles of `shape`.
+/// How a layout of `attention` tiles its condition region, as request processing counts it: whole
+/// tiles of the attention tile under sparse attention, row for row under dense attention.
+/// `capacity` is the deployment's condition capacity.
 ///
-/// A sparse layout's tiling is its attention tile's ([`Tiling::sparse`]); a dense layout packs row
-/// for row ([`Tiling::ROWS`]). [`Tiling::condition_rows`] is the one count of a request's condition
-/// rows: the packing places the conditions in that many rows, the request processing selects the
-/// rung of a request's layout by it, and a deployment's condition capacity is sized by it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Tiling {
-    /// Rows of one tile.
-    pub rows: u32,
-    /// `(time, height, width)` tokens of one video tile.
-    pub shape: (u32, u32, u32),
+/// # Errors
+///
+/// A sparse tile size the video grid does not hold.
+pub fn condition_packing(attention: AttentionKind, capacity: u32) -> Result<ConditionPacking> {
+    let (tile_rows, (time, height, width)) = match attention {
+        AttentionKind::Sparse { tile, .. } => (tile, tile_shape(tile)?),
+        AttentionKind::Dense => (1, (1, 1, 1)),
+    };
+    Ok(ConditionPacking {
+        capacity,
+        tile_rows,
+        video_tile: [time, height, width],
+    })
 }
 
-impl Tiling {
-    /// Row for row: tiles of one row and one token.
-    pub const ROWS: Self = Self {
-        rows: 1,
-        shape: (1, 1, 1),
-    };
-
-    /// The tiles of a sparse layout of `tile` rows.
-    pub fn sparse(tile: u32) -> Result<Self> {
-        Ok(Self {
-            rows: tile,
-            shape: tile_shape(tile)?,
+/// Rows `segments` take in a condition region of `packing`: their tiles' rows
+/// ([`condition_tiles`], the one statement request processing counts by).
+pub fn condition_rows(segments: &[Segment], packing: &ConditionPacking) -> u32 {
+    segments
+        .iter()
+        .map(|segment| {
+            condition_tiles(segment.audio_rows(), segment.visual(), packing)
+                .saturating_mul(packing.tile_rows.max(1))
         })
-    }
-
-    /// The tiling of a layout of `attention`.
-    pub fn of(attention: AttentionKind) -> Result<Self> {
-        match attention {
-            AttentionKind::Sparse { tile, .. } => Self::sparse(tile),
-            AttentionKind::Dense => Ok(Self::ROWS),
-        }
-    }
-
-    /// Tiles one condition occupies: its audio rows fill whole tiles, then a keyframe's or an
-    /// image's rows fill whole tiles and a video's rows fill the tiles of its token grid.
-    pub fn tiles(&self, segment: &Segment) -> u32 {
-        let tile = self.rows.max(1);
-        let (time, height, width) = self.shape;
-        let visual = match (segment.kind, segment.visual) {
-            (SegmentKind::Keyframe | SegmentKind::Image, _) => segment.video_rows().div_ceil(tile),
-            (SegmentKind::Video, Some(visual)) => {
-                let grid = video_grid(visual.frames, visual.raster);
-                grid.0.div_ceil(time.max(1))
-                    * grid.1.div_ceil(height.max(1))
-                    * grid.2.div_ceil(width.max(1))
-            }
-            // `condition_segments` gives every video its frames; audio has no pixels.
-            (SegmentKind::Video | SegmentKind::Audio, _) => 0,
-        };
-        segment.audio_rows().div_ceil(tile) + visual
-    }
-
-    /// Rows `segments` take in the condition region: their tiles' rows.
-    pub fn condition_rows(&self, segments: &[Segment]) -> u32 {
-        segments
-            .iter()
-            .map(|segment| self.tiles(segment).saturating_mul(self.rows.max(1)))
-            .fold(0, u32::saturating_add)
-    }
+        .fold(0, u32::saturating_add)
 }
 
 /// Tiles of a segment of `tiles` tiles that a query attends, keeping `1 - sparsity` of them.
@@ -323,21 +282,14 @@ pub fn kept_tiles(sparsity: f64, tiles: u32) -> u32 {
     (keep.ceil() as u32).clamp(1, tiles.max(1))
 }
 
-/// The order a `(time, height, width)` token grid is walked in whole tiles.
+/// The order a `(time, height, width)` token grid is walked in whole tiles of `shape`:
+/// `(raster, sizes)`, the raster row (row-major over the grid) of every row in tile-major order,
+/// and the valid rows of each tile.
 ///
-/// Tiles of `shape` cover the grid time-major, then by height, then by width; the grid's far edges
-/// cut boundary tiles short. Within a tile the rows inside the grid follow in row-major order,
-/// packed at the tile's front.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct TileOrder {
-    /// The raster row, row-major over the grid, of every row in tile-major order.
-    pub raster: Vec<u32>,
-    /// The valid rows of each tile, in order: a tile's rows lead its block.
-    pub sizes: Vec<u32>,
-}
-
-/// Walk `grid` in whole tiles of `shape`.
-pub fn tile_order(grid: (u32, u32, u32), shape: (u32, u32, u32)) -> TileOrder {
+/// Tiles cover the grid time-major, then by height, then by width; the grid's far edges cut
+/// boundary tiles short. Within a tile the rows inside the grid follow in row-major order, packed at
+/// the tile's front.
+pub fn tile_order(grid: (u32, u32, u32), shape: (u32, u32, u32)) -> (Vec<u32>, Vec<u32>) {
     let (frames, height, width) = grid;
     let (tile_t, tile_h, tile_w) = shape;
     let across = (
@@ -364,7 +316,7 @@ pub fn tile_order(grid: (u32, u32, u32), shape: (u32, u32, u32)) -> TileOrder {
         }
         sizes.push((raster.len() - start) as u32);
     }
-    TileOrder { raster, sizes }
+    (raster, sizes)
 }
 
 /// Rows of the first `tiles` tiles of [`tile_order`], without ordering the rows.
@@ -510,8 +462,8 @@ fn place_keyframe(
     frames: u32,
     spatial: &[[f64; 2]],
 ) {
-    let time = match keyframe.anchor {
-        Some(Anchor::FirstFrame) => origin,
+    let time = match keyframe.kind {
+        SegmentKind::FirstFrame => origin,
         _ => origin + video_span(frames) - ROPE_FRAME_RESCALE,
     };
     for (offset, point) in spatial.iter().enumerate() {
@@ -586,16 +538,21 @@ pub fn dense_packing(
     })
 }
 
-/// One request's row tables in a dense layout.
+/// One request's row tables in its layout, dense or sparse.
 ///
-/// The coordinates are the released contract: text row `i` sits at `(i, 0, 0)` and the media clock
+/// The coordinates are the released layout: text row `i` sits at `(i, 0, 0)` and the media clock
 /// starts at the prompt length. References advance it in packed order: an image by one unit at its
 /// own spatial grid; an audio track by its latent count, its channels at the ends of the target
 /// width grid; a video by the longer of its soundtrack and its frames. The generated video and
 /// audio start where the references leave the clock.
-#[derive(Clone, PartialEq, Debug)]
-pub struct DenseTables {
-    /// `[padded_tokens, 3]` rotary coordinates; padding rows hold zeros.
+///
+/// A sparse layout holds the same rows in tiles: a keyframe's rows fill whole dense tiles, as an
+/// image's do after a reference's audio rows, a reference video forms its own segment of video
+/// tiles over its token grid, and the generated video forms the last segment. Its tile tables are
+/// empty for a dense layout.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct RowTables {
+    /// `[padded_tokens, 3]` rotary coordinates; rows outside the request hold zeros.
     pub position_ids: Vec<[f64; 3]>,
     /// `[padded_tokens]` modulation tags of [`Tag`]; padding rows carry [`Tag::Video`].
     pub token_tags: Vec<i32>,
@@ -604,12 +561,21 @@ pub struct DenseTables {
     /// `[padded_tokens]` row of the prefix source each packed row takes: text rows first, then
     /// condition rows, and the source's zero row for generated and padding rows.
     pub prefix_index: Vec<i32>,
-    /// Rows attention attends: generated rows, text and conditions.
+    /// Rows attention attends in a dense layout: generated rows, text and conditions.
     pub used: u32,
+    /// `[video rows]` packed row of each generated video row of a sparse layout, ascending.
+    pub video_indices: Vec<u32>,
+    /// `[video rows]` raster row of each entry of `video_indices`.
+    pub video_raster_indices: Vec<u32>,
+    /// `[tiles]` rows of each tile; zero for a tile the request leaves empty.
+    pub variable_block_sizes: Vec<u32>,
+    /// `[tiles]` video segment of each tile, `-1` for a dense or empty tile.
+    pub tile_segments: Vec<i32>,
+    /// `[tiles]` tiles below each segment index: the dense and empty tiles included.
+    pub segment_starts: Vec<i32>,
+    /// `[tiles]` key tiles a video query keeps of each segment.
+    pub segment_keep: Vec<i32>,
 }
-
-/// The spans of a prompt that are vision tokens rather than text, as half-open row ranges.
-pub type VisionSpans<'a> = &'a [(u32, u32)];
 
 /// Build one request's tables in its dense layout.
 pub fn dense_tables(
@@ -618,9 +584,9 @@ pub fn dense_tables(
     canvas: &Canvas,
     num_text_tokens: u32,
     segments: &[Segment],
-    vision_spans: VisionSpans<'_>,
-) -> Result<DenseTables> {
-    let condition_rows = Tiling::ROWS.condition_rows(segments);
+    vision_spans: &[(u32, u32)],
+) -> Result<RowTables> {
+    let condition_rows = condition_rows(segments, &condition_packing(AttentionKind::Dense, 0)?);
     // One refusal per subject, and each names its own count: the two limits are independent - a
     // prompt's rows and a case's condition rows - and a single sentence covering both makes a caller
     // compare two numbers against a message that does not say which of them was too large.
@@ -699,14 +665,11 @@ pub fn dense_tables(
         for (index, row) in (audio.start..visual.end).enumerate() {
             prefix_index[row as usize] = (base + index as u32) as i32;
         }
-        if segment.kind == SegmentKind::Keyframe {
+        if segment.kind.is_keyframe() {
             // Placed once the generated timeline's origin is known.
             keyframes.push((*segment, visual));
         } else if segment.kind == SegmentKind::Image {
-            let visual_segment = segment.visual.ok_or_else(|| {
-                Error::config("an H3 image segment carries its latent frame".to_owned())
-            })?;
-            let (grid, _) = frame_grid(visual_segment.raster);
+            let (grid, _) = frame_grid(segment.raster);
             positions[visual.start as usize][0] = clock;
             for (offset, point) in grid.iter().enumerate() {
                 positions[visual.start as usize + offset] = [clock, point[0], point[1]];
@@ -723,10 +686,7 @@ pub fn dense_tables(
             );
             clock += f64::from(segment.audio_frames);
         } else {
-            let visual_segment = segment.visual.ok_or_else(|| {
-                Error::config("an H3 video segment carries its latent frames".to_owned())
-            })?;
-            let (grid, own_width) = frame_grid(visual_segment.raster);
+            let (grid, own_width) = frame_grid(segment.raster);
             place_audio(
                 &mut positions,
                 audio,
@@ -734,8 +694,8 @@ pub fn dense_tables(
                 clock,
                 &own_width,
             );
-            place_frames(&mut positions, visual, visual_segment.frames, clock, &grid);
-            clock += f64::from(segment.audio_frames).max(video_span(visual_segment.frames));
+            place_frames(&mut positions, visual, segment.frames, clock, &grid);
+            clock += f64::from(segment.audio_frames).max(video_span(segment.frames));
         }
     }
     for (segment, visual) in keyframes {
@@ -762,67 +722,14 @@ pub fn dense_tables(
         tags[row as usize] = Tag::Audio as i32;
         groups[row as usize] = Group::Audio as i32;
     }
-    Ok(DenseTables {
+    Ok(RowTables {
         position_ids: positions,
         token_tags: tags,
         groups,
         prefix_index,
         used: cursor,
+        ..RowTables::default()
     })
-}
-
-/// The role a request gives one of its conditions.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Role {
-    /// The condition anchors the first generated frame.
-    FirstFrame,
-    /// The condition anchors the last generated frame.
-    LastFrame,
-    /// The condition is a reference the request describes.
-    Reference,
-}
-
-/// One condition's pixels: a canvas and the frames drawn at it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Frame {
-    /// The condition's raster.
-    pub canvas: Canvas,
-    /// Frames of the condition: one for a still, otherwise a generated count.
-    pub num_frames: u32,
-}
-
-/// One condition of a request, as the packing reads it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Condition {
-    /// What the condition anchors, or that it is a reference.
-    pub role: Role,
-    /// Its pixels, absent for an audio-only reference.
-    pub frame: Option<Frame>,
-    /// Samples of its soundtrack.
-    pub audio_samples: u32,
-}
-
-impl Condition {
-    /// A condition as a request states it to the denoiser: its role, the raster and frames its
-    /// pixels are encoded at - none for an audio reference, whose raster is empty - and the samples
-    /// of its soundtrack. A raster no canvas can hold is refused by the packing that reads it.
-    pub fn of(shape: &nn::ConditionShape) -> Self {
-        Self {
-            role: match shape.role {
-                nn::ConditionRole::FirstFrame => Role::FirstFrame,
-                nn::ConditionRole::LastFrame => Role::LastFrame,
-                nn::ConditionRole::Reference => Role::Reference,
-            },
-            frame: (shape.width > 0 && shape.height > 0).then_some(Frame {
-                canvas: Canvas {
-                    width: shape.width,
-                    height: shape.height,
-                },
-                num_frames: shape.frames,
-            }),
-            audio_samples: shape.audio_samples,
-        }
-    }
 }
 
 /// Order a request's conditions as the packed sequence holds them.
@@ -832,47 +739,54 @@ impl Condition {
 /// request's keyframes lead its references as the SGLang layout holds them.
 /// A one-frame reference is an image; a longer one is a video, with its
 /// soundtrack when it carries audio; a reference without pixels is audio.
-pub fn condition_segments(conditions: &[Condition], canvas: &Canvas) -> Result<Vec<Segment>> {
+///
+/// A condition is stated as the denoiser receives it: its role, the raster and frames its pixels
+/// are encoded at (none for an audio reference, whose raster is empty) and the samples of its
+/// soundtrack.
+pub fn condition_segments(
+    conditions: &[nn::ConditionShape],
+    canvas: &Canvas,
+) -> Result<Vec<Segment>> {
     let mut keyframes = Vec::new();
     let mut references = Vec::new();
     for (index, condition) in conditions.iter().enumerate() {
-        let visual = match condition.frame {
-            None => None,
-            Some(frame) => {
-                let raster = latent_raster(&frame.canvas)?;
+        let visual = if condition.width == 0 || condition.height == 0 {
+            None
+        } else {
+            {
+                let raster = latent_raster(&Canvas {
+                    width: condition.width,
+                    height: condition.height,
+                })?;
                 // A condition is cut into clips, so its latent count is the frame rule's for any
                 // count ([`processing::FrameClips::latent_frames`]): a still is one frame and one
                 // latent frame, and a 30-frame reference is 7 latent frames, where rounding it up
                 // to the next generated count (39) would give 12.
-                if frame.num_frames == 0 {
+                if condition.frames == 0 {
                     return Err(Error::config(
                         "a video condition of no frame encodes nothing".to_owned(),
                     ));
                 }
-                let frames = FRAMES.latent_frames(frame.num_frames);
-                Some(Visual { frames, raster })
+                Some((FRAMES.latent_frames(condition.frames), raster))
             }
         };
-        let audio_frames = crate::encoding::audio_latent_frames(
-            u64::from(condition.audio_samples),
-            u64::from(AUDIO_HOP),
-        ) as u32;
-        let (kind, anchor) = match (condition.role, &visual) {
-            (Role::Reference, None) => (SegmentKind::Audio, None),
-            (Role::Reference, Some(visual)) if visual.frames == 1 => (SegmentKind::Image, None),
-            (Role::Reference, Some(_)) => (SegmentKind::Video, None),
-            (role, Some(frame)) => {
-                if frame.raster != latent_raster(canvas)? {
+        let audio_frames =
+            processing::minimax_h3::audio_latents(u64::from(condition.audio_samples)) as u32;
+        let kind = match (condition.role, &visual) {
+            (nn::ConditionRole::Reference, None) => SegmentKind::Audio,
+            (nn::ConditionRole::Reference, Some((1, _))) => SegmentKind::Image,
+            (nn::ConditionRole::Reference, Some(_)) => SegmentKind::Video,
+            (role, Some((_, raster))) => {
+                if *raster != latent_raster(canvas)? {
                     return Err(Error::config(
                         "H3 keyframes are fitted to the target canvas".to_owned(),
                     ));
                 }
-                let anchor = if role == Role::FirstFrame {
-                    Anchor::FirstFrame
+                if role == nn::ConditionRole::FirstFrame {
+                    SegmentKind::FirstFrame
                 } else {
-                    Anchor::LastFrame
-                };
-                (SegmentKind::Keyframe, Some(anchor))
+                    SegmentKind::LastFrame
+                }
             }
             (_, None) => {
                 return Err(Error::config("an H3 keyframe carries its frame".to_owned()));
@@ -883,14 +797,21 @@ pub fn condition_segments(conditions: &[Condition], canvas: &Canvas) -> Result<V
                 "an H3 image reference carries no audio".to_owned(),
             ));
         }
+        let (frames, raster) = visual.unwrap_or((
+            0,
+            LatentRaster {
+                height: 0,
+                width: 0,
+            },
+        ));
         let segment = Segment {
             kind,
             condition: index as u32,
-            anchor,
-            visual,
+            frames,
+            raster,
             audio_frames,
         };
-        if kind == SegmentKind::Keyframe {
+        if kind.is_keyframe() {
             keyframes.push(segment);
         } else {
             references.push(segment);
@@ -908,7 +829,7 @@ pub fn condition_segments(conditions: &[Condition], canvas: &Canvas) -> Result<V
 /// over its token grid and its audio rows channel-major.
 ///
 /// The counts follow from the frame count, the canvas, the capacities and the alignment alone, so
-/// evaluating a layout builds no tables; [`SegmentPacking`] adds the tables of the same rows.
+/// evaluating a layout builds no tables; [`segment_tables`] adds the tables of the same rows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SegmentExtent {
     /// Rows of one tile, a key of [`VIDEO_TILE_SHAPES`].
@@ -1045,84 +966,12 @@ pub fn segment_extent(
     })
 }
 
-/// The CPU tables of the generated rows of one sparse segment layout.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct SegmentPacking {
-    /// The rows this layout holds.
-    pub extent: SegmentExtent,
-    /// `[video rows]` packed row of each generated video row, ascending.
-    pub video_indices: Vec<u32>,
-    /// `[video rows]` raster row of each entry of `video_indices`.
-    pub video_raster_indices: Vec<u32>,
-    /// `[video tiles]` valid rows of each generated video tile.
-    pub video_variable_block_sizes: Vec<u32>,
-}
-
-impl SegmentPacking {
+impl SegmentExtent {
     /// `[audio rows]` packed rows of the generated audio, ascending.
     pub fn audio_indices(&self) -> Range<u32> {
-        let start = self.extent.audio_start();
-        start..start + self.extent.audio_rows
+        let start = self.audio_start();
+        start..start + self.audio_rows
     }
-}
-
-/// Build the tables of the rows [`segment_extent`] sizes.
-pub fn segment_packing(
-    num_frames: u32,
-    canvas: &Canvas,
-    text_rows: u32,
-    condition_rows: u32,
-    tile: u32,
-    token_multiple: u32,
-) -> Result<SegmentPacking> {
-    let extent = segment_extent(
-        num_frames,
-        canvas,
-        text_rows,
-        condition_rows,
-        tile,
-        token_multiple,
-    )?;
-    let order = tile_order(extent.video_grid, tile_shape(tile)?);
-    let (raster, sizes) = (order.raster, order.sizes);
-    let mut video_indices = Vec::with_capacity(raster.len());
-    for (index, size) in sizes.iter().enumerate() {
-        let start = extent.video_start() + index as u32 * tile;
-        video_indices.extend(start..start + size);
-    }
-    Ok(SegmentPacking {
-        extent,
-        video_indices,
-        video_raster_indices: raster,
-        video_variable_block_sizes: sizes,
-    })
-}
-
-/// One request's row and tile tables in its segment layout.
-///
-/// The rows and their coordinates are the released packed sequence
-/// `[text | keyframes | references | target audio | target video]` of [`DenseTables`], held in
-/// tiles: a keyframe's rows fill whole dense tiles, as an image's do after a reference's audio
-/// rows, and a reference video forms its own segment of video tiles over its token grid. Dense
-/// tiles attend and are attended densely. The generated video forms the last segment.
-#[derive(Clone, PartialEq, Debug)]
-pub struct SegmentTables {
-    /// `[padded_tokens, 3]` rotary coordinates; rows outside the request hold zeros.
-    pub position_ids: Vec<[f64; 3]>,
-    /// `[padded_tokens]` modulation tags of [`Tag`].
-    pub token_tags: Vec<i32>,
-    /// `[padded_tokens]` timestep groups of [`Group`].
-    pub groups: Vec<i32>,
-    /// `[padded_tokens]` row of the prefix source each packed row takes.
-    pub prefix_index: Vec<i32>,
-    /// `[tiles]` rows of each tile; zero for a tile the request leaves empty.
-    pub variable_block_sizes: Vec<u32>,
-    /// `[tiles]` video segment of each tile, `-1` for a dense or empty tile.
-    pub tile_segments: Vec<i32>,
-    /// `[tiles]` tiles below each segment index: the dense and empty tiles included.
-    pub segment_starts: Vec<i32>,
-    /// `[tiles]` key tiles a video query keeps of each segment.
-    pub segment_keep: Vec<i32>,
 }
 
 /// The rows of a dense segment of `count` rows filling tiles from `first_tile`.
@@ -1149,17 +998,17 @@ fn video_segment(
     tile_segments: &mut [i32],
     tile_counts: &mut Vec<u32>,
 ) -> (Vec<u32>, Vec<u32>) {
-    let order = tile_order(grid, shape);
-    let mut packed = Vec::with_capacity(order.raster.len());
-    for (index, size) in order.sizes.iter().enumerate() {
+    let (raster, sizes) = tile_order(grid, shape);
+    let mut packed = Vec::with_capacity(raster.len());
+    for (index, size) in sizes.iter().enumerate() {
         let slot = first_tile as usize + index;
         block_sizes[slot] = *size;
         tile_segments[slot] = tile_counts.len() as i32;
         let start = first_tile * tile + index as u32 * tile;
         packed.extend(start..start + size);
     }
-    tile_counts.push(order.sizes.len() as u32);
-    (packed, order.raster)
+    tile_counts.push(sizes.len() as u32);
+    (packed, raster)
 }
 
 /// Place tile-major video rows from the raster row each packed row holds.
@@ -1179,39 +1028,31 @@ fn place_grid_frames(
     }
 }
 
-/// The keep rates a segment layout's selection reads.
+/// Build one request's tables in its segment layout `extent`.
 ///
-/// The two rates travel together because they are not interchangeable: the generated video's
-/// `sparsity` decides its own kept tiles, and `reference_keep` decides how much of a reference
-/// segment survives. Both are `f64`, so a caller that swaps them still compiles - which is why they
-/// are named here rather than passed positionally.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Sparsity {
-    /// The fraction of a generated video segment's tiles the selection drops.
-    pub sparsity: f64,
-    /// The fraction of a reference segment's tiles the selection keeps.
-    pub reference_keep: Option<f64>,
-}
-
-/// Build one request's tables in its segment layout.
-///
-/// `reference_keep` is the fraction of tiles a generated video keeps of a reference segment; it is
-/// required the moment the request has a reference video, and unused otherwise.
+/// `sparsity` is the fraction of a generated video segment's tiles the selection drops, and
+/// `reference_keep` the fraction of a reference segment's tiles it keeps; the latter is required
+/// the moment the request has a reference video, and unused otherwise.
 pub fn segment_tables(
-    packing: &SegmentPacking,
+    extent: &SegmentExtent,
     num_frames: u32,
     canvas: &Canvas,
-    num_text_tokens: u32,
+    (num_text_tokens, vision_spans): (u32, &[(u32, u32)]),
     segments: &[Segment],
-    vision_spans: VisionSpans<'_>,
-    sparsity: Sparsity,
-) -> Result<SegmentTables> {
-    let extent = &packing.extent;
+    (sparsity, reference_keep): (f64, Option<f64>),
+) -> Result<RowTables> {
     let tile = extent.tile;
-    let tiling = Tiling::sparse(tile)?;
+    let packing = condition_packing(
+        AttentionKind::Sparse {
+            tile,
+            sparsity,
+            reference_keep,
+        },
+        extent.condition_rows,
+    )?;
     if num_text_tokens < 1
         || num_text_tokens > extent.text_rows
-        || tiling.condition_rows(segments) > extent.condition_rows
+        || condition_rows(segments, &packing) > extent.condition_rows
     {
         return Err(Error::config(
             "the prompt and conditions must fit their layout's capacities".to_owned(),
@@ -1275,7 +1116,7 @@ pub fn segment_tables(
             0..0
         };
         match segment.kind {
-            SegmentKind::Keyframe | SegmentKind::Image => {
+            SegmentKind::FirstFrame | SegmentKind::LastFrame | SegmentKind::Image => {
                 let visual = dense_rows(next_tile, segment.video_rows(), tile, &mut block_sizes);
                 next_tile += segment.video_rows().div_ceil(tile);
                 for (offset, row) in visual.clone().enumerate() {
@@ -1285,10 +1126,7 @@ pub fn segment_tables(
                 }
                 source += segment.video_rows();
                 if segment.kind == SegmentKind::Image {
-                    let visual_segment = segment.visual.ok_or_else(|| {
-                        Error::config("an H3 image segment carries its latent frame".to_owned())
-                    })?;
-                    let (grid, _) = frame_grid(visual_segment.raster);
+                    let (grid, _) = frame_grid(segment.raster);
                     for (offset, point) in grid.iter().enumerate() {
                         positions[visual.start as usize + offset] = [clock, point[0], point[1]];
                     }
@@ -1309,10 +1147,7 @@ pub fn segment_tables(
                 clock += f64::from(segment.audio_frames);
             }
             SegmentKind::Video => {
-                let visual_segment = segment.visual.ok_or_else(|| {
-                    Error::config("an H3 video segment carries its latent frames".to_owned())
-                })?;
-                let (grid, own_width) = frame_grid(visual_segment.raster);
+                let (grid, own_width) = frame_grid(segment.raster);
                 if segment.audio_rows() > 0 {
                     place_audio(
                         &mut positions,
@@ -1324,7 +1159,7 @@ pub fn segment_tables(
                 }
                 let (visual, raster_rows) = video_segment(
                     next_tile,
-                    video_grid(visual_segment.frames, visual_segment.raster),
+                    video_grid(segment.frames, segment.raster),
                     shape,
                     tile,
                     &mut block_sizes,
@@ -1341,12 +1176,12 @@ pub fn segment_tables(
                     &mut positions,
                     &visual,
                     &raster_rows,
-                    visual_segment.frames,
+                    segment.frames,
                     clock,
                     &grid,
                 );
                 source += segment.video_rows();
-                clock += f64::from(segment.audio_frames).max(video_span(visual_segment.frames));
+                clock += f64::from(segment.audio_frames).max(video_span(segment.frames));
             }
         }
     }
@@ -1374,16 +1209,23 @@ pub fn segment_tables(
         tags[row as usize] = Tag::Audio as i32;
         groups[row as usize] = Group::Audio as i32;
     }
+    // The generated video: tile-major over its token grid, from the layout's video tiles.
+    let (video_raster_indices, video_sizes) = tile_order(extent.video_grid, shape);
+    let mut video_indices = Vec::with_capacity(video_raster_indices.len());
+    for (index, size) in video_sizes.iter().enumerate() {
+        let start = extent.video_start() + index as u32 * tile;
+        video_indices.extend(start..start + size);
+    }
     let video_tile = extent.video_start() / tile;
-    for (offset, size) in packing.video_variable_block_sizes.iter().enumerate() {
+    for (offset, size) in video_sizes.iter().enumerate() {
         block_sizes[video_tile as usize + offset] = *size;
         tile_segments[video_tile as usize + offset] = tile_counts.len() as i32;
     }
     tile_counts.push(extent.video_tiles);
     place_grid_frames(
         &mut positions,
-        &packing.video_indices,
-        &packing.video_raster_indices,
+        &video_indices,
+        &video_raster_indices,
         frames,
         clock,
         &spatial,
@@ -1396,10 +1238,9 @@ pub fn segment_tables(
     let mut below = tile_segments.iter().filter(|index| **index < 0).count() as i32;
     for (index, count) in tile_counts.iter().enumerate() {
         let keep = if index + 1 == tile_counts.len() {
-            sparsity.sparsity
+            sparsity
         } else {
-            let reference_keep = sparsity
-                .reference_keep
+            let reference_keep = reference_keep
                 .ok_or_else(|| Error::config("reference videos need a keep rate".to_owned()))?;
             1.0 - reference_keep
         };
@@ -1407,11 +1248,14 @@ pub fn segment_tables(
         segment_starts[index] = below;
         below += *count as i32;
     }
-    Ok(SegmentTables {
+    Ok(RowTables {
         position_ids: positions,
         token_tags: tags,
         groups,
         prefix_index,
+        used: extent.padded_tokens,
+        video_indices,
+        video_raster_indices,
         variable_block_sizes: block_sizes,
         tile_segments,
         segment_starts,
@@ -1422,6 +1266,20 @@ pub fn segment_tables(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tiles `segment` occupies in a sparse layout of `tile` rows ([`condition_tiles`]).
+    fn tiles(segment: &Segment, tile: u32) -> u32 {
+        let packing = condition_packing(
+            AttentionKind::Sparse {
+                tile,
+                sparsity: 0.0,
+                reference_keep: None,
+            },
+            0,
+        )
+        .expect("a tile");
+        condition_tiles(segment.audio_rows(), segment.visual(), &packing)
+    }
 
     /// The 768p 16:9 canvas: 1344x768, 84x48 latent columns and rows.
     fn canvas() -> Canvas {
@@ -1502,22 +1360,22 @@ mod tests {
         ] {
             let order = tile_order(grid, shape);
             let rows = (grid.0 * grid.1 * grid.2) as usize;
-            assert_eq!(order.raster.len(), rows, "{grid:?}");
-            let mut sorted = order.raster.clone();
+            assert_eq!(order.0.len(), rows, "{grid:?}");
+            let mut sorted = order.0.clone();
             sorted.sort_unstable();
             assert_eq!(sorted, (0..rows as u32).collect::<Vec<_>>(), "{grid:?}");
-            assert_eq!(order.sizes.iter().sum::<u32>(), rows as u32);
+            assert_eq!(order.1.iter().sum::<u32>(), rows as u32);
             assert!(
                 order
-                    .sizes
+                    .1
                     .iter()
                     .all(|size| *size <= shape.0 * shape.1 * shape.2),
                 "{grid:?}"
             );
             // Every prefix of tiles covers exactly the rows it sizes.
             let mut below = 0;
-            for taken in 1..=order.sizes.len() as u32 {
-                below += order.sizes[taken as usize - 1];
+            for taken in 1..=order.1.len() as u32 {
+                below += order.1[taken as usize - 1];
                 assert_eq!(
                     tiled_rows(grid, shape, taken),
                     below,
@@ -1543,49 +1401,49 @@ mod tests {
     fn a_condition_occupies_whole_tiles_of_its_row_counts() {
         let raster = latent_raster(&canvas()).expect("a legal canvas");
         let keyframe = Segment {
-            kind: SegmentKind::Keyframe,
+            kind: SegmentKind::FirstFrame,
             condition: 0,
-            anchor: Some(Anchor::FirstFrame),
-            visual: Some(Visual { frames: 1, raster }),
+            frames: 1,
+            raster,
             audio_frames: 0,
         };
         assert_eq!(keyframe.video_rows(), 1008);
         assert_eq!(keyframe.audio_rows(), 0);
-        assert_eq!(Tiling::sparse(64).expect("a tile").tiles(&keyframe), 16);
-        assert_eq!(Tiling::sparse(128).expect("a tile").tiles(&keyframe), 8);
+        assert_eq!(tiles(&keyframe, 64), 16);
+        assert_eq!(tiles(&keyframe, 128), 8);
 
         // A reference at a 2048-pixel short edge, with its soundtrack.
-        let reference = Visual {
-            frames: 37,
-            raster: LatentRaster {
+        let reference = (
+            37,
+            LatentRaster {
                 height: 128,
                 width: 72,
             },
-        };
+        );
         let video = Segment {
             kind: SegmentKind::Video,
             condition: 0,
-            anchor: None,
-            visual: Some(reference),
+            frames: reference.0,
+            raster: reference.1,
             audio_frames: 207,
         };
         assert_eq!(video.video_rows(), 37 * 64 * 36);
         assert_eq!(video.audio_rows(), 414);
         // 414 audio rows fill 7 tiles of 64; the video's 37x64x36 grid fills 10x16x9 tiles.
-        assert_eq!(
-            Tiling::sparse(64).expect("a tile").tiles(&video),
-            7 + 10 * 16 * 9
-        );
+        assert_eq!(tiles(&video, 64), 7 + 10 * 16 * 9);
 
         let audio = Segment {
             kind: SegmentKind::Audio,
             condition: 1,
-            anchor: None,
-            visual: None,
+            frames: 0,
+            raster: LatentRaster {
+                height: 0,
+                width: 0,
+            },
             audio_frames: 207,
         };
         assert_eq!(audio.video_rows(), 0);
-        assert_eq!(Tiling::sparse(128).expect("a tile").tiles(&audio), 4);
+        assert_eq!(tiles(&audio, 128), 4);
     }
 
     #[test]
@@ -1593,21 +1451,15 @@ mod tests {
         let image = Segment {
             kind: SegmentKind::Image,
             condition: 0,
-            anchor: None,
-            visual: Some(Visual {
-                frames: 1,
-                raster: LatentRaster {
-                    height: 90,
-                    width: 160,
-                },
-            }),
+            frames: 1,
+            raster: LatentRaster {
+                height: 90,
+                width: 160,
+            },
             audio_frames: 0,
         };
         assert_eq!(image.video_rows(), 45 * 80);
-        assert_eq!(
-            Tiling::sparse(128).expect("a tile").tiles(&image),
-            (45 * 80_u32).div_ceil(128)
-        );
+        assert_eq!(tiles(&image, 128), (45 * 80_u32).div_ceil(128));
     }
 
     /// The spatial rotary grid of one axis, as the released plan defines it: evenly spaced over an
@@ -1706,14 +1558,17 @@ mod tests {
     fn a_keyframe_sits_on_the_generated_timeline_at_the_target_grid() {
         let plan = dense_packing(124, &canvas(), 1935, 2048, 64).expect("a conditioned plan");
         let raster = latent_raster(&canvas()).expect("raster");
-        let keyframe = |anchor| Segment {
-            kind: SegmentKind::Keyframe,
+        let keyframe = |kind| Segment {
+            kind,
             condition: 0,
-            anchor: Some(anchor),
-            visual: Some(Visual { frames: 1, raster }),
+            frames: 1,
+            raster,
             audio_frames: 0,
         };
-        let segments = [keyframe(Anchor::FirstFrame), keyframe(Anchor::LastFrame)];
+        let segments = [
+            keyframe(SegmentKind::FirstFrame),
+            keyframe(SegmentKind::LastFrame),
+        ];
         let tables =
             dense_tables(&plan, 124, &canvas(), 1935, &segments, &[]).expect("two keyframes");
         let (spatial, _) = frame_grid(raster);
@@ -1749,21 +1604,21 @@ mod tests {
         let image = Segment {
             kind: SegmentKind::Image,
             condition: 0,
-            anchor: None,
-            visual: Some(Visual {
-                frames: 1,
-                raster: LatentRaster {
-                    height: 32,
-                    width: 32,
-                },
-            }),
+            frames: 1,
+            raster: LatentRaster {
+                height: 32,
+                width: 32,
+            },
             audio_frames: 0,
         };
         let audio = Segment {
             kind: SegmentKind::Audio,
             condition: 1,
-            anchor: None,
-            visual: None,
+            frames: 0,
+            raster: LatentRaster {
+                height: 0,
+                width: 0,
+            },
             audio_frames: 124,
         };
         let tables = dense_tables(&plan, 124, &canvas(), 6913, &[image, audio], &[])
@@ -1816,13 +1671,10 @@ mod tests {
         );
 
         let keyframe = Segment {
-            kind: SegmentKind::Keyframe,
+            kind: SegmentKind::FirstFrame,
             condition: 0,
-            anchor: Some(Anchor::FirstFrame),
-            visual: Some(Visual {
-                frames: 1,
-                raster: latent_raster(&canvas()).expect("raster"),
-            }),
+            frames: 1,
+            raster: latent_raster(&canvas()).expect("raster"),
             audio_frames: 0,
         };
         let error = dense_tables(&plan, 124, &canvas(), 1935, &[keyframe], &[])
@@ -1898,8 +1750,12 @@ mod tests {
 
     #[test]
     fn the_generated_video_rows_of_a_sparse_layout_cover_every_patch_once() {
-        let packing = segment_packing(124, &canvas(), 7040, 512, 128, 128).expect("a layout");
-        let extent = packing.extent;
+        let extent = segment_extent(124, &canvas(), 7040, 512, 128, 128).expect("a layout");
+        let packing = segment_tables(&extent, 124, &canvas(), (1, &[]), &[], (0.9, None))
+            .expect("a sparse request");
+        let video_tile = (extent.video_start() / 128) as usize;
+        let video_variable_block_sizes =
+            &packing.variable_block_sizes[video_tile..][..extent.video_tiles as usize];
         assert_eq!(packing.video_indices.len(), 37 * 1008);
         assert_eq!(packing.video_indices[0], extent.video_start());
         assert!(
@@ -1914,17 +1770,9 @@ mod tests {
                 .iter()
                 .all(|row| *row < extent.video_start() + 360 * 128)
         );
-        assert_eq!(packing.video_variable_block_sizes.len(), 360);
-        assert_eq!(
-            packing.video_variable_block_sizes.iter().sum::<u32>(),
-            37 * 1008
-        );
-        assert!(
-            packing
-                .video_variable_block_sizes
-                .iter()
-                .all(|size| *size <= 128)
-        );
+        assert_eq!(video_variable_block_sizes.len(), 360);
+        assert_eq!(video_variable_block_sizes.iter().sum::<u32>(), 37 * 1008);
+        assert!(video_variable_block_sizes.iter().all(|size| *size <= 128));
 
         let mut raster = packing.video_raster_indices.clone();
         raster.sort_unstable();
@@ -1932,7 +1780,7 @@ mod tests {
         // Each tile's valid rows lead its block, in tile order.
         let mut taken = 0_u32;
         let mut start = extent.video_start();
-        for size in &packing.video_variable_block_sizes {
+        for size in video_variable_block_sizes {
             assert_eq!(packing.video_indices[taken as usize], start);
             for offset in 1..*size {
                 assert_eq!(
@@ -1945,23 +1793,19 @@ mod tests {
         }
         assert_eq!(taken, 37 * 1008);
 
-        assert_eq!(packing.audio_indices(), 7552..7966);
+        assert_eq!(extent.audio_indices(), 7552..7966);
     }
 
     #[test]
     fn a_text_only_sparse_request_fills_its_text_audio_and_video_tiles() {
-        let packing = segment_packing(124, &canvas(), 7040, 512, 128, 128).expect("a layout");
+        let packing = segment_extent(124, &canvas(), 7040, 512, 128, 128).expect("a layout");
         let tables = segment_tables(
             &packing,
             124,
             &canvas(),
-            1935,
+            (1935, &[(5, 10)]),
             &[],
-            &[(5, 10)],
-            Sparsity {
-                sparsity: 0.9,
-                reference_keep: None,
-            },
+            (0.9, None),
         )
         .expect("a sparse request");
         assert_eq!(tables.variable_block_sizes.len(), 423);
@@ -2000,47 +1844,41 @@ mod tests {
         assert_eq!(tables.segment_keep[0], 36);
         let (spatial, _) = frame_grid(latent_raster(&canvas()).expect("raster"));
         assert_eq!(
-            tables.position_ids[packing.video_indices[0] as usize],
+            tables.position_ids[tables.video_indices[0] as usize],
             [1935.0, spatial[0][0], spatial[0][1]]
         );
-        // The generated video's tile sizes are the layout's own.
-        assert_eq!(
-            tables.variable_block_sizes[63..423],
-            packing.video_variable_block_sizes[..]
+        // The generated video's tiles are the layout's own: every one holds rows, at most a tile.
+        assert!(
+            tables.variable_block_sizes[63..423]
+                .iter()
+                .all(|size| (1..=128).contains(size))
         );
     }
 
     #[test]
     fn a_reference_video_forms_its_own_segment_of_video_tiles() {
-        let packing = segment_packing(124, &canvas(), 7040, 10240, 128, 128).expect("a layout");
-        let extent = packing.extent;
+        let packing = segment_extent(124, &canvas(), 7040, 10240, 128, 128).expect("a layout");
+        let extent = packing;
         assert_eq!(extent.video_start(), 17792);
         assert_eq!(extent.padded_tokens, 499 * 128);
         let reference = Segment {
             kind: SegmentKind::Video,
             condition: 0,
-            anchor: None,
-            visual: Some(Visual {
-                frames: 37,
-                raster: LatentRaster {
-                    height: 32,
-                    width: 32,
-                },
-            }),
+            frames: 37,
+            raster: LatentRaster {
+                height: 32,
+                width: 32,
+            },
             audio_frames: 0,
         };
-        assert_eq!(Tiling::sparse(128).expect("tiles").tiles(&reference), 80);
+        assert_eq!(tiles(&reference, 128), 80);
         let tables = segment_tables(
             &packing,
             124,
             &canvas(),
-            6913,
+            (6913, &[]),
             std::slice::from_ref(&reference),
-            &[],
-            Sparsity {
-                sparsity: 0.9,
-                reference_keep: Some(0.1),
-            },
+            (0.9, Some(0.1)),
         )
         .expect("a reference request");
 
@@ -2077,31 +1915,24 @@ mod tests {
 
     #[test]
     fn a_reference_request_needs_a_keep_rate_for_its_videos() {
-        let packing = segment_packing(124, &canvas(), 7040, 10240, 128, 128).expect("a layout");
+        let packing = segment_extent(124, &canvas(), 7040, 10240, 128, 128).expect("a layout");
         let reference = Segment {
             kind: SegmentKind::Video,
             condition: 0,
-            anchor: None,
-            visual: Some(Visual {
-                frames: 37,
-                raster: LatentRaster {
-                    height: 32,
-                    width: 32,
-                },
-            }),
+            frames: 37,
+            raster: LatentRaster {
+                height: 32,
+                width: 32,
+            },
             audio_frames: 0,
         };
         let error = segment_tables(
             &packing,
             124,
             &canvas(),
-            6913,
+            (6913, &[]),
             std::slice::from_ref(&reference),
-            &[],
-            Sparsity {
-                sparsity: 0.9,
-                reference_keep: None,
-            },
+            (0.9, None),
         )
         .expect_err("a reference video without a keep rate");
         assert!(
@@ -2114,13 +1945,9 @@ mod tests {
             &packing,
             124,
             &canvas(),
-            6913,
+            (6913, &[]),
             &[reference; 2],
-            &[],
-            Sparsity {
-                sparsity: 0.9,
-                reference_keep: Some(0.1),
-            },
+            (0.9, Some(0.1)),
         )
         .expect_err("160 tiles do not fit 80");
         assert!(
@@ -2129,42 +1956,38 @@ mod tests {
         );
     }
 
+    /// A condition of `role` with `frames` frames of `canvas` and a track of `audio_samples`.
+    fn condition(
+        role: nn::ConditionRole,
+        frames: u32,
+        canvas: Canvas,
+        audio_samples: u32,
+    ) -> nn::ConditionShape {
+        nn::ConditionShape {
+            role,
+            frames,
+            height: canvas.height,
+            width: canvas.width,
+            audio_samples,
+        }
+    }
+
     #[test]
     fn conditions_are_ordered_keyframes_first_and_typed_by_what_they_carry() {
         let target = canvas();
+        let square = Canvas {
+            width: 512,
+            height: 512,
+        };
+        let none = Canvas {
+            width: 0,
+            height: 0,
+        };
         let conditions = [
-            Condition {
-                role: Role::Reference,
-                frame: None,
-                audio_samples: 124 * 800,
-            },
-            Condition {
-                role: Role::LastFrame,
-                frame: Some(Frame {
-                    canvas: target,
-                    num_frames: 1,
-                }),
-                audio_samples: 0,
-            },
-            Condition {
-                role: Role::Reference,
-                frame: Some(Frame {
-                    canvas: Canvas {
-                        width: 512,
-                        height: 512,
-                    },
-                    num_frames: 124,
-                }),
-                audio_samples: 0,
-            },
-            Condition {
-                role: Role::FirstFrame,
-                frame: Some(Frame {
-                    canvas: target,
-                    num_frames: 1,
-                }),
-                audio_samples: 0,
-            },
+            condition(nn::ConditionRole::Reference, 0, none, 124 * 800),
+            condition(nn::ConditionRole::LastFrame, 1, target, 0),
+            condition(nn::ConditionRole::Reference, 124, square, 0),
+            condition(nn::ConditionRole::FirstFrame, 1, target, 0),
         ];
         let segments = condition_segments(&conditions, &target).expect("four conditions");
         // Keyframes first in request order, then the references in request order: the audio track
@@ -2173,56 +1996,31 @@ mod tests {
         assert_eq!(
             kinds,
             [
-                SegmentKind::Keyframe,
-                SegmentKind::Keyframe,
+                SegmentKind::LastFrame,
+                SegmentKind::FirstFrame,
                 SegmentKind::Audio,
                 SegmentKind::Video
             ]
         );
         // The keyframes keep their request order, and their condition index with it.
         assert_eq!(segments[0].condition, 1);
-        assert_eq!(segments[0].anchor, Some(Anchor::LastFrame));
         assert_eq!(segments[1].condition, 3);
-        assert_eq!(segments[1].anchor, Some(Anchor::FirstFrame));
         assert_eq!(segments[2].condition, 0);
         assert_eq!(segments[2].audio_frames, 124);
         assert_eq!(segments[2].audio_rows(), 248);
         assert_eq!(segments[3].condition, 2);
-        assert_eq!(segments[3].visual.expect("pixels").frames, 37);
+        assert_eq!(segments[3].frames, 37);
 
         // A one-frame reference is an image, and an image carries no audio.
-        let image = Condition {
-            role: Role::Reference,
-            frame: Some(Frame {
-                canvas: Canvas {
-                    width: 512,
-                    height: 512,
-                },
-                num_frames: 1,
-            }),
-            audio_samples: 0,
-        };
+        let image = condition(nn::ConditionRole::Reference, 1, square, 0);
         let segments = condition_segments(&[image], &target).expect("an image");
         assert_eq!(segments[0].kind, SegmentKind::Image);
-        assert_eq!(segments[0].visual.expect("pixels").frames, 1);
-
-        let with_audio = Condition {
-            audio_samples: 800,
-            ..image
-        };
+        assert_eq!(segments[0].frames, 1);
+        let with_audio = condition(nn::ConditionRole::Reference, 1, square, 800);
         assert!(condition_segments(&[with_audio], &target).is_err());
 
-        let off_canvas = Condition {
-            role: Role::FirstFrame,
-            frame: Some(Frame {
-                canvas: Canvas {
-                    width: 512,
-                    height: 512,
-                },
-                num_frames: 1,
-            }),
-            audio_samples: 0,
-        };
+        // A keyframe is fitted to the target canvas.
+        let off_canvas = condition(nn::ConditionRole::FirstFrame, 1, square, 0);
         assert!(condition_segments(&[off_canvas], &target).is_err());
     }
 
@@ -2232,21 +2030,14 @@ mod tests {
         // 30-frame reference is 7 latent frames. The generated rule refuses that count, and rounding
         // it up to 39 frames would give 12 - five latent rows a condition does not have.
         let target = canvas();
-        let count = |num_frames| {
-            let condition = Condition {
-                role: Role::Reference,
-                frame: Some(Frame {
-                    canvas: target,
-                    num_frames,
-                }),
-                audio_samples: 0,
-            };
-            condition_segments(&[condition], &target)
-                .expect("a referenced clip")
-                .remove(0)
-                .visual
-                .expect("pixels")
-                .frames
+        let count = |frames| {
+            condition_segments(
+                &[condition(nn::ConditionRole::Reference, frames, target, 0)],
+                &target,
+            )
+            .expect("a referenced clip")
+            .remove(0)
+            .frames
         };
         assert_eq!(count(30), 7);
         assert_eq!(count(39), timeline_latents(39).expect("aligned"));

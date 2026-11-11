@@ -140,11 +140,13 @@ fn a_convolution_loads_the_filter_its_torch_arguments_state() {
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
     let view = |dims: &[u64]| arena.tensor(DType::F32, Shape::new(dims)).unwrap();
-    let (input, out) = (view(&[2, 4, 16]), view(&[2, 8, 16]));
-    let ((), launches) = recorded(|| conv.forward(&f, input, out).unwrap());
+    let input = view(&[2, 4, 16]);
+    let (out, launches) = recorded(|| conv.forward(&f, input).unwrap());
     assert_eq!(operators(&launches), ["conv1d"]);
-    let ((), launches) = recorded(|| up.forward(&f, out, view(&[2, 4, 32])).unwrap());
+    assert_eq!(out.shape.dims(), [2, 8, 16]);
+    let (up, launches) = recorded(|| up.forward(&f, out).unwrap());
     assert_eq!(operators(&launches), ["conv_transpose1d"]);
+    assert_eq!(up.shape.dims(), [2, 4, 32], "torch's transposed length");
 }
 
 /// A causal pad is one `frame_pad` launch, mirroring or repeating the border as its mode states.
@@ -153,15 +155,19 @@ fn a_causal_pad_is_one_frame_pad_launch() {
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
     let view = |dims: &[u64]| arena.tensor(DType::F32, Shape::new(dims)).unwrap();
-    let (values, padded) = (view(&[1, 3, 5, 16, 16]), view(&[1, 3, 7, 18, 18]));
+    let values = view(&[1, 3, 5, 16, 16]);
     let launches = [Padding::Reflect, Padding::Replicate].map(|padding| {
         let pad = CausalPad {
             top: 1,
+            bottom: 1,
             left: 1,
+            right: 1,
             front: 2,
             padding,
         };
-        recorded(|| pad.forward(&f, values, padded).unwrap()).1
+        let (padded, launches) = recorded(|| pad.forward(&f, values).unwrap());
+        assert_eq!(padded.shape.dims(), [1, 3, 7, 18, 18]);
+        launches
     });
     assert_eq!(operators(&launches[0]), ["frame_pad"]);
     assert_ne!(launches[0], launches[1], "the border mode is compiled in");
@@ -185,9 +191,8 @@ fn an_euler_step_gathers_its_coefficient_and_adds_the_scaled_velocity() {
     let latents = |dtype| arena.tensor(dtype, Shape::new(&[16, 3, 4, 4])).unwrap();
     let (sample, velocity) = (latents(DType::F32), latents(DType::F32));
     let step = arena.tensor(DType::I32, Shape::new(&[1])).unwrap();
-    let gathered = arena.tensor(DType::F32, Shape::new(&[1, 1])).unwrap();
 
-    let (result, launches) = recorded(|| euler.forward(&f, sample, velocity, step, gathered));
+    let (result, launches) = recorded(|| euler.forward(&f, sample, velocity, step));
     result.unwrap();
     assert_eq!(operators(&launches), ["logits_gather", "scaled_residual"]);
 
@@ -200,9 +205,9 @@ fn an_euler_step_gathers_its_coefficient_and_adds_the_scaled_velocity() {
 
     // A velocity of another type or extent, and a strided sample, are refused before any launch.
     let narrow = latents(DType::BF16);
-    assert!(euler.forward(&f, sample, narrow, step, gathered).is_err());
+    assert!(euler.forward(&f, sample, narrow, step).is_err());
     let short = arena.tensor(DType::F32, Shape::new(&[8, 3, 4, 4])).unwrap();
-    assert!(euler.forward(&f, sample, short, step, gathered).is_err());
+    assert!(euler.forward(&f, sample, short, step).is_err());
     let strided = TensorView::with_strides(
         sample.ptr,
         DType::F32,
@@ -291,7 +296,8 @@ fn a_bigvgan_generator_upsamples_through_its_stages() {
     let f = Forward::recording(&arena);
     let view = |dims: &[u64]| arena.tensor(DType::F32, Shape::new(dims)).unwrap();
     let input = view(&[2, 4, 16]);
-    let ((), launches) = recorded(|| generator.forward(&f, input, view(&[2, 1, 32])).unwrap());
+    let (waveform, launches) = recorded(|| generator.forward(&f, input).unwrap());
+    assert_eq!(waveform.shape.dims(), [2, 1, 32]);
     let count = |name: &str| launches.iter().filter(|(op, _)| op == name).count();
     // Two dilation steps of two activations each, then the post activation, each once per batch
     // row; the block's four convolutions between the pre- and post-convolutions.
@@ -299,7 +305,7 @@ fn a_bigvgan_generator_upsamples_through_its_stages() {
     assert_eq!(count("conv1d"), 1 + 4 + 1);
     assert_eq!(count("conv_transpose1d"), 1);
     assert_eq!(launches.first().map(|(op, _)| op.as_str()), Some("conv1d"));
-    assert!(generator.forward(&f, input, view(&[2, 1, 16])).is_err());
+    assert!(generator.forward(&f, view(&[2, 16])).is_err());
 }
 
 /// A DAC encoder loads `encoder.block`'s numbered modules, runs three Snake residual units and a
@@ -341,19 +347,12 @@ fn a_dac_encoder_widens_and_strides_through_its_stages() {
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
     let view = |dims: &[u64]| arena.tensor(DType::F32, Shape::new(dims)).unwrap();
-    let ((), launches) = recorded(|| {
-        encoder
-            .forward(&f, view(&[2, 1, 16]), view(&[2, 8, 8]))
-            .unwrap()
-    });
+    let (latent, launches) = recorded(|| encoder.forward(&f, view(&[2, 1, 16])).unwrap());
+    assert_eq!(latent.shape.dims(), [2, 8, 8]);
     let count = |name: &str| launches.iter().filter(|(op, _)| op == name).count();
     assert_eq!(count("snake"), 3 * 2 + 1 + 1);
     assert_eq!(count("conv1d"), 1 + 3 * 2 + 1 + 1);
-    assert!(
-        encoder
-            .forward(&f, view(&[2, 1, 15]), view(&[2, 8, 7]))
-            .is_err()
-    );
+    assert!(encoder.forward(&f, view(&[2, 1, 15])).is_err());
 }
 
 /// A posterior sample reads the mean and log-variance as the halves of one channel-major moments
@@ -369,22 +368,22 @@ fn a_posterior_sample_reads_the_two_halves_of_its_moments() {
             .unwrap()
     };
     let moments = raster(8, 3, DType::F32);
-    let (noise, out) = (raster(4, 3, DType::F32), raster(4, 3, DType::F32));
-    let ((), launches) = recorded(|| Posterior.sample(&f, moments, noise, out).unwrap());
+    let noise = raster(4, 3, DType::F32);
+    let (sample, launches) = recorded(|| Posterior.sample(&f, moments, noise).unwrap());
     assert_eq!(operators(&launches), ["posterior"]);
+    assert_eq!((sample.shape, sample.dtype), (noise.shape, DType::F32));
 
-    // Moments of the sample's own width have no log-variance; a draw of their width is two draws.
-    assert!(Posterior.sample(&f, noise, noise, out).is_err());
-    assert!(Posterior.sample(&f, moments, moments, out).is_err());
+    // Moments of the sample's own width have no log-variance.
+    assert!(Posterior.sample(&f, noise, noise).is_err());
     // A half-precision draw, another clip's draw, and planes that overlap.
     assert!(
         Posterior
-            .sample(&f, moments, raster(4, 3, DType::F16), out)
+            .sample(&f, moments, raster(4, 3, DType::F16))
             .is_err()
     );
     assert!(
         Posterior
-            .sample(&f, moments, raster(4, 2, DType::F32), out)
+            .sample(&f, moments, raster(4, 2, DType::F32))
             .is_err()
     );
     let overlapping = TensorView::with_strides(
@@ -393,7 +392,7 @@ fn a_posterior_sample_reads_the_two_halves_of_its_moments() {
         noise.shape,
         nn::Strides::new(&[60, 60, 10, 1]),
     );
-    assert!(Posterior.sample(&f, moments, overlapping, out).is_err());
+    assert!(Posterior.sample(&f, moments, overlapping).is_err());
 }
 
 /// A tiled encode runs the model's forward once per tile, then copies the first tile into the
@@ -407,38 +406,36 @@ fn a_tiled_encode_runs_each_tile_and_fades_its_seams() {
     assert_eq!(tiling.latent(), (2, 3));
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
-    let blocks = tiling.reserve(&f, DType::F32, 4, 3).unwrap();
-    let out = arena.tensor(DType::F32, Shape::new(&[4, 3, 2, 3])).unwrap();
+    let tile = arena.tensor(DType::F32, Shape::new(&[4, 3, 2, 2])).unwrap();
     let mut encoded = Vec::new();
-    let ((), launches) = recorded(|| {
+    let (raster, launches) = recorded(|| {
         tiling
-            .forward(
-                &f,
-                &blocks,
-                |index, block| {
-                    assert_eq!(block.shape.dims(), [4, 3, 2, 2]);
-                    encoded.push(index);
-                    Ok(())
-                },
-                out,
-            )
+            .forward(&f, (4, 3), |index| {
+                encoded.push(index);
+                Ok(tile)
+            })
             .unwrap()
     });
     assert_eq!(encoded, [0, 1]);
-    // The first tile has no seam, so its block reaches the raster as a copy; the second fades over
-    // the one column it shares with the first.
-    assert_eq!(operators(&launches), ["copy_block", "cross_fade"]);
-    assert!(launches[1].1.contains("extent_1") && launches[1].1.contains("axis_3"));
+    assert_eq!(raster.shape.dims(), [4, 3, 2, 3]);
+    // Each block is copied into the rank's share; then the first tile has no seam, so its block
+    // reaches the raster as a copy, and the second fades over the one column it shares with the
+    // first.
+    assert_eq!(
+        operators(&launches),
+        ["copy_block", "copy_block", "copy_block", "cross_fade"]
+    );
+    assert!(launches[3].1.contains("extent_1") && launches[3].1.contains("axis_3"));
 
-    // A raster of another element type, or one smaller than the latent raster, is refused.
-    let narrow = arena.tensor(DType::F32, Shape::new(&[4, 3, 2, 2])).unwrap();
-    assert!(tiling.forward(&f, &blocks, |_, _| Ok(()), narrow).is_err());
-    let half = arena.tensor(DType::F16, Shape::new(&[4, 3, 2, 3])).unwrap();
-    assert!(tiling.forward(&f, &blocks, |_, _| Ok(()), half).is_err());
+    // A block of another extent or element type is refused.
+    let wide = arena.tensor(DType::F32, Shape::new(&[4, 3, 2, 3])).unwrap();
+    assert!(tiling.forward(&f, (4, 3), |_| Ok(wide)).is_err());
+    let half = arena.tensor(DType::F16, Shape::new(&[4, 3, 2, 2])).unwrap();
+    assert!(tiling.forward(&f, (4, 3), |_| Ok(half)).is_err());
 }
 
-/// A tiled decode reserves every tile's tokens, hands them to the model's forward, and stitches
-/// them into the raster in one launch; a table of another extent is refused.
+/// A tiled decode uploads the grid's stitch table, hands the model's forward its turn, and stitches
+/// every tile's tokens into the raster in one launch; tokens of another extent are refused.
 #[test]
 fn a_tiled_decode_stitches_every_tiles_tokens_in_one_launch() {
     let decode = TiledDecode::new(DType::F16, 3, 4, 16).unwrap();
@@ -446,32 +443,25 @@ fn a_tiled_decode_stitches_every_tiles_tokens_in_one_launch() {
     let grid = Grid::split(32, 48, 32, 16, 16).unwrap();
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
-    let table = arena.tensor(DType::I32, Shape::new(&[32 + 48, 3])).unwrap();
-    let out = arena
-        .tensor(DType::F16, Shape::new(&[3, 8, 32, 48]))
+    let raster = Shape::new(&[3, 8, 32, 48]);
+    let tokens = arena
+        .tensor(DType::F16, Shape::new(&[2 * 13, 3 * 4 * 16 * 16]))
         .unwrap();
-    let mut decoded = None;
-    let ((), launches) = recorded(|| {
+    let (out, launches) = recorded(|| {
         decode
-            .forward(
-                &f,
-                &grid,
-                13,
-                |tokens| {
-                    decoded = Some(tokens.shape);
-                    Ok(())
-                },
-                table,
-                out,
-            )
+            .forward(&f, &grid, 13, raster, || Ok(tokens))
             .unwrap()
     });
-    assert_eq!(decoded.unwrap().dims(), [2 * 13, 3 * 4 * 16 * 16]);
+    assert_eq!((out.shape, out.dtype), (raster, DType::F16));
     assert_eq!(operators(&launches), ["tile_stitch"]);
-    let short = arena.tensor(DType::I32, Shape::new(&[32 + 47, 3])).unwrap();
     assert!(
         decode
-            .forward(&f, &grid, 13, |_| Ok(()), short, out)
+            .forward(&f, &grid, 12, raster, || Ok(tokens))
+            .is_err()
+    );
+    assert!(
+        decode
+            .forward(&f, &grid, 13, Shape::new(&[4, 8, 32, 48]), || Ok(tokens))
             .is_err()
     );
 }
@@ -485,24 +475,18 @@ fn a_frame_blend_fades_each_frame_in_three_rounded_steps() {
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
     let view = |dims: &[u64]| arena.tensor(DType::F16, Shape::new(dims)).unwrap();
-    let (previous, clip, out) = (
-        view(&[3, 5, 4, 6]),
-        view(&[3, 25, 4, 6]),
-        view(&[3, 5, 4, 6]),
-    );
-    let ((), launches) = recorded(|| blend.forward(&f, previous, clip, out).unwrap());
+    let (previous, clip) = (view(&[3, 5, 4, 6]), view(&[3, 25, 4, 6]));
+    let (faded, launches) = recorded(|| blend.forward(&f, previous, clip).unwrap());
+    assert_eq!(faded.shape, previous.shape);
     assert_eq!(launches.len(), 3 * 5 * 3);
     assert!(launches.iter().all(|(op, _)| op == "scaled_add"));
-    assert!(blend.forward(&f, view(&[3, 4, 4, 6]), clip, out).is_err());
-    assert!(
-        blend
-            .forward(&f, previous, view(&[3, 4, 4, 6]), out)
-            .is_err()
-    );
+    assert!(blend.forward(&f, view(&[3, 4, 4, 6]), clip).is_err());
+    assert!(blend.forward(&f, previous, view(&[3, 4, 4, 6])).is_err());
 
     let rows = Blend::new(DType::F16, 5, Axis::Rows).unwrap();
     let tile = view(&[3, 4, 16, 16]);
-    let ((), launches) = recorded(|| rows.forward(&f, tile, tile, tile).unwrap());
+    let (blended, launches) = recorded(|| rows.forward(&f, tile, tile).unwrap());
+    assert_eq!(blended.shape, tile.shape);
     assert_eq!(operators(&launches), ["cross_fade"]);
 }
 
@@ -519,17 +503,15 @@ fn a_gather_copies_each_tile_of_the_clip_once() {
         .tensor(DType::F32, Shape::new(&[8, 10, 2, 3]))
         .unwrap();
     let rows = voxels(&tiles, 7, 2, 3).len() as u64;
-    let block = arena.tensor(DType::F32, Shape::new(&[rows, 8])).unwrap();
-    let ((), launches) = recorded(|| {
-        gather(&f, &tiles, trajectory, 8, (2, 3), 3, 7, block).unwrap();
-    });
+    let (block, launches) = recorded(|| gather(&f, &tiles, trajectory, 8, (2, 3), (3, 7)).unwrap());
+    assert_eq!(block.shape.dims(), [rows, 8]);
     assert_eq!(operators(&launches), ["copy_block", "copy_block"]);
-    assert!(gather(&f, &tiles, trajectory, 8, (2, 3), 4, 7, block).is_err());
+    assert!(gather(&f, &tiles, trajectory, 8, (2, 3), (4, 7)).is_err());
 }
 
 /// A causal residual block loads diffusers' module names, runs two normalized causal convolutions
 /// and adds the input's projection where the width changes; one of the same width adds the input,
-/// and the block's working buffers are released when it returns.
+/// and only the block's output outlives the call.
 #[test]
 fn a_resnet_block_adds_its_input_or_its_projection() {
     let mut tensors: Vec<(String, Vec<u64>)> = Vec::new();
@@ -559,7 +541,9 @@ fn a_resnet_block_adds_its_input_or_its_projection() {
         eps: 1e-6,
         pad: CausalPad {
             top: 1,
+            bottom: 1,
             left: 1,
+            right: 1,
             front: 2,
             padding: Padding::Reflect,
         },
@@ -572,13 +556,9 @@ fn a_resnet_block_adds_its_input_or_its_projection() {
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
     let view = |dims: &[u64]| arena.tensor(DType::F32, Shape::new(dims)).unwrap();
-    let (narrow, input, out) = (
-        view(&[1, 4, 3, 6, 6]),
-        view(&[1, 8, 3, 6, 6]),
-        view(&[1, 8, 3, 6, 6]),
-    );
+    let (narrow, input) = (view(&[1, 4, 3, 6, 6]), view(&[1, 8, 3, 6, 6]));
     let used = arena.used();
-    let ((), launches) = recorded(|| wide.forward(&f, narrow, out).unwrap());
+    let (out, launches) = recorded(|| wide.forward(&f, narrow).unwrap());
     assert_eq!(
         operators(&launches),
         [
@@ -592,8 +572,13 @@ fn a_resnet_block_adds_its_input_or_its_projection() {
             "scaled_add"
         ]
     );
-    assert_eq!(arena.used(), used, "the working buffers are released");
-    let ((), launches) = recorded(|| same.forward(&f, input, out).unwrap());
+    assert_eq!(out.shape.dims(), [1, 8, 3, 6, 6]);
+    assert_eq!(
+        arena.used(),
+        used.next_multiple_of(nn::forward::ALIGNMENT) + out.byte_len().unwrap(),
+        "the working buffers are handed back"
+    );
+    let (_, launches) = recorded(|| same.forward(&f, input).unwrap());
     assert_eq!(launches.len(), 7, "no projection: {launches:?}");
-    assert!(same.forward(&f, narrow, out).is_err());
+    assert!(same.forward(&f, narrow).is_err());
 }

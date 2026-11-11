@@ -258,7 +258,7 @@ use nn::layers::{
     Spectrum, Varlen,
 };
 use nn::weights::{Weight, WeightLoader};
-use nn::{DType, DecodedMedia, Decoder, Shape, StateTable, TableValues, TensorView};
+use nn::{DType, DecodedMedia, Decoder, Shape, TensorView};
 use ops::gemm::WeightOrder;
 
 /// The element type of the decoder's projections and of the rows they read and write, and the type
@@ -327,65 +327,6 @@ pub struct VideoDecoder {
     /// Query heads per token.
     heads: u64,
     attention: DenseAttention,
-}
-
-/// The two tables a layout's decode reads, keyed by its latent extents.
-///
-/// The model's arithmetic, keyed by the **layout**: the rotary positions of the largest tile of the
-/// latent raster, which every other tile's positions are a slice of because the tiles are uniform, and
-/// the stitch's two axis tables, rows then columns, which say where each pixel of the raster comes
-/// from (`decoding::stitch_table`).
-pub(crate) fn table_specs(
-    config: &VideoVaeConfig,
-    latent_height: u32,
-    latent_width: u32,
-) -> Result<Vec<StateTable>> {
-    let positions = tile(config, &Canvas::clip(config, latent_height, latent_width))?.rows();
-    let ratio = u64::from(config.spatial_compression());
-    let pixels = (u64::from(latent_height) + u64::from(latent_width)) * ratio;
-    Ok(vec![
-        StateTable {
-            name: "video_positions",
-            dtype: DType::F32,
-            shape: Shape::new(&[3, positions]),
-        },
-        StateTable {
-            name: "video_stitch",
-            dtype: DType::I32,
-            shape: Shape::new(&[pixels, ops::tile_stitch::TABLE_WIDTH]),
-        },
-    ])
-}
-
-/// Write the host values of [`table_specs`], in its order, each checked against its table.
-pub(crate) fn table_values_into(
-    config: &VideoVaeConfig,
-    latent_height: u32,
-    latent_width: u32,
-    out: &mut [TableValues],
-) -> Result<()> {
-    let tables = table_specs(config, latent_height, latent_width)?;
-    if out.len() != tables.len() {
-        return Err(Error::config(format!(
-            "{} tables are read and {} buffers given",
-            tables.len(),
-            out.len()
-        )));
-    }
-    let clip = Canvas::clip(config, latent_height, latent_width);
-    let positions = TableValues::F32(positions(&tile(config, &clip)?)?);
-    let (height, width) = clip.pixels(config);
-    let stitch = TableValues::I32(
-        grid(config, &clip)?
-            .stitch_table(height, width)
-            .into_iter()
-            .flatten()
-            .collect(),
-    );
-    for ((held, table), values) in out.iter_mut().zip(&tables).zip([positions, stitch]) {
-        held.write(table.name, &values)?;
-    }
-    Ok(())
 }
 
 /// The attention of the decoder's block: FlashAttention 4 over one packed sequence per tile, which is
@@ -580,6 +521,7 @@ impl VideoDecoder {
                 PreNormSpec {
                     hidden: width,
                     eps: epsilon,
+                    activation: ACTIVATION,
                     norm1: "norm1",
                     norm2: "norm2",
                     layer_scale: Some(["scale1", "scale2"]),
@@ -707,37 +649,24 @@ fn restore_tables(config: &VideoVaeConfig) -> Result<(Vec<f32>, Vec<f32>)> {
     Ok((config.latents_std.clone(), config.latents_mean.clone()))
 }
 
-/// The decoder's rotary spectrum: one axis's frequencies repeated over the three axes, in f64.
+/// The decoder's rotary spectrum: one axis's frequencies repeated over the three axes.
 ///
 /// The reference builds its embedding with `head_dim · ratio / 3` and reuses those frequencies on
 /// all three axes, so axis `a` takes `theta^(-2k / sections[a])` rather than a slice of one wider
-/// spectrum; the decoder publishes it as `video_vae.rotary_emb.inv_freq`.
+/// spectrum, evaluated in FP32 (`1 / base ** arange(0, 1, 2n / dim, float32)`, sglang
+/// `vaes/minimax_h3_video_vae/base_module.py`); the decoder publishes it as
+/// `video_vae.rotary_emb.inv_freq`.
 pub fn spectrum(config: &VideoVaeConfig) -> Result<Spectrum> {
     let (_, sections) = rotary(config)?;
     Ok(Spectrum::Repeated {
         theta: config.decoder_rope_theta,
         pairs: sections[0] / 2,
         axes: sections.len() as u32,
-        precision: Precision::F64,
+        precision: Precision::F32,
     })
 }
 
 impl VideoDecoder {
-    /// The tables one layout's decode reads, in the order the table walk writes them.
-    pub fn tables(&self, latent_height: u32, latent_width: u32) -> Result<Vec<StateTable>> {
-        table_specs(&self.config, latent_height, latent_width)
-    }
-
-    /// Write the host values of each table of [`Self::tables`], in the same order.
-    pub fn table_values(
-        &self,
-        latent_height: u32,
-        latent_width: u32,
-        out: &mut [TableValues],
-    ) -> Result<()> {
-        table_values_into(&self.config, latent_height, latent_width, out)
-    }
-
     /// The rasters this decoder serves: the deployment's canvases, every one of them.
     ///
     /// The constants a decode reads are a **tile's** (its register and zero-row offsets, its sequence
@@ -747,49 +676,15 @@ impl VideoDecoder {
         &self.canvases
     }
 
-    /// The transformer's scratch for one clip: every tile's rows at once, because every tile runs in
-    /// the same launches.
-    pub fn scratch(&self, f: &Forward, canvas: &Canvas) -> Result<ClipScratch> {
-        let tile = tile(&self.config, canvas)?;
-        let tiles = grid(&self.config, canvas)?.len() as u64;
-        let rows = tiles * tile.rows();
-        let voxels = tiles * tile.voxels();
-        let width = u64::from(self.width);
-        let half = u64::from(rotary(&self.config)?.0 / 2);
-        let channels = u64::from(self.config.latent_channels);
-        let arena = f.arena();
-        Ok(ClipScratch {
-            stream: arena.tensor(STREAM, Shape::new(&[rows, width]))?,
-            restored: arena.tensor(STREAM, Shape::new(&[voxels, channels]))?,
-            rounded: arena.tensor(ACTIVATION, Shape::new(&[voxels, channels]))?,
-            quantized: arena.tensor(ACTIVATION, Shape::new(&[voxels, channels]))?,
-            projected: arena.tensor(ACTIVATION, Shape::new(&[voxels, width]))?,
-            cosine: arena.tensor(ACTIVATION, Shape::new(&[tile.rows(), half]))?,
-            sine: arena.tensor(ACTIVATION, Shape::new(&[tile.rows(), half]))?,
-            normalized: arena.tensor(ACTIVATION, Shape::new(&[rows, width]))?,
-            query_key_value: arena.tensor(ACTIVATION, Shape::new(&[rows, 3 * width]))?,
-            attended: arena.tensor(ACTIVATION, Shape::new(&[rows, width]))?,
-            update: arena.tensor(ACTIVATION, Shape::new(&[rows, width]))?,
-        })
-    }
-
-    /// Decode one clip's latent rows into the pixel block of every token.
+    /// Decode one clip's latent rows into the pixel block of every token, a fresh
+    /// `[tiles · rows, out_channels · 4 · 16 · 16]` tensor at [`ACTIVATION`]: one token's
+    /// 3×4×16×16 pixel block, tile after tile, which the stitch scatters into the clip's raster.
     ///
-    /// `latents` is `[voxels, latent_channels]` FP32 — every tile's voxels, tile after tile, in the
-    /// raster order the caller's clip rows select — `positions` is one tile's `[3, rows]` F32,
-    /// axis-major, the per-layout table the table walk declares, and `out` is
-    /// `[tiles · rows, out_channels · 4 · 16 · 16]` at [`ACTIVATION`]: one token's 3×4×16×16 pixel
-    /// block, tile after tile, which the caller scatters into the clip's raster. A tile's rows are its
-    /// voxels, then the register rows, then the trailing zero row.
-    pub fn decode(
-        &self,
-        f: &Forward,
-        canvas: &Canvas,
-        latents: TensorView,
-        positions: TensorView,
-        out: TensorView,
-        scratch: &ClipScratch,
-    ) -> Result<()> {
+    /// `latents` is `[voxels, latent_channels]` FP32, every tile's voxels tile after tile in the
+    /// order [`Decoder::latent_rows`] states. A tile's rows are its voxels, then the register
+    /// rows, then the trailing zero row; every tile shares one tile's rotary positions, which the
+    /// decode computes and uploads.
+    pub fn decode(&self, f: &Forward, canvas: &Canvas, latents: TensorView) -> Result<TensorView> {
         let tile = tile(&self.config, canvas)?;
         let tiles = grid(&self.config, canvas)?.len() as u64;
         let (tile_rows, tile_voxels) = (tile.rows(), tile.voxels());
@@ -802,46 +697,23 @@ impl VideoDecoder {
                 latents.shape.dims()
             )));
         }
-        if out.shape.rank() != 2 || out.shape.dim(0) != rows {
-            return Err(Error::config(format!(
-                "the decoder writes {rows} token rows for this clip's {voxels} voxels, not {:?}",
-                out.shape.dims()
-            )));
-        }
-        // The rotation reads one leading coordinate per axis; a row-major table would be read
-        // transposed and rotate every row by another row's angles, so the shape is checked here
-        // rather than trusted.
-        if positions.shape.rank() != 2
-            || positions.shape.dim(0) != 3
-            || positions.shape.dim(1) != tile_rows
-        {
-            return Err(Error::config(format!(
-                "the decoder reads a [3, {tile_rows}] position table, not {:?}",
-                positions.shape.dims()
-            )));
-        }
 
-        // The latents restore in FP32 and round once on their way into the FP16 projections.
-        self.restore.forward(f, latents, scratch.restored)?;
-        Cast.forward(f, scratch.restored, scratch.rounded)?;
-        self.post_quant
-            .forward(f, scratch.rounded, scratch.quantized)?;
-        self.post_quant_bias
-            .forward(f, scratch.quantized, scratch.rounded)?;
-        self.input.forward(f, scratch.rounded, scratch.projected)?;
+        // The latents restore in FP32 and round once on their way into the FP16 projections; the
+        // post-quant product rounds before its bias, as the reference's convolution does.
+        let restored = self.restore.forward(f, latents)?;
+        let rounded = Cast.forward(f, restored, ACTIVATION)?;
+        let quantized = self.post_quant.forward(f, rounded)?;
+        let biased = self.post_quant_bias.forward(f, quantized)?;
+        let projected = self.input.forward(f, biased)?;
 
-        // A tile's sequence is its voxels in the order they arrive, then the register rows, then the
-        // zero row (`cat((hidden, registers, zeros))`), so a
-        // voxel's token row is its own index within the tile. The voxels widen into the stream here:
-        // that `cat` is what promotes the stream to FP32.
-        let stream = scratch.stream;
+        // A tile's sequence is its voxels, then the register rows, then the zero row
+        // (`cat((hidden, registers, zeros))`), which promotes the stream to FP32.
+        let stream = f.empty(STREAM, Shape::new(&[rows, width]))?;
         for index in 0..tiles {
             let tile_stream = stream.narrow(0, index * tile_rows, tile_rows)?;
             let voxel_rows = stream.narrow(0, index * tile_rows, tile_voxels)?;
-            let projected = scratch
-                .projected
-                .narrow(0, index * tile_voxels, tile_voxels)?;
-            Cast.forward(f, projected, voxel_rows)?;
+            let voxels = projected.narrow(0, index * tile_voxels, tile_voxels)?;
+            nn::layers::Axpby.forward(f, voxel_rows, voxels, 1.0, 0.0)?;
             IndexRows.scatter(
                 f,
                 self.registers.view(),
@@ -851,62 +723,53 @@ impl VideoDecoder {
             IndexRows.scatter(f, self.zero_row.view(), self.zero_rows.view(), tile_stream)?;
         }
 
-        let (cosine, sine) = (scratch.cosine, scratch.sine);
-        self.rotary.factors(f, positions, cosine, sine)?;
-
+        // One tile's `[3, rows]` positions, axis-major: every tile is uniform.
+        let positions = f.upload(&positions(&tile)?, Shape::new(&[3, tile_rows]))?;
+        let factors = self.rotary.factors(f, positions)?;
         let (head, heads) = (self.head, self.heads);
-        let normalized = scratch.normalized;
-        let (attended, update) = (scratch.attended, scratch.update);
-        let per_head = |view: TensorView| view.reshape(Shape::new(&[rows, heads, head]));
-        // The three column ranges of the merged projection, turned and read in place through its row
-        // stride, which is the reference's arrangement: the keys and the values share one stride.
-        let merged = scratch.query_key_value;
-        let projection = |index: u64| {
-            TensorView::with_strides(
-                merged.offset_elements(index * width),
-                merged.dtype,
-                Shape::new(&[rows, heads, head]),
-                nn::Strides::new(&[3 * width, head, 1]),
-            )
-        };
         // One offset per tile and the end; a clip of fewer tiles than the largest reads a prefix.
-        let offsets = TensorView::new(
-            self.offsets.view().offset_elements(0),
-            DType::I32,
-            Shape::new(&[tiles + 1]),
-        );
-        let sequence = u32::try_from(tile_rows)
-            .map_err(|_| Error::config("too many tokens for one sequence".to_owned()))?;
-        let bound = u32::try_from(rows).map_err(|_| Error::config("too many tokens".to_owned()))?;
+        let offsets = self.offsets.view().narrow(0, 0, tiles + 1)?;
+        let visible = Varlen {
+            cu_q: offsets,
+            cu_k: offsets,
+            max_q: Some(
+                u32::try_from(tile_rows)
+                    .map_err(|_| Error::config("too many tokens for one sequence".to_owned()))?,
+            ),
+            max_k: u32::try_from(rows).map_err(|_| Error::config("too many tokens".to_owned()))?,
+        };
 
         // The first layer's first norm has no update to fold: it narrows the FP32 stream into the
         // FP16 rows the projections read. Every later norm folds the update before it.
+        let carried = f.empty(ACTIVATION, Shape::new(&[rows, width]))?;
         let mut pending = None;
         for layer in &self.layers {
-            let attend = |normalized: TensorView, update: TensorView| -> nn::Result<()> {
-                layer.query_key_value.forward(f, normalized, merged)?;
+            let attend = |normalized: TensorView| -> nn::Result<TensorView> {
+                // The three column ranges of the merged projection, turned in place through its
+                // row stride: the keys and the values share one stride, as the reference has them.
+                let merged = layer.query_key_value.forward(f, normalized)?;
+                let projection = |index: u64| {
+                    TensorView::with_strides(
+                        merged.offset_elements(index * width),
+                        merged.dtype,
+                        Shape::new(&[rows, heads, head]),
+                        nn::Strides::new(&[3 * width, head, 1]),
+                    )
+                };
                 self.rotary
-                    .apply_strided(f, projection(0), projection(1), cosine, sine)?;
-                self.attention.forward(
+                    .rotate(f, projection(0), projection(1), factors)?;
+                let attended = self.attention.forward(
                     f,
                     projection(0),
                     projection(1),
                     projection(2),
-                    Some(Varlen {
-                        cu_q: offsets,
-                        cu_k: offsets,
-                        max_q: Some(sequence),
-                        max_k: bound,
-                    }),
-                    per_head(attended),
+                    Some(visible),
                 )?;
-                layer.output.forward(f, attended, update)
-            };
-            pending = Some(
                 layer
-                    .block
-                    .forward(f, stream, pending, normalized, update, attend)?,
-            );
+                    .output
+                    .forward(f, attended.reshape(Shape::new(&[rows, width])))
+            };
+            pending = Some(layer.block.forward(f, stream, pending, carried, attend)?);
         }
 
         // The final norm folds the last layer's scaled update into the stream.
@@ -915,36 +778,15 @@ impl VideoDecoder {
             .scale
             .ok_or_else(|| Error::config("the decoder's layers scale their updates".to_owned()))?;
         let (weight, bias) = self.norm_out;
-        LayerNorm::new(
+        let normalized = LayerNorm::new(
             weight,
             Some(bias),
             self.config.decoder_norm_eps,
             Epilogue::ScaledResidual { scale, bias: None },
         )?
-        .forward(
-            f,
-            last.update,
-            Some(ResidualStream::in_place(stream)),
-            normalized,
-        )?;
-        Ok(self.output.forward(f, normalized, out)?)
+        .forward(f, last.update, Some(ResidualStream::in_place(stream)))?;
+        Ok(self.output.forward(f, normalized)?)
     }
-}
-
-/// The transformer's scratch for one clip, reserved once and read by every layer.
-#[derive(Clone, Copy)]
-pub struct ClipScratch {
-    stream: TensorView,
-    restored: TensorView,
-    rounded: TensorView,
-    quantized: TensorView,
-    projected: TensorView,
-    cosine: TensorView,
-    sine: TensorView,
-    normalized: TensorView,
-    query_key_value: TensorView,
-    attended: TensorView,
-    update: TensorView,
 }
 
 impl Decoder for VideoDecoder {
@@ -959,21 +801,6 @@ impl Decoder for VideoDecoder {
             layout.video.height,
             layout.video.width,
         )))
-    }
-
-    fn layout_tables(&self, layout: &proto::video::Layout) -> nn::Result<Vec<StateTable>> {
-        // A layout whose extents contradict the checkpoint is a named error and not an empty list: a
-        // runner that made a mistake hears which one, where an empty answer would have reached the
-        // decode as a block with no tables and read nothing.
-        Ok(self.tables(layout.video.height, layout.video.width)?)
-    }
-
-    fn prepare_layout(
-        &self,
-        layout: &proto::video::Layout,
-        out: &mut [TableValues],
-    ) -> nn::Result<()> {
-        Ok(self.table_values(layout.video.height, layout.video.width, out)?)
     }
 
     /// Clip `k` decodes latent frames `[5k, 5k + 7)`: five that advance the timeline, and two the
@@ -1013,16 +840,15 @@ impl Decoder for VideoDecoder {
         }
         let clip = Canvas::clip(&self.config, layout.video.height, layout.video.width);
         let tiles = grid(&self.config, &clip)?.tiles(self.config.spatial_compression());
-        nn::tiling::gather(
+        let gathered = nn::tiling::gather(
             f,
             &tiles,
             trajectory,
             self.config.latent_channels,
             (layout.video.height, layout.video.width),
-            first,
-            clip.frames,
-            block,
-        )
+            (first, clip.frames),
+        )?;
+        nn::layers::Axpby.forward(f, block, gathered, 1.0, 0.0)
     }
 
     /// The latent layout one clip's raster decodes from.
@@ -1091,8 +917,7 @@ impl Decoder for VideoDecoder {
     /// Decode one clip: every tile of its canvas, stitched into `out.video`.
     ///
     /// `latents` is the clip's `[voxels, latent_channels]` FP32 rows in tile order — the runner gathers
-    /// them through [`Self::latent_rows`] — `state` holds this block's two tables, `video_positions`
-    /// `[3, rows]` axis-major in radians and `video_stitch`, and `out.video` is the clip's raster. The
+    /// them through [`Self::latent_rows`] — and `out.video` is the clip's raster. The
     /// raster is `[channels, frames, rows, columns]` in the decoder's own element type: the stitch writes
     /// and the byte step reads a planar channels-first raster, and `frames` is the clip's **native**
     /// output, `temporal` frames per latent frame, so it still holds the three padding frames the splice
@@ -1100,27 +925,14 @@ impl Decoder for VideoDecoder {
     ///
     /// The grid is arithmetic on the raster's extent, so one block serves every canvas of this
     /// checkpoint; the clips are the runner's loop, and so is the splice.
-    ///
-    /// **A caller owes this call one clip at a time.** The transformer scratch is *reserved once per
-    /// clip* ([`Self::scratch`]), so two decodes in flight on one decoder object
-    /// write the same buffers of the same arena - the second clip corrupts the first silently rather
-    /// than costing another column. A warmup of one clip beside a served clip of another is the same
-    /// defect, and it looks identical from outside because the arena is the same size either way.
     fn decode(
         &self,
         f: &Forward,
+        _layout: &proto::video::Layout,
         latents: TensorView,
-        state: &[TensorView],
         out: DecodedMedia,
     ) -> nn::Result<()> {
         let refuse = |problem: String| -> nn::Error { Error::config(problem).into() };
-        let [positions, stitch] = state else {
-            return Err(refuse(format!(
-                "the video decoder reads two tables, video_positions and video_stitch, and {} were \
-                 given",
-                state.len()
-            )));
-        };
         let video = out
             .video
             .ok_or_else(|| refuse("a video decode writes a raster".to_owned()))?;
@@ -1177,92 +989,28 @@ impl Decoder for VideoDecoder {
             )));
         }
         let tile = tile(&self.config, &clip)?;
-        // The transformer runs over every tile at once into the tokens the stitch reads; its scratch
-        // is reserved after the tokens, inside the decode.
-        self.stitch.forward(
+        // The transformer runs over every tile at once into the tokens the stitch reads, and the
+        // stitched raster is stored into the runner's.
+        let raster = self.stitch.forward(
             f,
             &grid(&self.config, &clip)?,
             tile.rows(),
-            |tokens| {
-                let scratch = self.scratch(f, &clip)?;
-                Ok(self.decode(f, &clip, latents, *positions, tokens, &scratch)?)
-            },
-            *stitch,
-            video,
-        )
+            video.shape,
+            || Ok(VideoDecoder::decode(self, f, &clip, latents)?),
+        )?;
+        let flat = |view: TensorView| {
+            view.reshape(Shape::new(&[
+                view.shape.numel() / view.shape.last(),
+                view.shape.last(),
+            ]))
+        };
+        nn::layers::Axpby.forward(f, flat(video), flat(raster), 1.0, 0.0)
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-
-    /// A tile's sequence is its voxels in the order they arrive, then the trailing rows
-    /// (`cat((hidden, registers, zeros))`), so a voxel's token row is its own index
-    /// within the tile: the position table and the stitch read the same row. The projected voxels
-    /// therefore widen straight into the stream's leading rows, tile by tile, and only the register
-    /// rows and the zero row are placed. Scattering the voxels through the denoiser's patch rows sent
-    /// the four voxels of a `2 x 2` patch to one token and left three quarters of the sequence unwritten,
-    /// which decoded as the right scene in a mosaic.
-    #[test]
-    fn the_projected_voxels_fill_each_tiles_leading_rows() {
-        struct Launches(Vec<&'static str>);
-        impl ops::capture::Sink for Launches {
-            fn launched(&mut self, operator: &'static str, _key: &str) {
-                self.0.push(operator);
-            }
-        }
-        let config = video_config();
-        // Two tiles across and one down: the written rows repeat per tile.
-        let canvas = Canvas::clip(&config, 16, 28);
-        let tiles = 2_u64;
-        let tile = tile(&config, &canvas).expect("a tile");
-        let decoder = stated_decoder(&config, canvas);
-        let arena = nn::Arena::new(nn::DevicePtr::new(0), 1 << 40);
-        let forward = nn::Forward::recording(&arena);
-        let scratch = decoder.scratch(&forward, &canvas).expect("the scratch");
-        let latents = arena
-            .tensor(
-                STREAM,
-                Shape::new(&[tiles * tile.voxels(), u64::from(config.latent_channels)]),
-            )
-            .expect("the latents");
-        let positions = arena
-            .tensor(DType::F32, Shape::new(&[3, tile.rows()]))
-            .expect("the positions");
-        let out = arena
-            .tensor(
-                ACTIVATION,
-                Shape::new(&[tiles * tile.rows(), 3 * 4 * 16 * 16]),
-            )
-            .expect("the tokens");
-        let mut launches = Launches(Vec::new());
-        ops::capture::set_sink(Some(&mut launches));
-        let decoded = decoder.decode(&forward, &canvas, latents, positions, out, &scratch);
-        ops::capture::set_sink(None);
-        decoded.expect("a recorded clip");
-        assert_eq!(
-            launches.0[..11],
-            [
-                "channel_affine", // the restore
-                "scaled_add",     // the round down
-                "gemm",           // post_quant_conv's product
-                "gemm",           // its bias, a rounding of its own
-                "gemm",           // the input projection
-                "scaled_add",
-                "rows",
-                "rows", // the first tile's voxels, registers and zero row
-                "scaled_add",
-                "rows",
-                "rows", // the second tile's
-            ],
-        );
-        assert_eq!(
-            launches.0.iter().filter(|name| **name == "rows").count(),
-            2 * tiles as usize,
-            "nothing else is placed"
-        );
-    }
 
     /// A denoiser publishes its trajectory in FP32 and this decoder restores it in FP32. Reading the
     /// bytes in another type would reinterpret the trajectory silently, so the mismatch is refused and
@@ -1292,15 +1040,13 @@ pub(crate) mod tests {
                 ]),
             )
             .expect("a raster");
-        let positions = arena
-            .tensor(DType::F32, Shape::new(&[3, 1]))
-            .expect("a table");
+        let layout = nn::capability::Decoder::layout_of(&decoder, clip).expect("the clip's layout");
         // The capability's `decode`, not the inherent tile decoder of the same name.
         let error = nn::capability::Decoder::decode(
             &decoder,
             &forward,
+            &layout,
             latents,
-            &[positions, positions],
             nn::capability::DecodedMedia {
                 video: Some(video),
                 audio: None,
@@ -1558,42 +1304,6 @@ pub(crate) mod tests {
                 assert_eq!(table[(channel * tile.rows() + row) as usize], 0.0);
             }
         }
-        // The one table a layout declares is the one this decoder reads, and its descriptor is the
-        // extent the layout states - the adapter adds no arithmetic of its own.
-        //
-        // Two different quantities live in this one table, and three rounds were spent on this test
-        // for want of saying so. Its **rows** are a row per row of the largest tile - the tile's voxels
-        // plus the four register rows and the trailing zero row, 1,792 + 5 = 1,797 on every canvas - and
-        // one clip's rows are the whole of it, because how many clips a request has is the runner's and
-        // the splice's question, never this table's. Its **three** is the coordinate axis, which is a
-        // dimension of its own: the values are `3 · rows` in a flat buffer and `[3, rows]` as declared,
-        // so the twenty-four-radian frame row of each axis is contiguous. Neither number is a frame
-        // count and neither multiplies the other.
-        let layout = proto::video::Layout {
-            video: proto::video::LatentShape {
-                channels: config.latent_channels,
-                frames: clip.frames,
-                height: raster.height,
-                width: raster.width,
-            },
-            audio: None,
-            text_rows: 0,
-            condition_rows: 0,
-            condition_elements: 0,
-        };
-        let declared =
-            table_specs(&config, layout.video.height, layout.video.width).expect("specs");
-        assert_eq!(declared.len(), 2);
-        assert_eq!(declared[0].name, "video_positions");
-        // `[3, rows]`: the coordinate axis first, then one row per row of the largest tile.
-        assert_eq!(declared[0].shape.rank(), 2);
-        assert_eq!(declared[0].shape.dim(0), 3);
-        assert_eq!(declared[0].shape.dim(1), tile.rows());
-        assert_eq!(declared[0].dtype, DType::F32);
-        // The stitch's table: one row of three words per pixel of each axis.
-        assert_eq!(declared[1].name, "video_stitch");
-        assert_eq!(declared[1].dtype, DType::I32);
-        assert_eq!(declared[1].shape.dims(), [768 + 1344, 3]);
     }
 
     #[test]
@@ -1603,33 +1313,11 @@ pub(crate) mod tests {
         // here are the served ones - 768p at 768 x 1344 (48 x 84 latents) and 672p at 672 x 1536
         // (42 x 96) - and they are the same table, not two of the same shape by coincidence.
         let config = video_config();
-        let zeroed = |height, width| -> Vec<TableValues> {
-            table_specs(&config, height, width)
-                .expect("the tables")
-                .iter()
-                .map(|table| TableValues::zeroed(table).expect("a host table"))
-                .collect()
+        let table = |height, width| {
+            positions(&tile(&config, &Canvas::clip(&config, height, width)).expect("a tile"))
+                .expect("the positions")
         };
-        let mut vertical = zeroed(48, 84);
-        let mut wide = zeroed(42, 96);
-        table_values_into(&config, 48, 84, &mut vertical).expect("the vertical canvas");
-        table_values_into(&config, 42, 96, &mut wide).expect("the wide canvas");
-        assert_eq!(vertical[0], wide[0]);
-    }
-
-    #[test]
-    fn a_layout_with_the_wrong_number_of_tables_is_refused() {
-        // The worker sizes `out` from `table_specs`, so a count that disagrees with the block is a
-        // protocol error and must surface as one rather than as a partially written table.
-        let config = video_config();
-        let mut none: Vec<TableValues> = Vec::new();
-        assert!(table_values_into(&config, 48, 84, &mut none).is_err());
-        let mut three = vec![TableValues::I32(Vec::new()); 3];
-        assert!(table_values_into(&config, 48, 84, &mut three).is_err());
-        // A table of the right count whose extents are not the layout's is refused by its name.
-        let mut short = vec![TableValues::F32(Vec::new()), TableValues::I32(Vec::new())];
-        let error = table_values_into(&config, 48, 84, &mut short).expect_err("short tables");
-        assert!(error.to_string().contains("video_positions"), "{error}");
+        assert_eq!(table(48, 84), table(42, 96));
     }
 
     #[test]

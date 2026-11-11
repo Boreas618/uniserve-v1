@@ -41,21 +41,25 @@ impl AdaptiveAvgPool2d {
         Ok(Self { output })
     }
 
-    /// `out[b, 0, i]` from `x[b, rows, columns]`: the mean over every row and column window `i`.
+    /// `[b, 1, output]` from `x[b, rows, columns]` in `x`'s element type: element `i` of a row is
+    /// the mean over every row and column window `i`.
     ///
     /// # Errors
     ///
-    /// Views of another rank or extent, extents wider than a descriptor holds, or the operator's
-    /// refusal.
-    pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
+    /// A view of another rank, extents wider than a descriptor holds, an arena that cannot hold
+    /// the output, or the operator's refusal.
+    pub fn forward(&self, f: &Forward, x: TensorView) -> Result<TensorView> {
         const OWNER: &str = "AdaptiveAvgPool2d";
-        let expected = [x.shape.dim(0), 1, u64::from(self.output)];
-        if x.shape.rank() != 3 || out.shape.dims() != expected {
+        if x.shape.rank() != 3 {
             return Err(Error::shape(
                 OWNER,
-                format!("{:?} into {:?}", x.shape.dims(), out.shape.dims()),
+                format!("{:?} is not [batch, rows, columns]", x.shape.dims()),
             ));
         }
+        let pooled = f.empty(
+            x.dtype,
+            ops::Shape::new(&[x.shape.dim(0), 1, u64::from(self.output)]),
+        )?;
         let narrow = |value: u64| {
             u32::try_from(value)
                 .ok()
@@ -72,7 +76,8 @@ impl AdaptiveAvgPool2d {
             block: BLOCK,
             pdl: PDL,
         };
-        let out = out.reshape(ops::Shape::new(&[x.shape.dim(0), u64::from(self.output)]));
-        f.operate::<AdaptivePoolOp>(&descriptor, adaptive_pool::Args { x, out })
+        let out = pooled.reshape(ops::Shape::new(&[x.shape.dim(0), u64::from(self.output)]));
+        f.operate::<AdaptivePoolOp>(&descriptor, adaptive_pool::Args { x, out })?;
+        Ok(pooled)
     }
 }

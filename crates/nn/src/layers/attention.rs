@@ -18,7 +18,9 @@ use ops::kv::{self, Descriptor as KvDescriptor, KvWrite, KvWriteScaled};
 use ops::{DType, Shape, TensorView};
 use proto::program::PhaseKind;
 
-use crate::capability::{KvGroup, KvPlanes, KvView, TokenBatch};
+use crate::capability::{KvGroup, KvLayer, TokenBatch};
+#[cfg(any(doc, test))]
+use crate::capability::{KvPlanes, KvView};
 use crate::error::{Error, Result};
 use crate::forward::Forward;
 use crate::layers::launch::{PDL, kv_tile};
@@ -141,8 +143,8 @@ impl DenseAttention {
         }
     }
 
-    /// Attend `query [q_tokens, heads, head_dim]` to `key`/`value [kv_tokens, kv_heads, head_dim]`
-    /// into `out [q_tokens, heads, head_dim]`.
+    /// `query [q_tokens, heads, head_dim]` attended to `key`/`value [kv_tokens, kv_heads,
+    /// head_dim]`: a fresh `[q_tokens, heads, head_dim]` tensor of the query's element type.
     ///
     /// `varlen` names the packed sequences; absent, the call is **one sequence** of every query and
     /// every key, its key bound the key count, and the single-sequence program is launched rather
@@ -150,7 +152,8 @@ impl DenseAttention {
     ///
     /// # Errors
     ///
-    /// A key bound below the keys passed or above the layer's ceiling, or the operator's refusal.
+    /// A key bound below the keys passed or above the layer's ceiling, an arena that cannot hold the
+    /// output, or the operator's refusal.
     pub fn forward(
         &self,
         f: &Forward,
@@ -158,8 +161,7 @@ impl DenseAttention {
         key: TensorView,
         value: TensorView,
         varlen: Option<Varlen>,
-        out: TensorView,
-    ) -> Result<()> {
+    ) -> Result<TensorView> {
         const OWNER: &str = "DenseAttention";
         let kv_tokens = key.shape.dim(0);
         let keys = match varlen {
@@ -183,6 +185,7 @@ impl DenseAttention {
                 ),
             ));
         }
+        let out = f.empty(query.dtype, query.shape)?;
         let descriptor = self.descriptor(query.dtype, key.dtype, out.dtype, keys, varlen.is_some());
         let args = DenseArgs {
             query,
@@ -197,25 +200,7 @@ impl DenseAttention {
             longest: varlen.and_then(|varlen| varlen.max_q).map(u64::from),
         };
 
-        f.operate::<DenseOp>(&descriptor, args)
-    }
-
-    /// [`Self::forward`] into an output of the query's shape and element type, reserved from the
-    /// forward's arena.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::forward`], and an arena that cannot hold the output.
-    pub fn apply(
-        &self,
-        f: &Forward,
-        query: TensorView,
-        key: TensorView,
-        value: TensorView,
-        varlen: Option<Varlen>,
-    ) -> Result<TensorView> {
-        let out = f.arena().tensor(query.dtype, query.shape)?;
-        self.forward(f, query, key, value, varlen, out)?;
+        f.operate::<DenseOp>(&descriptor, args)?;
         Ok(out)
     }
 }
@@ -295,47 +280,31 @@ impl PagedAttention {
         f.zero(workspace, bytes.min(COUNTER_BYTES))
     }
 
-    /// Write `key` and `value` into `planes`, then attend.
+    /// Write `key` and `value` into the layer's `cache`, then attend: a fresh
+    /// `[tokens, q_heads, head_dim]` tensor of the query's element type.
     ///
-    /// The argument list is the design's: the batch, the cache, the layer's place in it, the three
-    /// projections, the output and the program's workspace.
+    /// `query` is `[tokens, q_heads, head_dim]`, `key` and `value` `[tokens, kv_heads, head_dim]`.
+    /// The page size is the cache group's, which the batch states too; the program's transient
+    /// scratch is the cache's workspace ([`KvView::workspace`]).
     ///
-    /// `query` and `out` are `[tokens, q_heads, head_dim]`, `key` and `value`
-    /// `[tokens, kv_heads, head_dim]`. The page size is the cache group's, which the batch states
-    /// too; the program's transient scratch is the cache's [`KvView::workspace`].
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the design's attention call carries the batch, the cache, the layer index and the \
-                  three projections; grouping them into a struct would name the same values twice"
-    )]
+    /// # Errors
+    ///
+    /// Projections or a cache the operators refuse, or an arena that cannot hold the output.
     pub fn forward(
         &self,
         f: &Forward,
         batch: &TokenBatch,
-        cache: &KvView<'_>,
-        group: usize,
-        layer: usize,
+        cache: KvLayer<'_>,
         query: TensorView,
         key: TensorView,
         value: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
-        // One selection for both halves: the layer's index names its planes once, and the read is
-        // handed what the write was handed.
-        let planes = cache.planes(group, layer)?;
-        let group_view = cache.group(group)?;
-        let page = self.page_of(batch, group_view)?;
-        self.write(f, batch, planes, page, key, value)?;
-        self.attend(
-            f,
-            batch,
-            group_view,
-            planes,
-            page,
-            query,
-            out,
-            cache.workspace,
-        )
+    ) -> Result<TensorView> {
+        // One selection for both halves: the read is handed the planes the write was handed.
+        let page = self.page_of(batch, cache.group)?;
+        self.write(f, batch, cache.planes, page, key, value)?;
+        let out = f.empty(query.dtype, query.shape)?;
+        self.attend(f, batch, cache, page, query, out)?;
+        Ok(out)
     }
 
     /// The tokens one page of `group` holds, which the batch's views address too.
@@ -613,30 +582,20 @@ impl PagedAttention {
         }
     }
 
-    /// Read one layer's cached keys and values and write this batch's attended output.
+    /// Read one layer's cached keys and values and write this batch's attended output into `out`.
     ///
-    /// The planes are the caller's *selection* — a layer's own, chosen once by [`Self::forward`] from
-    /// the index the model runs. They arrive as a value rather than as a cache and an index so that a
-    /// reader cannot derive a different layer's plane here: every plane of a group has its geometry,
-    /// so a reader that took the first one answers a plausible number from the wrong layer, which is
-    /// the shape of the defect this signature removes. The group travels for the page table and the
-    /// page size, which are the group's and not a layer's.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the design's attention call carries the batch, the group's geometry, the layer's \
-                  planes, the query, the output and the program's workspace"
-    )]
+    /// The planes are the layer's own selection ([`KvLayer`]); the group travels for the page table
+    /// and the page size, which are the group's and not a layer's.
     fn attend(
         &self,
         f: &Forward,
         batch: &TokenBatch,
-        group: &KvGroup<'_>,
-        planes: &KvPlanes,
+        cache: KvLayer<'_>,
         page: u32,
         query: TensorView,
         out: TensorView,
-        workspace: TensorView,
     ) -> Result<()> {
+        let (group, planes, workspace) = (cache.group, cache.planes, cache.workspace);
         // The batch's own parts are read by pointer arithmetic inside the programs, so they are
         // checked against each other once here, before any of them is addressed.
         batch.check()?;
@@ -879,24 +838,14 @@ mod tests {
         let query = tensor(DType::BF16, &[tokens, 32, 128]);
         let key = tensor(DType::BF16, &[tokens, 4, 128]);
         let value = tensor(DType::BF16, &[tokens, 4, 128]);
-        let out = tensor(DType::BF16, &[tokens, 32, 128]);
         let workspace = tensor(DType::U8, &[512 << 20]);
+        let cache = KvView {
+            groups: &groups,
+            workspace,
+            state: None,
+        };
         let (walked, launches) = crate::forward::recorded(|| {
-            attention.forward(
-                &f,
-                &batch,
-                &KvView {
-                    groups: &groups,
-                    workspace,
-                    state: None,
-                },
-                0,
-                0,
-                query,
-                key,
-                value,
-                out,
-            )
+            attention.forward(&f, &batch, cache.layer(0, 0)?, query, key, value)
         });
         walked.unwrap();
         launches
@@ -987,7 +936,7 @@ mod tests {
             max_k,
         };
         let call = |varlen: Option<Varlen>| {
-            crate::forward::recorded(|| attention.apply(&f, query, key, key, varlen))
+            crate::forward::recorded(|| attention.forward(&f, query, key, key, varlen))
         };
         let (single, one) = call(None);
         single.unwrap();

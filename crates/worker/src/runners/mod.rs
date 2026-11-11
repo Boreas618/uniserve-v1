@@ -21,7 +21,6 @@ pub mod lifecycle;
 pub mod media;
 pub(crate) mod output;
 pub mod recording;
-pub(crate) mod tables;
 
 pub use audio::AudioDecoderRunner;
 pub use causal_lm::CausalLmRunner;

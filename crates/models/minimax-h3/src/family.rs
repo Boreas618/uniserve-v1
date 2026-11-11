@@ -1,11 +1,10 @@
 //! MiniMax-H3 and FastH3 as execution loads them and request processing serves them ([`nn::family`]).
 //!
-//! [`FAMILY`] claims the `MiniMaxH3ModularPipeline` class. A checkpoint opens to its configuration
-//! (an export and the base release it pins read as one), a load places the network the deployment
-//! file's components name with the deployment's sequence and tensor splits, and the loaded
-//! pipeline states the model's own rules to execution: the `17 * n + 5` timeline, its canvases, the
-//! requests its denoiser graphs are captured for, and the description its request processing
-//! plans requests against.
+//! [`FAMILY`] claims the `MiniMaxH3ModularPipeline` class. A checkpoint opens to its [`Config`] (an
+//! export and the base release it pins read as one), a load places the stages the deployment names
+//! with the deployment's sequence and tensor splits, and the loaded [`MinimaxH3`] states the model's
+//! own rules to execution: the `17 * n + 5` timeline, its canvases, the requests its denoiser graphs
+//! are captured for, and the description its request processing admits requests against.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -13,32 +12,38 @@ use std::sync::Arc;
 
 use nn::capability::{Decoder, Encoder, ImageShape, MediaFormat, Splicer, WarmPrompt, WarmRequest};
 use nn::family::{
-    Component, ConditionBounds, Description, Family, Model, VideoCheckpoint, VideoFamily,
+    ConditionBounds, Description, Family, Model, Stage, Stages, VideoCheckpoint, VideoFamily,
     VideoModel, VideoPlacement, VideoServing,
 };
 use nn::{Checkpoint, DType, WeightLoader};
-
-use crate::config::{CANVAS_RULE, FRAMES, MIN_SECONDS, named_canvases};
-use crate::denoiser::Capacity;
-use crate::load::MinimaxH3;
-use crate::processing::ConditionPacking;
-use crate::{AUDIO_CHANNELS, AUDIO_HOP, AUDIO_SAMPLE_RATE, Config, FPS, Partition, VideoTask};
+use processing::minimax_h3::{ConditionPacking, DenoiserInfo, PreparedCondition, REFERENCE_LIMITS};
+use processing::qwen_vl::ProcessorConfig;
 use proto::video::Canvas;
-use qwen3::processor::ProcessorConfig;
+use qwen3::Qwen3VlModel;
+
+use crate::audio_vae::AudioDecoder;
+use crate::config::{
+    AUDIO_CHANNELS, AUDIO_HOP, AUDIO_SAMPLE_RATE, CANVAS_RULE, FPS, FRAMES, MIN_SECONDS,
+    RETAINED_LAYERS, named_canvases,
+};
+use crate::denoiser::Denoiser;
+use crate::output::VideoPostprocessor;
+use crate::video_vae::VideoDecoder;
+use crate::{Config, Error, Result, VideoTask};
 
 /// The MiniMax-H3 family: a diffusers modular pipeline, which request processing serves through its
-/// video processor ([`crate::processing`]).
+/// video processor ([`processing::minimax_h3::H3Family`]).
 pub const FAMILY: Family = Family {
-    request: ::processing::Family {
+    request: processing::Family {
         id: "minimax_h3",
         model_types: &[],
-        classes: &["MiniMaxH3ModularPipeline"],
-        serving: ::processing::Serving::Video(&crate::processing::H3Family),
+        classes: &[crate::checkpoint::PIPELINE_CLASS],
+        serving: processing::Serving::Video(&processing::minimax_h3::H3Family),
     },
     model: Model::Video(&MinimaxH3Family),
 };
 
-/// The family's one value, which [`FAMILY`] refers to.
+/// The family's value, which [`FAMILY`] refers to.
 struct MinimaxH3Family;
 
 impl VideoFamily for MinimaxH3Family {
@@ -51,14 +56,12 @@ impl VideoFamily for MinimaxH3Family {
                 checkpoint.roots().len()
             )));
         }
-        let config = Config::open(checkpoint)?;
-        Ok(Box::new(H3Checkpoint { config }))
+        Ok(Box::new(Config::open(checkpoint)?))
     }
 
-    /// A FastH3 adapter edits the base release's `transformer` partition, the one its student was
-    /// distilled from; it is fused there and the checkpoint then reads as that student
-    /// ([`crate::checkpoint::Contract::of_adapter`]).
-    fn adapter_component(
+    /// A FastH3 adapter edits the base release's `transformer`, the network its student was
+    /// distilled from; fused there, the checkpoint reads as that student.
+    fn adapter_stage(
         &self,
         checkpoint: &Checkpoint,
         adapter: &nn::Adapter,
@@ -74,7 +77,7 @@ impl VideoFamily for MinimaxH3Family {
             )));
         }
         // An adapter edits the base release: a FastH3 export is already a student.
-        if crate::checkpoint::Contract::read(checkpoint)?.is_some() {
+        if checkpoint.sidecar("fastvideo_inference.json")?.is_some() {
             return Err(nn::Error::Unsupported(format!(
                 "{} is a FastH3 export, and a FastH3 adapter is fused into the base release {} \
                  it was extracted from",
@@ -82,27 +85,19 @@ impl VideoFamily for MinimaxH3Family {
                 crate::checkpoint::FASTH3_BASE_MODEL,
             )));
         }
-        Ok(Some(crate::checkpoint::Dit::Base.directory()))
+        Ok(Some(Stage::Transformer.name()))
     }
 }
 
-/// A MiniMax-H3 checkpoint: the configuration read from it and its base, once.
-struct H3Checkpoint {
-    config: Config,
-}
-
-impl VideoCheckpoint for H3Checkpoint {
+impl VideoCheckpoint for Config {
     fn denoisers(&self) -> &'static [&'static str] {
         // The two networks a release holds, of which a deployment places one.
-        const NETWORKS: [&str; 2] = [
-            Component::Transformer.name(),
-            Component::TransformerRef.name(),
-        ];
+        const NETWORKS: [&str; 2] = [Stage::Transformer.name(), Stage::TransformerRef.name()];
         &NETWORKS
     }
 
     fn text_encoder(&self) -> &'static str {
-        Component::TextEncoder.name()
+        Stage::TextEncoder.name()
     }
 
     fn load(
@@ -111,124 +106,181 @@ impl VideoCheckpoint for H3Checkpoint {
         loader: &mut WeightLoader<'_>,
         placement: &VideoPlacement,
     ) -> nn::Result<Arc<dyn VideoModel>> {
-        let config = &self.config;
-        let serving = &placement.serving;
+        Ok(Arc::new(MinimaxH3::load(
+            self, checkpoint, loader, placement,
+        )?))
+    }
+}
 
-        // **The partition serves the tasks of the network the deployment places.** One partition
-        // carries one network's block set and condition capacity, so a deployment places one of
-        // the release's two networks.
+/// A loaded MiniMax-H3 pipeline: the stages this rank places, each constructed once, the
+/// configuration they were read with, the deployment's element type and the tasks its network
+/// serves.
+pub struct MinimaxH3 {
+    config: Config,
+    dtype: DType,
+    tasks: Vec<VideoTask>,
+    text_encoder: Option<Arc<Qwen3VlModel>>,
+    denoiser: Option<(Stage, Arc<Denoiser>)>,
+    splicer: Option<Arc<VideoPostprocessor>>,
+    video_decoder: Option<Arc<VideoDecoder>>,
+    audio_decoder: Option<Arc<AudioDecoder>>,
+}
+
+impl MinimaxH3 {
+    /// Load the stages `placement` places of `checkpoint`, whose configuration `config` is.
+    ///
+    /// Every weight is converted once to the deployment's element type as it is published, and the
+    /// retained key names the conversion. A stage this build cannot construct is refused by name
+    /// rather than omitted: a deployment that places one fails at load, not on the device.
+    fn load(
+        config: &Config,
+        checkpoint: &Checkpoint,
+        loader: &mut WeightLoader<'_>,
+        placement: &VideoPlacement,
+    ) -> Result<Self> {
+        let serving = &placement.serving;
+        let dtype = placement.dtype;
         let tasks = served_tasks(
             &config.tasks(),
-            placement.components.as_ref(),
+            placement.stages.as_ref(),
             checkpoint.root(),
         )?;
-
-        // **The prompt capacity is the deployment's, and the denoiser's packed prefix holds it.**
-        // A layout reserves one row per prompt token, so the text capacity the model is built with
-        // and the prompt capacities the deployment captures are one number: the largest of them,
-        // the longest prompt the deployment admits.
-        let text_capacity = *serving.text_capacities.last().ok_or_else(|| {
-            nn::Error::Unsupported(
-                "this deployment states no prompt capacity, so no layout could hold a prompt"
-                    .to_owned(),
-            )
-        })?;
-
-        // **The rank's place, its blocks and its capacity travel apart.** The partition is the
-        // split alone; the network the tasks run on, the condition encoders a conditioned task
-        // reads and the postprocessor - the clip splicer (`nn::capability::Splicer`),
-        // which holds no weights - are the placed blocks.
+        let stages = stages(config, &tasks)?;
         let sequence = placement.sequence;
-        let partition = Partition::new(
-            config,
-            sequence.split.size as usize,
-            placement.tensor.size as usize,
-            placement.tensor.rank as usize,
-            sequence.split.rank as usize,
-        )?
-        .projecting(sequence.projection);
-        let blocks = crate::partition::blocks(config, &tasks)?;
-
-        // The condition capacity is the deployment's when it states one: the rows a request's
-        // references take follow their rasters, which a task's own default cannot know. Without
-        // one it is the widest the tasks ask for.
-        let condition_rows = match serving.condition_rows {
-            Some(rows) => rows,
-            None => tasks
-                .iter()
-                .map(|task| crate::partition::condition_rows(config, *task))
-                .collect::<crate::Result<Vec<u32>>>()?
-                .into_iter()
-                .max()
-                .unwrap_or(0),
-        };
-        let capacity = Capacity {
-            text_rows: text_capacity,
-            condition_rows,
-        };
-
-        let canvases = deployment_canvases(&serving.sizes)?
-            .into_iter()
-            .map(|(_, canvas)| (canvas.width, canvas.height))
-            .collect::<Vec<_>>();
-        let model = crate::load(
-            config,
-            checkpoint,
-            partition,
-            blocks,
-            capacity,
-            Some(placement.dtype),
-            &canvases,
-            loader,
-        )?;
-
-        // **One number, checked where both halves meet.** A model built for fewer text rows than
-        // the deployment's longest prompt would refuse every longer prompt at the packed prefix,
-        // minutes into a load and in a component that never saw the deployment's number.
-        if let Some(denoiser) = model.transformer().or(model.transformer_ref()) {
-            let held = denoiser.rules().capacity().text_rows;
-            if serving
-                .text_capacities
-                .iter()
-                .any(|capacity| *capacity > held)
-            {
-                return Err(nn::Error::Unsupported(format!(
-                    "this deployment prepares prompts of up to {text_capacity} tokens and the \
-                     denoiser's layout holds {held} text rows: the prompt capacity is one number, \
-                     stated by the deployment and held by the packing"
+        // The Ulysses degree splits the attention heads between the ranks of the exchange.
+        for (dit, denoiser) in &config.denoisers {
+            let heads = denoiser.transformer.num_attention_heads;
+            if sequence.split.size == 0 || !heads.is_multiple_of(sequence.split.size) {
+                return Err(Error::config(format!(
+                    "the sequence degree {} does not divide the {heads} attention heads of {}",
+                    sequence.split.size,
+                    dit.name()
                 )));
             }
         }
 
-        Ok(Arc::new(H3Pipeline {
-            model,
+        // The prompt capacity is the deployment's longest prompt, which the denoiser's packed prefix
+        // holds; the condition capacity is the deployment's when it states one, and otherwise the
+        // widest its tasks ask for.
+        let text_rows = *serving.text_capacities.last().ok_or_else(|| {
+            Error::config(
+                "this deployment states no prompt capacity, so no layout could hold a prompt"
+                    .to_owned(),
+            )
+        })?;
+        let condition_rows = match serving.condition_rows {
+            Some(rows) => rows,
+            None => tasks
+                .iter()
+                .map(|task| condition_rows(config, *task))
+                .collect::<Result<Vec<u32>>>()?
+                .into_iter()
+                .max()
+                .unwrap_or(0),
+        };
+
+        let mut model = Self {
             config: config.clone(),
-            dtype: placement.dtype,
-            tasks,
-        }))
+            dtype,
+            tasks: tasks.clone(),
+            text_encoder: None,
+            denoiser: None,
+            splicer: None,
+            video_decoder: None,
+            audio_decoder: None,
+        };
+        if stages.contains(Stage::TextEncoder) {
+            let processor = config.processor.ok_or_else(|| {
+                Error::checkpoint(
+                    "the checkpoint states no processor/video_preprocessor_config.json, so the \
+                     text encoder's vision tower cannot size an image"
+                        .to_owned(),
+                )
+            })?;
+            model.text_encoder = Some(Arc::new(Qwen3VlModel::load(
+                &mut loader.reborrow(checkpoint.stage("text_encoder")?)?,
+                &config.text_encoder,
+                (processor, config.pixels),
+                placement.tensor,
+                dtype,
+                RETAINED_LAYERS,
+                false,
+            )?));
+        }
+        for dit in crate::checkpoint::DITS {
+            if !stages.contains(dit) {
+                continue;
+            }
+            let denoiser = config.denoisers.get(&dit).ok_or_else(|| {
+                Error::checkpoint(format!("the checkpoint holds no {} DiT", dit.name()))
+            })?;
+            // The two condition encoders are the denoiser's conditioning half.
+            let encoders = if stages.contains(Stage::LatentEncoder) {
+                Some(crate::denoiser::load_encoders(config, checkpoint, loader)?)
+            } else {
+                None
+            };
+            let source = checkpoint.stage(dit.name())?;
+            let mut shards = loader.reborrow(source)?;
+            // A parallel-decoding student stacks one head per fine interval; the loading boundary
+            // fuses them into one head per evaluation block.
+            let heads = if denoiser.transformer.output_heads > 1 {
+                let schedule = crate::schedule::Schedule::new(&denoiser.schedule)?;
+                Some(crate::transformer::fuse_heads(
+                    source,
+                    &schedule,
+                    &denoiser.transformer,
+                    &mut shards,
+                )?)
+            } else {
+                None
+            };
+            let network = Denoiser::load(
+                &mut shards,
+                denoiser.clone(),
+                (text_rows, condition_rows),
+                sequence,
+                encoders,
+                heads,
+            )?;
+            model.denoiser = Some((dit, Arc::new(network)));
+        }
+        if stages.contains(Stage::VideoPostprocessor) {
+            model.splicer = Some(Arc::new(VideoPostprocessor::new(
+                crate::video_vae::ACTIVATION,
+                crate::video_vae::clips(&config.video_vae),
+            )?));
+        }
+        if stages.contains(Stage::AudioDecoder) {
+            model.audio_decoder = Some(Arc::new(AudioDecoder::load(
+                &config.audio_vae,
+                &mut loader.reborrow(checkpoint.stage("audio_vae")?)?,
+            )?));
+        }
+        if stages.contains(Stage::VideoDecoder) {
+            let canvases: Vec<(u32, u32)> = deployment_canvases(&serving.sizes)?
+                .into_iter()
+                .map(|(_, canvas)| (canvas.width, canvas.height))
+                .collect();
+            model.video_decoder = Some(Arc::new(VideoDecoder::load(
+                &config.video_vae,
+                &canvases,
+                &mut loader.reborrow(checkpoint.stage("vae")?)?,
+            )?));
+        }
+        Ok(model)
     }
-}
 
-/// A loaded MiniMax-H3 pipeline: the components this rank places, the configuration they were
-/// read with, the deployment's element type and the tasks its network serves.
-struct H3Pipeline {
-    model: MinimaxH3,
-    config: Config,
-    dtype: DType,
-    tasks: Vec<VideoTask>,
-}
-
-impl H3Pipeline {
     /// The placed denoiser network.
-    fn network(&self) -> Option<&Arc<crate::denoiser::Denoiser>> {
-        self.model.transformer().or(self.model.transformer_ref())
+    fn network(&self) -> Option<&Arc<Denoiser>> {
+        self.denoiser.as_ref().map(|(_, network)| network)
     }
 }
 
-impl VideoModel for H3Pipeline {
+impl VideoModel for MinimaxH3 {
     fn text_encoder(&self) -> Option<Arc<dyn Encoder + Send + Sync>> {
-        self.model
-            .text_encoder()
+        self.text_encoder
+            .as_ref()
             .map(|encoder| Arc::clone(encoder) as Arc<dyn Encoder + Send + Sync>)
     }
 
@@ -241,11 +293,10 @@ impl VideoModel for H3Pipeline {
             .map(|denoiser| Arc::clone(denoiser) as Arc<dyn nn::Denoiser + Send + Sync>)
     }
 
-    fn denoiser_component(&self) -> &'static str {
-        if self.model.transformer_ref().is_some() {
-            Component::TransformerRef.name()
-        } else {
-            Component::Transformer.name()
+    fn denoiser_stage(&self) -> &'static str {
+        match self.denoiser {
+            Some((Stage::TransformerRef, _)) => Stage::TransformerRef.name(),
+            _ => Stage::Transformer.name(),
         }
     }
 
@@ -254,26 +305,26 @@ impl VideoModel for H3Pipeline {
     }
 
     fn video_decoder(&self) -> Option<Arc<dyn Decoder + Send + Sync>> {
-        self.model
-            .video_decoder()
+        self.video_decoder
+            .as_ref()
             .map(|decoder| Arc::clone(decoder) as Arc<dyn Decoder + Send + Sync>)
     }
 
     fn splicer(&self) -> Option<Arc<dyn Splicer + Send + Sync>> {
-        self.model
-            .video_postprocessor()
+        self.splicer
+            .as_ref()
             .map(|splicer| Arc::clone(splicer) as Arc<dyn Splicer + Send + Sync>)
     }
 
     fn audio_decoder(&self) -> Option<Arc<dyn Decoder + Send + Sync>> {
-        self.model
-            .audio_decoder()
+        self.audio_decoder
+            .as_ref()
             .map(|decoder| Arc::clone(decoder) as Arc<dyn Decoder + Send + Sync>)
     }
 
     fn audio_rate(&self) -> u32 {
-        self.model
-            .audio_decoder()
+        self.audio_decoder
+            .as_ref()
             .map_or(AUDIO_SAMPLE_RATE, |decoder| decoder.sampling_rate())
     }
 
@@ -283,17 +334,17 @@ impl VideoModel for H3Pipeline {
 
     fn decode_window(&self) -> u32 {
         // One decode call decodes the decoder's window of latent frames, each covering the VAE's
-        // temporal compression of output frames; a longer timeline is spliced from its units.
+        // temporal compression of output frames.
         crate::video_vae::clips(&self.config.video_vae).window()
             * self.config.video_vae.temporal_compression()
     }
 
     fn format(&self) -> nn::Result<MediaFormat> {
-        Ok(crate::encoding::media_format(&self.config, self.dtype))
+        Ok(crate::encoding::media_format(&self.config, self.dtype)?)
     }
 
     fn timeline(&self, seconds: f64) -> nn::Result<u32> {
-        timeline(seconds)
+        Ok(timeline(seconds)?)
     }
 
     fn video_units(&self, frames: u32) -> nn::Result<Vec<u32>> {
@@ -311,14 +362,16 @@ impl VideoModel for H3Pipeline {
         let rows = self
             .network()
             .filter(|denoiser| denoiser.places_encoders())
-            .map_or(0, |denoiser| denoiser.rules().capacity().condition_rows);
-
+            .map_or(0, |denoiser| denoiser.rules().condition_capacity());
         // A condition row is one latent patch, a cell of the canvas grid square, of one latent
         // frame, which covers up to a clip's frames over its latent frames, rounded up; a track's
         // latent frame is two rows.
         let frames = FRAMES.clip_frames.div_ceil(FRAMES.clip_latent_frames);
         let cell = CANVAS_RULE.multiple;
-        let merge = self.config.text_encoder.vision.spatial_merge_size;
+        let merge = self
+            .config
+            .vision()
+            .map_or(1, |vision| vision.spatial_merge_size);
         ConditionBounds {
             rows,
             pixels: rows.saturating_mul(cell * cell * frames),
@@ -329,73 +382,148 @@ impl VideoModel for H3Pipeline {
 
     fn candidates(&self, serving: &VideoServing) -> nn::Result<Vec<WarmRequest>> {
         let denoiser = self.network().ok_or_else(|| {
-            nn::Error::Unsupported(
-                "the checkpoint holds no transformer, so no denoising step could run".to_owned(),
-            )
+            Error::config("this rank places no denoiser, so no denoising step could run".to_owned())
         })?;
-        let ladder = denoiser.rules().condition_ladder();
-        candidates(
+        Ok(candidates(
             &self.tasks,
             serving,
-            &ladder,
+            &denoiser.rules().condition_ladder(),
             &condition_packing(denoiser)?,
             self.config.processor.as_ref(),
-        )
+        )?)
     }
 
     fn warm_prompts(&self, serving: &VideoServing) -> nn::Result<Vec<WarmPrompt>> {
-        warm_prompts(&self.tasks, serving, self.config.processor.as_ref())
+        Ok(warm_prompts(
+            &self.tasks,
+            serving,
+            self.config.processor.as_ref(),
+        )?)
     }
 
     fn description(&self, serving: &VideoServing) -> nn::Result<Description> {
-        describe(self, serving)
+        Ok(describe(self, serving)?)
     }
 }
 
-/// The tasks a deployment serves: those the checkpoint states, on the network the deployment
-/// places.
+/// The stages a deployment serving `tasks` places over a checkpoint of `config`.
 ///
-/// A release holds two networks, `transformer` and `transformer_ref`, and a deployment runs one:
-/// its components say which. A deployment that places the whole pipeline states no such choice,
-/// so it serves what the checkpoint states when that is one network's.
+/// A rank places **one** DiT partition, so the tasks must share one: `t2va` and `fl2va` run the
+/// base `transformer`, `ref2va` the `transformer_ref`. The decoders and the splicer are placed for
+/// every task, because every task returns video and audio; the condition encoders for the tasks
+/// that carry conditions.
+fn stages(config: &Config, tasks: &[VideoTask]) -> Result<Stages> {
+    if tasks.is_empty() {
+        return Err(Error::config(
+            "a deployment serves at least one task".to_owned(),
+        ));
+    }
+    let stated = config.tasks();
+    let mut stages = Stages::of([
+        Stage::TextEncoder,
+        Stage::VideoDecoder,
+        Stage::AudioDecoder,
+        Stage::VideoPostprocessor,
+    ]);
+    for task in tasks {
+        if !stated.contains(task) {
+            return Err(Error::config(format!(
+                "this checkpoint states {stated:?} and not {task:?}"
+            )));
+        }
+        stages = stages.with(crate::checkpoint::dit(*task));
+        if task.conditioned() {
+            stages = stages.with(Stage::LatentEncoder);
+        }
+    }
+    if stages.contains(Stage::Transformer) && stages.contains(Stage::TransformerRef) {
+        return Err(Error::config(
+            "a rank cannot hold both the base and the reference denoiser: they are one stage"
+                .to_owned(),
+        ));
+    }
+    Ok(stages)
+}
+
+/// The condition rows a deployment reserves to serve `task` at the largest canvas the checkpoint
+/// generates, in whole capacity units: the keyframes the task anchors, or a reference clip and
+/// its soundtrack, counted row for row by the packing ([`crate::packing::condition_rows`]). A task with
+/// no conditions still reserves one unit, which the packing's text region is placed against.
+fn condition_rows(config: &Config, task: VideoTask) -> Result<u32> {
+    let dit = crate::checkpoint::dit(task);
+    let denoiser = config
+        .denoisers
+        .get(&dit)
+        .ok_or_else(|| Error::config(format!("the checkpoint holds no {} DiT", dit.name())))?;
+    let mut rows = 0;
+    for (_, canvas) in named_canvases()? {
+        let keyframe = |role| nn::ConditionShape {
+            role,
+            frames: 1,
+            height: canvas.height,
+            width: canvas.width,
+            audio_samples: 0,
+        };
+        let conditions = match task {
+            VideoTask::TextToVideoAudio => Vec::new(),
+            VideoTask::FirstLastToVideoAudio => vec![
+                keyframe(nn::ConditionRole::FirstFrame),
+                keyframe(nn::ConditionRole::LastFrame),
+            ],
+            // A reference with a soundtrack is one clip of the frame rule's frames and a track as
+            // long as the clip.
+            VideoTask::ReferenceToVideoAudio => vec![nn::ConditionShape {
+                role: nn::ConditionRole::Reference,
+                frames: FRAMES.clip_frames,
+                height: canvas.height,
+                width: canvas.width,
+                audio_samples: FRAMES.clip_frames * AUDIO_SAMPLE_RATE / FPS,
+            }],
+        };
+        let segments = crate::packing::condition_segments(&conditions, &canvas)?;
+        let rows_packing =
+            crate::packing::condition_packing(crate::config::AttentionKind::Dense, 0)?;
+        rows = rows.max(crate::packing::condition_rows(&segments, &rows_packing));
+    }
+    let unit: u32 = denoiser.attention.capacity_rows();
+    Ok(rows.max(1).div_ceil(unit) * unit)
+}
+
+/// The tasks a deployment serves: those the checkpoint states, on the network the deployment
+/// places. A deployment that places the whole pipeline serves what the checkpoint states when that
+/// is one network's.
 fn served_tasks(
     stated: &[VideoTask],
-    components: Option<&BTreeSet<String>>,
+    stages: Option<&BTreeSet<String>>,
     checkpoint: &Path,
-) -> nn::Result<Vec<VideoTask>> {
-    let refuse = |problem: String| nn::Error::Unsupported(problem);
+) -> Result<Vec<VideoTask>> {
     if stated.is_empty() {
-        return Err(refuse(format!(
+        return Err(Error::config(format!(
             "the checkpoint {} states no task, so no denoiser partition can be sized for one",
             checkpoint.display()
         )));
     }
-
-    let reference = |task: &VideoTask| *task == VideoTask::ReferenceToVideoAudio;
-    let Some(components) = components else {
-        if stated.iter().all(reference) || !stated.iter().any(reference) {
+    let Some(stages) = stages else {
+        let first = crate::checkpoint::dit(stated[0]);
+        if stated
+            .iter()
+            .all(|task| crate::checkpoint::dit(*task) == first)
+        {
             return Ok(stated.to_vec());
         }
-        return Err(refuse(format!(
+        return Err(Error::config(format!(
             "the checkpoint {} holds two networks and this deployment places the whole model: a \
              deployment file that places one of them chooses it",
             checkpoint.display()
         )));
     };
-
     let served: Vec<VideoTask> = stated
         .iter()
         .copied()
-        .filter(|task| {
-            components.contains(if reference(task) {
-                Component::TransformerRef.name()
-            } else {
-                Component::Transformer.name()
-            })
-        })
+        .filter(|task| stages.contains(crate::checkpoint::dit(*task).name()))
         .collect();
     if served.is_empty() {
-        return Err(refuse(format!(
+        return Err(Error::config(format!(
             "the checkpoint {} states {stated:?} and the deployment places no network of them",
             checkpoint.display()
         )));
@@ -403,13 +531,11 @@ fn served_tasks(
     Ok(served)
 }
 
-/// The frames of the least timeline of the frame rule that lasts at least `seconds`: the duration's
-/// frames as the request rules count them ([`processing::requested_frames`]), aligned up to the
-/// frame rule ([`FRAMES`]), so 4 s is 96 frames and aligns to 107, 15 s is 360 and aligns to 362.
-fn timeline(seconds: f64) -> nn::Result<u32> {
+/// The frames of the least timeline of the frame rule that lasts at least `seconds`.
+fn timeline(seconds: f64) -> Result<u32> {
     let frames = processing::requested_frames(seconds, FPS);
     if !seconds.is_finite() || frames == 0 || frames > u32::MAX - FRAMES.clip_frames {
-        return Err(nn::Error::Unsupported(format!(
+        return Err(Error::config(format!(
             "{seconds} seconds is not a positive number of frames at {FPS} frames per second"
         )));
     }
@@ -418,12 +544,9 @@ fn timeline(seconds: f64) -> nn::Result<u32> {
 
 /// The canvases of the sizes a deployment serves, each with the aspect ratio that names it, in the
 /// deployment's order.
-///
-/// **One decoder serves the whole set**: the constants a decode reads are a tile's or a width's,
-/// the same for every canvas, so a size of the set is a lookup and costs no device storage.
-fn deployment_canvases(sizes: &[(u32, u32)]) -> nn::Result<Vec<((u32, u32), Canvas)>> {
+fn deployment_canvases(sizes: &[(u32, u32)]) -> Result<Vec<((u32, u32), Canvas)>> {
     if sizes.is_empty() {
-        return Err(nn::Error::Unsupported(
+        return Err(Error::config(
             "this deployment serves no size, so no raster could be decoded".to_owned(),
         ));
     }
@@ -436,7 +559,7 @@ fn deployment_canvases(sizes: &[(u32, u32)]) -> nn::Result<Vec<((u32, u32), Canv
                 .find(|(_, canvas)| canvas.width == width && canvas.height == height)
                 .copied()
                 .ok_or_else(|| {
-                    nn::Error::Unsupported(format!(
+                    Error::config(format!(
                         "this deployment serves {width}x{height}, which the checkpoint does not \
                          generate: it generates {}",
                         generated
@@ -450,61 +573,44 @@ fn deployment_canvases(sizes: &[(u32, u32)]) -> nn::Result<Vec<((u32, u32), Canv
         .collect()
 }
 
-/// The condition counts a task's warm graph is captured with.
-///
-/// A graph is captured for a layout, and a layout's capacities are the deployment's: what a request
-/// fills of them reaches the graph through its state tables. So a warm request needs no condition
-/// of its own, and `ref2va`'s references state none; `fl2va` anchors a first and a last frame.
-fn task_conditions(task: VideoTask) -> (u32, u32, u32) {
+/// The keyframes a task's warm graph is captured with, `(first, last)`: `fl2va` anchors both,
+/// every other task none (a `ref2va` reference's raster follows the client's media).
+fn task_keyframes(task: VideoTask) -> (u32, u32) {
     match task {
-        VideoTask::TextToVideoAudio | VideoTask::ReferenceToVideoAudio => (0, 0, 0),
-        VideoTask::FirstLastToVideoAudio => (1, 1, 0),
+        VideoTask::FirstLastToVideoAudio => (1, 1),
+        VideoTask::TextToVideoAudio | VideoTask::ReferenceToVideoAudio => (0, 0),
     }
 }
 
-/// The warm requests a deployment binds its denoiser with.
-///
-/// **One per (task, size, timeline, prompt capacity, condition rung) the deployment serves.** A
-/// denoiser bucket is a layout, and a layout counts the prompt's rows, the request's frames and its
-/// conditions; the runner keeps one candidate per distinct layout. The tasks are the checkpoint's,
-/// on the placed network; the timelines are every legal one from the shortest output to the
-/// deployment's longest.
-///
-/// A conditioned candidate also states the condition sets a request of its layout may open with
-/// ([`WarmRequest::openings`]): an `fl2va` layout those of [`keyframe_openings`] its rung serves.
-/// A `ref2va` reference's raster follows the client's media, so a `ref2va` layout states none.
+/// The warm requests a deployment captures its denoiser with: one per (task, size, timeline,
+/// prompt capacity, condition rung) the deployment serves. A conditioned `fl2va` candidate also
+/// states the keyframe sets a request of its layout may open with ([`keyframe_openings`]).
 fn candidates(
     tasks: &[VideoTask],
     serving: &VideoServing,
     ladder: &[u32],
     packing: &ConditionPacking,
     processor: Option<&ProcessorConfig>,
-) -> nn::Result<Vec<WarmRequest>> {
+) -> Result<Vec<WarmRequest>> {
     let longest = timeline(serving.max_seconds)?;
     let shortest = timeline(MIN_SECONDS)?;
     let timelines: Vec<u32> = (shortest..=longest)
         .step_by(FRAMES.clip_frames as usize)
         .collect();
-
     let mut candidates = Vec::new();
     for (_, canvas) in deployment_canvases(&serving.sizes)? {
         for task in tasks.iter().copied() {
-            let (first_frames, last_frames, references) = task_conditions(task);
-
-            // A layout's condition rows are real rows of every step, so a conditioned task
-            // captures one graph per rung of the ladder and a request rides the smallest that
-            // holds it. A task with no conditions holds none.
-            let rungs: Vec<Option<u32>> = if task == VideoTask::TextToVideoAudio {
-                vec![None]
-            } else {
+            let (first_frames, last_frames) = task_keyframes(task);
+            let rungs: Vec<Option<u32>> = if task.conditioned() {
                 ladder.iter().copied().map(Some).collect()
+            } else {
+                vec![None]
             };
             let openings = if task == VideoTask::FirstLastToVideoAudio {
                 keyframe_openings(&canvas, ladder, packing, processor)?
             } else {
                 Vec::new()
             };
-
             for frames in timelines.iter().copied() {
                 for capacity in &serving.text_capacities {
                     for rung in rungs.iter().copied() {
@@ -515,7 +621,10 @@ fn candidates(
                             fps: FPS,
                             first_frames,
                             last_frames,
-                            references,
+                            // A layout's capacities are the deployment's: a `ref2va` reference's
+                            // raster follows the client's media, so its warm request states none
+                            // and rides its rung's condition rows.
+                            references: 0,
                             text_tokens: *capacity,
                             conditions: Vec::new(),
                             vision_spans: Vec::new(),
@@ -535,136 +644,112 @@ fn candidates(
 }
 
 /// The keyframe sets an `fl2va` request of `canvas` may present, each with the rung of `ladder`
-/// that serves it.
-///
-/// A request anchors its first frame, its last, or both (`task_conditions`). Each keyframe is
-/// planned by the request processing's own keyframe plan, which fits it to the canvas whatever
-/// image the client sent, so its shape is the canvas's; a set rides the smallest rung that holds
-/// the rows the processing packs it into under the deployment's `packing`, and a set no rung holds
-/// is one the processing refuses.
+/// that serves it: every non-empty subset of the anchors, each keyframe fitted to the canvas by
+/// request processing's own rule, on the smallest rung holding the rows it packs into.
 fn keyframe_openings(
     canvas: &Canvas,
     ladder: &[u32],
     packing: &ConditionPacking,
     processor: Option<&ProcessorConfig>,
-) -> nn::Result<Vec<(u32, Vec<nn::ConditionShape>)>> {
-    use crate::processing::plan::plan_keyframe;
-
+) -> Result<Vec<(u32, Vec<nn::ConditionShape>)>> {
     let processor = processor.ok_or_else(|| {
-        nn::Error::Unsupported(
+        Error::checkpoint(
             "the deployment serves fl2va and the checkpoint states no \
-             processor/video_preprocessor_config.json, so a keyframe cannot be planned"
+             processor/video_preprocessor_config.json, so a keyframe cannot be prepared"
                 .to_owned(),
         )
     })?;
-    let size = *canvas;
-    // An image of the canvas's own size: the keyframe plan fits every image onto the canvas, so
-    // the image's size reaches only the media reader's crop and not the condition's shape.
+    // An image of the canvas's own size: the preparation fits every image onto the canvas.
     let image = processing::ImageMetadata {
         width: canvas.width,
         height: canvas.height,
     };
-    let (first_frames, last_frames, _) = task_conditions(VideoTask::FirstLastToVideoAudio);
-    let anchors: Vec<i64> = std::iter::repeat_n(0, first_frames as usize)
-        .chain(std::iter::repeat_n(-1, last_frames as usize))
-        .collect();
-
+    let anchors = [
+        proto::video::ConditionRole::FirstFrame,
+        proto::video::ConditionRole::LastFrame,
+    ];
     let mut openings = Vec::new();
-    // Every non-empty subset of the anchors, in anchor order.
     for mask in 1_u32..(1 << anchors.len()) {
-        let mut plans = Vec::new();
-        for (index, frame_index) in anchors
+        let roles: Vec<_> = anchors
             .iter()
             .enumerate()
             .filter(|(bit, _)| mask & (1 << bit) != 0)
-            .map(|(_, frame_index)| *frame_index)
+            .map(|(_, role)| *role)
+            .collect();
+        let prepared = roles
+            .iter()
             .enumerate()
-        {
-            let spec = processing::Reference {
-                kind: processing::ReferenceKind::Image,
-                frame_index: Some(frame_index),
-                start_time_seconds: None,
-            };
-            let plan = plan_keyframe(
-                index,
-                &spec,
-                &image,
-                size,
-                index,
-                VideoTask::FirstLastToVideoAudio,
-                processor,
-            )
+            .map(|(order, role)| {
+                PreparedCondition::keyframe(order, *role, &image, *canvas, order, true, processor)
+            })
+            .collect::<std::result::Result<Vec<_>, String>>()
             .map_err(|error| {
-                nn::Error::Unsupported(format!(
+                Error::config(format!(
                     "a keyframe of the {}x{} canvas: {error}",
                     canvas.width, canvas.height
                 ))
             })?;
-            plans.push(plan);
-        }
-        let rows =
-            crate::processing::plan::condition_rows(&plans, size, packing).map_err(|error| {
-                nn::Error::Unsupported(format!(
-                    "the keyframes of the {}x{} canvas: {error}",
-                    canvas.width, canvas.height
-                ))
-            })?;
+        let rows = processing::minimax_h3::condition_rows(&prepared, *canvas, packing);
         let Some(rung) = ladder.iter().copied().find(|rung| *rung >= rows) else {
             continue;
         };
-        openings.push((rung, plans.iter().map(|plan| plan.shape(size)).collect()));
+        let shapes = roles
+            .iter()
+            .map(|role| nn::ConditionShape {
+                role: match role {
+                    proto::video::ConditionRole::FirstFrame => nn::ConditionRole::FirstFrame,
+                    proto::video::ConditionRole::LastFrame => nn::ConditionRole::LastFrame,
+                    proto::video::ConditionRole::Reference => nn::ConditionRole::Reference,
+                },
+                frames: 1,
+                height: canvas.height,
+                width: canvas.width,
+                audio_samples: 0,
+            })
+            .collect();
+        openings.push((rung, shapes));
     }
     Ok(openings)
 }
 
-/// How the placed denoiser packs a request's conditions, as the request processing sizes them:
-/// its tiles under sparse attention, row for row under dense attention, and the rows it holds when
+/// How the placed denoiser packs a request's conditions, as request processing sizes them: its
+/// tiles under sparse attention, row for row under dense attention, and the rows it holds when
 /// this rank places the condition encoders.
-fn condition_packing(denoiser: &crate::denoiser::Denoiser) -> nn::Result<ConditionPacking> {
-    let tiling = crate::packing::Tiling::of(denoiser.config().attention)?;
-    Ok(ConditionPacking {
-        capacity: if denoiser.places_encoders() {
-            denoiser.rules().capacity().condition_rows
-        } else {
-            0
-        },
-        tile_rows: tiling.rows,
-        video_tile: [tiling.shape.0, tiling.shape.1, tiling.shape.2],
-    })
+fn condition_packing(denoiser: &Denoiser) -> Result<ConditionPacking> {
+    let capacity = if denoiser.places_encoders() {
+        denoiser.rules().condition_capacity()
+    } else {
+        0
+    };
+    crate::packing::condition_packing(denoiser.config().attention, capacity)
 }
 
-/// The prompts with vision blocks a deployment admits whose grids the deployment fixes.
-///
-/// An `fl2va` keyframe is fitted to the generated canvas and enters the conditioner at the canvas's
-/// own size, which the processor resizes to its grid ([`ProcessorConfig::image_grid`], as the
-/// request processing's keyframe plan calls it), so a request of each served canvas presents one
-/// such grid per keyframe: one keyframe, or every anchor the task takes. A `t2va` prompt presents
-/// no vision block, and a `ref2va` reference presents a grid that follows the client's media rather
-/// than anything the deployment serves, so neither states a prompt here.
+/// The prompts with vision blocks a deployment admits whose grids it fixes: per served canvas, an
+/// `fl2va` prompt of each keyframe count, each keyframe at the processor's grid of the canvas. A
+/// `t2va` prompt presents none, and a `ref2va` reference's grid follows the client's media.
 fn warm_prompts(
     tasks: &[VideoTask],
     serving: &VideoServing,
     processor: Option<&ProcessorConfig>,
-) -> nn::Result<Vec<WarmPrompt>> {
+) -> Result<Vec<WarmPrompt>> {
     if !tasks.contains(&VideoTask::FirstLastToVideoAudio) {
         return Ok(Vec::new());
     }
     let processor = processor.ok_or_else(|| {
-        nn::Error::Unsupported(
+        Error::checkpoint(
             "the deployment serves fl2va and the checkpoint states no \
              processor/video_preprocessor_config.json, so the vision grid a keyframe presents \
              cannot be sized"
                 .to_owned(),
         )
     })?;
-
-    let (first_frames, last_frames, _) = task_conditions(VideoTask::FirstLastToVideoAudio);
+    let (first_frames, last_frames) = task_keyframes(VideoTask::FirstLastToVideoAudio);
     let mut prompts: Vec<WarmPrompt> = Vec::new();
     for (_, canvas) in deployment_canvases(&serving.sizes)? {
         let grid = processor
             .image_grid(canvas.height, canvas.width)
             .map_err(|error| {
-                nn::Error::Unsupported(format!(
+                Error::config(format!(
                     "a keyframe of the {}x{} canvas: {error}",
                     canvas.width, canvas.height
                 ))
@@ -687,74 +772,50 @@ fn warm_prompts(
     Ok(prompts)
 }
 
-/// What the placed denoiser serves under `serving`, as the request processing plans requests
-/// against it.
-///
-/// The tasks are the checkpoint's on the placed network, which a distilled student narrows from
-/// what its network could run; the schedule and the shifts are its too. The frame rule is the clip
-/// rule, the rates are the model's output clock, and the canvases are the deployment's sizes.
-fn describe(pipeline: &H3Pipeline, serving: &VideoServing) -> nn::Result<Description> {
-    use crate::processing::{DenoiserInfo, ReferenceLimits, ServedCanvas};
-
+/// What the placed denoiser serves under `serving`, as request processing admits requests against
+/// it: the tasks of the placed network, its fixed schedule and shifts, the deployment's canvases,
+/// the reference limits and the condition packing.
+fn describe(pipeline: &MinimaxH3, serving: &VideoServing) -> Result<Description> {
     let denoiser = pipeline.network().ok_or_else(|| {
-        nn::Error::Unsupported(
-            "this media rank places no denoiser, so it serves no task".to_owned(),
-        )
+        Error::config("this media rank places no denoiser, so it serves no task".to_owned())
     })?;
-
     let tasks: Vec<VideoTask> = VideoTask::ALL
         .into_iter()
         .filter(|task| pipeline.tasks.contains(task))
         .collect();
-
     let steps = denoiser.schedule().num_steps()?;
     let shifts = &denoiser.config().schedule.shifts;
-
-    let condition_packing = condition_packing(denoiser)?;
-
     let report = DenoiserInfo {
         tasks: tasks.iter().map(|task| task.as_str().to_owned()).collect(),
         schedule_points: steps + 1,
         video_shift: f64::from(shifts.video),
         audio_shift: f64::from(shifts.audio),
-        frame_rate: FPS,
-        audio_sample_rate: AUDIO_SAMPLE_RATE,
-        audio_hop: AUDIO_HOP,
-        frames: FRAMES,
-        canvas_rule: CANVAS_RULE,
         canvases: deployment_canvases(&serving.sizes)?
             .into_iter()
-            .map(|((width, height), canvas)| ServedCanvas {
-                // Every canvas is generated at the rule's resolution class.
-                short_edge: CANVAS_RULE.short_edge,
-                aspect_ratio: format!("{width}:{height}"),
-                canvas,
-            })
+            .map(
+                |((width, height), canvas)| processing::minimax_h3::ServedCanvas {
+                    short_edge: CANVAS_RULE.short_edge,
+                    aspect_ratio: format!("{width}:{height}"),
+                    canvas,
+                },
+            )
             .collect(),
         references: if tasks.contains(&VideoTask::ReferenceToVideoAudio) {
-            // The counts the checkpoint documents for a reference request.
-            ReferenceLimits {
-                images: 9,
-                videos: 3,
-                audios: 3,
-                total: 12,
-                image_short_edge: 2048,
-            }
+            REFERENCE_LIMITS
         } else {
-            ReferenceLimits::default()
+            processing::minimax_h3::ReferenceLimits::default()
         },
-        condition_packing,
+        condition_packing: condition_packing(denoiser)?,
     };
-    report.validate().map_err(|reason| {
-        nn::Error::Unsupported(format!("the denoiser's description: {reason}"))
-    })?;
-
+    report
+        .validate()
+        .map_err(|reason| Error::config(format!("the denoiser's description: {reason}")))?;
     Ok(Description {
         takes_conditions: tasks.iter().any(|task| task.conditioned()),
         denoise_steps: steps,
-        details: report.encode().map_err(|error| {
-            nn::Error::Unsupported(format!("encoding the description: {error}"))
-        })?,
+        details: report
+            .encode()
+            .map_err(|error| Error::config(format!("encoding the description: {error}")))?,
     })
 }
 

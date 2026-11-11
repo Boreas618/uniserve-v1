@@ -590,6 +590,16 @@ pub struct Gains {
     pub key: TensorView,
 }
 
+/// The cosine and sine tables a batch's tokens turn by: `[tokens, columns]` each, of one element
+/// type (FP32 when [`Rotary::factors`] computes them).
+#[derive(Clone, Copy, Debug)]
+pub struct Factors {
+    /// The cosine of each token's angle per rotated pair.
+    pub cosine: TensorView,
+    /// The sine of each token's angle per rotated pair.
+    pub sine: TensorView,
+}
+
 /// One stack's rotary embedding: the published spectrum, the factors of a batch and the rotation.
 pub struct Rotary {
     /// The published spectrum [`Self::factors`] reads; absent for a rotation whose factor tables
@@ -721,29 +731,17 @@ impl Rotary {
         }
     }
 
-    /// The batch's factor tables: `positions` in, FP32 `cosine` and `sine` out.
+    /// The batch's factor tables: fresh FP32 `[tokens, columns]` cosine and sine of `positions`.
     ///
     /// `positions` is `[tokens]`, or `[axes, tokens]` axis-major for a sectioned or repeated
-    /// spectrum; `cosine` and `sine` are `[tokens, columns]`.
+    /// spectrum.
     ///
     /// # Errors
     ///
     /// A rotation built without its spectrum ([`Self::new`]), positions that are not one coordinate
-    /// per axis and token, tables of another extent, or the
-    /// operator's refusal.
-    pub fn factors(
-        &self,
-        f: &Forward,
-        positions: TensorView,
-        cosine: TensorView,
-        sine: TensorView,
-    ) -> Result<()> {
+    /// per axis and token, an arena that cannot hold the tables, or the operator's refusal.
+    pub fn factors(&self, f: &Forward, positions: TensorView) -> Result<Factors> {
         let columns = u64::from(self.columns());
-        cosine
-            .require_row("Rotary::factors", cosine.dtype, columns)
-            .map_err(Error::from)?;
-        sine.require_row("Rotary::factors", cosine.dtype, columns)
-            .map_err(Error::from)?;
         let axes = u64::from(self.axes());
         if self.spectrum.axes().is_some()
             && (positions.shape.rank() < 2 || positions.shape.dim(0) != axes)
@@ -763,22 +761,15 @@ impl Rotary {
             ));
         }
         let tokens = positions.numel() / axes;
-        if cosine.rows() != tokens || sine.rows() != tokens {
-            return Err(Error::shape(
-                "Rotary::factors",
-                format!(
-                    "{tokens} positions but {} and {} factor rows",
-                    cosine.rows(),
-                    sine.rows()
-                ),
-            ));
-        }
         let table = self.table.as_ref().ok_or_else(|| {
             Error::shape(
                 "Rotary::factors",
                 "this rotation published no spectrum: its factors are the caller's".to_owned(),
             )
         })?;
+        let shape = ops::Shape::new(&[tokens, columns]);
+        let cosine = f.empty(ops::DType::F32, shape)?;
+        let sine = f.empty(ops::DType::F32, shape)?;
         let descriptor = self.factors_descriptor(positions.dtype, cosine.dtype);
         let args = FactorsArgs {
             positions,
@@ -787,73 +778,58 @@ impl Rotary {
             sine,
         };
 
-        f.operate::<RotaryFactors>(&descriptor, args)
+        f.operate::<RotaryFactors>(&descriptor, args)?;
+        Ok(Factors { cosine, sine })
     }
 
-    /// Turn `query` and `key` into `q_out` and `k_out` by the `cosine` and `sine` tables.
+    /// `query` and `key` turned by `factors`: fresh tensors of their shapes and element type.
     ///
-    /// `query` and `q_out` are `[tokens, heads, head_dim]`, `key` and `k_out`
-    /// `[tokens, kv_heads, head_dim]`, and the tables `[tokens, columns]` FP32. A fused rotary
-    /// normalizes each head first, by `gains` when the stack's heads carry learned gains and
-    /// without a weight when they do not; a rotary without the norm takes no gains and turns the
-    /// queries and then the keys.
+    /// `query` is `[tokens, heads, head_dim]`, `key` `[tokens, kv_heads, head_dim]`, and the tables
+    /// `[tokens, columns]` FP32. A fused rotary normalizes each head first, by `gains` when the
+    /// stack's heads carry learned gains and without a weight when they do not; a rotary without
+    /// the norm takes no gains and turns the queries and then the keys.
     ///
     /// # Errors
     ///
     /// Views of another geometry, gains of another width, gains given to a rotary without the
-    /// norm, or the operator's refusal.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "a rotation call carries the two projections, the layer's gains, the two factor \
-                  tables and the two outputs; the design states them separately"
-    )]
-    pub fn apply(
+    /// norm, an arena that cannot hold the outputs, or the operator's refusal.
+    pub fn forward(
         &self,
         f: &Forward,
         query: TensorView,
         key: TensorView,
         gains: Option<Gains>,
-        cosine: TensorView,
-        sine: TensorView,
-        q_out: TensorView,
-        k_out: TensorView,
-    ) -> Result<()> {
+        factors: Factors,
+    ) -> Result<(TensorView, TensorView)> {
+        let Factors { cosine, sine } = factors;
         let head_dim = u64::from(self.spec.head_dim);
         let heads = u64::from(self.spec.heads);
         let kv_heads = u64::from(self.spec.kv_heads);
-        for (name, view, count) in [
-            ("query", query, heads),
-            ("q_out", q_out, heads),
-            ("key", key, kv_heads),
-            ("k_out", k_out, kv_heads),
-        ] {
+        for (name, view, count) in [("query", query, heads), ("key", key, kv_heads)] {
             if view.shape.rank() != 3 || view.shape.dim(1) != count || view.shape.dim(2) != head_dim
             {
                 return Err(Error::shape(
-                    "Rotary::apply",
+                    "Rotary::forward",
                     format!(
                         "{name} is {:?}, [tokens, {count}, {head_dim}] expected",
                         view.shape.dims(),
                     ),
                 ));
             }
-            view.require_row("Rotary::apply", view.dtype, head_dim)
+            view.require_row("Rotary::forward", view.dtype, head_dim)
                 .map_err(Error::from)?;
         }
         let tokens = query.shape.dim(0);
-        if key.shape.dim(0) != tokens
-            || q_out.shape.dim(0) != tokens
-            || k_out.shape.dim(0) != tokens
-        {
+        if key.shape.dim(0) != tokens {
             return Err(Error::shape(
-                "Rotary::apply",
+                "Rotary::forward",
                 "the query and key tensors have different token counts".to_owned(),
             ));
         }
         let columns = u64::from(self.columns());
         if cosine.numel() != tokens * columns || sine.numel() != tokens * columns {
             return Err(Error::shape(
-                "Rotary::apply",
+                "Rotary::forward",
                 format!(
                     "{} and {} factor elements for {tokens} tokens of {columns} factors",
                     cosine.numel(),
@@ -865,11 +841,13 @@ impl Rotary {
             && (gains.query.numel() != head_dim || gains.key.numel() != head_dim)
         {
             return Err(Error::shape(
-                "Rotary::apply",
+                "Rotary::forward",
                 format!("per-head gains of {head_dim} elements"),
             ));
         }
 
+        let q_out = f.empty(query.dtype, query.shape)?;
+        let k_out = f.empty(key.dtype, key.shape)?;
         match self.spec.qk_norm {
             QkNorm::Fused { epsilon, gain } => {
                 let descriptor = self.fused_descriptor(
@@ -888,12 +866,12 @@ impl Rotary {
                     q_out,
                     k_out,
                 };
-                f.operate::<QkNormRope>(&descriptor, args)
+                f.operate::<QkNormRope>(&descriptor, args)?;
             }
             QkNorm::None => {
                 if gains.is_some() {
                     return Err(Error::shape(
-                        "Rotary::apply",
+                        "Rotary::forward",
                         "this rotary normalizes no head, so it takes no gains".to_owned(),
                     ));
                 }
@@ -920,30 +898,30 @@ impl Rotary {
                     };
                     f.operate::<RopeApply>(&descriptor, args)?;
                 }
-                Ok(())
             }
         }
+        Ok((q_out, k_out))
     }
 
     /// Normalize and turn `query` and `key` in place: two views of `[tokens, heads, head_dim]` into
-    /// wider rows, the norm without a learned weight.
+    /// wider rows (a fused projection's), the norm without a learned weight.
     ///
-    /// `cosine` and `sine` are `[table rows, columns]` of a type the caller chose; token `t` reads
+    /// The factor tables are `[table rows, columns]` of a type the caller chose; token `t` reads
     /// row `t % table rows`, so tiles decoded in one launch share one table
     /// (`ops::rope::QkNormRopeDescriptor::strided`).
     ///
     /// # Errors
     ///
     /// A rotary without the fused norm, or the operator's refusal.
-    pub fn apply_strided(
+    pub fn rotate(
         &self,
         f: &Forward,
         query: TensorView,
         key: TensorView,
-        cosine: TensorView,
-        sine: TensorView,
+        factors: Factors,
     ) -> Result<()> {
-        let epsilon = self.epsilon("Rotary::apply_strided")?;
+        let Factors { cosine, sine } = factors;
+        let epsilon = self.epsilon("Rotary::rotate")?;
         let descriptor = QkNormRopeDescriptor {
             k_heads: self.spec.heads,
             rows: STRIDED_TOKENS,
@@ -1064,14 +1042,14 @@ mod tests {
         let arena = Arena::counting();
         let f = Forward::recording(&arena);
         let tensor = |dtype, dims: &[u64]| arena.tensor(dtype, Shape::new(dims)).unwrap();
-        let (cosine, sine) = (tensor(DType::F32, &[3, 8]), tensor(DType::F32, &[3, 8]));
+        let factors = Factors {
+            cosine: tensor(DType::F32, &[3, 8]),
+            sine: tensor(DType::F32, &[3, 8]),
+        };
         let positions = tensor(DType::I32, &[3]);
-        assert!(rotary.factors(&f, positions, cosine, sine).is_err());
+        assert!(rotary.factors(&f, positions).is_err());
         let heads = || tensor(DType::BF16, &[3, 2, 16]);
-        let (query, key) = (heads(), heads());
-        rotary
-            .apply(&f, query, key, None, cosine, sine, heads(), heads())
-            .unwrap();
+        rotary.forward(&f, heads(), heads(), None, factors).unwrap();
     }
 
     /// A plain spectrum is the f64 power series, its first pair unity and the rest falling.

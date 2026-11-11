@@ -20,7 +20,7 @@
 use std::sync::{Arc, Mutex};
 
 use nn::capability::{DecodedMedia, Decoder};
-use nn::{Forward, Result, StateTable, TableValues};
+use nn::{Forward, Result};
 use ops::{DType, TensorView};
 use platform::{Allocator, Budget, Device, DeviceId, PoolKind, Stream};
 use proto::video::{LatentShape, Layout};
@@ -61,14 +61,6 @@ fn pools() -> Arc<Mutex<Pools>> {
 struct Vocoder;
 
 impl Decoder for Vocoder {
-    fn layout_tables(&self, _: &Layout) -> Result<Vec<StateTable>> {
-        Ok(Vec::new())
-    }
-
-    fn prepare_layout(&self, _: &Layout, _: &mut [TableValues]) -> Result<()> {
-        Ok(())
-    }
-
     fn element_type(&self) -> DType {
         DType::F32
     }
@@ -77,7 +69,7 @@ impl Decoder for Vocoder {
         Ok((u64::from(audio.frames) * 64, 2))
     }
 
-    fn decode(&self, _: &Forward, _: TensorView, _: &[TensorView], _: DecodedMedia) -> Result<()> {
+    fn decode(&self, _: &Forward, _: &Layout, _: TensorView, _: DecodedMedia) -> Result<()> {
         Ok(())
     }
 }

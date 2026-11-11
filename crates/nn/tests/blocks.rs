@@ -55,6 +55,19 @@ fn view(arena: &Arena, dims: &[u64]) -> TensorView {
     arena.tensor(DType::BF16, Shape::new(dims)).unwrap()
 }
 
+/// Asserts that of everything a call reserved after `used` bytes of `arena`, only its answer is
+/// still held: the answer is the call's first reservation and ends at the arena's cursor.
+fn keeps_only(arena: &Arena, used: u64, answer: TensorView) {
+    let start = arena.base().address() + used.next_multiple_of(nn::forward::ALIGNMENT);
+    assert_eq!(
+        answer.ptr.address(),
+        start,
+        "the answer is the first reservation"
+    );
+    let end = answer.ptr.address() + answer.byte_len().unwrap() - arena.base().address();
+    assert_eq!(arena.used(), end, "the intermediates are handed back");
+}
+
 const HIDDEN: u64 = 64;
 const INTERMEDIATE: u64 = 128;
 
@@ -75,8 +88,8 @@ const SPLIT: GateUp<'static> = GateUp::Split {
     up: "up_proj",
 };
 
-/// A split gated MLP projects twice, gates at its rounding, projects back, and leaves the arena
-/// as it found it: its intermediates are its own.
+/// A split gated MLP projects twice, gates at its rounding, projects back, and keeps only its
+/// output: its intermediates are its own.
 #[test]
 fn a_split_gated_mlp_gates_at_its_rounding_and_releases_its_intermediates() {
     let directory = tempfile::tempdir().unwrap();
@@ -91,7 +104,7 @@ fn a_split_gated_mlp_gates_at_its_rounding_and_releases_its_intermediates() {
     let mut loader = WeightLoader::meta(&checkpoint, None, None);
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
-    let (x, out) = (view(&arena, &[5, HIDDEN]), view(&arena, &[5, HIDDEN]));
+    let x = view(&arena, &[5, HIDDEN]);
 
     for (rounding, gate) in [
         (Rounding::ValueProduct, "swiglu"),
@@ -104,10 +117,9 @@ fn a_split_gated_mlp_gates_at_its_rounding_and_releases_its_intermediates() {
         )
         .unwrap();
         let used = arena.used();
-        let (result, launches) = launched(|| mlp.forward(&f, x, out));
-        result.unwrap();
+        let (result, launches) = launched(|| mlp.forward(&f, x));
+        keeps_only(&arena, used, result.unwrap());
         assert_eq!(launches, ["gemm", "gemm", gate, "gemm"], "{rounding:?}");
-        assert_eq!(arena.used(), used, "the intermediates are released");
     }
 }
 
@@ -132,7 +144,7 @@ fn a_value_first_gated_mlp_reads_one_packed_projection() {
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
     let x = view(&arena, &[3, HIDDEN]);
-    let (out, launches) = launched(|| mlp.apply(&f, x));
+    let (out, launches) = launched(|| mlp.forward(&f, x));
     assert_eq!(out.unwrap().shape.dims(), &[3, HIDDEN]);
     assert_eq!(launches, ["gemm", "act_and_mul", "gemm"]);
 }
@@ -158,12 +170,12 @@ fn a_tensor_parallel_gated_mlp_reduces_in_its_down_projection() {
     )
     .unwrap();
     let arena = Arena::counting();
-    let (x, out) = (view(&arena, &[4, HIDDEN]), view(&arena, &[4, HIDDEN]));
+    let x = view(&arena, &[4, HIDDEN]);
 
     let split = Forward::recording(&arena).with_split(1, 2).unwrap();
-    assert!(mlp.forward(&split, x, out).is_ok());
+    assert!(mlp.forward(&split, x).is_ok());
     assert!(
-        mlp.forward(&Forward::recording(&arena), x, out).is_err(),
+        mlp.forward(&Forward::recording(&arena), x).is_err(),
         "a row-parallel projection with no group to reduce over"
     );
 
@@ -182,7 +194,8 @@ fn a_tensor_parallel_gated_mlp_reduces_in_its_down_projection() {
 
 use nn::blocks::{AttentionKind, Keys, QkNormNames, QkvAttention, QkvAttentionSpec, RopeFactors};
 use nn::layers::{
-    Bias, Precision, QkNorm, QkvBias, QkvNames, QkvSpec, Rotary, RotarySpec, Spectrum, Varlen,
+    Bias, Factors, Precision, QkNorm, QkvBias, QkvNames, QkvSpec, Rotary, RotarySpec, Spectrum,
+    Varlen,
 };
 use nn::{KvGroup, KvPlanes, KvView, PhaseKind, TokenBatch};
 
@@ -271,20 +284,17 @@ fn each_qk_norm_form_launches_its_own_programs() {
     let bare = rotary(&mut loader, QkNorm::None);
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
-    let (x, out) = (view(&arena, &[6, HIDDEN]), view(&arena, &[6, HIDDEN]));
-    let factors = || {
+    let x = view(&arena, &[6, HIDDEN]);
+    let table = || {
         arena
             .tensor(DType::F32, Shape::new(&[6, HEAD_DIM / 2]))
             .unwrap()
     };
-    let (cosine, sine) = (factors(), factors());
-    let rope = |rotary| {
-        Some(RopeFactors {
-            rotary,
-            cosine,
-            sine,
-        })
+    let factors = Factors {
+        cosine: table(),
+        sine: table(),
     };
+    let rope = |rotary| Some(RopeFactors { rotary, factors });
 
     let cases = [
         (
@@ -304,6 +314,7 @@ fn each_qk_norm_form_launches_its_own_programs() {
                 query: "q_norm",
                 key: "k_norm",
                 epsilon: 1e-6,
+                output: DType::BF16,
             },
             None,
             &[
@@ -338,10 +349,9 @@ fn each_qk_norm_form_launches_its_own_programs() {
         )
         .unwrap();
         let used = arena.used();
-        let (result, launches) = launched(|| block.forward(&f, x, rope, Keys::Dense(None), out));
-        result.unwrap();
+        let (result, launches) = launched(|| block.forward(&f, x, rope, Keys::Dense(None)));
+        keeps_only(&arena, used, result.unwrap());
         assert_eq!(launches, expected, "{qk_norm:?}");
-        assert_eq!(arena.used(), used, "the intermediates are released");
     }
 
     // A norm fused into the rotation needs the rotation.
@@ -351,7 +361,7 @@ fn each_qk_norm_form_launches_its_own_programs() {
         Split::WHOLE,
     )
     .unwrap();
-    assert!(block.forward(&f, x, None, Keys::Dense(None), out).is_err());
+    assert!(block.forward(&f, x, None, Keys::Dense(None)).is_err());
     // Packed sequences name their tables and their bounds.
     let offsets = arena.tensor(DType::I32, Shape::new(&[3])).unwrap();
     let varlen = Varlen {
@@ -362,7 +372,7 @@ fn each_qk_norm_form_launches_its_own_programs() {
     };
     assert!(
         block
-            .forward(&f, x, rope(&fused), Keys::Dense(Some(varlen)), out)
+            .forward(&f, x, rope(&fused), Keys::Dense(Some(varlen)))
             .is_ok()
     );
 }
@@ -429,26 +439,19 @@ fn a_paged_block_writes_its_layers_planes_then_reads_them() {
         workspace: tensor(DType::U8, &[1 << 20]),
         state: None,
     };
-    let (x, out) = (
-        view(&arena, &[tokens, HIDDEN]),
-        view(&arena, &[tokens, HIDDEN]),
-    );
-    let (cosine, sine) = (
-        tensor(DType::F32, &[tokens, HEAD_DIM / 2]),
-        tensor(DType::F32, &[tokens, HEAD_DIM / 2]),
-    );
+    let x = view(&arena, &[tokens, HIDDEN]);
     let rope = RopeFactors {
         rotary: &fused,
-        cosine,
-        sine,
+        factors: Factors {
+            cosine: tensor(DType::F32, &[tokens, HEAD_DIM / 2]),
+            sine: tensor(DType::F32, &[tokens, HEAD_DIM / 2]),
+        },
     };
     let keys = Keys::Paged {
         batch: &batch,
-        cache: &cache,
-        group: 0,
-        layer: 0,
+        cache: cache.layer(0, 0).unwrap(),
     };
-    let (result, launches) = launched(|| block.forward(&f, x, Some(rope), keys, out));
+    let (result, launches) = launched(|| block.forward(&f, x, Some(rope), keys));
     result.unwrap();
     assert_eq!(
         launches,
@@ -462,16 +465,12 @@ fn a_paged_block_writes_its_layers_planes_then_reads_them() {
             "gemm"
         ]
     );
-    assert!(
-        block
-            .forward(&f, x, Some(rope), Keys::Dense(None), out)
-            .is_err()
-    );
+    assert!(block.forward(&f, x, Some(rope), Keys::Dense(None)).is_err());
 }
 
 // ---- Timestep embedding -------------------------------------------------------------------------
 
-/// The timestep embedding projects, activates and projects, and leaves the arena as it found it.
+/// The timestep embedding projects, activates and projects, and keeps only its output.
 #[test]
 fn a_timestep_embedding_projects_activates_and_projects() {
     use nn::timestep::{TimestepEmbedding, TimestepSpec};
@@ -498,22 +497,21 @@ fn a_timestep_embedding_projects_activates_and_projects() {
     .unwrap();
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
-    let (x, out) = (view(&arena, &[2, 16]), view(&arena, &[2, INTERMEDIATE]));
+    let x = view(&arena, &[2, 16]);
     let used = arena.used();
-    let (result, launches) = launched(|| embedding.forward(&f, x, out));
-    result.unwrap();
+    let (result, launches) = launched(|| embedding.forward(&f, x));
+    keeps_only(&arena, used, result.unwrap());
     assert_eq!(launches.len(), 3, "{launches:?}");
     assert_eq!(
         (launches[0].as_str(), launches[2].as_str()),
         ("gemm", "gemm")
     );
-    assert_eq!(arena.used(), used);
 }
 
 // ---- Step-indexed projection --------------------------------------------------------------------
 
 /// A step-indexed projection gathers its step's weight and bias rows, projects with them, and
-/// releases the gathered rows; tables of another extent or type are refused.
+/// keeps only its output; tables of another extent or type are refused.
 #[test]
 fn a_step_indexed_projection_gathers_its_steps_row_then_projects() {
     use nn::Weight;
@@ -536,14 +534,12 @@ fn a_step_indexed_projection_gathers_its_steps_row_then_projects() {
     let f = Forward::recording(&arena);
     let step = arena.tensor(DType::I32, Shape::new(&[1])).unwrap();
     let input = arena.tensor(DType::F32, Shape::new(&[3, inputs])).unwrap();
-    let out = arena.tensor(DType::F32, Shape::new(&[3, outputs])).unwrap();
     let used = arena.used();
-    let (result, launches) = launched(|| projection.forward(&f, step, input, out));
-    result.unwrap();
+    let (result, launches) = launched(|| projection.forward(&f, step, input));
+    keeps_only(&arena, used, result.unwrap());
     assert_eq!(launches.len(), 3, "{launches:?}");
     assert_eq!(launches[2], "gemm");
     assert_eq!(launches[0], launches[1], "one gather per table");
-    assert_eq!(arena.used(), used);
 
     assert!(
         StepIndexed::new(
@@ -567,7 +563,7 @@ fn a_step_indexed_projection_gathers_its_steps_row_then_projects() {
 
 // ---- AdaLN block, final norm and timestep table ---------------------------------------------------
 
-use nn::blocks::{AdaLnBlock, AdaLnOut, AdaLnSpec, ModulationTable};
+use nn::blocks::{AdaLnBlock, AdaLnOut, AdaLnSpec, ModulationTable, RowModulation};
 use nn::diffusion::{TimestepTable, TimestepTableSpec};
 
 /// The step's gathered modulation of `parameters` rows of `vectors` vectors each.
@@ -656,26 +652,23 @@ fn an_adaln_block_modulates_both_inputs_and_gates_both_updates() {
     let tokens = 5;
     let table = ModulationTable::block(modulation(&arena, 6, 6), HIDDEN).unwrap();
     let rows = arena.tensor(DType::I32, Shape::new(&[tokens])).unwrap();
-    let [hidden, normalized, update, residual] = [0; 4].map(|_| view(&arena, &[tokens, HIDDEN]));
+    let hidden = view(&arena, &[tokens, HIDDEN]);
+    let step = RowModulation {
+        table: &table,
+        rows,
+    };
 
     let mut attended = None;
+    let used = arena.used();
     let (result, launches) = launched(|| {
-        block.forward(
-            &f,
-            &table,
-            rows,
-            hidden,
-            normalized,
-            update,
-            residual,
-            |input, output| {
-                attended = Some((input.ptr, output.ptr));
-                Ok(())
-            },
-        )
+        block.forward(&f, step, hidden, |input| {
+            attended = Some((input.shape, input.dtype));
+            Ok(input)
+        })
     });
     result.unwrap();
-    assert_eq!(attended, Some((normalized.ptr, update.ptr)));
+    assert_eq!(attended, Some((hidden.shape, hidden.dtype)));
+    assert_eq!(arena.used(), used, "the block works on `hidden` in place");
     assert_eq!(
         launches,
         [
@@ -690,14 +683,14 @@ fn an_adaln_block_modulates_both_inputs_and_gates_both_updates() {
 
     // A final norm's table carries no gated stage.
     let output = ModulationTable::output(modulation(&arena, 6, 2), HIDDEN).unwrap();
-    assert!(
-        block
-            .attention_input(&f, &output, rows, hidden, normalized)
-            .is_err()
-    );
+    let wrong = RowModulation {
+        table: &output,
+        rows,
+    };
+    assert!(block.attention_input(&f, wrong, hidden).is_err());
 }
 
-/// The final norm is one modulated launch into a buffer of its input's shape.
+/// The final norm is one modulated launch into a fresh buffer of its input's shape.
 #[test]
 fn the_final_adaln_norm_modulates_by_shift_and_scale() {
     let directory = tempfile::tempdir().unwrap();
@@ -709,18 +702,30 @@ fn the_final_adaln_norm_modulates_by_shift_and_scale() {
     let table = ModulationTable::output(modulation(&arena, 2, 2), HIDDEN).unwrap();
     let rows = arena.tensor(DType::I32, Shape::new(&[3])).unwrap();
     let hidden = view(&arena, &[3, HIDDEN]);
-    let (out, launches) = launched(|| norm.apply(&f, &table, rows, hidden));
+    let (out, launches) = launched(|| {
+        norm.forward(
+            &f,
+            RowModulation {
+                table: &table,
+                rows,
+            },
+            hidden,
+        )
+    });
     let out = out.unwrap();
     assert_eq!((out.shape, out.dtype), (hidden.shape, hidden.dtype));
     assert_eq!(launches, ["modulated_rms_norm"]);
 
     let block_table = ModulationTable::block(modulation(&arena, 2, 6), HIDDEN).unwrap();
-    assert!(norm.forward(&f, &block_table, rows, hidden, out).is_err());
+    let wrong = RowModulation {
+        table: &block_table,
+        rows,
+    };
+    assert!(norm.forward(&f, wrong, hidden).is_err());
 }
 
-/// The table holds one row per distinct level and the entry of each step's groups, and states the
-/// modulation tables the runtime allocates; bound to them, a step gathers its entries, then each
-/// block's rows at them.
+/// The table holds one row per distinct level and the entry of each step's groups, and reserves its
+/// own modulation tables; a step gathers its entries, then each block's rows at them.
 #[test]
 fn a_timestep_table_holds_each_distinct_level_once() {
     let directory = tempfile::tempdir().unwrap();
@@ -743,30 +748,21 @@ fn a_timestep_table_holds_each_distinct_level_once() {
     .unwrap();
     assert_eq!((table.groups(), table.steps()), (2, 3));
     assert_eq!(table.frequencies().shape.dims(), &[4, 16]);
-    let tables = table.tables();
-    assert_eq!(tables.len(), 2);
-    assert_eq!(tables[0].shape.dims(), &[2, 4, 6 * HIDDEN]);
-    assert_eq!(tables[1].shape.dims(), &[4, 2 * HIDDEN]);
+    assert_eq!(table.layer_table(1).unwrap().shape.dims(), &[4, 6 * HIDDEN]);
+    assert_eq!(table.output_table().shape.dims(), &[4, 2 * HIDDEN]);
 
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
-    let views: Vec<_> = tables
-        .iter()
-        .map(|stated| arena.tensor(stated.dtype, stated.shape).unwrap())
-        .collect();
-    let bound = table.bind(&views).unwrap();
-    assert_eq!(bound.layer_table(1).unwrap().shape.dims(), &[4, 6 * HIDDEN]);
-    assert!(table.bind(&views[..1]).is_err(), "both tables are bound");
     let step = arena.tensor(DType::I32, Shape::new(&[1])).unwrap();
-    let entries = arena.tensor(DType::I32, Shape::new(&[1, 2])).unwrap();
-    let rows = modulation(&arena, 2, 6);
     let (result, launches) = launched(|| {
-        table.entries_of(&f, step, entries)?;
-        bound.layer(&f, 1, entries, rows)
+        let entries = table.entries_of(&f, step)?;
+        assert_eq!(entries.shape.dims(), [1, 2]);
+        let rows = table.layer(&f, 1, entries)?;
+        assert!(table.layer(&f, 2, entries).is_err(), "two blocks");
+        Ok::<_, nn::Error>(rows)
     });
-    result.unwrap();
+    assert_eq!(result.unwrap().shape.dims(), [2, 6 * HIDDEN]);
     assert_eq!(launches.len(), 2);
-    assert!(bound.layer(&f, 2, entries, rows).is_err(), "two blocks");
 
     let (times, indices) = TimestepTable::entries(&levels, 2).unwrap();
     assert_eq!(times, [1.0, 0.75, 0.5, 0.25]);
@@ -809,14 +805,14 @@ fn a_patch_embedding_packs_projects_and_unpacks_its_tokens() {
     let f = Forward::recording(&arena);
     // Two frames of a 4x6 raster: 2 · 2 · 3 tokens.
     let latent = view(&arena, &[channels, 2, 4, 6]);
-    let tokens = view(&arena, &[12, channels * 4]);
-    let hidden = view(&arena, &[12, width]);
     let (result, launches) = launched(|| {
-        embed.patchify(&f, latent, tokens)?;
-        embed.project(&f, tokens, hidden)?;
-        embed.unpatchify(&f, tokens, latent)
+        let tokens = embed.patchify(&f, latent)?;
+        assert_eq!(tokens.shape.dims(), [12, channels * 4]);
+        let hidden = embed.project(&f, tokens)?;
+        assert_eq!(hidden.shape.dims(), [12, width]);
+        embed.unpatchify(&f, tokens, latent.shape)
     });
-    result.unwrap();
+    assert_eq!(result.unwrap().shape, latent.shape);
     assert_eq!(launches, ["patch", "gemm", "unpatchify_video"]);
 
     // A patch of no rows is refused before any tensor is read.
@@ -832,6 +828,7 @@ fn prenorm_spec(residual: ResidualForm, layer_scale: Option<[&str; 2]>) -> PreNo
     PreNormSpec {
         hidden: HIDDEN as u32,
         eps: 1e-6,
+        activation: DType::BF16,
         norm1: "norm1",
         norm2: "norm2",
         layer_scale,
@@ -868,7 +865,7 @@ fn a_pre_norm_block_joins_each_update_in_its_residual_form() {
     let stream = arena
         .tensor(DType::F32, Shape::new(&[tokens, HIDDEN]))
         .unwrap();
-    let [normalized, update] = [0; 2].map(|_| view(&arena, &[tokens, HIDDEN]));
+    let carried = view(&arena, &[tokens, HIDDEN]);
 
     // The stream is FP32 and the norms write the BF16 rows the projections read, so a norm that
     // reads the stream alone is the narrowing one.
@@ -892,20 +889,26 @@ fn a_pre_norm_block_joins_each_update_in_its_residual_form() {
         )
         .unwrap();
         let mut attended = Vec::new();
+        let used = arena.used();
         let (last, launches) = launched(|| -> nn::Result<Pending> {
             let mut pending = None;
             for _ in 0..2 {
-                let attend = |input: TensorView, output: TensorView| {
-                    attended.push((input.ptr, output.ptr));
-                    Ok(())
+                let attend = |input: TensorView| {
+                    attended.push((input.shape, input.dtype));
+                    Ok(input)
                 };
-                pending = Some(block.forward(&f, stream, pending, normalized, update, attend)?);
+                pending = Some(block.forward(&f, stream, pending, carried, attend)?);
             }
             Ok(pending.unwrap())
         });
         let last = last.unwrap();
-        assert_eq!(attended, [(normalized.ptr, update.ptr); 2]);
-        assert_eq!(last.update.ptr, update.ptr);
+        assert_eq!(attended, [(carried.shape, DType::BF16); 2]);
+        assert_eq!(last.update.ptr, carried.ptr);
+        assert_eq!(
+            arena.used(),
+            used,
+            "a block holds nothing past its own call"
+        );
         assert_eq!(last.scale.is_some(), layer_scale.is_some());
 
         // The first norm reads the FP32 stream alone and narrows it; every later norm joins the
@@ -922,7 +925,7 @@ fn a_pre_norm_block_joins_each_update_in_its_residual_form() {
 
     // The separate join of a stack's last update is one plain add into the stream.
     let last = Pending {
-        update,
+        update: carried,
         scale: None,
     };
     let (result, launches) = launched(|| last.join(&f, stream));

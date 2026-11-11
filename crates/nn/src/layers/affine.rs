@@ -46,14 +46,14 @@ impl ChannelAffine {
         Ok(Self { scale, shift, axis })
     }
 
-    /// Map `x` into `out`, two contiguous views of one shape whose `axis` axis holds the channels.
-    /// `out` may be `x` itself.
+    /// `x` mapped channel by channel into a fresh tensor of its shape and element type; `x` is a
+    /// contiguous view whose `axis` axis holds the channels.
     ///
     /// # Errors
     ///
-    /// Views of different shapes, a non-contiguous view, a channel axis past the rank or of another
-    /// extent, or the operator's refusal.
-    pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
+    /// A non-contiguous view, a channel axis past the rank or of another extent, an arena that
+    /// cannot hold the output, or the operator's refusal.
+    pub fn forward(&self, f: &Forward, x: TensorView) -> Result<TensorView> {
         const OWNER: &str = "ChannelAffine";
         let shape = x.shape;
         let channels = self.scale.shape().numel();
@@ -67,14 +67,13 @@ impl ChannelAffine {
                 ),
             ));
         }
-        for (name, view) in [("x", &x), ("out", &out)] {
-            if view.shape != shape || view.strides != Strides::row_major(shape) {
-                return Err(Error::shape(
-                    OWNER,
-                    format!("{name} is not a contiguous {:?}", shape.dims()),
-                ));
-            }
+        if x.strides != Strides::row_major(shape) {
+            return Err(Error::shape(
+                OWNER,
+                format!("x is not a contiguous {:?}", shape.dims()),
+            ));
         }
+        let out = f.empty(x.dtype, shape)?;
         // The axes before the channel fold into one batch axis and the ones after it into one
         // position axis: a contiguous tensor read as `[batch, channels, positions]`.
         let dims = shape.dims();
@@ -92,7 +91,8 @@ impl ChannelAffine {
             shift: self.shift.view(),
             out: out.reshape(folded),
         };
-        f.operate::<ChannelAffineOp>(&descriptor, args)
+        f.operate::<ChannelAffineOp>(&descriptor, args)?;
+        Ok(out)
     }
 }
 
@@ -116,17 +116,14 @@ mod tests {
         let (scale, shift) = (held(view(&[24])), held(view(&[24])));
         let last = ChannelAffine::new(scale, shift, 1).unwrap();
         let rows = view(&[100, 24]);
-        assert!(last.forward(&f, rows, rows).is_ok());
+        assert!(last.forward(&f, rows).is_ok());
         let middle = view(&[2, 24, 50]);
-        assert!(last.forward(&f, middle, middle).is_ok());
-        assert!(
-            last.forward(&f, view(&[24, 100]), view(&[24, 100]))
-                .is_err()
-        );
+        assert!(last.forward(&f, middle).is_ok());
+        assert!(last.forward(&f, view(&[24, 100])).is_err());
         assert!(
             ChannelAffine::new(scale, shift, 2)
                 .unwrap()
-                .forward(&f, rows, rows)
+                .forward(&f, rows)
                 .is_err()
         );
 
@@ -136,7 +133,7 @@ mod tests {
             Shape::new(&[100, 24]),
             Strides::new(&[1, 100]),
         );
-        assert!(last.forward(&f, transposed, rows).is_err());
+        assert!(last.forward(&f, transposed).is_err());
         assert!(ChannelAffine::new(scale, held(view(&[12])), 1).is_err());
     }
 }

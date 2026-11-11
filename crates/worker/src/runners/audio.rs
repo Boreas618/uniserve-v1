@@ -336,16 +336,13 @@ impl<M: Decoder + Send + Sync + ?Sized> AudioDecoderRunner<M> {
         let latents = self.latents(audio);
         let pcm = self.pcm(audio)?;
         let (samples, channels) = self.model.pcm_window(&audio).map_err(Error::from)?;
-        let waveform = forward
-            .arena()
-            .tensor(DType::F32, Shape::new(&[u64::from(channels), samples]))?;
+        let waveform = forward.empty(DType::F32, Shape::new(&[u64::from(channels), samples]))?;
+        let layout = self.layout(bucket)?;
         self.model
             .decode(
                 forward,
+                &layout,
                 latents,
-                // Every table this decoder reads is a weight, bound at load: the capability states
-                // that an audio decode is given none, so the runner passes none.
-                &[],
                 DecodedMedia {
                     video: None,
                     audio: Some(waveform),
@@ -433,7 +430,6 @@ impl<M: Decoder + Send + Sync + ?Sized> Runner for AudioDecoderRunner<M> {
             Job::Replay {
                 bucket, generation, ..
             } => {
-                let stream = self.stream.clone();
                 self.upload()?;
                 let (served, captured) = self
                     .lifecycle
@@ -454,7 +450,9 @@ impl<M: Decoder + Send + Sync + ?Sized> Runner for AudioDecoderRunner<M> {
                     );
                 }
                 let launched = std::time::Instant::now();
-                captured.launch(&stream)?;
+                self.lifecycle.replay(captured, |arena, staging| {
+                    self.decode(&nn::Forward::staging(arena, staging), *bucket)
+                })?;
                 if let Some(counters) = &self.counters {
                     counters.launches(captured.kernel_nodes());
                 }
@@ -518,7 +516,8 @@ impl<M: Decoder + Send + Sync + ?Sized> RunnerLifecycle for AudioDecoderRunner<M
             .begin(self.lifecycle.stream_id(), bucket)?;
         self.upload()?;
         let arena = self.lifecycle.arena()?;
-        let forward = nn::Forward::new(&stream, generation, &arena);
+        let staging = self.lifecycle.staging.captured(&stream)?;
+        let forward = nn::Forward::new(&stream, generation, &arena).with_staging(staging);
         self.decode(&forward, bucket)?;
         if first {
             self.lifecycle

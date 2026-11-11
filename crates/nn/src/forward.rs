@@ -9,16 +9,26 @@
 //! ## The arena
 //!
 //! The design puts the concrete activation arena with the worker — a region of the
-//! graph pool plus one static activation plan per captured bucket — but the worker also owns
+//! graph pool plus one static activation layout per captured bucket — but the worker also owns
 //! `Forward`'s borrow of it, and the crate dependency runs `worker → nn`, so the type itself
 //! lives here and the worker fills it. [`Arena`] is the bump region of one forward: the worker
 //! resets it at the start of a forward, every layer takes its activations from it in a fixed order,
 //! and because a captured bucket always executes the same sequence of layers on the same extents,
 //! the sequence of reservations is the same on capture and on every replay. Replaying a graph
-//! therefore touches exactly the addresses the plan recorded, and no step allocates.
+//! therefore touches exactly the addresses the first walk reserved, and no step allocates.
 //!
 //! A single-threaded worker is what makes the interior cursor sound: one worker thread issues
 //! every job of its device, so two forwards never share an arena at one time.
+//!
+//! ## Tensors and host values
+//!
+//! A forward is the tensor factory of the layers it runs: [`Forward::empty`] reserves an output,
+//! [`Forward::scoped`] hands a layer's intermediates back when it returns, and
+//! [`Forward::upload`] places host-computed values (positions, indices, coefficients) on the
+//! device through the [`Staging`] region execution lends. A forward runs in one of three modes:
+//! launching ([`Forward::new`], eager or captured), staging ([`Forward::staging`], before a replay:
+//! the host side runs and every upload writes the values the captured copies read, nothing
+//! launches) and recording ([`Forward::recording`], which states programs and measures extents).
 
 use std::cell::Cell;
 
@@ -39,7 +49,7 @@ pub const ALIGNMENT: u64 = 256;
 /// The activation region of one forward.
 ///
 /// Besides the cursor, the arena keeps the furthest byte any reservation reached since it was made
-/// ([`Arena::peak`]). A forward hands per-layer scratch back with [`Arena::release`], so the cursor
+/// ([`Arena::peak`]). A forward hands per-layer scratch back with [`Forward::scoped`], so the cursor
 /// at the end of a forward understates what the forward addressed; the peak is the extent a
 /// captured graph needs mapped.
 pub struct Arena {
@@ -99,14 +109,14 @@ impl Arena {
         self.bytes
     }
 
-    /// Bytes handed out since the last [`Arena::reset`], net of what [`Arena::release`] gave back.
+    /// Bytes handed out since the last [`Arena::reset`], net of what a [`Forward::scoped`] gave back.
     pub fn used(&self) -> u64 {
         self.cursor.get()
     }
 
     /// The furthest offset any reservation reached since this arena was made.
     ///
-    /// Neither [`Arena::release`] nor [`Arena::reset`] lowers it: it is the extent of the region
+    /// Neither a [`Forward::scoped`] nor [`Arena::reset`] lowers it: it is the extent of the region
     /// every forward run over this arena addressed, which is what the region must map.
     pub fn peak(&self) -> u64 {
         self.peak.get()
@@ -115,7 +125,7 @@ impl Arena {
     /// Start the next forward at the region's first address.
     ///
     /// The worker calls this once at the start of every forward, before the first layer runs. The
-    /// reservations that follow are the ones the static plan recorded for this bucket.
+    /// reservations that follow are the ones every earlier forward of this bucket made.
     pub fn reset(&self) {
         self.cursor.set(0);
     }
@@ -125,24 +135,24 @@ impl Arena {
     /// One forward reserves its layer-independent buffers once and then runs every layer; the
     /// scratch a single layer reserves is dead as soon as that layer's launches are enqueued. A
     /// captured bucket replays the same addresses, so a layer that took a fresh reservation each
-    /// pass would ask the region for `layers` copies of it — which is neither what the plan states
+    /// pass would ask the region for `layers` copies of it — which is neither what the bucket's layout states
     /// nor what a replayed graph needs.
-    pub fn mark(&self) -> u64 {
+    pub(crate) fn mark(&self) -> u64 {
         self.cursor.get()
     }
 
     /// Hand back everything reserved since `mark`.
     ///
     /// The memory stays in the region and the bytes are handed out again to the next layer, which
-    /// is what makes a plan one layer deep. The caller owes that nothing it still uses was reserved
+    /// is what keeps a layout one layer deep. The caller owes that nothing it still uses was reserved
     /// after `mark`: the stream orders the layer's launches before the next layer's, so reusing the
     /// same addresses is what a captured graph already does.
-    pub fn release(&self, mark: u64) {
+    pub(crate) fn release(&self, mark: u64) {
         self.cursor.set(mark);
     }
 
     /// Reserve `bytes` bytes at [`ALIGNMENT`] and answer their first address.
-    pub fn reserve(&self, bytes: u64) -> Result<DevicePtr> {
+    pub(crate) fn reserve(&self, bytes: u64) -> Result<DevicePtr> {
         let at = self.cursor.get().next_multiple_of(ALIGNMENT);
         let end = at.checked_add(bytes).ok_or(Error::Arena {
             needed: bytes,
@@ -181,6 +191,106 @@ impl Arena {
     }
 }
 
+/// The page-locked host region a forward writes the values it uploads into.
+///
+/// Execution owns the memory (one region per captured graph) and lends it to every forward over
+/// that graph. [`Forward::upload`] writes a value at the region's next aligned offset and, in a
+/// launching forward, issues a host-to-device copy from there; a captured graph keeps that copy
+/// and reads the same offset on every replay. Before a replay, execution runs the same forward in
+/// stage mode ([`Forward::staging`]), which writes this replay's values at the offsets the captured
+/// copies read, because reservations depend on shapes alone.
+///
+/// The region is append-only within a forward: a host write is immediate and its copy is not, so
+/// handing an offset back while the forward runs would overwrite a value its copy has not read
+/// yet. Execution calls [`Staging::reset`] before a forward, once the copies of the previous
+/// forward over the region have completed.
+pub struct Staging {
+    /// The region's first host address, or `None` for a counting region that only measures.
+    base: Option<u64>,
+    bytes: u64,
+    cursor: Cell<u64>,
+    peak: Cell<u64>,
+}
+
+impl Staging {
+    /// The region of `bytes` page-locked bytes at `base`.
+    ///
+    /// # Safety
+    ///
+    /// `base` addresses `bytes` bytes of page-locked host memory that stay valid, and that nothing
+    /// but forwards over this region writes, for as long as any graph whose copies read them may
+    /// replay.
+    pub unsafe fn new(base: *mut u8, bytes: u64) -> Self {
+        Self {
+            base: Some(base as u64),
+            bytes,
+            cursor: Cell::new(0),
+            peak: Cell::new(0),
+        }
+    }
+
+    /// An unbounded region with no memory behind it, for a recording forward: it answers through
+    /// [`Staging::peak`] the extent a forward's uploads need.
+    pub fn counting() -> Self {
+        Self {
+            base: None,
+            bytes: u64::MAX,
+            cursor: Cell::new(0),
+            peak: Cell::new(0),
+        }
+    }
+
+    /// Start the next forward at the region's first byte.
+    pub fn reset(&self) {
+        self.cursor.set(0);
+    }
+
+    /// The furthest byte any forward over this region reached.
+    pub fn peak(&self) -> u64 {
+        self.peak.get()
+    }
+
+    /// Reserve `bytes` at [`ALIGNMENT`]: the host address to write them at, or `None` in a
+    /// counting region.
+    fn reserve(&self, bytes: u64) -> Result<Option<u64>> {
+        let at = self.cursor.get().next_multiple_of(ALIGNMENT);
+        let end = at
+            .checked_add(bytes)
+            .filter(|end| *end <= self.bytes)
+            .ok_or(Error::Staging {
+                needed: bytes,
+                at,
+                available: self.bytes,
+            })?;
+        self.cursor.set(end);
+        self.peak.set(self.peak.get().max(end));
+        Ok(self.base.map(|base| base + at))
+    }
+}
+
+/// A host element type a forward can upload: its device element type and its bytes.
+pub trait HostValue: Copy + sealed::Sealed {
+    /// The element type the uploaded tensor carries.
+    const DTYPE: DType;
+}
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+macro_rules! host_value {
+    ($($host:ty => $dtype:ident),* $(,)?) => {
+        $(
+            impl sealed::Sealed for $host {}
+            impl HostValue for $host {
+                const DTYPE: DType = DType::$dtype;
+            }
+        )*
+    };
+}
+
+host_value!(u8 => U8, i16 => I16, i32 => I32, i64 => I64, f32 => F32);
+
 /// The borrowed execution resources of one forward.
 #[derive(Clone)]
 pub struct Forward<'a> {
@@ -198,6 +308,8 @@ pub struct Forward<'a> {
     kernels: Option<&'a Generation>,
     /// The activation region of this captured bucket.
     arena: &'a Arena,
+    /// The host region uploaded values are written into, when execution lends one.
+    staging: Option<&'a Staging>,
     /// The communicator of this rank's parallel group, when a launching forward's block is
     /// partitioned. Layers reach it only through this forward's collectives.
     group: Option<&'a Group>,
@@ -216,7 +328,7 @@ pub struct Forward<'a> {
     /// arena is the bucket's. The value is device-resident because it changes per replay of one
     /// captured graph, and the buffer must outlive the bucket - a layer reads it on every replay.
     live_tokens: Option<TensorView>,
-    /// Times the model's components on the device, or `None`.
+    /// Times the model's modules on the device, or `None`.
     ///
     /// A forward captured into a graph captures its probes, and every replay then runs them. Nothing
     /// a forward computes depends on a fence being present.
@@ -244,23 +356,23 @@ enum Collective<'a> {
     Record(Split),
 }
 
-/// Times a model's components on the device (`docs/profiling.md`, fence probes).
+/// Times a model's modules on the device (`docs/profiling.md`, fence probes).
 ///
-/// A model states each of its modules with [`Forward::fenced`]: the module's component, which names
+/// A model states each of its modules with [`Forward::fenced`]: the module's class, which names
 /// its class across the deployment (`models.<family>.<module>.<Class>`), and its path in the model
-/// (`layers.3`), which names this instance. Which components carry probes is the deployment's
-/// choice, so an implementation answers `None` for a component no pattern names and the module then
+/// (`layers.3`), which names this instance. Which classes carry probes is the deployment's
+/// choice, so an implementation answers `None` for a class no pattern names and the module then
 /// runs as if unobserved.
 pub trait Fence {
-    /// The module instance at `path` of `component` is entered on `stream`: launch its entry probe.
-    /// Answers the instance the exit names, or `None` when this component carries no probe.
+    /// The module instance at `path` of `class` is entered on `stream`: launch its entry probe.
+    /// Answers the instance the exit names, or `None` when this class carries no probe.
     ///
     /// # Errors
     ///
     /// When the probe could not be launched.
     fn enter(
         &self,
-        component: &'static str,
+        class: &'static str,
         path: std::fmt::Arguments<'_>,
         stream: &Stream,
     ) -> Result<Option<u32>>;
@@ -280,6 +392,7 @@ impl<'a> Forward<'a> {
             stream: Some(stream),
             kernels: Some(kernels),
             arena,
+            staging: None,
             group: None,
             split: None,
             dispatch: None,
@@ -303,6 +416,7 @@ impl<'a> Forward<'a> {
             stream: None,
             kernels: None,
             arena,
+            staging: None,
             group: None,
             split: None,
             dispatch: None,
@@ -312,9 +426,119 @@ impl<'a> Forward<'a> {
         }
     }
 
-    /// Whether this forward launches, rather than only recording what it would launch.
-    pub const fn is_recording(&self) -> bool {
-        self.stream.is_none()
+    /// A forward that writes the values a captured graph uploads and launches nothing.
+    ///
+    /// Execution runs this before each replay of a graph captured from a launching forward over
+    /// the same `arena` and `staging`: the model's forward runs its host side, every
+    /// [`Self::upload`] writes this replay's values at the offset the graph's captured copy reads,
+    /// and no kernel is resolved or launched.
+    pub fn staging(arena: &'a Arena, staging: &'a Staging) -> Self {
+        Self {
+            staging: Some(staging),
+            ..Self::recording(arena)
+        }
+    }
+
+    /// The same forward writing its uploaded values into `staging`.
+    pub fn with_staging(mut self, staging: &'a Staging) -> Self {
+        self.staging = Some(staging);
+        self
+    }
+
+    /// Whether this forward launches kernels and copies; a recording or staging forward does not.
+    pub const fn launches(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    /// A row-major tensor of `shape` elements of `dtype` from this forward's arena.
+    ///
+    /// Reservations are made in call order, so a forward run again over the same extents receives
+    /// the same addresses, which is what a captured graph replays.
+    ///
+    /// # Errors
+    ///
+    /// When the arena cannot hold the tensor, or `dtype` has no whole-byte size.
+    pub fn empty(&self, dtype: DType, shape: Shape) -> Result<TensorView> {
+        self.arena.tensor(dtype, shape)
+    }
+
+    /// A device tensor of `shape` holding `values`, row-major.
+    ///
+    /// The values are written into the staging region and, in a launching forward, copied to the
+    /// device in stream order. A recording forward without a staging region only reserves the
+    /// tensor. `shape` must follow from the bucket's extents and never from a request's values, so
+    /// that a captured copy and every staging walk before its replays agree on the offset.
+    ///
+    /// # Errors
+    ///
+    /// When `values` does not hold `shape`'s elements, a launching or staging forward has no
+    /// staging region, or a region cannot hold the values.
+    pub fn upload<T: HostValue>(&self, values: &[T], shape: Shape) -> Result<TensorView> {
+        if values.len() as u64 != shape.numel() {
+            return Err(Error::shape(
+                "Forward::upload",
+                format!("{} values for a {shape:?} tensor", values.len()),
+            ));
+        }
+        let tensor = self.empty(T::DTYPE, shape)?;
+        let bytes = std::mem::size_of_val(values) as u64;
+        let Some(staging) = self.staging else {
+            if self.launches() {
+                return Err(Error::Unsupported(
+                    "a launching forward uploads through a staging region, and this one has none"
+                        .to_owned(),
+                ));
+            }
+            return Ok(tensor);
+        };
+        let Some(host) = staging.reserve(bytes)? else {
+            // A counting region measures; a launching forward over one would hand its consumer a
+            // tensor nothing was copied into.
+            if self.launches() {
+                return Err(Error::Unsupported(
+                    "a launching forward uploads into page-locked memory, and its staging region \
+                     only counts"
+                        .to_owned(),
+                ));
+            }
+            return Ok(tensor);
+        };
+        // SAFETY: `reserve` answered `bytes` bytes of the region's page-locked memory that no
+        // other upload of this forward addresses, and `values` holds exactly `bytes` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                values.as_ptr().cast::<u8>(),
+                host as *mut u8,
+                bytes as usize,
+            );
+        }
+        if let Some(stream) = self.stream {
+            // SAFETY: the region outlives every graph that reads it (`Staging::new`), and nothing
+            // overwrites these bytes before execution resets the region after the copy completed.
+            unsafe { ops::platform::copy_from_host(tensor.ptr, host, bytes, stream) }?;
+        }
+        Ok(tensor)
+    }
+
+    /// Runs `body` and hands back every arena reservation it made when it returns.
+    ///
+    /// A stack runs each layer in a scope: a layer's intermediates are dead once its launches are
+    /// enqueued, and the next layer receives the same addresses, which is what a replayed graph
+    /// reads. What `body` answers must not be a tensor it reserved, unless the caller reserved that
+    /// storage before the scope. Uploads are not handed back: their host bytes stay until the
+    /// region is reset, because their copies run later.
+    ///
+    /// # Errors
+    ///
+    /// What `body` answers.
+    pub fn scoped<T, E>(
+        &self,
+        body: impl FnOnce(&Self) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        let mark = self.arena.mark();
+        let answer = body(self);
+        self.arena.release(mark);
+        answer
     }
 
     /// The stream this forward's launches and collectives are issued on.
@@ -360,7 +584,7 @@ impl<'a> Forward<'a> {
     /// When `ranks` is zero or `rank` is not below it, and on a launching forward, whose split is
     /// its group's.
     pub fn with_split(mut self, rank: u64, ranks: u64) -> Result<Self> {
-        if !self.is_recording() {
+        if self.launches() {
             return Err(Error::Unsupported(
                 "a launching forward is split by the group it is given".to_owned(),
             ));
@@ -556,22 +780,22 @@ impl<'a> Forward<'a> {
         self
     }
 
-    /// Runs `body`, the forward of the module instance at `path` of `component`, between its fence
-    /// probes when this forward has a fence and the deployment probes the component.
+    /// Runs `body`, the forward of the module instance at `path` of `class`, between its fence
+    /// probes when this forward has a fence and the deployment probes the class.
     ///
     /// # Errors
     ///
     /// What `body` answers, or the probe's own failure.
     pub fn fenced<T, E: From<Error>>(
         &self,
-        component: &'static str,
+        class: &'static str,
         path: std::fmt::Arguments<'_>,
         body: impl FnOnce() -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
         let (Some(fence), Some(stream)) = (self.fence, self.stream) else {
             return body();
         };
-        let instance = fence.enter(component, path, stream)?;
+        let instance = fence.enter(class, path, stream)?;
         let answer = body()?;
         if let Some(instance) = instance {
             fence.exit(instance, stream)?;
@@ -635,11 +859,6 @@ impl<'a> Forward<'a> {
             ops::capture::launched(O::NAME, &ops::descriptor::key(descriptor));
         }
     }
-
-    /// The arena of this forward.
-    pub fn arena(&self) -> &Arena {
-        self.arena
-    }
 }
 
 /// Runs `walk` with a capture sink installed and answers what it reported, as `(operator, key)`
@@ -673,12 +892,11 @@ mod tests {
     fn a_recording_forward_reports_the_program_it_would_launch() {
         let arena = Arena::new(DevicePtr::new(0), 1 << 20);
         let forward = Forward::recording(&arena);
-        assert!(forward.is_recording());
+        assert!(!forward.launches());
 
         let extent = Shape::new(&[4, 1024]);
         let x = arena.tensor(DType::BF16, extent).unwrap();
-        let out = arena.tensor(DType::BF16, extent).unwrap();
-        let (walked, launches) = recorded(|| crate::layers::Silu.forward(&forward, x, out));
+        let (walked, launches) = recorded(|| crate::layers::Silu.forward(&forward, x));
         walked.expect("a recording forward launches nothing");
 
         assert_eq!(launches.len(), 1, "{launches:?}");
@@ -725,7 +943,7 @@ mod tests {
 
     /// One forward reserves its layer-independent buffers once and runs every layer: a layer's
     /// scratch is handed back at its end and the next layer receives the same addresses, which is
-    /// what a replayed graph expects and what keeps the plan one layer deep.
+    /// what a replayed graph expects and what keeps the layout one layer deep.
     #[test]
     fn releasing_to_a_mark_hands_the_same_scratch_to_the_next_layer() {
         let arena = Arena::new(DevicePtr::new(0x1_0000), 4096);
@@ -768,6 +986,88 @@ mod tests {
         assert_eq!(counting.peak(), real.peak());
         assert_eq!(counting.base().address() % ALIGNMENT, 0);
         assert!(counting.tensor(DType::F32, Shape::new(&[1 << 40])).is_ok());
+    }
+
+    /// An upload writes its values at the staging region's next aligned offset, and a staging
+    /// forward over the reset region writes the next replay's values at the same offsets: that is
+    /// what makes a captured copy read the replay's values.
+    #[test]
+    fn a_staging_forward_writes_each_upload_where_the_captured_copy_reads_it() {
+        // Host memory stands in for the page-locked region: a staging forward copies nothing to a
+        // device, it only writes the region.
+        let mut memory = vec![0_u8; 4 * ALIGNMENT as usize];
+        // SAFETY: `memory` outlives the region and nothing else writes it while the test runs.
+        let staging = unsafe { Staging::new(memory.as_mut_ptr(), memory.len() as u64) };
+        let arena = Arena::counting();
+        let walk = |positions: [i32; 3], scale: f32| {
+            arena.reset();
+            staging.reset();
+            let f = Forward::staging(&arena, &staging);
+            let first = f.upload(&positions, Shape::new(&[3])).unwrap();
+            let second = f.upload(&[scale], Shape::new(&[1])).unwrap();
+            (first, second)
+        };
+        let (first, second) = walk([7, 8, 9], 0.5);
+        assert_eq!((first.dtype, second.dtype), (DType::I32, DType::F32));
+        let replayed = walk([1, 2, 3], 2.0);
+        assert_eq!((first.ptr, second.ptr), (replayed.0.ptr, replayed.1.ptr));
+
+        let base = memory.as_ptr() as u64;
+        let read_i32 = |at: usize| i32::from_ne_bytes(memory[at..at + 4].try_into().unwrap());
+        assert_eq!([read_i32(0), read_i32(4), read_i32(8)], [1, 2, 3]);
+        let second_at = ALIGNMENT as usize;
+        let scale = f32::from_ne_bytes(memory[second_at..second_at + 4].try_into().unwrap());
+        assert_eq!(scale, 2.0);
+        assert_eq!(staging.peak(), ALIGNMENT + 4);
+        assert_ne!(base, 0);
+    }
+
+    /// A recording forward without a staging region reserves the tensor and writes nothing; one over
+    /// a counting region measures the bytes its uploads need.
+    #[test]
+    fn a_recording_forward_only_reserves_and_counts_its_uploads() {
+        let arena = Arena::counting();
+        let f = Forward::recording(&arena);
+        let tensor = f.upload(&[1_i64, 2], Shape::new(&[2])).unwrap();
+        assert_eq!((tensor.dtype, tensor.shape.dims()), (DType::I64, &[2][..]));
+
+        let counting = Staging::counting();
+        let f = Forward::recording(&arena).with_staging(&counting);
+        f.upload(&[0_u8; 300], Shape::new(&[300])).unwrap();
+        f.upload(&[0_i16; 2], Shape::new(&[2])).unwrap();
+        assert_eq!(counting.peak(), 2 * ALIGNMENT + 4);
+        assert!(f.upload(&[0_i32; 2], Shape::new(&[3])).is_err());
+    }
+
+    /// A scope hands back every arena reservation made inside it, and leaves the ones before it.
+    #[test]
+    fn a_scope_hands_back_what_it_reserved() {
+        let arena = Arena::new(DevicePtr::new(0x1_0000), 1 << 20);
+        let f = Forward::recording(&arena);
+        let held = f.empty(DType::BF16, Shape::new(&[16])).unwrap();
+        let inside = f
+            .scoped(|f| {
+                f.empty(DType::F32, Shape::new(&[1024]))
+                    .map(|view| view.ptr)
+            })
+            .unwrap();
+        let next = f.empty(DType::F32, Shape::new(&[1024])).unwrap();
+        assert_eq!(inside, next.ptr);
+        assert_eq!(next.ptr.address(), held.ptr.address() + ALIGNMENT);
+    }
+
+    /// A launching forward copies what it uploads, so it refuses to upload with no staging region
+    /// and over a counting one: either would hand its consumer a tensor nothing was copied into.
+    #[test]
+    fn a_launching_forward_refuses_an_upload_it_cannot_copy() {
+        let stream = ops::Stream::new(platform::DeviceId(0)).expect("a CUDA device");
+        let kernels = Generation::new(0, []);
+        let arena = Arena::counting();
+        let f = Forward::new(&stream, &kernels, &arena);
+        assert!(f.upload(&[1_i32], Shape::new(&[1])).is_err());
+        let counting = Staging::counting();
+        let f = f.with_staging(&counting);
+        assert!(f.upload(&[1_i32], Shape::new(&[1])).is_err());
     }
 
     #[test]

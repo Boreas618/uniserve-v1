@@ -23,8 +23,8 @@ use ipc::execution::Variant;
 use nn::capability::{
     Clip, ConditionPiece, ConditionRole, ConditionShape, Conditioning, DecodedMedia, Decoder,
     Denoiser, Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageShape,
-    Latents, MediaRole, PatchFormat, PixelNorm, Seed, StateTable, Step, TableValues, TokenBatch,
-    VideoRequest, WarmPrompt, WarmRequest,
+    Latents, MediaRole, PatchFormat, PixelNorm, Seed, Step, TokenBatch, VideoRequest, WarmPrompt,
+    WarmRequest,
 };
 use nn::{Forward, Result};
 use ops::logits::{GatherArgs, GatherDescriptor, LogitsGather};
@@ -86,9 +86,7 @@ fn gather(columns: u32) -> GatherDescriptor {
 /// One fake forward: reserve `bytes` of the arena and launch `gather(columns)` over them.
 fn launch(f: &Forward<'_>, bytes: u64, columns: u32) -> Result<()> {
     let rows = bytes / 4 / u64::from(columns);
-    let reserved = f
-        .arena()
-        .tensor(DType::I32, Shape::new(&[rows, u64::from(columns)]))?;
+    let reserved = f.empty(DType::I32, Shape::new(&[rows, u64::from(columns)]))?;
     f.operate::<LogitsGather>(
         &gather(columns),
         GatherArgs {
@@ -120,7 +118,8 @@ fn latent(channels: u32, frames: u32, height: u32, width: u32) -> LatentShape {
     }
 }
 
-/// A denoiser whose constants, opening forwards and step each reserve a stated extent.
+/// A denoiser whose initialization, opening forwards and step each reserve a stated extent, and
+/// whose step uploads its host values.
 ///
 /// The opening's three forwards share one arena from its first address (2 + 3 + 4 KiB) and the
 /// captured step starts again at it (8 KiB), so the stream's peak is the opening's 9 KiB: an
@@ -151,7 +150,12 @@ impl Denoiser for Stepping {
         launch(f, 2048, 2)
     }
 
-    fn prepare_conditioning(&self, f: &Forward, _: Conditioning<'_>) -> Result<()> {
+    fn prepare_conditioning(
+        &self,
+        f: &Forward,
+        _: &VideoRequest<'_>,
+        _: Conditioning<'_>,
+    ) -> Result<()> {
         launch(f, 3072, 3)
     }
 
@@ -159,44 +163,22 @@ impl Denoiser for Stepping {
         launch(f, 4096, 4)
     }
 
-    fn denoise(&self, f: &Forward, _: Step, _: Latents, _: Conditioning<'_>) -> Result<()> {
+    fn forward(
+        &self,
+        f: &Forward,
+        step: Step,
+        request: &VideoRequest<'_>,
+        _: Latents,
+        _: Conditioning<'_>,
+    ) -> Result<()> {
+        // The step's host values: one word per prompt token, which a replay writes again.
+        let words = vec![step.index as i32; request.text_tokens as usize];
+        f.upload(&words, Shape::new(&[u64::from(request.text_tokens)]))?;
         launch(f, 8192, 5)
     }
 
-    fn evaluations(&self) -> u32 {
-        1
-    }
-
-    fn constant_tables(&self) -> Vec<StateTable> {
-        Vec::new()
-    }
-
-    fn prepare_constants(&self, f: &Forward, _: &[TensorView]) -> Result<()> {
+    fn initialize(&self, f: &Forward) -> Result<()> {
         launch(f, 1024, 1)
-    }
-
-    fn layout_tables(&self, _: &Layout) -> Result<Vec<StateTable>> {
-        Ok(Vec::new())
-    }
-
-    fn prepare_layout(&self, _: &Layout, _: &mut [TableValues]) -> Result<()> {
-        Ok(())
-    }
-
-    fn state_tables(&self, _: &Layout) -> Result<Vec<StateTable>> {
-        Ok(vec![StateTable {
-            name: "step",
-            dtype: DType::I32,
-            shape: Shape::new(&[1]),
-        }])
-    }
-
-    fn prepare_state(&self, _: &VideoRequest<'_>, _: &Layout, _: &mut [TableValues]) -> Result<()> {
-        Ok(())
-    }
-
-    fn prepare_evaluation(&self, _: u32, _: &mut [TableValues]) -> Result<()> {
-        Ok(())
     }
 }
 
@@ -217,9 +199,10 @@ fn warm() -> WarmRequest {
     }
 }
 
-/// A denoiser runner's footprint is its constants, the opening of each bucket's warm request and
-/// the step its graph captures: exactly their programs, and the furthest extent any of them
-/// reached - the eager opening's, which a captured step alone would understate.
+/// A denoiser runner's footprint is its initialization, the opening of each bucket's warm request
+/// and the step its graph captures: exactly their programs, the furthest extent any of them
+/// reached - the eager opening's, which a captured step alone would understate - and the bytes
+/// the step uploads.
 #[test]
 #[ignore = "requires a CUDA device"]
 fn a_denoiser_records_its_opening_and_its_step() {
@@ -243,6 +226,8 @@ fn a_denoiser_records_its_opening_and_its_step() {
 
     assert_eq!(footprint.keys, keys(&[1, 2, 3, 4, 5]));
     assert_eq!(footprint.peak, 2048 + 3072 + 4096);
+    // The step uploads one i32 per prompt token of the warm request.
+    assert_eq!(footprint.staging, 8 * 4);
     assert_eq!(
         footprint.widest,
         Some(Bucket::denoise(1, model.layout(&warm().view()).unwrap()).serving(1, 16, 16))
@@ -253,14 +238,6 @@ fn a_denoiser_records_its_opening_and_its_step() {
 struct Decoding;
 
 impl Decoder for Decoding {
-    fn layout_tables(&self, _: &Layout) -> Result<Vec<StateTable>> {
-        Ok(Vec::new())
-    }
-
-    fn prepare_layout(&self, _: &Layout, _: &mut [TableValues]) -> Result<()> {
-        Ok(())
-    }
-
     fn element_type(&self) -> DType {
         DType::F32
     }
@@ -286,7 +263,7 @@ impl Decoder for Decoding {
         launch(f, 1024, 6)
     }
 
-    fn decode(&self, f: &Forward, _: TensorView, _: &[TensorView], _: DecodedMedia) -> Result<()> {
+    fn decode(&self, f: &Forward, _: &Layout, _: TensorView, _: DecodedMedia) -> Result<()> {
         launch(f, 16384, 8)
     }
 }
@@ -351,24 +328,13 @@ impl Encoder for Prompting {
         }
     }
 
-    fn state_tables(&self, layout: &EncoderLayout) -> Result<Vec<StateTable>> {
-        Ok(vec![StateTable {
-            name: "positions",
-            dtype: DType::I32,
-            shape: Shape::new(&[u64::from(layout.tokens)]),
-        }])
-    }
-
-    fn prepare_state(
+    fn encode(
         &self,
+        f: &Forward,
         _: &EncoderPrompt<'_>,
-        _: &EncoderLayout,
-        _: &mut [TableValues],
+        inputs: EncoderInputs<'_>,
+        _: EncoderOutputs,
     ) -> Result<()> {
-        Ok(())
-    }
-
-    fn encode(&self, f: &Forward, inputs: EncoderInputs<'_>, _: EncoderOutputs) -> Result<()> {
         let images = inputs.images.len() as u64;
         if images == 0 {
             return launch(f, 1024, 2);
@@ -479,10 +445,15 @@ impl Denoiser for Anchoring {
         Stepping.draw_noise(f, seed, layout, latents)
     }
 
-    fn prepare_conditioning(&self, f: &Forward, cond: Conditioning<'_>) -> Result<()> {
+    fn prepare_conditioning(
+        &self,
+        f: &Forward,
+        request: &VideoRequest<'_>,
+        cond: Conditioning<'_>,
+    ) -> Result<()> {
         let pieces = cond.media.len() as u64;
         if pieces == 0 {
-            return Stepping.prepare_conditioning(f, cond);
+            return Stepping.prepare_conditioning(f, request, cond);
         }
         if cond.media.iter().any(|piece| piece.pixels.is_none()) {
             return Err(nn::Error::Unsupported(
@@ -496,51 +467,19 @@ impl Denoiser for Anchoring {
         Stepping.prepare_latents(f, cond, latents)
     }
 
-    fn denoise(
+    fn forward(
         &self,
         f: &Forward,
         step: Step,
+        request: &VideoRequest<'_>,
         latents: Latents,
         cond: Conditioning<'_>,
     ) -> Result<()> {
-        Stepping.denoise(f, step, latents, cond)
+        Stepping.forward(f, step, request, latents, cond)
     }
 
-    fn evaluations(&self) -> u32 {
-        1
-    }
-
-    fn constant_tables(&self) -> Vec<StateTable> {
-        Stepping.constant_tables()
-    }
-
-    fn prepare_constants(&self, f: &Forward, tables: &[TensorView]) -> Result<()> {
-        Stepping.prepare_constants(f, tables)
-    }
-
-    fn layout_tables(&self, layout: &Layout) -> Result<Vec<StateTable>> {
-        Stepping.layout_tables(layout)
-    }
-
-    fn prepare_layout(&self, layout: &Layout, out: &mut [TableValues]) -> Result<()> {
-        Stepping.prepare_layout(layout, out)
-    }
-
-    fn state_tables(&self, layout: &Layout) -> Result<Vec<StateTable>> {
-        Stepping.state_tables(layout)
-    }
-
-    fn prepare_state(
-        &self,
-        request: &VideoRequest<'_>,
-        layout: &Layout,
-        out: &mut [TableValues],
-    ) -> Result<()> {
-        Stepping.prepare_state(request, layout, out)
-    }
-
-    fn prepare_evaluation(&self, index: u32, out: &mut [TableValues]) -> Result<()> {
-        Stepping.prepare_evaluation(index, out)
+    fn initialize(&self, f: &Forward) -> Result<()> {
+        Stepping.initialize(f)
     }
 }
 
@@ -591,7 +530,7 @@ fn a_denoiser_records_the_openings_its_conditions_admit() {
 
     let footprint = runner.record_walk().expect("a recorded walk");
 
-    // The constants, the warm opening (draw, conditioning, latents), the step, and the encode of
+    // The initialization, the warm opening (draw, conditioning, latents), the step, and the encode of
     // one keyframe and of two.
     assert_eq!(footprint.keys, keys(&[1, 2, 3, 4, 5, 8, 16]));
     // Two keyframes' opening: the draw, their 32 KiB encode, then the latents' start.
@@ -612,8 +551,8 @@ mod support;
 /// distinct `(dtype, wide)`, so its key says which forward launched it.
 fn copy(f: &Forward<'_>, dtype: DType, rows: u64, columns: u64, wide: bool) -> Result<()> {
     let shape = Shape::new(&[1, 1, rows, columns]);
-    let source = f.arena().tensor(dtype, shape)?;
-    let out = f.arena().tensor(dtype, shape)?;
+    let source = f.empty(dtype, shape)?;
+    let out = f.empty(dtype, shape)?;
     let plane = (rows * columns) as i64;
     f.operate::<ops::copy_block::CopyBlock>(
         &ops::copy_block::Descriptor {
@@ -652,13 +591,13 @@ fn key_set(pairs: &[(String, String)]) -> BTreeMap<String, BTreeSet<String>> {
     keys
 }
 
-/// A denoiser whose every forward copies a block, so a device runs each of them: its constants and
-/// opening are eager forwards, its step the forward a bucket's graph captures.
+/// A denoiser whose every forward copies a block, so a device runs each of them: its
+/// initialization and opening are eager forwards, its step the forward a bucket's graph captures.
 struct Copying;
 
 impl Copying {
-    /// The programs of the forwards a denoiser runner issues eagerly: the constants, filled once
-    /// per load, and a request's opening (its noise, its conditioning and its latents).
+    /// The programs of the forwards a denoiser runner issues eagerly: the initialization, once per
+    /// load, and a request's opening (its noise, its conditioning and its latents).
     fn eager() -> Vec<(String, String)> {
         vec![
             copy_key(DType::F32, false),
@@ -687,7 +626,12 @@ impl Denoiser for Copying {
         copy(f, DType::F16, 4, 24, false)
     }
 
-    fn prepare_conditioning(&self, f: &Forward, _: Conditioning<'_>) -> Result<()> {
+    fn prepare_conditioning(
+        &self,
+        f: &Forward,
+        _: &VideoRequest<'_>,
+        _: Conditioning<'_>,
+    ) -> Result<()> {
         copy(f, DType::BF16, 4, 24, false)
     }
 
@@ -695,45 +639,19 @@ impl Denoiser for Copying {
         copy(f, DType::F32, 4, 32, true)
     }
 
-    fn denoise(&self, f: &Forward, _: Step, _: Latents, _: Conditioning<'_>) -> Result<()> {
+    fn forward(
+        &self,
+        f: &Forward,
+        _: Step,
+        _: &VideoRequest<'_>,
+        _: Latents,
+        _: Conditioning<'_>,
+    ) -> Result<()> {
         copy(f, DType::BF16, 8, 64, true)
     }
 
-    fn evaluations(&self) -> u32 {
-        1
-    }
-
-    fn constant_tables(&self) -> Vec<StateTable> {
-        Vec::new()
-    }
-
-    fn prepare_constants(&self, f: &Forward, _: &[TensorView]) -> Result<()> {
+    fn initialize(&self, f: &Forward) -> Result<()> {
         copy(f, DType::F32, 2, 24, false)
-    }
-
-    fn layout_tables(&self, layout: &Layout) -> Result<Vec<StateTable>> {
-        Stepping.layout_tables(layout)
-    }
-
-    fn prepare_layout(&self, layout: &Layout, values: &mut [TableValues]) -> Result<()> {
-        Stepping.prepare_layout(layout, values)
-    }
-
-    fn state_tables(&self, layout: &Layout) -> Result<Vec<StateTable>> {
-        Stepping.state_tables(layout)
-    }
-
-    fn prepare_state(
-        &self,
-        request: &VideoRequest<'_>,
-        layout: &Layout,
-        values: &mut [TableValues],
-    ) -> Result<()> {
-        Stepping.prepare_state(request, layout, values)
-    }
-
-    fn prepare_evaluation(&self, evaluation: u32, values: &mut [TableValues]) -> Result<()> {
-        Stepping.prepare_evaluation(evaluation, values)
     }
 }
 

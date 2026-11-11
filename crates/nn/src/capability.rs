@@ -24,7 +24,7 @@ use proto::video::{LatentShape, Layout};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, TensorView};
 
 /// The device-side layout of one batch, as a model's layers read it.
 ///
@@ -326,6 +326,32 @@ impl<'a> KvView<'a> {
             )
         })
     }
+
+    /// The cache of `layer` in `group`: its planes, its group's page geometry and the paged
+    /// program's workspace.
+    pub fn layer(&self, group: usize, layer: usize) -> Result<KvLayer<'_>> {
+        Ok(KvLayer {
+            group: self.group(group)?,
+            planes: self.planes(group, layer)?,
+            workspace: self.workspace,
+        })
+    }
+}
+
+/// One attention layer's cache: the layer's own planes, selected once, and the group's page table
+/// and page size, which the group's layers share.
+///
+/// The planes arrive selected so that a reader cannot derive another layer's plane: every plane of
+/// a group has the same geometry, so a reader that took the wrong one would answer a plausible
+/// number from the wrong layer.
+#[derive(Clone, Copy)]
+pub struct KvLayer<'a> {
+    /// The group the layer's pages belong to: its page table and page size.
+    pub group: &'a KvGroup<'a>,
+    /// The layer's planes.
+    pub planes: &'a KvPlanes,
+    /// The paged program's transient scratch ([`KvView::workspace`]).
+    pub workspace: TensorView,
 }
 
 /// What an encoder reads: token ids, the attention layout of their packed rows, and any media.
@@ -342,15 +368,11 @@ pub struct EncoderInputs<'a> {
     /// the layout a tower could not tell which of its per-layout rows belong to which image. It is
     /// a host value whose shape the encode was asked for, and it carries no request identity.
     pub layout: &'a EncoderLayout,
-    /// The encoder's tables for this layout, in [`Encoder::state_tables`]' order.
-    pub state: &'a [TensorView],
 }
 
 /// One image a multimodal tower reads: its pixels.
 ///
-/// The image's geometry and its tables are the **layout's**, not the image's: two images of one
-/// grid need the same tap tables, and the worker cannot produce any of them. They are therefore
-/// [`Encoder::state_tables`]' and reach the encode through [`EncoderInputs::state`], while this
+/// The image's geometry is the **layout's** ([`EncoderInputs::layout`]), not the image's: this
 /// value carries only what the caller decoded.
 #[derive(Clone, Copy)]
 pub struct ImageInput {
@@ -579,146 +601,6 @@ impl PrefixSource {
     }
 }
 
-/// A table a model needs on the device but does not own.
-///
-/// The worker allocates; the model says what it is and fills it. Four kinds exist, they differ
-/// in **who writes them, when, and how many times**, and that is the whole of the protocol:
-///
-/// - **constants** ([`Denoiser::constant_tables`]) are device memory written by
-///   [`Denoiser::prepare_constants`], one forward *after* loading and *before* any capture. They
-///   hold values that never change for a model — an AdaLN cache folded once from the weights — so
-///   they are filled once per load and read by every capture. The forward is capture-safe: it reads
-///   nothing back and synchronizes nothing.
-/// - **layout** ([`Denoiser::layout_tables`]) is per *layout* and needs no request: the rotary
-///   positions of a raster, the packed row of each clip's latent voxel. These are the
-///   model's mathematical layout, which the worker cannot compute, and they are the same for
-///   every request of one shape — so they are filled once per layout
-///   ([`Denoiser::prepare_layout`], host values only) and shared.
-/// - **state** ([`Denoiser::state_tables`]) is per *request* of a layout: a table derived from the
-///   request itself (its prompt clock, its spans, its mask) is one table per request.
-///   [`Denoiser::prepare_state`] writes **host values only**; the worker allocates each table and
-///   uploads those values. The list is deterministic for a layout, and the worker keys its storage
-///   by `(layout, name)` beside the layout constants'.
-/// - **evaluation** ([`Denoiser::prepare_evaluation`]) is per *evaluation index*: one solver
-///   coefficient set, again host values the worker uploads, so a request's schedule is chosen
-///   without capturing a graph per step.
-///
-/// No `prepare_*` allocates, takes an allocator, synchronizes or reads anything back; allocation is
-/// the worker's and uploads are the worker's.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct StateTable {
-    /// The table's name: unique within its kind and layout, and what the worker keys storage by.
-    pub name: &'static str,
-    /// The element type the model writes and the forward reads.
-    pub dtype: DType,
-    /// The extents.
-    pub shape: Shape,
-}
-
-/// The host values of one [`StateTable`], typed by the element type the table states.
-///
-/// The runtime allocates one per table at the table's extents ([`TableValues::zeroed`]), hands the
-/// model the list in the order the model stated the tables, and uploads each once the model has
-/// written it. The model writes values, never bytes: [`TableValues::write`] checks that the values
-/// are the table's element type and fill it exactly, and refuses by the table's name otherwise.
-#[derive(Clone, Debug, PartialEq)]
-pub enum TableValues {
-    /// A table of `i32` indices, offsets or counts.
-    I32(Vec<i32>),
-    /// A table of `f32` coefficients or coordinates.
-    F32(Vec<f32>),
-}
-
-impl TableValues {
-    /// A table of `table`'s element type and extents, every element zero.
-    ///
-    /// # Errors
-    ///
-    /// When the table states an element type a host table is not written in (anything but
-    /// `I32` and `F32`), or more elements than the host can address.
-    pub fn zeroed(table: &StateTable) -> Result<Self> {
-        let elements = usize::try_from(table.shape.numel()).map_err(|_| Error::Shape {
-            owner: "TableValues",
-            problem: format!("table `{}` holds more elements than memory", table.name),
-        })?;
-        match table.dtype {
-            DType::I32 => Ok(Self::I32(vec![0; elements])),
-            DType::F32 => Ok(Self::F32(vec![0.0; elements])),
-            other => Err(Error::Shape {
-                owner: "TableValues",
-                problem: format!(
-                    "table `{}` states {other}, and a host table is written as i32 or f32",
-                    table.name
-                ),
-            }),
-        }
-    }
-
-    /// The elements the table holds.
-    pub fn len(&self) -> usize {
-        match self {
-            Self::I32(values) => values.len(),
-            Self::F32(values) => values.len(),
-        }
-    }
-
-    /// Whether the table holds no element.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// The element type of the values.
-    pub fn dtype(&self) -> DType {
-        match self {
-            Self::I32(_) => DType::I32,
-            Self::F32(_) => DType::F32,
-        }
-    }
-
-    /// Write `values` over the whole table named `name`.
-    ///
-    /// # Errors
-    ///
-    /// When `values` is another element type than the table, or another count of elements.
-    pub fn write(&mut self, name: &str, values: &Self) -> Result<()> {
-        let refuse = |problem: String| Error::Shape {
-            owner: "TableValues",
-            problem: format!("table `{name}`: {problem}"),
-        };
-        match (self, values) {
-            (Self::I32(held), Self::I32(values)) if held.len() == values.len() => {
-                held.copy_from_slice(values);
-                Ok(())
-            }
-            (Self::F32(held), Self::F32(values)) if held.len() == values.len() => {
-                held.copy_from_slice(values);
-                Ok(())
-            }
-            (held, values) => Err(refuse(format!(
-                "{} {} elements written into a table of {} {}",
-                values.len(),
-                values.dtype(),
-                held.len(),
-                held.dtype()
-            ))),
-        }
-    }
-
-    /// The table's bytes as the device reads them: each element little-endian.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        match self {
-            Self::I32(values) => values
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect(),
-            Self::F32(values) => values
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect(),
-        }
-    }
-}
-
 /// The seed a noise draw is addressed by.
 ///
 /// A draw is a function of this seed and the element's index, never of a batch position, so
@@ -855,7 +737,7 @@ impl PatchFormat {
     }
 
     /// The raster a block of `grid` (`[temporal, rows, columns]` patches) spans, `(height, width)`
-    /// in pixels: the size the processor resized the block's frames to when it planned the grid,
+    /// in pixels: the size the processor resized the block's frames to when it laid out the grid,
     /// which the runtime resizes them to again before it lays out their patches.
     pub const fn raster(&self, grid: [u32; 3]) -> (u32, u32) {
         (grid[1] * self.side, grid[2] * self.side)
@@ -893,14 +775,6 @@ pub struct Conditioning<'a> {
     pub images: Option<TensorView>,
     /// `[rows, …]` encoded reference audio, when the task has audio references.
     pub audio: Option<TensorView>,
-    /// The tables [`Denoiser::state_tables`] named for this layout, in that order.
-    pub state: &'a [TensorView],
-    /// The model's constant tables ([`Denoiser::constant_tables`]), in that order, as the runtime
-    /// allocated them and [`Denoiser::prepare_constants`] filled them.
-    pub constants: &'a [TensorView],
-    /// `[1]` i64: the step the schedule evaluates, when the model selects coefficients on the
-    /// device. Absent when the model's coefficients arrive as launch scalars.
-    pub step: Option<TensorView>,
 }
 
 /// One denoising step's schedule values.
@@ -978,40 +852,26 @@ pub struct Placed {
 
 /// A tower that turns inputs into conditioning (a text encoder, a vision tower, a video encoder).
 ///
-/// The protocol is the denoiser's, in the denoiser's words: the model says what shape an encode
-/// has, which tables that shape needs and writes their host values; the worker allocates and
-/// uploads them. A tower's per-grid tables (its rotary clocks, its tap tables, the prompt rows its
-/// images replace) are mathematics the worker cannot reproduce, and they are the same for every
-/// request of one shape.
+/// The model says what shape an encode has ([`Encoder::layout`]), which the runner captures by;
+/// the values a shape's encode reads beyond its inputs (rotary clocks, tap tables, the prompt rows
+/// its images replace) are computed inside [`Encoder::encode`].
 pub trait Encoder {
     /// The shape an encode of `batch`'s rows and `images`' grids has.
     fn layout(&self, batch: &TokenBatch, images: &[ImageShape]) -> EncoderLayout;
 
-    /// The tables an encode of `layout` reads, in [`Self::prepare_state`]'s order.
+    /// Encode `inputs` into `out`, the runner's product buffers.
     ///
-    /// Deterministic for a layout, so the worker keys storage by `(layout, name)` and shares one
-    /// set between every request of that shape.
-    fn state_tables(&self, layout: &EncoderLayout) -> Result<Vec<StateTable>>;
-
-    /// Write the host values of each table of `layout`, in [`Self::state_tables`]' order.
-    ///
-    /// `prompt` is the request's own tokens, on the host and unspliced: two of a tower's tables (the
-    /// interleaved M-RoPE positions and the prompt rows its images replace) are arithmetic over the
-    /// token ids, and that arithmetic belongs to the model rather than to the runner. The ids are
-    /// deliberately **not** part of the layout: every table's shape follows from the layout's
-    /// counts, only the values follow from the ids, so two prompts of one shape share one capture.
-    ///
-    /// `out[i]` holds `state_tables(layout)[i]`'s values, row-major, already the
-    /// right length; the worker uploads it. No allocation, no synchronization, no read-back.
-    fn prepare_state(
+    /// `prompt` is the request's own tokens on the host: the tower's positions and the prompt rows
+    /// its images replace are arithmetic over them, which the forward computes and uploads
+    /// (`Forward::upload`). Their shapes follow from `layout`'s counts alone, so two prompts of one
+    /// shape share one capture.
+    fn encode(
         &self,
+        f: &Forward,
         prompt: &EncoderPrompt<'_>,
-        layout: &EncoderLayout,
-        out: &mut [TableValues],
+        inputs: EncoderInputs<'_>,
+        out: EncoderOutputs,
     ) -> Result<()>;
-
-    /// Encode `inputs` into `out`.
-    fn encode(&self, f: &Forward, inputs: EncoderInputs<'_>, out: EncoderOutputs) -> Result<()>;
 }
 
 /// A diffusion model that denoises latents step by step.
@@ -1113,68 +973,32 @@ pub trait Denoiser {
     /// must write it here. A no-op default would make forgetting the call — or forgetting the
     /// override — succeed silently, and a model whose conditioning is prepared nowhere generates a
     /// plausible clip from zeros; the absence of this method's work is not observable in the output.
-    fn prepare_conditioning(&self, f: &Forward, cond: Conditioning<'_>) -> Result<()>;
+    fn prepare_conditioning(
+        &self,
+        f: &Forward,
+        request: &VideoRequest<'_>,
+        cond: Conditioning<'_>,
+    ) -> Result<()>;
 
-    /// One denoising step: update `latents` in place with the model's velocity.
-    fn denoise<'a>(
+    /// One denoising step of `request`: update `latents` in place with the model's velocity.
+    ///
+    /// The host values the step reads (packing indices, rotary positions, the step's schedule
+    /// coefficients) are computed here from `request` and `step` and placed with
+    /// `Forward::upload`; their shapes follow from the request's layout alone, so every request of
+    /// one layout replays one capture.
+    fn forward(
         &self,
         f: &Forward,
         step: Step,
-        latents: Latents,
-        cond: Conditioning<'a>,
-    ) -> Result<()>;
-
-    /// How many solver evaluations one request makes: the coefficient sets
-    /// [`Self::prepare_evaluation`] can be asked for.
-    fn evaluations(&self) -> u32;
-
-    /// The tables that never change for this model, in the order [`Self::prepare_constants`] fills
-    /// them: values the model computes from its weights once, such as a fixed schedule's timestep
-    /// modulation. Their extents follow from the configuration; the runtime allocates them once per
-    /// load and hands them to every step ([`Conditioning::constants`]).
-    fn constant_tables(&self) -> Vec<StateTable>;
-
-    /// Fill `out` with the constants, in [`Self::constant_tables`]' order.
-    ///
-    /// The worker calls this once after loading and before it captures anything: the launches are
-    /// captured with everything else, so the forward must be capture-safe — no host read, no
-    /// synchronization, no allocation.
-    fn prepare_constants(&self, f: &Forward, out: &[TensorView]) -> Result<()>;
-
-    /// The constants a layout needs, in the order [`Self::prepare_layout`] fills them.
-    ///
-    /// These are the layout's alone: the per-voxel rotary positions of a raster, the packed row of
-    /// each clip's voxel. They are filled once per layout, not once per request, so the worker
-    /// keys its storage by `(layout, name)` beside the request's state and shares one set between
-    /// every request of that shape.
-    fn layout_tables(&self, layout: &Layout) -> Result<Vec<StateTable>>;
-
-    /// Write the host values of each layout constant of `layout`, in [`Self::layout_tables`]' order.
-    ///
-    /// Same rule as [`Self::prepare_state`]: host values only, already the right length, uploaded by
-    /// the worker, and deterministic for a layout so two requests of one shape agree.
-    fn prepare_layout(&self, layout: &Layout, out: &mut [TableValues]) -> Result<()>;
-
-    /// The tables a request of `layout` needs, in the order [`Self::prepare_state`] fills them.
-    ///
-    /// Deterministic for a layout: the worker keys its storage by `(layout, name)`, so two
-    /// requests of the same shape share one set.
-    fn state_tables(&self, layout: &Layout) -> Result<Vec<StateTable>>;
-
-    /// Write the host values of each table of `layout`, in [`Self::state_tables`]' order.
-    ///
-    /// `out[i]` holds `state_tables(layout)[i]`'s values, row-major, and is already
-    /// the right length; the worker uploads it.
-    fn prepare_state(
-        &self,
         request: &VideoRequest<'_>,
-        layout: &Layout,
-        out: &mut [TableValues],
+        latents: Latents,
+        cond: Conditioning<'_>,
     ) -> Result<()>;
 
-    /// Write the host values of evaluation `index`'s coefficient tables, in
-    /// [`Self::constant_tables`]' layout order.
-    fn prepare_evaluation(&self, index: u32, out: &mut [TableValues]) -> Result<()>;
+    /// Fill the values this model computes from its weights once, after the load and before any
+    /// capture: tables the load reserved as writable constants (`Scope::writable_zeros`), such as
+    /// a fixed schedule's timestep modulation. A model with none answers `Ok(())`.
+    fn initialize(&self, f: &Forward) -> Result<()>;
 }
 
 /// One clip's place on a timeline, as the runner states it.
@@ -1200,26 +1024,6 @@ pub struct Splice {
 
 /// A decoder that turns latents back into media.
 pub trait Decoder {
-    /// The tables a decode of `layout` reads, in [`Self::prepare_layout`]'s order.
-    ///
-    /// Every decoder table is layout-keyed: the copy blocks' offsets, the per-voxel rotary
-    /// positions and the packed row of each clip's voxel all follow from the layout's counts, not
-    /// from a request's seed or schedule. Deterministic for a layout, so the worker keys storage
-    /// by `(layout, name)` and shares one set between every request of that shape.
-    ///
-    /// A layout the block cannot serve is a **named error**, not an empty list: a block with no
-    /// tables and a block that cannot answer are different facts, and only one of them is the
-    /// caller's to act on. Returning `Ok(vec![])` for a contradictory layout is the shape a silent
-    /// failure takes - the runner uploads nothing, the decode reads nothing, and nothing said so.
-    fn layout_tables(&self, layout: &Layout) -> Result<Vec<StateTable>>;
-
-    /// Write the host values of each table of `layout`, in [`Self::layout_tables`]' order.
-    ///
-    /// `out[i]` holds `layout_tables(layout)[i]`'s values, row-major, and is
-    /// already the right length; the worker uploads it. Host values only: no allocation, no
-    /// synchronization and no read-back, so a decode captured after this call is capture-safe.
-    fn prepare_layout(&self, layout: &Layout, out: &mut [TableValues]) -> Result<()>;
-
     /// The element type this decoder reads its latents in and writes its decoded media in.
     ///
     /// The runner allocates the latents column and the raster column before a graph exists, and a
@@ -1317,12 +1121,16 @@ pub trait Decoder {
         ))
     }
 
-    /// Decode `latents` into `out`, reading the layout's tables in order.
+    /// Decode `latents` of `layout` into `out`, the runner's raster and waveform buffers.
+    ///
+    /// The values a decode of `layout` reads beyond its latents (copy-block offsets, rotary
+    /// positions, the packed row of each voxel) are computed here and placed with
+    /// `Forward::upload`; their shapes follow from `layout`'s counts alone.
     fn decode(
         &self,
         f: &Forward,
+        layout: &Layout,
         latents: TensorView,
-        state: &[TensorView],
         out: DecodedMedia,
     ) -> Result<()>;
 }
@@ -1379,23 +1187,24 @@ pub trait Splicer {
 /// The batch is already in the layout the kernels read (the mechanism writes the host rows, the
 /// worker uploads the [`TokenBatch`] views), so no method here converts or gathers on the host.
 pub trait CausalLm {
-    /// Write the embeddings of `ids` into `out` (`[tokens, hidden]`).
-    fn embed_input_ids(&self, f: &Forward, ids: TensorView, out: TensorView) -> Result<()>;
+    /// The embeddings of `ids`, `[tokens, hidden]` in the model's activation type.
+    fn embed_input_ids(&self, f: &Forward, ids: TensorView) -> Result<TensorView>;
 
-    /// Run the decoder stack over `hidden` in place, reading and writing `cache`.
+    /// Run the decoder stack over `hidden`, the batch's embeddings, reading and writing `cache`,
+    /// and answer the final normalized hidden state, `[tokens, hidden]`.
     fn forward(
         &self,
         f: &Forward,
         batch: &TokenBatch,
         cache: &KvView<'_>,
         hidden: TensorView,
-    ) -> Result<()>;
+    ) -> Result<TensorView>;
 
-    /// Project the rows of `hidden` onto the vocabulary, writing the logits to `out`.
+    /// The logits of the rows of `hidden`, `[rows, vocabulary]` FP32.
     ///
     /// `hidden` is the `[rows, hidden]` view of the rows named by `TokenBatch::logits_rows`; the
-    /// worker gathered them. `out` is `[rows, vocabulary]`.
-    fn compute_logits(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()>;
+    /// worker gathered them.
+    fn compute_logits(&self, f: &Forward, hidden: TensorView) -> Result<TensorView>;
 
     /// Runs every expert layer of one step with no tokens of this rank's own.
     ///
@@ -1414,8 +1223,7 @@ pub trait CausalLm {
 /// prefill writes into the request's context in place of the image's placeholder.
 ///
 /// The worker reads an image's bytes, sizes it by [`Vision::image_grid`], resizes and lays its
-/// pixels out in [`Vision::patch_format`] on its host threads, prepares the tables of its grid
-/// ([`Vision::image_tables`], [`Vision::prepare_image`]) and calls [`Vision::encode_image`]; the
+/// pixels out in [`Vision::patch_format`] on its host threads and calls [`Vision::encode_image`]; the
 /// features it keeps are the rows a later prefill places, at the rotary coordinates
 /// [`Vision::image_positions`] states. Every input is a borrowed view or a host value of the
 /// image's grid: no request identity crosses.
@@ -1453,24 +1261,9 @@ pub trait Vision {
     /// As [`Vision::image_rows`], or slices of another count or length.
     fn image_positions(&self, grid: [u32; 3], start: u32, out: &mut [&mut [i32]]) -> Result<()>;
 
-    /// The host tables an encode of `grid` reads, in the order [`Vision::prepare_image`] fills
-    /// them.
-    ///
-    /// # Errors
-    ///
-    /// As [`Vision::image_rows`].
-    fn image_tables(&self, grid: [u32; 3]) -> Result<Vec<StateTable>>;
-
-    /// Write the host values of [`Vision::image_tables`] for `grid`.
-    ///
-    /// # Errors
-    ///
-    /// Buffers of other shapes than the tables'.
-    fn prepare_image(&self, grid: [u32; 3], out: &mut [TableValues]) -> Result<()>;
-
-    /// Encode one image: `pixels` (`[patches, width]` in [`Vision::patch_format`]) with its
-    /// prepared `tables` into `out`, `[rows, hidden]` in the model's activation type, `rows` being
-    /// [`Vision::image_rows`].
+    /// Encode one image: `pixels` (`[patches, width]` in [`Vision::patch_format`]) into `out`,
+    /// `[rows, hidden]` in the model's activation type, `rows` being [`Vision::image_rows`]. The
+    /// grid's position tables are computed here and placed with `Forward::upload`.
     ///
     /// # Errors
     ///
@@ -1480,7 +1273,6 @@ pub trait Vision {
         f: &Forward,
         grid: [u32; 3],
         pixels: TensorView,
-        tables: &[TensorView],
         out: TensorView,
     ) -> Result<()>;
 }
@@ -1619,34 +1411,5 @@ mod batch_tests {
         let mut empty = batch(4);
         empty.num_tokens = 0;
         assert!(empty.check().is_err());
-    }
-
-    /// A host table is allocated in the type its statement names and accepts exactly its own
-    /// values: another element type or another count is refused by the table's name.
-    #[test]
-    fn a_host_table_holds_its_own_type_and_extent() {
-        let table = StateTable {
-            name: "offsets",
-            dtype: DType::I32,
-            shape: Shape::new(&[2, 2]),
-        };
-        let mut values = TableValues::zeroed(&table).unwrap();
-        assert_eq!(values, TableValues::I32(vec![0; 4]));
-        values
-            .write("offsets", &TableValues::I32(vec![1, -2, 3, 4]))
-            .unwrap();
-        assert_eq!(values.to_bytes()[4..8], (-2_i32).to_le_bytes());
-
-        let short = values.write("offsets", &TableValues::I32(vec![1, 2]));
-        let mistyped = values.write("offsets", &TableValues::F32(vec![0.0; 4]));
-        for refused in [short, mistyped] {
-            assert!(refused.unwrap_err().to_string().contains("offsets"));
-        }
-        let narrow = StateTable {
-            name: "half",
-            dtype: DType::BF16,
-            shape: Shape::new(&[1]),
-        };
-        assert!(TableValues::zeroed(&narrow).is_err());
     }
 }

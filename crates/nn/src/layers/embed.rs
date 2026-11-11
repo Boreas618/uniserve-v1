@@ -69,32 +69,36 @@ impl PatchEmbed {
         self.proj.weight()
     }
 
-    /// Pack `latent` `[channels, frames, rows, columns]` into `tokens` `[tokens, token_width]`.
+    /// `latent` `[channels, frames, rows, columns]` packed into `[tokens, token_width]` tokens.
     ///
     /// # Errors
     ///
     /// As [`Patchify::forward`].
-    pub fn patchify(&self, f: &Forward, latent: TensorView, tokens: TensorView) -> Result<()> {
-        self.patchify.forward(f, latent, tokens)
+    pub fn patchify(&self, f: &Forward, latent: TensorView) -> Result<TensorView> {
+        self.patchify.forward(f, latent)
     }
 
-    /// Project `tokens` `[rows, token_width]` into `out` `[rows, hidden]`; the output's element
-    /// type is the caller's.
+    /// `tokens` `[rows, token_width]` projected to `[rows, hidden]` in their element type.
     ///
     /// # Errors
     ///
     /// As [`Linear::forward`].
-    pub fn project(&self, f: &Forward, tokens: TensorView, out: TensorView) -> Result<()> {
-        self.proj.forward(f, tokens, out)
+    pub fn project(&self, f: &Forward, tokens: TensorView) -> Result<TensorView> {
+        self.proj.forward(f, tokens)
     }
 
-    /// Unpack `tokens` `[tokens, token_width]` back into the raster `out`, the inverse of the
-    /// tokenization (a prediction in token order returns to the latent's layout).
+    /// `tokens` `[tokens, token_width]` unpacked back into a raster of `raster` extents, the inverse
+    /// of the tokenization (a prediction in token order returns to the latent's layout).
     ///
     /// # Errors
     ///
     /// As [`Patchify::inverse`].
-    pub fn unpatchify(&self, f: &Forward, tokens: TensorView, out: TensorView) -> Result<()> {
-        self.patchify.inverse(f, tokens, out)
+    pub fn unpatchify(
+        &self,
+        f: &Forward,
+        tokens: TensorView,
+        raster: ops::Shape,
+    ) -> Result<TensorView> {
+        self.patchify.inverse(f, tokens, raster)
     }
 }

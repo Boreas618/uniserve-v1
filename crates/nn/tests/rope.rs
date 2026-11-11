@@ -7,7 +7,7 @@
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
 
-use nn::layers::{Gains, Precision, QkNorm, Rotary, RotarySpec, Spectrum};
+use nn::layers::{Factors, Gains, Precision, QkNorm, Rotary, RotarySpec, Spectrum};
 use nn::{Arena, Checkpoint, DType, Forward, Shape, TensorView, WeightLoader};
 
 /// Runs `walk` with a capture sink installed and answers the operators it reported.
@@ -93,29 +93,23 @@ fn the_factors_read_one_coordinate_per_axis_into_one_column_per_pair() {
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
     let tensor = |dtype, dims: &[u64]| arena.tensor(dtype, Shape::new(dims)).unwrap();
-    let (cosine, sine) = (tensor(DType::F32, &[10, 48]), tensor(DType::F32, &[10, 48]));
-    let (result, launches) =
-        launched(|| rotary.factors(&f, tensor(DType::I32, &[3, 10]), cosine, sine));
-    result.unwrap();
+    let (result, launches) = launched(|| rotary.factors(&f, tensor(DType::I32, &[3, 10])));
+    let factors = result.unwrap();
+    assert_eq!(
+        factors.cosine.shape.dims(),
+        [10, 48],
+        "one column per rotated pair"
+    );
+    assert_eq!(
+        (factors.sine.shape, factors.sine.dtype),
+        (factors.cosine.shape, DType::F32)
+    );
     assert_eq!(launches.len(), 1);
     assert_eq!(launches[0].0, "rotary_factors");
 
     assert!(
-        rotary
-            .factors(&f, tensor(DType::I32, &[30]), cosine, sine)
-            .is_err(),
+        rotary.factors(&f, tensor(DType::I32, &[30])).is_err(),
         "a sectioned rotation reads axis-major positions"
-    );
-    assert!(
-        rotary
-            .factors(
-                &f,
-                tensor(DType::I32, &[3, 10]),
-                tensor(DType::F32, &[10, 64]),
-                sine
-            )
-            .is_err(),
-        "a table as wide as the head, not the rotated pairs"
     );
 }
 
@@ -133,13 +127,18 @@ fn a_fused_rotary_turns_queries_and_keys_in_one_launch() {
         query: tensor(&[128]),
         key: tensor(&[128]),
     };
-    let (cosine, sine) = (factors(), factors());
-    let turn = |gains: Option<Gains>| {
-        launched(|| rotary.apply(&f, query, key, gains, cosine, sine, query, key))
+    let factors = Factors {
+        cosine: factors(),
+        sine: factors(),
     };
+    let turn = |gains: Option<Gains>| launched(|| rotary.forward(&f, query, key, gains, factors));
 
     let (learned, with_gains) = turn(Some(gains));
-    learned.unwrap();
+    let (turned_query, turned_key) = learned.unwrap();
+    assert_eq!(
+        (turned_query.shape, turned_key.shape),
+        (query.shape, key.shape)
+    );
     let (bare, without_gains) = turn(None);
     bare.unwrap();
     assert_eq!(with_gains.len(), 1);
@@ -148,7 +147,7 @@ fn a_fused_rotary_turns_queries_and_keys_in_one_launch() {
     assert_ne!(with_gains[0].1, without_gains[0].1);
 
     // The strided form turns two views of one buffer in place, without gains.
-    let (strided, launches) = launched(|| rotary.apply_strided(&f, query, query, cosine, sine));
+    let (strided, launches) = launched(|| rotary.rotate(&f, query, query, factors));
     strided.unwrap();
     assert_eq!(launches[0].0, "qk_norm_rope");
 
@@ -159,7 +158,7 @@ fn a_fused_rotary_turns_queries_and_keys_in_one_launch() {
     };
     assert!(
         rotary
-            .apply(&f, query, key, Some(narrow), cosine, sine, query, key)
+            .forward(&f, query, key, Some(narrow), factors)
             .is_err()
     );
 }
@@ -186,9 +185,11 @@ fn a_rotary_without_the_norm_turns_each_projection_alone() {
     let tensor = |dims: &[u64]| arena.tensor(DType::BF16, Shape::new(dims)).unwrap();
     let factors = || arena.tensor(DType::F32, Shape::new(&[6, 36])).unwrap();
     let (query, key) = (tensor(&[6, 16, 72]), tensor(&[6, 16, 72]));
-    let (cosine, sine) = (factors(), factors());
-    let (result, launches) =
-        launched(|| rotary.apply(&f, query, key, None, cosine, sine, query, key));
+    let factors = Factors {
+        cosine: factors(),
+        sine: factors(),
+    };
+    let (result, launches) = launched(|| rotary.forward(&f, query, key, None, factors));
     result.unwrap();
     let operators: Vec<&str> = launches.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(operators, ["rope_apply", "rope_apply"]);
@@ -199,10 +200,10 @@ fn a_rotary_without_the_norm_turns_each_projection_alone() {
     };
     assert!(
         rotary
-            .apply(&f, query, key, Some(gains), cosine, sine, query, key)
+            .forward(&f, query, key, Some(gains), factors)
             .is_err()
     );
-    assert!(rotary.apply_strided(&f, query, key, cosine, sine).is_err());
+    assert!(rotary.rotate(&f, query, key, factors).is_err());
 }
 
 /// A rotation wider than the head, or query heads that do not group the key heads, are refused at
@@ -224,19 +225,13 @@ fn a_projection_of_another_head_count_is_refused() {
     let f = Forward::recording(&arena);
     let view =
         |dims: &[u64]| -> TensorView { arena.tensor(DType::BF16, Shape::new(dims)).unwrap() };
-    let factors = arena.tensor(DType::F32, Shape::new(&[3, 32])).unwrap();
-    let wrong = view(&[3, 2, 64]);
+    let table = arena.tensor(DType::F32, Shape::new(&[3, 32])).unwrap();
+    let factors = Factors {
+        cosine: table,
+        sine: table,
+    };
     let error = rotary
-        .apply(
-            &f,
-            wrong,
-            view(&[3, 4, 64]),
-            None,
-            factors,
-            factors,
-            wrong,
-            view(&[3, 4, 64]),
-        )
+        .forward(&f, view(&[3, 2, 64]), view(&[3, 4, 64]), None, factors)
         .expect_err("two query heads for a four-head rotary");
     assert!(format!("{error}").contains("query"), "{error}");
 }

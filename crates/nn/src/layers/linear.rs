@@ -37,7 +37,9 @@ use crate::family::Split;
 use crate::forward::Forward;
 use crate::layers::ACCUMULATE;
 use crate::quantization::Scheme;
-use crate::weights::{Nvfp4Names, QuantizedWeight, Scope, Weight, WeightLayout, WeightRequest};
+use crate::weights::{
+    Nvfp4Names, QuantizedWeight, ScaleLayouts, Scope, Weight, WeightLayout, WeightRequest,
+};
 
 /// Elements of a row one activation-encoding program covers.
 ///
@@ -334,8 +336,10 @@ impl Linear {
             &scales,
             Some(&input_scale),
             spelling,
-            FILE_SCALE_LAYOUT,
-            PRODUCT_SCALE_LAYOUT,
+            ScaleLayouts {
+                file: FILE_SCALE_LAYOUT,
+                product: PRODUCT_SCALE_LAYOUT,
+            },
             global_scale,
         )?;
         let alpha = loader.constant(
@@ -467,18 +471,42 @@ impl Linear {
         matches!(self.form, Form::Packed(_))
     }
 
-    /// `out = input · weightᵀ + bias`, reduced over the split's group when the projection is
-    /// row-parallel.
+    /// `input · weightᵀ + bias`, `[m, n]` in `input`'s element type, reduced over the split's
+    /// group when the projection is row-parallel.
     ///
-    /// `input` is `[m, k]` and `out` is `[m, n]`. A packed product is launched at the row class of
-    /// `m` ([`ops::fp4::packed_rows`]) and writes whole tiles, so `out` must address a region that holds the
-    /// class's rows; its first `m` rows are the answer.
+    /// A packed product is launched at the row class of `m` ([`ops::fp4::packed_rows`]) and writes
+    /// whole tiles, so the output is reserved at the class's rows and the answer is its first `m`.
     ///
     /// # Errors
     ///
-    /// When a view does not fit the projection, an operator refuses, or a row-parallel projection
-    /// runs on a forward that carries no group.
-    pub fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
+    /// When `input` does not fit the projection, an operator refuses, the arena cannot hold the
+    /// output, or a row-parallel projection runs on a forward that carries no group.
+    pub fn forward(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
+        let out = self.reserve(f, input)?;
+        self.launch(f, input, out)?;
+        Ok(out)
+    }
+
+    /// The output [`Self::forward`] writes for `input`'s rows, in `input`'s element type, reserved
+    /// without launching: a block that keeps the projection's output across a scope reserves it
+    /// first and launches inside. Only `input`'s row count and element type are read.
+    pub(crate) fn reserve(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
+        let rows = input.rows();
+        let held = if self.is_packed() {
+            let counted = u32::try_from(rows)
+                .map_err(|_| Error::shape("Linear", format!("{rows} activation rows")))?;
+            u64::from(ops::fp4::packed_rows(counted)?)
+        } else {
+            rows
+        };
+        let n = u64::from(self.n);
+        let region = f.empty(input.dtype, Shape::new(&[held, n]))?;
+        Ok(prefix(region, &[rows, n]))
+    }
+
+    /// Launch the product of `input` into `out`, `[m, n]`, whose region holds the packed row
+    /// class when the weight is packed.
+    pub(crate) fn launch(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
         let k = u64::from(self.k);
         let n = u64::from(self.n);
         input
@@ -516,7 +544,7 @@ impl Linear {
                 };
                 f.operate::<Gemm>(&descriptor, args)?;
             }
-            Form::Packed(packed) => self.forward_packed(f, packed, input, out)?,
+            Form::Packed(packed) => self.launch_packed(f, packed, input, out)?,
             Form::Fp8 {
                 weight,
                 input_scale,
@@ -559,32 +587,6 @@ impl Linear {
         Ok(())
     }
 
-    /// [`Self::forward`] into an output of `dtype` reserved from the forward's arena.
-    ///
-    /// A packed product writes whole row classes ([`ops::fp4::packed_rows`]), so the reservation holds the
-    /// class's rows and the answer is the view of its first `m` rows; a dense product's
-    /// reservation is exactly `[m, n]`.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::forward`], a row count above the largest packed class, or an arena that cannot
-    /// hold the output.
-    pub fn apply(&self, f: &Forward, input: TensorView, dtype: DType) -> Result<TensorView> {
-        let rows = input.rows();
-        let held = if self.is_packed() {
-            let counted = u32::try_from(rows)
-                .map_err(|_| Error::shape("Linear", format!("{rows} activation rows")))?;
-            u64::from(ops::fp4::packed_rows(counted)?)
-        } else {
-            rows
-        };
-        let n = u64::from(self.n);
-        let region = f.arena().tensor(dtype, Shape::new(&[held, n]))?;
-        let out = TensorView::new(region.ptr, dtype, Shape::new(&[rows, n]));
-        self.forward(f, input, out)?;
-        Ok(out)
-    }
-
     /// The epilogue the bias asks for.
     fn epilogue(&self) -> Epilogue {
         if self.bias.is_some() {
@@ -594,8 +596,8 @@ impl Linear {
         }
     }
 
-    /// Encode `input` and contract it with the packed weight, at the row class of its rows.
-    fn forward_packed(
+    /// Encode `input` and multiply it by the packed weight, at the row class of its rows.
+    fn launch_packed(
         &self,
         f: &Forward,
         packed: &Packed,
@@ -628,11 +630,10 @@ impl Linear {
         // `code · block_scale · row factor`. The regions are class-height and the encode writes the
         // request's rows into their prefix; the product's rows past the request's are computed
         // from bytes nothing reads and discarded with the rows they land in.
-        let arena = f.arena();
-        let values_region = arena.tensor(DType::U8, Shape::new(&[class, k / 2]))?;
+        let values_region = f.empty(DType::U8, Shape::new(&[class, k / 2]))?;
         let scale_shape = PRODUCT_SCALE_LAYOUT.shape(class, k);
-        let scales = arena.tensor(DType::U8, scale_shape)?;
-        let token_scale_region = arena.tensor(DType::F32, Shape::new(&[class]))?;
+        let scales = f.empty(DType::U8, scale_shape)?;
+        let token_scale_region = f.empty(DType::F32, Shape::new(&[class]))?;
         let values = prefix(values_region, &[rows, k / 2]);
         // One scalar per row, so the view is rank one: the encode checks `[rows]`.
         let token_scale = prefix(token_scale_region, &[rows]);
@@ -661,7 +662,7 @@ impl Linear {
         };
         f.operate::<Nvfp4Quantize>(&quantize, encoded)?;
 
-        // 2. Contract the encoded activation with the weight, over the class's rows: the product
+        // 2. Multiply the encoded activation by the weight, over the class's rows: the product
         // writes whole tiles, so it is handed the class-height region `out` addresses.
         let descriptor = GemmDescriptor {
             packed: DType::U8,
@@ -747,7 +748,7 @@ fn prefix(buffer: TensorView, dims: &[u64]) -> TensorView {
 /// The heads an attention's query, key and value projections hold.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct QkvSpec {
-    /// The hidden width the projections contract.
+    /// The hidden width the projections reduce over.
     pub hidden: u32,
     /// Query heads of the whole module.
     pub heads: u32,
@@ -926,7 +927,7 @@ impl QkvLinear {
         &self.value
     }
 
-    /// Project `input` into the three outputs, query first.
+    /// Project `input` into the query, key and value, in that order.
     ///
     /// # Errors
     ///
@@ -935,13 +936,12 @@ impl QkvLinear {
         &self,
         f: &Forward,
         input: TensorView,
-        query: TensorView,
-        key: TensorView,
-        value: TensorView,
-    ) -> Result<()> {
-        self.query.forward(f, input, query)?;
-        self.key.forward(f, input, key)?;
-        self.value.forward(f, input, value)
+    ) -> Result<(TensorView, TensorView, TensorView)> {
+        Ok((
+            self.query.forward(f, input)?,
+            self.key.forward(f, input)?,
+            self.value.forward(f, input)?,
+        ))
     }
 }
 
@@ -1011,13 +1011,13 @@ impl MergedColumnLinear {
         self.linear.n()
     }
 
-    /// `out = input · [weight₀; weight₁; …]ᵀ + [bias₀; bias₁; …]`.
+    /// `input · [weight₀; weight₁; …]ᵀ + [bias₀; bias₁; …]`.
     ///
     /// # Errors
     ///
     /// As [`Linear::forward`].
-    pub fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
-        self.linear.forward(f, input, out)
+    pub fn forward(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
+        self.linear.forward(f, input)
     }
 }
 
@@ -1063,25 +1063,21 @@ mod tests {
     }
 
     /// One forward of `projection` over `rows` activation rows of `input` on a recording forward:
-    /// its answer, the programs it launched, and the arena it reserved beyond its operands.
+    /// its answer, the programs it launched, and the arena it reserved beyond its input, output
+    /// included.
     fn recorded_forward(
         projection: &Linear,
         rows: u64,
         input: DType,
-    ) -> (Result<()>, Vec<(String, String)>, u64) {
+    ) -> (Result<TensorView>, Vec<(String, String)>, u64) {
         let arena = crate::Arena::counting();
         let f = Forward::recording(&arena);
-        let class = u64::from(ops::fp4::packed_rows(rows as u32).expect("a row class"));
         let activations = arena
             .tensor(input, Shape::new(&[rows, u64::from(projection.k())]))
             .expect("a counting arena");
-        let out = arena
-            .tensor(DType::BF16, Shape::new(&[class, u64::from(projection.n())]))
-            .expect("a counting arena");
-        let out = prefix(out, &[rows, u64::from(projection.n())]);
-        let operands = arena.used();
-        let (answer, launches) =
-            crate::forward::recorded(|| projection.forward(&f, activations, out));
+        // Reservations start aligned, so the input's own padding is not the projection's.
+        let operands = arena.used().next_multiple_of(crate::forward::ALIGNMENT);
+        let (answer, launches) = crate::forward::recorded(|| projection.forward(&f, activations));
         (answer, launches, arena.peak() - operands)
     }
 
@@ -1160,10 +1156,7 @@ mod tests {
             let input = arena
                 .tensor(DType::BF16, Shape::new(&[rows, 64]))
                 .expect("a counting arena");
-            let out = arena
-                .tensor(DType::BF16, Shape::new(&[rows, 8]))
-                .expect("a counting arena");
-            let (answer, launches) = crate::forward::recorded(|| dense.forward(&f, input, out));
+            let (answer, launches) = crate::forward::recorded(|| dense.forward(&f, input));
             answer.expect("the recorded forward");
             launches
         };
@@ -1201,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn a_packed_projection_refuses_what_it_cannot_contract() {
+    fn a_packed_projection_refuses_what_it_cannot_encode() {
         let alpha = weight(DType::F32, &[1]);
         // A contraction that is not whole sixteen-element blocks has no encoder.
         assert!(Linear::packed(&quantized(8, 62), alpha).is_err());
@@ -1248,12 +1241,13 @@ mod tests {
         row.reduce = 2;
         let arena = crate::Arena::counting();
         let input = arena.tensor(DType::BF16, Shape::new(&[4, 32])).unwrap();
-        let out = arena.tensor(DType::BF16, Shape::new(&[4, 8])).unwrap();
         let alone = Forward::recording(&arena);
-        let refused = row.forward(&alone, input, out).unwrap_err().to_string();
+        let refused = row.forward(&alone, input).unwrap_err().to_string();
         assert!(refused.contains("no group"), "{refused}");
         let grouped = Forward::recording(&arena).with_split(1, 2).unwrap();
-        row.forward(&grouped, input, out)
+        let out = row
+            .forward(&grouped, input)
             .expect("a split forward reduces");
+        assert_eq!(out.shape.dims(), [4, 8]);
     }
 }

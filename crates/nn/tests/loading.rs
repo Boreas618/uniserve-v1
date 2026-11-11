@@ -587,8 +587,10 @@ fn a_calibrated_nvfp4_matrix_is_loaded_as_its_three_fields() {
             &WeightRequest::region("w_scale", 0, Shape::new(&[4, 4])),
             None,
             Nvfp4Names::vllm(),
-            ops::fp4::ScaleLayout::Linear,
-            ops::fp4::ScaleLayout::Linear,
+            nn::ScaleLayouts {
+                file: ops::fp4::ScaleLayout::Linear,
+                product: ops::fp4::ScaleLayout::Linear,
+            },
             0.25,
         )
         .unwrap();
@@ -635,8 +637,10 @@ fn the_block_scales_must_have_the_layout_s_shape() {
             &WeightRequest::region("w_scale", 0, Shape::new(&[4, 4])),
             None,
             Nvfp4Names::vllm(),
-            ops::fp4::ScaleLayout::Swizzled128X4,
-            ops::fp4::ScaleLayout::Swizzled128X4,
+            nn::ScaleLayouts {
+                file: ops::fp4::ScaleLayout::Swizzled128X4,
+                product: ops::fp4::ScaleLayout::Swizzled128X4,
+            },
             0.25,
         )
         .expect_err("a linear scale field is not the swizzled layout's field");
@@ -694,13 +698,17 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
         loader
             .nvfp4_stack(
                 "layer.0.mlp.experts.up_gate",
-                "experts",
-                &["up_proj", "gate_proj"],
-                &(0..2).collect::<Vec<u32>>(),
-                2,
+                nn::ExpertStack {
+                    prefix: "experts",
+                    projections: &["up_proj", "gate_proj"],
+                    slots: &(0..2).collect::<Vec<u32>>(),
+                    vocabulary: 2,
+                },
                 Nvfp4Names::vllm(),
-                nn::ValueLayout::Plain,
-                ops::fp4::ScaleLayout::Linear,
+                nn::StackLayout {
+                    values: nn::ValueLayout::Plain,
+                    scales: ops::fp4::ScaleLayout::Linear,
+                },
                 false,
             )
             .map(|(stack, _)| stack)
@@ -748,13 +756,17 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
         loader
             .nvfp4_stack(
                 "layer.0.mlp.experts.up_gate",
-                "experts",
-                &["up_proj", "gate_proj"],
-                &(0..2).collect::<Vec<u32>>(),
-                2,
+                nn::ExpertStack {
+                    prefix: "experts",
+                    projections: &["up_proj", "gate_proj"],
+                    slots: &(0..2).collect::<Vec<u32>>(),
+                    vocabulary: 2,
+                },
                 Nvfp4Names::vllm(),
-                nn::ValueLayout::Plain,
-                ops::fp4::ScaleLayout::Linear,
+                nn::StackLayout {
+                    values: nn::ValueLayout::Plain,
+                    scales: ops::fp4::ScaleLayout::Linear,
+                },
                 false,
             )
             .map(|(stack, _)| stack)
@@ -813,13 +825,17 @@ fn a_stack_needs_every_expert_to_agree_on_its_geometry() {
     let error = loader
         .nvfp4_stack(
             "layer.0.mlp.experts.up",
-            "experts",
-            &["up_proj"],
-            &(0..2).collect::<Vec<u32>>(),
-            2,
+            nn::ExpertStack {
+                prefix: "experts",
+                projections: &["up_proj"],
+                slots: &(0..2).collect::<Vec<u32>>(),
+                vocabulary: 2,
+            },
             Nvfp4Names::vllm(),
-            nn::ValueLayout::Plain,
-            ops::fp4::ScaleLayout::Linear,
+            nn::StackLayout {
+                values: nn::ValueLayout::Plain,
+                scales: ops::fp4::ScaleLayout::Linear,
+            },
             false,
         )
         .map(|(stack, _)| stack)
@@ -831,10 +847,10 @@ fn a_stack_needs_every_expert_to_agree_on_its_geometry() {
     assert!(store.published.is_empty());
 }
 
-/// A pipeline's components keep their indexes apart; one loader reborrows another checkpoint and
-/// keeps the store, so the two components share the conversion path and its retained weights.
+/// A pipeline's stages keep their indexes apart; one loader reborrows another checkpoint and
+/// keeps the store, so the two stages share the conversion path and its retained weights.
 #[test]
-fn a_loader_borrows_another_component_s_checkpoint_and_keeps_the_store() {
+fn a_loader_borrows_another_stage_s_checkpoint_and_keeps_the_store() {
     let root = tempfile::tempdir().unwrap();
     let transformer = root.path().join("transformer");
     let vae = root.path().join("vae");
@@ -872,7 +888,7 @@ fn a_loader_borrows_another_component_s_checkpoint_and_keeps_the_store() {
         (first.view().ptr, again.view().ptr)
     };
 
-    // Same tensor name, same bytes, two components: the keys differ by the file that holds them,
+    // Same tensor name, same bytes, two stages: the keys differ by the file that holds them,
     // and both are retained by the one store.
     assert_eq!(store.published.len(), 2);
     assert_ne!(store.published[0].0.files, store.published[1].0.files);
@@ -880,10 +896,10 @@ fn a_loader_borrows_another_component_s_checkpoint_and_keeps_the_store() {
     assert_eq!(again_ptr, first_ptr);
 }
 
-/// A pipeline root holds one component per subdirectory, each with its own index and its own file
+/// A pipeline root holds one stage per subdirectory, each with its own index and its own file
 /// identities, and one loader reads them all through one store.
 #[test]
-fn a_pipeline_root_holds_its_components() {
+fn a_pipeline_root_holds_its_stages() {
     let root = tempfile::tempdir().unwrap();
     let transformer = root.path().join("transformer");
     let vae = root.path().join("vae");
@@ -899,49 +915,49 @@ fn a_pipeline_root_holds_its_components() {
         "model.safetensors",
         &[("weight", vec![2], bf16(&[3.0, 4.0]))],
     );
-    // A file that is not a shard set is not a component.
+    // A file that is not a shard set is not a stage.
     std::fs::write(root.path().join("config.json"), b"{}").unwrap();
 
     let pipeline = Checkpoint::open(root.path()).unwrap();
     assert!(pipeline.is_pipeline());
     assert_eq!(
-        pipeline.components().collect::<Vec<_>>(),
+        pipeline.stages().collect::<Vec<_>>(),
         vec!["transformer", "vae"]
     );
 
-    let transformer = pipeline.component("transformer").unwrap();
-    let vae = pipeline.component("vae").unwrap();
-    let transformer_component = pipeline.component("transformer").unwrap();
+    let transformer = pipeline.stage("transformer").unwrap();
+    let vae = pipeline.stage("vae").unwrap();
+    let transformer_stage = pipeline.stage("transformer").unwrap();
     assert_eq!(transformer.read("weight").unwrap().bytes, bf16(&[1.0, 2.0]));
     assert_eq!(vae.read("weight").unwrap().bytes, bf16(&[3.0, 4.0]));
-    // The identities name the file each component's tensors came from, not the root's directory.
+    // The identities name the file each stage's tensors came from, not the root's directory.
     assert_ne!(
         transformer.identity("weight").unwrap(),
         vae.identity("weight").unwrap()
     );
-    // The root itself holds no tensor: a component's tensors are read from that component.
+    // The root itself holds no tensor: a stage's tensors are read from that stage.
     assert!(pipeline.tensor("weight").is_none());
-    assert!(pipeline.component("audio_vae").is_err());
+    assert!(pipeline.stage("audio_vae").is_err());
 
-    // The loader's policy is kept across the components, and a policy the component does not
+    // The loader's policy is kept across the stages, and a policy the stage does not
     // describe is refused rather than read as something else.
     let mut store = Recording::default();
     let mut loader = WeightLoader::new(vae, &mut store, None, None);
     assert!(
-        loader.reborrow(transformer_component).is_ok(),
-        "the same policy, another component"
+        loader.reborrow(transformer_stage).is_ok(),
+        "the same policy, another stage"
     );
     let mut fp8 = WeightLoader::new(vae, &mut store, None, Some(nn::Quantization::Fp8));
-    let error = match fp8.reborrow(transformer_component) {
-        Ok(_) => panic!("a BF16 component is not an FP8 checkpoint"),
+    let error = match fp8.reborrow(transformer_stage) {
+        Ok(_) => panic!("a BF16 stage is not an FP8 checkpoint"),
         Err(error) => error,
     };
     assert!(format!("{error}").contains("fp8"), "{error}");
 }
 
 /// An export over a base is one checkpoint whose file set spans both: the union is per tensor, the
-/// export's own tensors shadow the base's, a component only the base carries still answers, and a
-/// tensor only the base carries inside a unioned component comes from the base.
+/// export's own tensors shadow the base's, a stage only the base carries still answers, and a
+/// tensor only the base carries inside a unioned stage comes from the base.
 #[test]
 fn an_export_over_a_base_shadows_per_tensor_across_roots() {
     let root = tempfile::tempdir().unwrap();
@@ -952,8 +968,8 @@ fn an_export_over_a_base_shadows_per_tensor_across_roots() {
         (&base, vec!["transformer", "text_encoder"]),
         (&export, vec!["transformer"]),
     ] {
-        for component in files {
-            std::fs::create_dir_all(dir.join(component)).unwrap();
+        for stage in files {
+            std::fs::create_dir_all(dir.join(stage)).unwrap();
         }
     }
     // The base: `transformer` with two tensors, and a `text_encoder` the export does not carry.
@@ -982,37 +998,37 @@ fn an_export_over_a_base_shadows_per_tensor_across_roots() {
     // The export's root is the one a log names.
     assert_eq!(unioned.root(), export.as_path());
     // The override wins, and it is the export's *bytes*, not a duplicate-key refusal.
-    let transformer = unioned.component("transformer").unwrap();
+    let transformer = unioned.stage("transformer").unwrap();
     assert_eq!(
         transformer.read("shared").unwrap().bytes,
         bf16(&[9.0, 9.0]),
         "the export shadows the base's tensor of the same name"
     );
-    // The tensor only the base carries inside the unioned component comes from the base.
+    // The tensor only the base carries inside the unioned stage comes from the base.
     assert_eq!(
         transformer.read("base_only").unwrap().bytes,
         bf16(&[3.0]),
-        "a unioned component is not all-or-nothing"
+        "a unioned stage is not all-or-nothing"
     );
-    // A component the export does not carry is the base's.
+    // A stage the export does not carry is the base's.
     assert_eq!(
         unioned
-            .component("text_encoder")
+            .stage("text_encoder")
             .unwrap()
             .read("weight")
             .unwrap()
             .bytes,
         bf16(&[4.0]),
-        "a component only the base carries still answers"
+        "a stage only the base carries still answers"
     );
     assert_eq!(
-        unioned.components().collect::<Vec<_>>(),
+        unioned.stages().collect::<Vec<_>>(),
         ["text_encoder", "transformer"]
     );
     // One root is what `open` already means.
     let single = Checkpoint::open_roots(&[&export]).unwrap();
     assert_eq!(single.root(), export.as_path());
-    assert!(single.component("text_encoder").is_err());
+    assert!(single.stage("text_encoder").is_err());
 }
 
 /// A name neither root holds is refused with the tensor and the roots, in precedence order: in a
@@ -1174,13 +1190,17 @@ fn a_stack_keeps_the_checkpoint_s_e4m3_block_scales() {
     let stack = loader
         .nvfp4_stack(
             "layer.0.mlp.experts.up_gate",
-            "experts",
-            &["up_proj", "gate_proj"],
-            &(0..2).collect::<Vec<u32>>(),
-            2,
+            nn::ExpertStack {
+                prefix: "experts",
+                projections: &["up_proj", "gate_proj"],
+                slots: &(0..2).collect::<Vec<u32>>(),
+                vocabulary: 2,
+            },
             Nvfp4Names::vllm(),
-            nn::ValueLayout::Plain,
-            ops::fp4::ScaleLayout::Linear,
+            nn::StackLayout {
+                values: nn::ValueLayout::Plain,
+                scales: ops::fp4::ScaleLayout::Linear,
+            },
             false,
         )
         .map(|(stack, _)| stack)
@@ -1224,8 +1244,10 @@ fn a_calibrated_projection_is_read_in_the_spelling_its_export_wrote() {
                 &WeightRequest::region("p.up_proj.weight_scale", 0, Shape::new(&[4, 4])),
                 None,
                 Nvfp4Names::vllm(),
-                ops::fp4::ScaleLayout::Linear,
-                ops::fp4::ScaleLayout::Linear,
+                nn::ScaleLayouts {
+                    file: ops::fp4::ScaleLayout::Linear,
+                    product: ops::fp4::ScaleLayout::Linear,
+                },
                 0.25,
             )
             .unwrap();
@@ -1242,8 +1264,10 @@ fn a_calibrated_projection_is_read_in_the_spelling_its_export_wrote() {
                 &WeightRequest::region("p.up_proj.weight_scale", 0, Shape::new(&[4, 4])),
                 None,
                 Nvfp4Names::diffusers(),
-                ops::fp4::ScaleLayout::Linear,
-                ops::fp4::ScaleLayout::Linear,
+                nn::ScaleLayouts {
+                    file: ops::fp4::ScaleLayout::Linear,
+                    product: ops::fp4::ScaleLayout::Linear,
+                },
                 0.25,
             )
             .expect_err("a checkpoint in the other export's spelling");
@@ -1296,13 +1320,17 @@ fn a_calibrated_stack_names_its_fields_with_its_exports_suffixes() {
     let stack = loader
         .nvfp4_stack(
             "layer.0.mlp.experts.up",
-            "experts",
-            &["up_proj"],
-            &(0..2).collect::<Vec<u32>>(),
-            2,
+            nn::ExpertStack {
+                prefix: "experts",
+                projections: &["up_proj"],
+                slots: &(0..2).collect::<Vec<u32>>(),
+                vocabulary: 2,
+            },
             Nvfp4Names::diffusers(),
-            nn::ValueLayout::Plain,
-            ops::fp4::ScaleLayout::Linear,
+            nn::StackLayout {
+                values: nn::ValueLayout::Plain,
+                scales: ops::fp4::ScaleLayout::Linear,
+            },
             false,
         )
         .map(|(stack, _)| stack)
@@ -1318,13 +1346,17 @@ fn a_calibrated_stack_names_its_fields_with_its_exports_suffixes() {
         loader
             .nvfp4_stack(
                 "layer.0.mlp.experts.up",
-                "experts",
-                &["up_proj"],
-                &(0..2).collect::<Vec<u32>>(),
-                2,
+                nn::ExpertStack {
+                    prefix: "experts",
+                    projections: &["up_proj"],
+                    slots: &(0..2).collect::<Vec<u32>>(),
+                    vocabulary: 2,
+                },
                 Nvfp4Names::vllm(),
-                nn::ValueLayout::Plain,
-                ops::fp4::ScaleLayout::Linear,
+                nn::StackLayout {
+                    values: nn::ValueLayout::Plain,
+                    scales: ops::fp4::ScaleLayout::Linear,
+                },
                 false,
             )
             .map(|(stack, _)| stack)
@@ -1337,7 +1369,7 @@ fn a_calibrated_stack_names_its_fields_with_its_exports_suffixes() {
 
 /// A load that reads part of a checkpoint reports the rest by name, so a wrong number can be traced
 /// to the tensors nobody asked for rather than to the ones that loaded. A pipeline qualifies its
-/// components, because two components may hold one name each.
+/// stages, because two stages may hold one name each.
 #[test]
 fn a_reading_names_the_tensors_a_load_never_asked_for() {
     let directory = tempfile::tempdir().unwrap();
@@ -1363,7 +1395,7 @@ fn a_reading_names_the_tensors_a_load_never_asked_for() {
     checkpoint.read("c").unwrap();
     assert!(checkpoint.reading().is_complete());
 
-    // A pipeline root answers with its components' names qualified, and a component that was not
+    // A pipeline root answers with its stages' names qualified, and a stage that was not
     // read is reported whole.
     let root = tempfile::tempdir().unwrap();
     let transformer = root.path().join("transformer");
@@ -1382,7 +1414,7 @@ fn a_reading_names_the_tensors_a_load_never_asked_for() {
     );
     let pipeline = Checkpoint::open(root.path()).unwrap();
     pipeline
-        .component("transformer")
+        .stage("transformer")
         .unwrap()
         .read("weight")
         .unwrap();
@@ -1442,15 +1474,19 @@ fn a_shuffled_stack_permutes_its_values_rows_at_load() {
         loader
             .nvfp4_stack(
                 "layer.0.mlp.experts.up_gate",
-                "experts",
-                &["up_proj", "gate_proj"],
-                &(0..1).collect::<Vec<u32>>(),
-                1,
-                Nvfp4Names::diffusers(),
-                nn::ValueLayout::Shuffled {
-                    epilogue_tile_m: 128,
+                nn::ExpertStack {
+                    prefix: "experts",
+                    projections: &["up_proj", "gate_proj"],
+                    slots: &(0..1).collect::<Vec<u32>>(),
+                    vocabulary: 1,
                 },
-                ops::fp4::ScaleLayout::Linear,
+                Nvfp4Names::diffusers(),
+                nn::StackLayout {
+                    values: nn::ValueLayout::Shuffled {
+                        epilogue_tile_m: 128,
+                    },
+                    scales: ops::fp4::ScaleLayout::Linear,
+                },
                 false,
             )
             .map(|(stack, _)| stack)
@@ -1517,15 +1553,19 @@ fn a_shuffled_stack_permutes_its_values_rows_at_load() {
         loader
             .nvfp4_stack(
                 "layer.0.mlp.experts.up_gate",
-                "experts",
-                &["up_proj", "gate_proj"],
-                &(0..1).collect::<Vec<u32>>(),
-                1,
-                Nvfp4Names::diffusers(),
-                nn::ValueLayout::Shuffled {
-                    epilogue_tile_m: 128,
+                nn::ExpertStack {
+                    prefix: "experts",
+                    projections: &["up_proj", "gate_proj"],
+                    slots: &(0..1).collect::<Vec<u32>>(),
+                    vocabulary: 1,
                 },
-                ops::fp4::ScaleLayout::Linear,
+                Nvfp4Names::diffusers(),
+                nn::StackLayout {
+                    values: nn::ValueLayout::Shuffled {
+                        epilogue_tile_m: 128,
+                    },
+                    scales: ops::fp4::ScaleLayout::Linear,
+                },
                 false,
             )
             .map(|(stack, _)| stack)
@@ -1577,15 +1617,19 @@ fn a_swizzled_scale_table_is_built_from_the_shards_linear_one() {
         loader
             .nvfp4_stack(
                 "layer.0.mlp.experts.down",
-                "experts",
-                &["down_proj"],
-                &(0..1).collect::<Vec<u32>>(),
-                1,
-                Nvfp4Names::diffusers(),
-                nn::ValueLayout::Shuffled {
-                    epilogue_tile_m: 128,
+                nn::ExpertStack {
+                    prefix: "experts",
+                    projections: &["down_proj"],
+                    slots: &(0..1).collect::<Vec<u32>>(),
+                    vocabulary: 1,
                 },
-                ops::fp4::ScaleLayout::Swizzled128X4,
+                Nvfp4Names::diffusers(),
+                nn::StackLayout {
+                    values: nn::ValueLayout::Shuffled {
+                        epilogue_tile_m: 128,
+                    },
+                    scales: ops::fp4::ScaleLayout::Swizzled128X4,
+                },
                 false,
             )
             .map(|(stack, _)| stack)
@@ -1814,20 +1858,26 @@ fn nvfp4_loads(loader: &mut WeightLoader<'_>) -> nn::Result<Vec<Option<Answer>>>
             Shape::new(&[1]),
         )),
         Nvfp4Names::vllm(),
-        ops::fp4::ScaleLayout::Linear,
-        ops::fp4::ScaleLayout::Swizzled128X4,
+        nn::ScaleLayouts {
+            file: ops::fp4::ScaleLayout::Linear,
+            product: ops::fp4::ScaleLayout::Swizzled128X4,
+        },
         global_scale,
     )?;
     let stack = loader
         .nvfp4_stack(
             "experts.up_gate",
-            "experts",
-            &["up_proj", "gate_proj"],
-            &(0..2).collect::<Vec<u32>>(),
-            2,
+            nn::ExpertStack {
+                prefix: "experts",
+                projections: &["up_proj", "gate_proj"],
+                slots: &(0..2).collect::<Vec<u32>>(),
+                vocabulary: 2,
+            },
             Nvfp4Names::vllm(),
-            nn::ValueLayout::Plain,
-            ops::fp4::ScaleLayout::Swizzled128X4,
+            nn::StackLayout {
+                values: nn::ValueLayout::Plain,
+                scales: ops::fp4::ScaleLayout::Swizzled128X4,
+            },
             true,
         )
         .map(|(stack, _)| stack)?;
@@ -1953,13 +2003,17 @@ fn a_meta_load_refuses_what_the_header_contradicts() {
         loader
             .nvfp4_stack(
                 "experts.up_gate",
-                "experts",
-                &["up_proj", "gate_proj"],
-                &(0..1).collect::<Vec<u32>>(),
-                1,
+                nn::ExpertStack {
+                    prefix: "experts",
+                    projections: &["up_proj", "gate_proj"],
+                    slots: &(0..1).collect::<Vec<u32>>(),
+                    vocabulary: 1,
+                },
                 Nvfp4Names::vllm(),
-                nn::ValueLayout::Plain,
-                ops::fp4::ScaleLayout::Linear,
+                nn::StackLayout {
+                    values: nn::ValueLayout::Plain,
+                    scales: ops::fp4::ScaleLayout::Linear,
+                },
                 false,
             )
             .map(|(stack, _)| stack)
@@ -1974,8 +2028,8 @@ fn a_meta_load_refuses_what_the_header_contradicts() {
     assert!(refused.to_string().contains("linear"), "{refused}");
 }
 
-/// One component of `dtype`-typed vectors, `elements` each, under `root/name`.
-fn component(root: &Path, name: &str, tensors: &[(&str, DType, u64)]) {
+/// One stage of `dtype`-typed vectors, `elements` each, under `root/name`.
+fn stage(root: &Path, name: &str, tensors: &[(&str, DType, u64)]) {
     let directory = root.join(name);
     std::fs::create_dir_all(&directory).unwrap();
     let typed: Vec<(&str, DType, Vec<u64>, Vec<u8>)> = tensors
@@ -1994,13 +2048,13 @@ fn component(root: &Path, name: &str, tensors: &[(&str, DType, u64)]) {
 fn a_checkpoint_of_one_float_type_is_stored_in_it() {
     for dtype in [DType::BF16, DType::F16, DType::F32] {
         let root = tempfile::tempdir().unwrap();
-        component(
+        stage(
             root.path(),
             "text_encoder",
             &[("embed.weight", dtype, 7), ("norm.bias", dtype, 3)],
         );
         let checkpoint = Checkpoint::open(root.path()).unwrap();
-        let text_encoder = checkpoint.component("text_encoder").unwrap();
+        let text_encoder = checkpoint.stage("text_encoder").unwrap();
         assert_eq!(text_encoder.stored_dtype().unwrap(), dtype);
     }
 }
@@ -2010,7 +2064,7 @@ fn a_checkpoint_of_one_float_type_is_stored_in_it() {
 #[test]
 fn integer_tensors_are_not_a_stored_type() {
     let root = tempfile::tempdir().unwrap();
-    component(
+    stage(
         root.path(),
         "transformer",
         &[
@@ -2019,18 +2073,18 @@ fn integer_tensors_are_not_a_stored_type() {
             ("counts", DType::I32, 5),
         ],
     );
-    component(root.path(), "scheduler", &[("steps", DType::I64, 4)]);
+    stage(root.path(), "scheduler", &[("steps", DType::I64, 4)]);
     let checkpoint = Checkpoint::open(root.path()).unwrap();
     assert_eq!(
         checkpoint
-            .component("transformer")
+            .stage("transformer")
             .unwrap()
             .stored_dtype()
             .unwrap(),
         DType::F32
     );
     let error = checkpoint
-        .component("scheduler")
+        .stage("scheduler")
         .unwrap()
         .stored_dtype()
         .expect_err("no float type to keep");
@@ -2045,7 +2099,7 @@ fn integer_tensors_are_not_a_stored_type() {
 #[test]
 fn two_stored_types_are_listed_and_refused_as_one() {
     let root = tempfile::tempdir().unwrap();
-    component(
+    stage(
         root.path(),
         "transformer",
         &[
@@ -2056,7 +2110,7 @@ fn two_stored_types_are_listed_and_refused_as_one() {
         ],
     );
     let checkpoint = Checkpoint::open(root.path()).unwrap();
-    let transformer = checkpoint.component("transformer").unwrap();
+    let transformer = checkpoint.stage("transformer").unwrap();
     let types = transformer.stored_types();
     assert_eq!(
         types.iter().map(|(dtype, _)| *dtype).collect::<Vec<_>>(),
@@ -2092,7 +2146,7 @@ fn a_sidecar_is_read_from_the_first_root_that_holds_it() {
     let export = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
     for root in [export.path(), base.path()] {
-        component(root, "transformer", &[("proj_in.weight", DType::BF16, 2)]);
+        stage(root, "transformer", &[("proj_in.weight", DType::BF16, 2)]);
     }
     std::fs::write(
         export.path().join("transformer/config.json"),

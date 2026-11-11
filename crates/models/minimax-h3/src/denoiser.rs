@@ -20,36 +20,34 @@
 //! row of the source, every condition row reads its row in packed order, and every generated or
 //! padding row reads the source's **zero row**. That source is one buffer of `text_rows +
 //! condition_rows + 1` rows - the prompt's rows, then one row per packed condition row, then the
-//! zero row last - and [`Layouts::table_specs`]'s `prefix_index` addresses it directly
+//! zero row last - and the packing's `prefix_index` addresses it directly
 //! ([`nn::capability::PrefixSource`]). The runner builds it, because the encoders produce
 //! the pieces and the packing decides the order; the DiT reads no other conditioning view, so a
 //! condition the source does not carry cannot reach the model.
 //!
-//! Two model calls fill it, in either order, because they write disjoint rows and neither reads the
-//! other's: the text encoder's own features and the zero row are the encoder stage's, and then
-//! `Denoiser::prepare_conditioning` projects each condition's own rows into the condition rows and
-//! refines the prompt's rows in place. The condition projection
-//! needs the request's declared condition shapes and therefore the stage that holds the request;
-//! the refinement needs only the buffer, which is why it is the denoiser's own per-request hook.
+//! Its rows are filled in two places that write disjoint rows: `Denoiser::prepare_conditioning`
+//! projects each condition's own rows into the condition rows once per request, and every step
+//! refines the prompt's features into the text rows ([`crate::conditioning::TokenRefiner`]), where
+//! the prompt's length is known.
 //!
-//! ## Host bytes
+//! ## Host values
 //!
-//! Everything a request changes arrives as device tables the worker allocates: the rotary
-//! coordinates, the modulation tags, the timestep groups, the prefix index of every packed row, the
-//! AdaLN row each row reads, and the step index. `Layouts::prepare_state` writes their host bytes
-//! in the order `Layouts::state_tables` names them; nothing of a request reaches a capture as a
-//! host value, and no table is uploaded from inside a forward.
+//! Everything a request changes - the rotary coordinates, the timestep groups, the prefix index of
+//! every packed row, the AdaLN row each row reads, the rows each rank owns and the step index - is
+//! computed on the host inside the step and placed on the device with `Forward::upload`
+//! ([`Layouts::packed`]). Their extents follow from the layout alone, so a graph captured for a
+//! layout replays every request of it, its uploads rewritten before each replay.
 
-use nn::blocks::ModulationTable;
-use nn::capability::{ConditionRole, StateTable, TableValues, VideoRequest};
+use nn::blocks::{ModulationTable, RowModulation};
+use nn::capability::{ConditionRole, VideoRequest};
 use nn::diffusion::{TimestepTable, TimestepTableSpec};
-use nn::family::Split;
+use nn::family::{SequenceSplit, Split};
 use nn::{DType, Forward, Shape, TensorView, WeightLoader};
 use proto::video::{LatentShape, Layout};
 
-use crate::attention::Factors;
+use crate::attention::Visibility;
 use crate::config::{CANVAS_RULE, DenoiserConfig, FRAMES, MAX_FRAMES};
-use crate::modulation::{Groups, Projections};
+use crate::modulation::Projections;
 use crate::packing::{self, DensePacking};
 use crate::schedule::{Modality, Schedule};
 use crate::solver::Solver;
@@ -63,20 +61,6 @@ const ADALN_COLUMNS: u64 = 18;
 /// The least rung of a deployment's condition ladder: the tiles of one keyframe of the released
 /// canvases, which is the smallest condition a request brings.
 const LEAST_CONDITION_RUNG: u32 = 1024;
-
-/// The packed prefix rows a deployment's layouts hold: its text capacity and its condition
-/// capacity, each a whole number of the attention kind's capacity units.
-///
-/// Both are the deployment's (`nn::family::VideoServing`): the text capacity is its longest prompt,
-/// and the condition capacity the rows its widest conditioned request packs.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Capacity {
-    /// Text rows every layout of this deployment holds.
-    pub text_rows: u32,
-    /// Condition rows it holds at most; a request rides the rung of the condition ladder that
-    /// holds its own.
-    pub condition_rows: u32,
-}
 
 /// The element type of the sample the trajectory accumulates, and of its noise.
 ///
@@ -103,23 +87,32 @@ pub struct Capacity {
 /// evaluation, which no shape refuses.
 pub const SAMPLE_DTYPE: DType = DType::F32;
 
-/// The deployment's layout rule: how a request snaps, and what its tables are.
+/// The deployment's layout rule: how a request snaps to a layout, and what the layout packs.
 pub struct Layouts {
     config: DenoiserConfig,
-    capacity: Capacity,
+    /// The text rows every layout holds: the deployment's longest prompt.
+    text_rows: u32,
+    /// The condition rows a layout holds at most; a request rides the rung of the condition
+    /// ladder that holds its own.
+    condition_rows: u32,
     /// The denoiser's sequence split: the Ulysses degree its packing aligns to, and this rank's
     /// interval of the packed rows.
     sequence: Split,
 }
 
 impl Layouts {
-    /// The rule of a checkpoint and a deployment of `capacity`, at `sequence`.
+    /// The rule of a checkpoint and a deployment holding `(text rows, condition rows)`, at
+    /// `sequence`.
     ///
     /// # Errors
     ///
     /// A transformer without heads, a sequence degree that is not a power of two, or a capacity that
     /// is not a whole number of the attention kind's units.
-    pub fn new(config: DenoiserConfig, capacity: Capacity, sequence: Split) -> Result<Self> {
+    pub fn new(
+        config: DenoiserConfig,
+        (text_rows, condition_rows): (u32, u32),
+        sequence: Split,
+    ) -> Result<Self> {
         if config.transformer.head_dim == 0 || config.transformer.num_attention_heads == 0 {
             return Err(Error::config(
                 "a denoiser's transformer has attention heads".to_owned(),
@@ -133,10 +126,7 @@ impl Layouts {
             )));
         }
         let unit = config.attention.capacity_rows();
-        for (name, rows) in [
-            ("text", capacity.text_rows),
-            ("condition", capacity.condition_rows),
-        ] {
+        for (name, rows) in [("text", text_rows), ("condition", condition_rows)] {
             if rows == 0 || !rows.is_multiple_of(unit) {
                 return Err(Error::config(format!(
                     "a {name} capacity of {rows} rows is not a multiple of the {unit}-row unit"
@@ -145,7 +135,8 @@ impl Layouts {
         }
         Ok(Self {
             config,
-            capacity,
+            text_rows,
+            condition_rows,
             sequence,
         })
     }
@@ -169,14 +160,12 @@ impl Layouts {
     /// sum over their counts: a sum over counts is exactly where the audio-only case gets dropped.
     /// The entries' offsets are a partition of `[0, condition_elements(all))` in request order.
     pub fn condition_offsets(&self, request: &VideoRequest) -> Result<Vec<(u64, u64)>> {
-        let canvas = canvas_of(request)?;
-        let declared = conditions_of(request);
         let mut cursor = 0_u64;
-        Ok(declared
+        Ok(request
+            .conditions
             .iter()
             .map(|condition| {
-                let elements =
-                    u64::from(self.condition_elements(std::slice::from_ref(condition), &canvas));
+                let elements = u64::from(self.condition_elements(std::slice::from_ref(condition)));
                 let entry = (cursor, elements);
                 cursor += elements;
                 entry
@@ -196,18 +185,23 @@ impl Layouts {
     /// packing would accept contributes exactly its elements, and one it would refuse contributes
     /// none. A refused condition never reaches here - the runner lays the request out, and that
     /// packing is the same function of the same values - so a served request's offsets are exact.
-    pub fn condition_elements(&self, conditions: &[packing::Condition], _canvas: &Canvas) -> u32 {
+    pub fn condition_elements(&self, conditions: &[nn::ConditionShape]) -> u32 {
         let channels = u64::from(self.config.transformer.video_channels);
         let elements: u64 = conditions
             .iter()
+            .filter(|condition| condition.width > 0 && condition.height > 0)
             .map(|condition| {
-                condition.frame.map_or(0, |frame| {
+                {
                     // A condition is cut into clips, so its latent count is the frame rule's for
                     // any count ([`processing::FrameClips::latent_frames`]): a 30-frame reference is
                     // 7 latent frames, and counting none because 30 is not a generated count would
                     // shift every later draw of the request by the condition's whole volume.
-                    let frames = FRAMES.latent_frames(frame.num_frames);
-                    match packing::latent_raster(&frame.canvas) {
+                    let frames = FRAMES.latent_frames(condition.frames);
+                    let canvas = Canvas {
+                        width: condition.width,
+                        height: condition.height,
+                    };
+                    match packing::latent_raster(&canvas) {
                         Ok(raster) => {
                             u64::from(frames)
                                 * u64::from(raster.height)
@@ -216,7 +210,7 @@ impl Layouts {
                         }
                         Err(_) => 0,
                     }
-                })
+                }
             })
             .sum();
         elements as u32
@@ -236,8 +230,8 @@ impl Layouts {
                 packing::segment_extent(
                     frames,
                     canvas,
-                    self.capacity.text_rows,
-                    self.capacity.condition_rows,
+                    self.text_rows,
+                    self.condition_rows,
                     tile,
                     tile,
                 )
@@ -247,8 +241,8 @@ impl Layouts {
                 packing::dense_packing(
                     frames,
                     canvas,
-                    self.capacity.text_rows,
-                    self.capacity.condition_rows,
+                    self.text_rows,
+                    self.condition_rows,
                     self.sequence.size,
                 )
                 .map(|dense| dense.padded_tokens)
@@ -277,8 +271,8 @@ impl Layouts {
             packing::segment_extent(
                 frames,
                 canvas,
-                self.capacity.text_rows,
-                self.capacity.condition_rows,
+                self.text_rows,
+                self.condition_rows,
                 tile,
                 tile,
             )
@@ -313,7 +307,8 @@ impl Layouts {
         Ok(bound)
     }
 
-    pub fn segment_of(&self, layout: &Layout) -> Result<packing::SegmentPacking> {
+    /// The sparse segment layout of `layout`, checked against the layout's own extents.
+    pub fn segment_of(&self, layout: &Layout) -> Result<packing::SegmentExtent> {
         let tile = match self.config.attention {
             crate::config::AttentionKind::Sparse { tile, .. } => tile,
             crate::config::AttentionKind::Dense => {
@@ -324,7 +319,7 @@ impl Layouts {
         };
         let frames = frame_count(layout.video.frames)?;
         let canvas = canvas_of_latents(layout)?;
-        let packed = packing::segment_packing(
+        let extent = packing::segment_extent(
             frames,
             &canvas,
             layout.text_rows,
@@ -332,7 +327,6 @@ impl Layouts {
             tile,
             tile,
         )?;
-        let extent = &packed.extent;
         let raster = packing::latent_raster(&canvas)?;
         let video_rows = extent.video_grid.0 * extent.video_grid.1 * extent.video_grid.2;
         // The layout's capacities are rows of whole tokens; a segment packing rounds each prefix
@@ -348,7 +342,7 @@ impl Layouts {
                 layout.video
             )));
         }
-        Ok(packed)
+        Ok(extent)
     }
 
     /// The layout a request is laid out in, without packing it.
@@ -368,9 +362,9 @@ impl Layouts {
                 width: raster.width,
             },
             audio: Some(self.audio_latent(packing::audio_latent_frames(frames))),
-            text_rows: self.capacity.text_rows,
+            text_rows: self.text_rows,
             condition_rows: self.condition_rows_of(request),
-            condition_elements: self.condition_elements(&conditions_of(request), &canvas),
+            condition_elements: self.condition_elements(request.conditions),
         })
     }
 
@@ -382,12 +376,10 @@ impl Layouts {
     /// `t2va` request at a capacity sized for `fl2va` carried 2048 empty rows through all of them,
     /// and an image reference at a capacity sized for a reference video carried 40000.
     fn condition_rows_of(&self, request: &VideoRequest) -> u32 {
-        if crate::VideoTask::of(request) == crate::VideoTask::TextToVideoAudio {
+        if task_of(request) == crate::VideoTask::TextToVideoAudio {
             0
         } else {
-            request
-                .condition_rows
-                .unwrap_or(self.capacity.condition_rows)
+            request.condition_rows.unwrap_or(self.condition_rows)
         }
     }
 
@@ -399,7 +391,7 @@ impl Layouts {
     /// four keyframes up, where a request's empty rows start to cost more than their graphs. Each
     /// is a whole number of capacity units, so a layout of any rung packs.
     pub fn condition_ladder(&self) -> Vec<u32> {
-        let capacity = self.capacity.condition_rows;
+        let capacity = self.condition_rows;
         let unit = self.config.attention.capacity_rows();
         let mut rungs = Vec::new();
         let mut doubling = LEAST_CONDITION_RUNG;
@@ -414,9 +406,14 @@ impl Layouts {
         rungs
     }
 
-    /// The capacity this rule lays requests out in.
-    pub const fn capacity(&self) -> Capacity {
-        self.capacity
+    /// The text rows every layout of this rule holds.
+    pub const fn text_rows(&self) -> u32 {
+        self.text_rows
+    }
+
+    /// The condition rows a layout of this rule holds at most.
+    pub const fn condition_capacity(&self) -> u32 {
+        self.condition_rows
     }
 
     /// The layout a request is served in, with the packing of its row extents.
@@ -430,11 +427,11 @@ impl Layouts {
         let packing = packing::dense_packing(
             frames,
             &canvas,
-            self.capacity.text_rows,
+            self.text_rows,
             self.condition_rows_of(request),
             self.sequence.size,
         )?;
-        let elements = self.condition_elements(&conditions_of(request), &canvas);
+        let elements = self.condition_elements(request.conditions);
         let layout = self.layout_of(&packing, &canvas, elements)?;
         Ok((layout, packing))
     }
@@ -523,107 +520,6 @@ impl Layouts {
         Ok(packing)
     }
 
-    /// The tables one request of `layout` needs, in the order `Layouts::prepare_state` fills them.
-    ///
-    /// Sorted by name, so the order is a property of the layout alone and two requests of one shape
-    /// share one set. Every table is one the forward reads; none is a host value the worker would
-    /// otherwise have to pass through a launch.
-    pub fn table_specs(&self, layout: &Layout) -> Result<Vec<StateTable>> {
-        if matches!(
-            self.config.attention,
-            crate::config::AttentionKind::Sparse { .. }
-        ) {
-            return self.segment_table_specs(layout);
-        }
-        let packing = self.packing_of(layout)?;
-        let rows = u64::from(packing.padded_tokens);
-        let video = u64::from(packing.video_rows);
-        let audio = u64::from(packing.audio_rows);
-        let (video_rows, audio_rows) = dense_rows(&packing);
-        let mut tables = owned_tables(
-            self.owned_rows(rows, &video_rows).0.len() as u64,
-            self.owned_rows(rows, &audio_rows).0.len() as u64,
-        );
-        tables.extend([
-            // The row each modality's projected latents are scattered into: the layout places the
-            // video rows first and the audio rows after them.
-            StateTable {
-                name: "audio_indices",
-                dtype: DType::I32,
-                shape: Shape::new(&[audio]),
-            },
-            StateTable {
-                name: "video_indices",
-                dtype: DType::I32,
-                shape: Shape::new(&[video]),
-            },
-            // One sequence over the whole shard: every query row sees the used key rows and no
-            // query sees a padding row. `cu_seq_lens_k` is the dense visibility, `_q` the rows, and
-            // a single run is named by its two ends - a start and a stop - not by every row.
-            StateTable {
-                name: "cu_seq_lens_k",
-                dtype: DType::I32,
-                shape: Shape::new(&[2]),
-            },
-            StateTable {
-                name: "cu_seq_lens_q",
-                dtype: DType::I32,
-                shape: Shape::new(&[2]),
-            },
-            StateTable {
-                name: "groups",
-                dtype: DType::I32,
-                shape: Shape::new(&[rows]),
-            },
-            StateTable {
-                name: "modulation_indices",
-                dtype: DType::I32,
-                shape: Shape::new(&[rows]),
-            },
-            // Axis-major, `[axes, rows]`: `nn::Rotary`'s sectioned rotation reads one coordinate
-            // per axis per token and refuses a leading extent that is not the axis count. **The
-            // coordinates are real numbers**: the reference's `position_ids` is FP64, and the clock
-            // and the raster are rescaled (`ROPE_FRAME_RESCALE`, a column is `4/3`), so an integer
-            // table would truncate every generated row's place.
-            StateTable {
-                name: "position_ids",
-                dtype: DType::F32,
-                shape: Shape::new(&[3, rows]),
-            },
-            StateTable {
-                name: "prefix_index",
-                dtype: DType::I32,
-                shape: Shape::new(&[rows]),
-            },
-            StateTable {
-                name: "token_tags",
-                dtype: DType::I32,
-                shape: Shape::new(&[rows]),
-            },
-            // The text refiner's own boundaries: its queries are every padded row and its keys stop
-            // at the prompt's last row, so a padding row is never a key of any document.
-            StateTable {
-                name: "refiner_cu_seq_lens_k",
-                dtype: DType::I32,
-                shape: Shape::new(&[2]),
-            },
-            StateTable {
-                name: "refiner_cu_seq_lens_q",
-                dtype: DType::I32,
-                shape: Shape::new(&[2]),
-            },
-            // The step the schedule evaluates: written by the worker before each replay, one
-            // value per (request, capture) rather than per row.
-            StateTable {
-                name: "step",
-                dtype: DType::I32,
-                shape: Shape::new(&[1]),
-            },
-        ]);
-        tables.sort_by_key(|table| table.name);
-        Ok(tables)
-    }
-
     /// The rows of one modality this rank owns: `(sources, slots)`.
     ///
     /// `packed` holds each of the modality's rows' place in the packed sequence, in the modality's
@@ -645,309 +541,6 @@ impl Layouts {
         }
         (sources, slots)
     }
-
-    /// The tables a sparse layout needs, in the order [`Layouts::write_state`] fills them.
-    ///
-    /// A sparse layout holds four tables a dense one does not - the tile sizes, each tile's video
-    /// segment, each segment's first tile, and the key tiles a query keeps - and neither of the dense
-    /// attention's two sequence-length tables: the sparse attention reads its tiles, not one run.
-    fn segment_table_specs(&self, layout: &Layout) -> Result<Vec<StateTable>> {
-        let packed = self.segment_of(layout)?;
-        let extent = &packed.extent;
-        let rows = u64::from(extent.padded_tokens);
-        let tiles = u64::from(extent.padded_tokens / extent.tile);
-        let video = u64::from(extent.video_grid.0 * extent.video_grid.1 * extent.video_grid.2);
-        let audio = u64::from(extent.audio_rows);
-        let (video_rows, audio_rows) = segment_rows(&packed);
-        let mut tables = owned_tables(
-            self.owned_rows(rows, &video_rows).0.len() as u64,
-            self.owned_rows(rows, &audio_rows).0.len() as u64,
-        );
-        tables.extend([
-            StateTable {
-                name: "audio_indices",
-                dtype: DType::I32,
-                shape: Shape::new(&[audio]),
-            },
-            StateTable {
-                name: "video_indices",
-                dtype: DType::I32,
-                shape: Shape::new(&[video]),
-            },
-            StateTable {
-                name: "groups",
-                dtype: DType::I32,
-                shape: Shape::new(&[rows]),
-            },
-            StateTable {
-                name: "modulation_indices",
-                dtype: DType::I32,
-                shape: Shape::new(&[rows]),
-            },
-            StateTable {
-                name: "position_ids",
-                dtype: DType::F32,
-                shape: Shape::new(&[3, rows]),
-            },
-            StateTable {
-                name: "prefix_index",
-                dtype: DType::I32,
-                shape: Shape::new(&[rows]),
-            },
-            // The text refiner's own boundaries: its queries are every padded row and its keys stop
-            // at the prompt's last row, so a padding row is never a key of any document.
-            StateTable {
-                name: "refiner_cu_seq_lens_k",
-                dtype: DType::I32,
-                shape: Shape::new(&[2]),
-            },
-            StateTable {
-                name: "refiner_cu_seq_lens_q",
-                dtype: DType::I32,
-                shape: Shape::new(&[2]),
-            },
-            StateTable {
-                // Over-allocated to the tile count and filled by segment index, exactly as the
-                // reference builds it; `select` reads only its first
-                // `segments` entries, which is the prefix view the layer hands it.
-                name: "segment_keep",
-                dtype: DType::I32,
-                shape: Shape::new(&[tiles]),
-            },
-            StateTable {
-                name: "segment_starts",
-                dtype: DType::I32,
-                shape: Shape::new(&[tiles]),
-            },
-            StateTable {
-                name: "step",
-                dtype: DType::I32,
-                shape: Shape::new(&[1]),
-            },
-            StateTable {
-                name: "tile_segments",
-                dtype: DType::I32,
-                shape: Shape::new(&[tiles]),
-            },
-            StateTable {
-                name: "token_tags",
-                dtype: DType::I32,
-                shape: Shape::new(&[rows]),
-            },
-            StateTable {
-                name: "variable_block_sizes",
-                dtype: DType::I32,
-                shape: Shape::new(&[tiles]),
-            },
-        ]);
-        tables.sort_by_key(|table| table.name);
-        Ok(tables)
-    }
-
-    /// Fill a sparse layout's tables: the tile packing's own indices and the segment tables.
-    fn write_segment_state(
-        &self,
-        request: &VideoRequest<'_>,
-        layout: &Layout,
-        out: &mut [TableValues],
-    ) -> Result<()> {
-        let (sparsity, reference_keep) = match self.config.attention {
-            crate::config::AttentionKind::Sparse {
-                sparsity,
-                reference_keep,
-                ..
-            } => (sparsity, reference_keep),
-            crate::config::AttentionKind::Dense => {
-                return Err(Error::config(
-                    "a dense deployment holds no segment tables".to_owned(),
-                ));
-            }
-        };
-        let packing = self.segment_of(layout)?;
-        let frames = frame_count(layout.video.frames)?;
-        let canvas = canvas_of_latents(layout)?;
-        if request.text_tokens < 1 || request.text_tokens > packing.extent.text_rows {
-            return Err(Error::config(format!(
-                "a prompt of {} rows does not fit a text capacity of {}",
-                request.text_tokens, packing.extent.text_rows
-            )));
-        }
-        let conditions = conditions_of(request);
-        let segments = packing::condition_segments(&conditions, &canvas)?;
-        let tables = packing::segment_tables(
-            &packing,
-            frames,
-            &canvas,
-            request.text_tokens,
-            &segments,
-            &vision_spans(request),
-            packing::Sparsity {
-                sparsity,
-                reference_keep,
-            },
-        )?;
-        let rows = tables.groups.len();
-        if rows != packing.extent.padded_tokens as usize {
-            return Err(Error::config(format!(
-                "{rows} table rows for {} packed rows",
-                packing.extent.padded_tokens
-            )));
-        }
-        let tiles = tables.variable_block_sizes.len();
-        let specs = self.segment_table_specs(layout)?;
-        let sizes: Vec<i32> = tables
-            .variable_block_sizes
-            .iter()
-            .map(|size| *size as i32)
-            .collect();
-        let (video, audio) = segment_rows(&packing);
-        let packed_rows = u64::from(packing.extent.padded_tokens);
-        let (video_sources, video_slots) = self.owned_rows(packed_rows, &video);
-        let (audio_sources, audio_slots) = self.owned_rows(packed_rows, &audio);
-        // The refiner's document: one prompt, so its queries are every padded row and its keys stop
-        // at the prompt's last row. The prompt's row count is the media clock's own start.
-        let refiner_q = integers(&[0, layout.text_rows as i32]);
-        let refiner_k = integers(&[0, request.text_tokens as i32]);
-        let filled: [(&str, TableValues); 16] = [
-            ("audio_indices", integers(&audio)),
-            ("audio_slots", integers(&audio_slots)),
-            ("audio_sources", integers(&audio_sources)),
-            ("video_indices", integers(&video)),
-            ("video_slots", integers(&video_slots)),
-            ("video_sources", integers(&video_sources)),
-            ("groups", integers(&tables.groups)),
-            ("refiner_cu_seq_lens_q", refiner_q.clone()),
-            ("refiner_cu_seq_lens_k", refiner_k.clone()),
-            (
-                "modulation_indices",
-                modulation_indices(&tables.groups, &tables.token_tags),
-            ),
-            ("position_ids", coordinates(&tables.position_ids)),
-            ("prefix_index", integers(&tables.prefix_index)),
-            ("segment_keep", integers(&tables.segment_keep)),
-            ("segment_starts", integers(&tables.segment_starts)),
-            ("tile_segments", integers(&tables.tile_segments)),
-            ("token_tags", integers(&tables.token_tags)),
-        ];
-        for (name, values) in &filled {
-            place(&specs, out, name, values)?;
-        }
-        if tiles != sizes.len() {
-            return Err(Error::config(format!(
-                "variable_block_sizes holds {} sizes for {tiles} tiles",
-                sizes.len()
-            )));
-        }
-        place(&specs, out, "variable_block_sizes", &integers(&sizes))
-    }
-
-    /// Write one request's tables, in `Layouts::state_tables`' order.
-    ///
-    /// The bytes are host bytes in each table's own element type: the worker uploads them once
-    /// per request, before the capture it will replay. `text_tokens` is the prompt's row count,
-    /// which the media clock starts at; a prompt that does not fit the layout's capacity is
-    /// refused here rather than captured.
-    pub fn write_state(
-        &self,
-        request: &VideoRequest<'_>,
-        layout: &Layout,
-        out: &mut [TableValues],
-    ) -> Result<()> {
-        if matches!(
-            self.config.attention,
-            crate::config::AttentionKind::Sparse { .. }
-        ) {
-            return self.write_segment_state(request, layout, out);
-        }
-        let packing = self.packing_of(layout)?;
-        let text_tokens = request.text_tokens;
-        if text_tokens > layout.text_rows {
-            return Err(Error::config(format!(
-                "a prompt of {text_tokens} rows does not fit a text capacity of {}",
-                layout.text_rows
-            )));
-        }
-        let frames = frame_count(layout.video.frames)?;
-        let canvas = canvas_of_latents(layout)?;
-        let conditions = conditions_of(request);
-        let segments = packing::condition_segments(&conditions, &canvas)?;
-        let tables = packing::dense_tables(
-            &packing,
-            frames,
-            &canvas,
-            text_tokens,
-            &segments,
-            &vision_spans(request),
-        )?;
-        let rows = tables.groups.len();
-        let (video_indices, audio_indices) = dense_rows(&packing);
-        let packed_rows = u64::from(packing.padded_tokens);
-        let (video_sources, video_slots) = self.owned_rows(packed_rows, &video_indices);
-        let (audio_sources, audio_slots) = self.owned_rows(packed_rows, &audio_indices);
-        // One sequence: every query row sees the used key rows and no query sees a padding row.
-        let queries = [0, rows as i32];
-        let keys = [0, tables.used as i32];
-        let specs = self.table_specs(layout)?;
-        // The text refiner's document: one prompt, so its queries are every padded row and its
-        // keys stop at the prompt's last row - a padding row is never a key of any document.
-        let refiner_k = integers(&[0, text_tokens as i32]);
-        let refiner_q = integers(&[0, layout.text_rows as i32]);
-        for (name, values) in [
-            ("audio_indices", integers(&audio_indices)),
-            ("audio_slots", integers(&audio_slots)),
-            ("audio_sources", integers(&audio_sources)),
-            ("video_indices", integers(&video_indices)),
-            ("video_slots", integers(&video_slots)),
-            ("video_sources", integers(&video_sources)),
-            ("cu_seq_lens_k", integers(&keys)),
-            ("cu_seq_lens_q", integers(&queries)),
-            ("refiner_cu_seq_lens_k", refiner_k),
-            ("refiner_cu_seq_lens_q", refiner_q),
-            ("groups", integers(&tables.groups)),
-            (
-                "modulation_indices",
-                modulation_indices(&tables.groups, &tables.token_tags),
-            ),
-            ("position_ids", coordinates(&tables.position_ids)),
-            ("prefix_index", integers(&tables.prefix_index)),
-            ("token_tags", integers(&tables.token_tags)),
-        ] {
-            place(&specs, out, name, &values)?;
-        }
-        // The step is the worker's to write through `prepare_evaluation`: one i32 a replay
-        // changes.
-        let position = specs
-            .iter()
-            .position(|table| table.name == "step")
-            .ok_or_else(|| Error::config("the step table is missing".to_owned()))?;
-        if let Some(table) = out.get(position)
-            && (table.dtype() != DType::I32 || table.len() != 1)
-        {
-            return Err(Error::config(format!(
-                "the step table is {} {} elements, not one i32",
-                table.len(),
-                table.dtype()
-            )));
-        }
-        Ok(())
-    }
-}
-
-/// The four tables that say which modality rows a rank owns (`Layouts::owned_rows`).
-fn owned_tables(video: u64, audio: u64) -> Vec<StateTable> {
-    [
-        ("audio_slots", audio),
-        ("audio_sources", audio),
-        ("video_slots", video),
-        ("video_sources", video),
-    ]
-    .into_iter()
-    .map(|(name, rows)| StateTable {
-        name,
-        dtype: DType::I32,
-        shape: Shape::new(&[rows]),
-    })
-    .collect()
 }
 
 /// Each modality's rows' places in a dense packing: `(video, audio)`.
@@ -965,18 +558,21 @@ fn dense_rows(packing: &DensePacking) -> (Vec<i32>, Vec<i32>) {
 /// The video table is read in raster order: the patch writes raster rows, the scatter puts row `r`
 /// at `table[r]`, and the gather before the head reads them back. So it holds the packed row of each
 /// raster row, which is what orders a sparse layout's video rows tile-major.
-fn segment_rows(packing: &packing::SegmentPacking) -> (Vec<i32>, Vec<i32>) {
-    let mut video = vec![0_i32; packing.video_indices.len()];
-    for (packed, raster) in packing
+fn segment_rows(
+    extent: &packing::SegmentExtent,
+    tables: &packing::RowTables,
+) -> (Vec<i32>, Vec<i32>) {
+    let mut video = vec![0_i32; tables.video_indices.len()];
+    for (packed, raster) in tables
         .video_indices
         .iter()
-        .zip(&packing.video_raster_indices)
+        .zip(&tables.video_raster_indices)
     {
         video[*raster as usize] = *packed as i32;
     }
     (
         video,
-        packing.audio_indices().map(|row| row as i32).collect(),
+        extent.audio_indices().map(|row| row as i32).collect(),
     )
 }
 
@@ -1067,15 +663,6 @@ fn frame_count(latent_frames: u32) -> Result<u32> {
     })
 }
 
-/// The request's conditions in the geometry the packing places them by.
-fn conditions_of(request: &VideoRequest) -> Vec<packing::Condition> {
-    request
-        .conditions
-        .iter()
-        .map(packing::Condition::of)
-        .collect()
-}
-
 /// The pieces of `request`'s conditions, in the order the packing holds them.
 ///
 /// The draws are the reference's: one per visual condition, in packed order, each at the condition's
@@ -1088,7 +675,7 @@ fn pieces_of(
     request: &VideoRequest,
 ) -> Result<Vec<nn::capability::ConditionPiece>> {
     let canvas = canvas_of(request)?;
-    let segments = packing::condition_segments(&conditions_of(request), &canvas)?;
+    let segments = packing::condition_segments(request.conditions, &canvas)?;
     let channels = config.transformer.video_channels;
     let mut cursor = 0_u64;
     let mut pieces = Vec::with_capacity(segments.len());
@@ -1103,11 +690,11 @@ fn pieces_of(
                     request.conditions.len()
                 ))
             })?;
-        let draw = segment.visual.map(|visual| LatentShape {
+        let draw = (segment.frames > 0).then_some(LatentShape {
             channels,
-            frames: visual.frames,
-            height: visual.raster.height,
-            width: visual.raster.width,
+            frames: segment.frames,
+            height: segment.raster.height,
+            width: segment.raster.width,
         });
         let track = if shape.audio_samples > 0 {
             let hop = hop.ok_or_else(|| {
@@ -1134,7 +721,7 @@ fn pieces_of(
             },
             rows: segment.video_rows(),
             audio_rows: segment.audio_rows(),
-            pixels: segment.visual.map(|_| {
+            pixels: (segment.frames > 0).then(|| {
                 [
                     1,
                     u64::from(crate::encoding::PIXEL_CHANNELS),
@@ -1232,65 +819,16 @@ fn round_up(value: u32, unit: u32) -> u32 {
     value.div_ceil(unit) * unit
 }
 
-/// Coordinates as FP32, axis-major: every row's first axis, then every row's second.
-///
-/// The packing states one coordinate triple per row; `nn::Rotary`'s sectioned rotation indexes a
-/// table by `[axis, token]` and a row-major table would rotate each row by another row's angles.
-fn coordinates(points: &[[f64; 3]]) -> TableValues {
-    // FP32, which is the table's declared type: a coordinate is a place on a rescaled clock or
-    // raster, and the rotary reads one real number per axis per token.
-    TableValues::F32(
-        (0..3)
-            .flat_map(|axis| points.iter().map(move |point| point[axis] as f32))
-            .collect(),
-    )
-}
-
-/// Integers as an int32 table.
-fn integers(values: &[i32]) -> TableValues {
-    TableValues::I32(values.to_vec())
-}
-
-/// The AdaLN row of every packed row: `3 * group + tag`.
-fn modulation_indices(groups: &[i32], tags: &[i32]) -> TableValues {
-    TableValues::I32(
-        groups
-            .iter()
-            .zip(tags)
-            .map(|(group, tag)| 3 * group + tag)
-            .collect(),
-    )
-}
-
-/// Write `values` into the table of `specs` named `name`, which `out` holds in `specs`' order.
-fn place(
-    specs: &[StateTable],
-    out: &mut [TableValues],
-    name: &str,
-    values: &TableValues,
-) -> Result<()> {
-    let position = specs
-        .iter()
-        .position(|table| table.name == name)
-        .ok_or_else(|| Error::config(format!("{name} is not a table of this layout")))?;
-    out.get_mut(position)
-        .ok_or_else(|| Error::config(format!("the worker holds no table for {name}")))?
-        .write(name, values)?;
-    Ok(())
-}
-
 /// One checkpoint's denoiser: the DiT, the schedule it is evaluated on, its solver and the AdaLN
-/// cache the runner fills once after loading.
+/// cache.
 ///
-/// ## The AdaLN cache is a constant table
+/// ## The AdaLN cache
 ///
 /// The reference derives the modulation tables at load (`weights._prepare_adaln_cache`), so they are
 /// constants rather than per-request execution state: 50 tables of `[entries, 18 * hidden]` plus
 /// `[entries, 2 * hidden]`, about 1.9 GiB at FP32 for a 50-step checkpoint and 0.33 GiB for the DMD
-/// ladder. Their extents follow from the schedule's entry count and the stack's widths, which the
-/// model states as its constant tables ([`Denoiser::constant_tables`]); the runtime allocates them
-/// once per load, [`Denoiser::prepare_constants`] fills them with one post-load launch, and every
-/// step reads them ([`nn::capability::Conditioning::constants`]).
+/// ladder. The [`TimestepTable`] reserves them as writable constants at load, and
+/// [`nn::capability::Denoiser::initialize`] fills them once before any capture.
 pub struct Denoiser {
     config: DenoiserConfig,
     rules: Layouts,
@@ -1301,21 +839,15 @@ pub struct Denoiser {
     /// The modulation at each distinct level of the schedule, which `projections` fill once after
     /// loading.
     cache: TimestepTable,
-    evaluations: u32,
     /// The text refiner: the prompt features the DiT conditions on, refined once per request.
     refiner: crate::conditioning::TokenRefiner,
-    /// Whether this deployment places the condition encoders at all.
-    ///
-    /// The partition's, not the checkpoint's: a base release serves all three tasks, and a deployment
-    /// that places only `t2va` holds no `latent_encoder` component and must not attach one.
-    places_encoders: bool,
     /// The two condition encoders, when this deployment places them.
     ///
     /// A task with conditions (`fl2va`, `ref2va`) encodes the request's rasters and samples before its
     /// first evaluation; `t2va` has no conditions and constructs neither. They live inside this block
     /// rather than in one of their own because `nn` has no condition-encoder capability -
     /// `EncoderInputs` takes a token batch, and these take pixels and samples.
-    encoders: Option<ConditionEncoders>,
+    encoders: Option<(crate::encoding::VideoEncoder, crate::encoding::AudioEncoder)>,
     /// The packed row bound this deployment was loaded for.
     ///
     /// The stack's dense attention is compiled with it as its key bound (`nn`'s `DenseDescriptor`
@@ -1324,45 +856,32 @@ pub struct Denoiser {
     /// discovered at the first layer.
     rows: u32,
     /// This rank's position in the sequence shard and the shard's degree.
-    rank: u32,
-    shard: u32,
+    sequence: Split,
 }
 
-/// The two condition encoders a deployment with conditioned tasks holds.
+/// Load the two condition encoders a deployment with conditioned tasks holds: a condition's
+/// pixels to its normalised latent, and its samples to its latent rows.
 ///
-/// `fl2va` and `ref2va` read a keyframe's or a reference's pixels and samples, encode them, and write
-/// the resulting rows into the prefix source before the request's first evaluation. A `t2va`
-/// deployment places no encoder and attaches none.
-pub struct ConditionEncoders {
-    /// A condition's pixels to its normalised latent ([`crate::encoding::VideoEncoder`]).
-    pub video: crate::encoding::VideoEncoder,
-    /// A condition's samples to its latent rows ([`crate::encoding::AudioEncoder`]).
-    pub audio: crate::encoding::AudioEncoder,
-}
-
-impl ConditionEncoders {
-    /// Load both encoders from the checkpoint their two components hold.
-    ///
-    /// A deployment's components are built in the checkpoint's order, and `transformer` comes before
-    /// `latent_encoder`; a block is boxed as it is built, so the encoders have to be in hand before
-    /// the denoiser block is constructed. The loader calls this in a pass of its own and hands the
-    /// result to [`Denoiser::attach_encoders`].
-    pub fn load(
-        config: &crate::Config,
-        checkpoint: &nn::Checkpoint,
-        loader: &mut WeightLoader<'_>,
-    ) -> Result<Self> {
-        let video = crate::encoding::VideoEncoder::load(
-            &config.video_vae,
-            &mut loader.reborrow(checkpoint.component("vae")?)?,
-        )?;
-        // The audio VAE directory holds both halves, as the video one does.
-        let audio = crate::encoding::AudioEncoder::load(
-            &config.audio_vae,
-            &mut loader.reborrow(checkpoint.component("audio_vae")?)?,
-        )?;
-        Ok(Self { video, audio })
-    }
+/// `fl2va` and `ref2va` read a keyframe's or a reference's pixels and samples, encode them, and
+/// write the resulting rows into the prefix source before the request's first evaluation; a `t2va`
+/// deployment places neither. A deployment's stages are built in the checkpoint's order and
+/// `transformer` comes before `latent_encoder`, so the loader reads the encoders in a pass of its
+/// own and hands them to [`Denoiser::load`].
+pub fn load_encoders(
+    config: &crate::Config,
+    checkpoint: &nn::Checkpoint,
+    loader: &mut WeightLoader<'_>,
+) -> Result<(crate::encoding::VideoEncoder, crate::encoding::AudioEncoder)> {
+    let video = crate::encoding::VideoEncoder::load(
+        &config.video_vae,
+        &mut loader.reborrow(checkpoint.stage("vae")?)?,
+    )?;
+    // The audio VAE directory holds both halves, as the video one does.
+    let audio = crate::encoding::AudioEncoder::load(
+        &config.audio_vae,
+        &mut loader.reborrow(checkpoint.stage("audio_vae")?)?,
+    )?;
+    Ok((video, audio))
 }
 
 /// The capability surface the worker binds: layouts, tables, and the step.
@@ -1412,7 +931,7 @@ impl nn::capability::Denoiser for Denoiser {
     /// the right numbers for a task the checkpoint does not serve, and the deployment would serve a
     /// task its own contract denies.
     fn schedule(&self, request: &VideoRequest<'_>) -> nn::Result<Vec<nn::Step>> {
-        let task = crate::VideoTask::of(request);
+        let task = task_of(request);
         schedule_for(&self.config, &self.schedule, task).map_err(nn::Error::from)
     }
 
@@ -1519,7 +1038,7 @@ impl nn::capability::Denoiser for Denoiser {
         &self,
         request: &VideoRequest<'_>,
     ) -> nn::Result<Vec<nn::capability::ConditionPiece>> {
-        let hop = self.encoders.as_ref().map(|encoders| encoders.audio.hop());
+        let hop = self.encoders.as_ref().map(|(_, audio)| audio.hop());
         pieces_of(&self.config, hop, request).map_err(nn::Error::from)
     }
 
@@ -1540,14 +1059,15 @@ impl nn::capability::Denoiser for Denoiser {
         )
     }
 
-    fn prepare_latents<'a>(
+    fn prepare_latents(
         &self,
         f: &Forward,
-        cond: nn::capability::Conditioning<'a>,
+        cond: nn::capability::Conditioning<'_>,
         out: nn::capability::Latents,
     ) -> nn::Result<()> {
         // The schedule's start: unit noise for the released and distilled grids, a scaled draw for
         // a parallel-decoding student.
+        let _ = cond;
         self.solver
             .start(f, Modality::Video, out.video)
             .map_err(nn::Error::from)?;
@@ -1556,218 +1076,75 @@ impl nn::capability::Denoiser for Denoiser {
                 .start(f, Modality::Audio, audio)
                 .map_err(nn::Error::from)?;
         }
-        let _ = cond;
         Ok(())
     }
 
+    /// Refine the prompt's features into the prefix source's text rows and project the request's
+    /// conditions into the rows below them, once per request: both are functions of the request
+    /// alone, and the step's graph reads the rows they write.
+    ///
+    /// A request with no media has no condition rows at all, which is every `t2va`.
     fn prepare_conditioning(
         &self,
         f: &Forward,
+        request: &VideoRequest<'_>,
         cond: nn::capability::Conditioning<'_>,
     ) -> nn::Result<()> {
-        Denoiser::prepare_conditioning(self, f, cond).map_err(nn::Error::from)
-    }
-
-    fn denoise<'a>(
-        &self,
-        f: &Forward,
-        step: nn::Step,
-        latents: nn::capability::Latents,
-        cond: nn::capability::Conditioning<'a>,
-    ) -> nn::Result<()> {
-        Denoiser::denoise(self, f, &step, latents, cond).map_err(nn::Error::from)
-    }
-
-    fn evaluations(&self) -> u32 {
-        self.evaluations
-    }
-
-    fn constant_tables(&self) -> Vec<StateTable> {
-        Denoiser::constant_tables(self)
-    }
-
-    fn prepare_constants(&self, f: &Forward, out: &[TensorView]) -> nn::Result<()> {
-        Denoiser::prepare_constants(self, f, out).map_err(nn::Error::from)
-    }
-
-    fn layout_tables(&self, _layout: &Layout) -> nn::Result<Vec<StateTable>> {
-        // Every table this denoiser reads is a request's: the layout's are its packing's, which the
-        // model derives rather than stores.
-        Ok(Vec::new())
-    }
-
-    fn prepare_layout(&self, _layout: &Layout, out: &mut [TableValues]) -> nn::Result<()> {
-        if out.is_empty() {
-            Ok(())
-        } else {
-            Err(nn::Error::from(Error::config(format!(
-                "the H3 denoiser has no layout tables; {} buffers were offered",
-                out.len()
-            ))))
+        self.refine(f, request, cond).map_err(nn::Error::from)?;
+        if cond.media.is_empty() {
+            return Ok(());
         }
-    }
-
-    fn state_tables(&self, layout: &Layout) -> nn::Result<Vec<StateTable>> {
-        self.rules.table_specs(layout).map_err(nn::Error::from)
-    }
-
-    fn prepare_state(
-        &self,
-        request: &VideoRequest<'_>,
-        layout: &Layout,
-        out: &mut [TableValues],
-    ) -> nn::Result<()> {
-        self.rules
-            .write_state(request, layout, out)
+        self.encode_media(f, cond.media, cond.text)
             .map_err(nn::Error::from)
     }
 
-    fn prepare_evaluation(&self, index: u32, out: &mut [TableValues]) -> nn::Result<()> {
-        if index >= self.evaluations {
-            return Err(nn::Error::from(Error::config(format!(
-                "evaluation {index} is outside the {} this schedule has",
-                self.evaluations
-            ))));
-        }
-        // An evaluation has no host bytes of its own: every coefficient a step reads is a constant
-        // the loader wrote or the constant tables hold, and the step index is device data the
-        // worker writes before each replay. A buffer offered here means the caller and
-        // `constant_tables` disagree about what an evaluation owns.
-        if !out.is_empty() {
-            return Err(nn::Error::from(Error::config(format!(
-                "{} coefficient buffers offered, and this deployment declares none",
-                out.len()
-            ))));
-        }
-        Ok(())
+    fn forward(
+        &self,
+        f: &Forward,
+        step: nn::Step,
+        request: &VideoRequest<'_>,
+        latents: nn::capability::Latents,
+        cond: nn::capability::Conditioning<'_>,
+    ) -> nn::Result<()> {
+        Denoiser::step(self, f, step, request, latents, cond).map_err(nn::Error::from)
+    }
+
+    /// Fill the AdaLN cache from the schedule's levels: the one post-load launch.
+    fn initialize(&self, f: &Forward) -> nn::Result<()> {
+        self.projections
+            .compute(f, &self.cache)
+            .map_err(nn::Error::from)
     }
 }
 
-/// The state tables of a dense layout, in `table_specs`' order (sorted by name).
-const DENSE_TABLES: [&str; 16] = [
-    "audio_indices",
-    "audio_slots",
-    "audio_sources",
-    "cu_seq_lens_k",
-    "cu_seq_lens_q",
-    "groups",
-    "modulation_indices",
-    "position_ids",
-    "prefix_index",
-    "refiner_cu_seq_lens_k",
-    "refiner_cu_seq_lens_q",
-    "step",
-    "token_tags",
-    "video_indices",
-    "video_slots",
-    "video_sources",
-];
+/// Store the contiguous `source` into the contiguous `destination` of the same shape, rounding
+/// once into the destination's element type (`destination ← 1 · source`).
+fn store(f: &Forward, source: TensorView, destination: TensorView) -> Result<()> {
+    Ok(nn::layers::Axpby.forward(f, destination, source, 1.0, 0.0)?)
+}
 
-/// The state tables of a segment layout, in `segment_table_specs`' order (sorted by name).
-///
-/// A segment layout has no `cu_seq_lens` pair and carries four tables a dense one does not, so the
-/// two sets do not share positions: a name resolved against the wrong set silently reads another
-/// tensor. [`Tables`] picks the set from the deployment's attention kind for exactly that reason.
-const SEGMENT_TABLES: [&str; 18] = [
-    "audio_indices",
-    "audio_slots",
-    "audio_sources",
-    "groups",
-    "modulation_indices",
-    "position_ids",
-    "prefix_index",
-    "refiner_cu_seq_lens_k",
-    "refiner_cu_seq_lens_q",
-    "segment_keep",
-    "segment_starts",
-    "step",
-    "tile_segments",
-    "token_tags",
-    "variable_block_sizes",
-    "video_indices",
-    "video_slots",
-    "video_sources",
-];
+/// The task a request runs, from the conditions it states.
+fn task_of(request: &VideoRequest<'_>) -> crate::VideoTask {
+    crate::VideoTask::of(
+        request.first_frames,
+        request.last_frames,
+        request.references,
+    )
+}
 
 /// A rank-one row table as the rows of width one a row gather moves.
-///
-/// The per-row tables (`groups`, `prefix_index`, `modulation_indices`, `step`) are declared
-/// one-dimensional, because a layer reads one integer per row. `nn::layers::IndexRows::gather` states its
-/// source and its output as `[rows, columns]`, so a table enters it as rows of width one: the same
-/// buffer with row-major strides for the new shape, no copy and no change of value.
 fn one_column(view: TensorView) -> TensorView {
     view.reshape(Shape::new(&[view.numel(), 1]))
 }
 
-/// One request's state views, resolved by name against its kind's table set.
-struct Tables<'a> {
-    names: &'static [&'static str],
-    views: &'a [TensorView],
-}
-
-impl<'a> Tables<'a> {
-    fn new(kind: crate::config::AttentionKind, views: &'a [TensorView]) -> Self {
-        let names: &'static [&'static str] = match kind {
-            crate::config::AttentionKind::Dense => &DENSE_TABLES,
-            crate::config::AttentionKind::Sparse { .. } => &SEGMENT_TABLES,
-        };
-        Self { names, views }
-    }
-
-    fn get(&self, name: &str) -> Result<TensorView> {
-        let position = self
-            .names
-            .iter()
-            .position(|table| *table == name)
-            .ok_or_else(|| {
-                Error::config(format!(
-                    "{name} is not a state table of this layout, which declares {}",
-                    if self.names.is_empty() {
-                        "none".to_owned()
-                    } else {
-                        self.names.join(", ")
-                    }
-                ))
-            })?;
-        self.views
-            .get(position)
-            .copied()
-            .ok_or_else(|| Error::config(format!("the worker passed no {name} table")))
-    }
-}
-
 impl Denoiser {
-    /// Attach the condition encoders this deployment places.
-    ///
-    /// `load.rs` builds them from their own checkpoint directories (`vae` and `audio_vae`) and calls
-    /// this before the block is bound - `Block::Denoiser` is a trait object, so this is the last
-    /// moment at which the concrete block is reachable. A deployment whose tasks carry no conditions
-    /// places no encoder, and attaching one is refused here rather than left to sit unread: the
-    /// checkpoint's weights and the block's behaviour would then disagree.
-    pub fn attach_encoders(&mut self, encoders: ConditionEncoders) -> Result<()> {
-        if self.encoders.is_some() {
-            return Err(Error::config(
-                "this H3 denoiser already holds its condition encoders".to_owned(),
-            ));
-        }
-        if !self.places_encoders {
-            return Err(Error::config(format!(
-                "this deployment places {:?}, which carries no conditions, so it holds no condition \
-                 encoder",
-                self.rules.config.tasks
-            )));
-        }
-        self.encoders = Some(encoders);
-        Ok(())
-    }
-
     /// Whether this deployment places the condition encoders.
     ///
     /// The runner asks before it offers a conditioned request: a task that carries conditions on a
     /// deployment that places none is a configuration the runner refuses, and it is better refused
     /// there than discovered as a video conditioned on nothing.
     pub fn places_encoders(&self) -> bool {
-        self.places_encoders
+        self.encoders.is_some()
     }
 
     /// Encode the request's raw media and write its condition rows into the prefix source.
@@ -1802,7 +1179,7 @@ impl Denoiser {
         // zero row: a rung is the request's, and the source is sized by it, so the writer and the
         // packing's `prefix_index` read one number.
         let total = text.shape.dim(0);
-        let text_rows = u64::from(self.rules.capacity().text_rows);
+        let text_rows = u64::from(self.rules.text_rows());
         let reserved = total.checked_sub(text_rows + 1).ok_or_else(|| {
             Error::config(format!(
                 "a {total}-row prefix source cannot hold {text_rows} text rows and the zero row"
@@ -1824,27 +1201,23 @@ impl Denoiser {
                 let rows = u64::from(piece.audio_rows);
                 // The encoder writes channel-major latent rows in FP32, which is what the input
                 // projection reads.
-                let encoded = f
-                    .arena()
-                    .tensor(DType::F32, Shape::new(&[rows, audio_channels]))?;
-                encoders.audio.encode(f, samples, encoded)?;
-                let start = u32::try_from(start).map_err(|_| {
-                    Error::config("a condition row start above u32::MAX".to_owned())
-                })?;
-                // The projection's output is FP32, and the one rounding is the copy into the rows
-                // (`audio_input(rows, output_dtype=torch.float32).to(out.dtype)`).
-                let hidden = u64::from(self.config.transformer.hidden_size);
-                let projected = f.arena().tensor(DType::F32, Shape::new(&[rows, hidden]))?;
-                self.transformer.project_audio(f, encoded, projected)?;
-                nn::layers::Cast
-                    .forward(f, projected, text.narrow(0, u64::from(start), rows)?)
-                    .map_err(Error::from)?;
+                let encoded = encoders.1.encode(f, samples)?;
+                if encoded.shape.dims() != [rows, audio_channels] {
+                    return Err(Error::config(format!(
+                        "condition {:?} declares {rows} audio rows and its track encodes to {:?}",
+                        piece.role,
+                        encoded.shape.dims()
+                    )));
+                }
+                // The projection's output is FP32, and the one rounding is the store into the
+                // rows (`audio_input(rows, output_dtype=torch.float32).to(out.dtype)`).
+                let projected = self.transformer.project_audio(f, encoded)?;
+                store(f, projected, text.narrow(0, start, rows)?)?;
             }
             if piece.rows > 0 {
-                let visual = u32::try_from(start).map_err(|_| {
-                    Error::config("a condition row start above u32::MAX".to_owned())
-                })? + piece.audio_rows;
-                self.encode_visual(f, piece, encoders, text, visual)?;
+                let visual = start + u64::from(piece.audio_rows);
+                let rows = text.narrow(0, visual, u64::from(piece.rows))?;
+                self.encode_visual(f, piece, encoders, rows)?;
             }
         }
         Ok(())
@@ -1869,9 +1242,8 @@ impl Denoiser {
         &self,
         f: &Forward,
         piece: &nn::capability::MediaInput,
-        encoders: &ConditionEncoders,
-        text: TensorView,
-        start: u32,
+        encoders: &(crate::encoding::VideoEncoder, crate::encoding::AudioEncoder),
+        rows: TensorView,
     ) -> Result<()> {
         let pixels = piece.pixels.ok_or_else(|| {
             Error::config(format!(
@@ -1885,7 +1257,6 @@ impl Denoiser {
                 piece.role
             ))
         })?;
-        let compression = u64::from(packing::LATENT_COMPRESSION);
         if pixels.shape.rank() != 5 || pixels.shape.dim(0) != 1 {
             return Err(Error::config(format!(
                 "condition {:?} reads [1, channels, frames, height, width] pixels, not {:?}",
@@ -1899,572 +1270,409 @@ impl Denoiser {
                 piece.role, pixels.dtype, draw.dtype
             )));
         }
-        let (in_channels, frames, height, width) = (
-            pixels.shape.dim(1),
-            pixels.shape.dim(2),
-            pixels.shape.dim(3),
-            pixels.shape.dim(4),
-        );
-        let (taller, wider) = (
+        let dims = pixels.shape.dims();
+        let (frames, height, width) = (dims[2], dims[3], dims[4]);
+        let raster = pixels.reshape(Shape::new(&[dims[1], frames, height, width]));
+        let frame_count = u32::try_from(frames)
+            .ok()
+            .filter(|frames| *frames > 0)
+            .ok_or_else(|| {
+                Error::config(format!(
+                    "a video condition of {frames} frames encodes nothing"
+                ))
+            })?;
+        let clip = crate::tiled_encode::ClipEncoder::new(
             u32::try_from(height).unwrap_or(0),
             u32::try_from(width).unwrap_or(0),
-        );
-        let clip = crate::tiled_encode::ClipEncoder::new(taller, wider)?;
-        // One packed copy per tile, taken from the piece's own raster. `CausalPad` - which pads a
-        // tile's edges - reads each frame's rows in place, so it wants the *tile's* row stride and a
-        // tile cut from a wider raster has the raster's: the kernel refuses it by name ("a frame's
-        // pixels of one channel are not contiguous"). `Copy` is the strided-to-packed copy, and
-        // the tile's own pixels are a few megabytes against the encoder's set.
-        let raster = {
-            let strides = pixels.strides.as_slice();
-            TensorView::with_strides(
-                pixels.offset_elements(0),
-                pixels.dtype,
-                Shape::new(&[in_channels, frames, height, width]),
-                nn::Strides::new(&strides[1..]),
-            )
-        };
-        // A condition is encoded a clip at a time, each clip alone: a still is one clip of one
-        // frame, and a reference video its whole clips and a shorter last one.
-        let frame_count = u32::try_from(frames)
-            .map_err(|_| Error::config("a condition of more frames than u32 holds".to_owned()))?;
-        if frame_count == 0 {
-            return Err(Error::config(
-                "a video condition of no frame encodes nothing".to_owned(),
-            ));
-        }
-        let clips = FRAMES.clips(frame_count);
-        let longest = clips.iter().map(|clip| clip.frames).max().unwrap_or(1);
-        // A run's tiles are uniform (the seam split keeps every tile at the tile size), so one
-        // buffer holds any tile of this run and its extents are the plan's largest.
-        // The run's raster is the whole encoding's: the plan is the identity crop, so the raster's
-        // own latent extent is what the tiles stitch into. It carries the **moments'** channels and
-        // not the latent's - the encoder's last level writes `2 * latent_channels`, and `quant_conv`
-        // projects those to the two fields the posterior samples from, so the stitch, the projection
-        // and the posterior's first operand share one width
-        // (`crate::encoding::VideoEncoder::moments`).
+        )?;
+
+        // A condition is encoded a clip at a time, each clip alone, into its latent frames of the
+        // run's stitched moments: a still is one clip of one frame, a reference video its whole
+        // clips and a shorter last one. The moments are `2 · latent_channels` wide.
         let video_channels = u64::from(self.config.transformer.video_channels);
-        let run_rows = u64::from(clip.latent_extent().0);
-        let run_columns = u64::from(wider / packing::LATENT_COMPRESSION);
-        let latent_frames = u64::from(FRAMES.latent_frames(frame_count));
-        let (tile_height, tile_width) = clip.tiles().iter().fold((0_u64, 0_u64), |held, tile| {
-            (
-                held.0.max(u64::from(tile.rows.1) * compression),
-                held.1.max(u64::from(tile.columns.1) * compression),
-            )
-        });
-        let buffer = f.arena().tensor(
-            DType::F32,
-            Shape::new(&[in_channels, u64::from(longest), tile_height, tile_width]),
-        )?;
-        // Each tile's block of a clip of the piece's raster, which the encoding packs into `buffer`
-        // just before it reads it: one buffer serves every tile only because a tile is encoded
-        // before the next is copied, and copying them all first would encode the last tile's pixels
-        // every time.
-        let tiles_of = |first: u32, length: u32| {
-            clip.tiles()
-                .iter()
-                .map(|tile| {
-                    TensorView::with_strides(
-                        raster.offset_elements(
-                            u64::from(first) * height * width
-                                + u64::from(tile.rows.0) * compression * width
-                                + u64::from(tile.columns.0) * compression,
-                        ),
-                        raster.dtype,
-                        Shape::new(&[
-                            in_channels,
-                            u64::from(length),
-                            u64::from(tile.rows.1) * compression,
-                            u64::from(tile.columns.1) * compression,
-                        ]),
-                        raster.strides,
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-
         let moment_channels = 2 * video_channels;
-        let run = f.arena().tensor(
+        let (run_rows, run_columns) = clip.latent_extent();
+        let latent_frames = u64::from(FRAMES.latent_frames(frame_count));
+        let run = f.empty(
             DType::F32,
-            Shape::new(&[moment_channels, latent_frames, run_rows, run_columns]),
+            Shape::new(&[
+                moment_channels,
+                latent_frames,
+                u64::from(run_rows),
+                u64::from(run_columns),
+            ]),
         )?;
-        // One reservation for every clip, at the widest clip's blocks, then each clip into its own
-        // latent frames of the run.
-        let lengths: Vec<u32> = clips.iter().map(|clip| clip.frames).collect();
-        let widest = clips.iter().map(|clip| clip.latents).max().unwrap_or(1);
-        let widest = TensorView::with_strides(
-            run.element(&[0, 0, 0, 0]),
-            DType::F32,
-            Shape::new(&[moment_channels, u64::from(widest), run_rows, run_columns]),
-            run.strides,
-        );
-        let reserved = clip.reserve(f, &encoders.video, &lengths, widest)?;
-        for span in &clips {
-            let blended = TensorView::with_strides(
-                run.element(&[0, u64::from(span.latent), 0, 0]),
-                DType::F32,
-                Shape::new(&[
-                    moment_channels,
-                    u64::from(span.latents),
-                    run_rows,
-                    run_columns,
-                ]),
-                run.strides,
-            );
-            clip.encode(
-                f,
-                &encoders.video,
-                crate::tiled_encode::Scene {
-                    pixels: &tiles_of(span.first, span.frames),
-                    packed: Some(buffer),
-                    blended,
-                },
-                &reserved,
-            )?;
+        for span in FRAMES.clips(frame_count) {
+            f.scoped(|f| {
+                let clip_pixels =
+                    raster.narrow(1, u64::from(span.first), u64::from(span.frames))?;
+                let moments = clip.encode(
+                    f,
+                    &encoders.0,
+                    clip_pixels,
+                    (moment_channels, u64::from(span.latents)),
+                )?;
+                let destination = run.narrow(1, u64::from(span.latent), u64::from(span.latents))?;
+                let mut strides = [0_i64; ops::copy_block::RANK];
+                for (axis, stride) in destination.strides.as_slice().iter().enumerate() {
+                    strides[axis] = i64::try_from(*stride).map_err(|_| {
+                        Error::config("a condition's moments exceed i64 strides".to_owned())
+                    })?;
+                }
+                nn::layers::Copy::new(DType::F32, nn::layers::Access::Element)?.forward(
+                    f,
+                    moments,
+                    destination,
+                    &strides,
+                )?;
+                Ok::<_, Error>(())
+            })?;
         }
 
-        // `quant_conv` once over the stitched raster, then the posterior's sample: the moments in,
-        // the normalised latent out at half their width.
-        let moments = f.arena().tensor(DType::F32, run.shape)?;
-        encoders.video.project(f, run, moments)?;
-        let latent = f.arena().tensor(
-            DType::F32,
-            Shape::new(&[video_channels, latent_frames, run_rows, run_columns]),
+        // `quant_conv` once over the stitched raster, then the posterior's sample with its own
+        // draw at the module's seed: a fresh generator per condition, element zero each time. The
+        // piece's draw is the anchor's, and only there.
+        let moments = encoders.0.project(f, run)?;
+        let latent_shape = Shape::new(&[
+            video_channels,
+            latent_frames,
+            u64::from(run_rows),
+            u64::from(run_columns),
+        ]);
+        let posterior = f.empty(DType::F32, latent_shape)?;
+        nn::Noise::new().draw(
+            f,
+            posterior.reshape(Shape::new(&[
+                video_channels * latent_frames * u64::from(run_rows),
+                u64::from(run_columns),
+            ])),
+            nn::NoiseKey::Scalar(POSTERIOR_SEED),
+            0,
+            0,
+            0,
         )?;
-        // The posterior's own draw, at the module's seed and the latent's shape: a fresh generator
-        // per condition, element zero each time. The piece's draw is used
-        // below, for the anchor, and only there.
-        let posterior = f.arena().tensor(DType::F32, latent.shape)?;
-        let flat = posterior.reshape(Shape::new(&[
-            video_channels * latent_frames * run_rows,
-            run_columns,
-        ]));
-        nn::Noise::new().draw(f, flat, nn::NoiseKey::Scalar(POSTERIOR_SEED), 0, 0, 0)?;
-        encoders.video.posterior(f, moments, posterior, latent)?;
+        let latent = encoders.0.posterior(f, moments, posterior)?;
 
-        // The latent becomes rows, the draw becomes rows - the draw is drawn at latent resolution,
-        // so it takes the same mapping - and the anchor mixes them in place over the latent's rows.
-        let rows = u64::from(piece.rows);
-        let columns = video_channels * 4;
-        let clean = f.arena().tensor(DType::F32, Shape::new(&[rows, columns]))?;
-        self.transformer.patchify(f, latent, clean)?;
-        let anchored = f.arena().tensor(DType::F32, Shape::new(&[rows, columns]))?;
-        self.transformer.patchify(f, draw, anchored)?;
-        // `t · clean + (1 - t) · draw`, in place over the latent's rows.
-        nn::diffusion::add_noise(f, clean, anchored, VISUAL_CONDITION_TIME)?;
-        // The projection's output is FP32, and the one rounding is the copy into the rows
-        // (`video_input(anchored, output_dtype=torch.float32).to(out.dtype)`).
-        let hidden = u64::from(self.config.transformer.hidden_size);
-        let projected = f.arena().tensor(DType::F32, Shape::new(&[rows, hidden]))?;
-        self.transformer.project(f, clean, projected)?;
-        nn::layers::Cast
-            .forward(f, projected, text.narrow(0, u64::from(start), rows)?)
-            .map_err(Error::from)?;
-        Ok(())
+        // The latent and the draw become rows by the same mapping (the draw is drawn at latent
+        // resolution), the anchor `t · clean + (1 - t) · draw` mixes them in place in FP32, and
+        // the FP32 projection is stored into the rows with the one rounding.
+        let clean = self.transformer.patchify(f, latent)?;
+        let anchor = self.transformer.patchify(f, draw)?;
+        if clean.rows() != u64::from(piece.rows) {
+            return Err(Error::config(format!(
+                "condition {:?} declares {} visual rows and encodes to {}",
+                piece.role,
+                piece.rows,
+                clean.rows()
+            )));
+        }
+        nn::diffusion::add_noise(f, clean, anchor, VISUAL_CONDITION_TIME)?;
+        let projected = self.transformer.project_video(f, clean)?;
+        store(f, projected, rows)
     }
 
-    /// Refine one request's conditioning: the text encoder's features into the DiT's width.
+    /// Refine the prompt's features, `cond.source`, into the text rows of `cond.text`.
     ///
-    /// `source` is the encoder's `[rows, text_dim]` output and `text` the request's `[rows, hidden]`
-    /// conditioning buffer; both are the worker's, and neither is retained. The refiner's
-    /// document boundaries are the `refiner_cu_seq_lens_*` tables of `state`, so its queries are
-    /// every padded row and its keys stop at the prompt's last row.
-    ///
-    /// It runs once per request, before the first evaluation:
-    /// the conditioning never changes across a
-    /// trajectory, so refining inside the step loop would pay twice per layer per evaluation for a
-    /// value that is already right.
-    pub fn refine_conditioning(
+    /// The refiner reads one document: its queries are every padded row of the text capacity and
+    /// its keys stop at the prompt's last row. A model with no conditioner has no `source`.
+    fn refine(
         &self,
         f: &Forward,
-        source: TensorView,
-        text: TensorView,
-        state: &[TensorView],
+        request: &VideoRequest<'_>,
+        cond: nn::Conditioning<'_>,
     ) -> Result<()> {
-        let tables = Tables::new(self.config.attention, state);
-        let documents = crate::conditioning::Documents {
-            cu_seq_lens_q: tables.get("refiner_cu_seq_lens_q")?,
-            cu_seq_lens_k: tables.get("refiner_cu_seq_lens_k")?,
-            key_rows: self.refiner.rows(),
-        };
-        // The conditioning column holds the layout's condition rows below the prompt's, and they are
-        // the encoders' to write: the refiner's bound is the text capacity, and it reads and writes
-        // that many rows.
-        let rows = text.shape.dim(0).min(u64::from(self.refiner.rows()));
-        let source = source.narrow(0, 0, rows)?;
-        let text = text.narrow(0, 0, rows)?;
-        self.refiner.forward(f, source, &documents, text)?;
-        Ok(())
-    }
-
-    /// Project a request's conditions into its prefix source.
-    ///
-    /// The source is the compact prefix buffer - the prompt's rows, then one row per packed
-    /// condition row, then the zero row - which `Layouts::table_specs`' `prefix_index` addresses
-    /// directly ([`crate::packing::DensePacking::zero_row`]). The conditions' rows start at the
-    /// layout's text capacity, in packed order, audio before video within a segment
-    /// ([`crate::packing::condition_segments`]).
-    ///
-    /// A visual condition is anchored as `t z + (1 - t) noise` at `t = VISUAL_CONDITION_TIME` and
-    /// projected by the layer that projects the generated rows of its modality; an audio reference
-    /// is projected unchanged, which is [`AUDIO_CONDITION_TIME`]'s `1.0`.
-    ///
-    /// **Precision, declared.** The reference patches, mixes and projects a visual condition in
-    /// FP32 and rounds once, at the copy into the prefix source. This build patches the draw and
-    /// stores the mix in the prefix source's dtype, so a visual condition's rows round twice: the
-    /// draw at the patch (its relative error is BF16's half-ulp) and the sum at the mix. The audio
-    /// reference rounds once, at its projection. The residual is a fraction of the conditioning
-    /// level's `1 - t` term and is far below the noise it is mixed with; an exact path needs an F32
-    /// column of the input projection (2 MB of widened weights at load) because the crate has no
-    /// F32→BF16 convert and `Patch` writes one dtype.
-    ///
-    /// The model allocates nothing: `out`, the latents and the draws are the runner's views, and
-    /// the one scratch row buffer a visual condition needs comes from the forward pass's arena.
-    fn prepare_conditioning(
-        &self,
-        f: &Forward,
-        cond: nn::capability::Conditioning<'_>,
-    ) -> Result<()> {
-        // The refiner's rows are the denoiser's conditioning: every task's
-        // text passes through it once, in place over the runner's `text` buffer, and the encoder's
-        // own features arrive in `source`.
-        //
-        // The two widths are what makes the refiner the column's only producer: the encoder's
-        // features are `text_dim` (5120) and the conditioning column is `hidden_size` (5376), so
-        // nothing on the encoder's side writes a row of `text`. A request with no source therefore
-        // asks this model to denoise a column nothing projected - the shape a model whose encoder
-        // width *is* its column width has, and never this one's served path.
-        //
-        // A conditioned request's condition rows, below the prompt's: the encoders write them from
-        // `media`, at the offsets the layout's own counts place them, and the two writes are
-        // disjoint. A request with no media has no condition rows at all, which is every `t2va`.
         let Some(source) = cond.source else {
             return Ok(());
         };
-        if !cond.media.is_empty() {
-            self.encode_media(f, cond.media, cond.text)?;
-        }
-        self.refine_conditioning(f, source, cond.text, cond.state)
+        let layout = self.rules.cover(request)?;
+        let rows = layout.text_rows;
+        let capacity = u64::from(rows);
+        let int = |values: &[i32]| f.upload(values, Shape::new(&[values.len() as u64]));
+        let document = nn::layers::Varlen {
+            cu_q: int(&[0, rows as i32])?,
+            cu_k: int(&[0, request.text_tokens as i32])?,
+            max_q: None,
+            max_k: rows,
+        };
+        let refined = self
+            .refiner
+            .forward(f, source.narrow(0, 0, capacity)?, document)?;
+        store(f, refined, cond.text.narrow(0, 0, capacity)?)
     }
 
-    /// One denoising step: the latents in, the model's velocity, and the schedule's update.
+    /// One denoising step of `request`: the latents in, the model's velocity, and the schedule's
+    /// update in place.
     ///
-    /// The packed rows are assembled from the layout's tables: every row gathers its prefix source
-    /// (the refined text row it reads, or the zero row), then each modality's patchified latents are
-    /// projected and scattered into their own rows. The stack runs once, the step's modulation is
-    /// gathered from the AdaLN cache, and each modality's velocity is projected back, unpatched and
-    /// folded into its latents by the solver.
-    pub fn denoise(
+    /// The packed rows are assembled from the step's uploaded layout ([`Layouts::packed`]): every
+    /// row gathers its prefix source (the refined text row it reads, a condition row or the zero
+    /// row), then each modality's patchified latents are projected and scattered into this rank's
+    /// own rows. The stack runs once, conditioned by the step's AdaLN rows, and each modality's
+    /// velocity is projected back, gathered from every rank, unpatched and folded into its latents
+    /// by the solver.
+    pub fn step(
         &self,
         f: &Forward,
-        step: &nn::Step,
+        step: nn::Step,
+        request: &VideoRequest<'_>,
         latents: nn::Latents,
         cond: nn::Conditioning<'_>,
     ) -> Result<()> {
-        let tables = Tables::new(self.config.attention, cond.state);
         let video = latents.video;
-        let channels = video.shape.dim(0);
-        let tokens = u64::from(tables.get("groups")?.shape.dim(0) as u32);
-        // The bound this deployment was loaded for: the stack's dense attention is compiled with it
-        // as `DenseDescriptor.max_kv_len`, so a request wider than it has no attention module to
-        // run, and the runner's recorded walk of a layout past it refuses here at load.
-        if tokens > u64::from(self.rows) {
+        // The trajectory is FP32 and a latent of any other type is refused: a sample in the
+        // stack's type would round the trajectory once per evaluation.
+        if video.dtype != SAMPLE_DTYPE
+            || latents
+                .audio
+                .is_some_and(|audio| audio.dtype != SAMPLE_DTYPE)
+        {
             return Err(Error::config(format!(
-                "this denoiser was loaded for {} packed rows and the request has {tokens}; the \
-                 attention is compiled for the bound",
-                self.rows
-            )));
-        }
-        let hidden_size = u64::from(self.config.transformer.hidden_size);
-        let dtype = cond.text.dtype;
-        // The trajectory is FP32, and a latent input of any other type is refused. A sample in
-        // the stack's type would round the trajectory once per evaluation - a drift no shape refuses
-        // and no page localises - so this refuses instead of running the cheaper arithmetic.
-        if video.dtype != SAMPLE_DTYPE {
-            return Err(Error::config(format!(
-                "the video latents are {} and a trajectory is {SAMPLE_DTYPE}: the sample is what \
-                 the solver accumulates into, and the stack's own element type is {dtype}",
+                "the latents are {} and a trajectory is {SAMPLE_DTYPE}",
                 video.dtype
             )));
         }
-        // The sample and the stack meet at the two crossings `SAMPLE_DTYPE` states.
-        let arena = f.arena();
+        let layout = self.rules.cover(request)?;
+        // What the step reads of its layout, computed on the host and placed on the device: the
+        // packing's indices, this rank's rows of each modality, the rotary coordinates and the
+        // attention's visibility. Every extent follows from `layout` alone (its packing, this
+        // rank's interval of it), so a capture and every replay of the layout upload at the same
+        // offsets; only the values follow from the request's prompt length, conditions and vision
+        // spans.
+        if request.text_tokens > layout.text_rows {
+            return Err(Error::config(format!(
+                "a prompt of {} rows does not fit a text capacity of {}",
+                request.text_tokens, layout.text_rows
+            )));
+        }
+        let frames = frame_count(layout.video.frames)?;
+        let canvas = canvas_of_latents(&layout)?;
+        let segments = packing::condition_segments(request.conditions, &canvas)?;
+        let spans = vision_spans(request);
+        let int = |values: &[i32]| f.upload(values, Shape::new(&[values.len() as u64]));
 
-        // This rank owns one contiguous interval of the packed rows, and the sample and the tables
-        // are the whole sequence's on every rank: a table a row reads is cut to the interval here,
-        // and each modality's owned rows are named by the rank's own `*_sources` and `*_slots`.
-        let shard = u64::from(self.shard.max(1));
+        let (rows, video_places, audio_places, tables, visibility) =
+            match self.rules.config.attention {
+                crate::config::AttentionKind::Dense => {
+                    let dense = self.rules.packing_of(&layout)?;
+                    let tables = packing::dense_tables(
+                        &dense,
+                        frames,
+                        &canvas,
+                        request.text_tokens,
+                        &segments,
+                        &spans,
+                    )?;
+                    let rows = tables.groups.len() as u64;
+                    let (video_places, audio_places) = dense_rows(&dense);
+                    // One sequence: every query row sees the used key rows, no query a padding row.
+                    let visible = nn::layers::Varlen {
+                        cu_q: int(&[0, rows as i32])?,
+                        cu_k: int(&[0, tables.used as i32])?,
+                        max_q: None,
+                        max_k: rows as u32,
+                    };
+                    (
+                        rows,
+                        video_places,
+                        audio_places,
+                        tables,
+                        Visibility::Dense(visible),
+                    )
+                }
+                crate::config::AttentionKind::Sparse {
+                    sparsity,
+                    reference_keep,
+                    ..
+                } => {
+                    let extent = self.rules.segment_of(&layout)?;
+                    let tables = packing::segment_tables(
+                        &extent,
+                        frames,
+                        &canvas,
+                        (request.text_tokens, &spans),
+                        &segments,
+                        (sparsity, reference_keep),
+                    )?;
+                    let rows = tables.groups.len() as u64;
+                    if rows != u64::from(extent.padded_tokens) {
+                        return Err(Error::config(format!(
+                            "{rows} table rows for {} packed rows",
+                            extent.padded_tokens
+                        )));
+                    }
+                    let sizes: Vec<i32> = tables
+                        .variable_block_sizes
+                        .iter()
+                        .map(|size| *size as i32)
+                        .collect();
+                    let (video_places, audio_places) = segment_rows(&extent, &tables);
+                    // The keep table is over-allocated to the tile count and filled by segment index,
+                    // exactly as the reference builds it.
+                    let sparse = nn::layers::VsaTables {
+                        sizes: int(&sizes)?,
+                        segments: int(&tables.tile_segments)?,
+                        keep: int(&tables.segment_keep)?,
+                    };
+                    (
+                        rows,
+                        video_places,
+                        audio_places,
+                        tables,
+                        Visibility::Sparse(sparse),
+                    )
+                }
+            };
+        let (video_sources, video_slots) = self.rules.owned_rows(rows, &video_places);
+        let (audio_sources, audio_slots) = self.rules.owned_rows(rows, &audio_places);
+        // The AdaLN row of every packed row: `3 · group + tag` ([`crate::modulation::row`]).
+        let modulation: Vec<i32> = tables
+            .groups
+            .iter()
+            .zip(&tables.token_tags)
+            .map(|(group, tag)| crate::modulation::TAGS as i32 * group + tag)
+            .collect();
+        // Axis-major `[3, rows]` coordinates: the sectioned rotation reads one real coordinate per
+        // axis per token, and the clock and raster are rescaled, so they stay real numbers.
+        let coordinates: Vec<f32> = (0..3)
+            .flat_map(|axis| {
+                tables
+                    .position_ids
+                    .iter()
+                    .map(move |point| point[axis] as f32)
+            })
+            .collect();
+        let prefix_index = int(&tables.prefix_index)?;
+        let groups = int(&tables.groups)?;
+        let modulation = int(&modulation)?;
+        let positions = f.upload(&coordinates, Shape::new(&[3, rows]))?;
+        let video_rows = (
+            int(&video_places)?,
+            int(&video_sources)?,
+            int(&video_slots)?,
+        );
+        let audio_rows = (
+            int(&audio_places)?,
+            int(&audio_sources)?,
+            int(&audio_slots)?,
+        );
+        let tokens = rows;
+        // The stack's attention is compiled for this deployment's packed-row bound.
+        if tokens > u64::from(self.rows) {
+            return Err(Error::config(format!(
+                "this denoiser was loaded for {} packed rows and the layout has {tokens}",
+                self.rows
+            )));
+        }
+        let shard = u64::from(self.sequence.size.max(1));
         if !tokens.is_multiple_of(shard) {
             return Err(Error::config(format!(
                 "{tokens} packed rows do not divide over {shard} ranks"
             )));
         }
+        // This rank owns one contiguous interval of the packed rows; a per-row table is cut to it.
         let local = tokens / shard;
-        let first = u64::from(self.rank) * local;
-        let own = |table: TensorView| {
-            table
-                .at(table.offset_elements(first))
-                .reshape(Shape::new(&[local]))
-        };
+        let first = u64::from(self.sequence.rank) * local;
+        let own = |table: TensorView| table.narrow(0, first, local);
+        let index = i32::try_from(step.index)
+            .map_err(|_| Error::config(format!("evaluation {} exceeds i32", step.index)))?;
+        let evaluation = f.upload(&[index], Shape::new(&[1]))?;
+        let hidden_size = u64::from(self.config.transformer.hidden_size);
 
-        // The packed rows: every row gathers its prefix source, so a generated row reads the zero
-        // row and a text row reads itself.
-        let hidden = arena.tensor(dtype, Shape::new(&[local, hidden_size]))?;
-        nn::layers::IndexRows.gather(f, cond.text, own(tables.get("prefix_index")?), hidden)?;
+        // The prefix source: the refined prompt rows and the condition rows below them were
+        // written once per request by `prepare_conditioning`, and the zero row is the encoder
+        // stage's.
+        let text = cond.text;
+        let dtype = text.dtype;
 
-        // The video rows: patchify, project, scatter.
-        let video_indices = tables.get("video_indices")?;
-        let video_rows = u64::from(video_indices.shape.dim(0) as u32);
-        let video_sources = tables.get("video_sources")?;
-        let video_slots = tables.get("video_slots")?;
-        let own_video = video_sources.shape.dim(0);
-        let sample_dtype = SAMPLE_DTYPE;
-        // The DiT's `1x2x2` tiles: packed here, and unpacked back into the latent raster after the
-        // prediction.
-        let patched = arena.tensor(sample_dtype, Shape::new(&[video_rows, channels * 4]))?;
-        self.transformer.patchify(f, video, patched)?;
-        // The first crossing (`SAMPLE_DTYPE`): an FP32 projection, narrowed into the packed rows.
+        // The packed rows: every row gathers its prefix source.
+        let hidden = nn::layers::IndexRows.gather(f, text, own(prefix_index)?)?;
+
+        // The video rows: patchify, project in FP32, narrow, scatter into this rank's rows.
+        let channels = video.shape.dim(0);
+        let (video_indices, video_sources, video_slots) = video_rows;
+        let patched = self.transformer.patchify(f, video)?;
+        let own_video = video_sources.numel();
         if own_video > 0 {
-            let owned = arena.tensor(sample_dtype, Shape::new(&[own_video, channels * 4]))?;
-            nn::layers::IndexRows.gather(f, patched, video_sources, owned)?;
-            let projected = arena.tensor(DType::F32, Shape::new(&[own_video, hidden_size]))?;
-            self.transformer.project(f, owned, projected)?;
-            let narrowed = arena.tensor(dtype, Shape::new(&[own_video, hidden_size]))?;
-            nn::layers::Cast.forward(f, projected, narrowed)?;
+            let owned = nn::layers::IndexRows.gather(f, patched, video_sources)?;
+            let projected = self.transformer.project_video(f, owned)?;
+            let narrowed = nn::layers::Cast.forward(f, projected, dtype)?;
             nn::layers::IndexRows.scatter(f, narrowed, video_slots, hidden)?;
         }
 
-        // One audio stream or none. A layout with audio rows and no audio latents would otherwise
-        // denoise the video and return it without sound, and a missing table where the layout has
-        // one is a disagreement about the layout rather than an absent stream.
-        let audio = match (latents.audio, tables.get("audio_indices")) {
-            (Some(audio), Ok(indices)) => Some((audio, indices)),
-            (None, Ok(indices)) if indices.shape.dim(0) > 0 => {
+        // The audio rows: channel-major latent rows, projected like the video's.
+        let features = u64::from(self.config.transformer.audio_channels);
+        let (audio_indices, audio_sources, audio_slots) = audio_rows;
+        let audio = match latents.audio {
+            Some(audio) => Some(audio.reshape(Shape::new(&[audio_indices.numel(), features]))),
+            None if audio_indices.numel() > 0 => {
                 return Err(Error::config(format!(
                     "this layout has {} audio rows and no audio latents",
-                    indices.shape.dim(0)
+                    audio_indices.numel()
                 )));
             }
-            (Some(_), Err(error)) => return Err(error),
-            _ => None,
+            None => None,
         };
-
-        // The audio rows: one element per channel-step pair, projected like any other row.
-        if let Some((audio, audio_indices)) = audio {
-            // The audio trajectory is the video's type for the same reason, and the refusal belongs
-            // here rather than in the solver: a sample in another type would first widen the
-            // projection's 32-wide rows (`scaled_add target_f32_source_bf16_columns_32`) and only
-            // then fail against the prediction, which reads as a velocity defect instead of a dtype
-            // one.
-            if audio.dtype != DType::F32 {
-                return Err(Error::config(format!(
-                    "the audio latents are {} and a trajectory is FP32",
-                    audio.dtype
-                )));
-            }
-            let audio_rows = u64::from(audio_indices.shape.dim(0) as u32);
-            let features = u64::from(self.config.transformer.audio_channels);
-            let flat = TensorView::with_strides(
-                audio.ptr,
-                audio.dtype,
-                Shape::new(&[audio_rows, features]),
-                nn::Strides::new(&[features, 1]),
-            );
-            let audio_sources = tables.get("audio_sources")?;
-            let own_audio = audio_sources.shape.dim(0);
-            if own_audio > 0 {
-                let owned = arena.tensor(sample_dtype, Shape::new(&[own_audio, features]))?;
-                nn::layers::IndexRows.gather(f, flat, audio_sources, owned)?;
-                // The audio's first crossing, as the video's.
-                let projected = arena.tensor(DType::F32, Shape::new(&[own_audio, hidden_size]))?;
-                self.transformer.project_audio(f, owned, projected)?;
-                let narrowed = arena.tensor(dtype, Shape::new(&[own_audio, hidden_size]))?;
-                nn::layers::Cast.forward(f, projected, narrowed)?;
-                nn::layers::IndexRows.scatter(f, narrowed, tables.get("audio_slots")?, hidden)?;
-            }
+        if let Some(audio) = audio
+            && audio_sources.numel() > 0
+        {
+            let owned = nn::layers::IndexRows.gather(f, audio, audio_sources)?;
+            let projected = self.transformer.project_audio(f, owned)?;
+            let narrowed = nn::layers::Cast.forward(f, projected, dtype)?;
+            nn::layers::IndexRows.scatter(f, narrowed, audio_slots, hidden)?;
         }
 
-        // The rotary tables and the visibility of the one packed sequence. Each of the three axes
-        // rotates `rope_frequency_dim` channel pairs, and a factor table holds one column per pair.
-        // One column per rotated **pair**, and `rope_freq_dim` is already the pairs of one axis:
-        // the operator's `rotated` counts channels (three axes of `2 * rope_freq_dim` = 96) and a
-        // factor table is half that (48), so this product is the table's width and not the
-        // operator's field. The two numbers differ by two and are named alike.
-        let pairs = u64::from(self.transformer.rotary().columns());
-        let cosine = arena.tensor(DType::F32, Shape::new(&[tokens, pairs]))?;
-        let sine = arena.tensor(DType::F32, Shape::new(&[tokens, pairs]))?;
-        self.transformer
-            .factors(f, tables.get("position_ids")?, cosine, sine)?;
-        // The dense kind reads the whole packed sequence in one go; the sparse kind reads the
-        // segment tables instead and has no visibility pair at all.
-        let visible = self.config.attention.is_dense().then(|| {
-            Ok::<_, Error>(nn::layers::Varlen {
-                cu_q: tables.get("cu_seq_lens_q")?,
-                cu_k: tables.get("cu_seq_lens_k")?,
-                max_q: None,
-                max_k: tokens as u32,
-            })
-        });
-        let visible = match visible {
-            None => None,
-            Some(visible) => Some(visible?),
-        };
-        // A sparse deployment's layers read the valid rows of each tile, the segment of each tile,
-        // and the keep table; a dense one reads the whole packed sequence through `cu_seq_lens`
-        // and declares none of them. The two are exclusive, and the condition here was the wrong
-        // way round: a dense deployment asked its layout for `variable_block_sizes` - a table that
-        // layout never declares - and the refusal named the table rather than the inversion
-        // (`configuration: variable_block_sizes is not a state table of this kind`, launch 18).
-        let segments = if self.config.attention.is_dense() {
-            None
-        } else {
-            Some(crate::attention_sparse::Segments {
-                sizes: tables.get("variable_block_sizes")?,
-                segments: tables.get("tile_segments")?,
-                keep: tables.get("segment_keep")?,
-            })
-        };
-
-        // The stack, conditioned by the step's gathered modulation.
-        let step_index = tables.get("step")?;
-        let adaln = self.cache.bind(cond.constants)?;
+        // The stack, conditioned by the step's gathered modulation, over the whole sequence's
+        // rotary factors.
+        let factors = self.transformer.rotary().factors(f, positions)?;
+        let entries = self.cache.entries_of(f, evaluation)?;
+        let modulation_rows = own(modulation)?;
         self.transformer.forward(
             f,
-            &adaln,
-            step_index,
+            (&self.cache, entries),
             hidden,
-            own(tables.get("modulation_indices")?),
-            Factors {
-                rotary: self.transformer.rotary(),
-                cosine,
-                sine,
-            },
-            visible.as_ref(),
-            segments.as_ref(),
-            tokens as u32,
+            modulation_rows,
+            (factors, &visibility),
         )?;
 
-        // The output: the step's final modulation, then each modality's head.
-        let groups = self.cache.groups();
-        let entries = arena.tensor(DType::I32, Shape::new(&[1, groups]))?;
-        self.cache.entries_of(f, step_index, entries)?;
-        // This buffer's element is the stack's. The gather refuses an output of another type than
-        // its table, so a cache whose projections drifted away from the stack's type is a named
-        // refusal and not a mixed gather.
-        let modulation = arena.tensor(hidden.dtype, Shape::new(&[groups, 2 * hidden_size]))?;
-        adaln.output(f, entries, modulation)?;
-        let modulation = ModulationTable::output(modulation, hidden_size)?;
-
-        // The solver's scale: one FP32 word the `step` table indexes into the coefficient table.
-        let coefficient = arena.tensor(DType::F32, Shape::new(&[1, 1]))?;
-        // A rank predicts the rows it owns, and every rank then holds every row's prediction: the
-        // sample is whole on every rank, so the solver's update is the same arithmetic everywhere
-        // and the group's trajectories cannot drift apart.
-        let groups_table = own(tables.get("groups")?);
-        let predicted = if own_video > 0 {
-            let video_hidden = arena.tensor(dtype, Shape::new(&[own_video, hidden_size]))?;
-            nn::layers::IndexRows.gather(f, hidden, video_slots, video_hidden)?;
-            let video_groups = arena.tensor(DType::I32, Shape::new(&[own_video]))?;
-            nn::layers::IndexRows.gather(
-                f,
-                one_column(groups_table),
-                video_slots,
-                one_column(video_groups),
-            )?;
-            // The second crossing (`SAMPLE_DTYPE`): the head writes the FP32 prediction.
-            let rows = arena.tensor(sample_dtype, Shape::new(&[own_video, channels * 4]))?;
-            self.transformer.velocity(
-                f,
-                video_hidden,
-                Modality::Video,
-                &modulation,
-                video_groups,
-                step.index,
-                step_index,
-                rows,
-            )?;
-            Some(rows)
-        } else {
-            None
-        };
-        let velocity_rows = self.collected(
-            f,
-            predicted,
-            video_slots,
-            video_indices,
-            channels * 4,
-            local,
-            tokens,
-        )?;
-        let velocity = arena.tensor(sample_dtype, video.shape)?;
-        self.transformer.unpatchify(f, velocity_rows, velocity)?;
-        // The solver's coefficient is gathered on the device from the worker's `step` table, so
-        // this launch addresses one staging word whose contents change per evaluation rather than
-        // one buffer per evaluation; the same word serves the audio step's gather.
-        self.solver.step(
-            f,
-            Modality::Video,
-            video,
-            velocity,
-            step.index,
-            tables.get("step")?,
-            coefficient,
-        )?;
-
-        if let Some((audio, audio_indices)) = audio {
-            let audio_rows = u64::from(audio_indices.shape.dim(0) as u32);
-            let features = u64::from(self.config.transformer.audio_channels);
-            let audio_slots = tables.get("audio_slots")?;
-            let own_audio = audio_slots.shape.dim(0);
-            let predicted = if own_audio > 0 {
-                let audio_hidden = arena.tensor(dtype, Shape::new(&[own_audio, hidden_size]))?;
-                nn::layers::IndexRows.gather(f, hidden, audio_slots, audio_hidden)?;
-                let audio_groups = arena.tensor(DType::I32, Shape::new(&[own_audio]))?;
-                nn::layers::IndexRows.gather(
+        // The output: the step's final modulation, then each modality's head over its own rows.
+        let output_table = ModulationTable::output(self.cache.output(f, entries)?, hidden_size)?;
+        let groups = one_column(own(groups)?);
+        let velocity = |rows: (TensorView, TensorView), modality: Modality, width: u64| {
+            let (indices, slots) = rows;
+            let predicted = if slots.numel() > 0 {
+                let selected = nn::layers::IndexRows.gather(f, hidden, slots)?;
+                let selected_groups = nn::layers::IndexRows.gather(f, groups, slots)?;
+                Some(self.transformer.velocity(
                     f,
-                    one_column(groups_table),
-                    audio_slots,
-                    one_column(audio_groups),
-                )?;
-                let rows = arena.tensor(sample_dtype, Shape::new(&[own_audio, features]))?;
-                self.transformer.velocity(
-                    f,
-                    audio_hidden,
-                    Modality::Audio,
-                    &modulation,
-                    audio_groups,
-                    step.index,
-                    step_index,
-                    rows,
-                )?;
-                Some(rows)
+                    selected,
+                    modality,
+                    RowModulation {
+                        table: &output_table,
+                        rows: selected_groups.reshape(Shape::new(&[slots.numel()])),
+                    },
+                    (step.index, evaluation),
+                )?)
             } else {
                 None
             };
-            let velocity = self.collected(
-                f,
-                predicted,
-                audio_slots,
-                audio_indices,
-                features,
-                local,
-                tokens,
-            )?;
-            let flat = TensorView::with_strides(
-                audio.ptr,
-                audio.dtype,
-                Shape::new(&[audio_rows, features]),
-                nn::Strides::new(&[features, 1]),
-            );
+            self.collected(f, predicted, (slots, indices), (width, local, tokens))
+        };
+        let video_velocity = velocity((video_indices, video_slots), Modality::Video, channels * 4)?;
+        let video_velocity = self
+            .transformer
+            .unpatchify(f, video_velocity, video.shape)?;
+        self.solver.step(
+            f,
+            Modality::Video,
+            (video, video_velocity),
+            (step.index, evaluation),
+        )?;
+        if let Some(audio) = audio {
+            let audio_velocity = velocity((audio_indices, audio_slots), Modality::Audio, features)?;
             self.solver.step(
                 f,
                 Modality::Audio,
-                flat,
-                velocity,
-                step.index,
-                tables.get("step")?,
-                coefficient,
+                (audio, audio_velocity),
+                (step.index, evaluation),
             )?;
         }
         Ok(())
@@ -2477,28 +1685,23 @@ impl Denoiser {
     /// interval of the packed sequence, every member's intervals are gathered in member order, and
     /// the modality's rows are read out of the whole sequence by `indices`. The rows of an interval
     /// no modality row lands in are never read, so they are left as the arena holds them.
-    #[allow(clippy::too_many_arguments)]
     fn collected(
         &self,
         f: &Forward,
         predicted: Option<TensorView>,
-        slots: TensorView,
-        indices: TensorView,
-        width: u64,
-        local: u64,
-        tokens: u64,
+        (slots, indices): (TensorView, TensorView),
+        (width, local, tokens): (u64, u64, u64),
     ) -> Result<TensorView> {
-        let arena = f.arena();
-        if self.shard <= 1 {
+        if self.sequence.size <= 1 {
             return predicted.ok_or_else(|| {
                 Error::config("one rank owns every row, and it predicted none".to_owned())
             });
         }
-        let interval = arena.tensor(SAMPLE_DTYPE, Shape::new(&[local, width]))?;
+        let interval = f.empty(SAMPLE_DTYPE, Shape::new(&[local, width]))?;
         if let Some(predicted) = predicted {
             nn::layers::IndexRows.scatter(f, predicted, slots, interval)?;
         }
-        let sequence = arena.tensor(SAMPLE_DTYPE, Shape::new(&[tokens, width]))?;
+        let sequence = f.empty(SAMPLE_DTYPE, Shape::new(&[tokens, width]))?;
         if f.split().is_none() {
             return Err(Error::Unsupported(
                 "a sequence shard collects its predictions over a group, and this forward \
@@ -2507,50 +1710,50 @@ impl Denoiser {
             ));
         }
         f.all_gather(interval, sequence)?;
-        let rows = arena.tensor(SAMPLE_DTYPE, Shape::new(&[indices.shape.dim(0), width]))?;
-        nn::layers::IndexRows.gather(f, sequence, indices, rows)?;
-        Ok(rows)
+        Ok(nn::layers::IndexRows.gather(f, sequence, indices)?)
     }
 
     /// Read one DiT partition and everything around it.
     ///
-    /// `capacity` is the deployment's prefix rows and `rows` bounds the packed row count it serves,
-    /// which sizes the attention's scratch; `places_encoders` states whether the deployment places
-    /// the condition encoders this block attaches. The cache is sized from the checkpoint's
-    /// schedule alone - the distinct noise levels of its grid - so no request grows it and two
-    /// requests of one shape share it.
+    /// `capacity` is the deployment's `(text rows, condition rows)`, from which the packed-row
+    /// bound every attention is compiled for follows; `sequence` the denoiser's sequence split.
+    /// `encoders` are the condition encoders when the deployment places them, and `heads` a
+    /// parallel-decoding student's fused heads. The AdaLN cache is sized from the checkpoint's
+    /// schedule alone - the distinct noise levels of its grid - so no request grows it.
     pub fn load(
-        config: DenoiserConfig,
-        capacity: Capacity,
-        rows: u32,
-        partition: &crate::Partition,
-        places_encoders: bool,
         loader: &mut WeightLoader<'_>,
-        heads: Option<crate::transformer::StudentHeads>,
+        config: DenoiserConfig,
+        capacity: (u32, u32),
+        sequence: SequenceSplit,
+        encoders: Option<(crate::encoding::VideoEncoder, crate::encoding::AudioEncoder)>,
+        heads: Option<(nn::layers::StepIndexed, nn::layers::StepIndexed)>,
     ) -> Result<Self> {
-        let sequence = partition.sequence()?;
+        let rules = Layouts::new(config.clone(), capacity, sequence.split)?;
+        let rows = rules.rows_bound()?;
+        // A sparse deployment's compression reduces over every video tile any layout holds.
+        let tiles = match config.attention {
+            crate::config::AttentionKind::Sparse { .. } => rules.tiles_bound()?,
+            crate::config::AttentionKind::Dense => 0,
+        };
         let schedule = Schedule::new(&config.schedule)?;
         let evaluations = schedule.num_steps()?;
         let conditioned = config
             .tasks
             .iter()
             .any(|task| !matches!(task, crate::VideoTask::TextToVideoAudio));
-        let groups = Groups::of(conditioned);
         let levels = crate::modulation::levels(
             &schedule.timesteps(Modality::Video),
             &schedule.timesteps(Modality::Audio),
-            groups,
+            conditioned,
         )?;
         let hidden = u64::from(config.transformer.hidden_size);
         let projections = Projections::load(&config.transformer, loader)?;
-        // The tables are the modulation projections' own type, because the reference allocates them
-        // from the product - so at a BF16 stack they are BF16 and at an
-        // FP32 deployment FP32. The timestep pair in front of them stays FP32, and the one narrowing
-        // between the two halves lives in `Projections::compute`.
+        // The tables take the modulation projections' own type, as the reference allocates them
+        // from the product.
         let cache = TimestepTable::load(
             &mut loader.scope("adaln"),
             &levels,
-            groups.count(),
+            crate::modulation::groups(conditioned),
             TimestepTableSpec {
                 frequency_dim: config.transformer.frequency_dim,
                 layers: config.transformer.num_hidden_layers,
@@ -2559,53 +1762,27 @@ impl Denoiser {
                 dtype: projections.dtype(),
             },
         )?;
-        // One row per timestep of the ladder: the grid holds a level for the clean end as well, so
-        // a 49-evaluation schedule states 50 rows (one more than the steps a request takes), while
-        // the table's entries count the *distinct* levels those rows point at.
         if cache.steps() < u64::from(evaluations) {
             return Err(Error::checkpoint(format!(
                 "the AdaLN entry table has {} rows for {evaluations} evaluations",
                 cache.steps()
             )));
         }
-        // A sparse deployment states the compression's tile bound once, from its own layouts: the
-        // score matrix is `[heads, query tiles, tiles]` and must cover every video tile any layout
-        // it serves can hold. A dense one has no tiles, and the stack's attention kind never reads
-        // the zero.
-        let tile_bound = match config.attention {
-            crate::config::AttentionKind::Sparse { .. } => {
-                // The value is this deployment's own bound - the longest layout it can be asked
-                // for, a cap over canvases and frame counts rather than any one request's count -
-                // and the key names its *class*: `CompressPooledDescriptor`'s key is
-                // `max_tiles.next_power_of_two()`, because the package compiles the reduction to
-                // the bound's next power of two and two bounds inside one class are one module.
-                // The descriptor keeps the live bound, since the tolerance is written against the
-                // reduction length itself.
-                Layouts::new(config.clone(), capacity, sequence)?.tiles_bound()?
-            }
-            crate::config::AttentionKind::Dense => 0,
-        };
         let transformer = Transformer::load(
-            &config.transformer,
-            config.attention,
-            rows,
-            tile_bound,
-            partition,
             loader,
+            (&config.transformer, config.attention),
+            (rows, tiles),
+            sequence,
             heads,
         )?;
         let solver = Solver::load(&schedule, loader)?;
-        // The refiner reads the text encoder's features and writes the DiT's conditioning; its rows
-        // are bounded by the same packed-row bound the stack's attention is sized for.
-        // The refiner reads the encoder's rows, whose count is the text capacity - not the packed
-        // row bound: its scratch is sized per row it can see, and a packed bound would size it for
-        // every video row of the widest layout.
+        // The refiner reads the prompt's rows, whose count is the text capacity.
         let refiner = crate::conditioning::TokenRefiner::load(
-            &config.transformer,
-            capacity.text_rows,
             loader,
+            &config.transformer,
+            capacity.0,
+            transformer.dtype(),
         )?;
-        let rules = Layouts::new(config.clone(), capacity, sequence)?;
         Ok(Self {
             config,
             rules,
@@ -2614,15 +1791,10 @@ impl Denoiser {
             transformer,
             projections,
             cache,
-            evaluations,
             refiner,
-            places_encoders,
-            encoders: None,
+            encoders,
             rows,
-            // The denoiser's own rank, not the text encoder's: the two shards are independent, and
-            // with one tensor shard every rank's `tensor_rank` is 0 (`partition.rs`).
-            rank: sequence.rank,
-            shard: sequence.size,
+            sequence: sequence.split,
         })
     }
 
@@ -2639,16 +1811,6 @@ impl Denoiser {
     /// The schedule this denoiser steps along.
     pub const fn schedule(&self) -> &Schedule {
         &self.schedule
-    }
-
-    /// The tables the runner allocates after loading: the AdaLN cache's modulation tables.
-    pub fn constant_tables(&self) -> Vec<StateTable> {
-        self.cache.tables()
-    }
-
-    /// Fill the AdaLN cache `out` from the schedule's times: the one post-load launch.
-    pub fn prepare_constants(&self, f: &Forward, out: &[TensorView]) -> Result<()> {
-        self.projections.compute(f, &self.cache.bind(out)?)
     }
 }
 
@@ -2694,15 +1856,7 @@ mod tests {
             attention: AttentionKind::DENSE,
             tasks: vec![crate::VideoTask::TextToVideoAudio],
         };
-        Layouts::new(
-            config,
-            Capacity {
-                text_rows: 128,
-                condition_rows: 64,
-            },
-            Split::WHOLE,
-        )
-        .unwrap()
+        Layouts::new(config, (128, 64), Split::WHOLE).unwrap()
     }
 
     #[test]
@@ -2771,7 +1925,7 @@ mod tests {
     fn sparse_layouts() -> Layouts {
         let mut config = layouts().config;
         config.attention = AttentionKind::sparse(TILE, 0.8, None).unwrap();
-        Layouts::new(config, layouts().capacity, Split::WHOLE).unwrap()
+        Layouts::new(config, (128, 64), Split::WHOLE).unwrap()
     }
 
     /// The ladder starts at one keyframe, doubles, gains a halfway rung from four keyframes up, and
@@ -2780,7 +1934,7 @@ mod tests {
     fn the_condition_ladder_climbs_to_the_capacity() {
         let ladder = |capacity| {
             let mut rules = sparse_layouts();
-            rules.capacity.condition_rows = capacity;
+            rules.condition_rows = capacity;
             rules.condition_ladder()
         };
         assert_eq!(
@@ -2815,7 +1969,7 @@ mod tests {
     #[test]
     fn a_layout_holds_the_rung_of_its_request() {
         let mut rules = sparse_layouts();
-        rules.capacity.condition_rows = 2048;
+        rules.condition_rows = 2048;
         let widest = rules.cover(&conditioned()).unwrap();
         assert_eq!(widest.condition_rows, 2048);
         let rung = rules
@@ -2825,7 +1979,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rung.condition_rows, 1024);
-        let rows = |layout| rules.segment_of(layout).unwrap().extent.padded_tokens;
+        let rows = |layout| rules.segment_of(layout).unwrap().padded_tokens;
         assert_eq!(rows(&widest) - rows(&rung), 1024);
         // A request of no anchor and no reference is `t2va`, whatever rung it states.
         let plain = rules
@@ -2901,96 +2055,11 @@ mod tests {
         );
 
         // And the entries' total is the block the runner sizes: the two public answers agree.
-        let conditions: Vec<packing::Condition> =
-            shapes.iter().map(packing::Condition::of).collect();
-        let canvas = rule.canvas(&request).expect("a canvas");
         assert_eq!(
             cursor,
-            u64::from(rule.condition_elements(&conditions, &canvas)),
+            u64::from(rule.condition_elements(&shapes)),
             "the offsets partition the block `condition_elements` sizes"
         );
-    }
-
-    #[test]
-    fn a_layout_declares_the_refiners_boundaries_and_fills_them() {
-        // The refiner's document is the prompt: its queries are every padded row and its keys stop
-        // at the prompt's last row, so a padding row is never a key. Both kinds declare the pair -
-        // a sparse deployment's attention reads tiles, but its refiner reads a document.
-        let rule = layouts();
-        let mut request = request(49, 640, 480);
-        request.text_tokens = 12;
-        let (layout, _) = rule.layout(&request).unwrap();
-        let specs = rule.table_specs(&layout).unwrap();
-        let names: Vec<&str> = specs.iter().map(|table| table.name).collect();
-        for name in ["refiner_cu_seq_lens_q", "refiner_cu_seq_lens_k"] {
-            assert!(names.contains(&name), "{name}");
-            let table = specs.iter().find(|table| table.name == name).unwrap();
-            assert_eq!(table.shape.dims(), &[2], "{name}");
-        }
-        let mut out: Vec<TableValues> = specs
-            .iter()
-            .map(|table| TableValues::zeroed(table).unwrap())
-            .collect();
-        rule.write_state(&request, &layout, &mut out).unwrap();
-        let values = |name: &str| -> Vec<i32> {
-            let index = names.iter().position(|table| *table == name).unwrap();
-            decode_i32(&out[index])
-        };
-        assert_eq!(
-            values("refiner_cu_seq_lens_q"),
-            vec![0, layout.text_rows as i32]
-        );
-        assert_eq!(values("refiner_cu_seq_lens_k"), vec![0, 12]);
-    }
-
-    #[test]
-    fn a_sparse_layout_declares_the_refiners_boundaries_too() {
-        let rule = sparse_layouts();
-        let mut request = request(121, 1344, 768);
-        request.text_tokens = 12;
-        let (layout, _) = rule.layout(&request).unwrap();
-        let specs = rule.table_specs(&layout).unwrap();
-        let names: Vec<&str> = specs.iter().map(|table| table.name).collect();
-        // The four tile tables, and neither of the dense attention's sequence-length tables.
-        for name in [
-            "variable_block_sizes",
-            "tile_segments",
-            "segment_starts",
-            "segment_keep",
-        ] {
-            assert!(names.contains(&name), "{name}");
-        }
-        assert!(!names.contains(&"cu_seq_lens_k"));
-        assert!(!names.contains(&"cu_seq_lens_q"));
-        let tile = u64::from(TILE);
-        let rows = specs
-            .iter()
-            .find(|table| table.name == "groups")
-            .map(|table| table.shape.dim(0))
-            .expect("the group table");
-        assert_eq!(rows % tile, 0);
-        for name in ["variable_block_sizes", "segment_keep", "tile_segments"] {
-            let table = specs.iter().find(|table| table.name == name).unwrap();
-            assert_eq!(table.shape.dim(0), rows / tile, "{name}");
-        }
-        // The tables fill, and every block size is at most one tile's rows.
-        let mut out: Vec<TableValues> = specs
-            .iter()
-            .map(|table| TableValues::zeroed(table).unwrap())
-            .collect();
-        rule.write_state(&request, &layout, &mut out).unwrap();
-        let sizes = specs
-            .iter()
-            .position(|table| table.name == "variable_block_sizes")
-            .unwrap();
-        let block_sizes = decode_i32(&out[sizes]);
-        assert_eq!(block_sizes.len() as u64, rows / tile);
-        assert!(
-            block_sizes
-                .iter()
-                .all(|size| 0 <= *size && *size as u64 <= tile)
-        );
-        assert!(block_sizes.iter().any(|size| *size > 0));
     }
 
     #[test]
@@ -3000,14 +2069,11 @@ mod tests {
         // prefix capacity up to its tile and pads the rows to whole tiles.
         let (layout, _) = rule.layout(&request(121, 1344, 768)).unwrap();
         let packed = rule.segment_of(&layout).unwrap();
-        assert_eq!(packed.extent.tile, 64);
-        assert_eq!(packed.extent.text_rows, 128);
-        assert_eq!(packed.extent.condition_rows, 0);
-        assert_eq!(packed.extent.padded_tokens % 64, 0);
-        assert_eq!(
-            packed.video_variable_block_sizes.len() as u32,
-            packed.extent.video_tiles
-        );
+        assert_eq!(packed.tile, 64);
+        assert_eq!(packed.text_rows, 128);
+        assert_eq!(packed.condition_rows, 0);
+        assert_eq!(packed.padded_tokens % 64, 0);
+        assert!(packed.video_start() + packed.video_tiles * 64 <= packed.padded_tokens);
         // A dense deployment has no segment packing to give, and says so rather than guessing.
         assert!(layouts().segment_of(&layout).is_err());
     }
@@ -3018,7 +2084,7 @@ mod tests {
         // a layout whose raster does not match its frame count is refused by both.
         let (layout, dense) = layouts().layout(&request(121, 1344, 768)).unwrap();
         let packed = sparse_layouts().segment_of(&layout).unwrap();
-        assert!(packed.extent.padded_tokens > dense.padded_tokens);
+        assert!(packed.padded_tokens > dense.padded_tokens);
         let mut broken = layout;
         broken.video.frames = 24;
         assert!(sparse_layouts().segment_of(&broken).is_err());
@@ -3043,7 +2109,6 @@ mod tests {
                 rules
                     .segment_of(&rules.cover(&request).expect("a layout"))
                     .expect("a segment packing")
-                    .extent
                     .video_tiles
             })
             .collect();
@@ -3111,26 +2176,15 @@ mod tests {
 
     #[test]
     fn a_still_condition_draws_its_latent_elements_and_nothing_more() {
-        let conditions = [packing::Condition {
-            role: packing::Role::FirstFrame,
-            frame: Some(packing::Frame {
-                canvas: Canvas {
-                    width: 1344,
-                    height: 768,
-                },
-                num_frames: 1,
-            }),
+        let conditions = [nn::ConditionShape {
+            role: nn::ConditionRole::FirstFrame,
+            frames: 1,
+            height: 768,
+            width: 1344,
             audio_samples: 0,
         }];
-        let canvas = proto::video::Canvas {
-            width: 1344,
-            height: 768,
-        };
         // One latent frame of the canvas' raster, 24 channels wide: the video's stream starts here.
-        assert_eq!(
-            layouts().condition_elements(&conditions, &canvas),
-            48 * 84 * 24
-        );
+        assert_eq!(layouts().condition_elements(&conditions), 48 * 84 * 24);
     }
 
     #[test]
@@ -3143,12 +2197,11 @@ mod tests {
             width: 1344,
             height: 768,
         };
-        let conditions = [packing::Condition {
-            role: packing::Role::Reference,
-            frame: Some(packing::Frame {
-                canvas,
-                num_frames: 30,
-            }),
+        let conditions = [nn::ConditionShape {
+            role: nn::ConditionRole::Reference,
+            frames: 30,
+            height: canvas.height,
+            width: canvas.width,
             audio_samples: 0,
         }];
         let rule = layouts();
@@ -3156,7 +2209,7 @@ mod tests {
         let latents = FRAMES.latent_frames(30);
         assert!(latents > 1, "the condition is more than a still");
         assert_eq!(
-            rule.condition_elements(&conditions, &canvas),
+            rule.condition_elements(&conditions),
             latents * raster.height * raster.width * rule.config.transformer.video_channels
         );
     }
@@ -3383,61 +2436,32 @@ mod tests {
     }
 
     #[test]
-    fn a_condition_arrives_as_the_packing_reads_it() {
-        // The request states a role and an encoded raster; the packing wants a canvas and a frame
-        // count. A reference without pixels is an audio reference and has no frame.
-        let conditions = conditions_of(&conditioned());
-        assert_eq!(conditions.len(), 3);
-        assert_eq!(conditions[0].role, packing::Role::FirstFrame);
-        let frame = conditions[0].frame.expect("a keyframe carries its pixels");
-        assert_eq!((frame.canvas.width, frame.canvas.height), (832, 480));
-        assert_eq!(frame.num_frames, 1);
-        assert_eq!(conditions[1].role, packing::Role::Reference);
-        // A reference clip's frame count is a *generated* count, `17n + 5`: the fixture asks for 22,
-        // the smallest one, and the packing reads it as the clip's five latent frames. 12 is not a
-        // count H3 generates, and a fixture stating one would test a stream the model cannot serve.
-        let clip = conditions[1].frame.expect("a clip has pixels").num_frames;
-        assert_eq!(clip, 22);
-        assert!(FRAMES.is_legal(clip));
-        assert_eq!(conditions[1].audio_samples, 24_000);
-        assert!(
-            conditions[2].frame.is_none(),
-            "an audio reference has no pixels"
-        );
-        assert_eq!(conditions[2].audio_samples, 24_000);
-    }
-
-    #[test]
     fn an_audio_reference_draws_no_noise() {
         // The request's stream holds one draw per *visual* condition: the reference conditions an
         // audio reference at its posterior's mean, and counting its rows would shift the video's
         // draw and change the video without failing anything.
         let rule = layouts();
-        let conditions = conditions_of(&conditioned());
+        let request = conditioned();
+        let conditions = request.conditions;
         let channels = u64::from(rule.config.transformer.video_channels);
         let visual: u64 = conditions
             .iter()
-            .filter_map(|condition| condition.frame)
-            .map(|frame| {
-                let raster = packing::latent_raster(&frame.canvas).unwrap();
-                let frames = if frame.num_frames <= 1 {
+            .filter(|condition| condition.width > 0)
+            .map(|condition| {
+                let raster = packing::latent_raster(&Canvas {
+                    width: condition.width,
+                    height: condition.height,
+                })
+                .unwrap();
+                let frames = if condition.frames <= 1 {
                     1
                 } else {
-                    FRAMES.latent_frames(frame.num_frames)
+                    FRAMES.latent_frames(condition.frames)
                 };
                 u64::from(frames) * u64::from(raster.height) * u64::from(raster.width) * channels
             })
             .sum();
-        assert_eq!(
-            u64::from(rule.condition_elements(
-                &conditions,
-                &Canvas {
-                    width: 832,
-                    height: 480,
-                }
-            )),
-            visual
-        );
+        assert_eq!(u64::from(rule.condition_elements(conditions)), visual);
     }
 
     #[test]
@@ -3463,12 +2487,11 @@ mod tests {
             conditions: shapes,
             ..request(121, 832, 480)
         };
-        let conditions = conditions_of(&request);
         let canvas = Canvas {
             width: 832,
             height: 480,
         };
-        let segments = packing::condition_segments(&conditions, &canvas).unwrap();
+        let segments = packing::condition_segments(request.conditions, &canvas).unwrap();
         let audio: Vec<_> = segments
             .iter()
             .filter(|segment| segment.audio_rows() > 0)
@@ -3480,128 +2503,6 @@ mod tests {
             audio[0].audio_rows(),
             crate::config::AUDIO_CHANNELS * frames
         );
-    }
-
-    #[test]
-    fn the_tables_are_the_layout_s_and_the_step_is_the_worker_s_to_write() {
-        let rule = layouts();
-        // A prompt of twelve rows, the configuration `write_state` is exercised with below: every
-        // write index then points into the text rows rather than at the zero row, so a table the
-        // model fills is filled with something other than the sentinel this test offers.
-        let mut request = request(121, 1344, 768);
-        request.text_tokens = 12;
-        let (layout, packing) = rule.layout(&request).unwrap();
-        let tables = rule.table_specs(&layout).unwrap();
-        let names: Vec<_> = tables.iter().map(|table| table.name).collect();
-        // The worker addresses a table by name, so a name may appear once and no position is
-        // promised: the tables are sorted by name, and any positional claim about them goes stale
-        // the moment a table is added. The set itself is the code's own list, which
-        // `each_kind_resolves_its_state_tables_by_its_own_names` pins against `table_specs`.
-        let unique: std::collections::BTreeSet<_> = names.iter().collect();
-        assert_eq!(unique.len(), names.len(), "a name repeats: {names:?}");
-        // The step is the one table the model never fills: the worker writes its single index
-        // before each replay, so `write_state` must leave its values as the caller offered them.
-        const OFFERED: u8 = 0xAB;
-        const WORD: u32 = u32::from_ne_bytes([OFFERED; 4]);
-        let mut state: Vec<TableValues> = tables
-            .iter()
-            .map(|table| match TableValues::zeroed(table).unwrap() {
-                TableValues::I32(values) => TableValues::I32(vec![WORD as i32; values.len()]),
-                TableValues::F32(values) => {
-                    TableValues::F32(vec![f32::from_bits(WORD); values.len()])
-                }
-            })
-            .collect();
-        rule.write_state(&request, &layout, &mut state)
-            .expect("a dense layout's state is writable");
-        for (table, values) in tables.iter().zip(&state) {
-            let bytes = values.to_bytes();
-            if table.name == "step" {
-                assert!(
-                    bytes.iter().all(|byte| *byte == OFFERED),
-                    "the worker writes the step index; the model must not"
-                );
-            } else {
-                assert!(
-                    bytes.iter().any(|byte| *byte != OFFERED),
-                    "{} was offered to the model and left unwritten",
-                    table.name
-                );
-            }
-        }
-        // Every table but the step covers one row per packed row.
-        let rows = u64::from(packing.padded_tokens);
-        for table in &tables {
-            match table.name {
-                "step" => {
-                    assert_eq!(table.shape.dims(), &[1]);
-                }
-                // The audio table is addressed by audio row and names the packed row it occupies,
-                // so its length is the audio rows rather than every packed row.
-                "audio_indices" | "audio_slots" | "audio_sources" => {
-                    assert_eq!(table.shape.dim(0), u64::from(packing.audio_rows));
-                }
-                // A run's table names both of its ends, so it carries one more entry than the run
-                // has row counts: the pack's used rows, or the prompt's tokens for the refiner's.
-                "cu_seq_lens_k"
-                | "cu_seq_lens_q"
-                | "refiner_cu_seq_lens_k"
-                | "refiner_cu_seq_lens_q" => assert_eq!(table.shape.dims(), &[2]),
-                // The rotation reads the coordinates axis-major, so the axes lead.
-                "position_ids" => assert_eq!(table.shape.dims(), &[3, rows]),
-                // The video indices name the packed row of every video row, and video rows are
-                // patched: four voxels to a row.
-                "video_indices" | "video_slots" | "video_sources" => {
-                    assert_eq!(table.shape.dim(0), u64::from(packing.video_rows));
-                }
-                _ => assert_eq!(table.shape.dim(0), rows, "{}", table.name),
-            }
-        }
-        // Axis-major: the rotation reads `[axis, token]`, so the axes are the leading extent.
-        let positions = tables
-            .iter()
-            .find(|table| table.name == "position_ids")
-            .expect("the rotation's coordinates are a table");
-        assert_eq!(positions.shape.dims(), &[3, rows]);
-    }
-
-    #[test]
-    fn the_state_bytes_fill_the_tables_the_layout_names() {
-        let rule = layouts();
-        let mut request = request(121, 1344, 768);
-        request.text_tokens = 12;
-        let (layout, _) = rule.layout(&request).unwrap();
-        let tables = rule.table_specs(&layout).unwrap();
-        let mut out: Vec<TableValues> = tables
-            .iter()
-            .map(|table| TableValues::zeroed(table).unwrap())
-            .collect();
-        rule.write_state(&request, &layout, &mut out).unwrap();
-        // A prompt of 12 rows is text, so every write index points into the text rows and every
-        // generated row takes the prefix's zero row.
-        let at = |name: &str| {
-            tables
-                .iter()
-                .position(|table| table.name == name)
-                .expect("the layout names the table")
-        };
-        let prefix: Vec<i32> = decode_i32(&out[at("prefix_index")]);
-        assert_eq!(
-            prefix.len(),
-            tables[at("prefix_index")].shape.dim(0) as usize
-        );
-        // The prefix segment is packed after the generated rows, so the prompt's twelve rows sit at
-        // `prefix_start()` and each points at its own source row.
-        let first = rule.packing_of(&layout).unwrap().prefix_start() as usize;
-        assert!(
-            prefix[first..first + 12]
-                .iter()
-                .enumerate()
-                .all(|(row, column)| *column == row as i32)
-        );
-        // The first packed row is a generated video row, so it takes the video timestep.
-        let indices = decode_i32(&out[at("modulation_indices")]);
-        assert_eq!(indices[0], packing::Group::Video as i32);
     }
 
     #[test]
@@ -3622,9 +2523,6 @@ mod tests {
         // 24 latent frames is not a frame count a request snaps to: no rounding produces 5n + 2 = 24.
         layout.video.frames = 24;
         assert!(rule.packing_of(&layout).is_err());
-        // Its table list is refused with it: the capability answers the error, not an empty list
-        // a runner would upload nothing for.
-        assert!(rule.table_specs(&layout).is_err());
         // A prefix that holds no text row is not a layout this deployment packs either.
         let (mut layout, _) = rule.layout(&request(121, 1344, 768)).unwrap();
         layout.text_rows = 0;
@@ -3640,19 +2538,19 @@ mod tests {
         let (dense, _) = rule.layout(&request(121, 1344, 768)).unwrap();
         let dense_packing = rule.packing_of(&dense).unwrap();
         assert!(bound >= dense_packing.padded_tokens);
-        let segment = packing::segment_packing(
+        let segment = packing::segment_extent(
             124,
             &Canvas {
                 width: 1344,
                 height: 768,
             },
-            rule.capacity().text_rows,
-            rule.capacity().condition_rows,
+            rule.text_rows(),
+            rule.condition_capacity(),
             64,
             64,
         )
         .unwrap();
-        assert!(segment.extent.padded_tokens > dense_packing.padded_tokens);
+        assert!(segment.padded_tokens > dense_packing.padded_tokens);
     }
 
     #[test]
@@ -3663,11 +2561,10 @@ mod tests {
         let request = request(121, 1344, 768);
         let (layout, packing) = rule.layout(&request).unwrap();
         let canvas = canvas_of(&request).unwrap();
-        let conditions = conditions_of(&request);
-        let declared = rule.condition_elements(&conditions, &canvas);
+        let declared = rule.condition_elements(request.conditions);
         assert_eq!(layout.condition_elements, declared);
-        let segments = packing::condition_segments(&conditions, &canvas).unwrap();
-        assert_eq!(segments.len(), conditions.len());
+        let segments = packing::condition_segments(request.conditions, &canvas).unwrap();
+        assert_eq!(segments.len(), request.conditions.len());
         assert!(packing.padded_tokens > packing.video_rows + packing.audio_rows);
         // With no conditions the video's stream starts at zero.
         assert_eq!(declared, 0);
@@ -3677,46 +2574,14 @@ mod tests {
     fn a_prompt_wider_than_the_capacity_is_refused() {
         let rule = layouts();
         let request = request(121, 1344, 768);
-        let (layout, _) = rule.layout(&request).unwrap();
-        let tables = rule.table_specs(&layout).unwrap();
-        let mut out: Vec<TableValues> = tables
-            .iter()
-            .map(|table| TableValues::zeroed(table).unwrap())
-            .collect();
-        let refused = rule.write_state(&request, &layout, &mut out);
-        assert!(refused.is_err());
-    }
-
-    /// The values of an i32 host table.
-    fn decode_i32(table: &TableValues) -> Vec<i32> {
-        match table {
-            TableValues::I32(values) => values.clone(),
-            TableValues::F32(_) => panic!("an f32 table read as i32"),
-        }
-    }
-
-    #[test]
-    fn each_kind_resolves_its_state_tables_by_its_own_names() {
-        // The names are positional: the worker passes its views in `table_specs`' order, so a set
-        // that is not exactly that order reads another tensor without any shape complaining.
-        let dense = layouts();
-        let layout = dense.cover(&request(22, 1344, 768)).unwrap();
-        let names: Vec<&str> = dense
-            .table_specs(&layout)
-            .unwrap()
-            .iter()
-            .map(|table| table.name)
-            .collect();
-        assert_eq!(names, DENSE_TABLES);
-
-        let sparse = sparse_layouts();
-        let layout = sparse.cover(&request(22, 1344, 768)).unwrap();
-        let names: Vec<&str> = sparse
-            .table_specs(&layout)
-            .unwrap()
-            .iter()
-            .map(|table| table.name)
-            .collect();
-        assert_eq!(names, SEGMENT_TABLES);
+        let (layout, packing) = rule.layout(&request).unwrap();
+        // The step's row tables are built from the request: a prompt longer than the layout's text
+        // capacity is refused there.
+        let frames = frame_count(layout.video.frames).unwrap();
+        let canvas = canvas_of_latents(&layout).unwrap();
+        let tables =
+            |text_tokens| packing::dense_tables(&packing, frames, &canvas, text_tokens, &[], &[]);
+        assert!(tables(layout.text_rows).is_ok());
+        assert!(tables(layout.text_rows + 1).is_err());
     }
 }

@@ -118,8 +118,8 @@ impl Activation1d {
         }
     }
 
-    /// Apply the activation: `input` `[channels, length]` or `[batch, channels, length]` into `out`
-    /// of the same shape (the chain preserves the length).
+    /// The activation of `input` `[channels, length]` or `[batch, channels, length]`: a fresh tensor
+    /// of the same rank and the activation's element type, the length after the ratio's chain.
     ///
     /// A batch is the same channel set read again, so it is one launch per batch row over one
     /// descriptor.
@@ -127,7 +127,7 @@ impl Activation1d {
     /// # Errors
     ///
     /// Operands of another shape or element type, an empty signal, or the operator's refusal.
-    pub fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
+    pub fn forward(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
         const OWNER: &str = "Activation1d";
         let descriptor = self.descriptor();
         let channels = u64::from(self.channels);
@@ -161,29 +161,18 @@ impl Activation1d {
         let expected = descriptor
             .output(length)
             .map_err(|error| Error::shape(OWNER, format!("{error}")))?;
-        let tail = &out.shape.dims()[out.shape.rank().saturating_sub(2)..];
-        if out.shape.rank() != rank
-            || tail != [channels, expected]
-            || (batch > 1 && out.shape.dim(0) != batch)
-        {
+        if input.dtype != self.dtype {
             return Err(Error::shape(
                 OWNER,
                 format!(
-                    "{:?} is not {batch} × [{channels}, {expected}] after the ratio {}",
-                    out.shape.dims(),
-                    self.ratio
+                    "the activation is {} and the signal {}",
+                    self.dtype, input.dtype
                 ),
             ));
         }
-        if input.dtype != self.dtype || out.dtype != self.dtype {
-            return Err(Error::shape(
-                OWNER,
-                format!(
-                    "the activation is {}, the signal {} and the output {}",
-                    self.dtype, input.dtype, out.dtype
-                ),
-            ));
-        }
+        let mut dims = input.shape.dims().to_vec();
+        dims[rank - 1] = expected;
+        let out = f.empty(self.dtype, Shape::new(&dims))?;
         let length = u32::try_from(length)
             .map_err(|_| Error::shape(OWNER, format!("{length} samples exceed a launch value")))?;
         let element = self
@@ -216,7 +205,7 @@ impl Activation1d {
                 },
             )?;
         }
-        Ok(())
+        Ok(out)
     }
 }
 
@@ -290,54 +279,43 @@ impl AmpBlock {
         Ok(Self { channels, steps })
     }
 
-    /// The block's output for `input` `[batch, channels, length]` into `out` of the same shape;
-    /// `input` is never written.
-    ///
-    /// The running value starts as a copy of `input` in `out`, and each step adds its residual to
-    /// it. The three working buffers a step needs are reserved for the call and released at its
-    /// end, so the blocks of a stage reuse them.
+    /// The block over `input` `[batch, channels, length]`: a fresh tensor of its shape and element
+    /// type, each step's residual added into it in place. A step's intermediates are handed back
+    /// when its add is enqueued.
     ///
     /// # Errors
     ///
-    /// Operands of another shape, or an operator's refusal.
-    pub fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
-        if input.shape != out.shape
-            || input.shape.rank() != 3
-            || input.shape.dim(1) != u64::from(self.channels)
-        {
+    /// An input of another shape, or an operator's refusal.
+    pub fn forward(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
+        if input.shape.rank() != 3 || input.shape.dim(1) != u64::from(self.channels) {
             return Err(Error::shape(
                 "AmpBlock",
                 format!(
-                    "{:?} into {:?} for a block of {} channels",
+                    "{:?} for a block of {} channels",
                     input.shape.dims(),
-                    out.shape.dims(),
                     self.channels
                 ),
             ));
         }
-        let mark = f.arena().mark();
-        let result = self.steps(f, input, out);
-        f.arena().release(mark);
-        result
-    }
-
-    fn steps(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
-        let buffer = || f.arena().tensor(input.dtype, input.shape);
-        let (activated, convolved, residual) = (buffer()?, buffer()?, buffer()?);
-        Cast.forward(f, rows(input)?, rows(out)?)?;
+        let out = Cast
+            .forward(f, rows(input)?, input.dtype)?
+            .reshape(input.shape);
         for step in &self.steps {
-            step.first_activation.forward(f, out, activated)?;
-            step.first.forward(f, activated, convolved)?;
-            step.second_activation.forward(f, convolved, activated)?;
-            step.second.forward(f, activated, residual)?;
-            let running = rows(out)?;
-            Residual::default().forward(f, running, rows(residual)?, None, running)?;
+            f.scoped(|f| {
+                let convolved = step
+                    .first
+                    .forward(f, step.first_activation.forward(f, out)?)?;
+                let residual = step
+                    .second
+                    .forward(f, step.second_activation.forward(f, convolved)?)?;
+                Residual::default().forward(f, rows(out)?, rows(residual)?, None)?;
+                Ok::<_, Error>(())
+            })?;
         }
-        Ok(())
+        Ok(out)
     }
 }
 
-/// A BigVGAN generator's architecture, as its config states it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct BigVganSpec {
     /// Channels `conv_pre` reads.
@@ -480,59 +458,68 @@ impl BigVgan {
             .fold(length, |samples, stage| samples * u64::from(stage.rate))
     }
 
-    /// Generate `out` `[batch, 1, samples(length)]` from `input` `[batch, in_channels, length]`.
+    /// The waveform of `input` `[batch, in_channels, length]`: a fresh `[batch, 1,
+    /// samples(length)]` tensor of its element type.
     ///
-    /// Every intermediate is reserved from the arena in the input's element type.
+    /// Each stage's averaged output is reserved before the stage and its upsampled input and
+    /// blocks' outputs are handed back once the average is enqueued.
     ///
     /// # Errors
     ///
-    /// Operands of another shape, or an operator's refusal.
-    pub fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
-        let (batch, mut length) = (input.shape.dim(0), input.shape.dim(2));
-        if input.shape.rank() != 3 || out.shape.dims() != [batch, 1, self.samples(length)] {
+    /// An input of another rank, or an operator's refusal.
+    pub fn forward(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
+        if input.shape.rank() != 3 {
             return Err(Error::shape(
                 "BigVgan",
                 format!(
-                    "{:?} into {:?}: [batch, 1, samples] of the rates' product",
-                    input.shape.dims(),
-                    out.shape.dims()
+                    "{:?}: a [batch, channels, frames] latent",
+                    input.shape.dims()
                 ),
             ));
         }
-        let buffer = |channels: u32, length: u64| {
-            f.arena().tensor(
-                input.dtype,
-                Shape::new(&[batch, u64::from(channels), length]),
-            )
-        };
-        let first = self.stages.first().map_or(0, |stage| 2 * stage.channels);
-        let mut current = buffer(first, length)?;
-        self.pre.forward(f, input, current)?;
+        let (batch, mut length) = (input.shape.dim(0), input.shape.dim(2));
+        let mut current = self.pre.forward(f, input)?;
         for stage in &self.stages {
             length *= u64::from(stage.rate);
-            let upsampled = buffer(stage.channels, length)?;
-            stage.upsample.forward(f, current, upsampled)?;
-            current = self.stage(f, stage, upsampled)?;
+            let accumulated = f.empty(
+                input.dtype,
+                Shape::new(&[batch, u64::from(stage.channels), length]),
+            )?;
+            f.scoped(|f| {
+                let upsampled = stage.upsample.forward(f, current)?;
+                self.stage(f, stage, upsampled, accumulated)
+            })?;
+            current = accumulated;
         }
-        let activated = f.arena().tensor(current.dtype, current.shape)?;
-        self.post.forward(f, current, activated)?;
-        self.output.forward(f, activated, out)
+        let out = self.output.reserve(f, current)?;
+        f.scoped(|f| {
+            let activated = self.post.forward(f, current)?;
+            self.output.launch(f, activated, out)
+        })?;
+        Ok(out)
     }
 
-    /// One stage's blocks summed and multiplied by the reciprocal of their count.
-    fn stage(&self, f: &Forward, stage: &Stage, input: TensorView) -> Result<TensorView> {
-        let accumulated = f.arena().tensor(input.dtype, input.shape)?;
-        let block_out = f.arena().tensor(input.dtype, input.shape)?;
+    /// One stage's blocks over `input`, summed into `accumulated` and multiplied by the reciprocal
+    /// of their count.
+    fn stage(
+        &self,
+        f: &Forward,
+        stage: &Stage,
+        input: TensorView,
+        accumulated: TensorView,
+    ) -> Result<()> {
         for (index, block) in stage.blocks.iter().enumerate() {
-            block.forward(f, input, block_out)?;
-            // The first block initialises the sum (a zero `beta` reads no target); the rest add.
-            let beta = if index == 0 { 0.0 } else { 1.0 };
-            Axpby.forward(f, rows(accumulated)?, rows(block_out)?, 1.0, beta)?;
+            f.scoped(|f| {
+                let block_out = block.forward(f, input)?;
+                // The first block initialises the sum (a zero `beta` reads no target); the rest
+                // add.
+                let beta = if index == 0 { 0.0 } else { 1.0 };
+                Axpby.forward(f, rows(accumulated)?, rows(block_out)?, 1.0, beta)
+            })?;
         }
         // The reciprocal's product, not the reference's quotient: see the module documentation.
         let reciprocal = 1.0 / stage.blocks.len() as f32;
-        Axpby.forward(f, rows(accumulated)?, rows(accumulated)?, 0.0, reciprocal)?;
-        Ok(accumulated)
+        Axpby.forward(f, rows(accumulated)?, rows(accumulated)?, 0.0, reciprocal)
     }
 }
 

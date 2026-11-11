@@ -25,6 +25,9 @@ pub struct ParallelLMHead {
     padded: u32,
 }
 
+/// The element type of the logits a head answers: the sampler reads FP32.
+pub const LOGITS: DType = DType::F32;
+
 /// Elements one `logits_gather` / `logits_unpad` program handles.
 const BLOCK: u32 = 1024;
 
@@ -86,41 +89,27 @@ impl ParallelLMHead {
         self.padded
     }
 
-    /// Project `hidden` into `out`, gathering the ranks' shards.
+    /// The logits of `hidden` `[rows, hidden]` (the rows the batch asks logits for): a fresh
+    /// `[rows, vocabulary]` FP32 tensor, the ranks' shards gathered.
     ///
-    /// `hidden` is `[rows, hidden]` (the rows the batch asks logits for) and `out` is
-    /// `[rows, vocabulary]`. The head reserves this rank's `[rows, padded]` projection and, when
-    /// the forward's group has more than one rank, the `[rows, padded × ranks]` gather from the
-    /// forward's arena, in that order.
+    /// The head reserves this rank's `[rows, padded]` projection, when the forward's group has more
+    /// than one rank the `[rows, padded × ranks]` gather, and the logits, in that order. Logits are
+    /// FP32 because the sampler reads FP32; the unpad widens the model's product once.
     ///
     /// # Errors
     ///
-    /// When a view does not fit the head or an operator refuses.
-    pub fn forward(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
+    /// When a view does not fit the head, the arena cannot hold the buffers, or an operator
+    /// refuses.
+    pub fn forward(&self, f: &Forward, hidden: TensorView) -> Result<TensorView> {
         let rows = hidden.rows();
-        if out.shape.rank() != 2
-            || out.shape.dim(0) != rows
-            || out.shape.dim(1) != u64::from(self.vocabulary)
-        {
-            return Err(Error::shape(
-                "ParallelLMHead",
-                format!(
-                    "out is {:?}, [{rows}, {vocabulary}] expected",
-                    out.shape.dims(),
-                    vocabulary = self.vocabulary
-                ),
-            ));
-        }
         let ranks = f.split().map_or(1, |split| split.ranks);
-        let arena = f.arena();
-        let projected = arena.tensor(hidden.dtype, Shape::new(&[rows, u64::from(self.padded)]))?;
         // The projection itself: the same dense operator as any other linear layer, with the
         // vocabulary shard as its output width.
         let linear = Linear::new(self.weight, None, ops::gemm::WeightOrder::NxK)?;
-        linear.forward(f, hidden, projected)?;
+        let projected = linear.forward(f, hidden)?;
 
         let gathered = if ranks > 1 {
-            let gathered = arena.tensor(
+            let gathered = f.empty(
                 hidden.dtype,
                 Shape::new(&[rows, u64::from(self.padded) * ranks]),
             )?;
@@ -139,6 +128,7 @@ impl ParallelLMHead {
                 "a gathered width above u32::MAX".to_owned(),
             )
         })?;
+        let out = f.empty(LOGITS, Shape::new(&[rows, u64::from(self.vocabulary)]))?;
         let descriptor = self.unpad_descriptor(gathered.dtype, out.dtype, width);
         let args = logits::UnpadArgs {
             gathered,
@@ -148,7 +138,8 @@ impl ParallelLMHead {
             })?,
         };
 
-        f.operate::<VocabUnpad>(&descriptor, args)
+        f.operate::<VocabUnpad>(&descriptor, args)?;
+        Ok(out)
     }
     /// The descriptor the vocabulary unpad launches with, for a gathered matrix of `gathered_width`
     /// columns: the gathered logits' element type, the type the sampler's candidate buffer carries,

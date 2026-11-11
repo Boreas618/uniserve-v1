@@ -30,6 +30,7 @@ pub mod profiling;
 pub mod runner;
 pub mod runners;
 pub mod shadow;
+pub mod staging;
 
 pub mod blocking;
 pub mod capacity;

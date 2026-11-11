@@ -30,12 +30,13 @@
 //! The query halves are gathered into a packed tensor for the normalization and rotation, and the
 //! gate halves are read where the projection wrote them.
 
-use ops::{Shape, TensorView};
+use ops::{DType, Shape, TensorView};
 
-use crate::capability::{KvView, TokenBatch};
+use crate::capability::{KvLayer, KvView, TokenBatch};
 use crate::error::{Error, Result};
 use crate::family::Split;
 use crate::forward::Forward;
+use crate::layers::Factors;
 use crate::layers::{Access, Copy, GateBias, GatedActivation, Halves, Rounding};
 use crate::layers::{
     Bias, DenseAttention, DenseSpec, Gain, Gains, Linear, PagedAttention, PagedSpec, Parallel,
@@ -51,11 +52,13 @@ pub enum QkNormNames<'n> {
     None,
     /// Learned per-head gains (`<name>.weight`, `[head_dim]`), fused into the stack's rotation.
     Fused { query: &'n str, key: &'n str },
-    /// Per-head RmsNorm modules of this variance floor, launched before any rotation.
+    /// Per-head RmsNorm modules of this variance floor, launched before any rotation and writing
+    /// the projections' element type `output`.
     Separate {
         query: &'n str,
         key: &'n str,
         epsilon: f32,
+        output: DType,
     },
 }
 
@@ -101,8 +104,7 @@ pub struct QkvAttentionSpec<'n> {
 #[derive(Clone, Copy)]
 pub struct RopeFactors<'a> {
     pub rotary: &'a Rotary,
-    pub cosine: TensorView,
-    pub sine: TensorView,
+    pub factors: Factors,
 }
 
 /// What one forward's keys are: packed sequences, or the paged cache of one layer.
@@ -114,12 +116,10 @@ pub struct RopeFactors<'a> {
 pub enum Keys<'a> {
     /// The forward's own keys, as one sequence (`None`) or the sequences a [`Varlen`] names.
     Dense(Option<Varlen>),
-    /// The batch's keys written into the cache's planes of `layer`, then the cached keys read.
+    /// The batch's keys written into the layer's cache, then the cached keys read.
     Paged {
         batch: &'a TokenBatch,
-        cache: &'a KvView<'a>,
-        group: usize,
-        layer: usize,
+        cache: KvLayer<'a>,
     },
     /// The recurrent state of the cache's recurrent layer `layer`, which a linear-attention mixer
     /// reads and advances in place of keys ([`crate::blocks::GatedDeltaNet`]).
@@ -203,9 +203,22 @@ impl QkvAttention {
                 query,
                 key,
                 epsilon,
+                output,
             } => QkNorm::Separate {
-                query: RmsNorm::load(&mut scope.scope(query), head_dim, epsilon, Gain::Plain)?,
-                key: RmsNorm::load(&mut scope.scope(key), head_dim, epsilon, Gain::Plain)?,
+                query: RmsNorm::load(
+                    &mut scope.scope(query),
+                    head_dim,
+                    epsilon,
+                    Gain::Plain,
+                    output,
+                )?,
+                key: RmsNorm::load(
+                    &mut scope.scope(key),
+                    head_dim,
+                    epsilon,
+                    Gain::Plain,
+                    output,
+                )?,
             },
         };
         let attention = match spec.kind {
@@ -286,9 +299,7 @@ impl QkvAttention {
                 ]),
             )
         };
-        let query = f
-            .arena()
-            .tensor(dtype, Shape::new(&[rows, heads, head_dim]))?;
+        let query = f.empty(dtype, Shape::new(&[rows, heads, head_dim]))?;
         let packed = query.reshape(Shape::new(&[1, rows, heads, head_dim]));
         let strides = [
             (rows * heads * head_dim) as i64,
@@ -315,34 +326,52 @@ impl QkvAttention {
         ]))
     }
 
-    /// Attend `hidden [rows, hidden]` and write the output projection into `out [rows, hidden]`.
+    /// `hidden [rows, hidden]` attended and projected out: a fresh `[rows, hidden]` tensor of
+    /// `hidden`'s element type.
     ///
     /// `rope` is the stack's rotary and the forward's factors, absent for a block that does not
-    /// rotate; a fused q/k norm needs it. The block's intermediates are reserved from the arena
-    /// and released before return.
+    /// rotate; a fused q/k norm needs it. The output is reserved first and the block's
+    /// intermediates after it, in a scope that hands them back once the output projection is
+    /// enqueued.
     ///
     /// # Errors
     ///
     /// A fused norm without a rotation, keys of another kind than the block's attention, a view
-    /// a layer refuses, or an arena that cannot hold the intermediates.
+    /// a layer refuses, or an arena that cannot hold the output and intermediates.
     pub fn forward(
         &self,
         f: &Forward,
         hidden: TensorView,
         rope: Option<RopeFactors<'_>>,
         keys: Keys<'_>,
-        out: TensorView,
-    ) -> Result<()> {
-        let arena = f.arena();
-        let mark = arena.mark();
-        let dtype = hidden.dtype;
-        let projected = self.qkv.query().apply(f, hidden, dtype)?;
+    ) -> Result<TensorView> {
+        let flat = |rows: u64| Shape::new(&[rows, u64::from(self.output.k())]);
+        // The output projection's rows are `hidden`'s, which is all its reservation reads.
+        let out = self.output.reserve(f, hidden)?;
+        f.scoped(|f| {
+            let attended = self.attend(f, hidden, rope, keys)?;
+            // Row parallel: the projection sums each rank's partial output over the head split.
+            self.output
+                .launch(f, attended.reshape(flat(attended.shape.dim(0))), out)
+        })?;
+        Ok(out)
+    }
+
+    /// The attended heads of `hidden`, `[rows, heads, head_dim]`, gated when the block is.
+    fn attend(
+        &self,
+        f: &Forward,
+        hidden: TensorView,
+        rope: Option<RopeFactors<'_>>,
+        keys: Keys<'_>,
+    ) -> Result<TensorView> {
+        let (projected, key, value) = self.qkv.forward(f, hidden)?;
         let (query, gate) = match self.gate {
             None => (self.heads_of(projected, self.heads), None),
             Some(_) => self.split_gate(f, projected)?,
         };
-        let key = self.heads_of(self.qkv.key().apply(f, hidden, dtype)?, self.kv_heads);
-        let value = self.heads_of(self.qkv.value().apply(f, hidden, dtype)?, self.kv_heads);
+        let key = self.heads_of(key, self.kv_heads);
+        let value = self.heads_of(value, self.kv_heads);
 
         // Each head normalized and turned, in the block's form.
         let (query, key) = match (&self.qk_norm, rope) {
@@ -361,21 +390,7 @@ impl QkvAttention {
                     }),
                     _ => None,
                 };
-                let turned = (
-                    arena.tensor(dtype, query.shape)?,
-                    arena.tensor(dtype, key.shape)?,
-                );
-                rope.rotary.apply(
-                    f,
-                    query,
-                    key,
-                    gains,
-                    rope.cosine,
-                    rope.sine,
-                    turned.0,
-                    turned.1,
-                )?;
-                turned
+                rope.rotary.forward(f, query, key, gains, rope.factors)?
             }
             (
                 QkNorm::Separate {
@@ -393,70 +408,46 @@ impl QkvAttention {
                     ]))
                 };
                 let normed = (
-                    arena.tensor(dtype, query.shape)?,
-                    arena.tensor(dtype, key.shape)?,
+                    q_norm
+                        .forward(f, per_head(query), None)?
+                        .reshape(query.shape),
+                    k_norm.forward(f, per_head(key), None)?.reshape(key.shape),
                 );
-                q_norm.forward(f, per_head(query), None, per_head(normed.0))?;
-                k_norm.forward(f, per_head(key), None, per_head(normed.1))?;
                 match rope {
                     None => normed,
-                    Some(rope) => {
-                        let turned = (
-                            arena.tensor(dtype, query.shape)?,
-                            arena.tensor(dtype, key.shape)?,
-                        );
-                        rope.rotary.apply(
-                            f,
-                            normed.0,
-                            normed.1,
-                            None,
-                            rope.cosine,
-                            rope.sine,
-                            turned.0,
-                            turned.1,
-                        )?;
-                        turned
-                    }
+                    Some(rope) => rope
+                        .rotary
+                        .forward(f, normed.0, normed.1, None, rope.factors)?,
                 }
             }
         };
 
-        let attended = arena.tensor(dtype, query.shape)?;
-        match (&self.attention, keys) {
+        let attended = match (&self.attention, keys) {
             (Attention::Dense(attention), Keys::Dense(varlen)) => {
-                attention.forward(f, query, key, value, varlen, attended)?;
+                attention.forward(f, query, key, value, varlen)?
             }
-            (
-                Attention::Paged(attention),
-                Keys::Paged {
-                    batch,
-                    cache,
-                    group,
-                    layer,
-                },
-            ) => attention.forward(f, batch, cache, group, layer, query, key, value, attended)?,
+            (Attention::Paged(attention), Keys::Paged { batch, cache }) => {
+                attention.forward(f, batch, cache, query, key, value)?
+            }
             _ => {
                 return Err(Error::Unsupported(
                     "QkvAttention: the forward's keys are not of the block's attention kind"
                         .to_owned(),
                 ));
             }
+        };
+        match (&self.gate, gate) {
+            (Some(activation), Some(gate)) => {
+                // Each attended head is scaled by the sigmoid of its own gate.
+                let rows = attended.reshape(Shape::new(&[
+                    attended.shape.dim(0) * u64::from(self.heads),
+                    u64::from(self.head_dim),
+                ]));
+                Ok(activation
+                    .forward(f, Halves::Split { gate, value: rows })?
+                    .reshape(attended.shape))
+            }
+            _ => Ok(attended),
         }
-        if let (Some(activation), Some(gate)) = (&self.gate, gate) {
-            // Each attended head is scaled by the sigmoid of its own gate, in place.
-            let rows = attended.reshape(Shape::new(&[
-                attended.shape.dim(0) * u64::from(self.heads),
-                u64::from(self.head_dim),
-            ]));
-            activation.forward(f, Halves::Split { gate, value: rows }, rows)?;
-        }
-        // Row parallel: the projection sums each rank's partial output over the head split.
-        let flat = Shape::new(&[
-            attended.shape.dim(0),
-            u64::from(self.heads) * u64::from(self.head_dim),
-        ]);
-        self.output.forward(f, attended.reshape(flat), out)?;
-        arena.release(mark);
-        Ok(())
     }
 }

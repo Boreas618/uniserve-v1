@@ -148,10 +148,8 @@ fn an_adapter_is_fused_into_every_read_of_what_it_edits() {
         .unwrap()
         .attach(Some("transformer"), Adapter::open(adapters.path()).unwrap())
         .unwrap();
-    let transformer = adapted.component("transformer").unwrap();
-    let fusion = transformer
-        .adapter()
-        .expect("the component holds the adapter");
+    let transformer = adapted.stage("transformer").unwrap();
+    let fusion = transformer.adapter().expect("the stage holds the adapter");
     assert!(fusion.edits("proj.weight") && fusion.edits("proj.bias"));
     assert!(fusion.assigns("gate.weight") && !fusion.edits("other.weight"));
 
@@ -189,7 +187,7 @@ fn an_adapter_is_fused_into_every_read_of_what_it_edits() {
     let mut base_store = Recording::default();
     {
         let mut loader = WeightLoader::new(
-            plain.component("transformer").unwrap(),
+            plain.stage("transformer").unwrap(),
             &mut base_store,
             None,
             None,

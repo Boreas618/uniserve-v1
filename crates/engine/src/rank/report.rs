@@ -159,17 +159,17 @@ pub(super) fn media_rank_report(
     denoiser: &str,
 ) -> Result<worker::capacity::Report> {
     use ipc::MediaCall;
-    use nn::family::Component;
+    use nn::family::Stage;
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos() as u64);
-    // The component names are the deployment's own, which the pipeline's blocks answer to: a
-    // scheduler routes a call by component name, and a rank that advertised names of its own would
-    // hold nothing any pool asks for.
+    // The stage names are the deployment's own, which the pipeline's stages answer to: a scheduler
+    // routes a call by that name, and a rank that advertised names of its own would hold nothing
+    // any pool asks for.
     let mut media_components = std::collections::BTreeMap::new();
     media_components.insert(
         MediaCall::TextEncoding,
-        Component::TextEncoder.name().to_owned(),
+        Stage::TextEncoder.name().to_owned(),
     );
     media_components.insert(MediaCall::LatentPreparation, denoiser.to_owned());
     media_components.insert(MediaCall::Denoising, denoiser.to_owned());
@@ -179,20 +179,20 @@ pub(super) fn media_rank_report(
         media_components.insert(MediaCall::MediaReading, "media_reader".to_owned());
         media_components.insert(
             MediaCall::VisionEncoding,
-            Component::TextEncoder.name().to_owned(),
+            Stage::TextEncoder.name().to_owned(),
         );
         media_components.insert(
             MediaCall::LatentEncoding,
-            Component::LatentEncoder.name().to_owned(),
+            Stage::LatentEncoder.name().to_owned(),
         );
     }
     media_components.insert(
         MediaCall::VideoDecoding,
-        Component::VideoDecoder.name().to_owned(),
+        Stage::VideoDecoder.name().to_owned(),
     );
     media_components.insert(
         MediaCall::AudioDecoding,
-        Component::AudioDecoder.name().to_owned(),
+        Stage::AudioDecoder.name().to_owned(),
     );
     media_components.insert(MediaCall::VideoEncoding, "video_codec".to_owned());
     media_components.insert(MediaCall::AudioEncoding, "muxer".to_owned());

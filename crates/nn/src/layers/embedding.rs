@@ -100,12 +100,14 @@ impl VocabParallelEmbedding {
         }
     }
 
-    /// `out = embed(ids)`, all-reduced across the shard's ranks.
+    /// The embedding rows of `ids`, `[ids, hidden]` in the table's element type, all-reduced across
+    /// the shard's ranks.
     ///
     /// # Errors
     ///
-    /// When a view does not fit the table, or a sharded table runs on a forward with no group.
-    pub fn forward(&self, f: &Forward, ids: TensorView, out: TensorView) -> Result<()> {
+    /// Ids that are not one column, an arena that cannot hold the rows, or a sharded table on a
+    /// forward with no group.
+    pub fn forward(&self, f: &Forward, ids: TensorView) -> Result<TensorView> {
         let hidden = u64::from(self.hidden);
         if ids.shape.rank() != 1 {
             return Err(Error::shape(
@@ -113,14 +115,7 @@ impl VocabParallelEmbedding {
                 format!("ids are a column, not {:?}", ids.shape.dims()),
             ));
         }
-        out.require_row("VocabParallelEmbedding", out.dtype, hidden)
-            .map_err(Error::from)?;
-        if out.rows() != ids.numel() {
-            return Err(Error::shape(
-                "VocabParallelEmbedding",
-                format!("{} ids but {} embedding rows", ids.numel(), out.rows()),
-            ));
-        }
+        let out = f.empty(self.weight.dtype(), ops::Shape::new(&[ids.numel(), hidden]))?;
         let descriptor = self.descriptor(out.dtype, ids.dtype);
         let args = embedding::Args {
             ids,
@@ -139,7 +134,7 @@ impl VocabParallelEmbedding {
             }
             f.all_reduce(out)?;
         }
-        Ok(())
+        Ok(out)
     }
 }
 

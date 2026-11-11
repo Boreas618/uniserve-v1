@@ -20,7 +20,8 @@
 //!
 //! The attention is the caller's: a block's attention may be dense or sparse, local or exchanged
 //! over a sequence-parallel group, and an exchanged attention returns its rows interval by
-//! interval, so the block exposes its two modulated stages beside the whole forward.
+//! interval, so the block exposes its two modulated stages beside the whole forward. Each stage's
+//! intermediates are reserved from the forward's arena and handed back before it returns.
 
 use ops::{DType, DevicePtr, Shape, Strides, TensorView};
 
@@ -52,9 +53,19 @@ pub struct ModulationTable {
     vectors: u64,
 }
 
+/// One step's modulation of a call's rows: the gathered table and the `[rows]` parameter row each
+/// activation row reads.
+#[derive(Clone, Copy, Debug)]
+pub struct RowModulation<'a> {
+    /// The step's gathered modulation rows.
+    pub table: &'a ModulationTable,
+    /// `[rows]`: the parameter row of each activation row.
+    pub rows: TensorView,
+}
+
 /// The shift, scale and gate of one modulated stage.
 #[derive(Clone, Copy, Debug)]
-pub struct Stage {
+pub struct StageVectors {
     /// Added after the scale.
     pub shift: Weight,
     /// The normalized row is multiplied by `1 + scale`.
@@ -112,14 +123,14 @@ impl ModulationTable {
     }
 
     /// The stage whose three vectors start at `first`, refusing a final norm's table.
-    fn stage(&self, first: u64) -> Result<Stage> {
+    fn stage(&self, first: u64) -> Result<StageVectors> {
         if self.vectors != BLOCK_VECTORS {
             return Err(Error::shape(
                 "ModulationTable",
                 "a final norm's table holds no gated stage".to_owned(),
             ));
         }
-        Ok(Stage {
+        Ok(StageVectors {
             shift: self.vector(first)?,
             scale: self.vector(first + 1)?,
             gate: self.vector(first + 2)?,
@@ -131,7 +142,7 @@ impl ModulationTable {
     /// # Errors
     ///
     /// A final norm's table.
-    pub fn attention(&self) -> Result<Stage> {
+    pub fn attention(&self) -> Result<StageVectors> {
         self.stage(0)
     }
 
@@ -140,7 +151,7 @@ impl ModulationTable {
     /// # Errors
     ///
     /// A final norm's table.
-    pub fn mlp(&self) -> Result<Stage> {
+    pub fn mlp(&self) -> Result<StageVectors> {
         self.stage(3)
     }
 
@@ -204,121 +215,137 @@ impl AdaLnBlock {
         self.norm1.dtype()
     }
 
-    /// The attention's input: `hidden` normalized by `norm1` and modulated by the table's
-    /// attention shift and scale at each row's parameter row, written into `out`.
-    ///
-    /// `hidden` and `out` are `[rows, width]`, `rows` the `[rows]` parameter row of each.
+    /// The attention's input: `hidden` normalized by `norm1` and modulated by the attention's
+    /// shift and scale at each row's parameter row; a fresh `[rows, width]` tensor of `hidden`'s
+    /// element type.
     ///
     /// # Errors
     ///
-    /// A table of another width, or the norm's refusal.
+    /// A table of another width, an arena that cannot hold the output, or the norm's refusal.
     pub fn attention_input(
         &self,
         f: &Forward,
-        table: &ModulationTable,
-        rows: TensorView,
+        modulation: RowModulation<'_>,
+        hidden: TensorView,
+    ) -> Result<TensorView> {
+        self.attention_norm(modulation, hidden.dtype)?
+            .forward(f, hidden, None)
+    }
+
+    /// [`Self::attention_input`] into `out`, the caller's `[rows, width]` location: this member's
+    /// block of a whole sequence a sequence-parallel attention gathers, so the gather of these rows
+    /// starts as soon as they are normalized.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::attention_input`], or an `out` of another shape or element type.
+    pub fn attention_input_into(
+        &self,
+        f: &Forward,
+        modulation: RowModulation<'_>,
         hidden: TensorView,
         out: TensorView,
     ) -> Result<()> {
-        let stage = table.attention()?;
-        let norm = RmsNorm::new(
+        self.attention_norm(modulation, hidden.dtype)?
+            .forward_into(f, hidden, None, out)
+    }
+
+    /// The modulated pre-attention normalization of `modulation`'s rows, writing `dtype`.
+    fn attention_norm(&self, modulation: RowModulation<'_>, dtype: DType) -> Result<RmsNorm> {
+        let stage = modulation.table.attention()?;
+        RmsNorm::new(
             self.norm1,
             self.eps,
             Epilogue::Modulated(Modulation {
                 shift: stage.shift,
                 scale: stage.scale,
                 gate: None,
-                rows,
+                rows: modulation.rows,
                 retained: None,
             }),
             Gain::Plain,
-        )?;
-        norm.forward(f, hidden, None, out)
+            dtype,
+        )
     }
 
     /// The block after its attention, over any rows of the block: the attention's gated `update`
     /// joins `hidden`, the MLP reads the sum normalized and modulated, and its gated output joins
-    /// the sum. The block's output lands in `hidden`.
+    /// the sum. The block's output lands in `hidden`, in place.
     ///
-    /// `update` is the attention's output for these rows and is overwritten with the residual sum;
-    /// `residual` receives the same sum, which the MLP's gated residual reads after the MLP has
-    /// overwritten `hidden`; `normalized` holds the MLP's input. All are `[rows, width]`.
+    /// `update` is the attention's `[rows, width]` output for these rows and is overwritten with
+    /// the residual sum. The retained sum and the MLP's input are reserved inside the call and
+    /// handed back before return.
     ///
     /// # Errors
     ///
-    /// A table of another width, views the norm or the MLP refuse.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the stage reads the step's table and row index, the stream, the attention's \
-                  update and two caller-held intermediates"
-    )]
+    /// A table of another width, views the norm or the MLP refuse, or an arena that cannot hold
+    /// the intermediates.
     pub fn feed_forward(
         &self,
         f: &Forward,
-        table: &ModulationTable,
-        rows: TensorView,
+        modulation: RowModulation<'_>,
         hidden: TensorView,
         update: TensorView,
-        residual: TensorView,
-        normalized: TensorView,
     ) -> Result<()> {
-        // One launch folds the attention's gated update into the stream, normalizes and modulates
-        // the sum for the MLP, and retains the sum in `residual`: with an update operand the
-        // operator stores the gated sum over it, and with a retained view it copies the same value
-        // out.
-        let attention = table.attention()?;
-        let mlp = table.mlp()?;
-        let norm = RmsNorm::new(
-            self.norm2,
-            self.eps,
-            Epilogue::Modulated(Modulation {
-                shift: mlp.shift,
-                scale: mlp.scale,
-                gate: Some(attention.gate),
-                rows,
-                retained: Some(residual),
-            }),
-            Gain::Plain,
-        )?;
-        let stream = ResidualStream {
-            input: hidden,
-            output: update,
-        };
-        norm.forward(f, update, Some(stream), normalized)?;
+        let attention = modulation.table.attention()?;
+        let mlp = modulation.table.mlp()?;
+        f.scoped(|f| {
+            // One launch folds the attention's gated update into the stream, normalizes and
+            // modulates the sum for the MLP, and retains the sum in `residual`: with an update
+            // operand the operator stores the gated sum over it, and with a retained view it
+            // copies the same value out.
+            let residual = f.empty(hidden.dtype, hidden.shape)?;
+            let norm = RmsNorm::new(
+                self.norm2,
+                self.eps,
+                Epilogue::Modulated(Modulation {
+                    shift: mlp.shift,
+                    scale: mlp.scale,
+                    gate: Some(attention.gate),
+                    rows: modulation.rows,
+                    retained: Some(residual),
+                }),
+                Gain::Plain,
+                hidden.dtype,
+            )?;
+            let stream = ResidualStream {
+                input: hidden,
+                output: update,
+            };
+            let normalized = norm.forward(f, update, Some(stream))?;
 
-        // `hidden` is spent once the sum is retained, so the MLP writes there and the gated
-        // residual updates it in place.
-        self.mlp.forward(f, normalized, hidden)?;
-        Residual::new(Scale::Row(mlp.gate), None)?.forward(f, residual, hidden, Some(rows), hidden)
+            // `hidden` is spent once the sum is retained, so the MLP writes there and the gated
+            // residual updates it in place.
+            self.mlp.forward_into(f, normalized, hidden)?;
+            Residual::new(Scale::Row(mlp.gate), None)?.forward(
+                f,
+                residual,
+                hidden,
+                Some(modulation.rows),
+            )?;
+            Ok(())
+        })
     }
 
-    /// The whole block over `hidden`, in place, with `attend(normalized, update)` the attention.
-    ///
-    /// `normalized`, `update` and `residual` are caller-held `[rows, width]` intermediates of
-    /// `hidden`'s element type; see [`Self::feed_forward`].
+    /// The whole block over `hidden`, in place, with `attend(normalized)` the attention answering
+    /// its update; see [`Self::feed_forward`]. The block's intermediates are handed back before
+    /// return.
     ///
     /// # Errors
     ///
     /// As the two stages, or the attention's own error.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the block reads the step's table and row index, the stream, three caller-held \
-                  intermediates and the attention"
-    )]
     pub fn forward(
         &self,
         f: &Forward,
-        table: &ModulationTable,
-        rows: TensorView,
+        modulation: RowModulation<'_>,
         hidden: TensorView,
-        normalized: TensorView,
-        update: TensorView,
-        residual: TensorView,
-        attend: impl FnOnce(TensorView, TensorView) -> Result<()>,
+        attend: impl FnOnce(TensorView) -> Result<TensorView>,
     ) -> Result<()> {
-        self.attention_input(f, table, rows, hidden, normalized)?;
-        attend(normalized, update)?;
-        self.feed_forward(f, table, rows, hidden, update, residual, normalized)
+        f.scoped(|f| {
+            let normalized = self.attention_input(f, modulation, hidden)?;
+            let update = attend(normalized)?;
+            self.feed_forward(f, modulation, hidden, update)
+        })
     }
 }
 
@@ -341,40 +368,20 @@ impl AdaLnOut {
         })
     }
 
-    /// Normalize and modulate `hidden` into `out`, both `[rows, width]`, by the final table's
-    /// shift and scale at each row's parameter row `rows`.
+    /// `hidden` `[rows, width]` normalized and modulated by the final table's shift and scale at
+    /// each row's parameter row: a fresh tensor of `hidden`'s shape and element type.
     ///
     /// # Errors
     ///
-    /// A block's table, a table of another width, or the norm's refusal.
+    /// A block's table, a table of another width, an arena that cannot hold the output, or the
+    /// norm's refusal.
     pub fn forward(
         &self,
         f: &Forward,
-        table: &ModulationTable,
-        rows: TensorView,
-        hidden: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
-        self.norm(table, rows)?.forward(f, hidden, None, out)
-    }
-
-    /// [`Self::forward`] into a fresh buffer of `hidden`'s shape and element type from the arena.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::forward`], or an arena too small for the output.
-    pub fn apply(
-        &self,
-        f: &Forward,
-        table: &ModulationTable,
-        rows: TensorView,
+        modulation: RowModulation<'_>,
         hidden: TensorView,
     ) -> Result<TensorView> {
-        self.norm(table, rows)?.apply(f, hidden, None)
-    }
-
-    fn norm(&self, table: &ModulationTable, rows: TensorView) -> Result<RmsNorm> {
-        let (shift, scale) = table.shift_scale()?;
+        let (shift, scale) = modulation.table.shift_scale()?;
         RmsNorm::new(
             self.weight,
             self.eps,
@@ -382,10 +389,12 @@ impl AdaLnOut {
                 shift,
                 scale,
                 gate: None,
-                rows,
+                rows: modulation.rows,
                 retained: None,
             }),
             Gain::Plain,
-        )
+            hidden.dtype,
+        )?
+        .forward(f, hidden, None)
     }
 }

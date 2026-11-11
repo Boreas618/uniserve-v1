@@ -219,13 +219,13 @@ impl Reading {
     }
 }
 
-/// A checkpoint: its mapped shards and the tensors they hold, or a pipeline's components.
+/// A checkpoint: its mapped shards and the tensors they hold, or a pipeline's stages.
 ///
-/// A flat checkpoint is one shard set; a *pipeline* root holds one subdirectory per component
+/// A flat checkpoint is one shard set; a *pipeline* root holds one subdirectory per stage
 /// (`transformer/`, `vae/`, `text_encoder/`, …), each with its own index and therefore its own file
 /// identities, which §8's retained keys name. Opening a root discovers which of the two it is: a
 /// root with a shard set of its own is flat and behaves as it always has, and a root without one is
-/// read as the components its subdirectories hold.
+/// read as the stages its subdirectories hold.
 pub struct Checkpoint {
     root: PathBuf,
     /// Every root this checkpoint's tensors came from, in precedence order; one entry unless it was
@@ -234,7 +234,7 @@ pub struct Checkpoint {
     roots: Vec<PathBuf>,
     files: Vec<CheckpointFile>,
     tensors: BTreeMap<String, TensorLocation>,
-    components: BTreeMap<String, Checkpoint>,
+    stages: BTreeMap<String, Checkpoint>,
     /// The tensors a `read` has asked this checkpoint for, so [`Checkpoint::reading`] can answer the
     /// other half of the question: what the load never touched.
     read: Mutex<BTreeSet<String>>,
@@ -312,7 +312,7 @@ impl Checkpoint {
             roots: vec![root.to_path_buf()],
             files,
             tensors: locations,
-            components: BTreeMap::new(),
+            stages: BTreeMap::new(),
             read: Mutex::new(BTreeSet::new()),
             adapter: None,
         })
@@ -321,10 +321,10 @@ impl Checkpoint {
     /// Open `roots` as **one** checkpoint: the first root's tensors shadow the later ones'.
     ///
     /// A deployment that ships a delta export over a base is one checkpoint whose file set spans
-    /// both, so the union is per tensor and not per component: components are enumerated in each
-    /// root as [`Checkpoint::open`] already does; a component present in several roots is one
-    /// unioned component whose tensors come from the earliest root that holds each name; a
-    /// component that only a later root holds is that root's; and the same shadowing applies at the
+    /// both, so the union is per tensor and not per stage: stages are enumerated in each
+    /// root as [`Checkpoint::open`] already does; a stage present in several roots is one
+    /// unioned stage whose tensors come from the earliest root that holds each name; a
+    /// stage that only a later root holds is that root's; and the same shadowing applies at the
     /// top level, where an export's tensor replaces the base's.
     ///
     /// A shadowed tensor is expected and is **not** a byte comparison: a delta export legitimately
@@ -361,23 +361,23 @@ impl Checkpoint {
             self.tensors.insert(name, location);
         }
         self.files.extend(later.files);
-        for (name, component) in later.components {
-            let union = match self.components.remove(&name) {
-                Some(held) => held.merge(component),
-                None => component,
+        for (name, stage) in later.stages {
+            let union = match self.stages.remove(&name) {
+                Some(held) => held.merge(stage),
+                None => stage,
             };
-            self.components.insert(name, union);
+            self.stages.insert(name, union);
         }
         self
     }
 
-    /// Open a pipeline root: one component per subdirectory that holds a shard set.
+    /// Open a pipeline root: one stage per subdirectory that holds a shard set.
     fn pipeline(root: &Path) -> Result<Self> {
         let entries = std::fs::read_dir(root).map_err(|source| Error::Io {
             path: root.to_path_buf(),
             source,
         })?;
-        let mut components = BTreeMap::new();
+        let mut stages = BTreeMap::new();
         for entry in entries {
             let entry = entry.map_err(|source| Error::Io {
                 path: root.to_path_buf(),
@@ -394,12 +394,12 @@ impl Checkpoint {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            components.insert(name, Self::open(&path)?);
+            stages.insert(name, Self::open(&path)?);
         }
-        if components.is_empty() {
+        if stages.is_empty() {
             return Err(Error::Checkpoint {
                 path: root.to_path_buf(),
-                problem: "no shard set here and none in a component below it".to_owned(),
+                problem: "no shard set here and none in a stage below it".to_owned(),
             });
         }
         Ok(Self {
@@ -407,7 +407,7 @@ impl Checkpoint {
             roots: vec![root.to_path_buf()],
             files: Vec::new(),
             tensors: BTreeMap::new(),
-            components,
+            stages,
             read: Mutex::new(BTreeSet::new()),
             adapter: None,
         })
@@ -416,7 +416,7 @@ impl Checkpoint {
     /// The directory this checkpoint was opened with — and, for a union of roots, the **first** of
     /// them: the export's, which is the one a log names.
     ///
-    /// A pipeline's components are opened under it, so a model's `load()` can reach each component
+    /// A pipeline's stages are opened under it, so a model's `load()` can reach each stage
     /// without a second copy of the path being threaded through the engine.
     pub fn root(&self) -> &Path {
         &self.root
@@ -425,23 +425,23 @@ impl Checkpoint {
     /// Every directory this checkpoint spans, the first root's first.
     ///
     /// A pipeline's sidecars live in these directories rather than in a shard set: a processor has
-    /// no weights, so no component answers for it.
+    /// no weights, so no stage answers for it.
     pub fn roots(&self) -> &[PathBuf] {
         &self.roots
     }
 
-    /// Whether this checkpoint is a pipeline of components rather than one model's shards.
+    /// Whether this checkpoint is a pipeline of stages rather than one model's shards.
     pub fn is_pipeline(&self) -> bool {
-        !self.components.is_empty()
+        !self.stages.is_empty()
     }
 
-    /// The component numbered `name`, with its own shards and file identities.
-    pub fn component(&self, name: &str) -> Result<&Checkpoint> {
-        self.components.get(name).ok_or_else(|| Error::Checkpoint {
+    /// The stage numbered `name`, with its own shards and file identities.
+    pub fn stage(&self, name: &str) -> Result<&Checkpoint> {
+        self.stages.get(name).ok_or_else(|| Error::Checkpoint {
             path: PathBuf::from(name),
             problem: format!(
-                "this checkpoint has no component `{name}`; it holds {}",
-                self.components
+                "this checkpoint has no stage `{name}`; it holds {}",
+                self.stages
                     .keys()
                     .map(String::as_str)
                     .collect::<Vec<_>>()
@@ -450,19 +450,19 @@ impl Checkpoint {
         })
     }
 
-    /// The names of the components, in order.
-    pub fn components(&self) -> impl Iterator<Item = &str> {
-        self.components.keys().map(String::as_str)
+    /// The names of the stages, in order.
+    pub fn stages(&self) -> impl Iterator<Item = &str> {
+        self.stages.keys().map(String::as_str)
     }
 
-    /// Every element type the checkpoint or one of its components holds, each once.
+    /// Every element type the checkpoint or one of its stages holds, each once.
     pub fn dtypes(&self) -> Vec<DType> {
         let mut dtypes: Vec<DType> = Vec::new();
         for dtype in self
             .tensors
             .values()
             .map(|location| location.dtype)
-            .chain(self.components.values().flat_map(Checkpoint::dtypes))
+            .chain(self.stages.values().flat_map(Checkpoint::dtypes))
         {
             if !dtypes.contains(&dtype) {
                 dtypes.push(dtype);
@@ -475,7 +475,7 @@ impl Checkpoint {
     /// with the name of one tensor that carries it.
     ///
     /// Integer tensors (a table, an index) are not weights a precision describes and do not count.
-    /// A component answers for its own shards; a pipeline root with no shards of its own answers
+    /// A stage answers for its own shards; a pipeline root with no shards of its own answers
     /// none.
     pub fn stored_types(&self) -> Vec<(DType, String)> {
         let mut found: Vec<(DType, String)> = Vec::new();
@@ -491,7 +491,7 @@ impl Checkpoint {
     /// The one floating-point element type this checkpoint's weights are stored in.
     ///
     /// A loader that converts nothing keeps each weight in its stored type, so a consumer that
-    /// takes one element type for a whole component (a block whose activations follow its
+    /// takes one element type for a whole stage (a block whose activations follow its
     /// weights) asks this. A checkpoint of several stored types is legal — each weight loads in its
     /// own — and is refused here only because the caller asked for one, with every type named.
     ///
@@ -528,7 +528,7 @@ impl Checkpoint {
     /// it, or `None` when no root does.
     ///
     /// A checkpoint's configuration lives beside its shards rather than in them (`config.json`, a
-    /// pipeline's `model_index.json`, a component's `vae/config.json`, a quantization
+    /// pipeline's `model_index.json`, a stage's `vae/config.json`, a quantization
     /// declaration), and a checkpoint opened over an export and the base it continues reads each
     /// document from the export first. Whether an absent document is a refusal is the reader's
     /// question, so absence is answered as `None`.
@@ -678,33 +678,30 @@ impl Checkpoint {
         Ok(gathered)
     }
 
-    /// Fuse `adapter` into this checkpoint's tensors, or into the component `component` of a
+    /// Fuse `adapter` into this checkpoint's tensors, or into the stage `stage` of a
     /// pipeline root, and answer the adapted checkpoint.
     ///
     /// From then on every byte read of a tensor the adapter edits is its fused value, a tensor the
     /// adapter assigns is one of the checkpoint's tensors, and every other tensor reads as it did
-    /// ([`crate::adapter`]). Which component an adapter edits is the model family's statement, as
-    /// its checkpoint mapping is ([`crate::family::VideoFamily::adapter_component`]).
+    /// ([`crate::adapter`]). Which stage an adapter edits is the model family's statement, as
+    /// its checkpoint mapping is ([`crate::family::VideoFamily::adapter_stage`]).
     ///
     /// # Errors
     ///
-    /// Fails when the component does not exist or already holds an adapter, when the adapter edits
+    /// Fails when the stage does not exist or already holds an adapter, when the adapter edits
     /// a tensor the checkpoint does not hold, a non-floating-point tensor, or one whose extents its
     /// delta does not match, or when it assigns a tensor the checkpoint already holds.
-    pub fn attach(mut self, component: Option<&str>, adapter: Adapter) -> Result<Self> {
-        if let Some(name) = component {
-            let held = self
-                .components
-                .remove(name)
-                .ok_or_else(|| Error::Checkpoint {
-                    path: self.root.clone(),
-                    problem: format!("an adapter edits the component `{name}`, which is not here"),
-                })?;
+    pub fn attach(mut self, stage: Option<&str>, adapter: Adapter) -> Result<Self> {
+        if let Some(name) = stage {
+            let held = self.stages.remove(name).ok_or_else(|| Error::Checkpoint {
+                path: self.root.clone(),
+                problem: format!("an adapter edits the stage `{name}`, which is not here"),
+            })?;
             let adapted = held.attach(None, adapter)?;
-            self.components.insert(name.to_owned(), adapted);
+            self.stages.insert(name.to_owned(), adapted);
             return Ok(self);
         }
-        if self.adapter.is_some() || !self.components.is_empty() {
+        if self.adapter.is_some() || !self.stages.is_empty() {
             return Err(Error::Checkpoint {
                 path: self.root.clone(),
                 problem: "an adapter is fused into one shard set that holds none yet".to_owned(),
@@ -739,20 +736,20 @@ impl Checkpoint {
 
     /// What a load has asked this checkpoint for, and what it has left alone.
     ///
-    /// A component of a multi-component export legitimately reads a subset of what its shards hold
+    /// A stage of a multi-stage export legitimately reads a subset of what its shards hold
     /// — a second calibration scheme's per-layer `scale1`/`scale2`, a tied head, the calibration
     /// fields of a layer the model runs dense — so a non-empty [`Reading::unread`] is a **report
     /// and never a refusal**. It answers the one question a half-read export leaves open: when the
     /// numbers are wrong, which tensors did nobody ask for. It is device-free: it needs the claims
     /// the index states, not the tensors' values.
     ///
-    /// A pipeline root holds no tensors of its own, so its answer is its components', each name
-    /// qualified `component/name` — two components may hold one name each.
+    /// A pipeline root holds no tensors of its own, so its answer is its stages', each name
+    /// qualified `stage/name` — two stages may hold one name each.
     pub fn reading(&self) -> Reading {
-        if !self.components.is_empty() {
+        if !self.stages.is_empty() {
             let mut reading = Reading::default();
-            for (name, component) in &self.components {
-                let one = component.reading();
+            for (name, stage) in &self.stages {
+                let one = stage.reading();
                 reading.read.extend(
                     one.read
                         .into_iter()
@@ -846,7 +843,7 @@ fn shards_from_index(index: &Path) -> Result<Vec<PathBuf>> {
 /// The `*.safetensors` shards of a directory in name order, or `None` when it holds none.
 ///
 /// The index, when the directory has one, is what names the shards; a directory with neither is not
-/// a shard set at all, which a pipeline root's discovery uses to tell components from other files.
+/// a shard set at all, which a pipeline root's discovery uses to tell stages from other files.
 fn shards_in(root: &Path) -> Result<Option<Vec<PathBuf>>> {
     let index = root.join("model.safetensors.index.json");
     if index.is_file() {
@@ -1120,7 +1117,7 @@ mod tests {
     /// slice of the right length for every tensor and every shape agrees. The bytes are therefore
     /// unlike the header's own text and unlike each other, and the integer tensor is checked because
     /// `names()` must keep its meaning for it: a parser that filtered to float types would make a
-    /// mixed component look uniform.
+    /// mixed stage look uniform.
     #[test]
     fn a_shards_tensors_read_back_at_their_own_offsets_and_types() {
         let root = tempfile::tempdir().expect("a temp directory");

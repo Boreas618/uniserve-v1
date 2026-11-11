@@ -1,9 +1,10 @@
 //! The layers a model composes.
 //!
 //! Each layer holds borrowed weight views and the geometry it was built for, and its forward calls
-//! operators: no layer allocates, synchronizes, captures, looks up a program
-//! or names a device. Activations a layer needs beyond its arguments come from
-//! [`Forward::arena`](crate::Forward::arena), which the worker sizes per captured bucket.
+//! operators: no layer allocates device memory of its own, synchronizes, captures, looks up a
+//! program or names a device. A forward answers its outputs as fresh tensors, and those and every
+//! intermediate come from the forward's arena ([`Forward::empty`](crate::Forward::empty),
+//! [`Forward::scoped`](crate::Forward::scoped)), which the worker sizes per captured bucket.
 //!
 //! ## Tuning constants
 //!
@@ -48,7 +49,7 @@ pub use conv::{
 };
 pub use embed::{PatchEmbed, PatchEmbedSpec};
 pub use embedding::{VocabParallelEmbedding, vocabulary_shard};
-pub use head::ParallelLMHead;
+pub use head::{LOGITS, ParallelLMHead};
 pub use indexed::StepIndexed;
 pub use layout::{Access, Copy, Patchify};
 pub use linear::{
@@ -72,13 +73,13 @@ pub use recurrent::{
 };
 pub use residual::{Axpby, Cast, Residual, Scale};
 pub use rope::{
-    Gains, Normalization, Precision, QkNorm, Rotary, RotarySpec, Sections, Spectrum, Yarn,
+    Factors, Gains, Normalization, Precision, QkNorm, Rotary, RotarySpec, Sections, Spectrum, Yarn,
     grid_positions,
 };
 pub use rows::IndexRows;
 pub use transpose::Transpose;
 pub use ulysses::{Interval, UlyssesAttention, UlyssesSpec};
-pub use vsa::{VsaAttention, VsaScratch, VsaSpec, VsaTables};
+pub use vsa::{Branches, VsaAttention, VsaSpec, VsaTables};
 
 /// The constants a layer's operator descriptor carries and the program package owns.
 ///

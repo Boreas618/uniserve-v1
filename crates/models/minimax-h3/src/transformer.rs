@@ -1,33 +1,40 @@
 //! The diffusion transformer: the packed rows in, one evaluation's velocity out.
 //!
 //! One `Transformer` is a checkpoint's DiT partition: a projection of each modality's patchified
-//! latent into the hidden width, the stack of dilated layers, and the output projections back to
-//! each modality's velocity. A layer is an [`AdaLnBlock`] over H3's attention, conditioned by the
-//! step's AdaLN rows, and the final normalization is an [`AdaLnOut`].
+//! latent into the hidden width, the stack of layers, and the output projections back to each
+//! modality's velocity. A layer is an [`AdaLnBlock`] over H3's attention, conditioned by the step's
+//! AdaLN rows, and the final normalization is an [`AdaLnOut`].
 //!
-//! The step's AdaLN rows are device data gathered from the [`nn::diffusion::TimestepTable`] in H3's row layout
+//! The step's AdaLN rows are gathered on the device from the [`TimestepTable`] in H3's row layout
 //! ([`crate::modulation`]), so one captured stack serves every step of the schedule.
+//!
+//! ## The two crossings
+//!
+//! The trajectory is FP32 ([`crate::denoiser::SAMPLE_DTYPE`]) and the stack computes in the
+//! checkpoint's type. The four end projections are FP32 parameters at every preset, as the
+//! reference builds them, so the sample crosses to the stack's type once after the input projection
+//! and back once before the output head ([`Transformer::wide`]).
 
-use crate::attention::{self, Factors};
-use crate::attention_sparse::Segments;
+use nn::blocks::{
+    AdaLnBlock, AdaLnOut, AdaLnSpec, GateUp, GatedMlpSpec, ModulationTable, RowModulation,
+};
+use nn::diffusion::TimestepTable;
+use nn::family::{SequenceSplit, Split};
+use nn::layers::{
+    Bias, Linear, Parallel, PatchEmbed, PatchEmbedSpec, Precision, QkNorm, Rotary, RotarySpec,
+    Rounding, Spectrum, StepIndexed,
+};
+use nn::weights::WeightLoader;
+use nn::{DType, Forward, Shape, TensorView};
+
+use crate::attention::{self, Visibility};
 use crate::config::{AttentionKind, TransformerConfig};
 use crate::modulation::{TAGS, VECTORS};
-use crate::partition::Partition;
 use crate::schedule::{Modality, Schedule};
 use crate::{Error, Result};
 
-use nn::blocks::{AdaLnBlock, AdaLnOut, AdaLnSpec, GateUp, GatedMlpSpec, ModulationTable};
-use nn::diffusion::TimestepRows;
-use nn::family::Split;
-use nn::layers::{
-    Bias, Linear, Parallel, PatchEmbed, PatchEmbedSpec, Precision, QkNorm, Rotary, RotarySpec,
-    Rounding, Spectrum, StepIndexed, Varlen,
-};
-use nn::weights::WeightLoader;
-use nn::{Forward, Shape, TensorView};
-
-/// The components a deployment's fence probes name (`profiling_config.fence_components`): the
-/// denoiser's stack and one of its layers.
+/// The fence classes of the denoiser's stack and of one of its layers
+/// (`profiling_config.fence_components`).
 const TRANSFORMER: &str = "models.minimax_h3.denoiser.Transformer";
 const TRANSFORMER_LAYER: &str = "models.minimax_h3.denoiser.TransformerLayer";
 
@@ -39,18 +46,20 @@ const ROTARY_AXES: u32 = 3;
 /// The reference builds its rotary embedding as `RotaryEmbedding(2 * rope_frequency_dim)` and hands
 /// it one axis spanning the whole head, so the same spectrum is evaluated at each of the three
 /// coordinates and the axes' factors are three contiguous blocks of one table; the trailing
-/// channels of a head pass through. The table is evaluated in f64.
+/// channels of a head pass through. The inverse frequencies are FP32,
+/// `1 / theta ** (arange(0, 2f, 2, float32) / 2f)` (vllm-omni `minimax_h3_transformer.py`, the
+/// Diffusers load path; sglang `dits/minimax_h3.py` keeps the same FP32 `rope.inv_freq` buffer).
 pub fn spectrum(config: &TransformerConfig) -> Spectrum {
     Spectrum::Repeated {
         theta: config.rope_theta,
         pairs: config.rope_frequency_dim,
         axes: ROTARY_AXES,
-        precision: Precision::F64,
+        precision: Precision::F32,
     }
 }
 
-/// One dilated layer of the stack: an AdaLN block over the layer's dense or sparse attention.
-pub struct Layer {
+/// One layer of the stack: an AdaLN block over the layer's dense or sparse attention.
+struct Layer {
     /// The modulated norms and the value-first SwiGLU, `silu(gate)` and the product evaluated with
     /// one rounding each (`Rounding::Stepwise`), as the reference's activation rounds.
     block: AdaLnBlock,
@@ -59,21 +68,15 @@ pub struct Layer {
 
 impl Layer {
     /// Read layer `index` of a partition, turning by the stack's `rotary`.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "a layer is its index, the stack's configuration, rotary and bounds, the partition \
-                  and the loader"
-    )]
     fn load(
-        kind: AttentionKind,
-        index: u32,
-        config: &TransformerConfig,
-        rows: u32,
-        rotary: &Rotary,
-        tile_bound: u32,
-        partition: &Partition,
         loader: &mut WeightLoader<'_>,
+        stack: (&TransformerConfig, AttentionKind),
+        index: u32,
+        rotary: &Rotary,
+        bounds: (u32, u32),
+        sequence: SequenceSplit,
     ) -> Result<Self> {
+        let config = stack.0;
         let block = AdaLnBlock::load(
             &mut loader.scope(format!("transformer_blocks.{index}")),
             AdaLnSpec {
@@ -96,271 +99,197 @@ impl Layer {
         )?;
         Ok(Self {
             block,
-            attention: attention::Layer::load(
-                kind, index, config, rows, rotary, tile_bound, partition, loader,
-            )?,
+            attention: attention::Layer::load(loader, stack, index, rotary, bounds, sequence)?,
         })
     }
 
-    /// One layer from `hidden` into `out`, modulated by the step's gathered rows.
+    /// One layer over `hidden`, this rank's `[rows, width]` stream, in place, turned by
+    /// `rotation` and attending what `visibility` lets a query see.
     ///
-    /// `modulation` is this layer's `[3 · groups, 6 · hidden]` table and `rows` the `[tokens]`
-    /// AdaLN row each token reads. The layer's output lands in `hidden`, and `out` holds the
-    /// attention's residual in between, so no copy of the residual is made.
-    #[allow(clippy::too_many_arguments)]
+    /// Across ranks a sparse layer's attended rows return interval by interval and everything after
+    /// the attention reads a row alone, so an interval's output projection and feed-forward run
+    /// while the later intervals travel. Under the gather projection `ahead` holds the whole
+    /// sequence's normalized rows (`gathered`), the gathers of them still travelling (`arriving`),
+    /// and the next layer with its modulation: as each interval of this layer's output is
+    /// complete, the next layer's normalized rows of it are written into this rank's block of
+    /// `gathered` and start travelling beside the rest of this layer.
     fn forward(
         &self,
         f: &Forward,
+        modulation: RowModulation<'_>,
         hidden: TensorView,
-        out: TensorView,
-        modulation: &ModulationTable,
-        rows: TensorView,
-        factors: Factors<'_>,
-        visible: Option<&Varlen>,
-        segments: Option<&Segments>,
-        scratch: &Scratch,
-        next: Option<(&Layer, &ModulationTable)>,
-        arrived: Vec<nn::Transfer>,
-    ) -> Result<Vec<nn::Transfer>> {
-        let normalized = scratch.normalized;
-        let update = scratch.update;
-
-        // Attention: normalize, attend, and fold the gated update into `out` while normalizing the
-        // feed-forward's input.
-        // Under Ulysses the attended rows return interval by interval, and what follows attention
-        // reads a row alone, so an interval's output projection and feed-forward run while the
-        // later intervals travel.
-        if let (attention::Layer::Sparse(sparse), attention::LayerScratch::Sparse(views)) =
-            (&self.attention, &scratch.attention)
-            && sparse.exchanges()
-        {
-            let tables = segments.ok_or_else(|| {
-                Error::Unsupported("a sparse layer was handed no segment views".to_owned())
-            })?;
-            let own = hidden.rows();
-            let ahead = sparse.gathers_ahead();
-            let mut arrived = arrived;
-            // The stack's first layer has no layer before it to start its gather.
-            if !ahead {
-                self.block
-                    .attention_input(f, modulation, rows, hidden, normalized)?;
-            } else if arrived.is_empty() {
-                let rows_here = sparse.gathered_rows(views, own, 0, own);
-                self.block
-                    .attention_input(f, modulation, rows, hidden, rows_here)?;
-                arrived.push(sparse.start_gather(f, views, own, 0, own)?);
-            }
-            let gate = sparse.attend(
-                f,
-                normalized,
-                factors,
-                tables.sizes,
-                tables.segments,
-                tables.keep,
-                views,
-                arrived,
-            )?;
-            let mut gathering = Vec::new();
-            for interval in sparse.deliver(f, gate, views, own)? {
-                let (first, count) = (interval.first, interval.count);
-                let part = |view: TensorView| view.narrow(0, first, count);
-                let selected = rows
-                    .at(rows.offset_elements(first))
-                    .reshape(nn::Shape::new(&[count]));
-                sparse.receive(f, interval, views, part(update)?)?;
-                self.block.feed_forward(
-                    f,
-                    modulation,
-                    selected,
-                    part(hidden)?,
-                    part(update)?,
-                    part(out)?,
-                    part(normalized)?,
-                )?;
-                // These rows are the next layer's input, and its attention reads the whole
-                // sequence, so they leave now, beside the rest of this layer.
-                if ahead && let Some((layer, modulation)) = next {
-                    let rows_here = sparse.gathered_rows(views, own, first, count);
-                    layer.block.attention_input(
-                        f,
-                        modulation,
-                        selected,
-                        part(hidden)?,
-                        rows_here,
-                    )?;
-                    gathering.push(sparse.start_gather(f, views, own, first, count)?);
-                }
-            }
-            return Ok(gathering);
+        (rotation, visibility): ((&Rotary, nn::layers::Factors), &Visibility),
+        (gathered, next): (Option<TensorView>, Option<(&Layer, RowModulation<'_>)>),
+        arriving: &mut Vec<nn::Transfer>,
+    ) -> Result<()> {
+        let (attention::Layer::Sparse(sparse), Visibility::Sparse(tables)) =
+            (&self.attention, visibility)
+        else {
+            return Ok(self.block.forward(f, modulation, hidden, |normalized| {
+                Ok(self
+                    .attention
+                    .forward(f, normalized, rotation, visibility)?)
+            })?);
+        };
+        if !sparse.exchanges() {
+            return Ok(self.block.forward(f, modulation, hidden, |normalized| {
+                Ok(sparse.forward(f, normalized, rotation.1, tables)?)
+            })?);
         }
-        self.block.forward(
-            f,
-            modulation,
-            rows,
-            hidden,
-            normalized,
-            update,
-            out,
-            |normalized, update| {
-                Ok(self.attention.forward(
-                    f,
-                    normalized,
-                    factors,
-                    visible,
-                    segments,
-                    &scratch.attention,
-                    update,
-                )?)
-            },
-        )?;
-        Ok(Vec::new())
+        let own = hidden.rows();
+        let rows = match gathered {
+            Some(gathered) => {
+                for transfer in arriving.drain(..) {
+                    sparse.finish(f, transfer)?;
+                }
+                gathered
+            }
+            None => self.block.attention_input(f, modulation, hidden)?,
+        };
+        let attended = sparse.attend(f, rows, rotation.1, tables)?;
+        let update = f.empty(hidden.dtype, hidden.shape)?;
+        for returning in sparse.deliver(f, attended, own)? {
+            let (first, count) = (returning.0.first, returning.0.count);
+            sparse.receive(f, returning, update.narrow(0, first, count)?)?;
+            let interval = |modulation| interval_rows(modulation, (first, count));
+            let stream = hidden.narrow(0, first, count)?;
+            self.block.feed_forward(
+                f,
+                interval(modulation)?,
+                stream,
+                update.narrow(0, first, count)?,
+            )?;
+            // These rows are the next layer's input, and its attention reads the whole sequence,
+            // so they leave now, beside the rest of this layer.
+            if let (Some(gathered), Some((layer, next))) = (gathered, next) {
+                let block = gathered.narrow(0, own * u64::from(sparse.rank()) + first, count)?;
+                layer
+                    .block
+                    .attention_input_into(f, interval(next)?, stream, block)?;
+                arriving.push(sparse.start_gather(f, gathered, own, (first, count))?);
+            }
+        }
+        Ok(())
     }
 }
 
-/// A parallel-decoding student's output heads, fused per evaluation block at load.
+/// `modulation` over rows `first..first + count` of the rows it modulates.
+fn interval_rows(
+    modulation: RowModulation<'_>,
+    (first, count): (u64, u64),
+) -> Result<RowModulation<'_>> {
+    Ok(RowModulation {
+        table: modulation.table,
+        rows: modulation.rows.narrow(0, first, count)?,
+    })
+}
+
+/// A parallel-decoding student's output heads, fused per evaluation block at load: the video
+/// head and the audio head.
 ///
 /// A DMD/PDD student stacks one head per fine interval (`pdd_steps`, e.g. 32) and predicts one
 /// block's velocity from the weighted sum of its intervals' heads (weights and accumulation in
-/// FP32, rounded to the parameter's dtype). The fusion is arithmetic over the checkpoint's own
-/// numbers, so it is done once, on the host, at the loading boundary; what a forward does is pick
-/// one row.
-///
-/// The table is laid out `[blocks, out * hidden]` so that one evaluation's head is **one table
-/// row**: `IndexRows::gather` indexed by the worker's `step` view (`[1]` int32) gives `[1, out *
-/// hidden]`, and a projection over that view's element type is the ordinary output projection. The
-/// gathered buffers sit at fixed arena addresses with contents that change per evaluation, so the
-/// graph does not change: one capture serves every step of a layout.
-pub struct StudentHeads {
-    video: FusedHeads,
-    audio: Option<FusedHeads>,
-}
-
-/// One modality's fused heads: one projection per evaluation block, `[blocks, out * hidden]`
-/// FP32 weights and `[blocks, out]` biases.
+/// FP32). The fusion is arithmetic over the checkpoint's own numbers, so it is done once, on the
+/// host, at the loading boundary; what a forward does is pick one row of a [`StepIndexed`] table,
+/// `[blocks, out * hidden]` FP32, indexed by the step's evaluation (`[1]` int32), so one capture
+/// serves every step of a layout.
 ///
 /// FP32 because the reference builds a student's head FP32: the fused row is a sum of the
 /// checkpoint's BF16 rows and rounding it back would round a number the reference keeps exact. The
 /// projection reads the widened FP32 rows (`Transformer::wide`), so its two operands are one type
 /// and the only rounding is the store into the velocity.
-struct FusedHeads {
-    heads: StepIndexed,
+///
+/// The checkpoint stacks `output_heads` heads along the first axis of `proj_out` and
+/// `audio_proj_out` (`[output_heads * out, hidden]`, `[output_heads * out]`). Block `b`'s fused
+/// weight is `sum_n w[n] * head[start + n]` with `w` the block's normalized integration weights.
+pub fn fuse_heads(
+    source: &nn::Checkpoint,
+    schedule: &Schedule,
+    config: &TransformerConfig,
+    loader: &mut WeightLoader<'_>,
+) -> Result<(StepIndexed, StepIndexed)> {
+    let hidden = u64::from(config.hidden_size);
+    let video_out = u64::from(config.video_channels) * 4;
+    let audio_out = u64::from(config.audio_channels);
+    let video = fuse_modality(
+        source,
+        schedule,
+        (Modality::Video, "proj_out", video_out),
+        (hidden, config.output_heads),
+        loader,
+    )?;
+    let audio = fuse_modality(
+        source,
+        schedule,
+        (Modality::Audio, "audio_proj_out", audio_out),
+        (hidden, config.output_heads),
+        loader,
+    )?;
+    Ok((video, audio))
 }
 
-impl StudentHeads {
-    /// Fuse a checkpoint's stacked interval heads into one head per evaluation block.
-    ///
-    /// The checkpoint stacks `output_heads` heads along the first axis of `proj_out` and
-    /// `audio_proj_out` (`[output_heads * out, hidden]`, `[output_heads * out]`). Block `b`'s fused
-    /// weight is `sum_n w[n] * head[start + n]` with `w` the block's normalized integration weights,
-    /// the products and the sum in FP32, and the result rounded to the checkpoint's own type -
-    /// exactly `fuse_heads`. One derivation per block
-    /// per modality, once per load, published as a constant of the loader's store.
-    pub fn fuse(
-        source: &nn::Checkpoint,
-        schedule: &Schedule,
-        config: &TransformerConfig,
-        loader: &mut WeightLoader<'_>,
-    ) -> Result<Self> {
-        let hidden = u64::from(config.hidden_size);
-        let video_out = u64::from(config.video_channels) * 4;
-        let audio_out = u64::from(config.audio_channels);
-        let video = FusedHeads::fuse(
-            source,
-            schedule,
-            Modality::Video,
-            "proj_out",
-            video_out,
-            hidden,
-            config.output_heads,
-            loader,
-        )?;
-        let audio = FusedHeads::fuse(
-            source,
-            schedule,
-            Modality::Audio,
-            "audio_proj_out",
-            audio_out,
-            hidden,
-            config.output_heads,
-            loader,
-        )?;
-        Ok(Self {
-            video,
-            audio: Some(audio),
-        })
+/// Fuse one modality's stacked heads: `(modality, checkpoint module, output width)` and
+/// `(hidden width, stacked heads)`.
+fn fuse_modality(
+    source: &nn::Checkpoint,
+    schedule: &Schedule,
+    (modality, name, out): (Modality, &str, u64),
+    (hidden, heads): (u64, u32),
+    loader: &mut WeightLoader<'_>,
+) -> Result<StepIndexed> {
+    let heads = u64::from(heads);
+    let block_count = schedule.num_steps()?;
+    let weight = source.read(&format!("{name}.weight"))?;
+    let bias = source.read(&format!("{name}.bias"))?;
+    let rows = heads * out;
+    if weight.shape.dims() != [rows, hidden] {
+        return Err(Error::checkpoint(format!(
+            "{name}.weight is {:?}, [{rows}, {hidden}] expected for {heads} stacked heads",
+            weight.shape.dims()
+        )));
     }
-}
-
-impl FusedHeads {
-    #[allow(clippy::too_many_arguments)]
-    fn fuse(
-        source: &nn::Checkpoint,
-        schedule: &Schedule,
-        modality: Modality,
-        name: &str,
-        out: u64,
-        hidden: u64,
-        heads: u32,
-        loader: &mut WeightLoader<'_>,
-    ) -> Result<Self> {
-        let heads = u64::from(heads);
-        let block_count = schedule.num_steps()?;
-        let weight = source.read(&format!("{name}.weight"))?;
-        let bias = source.read(&format!("{name}.bias"))?;
-        let rows = heads * out;
-        if weight.shape.dims() != [rows, hidden] {
-            return Err(Error::checkpoint(format!(
-                "{name}.weight is {:?}, [{rows}, {hidden}] expected for {heads} stacked heads",
-                weight.shape.dims()
-            )));
-        }
-        if bias.shape.dims() != [rows] {
-            return Err(Error::checkpoint(format!(
-                "{name}.bias is {:?}, [{rows}] expected for {heads} stacked heads",
-                bias.shape.dims()
-            )));
-        }
-        let dtype = weight.dtype;
-        if bias.dtype != dtype {
-            return Err(Error::checkpoint(format!(
-                "{name}'s weight is {dtype} and its bias {}",
-                bias.dtype
-            )));
-        }
-        let values = dtype.decode(&weight.bytes).map_err(nn::Error::from)?;
-        let biases = dtype.decode(&bias.bytes).map_err(nn::Error::from)?;
-        let blocks = u64::from(block_count);
-        let per_head = out * hidden;
-        let mut fused = vec![0_f32; (blocks * per_head) as usize];
-        let mut fused_bias = vec![0_f32; (blocks * out) as usize];
-        for block in 0..block_count {
-            let (start, weights) = schedule.block_span(modality, block)?;
-            let start = u64::from(start);
-            let weights = weights
-                .iter()
-                .map(|weight| *weight as f32)
-                .collect::<Vec<_>>();
-            let (block_weight, block_bias) =
-                fuse_block(&values, &biases, out, hidden, start, &weights);
-            let target = (u64::from(block) * per_head) as usize;
-            fused[target..][..block_weight.len()].copy_from_slice(&block_weight);
-            let target = (u64::from(block) * out) as usize;
-            fused_bias[target..][..block_bias.len()].copy_from_slice(&block_bias);
-        }
-        let mut heads = loader.scope(format!("denoiser.{}.student_heads", modality.as_str()));
-        let width = |value: u64, what: &str| {
-            u32::try_from(value)
-                .map_err(|_| Error::checkpoint(format!("{name}'s {what} exceeds u32")))
-        };
-        Ok(Self {
-            heads: StepIndexed::new(
-                heads.constant_f32("weight", &[blocks, per_head], &fused)?,
-                heads.constant_f32("bias", &[blocks, out], &fused_bias)?,
-                width(hidden, "hidden width")?,
-                width(out, "width")?,
-            )?,
-        })
+    if bias.shape.dims() != [rows] {
+        return Err(Error::checkpoint(format!(
+            "{name}.bias is {:?}, [{rows}] expected for {heads} stacked heads",
+            bias.shape.dims()
+        )));
     }
+    let dtype = weight.dtype;
+    if bias.dtype != dtype {
+        return Err(Error::checkpoint(format!(
+            "{name}'s weight is {dtype} and its bias {}",
+            bias.dtype
+        )));
+    }
+    let values = dtype.decode(&weight.bytes).map_err(nn::Error::from)?;
+    let biases = dtype.decode(&bias.bytes).map_err(nn::Error::from)?;
+    let blocks = u64::from(block_count);
+    let per_head = out * hidden;
+    let mut fused = vec![0_f32; (blocks * per_head) as usize];
+    let mut fused_bias = vec![0_f32; (blocks * out) as usize];
+    for block in 0..block_count {
+        let (start, weights) = schedule.block_span(modality, block)?;
+        let start = u64::from(start);
+        let weights = weights
+            .iter()
+            .map(|weight| *weight as f32)
+            .collect::<Vec<_>>();
+        let (block_weight, block_bias) = fuse_block(&values, &biases, out, hidden, start, &weights);
+        let target = (u64::from(block) * per_head) as usize;
+        fused[target..][..block_weight.len()].copy_from_slice(&block_weight);
+        let target = (u64::from(block) * out) as usize;
+        fused_bias[target..][..block_bias.len()].copy_from_slice(&block_bias);
+    }
+    let mut heads = loader.scope(format!("denoiser.{}.student_heads", modality.as_str()));
+    let width = |value: u64, what: &str| {
+        u32::try_from(value).map_err(|_| Error::checkpoint(format!("{name}'s {what} exceeds u32")))
+    };
+    Ok(StepIndexed::new(
+        heads.constant_f32("weight", &[blocks, per_head], &fused)?,
+        heads.constant_f32("bias", &[blocks, out], &fused_bias)?,
+        width(hidden, "hidden width")?,
+        width(out, "width")?,
+    )?)
 }
 
 /// One block's fused head and bias: `sum_n w[n] * head[start + n]`, in FP32.
@@ -394,90 +323,11 @@ fn fuse_block(
 }
 
 impl Transformer {
-    /// Project one modality's patchified audio rows into the hidden width.
-    pub fn project_audio(&self, f: &Forward, rows: TensorView, out: TensorView) -> Result<()> {
-        let audio = self.audio_proj_in.as_ref().ok_or_else(|| {
-            Error::Unsupported("this H3 partition has no audio input projection".to_owned())
-        })?;
-        // The audio input projection reads an FP32 activation in the reference like the video's, so
-        // the rows widen first when they are not FP32 already: the audio latent's own width (32) is
-        // a declared `scaled_add` column count, which is what makes the widening launchable. The
-        // weight is the checkpoint's own - it is never widened at load - so the product is an FP32
-        // activation against a BF16 weight with an FP32 output, and the caller's `out` decides the
-        // one rounding that follows it.
-        let rows = self.wide(f, rows)?;
-        Ok(audio.forward(f, rows, out)?)
-    }
-
-    /// The stack's rotary: its spectrum, and the factor tables every layer turns by.
-    pub const fn rotary(&self) -> &Rotary {
-        &self.rotary
-    }
-
-    /// The rotary factor tables of the packed rows, from their `[3, rows]` axis-major positions.
-    pub fn factors(
-        &self,
-        f: &Forward,
-        positions: TensorView,
-        cosine: TensorView,
-        sine: TensorView,
-    ) -> Result<()> {
-        Ok(self.rotary.factors(f, positions, cosine, sine)?)
-    }
-
-    /// The final normalization and one modality's output projection: `hidden` in, velocity out.
+    /// The element type the stack's weights and activations are in.
     ///
-    /// The final normalization is modulated like every other one: `[groups, 2 * hidden]` of shift
-    /// and scale, gathered at the AdaLN entry the step reads. `rows` selects each row's group.
-    #[allow(clippy::too_many_arguments)]
-    pub fn velocity(
-        &self,
-        f: &Forward,
-        hidden: TensorView,
-        modality: Modality,
-        modulation: &ModulationTable,
-        rows: TensorView,
-        block: u32,
-        step: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
-        let normalized = self.norm_out.apply(f, modulation, rows, hidden)?;
-        // The second crossing (`crate::denoiser::SAMPLE_DTYPE`): the modulated rows are the
-        // stack's type and widen here, between the norm and the FP32 head.
-        let wide = self.wide(f, normalized)?;
-        self.project_head(f, wide, modality, block, step, out)
-    }
-}
-
-/// One H3 DiT partition: the projections, the stack and the two output heads.
-pub struct Transformer {
-    /// The video latent's `1x2x2` patch tokens and their projection into the hidden width.
-    patch: PatchEmbed,
-    audio_proj_in: Option<Linear>,
-    /// The stack's one rotary embedding, published once and applied by every layer.
-    rotary: Rotary,
-    layers: Vec<Layer>,
-    norm_out: AdaLnOut,
-    /// The base form's one output head per modality. A student fuses its heads instead.
-    video_out: Option<Linear>,
-    audio_out: Option<Linear>,
-    /// A parallel-decoding student's fused heads, when the checkpoint stacks more than one.
-    heads: Option<StudentHeads>,
-}
-
-impl Transformer {
-    /// The element type the checkpoint's weights and the activations they produce are in.
-    ///
-    /// One type for the whole stack: the precision rule keeps the checkpoint's own representation,
-    /// and every layer's operands are of it.
-    ///
-    /// The witness is a **block's** norm gain and not an end projection. Those four are pinned FP32
-    /// at every preset, so `proj_in` reports the pin rather than the
-    /// stack: at `auto` a BF16 deployment would claim FP32, a caller would allocate FP32
-    /// activations against BF16 blocks, and the sampler's first layer gemm would be the mixed pair
-    /// this branch has already spent rounds removing (`input_f32_weight_bf16`). A block's gain is
-    /// never pinned, so it is the deployment's type by construction.
-    pub fn dtype(&self) -> nn::DType {
+    /// The witness is a block's norm gain, never an end projection: those four are pinned FP32
+    /// at every preset, so they would report the pin rather than the stack.
+    pub fn dtype(&self) -> DType {
         self.layers
             .first()
             .map_or_else(|| self.patch.weight().dtype, |layer| layer.block.dtype())
@@ -485,60 +335,36 @@ impl Transformer {
 
     /// Read one DiT partition of the checkpoint.
     ///
-    /// `rows` bounds one call's keys: the largest packed row count the deployment's layouts hold,
-    /// not a request's count, so one partition serves every layout.
+    /// `bounds` is the deployment's `(packed rows, key tiles)`: the keys one attention call may
+    /// read over every layout the deployment serves, and the tiles a sparse compression reduces
+    /// over (zero for a dense stack). `heads` are a parallel-decoding student's fused heads, fused
+    /// by the loading boundary when the partition stacks more than one.
     pub fn load(
-        config: &TransformerConfig,
-        kind: AttentionKind,
-        rows: u32,
-        tile_bound: u32,
-        partition: &Partition,
         loader: &mut WeightLoader<'_>,
-        heads: Option<StudentHeads>,
+        stack: (&TransformerConfig, AttentionKind),
+        bounds: (u32, u32),
+        sequence: SequenceSplit,
+        heads: Option<(StepIndexed, StepIndexed)>,
     ) -> Result<Self> {
-        // A sparse deployment's key-tile bound is a statement about the deployment (`Layouts::
-        // tiles_bound`), and every layer that compresses reduces over it. Zero is legal only for a
-        // dense stack, where nothing reads it: a sparse stack holding zero would hand `VsaAttention` a
-        // bound of nothing, and the descriptor a plan reads would name a reduction over no tiles
-        // rather than refuse. A caller that passes zero for a sparse deployment is refused here
-        // instead of one layer later.
-        if matches!(kind, AttentionKind::Sparse { .. }) && tile_bound == 0 {
-            return Err(Error::config(
-                "a sparse deployment states its key-tile bound and this stack was handed zero: \
-                 `Layouts::tiles_bound` is the deployment's own, and a compression reduces over it"
-                    .to_owned(),
-            ));
-        }
+        let config = stack.0;
         match (config.output_heads, heads.is_some()) {
             (1, false) | (2.., true) => {}
-            (0, _) => {
-                return Err(Error::checkpoint(
-                    "the H3 partition predicts no output heads".to_owned(),
-                ));
-            }
-            (1, true) => {
-                return Err(Error::checkpoint(
-                    "the H3 partition predicts one output head per evaluation, and fused student \
-                     heads were handed in"
-                        .to_owned(),
-                ));
-            }
-            (count, false) => {
-                return Err(Error::Unsupported(format!(
-                    "the H3 partition predicts {count} output heads per evaluation (a \
-                     parallel-decoding student), and the loading boundary fused none: a student is \
-                     served from its fused per-block heads, never from a plain projection over a \
-                     [count * out, hidden] table"
+            (count, _) => {
+                return Err(Error::checkpoint(format!(
+                    "the H3 partition predicts {count} output heads per evaluation and {} fused \
+                     student heads were handed in: one head reads its projection, a student its \
+                     fused per-block heads",
+                    if heads.is_some() { "" } else { "no" }
                 )));
             }
         }
         let hidden = u64::from(config.hidden_size);
         let video_in = u64::from(config.video_channels) * 4;
         let audio_in = u64::from(config.audio_channels);
-        // The rotation reads *this rank's* heads: under Ulysses each rank attends `heads / degree`
-        // of them over the whole sequence (`Partition::denoiser_heads`), and every head's query and
-        // key are normalized by the layer's gains before they turn.
-        let local_heads = partition.denoiser_heads(config.num_attention_heads);
+        // The rotation reads this rank's heads: under Ulysses each rank attends `heads / degree` of
+        // them over the whole sequence, and every head's query and key are normalized by the
+        // layer's gains before they turn.
+        let local_heads = config.num_attention_heads / sequence.split.size.max(1);
         let rotary = Rotary::load(
             &mut loader.scope("transformer.rotary_emb"),
             spectrum(config),
@@ -553,20 +379,30 @@ impl Transformer {
             },
         )?;
         let layers = (0..config.num_hidden_layers)
-            .map(|index| {
-                Layer::load(
-                    kind, index, config, rows, &rotary, tile_bound, partition, loader,
-                )
-            })
+            .map(|index| Layer::load(loader, stack, index, &rotary, bounds, sequence))
             .collect::<Result<Vec<_>>>()?;
+        // The four end projections are FP32 parameters at every preset, as the reference builds
+        // them: they are what touches the trajectory.
+        let end = |loader: &mut WeightLoader<'_>, name: &str, inputs: u64, outputs: u64| {
+            Ok::<_, Error>(Linear::load(
+                &mut loader.scope(name).pinned(DType::F32),
+                attention::width(inputs)?,
+                attention::width(outputs)?,
+                Bias::Present,
+                Parallel::None,
+            )?)
+        };
+        let audio_proj_in = end(loader, "audio_proj_in", audio_in, hidden)?;
+        let outputs = match heads {
+            Some((video, audio)) => Heads::Fused { video, audio },
+            None => Heads::Plain {
+                video: end(loader, "proj_out", hidden, video_in)?,
+                audio: end(loader, "audio_proj_out", hidden, audio_in)?,
+            },
+        };
         Ok(Self {
-            // **The four end projections are FP32 parameters at every preset**, because they are
-            // what touches the trajectory: `video_input`, `audio_input`, `video_output` and
-            // `audio_output` are pinned at FP32 whatever the attention, MLP and VAE tiers are. So
-            // the widening `wide` performs meets an FP32 weight and the product is FP32 on both
-            // sides, which is what makes the released BF16 stack run a FP32 sample at all.
             patch: PatchEmbed::load(
-                &mut loader.scope("proj_in").pinned(nn::DType::F32),
+                &mut loader.scope("proj_in").pinned(DType::F32),
                 PatchEmbedSpec {
                     channels: config.video_channels,
                     temporal: 1,
@@ -574,13 +410,7 @@ impl Transformer {
                     hidden: config.hidden_size,
                 },
             )?,
-            audio_proj_in: Some(Linear::load(
-                &mut loader.scope("audio_proj_in").pinned(nn::DType::F32),
-                attention::width(audio_in)?,
-                attention::width(hidden)?,
-                Bias::Present,
-                Parallel::None,
-            )?),
+            audio_proj_in,
             rotary,
             layers,
             norm_out: AdaLnOut::load(
@@ -588,239 +418,205 @@ impl Transformer {
                 config.hidden_size,
                 config.norm_eps,
             )?,
-            // A student's checkpoint holds the stacked interval heads, so the plain projection is
-            // read only when the partition has one head.
-            video_out: match heads {
-                Some(_) => None,
-                None => Some(Linear::load(
-                    &mut loader.scope("proj_out").pinned(nn::DType::F32),
-                    attention::width(hidden)?,
-                    attention::width(video_in)?,
-                    Bias::Present,
-                    Parallel::None,
-                )?),
-            },
-            audio_out: match heads {
-                Some(_) => None,
-                None => Some(Linear::load(
-                    &mut loader.scope("audio_proj_out").pinned(nn::DType::F32),
-                    attention::width(hidden)?,
-                    attention::width(audio_in)?,
-                    Bias::Present,
-                    Parallel::None,
-                )?),
-            },
-            heads,
+            outputs,
         })
     }
 
-    /// The FP32 view an FP32 projection reads when `source` is not FP32 already.
+    /// The stack's rotary: its spectrum, and the factor tables every layer turns by.
+    pub const fn rotary(&self) -> &Rotary {
+        &self.rotary
+    }
+
+    /// `source` widened to FP32, the type the FP32 end projections read; an FP32 view as it is.
     ///
-    /// The reference builds all four of the transformer's end projections as FP32 parameters
-    /// and its `Linear` casts the activation up before the
-    /// product, so the projection reads FP32 whatever the stack's own element type is. The
-    /// checkpoint's weights need no conversion: a BF16 value is exactly representable in FP32, so a
-    /// product of FP32 inputs against them is the same arithmetic as against widened FP32 weights -
-    /// widening changes no value and the accumulation is FP32 either way. What the copy buys is the
-    /// input's rounding, which is the last place the stack's element type would otherwise reach the
-    /// prediction.
+    /// Every BF16 value is an FP32 value, so the widening is exact; it is where the reference's
+    /// `Linear` casts the activation up before the product.
     fn wide(&self, f: &Forward, source: TensorView) -> Result<TensorView> {
-        if source.dtype == nn::DType::F32 {
+        if source.dtype == DType::F32 {
             return Ok(source);
         }
-        // A widening: every BF16 value is an FP32 value, so the conversion is exact.
-        Ok(nn::layers::Cast.apply(f, source, nn::DType::F32)?)
+        Ok(nn::layers::Cast.forward(f, source, DType::F32)?)
     }
 
-    /// Cut a video latent `[channels, frames, rows, columns]` into the DiT's `1x2x2` patch tokens
-    /// `[tokens, channels · 4]`.
-    pub fn patchify(&self, f: &Forward, latent: TensorView, tokens: TensorView) -> Result<()> {
-        Ok(self.patch.patchify(f, latent, tokens)?)
+    /// A video latent `[channels, frames, rows, columns]` as the DiT's `1x2x2` patch tokens.
+    pub fn patchify(&self, f: &Forward, latent: TensorView) -> Result<TensorView> {
+        Ok(self.patch.patchify(f, latent)?)
     }
 
-    /// Unpack patch tokens back into the video latent's raster; `out`'s extents state the grid, so
-    /// a clip of another length replays the same launch.
-    pub fn unpatchify(&self, f: &Forward, tokens: TensorView, out: TensorView) -> Result<()> {
-        Ok(self.patch.unpatchify(f, tokens, out)?)
+    /// Patch tokens back into a video latent of extents `raster`.
+    pub fn unpatchify(&self, f: &Forward, tokens: TensorView, raster: Shape) -> Result<TensorView> {
+        Ok(self.patch.unpatchify(f, tokens, raster)?)
     }
 
-    /// Project video patch tokens into the hidden width.
-    pub fn project(&self, f: &Forward, tokens: TensorView, out: TensorView) -> Result<()> {
+    /// Video patch tokens projected into the hidden width, FP32.
+    pub fn project_video(&self, f: &Forward, tokens: TensorView) -> Result<TensorView> {
         let wide = self.wide(f, tokens)?;
-        Ok(self.patch.project(f, wide, out)?)
+        Ok(self.patch.project(f, wide)?)
     }
 
-    /// The output projection of `hidden` at one evaluation, for either form of the heads.
-    fn project_head(
+    /// Audio latent rows projected into the hidden width, FP32.
+    pub fn project_audio(&self, f: &Forward, rows: TensorView) -> Result<TensorView> {
+        let wide = self.wide(f, rows)?;
+        Ok(self.audio_proj_in.forward(f, wide)?)
+    }
+
+    /// The final normalization and one modality's output head: the stack's rows in, the FP32
+    /// velocity rows out.
+    ///
+    /// `modulation` is the step's final-norm table and each row's group; `step` is the evaluation
+    /// `[1]` i32 a student's fused heads are selected by, and `block` its host value.
+    pub fn velocity(
         &self,
         f: &Forward,
         hidden: TensorView,
         modality: Modality,
-        block: u32,
-        step: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
-        if let Some(heads) = &self.heads {
-            let fused = match modality {
-                Modality::Video => &heads.video,
-                Modality::Audio => heads.audio.as_ref().ok_or_else(|| {
-                    Error::Unsupported("this H3 partition predicts no audio velocity".to_owned())
-                })?,
-            };
-            if u64::from(block) >= fused.heads.steps() {
-                return Err(Error::checkpoint(format!(
-                    "H3 evaluation {block} is outside the {} fused student heads",
-                    fused.heads.steps()
-                )));
+        modulation: RowModulation<'_>,
+        (block, step): (u32, TensorView),
+    ) -> Result<TensorView> {
+        let normalized = self.norm_out.forward(f, modulation, hidden)?;
+        let wide = self.wide(f, normalized)?;
+        match &self.outputs {
+            Heads::Fused { video, audio } => {
+                let fused = match modality {
+                    Modality::Video => video,
+                    Modality::Audio => audio,
+                };
+                if u64::from(block) >= fused.steps() {
+                    return Err(Error::checkpoint(format!(
+                        "H3 evaluation {block} is outside the {} fused student heads",
+                        fused.steps()
+                    )));
+                }
+                Ok(fused.forward(f, step, wide)?)
             }
-            return Ok(fused.heads.forward(f, step, hidden, out)?);
-        }
-        match modality {
-            Modality::Video => {
-                let head = self.video_out.as_ref().ok_or_else(|| {
-                    Error::Unsupported("this H3 partition predicts no video velocity".to_owned())
-                })?;
-                Ok(head.forward(f, hidden, out)?)
-            }
-            Modality::Audio => {
-                let head = self.audio_out.as_ref().ok_or_else(|| {
-                    Error::Unsupported("this H3 partition predicts no audio velocity".to_owned())
-                })?;
-                Ok(head.forward(f, hidden, out)?)
-            }
+            Heads::Plain { video, audio } => Ok(match modality {
+                Modality::Video => video.forward(f, wide)?,
+                Modality::Audio => audio.forward(f, wide)?,
+            }),
         }
     }
 
-    /// The stack over `hidden` `[tokens, hidden_size]`, in place, at one step.
+    /// The stack over `hidden`, this rank's `[rows, hidden_size]` packed rows, in place, at one
+    /// step.
     ///
-    /// `adaln` is the AdaLN cache over the tables the runtime allocated, `step` the `[1]` i32 step index
-    /// the worker wrote before the replay, and `rows` the `[tokens]` AdaLN row of each token.
-    #[allow(clippy::too_many_arguments)]
+    /// `adaln` is the AdaLN table, `entries` the `[1, groups]` entries the step reads
+    /// ([`TimestepTable::entries_of`]), and `rows` this rank's `[rows]` AdaLN row of each token.
     pub fn forward(
         &self,
         f: &Forward,
-        adaln: &TimestepRows<'_>,
-        step: TensorView,
+        (adaln, entries): (&TimestepTable, TensorView),
         hidden: TensorView,
         rows: TensorView,
-        factors: Factors<'_>,
-        visible: Option<&Varlen>,
-        segments: Option<&Segments>,
-        total_rows: u32,
+        (factors, visibility): (nn::layers::Factors, &Visibility),
     ) -> Result<()> {
-        f.fenced(TRANSFORMER, format_args!("transformer"), || {
-            self.stack(
-                f, adaln, step, hidden, rows, factors, visible, segments, total_rows,
-            )
-        })
-    }
-
-    /// [`Self::forward`]'s work, between the stack's fence probes.
-    #[allow(clippy::too_many_arguments)]
-    fn stack(
-        &self,
-        f: &Forward,
-        adaln: &TimestepRows<'_>,
-        step: TensorView,
-        hidden: TensorView,
-        rows: TensorView,
-        factors: Factors<'_>,
-        visible: Option<&Varlen>,
-        segments: Option<&Segments>,
-        total_rows: u32,
-    ) -> Result<()> {
-        let groups = adaln.table().groups();
         let width = hidden.shape.last();
-        let tokens = hidden.shape.dim(0);
-        let arena = f.arena();
-        let entries = arena.tensor(nn::DType::I32, Shape::new(&[1, groups]))?;
-        adaln.table().entries_of(f, step, entries)?;
-        // **The gather's own arrangement: one row per entry, the whole 18-vector table across the
-        // columns** (`IndexRows::gather` derives its output from the table's columns and the index count,
-        // so a buffer of the same bytes in another shape is refused by name:
-        // `out is [12, 32256], [4, 96768] expected`). The block cuts three intervals per group out
-        // of it, and that is a view of the same flat order - group `g`'s row holds its three
-        // intervals' six vectors each, in order - so the block reads `[3 · groups, 6 · width]` over
-        // these bytes and nothing is copied.
-        let modulation = arena.tensor(
-            hidden.dtype,
-            Shape::new(&[groups, u64::from(TAGS) * VECTORS as u64 * width]),
-        )?;
-        // Two tables, because a layer's last rows are normalized for the next layer while the
-        // layer still reads its own.
-        let following = arena.tensor(modulation.dtype, modulation.shape)?;
-        let tables = [modulation, following];
-        let [current, following] = tables.map(|table| {
-            ModulationTable::block(
-                table.reshape(Shape::new(&[
+        let groups = entries.shape.numel();
+        // Block `index`'s `[3 · groups, 6 · width]` modulation: the gathered `[groups, 18 · width]`
+        // rows, group `g`'s row holding its three tags' six vectors each.
+        let table = |f: &Forward, index: usize| -> Result<ModulationTable> {
+            let gathered = adaln.layer(f, index, entries)?;
+            Ok(ModulationTable::block(
+                gathered.reshape(Shape::new(&[
                     groups * u64::from(TAGS),
                     VECTORS as u64 * width,
                 ])),
                 width,
-            )
-        });
-        let per_layer = [current?, following?];
-        let alternate = arena.tensor(hidden.dtype, Shape::new(&[tokens, width]))?;
-        let scratch = Scratch::reserve(self, f, hidden, total_rows)?;
-        adaln.layer(f, 0, entries, tables[0])?;
-        let mut arrived = Vec::new();
-        for (index, layer) in self.layers.iter().enumerate() {
-            let next = self.layers.get(index + 1);
-            if next.is_some() {
-                adaln.layer(f, index + 1, entries, tables[(index + 1) % 2])?;
+            )?)
+        };
+        // Under the gather projection the whole sequence's normalized rows live across the layers:
+        // each layer's are gathered while the layer before it computes.
+        let gathered = match self.layers.first().map(|layer| &layer.attention) {
+            Some(attention::Layer::Sparse(sparse)) if sparse.gathers_ahead() => {
+                let members = u64::from(sparse.members());
+                Some((
+                    sparse,
+                    f.empty(hidden.dtype, Shape::new(&[members * hidden.rows(), width]))?,
+                ))
             }
-            arrived = f.fenced(TRANSFORMER_LAYER, format_args!("layers.{index}"), || {
-                layer.forward(
-                    f,
-                    hidden,
-                    alternate,
-                    &per_layer[index % 2],
-                    rows,
-                    factors,
-                    visible,
-                    segments,
-                    &scratch,
-                    next.map(|layer| (layer, &per_layer[(index + 1) % 2])),
-                    arrived,
-                )
-            })?;
-        }
-        Ok(())
-    }
-}
-
-/// Every temporary view the stack reads, reserved once for the whole forward.
-///
-/// The worker's arena is a bump allocator reset once per forward, so scratch that does not depend
-/// on the layer is reserved once: reserving it per layer would multiply the arena by the layer
-/// count, which a 50-layer stack cannot afford at a served canvas.
-pub struct Scratch {
-    normalized: TensorView,
-    update: TensorView,
-    attention: attention::LayerScratch,
-}
-
-impl Scratch {
-    /// Reserve the stack's scratch for `hidden` `[tokens, width]` with a key set of `total_rows`.
-    pub fn reserve(
-        transformer: &Transformer,
-        f: &Forward,
-        hidden: TensorView,
-        total_rows: u32,
-    ) -> Result<Self> {
-        let arena = f.arena();
-        let dtype = hidden.dtype;
-        let tokens = hidden.shape.dim(0);
-        let width = hidden.shape.last();
-        let layer = transformer.layers.first().ok_or_else(|| {
-            Error::Unsupported("a stack with no layers has no scratch".to_owned())
-        })?;
-        Ok(Self {
-            normalized: arena.tensor(dtype, Shape::new(&[tokens, width]))?,
-            update: arena.tensor(dtype, Shape::new(&[tokens, width]))?,
-            attention: layer.attention.reserve(f, hidden, total_rows)?,
+            _ => None,
+        };
+        let mut arriving = Vec::new();
+        let rotation = (&self.rotary, factors);
+        f.fenced(TRANSFORMER, format_args!("transformer"), || {
+            if let Some((sparse, gathered)) = gathered {
+                // The first layer has no layer before it to start its gather.
+                f.scoped(|f| {
+                    let own = hidden.rows();
+                    let block = gathered.narrow(0, own * u64::from(sparse.rank()), own)?;
+                    let first = &self.layers[0];
+                    let table = table(f, 0)?;
+                    first.block.attention_input_into(
+                        f,
+                        RowModulation {
+                            table: &table,
+                            rows,
+                        },
+                        hidden,
+                        block,
+                    )?;
+                    arriving.push(sparse.start_gather(f, gathered, own, (0, own))?);
+                    Ok::<_, Error>(())
+                })?;
+            }
+            for (index, layer) in self.layers.iter().enumerate() {
+                f.fenced(TRANSFORMER_LAYER, format_args!("layers.{index}"), || {
+                    f.scoped(|f| {
+                        let own_table = table(f, index)?;
+                        let modulation = RowModulation {
+                            table: &own_table,
+                            rows,
+                        };
+                        let next_table = match (&gathered, self.layers.get(index + 1)) {
+                            (Some(_), Some(_)) => Some(table(f, index + 1)?),
+                            _ => None,
+                        };
+                        let gathered = gathered.map(|(_, gathered)| gathered);
+                        // The next layer's rows are gathered ahead only under the gather
+                        // projection.
+                        let next = gathered.and(
+                            self.layers
+                                .get(index + 1)
+                                .zip(next_table.as_ref())
+                                .map(|(next, table)| (next, RowModulation { table, rows })),
+                        );
+                        layer.forward(
+                            f,
+                            modulation,
+                            hidden,
+                            (rotation, visibility),
+                            (gathered, next),
+                            &mut arriving,
+                        )
+                    })
+                })?;
+            }
+            Ok(())
         })
     }
+}
+
+/// The output heads of a partition: one projection per modality, or a student's fused heads.
+enum Heads {
+    Plain {
+        video: Linear,
+        audio: Linear,
+    },
+    Fused {
+        video: StepIndexed,
+        audio: StepIndexed,
+    },
+}
+
+/// One H3 DiT partition: the projections, the stack and the two output heads.
+pub struct Transformer {
+    /// The video latent's `1x2x2` patch tokens and their projection into the hidden width.
+    patch: PatchEmbed,
+    audio_proj_in: Linear,
+    /// The stack's one rotary embedding, published once and applied by every layer.
+    rotary: Rotary,
+    layers: Vec<Layer>,
+    norm_out: AdaLnOut,
+    outputs: Heads,
 }
 
 #[cfg(test)]

@@ -23,7 +23,7 @@
 //! activation is elementwise over unit-strided rows: each element is read before it is written.
 //! What is *not* safe is `out` as a shifted view of an input, where a row's write lands on a position
 //! a later read has not reached yet; the operators' shape and stride checks refuse mismatched extents
-//! but cannot see a shift inside one row, so this documentation is the contract the caller holds.
+//! but cannot see a shift inside one row, so this documentation is the obligation the caller holds.
 
 use ops::DType;
 use ops::TensorView;
@@ -158,13 +158,27 @@ impl GatedActivation {
         })
     }
 
-    /// `out = act(gate) · value` over `input`'s halves into `out`, `[rows, width]`.
+    /// `act(gate) · value` over `input`'s halves: a fresh `[rows, width]` tensor of the input's
+    /// element type.
     ///
     /// # Errors
     ///
-    /// Halves whose width is not `out`'s, a bias of another width or packing than the input, or the
-    /// operator's refusal.
-    pub fn forward(&self, f: &Forward, input: Halves, out: TensorView) -> Result<()> {
+    /// Halves of different extents, a bias of another width or packing than the input, an arena
+    /// that cannot hold the output, or the operator's refusal.
+    pub fn forward(&self, f: &Forward, input: Halves) -> Result<TensorView> {
+        let (dtype, rows, width) = match input {
+            Halves::Split { gate, .. } => (gate.dtype, gate.rows(), gate.last()),
+            Halves::ValueFirst(projection) => {
+                (projection.dtype, projection.rows(), projection.last() / 2)
+            }
+        };
+        let out = f.empty(dtype, ops::Shape::new(&[rows, width]))?;
+        self.launch(f, input, out)?;
+        Ok(out)
+    }
+
+    /// The product of `input`'s halves into `out`, `[rows, width]`.
+    fn launch(&self, f: &Forward, input: Halves, out: TensorView) -> Result<()> {
         const OWNER: &str = "GatedActivation";
         let width = out.shape.last();
         match (self.rounding, input) {
@@ -343,21 +357,6 @@ impl GatedActivation {
         };
         f.operate::<activation::ValueFirstSwiglu>(&descriptor, args)
     }
-
-    /// Gate `input` into a fresh `[rows, width]` buffer of `dtype` reserved from the arena.
-    ///
-    /// # Errors
-    ///
-    /// An arena too small for the buffer, or [`Self::forward`]'s refusals.
-    pub fn apply(&self, f: &Forward, input: Halves, dtype: DType) -> Result<TensorView> {
-        let (rows, width) = match input {
-            Halves::Split { gate, .. } => (gate.rows(), gate.last()),
-            Halves::ValueFirst(projection) => (projection.rows(), projection.last() / 2),
-        };
-        let out = f.arena().tensor(dtype, ops::Shape::new(&[rows, width]))?;
-        self.forward(f, input, out)?;
-        Ok(out)
-    }
 }
 
 /// GELU over a row-major `[rows, columns]` activation.
@@ -402,18 +401,24 @@ impl Gelu {
         }
     }
 
-    /// `out = gelu(x)` over the rows.
-    pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
-        if x.shape.rank() != 2 || x.shape != out.shape {
+    /// `gelu(x)` over the rows of `x`, `[rows, columns]`, in `x`'s element type.
+    ///
+    /// # Errors
+    ///
+    /// A view of another rank, an arena that cannot hold the output, or the operator's refusal.
+    pub fn forward(&self, f: &Forward, x: TensorView) -> Result<TensorView> {
+        if x.shape.rank() != 2 {
             return Err(Error::shape(
                 "Gelu",
-                format!("{:?} into {:?}", x.shape.dims(), out.shape.dims()),
+                format!("{:?} is not [rows, columns]", x.shape.dims()),
             ));
         }
         let columns = u32::try_from(x.shape.last())
             .map_err(|_| Error::shape("Gelu", "more columns than a descriptor holds".to_owned()))?;
+        let out = f.empty(x.dtype, x.shape)?;
         let descriptor = Self::descriptor(x.dtype, columns, self.approximation);
-        f.operate::<ops::gelu::Gelu>(&descriptor, ops::gelu::Args { x, out })
+        f.operate::<ops::gelu::Gelu>(&descriptor, ops::gelu::Args { x, out })?;
+        Ok(out)
     }
 }
 
@@ -448,16 +453,14 @@ impl Snake {
         }
     }
 
-    /// `out = snake(x, alpha)` over `[rows, channels, width]`.
+    /// `snake(x, alpha)` over `[rows, channels, width]`, in `x`'s element type.
     ///
     /// `alpha` is `[channels]` in the activation's element type; the signal is row-major in and out.
-    pub fn forward(
-        &self,
-        f: &Forward,
-        x: TensorView,
-        alpha: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
+    ///
+    /// # Errors
+    ///
+    /// Views of another extent, an arena that cannot hold the output, or the operator's refusal.
+    pub fn forward(&self, f: &Forward, x: TensorView, alpha: TensorView) -> Result<TensorView> {
         if x.shape.rank() != 3 || x.shape.dim(1) != self.channels {
             return Err(Error::shape(
                 "Snake",
@@ -478,8 +481,10 @@ impl Snake {
                 ),
             ));
         }
+        let out = f.empty(x.dtype, x.shape)?;
         let descriptor = Self::descriptor(x.dtype, self.channels);
-        f.operate::<ops::snake::Snake>(&descriptor, ops::snake::Args { x, alpha, out })
+        f.operate::<ops::snake::Snake>(&descriptor, ops::snake::Args { x, alpha, out })?;
+        Ok(out)
     }
 }
 
@@ -502,18 +507,24 @@ impl Silu {
         }
     }
 
-    /// `out = silu(x)` over the rows.
-    pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
-        if x.shape.rank() != 2 || x.shape != out.shape {
+    /// `silu(x)` over the rows of `x`, `[rows, columns]`, in `x`'s element type.
+    ///
+    /// # Errors
+    ///
+    /// A view of another rank, an arena that cannot hold the output, or the operator's refusal.
+    pub fn forward(&self, f: &Forward, x: TensorView) -> Result<TensorView> {
+        if x.shape.rank() != 2 {
             return Err(Error::shape(
                 "Silu",
-                format!("{:?} into {:?}", x.shape.dims(), out.shape.dims()),
+                format!("{:?} is not [rows, columns]", x.shape.dims()),
             ));
         }
         let columns = u32::try_from(x.shape.last())
             .map_err(|_| Error::shape("Silu", "more columns than a descriptor holds".to_owned()))?;
+        let out = f.empty(x.dtype, x.shape)?;
         let descriptor = Self::descriptor(x.dtype, columns);
-        f.operate::<ops::activation::Silu>(&descriptor, ops::activation::SiluArgs { x, out })
+        f.operate::<ops::activation::Silu>(&descriptor, ops::activation::SiluArgs { x, out })?;
+        Ok(out)
     }
 }
 
@@ -537,14 +548,11 @@ mod tests {
             let packed = arena
                 .tensor(DType::BF16, Shape::new(&[rows, 2 * width]))
                 .expect("a counting arena");
-            let half = Shape::new(&[rows, width]);
-            let out = arena.tensor(DType::BF16, half).expect("a counting arena");
             let activation =
                 GatedActivation::new(Activation::Silu, Rounding::Stepwise, GateBias::None)
                     .expect("a stepwise SiLU product");
-            let (walked, launches) = crate::forward::recorded(|| {
-                activation.forward(&f, Halves::ValueFirst(packed), out)
-            });
+            let (walked, launches) =
+                crate::forward::recorded(|| activation.forward(&f, Halves::ValueFirst(packed)));
             walked.expect("the recorded forward");
             let (operator, key) = &launches[0];
             assert_eq!(operator, "act_and_mul");

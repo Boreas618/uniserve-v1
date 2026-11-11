@@ -71,13 +71,17 @@ fn a_split_recording_answers_the_gathered_width_of_its_rank() {
     let head = head(&checkpoint, 32, 1).unwrap();
     assert_eq!(head.padded(), 16);
     let hidden = arena.tensor(DType::BF16, Shape::new(&[3, 8])).unwrap();
-    let out = arena.tensor(DType::F32, Shape::new(&[3, 32])).unwrap();
 
     let before = arena.used();
-    let (answer, launches) = recorded(|| head.forward(&f, hidden, out));
-    answer.expect("two shards of 16 gather into 32 columns");
-    // The head reserved its shard's projection and the two shards' gather, BF16 each.
-    assert!(arena.used() - before >= 3 * 16 * 2 + 3 * 32 * 2);
+    let (answer, launches) = recorded(|| head.forward(&f, hidden));
+    let logits = answer.expect("two shards of 16 gather into 32 columns");
+    assert_eq!(
+        (logits.shape.dims(), logits.dtype),
+        (&[3, 32][..], DType::F32)
+    );
+    // The head reserved its shard's projection and the two shards' gather, BF16 each, and the
+    // FP32 logits.
+    assert!(arena.used() - before >= 3 * 16 * 2 + 3 * 32 * 2 + 3 * 32 * 4);
     // The unpad reads the gathered BF16 logits two shards wide and writes the vocabulary in FP32.
     assert!(
         launches
@@ -90,7 +94,7 @@ fn a_split_recording_answers_the_gathered_width_of_its_rank() {
     // Unsplit, the shard's 16 columns are the whole gathered width and cannot hold a vocabulary
     // of 32: the unpad refuses the call, as the device would.
     let unsplit = Forward::recording(&arena);
-    assert!(head.forward(&unsplit, hidden, out).is_err());
+    assert!(head.forward(&unsplit, hidden).is_err());
 }
 
 /// A shard that is not a whole number of tiles has no padded rows in the checkpoint to read: the
@@ -144,33 +148,40 @@ fn a_sequence_split_projects_heads_by_its_mode_and_returns_rows() {
     let f = Forward::recording(&arena).with_split(1, 2).unwrap();
     let tensor = |dims: &[u64]| arena.tensor(DType::BF16, Shape::new(dims)).unwrap();
     // Four own rows of a sequence of eight; this member's heads are two of four, 32 channels.
-    let (normalized, gathered) = (tensor(&[4, 32]), tensor(&[8, 32]));
-    let (staging, heads) = (tensor(&[4, 64]), tensor(&[8, 32]));
+    let normalized = tensor(&[4, 32]);
 
     let exchange = ulysses(&checkpoint, Projection::Exchange);
     let (projected, launches) = recorded(|| {
-        let rows = exchange.rows(&f, normalized, gathered)?;
-        exchange.project(&f, 0, rows, staging, heads)
+        let rows = exchange.rows(&f, normalized)?;
+        exchange.project(&f, 0, rows)
     });
-    projected.unwrap();
+    let heads = projected.unwrap();
+    assert_eq!(
+        heads.shape.dims(),
+        [8, 32],
+        "every row of this member's heads"
+    );
     let operators: Vec<&str> = launches.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(operators, ["gemm", "gemm"], "one product per member");
 
     let gather = ulysses(&checkpoint, Projection::Gather);
     let (projected, launches) = recorded(|| {
-        let rows = gather.rows(&f, normalized, gathered)?;
-        gather.project(&f, 0, rows, staging, heads)
+        let rows = gather.rows(&f, normalized)?;
+        gather.project(&f, 0, rows)
     });
-    projected.unwrap();
+    assert_eq!(projected.unwrap().shape.dims(), [8, 32]);
     assert_eq!(
         launches.len(),
         1,
         "one product of this member's heads: {launches:?}"
     );
 
-    let (merged, out) = (tensor(&[4, 64]), tensor(&[4, 32]));
-    let (returned, launches) = recorded(|| exchange.return_rows(&f, heads, staging, merged, out));
-    returned.unwrap();
+    let (returned, launches) = recorded(|| exchange.return_rows(&f, heads));
+    assert_eq!(
+        returned.unwrap().shape.dims(),
+        [4, 32],
+        "this member's rows of every head"
+    );
     let operators: Vec<&str> = launches.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(operators[operators.len() - 1], "gemm");
     assert!(
@@ -179,9 +190,7 @@ fn a_sequence_split_projects_heads_by_its_mode_and_returns_rows() {
     );
 
     let four = Forward::recording(&arena).with_split(1, 4).unwrap();
-    let refused = exchange
-        .project(&four, 0, normalized, staging, heads)
-        .unwrap_err();
+    let refused = exchange.project(&four, 0, normalized).unwrap_err();
     assert!(
         format!("{refused}").contains("built for 2 members"),
         "{refused}"

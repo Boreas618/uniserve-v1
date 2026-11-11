@@ -244,6 +244,20 @@ pub trait Runner: Send {
         Ok(crate::runners::recording::Footprint::default())
     }
 
+    /// Gives the runner a staging region of `bytes`, the extent its recorded walk's uploads reached
+    /// ([`crate::runners::recording::Footprint::staging`]), before its first capture: every
+    /// forward of the runner uploads its host values through it ([`crate::staging`]).
+    ///
+    /// # Errors
+    ///
+    /// When the page-locked allocation fails.
+    fn size_staging(&mut self, device: platform::DeviceId, bytes: u64) -> crate::Result<()> {
+        match self.lifecycle_mut() {
+            Some(lifecycle) => lifecycle.size_staging(device, bytes),
+            None => Ok(()),
+        }
+    }
+
     /// Gives the runner the device's graph pools, before its first capture.
     ///
     /// One pool set exists per device and every runner issuing on it books into the same one

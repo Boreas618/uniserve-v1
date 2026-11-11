@@ -201,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn an_exchange_of_the_planned_extents_passes() {
+    fn an_exchange_of_the_sized_extents_passes() {
         let exchange = exchange(2, 64, 2048, 8);
         assert_eq!(exchange.hidden(), 2048);
         assert_eq!(exchange.top(), 8);

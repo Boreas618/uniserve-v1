@@ -17,7 +17,7 @@
 use crate::{AudioVaeConfig, Error, Result};
 use nn::layers::{Bias, ChannelAffine, Conv1d, ConvSpec};
 use nn::vocoder::{BigVgan, BigVganSpec};
-use nn::{DType, DecodedMedia, Decoder, Forward, Shape, StateTable, TensorView, WeightLoader};
+use nn::{DType, DecodedMedia, Decoder, Forward, Shape, TensorView, WeightLoader};
 
 /// The alias-free activations' up- and down-sampling ratio: BigVGAN's, which the config does not
 /// state.
@@ -35,47 +35,36 @@ pub fn track_samples(config: &AudioVaeConfig, latent_frames: u32) -> u64 {
     u64::from(latent_frames) * u64::from(config.decoder_hop())
 }
 
-/// The latent statistics the decoder inverts before its first convolution.
+/// The latent statistics the decoder inverts before its first convolution, `(mean, std)`.
 ///
 /// A generated audio latent is normalized per channel; the decoder restores it with
-/// `value * std + mean` (`LatentDecoder` in the reference) before the input projection. The two
-/// vectors are load-time constants of the checkpoint, one entry per latent channel.
-#[derive(Clone, PartialEq, Debug)]
-pub struct Statistics {
-    /// The per-channel mean.
-    pub mean: Vec<f32>,
-    /// The per-channel standard deviation.
-    pub std: Vec<f32>,
-}
-
-impl Statistics {
-    /// The statistics the config states, one entry per latent channel.
-    pub fn of(config: &AudioVaeConfig) -> Result<Self> {
-        let channels = config.latent_channels as usize;
-        if config.latents_mean.len() != channels || config.latents_std.len() != channels {
+/// `value * std + mean` (`LatentDecoder` in the reference) before the input projection.
+///
+/// # Errors
+///
+/// Statistics of another count than the latent channels, or a non-finite value or zero deviation.
+pub fn statistics(config: &AudioVaeConfig) -> Result<(&[f32], &[f32])> {
+    let channels = config.latent_channels as usize;
+    if config.latents_mean.len() != channels || config.latents_std.len() != channels {
+        return Err(Error::config(format!(
+            "the audio latent statistics hold {} means and {} deviations for {channels} channels",
+            config.latents_mean.len(),
+            config.latents_std.len()
+        )));
+    }
+    for (index, (mean, std)) in config
+        .latents_mean
+        .iter()
+        .zip(&config.latents_std)
+        .enumerate()
+    {
+        if !mean.is_finite() || !std.is_finite() || *std == 0.0 {
             return Err(Error::config(format!(
-                "the audio latent statistics hold {} means and {} deviations for {channels} channels",
-                config.latents_mean.len(),
-                config.latents_std.len()
+                "the audio latent channel {index} has mean {mean} and deviation {std}"
             )));
         }
-        for (index, (mean, std)) in config
-            .latents_mean
-            .iter()
-            .zip(config.latents_std.iter())
-            .enumerate()
-        {
-            if !mean.is_finite() || !std.is_finite() || *std == 0.0 {
-                return Err(Error::config(format!(
-                    "the audio latent channel {index} has mean {mean} and deviation {std}"
-                )));
-            }
-        }
-        Ok(Self {
-            mean: config.latents_mean.clone(),
-            std: config.latents_std.clone(),
-        })
     }
+    Ok((&config.latents_mean, &config.latents_std))
 }
 
 /// The architecture of the checkpoint's BigVGAN, from its audio VAE config.
@@ -121,14 +110,14 @@ impl AudioDecoder {
 
     /// The audio decoder the checkpoint's `dec_in_proj` and `decoder` modules state, read in FP32.
     pub fn load(config: &AudioVaeConfig, loader: &mut WeightLoader) -> Result<Self> {
-        let statistics = Statistics::of(config)?;
+        let (mean, std) = statistics(config)?;
         let channels = u64::from(config.latent_channels);
         let denormalize = {
             let mut constants = loader.scope("audio_vae.denormalize");
             // The latents are `[batch, channels, frames]`: the channel is axis one.
             ChannelAffine::new(
-                constants.constant_f32("scale", &[channels], &statistics.std)?,
-                constants.constant_f32("shift", &[channels], &statistics.mean)?,
+                constants.constant_f32("scale", &[channels], std)?,
+                constants.constant_f32("shift", &[channels], mean)?,
                 1,
             )?
         };
@@ -169,7 +158,10 @@ impl AudioDecoder {
             )));
         }
         let frames = shape.dim(0);
-        let major = self.buffer(f, self.config.latent_channels, frames)?;
+        let major = f.empty(
+            DType::F32,
+            Shape::new(&[stereo, u64::from(self.config.latent_channels), frames]),
+        )?;
         // Four axes are what a block copy moves: `[stereo, channels, 1, frames]`.
         let block = Shape::new(&[stereo, channels, 1, frames]);
         let source = TensorView::with_strides(
@@ -207,13 +199,7 @@ impl AudioDecoder {
                 self.config.latent_channels
             )));
         }
-        let length = shape.dim(2);
-        // The reference restores each latent channel before the decoder's first convolution.
-        let restored = self.buffer(f, self.config.latent_channels, length)?;
-        self.denormalize.forward(f, latents, restored)?;
-        let projected = self.buffer(f, self.config.latent_dim, length)?;
-        self.input.forward(f, restored, projected)?;
-        let samples = self.generator.samples(length);
+        let samples = self.generator.samples(shape.dim(2));
         let planes = [u64::from(PCM_CHANNELS), samples];
         if out.dtype != DType::F32 || out.shape.dims() != planes || !out.is_row_major() {
             return Err(Error::config(format!(
@@ -222,17 +208,15 @@ impl AudioDecoder {
                 out.shape.dims()
             )));
         }
-        // The generator's batch axis is the stereo pair and its channel axis one.
-        let mono = out.reshape(Shape::new(&[u64::from(PCM_CHANNELS), 1, samples]));
-        Ok(self.generator.forward(f, projected, mono)?)
-    }
-
-    /// A FP32 buffer of the audio network's layout.
-    fn buffer(&self, f: &Forward, channels: u32, length: u64) -> Result<TensorView> {
-        Ok(f.arena().tensor(
-            DType::F32,
-            Shape::new(&[u64::from(PCM_CHANNELS), u64::from(channels), length]),
-        )?)
+        // The reference restores each latent channel before the decoder's first convolution; the
+        // generator's batch axis is the stereo pair and its channel axis one.
+        let restored = self.denormalize.forward(f, latents)?;
+        let projected = self.input.forward(f, restored)?;
+        let waveform = self
+            .generator
+            .forward(f, projected)?
+            .reshape(Shape::new(&planes));
+        Ok(nn::layers::Axpby.forward(f, out, waveform, 1.0, 0.0)?)
     }
 }
 
@@ -245,27 +229,6 @@ impl Decoder for AudioDecoder {
         nn::DType::F32
     }
 
-    fn layout_tables(&self, _layout: &proto::video::Layout) -> nn::Result<Vec<StateTable>> {
-        // Every table this decoder reads is a weight, bound at load: nothing follows from the
-        // layout, so the runner uploads nothing for it.
-        Ok(Vec::new())
-    }
-
-    fn prepare_layout(
-        &self,
-        _layout: &proto::video::Layout,
-        out: &mut [nn::TableValues],
-    ) -> nn::Result<()> {
-        if out.is_empty() {
-            return Ok(());
-        }
-        Err(Error::config(format!(
-            "the audio decoder has no layout tables; {} buffers were offered",
-            out.len()
-        ))
-        .into())
-    }
-
     /// The waveform one decode of `audio` writes: the track's latent frames times the decoder's hop,
     /// in [`PCM_CHANNELS`] channels.
     fn pcm_window(&self, audio: &proto::video::LatentShape) -> nn::Result<(u64, u32)> {
@@ -274,22 +237,15 @@ impl Decoder for AudioDecoder {
 
     /// Decode one run of latent frames into its waveform.
     ///
-    /// `state` must be empty, `out.audio` is the request's `[2, samples]` f32 waveform and
-    /// `out.video` must be absent: this path decodes sound only.
+    /// `out.audio` is the request's `[2, samples]` f32 waveform and `out.video` must be absent:
+    /// this path decodes sound only.
     fn decode(
         &self,
         f: &Forward,
+        _layout: &proto::video::Layout,
         latents: TensorView,
-        state: &[TensorView],
         out: DecodedMedia,
     ) -> nn::Result<()> {
-        if !state.is_empty() {
-            return Err(Error::config(format!(
-                "the audio decoder reads no layout table, {} were given",
-                state.len()
-            ))
-            .into());
-        }
         let audio = out.audio.ok_or_else(|| {
             Error::config("an audio decode writes the request's waveform".to_owned())
         })?;
@@ -337,15 +293,14 @@ pub(crate) mod tests {
     #[test]
     fn latent_statistics_of_the_wrong_count_or_a_zero_deviation_are_refused() {
         let config = audio_config();
-        let statistics = Statistics::of(&config).expect("the statistics");
-        assert_eq!(statistics.mean.len(), 32);
-        assert_eq!(statistics.std.len(), 32);
+        let (mean, std) = statistics(&config).expect("the statistics");
+        assert_eq!((mean.len(), std.len()), (32, 32));
         let mut broken = config.clone();
         broken.latents_mean.pop();
-        assert!(Statistics::of(&broken).is_err());
+        assert!(statistics(&broken).is_err());
         let mut broken = config.clone();
         broken.latents_std[3] = 0.0;
-        assert!(Statistics::of(&broken).is_err());
+        assert!(statistics(&broken).is_err());
     }
 
     #[test]

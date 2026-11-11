@@ -2,7 +2,7 @@
 //!
 //! A layer propagates an operator's failure unchanged; it never falls back to another path. The
 //! loading boundary adds the failures of reading a checkpoint and converting a weight, and the
-//! forward's arena adds the one failure a static activation plan can have: a request that does not
+//! forward's arena adds the one failure a static activation layout can have: a request that does not
 //! fit the region the worker reserved.
 
 use std::path::PathBuf;
@@ -65,6 +65,14 @@ pub enum Error {
         available: u64,
     },
 
+    /// The staging region lent to a forward cannot hold the values it uploads.
+    #[error("staging: {needed} bytes requested at offset {at} of a {available}-byte region")]
+    Staging {
+        needed: u64,
+        at: u64,
+        available: u64,
+    },
+
     /// A view's shape, dtype or rank does not fit what the layer was built for.
     #[error("{owner}: {problem}")]
     Shape {
@@ -74,7 +82,7 @@ pub enum Error {
 
     /// A loader's policy does not describe the checkpoint it is asked to read.
     ///
-    /// A policy (an element type, a quantization) is chosen once for a model; a component whose
+    /// A policy (an element type, a quantization) is chosen once for a model; a stage whose
     /// weights are not of that kind would be read as something it is not, which is a wrong answer
     /// rather than a convenience.
     #[error("loader policy: {problem}")]

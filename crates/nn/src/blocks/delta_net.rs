@@ -31,7 +31,7 @@ use crate::weights::Scope;
 /// The geometry of a [`GatedDeltaNet`], before any split.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GatedDeltaNetSpec {
-    /// The hidden width the input projections contract and the output projection writes.
+    /// The hidden width the input projections read and the output projection writes.
     pub hidden: u32,
     /// Query and key heads.
     pub key_heads: u32,
@@ -178,13 +178,16 @@ impl GatedDeltaNet {
         ]
     }
 
-    /// Mix `hidden [tokens, hidden]` through the block into `out [tokens, hidden]`, reading and
-    /// advancing recurrent layer `layer` of `state`.
+    /// `hidden [tokens, hidden]` mixed through the block, reading and advancing recurrent layer
+    /// `layer` of `state` in place: a fresh `[tokens, hidden]` tensor of `hidden`'s element type.
+    ///
+    /// The output is reserved first and the intermediates after it, in a scope that hands them
+    /// back once the output projection is enqueued.
     ///
     /// # Errors
     ///
     /// A state that does not hold the layer's two fields, a view an operator refuses, or an arena
-    /// that cannot hold the intermediates.
+    /// that cannot hold the output and intermediates.
     pub fn forward(
         &self,
         f: &Forward,
@@ -192,8 +195,7 @@ impl GatedDeltaNet {
         batch: &TokenBatch,
         state: &StateView<'_>,
         layer: usize,
-        out: TensorView,
-    ) -> Result<()> {
+    ) -> Result<TensorView> {
         let banks = state.layer(layer)?;
         let ([conv, recurrent], [conv_kept, recurrent_kept]) = (banks.live, banks.checkpoint)
         else {
@@ -220,73 +222,70 @@ impl GatedDeltaNet {
                 ));
             }
         };
-        let arena = f.arena();
-        let mark = arena.mark();
-        let dtype = hidden.dtype;
-        let tokens = hidden.rows();
-        let spec = self.spec;
+        // The output projection's rows are `hidden`'s, which is all its reservation reads.
+        let out = self.out_proj.reserve(f, hidden)?;
+        f.scoped(|f| {
+            let dtype = hidden.dtype;
+            let tokens = hidden.rows();
+            let spec = self.spec;
 
-        let qkv = self.in_proj_qkv.apply(f, hidden, dtype)?;
-        let z = self.in_proj_z.apply(f, hidden, dtype)?;
-        let b = self.in_proj_b.apply(f, hidden, dtype)?;
-        let a = self.in_proj_a.apply(f, hidden, dtype)?;
+            let qkv = self.in_proj_qkv.forward(f, hidden)?;
+            let z = self.in_proj_z.forward(f, hidden)?;
+            let b = self.in_proj_b.forward(f, hidden)?;
+            let a = self.in_proj_a.forward(f, hidden)?;
 
-        let channels = u64::from(spec.conv_channels());
-        let mixed = arena.tensor(dtype, Shape::new(&[tokens, channels]))?;
-        self.conv1d.forward(
-            f,
-            state,
-            FieldBanks {
-                live: *conv,
-                checkpoint: *conv_kept,
-                trail: conv_trail,
-            },
-            qkv,
-            mixed,
-        )?;
+            let channels = u64::from(spec.conv_channels());
+            let mixed = self.conv1d.forward(
+                f,
+                state,
+                FieldBanks {
+                    live: *conv,
+                    checkpoint: *conv_kept,
+                    trail: conv_trail,
+                },
+                qkv,
+            )?;
 
-        // The convolved row is [q | k | v]: three head-major views of one row stride.
-        let key_width = u64::from(spec.key_heads) * u64::from(spec.key_dim);
-        let heads = |offset: u64, count: u32, dim: u32| {
-            TensorView::with_strides(
-                mixed.offset_elements(offset),
-                dtype,
-                Shape::new(&[tokens, u64::from(count), u64::from(dim)]),
-                Strides::new(&[channels, u64::from(dim), 1]),
+            // The convolved row is [q | k | v]: three head-major views of one row stride.
+            let key_width = u64::from(spec.key_heads) * u64::from(spec.key_dim);
+            let heads = |offset: u64, count: u32, dim: u32| {
+                TensorView::with_strides(
+                    mixed.offset_elements(offset),
+                    dtype,
+                    Shape::new(&[tokens, u64::from(count), u64::from(dim)]),
+                    Strides::new(&[channels, u64::from(dim), 1]),
+                )
+            };
+            let query = heads(0, spec.key_heads, spec.key_dim);
+            let key = heads(key_width, spec.key_heads, spec.key_dim);
+            let value = heads(2 * key_width, spec.value_heads, spec.value_dim);
+
+            let value_heads = u64::from(spec.value_heads);
+            let value_dim = u64::from(spec.value_dim);
+            let core = self.rule.forward(
+                f,
+                batch,
+                state,
+                FieldBanks {
+                    live: *recurrent,
+                    checkpoint: *recurrent_kept,
+                    trail: recurrent_trail,
+                },
+                (query, key, value),
+                (a, b),
+            )?;
+
+            // The output norm runs per value head, gated by the same head's slice of `z`.
+            let per_head = Shape::new(&[tokens * value_heads, value_dim]);
+            let normed = self
+                .norm
+                .forward(f, core.reshape(per_head), z.reshape(per_head))?;
+            self.out_proj.launch(
+                f,
+                normed.reshape(Shape::new(&[tokens, value_heads * value_dim])),
+                out,
             )
-        };
-        let query = heads(0, spec.key_heads, spec.key_dim);
-        let key = heads(key_width, spec.key_heads, spec.key_dim);
-        let value = heads(2 * key_width, spec.value_heads, spec.value_dim);
-
-        let value_heads = u64::from(spec.value_heads);
-        let value_dim = u64::from(spec.value_dim);
-        let core = arena.tensor(dtype, Shape::new(&[tokens, value_heads, value_dim]))?;
-        self.rule.forward(
-            f,
-            batch,
-            state,
-            FieldBanks {
-                live: *recurrent,
-                checkpoint: *recurrent_kept,
-                trail: recurrent_trail,
-            },
-            (query, key, value),
-            (a, b),
-            core,
-        )?;
-
-        // The output norm runs per value head, gated by the same head's slice of `z`.
-        let per_head = Shape::new(&[tokens * value_heads, value_dim]);
-        let normed = arena.tensor(dtype, per_head)?;
-        self.norm
-            .forward(f, core.reshape(per_head), z.reshape(per_head), normed)?;
-        self.out_proj.forward(
-            f,
-            normed.reshape(Shape::new(&[tokens, value_heads * value_dim])),
-            out,
-        )?;
-        arena.release(mark);
-        Ok(())
+        })?;
+        Ok(out)
     }
 }

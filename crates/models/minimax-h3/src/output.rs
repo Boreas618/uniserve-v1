@@ -56,8 +56,8 @@ impl VideoPostprocessor {
     /// `clip` is the clip's cropped decode `[3, native, rows, columns]`; `previous` is the
     /// predecessor's tail `[3, overlap, rows, columns]`, absent for the timeline's first clip; `last`
     /// states whether the clip ends the timeline and so places its tail after its body. Answers the
-    /// runs of `[body (+ overlap when last)]` kept frames in order; the fade's output is reserved
-    /// here.
+    /// runs of `[body (+ overlap when last)]` kept frames in order; the fade's output is a fresh
+    /// tensor.
     pub fn forward(
         &self,
         f: &Forward,
@@ -65,33 +65,32 @@ impl VideoPostprocessor {
         clip: TensorView,
         last: bool,
     ) -> Result<Vec<Placed>> {
-        let raster = Raster::of(clip, &self.clips)?;
+        check_clip(clip, &self.clips)?;
         let body = self.clips.body;
         let tail = self.clips.tail();
         let mut placed = Vec::with_capacity(3);
         match previous {
             Some(previous) => {
-                raster.check_previous(previous, self.dtype, self.clips.overlap)?;
+                check_previous(clip, previous, self.dtype, self.clips.overlap)?;
                 let fade = self.clips.overlap;
-                let faded = f.arena().tensor(clip.dtype, previous.shape)?;
-                self.fade.forward(f, previous, clip, faded)?;
+                let faded = self.fade.forward(f, previous, clip)?;
                 placed.push(Placed {
                     raster: faded,
                     frame: 0,
                 });
                 placed.push(Placed {
-                    raster: raster.written(clip, (fade, body))?,
+                    raster: frames(clip, (fade, body))?,
                     frame: fade,
                 });
             }
             None => placed.push(Placed {
-                raster: raster.written(clip, (0, body))?,
+                raster: frames(clip, (0, body))?,
                 frame: 0,
             }),
         }
         if last {
             placed.push(Placed {
-                raster: raster.written(clip, tail)?,
+                raster: frames(clip, tail)?,
                 frame: body,
             });
         }
@@ -125,7 +124,7 @@ impl nn::capability::Splicer for VideoPostprocessor {
             ))
             .into());
         }
-        let clip = Raster::cropped(clip, &self.clips)?;
+        let clip = cropped(clip, &self.clips)?;
         // `splice.overlap` counts the frames a clip fades against its **predecessor**; the tail is
         // the clip's own whatever it says, and the clip that ends the timeline keeps it.
         let last = splice.keep > self.clips.body;
@@ -143,87 +142,74 @@ impl nn::capability::Splicer for VideoPostprocessor {
     }
 }
 
-/// The extents of one clip's decoded raster, read off the view.
-#[derive(Clone, Copy)]
-struct Raster {
-    frames: u32,
-    height: u32,
-    width: u32,
+/// A decode's own frames, without the ones it leads with.
+///
+/// The decoder emits whole latent frames, so its raster runs past a clip's native frames, and the
+/// surplus leads: the reference left-pads a clip to the temporal compression and crops those
+/// frames from the decoded timeline (`decoded[:, :, padding:]`).
+fn cropped(clip: TensorView, clips: &TemporalClips) -> Result<TensorView> {
+    let native = u64::from(clips.native());
+    if clip.shape.rank() != 4 || clip.shape.dim(1) < native {
+        return Err(Error::config(format!(
+            "a decoded clip is [channels, at least {native} frames, rows, columns], not {:?}",
+            clip.shape.dims()
+        )));
+    }
+    let leading = clip.shape.dim(1) - native;
+    Ok(clip.narrow(1, leading, native)?)
 }
 
-impl Raster {
-    /// A decode's own frames, without the ones it leads with.
-    ///
-    /// The decoder emits whole latent frames, so its raster runs past a clip's native frames, and
-    /// the surplus leads: the reference left-pads a clip to the temporal compression and crops those
-    /// frames from the decoded timeline (`decoded[:, :, padding:]`).
-    fn cropped(clip: TensorView, clips: &TemporalClips) -> Result<TensorView> {
-        let native = u64::from(clips.native());
-        if clip.shape.rank() != 4 || clip.shape.dim(1) < native {
-            return Err(Error::config(format!(
-                "a decoded clip is [channels, at least {native} frames, rows, columns], not {:?}",
-                clip.shape.dims()
-            )));
-        }
-        let leading = clip.shape.dim(1) - native;
-        Ok(clip.narrow(1, leading, native)?)
+/// Refuses a `clip` view that is not one clip's cropped decode, `[3, native, rows, columns]`.
+fn check_clip(clip: TensorView, clips: &TemporalClips) -> Result<()> {
+    if clip.shape.rank() != 4 || clip.shape.dim(0) != u64::from(RGB_CHANNELS) {
+        return Err(Error::config(format!(
+            "a decoded clip is [{RGB_CHANNELS}, frames, rows, columns], not {:?}",
+            clip.shape.dims()
+        )));
     }
+    if clip.shape.dim(1) != u64::from(clips.native()) {
+        return Err(Error::config(format!(
+            "a clip's decode is {} frames and the view carries {}",
+            clips.native(),
+            clip.shape.dim(1)
+        )));
+    }
+    Ok(())
+}
 
-    /// The raster `[channels, native, rows, columns]` a `clip` view describes.
-    fn of(clip: TensorView, clips: &TemporalClips) -> Result<Self> {
-        if clip.shape.rank() != 4 || clip.shape.dim(0) != u64::from(RGB_CHANNELS) {
-            return Err(Error::config(format!(
-                "a decoded clip is [{RGB_CHANNELS}, frames, rows, columns], not {:?}",
-                clip.shape.dims()
-            )));
-        }
-        let frames = u32::try_from(clip.shape.dim(1))
-            .map_err(|_| Error::config("a clip taller than a frame count".to_owned()))?;
-        if frames != clips.native() {
-            return Err(Error::config(format!(
-                "a clip's decode is {} frames and the view carries {frames}",
-                clips.native()
-            )));
-        }
-        Ok(Self {
-            frames,
-            height: u32::try_from(clip.shape.dim(2))
-                .map_err(|_| Error::config("a raster taller than a pixel count".to_owned()))?,
-            width: u32::try_from(clip.shape.dim(3))
-                .map_err(|_| Error::config("a raster wider than a pixel count".to_owned()))?,
-        })
+/// The view of frames `start..stop` of `clip`, `[channels, frames, rows, columns]` at the clip's
+/// own strides: only the frames extent narrows.
+fn frames(clip: TensorView, (start, stop): (u32, u32)) -> Result<TensorView> {
+    let held = clip.shape.dim(1);
+    if start >= stop || u64::from(stop) > held {
+        return Err(Error::config(format!(
+            "a clip's frames {start}..{stop} lie outside its {held} decoded frames"
+        )));
     }
+    Ok(clip.narrow(1, u64::from(start), u64::from(stop - start))?)
+}
 
-    /// The view of `range` frames of `raster`, as `[channels, frames, rows, columns]`, at the clip's
-    /// own strides: only the frames extent narrows.
-    fn written(&self, raster: TensorView, range: (u32, u32)) -> Result<TensorView> {
-        let (start, stop) = range;
-        if start >= stop || stop > self.frames {
-            return Err(Error::config(format!(
-                "a clip's frames {start}..{stop} lie outside its {} decoded frames",
-                self.frames
-            )));
-        }
-        Ok(raster.narrow(1, u64::from(start), u64::from(stop - start))?)
+/// Refuses a predecessor's tail that is not one contiguous block of `clip`'s raster and `dtype`.
+fn check_previous(
+    clip: TensorView,
+    previous: TensorView,
+    dtype: DType,
+    overlap: u32,
+) -> Result<()> {
+    let shape = [
+        u64::from(RGB_CHANNELS),
+        u64::from(overlap),
+        clip.shape.dim(2),
+        clip.shape.dim(3),
+    ];
+    if previous.shape.dims() != shape || previous.dtype != dtype {
+        return Err(Error::config(format!(
+            "a predecessor's tail is {shape:?} {dtype} and the view is {:?} {}",
+            previous.shape.dims(),
+            previous.dtype
+        )));
     }
-
-    /// The predecessor's tail, which must be one contiguous block of the clip's own type.
-    fn check_previous(&self, previous: TensorView, dtype: DType, overlap: u32) -> Result<()> {
-        let shape = [
-            u64::from(RGB_CHANNELS),
-            u64::from(overlap),
-            u64::from(self.height),
-            u64::from(self.width),
-        ];
-        if previous.shape.dims() != shape || previous.dtype != dtype {
-            return Err(Error::config(format!(
-                "a predecessor's tail is {shape:?} {dtype} and the view is {:?} {}",
-                previous.shape.dims(),
-                previous.dtype
-            )));
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -340,10 +326,10 @@ mod tests {
         let clips = clips();
         let (height, width) = (4, 6);
         let clip = raster_view(height, width);
-        let raster = Raster::of(clip, &clips).expect("a clip raster");
+        check_clip(clip, &clips).expect("a clip raster");
         let per_frame = u64::from(height) * u64::from(width);
         let per_channel = u64::from(clips.native()) * per_frame;
-        let body = raster.written(clip, (0, clips.body)).expect("a body");
+        let body = frames(clip, (0, clips.body)).expect("a body");
         assert_eq!(
             body.strides.as_slice(),
             [per_channel, per_frame, u64::from(width), 1]
@@ -351,7 +337,7 @@ mod tests {
         assert_eq!(body.element(&[1, 0, 0, 0]), clip.element(&[1, 0, 0, 0]));
         // The tail's first frame is the frame after the padding frames, with the same channel
         // stride.
-        let tail = raster.written(clip, clips.tail()).expect("a tail");
+        let tail = frames(clip, clips.tail()).expect("a tail");
         assert_eq!(tail.shape.dim(1), u64::from(clips.overlap));
         assert_eq!(
             tail.element(&[0, 0, 0, 0]),
@@ -362,12 +348,8 @@ mod tests {
             tail.element(&[0, 0, 0, 0])
         );
         // A range that leaves the clip is refused rather than read past it.
-        assert!(
-            raster
-                .written(clip, (clips.body, clips.native() + 1))
-                .is_err()
-        );
-        assert!(raster.written(clip, (clips.body, clips.body)).is_err());
+        assert!(frames(clip, (clips.body, clips.native() + 1)).is_err());
+        assert!(frames(clip, (clips.body, clips.body)).is_err());
     }
 
     #[test]
@@ -378,12 +360,12 @@ mod tests {
             nn::DType::F16,
             Shape::new(&[3, 24, 4, 6]),
         );
-        assert!(Raster::of(short, &clips).is_err());
+        assert!(check_clip(short, &clips).is_err());
         let grey = TensorView::new(
             nn::DevicePtr::new(0),
             nn::DType::F16,
             Shape::new(&[1, u64::from(clips.native()), 4, 6]),
         );
-        assert!(Raster::of(grey, &clips).is_err());
+        assert!(check_clip(grey, &clips).is_err());
     }
 }

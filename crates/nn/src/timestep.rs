@@ -9,7 +9,7 @@
 //! where the references compute in f32. The row is every cosine and then every sine of the same
 //! angles (the GLIDE/DiT order, not an interleaving).
 
-use ops::{Shape, TensorView};
+use ops::TensorView;
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -17,13 +17,14 @@ use crate::layers::{Bias, Linear, Parallel, Silu};
 use crate::weights::Scope;
 
 /// The base of the frequency ladder: `10000^(-i / half)`.
-const MAX_PERIOD: f64 = 10_000.0;
+const MAX_PERIOD: f32 = 10_000.0;
 
 /// The sinusoidal embedding of each time, `[times, dim]` FP32 row-major.
 ///
-/// Row `r`, element `i` is `cos(t_r · 10000^(-i/half))` for `i < half` and the sine of the same
-/// angle for `i ≥ half`, `half = dim / 2`; the angle is evaluated in f64 and each value rounded once
-/// to f32.
+/// Row `r`, element `i` is `cos(t_r · f_i)` for `i < half` and the sine of the same angle for
+/// `i ≥ half`, `half = dim / 2`, with `f_i = exp(-ln(10000) · i / half)`. Every step is FP32, as the
+/// diffusion references evaluate it (`torch.exp(-math.log(10000) * torch.arange(half,
+/// dtype=float32) / half)`, then `t * freqs` and the cosine and sine in FP32).
 ///
 /// # Errors
 ///
@@ -41,17 +42,19 @@ pub fn sinusoidal(times: &[f32], dim: u32) -> Result<Vec<f32>> {
             format!("a {dim}-wide embedding has no cosine half"),
         ));
     }
-    let half = (dim / 2) as usize;
+    let half = dim / 2;
+    let log = MAX_PERIOD.ln();
+    let frequencies: Vec<f32> = (0..half)
+        .map(|index| (-log * index as f32 / half as f32).exp())
+        .collect();
     let mut values = Vec::with_capacity(times.len() * dim as usize);
     for time in times {
-        let angles: Vec<f64> = (0..half)
-            .map(|index| {
-                let exponent = 2.0 * index as f64 / f64::from(dim);
-                f64::from(*time) * MAX_PERIOD.powf(-exponent)
-            })
+        let angles: Vec<f32> = frequencies
+            .iter()
+            .map(|frequency| time * frequency)
             .collect();
-        values.extend(angles.iter().map(|angle| angle.cos() as f32));
-        values.extend(angles.iter().map(|angle| angle.sin() as f32));
+        values.extend(angles.iter().map(|angle| angle.cos()));
+        values.extend(angles.iter().map(|angle| angle.sin()));
     }
     Ok(values)
 }
@@ -102,23 +105,22 @@ impl TimestepEmbedding {
         self.first.weight().dtype
     }
 
-    /// `out = linear_2(silu(linear_1(embedding)))`, `embedding` `[rows, frequency_dim]` and `out`
-    /// `[rows, out]`; the two intermediates are reserved from the arena and released before return.
+    /// `linear_2(silu(linear_1(embedding)))` of `embedding` `[rows, frequency_dim]`: a fresh
+    /// `[rows, out]` tensor of the embedding's element type. The two intermediates are reserved
+    /// after the output and handed back before return.
     ///
     /// # Errors
     ///
-    /// A view a projection refuses, or an arena that cannot hold the intermediates.
-    pub fn forward(&self, f: &Forward, embedding: TensorView, out: TensorView) -> Result<()> {
-        let arena = f.arena();
-        let mark = arena.mark();
-        let shape = Shape::new(&[embedding.rows(), u64::from(self.first.n())]);
-        let hidden = arena.tensor(embedding.dtype, shape)?;
-        let activated = arena.tensor(embedding.dtype, shape)?;
-        self.first.forward(f, embedding, hidden)?;
-        Silu.forward(f, hidden, activated)?;
-        self.second.forward(f, activated, out)?;
-        arena.release(mark);
-        Ok(())
+    /// A view a projection refuses, or an arena that cannot hold the output and intermediates.
+    pub fn forward(&self, f: &Forward, embedding: TensorView) -> Result<TensorView> {
+        // The second projection's rows are the embedding's, which is all its reservation reads.
+        let out = self.second.reserve(f, embedding)?;
+        f.scoped(|f| {
+            let hidden = self.first.forward(f, embedding)?;
+            let activated = Silu.forward(f, hidden)?;
+            self.second.launch(f, activated, out)
+        })?;
+        Ok(out)
     }
 }
 
@@ -136,11 +138,13 @@ mod tests {
         assert_eq!(values.len(), dim as usize);
         let half = dim as usize / 2;
         for index in 0..half {
-            let angle = f64::from(time) * 10_000_f64.powf(-(index as f64) / half as f64);
-            assert_eq!(values[index], angle.cos() as f32, "element {index}");
+            // The references' FP32 ladder: `exp(-ln(10000) * i / half)`, then `t * f`.
+            let frequency = (-10_000_f32.ln() * index as f32 / half as f32).exp();
+            let angle = time * frequency;
+            assert_eq!(values[index], angle.cos(), "element {index}");
             assert_eq!(
                 values[half + index],
-                angle.sin() as f32,
+                angle.sin(),
                 "element {}",
                 half + index
             );

@@ -16,7 +16,7 @@ mod delta_net;
 mod mlp;
 mod prenorm;
 
-pub use adaln::{AdaLnBlock, AdaLnOut, AdaLnSpec, ModulationTable, Stage};
+pub use adaln::{AdaLnBlock, AdaLnOut, AdaLnSpec, ModulationTable, RowModulation, StageVectors};
 pub use attention::{
     AttentionKind, Keys, QkNormNames, QkvAttention, QkvAttentionSpec, RopeFactors,
 };

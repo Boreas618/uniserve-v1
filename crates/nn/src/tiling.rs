@@ -295,29 +295,24 @@ pub fn voxels(tiles: &[Tile], frames: u32, height: u32, width: u32) -> Vec<u32> 
     rows
 }
 
-/// Gather the tiles' cells of `frames` frames from frame `first` of a channel-major `trajectory`
-/// into `block`, one row per voxel of [`voxels`]' order and one column per channel.
+/// The tiles' cells of `frames` frames from frame `first` of a channel-major `trajectory`,
+/// gathered into a fresh `[voxels, channels]` block of its element type, one row per voxel of
+/// [`voxels`]' order and one column per channel.
 ///
 /// `trajectory` holds `channels` planes of `[frames', height, width]` cells, each plane one whole
-/// timeline; `block` is `[voxels, channels]` of the same element type. One strided copy per tile.
+/// timeline. One strided copy per tile.
 ///
 /// # Errors
 ///
-/// A clip past the trajectory, views of other types, or the copy's refusal.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the trajectory's geometry and the clip's window are separate statements"
-)]
+/// A clip past the trajectory, an arena that cannot hold the block, or the copy's refusal.
 pub fn gather(
     f: &Forward,
     tiles: &[Tile],
     trajectory: TensorView,
     channels: u32,
     (height, width): (u32, u32),
-    first: u32,
-    frames: u32,
-    block: TensorView,
-) -> Result<()> {
+    (first, frames): (u32, u32),
+) -> Result<TensorView> {
     let channels = u64::from(channels);
     let (height, width) = (u64::from(height), u64::from(width));
     let plane = height * width;
@@ -325,19 +320,25 @@ pub fn gather(
     if channels == 0
         || !trajectory.numel().is_multiple_of(channels)
         || (u64::from(first) + u64::from(frames)) * plane > voxels
-        || block.dtype != trajectory.dtype
     {
         return Err(Error::shape(
             "gather",
             format!(
                 "a clip of {frames} frames from frame {first} of a {plane}-cell raster is past a \
-                 trajectory of {} {} elements in {channels} channels, or a block of {}",
+                 trajectory of {} {} elements in {channels} channels",
                 trajectory.numel(),
                 trajectory.dtype,
-                block.dtype
             ),
         ));
     }
+    let cells: u64 = tiles
+        .iter()
+        .map(|tile| u64::from(tile.rows.1) * u64::from(tile.columns.1))
+        .sum();
+    let block = f.empty(
+        trajectory.dtype,
+        Shape::new(&[u64::from(frames) * cells, channels]),
+    )?;
     let copy = Copy::new(trajectory.dtype, Access::Element)?;
     let frames = u64::from(frames);
     let mut row = 0_u64;
@@ -362,7 +363,7 @@ pub fn gather(
         copy.forward(f, source, destination, &strides.map(|stride| stride as i64))?;
         row += frames * rows * columns;
     }
-    Ok(())
+    Ok(block)
 }
 
 /// The axis a [`Blend`] runs along, of a `[channels, frames, rows, columns]` raster.
@@ -419,17 +420,31 @@ impl Blend {
         self.axis
     }
 
-    /// Blend `previous` and `current` into `out`.
+    /// `previous` and `current` blended into a fresh packed tensor of the blend's element type.
     ///
-    /// Along rows or columns the three views share one shape and `out` may be `current`. Along
-    /// frames, `previous` is the predecessor's tail of `extent` frames, `current` the clip whose
-    /// first `extent` frames fade in, and `out` the `extent` blended frames, all contiguous per
-    /// frame of a channel.
+    /// Along rows or columns the two views share one shape, which the answer has. Along frames,
+    /// `previous` is the predecessor's tail of `extent` frames and `current` the clip whose first
+    /// `extent` frames fade in, both contiguous per frame of a channel, and the answer is the
+    /// `extent` blended frames of `previous`'s shape.
     ///
     /// # Errors
     ///
-    /// Views the blend's operators refuse, or frame operands of another channel count or extent.
+    /// Views the blend's operators refuse, frame operands of another channel count or extent, or
+    /// an arena that cannot hold the answer.
     pub fn forward(
+        &self,
+        f: &Forward,
+        previous: TensorView,
+        current: TensorView,
+    ) -> Result<TensorView> {
+        let out = f.empty(self.dtype, previous.shape)?;
+        self.launch(f, previous, current, out)?;
+        Ok(out)
+    }
+
+    /// The blend of `previous` and `current` into `out`, which along rows or columns may be any
+    /// view of their shape (a tile's region of a raster, or `current` itself).
+    fn launch(
         &self,
         f: &Forward,
         previous: TensorView,
@@ -505,9 +520,8 @@ impl Blend {
             )
         };
         // The current frame's weighted term, one frame of scratch reused for every frame.
-        let mark = f.arena().mark();
-        let term = f.arena().tensor(out.dtype, Shape::new(&[1, pixels]));
-        let result = term.and_then(|term| {
+        f.scoped(|f| {
+            let term = f.empty(out.dtype, Shape::new(&[1, pixels]))?;
             for channel in 0..channels {
                 for index in 0..extent {
                     let weight = round(index as f32 / extent as f32)?;
@@ -520,9 +534,7 @@ impl Blend {
                 }
             }
             Ok(())
-        });
-        f.arena().release(mark);
-        result
+        })
     }
 }
 
@@ -594,21 +606,6 @@ impl TemporalClips {
     }
 }
 
-/// The device buffers one [`TiledEncode`] run works in, reserved once for all its clips.
-#[derive(Clone, Copy)]
-pub struct TileBlocks {
-    /// This rank's share of the tiles' blocks.
-    own: TensorView,
-    /// Every rank's share, in tile order; `own` itself without a split.
-    gathered: TensorView,
-    /// The block a two-way fade hands from its vertical blend to its horizontal one.
-    handed: TensorView,
-    rank: usize,
-    ranks: usize,
-    /// The tiles of one rank's share.
-    share: usize,
-}
-
 /// A tiled encode: a model's per-tile forward over a grid, its results shared among the forward's
 /// ranks and stitched into one raster.
 ///
@@ -624,6 +621,8 @@ pub struct TiledEncode {
     blends: Vec<Blend>,
     /// The copy that places the run's first tile, which has no seam to fade over.
     first: Copy,
+    /// The element type the blocks are encoded and blended in.
+    dtype: DType,
 }
 
 impl TiledEncode {
@@ -661,6 +660,7 @@ impl TiledEncode {
             latent: (height / ratio, width / ratio),
             blends,
             first: Copy::new(dtype, Access::Element)?,
+            dtype,
         })
     }
 
@@ -691,146 +691,110 @@ impl TiledEncode {
         Shape::new(&[channels, frames, u64::from(rows), u64::from(columns)])
     }
 
-    /// Reserve the blocks a run of clips of at most `frames` latent frames and `channels` channels
-    /// encodes into, in `dtype`.
+    /// `encode(index)` over this rank's tiles, every rank's blocks stitched into a fresh
+    /// `[channels, frames, latent rows, latent columns]` raster of the encode's element type.
     ///
-    /// The tiles are shared among the forward's ranks in contiguous shares, `ceil(tiles / ranks)`
-    /// each: the gather lays the shares end to end, so rank `r`'s tiles are the tiles from
-    /// `r · share`.
+    /// `encode(index)` answers tile `index`'s `[channels, frames, rows, columns]` block; each block
+    /// is copied into this rank's share of a contiguous stack, and the call's own intermediates are
+    /// handed back once the copy is enqueued. The tiles are shared among the forward's ranks in
+    /// contiguous shares, `ceil(tiles / ranks)` each, and gathered when the split has more than one
+    /// rank, so every rank stitches every tile.
     ///
     /// # Errors
     ///
-    /// The arena's refusal.
-    pub fn reserve(
+    /// A block of another extent or type, a collective without a group, an arena that cannot hold
+    /// the stacks, or the model's or an operator's refusal.
+    pub fn forward(
         &self,
         f: &Forward,
-        dtype: DType,
-        channels: u64,
-        frames: u64,
-    ) -> Result<TileBlocks> {
+        (channels, frames): (u64, u64),
+        mut encode: impl FnMut(usize) -> Result<TensorView>,
+    ) -> Result<TensorView> {
+        const OWNER: &str = "TiledEncode";
         let (rank, ranks) = f
             .split()
             .map_or((0, 1), |split| (split.rank as usize, split.ranks as usize));
         let share = self.tiles.len().div_ceil(ranks);
         let block = self.block(channels, frames);
-        let stack = |tiles: usize| {
-            let dims = block.dims();
-            Shape::new(&[tiles as u64, dims[0], dims[1], dims[2], dims[3]])
-        };
-        let own = f.arena().tensor(dtype, stack(share))?;
+        let elements = block.numel();
+        let stack = |tiles: usize| Shape::new(&[tiles as u64 * elements]);
+        let out = f.empty(
+            self.dtype,
+            Shape::new(&[
+                channels,
+                frames,
+                u64::from(self.latent.0),
+                u64::from(self.latent.1),
+            ]),
+        )?;
+        let own = f.empty(self.dtype, stack(share))?;
         let gathered = match ranks {
             1 => own,
-            _ => f.arena().tensor(dtype, stack(share * ranks))?,
+            _ => f.empty(self.dtype, stack(share * ranks))?,
         };
-        Ok(TileBlocks {
-            own,
-            gathered,
-            handed: f.arena().tensor(dtype, block)?,
-            rank,
-            ranks,
-            share,
-        })
-    }
-
-    /// Run `encode` over this rank's tiles and stitch every rank's into `out`.
-    ///
-    /// `encode(index, block)` writes tile `index`'s `[channels, frames, rows, columns]` block,
-    /// contiguous, where `frames` and `channels` are `out`'s; `out` is the
-    /// `[channels, frames, latent rows, latent columns]` raster, of any strides. The tiles are
-    /// gathered over the forward's split when it has more than one rank.
-    ///
-    /// # Errors
-    ///
-    /// A raster of another rank or type or one smaller than the latent raster, blocks reserved for
-    /// fewer frames, a collective without a group, or the forward's or an operator's refusal.
-    pub fn forward(
-        &self,
-        f: &Forward,
-        blocks: &TileBlocks,
-        mut encode: impl FnMut(usize, TensorView) -> Result<()>,
-        out: TensorView,
-    ) -> Result<()> {
-        const OWNER: &str = "TiledEncode";
-        if out.shape.rank() != 4
-            || out.dtype != blocks.own.dtype
-            || out.shape.dim(2) < u64::from(self.latent.0)
-            || out.shape.dim(3) < u64::from(self.latent.1)
-        {
-            return Err(Error::shape(
-                OWNER,
-                format!(
-                    "a {} raster of {:?} does not hold the {:?} latent cells in {}",
-                    out.dtype,
-                    out.shape.dims(),
-                    self.latent,
-                    blocks.own.dtype
-                ),
-            ));
-        }
-        let block = self.block(out.shape.dim(0), out.shape.dim(1));
-        let elements = block.numel();
-        if elements * blocks.share as u64 > blocks.own.numel() {
-            return Err(Error::shape(
-                OWNER,
-                format!(
-                    "blocks of {:?} do not fit the reserved {:?}",
-                    block.dims(),
-                    blocks.own.shape.dims()
-                ),
-            ));
-        }
-        // A clip's blocks lie one after another at this clip's own size: a last clip may be shorter
-        // than the run's widest.
         let block_of = |stack: TensorView, index: usize| {
             stack
                 .at(stack.offset_elements(index as u64 * elements))
                 .reshape(block)
         };
         let count = self.tiles.len();
-        let mine =
-            (blocks.rank * blocks.share).min(count)..((blocks.rank + 1) * blocks.share).min(count);
+        let mine = (rank * share).min(count)..((rank + 1) * share).min(count);
+        let packed: [i64; 4] =
+            std::array::from_fn(|axis| ops::Strides::row_major(block).get(axis) as i64);
         for index in mine.clone() {
-            encode(index, block_of(blocks.own, index - mine.start))?;
+            f.scoped(|_| {
+                let encoded = encode(index)?;
+                if encoded.shape != block || encoded.dtype != self.dtype {
+                    return Err(Error::shape(
+                        OWNER,
+                        format!(
+                            "tile {index} encoded {:?} {}, {:?} {} expected",
+                            encoded.shape.dims(),
+                            encoded.dtype,
+                            block.dims(),
+                            self.dtype
+                        ),
+                    ));
+                }
+                self.first
+                    .forward(f, encoded, block_of(own, index - mine.start), &packed)
+            })?;
         }
-        if blocks.ranks > 1 {
-            // This clip's blocks alone: a member's share of them lies at the head of its own.
-            let shared = blocks.share as u64 * elements;
-            f.all_gather(
-                blocks.own.reshape(Shape::new(&[shared])),
-                blocks
-                    .gathered
-                    .reshape(Shape::new(&[shared * blocks.ranks as u64])),
-            )?;
+        if ranks > 1 {
+            f.all_gather(own, gathered)?;
         }
 
         // Row-major tiles: the neighbour above is one grid row back, the one to the left the tile
         // before.
         let columns = self.grid.columns.len();
-        let handed = blocks.handed.reshape(block);
-        for (index, tile) in self.tiles.iter().enumerate() {
-            let decoded = block_of(blocks.gathered, index);
-            let placed = place(out, tile, block)?;
-            let above = (tile.above != 0).then(|| block_of(blocks.gathered, index - columns));
-            let left = (tile.left != 0).then(|| block_of(blocks.gathered, index - 1));
-            match (above, left) {
-                (Some(above), Some(left)) => {
-                    self.blend(tile.above, Axis::Rows)?
-                        .forward(f, above, decoded, handed)?;
-                    self.blend(tile.left, Axis::Columns)?
-                        .forward(f, left, handed, placed)?;
+        f.scoped(|f| {
+            let handed = f.empty(self.dtype, block)?;
+            for (index, tile) in self.tiles.iter().enumerate() {
+                let decoded = block_of(gathered, index);
+                let placed = place(out, tile, block)?;
+                let above = (tile.above != 0).then(|| block_of(gathered, index - columns));
+                let left = (tile.left != 0).then(|| block_of(gathered, index - 1));
+                match (above, left) {
+                    (Some(above), Some(left)) => {
+                        self.blend(tile.above, Axis::Rows)?
+                            .launch(f, above, decoded, handed)?;
+                        self.blend(tile.left, Axis::Columns)?
+                            .launch(f, left, handed, placed)?;
+                    }
+                    (Some(above), None) => {
+                        self.blend(tile.above, Axis::Rows)?
+                            .launch(f, above, decoded, placed)?;
+                    }
+                    (None, Some(left)) => {
+                        self.blend(tile.left, Axis::Columns)?
+                            .launch(f, left, decoded, placed)?;
+                    }
+                    (None, None) => self.place_first(f, decoded, placed)?,
                 }
-                (Some(above), None) => {
-                    self.blend(tile.above, Axis::Rows)?
-                        .forward(f, above, decoded, placed)?;
-                }
-                (None, Some(left)) => {
-                    self.blend(tile.left, Axis::Columns)?
-                        .forward(f, left, decoded, placed)?;
-                }
-                (None, None) => self.place_first(f, decoded, placed)?,
             }
-        }
-        Ok(())
+            Ok::<(), Error>(())
+        })?;
+        Ok(out)
     }
 
     /// Place the run's first tile, which has no neighbour to fade against: its block is copied
@@ -927,71 +891,91 @@ impl TiledDecode {
         })
     }
 
-    /// Run `decode` over the grid's tiles and stitch its tokens into `out`.
+    /// `decode()` over the grid's tiles, its tokens stitched into a fresh raster of `raster`
+    /// `[channels, frames, height, width]` extents and the tokens' element type.
     ///
-    /// `decode(tokens)` writes every tile's `token_rows` token rows, tile after tile, into
-    /// `[tiles · token_rows, patch]`; `table` is the grid's `[height + width, 3]` i32 stitch table
-    /// on the device, and `out` the `[channels, frames, height, width]` raster.
+    /// `decode()` answers every tile's `token_rows` token rows, tile after tile,
+    /// `[tiles · token_rows, patch]`. The grid's stitch table ([`Grid::stitch_table`]) is computed
+    /// on the host and uploaded through the forward's staging region; the decode's own
+    /// intermediates are handed back once the stitch is enqueued.
     ///
     /// # Errors
     ///
-    /// A table or raster of another extent, the model's error, or the stitch's refusal.
+    /// Tokens or a raster of another extent, the model's error, an arena or staging region that
+    /// cannot hold the buffers, or the stitch's refusal.
     pub fn forward(
         &self,
         f: &Forward,
         grid: &Grid,
         token_rows: u64,
-        decode: impl FnOnce(TensorView) -> Result<()>,
-        table: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
+        raster: Shape,
+        decode: impl FnOnce() -> Result<TensorView>,
+    ) -> Result<TensorView> {
         const OWNER: &str = "TiledDecode";
-        let (height, width) = (out.shape.dim(2), out.shape.dim(3));
-        if out.shape.rank() != 4
-            || out.shape.dim(0) != u64::from(self.descriptor.channels)
-            || table.shape.dims() != [height + width, tile_stitch::TABLE_WIDTH]
-        {
+        if raster.rank() != 4 || raster.dim(0) != u64::from(self.descriptor.channels) {
             return Err(Error::shape(
                 OWNER,
                 format!(
-                    "a stitch table of {:?} for a raster of {:?}",
-                    table.shape.dims(),
-                    out.shape.dims()
+                    "a raster of {:?} for tokens of {} channels",
+                    raster.dims(),
+                    self.descriptor.channels
                 ),
             ));
         }
+        let (height, width) = (raster.dim(2), raster.dim(3));
         let narrow = |value: u64| {
             u32::try_from(value).map_err(|_| Error::shape(OWNER, format!("{value} exceeds u32")))
         };
-        let tokens = f.arena().tensor(
-            out.dtype,
-            Shape::new(&[token_rows * grid.len() as u64, self.patch]),
+        let out = f.empty(self.descriptor.dtype, raster)?;
+        let table: Vec<i32> = grid
+            .stitch_table(narrow(height)?, narrow(width)?)
+            .into_iter()
+            .flatten()
+            .collect();
+        let table = f.upload(
+            &table,
+            Shape::new(&[height + width, tile_stitch::TABLE_WIDTH]),
         )?;
-        decode(tokens)?;
-        let (tile_rows, tile_columns) = grid.tile(1);
-        let row_table = TensorView::new(
-            table.offset_elements(0),
-            table.dtype,
-            Shape::new(&[height, tile_stitch::TABLE_WIDTH]),
-        );
-        let column_table = TensorView::new(
-            table.offset_elements(height * tile_stitch::TABLE_WIDTH),
-            table.dtype,
-            Shape::new(&[width, tile_stitch::TABLE_WIDTH]),
-        );
-        f.operate::<TileStitch>(
-            &self.descriptor,
-            tile_stitch::Args {
-                tokens,
-                rows: row_table,
-                columns: column_table,
-                out,
-                tile_columns: narrow(grid.columns.len() as u64)?,
-                token_rows: narrow(token_rows)?,
-                tile_height: tile_rows,
-                tile_width: tile_columns,
-            },
-        )
+        f.scoped(|f| {
+            let tokens = decode()?;
+            let expected = [token_rows * grid.len() as u64, self.patch];
+            if tokens.shape.dims() != expected || tokens.dtype != out.dtype {
+                return Err(Error::shape(
+                    OWNER,
+                    format!(
+                        "{:?} {} tokens, {expected:?} {} expected",
+                        tokens.shape.dims(),
+                        tokens.dtype,
+                        out.dtype
+                    ),
+                ));
+            }
+            let (tile_rows, tile_columns) = grid.tile(1);
+            let row_table = TensorView::new(
+                table.offset_elements(0),
+                table.dtype,
+                Shape::new(&[height, tile_stitch::TABLE_WIDTH]),
+            );
+            let column_table = TensorView::new(
+                table.offset_elements(height * tile_stitch::TABLE_WIDTH),
+                table.dtype,
+                Shape::new(&[width, tile_stitch::TABLE_WIDTH]),
+            );
+            f.operate::<TileStitch>(
+                &self.descriptor,
+                tile_stitch::Args {
+                    tokens,
+                    rows: row_table,
+                    columns: column_table,
+                    out,
+                    tile_columns: narrow(grid.columns.len() as u64)?,
+                    token_rows: narrow(token_rows)?,
+                    tile_height: tile_rows,
+                    tile_width: tile_columns,
+                },
+            )
+        })?;
+        Ok(out)
     }
 }
 

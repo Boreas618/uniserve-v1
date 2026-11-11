@@ -7,9 +7,9 @@
 //!
 //! ## What the solver writes
 //!
-//! Nothing but the sample. The samples are the worker's buffers, the velocity is the network's
-//! output for this evaluation, and both arrive borrowed. A model holds no host-to-device path, which
-//! is why the coefficients are constants rather than a per-step upload.
+//! Nothing but the sample. The samples are the worker's buffers and the velocity is the network's
+//! output for this evaluation. The coefficients are published constants of the schedule, and the
+//! step gathers its own by the evaluation index it uploads.
 //!
 //! ## Precision
 //!
@@ -65,20 +65,14 @@ impl Solver {
 
     /// Advance `sample` in place to the next noise level: `sample += velocity * Δsigma`.
     ///
-    /// `evaluation` is the step's index in the schedule; the runner gets it from
-    /// [`Schedule::steps`] and passes it back in [`nn::Step::index`](nn::Step). `index` is the
-    /// worker's `step` table the coefficient is gathered by on the device, and `gathered` the one
-    /// FP32 word it lands in.
-    #[allow(clippy::too_many_arguments)]
+    /// `evaluation` is the step's index in the schedule, on the host and as the `[1]` i32 the
+    /// coefficient is gathered by on the device.
     pub fn step(
         &self,
         f: &Forward,
         modality: Modality,
-        sample: TensorView,
-        velocity: TensorView,
-        evaluation: u32,
-        index: TensorView,
-        gathered: TensorView,
+        (sample, velocity): (TensorView, TensorView),
+        (evaluation, index): (u32, TensorView),
     ) -> Result<()> {
         let steps = self.steps(modality);
         if evaluation >= steps {
@@ -87,9 +81,7 @@ impl Solver {
                 modality.as_str()
             )));
         }
-        Ok(self
-            .euler(modality)
-            .forward(f, sample, velocity, index, gathered)?)
+        Ok(self.euler(modality).forward(f, sample, velocity, index)?)
     }
 
     /// Scale a fresh draw to the level the schedule starts from.

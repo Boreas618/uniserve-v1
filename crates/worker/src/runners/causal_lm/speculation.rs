@@ -197,11 +197,11 @@ impl ScoreColumns {
 
     /// The scores of `rows` rows of a `vocabulary`-wide distribution, with the candidates' chunks
     /// taken from `arena`.
-    fn views(&self, arena: &nn::Arena, rows: u64, vocabulary: u32) -> Result<Scores> {
+    fn views(&self, f: &Forward<'_>, rows: u64, vocabulary: u32) -> Result<Scores> {
         let width = u64::from(self.candidates);
         let top = match (&self.values, &self.ids) {
             (Some(values), Some(ids)) => Some(TopLogprobs::with_chunks(
-                arena,
+                f,
                 values.shaped(&[rows, width]),
                 ids.shaped(&[rows, width]),
                 rows,
@@ -666,6 +666,25 @@ impl<M: TextModel> CausalLmRunner<M> {
         generation: u64,
         batch: ipc::execution::BatchId,
     ) -> Result<BatchOutput> {
+        // The step's forward borrows the staging regions across calls that update the runner, so
+        // the regions are held apart from it for the step: moving them moves their handles, not
+        // the memory a graph addresses.
+        let regions = std::mem::replace(
+            &mut self.lifecycle.staging,
+            crate::staging::StagingRegion::empty(),
+        );
+        let answer = self.speculate_over(generation, batch, &regions);
+        self.lifecycle.staging = regions;
+        answer
+    }
+
+    /// [`Self::speculate`] with the runner's staging regions `regions`.
+    fn speculate_over(
+        &mut self,
+        generation: u64,
+        batch: ipc::execution::BatchId,
+        regions: &crate::staging::StagingRegion,
+    ) -> Result<BatchOutput> {
         let launched = Instant::now();
         let kernels = self.lifecycle.generation_named(generation)?;
         self.install_pending(batch)?;
@@ -679,12 +698,15 @@ impl<M: TextModel> CausalLmRunner<M> {
         let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let tensor = self.tensor.clone();
-        let mut forward = Forward::new(&stream, &kernels, &arena);
+        // The speculative step runs eagerly, so whatever its forwards upload is copied from a
+        // staging slot the stream consumes before the slot is reused.
+        let staging = regions.slot()?;
+        let mut forward = Forward::new(&stream, &kernels, &arena).with_staging(staging);
         if let Some(group) = tensor.as_deref() {
             forward = forward.with_group(group);
         }
 
-        let workspace = arena.tensor(DType::U8, ops::Shape::new(&[ATTENTION_WORKSPACE_BYTES]))?;
+        let workspace = forward.empty(DType::U8, ops::Shape::new(&[ATTENTION_WORKSPACE_BYTES]))?;
         self.write_target(&plan)?;
         let hidden = self.target(&forward, &plan, workspace)?;
         // The rows' checkpoints move into the state pages behind the forward that wrote them.
@@ -694,6 +716,7 @@ impl<M: TextModel> CausalLmRunner<M> {
         // their counts and bias rows.
         self.start_slots(&stream)?;
         self.sample_rows(&forward, &plan, hidden)?;
+        regions.release(&stream)?;
         stream.synchronize()?;
 
         let accepted = self.accept(&plan)?;
@@ -912,11 +935,7 @@ impl<M: TextModel> CausalLmRunner<M> {
         let ids = spec.ids.extent(0..tokens);
         let live = spec.live.extent(0..1);
         let forward = forward_with_live(forward, live);
-        let hidden = forward.arena().tensor(
-            self.model.dtype(),
-            Shape::new(&[tokens, u64::from(self.model.hidden())]),
-        )?;
-        let quiet = forward.is_recording();
+        let quiet = !forward.launches();
         self.with_kv_over(
             workspace,
             &slots,
@@ -924,18 +943,18 @@ impl<M: TextModel> CausalLmRunner<M> {
             quiet,
             Some((state_view, plan.verify)),
             |cache| {
-                self.model
-                    .embed_input_ids(&forward, ids, hidden)
+                let embedded = self
+                    .model
+                    .embed_input_ids(&forward, ids)
                     .map_err(Error::from)?;
-                if !forward.is_recording() {
-                    self.write_image_rows(hidden)?;
+                if forward.launches() {
+                    self.write_image_rows(embedded)?;
                 }
                 self.model
-                    .forward(&forward, &batch, cache, hidden)
+                    .forward(&forward, &batch, cache, embedded)
                     .map_err(Error::from)
             },
-        )?;
-        Ok(hidden)
+        )
     }
 
     /// Writes the sampling step's columns.
@@ -981,20 +1000,12 @@ impl<M: TextModel> CausalLmRunner<M> {
             .sampling
             .as_ref()
             .ok_or(Error::State("a speculating runner samples"))?;
-        let arena = forward.arena();
-        let gathered = arena.tensor(
-            self.model.dtype(),
-            Shape::new(&[rows, u64::from(self.model.hidden())]),
-        )?;
-        nn::IndexRows
-            .gather(forward, hidden, spec.indices.extent(0..rows), gathered)
+        let gathered = nn::IndexRows
+            .gather(forward, hidden, spec.indices.extent(0..rows))
             .map_err(Error::from)?;
-        let logits = arena.tensor(
-            LOGITS_DTYPE,
-            Shape::new(&[rows, u64::from(self.model.vocabulary())]),
-        )?;
-        self.model
-            .compute_logits(forward, gathered, logits)
+        let logits = self
+            .model
+            .compute_logits(forward, gathered)
             .map_err(Error::from)?;
         let state = SamplerState {
             counts: sampling.counts,
@@ -1020,18 +1031,18 @@ impl<M: TextModel> CausalLmRunner<M> {
             .verifier
             .as_ref()
             .ok_or(Error::State("a speculating runner verifies"))?;
-        if greedy || forward.is_recording() {
+        if greedy || !forward.launches() {
             sampler.greedy(
                 forward,
                 logits,
                 &state,
                 &Samples {
                     tokens: spec.greedy.extent(0..rows),
-                    scores: Some(spec.greedy_scores.views(arena, rows, spec.vocabulary)?),
+                    scores: Some(spec.greedy_scores.views(forward, rows, spec.vocabulary)?),
                 },
             )?;
         }
-        if drawn || forward.is_recording() {
+        if drawn || !forward.launches() {
             sampler.forward(
                 forward,
                 logits,
@@ -1039,7 +1050,7 @@ impl<M: TextModel> CausalLmRunner<M> {
                 spec.draws.extent(0..rows),
                 &Samples {
                     tokens: spec.drawn.extent(0..rows),
-                    scores: Some(spec.drawn_scores.views(arena, rows, spec.vocabulary)?),
+                    scores: Some(spec.drawn_scores.views(forward, rows, spec.vocabulary)?),
                 },
             )?;
         }
@@ -1309,7 +1320,7 @@ impl<M: TextModel> CausalLmRunner<M> {
         hidden: TensorView,
         workspace: TensorView,
     ) -> Result<Vec<Vec<u32>>> {
-        let recording = forward.is_recording();
+        let recording = !forward.launches();
         let pool = self
             .speculation
             .as_ref()
@@ -1440,9 +1451,6 @@ impl<M: TextModel> CausalLmRunner<M> {
             .as_ref()
             .ok_or(Error::State("speculation"))?;
         let planes = self.kv.draft_planes()?;
-        let dtype = self.model.dtype();
-        let width_hidden = u64::from(self.model.hidden());
-        let arena = forward.arena();
         let page = pool.page;
         let view = |tables: TensorView| -> [nn::KvGroup<'_>; 1] {
             [nn::KvGroup {
@@ -1454,18 +1462,17 @@ impl<M: TextModel> CausalLmRunner<M> {
         };
 
         // The entries.
-        let embedded = arena.tensor(dtype, Shape::new(&[tokens, width_hidden]))?;
-        let states = arena.tensor(dtype, Shape::new(&[tokens, width_hidden]))?;
         let entries_forward = forward_with_live(forward, spec.live.extent(0..1).shifted(pitch(1)));
-        self.model
-            .embed_input_ids(&entries_forward, spec.draft_ids.extent(0..tokens), embedded)
+        let embedded = self
+            .model
+            .embed_input_ids(&entries_forward, spec.draft_ids.extent(0..tokens))
             .map_err(Error::from)?;
-        nn::IndexRows
+        // The target states each entry reads.
+        let states = nn::IndexRows
             .gather(
                 &entries_forward,
                 hidden,
                 spec.draft_hidden.extent(0..tokens),
-                states,
             )
             .map_err(Error::from)?;
         let batch = TokenBatch {
@@ -1485,7 +1492,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             spec.draft_tables
                 .shaped(&[drafter_rows, u64::from(spec.width)]),
         );
-        drafter
+        let drafted = drafter
             .forward(
                 &entries_forward,
                 &batch,
@@ -1504,19 +1511,9 @@ impl<M: TextModel> CausalLmRunner<M> {
 
         // The first proposal of each call, from its last entry, then the chained steps.
         let chained = forward_with_live(forward, spec.live.extent(0..1).shifted(2 * pitch(1)));
-        let current = arena.tensor(dtype, Shape::new(&[calls, width_hidden]))?;
-        nn::IndexRows
-            .gather(
-                &chained,
-                states,
-                spec.last_entries.extent(0..calls),
-                current,
-            )
+        let mut current = nn::IndexRows
+            .gather(&chained, drafted, spec.last_entries.extent(0..calls))
             .map_err(Error::from)?;
-        let logits = arena.tensor(
-            LOGITS_DTYPE,
-            Shape::new(&[calls, u64::from(self.model.vocabulary())]),
-        )?;
         let argmax = ops::sampler::ArgMaxDescriptor {
             dtype: LOGITS_DTYPE,
             width: self.model.vocabulary(),
@@ -1531,9 +1528,10 @@ impl<M: TextModel> CausalLmRunner<M> {
                 Shape::new(&[calls]),
             )
         };
-        let propose = |step: u32| -> Result<()> {
-            self.model
-                .compute_logits(&chained, current, logits)
+        let propose = |step: u32, current: TensorView| -> Result<()> {
+            let logits = self
+                .model
+                .compute_logits(&chained, current)
                 .map_err(Error::from)?;
             chained
                 .operate::<ops::sampler::ArgMax>(
@@ -1545,9 +1543,8 @@ impl<M: TextModel> CausalLmRunner<M> {
                 )
                 .map_err(Error::from)
         };
-        propose(0)?;
+        propose(0, current)?;
         let chained_groups = view(spec.chained_tables.shaped(&[calls, u64::from(spec.width)]));
-        let step_embedded = arena.tensor(dtype, Shape::new(&[calls, width_hidden]))?;
         for step in 1..steps {
             let at = u64::from(step - 1) * pitch(calls);
             let column = |column: &Column| -> TensorView {
@@ -1557,8 +1554,9 @@ impl<M: TextModel> CausalLmRunner<M> {
                     Shape::new(&[calls]),
                 )
             };
-            self.model
-                .embed_input_ids(&chained, proposal(step - 1), step_embedded)
+            let step_embedded = self
+                .model
+                .embed_input_ids(&chained, proposal(step - 1))
                 .map_err(Error::from)?;
             let batch = TokenBatch {
                 positions: column(&spec.chained_positions),
@@ -1573,7 +1571,7 @@ impl<M: TextModel> CausalLmRunner<M> {
                 draft_lens: None,
                 rope_positions: None,
             };
-            drafter
+            current = drafter
                 .forward(
                     &chained,
                     &batch,
@@ -1586,7 +1584,7 @@ impl<M: TextModel> CausalLmRunner<M> {
                     current,
                 )
                 .map_err(Error::from)?;
-            propose(step)?;
+            propose(step, current)?;
         }
         if recording {
             return Ok(proposals);
@@ -1635,9 +1633,7 @@ impl<M: TextModel> CausalLmRunner<M> {
     /// One recorded speculative step of `plan`.
     fn walk_speculation(&mut self, walk: &Walk, plan: &Plan) -> Result<()> {
         let forward = walk.forward(self.tensor.as_deref())?;
-        let workspace = forward
-            .arena()
-            .tensor(DType::U8, ops::Shape::new(&[ATTENTION_WORKSPACE_BYTES]))?;
+        let workspace = forward.empty(DType::U8, ops::Shape::new(&[ATTENTION_WORKSPACE_BYTES]))?;
         let hidden = self.target(&forward, plan, workspace)?;
         self.sample_rows(&forward, plan, hidden)?;
         self.launch_commit(&forward, plan.calls.len() as u64)?;

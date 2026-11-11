@@ -13,7 +13,7 @@
 //!   denoiser, decoders and the media format of its conditions, which execution serves as the
 //!   calls of one diffusion request.
 //!
-//! The contract is numerical. A family reads its checkpoint and states its mathematical facts
+//! The interface is numerical. A family reads its checkpoint and states its mathematical facts
 //! (widths, cache shape, frame rule, the requests its graphs are captured for); it receives the
 //! deployment's mathematical partition ([`Split`], [`SequenceSplit`]) and the deployment's serving
 //! bounds ([`VideoServing`]), and it holds no runtime object: execution owns the devices, streams,
@@ -134,10 +134,10 @@ impl Split {
 /// One block of a video pipeline, by the name a deployment file places it under and execution
 /// reports it by.
 ///
-/// The vocabulary is the pipeline components' (`model_index.json`'s names), shared by every video
+/// The vocabulary is the pipeline stages' (`model_index.json`'s names), shared by every video
 /// family; which checkpoint directories a block reads is the family's own mapping.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum Component {
+pub enum Stage {
     /// The text encoder and its vision tower.
     TextEncoder,
     /// The base denoiser network.
@@ -154,19 +154,19 @@ pub enum Component {
     VideoPostprocessor,
 }
 
-impl Component {
-    /// Every component a deployment may place, in deployment order.
-    pub const ALL: [Component; 7] = [
-        Component::TextEncoder,
-        Component::Transformer,
-        Component::TransformerRef,
-        Component::VideoDecoder,
-        Component::AudioDecoder,
-        Component::LatentEncoder,
-        Component::VideoPostprocessor,
+impl Stage {
+    /// Every stage a deployment may place, in deployment order.
+    pub const ALL: [Stage; 7] = [
+        Stage::TextEncoder,
+        Stage::Transformer,
+        Stage::TransformerRef,
+        Stage::VideoDecoder,
+        Stage::AudioDecoder,
+        Stage::LatentEncoder,
+        Stage::VideoPostprocessor,
     ];
 
-    /// This component's bit in [`Components`].
+    /// This stage's bit in [`Stages`].
     const fn bit(self) -> u8 {
         match self {
             Self::TextEncoder => 0,
@@ -179,7 +179,7 @@ impl Component {
         }
     }
 
-    /// The component's name in a deployment file and in what execution reports.
+    /// The stage's name in a deployment file and in what execution reports.
     pub const fn name(self) -> &'static str {
         match self {
             Self::TextEncoder => "text_encoder",
@@ -193,50 +193,50 @@ impl Component {
     }
 }
 
-/// A set of pipeline components: the blocks one rank places.
+/// A set of pipeline stages: the blocks one rank places.
 ///
 /// A deployment places a handful of blocks out of seven, so the set is a bit per block and `Copy`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Components(u8);
+pub struct Stages(u8);
 
-impl Components {
+impl Stages {
     /// Every block a deployment may place.
-    pub const ALL: Components = Components((1 << Component::ALL.len()) - 1);
+    pub const ALL: Stages = Stages((1 << Stage::ALL.len()) - 1);
 
     /// No block.
-    pub const NONE: Components = Components(0);
+    pub const NONE: Stages = Stages(0);
 
-    /// The set of `components`.
-    pub fn of(components: impl IntoIterator<Item = Component>) -> Self {
-        components.into_iter().fold(Self::NONE, Self::with)
+    /// The set of `stages`.
+    pub fn of(stages: impl IntoIterator<Item = Stage>) -> Self {
+        stages.into_iter().fold(Self::NONE, Self::with)
     }
 
-    /// The set with `component` added.
-    pub const fn with(self, component: Component) -> Self {
-        Self(self.0 | 1 << component.bit())
+    /// The set with `stage` added.
+    pub const fn with(self, stage: Stage) -> Self {
+        Self(self.0 | 1 << stage.bit())
     }
 
-    /// The set without `component`.
-    pub const fn without(self, component: Component) -> Self {
-        Self(self.0 & !(1 << component.bit()))
+    /// The set without `stage`.
+    pub const fn without(self, stage: Stage) -> Self {
+        Self(self.0 & !(1 << stage.bit()))
     }
 
-    /// Whether `component` is placed.
-    pub const fn contains(self, component: Component) -> bool {
-        self.0 & (1 << component.bit()) != 0
+    /// Whether `stage` is placed.
+    pub const fn contains(self, stage: Stage) -> bool {
+        self.0 & (1 << stage.bit()) != 0
     }
 
     /// The blocks placed, in deployment order.
-    pub fn iter(self) -> impl Iterator<Item = Component> {
-        Component::ALL
+    pub fn iter(self) -> impl Iterator<Item = Stage> {
+        Stage::ALL
             .into_iter()
-            .filter(move |component| self.contains(*component))
+            .filter(move |stage| self.contains(*stage))
     }
 }
 
-impl FromIterator<Component> for Components {
-    fn from_iter<I: IntoIterator<Item = Component>>(components: I) -> Self {
-        Self::of(components)
+impl FromIterator<Stage> for Stages {
+    fn from_iter<I: IntoIterator<Item = Stage>>(stages: I) -> Self {
+        Self::of(stages)
     }
 }
 
@@ -294,7 +294,7 @@ pub struct TextPlacement {
     pub drafter: bool,
 }
 
-/// A loaded causal language model, as execution plans and serves it.
+/// A loaded causal language model, as execution sizes and serves it.
 pub trait TextModel: CausalLm + Send + Sync {
     /// The width of a hidden row.
     fn hidden(&self) -> u32;
@@ -345,9 +345,9 @@ pub trait Drafter: Send + Sync {
     fn cache(&self) -> CacheShape;
 
     /// Run the drafter over `batch`: `embedded [tokens, hidden]` holds the embedding of each
-    /// entry's next token and `hidden [tokens, hidden]` the hidden state each entry reads, which
-    /// the drafter overwrites with its own normalized hidden state. `cache` holds the draft cache's
-    /// one attention group, which the batch's slot mapping writes.
+    /// entry's next token and `hidden [tokens, hidden]` the hidden state each entry reads; answers
+    /// the drafter's own normalized hidden state, `[tokens, hidden]`. `cache` holds the draft
+    /// cache's one attention group, which the batch's slot mapping writes.
     ///
     /// # Errors
     ///
@@ -359,7 +359,7 @@ pub trait Drafter: Send + Sync {
         cache: &KvView<'_>,
         embedded: TensorView,
         hidden: TensorView,
-    ) -> Result<()>;
+    ) -> Result<TensorView>;
 }
 
 /// The recurrent state a causal language model keeps per request slot, as one rank holds it: every
@@ -440,7 +440,7 @@ pub trait VideoFamily: Send + Sync {
     /// Fails when the configuration cannot be read or states a pipeline this family cannot build.
     fn open(&self, checkpoint: &Checkpoint) -> Result<Box<dyn VideoCheckpoint>>;
 
-    /// The component of `checkpoint` whose tensors `adapter` edits, or `None` for a flat
+    /// The stage of `checkpoint` whose tensors `adapter` edits, or `None` for a flat
     /// checkpoint's own shard set: where the loading boundary fuses it
     /// ([`Checkpoint::attach`]) before [`VideoFamily::open`] reads the adapted checkpoint.
     ///
@@ -452,7 +452,7 @@ pub trait VideoFamily: Send + Sync {
     ///
     /// Fails when the family does not recognize `adapter` as an adapter of its checkpoints, which
     /// is every adapter for a family that serves none.
-    fn adapter_component(
+    fn adapter_stage(
         &self,
         checkpoint: &Checkpoint,
         adapter: &crate::Adapter,
@@ -467,11 +467,11 @@ pub trait VideoFamily: Send + Sync {
 
 /// A video generation checkpoint, read but not loaded.
 pub trait VideoCheckpoint: Send + Sync {
-    /// The deployment components that hold a denoiser network, in the names a deployment file
+    /// The deployment stages that hold a denoiser network, in the names a deployment file
     /// places them under; a checkpoint may hold several networks and a deployment places one.
     fn denoisers(&self) -> &'static [&'static str];
 
-    /// The deployment component that holds the text encoder.
+    /// The deployment stage that holds the text encoder.
     fn text_encoder(&self) -> &'static str;
 
     /// Loads the pipeline's share of `checkpoint`, the checkpoint [`VideoFamily::open`] read, for
@@ -492,9 +492,9 @@ pub trait VideoCheckpoint: Send + Sync {
 /// How a deployment splits a video pipeline and sizes it, and this rank's place in the split.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoPlacement {
-    /// The components the deployment places on this rank's group; `None` places the whole
+    /// The stages the deployment places on this rank's group; `None` places the whole
     /// pipeline.
-    pub components: Option<BTreeSet<String>>,
+    pub stages: Option<BTreeSet<String>>,
     /// The denoiser's sequence split.
     pub sequence: SequenceSplit,
     /// The text encoder's tensor split.
@@ -550,7 +550,7 @@ pub enum Projection {
     Exchange,
 }
 
-/// A loaded video generation pipeline, as execution plans and serves it.
+/// A loaded video generation pipeline, as execution sizes and serves it.
 ///
 /// Each block is absent when this rank does not place it. Execution binds one runner per block
 /// present and states to its scheduler the calls those runners serve.
@@ -564,9 +564,9 @@ pub trait VideoModel: Send + Sync {
     /// The denoiser network this rank places.
     fn denoiser(&self) -> Option<Arc<dyn Denoiser + Send + Sync>>;
 
-    /// The deployment component the placed denoiser is, one of
+    /// The deployment stage the placed denoiser is, one of
     /// [`VideoCheckpoint::denoisers`].
-    fn denoiser_component(&self) -> &'static str;
+    fn denoiser_stage(&self) -> &'static str;
 
     /// The element type the denoiser's trajectory and noise are kept in.
     fn sample_type(&self) -> DType;
@@ -637,7 +637,7 @@ pub trait VideoModel: Send + Sync {
     fn warm_prompts(&self, serving: &VideoServing) -> Result<Vec<WarmPrompt>>;
 
     /// What the placed denoiser serves under `serving`, as the deployment's request processing
-    /// plans requests against it.
+    /// admits requests against it.
     ///
     /// # Errors
     ///
