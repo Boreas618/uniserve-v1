@@ -28,6 +28,10 @@ pub fn rank(host: &str) -> MainProcessInfo {
         // The prefix cache is `MainProcessInfo::default`'s: a rank without one is refused every
         // token request at admission, which is the rule for a media-only rank and not this one.
         buffer_pool_bytes: 1 << 20,
+        // A rank that samples states how many candidates it computes for a position, which
+        // bounds what a request may ask (`GenerationLimits::max_logprobs`): the fake reports
+        // every sampled token's log-probability, as a launch with `max_logprobs = 20` does.
+        max_logprobs: 20,
         ..MainProcessInfo::default()
     }
 }
