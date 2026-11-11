@@ -6,7 +6,7 @@
 //! [`BlockPool`] owns physical unit availability and prefix-cache metadata.
 //! [`BlockTable`] maps one sequence's logical pages of one cache group to
 //! reference-counted pages of units. Dropping the final reference returns the
-//! units to the pool. [`PrefixCacheCoordinator`] applies allocation, window
+//! units to the pool. [`KvCacheManager`] applies allocation, window
 //! release and prefix reuse across every cache group of a request at once.
 //!
 //! Key concepts:
@@ -28,7 +28,7 @@
 //!   hit on an unreferenced page unlinks its units from wherever they sit.
 //! - Sliding windows: a table of a sliding-window group keeps pages from its
 //!   `start_page` on. Pages before it are retired, and a worker never reads
-//!   them. After a call completes, [`PrefixCacheCoordinator::release_window`]
+//!   them. After a call completes, [`KvCacheManager::release_window`]
 //!   retires the pages that lie entirely before the oldest history position
 //!   any later reader needs.
 //! - Prefix identity: a published page is keyed by its page key, the
@@ -42,6 +42,12 @@
 //!   page before it, and each sliding-window group's window of pages just
 //!   before it. The same managers decide reuse in the device cache and,
 //!   through [`KvOffloadManager`], in the host KV cache and the KV storage.
+//! - Tiers: a request's prefix is looked up once, device first
+//!   (`Scheduler::lookup_prefix`): [`KvCacheManager::find_prefix`] says what
+//!   the device holds, and [`KvOffloadManager`] extends it from the host
+//!   pool, then from the peers' pools and the remote store, through the one
+//!   client of the Storage Servers (`crate::host_pages`). A page has one key
+//!   at every tier, and a tier that fails is skipped.
 //! - State checkpoints: a state group (`CacheGroupKind::State`) holds the
 //!   checkpoints of the layers a worker keeps per request slot, such as a
 //!   recurrent state: page `k` holds the state after token `(k + 1) *
@@ -70,12 +76,10 @@ use storage::Key;
 
 use crate::lock;
 
-mod encoder_cache;
 mod freeq;
 pub(crate) mod manager;
 mod offload;
 
-pub(crate) use encoder_cache::{EncoderCacheManager, EncoderKey};
 use freeq::UnitMeta;
 pub use offload::HostCacheSize;
 pub(crate) use offload::{
@@ -1420,7 +1424,7 @@ impl GroupShape {
 
     /// Whether the group holds the draft cache, optional state a request
     /// may lack: its tables take units as the pool allows
-    /// ([`PrefixCacheCoordinator::ensure_capacity`]), its pages never bound
+    /// ([`KvCacheManager::allocate`]), its pages never bound
     /// a reuse of the other groups, and a page's key covers the token after
     /// the page ([`GroupShape::key_tokens`]).
     pub(crate) fn draft(&self) -> bool {
@@ -1845,10 +1849,10 @@ impl CacheAllocation {
 pub(crate) struct PrefixLookup {
     /// Chained hash of every complete prompt page, indexed by group and then
     /// by logical page. The scheduler keeps these to publish the prompt
-    /// through [`PrefixCacheCoordinator::publish_computed`] as prefill
+    /// through [`KvCacheManager::publish`] as prefill
     /// completes, and extends them over the tokens the request generates.
     /// Empty when prefix caching does not apply to the request.
-    pub(crate) page_hashes: Vec<Vec<Key>>,
+    pub(crate) page_keys: Vec<Vec<Key>>,
     /// Leading prompt tokens acquired from the prefix cache. A final
     /// partial page is copied before the resumed computation appends to it.
     pub(crate) cached_tokens: usize,
@@ -1862,7 +1866,9 @@ pub(crate) struct PrefixLookup {
     pub(crate) draft_tokens: usize,
 }
 
-/// Read-only prefix-cache probe result across every cache group.
+/// The longest prefix of a prompt the KV cache holds, across every cache
+/// group: what the device holds ([`KvCacheManager::find_prefix`]) and, once
+/// the scheduler's lookup asked them, what the tiers below it add.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct PrefixHit {
     /// The first unit of every page the hit covers, group by group, in logical
@@ -1877,6 +1883,10 @@ pub(crate) struct PrefixHit {
     /// Those units count as free capacity until acquired, so admission
     /// subtracts them from the free units.
     pub(crate) cached_free_units: usize,
+    /// Prompt tokens after `cached_tokens` that the tiers below the device
+    /// serve: the host pool, the peers' pools and the remote store. `None`
+    /// when no tier below the device applies to the request.
+    pub(crate) lower_tokens: Option<usize>,
 }
 
 /// The pages a validated prefix of `tokens` tokens needs from each group.
@@ -1937,29 +1947,34 @@ pub fn prefix_seeds(cache: &ipc::PrefixCacheInfo) -> Vec<Key> {
         .collect()
 }
 
-/// Coordinates capacity, window release and prefix state across cache
-/// groups over the unit pool it owns.
+/// The KV cache of one scheduler: what the scheduler calls to find the longest
+/// cached prefix of a request ([`Self::find_prefix`], [`Self::acquire_prefix`]),
+/// to allocate the pages its next call needs ([`Self::allocate`]), to free its
+/// pages ([`Self::free`]) and to publish the pages it computed
+/// ([`Self::publish`]). It owns the unit pool every group shares, and applies
+/// each group's reuse rules ([`manager`]) so a reuse ends at the deepest
+/// boundary all of them accept.
 ///
 /// Callers pass one [`CacheAllocation`] whose tables match `groups` in order;
 /// the methods return `None` or `false` for any other table set.
 #[derive(Debug)]
-pub(crate) struct PrefixCacheCoordinator {
+pub(crate) struct KvCacheManager {
     /// The units every group's pages take, shared by all of them.
     pool: BlockPool,
     groups: Vec<GroupShape>,
     prefix_enabled: bool,
     /// The page seed of each group's chain; a request's isolation key is
     /// mixed into its root (`storage::key::page_root`).
-    hash_seeds: Vec<Key>,
+    seeds: Vec<Key>,
 }
 
-impl PrefixCacheCoordinator {
-    /// Creates a coordinator for the given cache groups over `pool`, with
+impl KvCacheManager {
+    /// Creates a manager for the given cache groups over `pool`, with
     /// prefix caching enabled and a zero chain seed.
     pub(crate) fn new(pool: BlockPool, groups: Vec<GroupShape>) -> Self {
         Self {
             pool,
-            hash_seeds: vec![Key([0; 32]); groups.len()],
+            seeds: vec![Key([0; 32]); groups.len()],
             groups,
             prefix_enabled: true,
         }
@@ -1984,7 +1999,7 @@ impl PrefixCacheCoordinator {
                 pool.withdraw(usable);
             }
             pool.inherit(prefix_cache.inherited());
-            let mut coordinator = Self::new(
+            let mut kv_cache = Self::new(
                 pool,
                 prefix_cache
                     .groups
@@ -1992,8 +2007,8 @@ impl PrefixCacheCoordinator {
                     .map(GroupShape::from_group)
                     .collect(),
             );
-            coordinator.set_seeds(prefix_seeds(prefix_cache));
-            coordinator
+            kv_cache.set_seeds(prefix_seeds(prefix_cache));
+            kv_cache
         })
     }
 
@@ -2002,40 +2017,22 @@ impl PrefixCacheCoordinator {
         &self.pool
     }
 
-    /// Acquires one table per cache group holding `tokens` tokens for a read
-    /// from token zero, atomically.
-    pub(crate) fn allocate(
-        &self,
-        tokens: u32,
-    ) -> Result<CacheAllocation, crate::allocation::OutOfStorage> {
-        let mut allocation = self.empty();
-        self.ensure_capacity(&mut allocation, 0, tokens as usize, Checkpoint::Boundary)
-            .ok_or(crate::allocation::OutOfStorage::PrefixCache)?;
-        Ok(allocation)
-    }
-
-    /// Grows every cache group atomically for a call that reads from token
-    /// `read_start` and holds `tokens` tokens, retaining shared prefix
-    /// references; its state groups checkpoint as `checkpoint` says.
-    pub(crate) fn grow(
-        &self,
-        allocation: &mut CacheAllocation,
-        read_start: u32,
-        tokens: u32,
-        checkpoint: Checkpoint,
-    ) -> Result<(), crate::allocation::OutOfStorage> {
-        self.ensure_capacity(allocation, read_start as usize, tokens as usize, checkpoint)
-            .ok_or(crate::allocation::OutOfStorage::PrefixCache)
+    /// Frees the pages a request holds: every table's references return to
+    /// the pool, where a page no other table holds joins the tail of the
+    /// free queue and, when published, stays findable by its key until
+    /// allocation takes its units.
+    pub(crate) fn free(&self, allocation: CacheAllocation) {
+        drop(allocation);
     }
 
     /// Root subsequent page hashes at each group's upstream computation.
     pub(crate) fn set_seeds(&mut self, seeds: Vec<Key>) {
         assert_eq!(seeds.len(), self.groups.len());
-        self.hash_seeds = seeds;
+        self.seeds = seeds;
     }
 
     pub(crate) fn seeds(&self) -> &[Key] {
-        &self.hash_seeds
+        &self.seeds
     }
 
     /// The root of `group`'s page chain for a request of `scope`.
@@ -2046,7 +2043,7 @@ impl PrefixCacheCoordinator {
         let seed = scope
             .state_seeds
             .get(group)
-            .map_or(self.hash_seeds[group], |seed| Key(*seed));
+            .map_or(self.seeds[group], |seed| Key(*seed));
         storage::key::page_root(&seed, scope.isolation_key)
     }
 
@@ -2208,16 +2205,17 @@ impl PrefixCacheCoordinator {
             .sum()
     }
 
-    /// Grows every group table atomically for a call that reads from token
-    /// `read_start` and holds `total_tokens` tokens, checkpointing its
-    /// state groups as `checkpoint` says.
+    /// Allocates the pages a request's next call needs: grows every group
+    /// table atomically for a call that reads from token `read_start` and
+    /// holds `total_tokens` tokens, retaining shared prefix references and
+    /// checkpointing its state groups as `checkpoint` says.
     ///
     /// The sum of every group's unit demand must fit the free units; the call
     /// then allocates them all or nothing. Returns `None`, with every table
     /// unchanged, when the tables do not match the groups or the pool lacks
     /// free units. The draft cache's table then grows as the units left
     /// allow ([`Self::grow_draft`]).
-    pub(crate) fn ensure_capacity(
+    pub(crate) fn allocate(
         &self,
         allocation: &mut CacheAllocation,
         read_start: usize,
@@ -2478,19 +2476,19 @@ impl PrefixCacheCoordinator {
     /// different chains and reuse none of each other's pages
     /// (`storage::key::page_root`). Every cache level keys a page by its
     /// key in this chain.
-    pub(crate) fn prefix_hashes(&self, prompt: &[u32], scope: PrefixScope) -> Vec<Vec<Key>> {
+    pub(crate) fn page_keys(&self, prompt: &[u32], scope: PrefixScope) -> Vec<Vec<Key>> {
         let mut hashes = vec![Vec::new(); self.groups.len()];
-        self.extend_hashes(&mut hashes, CachedTokens::prompt(prompt), scope);
+        self.extend_page_keys(&mut hashes, CachedTokens::prompt(prompt), scope);
         hashes
     }
 
     /// Extends each group's hash chain in `hashes` over the complete pages of
-    /// `tokens` it does not cover yet, as [`Self::prefix_hashes`] chains a
+    /// `tokens` it does not cover yet, as [`Self::page_keys`] chains a
     /// prompt's pages: a chain over a request's prompt extended over the
     /// tokens it generated equals the chain over the prompt of its
     /// migration, whose prompt continues with those tokens. `hashes` holds
     /// one chain per group, each a prefix of the chain over `tokens`.
-    pub(crate) fn extend_hashes(
+    pub(crate) fn extend_page_keys(
         &self,
         hashes: &mut [Vec<Key>],
         tokens: CachedTokens<'_>,
@@ -2693,10 +2691,10 @@ impl PrefixCacheCoordinator {
     ///
     /// Admission uses the result to estimate the units a request needs
     /// before committing to it. A page found here can be evicted before
-    /// [`PrefixCacheCoordinator::acquire_prefix`] runs, so the hit is an
+    /// [`KvCacheManager::acquire_prefix`] runs, so the hit is an
     /// estimate. Returns an empty hit when prefix caching is disabled,
     /// `cache_read` is false, or the request carries images.
-    pub(crate) fn probe_prefix(
+    pub(crate) fn find_prefix(
         &self,
         prompt: &[u32],
         cache_read: bool,
@@ -2710,7 +2708,7 @@ impl PrefixCacheCoordinator {
         if scope.resume.is_none() && (!self.prefix_enabled || !cache_read || has_images) {
             return PrefixHit::default();
         }
-        let hashes = self.prefix_hashes(prompt, scope);
+        let hashes = self.page_keys(prompt, scope);
         let selection = self.select_prefix(
             prompt,
             &hashes,
@@ -2744,6 +2742,7 @@ impl PrefixCacheCoordinator {
             cached_tokens: selection.tokens,
             cached_free_units,
             matched_pages,
+            lower_tokens: None,
         }
     }
 
@@ -2777,13 +2776,13 @@ impl PrefixCacheCoordinator {
         }
 
         // Empty hashes also prevent prefix-cache insertion for image requests; see
-        // `probe_prefix` for why images are excluded.
+        // `find_prefix` for why images are excluded.
         if scope.resume.is_none() && (!self.prefix_enabled || has_images) {
             return Some(PrefixLookup::default());
         }
-        let hashes = self.prefix_hashes(prompt, scope);
+        let hashes = self.page_keys(prompt, scope);
         let mut result = PrefixLookup {
-            page_hashes: hashes,
+            page_keys: hashes,
             cached_tokens: 0,
             matched_pages: Vec::new(),
             draft_tokens: 0,
@@ -2794,7 +2793,7 @@ impl PrefixCacheCoordinator {
 
         let selection = self.select_prefix(
             prompt,
-            &result.page_hashes,
+            &result.page_keys,
             source,
             scope,
             self.prefix_enabled && cache_read && !has_images,
@@ -2811,7 +2810,7 @@ impl PrefixCacheCoordinator {
                     // `acquire` rechecks each page's identity.
                     pool.acquire(
                         *head,
-                        result.page_hashes[group][page],
+                        result.page_keys[group][page],
                         group as u32,
                         span,
                         source,
@@ -2881,7 +2880,7 @@ impl PrefixCacheCoordinator {
                     pool.publish(
                         reference,
                         group as u32,
-                        result.page_hashes[group][page],
+                        result.page_keys[group][page],
                         &prompt[first..first + table.shape.key_tokens()],
                         &source,
                         Some(resume),
@@ -2936,7 +2935,7 @@ impl PrefixCacheCoordinator {
         }
         let computed = computed.min(tokens.len());
         let mut hashes = vec![Vec::new(); self.groups.len()];
-        self.extend_hashes(&mut hashes, tokens, scope);
+        self.extend_page_keys(&mut hashes, tokens, scope);
         for (group, table) in allocation.tables.iter().enumerate() {
             let seed = self.group_seed(group, scope);
             let shape = table.shape;
@@ -2968,8 +2967,8 @@ impl PrefixCacheCoordinator {
     /// after it, whose pages a migration of the request finds as its prompt's.
     ///
     /// `hashes` chains every complete page of `tokens` (the prompt's from
-    /// [`PrefixCacheCoordinator::acquire_prefix`], the generated tokens'
-    /// through [`PrefixCacheCoordinator::extend_hashes`]), and `published`
+    /// [`KvCacheManager::acquire_prefix`], the generated tokens'
+    /// through [`KvCacheManager::extend_page_keys`]), and `published`
     /// records per group how many leading pages were already published; both
     /// advance together. A page is published once the worker has computed
     /// all of its tokens (`computed_tokens`) and while the table still holds
@@ -2985,7 +2984,7 @@ impl PrefixCacheCoordinator {
         clippy::too_many_arguments,
         reason = "one request's computed blocks, publication policy and source worker"
     )]
-    pub(crate) fn publish_computed(
+    pub(crate) fn publish(
         &self,
         allocation: &CacheAllocation,
         tokens: CachedTokens<'_>,
@@ -3109,11 +3108,11 @@ mod tests {
     /// takes nothing: taking it would pin it out of the free queue at every step.
     #[test]
     fn a_page_offered_to_the_host_is_not_offered_again() {
-        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(8, 0), vec![full(4, 1)]);
-        let pool = coordinator.pool();
+        let kv_cache = KvCacheManager::new(BlockPool::new(8, 0), vec![full(4, 1)]);
+        let pool = kv_cache.pool();
         let source = endpoint();
-        let offered = publish_pages(&coordinator, &[1, 2, 3, 4], 0, &[0], &source);
-        let kept = publish_pages(&coordinator, &[5, 6, 7, 8], 0, &[0], &source);
+        let offered = publish_pages(&kv_cache, &[1, 2, 3, 4], 0, &[0], &source);
+        let kept = publish_pages(&kv_cache, &[5, 6, 7, 8], 0, &[0], &source);
         pool.set_host_key(&offered[0], storage::Key([7; 32]));
         let units = [offered[0].units()[0].0, kept[0].units()[0].0];
         assert_eq!(pool.without_host_key(&units), vec![units[1]]);
@@ -3121,8 +3120,8 @@ mod tests {
 
     #[test]
     fn private_recovery_pages_are_held_and_reused_only_by_their_continuation() {
-        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(8, 0), vec![full(4, 1)]);
-        let pool = coordinator.pool();
+        let kv_cache = KvCacheManager::new(BlockPool::new(8, 0), vec![full(4, 1)]);
+        let pool = kv_cache.pool();
         let source = endpoint();
         let tokens = vec![1, 2, 3, 4, 5];
         let resume = proto::request::CacheResume {
@@ -3133,7 +3132,7 @@ mod tests {
             resume: Some(resume),
             ..Default::default()
         };
-        let hashes = coordinator.prefix_hashes(&tokens, scope);
+        let hashes = kv_cache.page_keys(&tokens, scope);
         let page = pool.allocate(1, 1).unwrap().remove(0);
         pool.activate([&page]);
         let lease = page.clone();
@@ -3141,8 +3140,8 @@ mod tests {
         assert_eq!(pool.free_units(), 6);
         pool.publish(&lease, 0, hashes[0][0], &tokens[..4], &source, Some(resume));
         assert_eq!(
-            coordinator
-                .probe_prefix(&tokens, true, false, PrefixScope::default(), &source)
+            kv_cache
+                .find_prefix(&tokens, true, false, PrefixScope::default(), &source)
                 .cached_tokens,
             0
         );
@@ -3154,19 +3153,19 @@ mod tests {
             ..scope
         };
         assert_eq!(
-            coordinator
-                .probe_prefix(&tokens, true, false, other, &source)
+            kv_cache
+                .find_prefix(&tokens, true, false, other, &source)
                 .cached_tokens,
             0
         );
-        let mut allocation = coordinator.empty();
+        let mut allocation = kv_cache.empty();
         assert_eq!(
-            coordinator
-                .probe_prefix(&tokens, false, true, scope, &source)
+            kv_cache
+                .find_prefix(&tokens, false, true, scope, &source)
                 .cached_tokens,
             4
         );
-        let hit = coordinator
+        let hit = kv_cache
             .acquire_prefix(&mut allocation, &tokens, false, true, scope, &source)
             .unwrap();
         assert_eq!(hit.cached_tokens, 4);
@@ -3174,13 +3173,13 @@ mod tests {
         assert_eq!(pool.free_units(), 6);
         drop(allocation);
         assert_eq!(pool.free_units(), 7);
-        let successor_cache = PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![full(4, 1)]);
+        let successor_cache = KvCacheManager::new(BlockPool::new(16, 0), vec![full(4, 1)]);
         let successor = successor_cache.pool();
         successor.inherit(8..16);
         successor.import(&pool.export(), 8, &source);
         assert_eq!(
             successor_cache
-                .probe_prefix(&tokens, false, true, scope, &source)
+                .find_prefix(&tokens, false, true, scope, &source)
                 .cached_tokens,
             4,
         );
@@ -3189,10 +3188,10 @@ mod tests {
 
     #[test]
     fn a_continuation_reuses_public_pages_only_under_its_read_policy() {
-        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(8, 0), vec![full(4, 1)]);
+        let kv_cache = KvCacheManager::new(BlockPool::new(8, 0), vec![full(4, 1)]);
         let source = endpoint();
         let tokens = vec![1, 2, 3, 4, 5];
-        let _published = publish(&coordinator, &tokens, &source);
+        let _published = publish(&kv_cache, &tokens, &source);
         let scope = PrefixScope {
             resume: Some(proto::request::CacheResume {
                 epoch: 3,
@@ -3215,14 +3214,14 @@ mod tests {
                 ..scope
             };
             assert_eq!(
-                coordinator
-                    .probe_prefix(&tokens, read, images, scope, &source)
+                kv_cache
+                    .find_prefix(&tokens, read, images, scope, &source)
                     .cached_tokens,
                 expected,
             );
-            let mut allocation = coordinator.empty();
+            let mut allocation = kv_cache.empty();
             assert_eq!(
-                coordinator
+                kv_cache
                     .acquire_prefix(&mut allocation, &tokens, read, images, scope, &source)
                     .unwrap()
                     .cached_tokens,
@@ -3233,11 +3232,11 @@ mod tests {
 
     #[test]
     fn mapped_pages_preserve_public_and_private_reuse_on_the_same_units() {
-        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![full(4, 1)]);
-        let pool = coordinator.pool();
+        let kv_cache = KvCacheManager::new(BlockPool::new(16, 0), vec![full(4, 1)]);
+        let pool = kv_cache.pool();
         let source = endpoint();
         let tokens = vec![1, 2, 3, 4, 5];
-        drop(publish(&coordinator, &tokens, &source));
+        drop(publish(&kv_cache, &tokens, &source));
         let resume = proto::request::CacheResume {
             epoch: 3,
             request_id: 7,
@@ -3246,9 +3245,9 @@ mod tests {
             resume: Some(resume),
             ..Default::default()
         };
-        let mut allocation = coordinator.empty();
+        let mut allocation = kv_cache.empty();
         assert_eq!(
-            coordinator
+            kv_cache
                 .acquire_prefix(&mut allocation, &tokens, true, false, scope, &source,)
                 .unwrap()
                 .cached_tokens,
@@ -3256,15 +3255,15 @@ mod tests {
         );
         drop(allocation);
 
-        let successor_cache = PrefixCacheCoordinator::new(BlockPool::new(32, 0), vec![full(4, 1)]);
+        let successor_cache = KvCacheManager::new(BlockPool::new(32, 0), vec![full(4, 1)]);
 
         let successor = successor_cache.pool();
         successor.inherit(16..32);
         successor.import(&pool.export(), 16, &source);
         successor.take_inherited();
         let free = successor.free_units();
-        let mut public = coordinator.empty();
-        let mut private = coordinator.empty();
+        let mut public = kv_cache.empty();
+        let mut private = kv_cache.empty();
         for (allocation, scope, read) in [
             (&mut public, PrefixScope::default(), true),
             (&mut private, scope, false),
@@ -3282,13 +3281,13 @@ mod tests {
         successor.forget_resume(resume);
         assert_eq!(
             successor_cache
-                .probe_prefix(&tokens, false, false, scope, &source,)
+                .find_prefix(&tokens, false, false, scope, &source,)
                 .cached_tokens,
             0
         );
         assert_eq!(
             successor_cache
-                .probe_prefix(&tokens, true, false, PrefixScope::default(), &source,)
+                .find_prefix(&tokens, true, false, PrefixScope::default(), &source,)
                 .cached_tokens,
             4
         );
@@ -3296,8 +3295,7 @@ mod tests {
 
     #[test]
     fn private_publication_keeps_the_latest_completed_state_checkpoint() {
-        let coordinator =
-            PrefixCacheCoordinator::new(BlockPool::new(64, 0), vec![full(4, 1), state(4, 2)]);
+        let kv_cache = KvCacheManager::new(BlockPool::new(64, 0), vec![full(4, 1), state(4, 2)]);
         let source = endpoint();
         let tokens: Vec<_> = (1..=25).collect();
         let resume = proto::request::CacheResume {
@@ -3308,24 +3306,24 @@ mod tests {
             resume: Some(resume),
             ..Default::default()
         };
-        let mut allocation = coordinator.empty();
-        let lookup = coordinator
+        let mut allocation = kv_cache.empty();
+        let lookup = kv_cache
             .acquire_prefix(&mut allocation, &tokens, false, false, scope, &source)
             .unwrap();
         let mut published = Vec::new();
-        coordinator
-            .ensure_capacity(&mut allocation, 0, 10, Checkpoint::Boundary)
+        kv_cache
+            .allocate(&mut allocation, 0, 10, Checkpoint::Boundary)
             .unwrap();
         for (start, end) in [(0, 10), (10, 14), (14, 18)] {
             if start > 0 {
-                coordinator
-                    .ensure_capacity(&mut allocation, start, end, Checkpoint::Interval(8))
+                kv_cache
+                    .allocate(&mut allocation, start, end, Checkpoint::Interval(8))
                     .unwrap();
             }
-            assert!(coordinator.publish_computed(
+            assert!(kv_cache.publish(
                 &allocation,
                 CachedTokens::prompt(&tokens),
-                &lookup.page_hashes,
+                &lookup.page_keys,
                 end,
                 0,
                 &mut published,
@@ -3333,31 +3331,31 @@ mod tests {
                 &source,
                 Some(resume),
             ));
-            assert!(coordinator.release_window(&mut allocation, end, None));
+            assert!(kv_cache.release_window(&mut allocation, end, None));
             let checkpoint = if end < 16 { 8 } else { 16 };
             assert!(allocation.tables[1].holds(checkpoint - 4, checkpoint));
             assert_eq!(
-                coordinator
-                    .probe_prefix(&tokens, false, false, scope, &source,)
+                kv_cache
+                    .find_prefix(&tokens, false, false, scope, &source,)
                     .cached_tokens,
                 checkpoint
             );
             assert_eq!(
-                coordinator
-                    .probe_prefix(&tokens, true, false, PrefixScope::default(), &source,)
+                kv_cache
+                    .find_prefix(&tokens, true, false, PrefixScope::default(), &source,)
                     .cached_tokens,
                 0
             );
         }
         // A future checkpoint's reserved units are not yet a completed state.
-        coordinator
-            .ensure_capacity(&mut allocation, 18, 24, Checkpoint::Interval(8))
+        kv_cache
+            .allocate(&mut allocation, 18, 24, Checkpoint::Interval(8))
             .unwrap();
-        assert!(coordinator.release_window(&mut allocation, 22, None));
+        assert!(kv_cache.release_window(&mut allocation, 22, None));
         assert!(allocation.tables[1].holds(12, 16));
         assert_eq!(
-            coordinator
-                .probe_prefix(&tokens, false, false, scope, &source,)
+            kv_cache
+                .find_prefix(&tokens, false, false, scope, &source,)
                 .cached_tokens,
             16
         );
@@ -3392,8 +3390,8 @@ mod tests {
             (sliding(64, 1, 128), false),
             (sliding(64, 1, 128), true),
         ] {
-            let coordinator = PrefixCacheCoordinator::new(BlockPool::new(128, 0), vec![shape]);
-            let pool = coordinator.pool();
+            let kv_cache = KvCacheManager::new(BlockPool::new(128, 0), vec![shape]);
+            let pool = kv_cache.pool();
             let source = endpoint();
             let tokens: Vec<u32> = (0..145).collect();
             let scope = PrefixScope {
@@ -3403,9 +3401,9 @@ mod tests {
                 }),
                 ..Default::default()
             };
-            let allocation = publish(&coordinator, &tokens, &source);
-            let hashes = coordinator.prefix_hashes(&tokens, scope);
-            assert!(coordinator.publish_computed(
+            let allocation = publish(&kv_cache, &tokens, &source);
+            let hashes = kv_cache.page_keys(&tokens, scope);
+            assert!(kv_cache.publish(
                 &allocation,
                 CachedTokens::prompt(&tokens),
                 &hashes,
@@ -3416,7 +3414,7 @@ mod tests {
                 &source,
                 scope.resume,
             ));
-            coordinator.publish_tails(
+            kv_cache.publish_tails(
                 &allocation,
                 CachedTokens::prompt(&tokens),
                 tokens.len(),
@@ -3427,14 +3425,14 @@ mod tests {
             let original = allocation.tables[0].unit_ids();
             drop(allocation);
             let successor = inherited.then(|| {
-                let successor = PrefixCacheCoordinator::new(BlockPool::new(256, 0), vec![shape]);
+                let successor = KvCacheManager::new(BlockPool::new(256, 0), vec![shape]);
                 successor.pool().inherit(128..256);
                 successor.pool().import(&pool.export(), 128, &source);
                 successor
             });
             let (cache, offset) = match &successor {
                 Some(successor) => (successor, 128),
-                None => (&coordinator, 0),
+                None => (&kv_cache, 0),
             };
             let pool = cache.pool();
             let mut prompt = tokens;
@@ -3473,7 +3471,7 @@ mod tests {
             };
             assert_eq!(
                 cache
-                    .probe_prefix(&prompt, false, false, foreign, &source)
+                    .find_prefix(&prompt, false, false, foreign, &source)
                     .cached_tokens,
                 0
             );
@@ -3490,12 +3488,12 @@ mod tests {
 
     /// Prefills `prompt` into fresh tables and publishes every complete page.
     fn publish(
-        coordinator: &PrefixCacheCoordinator,
+        kv_cache: &KvCacheManager,
         prompt: &[u32],
         source: &Arc<MainProcessEndpoint>,
     ) -> CacheAllocation {
-        let mut allocation = coordinator.empty();
-        let lookup = coordinator
+        let mut allocation = kv_cache.empty();
+        let lookup = kv_cache
             .acquire_prefix(
                 &mut allocation,
                 prompt,
@@ -3505,14 +3503,14 @@ mod tests {
                 source,
             )
             .unwrap();
-        coordinator
-            .ensure_capacity(&mut allocation, 0, prompt.len(), Checkpoint::Boundary)
+        kv_cache
+            .allocate(&mut allocation, 0, prompt.len(), Checkpoint::Boundary)
             .unwrap();
         let mut published = Vec::new();
-        assert!(coordinator.publish_computed(
+        assert!(kv_cache.publish(
             &allocation,
             CachedTokens::prompt(prompt),
-            &lookup.page_hashes,
+            &lookup.page_keys,
             prompt.len(),
             0,
             &mut published,
@@ -3526,15 +3524,15 @@ mod tests {
     /// Publishes only the chosen logical pages of one group of `prompt`, each
     /// on its own freshly allocated units, and returns their references.
     fn publish_pages(
-        coordinator: &PrefixCacheCoordinator,
+        kv_cache: &KvCacheManager,
         prompt: &[u32],
         group: usize,
         pages: &[usize],
         source: &Arc<MainProcessEndpoint>,
     ) -> Vec<PageRef> {
-        let pool = coordinator.pool();
-        let shape = coordinator.groups()[group];
-        let hashes = coordinator.prefix_hashes(prompt, PrefixScope::default());
+        let pool = kv_cache.pool();
+        let shape = kv_cache.groups()[group];
+        let hashes = kv_cache.page_keys(prompt, PrefixScope::default());
         pages
             .iter()
             .map(|page| {
@@ -3558,13 +3556,13 @@ mod tests {
     /// migration finds every page the request generated.
     #[test]
     fn a_chain_extended_over_generated_tokens_is_its_migrations_chain() {
-        let coordinator =
-            PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![full(4, 1), sliding(2, 1, 8)]);
+        let kv_cache =
+            KvCacheManager::new(BlockPool::new(16, 0), vec![full(4, 1), sliding(2, 1, 8)]);
         let prompt: Vec<u32> = (10..19).collect();
         let generated: Vec<u32> = (100..107).collect();
         let migrated: Vec<u32> = prompt.iter().chain(&generated).copied().collect();
 
-        let mut hashes = coordinator.prefix_hashes(
+        let mut hashes = kv_cache.page_keys(
             &prompt,
             PrefixScope {
                 isolation_key: Some(7),
@@ -3572,7 +3570,7 @@ mod tests {
                 resume: None,
             },
         );
-        coordinator.extend_hashes(
+        kv_cache.extend_page_keys(
             &mut hashes,
             CachedTokens::new(&prompt, &generated),
             PrefixScope {
@@ -3583,7 +3581,7 @@ mod tests {
         );
         assert_eq!(
             hashes,
-            coordinator.prefix_hashes(
+            kv_cache.page_keys(
                 &migrated,
                 PrefixScope {
                     isolation_key: Some(7),
@@ -3598,7 +3596,7 @@ mod tests {
         // Another isolation key chains other pages.
         assert_ne!(
             hashes,
-            coordinator.prefix_hashes(
+            kv_cache.page_keys(
                 &migrated,
                 PrefixScope {
                     isolation_key: Some(8),
@@ -3628,14 +3626,14 @@ mod tests {
     /// migration's prompt reuses them.
     #[test]
     fn published_generated_pages_serve_the_migrations_prompt() {
-        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![full(4, 1)]);
+        let kv_cache = KvCacheManager::new(BlockPool::new(16, 0), vec![full(4, 1)]);
         let source = endpoint();
         let prompt: Vec<u32> = (10..18).collect();
         let generated: Vec<u32> = (100..110).collect();
         let tokens = CachedTokens::new(&prompt, &generated);
 
-        let mut allocation = coordinator.empty();
-        let mut lookup = coordinator
+        let mut allocation = kv_cache.empty();
+        let mut lookup = kv_cache
             .acquire_prefix(
                 &mut allocation,
                 &prompt,
@@ -3645,15 +3643,15 @@ mod tests {
                 &source,
             )
             .unwrap();
-        coordinator
-            .ensure_capacity(&mut allocation, 0, tokens.len(), Checkpoint::Boundary)
+        kv_cache
+            .allocate(&mut allocation, 0, tokens.len(), Checkpoint::Boundary)
             .unwrap();
-        coordinator.extend_hashes(&mut lookup.page_hashes, tokens, PrefixScope::default());
+        kv_cache.extend_page_keys(&mut lookup.page_keys, tokens, PrefixScope::default());
         let mut published = Vec::new();
-        assert!(coordinator.publish_computed(
+        assert!(kv_cache.publish(
             &allocation,
             tokens,
-            &lookup.page_hashes,
+            &lookup.page_keys,
             tokens.len(),
             0,
             &mut published,
@@ -3664,27 +3662,25 @@ mod tests {
         assert_eq!(published, vec![4]);
 
         let migrated: Vec<u32> = prompt.iter().chain(&generated).copied().collect();
-        let hit = coordinator.probe_prefix(&migrated, true, false, PrefixScope::default(), &source);
+        let hit = kv_cache.find_prefix(&migrated, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 16);
     }
 
     #[test]
     fn pages_of_several_units_draw_from_one_pool_and_return_together() {
         // Nine allocatable units: a sliding page takes three, a full page one.
-        let coordinator = PrefixCacheCoordinator::new(
-            BlockPool::new(10, 0),
-            vec![full(8, 1), sliding(4, 3, 100)],
-        );
-        let pool = coordinator.pool();
-        let mut allocation = coordinator.empty();
+        let kv_cache =
+            KvCacheManager::new(BlockPool::new(10, 0), vec![full(8, 1), sliding(4, 3, 100)]);
+        let pool = kv_cache.pool();
+        let mut allocation = kv_cache.empty();
 
         // Eight tokens need one full page and two sliding pages: 1 + 6 units.
         assert_eq!(
-            coordinator.units_needed(&allocation, 0, 8, Checkpoint::Boundary),
+            kv_cache.units_needed(&allocation, 0, 8, Checkpoint::Boundary),
             Some(7)
         );
-        coordinator
-            .ensure_capacity(&mut allocation, 0, 8, Checkpoint::Boundary)
+        kv_cache
+            .allocate(&mut allocation, 0, 8, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(pool.free_units(), 2);
         assert_eq!(allocation.tables[1].unit_ids().len(), 6);
@@ -3699,8 +3695,8 @@ mod tests {
         // Growing to twelve tokens needs a full page and a sliding page,
         // four units, but only two are free: nothing is allocated.
         assert!(
-            coordinator
-                .ensure_capacity(&mut allocation, 8, 12, Checkpoint::Boundary)
+            kv_cache
+                .allocate(&mut allocation, 8, 12, Checkpoint::Boundary)
                 .is_none()
         );
         assert_eq!(pool.free_units(), 2);
@@ -3714,12 +3710,12 @@ mod tests {
     #[test]
     fn the_warmup_scratch_units_are_never_allocated() {
         // Units 1..=3 are scratch: six of ten units are allocatable.
-        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(10, 3), vec![full(1, 1)]);
-        let pool = coordinator.pool();
+        let kv_cache = KvCacheManager::new(BlockPool::new(10, 3), vec![full(1, 1)]);
+        let pool = kv_cache.pool();
         assert_eq!((pool.usable_units(), pool.free_units()), (6, 6));
-        let mut allocation = coordinator.empty();
-        coordinator
-            .ensure_capacity(&mut allocation, 0, 6, Checkpoint::Boundary)
+        let mut allocation = kv_cache.empty();
+        kv_cache
+            .allocate(&mut allocation, 0, 6, Checkpoint::Boundary)
             .unwrap();
         let units: Vec<u32> = allocation.tables[0]
             .unit_ids()
@@ -3729,8 +3725,8 @@ mod tests {
         assert_eq!(units.len(), 6);
         assert!(units.iter().all(|unit| *unit > 3));
         assert!(
-            coordinator
-                .ensure_capacity(&mut allocation, 6, 7, Checkpoint::Boundary)
+            kv_cache
+                .allocate(&mut allocation, 6, 7, Checkpoint::Boundary)
                 .is_none()
         );
     }
@@ -3738,11 +3734,11 @@ mod tests {
     #[test]
     fn withdrawn_units_leave_allocation_until_restored() {
         // Fifteen allocatable units; a request holds units 1..=12.
-        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![full(1, 1)]);
-        let pool = coordinator.pool();
-        let mut allocation = coordinator.empty();
-        coordinator
-            .ensure_capacity(&mut allocation, 0, 12, Checkpoint::Boundary)
+        let kv_cache = KvCacheManager::new(BlockPool::new(16, 0), vec![full(1, 1)]);
+        let pool = kv_cache.pool();
+        let mut allocation = kv_cache.empty();
+        kv_cache
+            .allocate(&mut allocation, 0, 12, Checkpoint::Boundary)
             .unwrap();
         let held: Vec<u32> = allocation.tables[0]
             .unit_ids()
@@ -3763,9 +3759,9 @@ mod tests {
         drop(allocation);
         assert_eq!(pool.withdrawn_held(), 0);
         assert_eq!(pool.free_units(), 7);
-        let mut allocation = coordinator.empty();
-        coordinator
-            .ensure_capacity(&mut allocation, 0, 7, Checkpoint::Boundary)
+        let mut allocation = kv_cache.empty();
+        kv_cache
+            .allocate(&mut allocation, 0, 7, Checkpoint::Boundary)
             .unwrap();
         assert!(
             allocation.tables[0]
@@ -3774,8 +3770,8 @@ mod tests {
                 .all(|unit| unit.0 < 8)
         );
         assert!(
-            coordinator
-                .ensure_capacity(&mut allocation, 7, 8, Checkpoint::Boundary)
+            kv_cache
+                .allocate(&mut allocation, 7, 8, Checkpoint::Boundary)
                 .is_none()
         );
 
@@ -3789,11 +3785,11 @@ mod tests {
 
     #[test]
     fn a_restore_queues_the_withdrawn_units_requests_hold_once_released() {
-        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(8, 0), vec![full(1, 1)]);
-        let pool = coordinator.pool();
-        let mut allocation = coordinator.empty();
-        coordinator
-            .ensure_capacity(&mut allocation, 0, 7, Checkpoint::Boundary)
+        let kv_cache = KvCacheManager::new(BlockPool::new(8, 0), vec![full(1, 1)]);
+        let pool = kv_cache.pool();
+        let mut allocation = kv_cache.empty();
+        kv_cache
+            .allocate(&mut allocation, 0, 7, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(pool.withdraw(4), 4);
         pool.restore();
@@ -3807,42 +3803,41 @@ mod tests {
         // Eight tokens need two units in one group and three in the other.
         // With one of five units taken, the four free units cover either
         // group alone, which a per-group minimum would accept, but not both.
-        let coordinator =
-            PrefixCacheCoordinator::new(BlockPool::new(6, 0), vec![full(4, 1), full(8, 3)]);
-        let pool = coordinator.pool();
-        let mut allocation = coordinator.empty();
+        let kv_cache = KvCacheManager::new(BlockPool::new(6, 0), vec![full(4, 1), full(8, 3)]);
+        let pool = kv_cache.pool();
+        let mut allocation = kv_cache.empty();
         assert_eq!(
-            coordinator.units_needed(&allocation, 0, 8, Checkpoint::Boundary),
+            kv_cache.units_needed(&allocation, 0, 8, Checkpoint::Boundary),
             Some(5)
         );
         let blocker = pool.allocate(1, 1).unwrap();
         assert!(
-            coordinator
-                .ensure_capacity(&mut allocation, 0, 8, Checkpoint::Boundary)
+            kv_cache
+                .allocate(&mut allocation, 0, 8, Checkpoint::Boundary)
                 .is_none()
         );
         drop(blocker);
-        coordinator
-            .ensure_capacity(&mut allocation, 0, 8, Checkpoint::Boundary)
+        kv_cache
+            .allocate(&mut allocation, 0, 8, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(pool.free_units(), 0);
     }
 
     #[test]
     fn sliding_pages_retire_only_behind_the_window_and_keep_published_copies() {
-        let coordinator =
-            PrefixCacheCoordinator::new(BlockPool::new(64, 0), vec![full(4, 1), sliding(4, 2, 6)]);
-        let pool = coordinator.pool();
+        let kv_cache =
+            KvCacheManager::new(BlockPool::new(64, 0), vec![full(4, 1), sliding(4, 2, 6)]);
+        let pool = kv_cache.pool();
         let source = endpoint();
         let prompt = (1..=16).collect::<Vec<u32>>();
-        let mut allocation = publish(&coordinator, &prompt, &source);
+        let mut allocation = publish(&kv_cache, &prompt, &source);
         let free = pool.free_units();
         let retired = (0..2)
             .flat_map(|page| allocation.tables[1].page(page).unwrap().units().to_vec())
             .collect::<Vec<_>>();
 
         // Visible 16 with window 6 keeps tokens [10, 16): pages 2 and 3.
-        assert!(coordinator.release_window(&mut allocation, 16, None));
+        assert!(kv_cache.release_window(&mut allocation, 16, None));
         let table = &allocation.tables[1];
         assert_eq!((table.start_page(), table.end_page()), (2, 4));
         assert_eq!(table.unit_ids().len(), 4);
@@ -3857,13 +3852,12 @@ mod tests {
                 .iter()
                 .all(|unit| pool.unit_state(*unit) == UnitState::Cached)
         );
-        let hit =
-            coordinator.probe_prefix(&prompt[..13], true, false, PrefixScope::default(), &source);
+        let hit = kv_cache.find_prefix(&prompt[..13], true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 12);
 
         // Growth appends after the window and never moves the start back.
-        coordinator
-            .ensure_capacity(&mut allocation, 16, 20, Checkpoint::Boundary)
+        kv_cache
+            .allocate(&mut allocation, 16, 20, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(allocation.tables[1].start_page(), 2);
         assert_eq!(allocation.tables[1].end_page(), 5);
@@ -3875,13 +3869,12 @@ mod tests {
     /// prompt's reuse, which ends where one is held.
     #[test]
     fn state_tables_hold_only_checkpoints_and_reuse_ends_at_one() {
-        let coordinator =
-            PrefixCacheCoordinator::new(BlockPool::new(128, 0), vec![full(4, 1), state(4, 3)]);
-        let pool = coordinator.pool();
+        let kv_cache = KvCacheManager::new(BlockPool::new(128, 0), vec![full(4, 1), state(4, 3)]);
+        let pool = kv_cache.pool();
         let source = endpoint();
         let tokens = (1..=24).collect::<Vec<u32>>();
-        let mut allocation = coordinator.empty();
-        let lookup = coordinator
+        let mut allocation = kv_cache.empty();
+        let lookup = kv_cache
             .acquire_prefix(
                 &mut allocation,
                 &tokens,
@@ -3895,8 +3888,8 @@ mod tests {
         // A first chunk of ten tokens covers three pages and checkpoints
         // boundary 8 alone: one state page of three units.
         let free = pool.free_units();
-        coordinator
-            .ensure_capacity(&mut allocation, 0, 10, Checkpoint::Boundary)
+        kv_cache
+            .allocate(&mut allocation, 0, 10, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(free - pool.free_units(), 3 + 3);
         assert_eq!(
@@ -3922,10 +3915,10 @@ mod tests {
         // Publication skips the pages without a checkpoint; release keeps
         // the latest completed checkpoint across non-checkpoint boundaries.
         let mut published = Vec::new();
-        assert!(coordinator.publish_computed(
+        assert!(kv_cache.publish(
             &allocation,
             CachedTokens::prompt(&tokens),
-            &lookup.page_hashes,
+            &lookup.page_keys,
             10,
             0,
             &mut published,
@@ -3933,22 +3926,22 @@ mod tests {
             &source,
             None,
         ));
-        assert!(coordinator.release_window(&mut allocation, 8, None));
+        assert!(kv_cache.release_window(&mut allocation, 8, None));
         assert_eq!(allocation.tables[1].start_page(), 1);
-        assert!(coordinator.release_window(&mut allocation, 10, None));
+        assert!(kv_cache.release_window(&mut allocation, 10, None));
         assert!(allocation.tables[1].holds(4, 8));
 
         // The second chunk checkpoints boundary 16; decoding checkpoints
         // boundary 24, a multiple of the interval, but not boundary 20, in
         // the page the table held without units since token 20.
-        coordinator
-            .ensure_capacity(&mut allocation, 10, 18, Checkpoint::Boundary)
+        kv_cache
+            .allocate(&mut allocation, 10, 18, Checkpoint::Boundary)
             .unwrap();
         assert!(allocation.tables[1].page(3).is_some());
         assert!(allocation.tables[1].page(4).is_none());
         for position in 18..23 {
-            coordinator
-                .ensure_capacity(
+            kv_cache
+                .allocate(
                     &mut allocation,
                     position,
                     position + 1,
@@ -3959,8 +3952,8 @@ mod tests {
         assert!(allocation.tables[1].page(4).is_none());
         assert!(allocation.tables[1].page(5).is_none());
         allocation.tables[1].mark_sent();
-        coordinator
-            .ensure_capacity(&mut allocation, 23, 24, Checkpoint::Interval(8))
+        kv_cache
+            .allocate(&mut allocation, 23, 24, Checkpoint::Interval(8))
             .unwrap();
         assert!(allocation.tables[1].page(5).is_some());
         assert!(allocation.tables[1].changed_since_sent());
@@ -3968,11 +3961,10 @@ mod tests {
         // A later prompt of the first 13 tokens finds no checkpoint at 12,
         // the deepest boundary it may reuse, and reuses the one at 8: its
         // state table starts at the checkpoint's page.
-        let hit =
-            coordinator.probe_prefix(&tokens[..13], true, false, PrefixScope::default(), &source);
+        let hit = kv_cache.find_prefix(&tokens[..13], true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 8);
-        let mut target = coordinator.empty();
-        let reused = coordinator
+        let mut target = kv_cache.empty();
+        let reused = kv_cache
             .acquire_prefix(
                 &mut target,
                 &tokens[..13],
@@ -4003,10 +3995,10 @@ mod tests {
         let source = endpoint();
         let prompt = (1..=10).collect::<Vec<u32>>();
         for inherited in [false, true] {
-            let publisher = PrefixCacheCoordinator::new(BlockPool::new(64, 0), groups.clone());
+            let publisher = KvCacheManager::new(BlockPool::new(64, 0), groups.clone());
             drop(publish(&publisher, &prompt, &source));
-            let coordinator = if inherited {
-                let successor = PrefixCacheCoordinator::new(BlockPool::new(128, 0), groups.clone());
+            let kv_cache = if inherited {
+                let successor = KvCacheManager::new(BlockPool::new(128, 0), groups.clone());
                 successor.pool().inherit(64..128);
                 successor
                     .pool()
@@ -4018,8 +4010,8 @@ mod tests {
 
             // The hit ends at the checkpoint of boundary 8, and the
             // admission's forward reaches no later boundary.
-            let mut resumed = coordinator.empty();
-            let hit = coordinator
+            let mut resumed = kv_cache.empty();
+            let hit = kv_cache
                 .acquire_prefix(
                     &mut resumed,
                     &prompt,
@@ -4030,20 +4022,20 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(hit.cached_tokens, 8);
-            coordinator
-                .ensure_capacity(&mut resumed, 8, 10, Checkpoint::Boundary)
+            kv_cache
+                .allocate(&mut resumed, 8, 10, Checkpoint::Boundary)
                 .unwrap();
             let shared = resumed.tables[1].page(1).unwrap().units().to_vec();
             assert_eq!(shared.iter().all(|unit| unit.0 >= 64), inherited);
 
             // The refill's last chunk ends at boundary 8.
-            coordinator.hold_states_from(&mut resumed, 0);
+            kv_cache.hold_states_from(&mut resumed, 0);
             assert_eq!(
-                coordinator.units_needed(&resumed, 0, 8, Checkpoint::Boundary),
+                kv_cache.units_needed(&resumed, 0, 8, Checkpoint::Boundary),
                 Some(3)
             );
-            coordinator
-                .ensure_capacity(&mut resumed, 0, 8, Checkpoint::Boundary)
+            kv_cache
+                .allocate(&mut resumed, 0, 8, Checkpoint::Boundary)
                 .unwrap();
             let written = resumed.tables[1].page(1).unwrap().units().to_vec();
             assert!(
@@ -4054,8 +4046,8 @@ mod tests {
             let serial = resumed.allocated_units - 3;
             assert_eq!(resumed.tables[1].fresh_units(serial), written);
 
-            let mut other = coordinator.empty();
-            let hit = coordinator
+            let mut other = kv_cache.empty();
+            let hit = kv_cache
                 .acquire_prefix(
                     &mut other,
                     &prompt,
@@ -4072,15 +4064,14 @@ mod tests {
 
     #[test]
     fn unpublished_sliding_pages_return_free() {
-        let coordinator =
-            PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![sliding(4, 1, 4)]);
-        let pool = coordinator.pool();
-        let mut allocation = coordinator.empty();
-        coordinator
-            .ensure_capacity(&mut allocation, 0, 12, Checkpoint::Boundary)
+        let kv_cache = KvCacheManager::new(BlockPool::new(16, 0), vec![sliding(4, 1, 4)]);
+        let pool = kv_cache.pool();
+        let mut allocation = kv_cache.empty();
+        kv_cache
+            .allocate(&mut allocation, 0, 12, Checkpoint::Boundary)
             .unwrap();
         let first = allocation.tables[0].page(0).unwrap().units()[0];
-        assert!(coordinator.release_window(&mut allocation, 12, None));
+        assert!(kv_cache.release_window(&mut allocation, 12, None));
         assert_eq!(allocation.tables[0].start_page(), 2);
         assert_eq!(pool.unit_state(first), UnitState::Free);
         assert_eq!(pool.free_units(), 14);
@@ -4088,18 +4079,18 @@ mod tests {
 
     #[test]
     fn a_fresh_sliding_table_starts_at_the_first_page_its_read_needs() {
-        let coordinator =
-            PrefixCacheCoordinator::new(BlockPool::new(32, 0), vec![full(4, 1), sliding(4, 1, 5)]);
-        let mut allocation = coordinator.empty();
+        let kv_cache =
+            KvCacheManager::new(BlockPool::new(32, 0), vec![full(4, 1), sliding(4, 1, 5)]);
+        let mut allocation = kv_cache.empty();
 
         // A read from token 16 needs history [11, 20): sliding pages 2..5,
         // while the full group needs pages 0..5.
         assert_eq!(
-            coordinator.units_needed(&allocation, 16, 20, Checkpoint::Boundary),
+            kv_cache.units_needed(&allocation, 16, 20, Checkpoint::Boundary),
             Some(5 + 3)
         );
-        coordinator
-            .ensure_capacity(&mut allocation, 16, 20, Checkpoint::Boundary)
+        kv_cache
+            .allocate(&mut allocation, 16, 20, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(allocation.tables[1].start_page(), 2);
         assert_eq!(allocation.tables[1].end_page(), 5);
@@ -4108,7 +4099,7 @@ mod tests {
 
     #[test]
     fn prefix_validation_iterates_until_every_sliding_window_holds() {
-        let coordinator = PrefixCacheCoordinator::new(
+        let kv_cache = KvCacheManager::new(
             BlockPool::new(64, 0),
             vec![sliding(4, 1, 4), sliding(8, 1, 8)],
         );
@@ -4120,14 +4111,14 @@ mod tests {
         // Group 0 misses pages 3 and 7; group 1 misses page 2. Group 0 lowers
         // 32 to 24, group 1 lowers 24 to 16, group 0 then lowers 16 to 8,
         // where both windows hold: group 0 page 1 and group 1 page 0.
-        let _first = publish_pages(&coordinator, &prompt, 0, &[1, 5], &source);
-        let _second = publish_pages(&coordinator, &prompt, 1, &[0, 1, 3], &source);
+        let _first = publish_pages(&kv_cache, &prompt, 0, &[1, 5], &source);
+        let _second = publish_pages(&kv_cache, &prompt, 1, &[0, 1, 3], &source);
 
-        let hit = coordinator.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
+        let hit = kv_cache.find_prefix(&prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 8);
 
-        let mut target = coordinator.empty();
-        let lookup = coordinator
+        let mut target = kv_cache.empty();
+        let lookup = kv_cache
             .acquire_prefix(
                 &mut target,
                 &prompt,
@@ -4150,28 +4141,28 @@ mod tests {
 
     #[test]
     fn full_groups_lock_the_whole_prefix_and_sliding_groups_only_their_window() {
-        let coordinator =
-            PrefixCacheCoordinator::new(BlockPool::new(128, 0), vec![full(8, 1), sliding(4, 2, 6)]);
-        let pool = coordinator.pool();
+        let kv_cache =
+            KvCacheManager::new(BlockPool::new(128, 0), vec![full(8, 1), sliding(4, 2, 6)]);
+        let pool = kv_cache.pool();
         let source = endpoint();
         // Full pages of 8 tokens and sliding pages of 4 with a 6-token window.
         let prompt = (1..=40).collect::<Vec<u32>>();
         // Every full page is cached, but the sliding group holds only pages
         // 2 and 3: the window of M = 16. M = 32 and M = 24 need sliding pages
         // 6 and 7, and 4 and 5.
-        let full_pages = publish_pages(&coordinator, &prompt, 0, &[0, 1, 2, 3, 4], &source);
-        let sliding_pages = publish_pages(&coordinator, &prompt, 1, &[2, 3], &source);
+        let full_pages = publish_pages(&kv_cache, &prompt, 0, &[0, 1, 2, 3, 4], &source);
+        let sliding_pages = publish_pages(&kv_cache, &prompt, 1, &[2, 3], &source);
         drop(full_pages);
         drop(sliding_pages);
 
         // Every hit page is unreferenced: two full units and two sliding
         // pages of two units each count as free until acquired.
-        let hit = coordinator.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
+        let hit = kv_cache.find_prefix(&prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 16);
         assert_eq!(hit.cached_free_units, 2 + 4);
 
-        let mut target = coordinator.empty();
-        let lookup = coordinator
+        let mut target = kv_cache.empty();
+        let lookup = kv_cache
             .acquire_prefix(
                 &mut target,
                 &prompt,
@@ -4206,8 +4197,8 @@ mod tests {
         );
 
         // The first prefill chunk appends after the prefix in every group.
-        coordinator
-            .ensure_capacity(&mut target, 16, 24, Checkpoint::Boundary)
+        kv_cache
+            .allocate(&mut target, 16, 24, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(target.tables[0].end_page(), 3);
         assert_eq!(target.tables[1].end_page(), 6);
@@ -4215,20 +4206,20 @@ mod tests {
 
     #[test]
     fn a_full_group_miss_limits_the_sliding_prefix() {
-        let coordinator =
-            PrefixCacheCoordinator::new(BlockPool::new(64, 0), vec![sliding(4, 1, 4), full(8, 1)]);
+        let kv_cache =
+            KvCacheManager::new(BlockPool::new(64, 0), vec![sliding(4, 1, 4), full(8, 1)]);
         let source = endpoint();
         let prompt = (1..=33).collect::<Vec<u32>>();
-        let owner = publish(&coordinator, &prompt[..16], &source);
+        let owner = publish(&kv_cache, &prompt[..16], &source);
 
         // Only 16 prompt tokens were published: the full group limits every
         // group to 16 even though a longer prompt is probed.
-        let hit = coordinator.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
+        let hit = kv_cache.find_prefix(&prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 16);
         // Both groups' hit pages are referenced by the owner.
         assert_eq!(hit.cached_free_units, 0);
         drop(owner);
-        let hit = coordinator.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
+        let hit = kv_cache.find_prefix(&prompt, true, false, PrefixScope::default(), &source);
         // Unreferenced hits count as free: sliding page 3 and full pages 0
         // and 1.
         assert_eq!(hit.cached_free_units, 3);
@@ -4251,26 +4242,26 @@ mod tests {
         ];
         // The previous epoch publishes under its seeds; the serving one reads
         // the same pool under its own.
-        let mut serving = PrefixCacheCoordinator::new(BlockPool::new(64, 0), groups);
+        let mut serving = KvCacheManager::new(BlockPool::new(64, 0), groups);
         serving.set_seeds(vec![prefix_seed("previous"), prefix_seed("draft")]);
         drop(publish(&serving, &prompt, &source));
 
         serving.set_seeds(vec![prefix_seed("previous"), prefix_seed("revised-draft")]);
         assert_eq!(
             serving
-                .probe_prefix(&prompt, true, false, PrefixScope::default(), &source)
+                .find_prefix(&prompt, true, false, PrefixScope::default(), &source)
                 .cached_tokens,
             8
         );
         serving.set_seeds(vec![prefix_seed("serving"), prefix_seed("revised-draft")]);
-        let own = serving.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
+        let own = serving.find_prefix(&prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(own.cached_tokens, 0);
         let kept = PrefixScope {
             isolation_key: None,
             state_seeds: &[prefix_seed("previous").0],
             resume: None,
         };
-        let continued = serving.probe_prefix(&prompt, true, false, kept, &source);
+        let continued = serving.find_prefix(&prompt, true, false, kept, &source);
         assert_eq!(continued.cached_tokens, 8);
     }
 
@@ -4286,11 +4277,11 @@ mod tests {
         let index = predecessor.pool().export();
         assert_eq!(index.len(), 2);
 
-        let successor = PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![full(4, 1)]);
+        let successor = KvCacheManager::new(BlockPool::new(16, 0), vec![full(4, 1)]);
         let pool = successor.pool();
         let free = pool.free_units();
         assert_eq!(pool.adopt(&index, &source), 2);
-        let hit = successor.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
+        let hit = successor.find_prefix(&prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 8);
         assert_eq!(pool.free_units(), free);
         // A second delivery of the same index adds nothing.
@@ -4298,7 +4289,7 @@ mod tests {
 
         // A successor that allocated the pages' units (1 to 9) and released
         // them adopts none of them.
-        let written = PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![full(4, 1)]);
+        let written = KvCacheManager::new(BlockPool::new(16, 0), vec![full(4, 1)]);
         drop(written.pool().allocate(9, 1).unwrap());
         assert!(written.pool().adoptable(&index).is_empty());
         assert_eq!(written.pool().adopt(&index, &source), 0);
@@ -4311,43 +4302,39 @@ mod tests {
     fn imported_pages_count_as_free_only_once_their_units_are_taken() {
         let source = endpoint();
         let prompt = (1..=9).collect::<Vec<u32>>();
-        let predecessor_cache =
-            PrefixCacheCoordinator::new(BlockPool::new(64, 0), vec![full(4, 1)]);
+        let predecessor_cache = KvCacheManager::new(BlockPool::new(64, 0), vec![full(4, 1)]);
         let predecessor = predecessor_cache.pool();
         drop(publish(&predecessor_cache, &prompt, &source));
         let index = predecessor.export();
         assert_eq!(index.len(), 2);
 
-        let successor_cache = PrefixCacheCoordinator::new(BlockPool::new(64, 0), vec![full(4, 1)]);
+        let successor_cache = KvCacheManager::new(BlockPool::new(64, 0), vec![full(4, 1)]);
 
         let successor = successor_cache.pool();
         successor.inherit(16..32);
         assert_eq!(successor.import(&index, 16, &source), 2);
         let free = successor.free_units();
         let hit =
-            successor_cache.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
+            successor_cache.find_prefix(&prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 8);
         assert_eq!(hit.cached_free_units, 0);
         assert_eq!(successor.free_units(), free);
 
         successor.take_inherited();
         let hit =
-            successor_cache.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
+            successor_cache.find_prefix(&prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 8);
         assert_eq!(hit.cached_free_units, 2);
     }
 
     /// A predecessor's pool of 16 units whose units 8, 9 and 10 hold
     /// `prompt`'s two complete pages and its partial last page, then released.
-    fn pages_past_a_filler(
-        prompt: &[u32],
-        source: &Arc<MainProcessEndpoint>,
-    ) -> PrefixCacheCoordinator {
-        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![full(4, 1)]);
-        let filler = coordinator.pool().allocate(7, 1).unwrap();
-        drop(publish(&coordinator, prompt, source));
+    fn pages_past_a_filler(prompt: &[u32], source: &Arc<MainProcessEndpoint>) -> KvCacheManager {
+        let kv_cache = KvCacheManager::new(BlockPool::new(16, 0), vec![full(4, 1)]);
+        let filler = kv_cache.pool().allocate(7, 1).unwrap();
+        drop(publish(&kv_cache, prompt, source));
         drop(filler);
-        coordinator
+        kv_cache
     }
 
     /// The inherited units a successor borrows are allocated as its own on
@@ -4361,8 +4348,8 @@ mod tests {
         let predecessor = pages_past_a_filler(&prompt, &source);
 
         // The successor maps the predecessor's 16 units after its own 16.
-        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(32, 0), vec![full(4, 1)]);
-        let successor = coordinator.pool();
+        let kv_cache = KvCacheManager::new(BlockPool::new(32, 0), vec![full(4, 1)]);
+        let successor = kv_cache.pool();
         successor.inherit(16..32);
         assert_eq!(
             successor.import(&predecessor.pool().export(), 16, &source),
@@ -4371,7 +4358,7 @@ mod tests {
         assert_eq!(successor.borrow(std::slice::from_ref(&(24..32))), 8);
         assert_eq!(successor.free_units(), 15 + 8);
         assert_eq!(successor.usable_units(), 15 + 8);
-        let hit = coordinator.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
+        let hit = kv_cache.find_prefix(&prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 8);
         assert_eq!(hit.cached_free_units, 2);
 
@@ -4387,7 +4374,7 @@ mod tests {
         );
         assert!(pages.iter().all(|page| !successor.shared(page)));
         assert!(successor.allocate(1, 1).is_none());
-        let hit = coordinator.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
+        let hit = kv_cache.find_prefix(&prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 0);
 
         successor.take_inherited();
@@ -4402,15 +4389,15 @@ mod tests {
     fn a_epoch_allocates_no_unit_it_lent_until_it_takes_them_back() {
         let source = endpoint();
         let prompt = (1..=9).collect::<Vec<u32>>();
-        let coordinator = pages_past_a_filler(&prompt, &source);
-        let pool = coordinator.pool();
+        let kv_cache = pages_past_a_filler(&prompt, &source);
+        let pool = kv_cache.pool();
         assert_eq!(pool.free_units(), 15);
 
         assert_eq!(pool.lend(std::slice::from_ref(&(8..16))), 2);
         assert_eq!(pool.lent(), vec![8..16]);
         assert_eq!(pool.free_units(), 7);
         assert_eq!(pool.usable_units(), 7);
-        let hit = coordinator.probe_prefix(&prompt, true, false, PrefixScope::default(), &source);
+        let hit = kv_cache.find_prefix(&prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 0);
         let pages = pool.allocate(7, 1).unwrap();
         assert!(pages.iter().all(|page| page.units()[0].0 < 8));
@@ -4426,8 +4413,8 @@ mod tests {
 
     #[test]
     fn prefix_copies_follow_worker_incarnations_without_releasing_active_pages() {
-        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(5, 0), vec![full(4, 1)]);
-        let pool = coordinator.pool();
+        let kv_cache = KvCacheManager::new(BlockPool::new(5, 0), vec![full(4, 1)]);
+        let pool = kv_cache.pool();
         let prompt = [1, 2, 3, 4, 5];
         let first = endpoint();
         let second = Arc::new(MainProcessEndpoint {
@@ -4435,10 +4422,10 @@ mod tests {
             ..first.as_ref().clone()
         });
         let owners = [&first, &second].map(|source| {
-            let allocation = publish(&coordinator, &prompt, source);
+            let allocation = publish(&kv_cache, &prompt, source);
             assert_eq!(
-                coordinator
-                    .probe_prefix(&prompt, true, false, PrefixScope::default(), source)
+                kv_cache
+                    .find_prefix(&prompt, true, false, PrefixScope::default(), source)
                     .cached_tokens,
                 4
             );
@@ -4449,8 +4436,8 @@ mod tests {
             ..first.as_ref().clone()
         };
         assert_eq!(
-            coordinator
-                .probe_prefix(&prompt, true, false, PrefixScope::default(), &replacement)
+            kv_cache
+                .find_prefix(&prompt, true, false, PrefixScope::default(), &replacement)
                 .cached_tokens,
             0
         );
@@ -4459,13 +4446,13 @@ mod tests {
         pool.invalidate_source(&first);
         assert_eq!(pool.free_units(), free_before);
         assert_eq!(
-            coordinator
-                .probe_prefix(&prompt, true, false, PrefixScope::default(), &first)
+            kv_cache
+                .find_prefix(&prompt, true, false, PrefixScope::default(), &first)
                 .cached_tokens,
             0
         );
-        let mut consumer = coordinator.empty();
-        let reused = coordinator
+        let mut consumer = kv_cache.empty();
+        let reused = kv_cache
             .acquire_prefix(
                 &mut consumer,
                 &prompt,
@@ -4487,11 +4474,11 @@ mod tests {
 
     #[test]
     fn fresh_units_follow_the_allocation_serial_in_every_group() {
-        let coordinator =
-            PrefixCacheCoordinator::new(BlockPool::new(32, 0), vec![full(4, 1), sliding(2, 2, 4)]);
-        let mut allocation = coordinator.empty();
-        coordinator
-            .ensure_capacity(&mut allocation, 0, 4, Checkpoint::Boundary)
+        let kv_cache =
+            KvCacheManager::new(BlockPool::new(32, 0), vec![full(4, 1), sliding(2, 2, 4)]);
+        let mut allocation = kv_cache.empty();
+        kv_cache
+            .allocate(&mut allocation, 0, 4, Checkpoint::Boundary)
             .unwrap();
         let watermark = allocation.allocated_units();
         assert_eq!(watermark, 1 + 4);
@@ -4500,8 +4487,8 @@ mod tests {
 
         // Growth to six tokens adds one full page and one sliding page; only
         // those units are fresh past the watermark, and both tables changed.
-        coordinator
-            .ensure_capacity(&mut allocation, 4, 6, Checkpoint::Boundary)
+        kv_cache
+            .allocate(&mut allocation, 4, 6, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(allocation.tables[0].fresh_units(watermark).len(), 1);
         assert_eq!(allocation.tables[1].fresh_units(watermark).len(), 2);
@@ -4513,12 +4500,12 @@ mod tests {
     /// withdrawn unit do not count.
     #[test]
     fn cached_pages_from_a_unit_count_the_idle_published_ones() {
-        let coordinator = PrefixCacheCoordinator::new(BlockPool::new(16, 0), vec![full(1, 1)]);
-        let pool = coordinator.pool();
+        let kv_cache = KvCacheManager::new(BlockPool::new(16, 0), vec![full(1, 1)]);
+        let pool = kv_cache.pool();
         let source = endpoint();
         let prompt: Vec<u32> = (100..112).collect();
         // Twelve pages on units 1..=12, all held by the request.
-        let held = publish(&coordinator, &prompt, &source);
+        let held = publish(&kv_cache, &prompt, &source);
         assert_eq!(pool.cached_from(1), 0);
 
         // Released, they are cached and idle.

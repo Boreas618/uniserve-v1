@@ -622,7 +622,7 @@ impl Scheduler {
             return;
         };
         let Some(group) = cache.groups().first() else {
-            tracing::debug!("a batch is dropped: the cache coordinator states no group");
+            tracing::debug!("a batch is dropped: the cache kv_cache states no group");
             return;
         };
         let (Ok(block_size), Ok(units_per_page)) = (

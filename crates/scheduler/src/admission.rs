@@ -1088,9 +1088,6 @@ impl Scheduler {
         }
 
         let n = head.req.prompt_token_ids.len();
-        let Some((target, prefix_hit)) = self.prefill_target(head) else {
-            return ControlFlow::Break(());
-        };
 
         // Units the first prefill chunk needs beyond the cached
         // prefix. The chunk is bounded by `chunked_prefill_size`
@@ -1100,52 +1097,19 @@ impl Scheduler {
             .prefill_chunk()
             .min(self.config.max_num_batched_tokens)
             .max(1);
+
+        // The prompt's longest cached prefix over every tier. The head
+        // waits while no prefill worker is ready or a tier below the device
+        // is still looking its pages up.
+        let Some((target, prefix_hit)) = self.lookup_prefix(id, n, 0, HOST_ANSWER_WAIT) else {
+            return ControlFlow::Break(());
+        };
+        let Some(cache) = self.storage.cache() else {
+            return ControlFlow::Break(());
+        };
         let cached_tokens = prefix_hit.cached_tokens.min(n);
-        // The host KV cache may hold the reusable pages that follow
-        // the device match; the head waits for its pins. A request
-        // continuing another epoch's state reads none: the host's
-        // pages are keyed by the epoch that serves.
-        let mut host_tokens = 0;
-        let mut host = host_prefix(
-            &mut self.kv_offload,
-            self.storage.cache(),
-            head,
-            &target,
-            cached_tokens,
-            n,
-            0,
-        );
-        // A lookup is a round trip to this host's Storage Server, which answers well
-        // within a millisecond. Taking the answer at the next step instead admitted a burst
-        // of prompts one per step: GSM8K at 64 slots ran 1320 prefill batches with the
-        // host tier on against 1101 with it off. So the head waits a bounded moment for
-        // its own answer; a prefetch from the KV storage, which takes longer, still waits
-        // across steps.
-        if matches!(host, HostHit::Pending) {
-            let deadline = std::time::Instant::now() + HOST_ANSWER_WAIT;
-            while matches!(host, HostHit::Pending) && std::time::Instant::now() < deadline {
-                if let Some(kv_offload) = self.kv_offload.as_mut() {
-                    kv_offload.poll();
-                }
-                std::thread::yield_now();
-                host = host_prefix(
-                    &mut self.kv_offload,
-                    self.storage.cache(),
-                    head,
-                    &target,
-                    cached_tokens,
-                    n,
-                    0,
-                );
-            }
-        }
-        match host {
-            HostHit::Serving(boundary) => host_tokens = boundary - cached_tokens,
-            // The host is looking up this request's pages: the head
-            // waits for the pins.
-            HostHit::Pending => return ControlFlow::Break(()),
-            HostHit::Nothing => {}
-        }
+        let host_tokens = prefix_hit.lower_tokens.unwrap_or(0);
+
         // The two facts of the hit that no view can compute, recorded
         // where admission measured them.
         self.recorder.prefix_hit(
@@ -1254,14 +1218,74 @@ impl Scheduler {
             .sum()
     }
 
-    /// Probes the prefix cache on the configured prefill owner.
+    /// Looks up the longest prefix of the token request `id`'s prompt that
+    /// the KV cache holds, over every tier, device first.
+    ///
+    /// The device is asked on the prefill worker that would serve the
+    /// request ([`Self::prefill_target`]). The tiers below it are asked for
+    /// the pages that follow the device's, up to `limit` tokens of the
+    /// prompt: the host pool, then the peers' pools and the remote store
+    /// when they deepen the hit by at least `min_deepening` tokens
+    /// (`KvOffloadManager::admission`). A tier that fails is skipped, and
+    /// the hit ends at what the other tiers hold.
+    ///
+    /// Asking below the device is a round trip to this host's Storage
+    /// Server, which answers well within a millisecond, so the call waits
+    /// for that answer at most `wait`: taking it at the next step instead
+    /// admits a burst of prompts one per step. A read from a peer or the
+    /// remote store takes longer and is waited for across steps.
+    ///
+    /// Returns the worker with the stage it binds and the hit, whose
+    /// `lower_tokens` the tiers below the device set. Returns `None` when
+    /// the request is unknown, no prefill worker is ready, or a tier below
+    /// the device is still looking the pages up: the request waits.
+    pub(super) fn lookup_prefix(
+        &mut self,
+        id: RequestId,
+        limit: usize,
+        min_deepening: usize,
+        wait: std::time::Duration,
+    ) -> Option<((crate::WorkerGroupId, String), crate::kv_cache::PrefixHit)> {
+        let state = self.requests.get(&id).and_then(Request::tokens)?;
+        let (target, mut hit) = self.prefill_target(state)?;
+        let device = hit.cached_tokens.min(state.req.prompt_token_ids.len());
+
+        let deadline = std::time::Instant::now() + wait;
+        let lower = loop {
+            let lower = lower_tiers(
+                &mut self.kv_offload,
+                self.storage.cache(),
+                state,
+                &target,
+                device,
+                limit,
+                min_deepening,
+            );
+            if let Some(lower) = lower {
+                break lower;
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            if let Some(kv_offload) = self.kv_offload.as_mut() {
+                kv_offload.poll();
+            }
+            std::thread::yield_now();
+        };
+
+        hit.lower_tokens = lower.map(|boundary| boundary - device);
+        Some((target, hit))
+    }
+
+    /// Looks the prompt's prefix up in the device cache of the configured
+    /// prefill owner.
     ///
     /// Picks the first ready worker that serves prefill and returns it with
     /// the component name it binds, plus the prefix hit on that worker's
     /// endpoint (prefix-cache residency is keyed by endpoint). The hit is an
     /// estimate; `acquire_cached_prefix` takes the actual prefix. Returns
     /// `None` when the runtime has no prefix cache or no prefill worker is ready.
-    pub(super) fn prefill_target(
+    fn prefill_target(
         &self,
         state: &TokenState,
     ) -> Option<((crate::WorkerGroupId, String), crate::kv_cache::PrefixHit)> {
@@ -1274,7 +1298,7 @@ impl Scheduler {
             )
             .filter(|(worker, _, _)| self.worker.is_ready(worker))
             .map(|(worker, component, info)| {
-                let hit = cache.probe_prefix(
+                let hit = cache.find_prefix(
                     &state.req.prompt_token_ids,
                     state.req.cache.read,
                     state.has_context_images(),
@@ -1336,10 +1360,7 @@ impl Scheduler {
             .map_err(|_| "admission checked request-row capacity")?;
         // Admission owns the request row and an initially empty table for every
         // cache group before the request enters the runnable set.
-        let Ok(prefix_cache) = cache.allocate(0) else {
-            self.storage.request_pool.free(request_slot);
-            return Err("an empty cache allocation always fits");
-        };
+        let prefix_cache = cache.empty();
         Ok(AdmissionReservation {
             source,
             request_slot,
@@ -1529,69 +1550,63 @@ pub(super) struct AdmissionReservation {
     prefix_cache: CacheAllocation,
 }
 
-/// How long admission waits for the head request's host KV lookup within one step.
+/// How long admission waits for the head request's lookup below the device within one step.
 const HOST_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_millis(2);
 
-/// What the host KV cache says about a request's prompt beyond its device hit.
-pub(super) enum HostHit {
-    /// Nothing to look for: no host cache serves that worker, the request
-    /// reads another epoch's pages or continues context images, or its prompt
-    /// is on the device already.
-    Nothing,
-    /// The host serves the prompt up to this token boundary.
-    Serving(usize),
-    /// The host is looking the pages up, and the request waits for the pins.
-    Pending,
-}
-
-/// Starts the host KV cache looking for the pages a request can reuse beyond
+/// Asks the tiers below the device for the pages a request can reuse beyond
 /// the device hit it already has, up to `limit` tokens of its prompt.
 ///
-/// Admission asks for the boundary it needs; a dispatch output's `prefetch` asks again
-/// later, and the answer grows as host pages arrive. Reusable pages leave one
-/// prompt token to compute, as in the device cache.
-pub(super) fn host_prefix(
+/// Admission asks for the boundary it needs; a dispatch output's `prefetch`
+/// asks again later, and the boundary grows as pages arrive in the host
+/// pool. Reusable pages leave one prompt token to compute, as in the device
+/// cache.
+///
+/// Returns `None` while the tiers are looking the pages up. Otherwise the
+/// inner value is the token boundary they serve the prompt up to, at least
+/// `device_hit`, or `None` when there is nothing to look for: no host pool
+/// serves that worker, the request reads another epoch's pages or continues
+/// context images, or its prompt is on the device already.
+fn lower_tiers(
     kv_offload: &mut Option<KvOffloadManager>,
-    coordinator: Option<&PrefixCacheCoordinator>,
+    kv_cache: Option<&KvCacheManager>,
     state: &TokenState,
     target: &(crate::WorkerGroupId, String),
     device_hit: usize,
     limit: usize,
     min_deepening: usize,
-) -> HostHit {
-    let (Some(kv_offload), Some(coordinator)) = (kv_offload.as_mut(), coordinator) else {
-        return HostHit::Nothing;
+) -> Option<Option<usize>> {
+    let (Some(kv_offload), Some(kv_cache)) = (kv_offload.as_mut(), kv_cache) else {
+        return Some(None);
     };
     let Some(step) = kv_offload.step(&target.0) else {
-        return HostHit::Nothing;
+        return Some(None);
     };
     if !state.req.cache.read
         || !state.req.cache.state_seeds.is_empty()
         || state.has_context_images()
     {
-        return HostHit::Nothing;
+        return Some(None);
     }
     let limit = limit.min(state.req.prompt_token_ids.len().saturating_sub(1)) / step * step;
     if limit <= device_hit {
-        return HostHit::Nothing;
+        return Some(None);
     }
     // The host pools hold a page under the key the device cache chains it
     // under: one chain, one key per page at every level.
-    let keys = coordinator.prefix_hashes(
+    let keys = kv_cache.page_keys(
         &state.req.prompt_token_ids[..limit.min(state.req.prompt_token_ids.len())],
         PrefixScope::of(&state.req.cache),
     );
-    match kv_offload.admission(
-        state.req.request_id,
-        &target.0,
-        &keys,
-        device_hit,
-        limit,
-        min_deepening,
-    ) {
-        Some(boundary) => HostHit::Serving(boundary),
-        None => HostHit::Pending,
-    }
+    kv_offload
+        .admission(
+            state.req.request_id,
+            &target.0,
+            &keys,
+            device_hit,
+            limit,
+            min_deepening,
+        )
+        .map(Some)
 }
 
 /// Acquires the longest prefix every cache group can reuse and records cache
@@ -1600,7 +1615,7 @@ pub(super) fn host_prefix(
 /// Fails, acquiring nothing, when the request holds no block tables or its
 /// tables do not match the pool's cache groups.
 fn acquire_cached_prefix(
-    coordinator: &PrefixCacheCoordinator,
+    kv_cache: &KvCacheManager,
     state: &mut TokenState,
     stats: &SchedulerStats,
     source: &ipc::MainProcessEndpoint,
@@ -1613,7 +1628,7 @@ fn acquire_cached_prefix(
     let allocation = state
         .prefix_cache_mut()
         .ok_or("an admitted request holds its block tables")?;
-    let hit = coordinator
+    let hit = kv_cache
         .acquire_prefix(
             allocation,
             &prompt,
@@ -1640,7 +1655,7 @@ fn acquire_cached_prefix(
     // starts past them, and their pages are already published.
     // The draft cache's pages publish as the request's entries complete
     // them; the reused ones, which the prefix holds, are its valid prefix.
-    state.prefix_published = coordinator
+    state.prefix_published = kv_cache
         .groups()
         .iter()
         .map(|group| {
@@ -1653,7 +1668,7 @@ fn acquire_cached_prefix(
         .collect();
     state.draft = Default::default();
     state.draft.valid = hit.draft_tokens as u32;
-    state.prefix_page_hashes = hit.page_hashes;
+    state.prefix_page_hashes = hit.page_keys;
     state.num_computed_prompt_tokens = hit.cached_tokens as u32;
     state.logical_position = state.num_computed_prompt_tokens;
     state.cache_visible_len = state.num_computed_prompt_tokens;

@@ -64,7 +64,7 @@ fn inputs(image: &[u8; 32], draw: Option<(u64, u32)>) -> [u8; 32] {
 
 /// The device tier's key of an encoding of output `name` that read what
 /// `inputs` digests.
-fn device_key(name: &str, inputs: &[u8; 32]) -> crate::kv_cache::EncoderKey {
+fn device_key(name: &str, inputs: &[u8; 32]) -> crate::encoder_cache::EncoderKey {
     let mut digest = Digest::new(b"encoder-cache");
     digest.text(name);
     digest.bytes(inputs);
@@ -85,7 +85,7 @@ pub(crate) struct Encoding {
 
 impl Encoding {
     /// The device tier's key of the encoding.
-    pub(super) fn device_key(&self) -> crate::kv_cache::EncoderKey {
+    pub(super) fn device_key(&self) -> crate::encoder_cache::EncoderKey {
         device_key(self.output.name, &self.inputs)
     }
 }

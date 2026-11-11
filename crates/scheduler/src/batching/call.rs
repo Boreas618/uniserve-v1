@@ -505,13 +505,13 @@ impl Scheduler {
                 return Err(1);
             };
             if cache
-                .grow(
+                .allocate(
                     &mut allocations.prefix_cache,
-                    read_start,
-                    total_tokens,
+                    read_start as usize,
+                    total_tokens as usize,
                     checkpoint,
                 )
-                .is_ok()
+                .is_some()
             {
                 return Ok(());
             }

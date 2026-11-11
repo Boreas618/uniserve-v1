@@ -49,6 +49,7 @@
 pub mod allocation;
 mod clock;
 mod core;
+mod encoder_cache;
 mod encoder_outputs;
 mod hand_off;
 mod handle;
@@ -169,7 +170,7 @@ use crate::generation::{
 };
 
 use crate::allocation::{BufferPool, BufferSpan, RequestPool, RequestSlot};
-use crate::kv_cache::{BlockPool, BlockTable, CacheAllocation, PrefixCacheCoordinator};
+use crate::kv_cache::{BlockPool, BlockTable, CacheAllocation, KvCacheManager};
 use crossbeam_channel::Receiver;
 use ipc::RequestId;
 use ipc::execution::EpochOperation;
@@ -232,7 +233,7 @@ pub struct SpecialTokenIds {
 
 /// Request-held reference to a reusable encoder-cache entry.
 struct EncoderCachePin {
-    key: crate::kv_cache::EncoderKey,
+    key: crate::encoder_cache::EncoderKey,
     product: TensorRef,
 }
 

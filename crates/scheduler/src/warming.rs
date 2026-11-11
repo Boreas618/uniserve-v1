@@ -389,7 +389,7 @@ impl Scheduler {
                 resume: Some(resume),
             };
             let mut hashes = vec![Vec::new(); cache.groups().len()];
-            cache.extend_hashes(&mut hashes, CachedTokens::prompt(&prefix.tokens), scope);
+            cache.extend_page_keys(&mut hashes, CachedTokens::prompt(&prefix.tokens), scope);
             let source_pages = std::mem::take(&mut prefix.pages);
             for (group, shape) in cache.groups().iter().enumerate() {
                 if shape.draft() {
@@ -482,7 +482,7 @@ impl Scheduler {
                     .filter(|(_, worker)| worker.prefix_cache.is_some())
                     .map(|(_, worker)| {
                         cache
-                            .probe_prefix(&prefix.tokens, true, false, scope, &worker.endpoint)
+                            .find_prefix(&prefix.tokens, true, false, scope, &worker.endpoint)
                             .cached_tokens as u32
                     })
                     .max()

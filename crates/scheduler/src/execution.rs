@@ -616,101 +616,6 @@ impl Scheduler {
         batches
     }
 
-    /// Asks the policy for the victims of the shortage the mechanism reports,
-    /// validates them, and frees exactly those (design §4.4).
-    ///
-    /// The mechanism decides that there is a shortage and owns every cache; the
-    /// policy decides what to give up. A victim list that does not validate is
-    /// a policy failure, like any other invalid decision.
-    fn preempt_shortage(&mut self) {
-        // A request no victim could let grow is no shortage a policy can
-        // relieve: it ends at the length the cache holds.
-        self.finish_outgrown();
-        let Some(shortage) = views::shortage_now(self) else {
-            return;
-        };
-        let Some(mut policy) = self.policy.take() else {
-            return;
-        };
-        let victims = match policy.preempt(&shortage) {
-            Ok(victims) => victims,
-            Err(error) => {
-                let _ = self.policy_failed(policy, error);
-                return;
-            }
-        };
-        let live = self.live();
-        match mechanism::validate_victims(&shortage, &victims, &live) {
-            Ok(()) => {}
-            Err(mechanism::VictimError::Invalid(error)) => {
-                let _ = self.policy_failed(policy, error);
-                return;
-            }
-            Err(mechanism::VictimError::Vanished(message)) => {
-                // Nothing of this step can free a page or end a request between
-                // the observation the policy answered from and this call, so a
-                // victim that is gone means the mechanism let go of it without
-                // recording that it did: an invariant of its own, never the
-                // policy's decision (§4.4's taxonomy).
-                self.policy = Some(policy);
-                self.invariant_broken(&message);
-                return;
-            }
-        }
-        self.policy = Some(policy);
-        for victim in &victims {
-            self.free_victim(victim);
-        }
-        if !victims.is_empty() {
-            tracing::debug!(
-                kind = ?shortage.kind,
-                need = shortage.need,
-                victims = victims.len(),
-                "the policy freed what it named"
-            );
-        }
-    }
-
-    /// Frees the one thing a victim names.
-    ///
-    /// An encoder entry leaves the encoder cache and its worker buffer goes with
-    /// it; a device page goes to the host KV cache, exactly as a withdrawal's
-    /// pages do, and the units it held return when the copy completes (or at
-    /// once when the host cache has nowhere to put it).
-    fn free_victim(&mut self, victim: &scheduling::guest::Victim) {
-        match victim {
-            scheduling::guest::Victim::Encoding(id) => {
-                let key = self
-                    .storage
-                    .encoder_cache
-                    .entries()
-                    .map(|(key, _)| key)
-                    .find(|key| views::encoding_id(key) == *id);
-                let freed = key.and_then(|key| self.storage.encoder_cache.evict(&key));
-                if let Some(product) = freed {
-                    self.free_buffers([product.buffer_id()]);
-                }
-            }
-            scheduling::guest::Victim::Page(page) => {
-                if let Some(unit) = views::unit_of(*page) {
-                    self.offload_units(&[unit]);
-                }
-            }
-            // Today's capacity preemption, which the design keeps: a request
-            // that must give its units away is marked migratable with `Drain`,
-            // as `recompute_starved` does when it withdraws the units its
-            // requests hold. `Drain` asks the engine to hold the epoch the
-            // stream is in, and there is no epoch change here, so the daemon
-            // resubmits the request as a continuation carrying the state it
-            // reached. Only a migratable request is marked: one the daemon
-            // could not resubmit would be lost. The request retires at its next
-            // call boundary, and what it holds returns then.
-            scheduling::guest::Victim::Request(request) => {
-                self.migrate_running(MigrationCause::Drain, |id| id.0 == request.0);
-            }
-        }
-    }
-
     /// Executes the page half of a validated output (§4.4).
     ///
     /// The policy names pages to hand to the host KV cache and requests whose
@@ -764,26 +669,19 @@ impl Scheduler {
             .policy
             .as_ref()
             .map_or(0, |policy| policy.limits().prefetch_min_tokens) as usize;
+        let Some((_, hit)) = self.lookup_prefix(id, usize::MAX, floor, std::time::Duration::ZERO)
+        else {
+            return;
+        };
         let Some(state) = self.requests.tokens(&id) else {
             return;
         };
-        let Some((target, hit)) = self.prefill_target(state) else {
-            return;
-        };
         let device_hit = hit.cached_tokens.min(state.req.prompt_token_ids.len());
-        if let admission::HostHit::Serving(boundary) = admission::host_prefix(
-            &mut self.kv_offload,
-            self.storage.cache(),
-            state,
-            &target,
-            device_hit,
-            usize::MAX,
-            floor,
-        ) {
+        if let Some(deepening) = hit.lower_tokens {
             self.recorder.prefix_hit(
                 scheduling::guest::RequestId(id.0),
                 u32::try_from(device_hit).unwrap_or(u32::MAX),
-                u32::try_from(boundary.saturating_sub(device_hit)).unwrap_or(u32::MAX),
+                u32::try_from(deepening).unwrap_or(u32::MAX),
             );
         }
     }
@@ -1193,7 +1091,7 @@ impl Scheduler {
     /// [`Self::refresh_views`] keeps current, and the pages the scheduler's own
     /// table, kept current by the page delta: a step borrows both rather than
     /// rebuilding a view of every request or copying every page.
-    fn live(&self) -> mechanism::Live<'_> {
+    pub(crate) fn live(&self) -> mechanism::Live<'_> {
         let mut live = mechanism::Live {
             requests: std::borrow::Cow::Borrowed(self.recorder.told()),
             pages: std::borrow::Cow::Borrowed(&self.pages),

@@ -15,8 +15,8 @@ use ipc::BufferId;
 /// Logical storage reservations and retained exports owned by the engine.
 pub(crate) struct Storage {
     /// Text cache pages and prefix cache; `None` when the runtime has no prefix cache.
-    pub(crate) cache: Option<PrefixCacheCoordinator>,
-    pub(crate) encoder_cache: crate::kv_cache::EncoderCacheManager,
+    pub(crate) cache: Option<KvCacheManager>,
+    pub(crate) encoder_cache: crate::encoder_cache::EncoderCacheManager,
     /// Encoder-cache entries promised to admitted requests. `admit` checks it
     /// against `EncoderCacheManager::budget` only for requests that reserve
     /// their worst case.
@@ -87,7 +87,7 @@ impl Storage {
 
     /// Returns the text prefix cache, which exists when the worker serves token
     /// generation; token requests are rejected at submission without it.
-    pub(crate) fn cache(&self) -> Option<&PrefixCacheCoordinator> {
+    pub(crate) fn cache(&self) -> Option<&KvCacheManager> {
         self.cache.as_ref()
     }
 
@@ -203,14 +203,14 @@ impl RequestAllocations {
     }
 
     /// Releases each resource through its owning pool.
-    ///
-    /// Cache units need no explicit release: each page in `prefix_cache` is a counted
-    /// reference, dropped with `self`.
     pub(crate) fn free(self, storage: &mut Storage) {
         for buffer in self.buffers.into_values() {
             storage.buffer_pool.free(buffer);
         }
         storage.request_pool.free(self.request_slot);
+        if let Some(cache) = storage.cache.as_ref() {
+            cache.free(self.prefix_cache);
+        }
     }
 }
 

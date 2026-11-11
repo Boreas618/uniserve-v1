@@ -426,14 +426,12 @@ impl Scheduler {
         let allocations = state.allocations_mut()?;
         let cache = self.storage.cache.as_ref()?;
         cache.hold_states_from(&mut allocations.prefix_cache, start as usize);
-        cache
-            .grow(
-                &mut allocations.prefix_cache,
-                start,
-                end,
-                Checkpoint::Boundary,
-            )
-            .ok()?;
+        cache.allocate(
+            &mut allocations.prefix_cache,
+            start as usize,
+            end as usize,
+            Checkpoint::Boundary,
+        )?;
         if !cache.holds_draft(&allocations.prefix_cache, start as usize, end as usize) {
             return None;
         }

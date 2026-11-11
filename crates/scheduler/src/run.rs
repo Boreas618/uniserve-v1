@@ -177,7 +177,7 @@ impl Scheduler {
         }
 
         // Storage and scheduler statistics share the resolved worker capacities.
-        let cache = PrefixCacheCoordinator::from_main_process_info(&info);
+        let cache = KvCacheManager::from_main_process_info(&info);
         let stats = Arc::new(SchedulerStats::default());
         stats.prefix_cache.num_units.store(
             cache
@@ -194,7 +194,7 @@ impl Scheduler {
             dispatch: dispatch::Dispatch::default(),
             storage: allocation::requests::Storage {
                 cache,
-                encoder_cache: crate::kv_cache::EncoderCacheManager::new(
+                encoder_cache: crate::encoder_cache::EncoderCacheManager::new(
                     generation_limits.encoder_cache_entries as usize,
                 ),
                 reserved_encoder_entries: 0,

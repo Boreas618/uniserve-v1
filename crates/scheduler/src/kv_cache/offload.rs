@@ -89,7 +89,7 @@
 //! A page has one key at every level: the key the device prefix cache
 //! chains it under (`storage::key::page_key`), rooted at the group's page
 //! seed, which the ranks' page identities give it, and the request's
-//! isolation key (`PrefixCacheCoordinator::prefix_hashes`). The keys of
+//! isolation key (`KvCacheManager::page_keys`). The keys of
 //! every group form one key space: for each key, the lookups say where its
 //! page is.
 //!
@@ -912,7 +912,7 @@ impl KvOffloadManager {
     /// most `limit`: `None` while pins, lookups or prefetches are in flight,
     /// else the boundary of the hit (at least `device`), which the caller
     /// takes with [`KvOffloadManager::admit`]. `keys` are the request's page
-    /// keys by group (`PrefixCacheCoordinator::prefix_hashes`), covering `limit`
+    /// keys by group (`KvCacheManager::page_keys`), covering `limit`
     /// tokens. The first call pins every group's keys from `device` on in
     /// every rank's pool and looks them up. Pins taken for another device
     /// match are released and taken again.
@@ -2830,12 +2830,12 @@ mod tests {
     /// `cache`, by group: the device cache's chain, which every level keys
     /// pages by.
     fn page_keys(cache: &PrefixCacheInfo, prompt: &[u32]) -> Vec<Vec<Key>> {
-        let mut coordinator = super::super::PrefixCacheCoordinator::new(
+        let mut kv_cache = super::super::KvCacheManager::new(
             BlockPool::new(cache.num_units, cache.scratch_units),
             cache.groups.iter().map(GroupShape::from_group).collect(),
         );
-        coordinator.set_seeds(super::super::prefix_seeds(cache));
-        coordinator.prefix_hashes(prompt, super::super::PrefixScope::default())
+        kv_cache.set_seeds(super::super::prefix_seeds(cache));
+        kv_cache.page_keys(prompt, super::super::PrefixScope::default())
     }
 
     /// An epoch asks for its device KV cache's tokens times the ratio, the

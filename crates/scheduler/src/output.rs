@@ -1327,13 +1327,13 @@ impl Scheduler {
             .zip(worker.as_ref())
             .filter(|(kv_offload, worker)| kv_offload.serves(worker));
         if !generated.is_empty() && !hashes.is_empty() {
-            prefix_cache.extend_hashes(&mut hashes, tokens, scope);
+            prefix_cache.extend_page_keys(&mut hashes, tokens, scope);
         }
 
         let mut reserved = Vec::new();
         let advanced = state.prefix_cache_mut().is_some_and(|allocation| {
             allocation.complete_copies();
-            let published_now = prefix_cache.publish_computed(
+            let published_now = prefix_cache.publish(
                 allocation,
                 tokens,
                 &hashes,
