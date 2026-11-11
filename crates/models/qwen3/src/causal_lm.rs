@@ -400,9 +400,9 @@ impl CausalLm for Qwen3ForCausalLm {
         if hidden.shape.dims() != [tokens, width] || hidden.dtype != self.dtype {
             return Err(Error::Config(format!(
                 "hidden is {} {:?}, {} [{tokens}, {width}] expected",
-                hidden.dtype,
+                ops::abi::name(hidden.dtype),
                 hidden.shape.dims(),
-                self.dtype
+                ops::abi::name(self.dtype)
             ))
             .into());
         }

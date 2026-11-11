@@ -5,8 +5,9 @@
 //! once on the runner's stream, and read by the captured graph through a view of the device buffer's
 //! address. Nothing here names a token or a cache.
 
-use ops::{DType, Operand};
+use ops::Operand;
 use platform::DeviceId;
+use uniserve_tensor::DType;
 
 use crate::{Error, Result};
 
@@ -43,9 +44,13 @@ struct Placed {
 impl Column {
     /// A column of `numel` elements of `dtype` on `device`.
     pub(crate) fn new(device: DeviceId, dtype: DType, numel: u64) -> Result<Self> {
-        let bytes = dtype
-            .bytes()
-            .ok_or_else(|| Error::Invalid(format!("{dtype} has no whole-byte size")))?
+        let bytes = ops::abi::bytes(dtype)
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "{dtype} has no whole-byte size",
+                    dtype = ops::abi::name(dtype)
+                ))
+            })?
             .checked_mul(numel)
             .ok_or_else(|| Error::Invalid("a batch column's extent overflows".into()))?;
         let host = platform::PinnedBuffer::new(device, bytes as usize)?;
@@ -202,9 +207,13 @@ pub(crate) struct Region {
 impl Region {
     /// A region of `numel` elements of `dtype` on `device`.
     pub(crate) fn new(device: DeviceId, dtype: DType, numel: u64) -> Result<Self> {
-        let bytes = dtype
-            .bytes()
-            .ok_or_else(|| Error::Invalid(format!("{dtype} has no whole-byte size")))?
+        let bytes = ops::abi::bytes(dtype)
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "{dtype} has no whole-byte size",
+                    dtype = ops::abi::name(dtype)
+                ))
+            })?
             .checked_mul(numel)
             .ok_or_else(|| Error::Invalid("a region's extent overflows".into()))?;
         let bytes = usize::try_from(bytes)

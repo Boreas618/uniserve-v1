@@ -12,6 +12,8 @@
 use std::mem::take;
 use std::sync::Arc;
 
+use proto::handoff::IncrementalDecode;
+
 use crate::tokenizer::{HuggingFaceTokenizer, Result};
 
 /// Stateful incremental decoder built on the configured Hugging Face tokenizer with prefix-diffing.
@@ -256,74 +258,42 @@ impl IncrementalDecoder {
     }
 
     /// Returns the stream's place, so that another process continues this
-    /// request's decoding where this one stopped (design §7.5.1).
+    /// request's decoding where this one stopped.
     ///
-    /// Every value here is the decoder's own state: the decode window, the
-    /// text it has emitted, the offsets already returned, and the two
-    /// buffering settings the stream was started with. The tokenizer is not
-    /// part of it; [`IncrementalDecoder::resume`] takes the one the state was
-    /// taken on.
-    pub fn state(&self) -> IncrementalDecodeState {
-        IncrementalDecodeState {
+    /// Every value is the decoder's own state: the decode window, the text it
+    /// has emitted, the offsets already returned, and the two buffering
+    /// settings the stream was started with. The tokenizer is not part of it;
+    /// [`IncrementalDecoder::resume`] takes the one the state was taken on.
+    pub fn state(&self) -> IncrementalDecode {
+        IncrementalDecode {
             ids: self.ids.clone(),
             prefix: self.prefix.clone(),
-            prefix_index: self.prefix_index,
+            prefix_index: self.prefix_index as u64,
             cumulative_output: self.cumulative_output.clone(),
-            output_index: self.output_index,
+            output_index: self.output_index as u64,
             prompt_seeded: self.prompt_seeded,
-            pending_since_emit: self.pending_since_emit,
+            pending_since_emit: self.pending_since_emit as u64,
             skip_special_tokens: self.skip_special_tokens,
-            min_bytes_to_buffer: self.min_bytes_to_buffer,
+            min_bytes_to_buffer: self.min_bytes_to_buffer as u64,
         }
     }
 
     /// Continues the stream `state` stopped, on `tokenizer`, which is the one
     /// the state was taken on.
-    pub fn resume(state: IncrementalDecodeState, tokenizer: Arc<HuggingFaceTokenizer>) -> Self {
+    pub fn resume(state: &IncrementalDecode, tokenizer: Arc<HuggingFaceTokenizer>) -> Self {
         Self {
             tokenizer,
             skip_special_tokens: state.skip_special_tokens,
-            min_bytes_to_buffer: state.min_bytes_to_buffer,
-            ids: state.ids,
-            prefix: state.prefix,
-            prefix_index: state.prefix_index,
-            cumulative_output: state.cumulative_output,
-            output_index: state.output_index,
+            min_bytes_to_buffer: state.min_bytes_to_buffer as usize,
+            ids: state.ids.clone(),
+            prefix: state.prefix.clone(),
+            prefix_index: state.prefix_index as usize,
+            cumulative_output: state.cumulative_output.clone(),
+            output_index: state.output_index as usize,
             prompt_seeded: state.prompt_seeded,
-            pending_since_emit: state.pending_since_emit,
+            pending_since_emit: state.pending_since_emit as usize,
         }
     }
-}
-
-/// One incremental decoder's place in a generation stream (design §7.5.1).
-///
-/// A request's response is produced by one decoder; when the process serving it
-/// hands the stream to a successor at an event boundary, this state moves with
-/// it, so the successor's text continues exactly where the predecessor's
-/// stopped. It is plain data: the handoff encodes it in its own append-only
-/// message.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct IncrementalDecodeState {
-    /// The token window the next decode uses as context.
-    pub ids: Vec<u32>,
-    /// Decode of the window at the last emit or seed.
-    pub prefix: String,
-    /// Number of leading window tokens the next emit drops.
-    pub prefix_index: usize,
-    /// All text the stream has emitted, including bytes `next_chunk`
-    /// withholds.
-    pub cumulative_output: String,
-    /// Byte offset in `cumulative_output` up to which `next_chunk` has
-    /// returned text.
-    pub output_index: usize,
-    /// Whether the prompt seed has run.
-    pub prompt_seeded: bool,
-    /// Consecutive pushes that emitted nothing.
-    pub pending_since_emit: usize,
-    /// Whether special tokens are removed from the decoded text.
-    pub skip_special_tokens: bool,
-    /// Trailing output bytes `next_chunk` withholds.
-    pub min_bytes_to_buffer: usize,
 }
 
 #[cfg(test)]

@@ -43,13 +43,14 @@ use std::sync::{Arc, Mutex};
 
 use nn::forward::Forward;
 use ops::{
-    Arguments, CubinMetadata, DType, DevicePtr, Generation, Kernel, KernelEntry, LaunchGrid, Op,
-    Operand, Shape, Tolerance, Twins, descriptor,
+    Arguments, CubinMetadata, DevicePtr, Generation, Kernel, KernelEntry, LaunchGrid, Op, Operand,
+    Shape, Tolerance, Twins, descriptor,
 };
 use platform::{
     Allocator, Budget, Buffer, Device, DeviceId, PinnedBuffer, PoolKind, Stream, memcpy_async,
     memset_d32,
 };
+use uniserve_tensor::DType;
 use worker::shadow::{Pairing, Shadow};
 
 const DEVICE: DeviceId = DeviceId(0);

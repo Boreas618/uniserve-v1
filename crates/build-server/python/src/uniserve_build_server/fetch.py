@@ -215,11 +215,7 @@ def cache_root() -> Path:
     root = (
         Path(configured).expanduser()
         if configured
-        else Path.home()
-        / ".cache"
-        / "uniserve"
-        / "build-server"
-        / "artifacts"
+        else Path.home() / ".cache" / "uniserve" / "build-server" / "artifacts"
     )
     return Path(os.path.abspath(root))
 
@@ -278,8 +274,8 @@ def _download(url: str, destination: Path) -> None:
         except (urllib.error.URLError, OSError) as error:
             if staged is not None:
                 staged.unlink(missing_ok=True)
-            # The repository's own refusal of the file is an answer, and asking
-            # again repeats it.
+            # The repository's own refusal of the file is its response, and
+            # asking again repeats it.
             refused = (
                 isinstance(error, urllib.error.HTTPError) and error.code < 500
             )
@@ -419,7 +415,7 @@ def fetch(
 ) -> Path:
     """Makes the cache hold verified copies of a pin's files.
 
-    ``names`` are manifest paths, every file of the pin when ``None``. Answers
+    ``names`` are manifest paths, every file of the pin when ``None``. Returns
     the pin's cache directory.
     """
     files = manifest(source, offline)

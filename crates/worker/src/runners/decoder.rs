@@ -30,9 +30,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use nn::capability::{Clip, DecodedMedia, Decoder, Splicer};
-use ops::{DType, Operand, Shape};
+use ops::{Operand, Shape};
 use platform::DeviceId;
 use proto::video::Layout;
+use uniserve_tensor::DType;
 
 use crate::arena::Pools;
 use crate::batch::{Job, Jobs, answered};
@@ -565,13 +566,16 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
         if published.dtype != self.latent {
             return Err(Error::Invalid(format!(
                 "the decoder reads its latents as {} and the denoiser published {}",
-                self.latent, published.dtype
+                ops::abi::name(self.latent),
+                ops::abi::name(published.dtype)
             )));
         }
-        let element = published
-            .dtype
-            .bytes()
-            .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", published.dtype)))?;
+        let element = ops::abi::bytes(published.dtype).ok_or_else(|| {
+            Error::Invalid(format!(
+                "{} has no whole-byte size",
+                ops::abi::name(published.dtype)
+            ))
+        })?;
         let elements = published.bytes / element;
         if self
             .trajectory
@@ -1633,7 +1637,7 @@ mod tests {
         // model rather than from its own deployment: the plan's columns are sized before a graph
         // exists, and a byte count cannot say whether a column holds f16 or bf16.
         assert_eq!(Fixed.element_type(), DType::F16);
-        assert_eq!(DType::F16.bytes(), Some(2));
+        assert_eq!(ops::abi::bytes(DType::F16), Some(2));
     }
 
     /// A batch with a phase, no calls and no media: what the mechanism sends when it has nothing to

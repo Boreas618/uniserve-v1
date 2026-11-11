@@ -73,10 +73,13 @@ pub(crate) fn require_i32_vector(
     operator: &'static str,
     view: &crate::tensor::Operand,
 ) -> crate::Result<()> {
-    if view.dtype != crate::tensor::DType::I32 {
+    if view.dtype != uniserve_tensor::DType::I32 {
         return Err(crate::Error::argument(
             operator,
-            format!("expected i32 metadata, found {}", view.dtype),
+            format!(
+                "expected i32 metadata, found {}",
+                crate::abi::name(view.dtype)
+            ),
         ));
     }
     if view.strides.last() != 1 {
@@ -101,19 +104,15 @@ pub(crate) fn to_i64(operator: &'static str, value: u64) -> crate::Result<i64> {
     i64::try_from(value).map_err(|_| crate::Error::argument(operator, "an extent above i64::MAX"))
 }
 
-/// The ABI number of an element type, as a package reads it.
-pub(crate) fn dtype_code(dtype: crate::tensor::DType) -> i64 {
-    dtype.as_i64()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::{DType, DevicePtr, Operand, Shape};
+    use crate::tensor::{DevicePtr, Operand, Shape};
+    use uniserve_tensor::DType;
 
     /// A C++ entry's dtype numbers are the operator crate's, or the build says so here.
     ///
-    /// `DType::as_i64()` is the numbering every packed word uses, and a C++ header cannot call it, so
+    /// `abi::code` is the numbering every packed word uses, and a C++ header cannot call it, so
     /// each native entry copies the numbers it names. A copy drifts: `gather_gemm_nvfp4` and
     /// `route_gemm_nvfp4` carried `bf16 = 3` and `e2m1 = 10` while the crate numbered them 4 and 7,
     /// and the refusal that surfaced named the *output's* dtype — a run of the slice cost, and the
@@ -138,7 +137,7 @@ mod tests {
                 for (name, dtype) in [
                     ("uniserve_dtype_bf16", DType::BF16),
                     ("uniserve_dtype_e4m3", DType::F8E4M3),
-                    ("uniserve_dtype_e2m1", DType::F4E2M1),
+                    ("uniserve_dtype_e2m1", DType::F4),
                 ] {
                     let Some(after) = text.split(&format!("constexpr int64_t {name} = ")).nth(1)
                     else {
@@ -153,12 +152,13 @@ mod tests {
                             panic!("{}: {name} states no number", header.display())
                         });
                     constants += 1;
+                    let number = crate::abi::code(dtype).expect("the ABI numbers the type");
                     assert_eq!(
                         stated,
-                        dtype.as_i64(),
-                        "{}: {name} is {stated}, and the operator crate numbers {dtype} as {}",
+                        number,
+                        "{}: {name} is {stated}, and the operator crate numbers {} as {number}",
                         header.display(),
-                        dtype.as_i64()
+                        crate::abi::name(dtype)
                     );
                 }
             }

@@ -9,6 +9,7 @@ The numerical checks of the kernel packages under `crates/ops/kernels` live in `
 | Variable | What it names | Tests |
 | --- | --- | --- |
 | `UNISERVE_KERNEL_MODULES` | A directory of built modules, `<op>/<backend>/` holding the module of the descriptor the check's defaults describe (a check comparing two builds reads named subdirectories, such as `dense_attention/f32/causal`) | the module checks of the native and cubin packages, among them the `topk_softmax` router's launch |
+| `UNISERVE_BINARY` | The base executable, whose `build-server fields` reads a descriptor key against its package's manifest; `uniserve` on the search path when unset. `just test-python-fast` builds it and sets the variable | the tensor primitives' checks (`tests/python/kernels/tensor`), which launch the module a key names |
 | `UNISERVE_KERNEL_KEYS`, `UNISERVE_KERNEL_STORE` | A key fixture and the store built from it | `test_kernel_arguments.py`, which compares every built cell's arguments with its operator's |
 
 ## GPU end-to-end tests
@@ -59,7 +60,7 @@ These name the checkpoints and inputs of the host. Set the ones the host has; th
 | `UNISERVE_REBIND_PACKAGE`, `UNISERVE_RECAPTURE_PACKAGE`, `UNISERVE_POLICY_PACKAGE`, `UNISERVE_WRONG_PACKAGE` | the kernel packages under `crates/ops/package-fixtures` and the policy package `crates/scheduling/policies/fixture` | The packages `test_generation_update_http.py` installs |
 | `SANITIZER_LOGS`, `COMPUTE_SANITIZER` | the run's `memcheck/`, `compute-sanitizer` | Where memcheck writes and which sanitizer runs (`just test-python-sanitizer`) |
 
-`tools/gpu_e2e.sh` sets `UNISERVE_RUN_GPU_E2E`, `UNISERVE_BINARY`, `UNISERVE_WORKER_EXECUTABLE`, `UNISERVE_SCHEDULING_PRECOMPILE`, `UNISERVE_MEMCHECK_TARGET` and `VIRTUAL_ENV` itself. A case's lease sets `UNISERVE_WORLD_DEVICES` to the GPUs it holds, comma-separated, and every test takes its devices from it (`http_helpers.granted_devices`); `cuda:N` ranks in a test's deployment index those GPUs.
+`tools/gpu_e2e.sh` sets `UNISERVE_RUN_GPU_E2E`, `UNISERVE_BINARY`, `UNISERVE_SCHEDULING_PRECOMPILE`, `UNISERVE_MEMCHECK_TARGET` and `VIRTUAL_ENV` itself. A case's lease sets `UNISERVE_WORLD_DEVICES` to the GPUs it holds, comma-separated, and every test takes its devices from it (`http_helpers.granted_devices`); `cuda:N` ranks in a test's deployment index those GPUs.
 
 ### Two hosts
 

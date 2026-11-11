@@ -34,7 +34,7 @@ use platform::{
 /// Wider than the kernel ABI on purpose: storage carries initialized flags
 /// (`Bool`), block-table indices (`I32`/`I64`), scale planes (`F32`) and
 /// checkpoint element types that no kernel operand describes. Every
-/// kernel-facing dtype in an `ops`/`nn` call is [`ops::DType`], and
+/// kernel-facing dtype in an `ops`/`nn` call is [`uniserve_tensor::DType`], and
 /// [`ElementType::to_ops`] is the only bridge between the two, so a `Bool`
 /// flag or an `F64` scale plane can never silently become `U8` or `F32` in a
 /// kernel argument.
@@ -131,43 +131,48 @@ impl From<proto::tensor::DType> for ElementType {
 impl ElementType {
     /// The kernel operand type of this storage element, when one describes it.
     ///
-    /// `None` for the storage-only elements: an initialized flag, an 8- or
-    /// 16-bit integer, an unsigned index, a double, or the second FP8 spelling
-    /// a checkpoint uses. A view handed to a kernel must go through this, so a
-    /// storage type no kernel reads never becomes a silently wrong operand.
-    pub fn to_ops(self) -> Option<ops::DType> {
+    /// `None` for the storage-only elements: an initialized flag, a signed
+    /// 8-bit integer, or the second FP8 spelling a checkpoint uses. A view
+    /// handed to a kernel must go through this, so a storage type no kernel
+    /// reads never becomes a silently wrong operand.
+    pub fn to_ops(self) -> Option<uniserve_tensor::DType> {
         match self {
-            Self::U8 => Some(ops::DType::U8),
-            Self::I32 => Some(ops::DType::I32),
-            Self::I64 => Some(ops::DType::I64),
-            Self::F16 => Some(ops::DType::F16),
-            Self::BF16 => Some(ops::DType::BF16),
-            Self::F32 => Some(ops::DType::F32),
-            Self::F8E4M3 => Some(ops::DType::F8E4M3),
-            Self::I16 => Some(ops::DType::I16),
-            Self::Bool | Self::I8 | Self::U32 | Self::F64 | Self::F8E5M2 => None,
+            Self::U8 => Some(uniserve_tensor::DType::U8),
+            Self::I32 => Some(uniserve_tensor::DType::I32),
+            Self::I64 => Some(uniserve_tensor::DType::I64),
+            Self::F16 => Some(uniserve_tensor::DType::F16),
+            Self::BF16 => Some(uniserve_tensor::DType::BF16),
+            Self::F32 => Some(uniserve_tensor::DType::F32),
+            Self::F8E4M3 => Some(uniserve_tensor::DType::F8E4M3),
+            Self::I16 => Some(uniserve_tensor::DType::I16),
+            Self::U32 => Some(uniserve_tensor::DType::U32),
+            Self::F64 => Some(uniserve_tensor::DType::F64),
+            Self::Bool | Self::I8 | Self::F8E5M2 => None,
         }
     }
 
     /// The storage element a kernel operand type is stored as, when a storage
     /// plane can hold it.
     ///
-    /// `None` for [`ops::DType::F4E2M1`]: a packed 4-bit operand exists only as
+    /// `None` for a packed element such as [`uniserve_tensor::DType::F4`]: a packed 4-bit operand exists only as
     /// a kernel operand. Screen storage counts bytes as elements times a whole
     /// element size, so a plane of packed nibbles would silently halve every
     /// byte count it feeds; such a plane is declared as its container bytes
     /// with the packed dtype named in the descriptor instead.
-    pub fn from_kernel(dtype: ops::DType) -> Option<Self> {
+    pub fn from_kernel(dtype: uniserve_tensor::DType) -> Option<Self> {
         Some(match dtype {
-            ops::DType::U8 => Self::U8,
-            ops::DType::I32 => Self::I32,
-            ops::DType::I64 => Self::I64,
-            ops::DType::F16 => Self::F16,
-            ops::DType::BF16 => Self::BF16,
-            ops::DType::F32 => Self::F32,
-            ops::DType::F8E4M3 => Self::F8E4M3,
-            ops::DType::I16 => Self::I16,
-            ops::DType::F4E2M1 => return None,
+            uniserve_tensor::DType::U8 => Self::U8,
+            uniserve_tensor::DType::I32 => Self::I32,
+            uniserve_tensor::DType::I64 => Self::I64,
+            uniserve_tensor::DType::F16 => Self::F16,
+            uniserve_tensor::DType::BF16 => Self::BF16,
+            uniserve_tensor::DType::F32 => Self::F32,
+            uniserve_tensor::DType::F8E4M3 => Self::F8E4M3,
+            uniserve_tensor::DType::I16 => Self::I16,
+            uniserve_tensor::DType::U32 => Self::U32,
+            uniserve_tensor::DType::F64 => Self::F64,
+            // A packed element, and one the tensor library adds, is no element of a plane.
+            _ => return None,
         })
     }
 }
@@ -886,25 +891,22 @@ mod tests {
 mod element_type_tests {
     use super::ElementType;
 
-    /// The eight element types the kernel ABI describes, and the six storage
+    /// The ten element types the kernel ABI describes, and the three storage
     /// carries that no kernel operand names.
-    const KERNEL: [ElementType; 8] = [
+    const KERNEL: [ElementType; 10] = [
         ElementType::U8,
+        ElementType::U32,
         ElementType::I32,
         ElementType::I64,
         ElementType::I16,
         ElementType::F16,
         ElementType::BF16,
         ElementType::F32,
+        ElementType::F64,
         ElementType::F8E4M3,
     ];
-    const STORAGE_ONLY: [ElementType; 5] = [
-        ElementType::Bool,
-        ElementType::I8,
-        ElementType::U32,
-        ElementType::F64,
-        ElementType::F8E5M2,
-    ];
+    const STORAGE_ONLY: [ElementType; 3] =
+        [ElementType::Bool, ElementType::I8, ElementType::F8E5M2];
 
     #[test]
     fn only_the_kernel_element_types_reach_a_kernel_operand() {
@@ -925,13 +927,15 @@ mod element_type_tests {
     #[test]
     fn every_storable_kernel_element_type_round_trips_and_packed_fp4_has_no_plane() {
         let storable = [
-            ops::DType::U8,
-            ops::DType::I32,
-            ops::DType::I64,
-            ops::DType::F16,
-            ops::DType::BF16,
-            ops::DType::F32,
-            ops::DType::F8E4M3,
+            uniserve_tensor::DType::U8,
+            uniserve_tensor::DType::U32,
+            uniserve_tensor::DType::I32,
+            uniserve_tensor::DType::I64,
+            uniserve_tensor::DType::F16,
+            uniserve_tensor::DType::BF16,
+            uniserve_tensor::DType::F32,
+            uniserve_tensor::DType::F64,
+            uniserve_tensor::DType::F8E4M3,
         ];
         for dtype in storable {
             let element = ElementType::from_kernel(dtype)
@@ -939,6 +943,6 @@ mod element_type_tests {
             assert_eq!(element.to_ops(), Some(dtype), "{dtype:?} must round-trip");
         }
         // A packed 4-bit operand is a kernel operand only: no plane of it exists.
-        assert_eq!(ElementType::from_kernel(ops::DType::F4E2M1), None);
+        assert_eq!(ElementType::from_kernel(uniserve_tensor::DType::F4), None);
     }
 }

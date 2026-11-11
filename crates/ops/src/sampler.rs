@@ -44,10 +44,13 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand, Shape};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -73,7 +76,7 @@ pub struct ShapeDescriptor {
 impl fmt::Display for ShapeDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("vocabulary", self.vocabulary)
             .field("block", self.block)
             .field("extras", self.extras)
@@ -274,9 +277,9 @@ impl fmt::Display for TopKDescriptor {
         // scalars. What the key names is what a program can be compiled to disagree about, which is
         // the element types and the chunk one pass reads.
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("tile", self.tile)
-            .field("ids", self.ids)
+            .field("ids", abi::name(self.ids))
             .field("pdl", self.pdl)
             .finish(formatter)
     }
@@ -334,7 +337,7 @@ impl Op for TopK {
                 format!(
                     "expected the kept logits as f32, found {}: the program recovers them from its \
                      ordered keys as f32, and a narrower buffer would round them a second time",
-                    args.values.dtype
+                    abi::name(args.values.dtype)
                 ),
             ));
         }
@@ -347,14 +350,18 @@ impl Op for TopK {
                 Self::NAME,
                 format!(
                     "expected the ordering's scratch as i32, found {}",
-                    args.workspace.dtype
+                    abi::name(args.workspace.dtype)
                 ),
             ));
         }
         if args.ids.dtype != descriptor.ids {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected {} ids, found {}", descriptor.ids, args.ids.dtype),
+                format!(
+                    "expected {} ids, found {}",
+                    abi::name(descriptor.ids),
+                    abi::name(args.ids.dtype)
+                ),
             ));
         }
         Ok(())
@@ -417,7 +424,7 @@ impl fmt::Display for FilterDescriptor {
         Key::new()
             .field("width", self.width)
             .field("tile", self.tile)
-            .field("ids", self.ids)
+            .field("ids", abi::name(self.ids))
             .field("pdl", self.pdl)
             .finish(formatter)
     }
@@ -454,7 +461,11 @@ impl Op for FilterCandidates {
         if args.ids.dtype != descriptor.ids {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected {} ids, found {}", descriptor.ids, args.ids.dtype),
+                format!(
+                    "expected {} ids, found {}",
+                    abi::name(descriptor.ids),
+                    abi::name(args.ids.dtype)
+                ),
             ));
         }
         args.parameters.require_shape(
@@ -465,7 +476,10 @@ impl Op for FilterCandidates {
         if args.valid.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 validity flags, found {}", args.valid.dtype),
+                format!(
+                    "expected i32 validity flags, found {}",
+                    abi::name(args.valid.dtype)
+                ),
             ));
         }
         Ok(())
@@ -527,8 +541,8 @@ impl fmt::Display for InverseCdfDescriptor {
         Key::new()
             .field("width", self.width)
             .field("tile", self.tile)
-            .field("ids", self.ids)
-            .field("tokens", self.tokens)
+            .field("ids", abi::name(self.ids))
+            .field("tokens", abi::name(self.tokens))
             .field("pdl", self.pdl)
             .finish(formatter)
     }
@@ -568,14 +582,18 @@ impl Op for InverseCdf {
         if args.ids.dtype != descriptor.ids {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected {} ids, found {}", descriptor.ids, args.ids.dtype),
+                format!(
+                    "expected {} ids, found {}",
+                    abi::name(descriptor.ids),
+                    abi::name(args.ids.dtype)
+                ),
             ));
         }
         args.draws.require_shape(Self::NAME, Shape::new(&[rows]))?;
         if args.draws.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected f32 draws, found {}", args.draws.dtype),
+                format!("expected f32 draws, found {}", abi::name(args.draws.dtype)),
             ));
         }
         args.tokens.require_shape(Self::NAME, Shape::new(&[rows]))?;
@@ -584,7 +602,8 @@ impl Op for InverseCdf {
                 Self::NAME,
                 format!(
                     "expected {} tokens, found {}",
-                    descriptor.tokens, args.tokens.dtype
+                    abi::name(descriptor.tokens),
+                    abi::name(args.tokens.dtype)
                 ),
             ));
         }
@@ -644,9 +663,9 @@ pub struct ArgMaxDescriptor {
 impl fmt::Display for ArgMaxDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("width", self.width)
-            .field("ids", self.ids)
+            .field("ids", abi::name(self.ids))
             .field("pdl", self.pdl)
             .finish(formatter)
     }
@@ -687,7 +706,11 @@ impl Op for ArgMax {
         if args.out.dtype != descriptor.ids {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected {} ids, found {}", descriptor.ids, args.out.dtype),
+                format!(
+                    "expected {} ids, found {}",
+                    abi::name(descriptor.ids),
+                    abi::name(args.out.dtype)
+                ),
             ));
         }
         Ok(())
@@ -740,7 +763,7 @@ pub struct LogSoftmaxDescriptor {
 impl fmt::Display for LogSoftmaxDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("columns", self.columns)
             .field("tile", self.tile)
             .field("pdl", self.pdl)
@@ -831,7 +854,7 @@ impl fmt::Display for LogprobDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
             .field("columns", self.columns)
-            .field("ids", self.ids)
+            .field("ids", abi::name(self.ids))
             .field("tile", self.tile)
             .field("pdl", self.pdl)
             .finish(formatter)
@@ -873,7 +896,8 @@ impl Op for LogprobGather {
                 Self::NAME,
                 format!(
                     "expected {} tokens, found {}",
-                    descriptor.ids, args.tokens.dtype
+                    abi::name(descriptor.ids),
+                    abi::name(args.tokens.dtype)
                 ),
             ));
         }
@@ -881,14 +905,17 @@ impl Op for LogprobGather {
         if args.out.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected f32 log-probabilities, found {}", args.out.dtype),
+                format!(
+                    "expected f32 log-probabilities, found {}",
+                    abi::name(args.out.dtype)
+                ),
             ));
         }
         args.ranks.require_shape(Self::NAME, Shape::new(&[rows]))?;
         if args.ranks.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 ranks, found {}", args.ranks.dtype),
+                format!("expected i32 ranks, found {}", abi::name(args.ranks.dtype)),
             ));
         }
         if descriptor.tile == 0 {
@@ -1030,7 +1057,11 @@ impl Op for TopLogprobs {
             {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected {dtype} {name}, found {}", view.dtype),
+                    format!(
+                        "expected {} {name}, found {}",
+                        abi::name(dtype),
+                        abi::name(view.dtype)
+                    ),
                 ));
             }
         }
@@ -1093,8 +1124,8 @@ impl fmt::Display for OrderDescriptor {
         // The candidate count is a launch value: the reference's width follows the request's top-k,
         // so an extent here would recompile the sampler per request.
         Key::new()
-            .field("values", self.values)
-            .field("ids", self.ids)
+            .field("values", abi::name(self.values))
+            .field("ids", abi::name(self.ids))
             .field("pdl", self.pdl)
             .finish(formatter)
     }
@@ -1174,8 +1205,9 @@ impl Op for CandidateOrder {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
-                        "the {name} are {dtype} over [{rows}, {width}], the view says {}",
-                        view.dtype
+                        "the {name} are {} over [{rows}, {width}], the view says {}",
+                        abi::name(dtype),
+                        abi::name(view.dtype)
                     ),
                 ));
             }
@@ -1206,7 +1238,8 @@ impl Op for CandidateOrder {
                 Self::NAME,
                 format!(
                     "the counts are i32 over [{rows}, {}], the view says {}",
-                    args.vocabulary, args.counts.dtype
+                    args.vocabulary,
+                    abi::name(args.counts.dtype)
                 ),
             ));
         }

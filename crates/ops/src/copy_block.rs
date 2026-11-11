@@ -28,10 +28,13 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand};
+use crate::tensor::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -67,8 +70,8 @@ pub struct Descriptor {
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("source", self.source)
-            .field("out", self.out)
+            .field("source", abi::name(self.source))
+            .field("out", abi::name(self.out))
             .field("wide", self.wide)
             .finish(formatter)
     }
@@ -126,7 +129,9 @@ impl Op for CopyBlock {
                 Self::NAME,
                 format!(
                     "a copy of {} into {} converts nothing: both sides move {} elements",
-                    descriptor.source, descriptor.out, descriptor.source
+                    abi::name(descriptor.source),
+                    abi::name(descriptor.out),
+                    abi::name(descriptor.source)
                 ),
             ));
         }
@@ -137,7 +142,11 @@ impl Op for CopyBlock {
             if view.dtype != dtype {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected {dtype} {name}, found {}", view.dtype),
+                    format!(
+                        "expected {} {name}, found {}",
+                        abi::name(dtype),
+                        abi::name(view.dtype)
+                    ),
                 ));
             }
             view.require_rank(Self::NAME, RANK)?;

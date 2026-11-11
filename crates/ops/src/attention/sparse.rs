@@ -65,12 +65,14 @@ use std::ffi::c_void;
 use std::fmt;
 
 use super::{address, head_stride, row_stride, to_i64};
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand, Shape};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
+use uniserve_tensor::DType;
 
 /// The largest value magnitude the sparse attention bound's absolute term is written for.
 ///
@@ -106,8 +108,8 @@ impl fmt::Display for SparseDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
             .field("block", self.block)
-            .field("dtype", self.dtype)
-            .field("output", self.output)
+            .field("dtype", abi::name(self.dtype))
+            .field("output", abi::name(self.output))
             .field("head_dim", self.head_dim)
             .field("lse", self.lse)
             .finish(formatter)
@@ -389,7 +391,7 @@ impl Op for SparseAttention {
                 format!(
                     "expected i32 indices [{heads}, {query_tiles}, selected] with selected > 0, \
                      found {} {:?}",
-                    args.indices.dtype,
+                    abi::name(args.indices.dtype),
                     args.indices.shape.dims()
                 ),
             ));
@@ -399,7 +401,10 @@ impl Op for SparseAttention {
         if args.counts.dtype != DType::I32 {
             return Err(Error::argument(
                 operator,
-                format!("expected i32 counts, found {}", args.counts.dtype),
+                format!(
+                    "expected i32 counts, found {}",
+                    abi::name(args.counts.dtype)
+                ),
             ));
         }
         args.valid
@@ -407,7 +412,10 @@ impl Op for SparseAttention {
         if args.valid.dtype != DType::I32 {
             return Err(Error::argument(
                 operator,
-                format!("expected i32 valid sizes, found {}", args.valid.dtype),
+                format!(
+                    "expected i32 valid sizes, found {}",
+                    abi::name(args.valid.dtype)
+                ),
             ));
         }
         match (descriptor.lse, args.lse) {
@@ -416,7 +424,7 @@ impl Op for SparseAttention {
                 if lse.dtype != DType::F32 {
                     return Err(Error::argument(
                         operator,
-                        format!("expected an f32 normalizer, found {}", lse.dtype),
+                        format!("expected an f32 normalizer, found {}", abi::name(lse.dtype)),
                     ));
                 }
             }
@@ -508,8 +516,8 @@ impl Op for SparseAttention {
             v_head_stride: to_i64(operator, head_stride(&args.value))?,
             selected: to_i64(operator, args.indices.shape.dim(2))?,
             head_dim: to_i64(operator, head_dim)?,
-            dtype: descriptor.dtype.as_i64(),
-            output_dtype: descriptor.output.as_i64(),
+            dtype: abi::code(descriptor.dtype)?,
+            output_dtype: abi::code(descriptor.output)?,
             scale: args.scale,
             error: [0; 512],
         };
@@ -542,7 +550,7 @@ impl Op for SparseAttention {
         let reduction = u64::from(descriptor.keys);
         let accumulate = DType::F32;
         let gamma = tolerance::gamma(reduction, accumulate);
-        let value_term = 2.0 * gamma + accumulate.unit_roundoff();
+        let value_term = 2.0 * gamma + tolerance::unit_roundoff(accumulate);
         Tolerance::rounding(reduction, accumulate, descriptor.output)
             .with_atol((value_term * f64::from(VALUE_ENVELOPE)) as f32)
     }

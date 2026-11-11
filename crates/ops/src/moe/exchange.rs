@@ -33,14 +33,17 @@ use std::ffi::c_void;
 use std::fmt;
 use std::sync::Arc;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, DevicePtr, Operand, Shape};
+use crate::tensor::{DevicePtr, Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
-use super::{address, dtype_code, to_i64};
+use super::{address, to_i64};
 
 /// Which direction of the exchange one module performs.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -150,7 +153,7 @@ impl fmt::Display for Descriptor {
             .field("max_tokens", self.max_tokens)
             .field("ranks", self.ranks)
             .field("attention", self.attention)
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .finish(formatter)
     }
 }
@@ -361,7 +364,7 @@ impl TransportShape {
             let sent = tokens * (hidden / 2 + hidden / 16 + top * 12);
             staged + shared + sent + Self::FUSED_FIXED_BYTES
         } else {
-            let element = self.dtype.bytes().unwrap_or(2);
+            let element = abi::bytes(self.dtype).unwrap_or(2);
             let received = rows * (2 * hidden * element + top * 24);
             let window = (rows + ranks) * (hidden * element + 256);
             received + window + Self::FIXED_BYTES
@@ -518,7 +521,7 @@ impl Transport {
             hidden: i64::from(shape.hidden),
             max_tokens: i64::from(shape.max_tokens),
             top: i64::from(shape.top),
-            dtype: dtype_code(shape.dtype),
+            dtype: abi::code(shape.dtype)?,
             device: i64::from(shape.device),
             intermediate: i64::from(shape.intermediate),
             capacity: 0,
@@ -644,7 +647,10 @@ impl Op for ExpertExchange {
             if live.dtype != DType::I32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected an i32 live count, found {}", live.dtype),
+                    format!(
+                        "expected an i32 live count, found {}",
+                        abi::name(live.dtype)
+                    ),
                 ));
             }
         }
@@ -725,7 +731,7 @@ impl Op for ExpertExchange {
             experts: to_i64(Self::NAME, experts)?,
             max_tokens: to_i64(Self::NAME, max_tokens)?,
             ranks: to_i64(Self::NAME, ranks)?,
-            dtype: dtype_code(descriptor.dtype),
+            dtype: abi::code(descriptor.dtype)?,
             error: [0; 512],
         };
         // SAFETY: `Call` is the call structure this package's entry declares, and its layout is

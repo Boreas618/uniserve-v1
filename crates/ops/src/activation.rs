@@ -23,11 +23,14 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand, Shape};
-use crate::tolerance::Tolerance;
+use crate::tensor::{Operand, Shape};
+use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
 /// The activation a gated pair applies to its gate half.
@@ -91,7 +94,7 @@ pub struct ActAndMulDescriptor {
 impl fmt::Display for ActAndMulDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("width", self.width)
             .field("block", self.block)
             .field("activation", self.activation)
@@ -173,7 +176,8 @@ impl Op for ActAndMul {
                     Self::NAME,
                     format!(
                         "expected {} {name} elements, found {}",
-                        descriptor.dtype, view.dtype
+                        abi::name(descriptor.dtype),
+                        abi::name(view.dtype)
                     ),
                 ));
             }
@@ -268,7 +272,10 @@ impl Op for ActAndMul {
             Activation::Silu | Activation::Sigmoid => 3.0,
             Activation::Gelu | Activation::GeluTanh => 4.0,
         };
-        Tolerance::new(0.0, roundings * descriptor.dtype.unit_roundoff() as f32)
+        Tolerance::new(
+            0.0,
+            roundings * tolerance::unit_roundoff(descriptor.dtype) as f32,
+        )
     }
 }
 
@@ -292,7 +299,7 @@ pub struct ValueFirstSwigluDescriptor {
 impl fmt::Display for ValueFirstSwigluDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("width", self.width)
             .field("block", self.block)
             .field("input_stride", self.input_stride)
@@ -447,7 +454,7 @@ impl Op for ValueFirstSwiglu {
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // The sigmoid, its product with the gate, the bias add and the product with the value: four
         // roundings in the output type, and no reduction.
-        Tolerance::new(0.0, 4.0 * descriptor.dtype.unit_roundoff() as f32)
+        Tolerance::new(0.0, 4.0 * tolerance::unit_roundoff(descriptor.dtype) as f32)
     }
 }
 
@@ -475,7 +482,7 @@ pub struct SwigluDescriptor {
 impl fmt::Display for SwigluDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("width", self.width)
             .field("block", self.block)
             .field("value_stride", self.value_stride)
@@ -639,7 +646,7 @@ impl Op for Swiglu {
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // Two bias adds, the sigmoid, its product with the biased gate and the product with the
         // biased value: five roundings in the output type, and no reduction.
-        Tolerance::new(0.0, 5.0 * descriptor.dtype.unit_roundoff() as f32)
+        Tolerance::new(0.0, 5.0 * tolerance::unit_roundoff(descriptor.dtype) as f32)
     }
 }
 
@@ -662,7 +669,7 @@ pub struct SiluDescriptor {
 impl fmt::Display for SiluDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("block", self.block)
             .field("pdl", self.pdl)
             .finish(formatter)
@@ -796,9 +803,9 @@ mod silu_tests {
         let bound = <Silu as Op>::tolerance(&descriptor(DType::BF16, false));
         assert!(bound.atol > 0.0, "the exponential needs an absolute part");
         assert!(
-            bound.atol < DType::BF16.unit_roundoff() as f32,
+            bound.atol < tolerance::unit_roundoff(DType::BF16) as f32,
             "the envelope must not swallow the output type's own rounding"
         );
-        assert!(bound.rtol >= DType::BF16.unit_roundoff() as f32);
+        assert!(bound.rtol >= tolerance::unit_roundoff(DType::BF16) as f32);
     }
 }

@@ -30,7 +30,8 @@
 //! indexed by the caller's step table. Every evaluation then launches against the same buffers, so
 //! one captured graph serves the whole trajectory; only the step table's index changes per replay.
 
-use ops::{DType, Operand, Shape, Strides};
+use ops::{Operand, Shape, Strides};
+use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -218,9 +219,9 @@ impl Euler {
                 format!(
                     "a velocity of {:?} {} does not cover a sample of {:?} {}",
                     velocity.shape.dims(),
-                    velocity.dtype,
+                    ops::abi::name(velocity.dtype),
                     sample.shape.dims(),
-                    sample.dtype
+                    ops::abi::name(sample.dtype)
                 ),
             ));
         }

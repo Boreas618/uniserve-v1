@@ -33,7 +33,8 @@
 use ops::attention::sparse::{SparseArgs, SparseAttention, SparseDescriptor};
 use ops::descriptor::Float;
 use ops::vsa::{self, MAX_MEMBERS, VsaZeroPadding};
-use ops::{DType, Operand, Shape};
+use ops::{Operand, Shape};
+use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -787,7 +788,8 @@ impl VsaAttention {
 
 #[cfg(test)]
 mod tests {
-    use ops::{DType, DevicePtr, Shape};
+    use ops::{DevicePtr, Shape};
+    use uniserve_tensor::DType;
 
     use super::*;
 

@@ -58,12 +58,14 @@ use std::ffi::c_void;
 use std::fmt;
 
 use super::{Mask, address, head_stride, row_stride, to_i64};
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand, Shape};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
+use uniserve_tensor::DType;
 
 /// The largest value magnitude the attention bound's absolute term is written for.
 ///
@@ -112,9 +114,9 @@ pub struct DenseDescriptor {
 impl fmt::Display for DenseDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let key = Key::new()
-            .field("dtype", self.query)
-            .field("kv", self.key_value)
-            .field("out", self.output)
+            .field("dtype", abi::name(self.query))
+            .field("kv", abi::name(self.key_value))
+            .field("out", abi::name(self.output))
             .field("head_dim", self.head_dim)
             .field("q_heads", self.q_heads)
             .field("kv_heads", self.kv_heads)
@@ -491,9 +493,9 @@ impl Op for DenseAttention {
             scale: f64::from(args.scale),
             window_left: i64::from(args.window_left),
             causal: i64::from(causal),
-            dtype_query: descriptor.query.as_i64(),
-            dtype_key_value: descriptor.key_value.as_i64(),
-            dtype_output: descriptor.output.as_i64(),
+            dtype_query: abi::code(descriptor.query)?,
+            dtype_key_value: abi::code(descriptor.key_value)?,
+            dtype_output: abi::code(descriptor.output)?,
             error: [0; 512],
         };
         // SAFETY: `DenseCall` is the call structure this package's entry declares, and its layout is
@@ -524,7 +526,7 @@ impl Op for DenseAttention {
         let reduction = u64::from(descriptor.max_kv_len);
         let accumulate = DType::F32;
         let gamma = tolerance::gamma(reduction, accumulate);
-        let value_term = 2.0 * gamma + accumulate.unit_roundoff();
+        let value_term = 2.0 * gamma + tolerance::unit_roundoff(accumulate);
         Tolerance::rounding(reduction, accumulate, descriptor.output)
             .with_atol((value_term * f64::from(VALUE_ENVELOPE)) as f32)
     }
@@ -584,7 +586,7 @@ fn sequence_layout(
         if view.dtype != DType::I32 {
             return Err(Error::argument(
                 operator,
-                format!("expected i32 {name}, found {}", view.dtype),
+                format!("expected i32 {name}, found {}", abi::name(view.dtype)),
             ));
         }
     }

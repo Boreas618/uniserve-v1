@@ -674,7 +674,11 @@ impl Rotary {
     }
 
     /// The factor table's descriptor, for positions of `positions` and a table of `factors`.
-    fn factors_descriptor(&self, positions: ops::DType, factors: ops::DType) -> FactorsDescriptor {
+    fn factors_descriptor(
+        &self,
+        positions: uniserve_tensor::DType,
+        factors: uniserve_tensor::DType,
+    ) -> FactorsDescriptor {
         let axes = self.spectrum.axes();
         FactorsDescriptor {
             dtype: factors,
@@ -696,8 +700,8 @@ impl Rotary {
     fn fused_descriptor(
         &self,
         (epsilon, gain): (f32, Gain),
-        input: ops::DType,
-        output: ops::DType,
+        input: uniserve_tensor::DType,
+        output: uniserve_tensor::DType,
         affine: bool,
     ) -> QkNormRopeDescriptor {
         let head = u64::from(self.spec.head_dim);
@@ -714,7 +718,7 @@ impl Rotary {
             block: head.next_power_of_two().min(1024) as u32,
             affine,
             pdl: PDL,
-            factors: ops::DType::F32,
+            factors: uniserve_tensor::DType::F32,
             strided: false,
             centred: affine && gain == Gain::Centred,
         }
@@ -768,8 +772,8 @@ impl Rotary {
             )
         })?;
         let shape = ops::Shape::new(&[tokens, columns]);
-        let cosine = f.empty(ops::DType::F32, shape)?;
-        let sine = f.empty(ops::DType::F32, shape)?;
+        let cosine = f.empty(uniserve_tensor::DType::F32, shape)?;
+        let sine = f.empty(uniserve_tensor::DType::F32, shape)?;
         let descriptor = self.factors_descriptor(positions.dtype, cosine.dtype);
         let args = FactorsArgs {
             positions,
@@ -1023,7 +1027,8 @@ mod tests {
     #[test]
     fn a_rotation_without_its_spectrum_computes_no_factors() {
         use crate::forward::{Arena, Forward};
-        use ops::{DType, Shape};
+        use ops::Shape;
+        use uniserve_tensor::DType;
 
         let rotary = Rotary::new(
             Spectrum::Default {

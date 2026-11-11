@@ -22,7 +22,8 @@
 //! final `tanh` or clamp is the caller's: a PCM step clamps as it quantizes.
 
 use ops::activation1d::{self, Activation1d as Activation1dOp};
-use ops::{DType, Operand, Shape};
+use ops::{Operand, Shape};
+use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -84,7 +85,10 @@ impl Activation1d {
             if weight.dtype() != DType::F32 {
                 return Err(Error::shape(
                     OWNER,
-                    format!("the {name} is f32 per channel, not {}", weight.dtype()),
+                    format!(
+                        "the {name} is f32 per channel, not {}",
+                        ops::abi::name(weight.dtype())
+                    ),
                 ));
             }
         }
@@ -166,7 +170,8 @@ impl Activation1d {
                 OWNER,
                 format!(
                     "the activation is {} and the signal {}",
-                    self.dtype, input.dtype
+                    ops::abi::name(self.dtype),
+                    ops::abi::name(input.dtype)
                 ),
             ));
         }
@@ -175,10 +180,12 @@ impl Activation1d {
         let out = f.empty(self.dtype, Shape::new(&dims))?;
         let length = u32::try_from(length)
             .map_err(|_| Error::shape(OWNER, format!("{length} samples exceed a launch value")))?;
-        let element = self
-            .dtype
-            .bytes()
-            .ok_or_else(|| Error::shape(OWNER, format!("{} has no byte width", self.dtype)))?;
+        let element = ops::abi::bytes(self.dtype).ok_or_else(|| {
+            Error::shape(
+                OWNER,
+                format!("{} has no byte width", ops::abi::name(self.dtype)),
+            )
+        })?;
         let (input_row, out_row) = (
             channels * u64::from(length) * element,
             channels * expected * element,

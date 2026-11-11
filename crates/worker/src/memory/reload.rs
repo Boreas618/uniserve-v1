@@ -131,7 +131,8 @@ pub fn paired(
         if from.dtype != to.dtype {
             return Err(format!(
                 "{tensor} is {} and the served {}",
-                to.dtype, from.dtype
+                ops::abi::name(to.dtype),
+                ops::abi::name(from.dtype)
             ));
         }
         if from.layout != to.layout {
@@ -308,8 +309,11 @@ impl<'a> Reloading<'a> {
         else {
             return Ok(None);
         };
-        let element = key.dtype.bytes().ok_or_else(|| {
-            Error::Invalid(format!("a {} stack has no whole-byte element", key.dtype))
+        let element = ops::abi::bytes(key.dtype).ok_or_else(|| {
+            Error::Invalid(format!(
+                "a {} stack has no whole-byte element",
+                ops::abi::name(key.dtype)
+            ))
         })?;
         let length = usize::try_from(key.region.shape.numel().saturating_mul(element))
             .map_err(|_| Error::Invalid("a stack larger than this host addresses".into()))?;

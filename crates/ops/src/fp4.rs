@@ -26,10 +26,13 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::platform::{self, Stream};
-use crate::tensor::{DType, Operand, Shape};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -137,7 +140,7 @@ pub struct QuantizeDescriptor {
 impl fmt::Display for QuantizeDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("input", self.input)
+            .field("input", abi::name(self.input))
             .field("columns", self.columns)
             .field("layout", self.layout)
             .field("block", self.block)
@@ -192,7 +195,7 @@ impl Op for Nvfp4Quantize {
                 Self::NAME,
                 format!(
                     "{} activations; NVFP4 encodes BF16 or FP16",
-                    descriptor.input
+                    abi::name(descriptor.input)
                 ),
             ));
         }
@@ -328,10 +331,10 @@ pub struct GemmDescriptor {
 impl fmt::Display for GemmDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("packed", self.packed)
-            .field("scale", self.scale)
-            .field("accumulate", self.accumulate)
-            .field("output", self.output)
+            .field("packed", abi::name(self.packed))
+            .field("scale", abi::name(self.scale))
+            .field("accumulate", abi::name(self.accumulate))
+            .field("output", abi::name(self.output))
             .field("layout", self.layout)
             .field("epilogue", self.epilogue)
             .field("m", self.m)
@@ -413,7 +416,7 @@ pub fn require_byte_scale(op: &'static str, view: Operand, columns: u64) -> Resu
             op,
             format!(
                 "block scales are one byte each, declared U8 or f8e4m3, found {}",
-                view.dtype
+                abi::name(view.dtype)
             ),
         ));
     }
@@ -433,7 +436,8 @@ pub fn check_gemm(descriptor: &GemmDescriptor) -> Result<()> {
             Nvfp4Gemm::NAME,
             format!(
                 "an NVFP4 product takes U8 packed bytes and an f8e4m3 block scale, not {} and {}",
-                descriptor.packed, descriptor.scale
+                abi::name(descriptor.packed),
+                abi::name(descriptor.scale)
             ),
         ));
     }
@@ -501,7 +505,8 @@ impl Op for Nvfp4Gemm {
                 Self::NAME,
                 format!(
                     "expected {} output, found {}",
-                    descriptor.output, args.out.dtype
+                    abi::name(descriptor.output),
+                    abi::name(args.out.dtype)
                 ),
             ));
         }

@@ -36,7 +36,7 @@ pub use platform::{
 
 pub use crate::tensor::DevicePtr;
 
-use crate::tensor::DType;
+use uniserve_tensor::DType;
 
 /// The device address a launch parameter carries.
 pub(crate) fn address(pointer: DevicePtr) -> u64 {
@@ -157,10 +157,13 @@ pub fn collective_type(dtype: DType) -> Option<CollectiveType> {
         DType::BF16 => CollectiveType::Bf16,
         DType::F32 => CollectiveType::F32,
         DType::F8E4M3 => CollectiveType::F8E4M3,
+        DType::U32 => CollectiveType::U32,
+        DType::F64 => CollectiveType::F64,
         // NCCL has no 16-bit integer reduction: a silent fallback would be a wrong answer, so a
         // PCM sample travels as bytes and never as a collective's element.
         DType::I16 => return None,
-        DType::F4E2M1 => return None,
+        // Neither a packed element nor one the tensor library adds is a collective's element.
+        _ => return None,
     })
 }
 
@@ -181,6 +184,27 @@ pub unsafe fn copy_from_host(
     })?;
     // SAFETY: forwarded from the caller.
     unsafe { platform::memcpy_async(destination.address(), source, bytes, stream) }
+        .map_err(crate::Error::from)
+}
+
+/// Copies `bytes` bytes at the device address `source` to host memory at `destination`, in
+/// stream order.
+///
+/// # Safety
+/// `source` holds `bytes` bytes on the stream's device and `destination` holds `bytes` writable
+/// bytes of host memory; both stay valid until the copy completes. The caller waits for the
+/// stream before it reads `destination`.
+pub unsafe fn copy_to_host(
+    destination: u64,
+    source: DevicePtr,
+    bytes: u64,
+    stream: &Stream,
+) -> crate::Result<()> {
+    let bytes = usize::try_from(bytes).map_err(|_| {
+        crate::Error::Shape(format!("a {bytes}-byte read is larger than usize::MAX"))
+    })?;
+    // SAFETY: forwarded from the caller.
+    unsafe { platform::memcpy_async(destination, source.address(), bytes, stream) }
         .map_err(crate::Error::from)
 }
 

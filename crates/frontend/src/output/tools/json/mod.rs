@@ -23,10 +23,6 @@
 //! included. A published call is never withdrawn; after a later failure only
 //! the input following its streamed arguments is returned.
 
-pub use qwen::Qwen25ToolParser;
-
-mod qwen;
-
 use winnow::ascii::multispace0 as ws0;
 use winnow::combinator::{alt, peek, seq};
 use winnow::error::{AddContext, ModalResult, StrContext, StrContextValue};
@@ -40,7 +36,7 @@ use super::utils::{
     JsonObjectScanPhase, JsonObjectScanState, MAX_BUFFER_BYTES, json_str, parse_buffered_event,
     safe_text_len, take_json_object,
 };
-use super::{Result, ToolCallDelta, ToolParserOutput};
+use super::{Result, ToolCallDelta, ToolParser, ToolParserOutput};
 
 type JsonToolInput<'i> = Partial<&'i str>;
 
@@ -74,7 +70,7 @@ enum JsonToolCallMode {
 /// One parsed unit of the buffered stream.
 ///
 /// `len` fields count bytes at the head of the parser buffer that
-/// `JsonToolCallParser::apply_event` copies into the output before the buffer
+/// `JsonToolParser::apply_event` copies into the output before the buffer
 /// drains them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum JsonToolCallEvent {
@@ -85,9 +81,33 @@ enum JsonToolCallEvent {
     ToolCallEnd,
 }
 
-/// Tool parser core for marker-wrapped JSON tool calls.
+/// The newlines belong to the delimiters, as in the format the chat templates
+/// of its families instruct and SGLang's detector matches, so a bare
+/// `<tool_call>` tag in prose stays plain text.
+const JSON_TOOL_CALL: JsonToolCallConfig = JsonToolCallConfig {
+    parser_name: "JSON",
+    start_delimiter: "<tool_call>\n",
+    end_delimiter: "\n</tool_call>",
+    name_key: "name",
+    arguments_key: &["arguments"],
+};
+
+/// The parser of the JSON tool-call format (`processing::ToolCallFormat::Json`):
+/// one JSON object per call inside `<tool_call>` tags.
+///
+/// ```text
+/// <tool_call>
+/// {"name": "get_weather", "arguments": {"location":"Tokyo"}}
+/// </tool_call>
+/// ```
+///
+/// Arguments are already OpenAI-style JSON text, so they are streamed as raw
+/// argument deltas, neither converted by a schema nor normalized; the parser
+/// reads no tool definition, and parsed function names are not checked against
+/// the request's tools. Parallel calls are repeated `<tool_call>...</tool_call>`
+/// blocks, not several calls inside one tag.
 #[derive(Debug)]
-struct JsonToolCallParser {
+pub struct JsonToolParser {
     config: JsonToolCallConfig,
     /// Input not yet consumed by a complete event.
     buffer: String,
@@ -100,11 +120,17 @@ struct JsonToolCallParser {
     emitted_tool_count: usize,
 }
 
-impl JsonToolCallParser {
-    /// Creates a marker-wrapped JSON tool-call parser.
-    fn new(config: JsonToolCallConfig) -> Self {
+impl Default for JsonToolParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl JsonToolParser {
+    /// A parser before any input.
+    pub fn new() -> Self {
         Self {
-            config,
+            config: JSON_TOOL_CALL,
             buffer: String::new(),
             mode: JsonToolCallMode::Text,
             active_tool_index: None,
@@ -113,7 +139,7 @@ impl JsonToolCallParser {
     }
 
     /// The parser's state, as `JsonToolCall`'s fields hold it.
-    fn state(&self) -> handoff::JsonToolCall {
+    fn json_state(&self) -> handoff::JsonToolCall {
         let mode = match &self.mode {
             JsonToolCallMode::Text => handoff::JsonToolMode {
                 kind: handoff::JsonToolModeKind::JsonToolModeText as i32,
@@ -152,8 +178,8 @@ impl JsonToolCallParser {
         }
     }
 
-    /// Takes over a state this parser produced (`JsonToolCallParser::state`).
-    fn resume(&mut self, state: &handoff::JsonToolCall) {
+    /// Takes over a state this parser produced (`JsonToolParser::json_state`).
+    fn resume_json(&mut self, state: &handoff::JsonToolCall) {
         self.buffer.clone_from(&state.buffer);
         let mode = state.mode.as_ref().map_or(JsonToolCallMode::Text, |mode| {
             let kind = handoff::JsonToolModeKind::try_from(mode.kind)
@@ -187,6 +213,63 @@ impl JsonToolCallParser {
         self.mode = mode;
         self.active_tool_index = state.active_tool_index.map(|index| index as usize);
         self.emitted_tool_count = state.emitted_tool_count as usize;
+    }
+
+    /// Applies one parsed JSON tool-call event to parser state and output.
+    fn apply_event(
+        &mut self,
+        event: JsonToolCallEvent,
+        output: &mut ToolParserOutput,
+    ) -> Result<()> {
+        match event {
+            JsonToolCallEvent::Text { len: consumed_len } => {
+                output.push_text(&self.buffer[..consumed_len]);
+            }
+            JsonToolCallEvent::ToolCallStart => self.mode = JsonToolCallMode::Header,
+            JsonToolCallEvent::ToolCallHeader { function_name } => {
+                let tool_index = self.emitted_tool_count;
+                self.emitted_tool_count += 1;
+                self.active_tool_index = Some(tool_index);
+                self.mode = JsonToolCallMode::Arguments {
+                    json_scan: JsonObjectScanState::default(),
+                };
+                output.push_call(ToolCallDelta {
+                    tool_index,
+                    name: Some(function_name),
+                    arguments: String::new(),
+                });
+            }
+            JsonToolCallEvent::Arguments { len: consumed_len } => {
+                let Some(tool_index) = self.active_tool_index else {
+                    return Err(parsing_failed!(
+                        "{} arguments without an active tool call",
+                        self.config.parser_name
+                    ));
+                };
+                output.push_call(ToolCallDelta {
+                    tool_index,
+                    name: None,
+                    arguments: self.buffer[..consumed_len].to_string(),
+                });
+            }
+            JsonToolCallEvent::ToolCallEnd => {
+                self.active_tool_index = None;
+                self.mode = JsonToolCallMode::Text;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ToolParser for JsonToolParser {
+    fn state(&self) -> Option<handoff::tool_stage::Parser> {
+        Some(handoff::tool_stage::Parser::Json(self.json_state()))
+    }
+
+    fn resume(&mut self, state: &handoff::tool_stage::Parser) {
+        if let handoff::tool_stage::Parser::Json(json) = state {
+            self.resume_json(json);
+        }
     }
 
     /// Advances incremental parsing and appends every complete event to `output`.
@@ -241,51 +324,6 @@ impl JsonToolCallParser {
         let mut output = ToolParserOutput::default();
         output.push_text(&self.reset());
         Ok(output)
-    }
-
-    /// Applies one parsed JSON tool-call event to parser state and output.
-    fn apply_event(
-        &mut self,
-        event: JsonToolCallEvent,
-        output: &mut ToolParserOutput,
-    ) -> Result<()> {
-        match event {
-            JsonToolCallEvent::Text { len: consumed_len } => {
-                output.push_text(&self.buffer[..consumed_len]);
-            }
-            JsonToolCallEvent::ToolCallStart => self.mode = JsonToolCallMode::Header,
-            JsonToolCallEvent::ToolCallHeader { function_name } => {
-                let tool_index = self.emitted_tool_count;
-                self.emitted_tool_count += 1;
-                self.active_tool_index = Some(tool_index);
-                self.mode = JsonToolCallMode::Arguments {
-                    json_scan: JsonObjectScanState::default(),
-                };
-                output.push_call(ToolCallDelta {
-                    tool_index,
-                    name: Some(function_name),
-                    arguments: String::new(),
-                });
-            }
-            JsonToolCallEvent::Arguments { len: consumed_len } => {
-                let Some(tool_index) = self.active_tool_index else {
-                    return Err(parsing_failed!(
-                        "{} arguments without an active tool call",
-                        self.config.parser_name
-                    ));
-                };
-                output.push_call(ToolCallDelta {
-                    tool_index,
-                    name: None,
-                    arguments: self.buffer[..consumed_len].to_string(),
-                });
-            }
-            JsonToolCallEvent::ToolCallEnd => {
-                self.active_tool_index = None;
-                self.mode = JsonToolCallMode::Text;
-            }
-        }
-        Ok(())
     }
 
     /// Resets the incremental parser state and returns the input that no
@@ -475,4 +513,336 @@ fn safe_text_event(
     config: JsonToolCallConfig,
 ) -> ModalResult<JsonToolCallEvent> {
     safe_text_len(input, config.start_delimiter).map(|len| JsonToolCallEvent::Text { len })
+}
+
+#[cfg(test)]
+mod tests {
+    use expect_test::expect;
+    use thiserror_ext::AsReport;
+
+    use super::JsonToolParser;
+    use crate::output::tools::test_utils::{collect_stream, split_by_chars};
+    use crate::output::tools::{ToolCallDelta, ToolParser, ToolParserItem, ToolParserOutput};
+
+    /// Collects the tool-call updates of `output` in order.
+    fn calls(output: &ToolParserOutput) -> Vec<&ToolCallDelta> {
+        output.calls().collect()
+    }
+
+    fn build_tool_call(function_name: &str, arguments: &str) -> String {
+        format!(
+            "<tool_call>\n{{\"name\": \"{function_name}\", \"arguments\": {arguments}}}\n</tool_call>"
+        )
+    }
+
+    #[test]
+    fn json_parse_complete_without_tool_call_keeps_text() {
+        let mut parser = JsonToolParser::new();
+        let output = parser.parse_complete("Hello, world!").unwrap();
+
+        assert_eq!(output.normal_text(), "Hello, world!");
+        assert!(calls(&output).is_empty());
+    }
+
+    #[test]
+    fn json_parse_complete_extracts_raw_json_arguments() {
+        let mut parser = JsonToolParser::new();
+        let arguments = r#"{ "location": "Tokyo", "days": "3" }"#;
+        let output = parser
+            .parse_complete(&format!(
+                "Let me check.\n{}",
+                build_tool_call("get_weather", arguments)
+            ))
+            .unwrap();
+
+        assert_eq!(output.normal_text(), "Let me check.\n");
+        assert_eq!(calls(&output).len(), 1);
+        assert_eq!(calls(&output)[0].tool_index, 0);
+        assert_eq!(calls(&output)[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(calls(&output)[0].arguments, arguments);
+    }
+
+    #[test]
+    fn json_does_not_validate_or_normalize_arguments() {
+        let mut parser = JsonToolParser::new();
+        let arguments = r#"{"location":"Tokyo",}"#;
+        let output = parser
+            .parse_complete(&build_tool_call("get_weather", arguments))
+            .unwrap();
+
+        assert_eq!(calls(&output)[0].arguments, arguments);
+    }
+
+    /// Argument bytes stream out chunk by chunk: the fifth chunk closes the
+    /// arguments object and the last one only closes the wrapper and the tag,
+    /// so exactly three argument deltas follow the header.
+    #[test]
+    fn json_streaming_emits_argument_deltas() {
+        let mut parser = JsonToolParser::new();
+        let chunks = [
+            "<tool_call>",
+            "\n{\"name\": \"get_weather\", \"arguments\": ",
+            "{\"location\":",
+            "\"Beijing\"",
+            "}",
+            "}\n</tool_call>",
+        ];
+
+        let mut output = ToolParserOutput::default();
+        let mut observed_arguments = Vec::new();
+        for chunk in chunks {
+            let next = parser.parse_chunk(chunk).unwrap();
+            observed_arguments.extend(
+                next.calls()
+                    .filter(|call| call.name.is_none())
+                    .map(|call| call.arguments.clone()),
+            );
+            output.append(next);
+        }
+        output.append(parser.finish().unwrap());
+
+        assert_eq!(observed_arguments, ["{\"location\":", "\"Beijing\"", "}"]);
+        assert_eq!(
+            calls(&output.coalesce_calls())[0].arguments,
+            r#"{"location":"Beijing"}"#
+        );
+    }
+
+    #[test]
+    fn json_streaming_handles_split_markers() {
+        let input = format!(
+            "hello {}",
+            build_tool_call("get_weather", r#"{"location":"Tokyo"}"#)
+        );
+        let chunks = split_by_chars(&input, 5);
+        let mut parser = JsonToolParser::new();
+
+        let output = collect_stream(&mut parser, &chunks);
+
+        assert_eq!(output.normal_text(), "hello ");
+        assert_eq!(calls(&output).len(), 1);
+        assert_eq!(calls(&output)[0].arguments, r#"{"location":"Tokyo"}"#);
+    }
+
+    #[test]
+    fn json_keeps_end_marker_literal_inside_json_string() {
+        let mut parser = JsonToolParser::new();
+        let arguments = r#"{"text":"literal </tool_call> inside"}"#;
+        let output = parser
+            .parse_complete(&build_tool_call("echo", arguments))
+            .unwrap();
+
+        assert_eq!(calls(&output).len(), 1);
+        assert_eq!(calls(&output)[0].arguments, arguments);
+    }
+
+    #[test]
+    fn json_decodes_escaped_function_name() {
+        let mut parser = JsonToolParser::new();
+        let output = parser
+            .parse_complete(
+                r#"<tool_call>
+{"name":"say_\"hi","arguments":{}}
+</tool_call>"#,
+            )
+            .unwrap();
+
+        assert_eq!(calls(&output)[0].name.as_deref(), Some("say_\"hi"));
+    }
+
+    /// Without the newline after `<tool_call>` the block is not a tool call,
+    /// and the whole input is plain text.
+    #[test]
+    fn json_requires_newline_after_tool_call_start() {
+        let mut parser = JsonToolParser::new();
+        let input = r#"<tool_call>{"name":"get_weather","arguments":{}}
+</tool_call>"#;
+
+        let output = parser.parse_complete(input).unwrap();
+
+        assert_eq!(output.normal_text(), input);
+        assert!(calls(&output).is_empty());
+    }
+
+    /// A `<tool_call>` tag that does not start a tool call streams out as
+    /// text with its chunk instead of holding back all later text.
+    #[test]
+    fn json_streams_text_after_tag_without_newline() {
+        let mut parser = JsonToolParser::new();
+
+        let first = parser.parse_chunk("Use the <tool_call> tag.").unwrap();
+        let second = parser.parse_chunk(" More.").unwrap();
+
+        assert_eq!(first.normal_text(), "Use the <tool_call> tag.");
+        assert_eq!(second.normal_text(), " More.");
+    }
+
+    /// A tag that does not start a tool call leaves later well-formed calls
+    /// in the same response parseable.
+    #[test]
+    fn json_parses_tool_call_after_tag_without_newline() {
+        let mut parser = JsonToolParser::new();
+        let output = parser
+            .parse_complete(&format!(
+                "<tool_call> x\n{}",
+                build_tool_call("add", r#"{"x":1}"#)
+            ))
+            .unwrap();
+
+        assert_eq!(output.normal_text(), "<tool_call> x\n");
+        assert_eq!(calls(&output).len(), 1);
+        assert_eq!(calls(&output)[0].name.as_deref(), Some("add"));
+        assert_eq!(calls(&output)[0].arguments, r#"{"x":1}"#);
+    }
+
+    /// JSON whitespace between the arguments object and the wrapper's closing
+    /// brace is insignificant, as it is anywhere else inside the wrapper.
+    #[test]
+    fn json_accepts_whitespace_before_wrapper_close() {
+        let mut parser = JsonToolParser::new();
+        let output = parser
+            .parse_complete(
+                "<tool_call>\n{\"name\": \"add\", \"arguments\": {\"x\": 1} \n}\n</tool_call>",
+            )
+            .unwrap();
+
+        assert_eq!(output.normal_text(), "");
+        assert_eq!(calls(&output).len(), 1);
+        assert_eq!(calls(&output)[0].name.as_deref(), Some("add"));
+        assert_eq!(calls(&output)[0].arguments, r#"{"x": 1}"#);
+    }
+
+    #[test]
+    fn json_requires_newline_before_tool_call_end() {
+        let mut parser = JsonToolParser::new();
+        let error = parser
+            .parse_complete(
+                r#"<tool_call>
+{"name":"get_weather","arguments":{}}</tool_call>"#,
+            )
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_report_string()
+                .starts_with("tool parser parsing failed:")
+        );
+    }
+
+    #[test]
+    fn json_streaming_extracts_multiple_tool_calls() {
+        let input = format!(
+            "{}{}",
+            build_tool_call("get_weather", r#"{"location":"Shanghai"}"#),
+            build_tool_call("add", r#"{"x":1,"y":2}"#),
+        );
+        let chunks = split_by_chars(&input, 7);
+        let mut parser = JsonToolParser::new();
+
+        let output = collect_stream(&mut parser, &chunks);
+
+        assert_eq!(
+            output.items,
+            [
+                ToolParserItem::Call(ToolCallDelta {
+                    tool_index: 0,
+                    name: Some("get_weather".to_string()),
+                    arguments: r#"{"location":"Shanghai"}"#.to_string(),
+                }),
+                ToolParserItem::Call(ToolCallDelta {
+                    tool_index: 1,
+                    name: Some("add".to_string()),
+                    arguments: r#"{"x":1,"y":2}"#.to_string(),
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn json_finish_fails_incomplete_tool_call() {
+        let mut parser = JsonToolParser::new();
+        parser
+            .parse_chunk(
+                r#"<tool_call>
+{"name":"get_weather","arguments":{"location""#,
+            )
+            .unwrap();
+
+        let error = parser.finish().unwrap_err();
+
+        expect!["tool parser parsing failed: incomplete JSON tool call"]
+            .assert_eq(&error.to_report_string());
+    }
+
+    /// An unfinished header has published no call, so finalization returns
+    /// it as plain text together with its start delimiter.
+    #[test]
+    fn json_finish_returns_incomplete_header_as_text() {
+        let mut parser = JsonToolParser::new();
+        let input = "Checking.<tool_call>\n{\"name\": \"get_wea";
+
+        let streamed = parser.parse_chunk(input).unwrap();
+        let finished = parser.finish().unwrap();
+
+        assert_eq!(
+            streamed.normal_text() + finished.normal_text().as_str(),
+            input
+        );
+        assert!(calls(&streamed).is_empty());
+        assert!(calls(&finished).is_empty());
+    }
+
+    /// A header that fails to parse publishes no call, and `reset` returns
+    /// the whole attempted call, start delimiter included, even when it
+    /// arrived over several chunks.
+    #[test]
+    fn json_reset_after_header_error_returns_whole_call() {
+        let mut parser = JsonToolParser::new();
+        let mut output = ToolParserOutput::default();
+
+        parser
+            .parse_into("Hi <tool_call>\n{\"na", &mut output)
+            .unwrap();
+        let result = parser.parse_into("me\": \"add\", \"args\": {}}\n</tool_call>", &mut output);
+
+        assert!(result.is_err());
+        assert_eq!(output.normal_text(), "Hi ");
+        assert!(calls(&output).is_empty());
+        assert_eq!(
+            parser.reset(),
+            "<tool_call>\n{\"name\": \"add\", \"args\": {}}\n</tool_call>"
+        );
+    }
+
+    /// Arguments that are not a JSON object fail the header, so no call is
+    /// published with unusable arguments and `reset` returns the whole call.
+    #[test]
+    fn json_rejects_non_object_arguments_before_publishing() {
+        let mut parser = JsonToolParser::new();
+        let mut output = ToolParserOutput::default();
+        let input = "<tool_call>\n{\"name\": \"add\", \"arguments\": \"{}\"}\n</tool_call>";
+
+        let result = parser.parse_into(input, &mut output);
+
+        assert!(result.is_err());
+        assert!(calls(&output).is_empty());
+        assert_eq!(parser.reset(), input);
+    }
+
+    #[test]
+    fn json_malformed_field_order_fails_fast() {
+        let mut parser = JsonToolParser::new();
+        let error = parser
+            .parse_chunk(
+                r#"<tool_call>
+{"arguments":{},"name":"get_weather"}
+</tool_call>"#,
+            )
+            .unwrap_err();
+
+        expect![[r#"
+            tool parser parsing failed: invalid JSON
+            expected `name`"#]]
+        .assert_eq(&error.to_report_string());
+    }
 }

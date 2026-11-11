@@ -72,7 +72,13 @@ pub(crate) fn encode(dtype: DType, values: &[f32]) -> Outcome<Vec<u8>> {
             .iter()
             .flat_map(|value| f32_to_bf16(*value).to_le_bytes())
             .collect(),
-        other => return Err(format!("no float encoding for {other}").into()),
+        other => {
+            return Err(format!(
+                "no float encoding for {other}",
+                other = ops::abi::name(other)
+            )
+            .into());
+        }
     })
 }
 
@@ -97,6 +103,12 @@ pub(crate) fn decode(dtype: DType, bytes: &[u8]) -> Outcome<Vec<f32>> {
             .iter()
             .map(|half| f32::from_bits(u32::from(u16::from_le_bytes(*half)) << 16))
             .collect(),
-        other => return Err(format!("no float decoding for {other}").into()),
+        other => {
+            return Err(format!(
+                "no float decoding for {other}",
+                other = ops::abi::name(other)
+            )
+            .into());
+        }
     })
 }

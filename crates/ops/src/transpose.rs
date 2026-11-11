@@ -21,10 +21,13 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand};
+use crate::tensor::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -46,7 +49,7 @@ impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Both extents are launch values, so the key names neither of them.
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("block", self.block)
             .field("pdl", self.pdl)
             .finish(formatter)
@@ -89,7 +92,11 @@ fn matrix(view: &Operand, name: &str, dtype: DType) -> Result<(u64, u64)> {
     if view.dtype != dtype {
         return Err(Error::argument(
             Transpose::NAME,
-            format!("expected {dtype} {name}, found {}", view.dtype),
+            format!(
+                "expected {} {name}, found {}",
+                abi::name(dtype),
+                abi::name(view.dtype)
+            ),
         ));
     }
     if !contiguous(view) {
@@ -127,7 +134,7 @@ impl Op for Transpose {
                 Self::NAME,
                 format!(
                     "expected f32, bf16 or f16 elements, the descriptor says {}",
-                    descriptor.dtype
+                    abi::name(descriptor.dtype)
                 ),
             ));
         }

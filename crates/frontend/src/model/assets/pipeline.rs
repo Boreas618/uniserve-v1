@@ -1,10 +1,10 @@
-//! Component files of a diffusers pipeline checkpoint.
+//! Stage files of a diffusers pipeline checkpoint.
 //!
-//! A pipeline checkpoint holds its components in the folders its root index
+//! A pipeline checkpoint holds its stages in the folders its root index
 //! names (`PipelineIndex`). A FastH3 export may omit some of them; its
 //! `fastvideo_inference.json` then pins, in `base_model_revision`
 //! (`hf://<repository>@<revision>`), the base revision whose folders supply
-//! them. [`PipelineCheckpoint`] reads each component file from the
+//! them. [`PipelineCheckpoint`] reads each stage file from the
 //! checkpoint, or from the Hub snapshot of that revision when the checkpoint
 //! lacks it, as the rank's loader (`uniserve.models.registry`) reads them.
 
@@ -18,8 +18,8 @@ use crate::model::assets::error::{Error, Result};
 use crate::model::assets::model_files::{HubClient, ModelSource, fetch_file};
 use crate::model::assets::pipeline_index::{PipelineIndex, pipeline_index};
 
-/// Inference contract a FastVideo export publishes at its root.
-const INFERENCE_CONTRACT: &str = "fastvideo_inference.json";
+/// The inference description a FastVideo export publishes at its root.
+const INFERENCE_FILE: &str = "fastvideo_inference.json";
 
 /// A Hugging Face repository pinned at one commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,7 +95,7 @@ async fn pinned_file(client: &HubClient, pin: &BaseRevision, filename: &str) -> 
 }
 
 /// The Hub cache's snapshot of the base revision the export at `root` pins, or
-/// `None` for a checkpoint that publishes no inference contract or pins no base.
+/// `None` for a checkpoint that publishes no inference description or pins no base.
 ///
 /// A rank opens the export and this snapshot as one checkpoint: the export
 /// holds its own DiT, and the snapshot the directories it omits. Nothing is
@@ -104,10 +104,10 @@ async fn pinned_file(client: &HubClient, pin: &BaseRevision, filename: &str) -> 
 ///
 /// # Errors
 ///
-/// Returns [`Error::Invalid`] when the contract or its pin is malformed or the
-/// snapshot is not in the cache, and the errors of reading the contract.
+/// Returns [`Error::Invalid`] when the description or its pin is malformed or the
+/// snapshot is not in the cache, and the errors of reading the description.
 pub fn pinned_snapshot(root: &std::path::Path) -> Result<Option<PathBuf>> {
-    let path = root.join(INFERENCE_CONTRACT);
+    let path = root.join(INFERENCE_FILE);
     if !path.is_file() {
         return Ok(None);
     }
@@ -115,9 +115,9 @@ pub fn pinned_snapshot(root: &std::path::Path) -> Result<Option<PathBuf>> {
         path: path.clone(),
         source,
     })?;
-    let contract: Value =
+    let description: Value =
         serde_json::from_str(&content).map_err(|source| Error::Json { path, source })?;
-    let Some(pin) = contract.get("base_model_revision") else {
+    let Some(pin) = description.get("base_model_revision") else {
         return Ok(None);
     };
     let pin = pin.as_str().ok_or_else(|| {
@@ -146,9 +146,9 @@ pub fn pinned_snapshot(root: &std::path::Path) -> Result<Option<PathBuf>> {
 }
 
 /// Reads the base revision a FastH3 export pins, or `None` for a checkpoint
-/// that publishes no inference contract or pins no base.
+/// that publishes no inference description or pins no base.
 async fn pinned_base(root: &ModelSource) -> Result<Option<BaseRevision>> {
-    let path = match root.file(INFERENCE_CONTRACT).await {
+    let path = match root.file(INFERENCE_FILE).await {
         Ok(path) => path,
         Err(Error::MissingFile { .. }) => return Ok(None),
         Err(error) => return Err(error),
@@ -157,9 +157,9 @@ async fn pinned_base(root: &ModelSource) -> Result<Option<BaseRevision>> {
         path: path.clone(),
         source,
     })?;
-    let contract: Value =
+    let description: Value =
         serde_json::from_str(&content).map_err(|source| Error::Json { path, source })?;
-    match contract.get("base_model_revision") {
+    match description.get("base_model_revision") {
         None => Ok(None),
         Some(pin) => pin
             .as_str()
@@ -174,7 +174,7 @@ async fn pinned_base(root: &ModelSource) -> Result<Option<BaseRevision>> {
     }
 }
 
-/// A diffusers pipeline checkpoint with the source of each component's files.
+/// A diffusers pipeline checkpoint with the source of each stage's files.
 pub struct PipelineCheckpoint {
     /// The checkpoint's root index.
     index: PipelineIndex,
@@ -225,17 +225,17 @@ impl PipelineCheckpoint {
         &self.index.class_name
     }
 
-    /// Returns `filename` inside `component`'s folder, read from the
+    /// Returns `filename` inside `stage`'s folder, read from the
     /// checkpoint, or from its base revision when the checkpoint lacks it.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Invalid`] for a component the index does not declare,
+    /// Returns [`Error::Invalid`] for a stage the index does not declare,
     /// and the errors of `ModelSource::file`
     /// for the file, including [`Error::MissingFile`] when neither source
     /// holds it.
-    pub async fn component_file(&self, component: &str, filename: &str) -> Result<PathBuf> {
-        let path = self.index.component_file(component, filename)?;
+    pub async fn stage_file(&self, stage: &str, filename: &str) -> Result<PathBuf> {
+        let path = self.index.stage_file(stage, filename)?;
         match (self.root.file(&path).await, &self.base) {
             (Err(Error::MissingFile { .. }), Some((client, pin))) => {
                 pinned_file(client, pin, &path).await
@@ -258,7 +258,7 @@ mod tests {
     const BASE: &str = "org/base";
     const PIN: &str = "9bfb6693f2cf6de171db46d1aa586f67d773a1da";
 
-    /// Index of a FastH3 export: every MiniMax-H3 component, of which the
+    /// Index of a FastH3 export: every MiniMax-H3 stage, of which the
     /// export holds only `transformer_ref`.
     const INDEX: &str = r#"{
         "_class_name": "MiniMaxH3ModularPipeline",
@@ -280,7 +280,7 @@ mod tests {
         let root = tempdir().unwrap();
         write(&root.path().join("modular_model_index.json"), INDEX);
         write(
-            &root.path().join(INFERENCE_CONTRACT),
+            &root.path().join(INFERENCE_FILE),
             &format!(r#"{{"model_type": "ref2va", "base_model_revision": "hf://{BASE}@{PIN}"}}"#),
         );
         write(
@@ -325,13 +325,13 @@ mod tests {
         assert_eq!(checkpoint.class_name(), "MiniMaxH3ModularPipeline");
         let snapshot = repository.join("snapshots").join(PIN);
         let tokenizer = checkpoint
-            .component_file("tokenizer", "tokenizer.json")
+            .stage_file("tokenizer", "tokenizer.json")
             .await
             .unwrap();
         assert_eq!(tokenizer, snapshot.join("tokenizer/tokenizer.json"));
         assert_eq!(read(tokenizer), "cached");
         let processor = checkpoint
-            .component_file("processor", "config.json")
+            .stage_file("processor", "config.json")
             .await
             .unwrap();
         assert!(processor.starts_with(&snapshot), "{}", processor.display());
@@ -339,7 +339,7 @@ mod tests {
         assert_eq!(
             read(
                 checkpoint
-                    .component_file("transformer_ref", "config.json")
+                    .stage_file("transformer_ref", "config.json")
                     .await
                     .unwrap()
             ),

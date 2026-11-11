@@ -21,10 +21,13 @@
 use std::fmt;
 use std::mem::{offset_of, size_of};
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand, Shape, Strides};
+use crate::tensor::{Operand, Shape, Strides};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -57,7 +60,7 @@ pub struct FramePadDescriptor {
 impl fmt::Display for FramePadDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("reflect", self.reflect)
             .field("block_pixels", self.block_pixels)
             .field("block_channels", self.block_channels)
@@ -124,7 +127,9 @@ impl Op for FramePad {
                 Self::NAME,
                 format!(
                     "expected {} values and output, found {} and {}",
-                    descriptor.dtype, args.values.dtype, args.out.dtype
+                    abi::name(descriptor.dtype),
+                    abi::name(args.values.dtype),
+                    abi::name(args.out.dtype)
                 ),
             ));
         }
@@ -405,7 +410,9 @@ impl fmt::Display for FrameMomentsDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // The epsilon is absent on purpose: it travels in the call, so the key would name several
         // cells for one program.
-        Key::new().field("dtype", self.dtype).finish(formatter)
+        Key::new()
+            .field("dtype", abi::name(self.dtype))
+            .finish(formatter)
     }
 }
 
@@ -568,7 +575,9 @@ impl fmt::Display for FrameNormPadDescriptor {
         // Three fields are absent on purpose: the object derives the order and the normalization
         // branch at run time and treats a one-pixel frame as one case among the rest, so naming any
         // of them would key several cells to one program.
-        Key::new().field("dtype", self.dtype).finish(formatter)
+        Key::new()
+            .field("dtype", abi::name(self.dtype))
+            .finish(formatter)
     }
 }
 

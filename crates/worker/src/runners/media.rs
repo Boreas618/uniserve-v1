@@ -691,7 +691,7 @@ fn read_conditions(
     let mut patches_at = 0_usize;
     let patch_bytes = usize::try_from(
         u64::from(format.patches.width())
-            * format.patches.dtype.bytes().ok_or_else(|| {
+            * ops::abi::bytes(format.patches.dtype).ok_or_else(|| {
                 crate::Error::Invalid("a patch row has no whole-byte size".into())
             })?,
     )
@@ -932,11 +932,10 @@ impl MediaStage {
             Ok(Some(platform::PinnedBuffer::new(self.device, bytes)?))
         };
         let row = u64::from(self.format.patches.width())
-            * self.format.patches.dtype.bytes().ok_or_else(|| {
+            * ops::abi::bytes(self.format.patches.dtype).ok_or_else(|| {
                 crate::Error::Invalid("a patch row has no whole-byte size".into())
             })?;
-        let float = CONDITION_MEDIA
-            .bytes()
+        let float = ops::abi::bytes(CONDITION_MEDIA)
             .ok_or_else(|| crate::Error::Invalid("an FP32 has no whole-byte size".into()))?;
         Ok(ConditionRead {
             conditioning,
@@ -964,7 +963,7 @@ impl MediaStage {
         let stream_id = crate::arena::StreamId(self.stream.raw());
         {
             let held = crate::lock(&regions);
-            let element = CONDITION_MEDIA.bytes().ok_or_else(|| {
+            let element = ops::abi::bytes(CONDITION_MEDIA).ok_or_else(|| {
                 crate::Error::Invalid("a condition element has no whole-byte size".into())
             })?;
             let float = |buffer: &platform::PinnedBuffer| {
@@ -978,7 +977,7 @@ impl MediaStage {
                 let dtype = format.patches.dtype;
                 let width = u64::from(format.patches.width());
                 let row = width
-                    * dtype.bytes().ok_or_else(|| {
+                    * ops::abi::bytes(dtype).ok_or_else(|| {
                         crate::Error::Invalid("a patch row has no whole-byte size".into())
                     })?;
                 Ok(ops::Operand::new(

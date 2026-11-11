@@ -65,7 +65,11 @@ pub(crate) fn collective(
     if send.dtype != recv.dtype {
         return Err(Error::shape(
             collective,
-            format!("collects {} against {}", send.dtype, recv.dtype),
+            format!(
+                "collects {} against {}",
+                ops::abi::name(send.dtype),
+                ops::abi::name(recv.dtype)
+            ),
         ));
     }
     let count = usize::try_from(send.numel())
@@ -73,7 +77,7 @@ pub(crate) fn collective(
     let dtype = ops::collective_type(send.dtype).ok_or_else(|| {
         Error::Unsupported(format!(
             "{collective}: {} has no NCCL element type",
-            send.dtype
+            ops::abi::name(send.dtype)
         ))
     })?;
     Ok((count, dtype))
@@ -96,8 +100,8 @@ pub(crate) fn gathered(
             format!(
                 "receives {} {} elements, {expected} of {} expected",
                 recv.numel(),
-                recv.dtype,
-                send.dtype
+                ops::abi::name(recv.dtype),
+                ops::abi::name(send.dtype)
             ),
         ));
     }

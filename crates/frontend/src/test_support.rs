@@ -77,14 +77,14 @@ pub fn configured_tokenizer() -> DynTokenizer {
     Arc::new(load_tokenizer(&tokenizer))
 }
 
-/// A chat family whose outputs are parsed in the Qwen3 formats.
+/// A chat family whose outputs are parsed as `<think>` reasoning and JSON tool calls.
 pub const CHAT: processing::Family = processing::Family {
     id: "chat",
     model_types: &["chat"],
     classes: &[],
     serving: processing::Serving::Chat(processing::ChatProfile {
-        reasoning: Some(processing::ReasoningFormat::Qwen3),
-        tool_calls: Some(processing::ToolCallFormat::Qwen3),
+        reasoning: Some(processing::ReasoningFormat::Think),
+        tool_calls: Some(processing::ToolCallFormat::Json),
         images: None,
     }),
 };
@@ -277,7 +277,7 @@ impl crate::events::Events for ChannelEvents {
 /// instant it holds.
 pub struct Unrecorded(pub std::time::Instant);
 
-impl crate::events::Outcome for Unrecorded {
+impl crate::events::Stats for Unrecorded {
     fn started(&self) -> std::time::Instant {
         self.0
     }
@@ -294,20 +294,32 @@ impl crate::events::Outcome for Unrecorded {
 /// Wire chat messages and requests for the tests that render or lower chat:
 /// each message as a client sends it.
 pub mod chat {
-    use crate::input::chat::{ChatConfig, ChatRequest, ChatToolChoice};
-    use crate::openai::{
-        ChatMessage, ContentPart, FunctionCallResponse, ImageUrl, MessageContent, ToolCall,
+    use crate::protocol::{
+        ChatCompletionRequest, ChatMessage, ContentPart, Function, FunctionCallResponse, ImageUrl,
+        MessageContent, Tool, ToolCall,
     };
-    use crate::output::chat::AssistantContentBlock;
-    use crate::output::tools::Tool;
 
-    /// A request of `messages` with default render options and no tools.
-    pub fn request(messages: Vec<ChatMessage>) -> ChatRequest {
-        ChatRequest {
-            messages,
-            chat_options: ChatConfig::default(),
-            tools: Vec::new(),
-            tool_choice: ChatToolChoice::None,
+    /// A request of `messages` to the model `test`, with every other field at
+    /// its wire default: no tools, and the model free to call the ones a test
+    /// adds.
+    pub fn request(messages: Vec<ChatMessage>) -> ChatCompletionRequest {
+        let mut request: ChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({"model": "test", "messages": []}))
+                .expect("a chat request of the wire defaults");
+        request.messages = messages;
+        request
+    }
+
+    /// The function tool `name`, taking arguments of the JSON schema
+    /// `parameters`.
+    pub fn function(name: &str, parameters: serde_json::Value) -> Tool {
+        Tool::Function {
+            function: Function {
+                name: name.to_owned(),
+                description: None,
+                parameters,
+                strict: None,
+            },
         }
     }
 
@@ -355,52 +367,43 @@ pub mod chat {
     pub fn developer(text: impl Into<String>, tools: Option<Vec<Tool>>) -> ChatMessage {
         ChatMessage::Developer {
             content: MessageContent::Text(text.into()),
-            tools: tools.map(|tools| {
-                tools
-                    .into_iter()
-                    .map(|tool| crate::openai::Tool::Function {
-                        function: crate::openai::Function {
-                            name: tool.name,
-                            description: tool.description,
-                            parameters: tool.parameters,
-                        },
-                    })
-                    .collect()
-            }),
+            tools,
             name: None,
         }
     }
 
     /// An assistant message of `text`.
     pub fn assistant(text: impl Into<String>) -> ChatMessage {
-        assistant_blocks(vec![AssistantContentBlock::Text { text: text.into() }])
+        assistant_turn("", text, Vec::new())
     }
 
-    /// The assistant message a client sends back for a turn whose output
-    /// was `blocks`: its reasoning, its text and its tool calls.
-    pub fn assistant_blocks(blocks: Vec<AssistantContentBlock>) -> ChatMessage {
-        let mut reasoning = String::new();
-        let mut text = String::new();
-        let mut tool_calls = Vec::new();
-        for block in blocks {
-            match block {
-                AssistantContentBlock::Reasoning { text: part } => reasoning.push_str(&part),
-                AssistantContentBlock::Text { text: part } => text.push_str(&part),
-                AssistantContentBlock::ToolCall(call) => tool_calls.push(ToolCall {
-                    id: call.id,
-                    tool_type: "function".to_owned(),
-                    function: FunctionCallResponse {
-                        name: call.name,
-                        arguments: Some(call.arguments),
-                    },
-                }),
-            }
-        }
+    /// The assistant message a client sends back for a turn that reasoned
+    /// `reasoning`, said `text` and called `tool_calls`; an empty part is
+    /// absent from the message.
+    pub fn assistant_turn(
+        reasoning: impl Into<String>,
+        text: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+    ) -> ChatMessage {
+        let (reasoning, text) = (reasoning.into(), text.into());
         ChatMessage::Assistant {
             content: (!text.is_empty()).then_some(MessageContent::Text(text)),
             name: None,
             tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
             reasoning: (!reasoning.is_empty()).then_some(reasoning),
+        }
+    }
+
+    /// The function call `id` of `name` with the JSON text `arguments`, as an
+    /// assistant message states it.
+    pub fn tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_owned(),
+            tool_type: "function".to_owned(),
+            function: FunctionCallResponse {
+                name: name.to_owned(),
+                arguments: Some(arguments.to_owned()),
+            },
         }
     }
 

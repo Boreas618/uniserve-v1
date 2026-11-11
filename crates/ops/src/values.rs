@@ -2,7 +2,7 @@
 //! and back.
 //!
 //! Every host-side producer of device bytes — a constant table, a loaded weight's conversion, a
-//! media sample — encodes through [`DType::encode`] and reads through [`DType::decode`], and the
+//! media sample — encodes through [`encode`] and reads through [`decode`], and the
 //! scalar converters below are what both use. They follow the device's own conversion so a value
 //! narrowed on the host and one narrowed on the card agree bit for bit:
 //!
@@ -15,8 +15,10 @@
 //! The bytes are little-endian, the order of every device this tree serves and of a safetensors
 //! payload.
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::error::{Error, Result};
-use crate::tensor::DType;
 
 /// The bfloat16 bit pattern nearest to `value`, ties to even.
 pub fn f32_to_bf16(value: f32) -> u16 {
@@ -120,75 +122,76 @@ pub fn f16_to_f32(half: u16) -> f32 {
     f32::from_bits(bits)
 }
 
-impl DType {
-    /// `values` as the little-endian bytes of this floating-point type, each rounded to nearest
-    /// with ties to even.
-    ///
-    /// # Errors
-    ///
-    /// For a type other than F32, BF16 or F16: a packed or integer type has no rounding from a real
-    /// number that a host producer may choose for it.
-    pub fn encode(self, values: &[f32]) -> Result<Vec<u8>> {
-        let mut bytes = Vec::with_capacity(values.len() * 4);
-        match self {
-            Self::F32 => values
-                .iter()
-                .for_each(|value| bytes.extend_from_slice(&value.to_le_bytes())),
-            Self::BF16 => values
-                .iter()
-                .for_each(|value| bytes.extend_from_slice(&f32_to_bf16(*value).to_le_bytes())),
-            Self::F16 => values
-                .iter()
-                .for_each(|value| bytes.extend_from_slice(&f32_to_f16(*value).to_le_bytes())),
-            other => {
-                return Err(Error::Shape(format!(
-                    "real numbers are encoded as f32, bf16 or f16, not {other}"
-                )));
-            }
-        }
-        Ok(bytes)
-    }
-
-    /// The real values the little-endian bytes of this floating-point type hold, exactly.
-    ///
-    /// # Errors
-    ///
-    /// For a type other than F32, BF16 or F16, and for a byte count that is not whole elements.
-    pub fn decode(self, bytes: &[u8]) -> Result<Vec<f32>> {
-        let width = match self {
-            Self::F32 => 4,
-            Self::BF16 | Self::F16 => 2,
-            other => {
-                return Err(Error::Shape(format!(
-                    "real numbers are decoded from f32, bf16 or f16, not {other}"
-                )));
-            }
-        };
-        if !bytes.len().is_multiple_of(width) {
+/// `values` as the little-endian bytes of the floating-point type `dtype`, each rounded to nearest
+/// with ties to even.
+///
+/// # Errors
+///
+/// For a type other than F32, BF16 or F16: a packed or integer type has no rounding from a real
+/// number that a host producer may choose for it.
+pub fn encode(dtype: DType, values: &[f32]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    match dtype {
+        DType::F32 => values
+            .iter()
+            .for_each(|value| bytes.extend_from_slice(&value.to_le_bytes())),
+        DType::BF16 => values
+            .iter()
+            .for_each(|value| bytes.extend_from_slice(&f32_to_bf16(*value).to_le_bytes())),
+        DType::F16 => values
+            .iter()
+            .for_each(|value| bytes.extend_from_slice(&f32_to_f16(*value).to_le_bytes())),
+        other => {
             return Err(Error::Shape(format!(
-                "{} bytes are not whole {self} elements",
-                bytes.len()
+                "real numbers are encoded as f32, bf16 or f16, not {}",
+                abi::name(other)
             )));
         }
-        Ok(bytes
-            .chunks_exact(width)
-            .map(|chunk| match self {
-                Self::F32 => f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
-                Self::BF16 => bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])),
-                _ => f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])),
-            })
-            .collect())
     }
+    Ok(bytes)
+}
 
-    /// The bytes of one element of value one: the coefficient a fused operator reads where a
-    /// scale of one is meant.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::encode`].
-    pub fn one(self) -> Result<Vec<u8>> {
-        self.encode(&[1.0])
+/// The real values the little-endian bytes of the floating-point type `dtype` hold, exactly.
+///
+/// # Errors
+///
+/// For a type other than F32, BF16 or F16, and for a byte count that is not whole elements.
+pub fn decode(dtype: DType, bytes: &[u8]) -> Result<Vec<f32>> {
+    let width = match dtype {
+        DType::F32 => 4,
+        DType::BF16 | DType::F16 => 2,
+        other => {
+            return Err(Error::Shape(format!(
+                "real numbers are decoded from f32, bf16 or f16, not {}",
+                abi::name(other)
+            )));
+        }
+    };
+    if !bytes.len().is_multiple_of(width) {
+        return Err(Error::Shape(format!(
+            "{} bytes are not whole {} elements",
+            bytes.len(),
+            abi::name(dtype)
+        )));
     }
+    Ok(bytes
+        .chunks_exact(width)
+        .map(|chunk| match dtype {
+            DType::F32 => f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+            DType::BF16 => bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])),
+            _ => f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])),
+        })
+        .collect())
+}
+
+/// The bytes of one element of value one: the coefficient a fused operator reads where a
+/// scale of one is meant.
+///
+/// # Errors
+///
+/// As [`encode`].
+pub fn one(dtype: DType) -> Result<Vec<u8>> {
+    encode(dtype, &[1.0])
 }
 
 #[cfg(test)]
@@ -277,15 +280,15 @@ mod tests {
     fn a_type_encodes_and_decodes_its_own_bytes() {
         let values = [1.0_f32, -0.5, 3.0];
         for dtype in [DType::F32, DType::BF16, DType::F16] {
-            let bytes = dtype.encode(&values).unwrap();
-            assert_eq!(bytes.len() as u64, 3 * dtype.bytes().unwrap());
-            assert_eq!(dtype.decode(&bytes).unwrap(), values, "{dtype}");
-            assert_eq!(dtype.one().unwrap(), dtype.encode(&[1.0]).unwrap());
+            let bytes = encode(dtype, &values).unwrap();
+            assert_eq!(bytes.len() as u64, 3 * abi::bytes(dtype).unwrap());
+            assert_eq!(decode(dtype, &bytes).unwrap(), values, "{dtype:?}");
+            assert_eq!(one(dtype).unwrap(), encode(dtype, &[1.0]).unwrap());
         }
-        assert_eq!(DType::BF16.one().unwrap(), [0x80, 0x3f]);
-        assert_eq!(DType::F16.one().unwrap(), [0x00, 0x3c]);
-        assert!(DType::I32.encode(&values).is_err());
-        assert!(DType::U8.decode(&[0]).is_err());
-        assert!(DType::BF16.decode(&[0; 3]).is_err());
+        assert_eq!(one(DType::BF16).unwrap(), [0x80, 0x3f]);
+        assert_eq!(one(DType::F16).unwrap(), [0x00, 0x3c]);
+        assert!(encode(DType::I32, &values).is_err());
+        assert!(decode(DType::U8, &[0]).is_err());
+        assert!(decode(DType::BF16, &[0; 3]).is_err());
     }
 }

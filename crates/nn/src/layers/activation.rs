@@ -25,9 +25,9 @@
 //! a later read has not reached yet; the operators' shape and stride checks refuse mismatched extents
 //! but cannot see a shift inside one row, so this documentation is the obligation the caller holds.
 
-use ops::DType;
 use ops::Operand;
 use ops::activation::{self, Activation};
+use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -444,7 +444,7 @@ impl Snake {
 
     /// The descriptor one Snake launch takes: the element type and the channel count, which is the
     /// length of every frequency. The samples per channel travel with the call.
-    fn descriptor(dtype: ops::DType, channels: u64) -> ops::snake::Descriptor {
+    fn descriptor(dtype: uniserve_tensor::DType, channels: u64) -> ops::snake::Descriptor {
         ops::snake::Descriptor {
             dtype,
             channels: u32::try_from(channels).unwrap_or(u32::MAX),
@@ -498,7 +498,7 @@ pub struct Silu;
 impl Silu {
     /// The descriptor one SiLU launch takes: the element type and the row's column count, which is the
     /// width the timestep embedding activates.
-    fn descriptor(dtype: ops::DType, columns: u32) -> ops::activation::SiluDescriptor {
+    fn descriptor(dtype: uniserve_tensor::DType, columns: u32) -> ops::activation::SiluDescriptor {
         ops::activation::SiluDescriptor {
             dtype,
             columns,

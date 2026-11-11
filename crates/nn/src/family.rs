@@ -33,7 +33,8 @@ use crate::capability::{
     CausalLm, Decoder, Denoiser, Encoder, KvView, MediaFormat, Splicer, TokenBatch, Vision,
     WarmPrompt, WarmRequest,
 };
-use crate::{Checkpoint, DType, Forward, Operand, Result, WeightLoader};
+use crate::{Checkpoint, Forward, Operand, Result, WeightLoader};
+use uniserve_tensor::DType;
 
 /// One model family a build serves: what execution loads of its checkpoints, beside how they
 /// declare it and what request processing serves ([`processing::Family`]).
@@ -79,12 +80,12 @@ impl Eq for Family {}
 /// The families an executable loads, each claiming the `model_type`s and classes its checkpoints
 /// declare.
 ///
-/// The claims are request processing's catalogue ([`processing::Catalogue`]) of the same families,
+/// The claims are request processing's registry ([`processing::Registry`]) of the same families,
 /// so both sides resolve a checkpoint by one rule.
 #[derive(Clone, Debug, Default)]
 pub struct Catalogue {
     families: Vec<Family>,
-    claims: processing::Catalogue,
+    claims: processing::Registry,
 }
 
 impl Catalogue {
@@ -96,7 +97,7 @@ impl Catalogue {
     /// it would resolve to either.
     pub fn new(families: impl IntoIterator<Item = Family>) -> Result<Self> {
         let families: Vec<Family> = families.into_iter().collect();
-        let claims = processing::Catalogue::new(families.iter().map(|family| family.request))
+        let claims = processing::Registry::new(families.iter().map(|family| family.request))
             .map_err(|error| crate::Error::Unsupported(error.to_string()))?;
         Ok(Self { families, claims })
     }
@@ -392,7 +393,7 @@ impl StateField {
     /// The bytes one slot of the field occupies.
     pub fn bytes(&self) -> u64 {
         let elements: u64 = self.dims.iter().product();
-        elements * self.dtype.bytes().unwrap_or(0)
+        elements * ops::abi::bytes(self.dtype).unwrap_or(0)
     }
 }
 

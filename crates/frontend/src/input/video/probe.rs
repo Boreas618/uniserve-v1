@@ -1,7 +1,7 @@
-//! Media probing: the facts of a condition's media that its plan needs.
+//! Media probing: the facts of a condition's media that its processing needs.
 //!
 //! The facts are read by the decoders that read the media for the request
-//! (`media::probe`), so the extent a request is planned with is the extent the
+//! (`media::probe`), so the extent a request is processed with is the extent the
 //! worker's media reader produces. This module states which media a request
 //! accepts:
 //!
@@ -134,7 +134,7 @@ impl MediaProber {
     }
 }
 
-/// Probes media of kind `kind` against the request contract.
+/// Probes media of kind `kind` against the request rules.
 fn probe_media(kind: ReferenceKind, bytes: &[u8]) -> Result<MediaMetadata, String> {
     let unreadable = |error: media::Error| format!("the media cannot be read: {error}");
     match kind {
@@ -552,7 +552,7 @@ mod tests {
     /// Other formats, malformed headers and decompression bombs are
     /// rejected.
     #[test]
-    fn images_outside_the_contract_are_rejected() {
+    fn images_outside_the_rules_are_rejected() {
         let mut gif = Vec::new();
         image::codecs::gif::GifEncoder::new(&mut gif)
             .encode(&[0; 12], 2, 2, image::ExtendedColorType::Rgb8)
@@ -662,9 +662,9 @@ mod tests {
     }
 
     /// Containers, codecs, frame rates, rotations and channel layouts
-    /// outside the contract are rejected.
+    /// outside the rules are rejected.
     #[test]
-    fn video_streams_outside_the_contract_are_rejected() {
+    fn video_streams_outside_the_rules_are_rejected() {
         let with = |change: fn(&mut VideoStream)| {
             let mut stream = h264();
             change(&mut stream);
@@ -705,7 +705,7 @@ mod tests {
 
     /// Audio files must be WAV or MP3 with a mono or stereo stream.
     #[test]
-    fn audio_streams_follow_the_contract() {
+    fn audio_streams_follow_the_rules() {
         let wav = container(
             "wav",
             None,

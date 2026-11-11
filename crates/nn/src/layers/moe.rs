@@ -37,7 +37,8 @@ use ops::moe::grouped::{
 };
 use ops::moe::routing::{TopkArgs, TopkDescriptor, TopkSoftmax};
 use ops::moe::sort::{self, MoeSort, SortArgs};
-use ops::{DType, DevicePtr, Operand, Shape};
+use ops::{DevicePtr, Operand, Shape};
+use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
 use crate::family::Split;
@@ -419,7 +420,8 @@ impl Moe {
                             "Moe",
                             format!(
                                 "the {name} block scales are {scales}, and a product's kernel \
-                                 reads one-byte scales: F8_E4M3 or U8"
+                                 reads one-byte scales: F8_E4M3 or U8",
+                                scales = ops::abi::name(scales)
                             ),
                         ));
                     }
@@ -1538,7 +1540,11 @@ impl Moe {
             if view.dtype != dtype {
                 return Err(Error::shape(
                     "Moe",
-                    format!("the exchange's {name} are {}, not {dtype}", view.dtype),
+                    format!(
+                        "the exchange's {name} are {}, not {dtype}",
+                        ops::abi::name(view.dtype),
+                        dtype = ops::abi::name(dtype)
+                    ),
                 ));
             }
         }
@@ -1547,7 +1553,8 @@ impl Moe {
                 "Moe",
                 format!(
                     "the exchange carries {} rows, the batch is {}",
-                    exchange.states.dtype, hidden.dtype
+                    ops::abi::name(exchange.states.dtype),
+                    ops::abi::name(hidden.dtype)
                 ),
             ));
         }

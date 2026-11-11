@@ -7,11 +7,11 @@ use storage::key::Digest;
 
 /// The digest of what the condition's encodings read: the media's
 /// content (`content`, the fetched media content key) and the
-/// condition's plan, but not where the media are published.
+/// condition's processed inputs, but not where the media are published.
 fn condition_key(condition: &Condition, content: &[u8; 32]) -> Result<[u8; 32], serde_json::Error> {
-    /// The plan of a condition without its media's object name.
+    /// What a condition's encodings read of it, without its media's object name.
     #[derive(Serialize)]
-    struct Plan<'a> {
+    struct ConditionInputs<'a> {
         role: &'a ConditionRole,
         bytes: u64,
         media: &'a ConditionMedia,
@@ -19,7 +19,7 @@ fn condition_key(condition: &Condition, content: &[u8; 32]) -> Result<[u8; 32], 
         latent_units: &'a [u32],
         audio_rows: u32,
     }
-    let plan = serde_json::to_vec(&Plan {
+    let inputs = serde_json::to_vec(&ConditionInputs {
         role: &condition.role,
         bytes: condition.source.bytes,
         media: &condition.media,
@@ -29,7 +29,7 @@ fn condition_key(condition: &Condition, content: &[u8; 32]) -> Result<[u8; 32], 
     })?;
     let mut hasher = Digest::new(b"video-condition");
     hasher.bytes(content);
-    hasher.bytes(&plan);
+    hasher.bytes(&inputs);
     Ok(hasher.finish())
 }
 
@@ -37,7 +37,7 @@ fn condition_key(condition: &Condition, content: &[u8; 32]) -> Result<[u8; 32], 
 /// from its presentation's tokens (`prompt_token_ids`) and the content key
 /// of each condition's fetched media in request order (`contents`).
 ///
-/// A condition's digest covers its media's content and its whole plan
+/// A condition's digest covers its media's content and everything processed of it
 /// but where the media are published (the locator's object name, which
 /// differs between publications of the same media): its role, how its
 /// media are decoded, what the conditioner reads of it and the rows it
@@ -49,7 +49,7 @@ fn condition_key(condition: &Condition, content: &[u8; 32]) -> Result<[u8; 32], 
 ///
 /// # Errors
 ///
-/// Fails only when serializing a condition's plan fails, which these
+/// Fails only when serializing a condition's inputs fails, which these
 /// plain values do not.
 ///
 /// The caller supplies one content key per condition, in condition order.

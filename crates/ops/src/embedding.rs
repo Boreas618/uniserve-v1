@@ -7,10 +7,13 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand, Shape};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -36,8 +39,8 @@ pub struct Descriptor {
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
-            .field("ids", self.ids)
+            .field("dtype", abi::name(self.dtype))
+            .field("ids", abi::name(self.ids))
             .field("hidden", self.hidden)
             .field("first", self.first)
             .field("rows", self.rows)
@@ -71,7 +74,11 @@ impl Op for Embedding {
         if args.ids.dtype != descriptor.ids {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected {} ids, found {}", descriptor.ids, args.ids.dtype),
+                format!(
+                    "expected {} ids, found {}",
+                    abi::name(descriptor.ids),
+                    abi::name(args.ids.dtype)
+                ),
             ));
         }
         args.ids.require_rank(Self::NAME, 1)?;

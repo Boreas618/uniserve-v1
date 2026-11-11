@@ -24,11 +24,14 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, DevicePtr, Operand, Shape};
-use crate::tolerance::Tolerance;
+use crate::tensor::{DevicePtr, Operand, Shape};
+use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
 use super::row_stride;
@@ -66,11 +69,11 @@ pub struct TopkDescriptor {
 impl fmt::Display for TopkDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let scale = match self.scale {
-            Some(dtype) => dtype.to_string(),
+            Some(dtype) => abi::name(dtype).to_owned(),
             None => "none".to_owned(),
         };
         Key::new()
-            .field("scores", self.scores)
+            .field("scores", abi::name(self.scores))
             .field("experts", self.experts)
             .field("top", self.top)
             .field("renormalize", self.renormalize)
@@ -124,7 +127,10 @@ impl Op for TopkSoftmax {
         if !matches!(descriptor.scores, DType::F32 | DType::BF16 | DType::F16) {
             return Err(Error::Unsupported {
                 operator: Self::NAME,
-                problem: format!("scores of {} are not routeable", descriptor.scores),
+                problem: format!(
+                    "scores of {} are not routeable",
+                    abi::name(descriptor.scores)
+                ),
             });
         }
         if descriptor.experts == 0 || descriptor.experts > MAX_EXPERTS {
@@ -154,13 +160,16 @@ impl Op for TopkSoftmax {
         if args.ids.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 ids, found {}", args.ids.dtype),
+                format!("expected i32 ids, found {}", abi::name(args.ids.dtype)),
             ));
         }
         if args.weights.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected FP32 weights, found {}", args.weights.dtype),
+                format!(
+                    "expected FP32 weights, found {}",
+                    abi::name(args.weights.dtype)
+                ),
             ));
         }
 
@@ -170,7 +179,11 @@ impl Op for TopkSoftmax {
                 if scale.dtype != dtype {
                     return Err(Error::argument(
                         Self::NAME,
-                        format!("expected {dtype} scales, found {}", scale.dtype),
+                        format!(
+                            "expected {} scales, found {}",
+                            abi::name(dtype),
+                            abi::name(scale.dtype)
+                        ),
                     ));
                 }
             }
@@ -194,7 +207,7 @@ impl Op for TopkSoftmax {
             if map.dtype != DType::I32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected an i32 expert map, found {}", map.dtype),
+                    format!("expected an i32 expert map, found {}", abi::name(map.dtype)),
                 ));
             }
         }
@@ -262,7 +275,7 @@ impl Op for TopkSoftmax {
         let rounding = Tolerance::rounding(reduction, accumulate, DType::F32);
         Tolerance::new(
             rounding.atol,
-            (f64::from(rounding.rtol) + 4.0 * accumulate.unit_roundoff()) as f32,
+            (f64::from(rounding.rtol) + 4.0 * tolerance::unit_roundoff(accumulate)) as f32,
         )
     }
 }

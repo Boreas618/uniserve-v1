@@ -59,7 +59,7 @@ impl PhaseKind {
     ///
     /// An operator split by phase writes the phase as its key's first field (`phase_decode_...`,
     /// the paged attention operator's keys); a key of an operator without one states no phase and
-    /// answers `None`.
+    /// returns `None`.
     pub fn of_key(key: &str) -> Option<Self> {
         let rest = key.strip_prefix("phase_")?;
         let name = rest.split('_').next()?;
@@ -142,7 +142,7 @@ pub const SINGLE_KEY: &str = "default";
 ///
 /// The daemon fixes a module set once, when a configuration is applied: it asks the Build Server
 /// which installed revision each named implementation and each installed kernel package is at, and
-/// records the answer. The set is part of the epoch's record and of every launch file made from it,
+/// records what it returns. The set is part of the epoch's record and of every launch file made from it,
 /// so a relaunch and a standby run exactly what their epoch runs, and a revision installed later is
 /// run by nobody until a configuration is applied again.
 #[serde_with::serde_as]
@@ -255,6 +255,14 @@ pub mod operator {
     pub const ROPE_APPLY: &str = "rope_apply";
     pub const PCM_INTERLEAVE: &str = "pcm_interleave";
     pub const RGB_BYTES: &str = "rgb_bytes";
+    pub const ELEMENTWISE_UNARY: &str = "elementwise_unary";
+    pub const ELEMENTWISE_BINARY: &str = "elementwise_binary";
+    pub const ELEMENTWISE_WHERE: &str = "elementwise_where";
+    pub const CAST: &str = "cast";
+    pub const COPY_STRIDED: &str = "copy_strided";
+    pub const FILL: &str = "fill";
+    pub const REDUCE: &str = "reduce";
+    pub const INDEX: &str = "index";
 
     /// Every operator this build has, in a stable order for a package's coverage check.
     ///
@@ -347,12 +355,20 @@ pub mod operator {
         ROPE_APPLY,
         PCM_INTERLEAVE,
         RGB_BYTES,
+        ELEMENTWISE_UNARY,
+        ELEMENTWISE_BINARY,
+        ELEMENTWISE_WHERE,
+        CAST,
+        COPY_STRIDED,
+        FILL,
+        REDUCE,
+        INDEX,
     ];
 
     /// `name`, interned, when this build has an operator by that name.
     ///
     /// A package's operator name arrives as text; this gives back the static name a generation is
-    /// keyed by, or `None` when no operator of this build answers to `name`.
+    /// keyed by, or `None` when this build has no operator named `name`.
     pub fn named(name: &str) -> Option<&'static str> {
         ALL.iter().copied().find(|candidate| *candidate == name)
     }

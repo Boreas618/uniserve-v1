@@ -7,9 +7,8 @@
 
 use std::collections::HashMap;
 
-use frontend::input::chat::{ChatRequest, GenerationPromptMode, HfChatRenderer};
-use frontend::openai::ChatMessage;
-use frontend::output::chat::{AssistantContentBlock, AssistantToolCall};
+use frontend::input::chat::{GenerationPromptMode, HfChatRenderer};
+use frontend::protocol::{ChatCompletionRequest, ChatMessage};
 use frontend::test_support::chat;
 use proto::config::ChatTemplateContentFormat;
 
@@ -18,35 +17,31 @@ const QWEN3_TEMPLATE: &str = include_str!(concat!(
     "/tests/templates/qwen3.jinja"
 ));
 
+/// Renders `request` for a new assistant turn.
 fn hf_render(
     template: &str,
     format: Option<ChatTemplateContentFormat>,
-    request: &ChatRequest,
+    request: &ChatCompletionRequest,
 ) -> String {
     HfChatRenderer::new(Some(template.to_owned()), HashMap::new(), format)
         .expect("template should compile")
-        .render(request)
+        .render(request, GenerationPromptMode::StartNewAssistant)
         .expect("render should succeed")
 }
 
-fn base_request(messages: Vec<ChatMessage>) -> ChatRequest {
-    ChatRequest {
-        messages,
-        ..chat::request(vec![chat::user("test")])
-    }
+fn base_request(messages: Vec<ChatMessage>) -> ChatCompletionRequest {
+    chat::request(messages)
 }
 
 /// One user message with two text parts, rendered without a generation prompt.
 ///
 /// Flattened to a string, the content reads `"ab"`; in the OpenAI format it is
 /// a list of two text-part objects.
-fn multipart_user() -> ChatRequest {
-    let mut request = base_request(vec![chat::user_parts(vec![
+fn multipart_user() -> ChatCompletionRequest {
+    base_request(vec![chat::user_parts(vec![
         chat::text_part("a"),
         chat::text_part("b"),
-    ])]);
-    request.chat_options.generation_prompt_mode = GenerationPromptMode::NoGenerationPrompt;
-    request
+    ])])
 }
 
 #[test]
@@ -80,7 +75,7 @@ fn auto_detection_treats_direct_content_loop_template_as_openai() {
     assert_eq!(rendered, "a|b|");
 }
 
-fn qwen_history() -> ChatRequest {
+fn qwen_history() -> ChatCompletionRequest {
     base_request(vec![
         chat::user("What is the capital of France?"),
         chat::assistant("The capital of France is Paris."),
@@ -111,11 +106,11 @@ const MIXED_ARGS: &str = r#"{"zulu":2,"alpha":1.00,"mike":"hi","delta":[3,4]}"#;
 fn assistant_tool_call_history(arguments: &str) -> Vec<ChatMessage> {
     vec![
         chat::user("Run the tool."),
-        chat::assistant_blocks(vec![AssistantContentBlock::ToolCall(AssistantToolCall {
-            id: "call-1".to_string(),
-            name: "do_thing".to_string(),
-            arguments: arguments.to_string(),
-        })]),
+        chat::assistant_turn(
+            "",
+            "",
+            vec![chat::tool_call("call-1", "do_thing", arguments)],
+        ),
         chat::tool_response("{\"ok\":true}", "call-1"),
     ]
 }

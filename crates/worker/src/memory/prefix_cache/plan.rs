@@ -761,12 +761,12 @@ mod tests {
             fields: vec![
                 nn::family::StateField {
                     name: "conv",
-                    dtype: ops::DType::BF16,
+                    dtype: uniserve_tensor::DType::BF16,
                     dims: vec![3, 8192],
                 },
                 nn::family::StateField {
                     name: "recurrent",
-                    dtype: ops::DType::F32,
+                    dtype: uniserve_tensor::DType::F32,
                     dims: vec![32, 128, 128],
                 },
             ],

@@ -13,8 +13,9 @@ use nn::capability::PixelNorm;
 use nn::layers::launch::PDL;
 use ops::pcm::{self, PcmInterleave as PcmInterleaveOp};
 use ops::rgb::{self, CHANNELS, RgbBytes as RgbBytesOp};
-use ops::{DType, Operand, Shape};
+use ops::{Operand, Shape};
 use platform::DeviceId;
+use uniserve_tensor::DType;
 
 use crate::runners::columns::{Column, encode_f32};
 use crate::{Error, Result};
@@ -82,7 +83,8 @@ impl RgbBytes {
                 "RgbBytes",
                 format!(
                     "the raster is {}, the conversion was built for {}",
-                    input.dtype, self.dtype
+                    ops::abi::name(input.dtype),
+                    ops::abi::name(self.dtype)
                 ),
             ));
         }
@@ -93,7 +95,7 @@ impl RgbBytes {
                 "RgbBytes",
                 format!(
                     "{} {:?} is not the packed u8 form of {:?}",
-                    out.dtype,
+                    ops::abi::name(out.dtype),
                     out.shape.dims(),
                     shape.dims()
                 ),
@@ -139,7 +141,7 @@ pub(crate) fn interleave_pcm(f: &Forward, planes: Operand, out: Operand) -> Resu
             "PcmInterleave",
             format!(
                 "the PCM interleave reads f32 channels, not {}",
-                planes.dtype
+                ops::abi::name(planes.dtype)
             ),
         ));
     }
@@ -149,7 +151,7 @@ pub(crate) fn interleave_pcm(f: &Forward, planes: Operand, out: Operand) -> Resu
             "PcmInterleave",
             format!(
                 "{} {:?} is not [{samples}, 2] interleaved i16 samples",
-                out.dtype,
+                ops::abi::name(out.dtype),
                 out.shape.dims()
             ),
         ));

@@ -6,14 +6,20 @@
 //! side (`processing::Family`). The daemon supplies what it does not own, the
 //! served model's engines and its HTTP connections, through
 //! [`openai::Server`], and the engine's side of a request through
-//! [`events::Events`] and [`events::Outcome`]. Its modules:
+//! [`events::Events`] and [`events::Stats`]. A request passes through its
+//! layers in one direction, route handler, `Processor`, the daemon's hold and
+//! an engine, `OutputProcessor`, response: input processing imports no output
+//! processing, and neither imports the route handlers. Its modules:
 //!
-//! - `openai`: the OpenAI-compatible API's wire schemas, errors and route
-//!   handlers;
-//! - `input`: input processing (chat templates, tokenization, media, each
-//!   model family's request lowering) into engine requests;
-//! - `output`: output processing (detokenization, stop strings, reasoning and
-//!   tool parsing) of engine events into public events and response bodies;
+//! - `protocol`: the OpenAI-compatible API's wire schemas;
+//! - `openai`: the API's route handlers, its errors and the response bodies
+//!   they write;
+//! - `input`: input processing ([`input::Processor`]: chat templates,
+//!   tokenization, media, each model family's request lowering) into engine
+//!   requests;
+//! - `output`: output processing ([`output::OutputProcessor`]:
+//!   detokenization, stop strings, reasoning and tool parsing) of engine
+//!   events into response deltas;
 //! - `body`: the freezable response body a connection writes ([`body::Session`]);
 //! - `events`: the engine's side of one request;
 //! - `tokenizer`: the served checkpoint's tokenizer and incremental decoding;
@@ -26,6 +32,7 @@ pub mod input;
 pub mod model;
 pub mod openai;
 pub mod output;
+pub mod protocol;
 pub mod tokenizer;
 
 #[cfg(any(test, feature = "testing"))]

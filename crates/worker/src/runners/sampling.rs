@@ -105,8 +105,9 @@ use ops::sampler::{
     OrderDescriptor, ShapeArgs, ShapeDescriptor, TopK, TopKArgs, TopKDescriptor, TopLogprobsArgs,
     TopLogprobsDescriptor,
 };
-use ops::{DType, Operand, Shape};
+use ops::{Operand, Shape};
 use proto::module::sampler::PARAMETER_COLUMNS;
+use uniserve_tensor::DType;
 
 use nn::Forward;
 use nn::layers::launch;
@@ -497,7 +498,7 @@ impl Sampler {
         if draws.dtype != DType::F32 {
             return Err(refused(
                 "Sampler",
-                format!("expected f32 draws, found {}", draws.dtype),
+                format!("expected f32 draws, found {}", ops::abi::name(draws.dtype)),
             ));
         }
 
@@ -839,7 +840,7 @@ impl Sampler {
                 "Sampler",
                 format!(
                     "{} logits are not a shape the shaper reads: f32, bf16 or f16",
-                    logits.dtype
+                    ops::abi::name(logits.dtype)
                 ),
             ));
         }
@@ -848,7 +849,8 @@ impl Sampler {
                 "Sampler",
                 format!(
                     "expected {} tokens, found {}",
-                    self.tokens, samples.tokens.dtype
+                    ops::abi::name(self.tokens),
+                    ops::abi::name(samples.tokens.dtype)
                 ),
             ));
         }
@@ -866,7 +868,11 @@ impl Sampler {
                 if view.dtype != dtype {
                     return Err(refused(
                         "Sampler",
-                        format!("expected {dtype} {name}, found {}", view.dtype),
+                        format!(
+                            "expected {dtype} {name}, found {}",
+                            ops::abi::name(view.dtype),
+                            dtype = ops::abi::name(dtype)
+                        ),
                     ));
                 }
             }
@@ -888,7 +894,10 @@ impl Sampler {
         if state.parameters.dtype != DType::F32 {
             return Err(refused(
                 "Sampler",
-                format!("expected f32 parameters, found {}", state.parameters.dtype),
+                format!(
+                    "expected f32 parameters, found {}",
+                    ops::abi::name(state.parameters.dtype)
+                ),
             ));
         }
         state
@@ -954,7 +963,10 @@ impl Sampler {
             if extra.dtype != DType::I32 {
                 return Err(refused(
                     "Sampler",
-                    format!("expected i32 extra tokens, found {}", extra.dtype),
+                    format!(
+                        "expected i32 extra tokens, found {}",
+                        ops::abi::name(extra.dtype)
+                    ),
                 ));
             }
         }

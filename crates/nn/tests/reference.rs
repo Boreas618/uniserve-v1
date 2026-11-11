@@ -284,7 +284,7 @@ fn a_gated_silu_matches_the_host_product_in_every_rounding_order() -> Outcome {
     let value = rounded(dtype, &draw.normals(rows * width, 1.0))?;
     let reference = gated_silu(&gate, &value);
     let dims = [rows as u64, width as u64];
-    let unit = dtype.unit_roundoff() as f32;
+    let unit = ops::tolerance::unit_roundoff(dtype) as f32;
 
     for (rounding, roundings) in [
         (Rounding::Fused, 3.0),

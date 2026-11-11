@@ -16,10 +16,13 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::{self, Stream};
-use crate::tensor::{DType, Operand, Shape, Strides};
+use crate::tensor::{Operand, Shape, Strides};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -66,9 +69,9 @@ impl fmt::Display for Descriptor {
         // bias, or in the transposed direction, launches the same module.
         // A key that named them would compile one module per clip length and per filter shape.
         Key::new()
-            .field("input", self.input)
-            .field("weight", self.weight)
-            .field("output", self.output)
+            .field("input", abi::name(self.input))
+            .field("weight", abi::name(self.weight))
+            .field("output", abi::name(self.output))
             .finish(formatter)
     }
 }
@@ -216,7 +219,10 @@ impl Conv {
                 operator,
                 format!(
                     "expected {} input and {} output, found {} and {}",
-                    descriptor.input, descriptor.output, args.input.dtype, args.out.dtype
+                    abi::name(descriptor.input),
+                    abi::name(descriptor.output),
+                    abi::name(args.input.dtype),
+                    abi::name(args.out.dtype)
                 ),
             ));
         }

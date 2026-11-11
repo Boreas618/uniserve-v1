@@ -65,7 +65,7 @@ def fields() -> dict[str, str]:
     ``UNISERVE_FIELDS``, in the key's order; a direct run states the same
     object as ``--fields``, which ``uniserve build-server fields <package>
     <key>`` prints. A dimension the key leaves out is absent: the package's
-    compilation answers for a field it needs and the key lacks.
+    compilation accounts for a field it needs and the key lacks.
     """
     reader = argparse.ArgumentParser()
     reader.add_argument("--fields")
@@ -89,43 +89,46 @@ def read_fields(package: pathlib.Path, key: str) -> dict[str, str]:
 
     Raises:
         ValueError: If the package's declared dimensions do not read the key.
+        SystemExit: If the executable is not there to run.
     """
-    answered = subprocess.run(
-        [
-            os.environ.get("UNISERVE_BINARY", "uniserve"),
-            "build-server",
-            "fields",
-            str(package),
-            key,
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if answered.returncode != 0:
-        raise ValueError(f"{key}: {answered.stderr.strip()}")
-    return json.loads(answered.stdout)
+    executable = os.environ.get("UNISERVE_BINARY", "uniserve")
+    try:
+        completed = subprocess.run(
+            [executable, "build-server", "fields", str(package), key],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        raise SystemExit(
+            f"no {executable} to read the key {key} with: build the base "
+            "executable (cargo build -p uniserve --bin uniserve) and name it "
+            "in UNISERVE_BINARY"
+        ) from None
+    if completed.returncode != 0:
+        raise ValueError(f"{key}: {completed.stderr.strip()}")
+    return json.loads(completed.stdout)
 
 
 def nvcc() -> tuple[str, str]:
     """The nvcc the Build Server checked, and the version line it prints.
 
     The Build Server compared it with the package's declared version.
-    A compiler that does not answer ``--version`` with CUDA's own line is
+    A compiler that does not print CUDA's own line for ``--version`` is
     refused here rather than producing a module from the host compiler.
     """
     compiler = os.environ["UNISERVE_NVCC"]
-    answered = subprocess.run(
+    completed = subprocess.run(
         [compiler, "--version"], capture_output=True, text=True
     )
     if (
-        answered.returncode != 0
-        or "Cuda compilation tools" not in answered.stdout
+        completed.returncode != 0
+        or "Cuda compilation tools" not in completed.stdout
     ):
         raise SystemExit(
             f"{compiler} is not CUDA's nvcc:\n"
-            f"{answered.stdout[-300:]}{answered.stderr[-300:]}"
+            f"{completed.stdout[-300:]}{completed.stderr[-300:]}"
         )
-    return compiler, answered.stdout.strip().splitlines()[-1].strip()
+    return compiler, completed.stdout.strip().splitlines()[-1].strip()
 
 
 def require_exports(module: pathlib.Path, entries: list[str]) -> None:

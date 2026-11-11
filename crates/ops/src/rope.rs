@@ -17,10 +17,13 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::{Float, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand, Shape};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -139,8 +142,8 @@ pub fn interleaved_axes(widths: &[u32]) -> Vec<u32> {
 impl fmt::Display for FactorsDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut key = Key::new()
-            .field("dtype", self.dtype)
-            .field("positions", self.positions)
+            .field("dtype", abi::name(self.dtype))
+            .field("positions", abi::name(self.positions))
             .field("columns", self.columns)
             .field("block", self.block)
             .field("scale", self.scale)
@@ -193,7 +196,8 @@ impl Op for RotaryFactors {
                 Self::NAME,
                 format!(
                     "expected {} positions, found {}",
-                    descriptor.positions, args.positions.dtype
+                    abi::name(descriptor.positions),
+                    abi::name(args.positions.dtype)
                 ),
             ));
         }
@@ -371,8 +375,8 @@ pub struct QkNormRopeDescriptor {
 impl fmt::Display for QkNormRopeDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let key = Key::new()
-            .field("dtype", self.dtype)
-            .field("output", self.output)
+            .field("dtype", abi::name(self.dtype))
+            .field("output", abi::name(self.output))
             .field("head_dim", self.head_dim)
             .field("q_heads", self.q_heads)
             .field("k_heads", self.k_heads)
@@ -397,7 +401,7 @@ impl fmt::Display for QkNormRopeDescriptor {
         let key = if self.factors == DType::F32 {
             key
         } else {
-            key.field("factors", self.factors)
+            key.field("factors", abi::name(self.factors))
         };
         let key = if self.strided {
             key.field("strided", true)
@@ -575,7 +579,9 @@ impl Op for QkNormRope {
                 Self::NAME,
                 format!(
                     "expected {} outputs, found {} and {}",
-                    descriptor.output, args.q_out.dtype, args.k_out.dtype
+                    abi::name(descriptor.output),
+                    abi::name(args.q_out.dtype),
+                    abi::name(args.k_out.dtype)
                 ),
             ));
         }
@@ -713,8 +719,8 @@ pub struct RopeApplyDescriptor {
 impl fmt::Display for RopeApplyDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let key = Key::new()
-            .field("dtype", self.dtype)
-            .field("output", self.output)
+            .field("dtype", abi::name(self.dtype))
+            .field("output", abi::name(self.output))
             .field("head_dim", self.head_dim)
             .field("heads", self.heads)
             .field("rotation", self.rotation)
@@ -788,7 +794,8 @@ impl Op for RopeApply {
                 Self::NAME,
                 format!(
                     "expected {} outputs, found {}",
-                    descriptor.output, args.out.dtype
+                    abi::name(descriptor.output),
+                    abi::name(args.out.dtype)
                 ),
             ));
         }

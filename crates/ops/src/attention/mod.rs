@@ -86,10 +86,13 @@ pub use sparse::{SparseArgs, SparseAttention, SparseCall, SparseDescriptor};
 use std::ffi::c_void;
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::platform::{self, Stream};
-use crate::tensor::{DType, DevicePtr, Operand, Shape};
+use crate::tensor::{DevicePtr, Operand, Shape};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -176,9 +179,9 @@ impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
             .field("phase", self.phase)
-            .field("dtype", self.query)
-            .field("kv", self.key_value)
-            .field("out", self.output)
+            .field("dtype", abi::name(self.query))
+            .field("kv", abi::name(self.key_value))
+            .field("out", abi::name(self.output))
             .field("head_dim", self.head_dim)
             .field("page", self.page_size)
             .field("q_heads", self.q_heads)
@@ -463,7 +466,8 @@ impl Op for PagedAttention {
                     Self::NAME,
                     format!(
                         "expected {} cached keys and values, found {}",
-                        descriptor.key_value, cache.dtype
+                        abi::name(descriptor.key_value),
+                        abi::name(cache.dtype)
                     ),
                 ));
             }
@@ -500,7 +504,10 @@ impl Op for PagedAttention {
         if args.page_table.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 pages, found {}", args.page_table.dtype),
+                format!(
+                    "expected i32 pages, found {}",
+                    abi::name(args.page_table.dtype)
+                ),
             ));
         }
         let batch = args.page_table.shape.dim(0);
@@ -517,7 +524,10 @@ impl Op for PagedAttention {
         if args.seq_lens.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 lengths, found {}", args.seq_lens.dtype),
+                format!(
+                    "expected i32 lengths, found {}",
+                    abi::name(args.seq_lens.dtype)
+                ),
             ));
         }
 
@@ -586,7 +596,7 @@ impl Op for PagedAttention {
                     if view.dtype != DType::F32 {
                         return Err(Error::argument(
                             Self::NAME,
-                            format!("expected an f32 {name}, found {}", view.dtype),
+                            format!("expected an f32 {name}, found {}", abi::name(view.dtype)),
                         ));
                     }
                 }
@@ -596,7 +606,7 @@ impl Op for PagedAttention {
                     Self::NAME,
                     format!(
                         "a {} cache is read through one scale per page, and the call passes fewer",
-                        descriptor.key_value
+                        abi::name(descriptor.key_value)
                     ),
                 ));
             }
@@ -652,7 +662,7 @@ impl Op for PagedAttention {
         // pointer that is not 16-byte aligned or a step that is not a multiple of 8 elements of a
         // 2-byte type. A host-side layout defect that breaks either surfaces here, by name,
         // rather than as a warp fault inside a kernel with no operand named in it.
-        let element_bytes = descriptor.query.bytes().unwrap_or(2).max(2);
+        let element_bytes = abi::bytes(descriptor.query).unwrap_or(2).max(2);
         let unit = 16 / element_bytes.max(1);
         for (name, view) in [
             ("query", args.query),
@@ -800,9 +810,9 @@ impl Op for PagedAttention {
             window_left: i64::from(args.window_left),
             causal,
             workspace_bytes: to_i64(Self::NAME, args.workspace.numel())?,
-            dtype_query: descriptor.query.as_i64(),
-            dtype_key_value: descriptor.key_value.as_i64(),
-            dtype_output: descriptor.output.as_i64(),
+            dtype_query: abi::code(descriptor.query)?,
+            dtype_key_value: abi::code(descriptor.key_value)?,
+            dtype_output: abi::code(descriptor.output)?,
             phase: match descriptor.phase {
                 Phase::Prefill => 0,
                 Phase::Decode => 1,
@@ -833,7 +843,7 @@ impl Op for PagedAttention {
         let reduction = u64::from(descriptor.max_kv_len);
         let accumulate = DType::F32;
         let gamma = tolerance::gamma(reduction, accumulate);
-        let value_term = 2.0 * gamma + accumulate.unit_roundoff();
+        let value_term = 2.0 * gamma + tolerance::unit_roundoff(accumulate);
         Tolerance::rounding(reduction, accumulate, descriptor.output)
             .with_atol((value_term * f64::from(VALUE_ENVELOPE)) as f32)
     }
@@ -1011,7 +1021,7 @@ impl PagedAttention {
                 Self::NAME,
                 format!(
                     "the Triton program decodes an E4M3 page and the descriptor's cache is {}; the                      full-precision rows are the vendor modules'",
-                    descriptor.key_value
+                    abi::name(descriptor.key_value)
                 ),
             ));
         }
@@ -1174,7 +1184,7 @@ impl PagedAttention {
 
 /// Whether the cache's pages hold quantized elements that are read through a per-page scale.
 fn quantized(dtype: DType) -> bool {
-    matches!(dtype, DType::F8E4M3 | DType::F4E2M1)
+    matches!(dtype, DType::F8E4M3 | DType::F4)
 }
 
 /// The elements between consecutive rows of a `[rows, heads, dim]` view.
@@ -1224,7 +1234,7 @@ pub(super) fn check_vector_alignment(
 ) -> Result<()> {
     // A four-bit element type packs two elements a byte, so "sixteen bytes" is not a whole number of
     // its elements and the packages that read one state their own alignment.
-    let Some(bytes) = view.dtype.bytes().filter(|bytes| *bytes > 0) else {
+    let Some(bytes) = abi::bytes(view.dtype).filter(|bytes| *bytes > 0) else {
         return Ok(());
     };
     if !ATTENTION_ALIGNMENT.is_multiple_of(bytes) {

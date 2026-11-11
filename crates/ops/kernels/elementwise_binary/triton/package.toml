@@ -1,0 +1,45 @@
+# The elementwise_binary operator's Triton backend: design 5.2's
+# package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Build Server runs for one descriptor and target).
+#
+# `out[i] = lhs[i] o rhs[i]` over two inputs read through their strides, into a
+# contiguous output: arithmetic in the inputs' element type, or a comparison
+# writing `u8`. A broadcast operand is a zero stride, so the function, the
+# element type and the number of axes the call traverses are all a compilation
+# holds; the shape and the strides are launch words. The key is the one
+# `BinaryDescriptor`'s `Display` prints, e.g.
+# `function_add_dtype_bf16_rank_2_block_1024_pdl_false`.
+#
+# `src/strided.py` links the address arithmetic every tensor primitive shares,
+# under `kernels/tensor/triton/src/`; an installation copies the file the link
+# names.
+
+op = "elementwise_binary"
+backend = "triton"
+interface_version = 1
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/elementwise_binary.py", "src/strided.py", "src/build.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { function = ["add", "sub", "mul", "div", "maximum", "minimum", "eq", "ne", "lt", "le", "gt", "ge"], dtype = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64"], rank = { min = 1, max = 6 }, block = { power_of_two = true }, pdl = ["false", "true"] }
+
+[parameters]

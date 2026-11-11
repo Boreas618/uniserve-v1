@@ -171,8 +171,8 @@ fn idle_devices() -> std::result::Result<Vec<u32>, String> {
 /// What the daemon serves: the request-processing side of every model family
 /// (`processing::FAMILIES`), which is all the daemon reads of a model. The
 /// engine executable registers the numerical side of the same families.
-pub(crate) fn served() -> Result<processing::Catalogue> {
-    Ok(processing::Catalogue::new(processing::FAMILIES)?)
+pub(crate) fn served() -> Result<processing::Registry> {
+    Ok(processing::Registry::new(processing::FAMILIES)?)
 }
 
 /// Drops a lifeline this process inherited from a daemon that started it

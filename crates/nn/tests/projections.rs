@@ -21,14 +21,17 @@ use nn::{Checkpoint, DType, DevicePtr, Operand, Shape, WeightKey, WeightLoader};
 fn dtype_name(dtype: DType) -> &'static str {
     match dtype {
         DType::U8 => "U8",
+        DType::U32 => "U32",
         DType::I16 => "I16",
         DType::I32 => "I32",
         DType::I64 => "I64",
         DType::F16 => "F16",
         DType::BF16 => "BF16",
         DType::F32 => "F32",
+        DType::F64 => "F64",
         DType::F8E4M3 => "F8_E4M3",
-        DType::F4E2M1 => "F4_E2M1",
+        DType::F4 => "F4_E2M1",
+        other => panic!("the fixtures write no {other:?} tensor"),
     }
 }
 

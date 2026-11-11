@@ -32,10 +32,13 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand, Shape, Strides};
+use crate::tensor::{Operand, Shape, Strides};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -61,7 +64,7 @@ pub struct Descriptor {
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("channels", self.channels)
             .field("in_side", self.in_side)
             .field("block", self.block)
@@ -122,13 +125,19 @@ impl Op for PositionInterpolate {
         if args.indices.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 tap indices, found {}", args.indices.dtype),
+                format!(
+                    "expected i32 tap indices, found {}",
+                    abi::name(args.indices.dtype)
+                ),
             ));
         }
         if args.weights.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected f32 tap weights, found {}", args.weights.dtype),
+                format!(
+                    "expected f32 tap weights, found {}",
+                    abi::name(args.weights.dtype)
+                ),
             ));
         }
         // The program walks the destination as rows of `channels` elements: a row that is not that

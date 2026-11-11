@@ -257,25 +257,28 @@ fn every_key_is_covered(packages: &[PathBuf], keys: &Path) -> Result<(), String>
     joined(problems)
 }
 
-/// The names `ops` prints for its element types: the vocabulary a descriptor value that carries an
-/// element type must come from.
+/// The names `ops` spells the package ABI's element types with in a key: the vocabulary a
+/// descriptor value that carries an element type must come from.
 fn element_type_names() -> Vec<String> {
     [
-        ops::DType::U8,
-        ops::DType::I32,
-        ops::DType::I64,
-        ops::DType::F16,
-        ops::DType::BF16,
-        ops::DType::F32,
-        ops::DType::F8E4M3,
-        ops::DType::F4E2M1,
+        uniserve_tensor::DType::U8,
+        uniserve_tensor::DType::U32,
+        uniserve_tensor::DType::I16,
+        uniserve_tensor::DType::I32,
+        uniserve_tensor::DType::I64,
+        uniserve_tensor::DType::F16,
+        uniserve_tensor::DType::BF16,
+        uniserve_tensor::DType::F32,
+        uniserve_tensor::DType::F64,
+        uniserve_tensor::DType::F8E4M3,
+        uniserve_tensor::DType::F4,
     ]
     .iter()
-    .map(ToString::to_string)
+    .map(|dtype| ops::abi::name(*dtype).to_owned())
     .collect()
 }
 
-/// The descriptor fields whose values are element types (`ops`' `DType` `Display`). A value in one
+/// The descriptor fields whose values are element types (as `ops::abi::name` spells them). A value in one
 /// of them is examined only when it is not a bare integer, which tells an element type from a width.
 const ELEMENT_TYPE_FIELDS: [&str; 7] = [
     "dtype",

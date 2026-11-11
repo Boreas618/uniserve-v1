@@ -44,10 +44,13 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand, Shape};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -144,7 +147,7 @@ pub struct Descriptor {
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("channels", self.channels)
             .field("block", self.block)
             .field("pdl", self.pdl)
@@ -189,7 +192,7 @@ impl Op for RgbBytes {
                 Self::NAME,
                 format!(
                     "expected an f16, bf16 or f32 raster, the descriptor says {}",
-                    descriptor.dtype
+                    abi::name(descriptor.dtype)
                 ),
             ));
         }
@@ -201,7 +204,8 @@ impl Op for RgbBytes {
                 Self::NAME,
                 format!(
                     "expected {} input, found {}",
-                    descriptor.dtype, args.input.dtype
+                    abi::name(descriptor.dtype),
+                    abi::name(args.input.dtype)
                 ),
             ));
         }
@@ -227,7 +231,7 @@ impl Op for RgbBytes {
             if view.dtype != DType::F32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected f32 {name}, found {}", view.dtype),
+                    format!("expected f32 {name}, found {}", abi::name(view.dtype)),
                 ));
             }
         }
@@ -236,7 +240,7 @@ impl Op for RgbBytes {
         if args.out.dtype != DType::U8 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected u8 output, found {}", args.out.dtype),
+                format!("expected u8 output, found {}", abi::name(args.out.dtype)),
             ));
         }
         args.out

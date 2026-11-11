@@ -977,7 +977,8 @@ impl nn::capability::Denoiser for Denoiser {
         if out.video.dtype != SAMPLE_DTYPE {
             return Err(nn::Error::from(Error::config(format!(
                 "the video latents are {} and the draw writes {SAMPLE_DTYPE}",
-                out.video.dtype
+                ops::abi::name(out.video.dtype),
+                SAMPLE_DTYPE = ops::abi::name(SAMPLE_DTYPE)
             ))));
         }
         if let Some(audio) = out.audio
@@ -985,7 +986,8 @@ impl nn::capability::Denoiser for Denoiser {
         {
             return Err(nn::Error::from(Error::config(format!(
                 "the audio latents are {} and the draw writes {SAMPLE_DTYPE}",
-                audio.dtype
+                ops::abi::name(audio.dtype),
+                SAMPLE_DTYPE = ops::abi::name(SAMPLE_DTYPE)
             ))));
         }
         let noise = nn::Noise::new();
@@ -1267,7 +1269,9 @@ impl Denoiser {
         if pixels.dtype != DType::F32 || draw.dtype != DType::F32 {
             return Err(Error::config(format!(
                 "condition {:?} is encoded in FP32: pixels are {} and the draw {}",
-                piece.role, pixels.dtype, draw.dtype
+                piece.role,
+                ops::abi::name(pixels.dtype),
+                ops::abi::name(draw.dtype)
             )));
         }
         let dims = pixels.shape.dims();
@@ -1427,7 +1431,8 @@ impl Denoiser {
         {
             return Err(Error::config(format!(
                 "the latents are {} and a trajectory is {SAMPLE_DTYPE}",
-                video.dtype
+                ops::abi::name(video.dtype),
+                SAMPLE_DTYPE = ops::abi::name(SAMPLE_DTYPE)
             )));
         }
         let layout = self.rules.cover(request)?;

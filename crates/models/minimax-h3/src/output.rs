@@ -201,7 +201,8 @@ fn check_previous(clip: Operand, previous: Operand, dtype: DType, overlap: u32) 
         return Err(Error::config(format!(
             "a predecessor's tail is {shape:?} {dtype} and the view is {:?} {}",
             previous.shape.dims(),
-            previous.dtype
+            ops::abi::name(previous.dtype),
+            dtype = ops::abi::name(dtype)
         )));
     }
     Ok(())

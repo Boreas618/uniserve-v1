@@ -38,11 +38,14 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand, Shape, Strides};
-use crate::tolerance::Tolerance;
+use crate::tensor::{Operand, Shape, Strides};
+use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
 /// What a launch does with the rows it picks out.
@@ -81,7 +84,7 @@ pub struct Descriptor {
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("mode", self.mode)
             .field("columns", self.columns)
             .field("block", self.block)
@@ -119,7 +122,10 @@ impl Op for Rows {
         if args.indices.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 row indices, found {}", args.indices.dtype),
+                format!(
+                    "expected i32 row indices, found {}",
+                    abi::name(args.indices.dtype)
+                ),
             ));
         }
         args.source
@@ -203,9 +209,8 @@ impl Op for Rows {
             // A copy: the element arrives unchanged.
             Mode::Replace => Tolerance::exact(),
             // One addition in the output's dtype: its own rounding, twice (the sum and the store).
-            Mode::Add => {
-                Tolerance::exact().with_atol(2.0 * descriptor.dtype.unit_roundoff() as f32)
-            }
+            Mode::Add => Tolerance::exact()
+                .with_atol(2.0 * tolerance::unit_roundoff(descriptor.dtype) as f32),
         }
     }
 }
@@ -240,7 +245,7 @@ mod tests {
     fn a_copy_is_exact_and_an_addition_carries_two_units_of_its_dtype() {
         assert_eq!(Rows::tolerance(&descriptor(Mode::Replace)).atol, 0.0);
         let add = Rows::tolerance(&descriptor(Mode::Add));
-        assert_eq!(add.atol, 2.0 * DType::BF16.unit_roundoff() as f32);
+        assert_eq!(add.atol, 2.0 * tolerance::unit_roundoff(DType::BF16) as f32);
         assert_eq!(add.rtol, 0.0);
     }
 }

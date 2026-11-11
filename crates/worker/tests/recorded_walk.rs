@@ -28,9 +28,10 @@ use nn::capability::{
 };
 use nn::{Forward, Result};
 use ops::logits::{GatherArgs, GatherDescriptor, LogitsGather};
-use ops::{DType, Op, Operand, Shape};
+use ops::{Op, Operand, Shape};
 use platform::{Allocator, Budget, Device, DeviceId, PoolKind, Stream};
 use proto::video::{LatentShape, Layout};
+use uniserve_tensor::DType;
 use worker::arena::Pools;
 use worker::plan::{Bucket, Buckets};
 use worker::runner::{Binding, Runner, RunnerId};

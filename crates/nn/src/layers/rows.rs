@@ -147,7 +147,7 @@ impl IndexRows {
 mod tests {
     use super::*;
     use crate::Arena;
-    use ops::DType;
+    use uniserve_tensor::DType;
 
     /// A gather reads a flat index view and writes one row per index of the source's width.
     #[test]

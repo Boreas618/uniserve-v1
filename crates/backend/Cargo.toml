@@ -1,0 +1,17 @@
+[package]
+name = "backend"
+description = "The CUDA and meta devices of the tensor library: execution context, allocator, kernel dispatch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The device backend of the tensor library over `ops` kernels: `backend → ops → platform`.
+# Models never depend on this crate; `nn` re-exports what they may use.
+[dependencies]
+ops.workspace = true
+uniserve-tensor.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

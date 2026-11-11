@@ -100,7 +100,7 @@ impl ChannelAffine {
 mod tests {
     use super::*;
     use crate::Arena;
-    use ops::DType;
+    use uniserve_tensor::DType;
 
     /// The channel axis may be any axis of a contiguous view; the map refuses one whose extent is
     /// not the parameters' length and a strided view it cannot fold.

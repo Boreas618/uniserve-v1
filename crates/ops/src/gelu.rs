@@ -22,11 +22,14 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand, Strides};
-use crate::tolerance::Tolerance;
+use crate::tensor::{Operand, Strides};
+use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
 /// The envelope of `|x|` the tolerance's absolute part follows.
@@ -68,7 +71,7 @@ pub struct Descriptor {
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("block", self.block)
             .field("approximate", self.approximate)
             .field("pdl", self.pdl)
@@ -154,7 +157,7 @@ impl Op for Gelu {
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // One rounding from FP32 into the output type; the `erf` or the `exp` is the transcendental
         // whose last place the envelope covers.
-        let unit = descriptor.dtype.unit_roundoff() as f32;
+        let unit = tolerance::unit_roundoff(descriptor.dtype) as f32;
         Tolerance::rounding(1, DType::F32, descriptor.dtype).with_atol(8.0 * VALUE_ENVELOPE * unit)
     }
 }

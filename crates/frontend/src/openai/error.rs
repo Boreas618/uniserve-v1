@@ -16,10 +16,10 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use thiserror_ext::{Construct, Macro};
 
-use crate::openai::{ErrorDetail, ErrorResponse};
+use crate::protocol::{ErrorDetail, ErrorResponse};
 use processing::InputError;
 
-use crate::input::ServeError;
+use crate::input::{ServeError, TokenizeError};
 use crate::output::OutputError;
 use crate::output::video::VideoStreamError;
 
@@ -225,6 +225,11 @@ impl From<ServeError> for ApiError {
             ServeError::ImageInput { ref source, .. } => {
                 Self::invalid_request(format!("{error}: {source}"), None)
             }
+            // A parameter the request states wrongly answers in its own words, naming it.
+            ServeError::Tokenize {
+                source: TokenizeError::InvalidParameter { param, message },
+                ..
+            } => Self::invalid_request(message, param),
             ServeError::Tokenize { ref source, .. } => {
                 Self::invalid_request(format!("{error}: {source}"), None)
             }
@@ -265,7 +270,7 @@ impl From<VideoStreamError> for ApiError {
 /// `input_references` field, whose index the message states.
 fn video_param(param: &str) -> Option<&'static str> {
     let field = param.split(['[', '.']).next().unwrap_or(param);
-    crate::input::video::request_field(field).map(|(name, _)| name)
+    crate::protocol::request_field(field).map(|(name, _)| name)
 }
 
 #[cfg(test)]

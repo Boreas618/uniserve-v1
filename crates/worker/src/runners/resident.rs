@@ -15,8 +15,9 @@
 use std::sync::{Arc, Mutex};
 
 use nn::KvPlanes;
-use ops::{DType, DevicePtr, Operand, Shape, Strides};
+use ops::{DevicePtr, Operand, Shape, Strides};
 use platform::{Buffer, PoolKind, Stream};
+use uniserve_tensor::DType;
 
 use crate::arena::Pools;
 use crate::memory::prefix_cache::scratch::ScratchCache;
@@ -782,7 +783,7 @@ mod tests {
     fn a_plane_of_a_storage_only_type_names_itself() {
         // `ElementType::to_ops` is the one bridge between storage and the kernel ABI; this asserts
         // the provider's error path names the type rather than guessing a mapping.
-        for element in [ElementType::Bool, ElementType::F64] {
+        for element in [ElementType::Bool, ElementType::I8] {
             assert!(
                 element.to_ops().is_none(),
                 "{element:?} has no kernel operand type"

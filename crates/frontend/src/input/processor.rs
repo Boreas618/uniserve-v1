@@ -1,57 +1,69 @@
-//! Load-time model resolution and model-owned request tokenization.
+//! Load-time model resolution and the lowering of requests into engine requests.
 //!
 //! `ModelConfig::load` resolves checkpoint facts, the tokenizer, and what renders requests
-//! at startup, by the family of the executable's catalogue the checkpoint declares: a diffusers
+//! at startup, by the family of the executable's registry the checkpoint declares: a diffusers
 //! pipeline index selects a video family, whose processor reads the pipeline files the family
-//! names, and otherwise the root `config.json` selects a chat family with its chat template. [`InputProcessor::new`] then binds the
-//! generation limits the started workers report and the request
+//! names, and otherwise the root `config.json` selects a chat family with its chat template.
+//! [`Processor::new`] then binds the generation limits the started workers report and the request
 //! renderer they complete ([`RequestRenderer`]), and the result is shared immutably by the
 //! serving runtime.
 //!
-//! [`InputProcessor`] binds tokenizer assets, generation limits, sampling policy, and
-//! output processing. [`InputProcessor::preprocess`] tokenizes a `GenerateRequest` into a
-//! [`GenerationRequest`] and the `OutputParams` (`crate::output`) the daemon retains.
-//! A video deployment's `VideoService` produces its `DiffusionRequest`s.
+//! [`Processor`] is the deployment's input processing, as vLLM's `Processor` is: it binds the
+//! tokenizer, the chat template, the generation limits and the sampling defaults, and
+//! [`Processor::process`] turns one parsed chat request into the engine's
+//! [`GenerationRequest`] and the lowering its output processing is built from
+//! (`proto::handoff::Lowering`). A video deployment's `VideoService` produces its
+//! `DiffusionRequest`s.
 
 use std::sync::Arc;
 
 use crate::model::ModelConfig;
 use crate::model::assets::{PipelineCheckpoint, ResolvedModelFiles};
 use crate::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
-use processing::Catalogue;
+use processing::Registry;
 use processing::{
     ImageFamily, ImageProcessor, ReasoningFormat, Serving, ToolCallFormat, VideoFamily,
 };
-use proto::request::{CachePolicy, GenerationFeatures, GenerationLimits, GenerationRequest};
-use proto::request::{RequestId, SamplingParams as EngineSamplingParams};
+use proto::handoff;
+use proto::request::{
+    CachePolicy, GenerationFeatures, GenerationLimits, GenerationRequest, RequestId,
+};
 use thiserror::Error;
 
-use crate::input::chat::template::MultimodalRenderInfo;
-use crate::input::chat::{ChatRequest, HfChatRenderer};
-use crate::input::request::GenerateRequest;
+use crate::input::chat::template::{MultimodalRenderInfo, RESERVED_TEMPLATE_KWARGS};
+use crate::input::chat::{GenerationPromptMode, HfChatRenderer};
 use crate::input::sampling::resolve_max_tokens;
 use crate::input::video::VideoService;
-use crate::input::{Result, ServeError};
-use crate::output::OutputParams;
-use crate::output::chat::ChatOutputProcessor;
+use crate::input::{Result, ServeError, TokenizeError};
+use crate::protocol::{
+    ChatCompletionRequest, ChatMessage, ChatModality, ChatToolChoice, ContentPart, MessageContent,
+};
 
-/// Owns the tokenizer and template resources used to produce final engine inputs.
-/// Runtime capabilities are fixed at construction, before this value is shared.
+/// The deployment's input processing: the tokenizer and template resources that turn a parsed
+/// request into the engine's request. Runtime capabilities are fixed at construction, before
+/// this value is shared.
 ///
-/// Preprocessing methods are synchronous and CPU-bound; the daemon's served model runs its request
-/// preprocessing on the blocking pool.
-pub struct InputProcessor {
+/// Its methods are synchronous and CPU-bound; the daemon runs them on its blocking thread
+/// pool.
+pub struct Processor {
     pub(super) config: ModelConfig,
     pub(super) tokenizer: DynTokenizer,
     renderer: RequestRenderer,
     // Worker-advertised generation features and resource limits.
     pub(super) limits: GenerationLimits,
     pub(super) parse_reasoning: bool,
-    // Whether the chat family writes tool calls and its checkpoint's template
-    // asks for them in that format.
-    tool_calls: bool,
     // The family's image processor, when the family takes images and the workers encode them.
     images: Option<Arc<dyn ImageProcessor>>,
+}
+
+/// The LoRA adapter a request computes with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterSelection {
+    /// The slot of the workers' adapter pool it lies in.
+    pub slot: u32,
+    /// What keeps its cache entries apart from every other adapter's, one
+    /// loaded into the same slot before included.
+    pub identity: String,
 }
 
 #[derive(Debug, Error)]
@@ -74,7 +86,7 @@ pub enum ModelResolutionError {
     Tokenizer(#[from] TokenizerError),
     /// The model chat renderer cannot be initialized.
     #[error(transparent)]
-    Chat(#[from] crate::output::chat::Error),
+    Chat(#[from] crate::input::chat::Error),
     /// The checkpoint's image processor files are not its family's.
     #[error("binding the image processor: {0}")]
     ImageProcessor(String),
@@ -131,7 +143,7 @@ pub enum RequestRenderer {
     Video(VideoService),
 }
 
-/// Loads a diffusers pipeline's `tokenizer` component as the pipeline's own
+/// Loads a diffusers pipeline's `tokenizer` stage as the pipeline's own
 /// `transformers` tokenizer loads it: `tokenizer.json` with the special
 /// tokens its `tokenizer_config.json`, when published, declares.
 ///
@@ -141,11 +153,9 @@ pub enum RequestRenderer {
 pub async fn pipeline_tokenizer(
     pipeline: &PipelineCheckpoint,
 ) -> std::result::Result<HuggingFaceTokenizer, ModelResolutionError> {
-    let path = pipeline
-        .component_file("tokenizer", "tokenizer.json")
-        .await?;
+    let path = pipeline.stage_file("tokenizer", "tokenizer.json").await?;
     let config = match pipeline
-        .component_file("tokenizer", "tokenizer_config.json")
+        .stage_file("tokenizer", "tokenizer_config.json")
         .await
     {
         Ok(config) => Some(config),
@@ -159,10 +169,10 @@ pub async fn pipeline_tokenizer(
 impl ModelConfig {
     /// Loads the checkpoint `model` names: its facts and the tokenizer and
     /// template resources request processing needs, with the family of
-    /// `catalogue` that claims it.
+    /// `registry` that claims it.
     ///
     /// A diffusers pipeline has no chat template and carries its conditioner's
-    /// vision processor geometry instead. The returned `max_model_len` is the
+    /// vision processor configuration instead. The returned `max_model_len` is the
     /// configured `max_model_len`, else, for a root configuration, its
     /// `max_position_embeddings` or `ModelConfig::DEFAULT_MAX_MODEL_LEN`; a
     /// pipeline's deployment must state it. `chat` configures a chat
@@ -171,30 +181,30 @@ impl ModelConfig {
     /// # Errors
     ///
     /// Fails when the checkpoint's files cannot be resolved or read, or no
-    /// family of `catalogue` serves it.
+    /// family of `registry` serves it.
     pub async fn load(
         model: &str,
         max_model_len: Option<std::num::NonZeroU32>,
         chat: &proto::config::ChatConfig,
-        catalogue: &Catalogue,
+        registry: &Registry,
     ) -> std::result::Result<LoadedModel, ModelResolutionError> {
         let max_model_len = max_model_len.map(std::num::NonZeroU32::get);
-        // A diffusers pipeline declares its class and component folders in a
+        // A diffusers pipeline declares its class and stage folders in a
         // root index rather than a root `config.json`, so the index selects the
-        // family and locates the tokenizer component before any other asset
-        // is resolved. A component export reads the components its pinned
+        // family and locates the tokenizer stage before any other asset
+        // is resolved. A stage export reads the stages its pinned
         // base supplies from the Hub cache at the pinned revision, as its
         // workers do. A family that a root `config.json` describes is
         // selected by that file alone, even when the checkpoint publishes an
         // index beside it.
         if let Some(pipeline) = PipelineCheckpoint::resolve(model).await?
-            && let Some(family) = catalogue.by_class(pipeline.class_name())
+            && let Some(family) = registry.by_class(pipeline.class_name())
             && let Serving::Video(video) = family.serving
         {
             let tokenizer: DynTokenizer = Arc::new(pipeline_tokenizer(&pipeline).await?);
             let mut files = Vec::with_capacity(video.processor_files().len());
-            for (component, name) in video.processor_files() {
-                let path = pipeline.component_file(component, name).await?;
+            for (stage, name) in video.processor_files() {
+                let path = pipeline.stage_file(stage, name).await?;
                 let text = std::fs::read_to_string(&path).map_err(|source| {
                     ModelResolutionError::ProcessorFile {
                         path: path.clone(),
@@ -218,7 +228,7 @@ impl ModelConfig {
             &files.tokenizer_path,
             files.tokenizer_config_path.as_deref(),
         )?);
-        let config = Self::from_files(catalogue, &files, max_model_len, tokenizer.as_ref()).await?;
+        let config = Self::from_files(registry, &files, max_model_len, tokenizer.as_ref()).await?;
         // A family that takes images binds its processor to the checkpoint's processor files; a
         // template that reads content parts writes its own image markup, and one that reads
         // flattened content is given the family's.
@@ -260,9 +270,9 @@ async fn bind_images(
         .map_err(ModelResolutionError::ImageProcessor)
 }
 
-impl InputProcessor {
-    /// The model's tokenizer, which a process continuing a response builds
-    /// its incremental decoder from.
+impl Processor {
+    /// The model's tokenizer, which output processing builds a request's incremental decoder
+    /// from.
     pub fn tokenizer(&self) -> DynTokenizer {
         Arc::clone(&self.tokenizer)
     }
@@ -271,7 +281,8 @@ impl InputProcessor {
     /// report in their handshake, without rebuilding model data.
     ///
     /// `renderer` is the checkpoint's chat template, or the video service a video pipeline's
-    /// denoiser handshake built.
+    /// denoiser handshake built. `parse_reasoning` is the deployment's choice
+    /// (`chat_config.reasoning_parser`) to answer reasoning apart from content.
     ///
     /// # Errors
     ///
@@ -290,25 +301,12 @@ impl InputProcessor {
         };
         validate_runtime_features(&config, &limits, needs)?;
 
-        // A chat checkpoint serves tool calls only when its family writes them
-        // and its template asks for them in that format; otherwise requests
-        // with tools are refused rather than returned with unparsed calls.
-        let tool_calls = match (config.chat(), &renderer) {
-            (Some(profile), RequestRenderer::Chat(renderer)) => match profile.tool_calls {
-                Some(ToolCallFormat::Qwen3) => {
-                    crate::input::chat::template::template_instructs_json_tool_calls(renderer)
-                }
-                None => false,
-            },
-            _ => false,
-        };
         Ok(Self {
             config,
             tokenizer,
             renderer,
             limits,
             parse_reasoning,
-            tool_calls,
             images: None,
         })
     }
@@ -347,7 +345,7 @@ impl InputProcessor {
         }
     }
 
-    /// The served video contract, as `GET /v1/capabilities` reports it;
+    /// What the deployment serves of video, as `GET /v1/capabilities` reports it;
     /// `Value::Null` for a model that serves no video. See
     /// `VideoService::capabilities`.
     pub fn video_capabilities(&self) -> serde_json::Value {
@@ -363,9 +361,12 @@ impl InputProcessor {
         self.images.is_some()
     }
 
-    /// Returns whether the model parses tool calls from its output.
+    /// Returns whether the model's tool calls are parsed from its output: whether its
+    /// family's chat profile names the format it writes them in.
     pub fn supports_tool_calling(&self) -> bool {
-        self.tool_calls
+        self.config
+            .chat()
+            .is_some_and(|profile| profile.tool_calls.is_some())
     }
 
     /// Returns whether the model produces structured reasoning output.
@@ -375,16 +376,15 @@ impl InputProcessor {
             .is_some_and(|profile| profile.reasoning.is_some())
     }
 
-    /// Validates the prompt and requested modalities against the loaded model.
+    /// Validates the features `request` reaches against the loaded model.
     ///
     /// Every refusal is `ServeError::UnsupportedFeature`. The final check asks the worker
     /// limits to cover the features this request reaches.
     fn validate_generation_features(
         &self,
         request_id: &str,
-        prompt: &ChatRequest,
+        request: &ChatCompletionRequest,
         has_input_image: bool,
-        image_output: bool,
     ) -> Result<()> {
         let reject = |feature| ServeError::UnsupportedFeature {
             request_id: request_id.to_owned(),
@@ -396,13 +396,14 @@ impl InputProcessor {
         if has_input_image && !self.supports_image_input() {
             return Err(reject("image_input"));
         }
-        if image_output {
+        // No served model generates images.
+        if request.modalities.contains(&ChatModality::Image) {
             return Err(reject("image_output"));
         }
-        if prompt.uses_tools() && !self.supports_tool_calling() {
+        if request.uses_tools() && !self.supports_tool_calling() {
             return Err(reject("tool_calling"));
         }
-        if prompt.chat_options.reasoning_effort.is_some() && !self.supports_reasoning() {
+        if request.reasoning_effort.is_some() && !self.supports_reasoning() {
             return Err(reject("reasoning"));
         }
         self.limits
@@ -410,85 +411,271 @@ impl InputProcessor {
             .map_err(|feature| reject(feature.name()))
     }
 
-    /// Tokenizes one generation request into its engine request and the
-    /// output parameters the daemon keeps.
+    /// Lowers one chat completion request into its engine request and the lowering its output
+    /// processing is built from.
     ///
-    /// `images` are the resolved `image_url` parts of a chat prompt, in
-    /// `ChatRequest::image_urls` order; a text prompt has none.
+    /// The engine request carries the rendered and tokenized prompt, the sampling parameters
+    /// (each of the request's controls over the checkpoint's defaults), the generation length,
+    /// the stop conditions and the cache partition of `cache_salt` and `adapter`. The lowering
+    /// states what the response needs of the same request: the prompt, the decode options, the
+    /// parsers of the model family's formats and the response's OpenAI fields, named
+    /// `request_id`.
+    ///
+    /// `images` are the fetched `image_url` parts of the request, in
+    /// `ChatCompletionRequest::image_urls` order; a text request has none. `adapter` is the
+    /// LoRA adapter the request's `model` names, when it names one.
     ///
     /// # Errors
     ///
-    /// Returns `ServeError::UnsupportedFeature` from feature validation and
-    /// `ServeError::Tokenize` for every
-    /// failure during tokenization, validation, and resource sizing.
-    pub fn preprocess(
+    /// Returns `ServeError::UnsupportedFeature` for a feature the deployment does not serve,
+    /// and `ServeError::Tokenize` for every failure of lowering, rendering, tokenization,
+    /// validation and resource sizing.
+    pub fn process(
         &self,
-        request: GenerateRequest,
+        request_id: &str,
+        request: &ChatCompletionRequest,
+        adapter: Option<&AdapterSelection>,
         images: Vec<crate::input::ImageInput>,
-    ) -> Result<(GenerationRequest, OutputParams)> {
-        let GenerateRequest {
-            request_id,
-            prompt,
-            image_output,
-            sampling,
-            max_tokens,
-            stop_token_ids,
-            decode,
-            priority,
-            cache_salt,
-            adapter,
-        } = request;
-        let has_input_image = !images.is_empty() || prompt.has_multimodal();
-        self.validate_generation_features(&request_id, &prompt, has_input_image, image_output)?;
-        let mut generation = GenerationRequest {
-            // The daemon's submission stamps the engine's identifier for the request.
-            request_id: RequestId::default(),
-            prompt_token_ids: Vec::new(),
-            multimodal_inputs: Default::default(),
-            sampling,
-            max_und_tokens: 0,
-            include_stop_token: decode.include_stop_str_in_output,
-            stop_strings: decode.stop_strings.clone().unwrap_or_default(),
-            stop_token_ids,
-            priority,
-            cache: CachePolicy {
-                isolation_key: crate::input::cache_isolation_key(
-                    cache_salt.as_deref(),
-                    adapter.as_ref().map(|adapter| adapter.identity.as_str()),
-                ),
-                ..CachePolicy::default()
-            },
-            generated_token_ids: Vec::new(),
-            adapter: adapter.as_ref().map_or(0, |adapter| adapter.slot),
-        };
+    ) -> Result<(GenerationRequest, handoff::Lowering)> {
+        let has_input_image = !images.is_empty() || !request.image_urls().is_empty();
+        self.validate_generation_features(request_id, request, has_input_image)?;
 
-        // Each model fills its actual computation inputs in the same request.
-        // No partially prepared request is exposed to the submission boundary.
         // The closure gathers every `TokenizeError` so it maps once to `ServeError::Tokenize`.
-        let processor = (|| -> std::result::Result<_, crate::input::TokenizeError> {
-            let processor =
-                self.preprocess_chat_input(prompt, max_tokens, &images, &mut generation)?;
+        let generation = (|| -> std::result::Result<_, TokenizeError> {
+            validate_request(request)?;
+            let mut generation = GenerationRequest {
+                // The daemon's submission stamps the engine's identifier for the request.
+                request_id: RequestId::default(),
+                prompt_token_ids: Vec::new(),
+                multimodal_inputs: Default::default(),
+                sampling: super::sampling::lower(
+                    request,
+                    &self.config.sampling_defaults,
+                    &self.tokenizer,
+                )?,
+                max_und_tokens: 0,
+                include_stop_token: request.include_stop_str_in_output,
+                stop_strings: request
+                    .stop
+                    .as_ref()
+                    .map(|stop| stop.as_slice().to_vec())
+                    .unwrap_or_default(),
+                stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
+                priority: request.priority.unwrap_or(0),
+                cache: CachePolicy {
+                    isolation_key: crate::input::cache_isolation_key(
+                        request.cache_salt.as_deref(),
+                        adapter.map(|adapter| adapter.identity.as_str()),
+                    ),
+                    ..CachePolicy::default()
+                },
+                generated_token_ids: Vec::new(),
+                adapter: adapter.map_or(0, |adapter| adapter.slot),
+            };
+
+            self.tokenize(request, &images, &mut generation)?;
             generation.validate()?;
             // The workers compute a position's candidates in their graphs, as many as they state.
             self.limits.covers_logprobs(&generation.sampling)?;
-            Ok(processor)
+            Ok(generation)
         })()
         .map_err(|source| ServeError::Tokenize {
-            request_id: request_id.clone(),
+            request_id: request_id.to_owned(),
             source,
         })?;
 
-        let output = OutputParams {
-            tokenizer: Arc::clone(&self.tokenizer),
+        let lowering = handoff::Lowering {
             // Detokenization needs the prompt after ownership moves to the engine.
             prompt_token_ids: generation.prompt_token_ids.clone(),
-            decode,
+            decode_options: Some(handoff::TextDecode {
+                skip_special_tokens: request.skip_special_tokens,
+                include_stop_str_in_output: request.include_stop_str_in_output,
+                stop_strings: generation.stop_strings.clone(),
+                min_tokens: request.min_tokens.unwrap_or(0),
+            }),
             prompt_logprobs: generation.sampling.prompt_logprobs_requested(),
             logprobs: generation.sampling.generated_logprobs_requested(),
-            processor,
+            parser: Some(self.parser(request)),
+            response: Some(response_options(request_id, request)),
+            // The daemon states both when it submits the request.
+            compile_us: 0,
+            started_unix_us: 0,
         };
-        Ok((generation, output))
+        Ok((generation, lowering))
     }
+
+    /// The parsers `request`'s output is read with: the formats the model family's chat profile
+    /// names, reasoning when the deployment answers it apart from content, tool calls when the
+    /// model may call the request's tools.
+    fn parser(&self, request: &ChatCompletionRequest) -> handoff::Parser {
+        let Some(profile) = self.config.chat() else {
+            return handoff::Parser::default();
+        };
+        // The kind names the tool-call format; a family that writes none has its reasoning
+        // parsed under the first kind, which then parses no tool call.
+        let kind = match (profile.reasoning, profile.tool_calls) {
+            (None, None) => handoff::parser::Kind::ParserKindNone,
+            (_, Some(ToolCallFormat::Xml)) => handoff::parser::Kind::ParserKindXml,
+            (_, Some(ToolCallFormat::Json)) | (Some(ReasoningFormat::Think), None) => {
+                handoff::parser::Kind::ParserKindJson
+            }
+        };
+        let tools = request
+            .callable_tools()
+            .filter(|_| profile.tool_calls.is_some());
+
+        handoff::Parser {
+            kind: kind as i32,
+            parse_reasoning: self.parse_reasoning && profile.reasoning.is_some(),
+            parse_tools: tools.is_some(),
+            // A request's tools serialize as it stated them.
+            tools: tools
+                .and_then(|tools| serde_json::to_string(tools).ok())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// The OpenAI fields the response to `request` carries, named `request_id`.
+///
+/// The route has checked that `request.model` names the served model or a loaded adapter, so
+/// the response names it back.
+fn response_options(
+    request_id: &str,
+    request: &ChatCompletionRequest,
+) -> handoff::ChatResponseOptions {
+    handoff::ChatResponseOptions {
+        request_id: request_id.to_owned(),
+        response_model: request.model.clone(),
+        include_usage: request
+            .stream_options
+            .as_ref()
+            .and_then(|options| options.include_usage)
+            .unwrap_or(false),
+        requested_logprobs: request.logprobs,
+        // Only a response answered as one document carries prompt logprobs.
+        include_prompt_logprobs: request.prompt_logprobs.is_some(),
+        include_reasoning: request.include_reasoning,
+        return_token_ids: request.return_token_ids.unwrap_or(false),
+        return_tokens_as_token_ids: request.return_tokens_as_token_ids.unwrap_or(false),
+        // One timestamp for the whole response, shared by every streamed chunk.
+        created: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        // How many of a generated position's candidates `top_logprobs` lists, the sampled
+        // token first: the request's count, zero when unset and every one for `-1`, as
+        // vLLM's `chat_top_logprobs_limit`.
+        top_logprobs: request
+            .top_logprobs
+            .map_or(0, |count| u32::try_from(count).unwrap_or(u32::MAX)),
+    }
+}
+
+/// Checks the rules of a chat request that its schema does not state.
+///
+/// # Errors
+///
+/// Refuses a `prompt_logprobs` value below `-1` or a positive or `-1` value on a streamed
+/// request, a `tool_choice` that makes the model call a tool, template arguments that set a
+/// variable the request itself determines, an assistant
+/// message with no reasoning, content, or tool calls or with image content, and a non-function
+/// tool call.
+fn validate_request(request: &ChatCompletionRequest) -> std::result::Result<(), TokenizeError> {
+    let invalid = |param: &'static str, message: &str| TokenizeError::InvalidParameter {
+        param: Some(param).filter(|param| !param.is_empty()),
+        message: message.to_owned(),
+    };
+
+    if let Some(prompt_logprobs) = request.prompt_logprobs {
+        // Any non-negative count, or `-1` for the full vocabulary.
+        if prompt_logprobs < -1 {
+            return Err(invalid(
+                "prompt_logprobs",
+                "prompt_logprobs must be a non-negative value or -1.",
+            ));
+        }
+
+        // Stream chunks have no `prompt_logprobs` field, so a streamed response could not
+        // deliver them. A streamed `0` is accepted, as vLLM accepts it, and the sampling
+        // lowering drops it: scoring every prompt position would disable prefix-cache reads
+        // for output the client never receives.
+        if request.stream && (prompt_logprobs > 0 || prompt_logprobs == -1) {
+            return Err(invalid(
+                "prompt_logprobs",
+                "prompt_logprobs are not available when stream=true.",
+            ));
+        }
+    }
+
+    // Holding a model to a tool call takes constrained decoding, as vLLM serves both of these
+    // choices, and this server has none: a model left free would answer in text under a
+    // response that promised a call.
+    let unserved = match &request.tool_choice {
+        Some(ChatToolChoice::Required) => Some("`required`".to_owned()),
+        Some(ChatToolChoice::Function(name)) => Some(format!("the function `{name}`")),
+        Some(ChatToolChoice::Auto | ChatToolChoice::None) | None => None,
+    };
+    if let Some(choice) = unserved {
+        return Err(invalid(
+            "tool_choice",
+            &format!(
+                "tool_choice {choice} is not served: it needs constrained decoding, which this \
+                 server does not provide. Use `auto` or `none`."
+            ),
+        ));
+    }
+
+    // Template arguments may not replace the variables the renderer derives from the request
+    // itself.
+    if let Some(kwargs) = request.chat_template_kwargs.as_ref()
+        && let Some(name) = RESERVED_TEMPLATE_KWARGS
+            .into_iter()
+            .find(|name| kwargs.contains_key(*name))
+    {
+        return Err(invalid(
+            "chat_template_kwargs",
+            &format!(
+                "chat_template_kwargs may not set `{name}`, which the request itself determines."
+            ),
+        ));
+    }
+
+    for message in &request.messages {
+        let ChatMessage::Assistant {
+            content,
+            tool_calls,
+            reasoning,
+            ..
+        } = message
+        else {
+            continue;
+        };
+        if let Some(MessageContent::Parts(parts)) = content
+            && parts
+                .iter()
+                .any(|part| matches!(part, ContentPart::ImageUrl { .. }))
+        {
+            return Err(invalid("", "Assistant message content must be text."));
+        }
+        let tool_calls = tool_calls.as_deref().unwrap_or_default();
+        if tool_calls.iter().any(|call| call.tool_type != "function") {
+            return Err(invalid("", "Only function tool calls are supported."));
+        }
+        let has_reasoning = reasoning.as_ref().is_some_and(|text| !text.is_empty());
+        let has_content = match content {
+            None => false,
+            Some(MessageContent::Text(_)) => true,
+            Some(MessageContent::Parts(parts)) => !parts.is_empty(),
+        };
+        if !has_reasoning && !has_content && tool_calls.is_empty() {
+            return Err(invalid(
+                "",
+                "Assistant messages must contain content or tool_calls.",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Refuses to bind a model whose required features the worker limits do not cover,
@@ -506,38 +693,19 @@ fn validate_runtime_features(
         })
 }
 
-impl InputProcessor {
-    /// Renders a chat prompt and fills its token, sampling, and cache requirements; the output
-    /// is parsed in the formats the chat family writes.
-    fn preprocess_chat_input(
+impl Processor {
+    /// Renders and tokenizes `request`'s prompt into `generation`, with its image blocks, its
+    /// generation length and its stop tokens.
+    fn tokenize(
         &self,
-        chat_request: ChatRequest,
-        max_tokens: Option<u32>,
+        request: &ChatCompletionRequest,
         images: &[crate::input::ImageInput],
         generation: &mut GenerationRequest,
-    ) -> std::result::Result<ChatOutputProcessor, crate::input::TokenizeError> {
-        chat_request.validate()?;
-        let profile = self.config.chat().unwrap_or(processing::ChatProfile {
-            reasoning: None,
-            tool_calls: None,
-            images: None,
-        });
-        let tools = (profile.tool_calls.is_some() && chat_request.tool_parsing_enabled())
-            .then_some(chat_request.tools.as_slice());
-        let processor = match (profile.reasoning, profile.tool_calls) {
-            (Some(ReasoningFormat::Qwen3), _) | (None, Some(ToolCallFormat::Qwen3)) => {
-                ChatOutputProcessor::qwen3(
-                    tools,
-                    std::sync::Arc::clone(&self.tokenizer),
-                    self.parse_reasoning && profile.reasoning.is_some(),
-                )?
-            }
-            (None, None) => ChatOutputProcessor::new(None, None),
-        };
+    ) -> std::result::Result<(), TokenizeError> {
         let rendered_text = self
             .chat_renderer()
-            .ok_or(crate::output::chat::Error::MissingChatTemplate)?
-            .render(&chat_request)?;
+            .ok_or(crate::input::chat::Error::MissingChatTemplate)?
+            .render(request, GenerationPromptMode::StartNewAssistant)?;
         let mut prompt_token_ids = self.tokenizer.encode(&rendered_text, false)?;
         generation.multimodal_inputs.images = self.lower_images(
             &mut prompt_token_ids,
@@ -554,14 +722,15 @@ impl InputProcessor {
             .filter_map(|encoder| encoder.num_cache_tokens)
             .sum();
         let prompt_len = prompt_token_ids.len() as u32 + image_tokens;
-        let max_tokens = self.resolve_length(generation, max_tokens, prompt_len)?;
+        let max_tokens =
+            self.resolve_length(generation, request.max_output_tokens(), prompt_len)?;
 
         generation.prompt_token_ids = prompt_token_ids;
         generation.max_und_tokens = max_tokens as usize;
         // Prompt logprobs require computation for every prompt token, which a prefix-cache
         // read would skip.
         generation.cache.read &= !generation.sampling.prompt_logprobs_requested();
-        Ok(processor)
+        Ok(())
     }
 
     /// Lowers the fetched `images` of a rendered prompt into the request's image inputs.
@@ -577,7 +746,7 @@ impl InputProcessor {
         prompt: &mut Vec<u32>,
         images: &[crate::input::ImageInput],
         isolation: Option<u64>,
-    ) -> std::result::Result<Vec<proto::request::ImageInput>, crate::input::TokenizeError> {
+    ) -> std::result::Result<Vec<proto::request::ImageInput>, TokenizeError> {
         use base64::Engine as _;
 
         let Some(processor) = self.images.as_ref() else {
@@ -587,14 +756,14 @@ impl InputProcessor {
             .tokenizer
             .token_to_id(processor.placeholder())
             .ok_or_else(|| {
-                crate::input::TokenizeError::Invalid(format!(
+                TokenizeError::Invalid(format!(
                     "the vocabulary has no image placeholder `{}`",
                     processor.placeholder()
                 ))
             })?;
         let found = prompt.iter().filter(|id| **id == placeholder).count();
         if found != images.len() {
-            return Err(crate::input::TokenizeError::Invalid(format!(
+            return Err(TokenizeError::Invalid(format!(
                 "the prompt renders {found} image placeholder(s) for {} image(s)",
                 images.len()
             )));
@@ -609,11 +778,11 @@ impl InputProcessor {
                 continue;
             }
             let image = next.next().ok_or_else(|| {
-                crate::input::TokenizeError::Invalid("an image placeholder has no image".into())
+                TokenizeError::Invalid("an image placeholder has no image".into())
             })?;
             let block = processor
                 .block(image.width(), image.height())
-                .map_err(crate::input::TokenizeError::Invalid)?;
+                .map_err(TokenizeError::Invalid)?;
             let mut digest = storage::key::Digest::new(b"chat-image");
             digest.bytes(&image.digest());
             match isolation {
@@ -641,27 +810,6 @@ impl InputProcessor {
         Ok(inputs)
     }
 
-    /// The engine's sampling parameters of a chat `request`: its controls
-    /// over the model's sampling defaults, lowered once, with its logit
-    /// biases keyed by token ID.
-    ///
-    /// # Errors
-    ///
-    /// Fails when a bad word cannot be tokenized or the parameters violate
-    /// the engine's sampling contract.
-    pub fn sampling(
-        &self,
-        request: &crate::openai::ChatCompletionRequest,
-        logit_bias: Option<std::collections::HashMap<u32, f32>>,
-    ) -> std::result::Result<EngineSamplingParams, crate::input::TokenizeError> {
-        super::sampling::lower(
-            request,
-            logit_bias,
-            &self.config.sampling_defaults,
-            &self.tokenizer,
-        )
-    }
-
     /// Resolves the request's generation length for a prompt of
     /// `prompt_len` tokens, and adds the checkpoint's EOS tokens other than
     /// the primary one to `generation`'s stop tokens unless it ignores EOS.
@@ -675,7 +823,7 @@ impl InputProcessor {
         generation: &mut GenerationRequest,
         max_tokens: Option<u32>,
         prompt_len: u32,
-    ) -> std::result::Result<u32, crate::input::TokenizeError> {
+    ) -> std::result::Result<u32, TokenizeError> {
         let max_tokens = resolve_max_tokens(
             max_tokens,
             self.config.sampling_defaults.max_output_tokens,
@@ -700,7 +848,7 @@ impl InputProcessor {
         }
 
         if min_tokens > max_tokens {
-            return Err(crate::input::TokenizeError::MinTokensExceedsMaximum {
+            return Err(TokenizeError::MinTokensExceedsMaximum {
                 min_tokens,
                 max_tokens,
             });
@@ -754,12 +902,12 @@ mod tests {
         )
         .unwrap();
 
-        let catalogue = processing::Catalogue::new([crate::test_support::CHAT]).unwrap();
+        let registry = processing::Registry::new([crate::test_support::CHAT]).unwrap();
         let loaded = ModelConfig::load(
             directory.path().to_str().unwrap(),
             None,
             &proto::config::ChatConfig::default(),
-            &catalogue,
+            &registry,
         )
         .await
         .unwrap();

@@ -41,13 +41,14 @@ use std::sync::{Arc, Mutex};
 use ipc::execution::{Shape as PlanShape, Variant};
 use nn::forward::Forward;
 use ops::{
-    Arguments, CubinMetadata, DType, DevicePtr, Generation, Kernel, KernelEntry, LaunchGrid, Op,
-    Operand, Shape, Tolerance, Twins, descriptor,
+    Arguments, CubinMetadata, DevicePtr, Generation, Kernel, KernelEntry, LaunchGrid, Op, Operand,
+    Shape, Tolerance, Twins, descriptor,
 };
 use platform::{
     Allocator, Budget, Buffer, CaptureMode, Device, DeviceId, GraphNodeKind, PinnedBuffer,
     PoolKind, Stream, memcpy_async, memset_d32,
 };
+use uniserve_tensor::DType;
 use worker::captured::Captured;
 use worker::graph::Graphs;
 use worker::plan::Bucket;

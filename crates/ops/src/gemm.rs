@@ -23,10 +23,13 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::{self, DevicePtr, Stream};
-use crate::tensor::{DType, Operand, Shape, Strides};
+use crate::tensor::{Operand, Shape, Strides};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -91,10 +94,10 @@ impl fmt::Display for Descriptor {
         // the module is the same code whatever they are. A key that named `k` compiled one module per
         // weight shape for no gain.
         Key::new()
-            .field("input", self.input)
-            .field("weight", self.weight)
-            .field("accumulate", self.accumulate)
-            .field("output", self.output)
+            .field("input", abi::name(self.input))
+            .field("weight", abi::name(self.weight))
+            .field("accumulate", abi::name(self.accumulate))
+            .field("output", abi::name(self.output))
             .field("order", self.order)
             .field("epilogue", self.epilogue)
             .finish(formatter)
@@ -223,7 +226,8 @@ impl Gemm {
             Self::NAME,
             format!(
                 "the operands are {} input against {} weight: a contraction takes one type on both sides",
-                descriptor.input, descriptor.weight
+                abi::name(descriptor.input),
+                abi::name(descriptor.weight)
             ),
         ))
     }
@@ -258,7 +262,8 @@ impl Op for Gemm {
                 Self::NAME,
                 format!(
                     "expected {} output, found {}",
-                    descriptor.output, args.out.dtype
+                    abi::name(descriptor.output),
+                    abi::name(args.out.dtype)
                 ),
             ));
         }

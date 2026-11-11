@@ -32,8 +32,9 @@ use nn::{Forward, StateLayer, StateView};
 use ops::block_copy::{
     BlockShape, COPY_BLOCK, CacheBlockScatter, CacheBlockSnapshot, ScatterArgs, SnapshotArgs,
 };
-use ops::{DType, DevicePtr, Operand, Shape, Strides};
+use ops::{DevicePtr, Operand, Shape, Strides};
 use platform::{Buffer, DeviceId, PoolKind};
+use uniserve_tensor::DType;
 
 use crate::arena::Pools;
 use crate::memory::{CachePlan, StatePlanes};

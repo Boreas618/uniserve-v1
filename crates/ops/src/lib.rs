@@ -8,9 +8,10 @@
 //! type with a name, a descriptor, and an argument struct; a kernel package — a Triton package, a
 //! CuTe DSL package, a CUDA C++ package or a native library — fills that operator, and
 //! `uniserve engine` resolves the programs the epoch record names and hands the modules to
-//! [`Kernel`]. `ops` depends on `platform` and on the module vocabulary of `proto` (operator
-//! names and phases) alone: it launches what it is given, allocates nothing
-//! that outlives a launch, owns no model and knows no layer.
+//! [`Kernel`]. `ops` depends on `platform`, on the module vocabulary of `proto` (operator
+//! names and phases) and on the tensor library for the element type of an operand, whose number
+//! and spelling in the package ABI [`abi`] states: it launches what it is given, allocates
+//! nothing that outlives a launch, owns no model and knows no layer.
 //!
 //! ## The operators
 //!
@@ -59,6 +60,19 @@
 //!
 //! The attention and mixture-of-experts operators are `attention` and `moe`, beside these.
 //!
+//! Tensor primitives, which read strided operands of any shape ([`strided`]):
+//!
+//! | Operator | `NAME` | Module |
+//! | --- | --- | --- |
+//! | [`elementwise::ElementwiseUnary`] | `elementwise_unary` | [`elementwise`] |
+//! | [`elementwise::ElementwiseBinary`] | `elementwise_binary` | [`elementwise`] |
+//! | [`elementwise::ElementwiseWhere`] | `elementwise_where` | [`elementwise`] |
+//! | [`cast::Cast`] | `cast` | [`cast`] |
+//! | [`copy_strided::CopyStrided`] | `copy_strided` | [`copy_strided`] |
+//! | [`fill::Fill`] | `fill` | [`fill`] |
+//! | [`reduce::Reduce`] | `reduce` | [`reduce`] |
+//! | [`index::Index`] | `index` | [`index`] |
+//!
 //! ## Descriptor keys
 //!
 //! A descriptor's `Display` is its key, and the key is the last segment of the module's path
@@ -78,6 +92,7 @@
 /// tools read.
 pub const KERNELS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/kernels");
 
+pub mod abi;
 pub mod activation;
 pub mod activation1d;
 pub mod adaptive_pool;
@@ -87,20 +102,25 @@ pub mod block_copy;
 #[cfg(test)]
 pub mod call_layout_check;
 pub mod capture;
+pub mod cast;
 pub mod channel_affine;
 pub mod commit;
 pub mod conv;
 pub mod copy_block;
+pub mod copy_strided;
 pub mod cross_fade;
 pub mod descriptor;
+pub mod elementwise;
 pub mod embedding;
 pub mod error;
+pub mod fill;
 pub mod fp4;
 pub mod fp8;
 pub mod frame;
 pub mod gelu;
 pub mod gemm;
 pub mod generation;
+pub mod index;
 pub mod install;
 pub mod kernel;
 pub mod kv;
@@ -117,12 +137,14 @@ pub mod position;
 pub mod posterior;
 pub mod prefix_cache;
 pub mod recurrent;
+pub mod reduce;
 pub mod residual;
 pub mod rgb;
 pub mod rope;
 pub mod rows;
 pub mod sampler;
 pub mod snake;
+pub mod strided;
 pub mod tensor;
 pub mod tile_stitch;
 pub mod tolerance;
@@ -143,6 +165,6 @@ pub use platform::zero_bytes;
 pub use platform::{
     CollectiveType, Communicator, DeviceRange, PlatformDevicePtr, ReduceOp, Stream, collective_type,
 };
-pub use tensor::{DType, DevicePtr, MAX_RANK, Operand, Shape, Strides};
+pub use tensor::{DevicePtr, MAX_RANK, Operand, Shape, Strides};
 pub use tolerance::Tolerance;
 pub use twins::{Twin, Twins};

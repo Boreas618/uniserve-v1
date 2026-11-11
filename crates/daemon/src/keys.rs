@@ -30,7 +30,7 @@ use crate::options::{ServerArgs, Stated};
 /// not resolve, an option of another family was stated, the options do not resolve into an engine
 /// configuration, the replicas are not independent, or a process cannot be placed on this node.
 pub async fn launches(
-    families: &processing::Catalogue,
+    families: &processing::Registry,
     config: &ServerArgs,
     stated: &Stated,
 ) -> anyhow::Result<Vec<EngineArgs>> {
@@ -66,7 +66,7 @@ pub async fn launches(
 /// Fails as [`launches`] does, when the engine package cannot be selected or resolved, and when
 /// a recording process fails or prints a line that is no `operator<TAB>key`.
 pub async fn record(
-    families: &processing::Catalogue,
+    families: &processing::Registry,
     config: &ServerArgs,
     stated: &Stated,
 ) -> anyhow::Result<BTreeMap<String, BTreeSet<String>>> {

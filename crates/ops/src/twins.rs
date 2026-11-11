@@ -19,8 +19,11 @@
 //! there. A region that is too small therefore cannot turn into a comparison of a buffer against
 //! itself.
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::platform::{Allocator, Buffer, PoolKind, Stream};
-use crate::tensor::{DType, DevicePtr, Operand, Shape};
+use crate::tensor::{DevicePtr, Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Result, platform};
 
@@ -195,9 +198,10 @@ impl Twins {
 
     /// A buffer of `shape` elements of `dtype`, from the region.
     fn carve(&mut self, shape: Shape, dtype: DType) -> Result<DevicePtr> {
-        let bytes = dtype.bytes().ok_or_else(|| {
+        let bytes = abi::bytes(dtype).ok_or_else(|| {
             Error::Shape(format!(
-                "{dtype} elements have no whole-byte size; a twin cannot address them"
+                "{} elements have no whole-byte size; a twin cannot address them",
+                abi::name(dtype)
             ))
         })?;
         let bytes = shape.numel() * bytes;

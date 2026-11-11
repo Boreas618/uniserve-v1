@@ -3,6 +3,6 @@
 
 #![cfg(test)]
 
+mod chat_output;
 mod chat_template;
 mod model_preprocessing;
-mod qwen3_output;

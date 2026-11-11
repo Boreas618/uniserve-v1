@@ -1,6 +1,6 @@
 //! The engine's side of one request, as output processing reads it: the
 //! request's engine events ([`Events`]) and the recorder of its statistics
-//! ([`Outcome`]).
+//! ([`Stats`]).
 //!
 //! The daemon's engine client implements both: its events follow the request
 //! across the engines that serve it when it migrates, and its recorder
@@ -78,7 +78,7 @@ pub trait Events: Send {
 }
 
 /// The recorder of one request's statistics, folded from its public outputs.
-pub trait Outcome: Send {
+pub trait Stats: Send {
     /// When the request entered the server.
     fn started(&self) -> Instant;
 

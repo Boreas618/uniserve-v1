@@ -29,10 +29,13 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand};
+use crate::tensor::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -59,7 +62,7 @@ impl fmt::Display for Descriptor {
         // The axis is a compiled loop, not a launch value, so it is in the key; `extent` is too,
         // because it is the number of blended positions and the divisor of the weights.
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("extent", self.extent)
             .field("axis", self.axis)
             .field("block", self.block)
@@ -149,7 +152,11 @@ impl Op for CrossFade {
             if view.dtype != descriptor.dtype {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected {} {name}, found {}", descriptor.dtype, view.dtype),
+                    format!(
+                        "expected {} {name}, found {}",
+                        abi::name(descriptor.dtype),
+                        abi::name(view.dtype)
+                    ),
                 ));
             }
         }
@@ -159,7 +166,8 @@ impl Op for CrossFade {
                 Self::NAME,
                 format!(
                     "expected {} out, found {}",
-                    descriptor.dtype, args.out.dtype
+                    abi::name(descriptor.dtype),
+                    abi::name(args.out.dtype)
                 ),
             ));
         }

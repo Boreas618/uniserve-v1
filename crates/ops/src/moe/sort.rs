@@ -26,14 +26,17 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand, Shape};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
-use super::{address, dtype_code, to_i64};
+use super::{address, to_i64};
 
 /// One compilation of `moe_sort`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -67,7 +70,7 @@ impl fmt::Display for Descriptor {
             .field("top", self.top)
             .field("local", self.local_experts)
             .field("tile", self.tile_tokens)
-            .field("scales", self.scales)
+            .field("scales", abi::name(self.scales))
             .field("counted", self.counted)
             .finish(formatter)
     }
@@ -260,7 +263,10 @@ impl Op for MoeSort {
         if args.ids.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 route ids, found {}", args.ids.dtype),
+                format!(
+                    "expected i32 route ids, found {}",
+                    abi::name(args.ids.dtype)
+                ),
             ));
         }
         if args.scales.dtype != descriptor.scales {
@@ -268,14 +274,18 @@ impl Op for MoeSort {
                 Self::NAME,
                 format!(
                     "expected {} route weights, found {}",
-                    descriptor.scales, args.scales.dtype
+                    abi::name(descriptor.scales),
+                    abi::name(args.scales.dtype)
                 ),
             ));
         }
         if !matches!(descriptor.scales, DType::F32 | DType::BF16 | DType::F16) {
             return Err(Error::Unsupported {
                 operator: Self::NAME,
-                problem: format!("{} route weights are not a sort weight", descriptor.scales),
+                problem: format!(
+                    "{} route weights are not a sort weight",
+                    abi::name(descriptor.scales)
+                ),
             });
         }
         for view in [&args.tile_to_expert, &args.tile_to_limit] {
@@ -307,7 +317,7 @@ impl Op for MoeSort {
             if view.dtype != DType::I32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected i32 metadata, found {}", view.dtype),
+                    format!("expected i32 metadata, found {}", abi::name(view.dtype)),
                 ));
             }
         }
@@ -350,7 +360,7 @@ impl Op for MoeSort {
             local_experts: to_i64(Self::NAME, local)?,
             local_offset: to_i64(Self::NAME, u64::from(args.local_offset))?,
             tile_tokens: to_i64(Self::NAME, tile)?,
-            scales_dtype: dtype_code(descriptor.scales),
+            scales_dtype: abi::code(descriptor.scales)?,
             error: [0; 512],
             live_tokens: args.live_tokens.map_or(std::ptr::null(), |view| {
                 address(view.ptr) as usize as *const i32

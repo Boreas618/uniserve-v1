@@ -15,7 +15,8 @@
 //! Whether they are is the block's [`ResidualForm`], because the two forms round differently: a
 //! fused join normalizes the unrounded FP32 sum, a separate join normalizes the stream it stored.
 
-use ops::{DType, Operand};
+use ops::Operand;
+use uniserve_tensor::DType;
 
 use crate::error::Result;
 use crate::family::Split;

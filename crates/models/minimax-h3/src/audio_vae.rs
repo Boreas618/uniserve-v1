@@ -204,7 +204,7 @@ impl AudioDecoder {
         if out.dtype != DType::F32 || out.shape.dims() != planes || !out.is_row_major() {
             return Err(Error::config(format!(
                 "the waveform is a contiguous f32 {planes:?}, not {} {:?}",
-                out.dtype,
+                ops::abi::name(out.dtype),
                 out.shape.dims()
             )));
         }

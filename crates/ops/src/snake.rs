@@ -30,11 +30,14 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand, Shape, Strides};
-use crate::tolerance::Tolerance;
+use crate::tensor::{Operand, Shape, Strides};
+use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
 /// The envelope of `|α · x|`: the absolute part of the tolerance follows it.
@@ -56,7 +59,7 @@ pub struct Descriptor {
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("channels", self.channels)
             .field("block", self.block)
             .field("pdl", self.pdl)
@@ -163,7 +166,7 @@ impl Op for Snake {
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // `sin`, its square and the reciprocal are three roundings in FP32 before the output's own;
         // the envelope above bounds the addend by the value 1.
-        let unit = descriptor.dtype.unit_roundoff() as f32;
+        let unit = tolerance::unit_roundoff(descriptor.dtype) as f32;
         Tolerance::rounding(3, DType::F32, descriptor.dtype).with_atol(8.0 * VALUE_ENVELOPE * unit)
     }
 }

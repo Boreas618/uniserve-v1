@@ -24,11 +24,14 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand, Shape, Strides};
-use crate::tolerance::Tolerance;
+use crate::tensor::{Operand, Shape, Strides};
+use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
 /// The envelope of one row's mean, which the absolute part of the tolerance follows.
@@ -54,7 +57,7 @@ pub struct Descriptor {
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("heads", self.heads)
             .field("width", self.width)
             .field("output", self.output)
@@ -170,7 +173,7 @@ impl Op for AdaptivePool {
             .div_ceil(u64::from(descriptor.output))
             .max(1);
         let reduction = u64::from(descriptor.heads) * window;
-        let unit = descriptor.dtype.unit_roundoff() as f32;
+        let unit = tolerance::unit_roundoff(descriptor.dtype) as f32;
         Tolerance::rounding(reduction, DType::F32, descriptor.dtype)
             .with_atol(8.0 * VALUE_ENVELOPE * unit)
     }

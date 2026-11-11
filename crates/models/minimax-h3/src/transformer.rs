@@ -258,11 +258,12 @@ fn fuse_modality(
     if bias.dtype != dtype {
         return Err(Error::checkpoint(format!(
             "{name}'s weight is {dtype} and its bias {}",
-            bias.dtype
+            ops::abi::name(bias.dtype),
+            dtype = ops::abi::name(dtype)
         )));
     }
-    let values = dtype.decode(&weight.bytes).map_err(nn::Error::from)?;
-    let biases = dtype.decode(&bias.bytes).map_err(nn::Error::from)?;
+    let values = ops::values::decode(dtype, &weight.bytes).map_err(nn::Error::from)?;
+    let biases = ops::values::decode(dtype, &bias.bytes).map_err(nn::Error::from)?;
     let blocks = u64::from(block_count);
     let per_head = out * hidden;
     let mut fused = vec![0_f32; (blocks * per_head) as usize];

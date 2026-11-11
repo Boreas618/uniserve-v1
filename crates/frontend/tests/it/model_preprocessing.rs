@@ -6,15 +6,15 @@ use std::sync::Arc;
 
 use frontend::input::chat::HfChatRenderer;
 use frontend::input::media::ImageInput;
-use frontend::input::{InputProcessor, ModelResolutionError, RequestRenderer};
+use frontend::input::{ModelResolutionError, Processor, RequestRenderer};
 use frontend::model::ModelConfig;
 use frontend::model::assets::ResolvedModelFiles;
 use frontend::openai::ApiError;
-use frontend::output::OutputParams;
 use frontend::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
-use processing::{Catalogue, Family};
 use processing::{ChatProfile, ReasoningFormat, Serving, ToolCallFormat};
+use processing::{Family, Registry};
 use proto::config::ChatTemplateContentFormat;
+use proto::handoff::Lowering;
 use proto::request::{GenerationLimits, GenerationRequest};
 use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
@@ -42,14 +42,26 @@ const SPECIAL_TOKENS: &[&str] = &[
     "</answer>",
 ];
 
+/// A chat family that declares neither a reasoning nor a tool-call format.
+const PLAIN: Family = Family {
+    id: "plain",
+    model_types: &["plain"],
+    classes: &[],
+    serving: Serving::Chat(ChatProfile {
+        reasoning: None,
+        tool_calls: None,
+        images: None,
+    }),
+};
+
 /// A chat family of Qwen3's `model_type`s whose outputs are parsed in its formats.
 const CHAT: Family = Family {
     id: "chat",
     model_types: &["qwen3", "qwen3_moe"],
     classes: &[],
     serving: Serving::Chat(ChatProfile {
-        reasoning: Some(ReasoningFormat::Qwen3),
-        tool_calls: Some(ToolCallFormat::Qwen3),
+        reasoning: Some(ReasoningFormat::Think),
+        tool_calls: Some(ToolCallFormat::Json),
         images: None,
     }),
 };
@@ -57,12 +69,12 @@ const CHAT: Family = Family {
 /// Resolves a chat checkpoint of `model_type` over a synthetic checkpoint with
 /// worker limits that cover every generation feature; see
 /// `try_resolved_model`.
-fn resolved_model(model_type: &str) -> (tempfile::TempDir, DynTokenizer, InputProcessor) {
+fn resolved_model(model_type: &str) -> (tempfile::TempDir, DynTokenizer, Processor) {
     try_resolved_model(model_type, runtime_limits()).unwrap()
 }
 
 /// Writes a synthetic checkpoint to a temporary directory and binds an
-/// `InputProcessor` for it with the given worker limits.
+/// `Processor` for it with the given worker limits.
 ///
 /// The tokenizer maps each ASCII code point from 1 to 127 to one token whose
 /// ID is the code point (no merges), plus `SPECIAL_TOKENS`, so outside the
@@ -72,12 +84,12 @@ fn resolved_model(model_type: &str) -> (tempfile::TempDir, DynTokenizer, InputPr
 ///
 /// # Errors
 ///
-/// Returns the `InputProcessor::new` error, for example when `limits` do not
+/// Returns the `Processor::new` error, for example when `limits` do not
 /// cover a feature the profile needs. Other setup failures panic.
 fn try_resolved_model(
     model_type: &str,
     limits: GenerationLimits,
-) -> Result<(tempfile::TempDir, DynTokenizer, InputProcessor), ModelResolutionError> {
+) -> Result<(tempfile::TempDir, DynTokenizer, Processor), ModelResolutionError> {
     let directory = tempdir().unwrap();
 
     let mut vocab = Vocab::from_iter([("<unk>".to_string(), 0_u32)]);
@@ -146,14 +158,14 @@ fn try_resolved_model(
         .build()
         .unwrap()
         .block_on(ModelConfig::from_files(
-            &Catalogue::new([CHAT]).unwrap(),
+            &Registry::new([CHAT, PLAIN, processing::qwen::QWEN4_EXP]).unwrap(),
             &files,
             Some(4096),
             tokenizer.as_ref(),
         ))
         .unwrap();
     let renderer = RequestRenderer::Chat(renderer);
-    let model = InputProcessor::new(config, Arc::clone(&tokenizer), renderer, limits, true)?;
+    let model = Processor::new(config, Arc::clone(&tokenizer), renderer, limits, true)?;
     Ok((directory, tokenizer, model))
 }
 
@@ -171,28 +183,22 @@ fn runtime_limits() -> GenerationLimits {
     }
 }
 
-/// Preprocesses a chat completion as its route lowers it, answering a
-/// refusal as the route does.
+/// Lowers a chat completion as the deployment's `Processor` does for its
+/// route, answering a refusal as the route does.
 fn preprocess_chat(
-    processor: &InputProcessor,
+    processor: &Processor,
     request_id: String,
-    request: frontend::openai::ChatCompletionRequest,
+    request: frontend::protocol::ChatCompletionRequest,
     images: Vec<ImageInput>,
-) -> Result<(GenerationRequest, OutputParams), ApiError> {
-    let (request, _) = frontend::openai::chat_completions::lower_chat_request(
-        request_id,
-        SERVED_MODEL,
-        request,
-        processor,
-    )?;
+) -> Result<(GenerationRequest, Lowering), ApiError> {
     processor
-        .preprocess(request, images)
+        .process(&request_id, &request, None, images)
         .map_err(ApiError::from)
 }
 
 /// A single-turn text chat request to the served model, with the wire
 /// `fields` set on top.
-fn chat_request(fields: serde_json::Value) -> frontend::openai::ChatCompletionRequest {
+fn chat_request(fields: serde_json::Value) -> frontend::protocol::ChatCompletionRequest {
     let mut request = serde_json::json!({
         "model": SERVED_MODEL,
         "messages": [{"role": "user", "content": "hello"}],
@@ -205,7 +211,7 @@ fn chat_request(fields: serde_json::Value) -> frontend::openai::ChatCompletionRe
     serde_json::from_value(request).unwrap()
 }
 
-/// `InputProcessor::new` refuses to bind a profile whose worker limits lack a
+/// `Processor::new` refuses to bind a profile whose worker limits lack a
 /// feature the profile's configured branches need, and names the missing
 /// feature by its `GenerationFeatures::name` diagnostic.
 #[test]
@@ -235,7 +241,7 @@ fn context_length_limits_preprocessed_requests() {
     .unwrap();
     let mut config = loaded.config().clone();
     config.max_model_len = 8;
-    let processor = InputProcessor::new(
+    let processor = Processor::new(
         config,
         tokenizer,
         RequestRenderer::Chat(renderer),
@@ -266,7 +272,7 @@ fn context_length_limits_preprocessed_requests() {
 #[test]
 fn sampling_defaults_preserve_explicit_zero_controls() {
     let (_directory, _tokenizer, model) = resolved_model("qwen3");
-    let mut request: frontend::openai::ChatCompletionRequest =
+    let mut request: frontend::protocol::ChatCompletionRequest =
         serde_json::from_value(serde_json::json!({
             "model": SERVED_MODEL, "messages": [{"role": "user", "content": "hello"}]
         }))
@@ -346,7 +352,7 @@ fn cache_salt_isolates_and_prompt_logprobs_disable_cache_reads() {
 fn streamed_chat_does_not_request_undeliverable_prompt_logprobs() {
     let (_directory, _tokenizer, processor) = resolved_model("qwen3");
     for stream in [true, false] {
-        let request: frontend::openai::ChatCompletionRequest =
+        let request: frontend::protocol::ChatCompletionRequest =
             serde_json::from_value(serde_json::json!({
                 "model": SERVED_MODEL,
                 "messages": [{"role": "user", "content": "hello"}],
@@ -380,12 +386,12 @@ const QWEN3_TEMPLATE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/templates/qwen3.jinja"
 ));
-/// Tool instruction in the style of Qwen3-Coder templates, which ask for XML
-/// `<function=...>` calls instead of JSON objects.
+/// A template whose tool instruction shows function and parameter tags
+/// instead of JSON objects.
 const XML_CALL_TEMPLATE: &str = "{%- if tools -%}<|im_start|>system\n# Tools\n<tools>{%- for tool in tools -%}{{ tool | tojson }}{%- endfor -%}</tools>\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter>\nvalue\n</parameter>\n</function>\n</tool_call><|im_end|>\n{%- endif -%}{%- for message in messages -%}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{%- endfor -%}{%- if add_generation_prompt -%}<|im_start|>assistant\n{%- endif -%}";
 
 /// Rebinds a resolved Qwen3-family model to `template`.
-fn with_template(model_type: &str, template: &str) -> InputProcessor {
+fn with_template(model_type: &str, template: &str) -> Processor {
     let (_directory, tokenizer, loaded) = resolved_model(model_type);
     let renderer = HfChatRenderer::new(
         Some(template.to_string()),
@@ -393,7 +399,7 @@ fn with_template(model_type: &str, template: &str) -> InputProcessor {
         Some(ChatTemplateContentFormat::String),
     )
     .unwrap();
-    InputProcessor::new(
+    Processor::new(
         loaded.config().clone(),
         tokenizer,
         RequestRenderer::Chat(renderer),
@@ -410,7 +416,7 @@ fn with_template(model_type: &str, template: &str) -> InputProcessor {
 fn a_chat_request_for_image_output_is_refused_by_name() {
     let (_directory, _tokenizer, processor) = resolved_model("qwen3");
     for modalities in [vec!["image"], vec!["text", "image"]] {
-        let request: frontend::openai::ChatCompletionRequest =
+        let request: frontend::protocol::ChatCompletionRequest =
             serde_json::from_value(serde_json::json!({
                 "model": SERVED_MODEL,
                 "messages": [{"role": "user", "content": "draw a bird"}],
@@ -433,12 +439,13 @@ fn a_chat_request_for_image_output_is_refused_by_name() {
     }
 }
 
-/// Dense and mixture-of-experts Qwen3 checkpoints serve tool calls only when
-/// their chat template asks for the JSON calls the Qwen3 parser reads; a
-/// template asking for another call format refuses requests with tools
-/// instead of returning their calls as unparsed text.
+/// A family's chat profile declares its tool-call format, and that alone
+/// decides whether requests with tools are served: whatever the checkpoint's
+/// template text instructs, a family that declares a format has its calls
+/// parsed in it, and the lowering states the format and the request's tools
+/// to output processing.
 #[test]
-fn qwen3_family_declares_tool_calling_only_for_json_calls() {
+fn the_profile_declares_the_tool_call_format() {
     let tool_request = serde_json::json!({
         "model": SERVED_MODEL,
         "messages": [{"role": "user", "content": "weather?"}],
@@ -448,50 +455,268 @@ fn qwen3_family_declares_tool_calling_only_for_json_calls() {
         }}]
     });
     for model_type in ["qwen3", "qwen3_moe"] {
-        let json_calls = with_template(model_type, QWEN3_TEMPLATE);
-        assert!(json_calls.supports_tool_calling(), "{model_type}");
-        preprocess_chat(
-            &json_calls,
-            String::from("json-tools"),
-            serde_json::from_value(tool_request.clone()).unwrap(),
-            Vec::new(),
-        )
-        .unwrap();
-
-        for template in [XML_CALL_TEMPLATE, CHAT_TEMPLATE] {
-            let other = with_template(model_type, template);
-            assert!(!other.supports_tool_calling(), "{model_type}");
-            let error = preprocess_chat(
-                &other,
-                String::from("other-tools"),
+        for template in [QWEN3_TEMPLATE, XML_CALL_TEMPLATE, CHAT_TEMPLATE] {
+            let processor = with_template(model_type, template);
+            assert!(processor.supports_tool_calling(), "{model_type}");
+            let (_, lowering) = preprocess_chat(
+                &processor,
+                String::from("tools"),
                 serde_json::from_value(tool_request.clone()).unwrap(),
                 Vec::new(),
             )
-            .err()
             .unwrap();
-            assert_eq!(error.status_code().as_u16(), 400, "{model_type}");
-            let message = error.to_error_response().error.message;
-            assert!(message.contains("tool_calling"), "{message}");
+
+            let parser = lowering.parser.unwrap();
+            assert_eq!(
+                parser.kind,
+                proto::handoff::parser::Kind::ParserKindJson as i32
+            );
+            assert!(parser.parse_tools && parser.parse_reasoning);
+            let tools: serde_json::Value = serde_json::from_str(&parser.tools).unwrap();
+            assert_eq!(tools[0]["function"]["name"], "weather");
         }
+    }
+
+    // `tool_choice: none` withholds the tools from the model, so no call is parsed.
+    let mut withheld = tool_request.clone();
+    withheld["tool_choice"] = serde_json::json!("none");
+    let (_, lowering) = preprocess_chat(
+        &with_template("qwen3", QWEN3_TEMPLATE),
+        String::from("no-tools"),
+        serde_json::from_value(withheld).unwrap(),
+        Vec::new(),
+    )
+    .unwrap();
+    let parser = lowering.parser.unwrap();
+    assert!(!parser.parse_tools);
+    assert!(parser.tools.is_empty());
+}
+
+/// A family whose profile declares no tool-call format refuses a request
+/// with tools by name, rather than returning its calls as unparsed text, and
+/// one that declares function and parameter tags has them stated to output
+/// processing.
+#[test]
+fn tool_calling_follows_the_familys_declared_format() {
+    let tool_request = serde_json::json!({
+        "model": SERVED_MODEL,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{"type": "function", "function": {
+            "name": "weather",
+            "parameters": {"type": "object", "properties": {}}
+        }}]
+    });
+
+    let (_directory, _, plain) = resolved_model("plain");
+    assert!(!plain.supports_tool_calling());
+    let error = preprocess_chat(
+        &plain,
+        String::from("plain-tools"),
+        serde_json::from_value(tool_request.clone()).unwrap(),
+        Vec::new(),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.status_code().as_u16(), 400);
+    let message = error.to_error_response().error.message;
+    assert!(message.contains("tool_calling"), "{message}");
+
+    let (_directory, _, tagged) = resolved_model("qwen4_exp");
+    assert!(tagged.supports_tool_calling());
+    let (_, lowering) = preprocess_chat(
+        &tagged,
+        String::from("xml-tools"),
+        serde_json::from_value(tool_request).unwrap(),
+        Vec::new(),
+    )
+    .unwrap();
+    let parser = lowering.parser.unwrap();
+    assert_eq!(
+        parser.kind,
+        proto::handoff::parser::Kind::ParserKindXml as i32
+    );
+    assert!(parser.parse_tools);
+}
+
+/// What an agent harness sends turn after turn is lowered as it sends it: tool
+/// definitions with OpenAI's `strict`, `tool_choice: auto`, `max_tokens`, an
+/// assistant turn sent back as it was received (`reasoning_content`, null
+/// content, tool calls) and the tools' results. Each turn's prompt begins with
+/// the prompt of the turn before it, under the same cache salt and so in the
+/// same cache partition, which is what lets the prefix cache serve it.
+#[test]
+fn a_harness_conversation_grows_by_its_new_turns() {
+    let processor = with_template("qwen3", QWEN3_TEMPLATE);
+    let turn = |messages: serde_json::Value| {
+        let request = serde_json::json!({
+            "model": SERVED_MODEL,
+            "messages": messages,
+            "tools": [{"type": "function", "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            }}],
+            "tool_choice": "auto",
+            "max_tokens": 64,
+            "cache_salt": "harness-session",
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        });
+        preprocess_chat(
+            &processor,
+            String::from("harness"),
+            serde_json::from_value(request).unwrap(),
+            Vec::new(),
+        )
+        .unwrap()
+    };
+
+    let first = serde_json::json!([
+        {"role": "system", "content": "You improve the server."},
+        {"role": "user", "content": "Read the scheduler."},
+    ]);
+    let mut second = first.clone();
+    second.as_array_mut().unwrap().extend([
+        serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "reasoning_content": "I need the file first.",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{\"path\": \"a.rs\"}"},
+            }],
+        }),
+        serde_json::json!({"role": "tool", "tool_call_id": "call_1", "content": "fn main() {}"}),
+    ]);
+
+    let (first_turn, first_lowering) = turn(first);
+    let (second_turn, _) = turn(second);
+
+    assert_eq!(first_turn.max_und_tokens, 64);
+    assert!(first_lowering.parser.unwrap().parse_tools);
+    assert!(first_lowering.response.unwrap().include_usage);
+    assert!(first_turn.cache.isolation_key.is_some());
+    assert_eq!(
+        first_turn.cache.isolation_key,
+        second_turn.cache.isolation_key
+    );
+    assert!(second_turn.cache.read && second_turn.cache.write);
+    assert!(
+        second_turn.prompt_token_ids.len() > first_turn.prompt_token_ids.len()
+            && second_turn
+                .prompt_token_ids
+                .starts_with(&first_turn.prompt_token_ids),
+        "the second turn's prompt does not begin with the first turn's"
+    );
+}
+
+/// A `tool_choice` that makes the model call a tool, `required` or one named
+/// function, is refused by name: vLLM serves both through guided decoding,
+/// which a deployment here does not have.
+#[test]
+fn a_tool_choice_that_needs_constrained_decoding_is_refused() {
+    let processor = with_template("qwen3", QWEN3_TEMPLATE);
+    for choice in [
+        serde_json::json!("required"),
+        serde_json::json!({"type": "function", "function": {"name": "weather"}}),
+    ] {
+        let request = serde_json::json!({
+            "model": SERVED_MODEL,
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [{"type": "function", "function": {
+                "name": "weather",
+                "parameters": {"type": "object", "properties": {}}
+            }}],
+            "tool_choice": choice,
+        });
+        let error = preprocess_chat(
+            &processor,
+            String::from("forced"),
+            serde_json::from_value(request).unwrap(),
+            Vec::new(),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("tool_choice {choice} was admitted"));
+
+        assert_eq!(error.status_code().as_u16(), 400, "{choice}");
+        let response = error.to_error_response().error;
+        assert_eq!(response.param.as_deref(), Some("tool_choice"), "{choice}");
+        assert!(
+            response.message.contains("constrained decoding"),
+            "{}",
+            response.message
+        );
     }
 }
 
 /// Negative seeds are accepted and reinterpreted as their two's-complement
-/// `u64` value, and a logprob count of `-1` requests every candidate
-/// (`u32::MAX`).
+/// `u64` value.
 #[test]
-fn negative_seeds_and_logprob_counts_are_reinterpreted() {
+fn negative_seeds_are_reinterpreted() {
     let (_directory, _, model) = resolved_model("qwen3");
     for seed in [-1, -2] {
         let (request, _) = preprocess_chat(
             &model,
             String::from("sampling"),
-            chat_request(serde_json::json!({"seed": seed, "logprobs": true, "top_logprobs": -1})),
+            chat_request(serde_json::json!({"seed": seed})),
             Vec::new(),
         )
         .unwrap();
         assert_eq!(request.sampling.seed, Some(seed as u64));
-        assert_eq!(request.sampling.n_logprobs, u32::MAX);
+    }
+}
+
+/// A request may ask for as many candidates at a position as the deployment's
+/// `max_logprobs` (20 here), and no more, as vLLM rules: a larger count is
+/// refused, and so is `-1`, every candidate of the vocabulary, which vLLM
+/// serves only where `max_logprobs` itself is `-1`. A deployment's workers
+/// compute `max_logprobs` candidates a position, a count, so no deployment
+/// here serves the whole vocabulary.
+#[test]
+fn a_logprob_count_above_max_logprobs_is_refused() {
+    let (_directory, _, model) = resolved_model("qwen3");
+    let lowered = |fields: serde_json::Value| {
+        preprocess_chat(
+            &model,
+            String::from("logprobs"),
+            chat_request(fields),
+            Vec::new(),
+        )
+    };
+
+    for count in [0, 5, 20] {
+        let (generated, _) =
+            lowered(serde_json::json!({"logprobs": true, "top_logprobs": count})).unwrap();
+        assert_eq!(generated.sampling.n_logprobs, count);
+        let (prompt, _) = lowered(serde_json::json!({"prompt_logprobs": count})).unwrap();
+        assert_eq!(prompt.sampling.n_prompt_logprobs, count);
+    }
+
+    for count in [21, -1] {
+        for (fields, parameter) in [
+            (
+                serde_json::json!({"logprobs": true, "top_logprobs": count}),
+                "logprobs",
+            ),
+            (
+                serde_json::json!({"prompt_logprobs": count}),
+                "prompt_logprobs",
+            ),
+        ] {
+            let error = lowered(fields)
+                .err()
+                .unwrap_or_else(|| panic!("{parameter} of {count} was admitted"));
+            assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
+            let message = error.to_error_response().error.message;
+            assert!(message.contains(parameter), "{count}: {message}");
+            assert!(message.contains("20"), "{count}: {message}");
+        }
     }
 }
 
@@ -526,7 +751,7 @@ fn png(width: u32, height: u32) -> ImageInput {
 }
 
 /// A chat request whose user turn is the text `before`, an image, then `after`.
-fn image_chat(before: &str, after: &str) -> frontend::openai::ChatCompletionRequest {
+fn image_chat(before: &str, after: &str) -> frontend::protocol::ChatCompletionRequest {
     chat_request(serde_json::json!({
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": before},
@@ -548,8 +773,7 @@ fn a_text_only_deployment_refuses_an_image_part() {
         image_chat("look ", " now"),
         vec![png(64, 32)],
     )
-    .err()
-    .expect("an image part reached a text-only deployment");
+    .expect_err("an image part reached a text-only deployment");
     let message = error.to_error_response().error.message;
     assert!(message.contains("image_input"), "{message}");
 }
@@ -573,7 +797,7 @@ fn an_image_part_becomes_a_vision_block_in_place_of_its_placeholder() {
             placeholder_token: "<|vision_start|><|image_pad|><|vision_end|>".to_owned(),
         },
     ));
-    let processor = InputProcessor::new(
+    let processor = Processor::new(
         loaded.config().clone(),
         Arc::clone(&tokenizer),
         RequestRenderer::Chat(renderer),

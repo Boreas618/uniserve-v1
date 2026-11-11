@@ -9,8 +9,8 @@
 //! - [`FAMILY`]: `Qwen3MoeForCausalLM`, whose outputs delimit reasoning between `<think>` and
 //!   `</think>` and write tool calls as JSON between `<tool_call>` and `</tool_call>`;
 //! - [`HYBRID_FAMILY`]: `Qwen3_5MoeForConditionalGeneration` (Qwen3.6-35B-A3B), which reasons the
-//!   same way and takes images; its tool calls are `<function=…>` blocks, a format no output
-//!   parser of request processing reads, so the profile states none.
+//!   same way and takes images; its tool calls are `<function=…>` and `<parameter=…>` tags
+//!   between `<tool_call>` and `</tool_call>`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -29,13 +29,13 @@ use processing::qwen_vl::ProcessorConfig;
 
 /// The `Qwen3MoeForCausalLM` registration.
 pub const FAMILY: Family = Family {
-    request: processing::qwen3::MOE,
+    request: processing::qwen::QWEN3,
     model: Model::Text(&Qwen3),
 };
 
 /// The `Qwen3_5MoeForConditionalGeneration` registration.
 pub const HYBRID_FAMILY: Family = Family {
-    request: processing::qwen3::HYBRID,
+    request: processing::qwen::QWEN3_5_MOE,
     model: Model::Text(&Qwen3),
 };
 

@@ -865,9 +865,9 @@ mod tests {
         let walk = || -> Vec<u64> {
             let mut addresses = Vec::new();
             for (dtype, numel) in [
-                (ops::DType::F32, 8 * 4_096),
-                (ops::DType::BF16, 8 * 4_096),
-                (ops::DType::F32, 8 * 1_024),
+                (uniserve_tensor::DType::F32, 8 * 4_096),
+                (uniserve_tensor::DType::BF16, 8 * 4_096),
+                (uniserve_tensor::DType::F32, 8 * 1_024),
             ] {
                 let view = arena
                     .tensor(dtype, ops::Shape::new(&[numel]))
@@ -899,7 +899,7 @@ mod tests {
         // The same sequence over a range that does not hold it is refused, naming the figures.
         arena.reset();
         let error = arena
-            .tensor(ops::DType::U8, ops::Shape::new(&[RESERVED + 1]))
+            .tensor(uniserve_tensor::DType::U8, ops::Shape::new(&[RESERVED + 1]))
             .expect_err("a reservation past the range has nowhere to go");
         let message = error.to_string();
         assert!(message.contains(&format!("{RESERVED}")), "{message}");

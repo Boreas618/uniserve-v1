@@ -20,7 +20,8 @@
 //! attention `A` is any layer the model composes over the head-split rows; this layer owns the
 //! projections around it.
 
-use ops::{DType, Operand, Shape, Strides};
+use ops::{Operand, Shape, Strides};
+use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
 use crate::family::{Projection, Split};
@@ -420,9 +421,9 @@ impl<A> UlyssesAttention<A> {
                 format!(
                     "{} {} elements against {} {}: {members} equal blocks of one type",
                     send.numel(),
-                    send.dtype,
+                    ops::abi::name(send.dtype),
                     recv.numel(),
-                    recv.dtype
+                    ops::abi::name(recv.dtype)
                 ),
             ));
         }

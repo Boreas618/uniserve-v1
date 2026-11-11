@@ -192,10 +192,10 @@ pub struct Config {
 pub const CLASSES: [&str; 3] = [QWEN3_MOE, QWEN3_5_MOE, "Qwen3VLForConditionalGeneration"];
 
 /// `Qwen3MoeForCausalLM`, as request processing claims it.
-pub const QWEN3_MOE: &str = processing::qwen3::MOE_CLASS;
+pub const QWEN3_MOE: &str = processing::qwen::QWEN3_MOE_CLASS;
 
 /// `Qwen3_5MoeForConditionalGeneration`, as request processing claims it.
-pub const QWEN3_5_MOE: &str = processing::qwen3::HYBRID_CLASS;
+pub const QWEN3_5_MOE: &str = processing::qwen::QWEN3_5_MOE_CLASS;
 
 impl Config {
     /// Read and validate the checkpoint's `config.json`.

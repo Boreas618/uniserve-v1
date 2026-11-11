@@ -185,14 +185,20 @@ message TextDecode {
   uint32 min_tokens = 4;
 }
 
-// The output parsers of a request, as its model family chose them.
+// The output parsers of a request: the formats its model family's chat
+// profile names, and which of them the request's output is read with.
 message Parser {
-  // Which parser set the request uses.
+  // The formats the request's output may be written in. Reasoning has one
+  // format, `<think>` and `</think>` around it; a kind names the tool-call
+  // format beside it.
   enum Kind {
     // Neither reasoning nor tool calls are parsed.
     PARSER_KIND_NONE = 0;
-    // Qwen3's `<think>` reasoning and Qwen2.5's JSON tool calls.
-    PARSER_KIND_QWEN3 = 1;
+    // Tool calls as one JSON object between `<tool_call>` and `</tool_call>`.
+    PARSER_KIND_JSON = 1;
+    // Tool calls as `<function=NAME>` and `<parameter=ARG>` tags between
+    // `<tool_call>` and `</tool_call>`.
+    PARSER_KIND_XML = 2;
   }
 
   Kind kind = 1;
@@ -200,6 +206,10 @@ message Parser {
   bool parse_reasoning = 2;
   // Whether tool calls are parsed.
   bool parse_tools = 3;
+  // The request's tool definitions, as the JSON array the request stated: a
+  // parser that types a call's values by its tool's schema reads them. Empty
+  // when tool calls are not parsed.
+  string tools = 4;
 }
 
 // The OpenAI fields every chunk and the final body of a chat response carry.
@@ -300,7 +310,25 @@ message ToolStage {
   // The parser behind the stage, with its state.
   oneof parser {
     JsonToolCall json = 3;
+    XmlToolCall xml = 4;
   }
+}
+
+// The function-and-parameter tag tool-call parser's state.
+message XmlToolCall {
+  // Input no complete tag or parameter consumed.
+  string buffer = 1;
+  // Whether the text parsed so far is inside `<tool_call>`.
+  bool in_tool_call = 2;
+  // The function whose call is open, from its `<function=NAME>` tag until its
+  // `</function>`.
+  optional string function = 3;
+  // Parameters the open call has published.
+  uint64 parameters = 4;
+  // The tool call later arguments extend.
+  optional uint64 active_tool_index = 5;
+  // Tool calls published since the last reset; the next call's index.
+  uint64 emitted_tool_count = 6;
 }
 
 // The marker-wrapped JSON tool-call parser's state.
@@ -455,15 +483,24 @@ message TokenLogprob {
   uint32 rank = 3;
 }
 
-// One decoded token candidate and its logprob metadata.
+// One decoded token candidate and its logprob metadata. Output processing
+// produces these from the engine's token-identifier candidates, a response
+// collects them, and a handoff carries what a response collected.
 message DecodedTokenLogprob {
+  // The candidate's vocabulary token identifier.
   uint32 token_id = 1;
+  // The candidate decoded in isolation, so the string can differ from the
+  // token's contribution to the fully decoded text.
   string token = 2;
+  // The candidate's log probability.
   float logprob = 3;
+  // The candidate's one-based competition rank at its position; tied log
+  // probabilities share a rank.
   uint32 rank = 4;
 }
 
-// One position's decoded token candidates.
+// One position's decoded token candidates, in the engine's order. At a
+// generated position the first entry is the sampled token.
 message DecodedPositionLogprobs {
   repeated DecodedTokenLogprob entries = 1;
 }
@@ -473,7 +510,9 @@ message DecodedLogprobs {
   repeated DecodedPositionLogprobs positions = 1;
 }
 
-// Per-position prompt logprobs.
+// Per-position prompt logprobs. The first prompt token has no left context to
+// score against, so it is stated apart: `scored_positions[i]` is the prompt
+// token at position `i + 1`.
 message DecodedPromptLogprobs {
   uint32 first_token_id = 1;
   string first_token = 2;

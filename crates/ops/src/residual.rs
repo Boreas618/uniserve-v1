@@ -27,11 +27,14 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand, Shape};
-use crate::tolerance::Tolerance;
+use crate::tensor::{Operand, Shape};
+use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
 /// The widest row these kernels reduce, in elements.
@@ -58,7 +61,7 @@ pub struct WeightedRmsNormDescriptor {
 impl fmt::Display for WeightedRmsNormDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let key = Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("columns", self.columns)
             .field("tile", self.tile)
             .field("absmax", self.absmax);
@@ -71,7 +74,7 @@ fn activation_of(key: Key, dtype: DType, activation: DType) -> Key {
     if activation == dtype {
         key
     } else {
-        key.field("activation", activation)
+        key.field("activation", abi::name(activation))
     }
 }
 
@@ -183,7 +186,7 @@ pub struct ScaledResidualRmsNormDescriptor {
 impl fmt::Display for ScaledResidualRmsNormDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let key = Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("columns", self.columns)
             .field("tile", self.tile)
             .field("update_bias", self.update_bias)
@@ -323,7 +326,7 @@ impl Op for ScaledResidualRmsNorm {
         );
         Tolerance::new(
             statistics.atol,
-            statistics.rtol + 3.0 * descriptor.activation.unit_roundoff() as f32,
+            statistics.rtol + 3.0 * tolerance::unit_roundoff(descriptor.activation) as f32,
         )
     }
 }
@@ -348,7 +351,7 @@ pub struct ScaledResidualLayerNormDescriptor {
 impl fmt::Display for ScaledResidualLayerNormDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let key = Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("columns", self.columns)
             .field("tile", self.tile)
             .field("update_bias", self.update_bias)
@@ -491,7 +494,7 @@ impl Op for ScaledResidualLayerNorm {
         );
         Tolerance::new(
             statistics.atol,
-            statistics.rtol + 3.0 * descriptor.dtype.unit_roundoff() as f32,
+            statistics.rtol + 3.0 * tolerance::unit_roundoff(descriptor.dtype) as f32,
         )
     }
 }
@@ -512,7 +515,7 @@ pub struct ScaledResidualDescriptor {
 impl fmt::Display for ScaledResidualDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("columns", self.columns)
             .field("block", self.block)
             .field("update_bias", self.update_bias)
@@ -628,7 +631,7 @@ impl Op for ScaledResidual {
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // The biased update rounds, its product with the scale rounds, the sum rounds.
-        Tolerance::new(0.0, 3.0 * descriptor.dtype.unit_roundoff() as f32)
+        Tolerance::new(0.0, 3.0 * tolerance::unit_roundoff(descriptor.dtype) as f32)
     }
 }
 
@@ -715,7 +718,7 @@ pub struct SigmoidGatedAddDescriptor {
 impl fmt::Display for SigmoidGatedAddDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("columns", self.columns)
             .field("block", self.block)
             .finish(formatter)
@@ -818,8 +821,8 @@ impl Op for SigmoidGatedAdd {
         // relative to the output's largest magnitude.
         Tolerance {
             atol: 0.0,
-            rtol: (2.0 * descriptor.dtype.unit_roundoff() + 4.0 * DType::F32.unit_roundoff())
-                as f32,
+            rtol: (2.0 * tolerance::unit_roundoff(descriptor.dtype)
+                + 4.0 * tolerance::unit_roundoff(DType::F32)) as f32,
             cancels: true,
         }
     }
@@ -846,8 +849,8 @@ pub struct ScaledAddDescriptor {
 impl fmt::Display for ScaledAddDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("target", self.target)
-            .field("source", self.source)
+            .field("target", abi::name(self.target))
+            .field("source", abi::name(self.source))
             .field("block", self.block)
             .finish(formatter)
     }
@@ -908,8 +911,9 @@ impl Op for ScaledAdd {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
-                        "the {role} is {} and the descriptor names {named}",
-                        operand.dtype
+                        "the {role} is {} and the descriptor names {}",
+                        abi::name(operand.dtype),
+                        abi::name(named)
                     ),
                 ));
             }
@@ -986,8 +990,8 @@ impl Op for ScaledAdd {
         // tested. A stricter bound is what an element type's unit round-off buys and nothing more.
         Tolerance::new(
             0.0,
-            2.0 * descriptor.target.unit_roundoff() as f32
-                + descriptor.source.unit_roundoff() as f32,
+            2.0 * tolerance::unit_roundoff(descriptor.target) as f32
+                + tolerance::unit_roundoff(descriptor.source) as f32,
         )
     }
 }
@@ -1085,7 +1089,8 @@ mod scaled_add_tests {
     #[test]
     fn the_bound_is_the_targets_two_roundings_plus_the_sources_representation() {
         let bound = <ScaledAdd as Op>::tolerance(&descriptor(DType::BF16, DType::F32));
-        let expected = 2.0 * DType::BF16.unit_roundoff() as f32 + DType::F32.unit_roundoff() as f32;
+        let expected = 2.0 * tolerance::unit_roundoff(DType::BF16) as f32
+            + tolerance::unit_roundoff(DType::F32) as f32;
         assert_eq!(bound.rtol, expected);
         assert_eq!(bound.atol, 0.0);
     }

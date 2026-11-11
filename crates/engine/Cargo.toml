@@ -30,6 +30,8 @@ qwen3.workspace = true
 service.workspace = true
 nn.workspace = true
 ops.workspace = true
+# The element type of a kernel operand (`DType`).
+uniserve-tensor.workspace = true
 platform.workspace = true
 build-server.workspace = true
 proto.workspace = true

@@ -30,7 +30,8 @@ use ops::fp4::{
 };
 use ops::fp8::{Fp8Gemm, Fp8GemmArgs, Fp8GemmDescriptor};
 use ops::gemm::{self, Descriptor, Epilogue, Gemm, WeightOrder};
-use ops::{DType, Operand, Shape};
+use ops::{Operand, Shape};
+use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
 use crate::family::Split;
@@ -259,7 +260,7 @@ impl Linear {
                 &name,
                 format!(
                     "an FP8 projection's weight is F8_E4M3, not {}",
-                    weight.dtype()
+                    ops::abi::name(weight.dtype())
                 ),
             ));
         }
@@ -367,7 +368,7 @@ impl Linear {
         if weight.packed.shape().rank() != 2 || weight.packed.dtype() != DType::U8 {
             return Err(refuse(format!(
                 "a packed weight is a U8 matrix, not {} {:?}",
-                weight.packed.dtype(),
+                ops::abi::name(weight.packed.dtype()),
                 weight.packed.shape().dims()
             )));
         }
@@ -405,7 +406,7 @@ impl Linear {
             if scalar.dtype() != DType::F32 || scalar.shape().numel() != 1 {
                 return Err(refuse(format!(
                     "the {what} is {} {:?}, and the product reads one FP32 number",
-                    scalar.dtype(),
+                    ops::abi::name(scalar.dtype()),
                     scalar.shape().dims()
                 )));
             }
@@ -616,7 +617,10 @@ impl Linear {
         if !matches!(input.dtype, DType::BF16 | DType::F16) {
             return Err(Error::shape(
                 "Linear",
-                format!("{} activations; NVFP4 encodes BF16 or FP16", input.dtype),
+                format!(
+                    "{} activations; NVFP4 encodes BF16 or FP16",
+                    ops::abi::name(input.dtype)
+                ),
             ));
         }
         let counted = u32::try_from(rows)

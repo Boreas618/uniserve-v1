@@ -892,7 +892,11 @@ impl Connection {
             chunked,
             content_length,
         };
-        let state = application.into_stream(http, request_id.to_owned());
+        let state = proto::handoff::Stream {
+            http: Some(http),
+            request_id: request_id.to_owned(),
+            application: Some(application),
+        };
         let descriptor = self.descriptor()?;
         let frozen_at_ns = handoff::now_ns();
         // `report` installs the real decision channel; this one only fills the

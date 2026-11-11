@@ -56,13 +56,21 @@ def capability(target: str) -> int:
     return int(digits)
 
 
-def described(spec: Spec, root: pathlib.Path, key: str, target: str) -> dict:
+def described(
+    spec: Spec,
+    root: pathlib.Path,
+    key: str,
+    target: str,
+    fields: dict[str, str],
+) -> dict:
     """What ``spec`` states for descriptor ``key`` of the package at ``root``.
 
-    A dimension the spec needs and the key leaves out is refused by name, as
-    the key's own parse would refuse a misspelled one.
+    ``fields`` are the key's fields as the Build Server reads them: the ones
+    a build is handed (``package.fields``), or, outside a build, the ones its
+    executable reads for the key (``package.read_fields``). A dimension the
+    spec needs and the key leaves out is refused by name, as the key's own
+    parse would refuse a misspelled one.
     """
-    fields = package.fields()
     try:
         return spec(
             fields, package.manifest(root).get("parameters", {}), target
@@ -75,7 +83,7 @@ def compile_one(
     root: pathlib.Path, key: str, target: str, out: pathlib.Path, spec: Spec
 ) -> None:
     """Compile descriptor ``key`` of the package at ``root`` into ``out``."""
-    stated = described(spec, root, key, target)
+    stated = described(spec, root, key, target, package.fields())
     signature = stated["signature"]
     # An aligned argument is attributed by its position in the signature,
     # which is the order of the kernel's parameters. A module is compiled

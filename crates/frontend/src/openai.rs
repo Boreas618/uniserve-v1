@@ -1,21 +1,23 @@
-//! The OpenAI-compatible API: wire schemas, errors, and the route handlers.
+//! The OpenAI-compatible API's route handlers, its errors, and the response
+//! bodies the handlers write.
 //!
 //! Each endpoint module builds its own router over the served model, which
 //! the daemon supplies as a [`Server`] (`chat_completions`, `videos`); the
 //! daemon's HTTP layer registers the routers of the tasks the engine serves.
-//! A request is deserialized into the strict schemas of `protocol` (unknown
-//! fields are rejected) and validated by `ValidatedJson`; input processing
-//! lowers and tokenizes it, the server submits it, and the endpoint module
-//! assembles the response from its engine events. Every failure answers in
-//! the OpenAI error envelope of [`ApiError`].
+//! A request is deserialized into the strict schemas of `crate::protocol`
+//! (unknown fields are rejected) and validated by `ValidatedJson`; the server
+//! lowers it through the deployment's `Processor` and submits it, and the
+//! endpoint module writes the response from the outputs of the request's
+//! `OutputProcessor` (`run`). A handler holds no model knowledge: what a
+//! model's requests and outputs look like is input and output processing's.
+//! Every failure answers in the OpenAI error envelope of [`ApiError`].
 
 pub mod chat_completions;
 pub mod error;
-pub mod protocol;
+pub mod run;
 pub mod video_jobs;
 pub mod videos;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::rejection::JsonRejection;
@@ -29,24 +31,15 @@ use axum::response::Response;
 use futures::future::BoxFuture;
 
 use crate::body::{Opening, Session};
-use crate::events::{Events, Outcome};
-use crate::input::video::{ProcessedVideo, VideoGenerationRequest};
-use crate::input::{AdapterSelection, GenerateRequest, InputProcessor, ServeError};
-use crate::output::{OutputParams, RequestOutputStream};
+use crate::events::Events;
+use crate::input::video::ProcessedVideo;
+use crate::input::{AdapterSelection, Processor, ServeError};
+use crate::output::{OutputProcessor, RequestOutputStream};
+use crate::protocol::{
+    ChatCompletionRequest, ListModelsResponse, ModelObject, VideoGenerationRequest,
+};
 
 pub use error::{ApiError, Result};
-
-/// One submitted generation request: what its response body is built from.
-pub struct Generation {
-    /// The request's engine events.
-    pub events: Box<dyn Events>,
-    /// The parameters of its output processing.
-    pub output: OutputParams,
-    /// How long the request took to reach the engine, in microseconds.
-    pub compile_us: u64,
-    /// The recorder of its statistics.
-    pub outcome: Box<dyn Outcome>,
-}
 
 /// The served model as the API's routes reach it: the daemon's request
 /// facade over its input processing, its engines and its HTTP connections.
@@ -61,20 +54,27 @@ pub trait Server: Send + Sync + 'static {
     fn adapter(&self, name: &str) -> Option<AdapterSelection>;
 
     /// The deployment's input processing.
-    fn processor(&self) -> &InputProcessor;
+    fn processor(&self) -> &Processor;
 
-    /// Fetches, renders and tokenizes a generation request and submits it.
+    /// Lowers the chat request `request` through the deployment's
+    /// `Processor`, fetching its images, and submits it; `adapter` is the
+    /// LoRA adapter its `model` names, when it names one.
+    ///
+    /// Returns the request's engine events and the output processor that
+    /// turns them into the response named `request_id`.
     ///
     /// # Errors
     ///
-    /// Fails when its input cannot be fetched, preprocessing refuses it, or
-    /// no engine accepts it.
+    /// Fails when an input cannot be fetched, input processing refuses the
+    /// request, or no engine accepts it.
     fn generate(
         &self,
-        request: GenerateRequest,
-    ) -> BoxFuture<'_, std::result::Result<Generation, ServeError>>;
+        request_id: String,
+        request: ChatCompletionRequest,
+        adapter: Option<AdapterSelection>,
+    ) -> BoxFuture<'_, Result<(Box<dyn Events>, OutputProcessor)>>;
 
-    /// Fetches, probes and plans a video request, submits it, and streams its
+    /// Fetches, probes and processes a video request, submits it, and streams its
     /// output; also returns what the request generates.
     ///
     /// # Errors
@@ -111,7 +111,6 @@ pub trait Server: Send + Sync + 'static {
 /// not be unique: the engine identifies each request by its own identifier.
 #[derive(Clone, Debug)]
 pub struct RequestId(pub String);
-pub use protocol::*;
 
 /// The model listing route, `GET /v1/models`.
 pub fn models_router(engine: Arc<dyn Server>) -> Router {
@@ -197,34 +196,4 @@ pub fn check_model_served(model: &str, served_model_name: &str) -> Result<()> {
         return Err(ApiError::model_not_found(model));
     }
     Ok(())
-}
-
-/// Converts OpenAI-style `logit_bias` with string token-ID keys into the
-/// internal token-ID map.
-///
-/// JSON object keys are always strings, so each key is parsed as a decimal
-/// `u32` token ID; any key that does not parse fails the whole conversion
-/// with an invalid-request error on `logit_bias`. Bias values pass through
-/// unchanged, and an absent map stays `None`. Token IDs are not checked
-/// against the vocabulary here.
-pub fn convert_logit_bias(
-    logit_bias: Option<HashMap<String, f32>>,
-) -> Result<Option<HashMap<u32, f32>>> {
-    logit_bias
-        .map(|bias| {
-            bias.into_iter()
-                .map(|(key, value)| {
-                    key.parse().map(|token| (token, value)).map_err(|_| {
-                        ApiError::invalid_request(
-                            format!(
-                                "Invalid key in 'logit_bias': '{key}' is not a valid token ID. \
-                                 Token IDs must be non-negative integers."
-                            ),
-                            Some("logit_bias"),
-                        )
-                    })
-                })
-                .collect()
-        })
-        .transpose()
 }

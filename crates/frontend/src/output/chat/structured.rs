@@ -13,9 +13,7 @@ use super::AssistantEvent;
 use crate::output::RequestOutput;
 use proto::handoff;
 
-use crate::output::chat::{
-    AssistantBlockKind, AssistantContentBlock, AssistantToolCall, Error, Result,
-};
+use crate::output::chat::{AssistantBlockKind, Error, Result};
 
 /// One currently open assistant text-like block being assembled from streamed
 /// deltas.
@@ -241,12 +239,10 @@ impl StructuredEventState {
         };
 
         let block = match open_block.kind {
-            AssistantBlockKind::Text => AssistantContentBlock::Text {
-                text: open_block.text,
-            },
-            AssistantBlockKind::Reasoning => AssistantContentBlock::Reasoning {
-                text: open_block.text,
-            },
+            AssistantBlockKind::Text => handoff::assistant_block::Block::Text(open_block.text),
+            AssistantBlockKind::Reasoning => {
+                handoff::assistant_block::Block::Reasoning(open_block.text)
+            }
         };
         self.num_completed_blocks += 1;
         events.push(RequestOutput::OutputBlockEnd {
@@ -264,7 +260,7 @@ impl StructuredEventState {
         self.num_completed_blocks += 1;
         events.push(RequestOutput::ToolCallEnd {
             index: open_tool_call.index,
-            call: AssistantToolCall {
+            call: handoff::ToolCall {
                 id: open_tool_call.id,
                 name: open_tool_call.name,
                 arguments: open_tool_call.arguments,
