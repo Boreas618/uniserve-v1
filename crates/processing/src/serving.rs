@@ -16,13 +16,15 @@ pub enum Serving {
 
 /// The output formats a chat family's checkpoints write, and the image input it takes.
 ///
-/// A format is a shared parser keyed by its name, as other serving systems key theirs; several
-/// families may write one format.
+/// A format is named for what the model writes, never for a model: request processing holds one
+/// parser per format, and several families may write one format. What a checkpoint's template
+/// instructs is the family's to state here; request processing does not read a template to
+/// find out.
 #[derive(Clone, Copy)]
 pub struct ChatProfile {
     /// How the model delimits its reasoning, when it reasons.
     pub reasoning: Option<ReasoningFormat>,
-    /// How the model writes tool calls, when its chat template asks for them.
+    /// How the model writes tool calls, when it calls tools.
     pub tool_calls: Option<ToolCallFormat>,
     /// How the family's checkpoints take images, when they do; a family without it serves text
     /// alone and refuses an image part.
@@ -56,13 +58,42 @@ impl Eq for ChatProfile {}
 /// A reasoning output format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReasoningFormat {
-    /// Reasoning between `<think>` and `</think>`, as Qwen3 writes it.
-    Qwen3,
+    /// Reasoning between `<think>` and `</think>`, each one token of the vocabulary.
+    Think,
 }
 
-/// A tool call output format.
+impl ReasoningFormat {
+    /// The text that opens a reasoning section and the text that closes it.
+    pub const fn delimiters(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Think => ("<think>", "</think>"),
+        }
+    }
+}
+
+/// A tool-call output format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolCallFormat {
-    /// One JSON object per call between `<tool_call>` and `</tool_call>`, as Qwen3 writes it.
-    Qwen3,
+    /// One JSON object per call, naming the function and its arguments, between `<tool_call>`
+    /// and `</tool_call>`:
+    ///
+    /// ```text
+    /// <tool_call>
+    /// {"name": NAME, "arguments": {ARG: VALUE}}
+    /// </tool_call>
+    /// ```
+    Json,
+    /// Function and parameter tags between `<tool_call>` and `</tool_call>`, each value as
+    /// text that the tool's JSON schema types:
+    ///
+    /// ```text
+    /// <tool_call>
+    /// <function=NAME>
+    /// <parameter=ARG>
+    /// VALUE
+    /// </parameter>
+    /// </function>
+    /// </tool_call>
+    /// ```
+    Xml,
 }

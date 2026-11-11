@@ -1,20 +1,22 @@
 //! Assistant output processing for chat generation.
 //!
-//! [`ChatOutputProcessor`] parses one request's decoded text, as vLLM's
-//! default chat output processor does: an optional reasoning parser splits
-//! reasoning from visible text, and an optional tool parser extracts tool
-//! calls from the visible text (`tool`). Qwen3 chooses its parsers:
-//! `<think>` reasoning and JSON tool calls. `output::assembly` feeds the
-//! processor and frames its [`AssistantEvent`]s as content blocks and tool
-//! calls (`structured`).
+//! [`ChatParser`] parses one request's decoded text, as vLLM's chat serving
+//! does with its reasoning and tool parsers: an optional reasoning parser
+//! splits reasoning from visible text, and an optional tool parser extracts
+//! tool calls from the visible text (`tool`). Which parsers a request has is
+//! stated by its lowering (`handoff::Parser`): the formats its model family's
+//! chat profile names. The request's `OutputProcessor` feeds the parser and
+//! frames its [`AssistantEvent`]s as content blocks and tool calls
+//! (`structured`).
 
 use proto::handoff;
 use uuid::Uuid;
 
 use crate::output::chat::{AssistantBlockKind, Error, Result};
-use crate::output::reasoning::{Qwen3ReasoningParser, ReasoningDelta, ReasoningParser};
-use crate::output::tools::{Qwen25ToolParser, Tool, ToolParser};
+use crate::output::reasoning::{DelimitedReasoningParser, ReasoningDelta};
+use crate::output::tools::{JsonToolParser, ToolParser, XmlToolParser};
 use crate::tokenizer::DynTokenizer;
+use processing::{ReasoningFormat, ToolCallFormat};
 
 use super::tool::ToolStage;
 
@@ -42,37 +44,74 @@ pub enum AssistantEvent {
     },
 }
 
-/// The request-scoped output processor of a chat request: its reasoning and
+/// The parsers of one chat request's decoded text: its reasoning and
 /// tool-call parsers, either of which may be absent.
 ///
 /// Without a reasoning parser all text is visible; without a tool parser
 /// visible text passes unchanged. Text a parser holds back as a possible
 /// partial delimiter is released by a later push or by [`Self::finish`].
 #[derive(Default)]
-pub struct ChatOutputProcessor {
-    reasoning: Option<Box<dyn ReasoningParser>>,
+pub struct ChatParser {
+    reasoning: Option<DelimitedReasoningParser>,
     tools: Option<ToolStage>,
-    /// The parser set the request's model family chose, which a successor
-    /// rebuilds the same processors from (design §7.5.1 step 3).
-    parser: handoff::Parser,
 }
 
-impl ChatOutputProcessor {
-    /// A processor over `reasoning` and `tools`.
-    pub fn new(
-        reasoning: Option<Box<dyn ReasoningParser>>,
-        tools: Option<Box<dyn ToolParser>>,
-    ) -> Self {
-        Self {
+impl ChatParser {
+    /// The parsers `parser` states for a request: the `<think>` reasoning parser when
+    /// reasoning is parsed, and the parser of the kind's tool-call format when tool calls
+    /// are.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::ParserInitialization` when the tokenizer lacks a reasoning delimiter
+    /// as one token, or the request's tools are not the JSON array a request states.
+    pub fn new(parser: &handoff::Parser, tokenizer: DynTokenizer) -> Result<Self> {
+        let kind = handoff::parser::Kind::try_from(parser.kind)
+            .unwrap_or(handoff::parser::Kind::ParserKindNone);
+
+        let reasoning = match kind {
+            handoff::parser::Kind::ParserKindNone => None,
+            handoff::parser::Kind::ParserKindJson | handoff::parser::Kind::ParserKindXml
+                if parser.parse_reasoning =>
+            {
+                let format = ReasoningFormat::Think;
+                let (start, end) = format.delimiters();
+                let reasoning = DelimitedReasoningParser::new(tokenizer, start, end, false)
+                    .map_err(|error| Error::ParserInitialization {
+                        kind: "reasoning",
+                        name: format!("{format:?}"),
+                        error: Box::new(error),
+                    })?;
+                Some(reasoning)
+            }
+            _ => None,
+        };
+
+        let tools: Option<Box<dyn ToolParser>> = match kind {
+            _ if !parser.parse_tools => None,
+            handoff::parser::Kind::ParserKindNone => None,
+            handoff::parser::Kind::ParserKindJson => Some(Box::new(JsonToolParser::new())),
+            handoff::parser::Kind::ParserKindXml => {
+                // The tools travel as the JSON array the request stated them in.
+                let tools = if parser.tools.is_empty() {
+                    Vec::new()
+                } else {
+                    serde_json::from_str(&parser.tools).map_err(|error| {
+                        Error::ParserInitialization {
+                            kind: "tool",
+                            name: format!("{:?}", ToolCallFormat::Xml),
+                            error: Box::new(error),
+                        }
+                    })?
+                };
+                Some(Box::new(XmlToolParser::new(tools)))
+            }
+        };
+
+        Ok(Self {
             reasoning,
             tools: tools.map(ToolStage::new),
-            parser: handoff::Parser::default(),
-        }
-    }
-
-    /// The parser set this processor was built for.
-    pub fn parser(&self) -> &handoff::Parser {
-        &self.parser
+        })
     }
 
     /// The parsers' state, for the process that goes on writing the response
@@ -80,10 +119,7 @@ impl ChatOutputProcessor {
     /// processor cannot be continued, in which case the response cannot be
     /// handed over.
     pub fn state(&self) -> Option<handoff::Processor> {
-        let reasoning = match self.reasoning.as_ref() {
-            Some(reasoning) => Some(reasoning.state()?),
-            None => None,
-        };
+        let reasoning = self.reasoning.as_ref().map(DelimitedReasoningParser::state);
         let tools = match self.tools.as_ref() {
             Some(tools) => Some(tools.state()?),
             None => None,
@@ -103,42 +139,6 @@ impl ChatOutputProcessor {
         if let (Some(tools), Some(tools_state)) = (self.tools.as_mut(), state.tools.as_ref()) {
             tools.resume(tools_state);
         }
-    }
-
-    /// The Qwen3 processor of a request: `<think>` reasoning when
-    /// `parse_reasoning` is set, and JSON tool calls naming `tools` when a
-    /// request parses tool calls (`ChatRequest::tool_parsing_enabled`, the
-    /// condition under which its chat template sees the tools).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::ParserInitialization` when the tokenizer lacks the
-    /// `<think>` or `</think>` token.
-    pub fn qwen3(
-        tools: Option<&[Tool]>,
-        tokenizer: DynTokenizer,
-        parse_reasoning: bool,
-    ) -> Result<Self> {
-        let reasoning = parse_reasoning
-            .then(|| Qwen3ReasoningParser::new(tokenizer))
-            .transpose()
-            .map_err(|error| Error::ParserInitialization {
-                kind: "reasoning",
-                name: "qwen3".to_string(),
-                error: Box::new(error),
-            })?;
-        let parse_tools = tools.is_some();
-        let tools = tools.map(Qwen25ToolParser::new);
-        let mut processor = Self::new(
-            reasoning.map(|parser| Box::new(parser) as Box<dyn ReasoningParser>),
-            tools.map(|parser| Box::new(parser) as Box<dyn ToolParser>),
-        );
-        processor.parser = handoff::Parser {
-            kind: handoff::parser::Kind::ParserKindQwen3 as i32,
-            parse_reasoning,
-            parse_tools,
-        };
-        Ok(processor)
     }
 
     /// Chooses the region generation starts in from the prompt.

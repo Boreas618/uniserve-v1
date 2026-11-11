@@ -79,12 +79,12 @@ impl Eq for Family {}
 /// The families an executable loads, each claiming the `model_type`s and classes its checkpoints
 /// declare.
 ///
-/// The claims are request processing's catalogue ([`processing::Catalogue`]) of the same families,
+/// The claims are request processing's registry ([`processing::Registry`]) of the same families,
 /// so both sides resolve a checkpoint by one rule.
 #[derive(Clone, Debug, Default)]
 pub struct Catalogue {
     families: Vec<Family>,
-    claims: processing::Catalogue,
+    claims: processing::Registry,
 }
 
 impl Catalogue {
@@ -96,7 +96,7 @@ impl Catalogue {
     /// it would resolve to either.
     pub fn new(families: impl IntoIterator<Item = Family>) -> Result<Self> {
         let families: Vec<Family> = families.into_iter().collect();
-        let claims = processing::Catalogue::new(families.iter().map(|family| family.request))
+        let claims = processing::Registry::new(families.iter().map(|family| family.request))
             .map_err(|error| crate::Error::Unsupported(error.to_string()))?;
         Ok(Self { families, claims })
     }

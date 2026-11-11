@@ -375,7 +375,7 @@ impl Leader {
         // options state the scheduler and the rank layout, and the model's files complete what they
         // determine. Its launch file carries it whole (§2.3).
         let engine = Leader::prepare(
-            &self.catalogue,
+            &self.families,
             target,
             &crate::options::Stated::from_paths(Vec::new()),
         )
@@ -681,7 +681,7 @@ impl Replica {
         // The target's engine configuration is resolved as a deployment's
         // start resolves it: from the options, completed by what the model's
         // files determine, and divided into the deployment's replicas.
-        let prepared = Leader::prepare(&self.catalogue, &target, &stated)
+        let prepared = Leader::prepare(&self.families, &target, &stated)
             .await
             .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
         let replicas = crate::leader::replica_configs(&prepared.engine)

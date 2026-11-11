@@ -6,14 +6,14 @@
 //! at a time, writes the frames it yields, and pauses it at a boundary when a
 //! hot restart hands the deployment to a successor. The connection, its
 //! driver and the handoff registry are the daemon's; what a body produces and
-//! the state it freezes to ([`Application`]) are the frontend's.
+//! the state it freezes to (`handoff::stream::Application`) are the frontend's.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use proto::handoff;
+use proto::handoff::stream::Application;
 
 use crate::openai::ApiError;
 
@@ -71,38 +71,11 @@ pub trait Session: Send + 'static {
     fn detach(&mut self);
 }
 
-/// The application state of one frozen response, as the `application` of
-/// `handoff.Stream`.
-pub enum Application {
-    /// A chat completion streamed as server-sent events.
-    ChatStream(handoff::ChatStream),
-    /// A chat completion answered as one JSON body.
-    ChatResponse(handoff::ChatResponse),
-    /// A video artifact streamed from a job's retained media.
-    VideoContent(handoff::VideoContent),
-}
-
-impl Application {
-    /// The application state as the `application` of `handoff.Stream`.
-    pub fn into_stream(self, http: handoff::Http, request_id: String) -> handoff::Stream {
-        let application = match self {
-            Self::ChatStream(chat) => handoff::stream::Application::ChatStream(chat),
-            Self::ChatResponse(chat) => handoff::stream::Application::ChatResponse(chat),
-            Self::VideoContent(video) => handoff::stream::Application::VideoContent(video),
-        };
-        handoff::Stream {
-            http: Some(http),
-            request_id,
-            application: Some(application),
-        }
-    }
-}
-
 /// How a response's head goes out relative to its body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Opening {
     /// The head waits for the body's first output: one document, whose
-    /// status is its outcome.
+    /// status is its result.
     Held,
     /// The head goes out at once; `keep_alive` writes a server-sent-event
     /// comment while the body waits for its engine.

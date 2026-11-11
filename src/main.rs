@@ -188,8 +188,8 @@ pub(crate) fn catalogue() -> Result<nn::family::Catalogue> {
 
 /// What the daemon serves of [`FAMILIES`]: each family's request-processing side, which is all the
 /// daemon reads of a model.
-pub(crate) fn served() -> Result<processing::Catalogue> {
-    Ok(processing::Catalogue::new(
+pub(crate) fn served() -> Result<processing::Registry> {
+    Ok(processing::Registry::new(
         FAMILIES.map(|family| family.request),
     )?)
 }

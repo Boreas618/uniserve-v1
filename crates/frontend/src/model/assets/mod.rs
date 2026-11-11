@@ -3,7 +3,7 @@
 //! [`model_files`] locates checkpoint files in a local directory, the local
 //! Hugging Face Hub cache, or the Hub itself; [`PipelineCheckpoint`] reads
 //! the root index that identifies a diffusers pipeline checkpoint and
-//! locates its component files, including those a component
+//! locates its stage files, including those a stage
 //! export draws from the base checkpoint it pins; [`checkpoint`]
 //! reads tensor shapes from a safetensors header without loading weights;
 //! [`config`] deserializes the JSON metadata that profile resolution in the
@@ -21,7 +21,7 @@ mod pipeline_index;
 
 pub use checkpoint::resolve_tensor_shape;
 pub use config::{
-    GenerationConfig, HfSpecialTokens, HfTokenizerConfig, ModelConfig, NamedSpecialToken,
+    GenerationConfig, HfConfig, HfSpecialTokens, HfTokenizerConfig, NamedSpecialToken,
     OneOrManyTokenIds, load_generation_config, load_model_config, load_tokenizer_config, read_json,
 };
 pub use error::{Error, Result};

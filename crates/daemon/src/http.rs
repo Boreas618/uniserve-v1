@@ -86,7 +86,7 @@ const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.
 pub async fn serve(
     config: ServerArgs,
     stated: Stated,
-    catalogue: processing::Catalogue,
+    families: processing::Registry,
     devices: crate::supervision::DeviceProbe,
     shutdown: CancellationToken,
 ) -> Result<()> {
@@ -142,7 +142,7 @@ pub async fn serve(
         .as_ref()
         .and_then(Daemon::commands);
     let engine = tokio::select! {
-        engine = Leader::start(&catalogue, &config, &stated, address, commands.as_ref(), updates) => {
+        engine = Leader::start(&families, &config, &stated, address, commands.as_ref(), updates) => {
             engine.map(Arc::new)
         }
         () = shutdown.cancelled() => return stop_daemon(daemon).await,
@@ -1274,7 +1274,7 @@ mod tests {
         );
         assert_eq!(
             body["video"]["request_fields"],
-            serde_json::json!(frontend::input::video::request_field_names())
+            serde_json::json!(frontend::protocol::request_field_names())
         );
     }
 }

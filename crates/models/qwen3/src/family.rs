@@ -9,8 +9,8 @@
 //! - [`FAMILY`]: `Qwen3MoeForCausalLM`, whose outputs delimit reasoning between `<think>` and
 //!   `</think>` and write tool calls as JSON between `<tool_call>` and `</tool_call>`;
 //! - [`HYBRID_FAMILY`]: `Qwen3_5MoeForConditionalGeneration` (Qwen3.6-35B-A3B), which reasons the
-//!   same way and takes images; its tool calls are `<function=…>` blocks, a format no output
-//!   parser of request processing reads, so the profile states none.
+//!   same way and takes images; its tool calls are `<function=…>` and `<parameter=…>` tags
+//!   between `<tool_call>` and `</tool_call>`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use nn::family::{
 };
 use nn::quantization::Declaration;
 use nn::{Checkpoint, WeightLoader};
-use processing::{ChatProfile, ReasoningFormat, Serving, ToolCallFormat};
+use processing::{ChatProfile, Serving};
 
 use crate::Qwen3ForCausalLm;
 use crate::causal_lm::expert_layers;
@@ -34,11 +34,7 @@ pub const FAMILY: Family = Family {
         id: "qwen3",
         model_types: &["qwen3", "qwen3_moe"],
         classes: &[QWEN3_MOE],
-        serving: Serving::Chat(ChatProfile {
-            reasoning: Some(ReasoningFormat::Qwen3),
-            tool_calls: Some(ToolCallFormat::Qwen3),
-            images: None,
-        }),
+        serving: Serving::Chat(processing::qwen::QWEN3),
     },
     model: Model::Text(&Qwen3),
 };
@@ -50,9 +46,8 @@ pub const HYBRID_FAMILY: Family = Family {
         model_types: &["qwen3_5_moe"],
         classes: &[QWEN3_5_MOE],
         serving: Serving::Chat(ChatProfile {
-            reasoning: Some(ReasoningFormat::Qwen3),
-            tool_calls: None,
             images: Some(&Qwen3),
+            ..processing::qwen::QWEN3_5_MOE
         }),
     },
     model: Model::Text(&Qwen3),

@@ -30,7 +30,7 @@ use crate::options::ChatTemplateContentFormat;
 use crate::options::{ImageFetchConfig, LoggingConfig, ServerArgs, ServerConfig, VideoJobConfig};
 use frontend::input::chat::HfChatRenderer;
 use frontend::input::media::MediaConnector;
-use frontend::input::{InputProcessor, RequestRenderer};
+use frontend::input::{Processor, RequestRenderer};
 use frontend::model::{ModelConfig, SamplingDefaults};
 use frontend::openai::video_jobs::VideoJobs;
 use frontend::tokenizer::DynTokenizer;
@@ -311,7 +311,7 @@ pub(crate) fn leader_over(
             .unwrap(),
         ),
     };
-    let processor = InputProcessor::new(
+    let processor = Processor::new(
         model,
         tokenizer,
         renderer,

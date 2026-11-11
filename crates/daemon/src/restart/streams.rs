@@ -367,17 +367,17 @@ fn take_over(
                 &chat.engine_request_id,
                 chat.consumed_events,
             )?;
-            let started = frontend::output::run::started_instant(
+            let started = frontend::output::started_instant(
                 chat.lowering
                     .as_ref()
                     .map_or(0, |lowering| lowering.started_unix_us),
             );
-            let outcome = leader.request_outcome(&state.request_id, chat.engine_replica, started);
-            let run = frontend::output::run::GenerationRun::resume_stream(
+            let stats = leader.stat_logger(&state.request_id, chat.engine_replica, started);
+            let run = frontend::openai::run::GenerationRun::resume_stream(
                 &chat,
                 leader.tokenizer(),
                 Box::new(events),
-                Box::new(outcome),
+                Box::new(stats),
             )?;
             // Server-sent events: the body keeps its connection alive while
             // it waits for the engine.
@@ -389,17 +389,17 @@ fn take_over(
                 &chat.engine_request_id,
                 chat.consumed_events,
             )?;
-            let started = frontend::output::run::started_instant(
+            let started = frontend::output::started_instant(
                 chat.lowering
                     .as_ref()
                     .map_or(0, |lowering| lowering.started_unix_us),
             );
-            let outcome = leader.request_outcome(&state.request_id, chat.engine_replica, started);
-            let run = frontend::output::run::GenerationRun::resume_collection(
+            let stats = leader.stat_logger(&state.request_id, chat.engine_replica, started);
+            let run = frontend::openai::run::GenerationRun::resume_collection(
                 &chat,
                 leader.tokenizer(),
                 Box::new(events),
-                Box::new(outcome),
+                Box::new(stats),
             )?;
             // One JSON body: no server-sent events, so no keep-alive comment.
             ResponseStream::start(Box::new(run), false)
@@ -414,7 +414,7 @@ fn take_over(
                     content.job_id
                 )
             })?;
-            let run = frontend::output::run::VideoContentRun::new(
+            let run = frontend::openai::run::VideoContentRun::new(
                 content.job_id.clone(),
                 content.content_type.clone(),
                 media,

@@ -1,67 +1,19 @@
 //! Token decoding for generated and prompt logprobs.
 //!
 //! Converts the engine's token-ID candidates (`proto::request::PositionLogprobs`)
-//! into decoded candidate strings. Ranks and log probabilities are passed
-//! through unchanged from the engine.
+//! into decoded candidate strings (`proto::handoff::DecodedLogprobs` and
+//! `DecodedPromptLogprobs`, the form a response collects and a handoff
+//! carries). Ranks and log probabilities are passed through unchanged from
+//! the engine.
 
 use crate::tokenizer::HuggingFaceTokenizer;
 use itertools::Itertools as _;
+use proto::handoff::{
+    DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs, DecodedTokenLogprob,
+};
 use proto::request::PositionLogprobs;
-use serde::{Deserialize, Serialize};
 
 use crate::output::text::error::Error;
-
-/// One decoded token candidate and its logprob metadata.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DecodedTokenLogprob {
-    /// Original vocabulary token ID for this candidate.
-    pub token_id: u32,
-    /// Best-effort decoded token string for this candidate.
-    ///
-    /// The token is decoded in isolation, so the string can differ from the
-    /// token's contribution to the fully decoded text.
-    pub token: String,
-    /// Log probability of this token candidate.
-    pub logprob: f32,
-    /// One-based competition rank of this candidate at its position; tied log
-    /// probabilities share a rank.
-    pub rank: u32,
-}
-
-/// One position's decoded token candidates and their logprobs.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DecodedPositionLogprobs {
-    /// Candidate tokens for this position, in engine order.
-    ///
-    /// For a generated position the first entry is the sampled token; the
-    /// stream consumers in `output::text` and `output::assembly`
-    /// reject engine output that violates this.
-    pub entries: Vec<DecodedTokenLogprob>,
-}
-
-/// Decoded sample logprobs for generated token positions.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DecodedLogprobs {
-    /// Generated token positions covered by this payload.
-    pub positions: Vec<DecodedPositionLogprobs>,
-}
-
-/// Decoded prompt logprobs for prompt token positions.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DecodedPromptLogprobs {
-    /// Original vocabulary token ID for the first prompt token.
-    pub first_token_id: u32,
-    /// Best-effort decoded string for the first prompt token.
-    ///
-    /// The first prompt token has no left context to score against, so it is
-    /// stored separately instead of appearing in `scored_positions`.
-    pub first_token: String,
-    /// Scored prompt positions after the first prompt token.
-    ///
-    /// `scored_positions[i]` corresponds to the prompt token at position `i +
-    /// 1`.
-    pub scored_positions: Vec<DecodedPositionLogprobs>,
-}
 
 /// Decodes generated-token logprobs from the engine's token-ID candidates into
 /// the text-layer decoded-token representation.

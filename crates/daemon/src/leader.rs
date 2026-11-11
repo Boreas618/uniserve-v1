@@ -1,23 +1,24 @@
 //! The leader's served model: one model's input processing, its engine
 //! process, and the output processing of every request.
 //!
-//! A [`Leader`] owns the model's [`InputProcessor`] and the client of the
+//! A [`Leader`] owns the model's [`Processor`] and the client of the
 //! engine process that schedules its requests ([`EngineClient`]), as vLLM's
 //! `AsyncLLM` owns its input and output processors over its engine core
 //! client and SGLang's tokenizer manager drives its schedulers. Every
 //! request takes one path:
 //!
 //! 1. its images are fetched on the async runtime and its prompt rendered and
-//!    tokenized on the blocking pool ([`InputProcessor`]);
+//!    tokenized on the blocking pool ([`Processor`]);
 //! 2. [`Leader::submit`] hands the tokenized request through the migrator
 //!    to the engine process, which routes it to one of its schedulers and
 //!    returns its events ([`RequestEvents`]), across the engines that serve
 //!    it when it migrates;
 //! 3. the events are assembled into public [`RequestOutput`] events: a
 //!    token request's by the body that writes its response
-//!    (`output::run::GenerationRun`, from [`Leader::generate`]'s
-//!    parts), a media request's by [`output::media_output`] wrapped in
-//!    `RequestStats`; either records the request's metrics once.
+//!    (`openai::run::GenerationRun`, through the `OutputProcessor`
+//!    [`Leader::generate`] built), a media request's by
+//!    [`output::media_output`] wrapped in `RequestStats`; either records the
+//!    request's metrics once.
 //!
 //! Dropping a request's `RequestEvents` cancels the request in the engine
 //! that serves it; that is the only cancellation path.
@@ -46,13 +47,14 @@ use crate::metrics::stats::{self as metrics, RequestStats};
 use crate::migration::{Migrator, RequestEvents};
 use crate::options::{ReasoningParser, ServerArgs, Stated};
 use frontend::input::media::MediaConnector;
-use frontend::input::video::{ProcessedVideo, VideoGenerationRequest, VideoService};
+use frontend::input::video::{ProcessedVideo, VideoService};
 use frontend::input::{
-    GenerateRequest, InputProcessor, LoadedModel, LoadedRenderer, RequestRenderer, ServeError,
+    AdapterSelection, LoadedModel, LoadedRenderer, Processor, RequestRenderer, ServeError,
     TokenizeError,
 };
 use frontend::model::ModelConfig;
 use frontend::output::RequestOutputStream;
+use frontend::protocol::VideoGenerationRequest;
 
 /// How long the epoch's Program Servers may take to select its programs.
 ///
@@ -87,12 +89,12 @@ const SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25 * 
 pub struct Leader {
     /// The model families the executable serves, which every preparation of an epoch resolves
     /// its checkpoint with.
-    pub(crate) catalogue: processing::Catalogue,
+    pub(crate) families: processing::Registry,
     /// The single model name the API serves.
     served_model_name: String,
     /// The model the request and scheduler metrics are labelled with.
     model_name: String,
-    processor: Arc<InputProcessor>,
+    processor: Arc<Processor>,
     /// Independent replica epochs behind the public request entry point.
     pub(crate) replicas: Arc<Replicas>,
     images: MediaConnector,
@@ -235,7 +237,7 @@ pub(crate) fn replica_configs(
 
 /// What a leader prepares before it has an engine (`Leader::prepare`).
 pub(crate) struct Prepared {
-    catalogue: processing::Catalogue,
+    families: processing::Registry,
     model_config: ModelConfig,
     tokenizer: frontend::tokenizer::DynTokenizer,
     renderer: LoadedRenderer,
@@ -570,14 +572,14 @@ impl Leader {
     /// start, or when the model cannot be bound to the capabilities its
     /// workers report.
     pub(crate) async fn start(
-        catalogue: &processing::Catalogue,
+        families: &processing::Registry,
         config: &ServerArgs,
         stated: &Stated,
         daemon: String,
         commands: Option<&crate::supervision::ProcessCommands>,
         updates: Arc<crate::updates::driver::Driver>,
     ) -> anyhow::Result<Self> {
-        let prepared = Self::prepare(catalogue, config, stated).await?;
+        let prepared = Self::prepare(families, config, stated).await?;
         info!(parallel = ?prepared.engine.parallel, "starting the engine process");
         let control = Arc::new(EngineControl::new(
             &config.request_socket(),
@@ -627,7 +629,7 @@ impl Leader {
         )?;
         for (index, (client, served, observer)) in clients.enumerate() {
             let replica = Replica::new(
-                leader.catalogue.clone(),
+                leader.families.clone(),
                 config,
                 Arc::new(client),
                 observer,
@@ -872,7 +874,7 @@ impl Leader {
     ///
     /// As [`Leader::start`], before the engine starts.
     pub(crate) async fn prepare(
-        catalogue: &processing::Catalogue,
+        families: &processing::Registry,
         config: &ServerArgs,
         stated: &Stated,
     ) -> anyhow::Result<Prepared> {
@@ -884,7 +886,7 @@ impl Leader {
             config.model(),
             config.max_model_len,
             &config.chat_config,
-            catalogue,
+            families,
         )
         .await
         .with_context(|| format!("failed to resolve model assets for `{}`", config.model()))?;
@@ -917,7 +919,7 @@ impl Leader {
         }
 
         Ok(Prepared {
-            catalogue: catalogue.clone(),
+            families: families.clone(),
             model_config,
             tokenizer,
             renderer,
@@ -942,7 +944,7 @@ impl Leader {
         updates: Arc<crate::updates::driver::Driver>,
     ) -> anyhow::Result<Self> {
         let Prepared {
-            catalogue,
+            families,
             model_config,
             tokenizer,
             renderer,
@@ -993,7 +995,7 @@ impl Leader {
             }
         };
 
-        let processor = InputProcessor::new(
+        let processor = Processor::new(
             model_config,
             tokenizer,
             renderer,
@@ -1005,7 +1007,7 @@ impl Leader {
         let images = MediaConnector::from_image_options(&config.image_fetch_config)
             .context("failed to initialize the image URL fetcher")?;
         let engine = Self::observed(
-            catalogue,
+            families,
             config.served_model_name().to_owned(),
             model_name,
             vec![Arc::new(client)],
@@ -1031,13 +1033,13 @@ impl Leader {
         served_model_name: String,
         model_name: String,
         clients: Vec<Arc<EngineClient>>,
-        processor: InputProcessor,
+        processor: Processor,
         images: MediaConnector,
         options: &ServerArgs,
         updates: Arc<crate::updates::driver::Driver>,
     ) -> Self {
         Self::observed(
-            processing::Catalogue::default(),
+            processing::Registry::default(),
             served_model_name,
             model_name,
             clients,
@@ -1056,11 +1058,11 @@ impl Leader {
         reason = "a leader's model, engine and options, and its statistics' observer"
     )]
     fn observed(
-        catalogue: processing::Catalogue,
+        families: processing::Registry,
         served_model_name: String,
         model_name: String,
         clients: Vec<Arc<EngineClient>>,
-        processor: InputProcessor,
+        processor: Processor,
         images: MediaConnector,
         options: &ServerArgs,
         observer: Arc<crate::observe::Observer>,
@@ -1088,7 +1090,7 @@ impl Leader {
                     .enumerate()
                     .map(|(index, client)| {
                         Replica::new(
-                            catalogue.clone(),
+                            families.clone(),
                             &replica_options,
                             client,
                             Arc::clone(&observer),
@@ -1108,7 +1110,7 @@ impl Leader {
             replica.monitor();
         }
         Self {
-            catalogue,
+            families,
             served_model_name,
             model_name,
             processor: Arc::new(processor),
@@ -1121,7 +1123,7 @@ impl Leader {
     }
 
     /// The loaded model's input processor.
-    pub fn processor(&self) -> &InputProcessor {
+    pub fn processor(&self) -> &Processor {
         &self.processor
     }
 
@@ -1161,31 +1163,38 @@ impl Leader {
             .any(|replica| replica.hold.is_serving())
     }
 
-    /// Submits one generation request and returns what its handoffable body
-    /// is built from: the request's engine events, the pipeline that produces
-    /// its output, how long it took to reach the engine, and the recorder of
-    /// its statistics.
+    /// Lowers one chat request through the deployment's `Processor`, submits it, and
+    /// returns what its response body is built from: the request's engine events and the
+    /// output processor that turns them into the response named `request_id`.
     ///
     /// The caller drives the body one engine event at a time
-    /// (`output::run::GenerationRun`), so the response can stop at an engine
+    /// (`openai::run::GenerationRun`), so the response can stop at an engine
     /// event boundary and go on in a successor.
     ///
-    /// A chat prompt's `image_url` parts are fetched only for a model that
-    /// accepts image input; for any other model, preprocessing rejects them
-    /// without network access.
+    /// The request's `image_url` parts are fetched only for a model that
+    /// accepts image input; for any other model, input processing refuses them
+    /// without network access. `adapter` is the LoRA adapter the request's
+    /// model names, when it names one.
     ///
     /// # Errors
     ///
-    /// Fails when an image cannot be fetched, preprocessing refuses the
+    /// Fails when an image cannot be fetched, input processing refuses the
     /// request, or no scheduler accepts it.
     pub(crate) async fn generate(
         &self,
-        request: GenerateRequest,
-    ) -> Result<frontend::openai::Generation, ServeError> {
+        request_id: String,
+        request: frontend::protocol::ChatCompletionRequest,
+        adapter: Option<AdapterSelection>,
+    ) -> Result<
+        (
+            Box<dyn frontend::events::Events>,
+            frontend::output::OutputProcessor,
+        ),
+        frontend::openai::ApiError,
+    > {
         let started = Instant::now();
-        let request_id = request.request_id.clone();
         let image_urls = if self.processor.supports_image_input() {
-            request.prompt.image_urls()
+            request.image_urls()
         } else {
             Vec::new()
         };
@@ -1199,23 +1208,31 @@ impl Leader {
                 source: error.source,
             })?;
         let processor = Arc::clone(&self.processor);
-        let (request, output) =
-            preprocess(&request_id, move || processor.preprocess(request, images)).await?;
+        let (request, mut lowering) = preprocess(&request_id, {
+            let request_id = request_id.clone();
+            move || processor.process(&request_id, &request, adapter.as_ref(), images)
+        })
+        .await?;
 
-        let compile_us = elapsed_us(started);
-        let (events, core) = self.submit(request.into()).await?;
+        lowering.compile_us = elapsed_us(started);
+        let (events, core) = self
+            .submit(request.into())
+            .await
+            .map_err(ServeError::from)?;
         let labels = EngineLabels {
             model_name: self.model_name.clone(),
             engine: core,
         };
         let log = self.log_requests.then_some(request_id);
-        let outcome = crate::metrics::stats::RequestOutcome::new(labels, started, log);
-        Ok(frontend::openai::Generation {
-            events: Box::new(events),
-            output,
-            compile_us,
-            outcome: Box::new(outcome),
-        })
+        let stats = crate::metrics::stats::StatLogger::new(labels, started, log);
+        // Dropping the events on a failure cancels the request in its engine.
+        let output = frontend::output::OutputProcessor::new(
+            self.processor.tokenizer(),
+            lowering,
+            Box::new(stats),
+        )?;
+
+        Ok((Box::new(events), output))
     }
 
     /// The model's tokenizer, which a successor builds a handed-over body's
@@ -1226,18 +1243,18 @@ impl Leader {
 
     /// The statistics recorder of a request this process takes over, under
     /// the replica that serves it and the instant it entered the deployment.
-    pub(crate) fn request_outcome(
+    pub(crate) fn stat_logger(
         &self,
         request_id: &str,
         replica: u32,
         started: std::time::Instant,
-    ) -> crate::metrics::stats::RequestOutcome {
+    ) -> crate::metrics::stats::StatLogger {
         let labels = EngineLabels {
             model_name: self.model_name.clone(),
             engine: replica,
         };
         let log = self.log_requests.then(|| request_id.to_owned());
-        crate::metrics::stats::RequestOutcome::new(labels, started, log)
+        crate::metrics::stats::StatLogger::new(labels, started, log)
     }
 
     /// Takes one request's engine event stream over from the process that
@@ -2054,7 +2071,7 @@ pub(crate) fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_
 pub(crate) struct Replica {
     /// The model families the executable serves, which an update of this replica resolves its
     /// target checkpoint with.
-    pub(crate) catalogue: processing::Catalogue,
+    pub(crate) families: processing::Registry,
     pub(crate) registry: std::sync::Weak<Replicas>,
     pub(crate) ordinal: usize,
     served_model_name: String,
@@ -2118,7 +2135,7 @@ pub(crate) struct Replica {
 
 impl Replica {
     pub(crate) fn new(
-        catalogue: processing::Catalogue,
+        families: processing::Registry,
         options: &ServerArgs,
         client: Arc<EngineClient>,
         observer: Arc<crate::observe::Observer>,
@@ -2128,7 +2145,7 @@ impl Replica {
     ) -> Arc<Self> {
         let hold = Arc::new(RequestHold::new());
         let replica = Arc::new(Replica {
-            catalogue,
+            families,
             registry,
             ordinal,
             served_model_name: options.served_model_name().to_owned(),
@@ -3541,7 +3558,7 @@ impl Replica {
             config.model = Some(model_path.to_owned());
             config.load_config.weights = None;
             let prepared =
-                Leader::prepare(&self.catalogue, &config, &Stated::from_paths(Vec::new()))
+                Leader::prepare(&self.families, &config, &Stated::from_paths(Vec::new()))
                     .await
                     .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
             let served = locked(&self.served)

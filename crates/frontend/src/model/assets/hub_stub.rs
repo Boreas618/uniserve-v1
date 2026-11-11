@@ -68,7 +68,7 @@ impl HubStub {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let router = Router::new().fallback(move |uri: Uri, headers: HeaderMap| {
             let stub = self.clone();
-            async move { stub.answer(&uri, &headers) }
+            async move { stub.respond(&uri, &headers) }
         });
         tokio::spawn(async move { axum::serve(listener, router).await });
 
@@ -89,7 +89,7 @@ impl HubStub {
     }
 
     /// Answers one request by its path and `Range` header.
-    fn answer(&self, uri: &Uri, headers: &HeaderMap) -> Response {
+    fn respond(&self, uri: &Uri, headers: &HeaderMap) -> Response {
         let path = uri.path();
         if path.starts_with("/api/models/") {
             if let Some(status) = self.listing_status {

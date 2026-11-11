@@ -3,8 +3,8 @@
 //! [`DecodeStream`] consumes one generation request's `RequestEvents`,
 //! checks the engine event protocol, detokenizes generated tokens with the
 //! tokenizer's `IncrementalDecoder`, decodes requested logprobs, matches stop
-//! strings, and passes image events through in order. `output::run`
-//! feeds its output to the request's chat output processor.
+//! strings, and passes image events through in order. The request's
+//! `OutputProcessor` feeds its output to the reasoning and tool-call parsers.
 //!
 //! The decoder also reports its stop-string decisions to the engine: it
 //! acknowledges each token only after checking that it completes no stop
@@ -14,55 +14,15 @@
 use std::sync::Arc;
 
 use crate::events::Events;
+use proto::handoff::TextDecode;
 use proto::request::{Event, PositionLogprobs, RejectionKind};
-use serde::{Deserialize, Serialize};
 use tracing::{Level, debug, trace};
 
-use super::logprobs::{DecodedLogprobs, decode_logprobs, decode_prompt_logprobs};
+use super::logprobs::{decode_logprobs, decode_prompt_logprobs};
 use crate::output::events::{FinishReason, PromptInfo, StopReason};
 use crate::output::text::error::Error;
 use crate::tokenizer::{DynTokenizer, IncrementalDecoder};
-
-/// Request-neutral options for incremental text decoding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TextDecodeOptions {
-    /// Whether tokenizer special tokens are omitted from decoded text.
-    pub skip_special_tokens: bool,
-    /// Whether the matched stop string remains in emitted output.
-    pub include_stop_str_in_output: bool,
-    /// Decoded strings that terminate generation.
-    pub stop_strings: Option<Vec<String>>,
-    /// Minimum number of generated tokens before stop strings can terminate output.
-    pub min_tokens: u32,
-}
-
-impl Default for TextDecodeOptions {
-    /// Skips special tokens, excludes a matched stop string from output, and
-    /// configures no stop strings or minimum length.
-    fn default() -> Self {
-        Self {
-            skip_special_tokens: true,
-            include_stop_str_in_output: false,
-            stop_strings: None,
-            min_tokens: 0,
-        }
-    }
-}
-
-/// How a decoded request finished, with its token counts.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Finished {
-    /// Why the request finished.
-    pub reason: FinishReason,
-    /// Prompt tokens submitted to the engine.
-    pub prompt_tokens: usize,
-    /// Generated tokens.
-    ///
-    /// The engine's `completion_tokens` when the engine finishes the request,
-    /// which counts the tokens of internal sections it never published as
-    /// text; the decoder's own count when a stop string ends the stream.
-    pub output_tokens: usize,
-}
+use proto::handoff::DecodedLogprobs;
 
 /// Decoded output of one generation request.
 ///
@@ -99,7 +59,19 @@ pub enum DecodedTextEvent {
         logprobs: Option<DecodedLogprobs>,
     },
     /// The request finished.
-    Done(Finished),
+    Done {
+        /// Why the request finished.
+        reason: FinishReason,
+        /// The stop token or string that matched, when one did.
+        stop_reason: Option<StopReason>,
+        /// Prompt tokens submitted to the engine.
+        prompt_tokens: usize,
+        /// Generated tokens: the engine's `completion_tokens` when the engine
+        /// finishes the request, which counts the tokens of internal sections
+        /// it never published as text; the decoder's own count when a stop
+        /// string ends the stream.
+        output_tokens: usize,
+    },
     /// The engine refused the request before executing it.
     Rejected {
         /// Whether the request is unservable or the engine is full.
@@ -112,15 +84,6 @@ pub enum DecodedTextEvent {
         /// Engine-supplied failure detail.
         message: String,
     },
-}
-
-/// Result of decoding one generated token.
-struct ArDecode {
-    /// Newly visible text; empty when a stop string matched.
-    delta: String,
-    /// Matched stop string and the byte offset of its start in
-    /// `IncrementalDecoder::output`.
-    stop: Option<(String, usize)>,
 }
 
 /// One generation stream's decoding state, advanced one engine event at a
@@ -138,7 +101,7 @@ pub struct DecodeStream {
     generated_logprobs_requested: bool,
     decoder: IncrementalDecoder,
     /// Decode options; matched stop strings are removed from `stop_strings`.
-    options: TextDecodeOptions,
+    options: TextDecode,
     /// Prompt logprob positions received so far.
     prompt_positions: Vec<PositionLogprobs>,
     /// `(queued_at, scheduled_at)` of the engine's scheduling event.
@@ -150,18 +113,6 @@ pub struct DecodeStream {
     pending_token: Option<u32>,
     /// Generated text tokens consumed by the decoder.
     output_tokens: usize,
-}
-
-/// The decoded events one engine event produced.
-pub struct Decoded {
-    /// The events, in order; a terminal event is the last.
-    pub events: Vec<DecodedTextEvent>,
-}
-
-impl Decoded {
-    fn new(events: Vec<DecodedTextEvent>) -> Self {
-        Self { events }
-    }
 }
 
 impl DecodeStream {
@@ -176,7 +127,7 @@ impl DecodeStream {
         prompt_token_ids: Vec<u32>,
         prompt_logprobs_requested: bool,
         generated_logprobs_requested: bool,
-        decode_options: TextDecodeOptions,
+        decode_options: TextDecode,
     ) -> Result<Self, Error> {
         if prompt_token_ids.is_empty() {
             return Err(Error::EmptyPromptTokenIds { request_id });
@@ -202,8 +153,13 @@ impl DecodeStream {
         })
     }
 
+    /// The prompt's token identifiers, which seeded the decoder.
+    pub fn prompt_token_ids(&self) -> &[u32] {
+        &self.prompt_token_ids
+    }
+
     /// The decode options, with the stop strings not matched yet.
-    pub fn options(&self) -> &TextDecodeOptions {
+    pub fn options(&self) -> &TextDecode {
         &self.options
     }
 
@@ -254,7 +210,11 @@ impl DecodeStream {
     /// Fails with [`Error::MalformedOutput`] when engine events violate the
     /// protocol of [`DecodedTextEvent`], and with a tokenizer error when
     /// decoding fails.
-    pub fn push(&mut self, event: Event, raw_stream: &mut dyn Events) -> Result<Decoded, Error> {
+    pub fn push(
+        &mut self,
+        event: Event,
+        raw_stream: &mut dyn Events,
+    ) -> Result<Vec<DecodedTextEvent>, Error> {
         let prompt_token_ids = self.prompt_token_ids.clone();
         let prompt_tokens = prompt_token_ids.len();
         let mut events = Vec::new();
@@ -304,7 +264,7 @@ impl DecodeStream {
                     raw_stream,
                     &mut events,
                 )? {
-                    return Ok(Decoded::new(events));
+                    return Ok(events);
                 }
             }
             // Tokens committed together, such as a block-diffusion canvas,
@@ -328,7 +288,7 @@ impl DecodeStream {
                     raw_stream,
                     &mut events,
                 )? {
-                    return Ok(Decoded::new(events));
+                    return Ok(events);
                 }
             }
             Event::TokenLogprobs { id, candidates } => {
@@ -356,7 +316,7 @@ impl DecodeStream {
                     raw_stream,
                     &mut events,
                 )? {
-                    return Ok(Decoded::new(events));
+                    return Ok(events);
                 }
             }
             // A terminal event flushes decoder holdback only after every pending
@@ -371,12 +331,12 @@ impl DecodeStream {
                     events.push(start);
                 }
                 self.ensure_output_ready_from(&events, "the terminal event")?;
-                let Some(reason) = FinishReason::from_engine(reason, stop_reason) else {
+                if reason == FinishReason::Error {
                     events.push(DecodedTextEvent::Failed {
                         message: "engine execution failed".to_owned(),
                     });
-                    return Ok(Decoded::new(events));
-                };
+                    return Ok(events);
+                }
 
                 // Release the decoder's holdback untruncated: a stop-string
                 // match would have ended the stream in `consume_tokens`.
@@ -395,20 +355,21 @@ impl DecodeStream {
                     token_ids: Vec::new(),
                     logprobs: None,
                 });
-                events.push(DecodedTextEvent::Done(Finished {
+                events.push(DecodedTextEvent::Done {
                     reason,
+                    stop_reason,
                     prompt_tokens,
                     output_tokens: completion_tokens,
-                }));
-                return Ok(Decoded::new(events));
+                });
+                return Ok(events);
             }
             Event::Rejected { kind, message } => {
                 events.push(DecodedTextEvent::Rejected { kind, message });
-                return Ok(Decoded::new(events));
+                return Ok(events);
             }
             Event::Error { message } | Event::ArtifactUnavailable { message } => {
                 events.push(DecodedTextEvent::Failed { message });
-                return Ok(Decoded::new(events));
+                return Ok(events);
             }
             // A request's events migrate with it (`crate::migration`), which
             // carries a migratable end over to the next engine.
@@ -427,7 +388,7 @@ impl DecodeStream {
                 });
             }
         }
-        Ok(Decoded::new(events))
+        Ok(events)
     }
 
     /// Fails unless `Start` is emitted (by `start_event` or earlier) and no
@@ -475,15 +436,15 @@ impl DecodeStream {
 
         let mut delta = String::new();
         for (index, &token_id) in token_ids.iter().enumerate() {
-            let decoded = decode_one_token(
+            let (visible, stop) = decode_one_token(
                 &mut self.decoder,
                 token_id,
                 self.output_tokens,
                 &mut self.options,
             )?;
             self.output_tokens = self.output_tokens.saturating_add(1);
-            delta.push_str(&decoded.delta);
-            let Some((stop_string, offset)) = decoded.stop else {
+            delta.push_str(&visible);
+            let Some((stop_string, offset)) = stop else {
                 continue;
             };
 
@@ -503,11 +464,12 @@ impl DecodeStream {
                 token_ids: token_ids[..=index].to_vec(),
                 logprobs: decoded_logprobs,
             });
-            events.push(DecodedTextEvent::Done(Finished {
-                reason: FinishReason::Stop(Some(StopReason::String(stop_string))),
+            events.push(DecodedTextEvent::Done {
+                reason: FinishReason::Stop,
+                stop_reason: Some(StopReason::String(stop_string)),
                 prompt_tokens: prompt_token_ids.len(),
                 output_tokens: self.output_tokens,
-            }));
+            });
             return Ok(true);
         }
         raw_stream.acknowledge_consumed_prefix();
@@ -522,20 +484,9 @@ impl DecodeStream {
     /// The decoder's state, for a successor process (design §7.5.1).
     pub fn state(&self) -> proto::handoff::Decode {
         use proto::handoff;
-        let decoder = self.decoder.state();
         handoff::Decode {
-            decoder: Some(handoff::IncrementalDecode {
-                ids: decoder.ids,
-                prefix: decoder.prefix,
-                prefix_index: decoder.prefix_index as u64,
-                cumulative_output: decoder.cumulative_output,
-                output_index: decoder.output_index as u64,
-                prompt_seeded: decoder.prompt_seeded,
-                pending_since_emit: decoder.pending_since_emit as u64,
-                skip_special_tokens: decoder.skip_special_tokens,
-                min_bytes_to_buffer: decoder.min_bytes_to_buffer as u64,
-            }),
-            stop_strings: self.options.stop_strings.clone().unwrap_or_default(),
+            decoder: Some(self.decoder.state()),
+            stop_strings: self.options.stop_strings.clone(),
             prompt_positions: self
                 .prompt_positions
                 .iter()
@@ -570,27 +521,14 @@ impl DecodeStream {
         prompt_token_ids: Vec<u32>,
         prompt_logprobs_requested: bool,
         generated_logprobs_requested: bool,
-        options: TextDecodeOptions,
+        options: TextDecode,
         state: &proto::handoff::Decode,
     ) -> Result<Self, Error> {
         if prompt_token_ids.is_empty() {
             return Err(Error::EmptyPromptTokenIds { request_id });
         }
         let decoder = match &state.decoder {
-            Some(decoder) => IncrementalDecoder::resume(
-                crate::tokenizer::IncrementalDecodeState {
-                    ids: decoder.ids.clone(),
-                    prefix: decoder.prefix.clone(),
-                    prefix_index: decoder.prefix_index as usize,
-                    cumulative_output: decoder.cumulative_output.clone(),
-                    output_index: decoder.output_index as usize,
-                    prompt_seeded: decoder.prompt_seeded,
-                    pending_since_emit: decoder.pending_since_emit as usize,
-                    skip_special_tokens: decoder.skip_special_tokens,
-                    min_bytes_to_buffer: decoder.min_bytes_to_buffer as usize,
-                },
-                Arc::clone(&tokenizer),
-            ),
+            Some(decoder) => IncrementalDecoder::resume(decoder, Arc::clone(&tokenizer)),
             None => tokenizer.create_decode_stream(
                 &prompt_token_ids,
                 options.skip_special_tokens,
@@ -598,7 +536,7 @@ impl DecodeStream {
             ),
         };
         let mut options = options;
-        options.stop_strings = (!state.stop_strings.is_empty()).then(|| state.stop_strings.clone());
+        options.stop_strings.clone_from(&state.stop_strings);
         Ok(Self {
             request_id,
             tokenizer,
@@ -633,7 +571,11 @@ impl DecodeStream {
     }
 }
 
-/// Advances incremental decoding and returns only bytes newly made visible by this token.
+/// Advances incremental decoding by one generated token.
+///
+/// Returns the text this token newly made visible, empty when a stop string
+/// matched, and the matched stop string with the byte offset of its start in
+/// `IncrementalDecoder::output`.
 ///
 /// Stop strings are checked only from token number `min_tokens + 1` onward
 /// (`output_tokens` counts the tokens before this one). A matched stop
@@ -642,17 +584,12 @@ fn decode_one_token(
     decoder: &mut IncrementalDecoder,
     token_id: u32,
     output_tokens: usize,
-    options: &mut TextDecodeOptions,
-) -> Result<ArDecode, Error> {
+    options: &mut TextDecode,
+) -> Result<(String, Option<(String, usize)>), Error> {
     let new_bytes = decoder.push_token(token_id)?;
     let stop = if output_tokens + 1 > options.min_tokens as usize {
-        if let Some(stops) = options.stop_strings.as_mut()
-            && let Some((index, offset)) = matches_stop_string(stops, decoder.output(), new_bytes)
-        {
-            Some((stops.swap_remove(index), offset))
-        } else {
-            None
-        }
+        matches_stop_string(&options.stop_strings, decoder.output(), new_bytes)
+            .map(|(index, offset)| (options.stop_strings.swap_remove(index), offset))
     } else {
         None
     };
@@ -661,7 +598,7 @@ fn decode_one_token(
     } else {
         String::new()
     };
-    Ok(ArDecode { delta, stop })
+    Ok((delta, stop))
 }
 
 /// Returns the suffix byte count retained to detect cross-chunk stop strings.
@@ -670,14 +607,15 @@ fn decode_one_token(
 /// match out of emitted text until the next token confirms or rules it out.
 /// No holdback is needed when matched stop strings stay in the output. The
 /// result is passed to the decoder as its `min_bytes_to_buffer`.
-fn stop_string_holdback_bytes(options: &TextDecodeOptions) -> usize {
+fn stop_string_holdback_bytes(options: &TextDecode) -> usize {
     if options.include_stop_str_in_output {
         return 0;
     }
     options
         .stop_strings
-        .as_ref()
-        .and_then(|stops| stops.iter().map(String::len).max())
+        .iter()
+        .map(String::len)
+        .max()
         .unwrap_or(1)
         .saturating_sub(1)
 }

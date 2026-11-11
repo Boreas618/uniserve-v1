@@ -1,10 +1,10 @@
-//! Root component index of a diffusers pipeline checkpoint.
+//! Root stage index of a diffusers pipeline checkpoint.
 //!
-//! A pipeline checkpoint names its pipeline class and component folders in a
+//! A pipeline checkpoint names its pipeline class and stage folders in a
 //! root index instead of a root `config.json`. The classic layout publishes
-//! `model_index.json`, where each component lives in the folder named by its
+//! `model_index.json`, where each stage lives in the folder named by its
 //! key; the modular layout publishes `modular_model_index.json`, where a
-//! component's specification may name its folder explicitly.
+//! stage's specification may name its folder explicitly.
 //!
 //! Server startup (`ModelConfig::load` in `input::processor`) consults this
 //! index, through `PipelineCheckpoint`, before any other asset: its presence
@@ -23,22 +23,22 @@ use crate::model::assets::model_files::ModelSource;
 /// The first file that resolves wins, even when both are published.
 const PIPELINE_INDEX_FILES: [&str; 2] = ["model_index.json", "modular_model_index.json"];
 
-/// Pipeline class and component folders declared by a checkpoint's root index.
+/// Pipeline class and stage folders declared by a checkpoint's root index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PipelineIndex {
     /// Pipeline class the index declares in `_class_name`.
     pub(super) class_name: String,
-    /// Component name mapped to the checkpoint-relative folder holding its
+    /// Stage name mapped to the checkpoint-relative folder holding its
     /// files.
-    components: BTreeMap<String, String>,
+    stages: BTreeMap<String, String>,
 }
 
 impl PipelineIndex {
     /// Parses a root index.
     ///
     /// Keys starting with `_` are index metadata. Every other key whose value
-    /// is an array (a component specification `[library, class, options?]`)
-    /// names a component; its folder is the string `subfolder` option when
+    /// is an array (a stage specification `[library, class, options?]`)
+    /// names a stage; its folder is the string `subfolder` option when
     /// present and the key otherwise. Keys with non-array values are ignored.
     ///
     /// # Errors
@@ -59,7 +59,7 @@ impl PipelineIndex {
                 field: "_class_name",
             })?
             .to_owned();
-        let components = index
+        let stages = index
             .iter()
             .filter(|(name, specification)| !name.starts_with('_') && specification.is_array())
             .map(|(name, specification)| {
@@ -71,20 +71,17 @@ impl PipelineIndex {
                 (name.clone(), folder.to_owned())
             })
             .collect();
-        Ok(Self {
-            class_name,
-            components,
-        })
+        Ok(Self { class_name, stages })
     }
 
-    /// Returns the checkpoint-relative path of `filename` inside `component`'s folder.
+    /// Returns the checkpoint-relative path of `filename` inside `stage`'s folder.
     ///
     /// The result is suitable for `ModelSource::file`. An undeclared
-    /// component is [`Error::Invalid`].
-    pub(super) fn component_file(&self, component: &str, filename: &str) -> Result<String> {
-        let folder = self.components.get(component).ok_or_else(|| {
+    /// stage is [`Error::Invalid`].
+    pub(super) fn stage_file(&self, stage: &str, filename: &str) -> Result<String> {
+        let folder = self.stages.get(stage).ok_or_else(|| {
             Error::invalid(format!(
-                "pipeline {} declares no {component} component",
+                "pipeline {} declares no {stage} stage",
                 self.class_name
             ))
         })?;
@@ -128,7 +125,7 @@ mod tests {
     use crate::model::assets::hub_stub::HubStub;
 
     #[test]
-    fn a_modular_component_resolves_to_its_declared_subfolder() {
+    fn a_modular_stage_resolves_to_its_declared_subfolder() {
         let index = PipelineIndex::parse(
             r#"{
                 "_class_name": "MiniMaxH3ModularPipeline",
@@ -141,23 +138,23 @@ mod tests {
 
         assert_eq!(index.class_name, "MiniMaxH3ModularPipeline");
         assert_eq!(
-            index.component_file("tokenizer", "tokenizer.json").unwrap(),
+            index.stage_file("tokenizer", "tokenizer.json").unwrap(),
             "text_tokenizer/tokenizer.json"
         );
     }
 
     #[test]
-    fn a_classic_component_resolves_to_its_key() {
+    fn a_classic_stage_resolves_to_its_key() {
         let index = PipelineIndex::parse(
             r#"{"_class_name": "ClassicPipeline", "tokenizer": ["transformers", "CLIPTokenizer"]}"#,
         )
         .unwrap();
 
         assert_eq!(
-            index.component_file("tokenizer", "tokenizer.json").unwrap(),
+            index.stage_file("tokenizer", "tokenizer.json").unwrap(),
             "tokenizer/tokenizer.json"
         );
-        assert!(index.component_file("vae", "config.json").is_err());
+        assert!(index.stage_file("vae", "config.json").is_err());
     }
 
     #[tokio::test]

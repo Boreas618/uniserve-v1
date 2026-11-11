@@ -31,13 +31,12 @@ use axum::{Extension, Json, Router};
 use futures::StreamExt as _;
 use serde_json::{Value, json};
 
-use crate::input::video::VideoGenerationRequest;
-use crate::input::video::{FieldKind, request_field};
 use crate::openai::RequestId;
 use crate::openai::Server;
 use crate::openai::video_jobs::{StageClock, VideoFailure, VideoJob, VideoJobs};
 use crate::openai::{ApiError, check_model_served};
 use crate::output::video::ArtifactCollector;
+use crate::protocol::{FieldKind, VideoGenerationRequest, request_field};
 use String;
 
 /// The state of the asynchronous video job routes.
@@ -115,8 +114,8 @@ async fn videos_sync(
         if let Some(event) = &event {
             clock.observe(event);
         }
-        if let ControlFlow::Break(outcome) = collector.push(event) {
-            match outcome {
+        if let ControlFlow::Break(result) = collector.push(event) {
+            match result {
                 Ok(artifact) => break artifact,
                 Err(error) => return ApiError::from(error).into_response(),
             }
@@ -333,8 +332,8 @@ async fn videos_create(
             if let Some((phase, steps)) = event.as_ref().and_then(|event| clock.observe(event)) {
                 store.progress(&id, phase, steps);
             }
-            if let ControlFlow::Break(outcome) = collector.push(event) {
-                break outcome.map(|artifact| artifact.media).map_err(Into::into);
+            if let ControlFlow::Break(result) = collector.push(event) {
+                break result.map(|artifact| artifact.media).map_err(Into::into);
             }
         };
 
@@ -403,7 +402,7 @@ async fn videos_content(State(state): State<JobState>, Path(id): Path<String>) -
     // The body registers before it writes a chunk, so a hot restart pauses it
     // between two chunks and the successor goes on streaming the same
     // artifact from the byte this process reached.
-    let body = crate::output::run::VideoContentRun::new(id.clone(), "video/mp4".to_owned(), media);
+    let body = crate::openai::run::VideoContentRun::new(id.clone(), "video/mp4".to_owned(), media);
     let opening = crate::body::Opening::Streamed { keep_alive: false };
     match state
         .engine
@@ -443,7 +442,7 @@ fn media_body<M: AsRef<[u8]> + Send + Sync + 'static>(media: Arc<M>) -> Body {
 }
 
 /// Reports the served model, its video limits
-/// (`InputProcessor::video_capabilities`), and the settings of the job store.
+/// (`Processor::video_capabilities`), and the settings of the job store.
 async fn capabilities(State(state): State<JobState>) -> Json<Value> {
     let settings = state.jobs.settings();
     Json(json!({

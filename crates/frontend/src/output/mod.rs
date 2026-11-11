@@ -1,20 +1,19 @@
 //! Output processing: what turns a submitted request's engine events into
-//! its public events.
+//! its response's deltas.
 //!
-//! A token request's body (`run::GenerationRun`) decodes its events
-//! (`text`), runs them through the request's chat output processor
-//! (`chat`), whose model family chose its reasoning and tool parsers
-//! (`reasoning`, `tools`), frames the result as [`RequestOutput`] events and
-//! hands each to the sink that writes the response; `media_output` frames a
-//! video request's events, whose artifacts `video` collects. The
-//! parameters each request's output takes ([`OutputParams`]) come from its
-//! input processing.
+//! A token request's [`OutputProcessor`] decodes its events (`text`), parses
+//! reasoning and tool calls in the formats the request's model family writes
+//! (`chat`, `reasoning`, `tools`) and frames the result as [`RequestOutput`]s,
+//! which the route's response body writes; `media_output` frames a video
+//! request's events, whose artifacts `video` collects. What a request's
+//! output processing is built from is the lowering its input processing
+//! stated (`proto::handoff::Lowering`).
 
 mod assembly;
 pub mod chat;
 mod events;
+mod processor;
 pub mod reasoning;
-pub mod run;
 pub mod text;
 pub mod tools;
 pub mod video;
@@ -26,9 +25,12 @@ use futures::Stream;
 
 use crate::events::Events;
 
+pub use assembly::started_instant;
 pub use events::{
     FinishReason, PromptInfo, RequestOutput, RequestUsage, RuntimeTimings, StopReason,
+    finish_reason_name,
 };
+pub use processor::OutputProcessor;
 
 /// Why a submitted request's engine events could not be processed into its
 /// public events, for example because they violate the engine's event
@@ -41,24 +43,6 @@ pub struct OutputError {
     /// Underlying decoding or parsing failure.
     #[source]
     pub source: chat::Error,
-}
-
-/// What the daemon keeps of a generation request to decode and parse its
-/// output once the request has moved into the engine.
-pub struct OutputParams {
-    /// The model's tokenizer.
-    pub tokenizer: crate::tokenizer::DynTokenizer,
-    /// The prompt token IDs submitted to the engine, which seed incremental
-    /// detokenization.
-    pub prompt_token_ids: Vec<u32>,
-    /// Incremental detokenization and stop strings.
-    pub decode: text::TextDecodeOptions,
-    /// Whether prompt log-probabilities are requested.
-    pub prompt_logprobs: bool,
-    /// Whether generated-token log-probabilities are requested.
-    pub logprobs: bool,
-    /// The request's reasoning and tool-call parsers.
-    pub processor: chat::ChatOutputProcessor,
 }
 
 /// Boxed asynchronous stream of a request's public events.

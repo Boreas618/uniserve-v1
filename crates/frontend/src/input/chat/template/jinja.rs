@@ -21,7 +21,7 @@ use thiserror::Error as ThisError;
 use super::format::{ChatTemplateContentFormat, detect_chat_template_content_format};
 use super::tojson::hf_tojson_filter;
 use super::{TemplateMessage, TemplateTool};
-use crate::input::chat::ReasoningEffort;
+use crate::protocol::ReasoningEffort;
 
 #[derive(Debug, ThisError)]
 /// Error returned while loading, detecting, or rendering a chat template.

@@ -1,4 +1,4 @@
-//! The tool-call stage of [`ChatOutputProcessor`](super::ChatOutputProcessor).
+//! The tool-call stage of [`ChatParser`](super::ChatParser).
 //!
 //! Visible text passes through the model's `ToolParser`; reasoning passes
 //! unchanged. A parser error does not fail the request: the stage logs it and
@@ -13,7 +13,7 @@ use thiserror_ext::AsReport as _;
 use tracing::warn;
 
 use super::AssistantEvent;
-use super::processor::generate_tool_call_id;
+use super::parser::generate_tool_call_id;
 use crate::output::chat::{AssistantBlockKind, Error, Result};
 use crate::output::tools::{ToolCallDelta, ToolParser, ToolParserItem, ToolParserOutput};
 

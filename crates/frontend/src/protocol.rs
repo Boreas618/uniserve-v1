@@ -1,10 +1,13 @@
 //! OpenAI-compatible wire schemas: requests, responses and the values they
-//! share.
+//! share; `video` holds the video generation request.
 //!
 //! Every request schema rejects unknown fields (`deny_unknown_fields`), at
 //! every level. The chat request's ranges and cross-field rules run through
-//! `validator` in the route's `ValidatedJson` extractor. The video request is
-//! the video service's own form (`input::video::VideoGenerationRequest`).
+//! `validator` in the route's `ValidatedJson` extractor; the rules that depend
+//! on the served model run when the deployment's `Processor` lowers the
+//! request.
+
+pub mod video;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -16,7 +19,10 @@ use serde_json::Value;
 use serde_with::SerializeDisplay;
 use validator::Validate;
 
-use crate::input::chat::{ChatToolChoice, ReasoningEffort};
+pub use video::{
+    FieldKind, REQUEST_FIELDS, Seconds, VideoGenerationRequest, VideoReference, request_field,
+    request_field_names,
+};
 
 /// Returns `true` for fields whose wire default is enabled.
 fn default_true() -> bool {
@@ -111,6 +117,91 @@ pub struct StreamOptions {
     pub include_usage: Option<bool>,
 }
 
+/// Whether the assistant may call a tool, as OpenAI's `tool_choice` states it: one of the
+/// strings `auto`, `none` and `required`, or `{"type": "function", "function": {"name": NAME}}`
+/// for one function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatToolChoice {
+    /// The model chooses between text and tool calls. Tools are passed to the
+    /// chat template and tool calls parsed only when the request declares
+    /// tools.
+    Auto,
+    /// The request's `tools` are withheld from the chat template and tool
+    /// calls are not parsed. Message-local tools on developer messages are
+    /// still passed to the template.
+    None,
+    /// The model must call a tool. Only constrained decoding can hold a model
+    /// to that, so a deployment without it refuses the request.
+    Required,
+    /// The model must call the function of this name; refused as `Required`
+    /// is.
+    Function(String),
+}
+
+impl<'de> Deserialize<'de> for ChatToolChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// The two shapes the field takes on the wire.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Mode(String),
+            Named {
+                #[serde(rename = "type")]
+                kind: String,
+                function: Named,
+            },
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Named {
+            name: String,
+        }
+
+        let invalid = |stated: &str| {
+            serde::de::Error::custom(format!(
+                "invalid `tool_choice` {stated:?}: expected \"auto\", \"none\", \"required\" or \
+                 {{\"type\": \"function\", \"function\": {{\"name\": ...}}}}"
+            ))
+        };
+        match Wire::deserialize(deserializer)? {
+            Wire::Mode(mode) => match mode.as_str() {
+                "auto" => Ok(Self::Auto),
+                "none" => Ok(Self::None),
+                "required" => Ok(Self::Required),
+                other => Err(invalid(other)),
+            },
+            Wire::Named { kind, function } if kind == "function" => {
+                Ok(Self::Function(function.name))
+            }
+            Wire::Named { kind, .. } => Err(invalid(&kind)),
+        }
+    }
+}
+
+/// Semantic effort level for reasoning models.
+///
+/// The value reaches the model only through the chat template, which receives
+/// it as `reasoning_effort`; its effect depends on that template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    /// Disables model reasoning.
+    None,
+    /// Requests the smallest available reasoning budget.
+    Minimal,
+    /// Requests a low reasoning budget.
+    Low,
+    /// Requests a medium reasoning budget.
+    Medium,
+    /// Requests a high reasoning budget.
+    High,
+    /// Requests an extra-high reasoning budget.
+    XHigh,
+    /// Requests the maximum available reasoning budget.
+    Max,
+}
+
 /// A tool definition accepted by chat-completion requests.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -133,6 +224,10 @@ pub struct Function {
     pub description: Option<String>,
     /// JSON Schema describing accepted function arguments.
     pub parameters: Value,
+    /// Whether the caller asks for arguments that follow the schema exactly, as OpenAI's
+    /// function definition states it. The chat template is given the value; generation is
+    /// not constrained by it.
+    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -216,7 +311,10 @@ pub enum ChatMessage {
         /// Tool calls requested by the assistant.
         tool_calls: Option<Vec<ToolCall>>,
         /// Reasoning content for reasoning-capable models. The request field
-        /// is named `reasoning`, while responses emit `reasoning_content`.
+        /// is named `reasoning`; `reasoning_content`, the name responses emit
+        /// it under, is accepted for it, so a client may send an assistant
+        /// message back as it received it.
+        #[serde(alias = "reasoning_content")]
         reasoning: Option<String>,
     },
     /// Tool result message.
@@ -359,12 +457,11 @@ pub struct ListModelsResponse {
 ///
 /// The route's `ValidatedJson` extractor deserializes it (unknown fields are
 /// rejected) and then runs the field validators below and
-/// `validate_chat_cross_parameters`. The served-model
-/// and `prompt_logprobs` checks run later in `validate_request_compat`, and
-/// `chat_completions::lower_chat_request` lowers the request into serving
-/// inputs. Besides the OpenAI fields, the schema accepts sampling and output
-/// extensions such as `top_k`, `min_p`, `prompt_logprobs`, and
-/// `return_token_ids`.
+/// `validate_chat_cross_parameters`. The route checks the served model, and
+/// the deployment's `Processor` lowers the request into the engine's request,
+/// where the `prompt_logprobs` rules run. Besides the OpenAI fields, the
+/// schema accepts sampling and output extensions such as `top_k`, `min_p`,
+/// `prompt_logprobs`, and `return_token_ids`.
 #[derive(Debug, Clone, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 #[validate(schema(function = "validate_chat_cross_parameters"))]
@@ -378,7 +475,7 @@ pub struct ChatCompletionRequest {
     #[validate(range(min = -2.0, max = 2.0))]
     pub frequency_penalty: Option<f32>,
     /// Additive sampling biases keyed by decimal token identifier. Keys are
-    /// parsed by `convert_logit_bias` during lowering, not by serde.
+    /// parsed during lowering, not by serde.
     pub logit_bias: Option<HashMap<String, f32>>,
     /// Whether generated-token log probabilities are returned.
     #[serde(default)]
@@ -389,11 +486,15 @@ pub struct ChatCompletionRequest {
     /// Maximum number of completion tokens.
     #[validate(range(min = 1))]
     pub max_completion_tokens: Option<u32>,
+    /// The older name of `max_completion_tokens`, which wins when both are
+    /// stated, as in vLLM.
+    #[validate(range(min = 1))]
+    pub max_tokens: Option<u32>,
     /// Presence-based token penalty in the inclusive range `[-2, 2]`.
     #[validate(range(min = -2.0, max = 2.0))]
     pub presence_penalty: Option<f32>,
-    /// Deterministic sampling seed. `apply_sampling` reinterprets the signed
-    /// value's bit pattern as `u64`.
+    /// Deterministic sampling seed. Lowering reinterprets the signed value's
+    /// bit pattern as `u64`.
     pub seed: Option<i64>,
     /// Text sequences that terminate generation.
     #[validate(custom(function = "validate_stop"))]
@@ -444,8 +545,8 @@ pub struct ChatCompletionRequest {
     #[serde(default = "default_true")]
     pub skip_special_tokens: bool,
     /// Number of alternate prompt-token logprobs, or `-1` for all. The bound
-    /// and its interaction with `stream` are checked by
-    /// `validate_request_compat`.
+    /// and its interaction with `stream` are checked when the request is
+    /// lowered.
     pub prompt_logprobs: Option<i32>,
     /// Optional whitelist of token identifiers eligible for sampling.
     pub allowed_token_ids: Option<Vec<u32>>,
@@ -467,6 +568,76 @@ pub struct ChatCompletionRequest {
     pub return_token_ids: Option<bool>,
     /// Caller-provided salt folded into the prompt-cache isolation key.
     pub cache_salt: Option<String>,
+}
+
+impl ChatCompletionRequest {
+    /// The content parts of every message but the assistant's, in message
+    /// order and then part order.
+    fn input_parts(&self) -> impl Iterator<Item = &ContentPart> {
+        self.messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatMessage::System { content, .. }
+                | ChatMessage::Developer { content, .. }
+                | ChatMessage::User { content, .. }
+                | ChatMessage::Tool { content, .. } => Some(content),
+                ChatMessage::Assistant { .. } => None,
+            })
+            .filter_map(|content| match content {
+                MessageContent::Parts(parts) => Some(parts),
+                MessageContent::Text(_) => None,
+            })
+            .flatten()
+    }
+
+    /// The URL of every input image, in prompt order: the `image_url` parts
+    /// of system, developer, user, and tool-response messages, in message
+    /// order and then part order. Assistant content carries no input images.
+    /// Lowering pairs the fetched images with their parts in this order.
+    pub fn image_urls(&self) -> Vec<String> {
+        self.input_parts()
+            .filter_map(|part| match part {
+                ContentPart::ImageUrl { image_url, .. } => Some(image_url.url.clone()),
+                ContentPart::Text { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Whether the conversation uses tools: tool definitions, prior
+    /// assistant tool calls or tool responses, all of which need a model
+    /// whose tool calls are parsed.
+    pub fn uses_tools(&self) -> bool {
+        self.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+            || self.messages.iter().any(|message| match message {
+                ChatMessage::Developer { tools, .. } => {
+                    tools.as_ref().is_some_and(|tools| !tools.is_empty())
+                }
+                ChatMessage::Assistant { tool_calls, .. } => {
+                    tool_calls.as_ref().is_some_and(|calls| !calls.is_empty())
+                }
+                ChatMessage::Tool { .. } => true,
+                ChatMessage::System { .. } | ChatMessage::User { .. } => false,
+            })
+    }
+
+    /// The most tokens the request generates, when it states a limit:
+    /// `max_completion_tokens`, or `max_tokens`, its older name.
+    pub fn max_output_tokens(&self) -> Option<u32> {
+        self.max_completion_tokens.or(self.max_tokens)
+    }
+
+    /// The tools the model may call: the request's tools unless
+    /// `tool_choice` is `none`, an absent choice letting the model decide as
+    /// OpenAI's default does; `None` when there are none.
+    ///
+    /// The chat template is given exactly these tools, and tool calls are
+    /// parsed from the output exactly when there are some.
+    pub fn callable_tools(&self) -> Option<&[Tool]> {
+        let allowed = !matches!(self.tool_choice, Some(ChatToolChoice::None));
+        self.tools
+            .as_deref()
+            .filter(|tools| allowed && !tools.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
@@ -555,9 +726,8 @@ pub struct ChatCompletionMessage {
 #[derive(Debug, Clone, Serialize)]
 /// One server-sent chat-completion chunk.
 ///
-/// Chunks have no `prompt_logprobs` field; `validate_request_compat` rejects
-/// a streamed request that asks for a positive or `-1` `prompt_logprobs`
-/// count.
+/// Chunks have no `prompt_logprobs` field; lowering rejects a streamed
+/// request that asks for a positive or `-1` `prompt_logprobs` count.
 pub struct ChatCompletionStreamResponse {
     /// OpenAI-compatible completion identifier.
     pub id: String,
@@ -668,7 +838,7 @@ fn validate_chat_cross_parameters(
         ));
     }
 
-    if let (Some(minimum), Some(maximum)) = (request.min_tokens, request.max_completion_tokens)
+    if let (Some(minimum), Some(maximum)) = (request.min_tokens, request.max_output_tokens())
         && minimum > maximum
     {
         return Err(validator::ValidationError::new(
@@ -688,9 +858,14 @@ fn validate_chat_cross_parameters(
         return Err(validator::ValidationError::new("modalities_duplicate"));
     }
 
-    // An explicit `auto` without a non-empty tool list is refused; an absent
-    // choice defaults to `auto`, which serves no tools when the list is empty.
-    if request.tool_choice == Some(ChatToolChoice::Auto)
+    // A choice that lets or makes the model call a tool needs tools to call; an
+    // absent choice defaults to `auto`, which serves no tools when the list is
+    // empty.
+    let calls_tools = matches!(
+        request.tool_choice,
+        Some(ChatToolChoice::Auto | ChatToolChoice::Required | ChatToolChoice::Function(_))
+    );
+    if calls_tools
         && !request
             .tools
             .as_ref()
@@ -706,6 +881,65 @@ fn validate_chat_cross_parameters(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `tool_choice` takes OpenAI's three strings and its named-function object, and
+    /// nothing else.
+    #[test]
+    fn tool_choice_takes_the_openai_shapes() {
+        let choice = |value: serde_json::Value| serde_json::from_value::<ChatToolChoice>(value);
+
+        assert_eq!(
+            choice(serde_json::json!("auto")).unwrap(),
+            ChatToolChoice::Auto
+        );
+        assert_eq!(
+            choice(serde_json::json!("none")).unwrap(),
+            ChatToolChoice::None
+        );
+        assert_eq!(
+            choice(serde_json::json!("required")).unwrap(),
+            ChatToolChoice::Required
+        );
+        assert_eq!(
+            choice(serde_json::json!({"type": "function", "function": {"name": "f"}})).unwrap(),
+            ChatToolChoice::Function("f".to_owned())
+        );
+        for refused in [
+            serde_json::json!("always"),
+            serde_json::json!({"type": "tool", "function": {"name": "f"}}),
+            serde_json::json!({"type": "function", "function": {"name": "f", "x": 1}}),
+        ] {
+            assert!(choice(refused.clone()).is_err(), "{refused}");
+        }
+    }
+
+    /// `max_tokens` is the older name of `max_completion_tokens`, which wins when a
+    /// request states both.
+    #[test]
+    fn max_tokens_is_the_older_name_of_max_completion_tokens() {
+        let request = |fields: serde_json::Value| {
+            let mut value = serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            serde_json::from_value::<ChatCompletionRequest>(value).unwrap()
+        };
+
+        assert_eq!(request(serde_json::json!({})).max_output_tokens(), None);
+        assert_eq!(
+            request(serde_json::json!({"max_tokens": 7})).max_output_tokens(),
+            Some(7)
+        );
+        assert_eq!(
+            request(serde_json::json!({"max_tokens": 7, "max_completion_tokens": 9}))
+                .max_output_tokens(),
+            Some(9)
+        );
+    }
 
     #[test]
     fn configured_request_schema_rejects_unknown_controls() {

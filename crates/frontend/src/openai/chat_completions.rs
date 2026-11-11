@@ -1,18 +1,20 @@
-//! `POST /v1/chat/completions`: validation, the response options, and the
-//! buffered and streaming responses.
+//! `POST /v1/chat/completions`: the route, and the buffered and streaming
+//! responses.
 //!
-//! The handler validates and lowers the body (the schema's `validator` rules
-//! in `ValidatedJson`, then [`lower_chat_request`]), capturing the response
-//! options ([`ChatResponseContext`]), submits the request
-//! ([`Server::generate`]) and answers with the body
-//! `output::run::GenerationRun` drives one engine event at a time. Its sink
-//! turns each `RequestOutput`: [`ChatCollector`] folds them into one
+//! The handler parses the body (the schema's `validator` rules in
+//! `ValidatedJson`), checks the model it names, submits the request
+//! ([`Server::generate`]: the deployment's `Processor`, the hold, an engine)
+//! and answers with the body `run::GenerationRun` drives one engine event at
+//! a time through the request's `OutputProcessor`. Its sink writes each
+//! `RequestOutput`: [`ChatCollector`] folds them into one
 //! `ChatCompletionResponse`; [`ChatStreamEmitter`] maps them to
-//! `ChatCompletionStreamResponse` chunks.
+//! `ChatCompletionStreamResponse` chunks. Which fields a response carries is
+//! the request's response options (`handoff::ChatResponseOptions`), stated
+//! when the request was lowered.
 //!
-//! One decoded update from the engine becomes several events: semantic events
+//! One decoded update from the engine becomes several outputs: semantic ones
 //! (reasoning and text deltas, block and tool-call boundaries) followed by the
-//! update's `TokenDelta`. Events flushed when generation finishes follow the
+//! update's `TokenDelta`. Outputs flushed when generation finishes follow the
 //! final update's tokens. The streaming path relies on this order to attach
 //! token metadata to the chunk of the same update and to drop the metadata of
 //! updates that contain hidden reasoning.
@@ -30,29 +32,26 @@ use axum::routing::post;
 use axum::{Extension, Router};
 use itertools::Itertools as _;
 use proto::handoff;
+use proto::handoff::assistant_block::Block;
+use proto::handoff::{
+    DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs, DecodedTokenLogprob,
+};
 use serde_json::Value;
 use tracing::{debug, error};
 use tracing_futures::Instrument as _;
 
-use crate::input::chat::{ChatRequest, ChatToolChoice};
-use crate::input::{GenerateRequest, InputProcessor, ServeError};
-use crate::openai::RequestId;
-use crate::openai::error::{bail_invalid_request, bail_server_error, server_error};
-use crate::openai::{
-    ApiError, AssistantRole, ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest,
+use crate::body::{Opening, Session};
+use crate::openai::error::{bail_server_error, server_error};
+use crate::openai::run::{ChatBodySink, GenerationRun};
+use crate::openai::{ApiError, RequestId, Server, ValidatedJson, check_model_served};
+use crate::output::chat::AssistantBlockKind;
+use crate::output::{FinishReason, RequestOutput, RequestUsage, StopReason, finish_reason_name};
+use crate::protocol::{
+    AssistantRole, ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest,
     ChatCompletionResponse, ChatCompletionStreamChoice, ChatCompletionStreamResponse, ChatLogProbs,
-    ChatLogProbsContent, ChatMessage, ChatMessageDelta, ChatModality, ContentPart,
-    FunctionCallDelta, FunctionCallResponse, MessageContent, Tool, ToolCall, ToolCallDelta,
-    TopLogProb, Usage, ValidatedJson, check_model_served, convert_logit_bias,
+    ChatLogProbsContent, ChatMessageDelta, FunctionCallDelta, FunctionCallResponse, ToolCall,
+    ToolCallDelta, TopLogProb, Usage,
 };
-use crate::openai::{Generation, Server};
-use crate::output::chat::{AssistantBlockKind, AssistantContentBlock, AssistantMessage};
-use crate::output::text::TextDecodeOptions;
-use crate::output::text::{
-    DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs, DecodedTokenLogprob,
-};
-use crate::output::tools;
-use crate::output::{FinishReason, RequestOutput, StopReason};
 
 /// The chat completions route.
 ///
@@ -65,11 +64,11 @@ pub fn router(engine: Arc<dyn Server>) -> Router {
         .with_state(engine)
 }
 
-/// Validates one chat completion request and runs it through the engine.
+/// Runs one chat completion request through the engine.
 ///
 /// Returns an SSE stream when `stream` is set and one JSON completion
-/// otherwise. Errors from submission, and from collection in the
-/// non-streaming case, become `ApiError` responses; errors after an SSE
+/// otherwise. A request the deployment refuses, and a failure of a response
+/// answered as one document, become `ApiError` responses; errors after an SSE
 /// stream has started are reported inside the stream.
 async fn chat_completions(
     State(engine): State<Arc<dyn Server>>,
@@ -78,66 +77,53 @@ async fn chat_completions(
 ) -> Response {
     let stream = body.stream;
     let request_id = format!("chatcmpl-{base_id}");
-    // A request that names a loaded LoRA adapter as its model computes with
-    // it, and its response names the adapter.
+
+    // A request names the served model, or a loaded LoRA adapter, which it
+    // then computes with and its response names.
     let adapter = engine.adapter(&body.model);
-    let model = if adapter.is_some() {
-        body.model.clone()
-    } else {
-        engine.served_model_name().to_owned()
-    };
-    let (mut request, response) =
-        match lower_chat_request(request_id, &model, body, engine.processor()) {
-            Ok(lowered) => lowered,
-            Err(error) => return error.into_response(),
-        };
-    request.adapter = adapter;
+    if adapter.is_none()
+        && let Err(error) = check_model_served(&body.model, engine.served_model_name())
+    {
+        return error.into_response();
+    }
+
     let request_span = tracing::info_span!(
         "chat_completions",
-        request_id = %response.request_id,
+        request_id = %request_id,
         engine_request_id = tracing::field::Empty,
     );
-
-    // One timestamp for the whole response, shared by every streamed chunk.
-    let created = crate::openai::unix_time();
-    let handed = match engine
-        .generate(request)
+    let (events, output) = match engine
+        .generate(request_id.clone(), body, adapter)
         .instrument(request_span.clone())
         .await
     {
-        Ok(handed) => handed,
-        Err(error) => return ApiError::from(error).into_response(),
+        Ok(generation) => generation,
+        Err(error) => return error.into_response(),
     };
-    let request_id = response.request_id.clone();
+
     // A streamed response writes its head at once and answers as server-sent
     // events; a response answered as one document holds its head until the
-    // document exists, so its status is the outcome.
-    let (session, content_type, opening): (Box<dyn crate::body::Session>, _, _) = if stream {
-        let sink = ChatStreamEmitter::new(&response, created);
-        match chat_body(handed, response, sink) {
-            Ok(run) => (
-                Box::new(run),
-                "text/event-stream",
-                crate::body::Opening::Streamed { keep_alive: true },
-            ),
-            Err(error) => return error.into_response(),
-        }
+    // document exists, so its status is its result.
+    let (session, content_type, opening): (Box<dyn Session>, _, _) = if stream {
+        let sink = ChatStreamEmitter::new(output.response());
+        (
+            Box::new(GenerationRun::new(events, output, sink)),
+            "text/event-stream",
+            Opening::Streamed { keep_alive: true },
+        )
     } else {
-        let sink = crate::output::run::ChatBodySink::new(&response, created);
-        match chat_body(handed, response, sink) {
-            Ok(run) => (
-                Box::new(run),
-                "application/json",
-                crate::body::Opening::Held,
-            ),
-            Err(error) => return error.into_response(),
-        }
+        let sink = ChatBodySink::new(output.response());
+        (
+            Box::new(GenerationRun::new(events, output, sink)),
+            "application/json",
+            Opening::Held,
+        )
     };
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type);
-    if opening != crate::body::Opening::Held {
+    if opening != Opening::Held {
         builder = builder
             .header(header::CACHE_CONTROL, "no-cache")
             .header(header::CONNECTION, "keep-alive");
@@ -153,174 +139,30 @@ async fn chat_completions(
     }
 }
 
-/// The body of one submitted chat request, whose outputs `sink` turns into
-/// the frames the response writes.
-///
-/// `handed` is what [`Server::generate`] returned for the request and
-/// `context` the response options its lowering captured.
+/// The non-streaming response `collector` collected, with the fields
+/// `options` asks for.
 ///
 /// # Errors
 ///
-/// Fails when the request's output pipeline cannot be built, for example
-/// because its prompt is empty.
-pub fn chat_body<S: crate::output::run::ResponseSink>(
-    handed: Generation,
-    context: ChatResponseContext,
-    sink: S,
-) -> Result<crate::output::run::GenerationRun<S>, ApiError> {
-    let Generation {
-        events,
-        output,
-        compile_us,
-        outcome,
-    } = handed;
-    let crate::output::OutputParams {
-        tokenizer,
-        prompt_token_ids,
-        decode,
-        prompt_logprobs,
-        logprobs,
-        processor,
-    } = output;
-    let request_id = context.request_id.clone();
-    let parser = *processor.parser();
-    let inputs = crate::output::run::ChatOutputInputs {
-        tokenizer,
-        prompt_token_ids,
-        decode,
-        prompt_logprobs,
-        logprobs,
-        processor,
-        parser,
-        context,
-    };
-    crate::output::run::GenerationRun::new(
-        request_id.clone(),
-        compile_us,
-        inputs,
-        events,
-        outcome,
-        sink,
-    )
-    .map_err(|error| {
-        ApiError::from(crate::output::OutputError {
-            request_id,
-            source: error.into(),
-        })
-    })
-}
-
-/// Validates the rules of a chat request that depend on the served model.
-///
-/// Rejects a `model` other than `served_model_name` with
-/// [`ApiError::ModelNotFound`], and rejects with [`ApiError::InvalidRequest`]
-/// a `prompt_logprobs` value below `-1` or a positive or `-1` value on a
-/// streamed request.
-pub fn validate_request_compat(
-    request: &ChatCompletionRequest,
-    served_model_name: &str,
-) -> Result<(), ApiError> {
-    check_model_served(&request.model, served_model_name)?;
-
-    if let Some(prompt_logprobs) = request.prompt_logprobs {
-        // Any non-negative count, or `-1` for the full vocabulary.
-        if prompt_logprobs < -1 {
-            bail_invalid_request!(
-                param = "prompt_logprobs",
-                "prompt_logprobs must be a non-negative value or -1."
-            );
-        }
-
-        // Stream chunks (`ChatCompletionStreamResponse`) have no
-        // `prompt_logprobs` field, so a streamed response could not deliver
-        // them. A streamed `0` is accepted, as vLLM accepts it, and
-        // `lower_chat_request` drops it.
-        if request.stream && (prompt_logprobs > 0 || prompt_logprobs == -1) {
-            bail_invalid_request!(
-                param = "prompt_logprobs",
-                "prompt_logprobs are not available when stream=true."
-            );
-        }
-    }
-
-    Ok(())
-}
-
-/// The response options of one chat request, captured when the request is
-/// lowered.
-///
-/// The handler passes it to the response's sink ([`ChatCollector`] through
-/// `output::run::ChatBodySink`, or [`ChatStreamEmitter`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChatResponseContext {
-    /// OpenAI-compatible response identifier.
-    pub request_id: String,
-    /// Model name reported in response objects.
-    pub response_model: String,
-    /// Whether streaming responses include a terminal usage chunk
-    /// (`stream_options.include_usage`). Non-streaming responses always
-    /// carry usage.
-    pub include_usage: bool,
-    /// Whether generated-token logprobs were requested.
-    pub requested_logprobs: bool,
-    /// How many of a generated position's candidates `top_logprobs` lists, in the engine's order
-    /// (the sampled token first): the request's `top_logprobs`, zero when unset and every one for
-    /// `-1` - vLLM's `chat_top_logprobs_limit`.
-    pub top_logprobs: u32,
-    /// Whether prompt-token logprobs were requested. Only non-streaming
-    /// responses carry them; [`validate_request_compat`] rejects a streamed
-    /// request that asks for a positive or `-1` count, and
-    /// [`lower_chat_request`] drops a streamed `0`.
-    pub include_prompt_logprobs: bool,
-    /// Whether parsed reasoning is exposed in responses.
-    pub include_reasoning: bool,
-    /// Whether token identifiers are exposed in responses.
-    pub return_token_ids: bool,
-    /// Whether textual tokens use token-identifier placeholders.
-    pub return_tokens_as_token_ids: bool,
-}
-
-impl ChatResponseContext {
-    /// Captures the response options of `request`.
-    pub fn from_request(
-        request: &ChatCompletionRequest,
-        request_id: String,
-        served_model_name: &str,
-    ) -> Self {
-        Self {
-            request_id,
-            response_model: served_model_name.to_string(),
-            include_usage: request
-                .stream_options
-                .as_ref()
-                .and_then(|options| options.include_usage)
-                .unwrap_or(false),
-            requested_logprobs: request.logprobs,
-            top_logprobs: request
-                .top_logprobs
-                .map_or(0, |count| u32::try_from(count).unwrap_or(u32::MAX)),
-            include_prompt_logprobs: request.prompt_logprobs.is_some(),
-            include_reasoning: request.include_reasoning,
-            return_token_ids: request.return_token_ids.unwrap_or(false),
-            return_tokens_as_token_ids: request.return_tokens_as_token_ids.unwrap_or(false),
-        }
-    }
-}
-
-/// The non-streaming response of one collected request.
-///
-/// # Errors
-///
-/// Fails when the request asked for logprobs generation did not return, or
-/// when a logprob cannot be converted.
+/// Fails when the request's terminal output has not arrived, when the request
+/// asked for logprobs generation did not return, or when a logprob cannot be
+/// converted.
 pub fn chat_response(
-    collected: CollectedChatOutput,
-    context: &ChatResponseContext,
-    created: u64,
+    collector: &ChatCollector,
+    options: &handoff::ChatResponseOptions,
 ) -> Result<ChatCompletionResponse, ApiError> {
-    let ChatResponseContext {
-        request_id,
-        response_model,
+    let Some((reason, stop_reason, usage)) = collector.finished.clone() else {
+        return Err(server_error!(
+            "chat completion stream closed before terminal finish event"
+        ));
+    };
+    let blocks = || {
+        collector
+            .blocks
+            .iter()
+            .filter_map(|block| block.block.as_ref())
+    };
+    let handoff::ChatResponseOptions {
         requested_logprobs,
         top_logprobs,
         include_prompt_logprobs,
@@ -328,39 +170,46 @@ pub fn chat_response(
         return_token_ids,
         return_tokens_as_token_ids,
         ..
-    } = context.clone();
-    let CollectedChatOutput {
-        message,
-        prompt_token_ids,
-        prompt_logprobs,
-        logprobs,
-        token_ids,
-        reason,
-        usage,
-    } = collected;
+    } = *options;
 
-    let stop_reason = stop_reason_value(&reason);
-    let saw_tool_calls = message.tool_calls().next().is_some();
-    let reasoning = message.reasoning();
+    let stop_reason = stop_reason_value(stop_reason.as_ref());
+    // The message's visible text, its reasoning and its tool calls, each the
+    // concatenation of its blocks in order.
+    let text: String = blocks()
+        .filter_map(|block| match block {
+            Block::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let reasoning: String = blocks()
+        .filter_map(|block| match block {
+            Block::Reasoning(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let reasoning = Some(reasoning).filter(|text| !text.is_empty());
+    let tool_calls = blocks()
+        .filter_map(|block| match block {
+            Block::ToolCall(call) => Some(ToolCall {
+                id: call.id.clone(),
+                tool_type: "function".to_string(),
+                function: FunctionCallResponse {
+                    name: call.name.clone(),
+                    arguments: Some(call.arguments.clone()),
+                },
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let saw_tool_calls = !tool_calls.is_empty();
     // Output logprobs and token IDs cover the complete generated token stream.
     // When reasoning is hidden, omit them rather than leaking hidden reasoning
     // tokens through per-token metadata.
     let include_output_metadata = include_reasoning || reasoning.is_none();
     let finish_reason = openai_finish_reason(&reason, saw_tool_calls).to_string();
-    let tool_calls = message
-        .tool_calls()
-        .map(|call| ToolCall {
-            id: call.id.clone(),
-            tool_type: "function".to_string(),
-            function: FunctionCallResponse {
-                name: call.name.clone(),
-                arguments: Some(call.arguments.clone()),
-            },
-        })
-        .collect::<Vec<_>>();
     let logprobs = if requested_logprobs && include_output_metadata {
         Some(decoded_logprobs_to_openai_chat(
-            logprobs.as_ref().ok_or_else(|| {
+            collector.logprobs.as_ref().ok_or_else(|| {
                 server_error!("chat response requested logprobs but generation returned none")
             })?,
             return_tokens_as_token_ids,
@@ -371,7 +220,7 @@ pub fn chat_response(
     };
     let prompt_logprobs = if include_prompt_logprobs {
         Some(decoded_prompt_logprobs_to_maps(
-            prompt_logprobs.as_ref().ok_or_else(|| {
+            collector.prompt_logprobs.as_ref().ok_or_else(|| {
                 server_error!(
                     "chat response requested prompt_logprobs but generation returned none"
                 )
@@ -384,41 +233,28 @@ pub fn chat_response(
     let usage = Usage::new(usage.prompt_tokens, usage.output_tokens);
 
     Ok(ChatCompletionResponse {
-        id: request_id,
+        id: options.request_id.clone(),
         object: "chat.completion".to_string(),
-        created,
-        model: response_model,
+        created: options.created,
+        model: options.response_model.clone(),
         choices: vec![ChatCompletionChoice {
             index: 0,
             message: ChatCompletionMessage {
                 role: AssistantRole,
-                content: Some(message.text()).filter(|text| !text.is_empty()),
+                content: Some(text).filter(|text| !text.is_empty()),
                 tool_calls: Some(tool_calls).filter(|calls| !calls.is_empty()),
                 reasoning: if include_reasoning { reasoning } else { None },
             },
             logprobs,
             finish_reason: Some(finish_reason),
             stop_reason,
-            token_ids: (return_token_ids && include_output_metadata).then_some(token_ids),
+            token_ids: (return_token_ids && include_output_metadata)
+                .then(|| collector.token_ids.clone()),
         }],
         usage: Some(usage),
         prompt_logprobs,
-        prompt_token_ids: return_token_ids.then(|| prompt_token_ids.to_vec()),
+        prompt_token_ids: return_token_ids.then(|| collector.prompt_token_ids.clone()),
     })
-}
-
-/// Everything a [`ChatCollector`] accumulates from one request's outputs.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CollectedChatOutput {
-    message: AssistantMessage,
-    prompt_token_ids: Vec<u32>,
-    prompt_logprobs: Option<crate::output::text::DecodedPromptLogprobs>,
-    /// Output logprobs concatenated across `TokenDelta` updates; `None` when
-    /// no update carried any.
-    logprobs: Option<DecodedLogprobs>,
-    token_ids: Vec<u32>,
-    reason: FinishReason,
-    usage: crate::output::RequestUsage,
 }
 
 /// One non-streaming chat response, collected from the request's outputs.
@@ -430,14 +266,17 @@ pub struct CollectedChatOutput {
 /// response has.
 #[derive(Default)]
 pub struct ChatCollector {
-    message: AssistantMessage,
+    /// The closed blocks of the assistant message, in order.
+    blocks: Vec<handoff::AssistantBlock>,
     prompt_token_ids: Vec<u32>,
-    prompt_logprobs: Option<crate::output::text::DecodedPromptLogprobs>,
+    prompt_logprobs: Option<DecodedPromptLogprobs>,
     /// Output logprobs concatenated across `TokenDelta` updates; `None` when
     /// no update carried any.
     logprobs: Option<DecodedLogprobs>,
     token_ids: Vec<u32>,
-    finished: Option<(FinishReason, crate::output::RequestUsage)>,
+    /// The request's terminal output: why it finished, the stop token or
+    /// string that matched, and what it consumed.
+    finished: Option<(FinishReason, Option<StopReason>, RequestUsage)>,
 }
 
 impl ChatCollector {
@@ -471,13 +310,22 @@ impl ChatCollector {
                         .extend(delta_logprobs.positions.iter().cloned());
                 }
             }
-            RequestOutput::OutputBlockEnd { block, .. } => self.message.push_block(block.clone()),
-            RequestOutput::ToolCallEnd { call, .. } => {
-                self.message
-                    .push_block(AssistantContentBlock::ToolCall(call.clone()));
+            RequestOutput::OutputBlockEnd { block, .. } => {
+                self.blocks.push(handoff::AssistantBlock {
+                    block: Some(block.clone()),
+                });
             }
-            RequestOutput::Finished { reason, usage } => {
-                self.finished = Some((reason.clone(), usage.clone()));
+            RequestOutput::ToolCallEnd { call, .. } => {
+                self.blocks.push(handoff::AssistantBlock {
+                    block: Some(Block::ToolCall(call.clone())),
+                });
+            }
+            RequestOutput::Finished {
+                reason,
+                stop_reason,
+                usage,
+            } => {
+                self.finished = Some((reason.clone(), stop_reason.clone(), usage.clone()));
             }
             RequestOutput::Rejected { kind, message } => {
                 return Err(ApiError::rejected(*kind, message.clone()));
@@ -497,68 +345,25 @@ impl ChatCollector {
         self.finished.is_some()
     }
 
-    /// The collected response, once its terminal output arrived.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the stream ended before the terminal output.
-    pub fn collected(&self) -> Result<CollectedChatOutput, ApiError> {
-        let Some((reason, usage)) = self.finished.clone() else {
-            return Err(server_error!(
-                "chat completion stream closed before terminal finish event"
-            ));
-        };
-        Ok(CollectedChatOutput {
-            message: self.message.clone(),
-            prompt_token_ids: self.prompt_token_ids.clone(),
-            prompt_logprobs: self.prompt_logprobs.clone(),
-            logprobs: self.logprobs.clone(),
-            token_ids: self.token_ids.clone(),
-            reason,
-            usage,
-        })
-    }
-
     /// The collector's state, for the process that goes on collecting after a
     /// hot restart (design §7.5.1 step 3).
     pub fn state(&self) -> handoff::ChatCollection {
         let finish_reason = self
             .finished
             .as_ref()
-            .map(|(reason, _)| reason.as_str().to_owned())
+            .map(|(reason, _, _)| finish_reason_name(reason).to_owned())
             .unwrap_or_default();
         handoff::ChatCollection {
-            blocks: self
-                .message
-                .content
-                .iter()
-                .map(|block| match block {
-                    AssistantContentBlock::Text { text } => handoff::AssistantBlock {
-                        block: Some(handoff::assistant_block::Block::Text(text.clone())),
-                    },
-                    AssistantContentBlock::Reasoning { text } => handoff::AssistantBlock {
-                        block: Some(handoff::assistant_block::Block::Reasoning(text.clone())),
-                    },
-                    AssistantContentBlock::ToolCall(call) => handoff::AssistantBlock {
-                        block: Some(handoff::assistant_block::Block::ToolCall(
-                            handoff::ToolCall {
-                                id: call.id.clone(),
-                                name: call.name.clone(),
-                                arguments: call.arguments.clone(),
-                            },
-                        )),
-                    },
-                })
-                .collect(),
+            blocks: self.blocks.clone(),
             prompt_token_ids: self.prompt_token_ids.clone(),
             // The logprobs the response already collected are the response:
             // the collector concatenated them as each update carried them, and
             // no later update repeats an earlier position (§7.5.1 step 3).
-            prompt_logprobs: self.prompt_logprobs.as_ref().map(handoff_prompt_logprobs),
-            logprobs: self.logprobs.as_ref().map(handoff_logprobs),
+            prompt_logprobs: self.prompt_logprobs.clone(),
+            logprobs: self.logprobs.clone(),
             token_ids: self.token_ids.clone(),
             finish_reason,
-            usage: self.finished.as_ref().map(|(_, usage)| handoff::Usage {
+            usage: self.finished.as_ref().map(|(_, _, usage)| handoff::Usage {
                 prompt_tokens: usage.prompt_tokens,
                 output_tokens: usage.output_tokens,
             }),
@@ -568,113 +373,19 @@ impl ChatCollector {
 
     /// Takes over a state this collector produced.
     pub fn resume(&mut self, state: &handoff::ChatCollection) {
-        let mut message = AssistantMessage::default();
-        for block in &state.blocks {
-            match block.block.as_ref() {
-                Some(handoff::assistant_block::Block::Text(text)) => {
-                    message.push_block(AssistantContentBlock::Text { text: text.clone() });
-                }
-                Some(handoff::assistant_block::Block::Reasoning(text)) => {
-                    message.push_block(AssistantContentBlock::Reasoning { text: text.clone() });
-                }
-                Some(handoff::assistant_block::Block::ToolCall(call)) => {
-                    message.push_block(AssistantContentBlock::ToolCall(
-                        crate::output::chat::AssistantToolCall {
-                            id: call.id.clone(),
-                            name: call.name.clone(),
-                            arguments: call.arguments.clone(),
-                        },
-                    ));
-                }
-                None => {}
-            }
-        }
-        self.message = message;
+        self.blocks.clone_from(&state.blocks);
         self.prompt_token_ids.clone_from(&state.prompt_token_ids);
-        self.prompt_logprobs = state.prompt_logprobs.as_ref().map(decoded_prompt_logprobs);
-        self.logprobs = state.logprobs.as_ref().map(decoded_logprobs);
+        self.prompt_logprobs.clone_from(&state.prompt_logprobs);
+        self.logprobs.clone_from(&state.logprobs);
         self.token_ids.clone_from(&state.token_ids);
         self.finished = None;
-    }
-}
-
-/// The generated-token logprobs a handoff carries (§7.5.1 step 3).
-fn handoff_logprobs(logprobs: &DecodedLogprobs) -> handoff::DecodedLogprobs {
-    handoff::DecodedLogprobs {
-        positions: logprobs.positions.iter().map(handoff_position).collect(),
-    }
-}
-
-/// One position's decoded candidates, as the handoff carries them.
-fn handoff_position(position: &DecodedPositionLogprobs) -> handoff::DecodedPositionLogprobs {
-    handoff::DecodedPositionLogprobs {
-        entries: position
-            .entries
-            .iter()
-            .map(|entry| handoff::DecodedTokenLogprob {
-                token_id: entry.token_id,
-                token: entry.token.clone(),
-                logprob: entry.logprob,
-                rank: entry.rank,
-            })
-            .collect(),
-    }
-}
-
-/// The prompt logprobs a handoff carries, as [`handoff_logprobs`].
-fn handoff_prompt_logprobs(logprobs: &DecodedPromptLogprobs) -> handoff::DecodedPromptLogprobs {
-    handoff::DecodedPromptLogprobs {
-        first_token_id: logprobs.first_token_id,
-        first_token: logprobs.first_token.clone(),
-        scored_positions: logprobs
-            .scored_positions
-            .iter()
-            .map(handoff_position)
-            .collect(),
-    }
-}
-
-/// The generated-token logprobs a collector resumes with.
-fn decoded_logprobs(state: &handoff::DecodedLogprobs) -> DecodedLogprobs {
-    DecodedLogprobs {
-        positions: state.positions.iter().map(decoded_position).collect(),
-    }
-}
-
-/// One position's decoded candidates, as a resumed collector holds them.
-fn decoded_position(position: &handoff::DecodedPositionLogprobs) -> DecodedPositionLogprobs {
-    DecodedPositionLogprobs {
-        entries: position
-            .entries
-            .iter()
-            .map(|entry| DecodedTokenLogprob {
-                token_id: entry.token_id,
-                token: entry.token.clone(),
-                logprob: entry.logprob,
-                rank: entry.rank,
-            })
-            .collect(),
-    }
-}
-
-/// The prompt logprobs a collector resumes with.
-fn decoded_prompt_logprobs(state: &handoff::DecodedPromptLogprobs) -> DecodedPromptLogprobs {
-    DecodedPromptLogprobs {
-        first_token_id: state.first_token_id,
-        first_token: state.first_token.clone(),
-        scored_positions: state
-            .scored_positions
-            .iter()
-            .map(decoded_position)
-            .collect(),
     }
 }
 
 /// The OpenAI chunks of one streamed chat completion: converts one serving
 /// event stream into OpenAI chat-completion chunks.
 ///
-/// `context` holds the response options the request chose. Prompt logprobs
-/// are never streamed (`ChatResponseContext::include_prompt_logprobs`). The
+/// Prompt logprobs are never streamed: a chunk has no field for them. The
 /// chunk sequence is an assistant-role start chunk, content, reasoning,
 /// tool-call, logprob, and image deltas, one chunk carrying `finish_reason`,
 /// and, with `include_usage`, a final usage chunk.
@@ -689,9 +400,8 @@ fn decoded_prompt_logprobs(state: &handoff::DecodedPromptLogprobs) -> DecodedPro
 /// successor writes the same chunk sequence, including the chunk an update
 /// had buffered when the response stopped.
 pub struct ChatStreamEmitter {
-    context: ChatResponseContext,
-    /// The response's `created` timestamp, which every chunk repeats.
-    created: u64,
+    /// The response's OpenAI fields; every chunk repeats its `created`.
+    response: handoff::ChatResponseOptions,
     /// Whether a tool call was published, which the finish reason follows.
     saw_tool_calls: bool,
     /// Whether a reasoning block is open that the client does not see.
@@ -707,16 +417,14 @@ pub struct ChatStreamEmitter {
 }
 
 impl ChatStreamEmitter {
-    /// The emitter of the streamed response `context` describes, whose chunks
-    /// carry the `created` timestamp.
-    pub fn new(context: &ChatResponseContext, created: u64) -> Self {
+    /// The emitter of the streamed response `response` describes.
+    pub fn new(response: &handoff::ChatResponseOptions) -> Self {
         // With logprobs or token IDs requested, semantic deltas are buffered
         // until the update's `TokenDelta` arrives, so one chunk carries both.
-        let pending_chunk = (context.requested_logprobs || context.return_token_ids)
+        let pending_chunk = (response.requested_logprobs || response.return_token_ids)
             .then(PendingChatChunk::default);
         Self {
-            context: context.clone(),
-            created,
+            response: response.clone(),
             saw_tool_calls: false,
             inside_hidden_reasoning: false,
             suppress_current_update_metadata: false,
@@ -746,11 +454,11 @@ impl ChatStreamEmitter {
         match output {
             RequestOutput::Accepted(prompt) => {
                 let mut chunk = start_chunk(
-                    &self.context.request_id,
-                    &self.context.response_model,
-                    self.created,
+                    &self.response.request_id,
+                    &self.response.response_model,
+                    self.response.created,
                 );
-                if self.context.return_token_ids {
+                if self.response.return_token_ids {
                     chunk.prompt_token_ids = Some(prompt.token_ids.to_vec());
                 }
                 chunks.push(chunk);
@@ -762,9 +470,9 @@ impl ChatStreamEmitter {
                         pending_chunk.push_block_delta(kind, text.clone());
                     } else {
                         chunks.push(block_delta_chunk(
-                            &self.context.request_id,
-                            &self.context.response_model,
-                            self.created,
+                            &self.response.request_id,
+                            &self.response.response_model,
+                            self.response.created,
                             kind,
                             text.clone(),
                         ));
@@ -784,8 +492,8 @@ impl ChatStreamEmitter {
                         .map(|lp| {
                             decoded_logprobs_to_openai_chat(
                                 lp,
-                                self.context.return_tokens_as_token_ids,
-                                self.context.top_logprobs,
+                                self.response.return_tokens_as_token_ids,
+                                self.response.top_logprobs,
                             )
                         })
                         .transpose()?
@@ -794,39 +502,39 @@ impl ChatStreamEmitter {
                 };
                 let openai_token_ids = include_metadata
                     .then_some(token_ids)
-                    .and_then(|token_ids| self.context.return_token_ids.then_some(token_ids))
+                    .and_then(|token_ids| self.response.return_token_ids.then_some(token_ids))
                     .filter(|tokens| !tokens.is_empty());
                 if let Some(pending_chunk) = self.pending_chunk.as_mut() {
                     pending_chunk.logprobs = openai_logprobs;
                     pending_chunk.token_ids = openai_token_ids.cloned();
                     if let Some(chunk) = pending_chunk.take_chunk(
-                        &self.context.request_id,
-                        &self.context.response_model,
-                        self.created,
+                        &self.response.request_id,
+                        &self.response.response_model,
+                        self.response.created,
                     ) {
                         chunks.push(chunk);
                     }
                 } else if let Some(logprobs) = openai_logprobs {
                     chunks.push(logprobs_only_chunk(
-                        &self.context.request_id,
-                        &self.context.response_model,
-                        self.created,
+                        &self.response.request_id,
+                        &self.response.response_model,
+                        self.response.created,
                         logprobs,
                     ));
                 }
             }
             RequestOutput::ReasoningDelta { text: delta } => {
                 let kind = AssistantBlockKind::Reasoning;
-                let include_delta = self.context.include_reasoning
+                let include_delta = self.response.include_reasoning
                     || !matches!(kind, AssistantBlockKind::Reasoning);
                 if include_delta {
                     if let Some(pending_chunk) = self.pending_chunk.as_mut() {
                         pending_chunk.push_block_delta(kind, delta.clone());
                     } else {
                         chunks.push(block_delta_chunk(
-                            &self.context.request_id,
-                            &self.context.response_model,
-                            self.created,
+                            &self.response.request_id,
+                            &self.response.response_model,
+                            self.response.created,
                             kind,
                             delta.clone(),
                         ));
@@ -837,7 +545,7 @@ impl ChatStreamEmitter {
             }
             RequestOutput::OutputBlockStart { kind, .. } => {
                 debug!(?kind, "starting new block");
-                if !self.context.include_reasoning && matches!(kind, AssistantBlockKind::Reasoning)
+                if !self.response.include_reasoning && matches!(kind, AssistantBlockKind::Reasoning)
                 {
                     self.inside_hidden_reasoning = true;
                     self.suppress_current_update_metadata = true;
@@ -862,9 +570,9 @@ impl ChatStreamEmitter {
                     pending_chunk.push_tool_call_start(tool_index, id.clone(), name.clone());
                 } else {
                     chunks.push(tool_call_start_chunk(
-                        &self.context.request_id,
-                        &self.context.response_model,
-                        self.created,
+                        &self.response.request_id,
+                        &self.response.response_model,
+                        self.response.created,
                         tool_index,
                         id.clone(),
                         name.clone(),
@@ -877,9 +585,9 @@ impl ChatStreamEmitter {
                     pending_chunk.push_tool_call_arguments(tool_index, delta.clone());
                 } else {
                     chunks.push(tool_call_arguments_chunk(
-                        &self.context.request_id,
-                        &self.context.response_model,
-                        self.created,
+                        &self.response.request_id,
+                        &self.response.response_model,
+                        self.response.created,
                         tool_index,
                         delta.clone(),
                     ));
@@ -888,28 +596,33 @@ impl ChatStreamEmitter {
             RequestOutput::ToolCallEnd { .. } => {
                 debug!("ending current tool call");
             }
-            RequestOutput::Finished { reason, usage } => {
+            RequestOutput::Finished {
+                reason,
+                stop_reason,
+                usage,
+            } => {
                 if let Some(pending_chunk) = self.pending_chunk.as_mut()
                     && let Some(chunk) = pending_chunk.take_chunk(
-                        &self.context.request_id,
-                        &self.context.response_model,
-                        self.created,
+                        &self.response.request_id,
+                        &self.response.response_model,
+                        self.response.created,
                     )
                 {
                     chunks.push(chunk);
                 }
                 chunks.push(final_chunk(
-                    &self.context.request_id,
-                    &self.context.response_model,
-                    self.created,
+                    &self.response.request_id,
+                    &self.response.response_model,
+                    self.response.created,
                     reason,
+                    stop_reason.as_ref(),
                     self.saw_tool_calls,
                 ));
-                if self.context.include_usage {
+                if self.response.include_usage {
                     chunks.push(usage_chunk(
-                        &self.context.request_id,
-                        &self.context.response_model,
-                        self.created,
+                        &self.response.request_id,
+                        &self.response.response_model,
+                        self.response.created,
                         Usage::new(usage.prompt_tokens, usage.output_tokens),
                     ));
                 }
@@ -953,7 +666,7 @@ impl ChatStreamEmitter {
             suppress_current_update_metadata: self.suppress_current_update_metadata,
             frames: self.frames,
             done: self.done,
-            created: self.created,
+            created: self.response.created,
         })
     }
 
@@ -964,7 +677,6 @@ impl ChatStreamEmitter {
         self.suppress_current_update_metadata = state.suppress_current_update_metadata;
         self.frames = state.frames;
         self.done = state.done;
-        self.created = state.created;
     }
 
     /// Whether a chunk is buffered from an update whose metadata has not
@@ -1035,9 +747,12 @@ impl PendingChatChunk {
                 index,
                 id: Some(id),
                 tool_type: Some("function".to_string()),
+                // The call opens with its name and empty arguments, as OpenAI's first
+                // chunk of a call does, so a client that concatenates `arguments` has
+                // a string to start from.
                 function: Some(FunctionCallDelta {
                     name: Some(name),
-                    arguments: None,
+                    arguments: Some(String::new()),
                 }),
             });
     }
@@ -1175,9 +890,12 @@ fn tool_call_start_chunk(
                 index: tool_index,
                 id: Some(id),
                 tool_type: Some("function".to_string()),
+                // The call opens with its name and empty arguments, as OpenAI's first
+                // chunk of a call does, so a client that concatenates `arguments` has
+                // a string to start from.
                 function: Some(FunctionCallDelta {
                     name: Some(name),
-                    arguments: None,
+                    arguments: Some(String::new()),
                 }),
             }]),
             ..Default::default()
@@ -1235,9 +953,10 @@ fn final_chunk(
     response_model: &str,
     created: u64,
     reason: &FinishReason,
+    stop_reason: Option<&StopReason>,
     saw_tool_calls: bool,
 ) -> ChatCompletionStreamResponse {
-    let stop_reason = stop_reason_value(reason);
+    let stop_reason = stop_reason_value(stop_reason);
     let finish_reason = openai_finish_reason(reason, saw_tool_calls);
 
     debug!(
@@ -1260,162 +979,21 @@ fn final_chunk(
 /// A stop after any tool call reports `tool_calls`, and a repetition stop
 /// reports `stop`.
 fn openai_finish_reason(reason: &FinishReason, saw_tool_calls: bool) -> &'static str {
-    match reason {
-        FinishReason::Stop(_) if saw_tool_calls => "tool_calls",
-        FinishReason::Stop(_) | FinishReason::Repetition => "stop",
-        reason => reason.as_str(),
+    match finish_reason_name(reason) {
+        "stop" if saw_tool_calls => "tool_calls",
+        "repetition" => "stop",
+        name => name,
     }
 }
 
 /// Returns the `stop_reason` response value: the matched stop token ID or
-/// stop string, or `None` for a stop without one and every other reason.
-fn stop_reason_value(reason: &FinishReason) -> Option<Value> {
+/// stop string, or `None` for a finish without one.
+fn stop_reason_value(reason: Option<&StopReason>) -> Option<Value> {
     match reason {
-        FinishReason::Stop(Some(StopReason::Token(id))) => Some(serde_json::json!(id)),
-        FinishReason::Stop(Some(StopReason::String(text))) => Some(serde_json::json!(text)),
-        _ => None,
+        Some(StopReason::Token(id)) => Some(serde_json::json!(id)),
+        Some(StopReason::String(text)) => Some(serde_json::json!(text)),
+        None => None,
     }
-}
-
-/// Validates and lowers one chat completion request into the serving
-/// layer's generate request, capturing its response options.
-///
-/// # Errors
-///
-/// Fails as [`validate_request_compat`] does, and with an invalid request
-/// for template kwargs that set a variable the request itself determines, an
-/// assistant message with no reasoning, content, or tool calls or with image
-/// content, a non-function tool call, or a `logit_bias` key that is not a
-/// token ID.
-pub fn lower_chat_request(
-    request_id: String,
-    served_model_name: &str,
-    request: ChatCompletionRequest,
-    processor: &InputProcessor,
-) -> Result<(GenerateRequest, ChatResponseContext), ApiError> {
-    validate_request_compat(&request, served_model_name)?;
-    let context =
-        ChatResponseContext::from_request(&request, request_id.clone(), served_model_name);
-
-    // Stream chunks have no `prompt_logprobs` field. Validation accepts a
-    // streamed `prompt_logprobs: 0` for vLLM compatibility, but lowering it
-    // would score every prompt position and disable prefix-cache reads for
-    // output the client never receives, so the sampling lowering drops it.
-    let logit_bias = convert_logit_bias(request.logit_bias.clone())?;
-    let sampling =
-        processor
-            .sampling(&request, logit_bias)
-            .map_err(|source| ServeError::Tokenize {
-                request_id: request_id.clone(),
-                source,
-            })?;
-    let decode = TextDecodeOptions {
-        skip_special_tokens: request.skip_special_tokens,
-        include_stop_str_in_output: request.include_stop_str_in_output,
-        stop_strings: request
-            .stop
-            .map(|stop| stop.into_vec())
-            .filter(|stop| !stop.is_empty()),
-        min_tokens: request.min_tokens.unwrap_or(0),
-    };
-
-    // Template kwargs may not replace the variables the renderer derives
-    // from the request itself.
-    let template_kwargs = request.chat_template_kwargs.unwrap_or_default();
-    if let Some(name) = crate::input::chat::ChatConfig::RESERVED_TEMPLATE_KWARGS
-        .into_iter()
-        .find(|name| template_kwargs.contains_key(*name))
-    {
-        bail_invalid_request!(
-            param = "chat_template_kwargs",
-            "chat_template_kwargs may not set `{name}`, which the request itself determines."
-        );
-    }
-    for message in &request.messages {
-        validate_message(message)?;
-    }
-
-    let lowered = GenerateRequest {
-        request_id,
-        prompt: ChatRequest {
-            messages: request.messages,
-            tools: convert_tools(request.tools),
-            // An absent choice lets the model decide, as OpenAI's default does.
-            tool_choice: request.tool_choice.unwrap_or(ChatToolChoice::Auto),
-            chat_options: crate::input::chat::ChatConfig {
-                reasoning_effort: request.reasoning_effort,
-                template_kwargs,
-                ..Default::default()
-            },
-        },
-        image_output: request.modalities.contains(&ChatModality::Image),
-        sampling,
-        max_tokens: request.max_completion_tokens,
-        stop_token_ids: request.stop_token_ids.unwrap_or_default(),
-        decode,
-        priority: request.priority.unwrap_or(0),
-        cache_salt: request.cache_salt,
-        adapter: None,
-    };
-    Ok((lowered, context))
-}
-
-/// Validates one wire chat message as the template renders it.
-///
-/// # Errors
-///
-/// Rejects an assistant message with no reasoning, content, or tool calls, an
-/// assistant message with image content, and a non-function tool call.
-fn validate_message(message: &ChatMessage) -> Result<(), ApiError> {
-    let ChatMessage::Assistant {
-        content,
-        tool_calls,
-        reasoning,
-        ..
-    } = message
-    else {
-        return Ok(());
-    };
-    if let Some(MessageContent::Parts(parts)) = content
-        && parts
-            .iter()
-            .any(|part| matches!(part, ContentPart::ImageUrl { .. }))
-    {
-        bail_invalid_request!("Assistant message content must be text.");
-    }
-    let tool_calls = tool_calls.as_deref().unwrap_or_default();
-    if tool_calls.iter().any(|call| call.tool_type != "function") {
-        bail_invalid_request!("Only function tool calls are supported.");
-    }
-    let has_reasoning = reasoning.as_ref().is_some_and(|text| !text.is_empty());
-    let has_content = match content {
-        None => false,
-        Some(MessageContent::Text(_)) => true,
-        Some(MessageContent::Parts(parts)) => !parts.is_empty(),
-    };
-    if !has_reasoning && !has_content && tool_calls.is_empty() {
-        bail_invalid_request!("Assistant messages must contain content or tool_calls.");
-    }
-    Ok(())
-}
-
-impl From<&Tool> for tools::Tool {
-    /// The function a wire tool declares, as the template presents it and
-    /// the tool parser reads calls of it.
-    fn from(tool: &Tool) -> Self {
-        let Tool::Function { function } = tool;
-        Self {
-            name: function.name.clone(),
-            description: function.description.clone(),
-            parameters: function.parameters.clone(),
-            strict: None,
-        }
-    }
-}
-
-/// Converts OpenAI function tools into serving tool definitions.
-fn convert_tools(tools: Option<Vec<Tool>>) -> Vec<tools::Tool> {
-    tools.iter().flatten().map(tools::Tool::from).collect()
 }
 
 // Logprob values: the text layer's decoded candidates, where each position
@@ -1537,14 +1115,16 @@ fn clamp_logprob(logprob: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::protocol::ChatCompletionStreamResponse;
+    use proto::handoff::ChatResponseOptions;
+
     use super::ChatCollector;
-    use super::ChatResponseContext;
     use super::ChatStreamEmitter;
     use super::chat_response;
-    use crate::output::chat::{AssistantBlockKind, AssistantContentBlock};
-    use crate::output::text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
+    use crate::output::chat::AssistantBlockKind;
     use crate::output::{FinishReason, PromptInfo, RequestOutput, RequestUsage};
+    use crate::protocol::ChatCompletionStreamResponse;
+    use proto::handoff::assistant_block::Block;
+    use proto::handoff::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
 
     /// Single-candidate logprobs for one generated token.
     fn logprobs(token_id: u32) -> Option<DecodedLogprobs> {
@@ -1583,9 +1163,7 @@ mod tests {
             }),
             Ok(RequestOutput::OutputBlockEnd {
                 index: 0,
-                block: AssistantContentBlock::Reasoning {
-                    text: "think".to_string(),
-                },
+                block: Block::Reasoning("think".to_string()),
             }),
             Ok(RequestOutput::OutputBlockStart {
                 index: 1,
@@ -1599,7 +1177,8 @@ mod tests {
                 logprobs: logprobs(11),
             }),
             Ok(RequestOutput::Finished {
-                reason: FinishReason::Stop(None),
+                reason: FinishReason::Stop,
+                stop_reason: None,
                 usage: RequestUsage::default(),
             }),
         ]
@@ -1608,18 +1187,17 @@ mod tests {
     /// Streams `thinking_response` with logprobs and token IDs requested and
     /// returns the streamed token IDs and the number of logprob positions.
     async fn streamed_metadata(include_reasoning: bool) -> (Vec<u32>, usize) {
-        let context = ChatResponseContext {
+        let context = ChatResponseOptions {
             request_id: "r".to_string(),
             response_model: "m".to_string(),
             include_usage: false,
             requested_logprobs: true,
-            top_logprobs: 0,
-            include_prompt_logprobs: false,
             include_reasoning,
             return_token_ids: true,
-            return_tokens_as_token_ids: false,
+            created: 7,
+            ..Default::default()
         };
-        let mut emitter = ChatStreamEmitter::new(&context, 0);
+        let mut emitter = ChatStreamEmitter::new(&context);
         let chunks: Vec<ChatCompletionStreamResponse> = thinking_response()
             .into_iter()
             .flat_map(|output| emitter.push(&output.unwrap()).unwrap())
@@ -1664,16 +1242,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_handed_over_chunk_stage_writes_the_same_chunks() {
-        let context = ChatResponseContext {
+        let context = ChatResponseOptions {
             request_id: "r".to_string(),
             response_model: "m".to_string(),
             include_usage: true,
             requested_logprobs: true,
-            top_logprobs: 0,
-            include_prompt_logprobs: false,
             include_reasoning: true,
             return_token_ids: true,
-            return_tokens_as_token_ids: false,
+            created: 7,
+            ..Default::default()
         };
         let outputs: Vec<RequestOutput> = thinking_response()
             .into_iter()
@@ -1681,7 +1258,7 @@ mod tests {
             .collect();
 
         // The same response written in one process: the reference sequence.
-        let mut uninterrupted = ChatStreamEmitter::new(&context, 7);
+        let mut uninterrupted = ChatStreamEmitter::new(&context);
         let mut expected = Vec::new();
         for output in &outputs {
             expected.extend(uninterrupted.push(output).expect("a chunk"));
@@ -1693,7 +1270,7 @@ mod tests {
         // chunks; where it cannot, it says so instead of losing one.
         let mut handable = 0;
         for split in 1..outputs.len() {
-            let mut first = ChatStreamEmitter::new(&context, 7);
+            let mut first = ChatStreamEmitter::new(&context);
             let mut chunks = Vec::new();
             for output in &outputs[..split] {
                 chunks.extend(first.push(output).expect("a chunk"));
@@ -1704,7 +1281,7 @@ mod tests {
                 continue;
             };
             handable += 1;
-            let mut second = ChatStreamEmitter::new(&context, 7);
+            let mut second = ChatStreamEmitter::new(&context);
             second.resume(&state);
             for output in &outputs[split..] {
                 chunks.extend(second.push(output).expect("a chunk"));
@@ -1726,16 +1303,15 @@ mod tests {
     /// uninterrupted one does.
     #[tokio::test]
     async fn a_handed_over_collector_writes_the_same_response() {
-        let context = ChatResponseContext {
+        let context = ChatResponseOptions {
             request_id: "r".to_string(),
             response_model: "m".to_string(),
             include_usage: false,
             requested_logprobs: true,
-            top_logprobs: 0,
-            include_prompt_logprobs: false,
             include_reasoning: true,
             return_token_ids: true,
-            return_tokens_as_token_ids: false,
+            created: 7,
+            ..Default::default()
         };
         let outputs: Vec<RequestOutput> = thinking_response()
             .into_iter()
@@ -1746,15 +1322,9 @@ mod tests {
         for output in &outputs {
             uninterrupted.push(output).expect("a collected output");
         }
-        let expected = serde_json::to_value(
-            chat_response(
-                uninterrupted.collected().expect("the response"),
-                &context,
-                7,
-            )
-            .expect("a response"),
-        )
-        .expect("the response serializes");
+        let expected =
+            serde_json::to_value(chat_response(&uninterrupted, &context).expect("a response"))
+                .expect("the response serializes");
 
         for split in 1..outputs.len() {
             let mut first = ChatCollector::new();
@@ -1768,11 +1338,9 @@ mod tests {
             for output in &outputs[split..] {
                 second.push(output).expect("a collected output");
             }
-            let response = serde_json::to_value(
-                chat_response(second.collected().expect("the response"), &context, 7)
-                    .expect("a response"),
-            )
-            .expect("the response serializes");
+            let response =
+                serde_json::to_value(chat_response(&second, &context).expect("a response"))
+                    .expect("the response serializes");
             assert_eq!(
                 response, expected,
                 "a handoff after {split} outputs differs"
@@ -1784,19 +1352,18 @@ mod tests {
     /// rather than handing over a state that would drop it.
     #[tokio::test]
     async fn a_buffered_chunk_cannot_be_handed_over() {
-        let context = ChatResponseContext {
+        let context = ChatResponseOptions {
             request_id: "r".to_string(),
             response_model: "m".to_string(),
             include_usage: false,
             requested_logprobs: true,
-            top_logprobs: 0,
-            include_prompt_logprobs: false,
             include_reasoning: true,
             return_token_ids: true,
-            return_tokens_as_token_ids: false,
+            created: 7,
+            ..Default::default()
         };
         // The deltas of one update are buffered until its metadata arrives.
-        let mut emitter = ChatStreamEmitter::new(&context, 7);
+        let mut emitter = ChatStreamEmitter::new(&context);
         emitter
             .push(&RequestOutput::TextDelta {
                 text: "Hi".to_string(),

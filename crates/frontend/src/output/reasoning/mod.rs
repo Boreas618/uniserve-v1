@@ -1,48 +1,17 @@
-//! Streaming reasoning parsers and semantic deltas.
+//! The streaming reasoning parser and its deltas.
 //!
-//! A parser splits a stream of decoded text deltas into reasoning text and
-//! visible content by matching delimiter text such as `<think>` and
-//! `</think>`. [`DelimitedReasoningParser`] implements the state machine;
-//! [`Qwen3ReasoningParser`] configures it for its chat output format behind
-//! the [`ReasoningParser`] interface that the chat output stage consumes.
+//! [`DelimitedReasoningParser`] splits a stream of decoded text deltas into
+//! reasoning text and visible content by matching the delimiters of the
+//! request's reasoning format (`processing::ReasoningFormat`), such as
+//! `<think>` and `</think>`. One instance serves one generation stream: call
+//! `initialize` with the prompt, `push` for each decoded delta, then `finish`
+//! once at end of stream.
 
 mod delimited;
-mod qwen3;
 
 use thiserror::Error;
 
 pub use self::delimited::DelimitedReasoningParser;
-pub use self::qwen3::Qwen3ReasoningParser;
-
-/// Incremental split of one generation's decoded text into reasoning and
-/// visible content.
-///
-/// One instance serves one generation stream: call `initialize` with the
-/// prompt, `push` for each decoded delta, then `finish` once at end of stream.
-pub trait ReasoningParser: Send {
-    /// Chooses the region generation starts in from the prompt token IDs.
-    fn initialize(&mut self, prompt_token_ids: &[u32]);
-
-    /// Parses one decoded text delta into its reasoning and content parts.
-    ///
-    /// Text that could begin a delimiter stays buffered until a later delta
-    /// completes or rules it out, so the returned delta may be empty.
-    fn push(&mut self, delta: &str) -> ReasoningDelta;
-
-    /// Flushes buffered text at end of stream as text of the current region.
-    fn finish(&mut self) -> ReasoningDelta;
-
-    /// The parser's state, for a response that moves to another process
-    /// (design §7.5.1).
-    ///
-    /// `None` when the parser's state is not one delimited state machine's:
-    /// a model family the design retires keeps such a parser, and a stream
-    /// with one is served where it began.
-    fn state(&self) -> Option<proto::handoff::Reasoning>;
-
-    /// Restores the state [`Self::state`] reported.
-    fn resume(&mut self, state: &proto::handoff::Reasoning);
-}
 
 /// Result alias for reasoning parser calls.
 pub type Result<T> = std::result::Result<T, ReasoningError>;

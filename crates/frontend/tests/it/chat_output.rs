@@ -1,20 +1,20 @@
-//! Qwen3 reasoning and tool-call output behavior across stream boundaries.
+//! Reasoning and tool-call parsing of a chat request's output across stream boundaries, in each
+//! tool-call format.
 
 use std::sync::Arc;
 
-use frontend::input::chat::{ChatRequest, ChatToolChoice};
 use frontend::output::chat::AssistantEvent;
-use frontend::output::chat::{AssistantBlockKind, ChatOutputProcessor};
-use frontend::output::tools::Tool;
-use frontend::test_support::chat;
+use frontend::output::chat::{AssistantBlockKind, ChatParser};
 use frontend::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
+use proto::handoff;
 use tokenizers::models::bpe::BPE;
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 /// Builds a tokenizer whose only special tokens are the reasoning delimiters
-/// that `Qwen3ReasoningParser` requires and the `<|im_end|>` turn delimiter.
+/// that the `<think>` reasoning parser requires and the `<|im_end|>` turn
+/// delimiter.
 fn qwen_tokenizer() -> Result<DynTokenizer, Box<dyn std::error::Error + Send + Sync>> {
     let model = BPE::builder()
         .vocab_and_merges([("<unk>".to_string(), 0), ("a".to_string(), 1)], Vec::new())
@@ -30,27 +30,25 @@ fn qwen_tokenizer() -> Result<DynTokenizer, Box<dyn std::error::Error + Send + S
     Ok(Arc::new(HuggingFaceTokenizer::from_json(definition)?))
 }
 
-/// A chat request that declares the `lookup` tool with `Auto` tool choice,
-/// which enables tool-call parsing.
-fn request_with_lookup() -> ChatRequest {
-    let mut request = chat::request(vec![chat::user("test")]);
-    request.tools = vec![Tool {
-        name: "lookup".to_string(),
-        description: None,
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {"q": {"type": "string"}},
-            "required": ["q"]
-        }),
-        strict: None,
-    }];
-    request.tool_choice = ChatToolChoice::Auto;
-    request
+/// The parsers of a request whose family writes JSON tool calls: `<think>`
+/// reasoning when `reasoning` is set, tool calls when `tools` is.
+fn qwen3(
+    tools: bool,
+    tokenizer: DynTokenizer,
+    reasoning: bool,
+) -> Result<ChatParser, Box<dyn std::error::Error + Send + Sync>> {
+    let parser = handoff::Parser {
+        kind: handoff::parser::Kind::ParserKindJson as i32,
+        parse_reasoning: reasoning,
+        parse_tools: tools,
+        tools: String::new(),
+    };
+    Ok(ChatParser::new(&parser, tokenizer)?)
 }
 
 /// Runs `processor` over `prompt` and `deltas`, then finishes it.
 fn parse(
-    mut processor: ChatOutputProcessor,
+    mut processor: ChatParser,
     prompt: &[u32],
     deltas: &[&str],
 ) -> Result<Vec<AssistantEvent>, Box<dyn std::error::Error + Send + Sync>> {
@@ -117,8 +115,7 @@ fn qwen3_processor_emits_reasoning_text_and_tool_calls() -> TestResult {
         .token_to_id("<|im_end|>")
         .ok_or_else(|| std::io::Error::other("configured prompt-end token is unavailable"))?;
     // The final argument enables reasoning parsing.
-    let processor =
-        ChatOutputProcessor::qwen3(Some(&request_with_lookup().tools), tokenizer, true)?;
+    let processor = qwen3(true, tokenizer, true)?;
 
     // The prompt ends with `<|im_end|>` and has no reasoning delimiter after
     // it, so generation starts outside a reasoning section and the `<think>`
@@ -158,8 +155,7 @@ fn qwen3_processor_emits_reasoning_text_and_tool_calls() -> TestResult {
 /// starts inside a call's arguments.
 #[test]
 fn qwen3_processor_keeps_text_and_tool_call_order_within_a_delta() -> TestResult {
-    let processor =
-        ChatOutputProcessor::qwen3(Some(&request_with_lookup().tools), qwen_tokenizer()?, false)?;
+    let processor = qwen3(true, qwen_tokenizer()?, false)?;
 
     // The first delta starts outside any call and ends inside the second
     // call's arguments; the second delta starts inside those arguments.
@@ -206,10 +202,64 @@ fn qwen3_processor_keeps_text_and_tool_call_order_within_a_delta() -> TestResult
 /// delimiters arrive in separate deltas.
 #[test]
 fn disabled_reasoning_parsing_streams_delimiters_as_content() -> TestResult {
-    let processor = ChatOutputProcessor::qwen3(None, qwen_tokenizer()?, false)?;
+    let processor = qwen3(false, qwen_tokenizer()?, false)?;
 
     let events = parse(processor, &[], &["<think>", "hi</think>after"])?;
 
     assert_eq!(ordered(events), vec![text("<think>hi</think>after")]);
+    Ok(())
+}
+
+/// A family that writes function and parameter tags has its calls parsed in
+/// that format, each value typed by the schema of the tool the request
+/// declared, after its reasoning and among its text.
+#[test]
+fn function_and_parameter_tags_become_typed_tool_calls() -> TestResult {
+    let parser = handoff::Parser {
+        kind: handoff::parser::Kind::ParserKindXml as i32,
+        parse_reasoning: true,
+        parse_tools: true,
+        tools: serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}, "limit": {"type": "integer"}},
+                },
+            },
+        }])
+        .to_string(),
+    };
+    let processor = ChatParser::new(&parser, qwen_tokenizer()?)?;
+
+    // The deltas cut the reasoning delimiter, a tag and a value.
+    let events = parse(
+        processor,
+        &[],
+        &[
+            "<think>look it up</think>Searching.<tool_call>\n<func",
+            "tion=lookup>\n<parameter=q>\nrust tra",
+            "its\n</parameter>\n<parameter=limit>\n3\n</parameter>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=lookup>\n<parameter=q>\nx\n</parameter>\n</function>\n</tool_call>done",
+        ],
+    )?;
+
+    assert_eq!(
+        ordered(events),
+        vec![
+            OrderedOutput::Text(AssistantBlockKind::Reasoning, "look it up".to_string()),
+            text("Searching."),
+            OrderedOutput::Call {
+                name: "lookup".to_string(),
+                arguments: r#"{"q": "rust traits", "limit": 3}"#.to_string(),
+            },
+            OrderedOutput::Call {
+                name: "lookup".to_string(),
+                arguments: r#"{"q": "x"}"#.to_string(),
+            },
+            text("done"),
+        ]
+    );
     Ok(())
 }
