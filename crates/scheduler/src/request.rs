@@ -313,3 +313,47 @@ impl Requests {
         std::mem::take(&mut self.changed)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::FinishReason;
+
+    /// A request waits, runs and finishes, and the first end decided for it
+    /// is the one it keeps.
+    #[test]
+    fn a_status_goes_from_waiting_to_running_to_its_first_decided_end() {
+        let mut status = RequestStatus::Waiting;
+        assert!(!status.is_finished());
+        assert!(status.terminal().is_none());
+
+        status = RequestStatus::Running;
+        assert!(!status.is_finished());
+        assert!(status.terminal().is_none());
+
+        status.finish(Terminal::finish(FinishReason::Stop));
+        assert!(status.is_finished());
+        status.finish(Terminal::finish(FinishReason::MaxTokens));
+        assert!(matches!(
+            status.terminal(),
+            Some(Terminal::Finished {
+                reason: FinishReason::Stop,
+                ..
+            })
+        ));
+    }
+
+    /// A waiting request that ends is finished without ever running.
+    #[test]
+    fn a_waiting_request_can_end_without_running() {
+        let mut status = RequestStatus::Waiting;
+        status.finish(Terminal::finish(FinishReason::Cancelled));
+        assert!(matches!(
+            status,
+            RequestStatus::Finished(Terminal::Finished {
+                reason: FinishReason::Cancelled,
+                ..
+            })
+        ));
+    }
+}

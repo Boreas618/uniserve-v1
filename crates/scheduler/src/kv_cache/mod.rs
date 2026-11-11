@@ -4516,4 +4516,126 @@ mod tests {
         pool.withdraw(11);
         assert_eq!(pool.cached_from(9), 2);
     }
+
+    /// The chain of `storage::key` from a zero seed, computed apart from this
+    /// crate: a page's key is fixed by its group, its tokens and the keys
+    /// before it, and an isolation key roots another chain.
+    #[test]
+    fn the_page_key_chain_matches_its_fixed_vectors() {
+        let hex = |key: &Key| {
+            key.0
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let kv_cache = KvCacheManager::new(BlockPool::new(8, 0), vec![full(4, 1)]);
+        let prompt = (1..=8).collect::<Vec<u32>>();
+
+        let shared = kv_cache.page_keys(&prompt, PrefixScope::default());
+        assert_eq!(
+            shared[0].iter().map(hex).collect::<Vec<_>>(),
+            [
+                "d82404dd8bfea249aec17a3856952089f9a004f8c56e533b9f9cbae86f47b421",
+                "ba86d1709ff8ac538e9aabba75a7f8838f16d3c622ce9b286bd63301cb520c37",
+            ]
+        );
+
+        let isolated = kv_cache.page_keys(
+            &prompt,
+            PrefixScope {
+                isolation_key: Some(7),
+                ..PrefixScope::default()
+            },
+        );
+        assert_eq!(
+            isolated[0].iter().map(hex).collect::<Vec<_>>(),
+            [
+                "e96a1c1f75c37f1ee0012bb59a32daabf95e1086c1e0585b2df75f575abd99d9",
+                "2fa8b480f6a0e7db59c2d7d139b2eb3ed0e146ea90f851648a545756422560d5",
+            ]
+        );
+    }
+
+    /// Allocation takes units from the head of the free queue; a freed page
+    /// joins its tail and stays findable by its key until allocation reaches
+    /// its units, so pages are evicted in the order they were freed.
+    #[test]
+    fn allocation_takes_the_head_and_evicts_freed_pages_in_the_order_they_were_freed() {
+        // Three allocatable units: unit zero is the padding sentinel.
+        let kv_cache = KvCacheManager::new(BlockPool::new(4, 0), vec![full(4, 1)]);
+        let pool = kv_cache.pool();
+        let source = endpoint();
+        let prompt = (1..=12).collect::<Vec<u32>>();
+        let cached = || {
+            kv_cache
+                .find_prefix(&prompt, true, false, PrefixScope::default(), &source)
+                .cached_tokens
+        };
+
+        // The first two pages take the head of the queue: units 1 and 2.
+        let mut pages = publish_pages(&kv_cache, &prompt, 0, &[0, 1], &source);
+        assert_eq!(pages[0].units(), [UnitId(1)]);
+        assert_eq!(pages[1].units(), [UnitId(2)]);
+        assert_eq!(pool.free_units(), 1);
+
+        // Page 1 is freed before page 0: both join the tail and stay findable.
+        drop(pages.pop());
+        drop(pages.pop());
+        assert_eq!(pool.free_units(), 3);
+        assert_eq!(cached(), 8);
+
+        // The unit never used is at the head, so taking it evicts nothing.
+        let fresh = pool.allocate(1, 1).unwrap();
+        assert_eq!(fresh[0].units(), [UnitId(3)]);
+        assert_eq!(cached(), 8);
+
+        // Page 1's unit was freed first and is taken next: page 1 is gone and
+        // the prefix ends at page 0.
+        let second = pool.allocate(1, 1).unwrap();
+        assert_eq!(second[0].units(), [UnitId(2)]);
+        assert_eq!(cached(), 4);
+
+        // Page 0's unit is the last one, and nothing is left to find.
+        let third = pool.allocate(1, 1).unwrap();
+        assert_eq!(third[0].units(), [UnitId(1)]);
+        assert_eq!(cached(), 0);
+        assert!(pool.allocate(1, 1).is_none());
+    }
+
+    /// A page two requests reuse is held by both: its units return to the
+    /// free queue only when the last of them frees its pages.
+    #[test]
+    fn a_shared_page_returns_when_its_last_holder_frees_it() {
+        let kv_cache = KvCacheManager::new(BlockPool::new(4, 0), vec![full(4, 1)]);
+        let pool = kv_cache.pool();
+        let source = endpoint();
+        let prompt = (1..=8).collect::<Vec<u32>>();
+        drop(publish_pages(&kv_cache, &prompt, 0, &[0], &source));
+        assert_eq!(pool.free_units(), 3);
+
+        let acquire = || {
+            let mut allocation = kv_cache.empty();
+            let lookup = kv_cache
+                .acquire_prefix(
+                    &mut allocation,
+                    &prompt,
+                    true,
+                    false,
+                    PrefixScope::default(),
+                    &source,
+                )
+                .unwrap();
+            assert_eq!(lookup.cached_tokens, 4);
+            allocation
+        };
+        let first = acquire();
+        assert_eq!(pool.free_units(), 2);
+        let second = acquire();
+        assert_eq!(pool.free_units(), 2);
+
+        kv_cache.free(first);
+        assert_eq!(pool.free_units(), 2);
+        kv_cache.free(second);
+        assert_eq!(pool.free_units(), 3);
+    }
 }
