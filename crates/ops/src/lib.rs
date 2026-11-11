@@ -68,6 +68,7 @@
 //! | [`elementwise::ElementwiseWhere`] | `elementwise_where` | [`elementwise`] |
 //! | [`cast::Cast`] | `cast` | [`cast`] |
 //! | [`copy_strided::CopyStrided`] | `copy_strided` | [`copy_strided`] |
+//! | [`fill::Fill`] | `fill` | [`fill`] |
 //!
 //! ## Descriptor keys
 //!
@@ -108,6 +109,7 @@ pub mod descriptor;
 pub mod elementwise;
 pub mod embedding;
 pub mod error;
+pub mod fill;
 pub mod fp4;
 pub mod fp8;
 pub mod frame;

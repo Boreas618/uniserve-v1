@@ -224,6 +224,7 @@ pub mod operator {
     pub const ELEMENTWISE_WHERE: &str = "elementwise_where";
     pub const CAST: &str = "cast";
     pub const COPY_STRIDED: &str = "copy_strided";
+    pub const FILL: &str = "fill";
 
     /// Every operator this build has, in a stable order for a package's coverage check.
     ///
@@ -321,6 +322,7 @@ pub mod operator {
         ELEMENTWISE_WHERE,
         CAST,
         COPY_STRIDED,
+        FILL,
     ];
 
     /// `name`, interned, when this build has an operator by that name.
