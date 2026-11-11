@@ -187,6 +187,27 @@ pub unsafe fn copy_from_host(
         .map_err(crate::Error::from)
 }
 
+/// Copies `bytes` bytes at the device address `source` to host memory at `destination`, in
+/// stream order.
+///
+/// # Safety
+/// `source` holds `bytes` bytes on the stream's device and `destination` holds `bytes` writable
+/// bytes of host memory; both stay valid until the copy completes. The caller waits for the
+/// stream before it reads `destination`.
+pub unsafe fn copy_to_host(
+    destination: u64,
+    source: DevicePtr,
+    bytes: u64,
+    stream: &Stream,
+) -> crate::Result<()> {
+    let bytes = usize::try_from(bytes).map_err(|_| {
+        crate::Error::Shape(format!("a {bytes}-byte read is larger than usize::MAX"))
+    })?;
+    // SAFETY: forwarded from the caller.
+    unsafe { platform::memcpy_async(destination, source.address(), bytes, stream) }
+        .map_err(crate::Error::from)
+}
+
 /// Fills `bytes` bytes at `destination` with zero, in stream order.
 ///
 /// # Safety

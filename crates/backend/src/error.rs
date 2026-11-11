@@ -1,6 +1,11 @@
 //! What the backend refuses.
+//!
+//! The tensor library reports a backend's failure as its own `Error::Backend`, which keeps this
+//! type: a primitive converts with `?`, and a caller that needs the cause downcasts the boxed
+//! error to [`Error`].
 
 use ops::platform::PlatformError;
+use uniserve_tensor::{DType, DeviceLocation};
 
 /// A failure of the device backend.
 #[derive(Debug, thiserror::Error)]
@@ -78,6 +83,79 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// A tensor operation this backend has no kernel for, or whose arguments no kernel it has
+    /// covers.
+    #[error("{operation} is unsupported on this backend: {reason}")]
+    Unsupported {
+        /// The tensor operation: `"matmul"`, `"max_pool2d"`.
+        operation: &'static str,
+        /// What the backend's kernels lack for it.
+        reason: String,
+    },
+
+    /// A tensor or a device of another backend, or of the CPU, where one of this backend's is
+    /// needed.
+    #[error("{operation} needs a tensor of the CUDA backend, and was given one on {location:?}")]
+    ForeignTensor {
+        /// What was asked for, as the sentence's subject: `"a kernel operand"`.
+        operation: &'static str,
+        /// Where the tensor or the device is.
+        location: DeviceLocation,
+    },
+
+    /// A tensor with more axes than a kernel argument carries.
+    #[error("a tensor of {rank} axes is no kernel argument: an operand carries at most {limit}")]
+    Rank {
+        /// The tensor's number of axes.
+        rank: usize,
+        /// `ops::MAX_RANK`.
+        limit: usize,
+    },
+
+    /// An element type whose elements this backend cannot place in memory: a packed element
+    /// with no byte layout, or a view into a packed tensor that does not start at a whole byte.
+    #[error("{operation} cannot address {dtype:?} elements: {reason}")]
+    ElementType {
+        /// What was asked for: `"an allocation"`, `"a kernel operand"`.
+        operation: &'static str,
+        /// The element type.
+        dtype: DType,
+        /// What its layout lacks.
+        reason: &'static str,
+    },
+
+    /// A byte count beyond what the device addresses.
+    #[error("{elements} elements of {dtype:?} exceed the bytes a device addresses")]
+    TooLarge {
+        /// The element count asked for.
+        elements: u64,
+        /// The element type.
+        dtype: DType,
+    },
+
+    /// A tensor was asked for on a GPU other than the one the installed context computes on.
+    #[error("a tensor was asked for on GPU {asked} under a context of GPU {context}")]
+    WrongDevice {
+        /// The ordinal of the device the caller named.
+        asked: usize,
+        /// The ordinal of the context installed on the thread.
+        context: usize,
+    },
+
+    /// A meta tensor, which has no data, was given to a context that launches.
+    #[error("a meta tensor has no data for a launching context to compute on")]
+    MetaOperand,
+
+    /// A device-to-host read of a meta tensor, or under a meta context, which has no stream to
+    /// copy on.
+    #[error("a meta tensor has no data to read, and a meta context has no stream to read on")]
+    MetaRead,
+
+    /// A device-to-host read while the context's stream is being captured: the read would wait
+    /// for kernels that have not run.
+    #[error("a device-to-host read is refused while the stream is being captured")]
+    CapturedRead,
+
     /// The kernel library refused a call that is not an operator launch, such as a copy.
     #[error(transparent)]
     Ops(#[from] ops::Error),
@@ -85,6 +163,13 @@ pub enum Error {
     /// A call into the CUDA boundary failed: a stream, an event or the communicator.
     #[error("platform: {0}")]
     Platform(#[from] PlatformError),
+}
+
+impl From<Error> for uniserve_tensor::Error {
+    /// The backend's failure as the tensor library carries it across its backend traits.
+    fn from(error: Error) -> Self {
+        Self::Backend(Box::new(error))
+    }
 }
 
 /// The backend's result.

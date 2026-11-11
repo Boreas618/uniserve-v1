@@ -3,8 +3,8 @@
 //! A partitioned forward computes one rank's share and meets the other ranks through
 //! collectives: a sum over every rank's buffer, a gather of every rank's buffer in rank order,
 //! and an exchange of equal blocks between every pair of ranks. A module reads its place in the
-//! group with [`split`] and calls the collective; which communicator and stream carry it is the
-//! context's.
+//! group with [`split`] and calls the collective on its tensors; which communicator and stream
+//! carry it is the context's.
 //!
 //! Under a context that launches, a collective is issued through the context's [`Group`] on the
 //! context's stream, and while that stream is being captured it becomes nodes of the graph.
@@ -24,9 +24,10 @@ use ops::platform::{
     ReduceOp, Stream, collective_group,
 };
 use ops::{Operand, collective_type};
+use uniserve_tensor::Tensor;
 
 use crate::context::{self, Context};
-use crate::{Error, Result};
+use crate::{Error, Result, storage};
 
 /// The priority of a group's side stream: the driver clamps it to the device's highest.
 ///
@@ -159,11 +160,6 @@ impl Group {
     }
 }
 
-// tensors: the public collectives take their buffers as kernel operands, the form a tensor's
-// storage and layout give. The signatures from here to `finish` are the one place a collective's
-// argument type is stated to a caller; the checks and the group below work on operands, reading
-// an address, an element type and an element count.
-
 /// This rank's index in the group and the group's member count, or `None` when the forward is
 /// not partitioned or no context is installed.
 ///
@@ -177,14 +173,17 @@ pub fn split() -> Option<(u64, u64)> {
 
 /// Sums every rank's `x` into every rank's `x`, in place.
 ///
-/// `x` has the same shape and element type on every rank.
+/// `x` has the same shape and element type on every rank. Like every buffer of a collective it
+/// is a contiguous tensor of this backend, meta under a meta context.
 ///
 /// # Errors
 ///
-/// [`Error::NoContext`]; [`Error::Collective`] when the context carries no group or NCCL has no
-/// element type for `x`; [`Error::Platform`] when the collective cannot be issued.
-pub fn all_reduce(x: Operand) -> Result<()> {
+/// [`Error::NoContext`]; [`Error::Collective`] when the context carries no group, `x` is not
+/// contiguous or NCCL has no element type for it; [`Error::ForeignTensor`] for a CPU tensor;
+/// [`Error::Platform`] when the collective cannot be issued.
+pub fn all_reduce(x: &Tensor) -> Result<()> {
     let (context, _) = member("all_reduce")?;
+    let x = buffer(x, "all_reduce")?;
     let (count, dtype) = elements(x, x, "all_reduce")?;
 
     let Some(stream) = context.stream() else {
@@ -210,8 +209,9 @@ pub fn all_reduce(x: Operand) -> Result<()> {
 ///
 /// As [`all_reduce`], and [`Error::Collective`] when `recv` does not hold the group's member
 /// count times `send`'s elements of the same element type.
-pub fn all_gather(send: Operand, recv: Operand) -> Result<()> {
+pub fn all_gather(send: &Tensor, recv: &Tensor) -> Result<()> {
     let (context, ranks) = member("all_gather")?;
+    let (send, recv) = (buffer(send, "all_gather")?, buffer(recv, "all_gather")?);
     let (count, gathered, dtype) = gather(send, recv, ranks)?;
 
     let Some(stream) = context.stream() else {
@@ -237,8 +237,9 @@ pub fn all_gather(send: Operand, recv: Operand) -> Result<()> {
 ///
 /// As [`all_reduce`], and [`Error::Collective`] when the buffers are not the group's member count
 /// of equal blocks of one element type.
-pub fn all_to_all(send: Operand, recv: Operand) -> Result<()> {
+pub fn all_to_all(send: &Tensor, recv: &Tensor) -> Result<()> {
     let (context, ranks) = member("all_to_all")?;
+    let (send, recv) = (buffer(send, "all_to_all")?, buffer(recv, "all_to_all")?);
     let exchange = exchange(send, recv, ranks)?;
 
     let Some(stream) = context.stream() else {
@@ -249,14 +250,16 @@ pub fn all_to_all(send: Operand, recv: Operand) -> Result<()> {
 
 /// Starts [`all_to_all`] beside the context's stream, which goes on at once.
 ///
-/// The buffers belong to the collective until [`finish`] is given the returned value; what
-/// `recv` holds is readable on the context's stream after that.
+/// The buffers belong to the collective until [`finish`] is given the returned value: the
+/// caller keeps both tensors until then, and what `recv` holds is readable on the context's
+/// stream after that.
 ///
 /// # Errors
 ///
 /// As [`all_to_all`].
-pub fn start_all_to_all(send: Operand, recv: Operand) -> Result<usize> {
+pub fn start_all_to_all(send: &Tensor, recv: &Tensor) -> Result<usize> {
     let (context, ranks) = member("all_to_all")?;
+    let (send, recv) = (buffer(send, "all_to_all")?, buffer(recv, "all_to_all")?);
     let exchange = exchange(send, recv, ranks)?;
 
     let Some(stream) = context.stream() else {
@@ -279,12 +282,13 @@ pub fn start_all_to_all(send: Operand, recv: Operand) -> Result<usize> {
 /// As [`all_reduce`], and [`Error::Collective`] when `gathered` is not every rank's
 /// `owner_rows` rows or the interval is not inside them.
 pub fn start_gather_rows(
-    gathered: Operand,
+    gathered: &Tensor,
     owner_rows: u64,
     first: u64,
     count: u64,
 ) -> Result<usize> {
     let (context, ranks) = member("gather_rows")?;
+    let gathered = buffer(gathered, "gather_rows")?;
     let (_, dtype) = elements(gathered, gathered, "gather_rows")?;
     let width = gathered.shape.last();
 
@@ -391,6 +395,26 @@ fn group(context: &Context, name: &'static str) -> Result<Arc<Group>> {
     })
 }
 
+/// The buffer of the collective `name` that `tensor` is: its kernel argument, from whose
+/// address the collective moves the tensor's elements.
+///
+/// A collective moves a run of bytes, so the tensor is contiguous; a view with a stride would
+/// send the elements between its own.
+fn buffer(tensor: &Tensor, name: &'static str) -> Result<Operand> {
+    if !tensor.is_contiguous() {
+        return Err(misuse(
+            name,
+            format!(
+                "a collective moves a contiguous buffer, and a tensor of shape {:?} is a strided \
+                 view",
+                tensor.shape()
+            ),
+        ));
+    }
+
+    storage::operand(tensor)
+}
+
 /// A refused call of `collective`.
 fn misuse(collective: &'static str, problem: impl Into<String>) -> Error {
     Error::Collective {
@@ -417,7 +441,11 @@ fn elements(
     if send.dtype != recv.dtype {
         return Err(misuse(
             collective,
-            format!("sends {} and receives {}", ops::abi::name(send.dtype), ops::abi::name(recv.dtype)),
+            format!(
+                "sends {} and receives {}",
+                ops::abi::name(send.dtype),
+                ops::abi::name(recv.dtype)
+            ),
         ));
     }
 
@@ -494,18 +522,17 @@ fn wait_unless_captured(stream: &Stream) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use ops::{DevicePtr, Operand, Shape};
-    use uniserve_tensor::DType;
+    use uniserve_tensor::{DType, Device, Tensor};
 
     use super::{
         all_gather, all_reduce, all_to_all, finish, settle, split, start_all_to_all,
         start_gather_rows,
     };
-    use crate::{Context, Error};
+    use crate::{Context, Error, meta, retained};
 
-    /// A buffer of `elements` elements of `dtype`; a meta context never reads its address.
-    fn buffer(dtype: DType, elements: u64) -> Operand {
-        Operand::new(DevicePtr::new(0x4000), dtype, Shape::new(&[elements]))
+    /// A meta buffer of `elements` elements of `dtype`: no context reads its address.
+    fn buffer(dtype: DType, elements: usize) -> Tensor {
+        retained(0x4000, elements, dtype, &meta()).unwrap()
     }
 
     /// Whether `result` is the refusal of a misused collective.
@@ -515,7 +542,7 @@ mod tests {
 
     #[test]
     fn a_collective_with_no_context_installed_names_what_is_missing() {
-        let refused = all_reduce(buffer(DType::F32, 8)).unwrap_err();
+        let refused = all_reduce(&buffer(DType::F32, 8)).unwrap_err();
         assert!(matches!(
             refused,
             Error::NoContext {
@@ -532,7 +559,7 @@ mod tests {
         let _guard = context.enter();
 
         assert_eq!(split(), None);
-        assert!(misused(all_reduce(buffer(DType::F32, 8))));
+        assert!(misused(all_reduce(&buffer(DType::F32, 8))));
         assert!(misused(finish(0)));
     }
 
@@ -543,11 +570,11 @@ mod tests {
         let _guard = context.enter();
 
         assert_eq!(split(), Some((1, 4)));
-        all_reduce(buffer(DType::BF16, 8)).unwrap();
-        all_gather(buffer(DType::F32, 8), buffer(DType::F32, 32)).unwrap();
-        all_to_all(buffer(DType::F32, 8), buffer(DType::F32, 8)).unwrap();
+        all_reduce(&buffer(DType::BF16, 8)).unwrap();
+        all_gather(&buffer(DType::F32, 8), &buffer(DType::F32, 32)).unwrap();
+        all_to_all(&buffer(DType::F32, 8), &buffer(DType::F32, 8)).unwrap();
 
-        let started = start_all_to_all(buffer(DType::I32, 12), buffer(DType::I32, 12)).unwrap();
+        let started = start_all_to_all(&buffer(DType::I32, 12), &buffer(DType::I32, 12)).unwrap();
         finish(started).unwrap();
         settle().unwrap();
     }
@@ -560,26 +587,26 @@ mod tests {
 
         // Four ranks of eight elements are thirty-two, of the element type sent.
         assert!(misused(all_gather(
-            buffer(DType::F32, 8),
-            buffer(DType::F32, 16)
+            &buffer(DType::F32, 8),
+            &buffer(DType::F32, 16)
         )));
         assert!(misused(all_gather(
-            buffer(DType::F32, 8),
-            buffer(DType::BF16, 32)
+            &buffer(DType::F32, 8),
+            &buffer(DType::BF16, 32)
         )));
 
         // Six elements are not four equal blocks, and both buffers hold every block.
         assert!(misused(all_to_all(
-            buffer(DType::F32, 6),
-            buffer(DType::F32, 6)
+            &buffer(DType::F32, 6),
+            &buffer(DType::F32, 6)
         )));
         assert!(misused(start_all_to_all(
-            buffer(DType::F32, 8),
-            buffer(DType::F32, 4)
+            &buffer(DType::F32, 8),
+            &buffer(DType::F32, 4)
         )));
 
         // NCCL has no 16-bit integer element.
-        assert!(misused(all_reduce(buffer(DType::I16, 8))));
+        assert!(misused(all_reduce(&buffer(DType::I16, 8))));
     }
 
     #[test]
@@ -589,12 +616,30 @@ mod tests {
         let _guard = context.enter();
 
         // Two ranks of five rows, sixteen wide.
-        let gathered = Operand::new(DevicePtr::new(0x4000), DType::BF16, Shape::new(&[10, 16]));
-        let started = start_gather_rows(gathered, 5, 2, 3).unwrap();
+        let gathered = retained(0x4000, (10, 16), DType::BF16, &meta()).unwrap();
+        let started = start_gather_rows(&gathered, 5, 2, 3).unwrap();
         finish(started).unwrap();
 
         // Rows 3..7 leave a rank's five rows, and four rows per rank are not this sequence.
-        assert!(misused(start_gather_rows(gathered, 5, 3, 4)));
-        assert!(misused(start_gather_rows(gathered, 4, 0, 4)));
+        assert!(misused(start_gather_rows(&gathered, 5, 3, 4)));
+        assert!(misused(start_gather_rows(&gathered, 4, 0, 4)));
+    }
+
+    #[test]
+    fn a_collective_moves_a_contiguous_tensor_of_this_backend() {
+        let context = Context::meta(None);
+        context.set_group(None, 0, 2).unwrap();
+        let _guard = context.enter();
+
+        // Every other column of a matrix is not a run of bytes.
+        let columns = retained(0x4000, (4, 8), DType::F32, &meta()).unwrap();
+        let strided = columns.transpose(0, 1).unwrap();
+        assert!(misused(all_reduce(&strided)));
+
+        let host = Tensor::zeros(8, DType::F32, &Device::Cpu).unwrap();
+        assert!(matches!(
+            all_reduce(&host),
+            Err(Error::ForeignTensor { .. })
+        ));
     }
 }

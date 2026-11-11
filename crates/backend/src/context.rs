@@ -284,22 +284,11 @@ impl Context {
     }
 
     /// The GPU a launching context's tensors are on; `None` under a meta context.
-    #[expect(
-        dead_code,
-        reason = "read by the CUDA device, which names a storage's device by its ordinal"
-    )]
     pub(crate) fn ordinal(&self) -> Option<usize> {
         self.device.as_ref().map(|(ordinal, _)| *ordinal)
     }
 
     /// The allocator a new storage takes its block from and keeps, to return the block on drop.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by the storage layer, which allocates a tensor's block and keeps the allocator"
-        )
-    )]
     pub(crate) fn allocator(&self) -> &Arc<Allocator> {
         &self.allocator
     }

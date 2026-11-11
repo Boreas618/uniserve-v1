@@ -41,13 +41,6 @@ use crate::{Error, Result};
 /// `address` is the first of `bytes.len()` bytes on the context's device that stay valid until
 /// the copy has completed, including the copies execution issues from a recorded input copy.
 /// Under a meta context the address is never written.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "called by the storage layer, which allocates the tensor a host value is copied to"
-    )
-)]
 pub(crate) unsafe fn copy_to_device(address: u64, bytes: &[u8]) -> Result<()> {
     let context = context::current("a host-to-device copy")?;
     if bytes.is_empty() {
