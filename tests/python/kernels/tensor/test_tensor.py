@@ -23,6 +23,7 @@ CHECKS = (
     "elementwise_binary_check.py",
     "elementwise_where_check.py",
     "cast_check.py",
+    "copy_strided_check.py",
 )
 
 

@@ -67,6 +67,7 @@
 //! | [`elementwise::ElementwiseBinary`] | `elementwise_binary` | [`elementwise`] |
 //! | [`elementwise::ElementwiseWhere`] | `elementwise_where` | [`elementwise`] |
 //! | [`cast::Cast`] | `cast` | [`cast`] |
+//! | [`copy_strided::CopyStrided`] | `copy_strided` | [`copy_strided`] |
 //!
 //! ## Descriptor keys
 //!
@@ -101,6 +102,7 @@ pub mod channel_affine;
 pub mod commit;
 pub mod conv;
 pub mod copy_block;
+pub mod copy_strided;
 pub mod cross_fade;
 pub mod descriptor;
 pub mod elementwise;

@@ -223,6 +223,7 @@ pub mod operator {
     pub const ELEMENTWISE_BINARY: &str = "elementwise_binary";
     pub const ELEMENTWISE_WHERE: &str = "elementwise_where";
     pub const CAST: &str = "cast";
+    pub const COPY_STRIDED: &str = "copy_strided";
 
     /// Every operator this build has, in a stable order for a package's coverage check.
     ///
@@ -319,6 +320,7 @@ pub mod operator {
         ELEMENTWISE_BINARY,
         ELEMENTWISE_WHERE,
         CAST,
+        COPY_STRIDED,
     ];
 
     /// `name`, interned, when this build has an operator by that name.

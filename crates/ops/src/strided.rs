@@ -28,8 +28,9 @@
 //! index needs no modulus on its outermost axis.
 
 use crate::kernel::Arguments;
+use crate::platform::Stream;
 use crate::tensor::{DType, MAX_RANK, Operand, Shape, Strides};
-use crate::{Error, Result};
+use crate::{Error, Result, Twins};
 
 /// The element types the primitives compute with.
 pub(crate) const ELEMENTS: [DType; 9] = [
@@ -176,6 +177,37 @@ pub(crate) fn require_contiguous(
     ))
 }
 
+/// Check that the operand `name` is a row-major window: a destination whose elements keep their
+/// row-major order and never share an address.
+///
+/// Each axis steps past everything the axes inside it reach, which is what a contiguous tensor
+/// does and what a block of a larger contiguous tensor does with the larger tensor's strides. A
+/// permuted destination and a broadcast one are refused: the first has no caller, and the second
+/// would be written once per repetition.
+pub(crate) fn require_window(operator: &'static str, name: &str, operand: &Operand) -> Result<()> {
+    // The largest offset the axes inside the current one reach.
+    let mut reach = 0_u64;
+    for axis in (0..operand.shape.rank()).rev() {
+        let extent = operand.shape.dim(axis);
+        if extent <= 1 {
+            continue;
+        }
+        let stride = operand.strides.get(axis);
+        if stride <= reach {
+            return Err(Error::argument(
+                operator,
+                format!(
+                    "axis {axis} of {name} advances by {stride} elements while the axes inside it \
+                     reach {reach}: its strides {:?} over {:?} are no row-major window",
+                    operand.strides, operand.shape
+                ),
+            ));
+        }
+        reach = reach.saturating_add((extent - 1).saturating_mul(stride));
+    }
+    Ok(())
+}
+
 /// Check that a descriptor states the axes its call traverses.
 pub(crate) fn require_rank(
     operator: &'static str,
@@ -190,6 +222,38 @@ pub(crate) fn require_rank(
         operator,
         format!("the operands traverse {traversed} axes and the descriptor's {field} is {stated}"),
     ))
+}
+
+/// The elements from an operand's address to its last element, inclusive: the storage a strided
+/// operand reaches.
+pub(crate) fn span(operand: &Operand) -> u64 {
+    let last = operand
+        .shape
+        .dims()
+        .iter()
+        .zip(operand.strides.as_slice())
+        .map(|(&extent, &stride)| extent.saturating_sub(1).saturating_mul(stride))
+        .fold(0_u64, u64::saturating_add);
+    last.saturating_add(1)
+}
+
+/// The shadow buffer of a destination that is a row-major window, for an operator's `shadow`.
+///
+/// A contiguous destination is written whole, so its shadow buffer needs none of its bytes. A
+/// window leaves the elements between its own untouched: its shadow buffer is the storage the
+/// window reaches, with that storage's bytes copied in, and the window keeps its strides inside
+/// it. The two sides of the comparison then differ only where the operator wrote.
+pub(crate) fn shadow_window(destination: Operand, twins: &mut Twins, stream: &Stream) -> Operand {
+    if is_contiguous(&destination) {
+        return twins.shadow_of(destination);
+    }
+
+    let reached = Operand::new(
+        destination.ptr,
+        destination.dtype,
+        Shape::new(&[span(&destination)]),
+    );
+    destination.at(twins.in_place(reached, stream).ptr)
 }
 
 /// The operands with every run of adjacent axes they all step through as one merged into one axis.
