@@ -1,6 +1,5 @@
 //! Types for elements that can be stored and manipulated using tensors.
 #![allow(clippy::redundant_closure_call)]
-use crate::backend::BackendStorage;
 use crate::{CpuStorage, CpuStorageRef, Error, Result};
 
 /// The different types of elements allowed in tensors.

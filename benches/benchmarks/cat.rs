@@ -1,8 +1,8 @@
-use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
-use uniserve_tensor::{DType, Device, Tensor};
+use crate::benchmarks::bench_name;
 use criterion::{criterion_group, Criterion, Throughput};
 use std::hint::black_box;
 use std::time::Instant;
+use uniserve_tensor::{DType, Device, Tensor};
 
 // Shape: [batch, seq, hidden] — representative of transformer KV-cache growth.
 const BATCH: usize = 4;
@@ -39,7 +39,7 @@ fn bench_cat(c: &mut Criterion, device: &Device) {
     // contiguous, dim 0
     {
         let tensors = make_contiguous(device);
-        let mut group = c.benchmark_group(device.bench_name("cat_dim0"));
+        let mut group = c.benchmark_group(bench_name(device, "cat_dim0"));
         group.throughput(Throughput::Bytes(total_bytes));
         group.bench_function("iter", move |b| {
             b.iter_custom(|iters| {
@@ -47,7 +47,7 @@ fn bench_cat(c: &mut Criterion, device: &Device) {
                 for _ in 0..iters {
                     run_cat(black_box(&tensors), 0);
                 }
-                device.sync().unwrap();
+                device.synchronize().unwrap();
                 start.elapsed()
             })
         });
@@ -57,7 +57,7 @@ fn bench_cat(c: &mut Criterion, device: &Device) {
     // contiguous, dim 1
     {
         let tensors = make_contiguous(device);
-        let mut group = c.benchmark_group(device.bench_name("cat_dim1"));
+        let mut group = c.benchmark_group(bench_name(device, "cat_dim1"));
         group.throughput(Throughput::Bytes(total_bytes));
         group.bench_function("iter", move |b| {
             b.iter_custom(|iters| {
@@ -65,7 +65,7 @@ fn bench_cat(c: &mut Criterion, device: &Device) {
                 for _ in 0..iters {
                     run_cat(black_box(&tensors), 1);
                 }
-                device.sync().unwrap();
+                device.synchronize().unwrap();
                 start.elapsed()
             })
         });
@@ -75,7 +75,7 @@ fn bench_cat(c: &mut Criterion, device: &Device) {
     // strided, dim 0 -> cat0 path
     {
         let tensors = make_non_contiguous(device);
-        let mut group = c.benchmark_group(device.bench_name("cat_strided_dim0"));
+        let mut group = c.benchmark_group(bench_name(device, "cat_strided_dim0"));
         group.throughput(Throughput::Bytes(total_bytes));
         group.bench_function("iter", move |b| {
             b.iter_custom(|iters| {
@@ -83,7 +83,7 @@ fn bench_cat(c: &mut Criterion, device: &Device) {
                 for _ in 0..iters {
                     run_cat(black_box(&tensors), 0);
                 }
-                device.sync().unwrap();
+                device.synchronize().unwrap();
                 start.elapsed()
             })
         });
@@ -93,7 +93,7 @@ fn bench_cat(c: &mut Criterion, device: &Device) {
     // non-contiguous, dim 1 -> transpose -> cat0 -> transpose path
     {
         let tensors = make_non_contiguous(device);
-        let mut group = c.benchmark_group(device.bench_name("cat_strided_dim1"));
+        let mut group = c.benchmark_group(bench_name(device, "cat_strided_dim1"));
         group.throughput(Throughput::Bytes(total_bytes));
         group.bench_function("iter", move |b| {
             b.iter_custom(|iters| {
@@ -101,7 +101,7 @@ fn bench_cat(c: &mut Criterion, device: &Device) {
                 for _ in 0..iters {
                     run_cat(black_box(&tensors), 1);
                 }
-                device.sync().unwrap();
+                device.synchronize().unwrap();
                 start.elapsed()
             })
         });
@@ -110,10 +110,8 @@ fn bench_cat(c: &mut Criterion, device: &Device) {
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
-    let handler = BenchDeviceHandler::new().unwrap();
-    for device in &handler.devices {
-        bench_cat(c, device);
-    }
+    let device = &Device::Cpu;
+    bench_cat(c, device);
 }
 
 criterion_group!(benches, criterion_benchmark);

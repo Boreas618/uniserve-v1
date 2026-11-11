@@ -1,9 +1,9 @@
-use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
-use uniserve_tensor::{DType, Device, Tensor};
+use crate::benchmarks::{bench_name, uniform};
 use criterion::{criterion_group, Criterion, Throughput};
 use half::{bf16, f16};
 use std::hint::black_box;
 use std::time::Instant;
+use uniserve_tensor::{DType, Device, Tensor};
 
 fn run_sum(a: &Tensor) {
     a.sum_keepdim(2).unwrap();
@@ -13,25 +13,23 @@ fn run_arg_min(a: &Tensor) {
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
-    let handler = BenchDeviceHandler::new().unwrap();
     let (lo, up) = (-1000.0f32, 1000.0f32);
-    for device in handler.devices {
-        run_reduce(c, &device, (lo, up), false);
-        run_reduce(c, &device, (f16::from_f32(lo), f16::from_f32(up)), false);
-        run_reduce(c, &device, (bf16::from_f32(lo), bf16::from_f32(up)), false);
+    let device = Device::Cpu;
+    run_reduce(c, &device, (lo, up), false);
+    run_reduce(c, &device, (f16::from_f32(lo), f16::from_f32(up)), false);
+    run_reduce(c, &device, (bf16::from_f32(lo), bf16::from_f32(up)), false);
 
-        run_arg_reduce(c, &device, (lo, up), false);
-        run_arg_reduce(c, &device, (f16::from_f32(lo), f16::from_f32(up)), false);
-        run_arg_reduce(c, &device, (bf16::from_f32(lo), bf16::from_f32(up)), false);
+    run_arg_reduce(c, &device, (lo, up), false);
+    run_arg_reduce(c, &device, (f16::from_f32(lo), f16::from_f32(up)), false);
+    run_arg_reduce(c, &device, (bf16::from_f32(lo), bf16::from_f32(up)), false);
 
-        run_reduce(c, &device, (lo, up), true);
-        run_reduce(c, &device, (f16::from_f32(lo), f16::from_f32(up)), true);
-        run_reduce(c, &device, (bf16::from_f32(lo), bf16::from_f32(up)), true);
+    run_reduce(c, &device, (lo, up), true);
+    run_reduce(c, &device, (f16::from_f32(lo), f16::from_f32(up)), true);
+    run_reduce(c, &device, (bf16::from_f32(lo), bf16::from_f32(up)), true);
 
-        run_arg_reduce(c, &device, (lo, up), true);
-        run_arg_reduce(c, &device, (f16::from_f32(lo), f16::from_f32(up)), true);
-        run_arg_reduce(c, &device, (bf16::from_f32(lo), bf16::from_f32(up)), true);
-    }
+    run_arg_reduce(c, &device, (lo, up), true);
+    run_arg_reduce(c, &device, (f16::from_f32(lo), f16::from_f32(up)), true);
+    run_arg_reduce(c, &device, (bf16::from_f32(lo), bf16::from_f32(up)), true);
 }
 
 fn run_reduce<T: uniserve_tensor::FloatDType>(
@@ -44,13 +42,11 @@ fn run_reduce<T: uniserve_tensor::FloatDType>(
     let m = 1024;
     let k = 1024;
 
+    let a = uniform(lo.to_f64(), up.to_f64(), (b, m, k), T::DTYPE, device);
     let a = if strided {
-        Tensor::rand(lo, up, (b, m, k), device)
-            .unwrap()
-            .transpose(0, 2)
-            .unwrap()
+        a.transpose(0, 2).unwrap()
     } else {
-        Tensor::rand(lo, up, (b, m, k), device).unwrap()
+        a
     };
 
     let flops = b * m * k * T::DTYPE.size_in_bytes();
@@ -80,7 +76,7 @@ fn run_reduce<T: uniserve_tensor::FloatDType>(
         _ => "unknown",
     };
 
-    let mut group = c.benchmark_group(device.bench_name(name));
+    let mut group = c.benchmark_group(bench_name(device, name));
     group.throughput(Throughput::Bytes(flops as u64));
     group.bench_function("iter", move |b| {
         b.iter_custom(|iters| {
@@ -88,7 +84,7 @@ fn run_reduce<T: uniserve_tensor::FloatDType>(
             for _i in 0..iters {
                 run_sum(black_box(&a));
             }
-            device.sync().unwrap();
+            device.synchronize().unwrap();
             start.elapsed()
         })
     });
@@ -105,13 +101,11 @@ fn run_arg_reduce<T: uniserve_tensor::FloatDType>(
     let m = 1024;
     let k = 1024;
 
+    let a = uniform(lo.to_f64(), up.to_f64(), (b, m, k), T::DTYPE, device);
     let a = if strided {
-        Tensor::rand(lo, up, (b, m, k), device)
-            .unwrap()
-            .transpose(0, 2)
-            .unwrap()
+        a.transpose(0, 2).unwrap()
     } else {
-        Tensor::rand(lo, up, (b, m, k), device).unwrap()
+        a
     };
 
     let flops = b * m * k * T::DTYPE.size_in_bytes();
@@ -141,7 +135,7 @@ fn run_arg_reduce<T: uniserve_tensor::FloatDType>(
         _ => "unknown",
     };
 
-    let mut group = c.benchmark_group(device.bench_name(name));
+    let mut group = c.benchmark_group(bench_name(device, name));
     group.throughput(Throughput::Bytes(flops as u64));
     group.bench_function("iter", move |b| {
         b.iter_custom(|iters| {
@@ -149,7 +143,7 @@ fn run_arg_reduce<T: uniserve_tensor::FloatDType>(
             for _i in 0..iters {
                 run_arg_min(black_box(&a));
             }
-            device.sync().unwrap();
+            device.synchronize().unwrap();
             start.elapsed()
         })
     });

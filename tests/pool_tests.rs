@@ -1,4 +1,7 @@
-use uniserve_tensor::{test_device, test_utils, Device, IndexOp, Result, Tensor};
+#[macro_use]
+mod common;
+
+use uniserve_tensor::{test_utils, Device, IndexOp, Result, Tensor};
 
 // https://github.com/huggingface/candle/issues/364
 fn avg_pool2d(dev: &Device) -> Result<()> {
@@ -43,9 +46,6 @@ res = torch.nn.functional.avg_pool2d(t, 2)
 print(res)
 */
 fn avg_pool2d_pytorch(dev: &Device) -> Result<()> {
-    if dev.is_metal() {
-        return Ok(());
-    }
     let t = Tensor::new(
         &[
             0.4056f32, -0.8689, -0.0773, -1.5630, -2.8012, -1.5059, 0.3972, 1.0852, 0.4997, 3.0616,
@@ -101,17 +101,7 @@ fn upsample_nearest2d(dev: &Device) -> Result<()> {
     Ok(())
 }
 
-test_device!(avg_pool2d, avg_pool2d_cpu, avg_pool2d_gpu, avg_pool2d_metal);
-test_device!(
-    avg_pool2d_pytorch,
-    avg_pool2d_pytorch_cpu,
-    avg_pool2d_pytorch_gpu,
-    avg_pool2d_pytorch_metal
-);
-test_device!(max_pool2d, max_pool2d_cpu, max_pool2d_gpu, max_pool2d_metal);
-test_device!(
-    upsample_nearest2d,
-    upsample_nearest2d_cpu,
-    upsample_nearest2d_gpu,
-    upsample_nearest2d_metal
-);
+test_device!(avg_pool2d);
+test_device!(avg_pool2d_pytorch);
+test_device!(max_pool2d);
+test_device!(upsample_nearest2d);

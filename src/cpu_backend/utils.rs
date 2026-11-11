@@ -1,5 +1,4 @@
 /// Helper functions to write CPU kernels.
-use crate::backend::BackendStorage;
 use crate::nditer::NdIter;
 use crate::{Error, Layout, Result, WithDType};
 

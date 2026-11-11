@@ -1,5 +1,7 @@
-use uniserve_tensor::{test_device, Device, IndexOp, Result, Tensor};
-use uniserve_tensor as candle;
+#[macro_use]
+mod common;
+
+use uniserve_tensor::{Device, IndexOp, Result, Tensor};
 
 fn contiguous(device: &Device) -> Result<()> {
     let tensor = Tensor::arange(0u32, 24u32, device)?.reshape((2, 3, 4))?;
@@ -49,7 +51,7 @@ fn contiguous(device: &Device) -> Result<()> {
     Ok(())
 }
 
-test_device!(contiguous, contiguous_cpu, contiguous_gpu, contiguous_metal);
+test_device!(contiguous);
 
 #[test]
 fn strided_blocks() -> Result<()> {

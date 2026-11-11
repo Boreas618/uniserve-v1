@@ -12,8 +12,6 @@ criterion_main!(
     benchmarks::copy::benches,
     benchmarks::conv_transpose2d::benches,
     benchmarks::matmul::benches,
-    benchmarks::qmatmul::benches,
-    benchmarks::random::benches,
     benchmarks::reduce::benches,
     benchmarks::unary::benches,
     benchmarks::where_cond::benches,

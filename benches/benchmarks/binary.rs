@@ -1,8 +1,8 @@
-use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
-use uniserve_tensor::{DType, Device, Tensor};
+use crate::benchmarks::bench_name;
 use criterion::{criterion_group, Criterion, Throughput};
 use std::hint::black_box;
 use std::time::Instant;
+use uniserve_tensor::{DType, Device, Tensor};
 
 fn run(lhs: &Tensor, rhs: &Tensor) -> Tensor {
     lhs.mul(rhs).unwrap()
@@ -29,7 +29,7 @@ fn run_binary_benchmark(c: &mut Criterion, device: &Device, dtype: DType, name: 
 
     let flops = 2 * b * m * k * dtype.size_in_bytes();
 
-    let mut group = c.benchmark_group(device.bench_name(name));
+    let mut group = c.benchmark_group(bench_name(device, name));
     group.throughput(Throughput::Bytes(flops as u64));
     group.bench_function("iter", move |b| {
         b.iter_custom(|iters| {
@@ -37,7 +37,7 @@ fn run_binary_benchmark(c: &mut Criterion, device: &Device, dtype: DType, name: 
             for _i in 0..iters {
                 run(black_box(&lhs), black_box(&rhs));
             }
-            device.sync().unwrap();
+            device.synchronize().unwrap();
             start.elapsed()
         })
     });
@@ -45,12 +45,10 @@ fn run_binary_benchmark(c: &mut Criterion, device: &Device, dtype: DType, name: 
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
-    let handler = BenchDeviceHandler::new().unwrap();
-    for device in handler.devices {
-        for dtype in [DType::F32, DType::BF16, DType::F16] {
-            let name = format!("binary_mul_{dtype:?}");
-            run_binary_benchmark(c, &device, dtype, &name);
-        }
+    let device = Device::Cpu;
+    for dtype in [DType::F32, DType::BF16, DType::F16] {
+        let name = format!("binary_mul_{dtype:?}");
+        run_binary_benchmark(c, &device, dtype, &name);
     }
 }
 

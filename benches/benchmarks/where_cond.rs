@@ -1,8 +1,8 @@
-use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
-use uniserve_tensor::{DType, Device, Tensor};
+use crate::benchmarks::bench_name;
 use criterion::{criterion_group, Criterion, Throughput};
 use std::hint::black_box;
 use std::time::Instant;
+use uniserve_tensor::{DType, Device, Tensor};
 
 fn run(a: &Tensor, b: &Tensor, c: &Tensor) {
     a.where_cond(b, c).unwrap();
@@ -46,7 +46,7 @@ fn run_where_cond_benchmark(c: &mut Criterion, device: &Device, dtype: DType, na
     // E.g. 2 f32 tensors + 1 u8 tensor
     let flops = (2 * elements * dtype.size_in_bytes()) + elements;
 
-    let mut group = c.benchmark_group(device.bench_name(name));
+    let mut group = c.benchmark_group(bench_name(device, name));
     group.throughput(Throughput::Bytes(flops as u64));
     group.bench_function("iter", move |b| {
         b.iter_custom(|iters| {
@@ -58,7 +58,7 @@ fn run_where_cond_benchmark(c: &mut Criterion, device: &Device, dtype: DType, na
                     black_box(&on_false),
                 );
             }
-            device.sync().unwrap();
+            device.synchronize().unwrap();
             start.elapsed()
         })
     });
@@ -85,7 +85,7 @@ fn run_masked_fill_benchmark(c: &mut Criterion, device: &Device, dtype: DType, n
     let elements = AB * AH * AS * AS;
     let flops = (2 * elements * dtype.size_in_bytes()) + elements;
 
-    let mut group = c.benchmark_group(device.bench_name(name));
+    let mut group = c.benchmark_group(bench_name(device, name));
     group.throughput(Throughput::Bytes(flops as u64));
     group.bench_function("iter", move |b| {
         b.iter_custom(|iters| {
@@ -97,7 +97,7 @@ fn run_masked_fill_benchmark(c: &mut Criterion, device: &Device, dtype: DType, n
                     black_box(&on_false),
                 );
             }
-            device.sync().unwrap();
+            device.synchronize().unwrap();
             start.elapsed()
         })
     });
@@ -121,7 +121,7 @@ fn run_masked_fill_bcast_benchmark(c: &mut Criterion, device: &Device, dtype: DT
     let elements = AB * AH * AS * AS;
     let flops = (2 * elements * dtype.size_in_bytes()) + elements;
 
-    let mut group = c.benchmark_group(device.bench_name(name));
+    let mut group = c.benchmark_group(bench_name(device, name));
     group.throughput(Throughput::Bytes(flops as u64));
     group.bench_function("iter", move |b| {
         b.iter_custom(|iters| {
@@ -133,7 +133,7 @@ fn run_masked_fill_bcast_benchmark(c: &mut Criterion, device: &Device, dtype: DT
                     black_box(&on_false),
                 );
             }
-            device.sync().unwrap();
+            device.synchronize().unwrap();
             start.elapsed()
         })
     });
@@ -151,7 +151,7 @@ fn run_transposed_benchmark(c: &mut Criterion, device: &Device, dtype: DType, na
     let elements = M * K;
     let flops = (2 * elements * dtype.size_in_bytes()) + elements;
 
-    let mut group = c.benchmark_group(device.bench_name(name));
+    let mut group = c.benchmark_group(bench_name(device, name));
     group.throughput(Throughput::Bytes(flops as u64));
     group.bench_function("iter", move |b| {
         b.iter_custom(|iters| {
@@ -163,7 +163,7 @@ fn run_transposed_benchmark(c: &mut Criterion, device: &Device, dtype: DType, na
                     black_box(&on_false),
                 );
             }
-            device.sync().unwrap();
+            device.synchronize().unwrap();
             start.elapsed()
         })
     });
@@ -195,7 +195,7 @@ fn run_narrow_inner_benchmark(c: &mut Criterion, device: &Device, dtype: DType, 
     let elements = NB * NS * ND;
     let flops = (2 * elements * dtype.size_in_bytes()) + elements;
 
-    let mut group = c.benchmark_group(device.bench_name(name));
+    let mut group = c.benchmark_group(bench_name(device, name));
     group.throughput(Throughput::Bytes(flops as u64));
     group.bench_function("iter", move |b| {
         b.iter_custom(|iters| {
@@ -207,7 +207,7 @@ fn run_narrow_inner_benchmark(c: &mut Criterion, device: &Device, dtype: DType, 
                     black_box(&on_false),
                 );
             }
-            device.sync().unwrap();
+            device.synchronize().unwrap();
             start.elapsed()
         })
     });
@@ -215,28 +215,26 @@ fn run_narrow_inner_benchmark(c: &mut Criterion, device: &Device, dtype: DType, 
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
-    let device = BenchDeviceHandler::new().unwrap();
-    for d in device.devices {
-        run_where_cond_benchmark(c, &d, DType::F32, "where_cond_f32");
-        run_where_cond_benchmark(c, &d, DType::BF16, "where_cond_bf16");
-        run_where_cond_benchmark(c, &d, DType::F16, "where_cond_f16");
+    let d = Device::Cpu;
+    run_where_cond_benchmark(c, &d, DType::F32, "where_cond_f32");
+    run_where_cond_benchmark(c, &d, DType::BF16, "where_cond_bf16");
+    run_where_cond_benchmark(c, &d, DType::F16, "where_cond_f16");
 
-        run_masked_fill_benchmark(c, &d, DType::F32, "where_cond_masked_fill_f32");
-        run_masked_fill_benchmark(c, &d, DType::BF16, "where_cond_masked_fill_bf16");
-        run_masked_fill_benchmark(c, &d, DType::F16, "where_cond_masked_fill_f16");
+    run_masked_fill_benchmark(c, &d, DType::F32, "where_cond_masked_fill_f32");
+    run_masked_fill_benchmark(c, &d, DType::BF16, "where_cond_masked_fill_bf16");
+    run_masked_fill_benchmark(c, &d, DType::F16, "where_cond_masked_fill_f16");
 
-        run_masked_fill_bcast_benchmark(c, &d, DType::F32, "where_cond_masked_fill_bcast_f32");
-        run_masked_fill_bcast_benchmark(c, &d, DType::BF16, "where_cond_masked_fill_bcast_bf16");
-        run_masked_fill_bcast_benchmark(c, &d, DType::F16, "where_cond_masked_fill_bcast_f16");
+    run_masked_fill_bcast_benchmark(c, &d, DType::F32, "where_cond_masked_fill_bcast_f32");
+    run_masked_fill_bcast_benchmark(c, &d, DType::BF16, "where_cond_masked_fill_bcast_bf16");
+    run_masked_fill_bcast_benchmark(c, &d, DType::F16, "where_cond_masked_fill_bcast_f16");
 
-        run_transposed_benchmark(c, &d, DType::F32, "where_cond_transposed_f32");
-        run_transposed_benchmark(c, &d, DType::BF16, "where_cond_transposed_bf16");
-        run_transposed_benchmark(c, &d, DType::F16, "where_cond_transposed_f16");
+    run_transposed_benchmark(c, &d, DType::F32, "where_cond_transposed_f32");
+    run_transposed_benchmark(c, &d, DType::BF16, "where_cond_transposed_bf16");
+    run_transposed_benchmark(c, &d, DType::F16, "where_cond_transposed_f16");
 
-        run_narrow_inner_benchmark(c, &d, DType::F32, "where_cond_narrow_inner_f32");
-        run_narrow_inner_benchmark(c, &d, DType::BF16, "where_cond_narrow_inner_bf16");
-        run_narrow_inner_benchmark(c, &d, DType::F16, "where_cond_narrow_inner_f16");
-    }
+    run_narrow_inner_benchmark(c, &d, DType::F32, "where_cond_narrow_inner_f32");
+    run_narrow_inner_benchmark(c, &d, DType::BF16, "where_cond_narrow_inner_bf16");
+    run_narrow_inner_benchmark(c, &d, DType::F16, "where_cond_narrow_inner_f16");
 }
 
 criterion_group!(benches, criterion_benchmark);

@@ -1,8 +1,8 @@
-use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
-use uniserve_tensor::{DType, Device, Tensor};
+use crate::benchmarks::bench_name;
 use criterion::{criterion_group, Criterion, Throughput};
 use std::hint::black_box;
 use std::time::Instant;
+use uniserve_tensor::{DType, Device, Tensor};
 
 // Representative transformer KV-cache shape: [batch, seq, head_dim].
 const BATCH: usize = 8;
@@ -23,7 +23,7 @@ fn bench_contiguous(c: &mut Criterion, device: &Device) {
     // not interested in the performance of `Arc::clone()`
     {
         let t = Tensor::zeros((BATCH, SEQ, HIDDEN), DType::F32, device).unwrap();
-        let mut group = c.benchmark_group(device.bench_name("contiguous"));
+        let mut group = c.benchmark_group(bench_name(device, "contiguous"));
         group.throughput(Throughput::Bytes(bytes));
         group.bench_function("iter", |b| {
             b.iter_custom(|iters| {
@@ -31,7 +31,7 @@ fn bench_contiguous(c: &mut Criterion, device: &Device) {
                 for _ in 0..iters {
                     black_box(t.force_contiguous().unwrap());
                 }
-                device.sync().unwrap();
+                device.synchronize().unwrap();
                 start.elapsed()
             })
         });
@@ -51,7 +51,7 @@ fn bench_contiguous(c: &mut Criterion, device: &Device) {
             "expected non-contiguous tensor for benchmark"
         );
 
-        let mut group = c.benchmark_group(device.bench_name("contiguous_uniform"));
+        let mut group = c.benchmark_group(bench_name(device, "contiguous_uniform"));
         group.throughput(Throughput::Bytes(bytes));
         group.bench_function("iter", |b| {
             b.iter_custom(|iters| {
@@ -59,7 +59,7 @@ fn bench_contiguous(c: &mut Criterion, device: &Device) {
                 for _ in 0..iters {
                     run_contiguous(black_box(&t));
                 }
-                device.sync().unwrap();
+                device.synchronize().unwrap();
                 start.elapsed()
             })
         });
@@ -79,7 +79,7 @@ fn bench_contiguous(c: &mut Criterion, device: &Device) {
             "expected non-contiguous tensor for benchmark"
         );
 
-        let mut group = c.benchmark_group(device.bench_name("contiguous_strided"));
+        let mut group = c.benchmark_group(bench_name(device, "contiguous_strided"));
         group.throughput(Throughput::Bytes(bytes));
         group.bench_function("iter", |b| {
             b.iter_custom(|iters| {
@@ -87,7 +87,7 @@ fn bench_contiguous(c: &mut Criterion, device: &Device) {
                 for _ in 0..iters {
                     run_contiguous(black_box(&t));
                 }
-                device.sync().unwrap();
+                device.synchronize().unwrap();
                 start.elapsed()
             })
         });
@@ -96,10 +96,8 @@ fn bench_contiguous(c: &mut Criterion, device: &Device) {
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
-    let handler = BenchDeviceHandler::new().unwrap();
-    for device in &handler.devices {
-        bench_contiguous(c, device);
-    }
+    let device = &Device::Cpu;
+    bench_contiguous(c, device);
 }
 
 criterion_group!(benches, criterion_benchmark);

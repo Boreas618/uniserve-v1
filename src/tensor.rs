@@ -1,7 +1,6 @@
 //! Tensors are N-dimensional matrixes of elements using a single data type.
 #![allow(clippy::redundant_closure_call)]
-use crate::backend::{BackendDevice, BackendStorage};
-use crate::op::{BackpropOp, BinaryOp, CmpOp, Op, ReduceOp, UnaryOp};
+use crate::op::{BinaryOp, CmpOp, ReduceOp, UnaryOp};
 use crate::scalar::TensorOrScalar;
 use crate::shape::{Dim, Dims, ShapeWithOneHole};
 use crate::storage::{StorageMutRef, StorageRef};
@@ -33,13 +32,8 @@ pub struct Tensor_ {
     //   verified dynamically, but the resulting tensors would not be send or sync.
     // - Using an unsafe cell would have the lowest cost but undefined behavior on concurrent
     //   accesses.
-    // Ideally, we would use Arc<Storage> for tensors on which we don't plan on modifying the data
-    // and Arc<Mutex<Storage>> for tensors where the data could be modified, e.g. variables but
-    // that's tricky to encode in the current setup.
     storage: Arc<RwLock<Storage>>,
     layout: Layout,
-    op: BackpropOp,
-    is_variable: bool,
     dtype: DType,
     device: Device,
 }
@@ -50,7 +44,7 @@ impl AsRef<Tensor> for Tensor {
     }
 }
 
-// Tensors are refcounted so that cloning is cheap when building the op graph.
+// Tensors are refcounted so that cloning is cheap.
 // Storages are also refcounted independently so that its possible to avoid
 // copying the storage for operations that only modify the shape or stride.
 #[derive(Clone)]
@@ -84,11 +78,8 @@ macro_rules! unary_op {
             if shape.elem_count() == 0 {
                 return Ok(self.clone());
             }
-            let storage = self
-                .storage()
-                .unary_impl::<crate::op::$op_name>(self.layout())?;
-            let op = BackpropOp::new1(self, |s| Op::Unary(s, UnaryOp::$op_name));
-            Ok(from_storage(storage, shape.clone(), op, false))
+            let storage = self.storage().unary(UnaryOp::$op_name, self.layout())?;
+            Ok(from_storage(storage, shape.clone()))
         }
     };
 }
@@ -100,13 +91,13 @@ macro_rules! binary_op {
             if shape.elem_count() == 0 {
                 return Ok(self.clone());
             }
-            let storage = self.storage().binary_impl::<crate::op::$op_name>(
+            let storage = self.storage().binary(
+                BinaryOp::$op_name,
                 &*rhs.storage(),
                 self.layout(),
                 rhs.layout(),
             )?;
-            let op = BackpropOp::new2(self, rhs, |t1, t2| Op::Binary(t1, t2, BinaryOp::$op_name));
-            Ok(from_storage(storage, shape.clone(), op, false))
+            Ok(from_storage(storage, shape.clone()))
         }
     };
 }
@@ -125,13 +116,13 @@ macro_rules! binary_op_scalar {
             if self.elem_count() == 0 {
                 return Ok(self.clone());
             }
-            let storage = self.storage().binary_impl::<crate::op::$op_name>(
+            let storage = self.storage().binary(
+                BinaryOp::$op_name,
                 &*rhs.storage(),
                 self.layout(),
                 rhs.layout(),
             )?;
-            let op = BackpropOp::new2(self, &rhs, |t1, t2| Op::Binary(t1, t2, BinaryOp::$op_name));
-            Ok(from_storage(storage, shape.clone(), op, false))
+            Ok(from_storage(storage, shape.clone()))
         }
     };
 }
@@ -158,20 +149,13 @@ macro_rules! broadcast_binary_op {
 }
 
 /// Creates a fresh tensor structure based on a storage and a shape, this uses contiguous strides.
-pub(crate) fn from_storage<S: Into<Shape>>(
-    storage: Storage,
-    shape: S,
-    op: BackpropOp,
-    is_variable: bool,
-) -> Tensor {
+pub(crate) fn from_storage<S: Into<Shape>>(storage: Storage, shape: S) -> Tensor {
     let dtype = storage.dtype();
     let device = storage.device();
     let tensor_ = Tensor_ {
         id: TensorId::new(),
         storage: Arc::new(RwLock::new(storage)),
         layout: Layout::contiguous(shape),
-        op,
-        is_variable,
         dtype,
         device,
     };
@@ -179,20 +163,6 @@ pub(crate) fn from_storage<S: Into<Shape>>(
 }
 
 impl Tensor {
-    pub(crate) fn ones_impl<S: Into<Shape>>(
-        shape: S,
-        dtype: DType,
-        device: &Device,
-        is_variable: bool,
-    ) -> Result<Self> {
-        let none = BackpropOp::none();
-        let shape = shape.into();
-        let mut storage = unsafe { device.alloc_uninit(&shape, dtype)? };
-        let layout = Layout::contiguous(shape.clone());
-        storage.const_set(crate::scalar::Scalar::one(dtype), &layout)?;
-        Ok(from_storage(storage, shape, none, is_variable))
-    }
-
     /// Creates a new tensor filled with ones.
     ///
     /// ```rust
@@ -203,7 +173,11 @@ impl Tensor {
     /// # Ok::<(), uniserve_tensor::Error>(())
     /// ```
     pub fn ones<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
-        Self::ones_impl(shape, dtype, device, false)
+        let shape = shape.into();
+        let mut storage = unsafe { device.alloc_uninit(&shape, dtype)? };
+        let layout = Layout::contiguous(shape.clone());
+        storage.const_set(crate::scalar::Scalar::one(dtype), &layout)?;
+        Ok(from_storage(storage, shape))
     }
 
     pub fn const_set(&self, value: crate::scalar::Scalar) -> Result<()> {
@@ -231,20 +205,6 @@ impl Tensor {
         Tensor::ones(self.shape(), self.dtype(), self.device())
     }
 
-    // Do not expose outside of the crate, the `is_variable=true` case should only be accessed from
-    // the variable module.
-    pub(crate) fn zeros_impl<S: Into<Shape>>(
-        shape: S,
-        dtype: DType,
-        device: &Device,
-        is_variable: bool,
-    ) -> Result<Self> {
-        let none = BackpropOp::none();
-        let shape = shape.into();
-        let storage = device.zeros(&shape, dtype)?;
-        Ok(from_storage(storage, shape, none, is_variable))
-    }
-
     /// Creates a new tensor filled with zeros.
     ///
     /// ```rust
@@ -255,7 +215,9 @@ impl Tensor {
     /// # Ok::<(), uniserve_tensor::Error>(())
     /// ```
     pub fn zeros<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
-        Self::zeros_impl(shape, dtype, device, false)
+        let shape = shape.into();
+        let storage = device.zeros(&shape, dtype)?;
+        Ok(from_storage(storage, shape))
     }
 
     /// Creates a new tensor filled with zeros with same shape, dtype, and device as the other
@@ -272,20 +234,6 @@ impl Tensor {
         Tensor::zeros(self.shape(), self.dtype(), self.device())
     }
 
-    // Do not expose outside of the crate, the `is_variable=true` case should only be accessed from
-    // the variable module.
-    pub(crate) unsafe fn empty_impl<S: Into<Shape>>(
-        shape: S,
-        dtype: DType,
-        device: &Device,
-        is_variable: bool,
-    ) -> Result<Self> {
-        let none = BackpropOp::none();
-        let shape = shape.into();
-        let storage = device.alloc_uninit(&shape, dtype)?;
-        Ok(from_storage(storage, shape, none, is_variable))
-    }
-
     /// Creates a new tensor filled with uninitialized memory.
     ///
     /// # Safety
@@ -298,7 +246,9 @@ impl Tensor {
     /// # Ok::<(), uniserve_tensor::Error>(())
     /// ```
     pub unsafe fn empty<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
-        Self::empty_impl(shape, dtype, device, false)
+        let shape = shape.into();
+        let storage = device.alloc_uninit(&shape, dtype)?;
+        Ok(from_storage(storage, shape))
     }
 
     /// Creates a new tensor filled with uninitialized memory of the same shape, dtype, and device as the other
@@ -317,116 +267,11 @@ impl Tensor {
         Tensor::empty(self.shape(), self.dtype(), self.device())
     }
 
-    pub(crate) fn rand_impl<S: Into<Shape>, T: crate::FloatDType>(
-        lo: T,
-        up: T,
-        s: S,
-        device: &Device,
-        is_variable: bool,
-    ) -> Result<Self> {
-        let s = s.into();
-        let storage = device.rand_uniform(lo, up, &s)?;
-        let none = BackpropOp::none();
-        Ok(from_storage(storage, s, none, is_variable))
-    }
-
-    pub(crate) fn rand_f64_impl<S: Into<Shape>>(
-        lo: f64,
-        up: f64,
-        s: S,
-        dtype: DType,
-        device: &Device,
-        is_variable: bool,
-    ) -> Result<Self> {
-        let s = s.into();
-        let storage = device.rand_uniform_f64(lo, up, &s, dtype)?;
-        let none = BackpropOp::none();
-        Ok(from_storage(storage, s, none, is_variable))
-    }
-
-    /// Creates a new tensor initialized with values sampled uniformly between `lo` and `up`.
-    pub fn rand<S: Into<Shape>, T: crate::FloatDType>(
-        lo: T,
-        up: T,
-        s: S,
-        device: &Device,
-    ) -> Result<Self> {
-        Self::rand_impl(lo, up, s, device, false)
-    }
-
-    pub fn rand_like(&self, lo: f64, up: f64) -> Result<Self> {
-        Tensor::rand_f64_impl(lo, up, self.shape(), self.dtype(), self.device(), false)
-    }
-
-    pub(crate) fn randn_impl<S: Into<Shape>, T: crate::FloatDType>(
-        mean: T,
-        std: T,
-        s: S,
-        device: &Device,
-        is_variable: bool,
-    ) -> Result<Self> {
-        let s = s.into();
-        let storage = device.rand_normal(mean, std, &s)?;
-        let none = BackpropOp::none();
-        Ok(from_storage(storage, s, none, is_variable))
-    }
-
-    pub(crate) fn randn_f64_impl<S: Into<Shape>>(
-        mean: f64,
-        std: f64,
-        s: S,
-        dtype: DType,
-        device: &Device,
-        is_variable: bool,
-    ) -> Result<Self> {
-        let s = s.into();
-        let storage = device.rand_normal_f64(mean, std, &s, dtype)?;
-        let none = BackpropOp::none();
-        Ok(from_storage(storage, s, none, is_variable))
-    }
-
-    pub fn randn_like(&self, mean: f64, stdev: f64) -> Result<Self> {
-        Tensor::randn_f64_impl(
-            mean,
-            stdev,
-            self.shape(),
-            self.dtype(),
-            self.device(),
-            false,
-        )
-    }
-
-    /// Creates a new tensor initialized with values sampled from a normal distribution with the
-    /// specified `mean` and standard deviation `std`.
-    pub fn randn<S: Into<Shape>, T: crate::FloatDType>(
-        mean: T,
-        std: T,
-        s: S,
-        device: &Device,
-    ) -> Result<Self> {
-        Self::randn_impl(mean, std, s, device, false)
-    }
-
-    pub(crate) fn new_impl<A: crate::device::NdArray>(
-        array: A,
-        shape: Shape,
-        device: &Device,
-        is_variable: bool,
-    ) -> Result<Self> {
-        let n: usize = shape.elem_count();
-        let buffer_size: usize = array.shape()?.elem_count();
-        if buffer_size != n {
-            return Err(Error::ShapeMismatch { buffer_size, shape }.bt());
-        }
-        let storage = device.storage(array)?;
-        let none = BackpropOp::none();
-        Ok(from_storage(storage, shape, none, is_variable))
-    }
-
     /// Creates a new tensor on the specified device using the content and shape of the input.
     pub fn new<A: crate::device::NdArray>(array: A, device: &Device) -> Result<Self> {
         let shape = array.shape()?;
-        Self::new_impl(array, shape, device, false)
+        let storage = device.storage(array)?;
+        Ok(from_storage(storage, shape))
     }
 
     /// Returns a new tensor with all the elements having the same specified value.
@@ -444,12 +289,11 @@ impl Tensor {
         shape: S,
         device: &Device,
     ) -> Result<Self> {
-        let none = BackpropOp::none();
         let shape = shape.into();
         let mut storage = unsafe { device.alloc_uninit(&shape, D::DTYPE)? };
         let layout = Layout::contiguous(shape.clone());
         storage.const_set(value.to_scalar(), &layout)?;
-        Ok(from_storage(storage, shape, none, false))
+        Ok(from_storage(storage, shape))
     }
 
     /// Creates a new 1D tensor from an iterator.
@@ -466,7 +310,7 @@ impl Tensor {
     ) -> Result<Self> {
         let data = iter.into_iter().collect::<Vec<_>>();
         let len = data.len();
-        Self::from_vec_impl(data, len, device, false)
+        Self::from_vec(data, len, device)
     }
 
     /// Creates a new 1D tensor with values from the interval `[start, end)` taken with a common
@@ -514,19 +358,7 @@ impl Tensor {
             }
         }
         let len = data.len();
-        Self::from_vec_impl(data, len, device, false)
-    }
-
-    pub(crate) fn from_vec_impl<S: ShapeWithOneHole, D: crate::WithDType>(
-        data: Vec<D>,
-        shape: S,
-        device: &Device,
-        is_variable: bool,
-    ) -> Result<Self> {
-        let shape = shape.into_shape(data.len())?;
-        let storage = device.storage_owned(data)?;
-        let none = BackpropOp::none();
-        Ok(from_storage(storage, shape, none, is_variable))
+        Self::from_vec(data, len, device)
     }
 
     /// Creates a new tensor initialized with values from the input vector. The number of elements
@@ -547,7 +379,9 @@ impl Tensor {
         shape: S,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_vec_impl(data, shape, device, false)
+        let shape = shape.into_shape(data.len())?;
+        let storage = device.storage_owned(data)?;
+        Ok(from_storage(storage, shape))
     }
 
     /// Creates a new tensor initialized with values from the input slice. The number of elements
@@ -570,8 +404,7 @@ impl Tensor {
     ) -> Result<Self> {
         let shape = shape.into_shape(array.len())?;
         let storage = device.storage_from_slice(array)?;
-        let none = BackpropOp::none();
-        Ok(from_storage(storage, shape, none, false))
+        Ok(from_storage(storage, shape))
     }
 
     pub(crate) fn same_shape_binary_op(&self, rhs: &Self, op: &'static str) -> Result<&Shape> {
@@ -589,28 +422,15 @@ impl Tensor {
         }
     }
 
-    /// Returns true if the computation graph should track this op, that is if it is
-    /// a variable or if it has some variable as dependencies.
-    pub fn track_op(&self) -> bool {
-        self.is_variable || self.op.is_some()
-    }
-
-    /// Creates a fresh tensor structure based on a storage and a shape.
+    /// Creates a tensor over a storage, viewed contiguously in row-major order from its first
+    /// element.
     ///
-    /// # Note
-    /// - This uses contiguous strides
-    /// - Ensure the shape is compatible with the shape of the storage.
-    pub fn from_storage<S: Into<Shape>>(
-        storage: Storage,
-        shape: S,
-        op: BackpropOp,
-        is_variable: bool,
-    ) -> Tensor {
-        from_storage(storage, shape, op, is_variable)
+    /// The caller ensures that the storage holds at least `shape.elem_count()` elements. This is
+    /// how a device backend and custom operators build tensors over storage they own.
+    pub fn from_storage<S: Into<Shape>>(storage: Storage, shape: S) -> Tensor {
+        from_storage(storage, shape)
     }
 
-    // TODO: Also make an inplace version or a pre-allocated? This could be tricky
-    // if this can create cycles in the compute graph.
     binary_op!(add, Add);
     binary_op!(mul, Mul);
     binary_op!(sub, Sub);
@@ -676,8 +496,7 @@ impl Tensor {
         };
         match &*self.storage() {
             Storage::Cpu(cpu_storage) => from_cpu_storage(cpu_storage),
-            Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
-            Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Backend(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -790,8 +609,7 @@ impl Tensor {
             return Ok(self.clone());
         }
         let storage = self.storage().affine(self.layout(), mul, add)?;
-        let op = BackpropOp::new1(self, |arg| Op::Affine { arg, mul, add });
-        Ok(from_storage(storage, self.shape(), op, false))
+        Ok(from_storage(storage, self.shape()))
     }
 
     /// Applies the Exponential Linear Unit (ELU) function on each element of the input tensor.
@@ -800,8 +618,7 @@ impl Tensor {
             return Ok(self.clone());
         }
         let storage = self.storage().elu(self.layout(), alpha)?;
-        let op = BackpropOp::new1(self, |t| Op::Elu(t, alpha));
-        Ok(from_storage(storage, self.shape(), op, false))
+        Ok(from_storage(storage, self.shape()))
     }
 
     /// Raise the tensor to some float exponent `e`.
@@ -810,8 +627,7 @@ impl Tensor {
             return Ok(self.clone());
         }
         let storage = self.storage().powf(self.layout(), e)?;
-        let op = BackpropOp::new1(self, |t| Op::Powf(t, e));
-        Ok(from_storage(storage, self.shape(), op, false))
+        Ok(from_storage(storage, self.shape()))
     }
 
     pub(crate) fn check_dim(&self, dim: usize, op: &'static str) -> Result<()> {
@@ -903,14 +719,11 @@ impl Tensor {
         if start == 0 && dims[dim] == len {
             Ok(self.clone())
         } else {
-            let op = BackpropOp::new1(self, |t| Op::Narrow(t, dim, start, len));
             let layout = self.layout().narrow(dim, start, len)?;
             let tensor_ = Tensor_ {
                 id: TensorId::new(),
                 storage: self.storage.clone(),
                 layout,
-                op,
-                is_variable: false,
                 dtype: self.dtype,
                 device: self.device.clone(),
             };
@@ -942,16 +755,10 @@ impl Tensor {
 
     fn reduce_impl<D: Dim>(&self, dim: D, keepdim: bool, op: ReduceOp) -> Result<Self> {
         let dim = dim.to_index(self.shape(), op.name())?;
-        let storage = self.storage().reduce_op(op, self.layout(), &[dim])?;
+        let storage = self.storage().reduce(op, self.layout(), &[dim])?;
         let mut dims = self.dims().to_vec();
         dims[dim] = 1;
-        let op = match op {
-            ReduceOp::Sum | ReduceOp::Min | ReduceOp::Max => {
-                BackpropOp::new1(self, |arg| Op::Reduce(arg, op, dims.to_vec()))
-            }
-            ReduceOp::ArgMin | ReduceOp::ArgMax => BackpropOp::none(),
-        };
-        let res = from_storage(storage, dims, op, false);
+        let res = from_storage(storage, dims);
         if keepdim {
             Ok(res)
         } else {
@@ -963,13 +770,12 @@ impl Tensor {
         let sum_dims = sum_dims.to_indexes(self.shape(), "sum")?;
         let storage = self
             .storage()
-            .reduce_op(ReduceOp::Sum, self.layout(), &sum_dims)?;
+            .reduce(ReduceOp::Sum, self.layout(), &sum_dims)?;
         let mut dims = self.dims().to_vec();
         for &sum_dim in sum_dims.iter() {
             dims[sum_dim] = 1
         }
-        let op = BackpropOp::new1(self, |a| Op::Reduce(a, ReduceOp::Sum, dims.to_vec()));
-        let sum = from_storage(storage, dims, op, false);
+        let sum = from_storage(storage, dims);
         if keepdim {
             Ok(sum)
         } else {
@@ -1138,8 +944,7 @@ impl Tensor {
         let storage = self
             .storage()
             .cmp(op, &rhs.storage(), self.layout(), rhs.layout())?;
-        let op = BackpropOp::new1(self, |a| Op::Cmp(a, op));
-        Ok(from_storage(storage, shape.dims(), op, false))
+        Ok(from_storage(storage, shape.dims()))
     }
 
     /// Element-wise equality.
@@ -1187,11 +992,10 @@ impl Tensor {
     /// tensor also has three dimensions, `(batch, channels, target_size)`.
     pub fn interpolate1d(&self, target_size: usize) -> Result<Self> {
         let (n, c, _l) = self.dims3()?;
-        let op = BackpropOp::new1(self, |arg| Op::UpsampleNearest1D { arg, target_size });
         let storage = self
             .storage()
             .upsample_nearest1d(self.layout(), target_size)?;
-        Ok(from_storage(storage, (n, c, target_size), op, false))
+        Ok(from_storage(storage, (n, c, target_size)))
     }
 
     /// Alias for `interpolate1d`.
@@ -1206,15 +1010,10 @@ impl Tensor {
     /// tensor also has four dimensions, `(batch, channels, target_h, target_w)`.
     pub fn interpolate2d(&self, target_h: usize, target_w: usize) -> Result<Self> {
         let (n, c, _h, _w) = self.dims4()?;
-        let op = BackpropOp::new1(self, |arg| Op::UpsampleNearest2D {
-            arg,
-            target_h,
-            target_w,
-        });
         let storage = self
             .storage()
             .upsample_nearest2d(self.layout(), target_h, target_w)?;
-        Ok(from_storage(storage, (n, c, target_h, target_w), op, false))
+        Ok(from_storage(storage, (n, c, target_h, target_w)))
     }
 
     /// Alias for `interpolate2d`.
@@ -1252,12 +1051,6 @@ impl Tensor {
         align_corners: bool,
     ) -> Result<Self> {
         let (n, c, _h, _w) = self.dims4()?;
-        let op = BackpropOp::new1(self, |arg| Op::UpsampleBilinear2D {
-            arg,
-            target_h,
-            target_w,
-            align_corners,
-        });
         // Pass None for scale factors (size mode)
         let storage = self.storage().upsample_bilinear2d(
             self.layout(),
@@ -1267,7 +1060,7 @@ impl Tensor {
             None,
             None,
         )?;
-        Ok(from_storage(storage, (n, c, target_h, target_w), op, false))
+        Ok(from_storage(storage, (n, c, target_h, target_w)))
     }
 
     /// Bilinear interpolation using scale factors.
@@ -1310,13 +1103,6 @@ impl Tensor {
             return Ok(self.clone());
         }
 
-        let op = BackpropOp::new1(self, |arg| Op::UpsampleBilinear2D {
-            arg,
-            target_h: height_out,
-            target_w: width_out,
-            align_corners,
-        });
-
         // Pass original scale factors (scale_factor mode)
         // This ensures PyTorch-compatible scale calculation
         let storage = self.storage().upsample_bilinear2d(
@@ -1327,12 +1113,7 @@ impl Tensor {
             Some(scale_h),
             Some(scale_w),
         )?;
-        Ok(from_storage(
-            storage,
-            (n, c, height_out, width_out),
-            op,
-            false,
-        ))
+        Ok(from_storage(storage, (n, c, height_out, width_out)))
     }
 
     /// 2D average pooling over an input tensor with multiple channels.
@@ -1362,15 +1143,10 @@ impl Tensor {
         // https://pytorch.org/docs/stable/generated/torch.nn.AvgPool2d.html#torch.nn.AvgPool2d
         let h_out = (h - kernel_size.0) / stride.0 + 1;
         let w_out = (w - kernel_size.1) / stride.1 + 1;
-        let op = BackpropOp::new1(self, |arg| Op::AvgPool2D {
-            arg,
-            kernel_size,
-            stride,
-        });
         let storage = self
             .storage()
             .avg_pool2d(self.layout(), kernel_size, stride)?;
-        Ok(from_storage(storage, (n, c, h_out, w_out), op, false))
+        Ok(from_storage(storage, (n, c, h_out, w_out)))
     }
 
     /// 2D max pooling over an input tensor with multiple channels.
@@ -1400,15 +1176,10 @@ impl Tensor {
         // https://pytorch.org/docs/stable/generated/torch.nn.MaxPool2d.html#torch.nn.MaxPool2d
         let h_out = (h - kernel_size.0) / stride.0 + 1;
         let w_out = (w - kernel_size.1) / stride.1 + 1;
-        let op = BackpropOp::new1(self, |arg| Op::MaxPool2D {
-            arg,
-            kernel_size,
-            stride,
-        });
         let storage = self
             .storage()
             .max_pool2d(self.layout(), kernel_size, stride)?;
-        Ok(from_storage(storage, (n, c, h_out, w_out), op, false))
+        Ok(from_storage(storage, (n, c, h_out, w_out)))
     }
 
     /// Computes the dot product of two 1D tensors.
@@ -1536,8 +1307,7 @@ impl Tensor {
             }
 
             let storage = self.device().zeros(&c_shape, self.dtype())?;
-            let op = BackpropOp::new2(self, rhs, Op::Matmul);
-            return Ok(from_storage(storage, c_shape, op, false));
+            return Ok(from_storage(storage, c_shape));
         }
 
         let storage = self.storage().matmul(
@@ -1546,8 +1316,7 @@ impl Tensor {
             self.layout(),
             rhs.layout(),
         )?;
-        let op = BackpropOp::new2(self, rhs, Op::Matmul);
-        Ok(from_storage(storage, c_shape, op, false))
+        Ok(from_storage(storage, c_shape))
     }
 
     /// Matrix-multiplication with broadcasting support.
@@ -1569,8 +1338,8 @@ impl Tensor {
             // A rank-2 rhs is only broadcast over the batch dimensions, so the whole product is
             // a single 2D matmul once the leading dims of lhs are folded into its row dimension.
             // Broadcasting the rhs instead would copy it `batch` times -- for an lm_head that is
-            // the entire vocabulary matrix, per call. Same trick, and same contiguity guard, as
-            // `candle_nn::Linear::forward`.
+            // the entire vocabulary matrix, per call. The fold is a view only when lhs is
+            // contiguous.
             (false, true) if rhs.rank() == 2 && lhs.is_contiguous() => {
                 let (lhs_dims, rhs_dims) = (lhs.dims(), rhs.dims());
                 let (m, k) = (lhs_dims[lhs.rank() - 2], lhs_dims[lhs.rank() - 1]);
@@ -1600,8 +1369,7 @@ impl Tensor {
             &on_false.storage(),
             on_false.layout(),
         )?;
-        let op = BackpropOp::new3(self, on_true, on_false, Op::WhereCond);
-        Ok(from_storage(storage, shape, op, false))
+        Ok(from_storage(storage, shape))
     }
 
     /// Returns a tensor with the values from the `self` tensor at the index corresponding to the
@@ -1685,10 +1453,7 @@ impl Tensor {
             source.layout(),
             dim,
         )?;
-        let op = BackpropOp::new3(self, indexes, source, |t1, t2, t3| {
-            Op::Scatter(t1, t2, t3, dim)
-        });
-        Ok(from_storage(storage, self.shape(), op, false))
+        Ok(from_storage(storage, self.shape()))
     }
 
     pub fn scatter_set<D: Dim>(&self, indexes: &Self, source: &Self, dim: D) -> Result<()> {
@@ -1719,7 +1484,7 @@ impl Tensor {
         self.storage()
             .copy_strided_src(&mut storage, 0, self.layout())?;
         let layout = Layout::contiguous(shape);
-        storage.scatter_add(
+        storage.scatter_add_set(
             &layout,
             &indexes.storage(),
             indexes.layout(),
@@ -1727,10 +1492,7 @@ impl Tensor {
             source.layout(),
             dim,
         )?;
-        let op = BackpropOp::new3(self, indexes, source, |t1, t2, t3| {
-            Op::ScatterAdd(t1, t2, t3, dim)
-        });
-        Ok(from_storage(storage, self.shape(), op, false))
+        Ok(from_storage(storage, self.shape()))
     }
 
     pub fn scatter_add_set<D: Dim>(&self, indexes: &Self, source: &Self, dim: D) -> Result<()> {
@@ -1742,7 +1504,7 @@ impl Tensor {
         }
         let dim = dim.to_index(self.shape(), "scatter-add-set")?;
         self.scatter_checks(indexes, source, dim)?;
-        self.storage_mut().scatter_add(
+        self.storage_mut().scatter_add_set(
             self.layout(),
             &indexes.storage(),
             indexes.layout(),
@@ -1776,7 +1538,7 @@ impl Tensor {
             }
             .bt())?
         }
-        if self.device().location() != src.device.location() {
+        if !self.device().same_device(src.device()) {
             Err(Error::DeviceMismatchBinaryOp {
                 lhs: self.device().location(),
                 rhs: src.device().location(),
@@ -1818,8 +1580,7 @@ impl Tensor {
         let offset = start * src.dims()[1..].iter().product::<usize>();
         src.storage()
             .copy_strided_src(&mut storage, offset, src.layout())?;
-        let op = BackpropOp::new2(self, src, |t1, t2| Op::SliceScatter0(t1, t2, start));
-        Ok(from_storage(storage, self.shape(), op, false))
+        Ok(from_storage(storage, self.shape()))
     }
 
     /// Accumulate element from `source` at indexes `indexes` and add them to `self`.
@@ -1867,10 +1628,7 @@ impl Tensor {
             source.layout(),
             dim,
         )?;
-        let op = BackpropOp::new3(self, indexes, source, |t1, t2, t3| {
-            Op::IndexAdd(t1, t2, t3, dim)
-        });
-        Ok(from_storage(storage, self.shape(), op, false))
+        Ok(from_storage(storage, self.shape()))
     }
 
     /// Gather values across the target dimension.
@@ -1912,8 +1670,7 @@ impl Tensor {
         let storage =
             self.storage()
                 .gather(self.layout(), &indexes.storage(), indexes.layout(), dim)?;
-        let op = BackpropOp::new2(self, indexes, |t1, t2| Op::Gather(t1, t2, dim));
-        Ok(from_storage(storage, indexes.shape(), op, false))
+        Ok(from_storage(storage, indexes.shape()))
     }
 
     /// Select values for the input tensor at the target indexes across the specified dimension.
@@ -1942,8 +1699,7 @@ impl Tensor {
         )?;
         let mut dims = self.dims().to_vec();
         dims[dim] = indexes_len;
-        let op = BackpropOp::new2(self, indexes, |t1, t2| Op::IndexSelect(t1, t2, dim));
-        Ok(from_storage(storage, dims, op, false))
+        Ok(from_storage(storage, dims))
     }
 
     /// Returns an iterator over position of the elements in the storage when ranging over the
@@ -1980,8 +1736,7 @@ impl Tensor {
         };
         match &*self.storage() {
             Storage::Cpu(storage) => from_cpu_storage(storage),
-            Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
-            Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Backend(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -2011,8 +1766,7 @@ impl Tensor {
         };
         match &*self.storage() {
             Storage::Cpu(storage) => from_cpu_storage(storage),
-            Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
-            Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Backend(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -2052,8 +1806,7 @@ impl Tensor {
         };
         match &*self.storage() {
             Storage::Cpu(storage) => from_cpu_storage(storage),
-            Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
-            Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Backend(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -2106,16 +1859,6 @@ impl Tensor {
     /// The unique identifier for this tensor.
     pub fn id(&self) -> TensorId {
         self.id
-    }
-
-    /// Whether this tensor is a variable or not. A variable is a tensor for which gradient is
-    /// tracked and on which backpropagation can be performed.
-    pub fn is_variable(&self) -> bool {
-        self.is_variable
-    }
-
-    pub(crate) fn op(&self) -> &Option<Op> {
-        &self.op
     }
 
     /// Computes the max of all the elements in this tensor and returns a tensor holding this
@@ -2302,13 +2045,10 @@ impl Tensor {
         if dim1 == dim2 {
             return Ok(self.clone());
         }
-        let op = BackpropOp::new1(self, |t| Op::Transpose(t, dim1, dim2));
         let tensor_ = Tensor_ {
             id: TensorId::new(),
             storage: self.storage.clone(),
             layout: self.layout.transpose(dim1, dim2)?,
-            op,
-            is_variable: false,
             dtype: self.dtype,
             device: self.device.clone(),
         };
@@ -2338,13 +2078,10 @@ impl Tensor {
                 dims
             )
         }
-        let op = BackpropOp::new1(self, |t| Op::Permute(t, dims.clone()));
         let tensor_ = Tensor_ {
             id: TensorId::new(),
             storage: self.storage.clone(),
             layout: self.layout.permute(&dims)?,
-            op,
-            is_variable: false,
             dtype: self.dtype,
             device: self.device.clone(),
         };
@@ -2364,80 +2101,48 @@ impl Tensor {
     /// Compared to clone, this copies the actual storage but may fail because of running out of
     /// memory.
     pub fn copy(&self) -> Result<Tensor> {
-        let op = BackpropOp::new1(self, Op::Copy);
         let tensor_ = Tensor_ {
             id: TensorId::new(),
             storage: Arc::new(RwLock::new(self.storage().try_clone(self.layout())?)),
             layout: self.layout.clone(),
-            op,
-            is_variable: false,
             dtype: self.dtype,
             device: self.device.clone(),
         };
         Ok(Tensor(Arc::new(tensor_)))
     }
 
-    /// Returns a new tensor detached from the current graph, gradient are not propagated through
-    /// this new node. The storage of this tensor is shared with the initial tensor.
+    /// Moves the tensor to `device`.
     ///
-    /// If the tensor is already detached from the computation graph, the same tensor is returned.
-    pub fn detach(&self) -> Tensor {
-        if self.op.is_none() && !self.is_variable {
-            self.clone()
-        } else {
-            let tensor_ = Tensor_ {
-                id: TensorId::new(),
-                storage: self.storage.clone(),
-                layout: self.layout.clone(),
-                op: BackpropOp::none(),
-                is_variable: false,
-                dtype: self.dtype,
-                device: self.device.clone(),
-            };
-            Tensor(Arc::new(tensor_))
-        }
-    }
-
-    /// If the target device is the same as the tensor device, only a shallow copy is performed.
+    /// If `device` is the same device as the tensor's, only a shallow copy is performed. Between
+    /// the CPU and a backend device the storage is copied by the backend, host-to-device or
+    /// device-to-host. Moving between two backend devices that are not the same device is an
+    /// error.
     pub fn to_device(&self, device: &Device) -> Result<Tensor> {
         if self.device().same_device(device) {
-            Ok(self.clone())
-        } else {
-            let storage = match (&*self.storage(), device) {
-                (Storage::Cpu(storage), Device::Cuda(cuda)) => {
-                    Storage::Cuda(cuda.storage_from_cpu_storage(storage)?)
-                }
-                (Storage::Cpu(storage), Device::Metal(metal)) => {
-                    Storage::Metal(metal.storage_from_cpu_storage(storage)?)
-                }
-                (Storage::Cuda(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
-                (Storage::Metal(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
-                (Storage::Cuda(storage), Device::Cuda(cuda)) => {
-                    // can't clone storage if it's the same device because of the underlying device ptr
-                    let dst_storage = storage.transfer_to_device(cuda)?;
-                    Storage::Cuda(dst_storage)
-                }
-                (Storage::Cpu(storage), Device::Cpu) => Storage::Cpu(storage.clone()),
-                _ => {
-                    bail!(
-                        "not implemented yet, self.device: {:?}, device: {:?}",
-                        self.device(),
-                        device
-                    )
-                }
-            };
-            let op = BackpropOp::new1(self, Op::ToDevice);
-            let tensor_ = Tensor_ {
-                id: TensorId::new(),
-                storage: Arc::new(RwLock::new(storage)),
-                layout: self.layout.clone(),
-                op,
-                is_variable: false,
-                dtype: self.dtype,
-                device: device.clone(),
-            };
-            Ok(Tensor(Arc::new(tensor_)))
+            return Ok(self.clone());
         }
+
+        let storage = match (&*self.storage(), device) {
+            (Storage::Cpu(storage), Device::Backend(backend)) => {
+                Storage::Backend(backend.storage_from_cpu_storage(storage)?)
+            }
+            (Storage::Backend(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
+            _ => bail!(
+                "cannot move a tensor from {:?} to {:?}",
+                self.device().location(),
+                device.location()
+            ),
+        };
+
+        // Both copies keep every element at its position, so the layout still applies.
+        let tensor_ = Tensor_ {
+            id: TensorId::new(),
+            storage: Arc::new(RwLock::new(storage)),
+            layout: self.layout.clone(),
+            dtype: self.dtype,
+            device: device.clone(),
+        };
+        Ok(Tensor(Arc::new(tensor_)))
     }
 
     /// Returns a new tensor duplicating data from the original tensor. New dimensions are inserted
@@ -2461,8 +2166,6 @@ impl Tensor {
             id: TensorId::new(),
             storage: self.storage.clone(),
             layout: self.layout.broadcast_as(shape)?,
-            op: BackpropOp::new1(self, Op::Broadcast),
-            is_variable: false,
             dtype: self.dtype,
             device: self.device.clone(),
         };
@@ -2490,8 +2193,7 @@ impl Tensor {
         } else {
             let shape = self.shape();
             let storage = self.storage().to_dtype(self.layout(), dtype)?;
-            let op = BackpropOp::new1(self, Op::ToDType);
-            Ok(from_storage(storage, shape.clone(), op, false))
+            Ok(from_storage(storage, shape.clone()))
         }
     }
 
@@ -2505,8 +2207,7 @@ impl Tensor {
             let mut storage = unsafe { self.device().alloc_uninit(shape, self.dtype())? };
             self.storage()
                 .copy_strided_src(&mut storage, 0, self.layout())?;
-            let op = BackpropOp::new1(self, Op::Copy);
-            Ok(from_storage(storage, shape.clone(), op, false))
+            Ok(from_storage(storage, shape.clone()))
         }
     }
 
@@ -2516,18 +2217,7 @@ impl Tensor {
         let mut storage = unsafe { self.device().alloc_uninit(shape, self.dtype())? };
         self.storage()
             .copy_strided_src(&mut storage, 0, self.layout())?;
-        let op = BackpropOp::new1(self, Op::Copy);
-        Ok(from_storage(storage, shape.clone(), op, false))
-    }
-
-    /// Create a variable based on the values currently stored in a tensor. The storage is always
-    /// copied.
-    pub(crate) fn make_var(&self) -> Result<Tensor> {
-        let shape = self.shape().clone();
-        let mut storage = unsafe { self.device().alloc_uninit(&shape, self.dtype())? };
-        self.storage()
-            .copy_strided_src(&mut storage, 0, self.layout())?;
-        Ok(from_storage(storage, shape, BackpropOp::none(), true))
+        Ok(from_storage(storage, shape.clone()))
     }
 
     /// Reshape returns a tensor with the target shape provided that the number of elements of the
@@ -2564,14 +2254,11 @@ impl Tensor {
             }
             .bt());
         }
-        let op = BackpropOp::new1(self, Op::Reshape);
         if self.is_contiguous() {
             let tensor_ = Tensor_ {
                 id: TensorId::new(),
                 storage: self.storage.clone(),
                 layout: Layout::contiguous_with_offset(shape, self.layout.start_offset()),
-                op,
-                is_variable: false,
                 dtype: self.dtype,
                 device: self.device.clone(),
             };
@@ -2580,7 +2267,7 @@ impl Tensor {
             let mut storage = unsafe { self.device().alloc_uninit(&shape, self.dtype())? };
             self.storage()
                 .copy_strided_src(&mut storage, 0, self.layout())?;
-            Ok(from_storage(storage, shape, op, false))
+            Ok(from_storage(storage, shape))
         }
     }
 
@@ -2611,8 +2298,6 @@ impl Tensor {
                 id: TensorId::new(),
                 storage: self.storage.clone(),
                 layout: Layout::new(dims.into(), strides, self.layout.start_offset()),
-                op: BackpropOp::new1(self, Op::Reshape),
-                is_variable: false,
                 dtype: self.dtype,
                 device: self.device.clone(),
             };
@@ -2649,8 +2334,6 @@ impl Tensor {
             id: TensorId::new(),
             storage: self.storage.clone(),
             layout: Layout::new(dims.into(), strides, self.layout.start_offset()),
-            op: BackpropOp::new1(self, Op::Reshape),
-            is_variable: false,
             dtype: self.dtype,
             device: self.device.clone(),
         };
@@ -2758,11 +2441,6 @@ impl Tensor {
         m.forward(self)
     }
 
-    /// Run the `forward` method of `m` on `self`.
-    pub fn apply_t<M: crate::ModuleT>(&self, m: &M, train: bool) -> Result<Self> {
-        m.forward_t(self, train)
-    }
-
     /// Acquire read lock on storage and returns guard.
     /// `read_recursive` allows for shared read access.
     pub(crate) fn storage(&self) -> StorageRef<'_> {
@@ -2774,9 +2452,13 @@ impl Tensor {
         self.storage.write()
     }
 
-    // If we extend the visibility of this function to be usable outside of this crate, we should
-    // make it unsafe.
-    pub(crate) fn storage_mut_and_layout(&self) -> (StorageMutRef<'_>, &Layout) {
+    /// The storage used by this tensor locked for writing, together with the layout to use to
+    /// access it.
+    ///
+    /// Every tensor that shares the storage observes what is written through the guard. Any
+    /// operation that reads one of them blocks until the guard is dropped, including on the
+    /// thread that holds it.
+    pub fn storage_mut_and_layout(&self) -> (StorageMutRef<'_>, &Layout) {
         let storage = self.storage.write();
         (storage, &self.layout)
     }
@@ -3003,8 +2685,6 @@ impl Tensor {
             id: TensorId::new(),
             storage: self.storage.clone(),
             layout: Layout::new(sizes.into(), strides, self.layout.start_offset()),
-            op: BackpropOp::new1(self, Op::Reshape),
-            is_variable: false,
             dtype: self.dtype,
             device: self.device.clone(),
         };
@@ -3153,6 +2833,6 @@ impl std::ops::Div<&Tensor> for f64 {
 
 impl<S: Into<Shape>> From<(Storage, S)> for Tensor {
     fn from((storage, shape): (Storage, S)) -> Self {
-        from_storage(storage, shape, BackpropOp::none(), false)
+        from_storage(storage, shape)
     }
 }

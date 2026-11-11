@@ -1,8 +1,8 @@
-use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
-use uniserve_tensor::{DType, Device, Tensor};
+use crate::benchmarks::bench_name;
 use criterion::{criterion_group, Criterion, Throughput};
 use std::hint::black_box;
 use std::time::Instant;
+use uniserve_tensor::{DType, Device, Tensor};
 
 /// Matmul benchmark shapes covering common GEMM scenarios
 const MATMUL_SHAPES: &[(&str, &[usize], &[usize])] = &[
@@ -43,7 +43,7 @@ fn run_bench(c: &mut Criterion, device: &Device, name: &str, shape_a: &[usize], 
 
     let flops = calculate_flops(shape_a, shape_b);
 
-    let mut group = c.benchmark_group(device.bench_name(format!("matmul_{name}")));
+    let mut group = c.benchmark_group(bench_name(device, format!("matmul_{name}")));
     group.throughput(Throughput::Bytes(flops as u64));
     group.bench_function("iter", move |b| {
         b.iter_custom(|iters| {
@@ -51,7 +51,7 @@ fn run_bench(c: &mut Criterion, device: &Device, name: &str, shape_a: &[usize], 
             for _i in 0..iters {
                 run(black_box(&lhs), black_box(&rhs));
             }
-            device.sync().unwrap();
+            device.synchronize().unwrap();
             start.elapsed()
         })
     });
@@ -59,11 +59,9 @@ fn run_bench(c: &mut Criterion, device: &Device, name: &str, shape_a: &[usize], 
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
-    let handler = BenchDeviceHandler::new().unwrap();
-    for device in handler.devices {
-        for (name, shape_a, shape_b) in MATMUL_SHAPES {
-            run_bench(c, &device, name, shape_a, shape_b);
-        }
+    let device = Device::Cpu;
+    for (name, shape_a, shape_b) in MATMUL_SHAPES {
+        run_bench(c, &device, name, shape_a, shape_b);
     }
 }
 

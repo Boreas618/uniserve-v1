@@ -1,4 +1,7 @@
-use uniserve_tensor::{test_device, DType, Device, IndexOp, Result, Tensor};
+#[macro_use]
+mod common;
+
+use uniserve_tensor::{DType, Device, IndexOp, Result, Tensor};
 
 fn matmul(device: &Device) -> Result<()> {
     let data = vec![1.0f32, 2.0, 3.0, 4.0];
@@ -50,9 +53,6 @@ fn matmul(device: &Device) -> Result<()> {
 }
 
 fn matmul_bf16(device: &Device) -> Result<()> {
-    if !device.supports_bf16() {
-        return Ok(());
-    }
     let data = vec![1.0f32, 2.0, 3.0, 4.0];
     let a = Tensor::from_slice(&data, (2, 2), device)?.to_dtype(DType::BF16)?;
     let data = vec![1.0f32, 2.0, 3.0, 4.0];
@@ -64,8 +64,8 @@ fn matmul_bf16(device: &Device) -> Result<()> {
 }
 
 fn broadcast_matmul(device: &Device) -> Result<()> {
-    let lhs = Tensor::randn(0f32, 1f32, (3, 1, 4, 5), device)?;
-    let rhs = Tensor::randn(0f32, 1f32, (6, 5, 2), device)?;
+    let lhs = common::sample(1, (3, 1, 4, 5), device)?;
+    let rhs = common::sample(2, (6, 5, 2), device)?;
     let out = lhs.broadcast_matmul(&rhs)?;
     assert_eq!(out.dims(), &[3, 6, 4, 2]);
     for idx1 in 0..3 {
@@ -75,7 +75,6 @@ fn broadcast_matmul(device: &Device) -> Result<()> {
             let rhs = rhs.i(idx2)?;
             let out2 = lhs.matmul(&rhs);
             let sum_diff2 = (out - out2)?.sqr()?.sum_all()?;
-            // With cuda, we see errors of up to ~1e-12.
             assert!(sum_diff2.to_vec0::<f32>()? < 1e-6)
         }
     }
@@ -88,8 +87,8 @@ fn broadcast_matmul(device: &Device) -> Result<()> {
 // per-batch loop.
 fn broadcast_matmul_stride_zero_lhs(device: &Device) -> Result<()> {
     for (b, m, n, k) in [(32, 32, 32, 32), (3, 1, 2, 5), (4, 2, 3, 1), (2, 5, 1, 3)] {
-        let lhs = Tensor::randn(0f32, 1f32, (1, m, k), device)?;
-        let rhs = Tensor::randn(0f32, 1f32, (b, k, n), device)?;
+        let lhs = common::sample(3, (1, m, k), device)?;
+        let rhs = common::sample(4, (b, k, n), device)?;
 
         let out = lhs.broadcast_as((b, m, k))?.matmul(&rhs)?;
         assert_eq!(out.dims(), &[b, m, n]);
@@ -177,12 +176,12 @@ fn zero_matmul_device_validation(device: &Device) -> Result<()> {
 // single 2D matmul instead of copying the rhs. Check the folded path against the per-batch
 // products it stands for, contiguous lhs (folded) and non-contiguous lhs (fallback) alike.
 fn broadcast_matmul_rank2_rhs(device: &Device) -> Result<()> {
-    let rhs = Tensor::randn(0f32, 1f32, (5, 2), device)?;
+    let rhs = common::sample(5, (5, 2), device)?;
     for lhs in [
-        Tensor::randn(0f32, 1f32, (3, 4, 5), device)?,
-        Tensor::randn(0f32, 1f32, (3, 6, 4, 5), device)?,
-        Tensor::randn(0f32, 1f32, (1, 1, 5), device)?,
-        Tensor::randn(0f32, 1f32, (3, 5, 4), device)?.transpose(1, 2)?,
+        common::sample(6, (3, 4, 5), device)?,
+        common::sample(7, (3, 6, 4, 5), device)?,
+        common::sample(8, (1, 1, 5), device)?,
+        common::sample(9, (3, 5, 4), device)?.transpose(1, 2)?,
     ] {
         let out = lhs.broadcast_matmul(&rhs)?;
         let mut dims = lhs.dims().to_vec();
@@ -249,48 +248,13 @@ fn mm_layout(device: &Device) -> Result<()> {
     Ok(())
 }
 
-test_device!(matmul, matmul_cpu, matmul_gpu, matmul_metal);
-test_device!(
-    matmul_bf16,
-    matmul_bf16_cpu,
-    matmul_bf16_gpu,
-    matmul_bf16_metal
-);
-test_device!(
-    broadcast_matmul,
-    broadcast_matmul_cpu,
-    broadcast_matmul_gpu,
-    broadcast_matmul_metal
-);
-test_device!(
-    broadcast_matmul_stride_zero_lhs,
-    broadcast_matmul_stride_zero_lhs_cpu,
-    broadcast_matmul_stride_zero_lhs_gpu,
-    broadcast_matmul_stride_zero_lhs_metal
-);
-test_device!(
-    zero_matmul,
-    zero_matmul_cpu,
-    zero_matmul_gpu,
-    zero_matmul_metal
-);
-test_device!(
-    zero_matmul_validation,
-    zero_matmul_validation_cpu,
-    zero_matmul_validation_gpu,
-    zero_matmul_validation_metal
-);
-test_device!(
-    zero_matmul_device_validation,
-    zero_matmul_device_validation_cpu,
-    zero_matmul_device_validation_gpu,
-    zero_matmul_device_validation_metal
-);
-test_device!(
-    broadcast_matmul_rank2_rhs,
-    broadcast_matmul_rank2_rhs_cpu,
-    broadcast_matmul_rank2_rhs_gpu,
-    broadcast_matmul_rank2_rhs_metal
-);
-test_device!(squeeze_mm, squeeze_mm_cpu, squeeze_mm_gpu, squeeze_mm_metal);
-test_device!(mm_layout, mm_layout_cpu, mm_layout_gpu, mm_layout_metal);
+test_device!(matmul);
+test_device!(matmul_bf16);
+test_device!(broadcast_matmul);
+test_device!(broadcast_matmul_stride_zero_lhs);
+test_device!(zero_matmul);
+test_device!(zero_matmul_validation);
+test_device!(zero_matmul_device_validation);
+test_device!(broadcast_matmul_rank2_rhs);
+test_device!(squeeze_mm);
+test_device!(mm_layout);

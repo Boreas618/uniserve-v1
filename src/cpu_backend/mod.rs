@@ -1,6 +1,5 @@
-//! Implementation of Backend Fns for CPU
-use crate::backend::{BackendDevice, BackendStorage};
-use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
+//! The CPU backend: host storage and the primitives tensor operations are built from.
+use crate::op::{self, BinaryOp, BinaryOpT, CmpOp, ReduceOp, UnaryOp, UnaryOpT};
 use crate::{DType, Error, IntDType, Layout, NdIter, Result, Shape, WithDType};
 use float8::F8E4M3;
 use half::{bf16, f16, slice::HalfFloatSliceExt, vec::HalfFloatVecExt};
@@ -1442,7 +1441,6 @@ impl MatMul {
 impl Map2 for MatMul {
     const OP: &'static str = "mat_mul";
 
-    #[cfg(all(not(feature = "mkl"), not(feature = "accelerate")))]
     fn f<T: 'static + WithDType + num_traits::Num + Copy>(
         &self,
         lhs: &[T],
@@ -1526,215 +1524,6 @@ impl Map2 for MatMul {
                     parallelism,
                 )
             }
-        }
-        Ok(dst)
-    }
-
-    #[cfg(feature = "accelerate")]
-    fn f<T: 'static + WithDType + num_traits::Num + Copy>(
-        &self,
-        lhs: &[T],
-        lhs_l: &Layout,
-        rhs: &[T],
-        rhs_l: &Layout,
-    ) -> Result<Vec<T>> {
-        let (b, m, n, k) = self.0;
-        let lhs = &lhs[lhs_l.start_offset()..];
-        let rhs = &rhs[rhs_l.start_offset()..];
-
-        let lhs_stride = lhs_l.stride();
-        let rhs_stride = rhs_l.stride();
-
-        let (a_skip, b_skip) = self.ab_skip(lhs_l, rhs_l)?;
-        let c_skip: usize = m * n;
-
-        let rhs_m1 = rhs_stride[rhs_stride.len() - 1];
-        let rhs_m2 = rhs_stride[rhs_stride.len() - 2];
-        let lhs_m1 = lhs_stride[lhs_stride.len() - 1];
-        let lhs_m2 = lhs_stride[lhs_stride.len() - 2];
-
-        let (lda, transa) = if (rhs_m1 == 1 || n == 1) && (rhs_m2 == n || k == 1) {
-            (n as i32, b'N')
-        } else if rhs_m1 == k && rhs_m2 == 1 {
-            (k as i32, b'T')
-        } else {
-            Err(self.striding_error(lhs_l, rhs_l, "non-contiguous rhs"))?
-        };
-        // The b tensor has dims batching, m, k (lhs)
-        let (ldb, transb) = if (lhs_m1 == 1 || k == 1) && (lhs_m2 == k || m == 1) {
-            (k as i32, b'N')
-        } else if lhs_m1 == m && lhs_m2 == 1 {
-            (m as i32, b'T')
-        } else {
-            Err(self.striding_error(lhs_l, rhs_l, "non-contiguous lhs"))?
-        };
-
-        let mut dst = vec![T::zero(); b * m * n];
-        match T::DTYPE {
-            DType::F16 => {
-                crate::bail!("the accelerate backend does not support f16 matmul")
-            }
-            DType::F32 => {
-                for step in 0..b {
-                    let lhs_p = &lhs[step * a_skip..];
-                    let rhs_p = &rhs[step * b_skip..];
-                    let dst_p = &mut dst[step * c_skip..];
-                    unsafe {
-                        let a = rhs_p.as_ptr() as *const f32;
-                        let b = lhs_p.as_ptr() as *const f32;
-                        let c = dst_p.as_mut_ptr() as *mut f32;
-                        let a = std::slice::from_raw_parts(a, a_skip);
-                        let b = std::slice::from_raw_parts(b, b_skip);
-                        let c = std::slice::from_raw_parts_mut(c, c_skip);
-                        crate::accelerate::sgemm(
-                            transa, transb, /* m= */ n as i32, /* n= */ m as i32,
-                            /* k= */ k as i32, /* alpha= */ 1., /* a= */ a,
-                            /* lda= */ lda, /* b= */ b, /* ldb= */ ldb,
-                            /* beta= */ 0., /* c= */ c, /* ldc= */ n as i32,
-                        )
-                    }
-                }
-            }
-            DType::F64 => {
-                for step in 0..b {
-                    let lhs_p = &lhs[step * a_skip..];
-                    let rhs_p = &rhs[step * b_skip..];
-                    let dst_p = &mut dst[step * c_skip..];
-                    unsafe {
-                        let a = rhs_p.as_ptr() as *const f64;
-                        let b = lhs_p.as_ptr() as *const f64;
-                        let c = dst_p.as_mut_ptr() as *mut f64;
-                        let a = std::slice::from_raw_parts(a, a_skip);
-                        let b = std::slice::from_raw_parts(b, b_skip);
-                        let c = std::slice::from_raw_parts_mut(c, c_skip);
-                        crate::accelerate::dgemm(
-                            transa, transb, /* m= */ n as i32, /* n= */ m as i32,
-                            /* k= */ k as i32, /* alpha= */ 1., /* a= */ a,
-                            /* lda= */ lda, /* b= */ b, /* ldb= */ ldb,
-                            /* beta= */ 0., /* c= */ c, /* ldc= */ n as i32,
-                        )
-                    }
-                }
-            }
-            dtype => Err(Error::UnsupportedDTypeForOp(dtype, "matmul").bt())?,
-        }
-        Ok(dst)
-    }
-
-    #[cfg(feature = "mkl")]
-    fn f<T: 'static + WithDType + num_traits::Num + Copy>(
-        &self,
-        lhs: &[T],
-        lhs_l: &Layout,
-        rhs: &[T],
-        rhs_l: &Layout,
-    ) -> Result<Vec<T>> {
-        let (b, m, n, k) = self.0;
-        let lhs = &lhs[lhs_l.start_offset()..];
-        let rhs = &rhs[rhs_l.start_offset()..];
-
-        let lhs_stride = lhs_l.stride();
-        let rhs_stride = rhs_l.stride();
-
-        let (a_skip, b_skip) = self.ab_skip(lhs_l, rhs_l)?;
-        let c_skip: usize = m * n;
-
-        let rhs_m1 = rhs_stride[rhs_stride.len() - 1];
-        let rhs_m2 = rhs_stride[rhs_stride.len() - 2];
-        let lhs_m1 = lhs_stride[lhs_stride.len() - 1];
-        let lhs_m2 = lhs_stride[lhs_stride.len() - 2];
-
-        let (lda, transa) = if (rhs_m1 == 1 || n == 1) && (rhs_m2 == n || k == 1) {
-            (n as i32, b'N')
-        } else if rhs_m1 == k && rhs_m2 == 1 {
-            (k as i32, b'T')
-        } else {
-            Err(self.striding_error(lhs_l, rhs_l, "non-contiguous rhs"))?
-        };
-        // The b tensor has dims batching, m, k (lhs)
-        let (ldb, transb) = if (lhs_m1 == 1 || k == 1) && (lhs_m2 == k || m == 1) {
-            (k as i32, b'N')
-        } else if lhs_m1 == m && lhs_m2 == 1 {
-            (m as i32, b'T')
-        } else {
-            Err(self.striding_error(lhs_l, rhs_l, "non-contiguous lhs"))?
-        };
-
-        let mut dst = vec![T::zero(); b * m * n];
-        match T::DTYPE {
-            DType::F16 => {
-                for step in 0..b {
-                    let lhs_p = &lhs[step * a_skip..];
-                    let rhs_p = &rhs[step * b_skip..];
-                    let dst_p = &mut dst[step * c_skip..];
-                    unsafe {
-                        let a = rhs_p.as_ptr() as *const f16;
-                        let b = lhs_p.as_ptr() as *const f16;
-                        let c = dst_p.as_mut_ptr() as *mut f16;
-                        let a = std::slice::from_raw_parts(a, a_skip);
-                        let b = std::slice::from_raw_parts(b, b_skip);
-                        let c = std::slice::from_raw_parts_mut(c, c_skip);
-                        crate::mkl::hgemm(
-                            transa,
-                            transb,
-                            /* m= */ n as i32,
-                            /* n= */ m as i32,
-                            /* k= */ k as i32,
-                            /* alpha= */ f16::ONE,
-                            /* a= */ a,
-                            /* lda= */ lda,
-                            /* b= */ b,
-                            /* ldb= */ ldb,
-                            /* beta= */ f16::ZERO,
-                            /* c= */ c,
-                            /* ldc= */ n as i32,
-                        )
-                    }
-                }
-            }
-            DType::F32 => {
-                for step in 0..b {
-                    let lhs_p = &lhs[step * a_skip..];
-                    let rhs_p = &rhs[step * b_skip..];
-                    let dst_p = &mut dst[step * c_skip..];
-                    unsafe {
-                        let a = rhs_p.as_ptr() as *const f32;
-                        let b = lhs_p.as_ptr() as *const f32;
-                        let c = dst_p.as_mut_ptr() as *mut f32;
-                        let a = std::slice::from_raw_parts(a, a_skip);
-                        let b = std::slice::from_raw_parts(b, b_skip);
-                        let c = std::slice::from_raw_parts_mut(c, c_skip);
-                        crate::mkl::sgemm(
-                            transa, transb, /* m= */ n as i32, /* n= */ m as i32,
-                            /* k= */ k as i32, /* alpha= */ 1., /* a= */ a,
-                            /* lda= */ lda, /* b= */ b, /* ldb= */ ldb,
-                            /* beta= */ 0., /* c= */ c, /* ldc= */ n as i32,
-                        )
-                    }
-                }
-            }
-            DType::F64 => {
-                for step in 0..b {
-                    let lhs_p = &lhs[step * a_skip..];
-                    let rhs_p = &rhs[step * b_skip..];
-                    let dst_p = &mut dst[step * c_skip..];
-                    unsafe {
-                        let a = rhs_p.as_ptr() as *const f64;
-                        let b = lhs_p.as_ptr() as *const f64;
-                        let c = dst_p.as_mut_ptr() as *mut f64;
-                        let a = std::slice::from_raw_parts(a, a_skip);
-                        let b = std::slice::from_raw_parts(b, b_skip);
-                        let c = std::slice::from_raw_parts_mut(c, c_skip);
-                        crate::mkl::dgemm(
-                            transa, transb, /* m= */ n as i32, /* n= */ m as i32,
-                            /* k= */ k as i32, /* alpha= */ 1., /* a= */ a,
-                            /* lda= */ lda, /* b= */ b, /* ldb= */ ldb,
-                            /* beta= */ 0., /* c= */ c, /* ldc= */ n as i32,
-                        )
-                    }
-                }
-            }
-            dtype => Err(Error::UnsupportedDTypeForOp(dtype, "matmul").bt())?,
         }
         Ok(dst)
     }
@@ -1915,10 +1704,8 @@ impl CpuStorage {
     }
 }
 
-impl BackendStorage for CpuStorage {
-    type Device = CpuDevice;
-
-    fn dtype(&self) -> DType {
+impl CpuStorage {
+    pub fn dtype(&self) -> DType {
         match self {
             Self::U8(_) => DType::U8,
             Self::U32(_) => DType::U32,
@@ -1937,7 +1724,7 @@ impl BackendStorage for CpuStorage {
         }
     }
 
-    fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
+    pub fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
         // TODO: find a way around the quadratic number of cases below.
         match (self, dtype) {
             (Self::U8(storage), DType::BF16) => {
@@ -2359,7 +2146,7 @@ impl BackendStorage for CpuStorage {
         }
     }
 
-    fn reduce_op(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
+    pub fn reduce(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
         match op {
             ReduceOp::Sum => {
                 let src_dims = layout.dims();
@@ -2415,15 +2202,15 @@ impl BackendStorage for CpuStorage {
         }
     }
 
-    fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+    pub fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
         Cmp(op).map(self, lhs_l, rhs, rhs_l)
     }
 
-    fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
+    pub fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
         Affine(mul, add).map(self, layout)
     }
 
-    fn avg_pool2d(
+    pub fn avg_pool2d(
         &self,
         layout: &Layout,
         kernel_size: (usize, usize),
@@ -2432,7 +2219,7 @@ impl BackendStorage for CpuStorage {
         AvgPool2D(kernel_size, stride).map(self, layout)
     }
 
-    fn max_pool2d(
+    pub fn max_pool2d(
         &self,
         layout: &Layout,
         kernel_size: (usize, usize),
@@ -2441,15 +2228,15 @@ impl BackendStorage for CpuStorage {
         MaxPool2D(kernel_size, stride).map(self, layout)
     }
 
-    fn upsample_nearest1d(&self, layout: &Layout, sz: usize) -> Result<Self> {
+    pub fn upsample_nearest1d(&self, layout: &Layout, sz: usize) -> Result<Self> {
         UpsampleNearest1D(sz).map(self, layout)
     }
 
-    fn upsample_nearest2d(&self, layout: &Layout, h: usize, w: usize) -> Result<Self> {
+    pub fn upsample_nearest2d(&self, layout: &Layout, h: usize, w: usize) -> Result<Self> {
         UpsampleNearest2D(h, w).map(self, layout)
     }
 
-    fn upsample_bilinear2d(
+    pub fn upsample_bilinear2d(
         &self,
         layout: &Layout,
         h: usize,
@@ -2468,7 +2255,7 @@ impl BackendStorage for CpuStorage {
         .map(self, layout)
     }
 
-    fn powf(&self, layout: &Layout, e: f64) -> Result<Self> {
+    pub fn powf(&self, layout: &Layout, e: f64) -> Result<Self> {
         use num_traits::Float;
         // TODO: Have some generic map for functions that apply on num_traits::Float elements.
         match self {
@@ -2504,7 +2291,7 @@ impl BackendStorage for CpuStorage {
         }
     }
 
-    fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
+    pub fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
         // TODO: Have some generic map for functions that apply on num_traits::Float elements.
         match self {
             Self::BF16(storage) => {
@@ -2539,7 +2326,42 @@ impl BackendStorage for CpuStorage {
         }
     }
 
-    fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
+    pub fn unary(&self, op: UnaryOp, layout: &Layout) -> Result<Self> {
+        match op {
+            UnaryOp::Exp => self.unary_impl::<op::Exp>(layout),
+            UnaryOp::Log => self.unary_impl::<op::Log>(layout),
+            UnaryOp::Sin => self.unary_impl::<op::Sin>(layout),
+            UnaryOp::Cos => self.unary_impl::<op::Cos>(layout),
+            UnaryOp::Abs => self.unary_impl::<op::Abs>(layout),
+            UnaryOp::Neg => self.unary_impl::<op::Neg>(layout),
+            UnaryOp::Recip => self.unary_impl::<op::Recip>(layout),
+            UnaryOp::Sqr => self.unary_impl::<op::Sqr>(layout),
+            UnaryOp::Sqrt => self.unary_impl::<op::Sqrt>(layout),
+            UnaryOp::Gelu => self.unary_impl::<op::Gelu>(layout),
+            UnaryOp::GeluErf => self.unary_impl::<op::GeluErf>(layout),
+            UnaryOp::Erf => self.unary_impl::<op::Erf>(layout),
+            UnaryOp::Relu => self.unary_impl::<op::Relu>(layout),
+            UnaryOp::Silu => self.unary_impl::<op::Silu>(layout),
+            UnaryOp::Tanh => self.unary_impl::<op::Tanh>(layout),
+            UnaryOp::Floor => self.unary_impl::<op::Floor>(layout),
+            UnaryOp::Ceil => self.unary_impl::<op::Ceil>(layout),
+            UnaryOp::Round => self.unary_impl::<op::Round>(layout),
+            UnaryOp::Sign => self.unary_impl::<op::Sign>(layout),
+        }
+    }
+
+    pub fn binary(&self, op: BinaryOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+        match op {
+            BinaryOp::Add => self.binary_impl::<op::Add>(rhs, lhs_l, rhs_l),
+            BinaryOp::Mul => self.binary_impl::<op::Mul>(rhs, lhs_l, rhs_l),
+            BinaryOp::Sub => self.binary_impl::<op::Sub>(rhs, lhs_l, rhs_l),
+            BinaryOp::Div => self.binary_impl::<op::Div>(rhs, lhs_l, rhs_l),
+            BinaryOp::Maximum => self.binary_impl::<op::Maximum>(rhs, lhs_l, rhs_l),
+            BinaryOp::Minimum => self.binary_impl::<op::Minimum>(rhs, lhs_l, rhs_l),
+        }
+    }
+
+    pub fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
         match self {
             Self::BF16(storage) => {
                 let data = unary_map_vec_par(storage, layout, B::bf16, B::bf16_vec);
@@ -2588,7 +2410,7 @@ impl BackendStorage for CpuStorage {
         }
     }
 
-    fn binary_impl<B: BinaryOpT>(
+    pub fn binary_impl<B: BinaryOpT>(
         &self,
         rhs: &Self,
         lhs_l: &Layout,
@@ -2712,7 +2534,8 @@ impl BackendStorage for CpuStorage {
         }
     }
 
-    fn copy2d(
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy2d(
         &self,
         dst: &mut Self,
         d1: usize,
@@ -2773,7 +2596,12 @@ impl BackendStorage for CpuStorage {
         Ok(())
     }
 
-    fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
+    pub fn copy_strided_src(
+        &self,
+        dst: &mut Self,
+        dst_offset: usize,
+        src_l: &Layout,
+    ) -> Result<()> {
         match (self, dst) {
             (Self::U8(src), Self::U8(dst)) => copy_strided_src_(src, dst, dst_offset, src_l),
             (Self::U32(src), Self::U32(dst)) => copy_strided_src_(src, dst, dst_offset, src_l),
@@ -2810,7 +2638,7 @@ impl BackendStorage for CpuStorage {
         Ok(())
     }
 
-    fn where_cond(
+    pub fn where_cond(
         &self,
         layout: &Layout,
         t: &Self,
@@ -2828,7 +2656,7 @@ impl BackendStorage for CpuStorage {
         }
     }
 
-    fn conv1d(
+    pub fn conv1d(
         &self,
         l: &Layout,
         kernel: &Self,
@@ -2858,10 +2686,7 @@ impl BackendStorage for CpuStorage {
             col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
         } else {
             // Make the kernel contiguous if not already the case.
-            let mut kernel_c = unsafe {
-                self.device()
-                    .alloc_uninit(kernel_l.shape(), kernel.dtype())?
-            };
+            let mut kernel_c = unsafe { CpuDevice.alloc_uninit(kernel_l.shape(), kernel.dtype())? };
             kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
             let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
                 .transpose(1, 2)?
@@ -2869,12 +2694,12 @@ impl BackendStorage for CpuStorage {
             col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
         };
         let res_l = Layout::contiguous((b, l_out, params.c_out)).transpose(1, 2)?;
-        let mut res_t = unsafe { self.device().alloc_uninit(res_l.shape(), res.dtype())? };
+        let mut res_t = unsafe { CpuDevice.alloc_uninit(res_l.shape(), res.dtype())? };
         res.copy_strided_src(&mut res_t, 0, &res_l)?;
         Ok(res_t)
     }
 
-    fn conv_transpose1d(
+    pub fn conv_transpose1d(
         &self,
         l: &Layout,
         kernel: &Self,
@@ -2929,7 +2754,7 @@ impl BackendStorage for CpuStorage {
         }
     }
 
-    fn conv2d(
+    pub fn conv2d(
         &self,
         l: &Layout,
         kernel: &Self,
@@ -2939,7 +2764,7 @@ impl BackendStorage for CpuStorage {
         Conv2D(params).map(self, l, kernel, kernel_l)
     }
 
-    fn conv_transpose2d(
+    pub fn conv_transpose2d(
         &self,
         l: &Layout,
         kernel: &Self,
@@ -2949,7 +2774,7 @@ impl BackendStorage for CpuStorage {
         ConvTranspose2D(params).map(self, l, kernel, kernel_l)
     }
 
-    fn index_select(&self, ids: &Self, l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
+    pub fn index_select(&self, ids: &Self, l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
         match ids {
             Self::U8(ids) => IndexSelect { ids, ids_l, dim }.map(self, l),
             Self::U32(ids) => IndexSelect { ids, ids_l, dim }.map(self, l),
@@ -2958,7 +2783,7 @@ impl BackendStorage for CpuStorage {
         }
     }
 
-    fn gather(&self, l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
+    pub fn gather(&self, l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
         match ids {
             Self::U8(ids) => Gather { ids, ids_l, dim }.map(self, l),
             Self::U32(ids) => Gather { ids, ids_l, dim }.map(self, l),
@@ -2967,7 +2792,7 @@ impl BackendStorage for CpuStorage {
         }
     }
 
-    fn scatter_set(
+    pub fn scatter_set(
         &mut self,
         l: &Layout,
         ids: &Self,
@@ -2984,7 +2809,7 @@ impl BackendStorage for CpuStorage {
         }
     }
 
-    fn scatter_add_set(
+    pub fn scatter_add_set(
         &mut self,
         l: &Layout,
         ids: &Self,
@@ -3003,7 +2828,7 @@ impl BackendStorage for CpuStorage {
         }
     }
 
-    fn index_add(
+    pub fn index_add(
         &self,
         l: &Layout,
         ids: &Self,
@@ -3052,7 +2877,7 @@ impl BackendStorage for CpuStorage {
         }
     }
 
-    fn matmul(
+    pub fn matmul(
         &self,
         rhs: &Self,
         bmnk: (usize, usize, usize, usize),
@@ -3072,19 +2897,7 @@ impl BackendStorage for CpuStorage {
         MatMul(bmnk).map(self, lhs_l, rhs, rhs_l)
     }
 
-    fn device(&self) -> &Self::Device {
-        &CpuDevice
-    }
-
-    fn try_clone(&self, _: &Layout) -> Result<Self> {
-        Ok(self.clone())
-    }
-
-    fn to_cpu_storage(&self) -> Result<CpuStorage> {
-        Ok(self.clone())
-    }
-
-    fn const_set(&mut self, s: crate::scalar::Scalar, l: &Layout) -> Result<()> {
+    pub fn const_set(&mut self, s: crate::scalar::Scalar, l: &Layout) -> Result<()> {
         use crate::scalar::Scalar;
         fn set<T: crate::WithDType>(src: &mut [T], l: &Layout, s: T) {
             match l.strided_blocks() {
@@ -3154,168 +2967,14 @@ impl BackendStorage for CpuStorage {
     }
 }
 
-impl BackendDevice for CpuDevice {
-    type Storage = CpuStorage;
-
-    fn location(&self) -> crate::DeviceLocation {
-        crate::DeviceLocation::Cpu
-    }
-
-    fn same_device(&self, _: &Self) -> bool {
-        true
-    }
-
-    fn storage_from_slice<T: crate::WithDType>(&self, s: &[T]) -> Result<Self::Storage> {
-        Ok(T::to_cpu_storage(s))
-    }
-
-    fn storage_from_cpu_storage(&self, s: &CpuStorage) -> Result<Self::Storage> {
-        Ok(s.clone())
-    }
-
-    fn storage_from_cpu_storage_owned(&self, s: CpuStorage) -> Result<Self::Storage> {
-        Ok(s)
-    }
-
-    fn new(_: usize) -> Result<Self> {
-        Ok(Self)
-    }
-
-    fn set_seed(&self, _seed: u64) -> Result<()> {
-        crate::bail!("cannot seed the CPU rng with set_seed")
-    }
-
-    fn get_current_seed(&self) -> Result<u64> {
-        crate::bail!("cannot get the CPU rng seed with get_current_seed")
-    }
-
-    fn rand_uniform(&self, shape: &Shape, dtype: DType, min: f64, max: f64) -> Result<CpuStorage> {
-        use rand::prelude::*;
-
-        let elem_count = shape.elem_count();
-        let mut rng = rand::rng();
-        match dtype {
-            DType::U8
-            | DType::U32
-            | DType::I16
-            | DType::I32
-            | DType::I64
-            | DType::F6E2M3
-            | DType::F6E3M2
-            | DType::F4
-            | DType::F8E8M0 => Err(Error::UnsupportedDTypeForOp(dtype, "rand_uniform").bt()),
-            DType::BF16 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let uniform = rand::distr::Uniform::new(bf16::from_f64(min), bf16::from_f64(max))
-                    .map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(rng.sample::<bf16, _>(uniform))
-                }
-                Ok(CpuStorage::BF16(data))
-            }
-            DType::F16 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let uniform = rand::distr::Uniform::new(f16::from_f64(min), f16::from_f64(max))
-                    .map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(rng.sample::<f16, _>(uniform))
-                }
-                Ok(CpuStorage::F16(data))
-            }
-            DType::F8E4M3 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let uniform =
-                    rand::distr::Uniform::new(F8E4M3::from_f64(min), F8E4M3::from_f64(max))
-                        .map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(rng.sample::<F8E4M3, _>(uniform))
-                }
-                Ok(CpuStorage::F8E4M3(data))
-            }
-            DType::F32 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let uniform =
-                    rand::distr::Uniform::new(min as f32, max as f32).map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(rng.sample::<f32, _>(uniform))
-                }
-                Ok(CpuStorage::F32(data))
-            }
-            DType::F64 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let uniform = rand::distr::Uniform::new(min, max).map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(rng.sample::<f64, _>(uniform))
-                }
-                Ok(CpuStorage::F64(data))
-            }
-        }
-    }
-
-    fn rand_normal(&self, shape: &Shape, dtype: DType, mean: f64, std: f64) -> Result<CpuStorage> {
-        use rand::prelude::*;
-
-        let elem_count = shape.elem_count();
-        let mut rng = rand::rng();
-        match dtype {
-            DType::U8
-            | DType::U32
-            | DType::I16
-            | DType::I32
-            | DType::I64
-            | DType::F6E2M3
-            | DType::F6E3M2
-            | DType::F4
-            | DType::F8E8M0 => Err(Error::UnsupportedDTypeForOp(dtype, "rand_normal").bt()),
-            DType::BF16 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let normal = rand_distr::Normal::new(bf16::from_f64(mean), bf16::from_f64(std))
-                    .map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(normal.sample(&mut rng))
-                }
-                Ok(CpuStorage::BF16(data))
-            }
-            DType::F16 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let normal = rand_distr::Normal::new(f16::from_f64(mean), f16::from_f64(std))
-                    .map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(normal.sample(&mut rng))
-                }
-                Ok(CpuStorage::F16(data))
-            }
-            DType::F8E4M3 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let normal = rand_distr::Normal::new(F8E4M3::from_f64(mean), F8E4M3::from_f64(std))
-                    .map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(normal.sample(&mut rng))
-                }
-                Ok(CpuStorage::F8E4M3(data))
-            }
-            DType::F32 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let normal =
-                    rand_distr::Normal::new(mean as f32, std as f32).map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(normal.sample(&mut rng))
-                }
-                Ok(CpuStorage::F32(data))
-            }
-            DType::F64 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let normal = rand_distr::Normal::new(mean, std).map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(normal.sample(&mut rng))
-                }
-                Ok(CpuStorage::F64(data))
-            }
-        }
-    }
-
+impl CpuDevice {
+    /// A storage of `shape.elem_count()` elements whose content is unspecified.
+    ///
+    /// # Safety
+    ///
+    /// The caller writes every element before it reads one.
     #[allow(clippy::uninit_vec)]
-    unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<CpuStorage> {
+    pub unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<CpuStorage> {
         let elem_count = shape.elem_count();
         // The code below is highly unsafe but hopefully not directly unsound as we only consider
         // types that are Copy, not Drop, and for which all bit patterns are proper values.
@@ -3379,7 +3038,8 @@ impl BackendDevice for CpuDevice {
         Ok(storage)
     }
 
-    fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<CpuStorage> {
+    /// A storage of `shape.elem_count()` zeros.
+    pub fn zeros(&self, shape: &Shape, dtype: DType) -> Result<CpuStorage> {
         let elem_count = shape.elem_count();
         let storage = match dtype {
             DType::U8 => CpuStorage::U8(vec![0u8; elem_count]),
@@ -3398,18 +3058,14 @@ impl BackendDevice for CpuDevice {
         };
         Ok(storage)
     }
-
-    fn synchronize(&self) -> Result<()> {
-        Ok(())
-    }
 }
 
 #[macro_export]
 macro_rules! map_dtype {
     ($name:expr, $storage:ident, $fn:expr, ($($dtypes:ident),+)) => {
         match $storage {
-            $(CpuStorage::$dtypes(__e) => CpuStorage::$dtypes($fn(__e)),)*
-            s => Err(Error::UnsupportedDTypeForOp(s.dtype(), $name).bt())?,
+            $($crate::CpuStorage::$dtypes(__e) => $crate::CpuStorage::$dtypes($fn(__e)),)*
+            s => Err($crate::Error::UnsupportedDTypeForOp(s.dtype(), $name).bt())?,
         }
     };
 }

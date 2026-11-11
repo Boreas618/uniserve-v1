@@ -97,18 +97,6 @@ impl VecOps for f32 {
         Self::max(self, other)
     }
 
-    fn vec_add(lhs: &[Self], rhs: &[Self], res: &mut [Self]) {
-        #[cfg(feature = "mkl")]
-        crate::mkl::vs_add(lhs, rhs, res);
-        #[cfg(all(feature = "accelerate", not(feature = "mkl")))]
-        crate::accelerate::vs_add(lhs, rhs, res);
-        #[cfg(not(any(feature = "mkl", feature = "accelerate")))]
-        lhs.iter()
-            .zip(rhs)
-            .zip(res)
-            .for_each(|((&a, &b), y)| *y = a + b)
-    }
-
     #[inline(always)]
     unsafe fn vec_dot(lhs: *const Self, rhs: *const Self, res: *mut Self, len: usize) {
         super::vec_dot_f32(lhs, rhs, res, len)
@@ -158,20 +146,8 @@ impl VecOps for f64 {
     fn max(self, other: Self) -> Self {
         Self::max(self, other)
     }
-
-    #[inline(always)]
-    fn vec_add(lhs: &[f64], rhs: &[f64], res: &mut [f64]) {
-        #[cfg(feature = "mkl")]
-        crate::mkl::vd_add(lhs, rhs, res);
-        #[cfg(all(feature = "accelerate", not(feature = "mkl")))]
-        crate::accelerate::vd_add(lhs, rhs, res);
-        #[cfg(not(any(feature = "mkl", feature = "accelerate")))]
-        lhs.iter()
-            .zip(rhs)
-            .zip(res)
-            .for_each(|((&a, &b), y)| *y = a + b)
-    }
 }
+
 impl VecOps for half::bf16 {
     #[inline(always)]
     fn min(self, other: Self) -> Self {

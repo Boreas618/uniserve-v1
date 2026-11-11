@@ -1,4 +1,5 @@
-//! ML framework for Rust
+//! Tensors for UniServe: n-dimensional arrays of one element type on a device, their views and
+//! the operations on them.
 //!
 //! ```rust
 //! use uniserve_tensor::{Tensor, DType, Device};
@@ -12,123 +13,74 @@
 //! # Ok(())}
 //! ```
 //!
-//! ## Features
+//! The crate serves inference only: a tensor is a value, it records no computation graph and
+//! there are no gradients.
 //!
-//! - Simple syntax (looks and feels like PyTorch)
-//! - CPU and Cuda backends (and M1 support)
-//! - Enable serverless (CPU) small and fast deployments
-//! - Model training
-//! - Distributed computing (NCCL).
-//! - Models out of the box (Llama, Whisper, Falcon, ...)
+//! ## Devices
 //!
-//! ## FAQ
+//! A [`Device`] is the CPU, whose backend is built into this crate, or a backend device
+//! implemented outside of it through the two object-safe traits of [`backend`]:
+//! [`backend::BackendDevice`] and [`backend::BackendStorage`]. Tensor operations are the same on
+//! every device; each one checks its operands and calls one primitive of the storage's backend.
+//! The operands of one operation are on the same device, and [`Tensor::to_device`] moves a
+//! tensor between the CPU and a backend device.
 //!
-//! - Why Candle?
+//! ## Custom operators
 //!
-//! Candle stems from the need to reduce binary size in order to *enable serverless*
-//! possible by making the whole engine smaller than PyTorch very large library volume
+//! An operator that is not a composition of tensor operations implements [`CustomOp1`],
+//! [`CustomOp2`] or [`CustomOp3`] (or their in-place counterparts) with one forward for CPU
+//! storage and one for backend storage, and is applied with [`Tensor::apply_op1`] and its
+//! siblings. [`Tensor::from_storage`], [`Tensor::storage_and_layout`] and
+//! [`Tensor::storage_mut_and_layout`] give a backend and such operators access to the storage
+//! under a tensor.
 //!
-//! And simply *removing Python* from production workloads.
-//! Python can really add overhead in more complex workflows and the [GIL](https://www.backblaze.com/blog/the-python-gil-past-present-and-future/) is a notorious source of headaches.
+//! ## Origin
 //!
-//! Rust is cool, and a lot of the HF ecosystem already has Rust crates [safetensors](https://github.com/huggingface/safetensors) and [tokenizers](https://github.com/huggingface/tokenizers)
-//!
-//! ## Other Crates
-//!
-//! Candle consists of a number of crates. This crate holds core the common data structures but you may wish
-//! to look at the docs for the other crates which can be found here:
-//!
-//! - [candle-core](https://docs.rs/candle-core/). Core Datastructures and DataTypes.
-//! - [candle-nn](https://docs.rs/candle-nn/). Building blocks for Neural Nets.
-//! - [candle-datasets](https://docs.rs/candle-datasets/). Rust access to commonly used Datasets like MNIST.
-//! - [candle-examples](https://docs.rs/candle-examples/). Examples of Candle in Use.
-//! - [candle-onnx](https://docs.rs/candle-onnx/). Loading and using ONNX models.
-//! - [candle-pyo3](https://docs.rs/candle-pyo3/). Access to Candle from Python.
-//! - [candle-transformers](https://docs.rs/candle-transformers/). Candle implementation of many published transformer models.
-//!
+//! The crate is derived from `candle-core` of
+//! [huggingface/candle](https://github.com/huggingface/candle); see the repository's README.
 
-#[cfg(feature = "accelerate")]
-mod accelerate;
 pub mod backend;
-pub mod backprop;
 pub mod conv;
 mod convert;
 pub mod cpu;
 pub mod cpu_backend;
-#[cfg(feature = "cuda")]
-pub mod cuda_backend;
 mod custom_op;
 mod device;
 pub mod display;
 mod dtype;
-pub mod dummy_cuda_backend;
 pub mod dummy_dtype;
-mod dummy_metal_backend;
 pub mod error;
 mod indexer;
 pub mod layout;
-#[cfg(feature = "metal")]
-pub mod metal_backend;
-#[cfg(feature = "mkl")]
-mod mkl;
 pub mod nditer;
-pub mod npy;
 pub mod op;
-pub mod pickle;
-pub mod quantized;
 pub mod safetensors;
 pub mod scalar;
 pub mod shape;
 mod sort;
 mod storage;
-pub mod streaming;
 mod strided_index;
 mod tensor;
 mod tensor_cat;
 pub mod test_utils;
 pub mod utils;
-mod variable;
-
-#[cfg(feature = "cudnn")]
-pub use cuda_backend::cudnn;
-#[cfg(feature = "cutile")]
-pub use cuda_backend::cutile;
 
 pub use cpu_backend::{CpuStorage, CpuStorageRef};
-pub use custom_op::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3};
+pub use custom_op::{
+    AccessPattern, CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3, InplaceOpN,
+    Src,
+};
 pub use device::{Device, DeviceLocation, NdArray};
 pub use dtype::{DType, DTypeParseError, FloatDType, IntDType, WithDType};
 pub use dummy_dtype::{F4, F6E2M3, F6E3M2, F8E8M0};
 pub use error::{Context, Error, Result};
 pub use indexer::{IndexOp, TensorIndexer};
-pub use layout::Layout;
+pub use layout::{Layout, LayoutRelation};
 pub use nditer::NdIter;
 pub use shape::{Shape, D};
 pub use storage::{Storage, StorageMutRef, StorageRef};
-pub use streaming::{StreamTensor, StreamingBinOp, StreamingModule};
 pub use strided_index::{StridedBlocks, StridedIndex};
 pub use tensor::{Tensor, TensorId};
-pub use variable::Var;
-
-#[cfg(feature = "cuda")]
-pub use cuda_backend as cuda;
-
-#[cfg(not(feature = "cuda"))]
-pub use dummy_cuda_backend as cuda;
-
-pub use cuda::{CudaDevice, CudaStorage};
-
-#[cfg(feature = "metal")]
-pub use metal_backend::{MetalDevice, MetalError, MetalStorage};
-
-#[cfg(not(feature = "metal"))]
-pub use dummy_metal_backend::{MetalDevice, MetalError, MetalStorage};
-
-#[cfg(feature = "mkl")]
-extern crate intel_mkl_src;
-
-#[cfg(feature = "accelerate")]
-extern crate accelerate_src;
 
 pub trait ToUsize2 {
     fn to_usize2(self) -> (usize, usize);
@@ -163,17 +115,5 @@ impl<M: Module> Module for Option<&M> {
             None => Ok(xs.clone()),
             Some(m) => m.forward(xs),
         }
-    }
-}
-
-/// A single forward method using a single tensor argument and a flag to
-/// separate the training and evaluation behaviors.
-pub trait ModuleT {
-    fn forward_t(&self, xs: &Tensor, train: bool) -> Result<Tensor>;
-}
-
-impl<M: Module> ModuleT for M {
-    fn forward_t(&self, xs: &Tensor, _train: bool) -> Result<Tensor> {
-        self.forward(xs)
     }
 }

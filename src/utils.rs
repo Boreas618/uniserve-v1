@@ -105,7 +105,7 @@ fn get_cluster_size() -> usize {
 }
 
 fn barrier_pool_spin_limit() -> u32 {
-    std::env::var("CANDLE_BARRIER_POOL_SPIN_LIMIT")
+    std::env::var("UNISERVE_TENSOR_BARRIER_POOL_SPIN_LIMIT")
         .ok()
         .and_then(|s| u32::from_str(&s).ok())
         .unwrap_or(DEFAULT_BARRIER_POOL_SPIN_LIMIT)
@@ -139,7 +139,7 @@ impl BarrierPool {
             .map(|tid| {
                 let children = children[tid].clone();
                 std::thread::Builder::new()
-                    .name(format!("candle-bp-{tid}"))
+                    .name(format!("tensor-bp-{tid}"))
                     .spawn(move || {
                         IN_BARRIER_POOL.with(|f| f.set(true));
                         set_thread_affinity();
@@ -203,7 +203,7 @@ impl BarrierPool {
                             slot.done.store(gen, Ordering::Release);
                         }
                     })
-                    .expect("failed to spawn candle barrier pool worker")
+                    .expect("failed to spawn barrier pool worker")
             })
             .collect();
 
@@ -291,29 +291,6 @@ impl BarrierPool {
         // _guard drops here, waiting for root workers.
     }
 
-    // Uniform, short work units can avoid shared-cursor contention by assigning
-    // one contiguous range per thread.
-    pub(crate) fn execute_static<F: Fn(std::ops::Range<usize>) + Sync>(
-        &self,
-        n_items: usize,
-        f: F,
-    ) {
-        if n_items == 0 {
-            return;
-        }
-        if IN_BARRIER_POOL.with(|f| f.get()) {
-            f(0..n_items);
-            return;
-        }
-        let chunk = n_items.div_ceil(self.threads.len() + 1);
-        self.execute(|tid| {
-            let start = tid * chunk;
-            if start < n_items {
-                f(start..n_items.min(start + chunk));
-            }
-        });
-    }
-
     // Static per-tid slices make every op wait for the slowest thread; a shared cursor
     // lets fast threads absorb a straggler's work instead of spinning at the barrier.
     pub fn execute_chunked<F: Fn(std::ops::Range<usize>) + Sync>(&self, n_items: usize, f: F) {
@@ -364,11 +341,11 @@ static BARRIER_POOL: OnceLock<BarrierPool> = OnceLock::new();
 
 /// Persistent barrier pool
 pub fn barrier_pool() -> &'static BarrierPool {
-    BARRIER_POOL.get_or_init(|| BarrierPool::new(candle_num_threads().saturating_sub(1)))
+    BARRIER_POOL.get_or_init(|| BarrierPool::new(pool_num_threads().saturating_sub(1)))
 }
 
 pub fn with_threadpool<F: FnOnce() -> R + Send, R: Send>(f: F) -> R {
-    candle_pool().install(f)
+    thread_pool().install(f)
 }
 
 pub fn init_global_threadpool() {
@@ -408,8 +385,8 @@ fn rayon_num_threads() -> usize {
         .unwrap_or_else(default_num_threads)
 }
 
-fn candle_num_threads() -> usize {
-    std::env::var("CANDLE_NUM_THREADS")
+fn pool_num_threads() -> usize {
+    std::env::var("UNISERVE_TENSOR_NUM_THREADS")
         .ok()
         .and_then(|s| usize::from_str(&s).ok())
         .filter(|nt| nt > &0)
@@ -450,7 +427,7 @@ fn linux_preferred_cpus() -> Option<&'static [usize]> {
 fn linux_env_cpu_mask() -> Option<&'static [usize]> {
     static CPUS: OnceLock<Option<Vec<usize>>> = OnceLock::new();
     CPUS.get_or_init(|| {
-        std::env::var("CANDLE_CPU_MASK")
+        std::env::var("UNISERVE_TENSOR_CPU_MASK")
             .ok()
             .and_then(|mask| linux_parse_cpu_list(&mask))
     })
@@ -459,7 +436,7 @@ fn linux_env_cpu_mask() -> Option<&'static [usize]> {
 
 #[cfg(target_os = "linux")]
 fn linux_affinity_enabled() -> bool {
-    std::env::var("CANDLE_CPU_AFFINITY")
+    std::env::var("UNISERVE_TENSOR_CPU_AFFINITY")
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(false)
 }
@@ -544,13 +521,13 @@ fn linux_detect_preferred_cpus() -> Option<Vec<usize>> {
 
 static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 
-pub(crate) fn candle_pool() -> &'static rayon::ThreadPool {
+pub(crate) fn thread_pool() -> &'static rayon::ThreadPool {
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(get_num_threads())
             .start_handler(|_| set_thread_affinity())
             .build()
-            .expect("failed to build candle rayon threadpool")
+            .expect("failed to build the rayon threadpool")
     })
 }
 
@@ -581,22 +558,6 @@ pub fn set_thread_affinity() {
             );
         }
     }
-}
-
-pub fn has_accelerate() -> bool {
-    cfg!(feature = "accelerate")
-}
-
-pub fn has_mkl() -> bool {
-    cfg!(feature = "mkl")
-}
-
-pub fn cuda_is_available() -> bool {
-    cfg!(feature = "cuda")
-}
-
-pub fn metal_is_available() -> bool {
-    cfg!(feature = "metal")
 }
 
 pub fn with_avx() -> bool {

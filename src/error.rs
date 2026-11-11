@@ -1,7 +1,7 @@
-//! Candle-specific Error and Result
+//! The crate's Error and Result
 use std::{convert::Infallible, fmt::Display};
 
-use crate::{DType, DeviceLocation, Layout, MetalError, Shape};
+use crate::{DType, DeviceLocation, Layout, Shape};
 
 #[derive(Debug, Clone)]
 pub struct MatMulUnexpectedStriding {
@@ -138,9 +138,6 @@ pub enum Error {
     #[error("cannot broadcast {src_shape:?} to {dst_shape:?}")]
     BroadcastIncompatibleShapes { src_shape: Shape, dst_shape: Shape },
 
-    #[error("cannot set variable {msg}")]
-    CannotSetVar { msg: &'static str },
-
     // Box indirection to avoid large variant.
     #[error("{0:?}")]
     MatMulUnexpectedStriding(Box<MatMulUnexpectedStriding>),
@@ -154,43 +151,17 @@ pub enum Error {
     #[error("{op} expects at least two tensors")]
     OpRequiresAtLeastTwoTensors { op: &'static str },
 
-    #[error("backward is not supported for {op}")]
-    BackwardNotSupported { op: &'static str },
-
     // === Other Errors ===
-    #[error("the candle crate has not been built with cuda support")]
-    NotCompiledWithCudaSupport,
-
-    #[error("the candle crate has not been built with metal support")]
-    NotCompiledWithMetalSupport,
-
     #[error("cannot find tensor {path}")]
     CannotFindTensor { path: String },
 
     // === Wrapped Errors ===
+    /// An error of a device backend, kept as the backend's own error type.
     #[error(transparent)]
-    Cuda(Box<dyn std::error::Error + Send + Sync>),
-
-    #[error("Metal error {0}")]
-    Metal(#[from] MetalError),
+    Backend(Box<dyn std::error::Error + Send + Sync>),
 
     #[error(transparent)]
     TryFromIntError(#[from] core::num::TryFromIntError),
-
-    #[error("npy/npz error {0}")]
-    Npy(String),
-
-    /// Zip file format error.
-    #[error(transparent)]
-    Zip(#[from] zip::result::ZipError),
-
-    /// Integer parse error.
-    #[error(transparent)]
-    ParseInt(#[from] std::num::ParseIntError),
-
-    /// Utf8 parse error.
-    #[error(transparent)]
-    FromUtf8(#[from] std::string::FromUtf8Error),
 
     /// I/O error.
     #[error(transparent)]

@@ -5,20 +5,21 @@
 use crate::{DType, Result, Tensor, WithDType};
 use half::{bf16, f16};
 
+/// What a tensor's description says about its device: nothing on the CPU, `, kind:ordinal` on a
+/// backend device.
+fn device_suffix(location: crate::DeviceLocation) -> String {
+    match location {
+        crate::DeviceLocation::Cpu => String::new(),
+        crate::DeviceLocation::Backend { kind, ordinal } => format!(", {kind}:{ordinal}"),
+    }
+}
+
 impl Tensor {
     fn fmt_dt<T: WithDType + std::fmt::Display>(
         &self,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        let device_str = match self.device().location() {
-            crate::DeviceLocation::Cpu => "".to_owned(),
-            crate::DeviceLocation::Cuda { gpu_id } => {
-                format!(", cuda:{gpu_id}")
-            }
-            crate::DeviceLocation::Metal { gpu_id } => {
-                format!(", metal:{gpu_id}")
-            }
-        };
+        let device_str = device_suffix(self.device().location());
 
         write!(f, "Tensor[")?;
         match self.dims() {
@@ -537,15 +538,7 @@ impl std::fmt::Display for Tensor {
             }
         };
 
-        let device_str = match self.device().location() {
-            crate::DeviceLocation::Cpu => "".to_owned(),
-            crate::DeviceLocation::Cuda { gpu_id } => {
-                format!(", cuda:{gpu_id}")
-            }
-            crate::DeviceLocation::Metal { gpu_id } => {
-                format!(", metal:{gpu_id}")
-            }
-        };
+        let device_str = device_suffix(self.device().location());
 
         write!(
             f,

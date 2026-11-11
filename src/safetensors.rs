@@ -1,4 +1,4 @@
-//! Module to load `safetensor` files into CPU/GPU memory.
+//! Module to load `safetensor` files into the memory of a device.
 //!
 //! There are multiple ways to load tensors from safetensor files:
 //! - `load` function for loading directly into memory and returning a HashMap of tensors
@@ -9,8 +9,7 @@
 //! Tensors can also be serialized to safetensor format using the `save` function or
 //! `Tensor::save_safetensors` method.
 //!
-use crate::op::BackpropOp;
-use crate::storage::Storage;
+use crate::cpu_backend::CpuStorage;
 use crate::tensor::from_storage;
 use crate::{DType, Device, Error, Result, Tensor, WithDType};
 use safetensors::tensor as st;
@@ -72,7 +71,7 @@ impl st::View for Tensor {
     }
 
     fn data(&self) -> Cow<'_, [u8]> {
-        // This copies data from GPU to CPU.
+        // This copies the data to the host when the tensor is on a backend device.
         // TODO: Avoid the unwrap here.
         Cow::Owned(convert_back(self).unwrap())
     }
@@ -93,7 +92,7 @@ impl st::View for &Tensor {
     }
 
     fn data(&self) -> Cow<'_, [u8]> {
-        // This copies data from GPU to CPU.
+        // This copies the data to the host when the tensor is on a backend device.
         // TODO: Avoid the unwrap here.
         Cow::Owned(convert_back(self).unwrap())
     }
@@ -224,67 +223,24 @@ impl Tensor {
             DType::F64 => convert_slice::<f64>(data, shape, device),
             DType::F8E4M3 => convert_slice::<float8::F8E4M3>(data, shape, device),
             DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
-                // For dummy types, create storage with raw bytes
-                let storage = match device {
-                    Device::Cpu => {
-                        let cpu_storage = match dtype {
-                            DType::F6E2M3 => crate::cpu_backend::CpuStorage::F6E2M3(data.to_vec()),
-                            DType::F6E3M2 => crate::cpu_backend::CpuStorage::F6E3M2(data.to_vec()),
-                            DType::F4 => crate::cpu_backend::CpuStorage::F4(data.to_vec()),
-                            DType::F8E8M0 => crate::cpu_backend::CpuStorage::F8E8M0(data.to_vec()),
-                            _ => unreachable!(),
-                        };
-                        Storage::Cpu(cpu_storage)
-                    }
-                    #[cfg(feature = "cuda")]
-                    Device::Cuda(device) => {
-                        let mut slice = unsafe { device.alloc::<u8>(data.len())? };
-                        device.memcpy_htod(data, &mut slice)?;
-
-                        let slice = match dtype {
-                            DType::F6E2M3 => crate::cuda_backend::CudaStorageSlice::F6E2M3(slice),
-                            DType::F6E3M2 => crate::cuda_backend::CudaStorageSlice::F6E3M2(slice),
-                            DType::F4 => crate::cuda_backend::CudaStorageSlice::F4(slice),
-                            DType::F8E8M0 => crate::cuda_backend::CudaStorageSlice::F8E8M0(slice),
-                            _ => unreachable!(),
-                        };
-                        let storage = crate::cuda_backend::CudaStorage {
-                            slice,
-                            device: device.clone(),
-                        };
-                        Storage::Cuda(storage)
-                    }
-                    #[cfg(not(feature = "cuda"))]
-                    Device::Cuda(_) => {
-                        return Err(Error::Msg("CUDA support not compiled".to_string()));
-                    }
-                    #[cfg(feature = "metal")]
-                    Device::Metal(device) => {
-                        let buffer = device
-                            .new_buffer_builder()
-                            .with_data(data)
-                            .with_label("safetensors_view")
-                            .build()?;
-
-                        let storage = crate::metal_backend::MetalStorage::new(
-                            buffer,
-                            device.clone(),
-                            data.len(),
-                            dtype,
-                        );
-                        Storage::Metal(storage)
-                    }
-                    #[cfg(not(feature = "metal"))]
-                    Device::Metal(_) => {
-                        return Err(Error::Msg("Metal support not compiled".to_string()));
-                    }
-                };
-
-                let op = BackpropOp::none();
-                Ok(from_storage(storage, shape, op, false))
+                packed_tensor(data, dtype, shape, device)
             }
         }
     }
+}
+
+/// A tensor of a packed dtype. Its storage holds the bytes of `data` as they are, since these
+/// dtypes have no host element type.
+fn packed_tensor(data: &[u8], dtype: DType, shape: &[usize], device: &Device) -> Result<Tensor> {
+    let storage = match dtype {
+        DType::F6E2M3 => CpuStorage::F6E2M3(data.to_vec()),
+        DType::F6E3M2 => CpuStorage::F6E3M2(data.to_vec()),
+        DType::F4 => CpuStorage::F4(data.to_vec()),
+        DType::F8E8M0 => CpuStorage::F8E8M0(data.to_vec()),
+        dtype => return Err(Error::UnsupportedDTypeForOp(dtype, "packed load").bt()),
+    };
+    let storage = device.storage_from_cpu_storage(storage)?;
+    Ok(from_storage(storage, shape))
 }
 
 fn convert(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
@@ -303,86 +259,12 @@ fn convert(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
         st::Dtype::F32 => convert_::<f32>(view, device),
         st::Dtype::F64 => convert_::<f64>(view, device),
         st::Dtype::F8_E4M3 => convert_::<float8::F8E4M3>(view, device),
-        st::Dtype::F6_E2M3 | st::Dtype::F6_E3M2 | st::Dtype::F4 | st::Dtype::F8_E8M0 => {
-            // For dummy types, we need to handle loading by creating a dummy tensor
-            // Since these types don't have actual data representation, we'll create
-            // a tensor that indicates it's a dummy type
-            convert_dummy(view, device)
-        }
+        st::Dtype::F6_E2M3 => packed_tensor(view.data(), DType::F6E2M3, view.shape(), device),
+        st::Dtype::F6_E3M2 => packed_tensor(view.data(), DType::F6E3M2, view.shape(), device),
+        st::Dtype::F4 => packed_tensor(view.data(), DType::F4, view.shape(), device),
+        st::Dtype::F8_E8M0 => packed_tensor(view.data(), DType::F8E8M0, view.shape(), device),
         dtype => Err(Error::UnsupportedSafeTensorDtype(dtype)),
     }
-}
-
-fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
-    // For dummy types, we'll create the appropriate storage variant that preserves
-    // both the raw data and the correct dtype
-    let (dtype, _dtype_name) = match view.dtype() {
-        st::Dtype::F6_E2M3 => (DType::F6E2M3, "F6_E2M3 (MX6)"),
-        st::Dtype::F6_E3M2 => (DType::F6E3M2, "F6_E3M2 (MX6)"),
-        st::Dtype::F4 => (DType::F4, "F4 (MX4)"),
-        st::Dtype::F8_E8M0 => (DType::F8E8M0, "F8_E8M0"),
-        _ => unreachable!("convert_dummy called with non-dummy dtype"),
-    };
-
-    // Load the raw bytes
-    let data = view.data();
-    let shape = view.shape();
-
-    // Create storage with the appropriate dummy type variant
-    let storage = match device {
-        Device::Cpu => {
-            let cpu_storage = match dtype {
-                DType::F6E2M3 => crate::cpu_backend::CpuStorage::F6E2M3(data.to_vec()),
-                DType::F6E3M2 => crate::cpu_backend::CpuStorage::F6E3M2(data.to_vec()),
-                DType::F4 => crate::cpu_backend::CpuStorage::F4(data.to_vec()),
-                DType::F8E8M0 => crate::cpu_backend::CpuStorage::F8E8M0(data.to_vec()),
-                _ => unreachable!(),
-            };
-            Storage::Cpu(cpu_storage)
-        }
-        #[cfg(feature = "cuda")]
-        Device::Cuda(device) => {
-            let mut slice = unsafe { device.alloc::<u8>(data.len())? };
-            device.memcpy_htod(data, &mut slice)?;
-
-            let slice = match dtype {
-                DType::F6E2M3 => crate::cuda_backend::CudaStorageSlice::F6E2M3(slice),
-                DType::F6E3M2 => crate::cuda_backend::CudaStorageSlice::F6E3M2(slice),
-                DType::F4 => crate::cuda_backend::CudaStorageSlice::F4(slice),
-                DType::F8E8M0 => crate::cuda_backend::CudaStorageSlice::F8E8M0(slice),
-                _ => unreachable!(),
-            };
-            let storage = crate::cuda_backend::CudaStorage {
-                slice,
-                device: device.clone(),
-            };
-            Storage::Cuda(storage)
-        }
-        #[cfg(not(feature = "cuda"))]
-        Device::Cuda(_) => {
-            return Err(Error::Msg("CUDA support not compiled".to_string()));
-        }
-        #[cfg(feature = "metal")]
-        Device::Metal(device) => {
-            let buffer = device
-                .new_buffer_builder()
-                .with_data(data)
-                .with_label("safetensors_load")
-                .build()?;
-
-            let storage =
-                crate::metal_backend::MetalStorage::new(buffer, device.clone(), data.len(), dtype);
-            Storage::Metal(storage)
-        }
-        #[cfg(not(feature = "metal"))]
-        Device::Metal(_) => {
-            return Err(Error::Msg("Metal support not compiled".to_string()));
-        }
-    };
-
-    // Create tensor with correct dtype
-    let op = BackpropOp::none();
-    Ok(from_storage(storage, shape, op, false))
 }
 
 fn convert_back(tensor: &Tensor) -> Result<Vec<u8>> {

@@ -1,5 +1,8 @@
+#[macro_use]
+mod common;
+
 use anyhow::Result;
-use uniserve_tensor::{test_device, test_utils, Device, IndexOp, Tensor};
+use uniserve_tensor::{test_utils, Device, IndexOp, Tensor};
 
 /* This test is based on the following script.
 import torch
@@ -387,36 +390,22 @@ fn conv2d_non_square(dev: &Device) -> Result<()> {
 import torch
 torch.manual_seed(4242)
 
-t = torch.randn((1, 4, 5, 5), requires_grad=True)
-w = torch.randn((2, 4, 3, 3), requires_grad=True)
+t = torch.randn((1, 4, 5, 5))
+w = torch.randn((2, 4, 3, 3))
 print(t.flatten())
 print(w.flatten())
 res = torch.nn.functional.conv2d(t, w)
 print(res.flatten())
 loss = (res ** 2).sum()
 print(loss)
-loss.backward()
-print(t.grad.shape)
-print(t.grad.flatten())
-print(w.grad.shape)
-print(w.grad.flatten())
 
-t.grad.zero_()
-w.grad.zero_()
 res = torch.nn.functional.conv2d(t, w, stride=2)
 print(res.flatten())
 loss = (res ** 2).sum()
 print(loss)
-loss.backward()
-print(t.grad.shape)
-print(t.grad[0])
-print(w.grad.shape)
-print(w.grad[0])
 */
-fn conv2d_grad(dev: &Device) -> Result<()> {
-    // conv-transposes are not implemented for metal
-    use uniserve_tensor::Var;
-    let t = Var::from_slice(
+fn conv2d_sum_of_squares(dev: &Device) -> Result<()> {
+    let t = Tensor::from_slice(
         &[
             0.4056f32, -0.8689, -0.0773, -1.5630, -2.8012, -1.5059, 0.3972, 1.0852, 0.4997, 3.0616,
             1.6541, 0.0964, -0.8338, -1.6523, -0.8323, -0.1699, 0.0823, 0.3526, 0.6843, 0.2395,
@@ -432,7 +421,7 @@ fn conv2d_grad(dev: &Device) -> Result<()> {
         (1, 4, 5, 5),
         dev,
     )?;
-    let w = Var::from_slice(
+    let w = Tensor::from_slice(
         &[
             -0.9325f32, 0.6451, -0.8537, 0.2378, 0.8764, -0.1832, 0.2987, -0.6488, -0.2273,
             -2.4184, -0.1192, -0.4821, -0.5079, -0.5766, -2.4729, 1.6734, 0.4558, 0.2851, 1.1514,
@@ -449,168 +438,16 @@ fn conv2d_grad(dev: &Device) -> Result<()> {
     let res = t.conv2d(&w, 0, 1, 1, 1)?;
     let loss = res.sqr()?.sum_all()?;
     assert_eq!(test_utils::to_vec0_round(&loss, 2)?, 741.12f32);
-    let grads = loss.backward()?;
-    let grad_t = grads.get(&t).unwrap();
-    let grad_w = grads.get(&w).unwrap();
-    assert_eq!(grad_t.dims(), [1, 4, 5, 5]);
-    assert_eq!(grad_w.dims(), [2, 4, 3, 3]);
-    assert_eq!(
-        test_utils::to_vec1_round(&grad_t.flatten_all()?, 2)?,
-        [
-            9.29, -2.84, -5.71, 3.38, -7.71, -19.15, 7.02, 29.1, 9.34, 34.73, -22.87, 24.35,
-            -39.88, -14.01, 21.08, 9.94, 13.63, -34.68, 11.21, -6.26, 7.72, -6.32, -16.64, -1.08,
-            -20.22, 21.73, -0.37, -4.06, 5.82, -3.65, -30.73, 14.55, 87.7, 31.6, 4.53, -89.78,
-            -75.37, -57.43, -7.56, 92.96, 18.79, -4.63, -159.75, -42.47, -47.26, 52.88, 37.32,
-            49.0, 12.82, 2.01, -8.98, 20.18, 16.62, 12.06, 15.38, 20.0, 2.57, -15.22, 72.62,
-            -10.75, 2.25, -31.2, 3.75, -0.2, 9.76, -0.68, 5.21, -40.44, -22.59, -61.61, 17.28,
-            20.41, 37.55, 5.23, 6.81, 23.54, 23.62, -9.99, -9.13, 4.87, -35.06, -26.1, 63.48,
-            25.81, -39.21, -70.68, -46.96, 2.33, 41.81, 82.42, -28.63, -11.78, -35.33, -10.28,
-            -28.57, -9.13, 7.21, -9.05, -9.62, -11.25
-        ]
-    );
-    assert_eq!(
-        test_utils::to_vec1_round(&grad_w.flatten_all()?, 2)?,
-        [
-            -28.92, -22.88, -141.23, 73.35, 61.07, 47.81, -20.0, -73.71, -41.82, -13.59, 21.5,
-            28.72, 28.57, -46.85, -90.19, 143.61, 16.68, 7.43, 18.88, -90.81, -20.29, 54.79, 82.63,
-            22.94, 77.81, -16.39, -13.2, 9.34, -40.39, -26.62, 5.33, -60.91, 9.09, -59.37, 7.08,
-            58.64, 5.55, 20.52, 2.5, -17.25, -6.8, 22.21, 30.15, -7.52, -37.46, 5.67, 22.58, 9.03,
-            47.05, 17.61, 37.31, -98.13, -14.61, -4.8, -6.36, 44.69, 23.34, 8.37, -13.52, 80.05,
-            -34.24, -16.36, -12.31, 1.92, -33.62, -14.1, -49.23, -7.39, 11.5, -9.98, 9.66, 29.6
-        ]
-    );
 
     // Same as before but with stride.
     let res = t.conv2d(&w, 0, 2, 1, 1)?;
     let loss = res.sqr()?.sum_all()?;
     assert_eq!(test_utils::to_vec0_round(&loss, 2)?, 277.16f32);
-    let grads = loss.backward()?;
-    let grad_t = grads.get(&t).unwrap();
-    let grad_w = grads.get(&w).unwrap();
-    assert_eq!(grad_t.dims(), [1, 4, 5, 5]);
-    assert_eq!(grad_w.dims(), [2, 4, 3, 3]);
-    assert_eq!(
-        test_utils::to_vec3_round(&grad_t.i(0)?, 2)?,
-        [
-            [
-                [9.29, -7.03, 0.94, 3.49, -7.71],
-                [-1.8, -7.82, 8.9, 8.46, 7.43],
-                [-25.84, 22.09, -19.27, -0.22, 1.69],
-                [4.02, 18.53, -18.37, 2.3, -24.51],
-                [7.72, -9.68, -12.34, 5.6, -20.22]
-            ],
-            [
-                [21.73, 3.39, -18.27, 3.86, -3.65],
-                [8.25, 3.73, 30.73, -8.61, -11.93],
-                [-72.15, -15.36, -17.53, -12.32, -1.61],
-                [-22.32, -7.79, -91.82, 6.44, -37.69],
-                [52.88, 14.44, 42.75, 9.88, 2.01]
-            ],
-            [
-                [-8.98, 9.91, 6.75, -4.68, 15.38],
-                [4.93, -0.33, 9.94, -1.46, 14.78],
-                [13.62, -30.63, 3.96, -3.58, -4.48],
-                [-14.13, 1.19, -34.43, 3.08, -33.83],
-                [17.28, 12.94, 31.83, -3.35, 6.81]
-            ],
-            [
-                [23.54, 6.98, -24.52, 0.52, 4.87],
-                [9.65, 6.18, 1.71, -25.23, -4.93],
-                [-54.99, -23.66, 3.19, -3.73, 18.58],
-                [-21.35, -10.39, -39.88, 28.73, -30.76],
-                [-9.13, 11.12, -14.0, -8.23, -11.25]
-            ]
-        ]
-    );
-    assert_eq!(
-        test_utils::to_vec3_round(&grad_w.i(0)?, 2)?,
-        [
-            [
-                [28.34, -7.91, -45.75],
-                [21.03, 3.86, 29.86],
-                [0.72, -36.58, -35.28]
-            ],
-            [
-                [-16.04, 11.53, -16.38],
-                [29.62, -16.32, -48.35],
-                [57.5, 28.29, 25.81]
-            ],
-            [
-                [2.93, -19.6, 1.57],
-                [27.15, 53.88, -24.64],
-                [12.74, -22.6, -26.2]
-            ],
-            [
-                [-0.18, -14.86, -6.82],
-                [-19.55, -2.72, 45.9],
-                [-2.54, 36.97, 27.11]
-            ]
-        ]
-    );
 
     // Replicate the issue from https://github.com/huggingface/candle/issues/1212
     let res = t.i((.., .., 0..4, 0..4))?.conv2d(&w, 0, 2, 1, 1)?;
     let loss = res.sqr()?.sum_all()?;
     assert_eq!(test_utils::to_vec0_round(&loss, 2)?, 21.12f32);
-    let grads = loss.backward()?;
-    let grad_t = grads.get(&t).unwrap();
-    let grad_w = grads.get(&w).unwrap();
-    assert_eq!(grad_t.dims(), [1, 4, 5, 5]);
-    assert_eq!(grad_w.dims(), [2, 4, 3, 3]);
-    assert_eq!(
-        test_utils::to_vec3_round(&grad_t.i(0)?, 2)?,
-        [
-            [
-                [9.29, -7.03, 7.87, 0.0, 0.0],
-                [-1.8, -7.82, 5.9, 0.0, 0.0],
-                [-3.12, 4.49, 5.52, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0, 0.0]
-            ],
-            [
-                [21.73, 3.39, 4.77, 0.0, 0.0],
-                [8.25, 3.73, 27.61, 0.0, 0.0],
-                [-20.55, -5.61, -2.77, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0, 0.0]
-            ],
-            [
-                [-8.98, 9.91, -7.15, 0.0, 0.0],
-                [4.93, -0.33, 4.56, 0.0, 0.0],
-                [-6.7, -5.76, -8.05, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0, 0.0]
-            ],
-            [
-                [23.54, 6.98, -10.0, 0.0, 0.0],
-                [9.65, 6.18, 18.72, 0.0, 0.0],
-                [3.29, -5.27, 0.79, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0, 0.0]
-            ]
-        ]
-    );
-    assert_eq!(
-        test_utils::to_vec3_round(&grad_w.i(0)?, 2)?,
-        [
-            [
-                [-3.47, 7.44, 0.66],
-                [12.89, -3.4, -9.29],
-                [-14.16, -0.83, 7.14]
-            ],
-            [
-                [-3.23, 5.37, -3.02],
-                [-2.12, -11.24, 1.94],
-                [6.97, 7.2, 2.99]
-            ],
-            [
-                [-4.04, -3.31, 4.87],
-                [-6.68, -5.68, 1.73],
-                [-5.54, 4.32, 0.52]
-            ],
-            [[-4.72, 1.5, 4.72], [3.79, 4.04, 6.76], [-4.6, 5.8, 6.93]]
-        ]
-    );
 
     // Conv Transpose 2d Test
     //tested against following python
@@ -621,8 +458,8 @@ fn conv2d_grad(dev: &Device) -> Result<()> {
     // outpadding = 2
     // dilation = 3
     // stride = 3
-    // input = torch.randn((1, 4, 7, 5), requires_grad=True)
-    // kernel = torch.randn((4, 2, 3, 5), requires_grad=True)
+    // input = torch.randn((1, 4, 7, 5))
+    // kernel = torch.randn((4, 2, 3, 5))
     // print("input", input.flatten())
     // print("kernel", kernel.flatten())
     // res = torch.nn.functional.conv_transpose2d(
@@ -633,22 +470,16 @@ fn conv2d_grad(dev: &Device) -> Result<()> {
     //     dilation=dilation,
     //     output_padding=outpadding,
     // )
-    // res.retain_grad()
     // print(res.shape)
     // loss = (res**2).sum()
     // print(loss)
-    // loss.backward()
-    // print(input.grad.shape)
-    // print("input grad", torch.round(input.grad, decimals=1))
-    // print(kernel.grad.shape)
-    // print("kernel grad", torch.round(kernel.grad.flatten(), decimals=1))
 
     let padding = 4;
     let outpadding = 2;
     let dilation = 3;
     let stride = 3;
 
-    let t = Var::from_slice(
+    let t = Tensor::from_slice(
         &[
             0.4056_f32, -0.8689, -0.0773, -1.5630, -2.8012, -1.5059, 0.3972, 1.0852, 0.4997,
             3.0616, 1.6541, 0.0964, -0.8338, -1.6523, -0.8323, -0.1699, 0.0823, 0.3526, 0.6843,
@@ -671,7 +502,7 @@ fn conv2d_grad(dev: &Device) -> Result<()> {
     )?;
 
     #[rustfmt::skip]
-    let w = Var::from_slice(
+    let w = Tensor::from_slice(
         &[
             -1.1744_f32, 0.3266, 2.5893, 1.0142, 0.1763, 0.7752, 0.6604, 0.2029, -0.2145, 0.7234,
             -0.3441, -1.5400, -0.6333, 0.6613, 0.2083, 0.6230, -1.7002, 0.3393, 0.4049, 1.0762,
@@ -692,74 +523,6 @@ fn conv2d_grad(dev: &Device) -> Result<()> {
     let res = t.conv_transpose2d(&w, padding, outpadding, stride, dilation)?;
     let loss = res.sqr()?.sum_all()?;
     assert_eq!(test_utils::to_vec0_round(&loss, 0)?, 2904.0);
-    let grads = loss.backward()?;
-
-    let grad_t = grads.get(&t).unwrap();
-    let grad_w = grads.get(&w).unwrap();
-    assert_eq!(grad_t.dims(), [1, 4, 7, 5]);
-    assert_eq!(grad_w.dims(), [4, 2, 3, 5]);
-
-    assert_eq!(
-        test_utils::to_vec1_round(&grad_w.flatten_all()?, 1)?,
-        [
-            // torch gets 89.1
-            -89.0, -135.3, 136.7, 102.0, -53.4, 117.9, 118.6, -43.9, -218.0, -58.5, -114.3, -150.0,
-            -15.6, 172.1, 66.3, -64.3, -27.9, -19.8, 31.7, 62.1, 5.5, 92.6, 28.2, -29.6, 55.9,
-            52.7, -72.7, -119.8, 53.8, -25.5, 128.8, 19.3, 68.0, 190.9, -64.1, -86.2, -111.2,
-            106.6, -67.7, 37.8, 115.9, 50.4, -77.7, -54.9, 22.3, -4.6, 89.8, 61.7, 122.4, 192.6,
-            -27.8, -104.6, 57.0, 166.4, 27.1, 6.1, 18.7, -93.2, 31.5, 168.2, -3.7, -99.5, -55.5,
-            -10.8, 17.5, 20.8, 16.9, 43.8, 42.0, -89.2, 18.8, -9.6, -84.1, 212.6, 19.7, -50.0,
-            -52.0, -40.0, -166.6, -73.2, -10.8, -73.3, 31.5, -23.4, -79.3, -27.0, -84.4, -42.9,
-            -20.3, 51.8, -16.7, 76.3, -120.5, -65.8, 96.5, -10.7, -45.9, -88.1, 65.4, -7.0, -1.5,
-            92.8, -25.1, -114.2, -5.8, -14.8, -51.2, -20.7, 54.2, -79.8, 47.7, -29.2, -8.8, 53.5,
-            -28.4, 85.0, -18.3, 107.0, 28.3, -71.8
-        ]
-    );
-
-    assert_eq!(
-        test_utils::to_vec3_round(&grad_t.i(0)?, 1)?,
-        [
-            [
-                [32.3, -41.6, -24.0, 14.1, 17.6],
-                [-11.8, 72.5, 87.6, 46.4, 61.5],
-                [115.0, 108.5, -48.6, -63.4, -50.0],
-                [51.3, 5.4, 31.3, 91.1, -30.9],
-                [52.7, 92.8, -68.0, -47.0, 83.0],
-                // pytorch gets -107.1
-                [-10.2, -107.0, -5.4, 213.1, -31.4],
-                [-2.4, 65.1, 9.2, -146.2, -24.2]
-            ],
-            [
-                [-72.6, -63.9, -61.9, 45.3, 33.0],
-                [79.3, -0.5, -26.2, 78.2, 42.7],
-                [90.9, 141.6, 40.1, -62.7, 37.0],
-                [32.8, 198.2, -0.8, -31.1, 27.3],
-                // torch gets 48.0
-                [34.5, 34.9, -47.9, 127.6, -12.3],
-                [-61.4, -3.2, -2.9, -10.9, -16.6],
-                [74.6, 60.1, -68.9, 34.5, -50.4]
-            ],
-            [
-                [37.5, -56.9, -43.6, -13.5, -9.9],
-                [40.0, 97.3, 28.6, 14.2, -30.1],
-                [-22.3, -126.3, -68.8, -8.2, 26.1],
-                [-32.9, 37.3, 108.5, -54.8, 29.6],
-                [34.9, -176.9, -125.0, -28.3, -13.9],
-                [-54.9, 142.6, 62.1, -80.4, -65.6],
-                [7.4, -91.1, -67.6, 35.0, 39.7]
-            ],
-            [
-                [-57.2, -40.9, -10.1, 32.6, 29.4],
-                [18.7, -18.0, 29.5, -1.2, 59.2],
-                [-14.0, -74.4, 19.8, -117.0, 58.2],
-                [-21.8, 163.5, -71.1, -99.0, 80.9],
-                [-58.9, -10.9, 93.8, -139.6, 98.0],
-                // torch gets 54.5
-                [-54.4, 135.3, 6.0, -79.1, 134.6],
-                [27.5, -76.0, 43.4, -2.8, -7.8]
-            ]
-        ]
-    );
 
     // Test the same, but then with the following properties, t & w are unmodified.
     let padding = 1;
@@ -770,92 +533,6 @@ fn conv2d_grad(dev: &Device) -> Result<()> {
     let res = t.conv_transpose2d(&w, padding, outpadding, stride, dilation)?;
     let loss = res.sqr()?.sum_all()?;
     assert_eq!(test_utils::to_vec0_round(&loss, 0)?, 3627.0); // torch gives 3626.8560
-
-    let grads = loss.backward()?;
-
-    let grad_t = grads.get(&t).unwrap();
-    let grad_w = grads.get(&w).unwrap();
-    assert_eq!(grad_t.dims(), [1, 4, 7, 5]);
-    assert_eq!(grad_w.dims(), [4, 2, 3, 5]);
-
-    #[rustfmt::skip]
-    assert_eq!(
-        test_utils::to_vec3_round(&grad_t.i(0)?, 1)?,
-        [
-            [
-                [  13.2,  -40.7,   -9.7,  -47.3,  -82.7],
-                [ -98.2,    9.7,   57.7,   -6.2,  180.7],
-                [ 100.2,   24.1,    3.7, -100.5,  -48.1],
-                [  -0.3,   13.5,   -2.9,   80.0,  -49.8],
-                [  47.2,  -25.6,  -74.4,   61.2,  -18.4],
-                [   4.6,  -69.5,   27.9,   66.5,  -88.1],
-                 // 4th column on next row; torch is 4.2
-                [ -12.0,   79.2,  -40.0,    4.1,  -97.1],
-            ],
-            [
-                [ -42.2,  -36.5,  -51.1,    7.5,   32.3],
-                [  74.1,  -44.6,  -68.8,   19.5,    7.7],
-                [ 137.1,   54.2,  153.8,  -58.0,   45.5],
-                [  24.4,  -56.8,    9.7,  -41.0,  -14.5],
-                [  -3.7,   72.6,    8.3,  134.8,   40.5],
-                [  43.2,  -56.9,  -47.5,  -89.4,  -95.4],
-                [  68.2,  108.1,  -80.0,   57.0, -121.1]
-            ],
-            [
-                [  31.1,  -11.4,  -34.8,   33.1,  -44.2],
-                [  29.4,  -31.6,  -40.2,   13.7,   13.1],
-                [  -0.8,  -83.8,   -7.8,  -17.3,   78.2],
-                [  12.0, -118.7,  137.5,  -76.7,   50.8],
-                [ -28.7, -114.2,   -3.7,  -96.3,  -13.8],
-                [ -31.8,   28.5,  -14.3,    4.6,   13.4],
-                [  28.0,   -0.2,  -38.9,  -29.7,  -59.0]
-            ],
-            [
-                [ -16.8,   38.5,   15.5,   26.6,   48.9],
-                [  14.5,   49.6,  -24.8,   65.6,   61.7],
-                [  22.1,  -64.7,   -4.3,  -51.0,   36.3],
-                [  31.0,  -88.9,   47.1, -123.5,   -3.8],
-                [ -14.8,  -39.8,  128.2, -110.3,   42.6],
-                // 1st column on next row; torch is -7.2
-                [  -7.1,   95.3,  -21.3,  -58.7,  -13.9],
-                [  26.9,   21.3,   16.1,   70.3,   32.1]
-            ]
-        ]
-    );
-
-    #[rustfmt::skip]
-    assert_eq!(
-        test_utils::to_vec1_round(&grad_w.flatten_all()?, 1)?,
-        [
-            // 2nd value; torch gets -3.2, 3rd value; torch gets 221.8
-           -2.460e+01, -3.100e+00,  2.219e+02,  7.400e+00,  5.620e+01,
-            7.420e+01,  7.830e+01,  8.900e+00,  1.050e+01,  2.810e+01,
-            5.100e+00, -1.046e+02, -1.572e+02,  8.710e+01, -9.840e+01,
-           -4.230e+01, -1.898e+02,  1.860e+01, -3.570e+01,  9.810e+01,
-            4.680e+01,  1.182e+02,  4.020e+01, -1.900e+00,  1.508e+02,
-            1.094e+02,  1.018e+02, -4.620e+01,  1.591e+02, -2.320e+01,
-            // 5th value; torch gets 7.1
-           -8.450e+01, -4.600e+00,  6.330e+01,  1.123e+02, -7.000e+00,
-            1.101e+02, -6.620e+01,  2.090e+01, -5.120e+01,  8.990e+01,
-            9.050e+01, -6.990e+01,  6.800e+01, -9.250e+01,  1.380e+02,
-            4.720e+01,  4.710e+01,  6.210e+01,  8.870e+01,  2.098e+02,
-            3.870e+01, -1.390e+01,  6.270e+01,  1.484e+02, -9.920e+01,
-           -4.200e+01, -1.505e+02, -1.480e+01, -2.620e+01,  8.220e+01,
-           -3.350e+01, -2.260e+01, -1.198e+02, -5.080e+01,  1.259e+02,
-            5.600e+01,  9.270e+01,  1.209e+02,  6.590e+01, -8.330e+01,
-            7.000e+00, -2.600e+01, -1.133e+02,  3.870e+01,  4.020e+01,
-           -6.300e+00, -8.710e+01, -5.150e+01, -8.510e+01,  2.000e-01,
-            3.640e+01, -6.100e+00,  6.590e+01, -2.700e+00,  6.550e+01,
-            // 4th value; torch gets 3.8
-            5.300e+00, -6.760e+01, -4.270e+01, -3.900e+00,  2.880e+01,
-            5.260e+01,  6.170e+01, -1.203e+02, -1.610e+01,  7.740e+01,
-           -1.008e+02, -1.070e+01, -9.900e+00,  3.300e+00, -2.620e+01,
-           -4.440e+01,  2.580e+01, -6.920e+01, -4.220e+01,  1.108e+02,
-            1.240e+01, -3.440e+01, -2.800e+00,  7.880e+01, -6.690e+01,
-            1.480e+01,  2.310e+01, -4.260e+01, -1.500e+00, -4.760e+01,
-            5.350e+01, -2.260e+01,  8.000e-01, -3.840e+01, -2.500e+00
-        ]
-    );
 
     Ok(())
 }
@@ -933,89 +610,35 @@ fn conv2d_c_eq_h_eq_w(dev: &Device) -> Result<()> {
 }
 
 // Regression test for https://github.com/huggingface/candle/issues/3735: a non-contiguous
-// kernel and its contiguous copy must produce identical forward results and gradients.
-fn conv2d_grad_noncontiguous_kernel(dev: &Device) -> Result<()> {
-    use uniserve_tensor::Var;
+// kernel and its contiguous copy must produce identical results.
+fn conv2d_noncontiguous_kernel(dev: &Device) -> Result<()> {
     let input_data: Vec<f32> = (1..=32).map(|v| v as f32 * 0.1).collect();
     let weight_data: Vec<f32> = (1..=12).map(|v| v as f32 * 0.1).collect();
+    let input = Tensor::from_slice(&input_data, (1, 2, 4, 4), dev)?;
+    let weight = Tensor::from_slice(&weight_data, (3, 4, 1, 1), dev)?;
 
     // Non-contiguous kernel: a channel slice of a larger weight, so it has a non-zero offset.
-    let input = Var::from_slice(&input_data, (1, 2, 4, 4), dev)?;
-    let weight = Var::from_slice(&weight_data, (3, 4, 1, 1), dev)?;
     let kernel = weight.i((.., 1..3, .., ..))?;
-    let loss = input.conv2d(&kernel, 0, 2, 1, 1)?.sqr()?.sum_all()?;
-    let grads = loss.backward()?;
-    let grad_input = grads.get(&input).unwrap();
-    let grad_weight = grads.get(&weight).unwrap();
+    let res = input.conv2d(&kernel, 0, 2, 1, 1)?;
 
     // Reference: the same logical kernel forced contiguous.
-    let input_ref = Var::from_slice(&input_data, (1, 2, 4, 4), dev)?;
-    let weight_ref = Var::from_slice(&weight_data, (3, 4, 1, 1), dev)?;
-    let kernel_ref = weight_ref.i((.., 1..3, .., ..))?.contiguous()?;
-    let loss_ref = input_ref
-        .conv2d(&kernel_ref, 0, 2, 1, 1)?
-        .sqr()?
-        .sum_all()?;
-    let grads_ref = loss_ref.backward()?;
-    let grad_input_ref = grads_ref.get(&input_ref).unwrap();
-    let grad_weight_ref = grads_ref.get(&weight_ref).unwrap();
+    let kernel_ref = kernel.contiguous()?;
+    let res_ref = input.conv2d(&kernel_ref, 0, 2, 1, 1)?;
 
+    assert_eq!(res.dims(), [1, 3, 2, 2]);
     assert_eq!(
-        test_utils::to_vec0_round(&loss, 4)?,
-        test_utils::to_vec0_round(&loss_ref, 4)?,
-    );
-    assert_eq!(
-        test_utils::to_vec1_round(&grad_input.flatten_all()?, 4)?,
-        test_utils::to_vec1_round(&grad_input_ref.flatten_all()?, 4)?,
-    );
-    assert_eq!(
-        test_utils::to_vec1_round(&grad_weight.flatten_all()?, 4)?,
-        test_utils::to_vec1_round(&grad_weight_ref.flatten_all()?, 4)?,
+        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
+        test_utils::to_vec1_round(&res_ref.flatten_all()?, 4)?,
     );
     Ok(())
 }
 
-test_device!(conv1d, conv1d_cpu, conv1d_gpu, conv1d_metal);
-test_device!(
-    conv1d_small,
-    conv1d_small_cpu,
-    conv1d_small_gpu,
-    conv1d_small_metal
-);
-test_device!(conv2d, conv2d_cpu, conv2d_gpu, conv2d_metal);
-test_device!(
-    conv2d_non_square,
-    conv2d_non_square_cpu,
-    conv2d_non_square_gpu,
-    conv2d_non_square_metal
-);
-test_device!(
-    conv2d_small,
-    conv2d_small_cpu,
-    conv2d_small_gpu,
-    conv2d_small_metal
-);
-test_device!(
-    conv2d_smaller,
-    conv2d_smaller_cpu,
-    conv2d_smaller_gpu,
-    conv2d_smaller_metal
-);
-test_device!(
-    conv2d_grad,
-    conv2d_grad_cpu,
-    conv2d_grad_gpu,
-    conv2_grad_metal
-);
-test_device!(
-    conv2d_c_eq_h_eq_w,
-    conv2d_c_eq_h_eq_w_cpu,
-    conv2d_c_eq_h_eq_w_gpu,
-    conv2d_c_eq_h_eq_w_metal
-);
-test_device!(
-    conv2d_grad_noncontiguous_kernel,
-    conv2d_grad_noncontiguous_kernel_cpu,
-    conv2d_grad_noncontiguous_kernel_gpu,
-    conv2d_grad_noncontiguous_kernel_metal
-);
+test_device!(conv1d);
+test_device!(conv1d_small);
+test_device!(conv2d);
+test_device!(conv2d_non_square);
+test_device!(conv2d_small);
+test_device!(conv2d_smaller);
+test_device!(conv2d_sum_of_squares);
+test_device!(conv2d_c_eq_h_eq_w);
+test_device!(conv2d_noncontiguous_kernel);

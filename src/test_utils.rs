@@ -1,29 +1,5 @@
 use crate::{Result, Tensor};
 
-#[macro_export]
-macro_rules! test_device {
-    // TODO: Switch to generating the two last arguments automatically once concat_idents is
-    // stable. https://github.com/rust-lang/rust/issues/29599
-    ($fn_name: ident, $test_cpu: ident, $test_cuda: ident, $test_metal: ident) => {
-        #[test]
-        fn $test_cpu() -> Result<()> {
-            $fn_name(&Device::Cpu)
-        }
-
-        #[cfg(feature = "cuda")]
-        #[test]
-        fn $test_cuda() -> Result<()> {
-            $fn_name(&Device::new_cuda(0)?)
-        }
-
-        #[cfg(feature = "metal")]
-        #[test]
-        fn $test_metal() -> Result<()> {
-            $fn_name(&Device::new_metal(0)?)
-        }
-    };
-}
-
 pub fn assert_tensor_eq(t1: &Tensor, t2: &Tensor) -> Result<()> {
     assert_eq!(t1.shape(), t2.shape());
     // Default U8 may not be large enough to hold the sum (`t.sum_all` defaults to the dtype of `t`)

@@ -6,75 +6,45 @@ pub(crate) mod contiguous;
 pub(crate) mod conv_transpose2d;
 pub(crate) mod copy;
 pub(crate) mod matmul;
-pub(crate) mod qmatmul;
-pub(crate) mod random;
 pub(crate) mod reduce;
 pub(crate) mod unary;
 pub(crate) mod vec_dot;
 pub(crate) mod where_cond;
 
-use uniserve_tensor::{Device, Result};
+use uniserve_tensor::{DType, Device, DeviceLocation, Shape, Tensor};
 
-pub(crate) trait BenchDevice {
-    fn sync(&self) -> Result<()>;
-
-    fn bench_name<S: Into<String>>(&self, name: S) -> String;
-}
-
-impl BenchDevice for Device {
-    fn sync(&self) -> Result<()> {
-        match self {
-            Device::Cpu => Ok(()),
-            Device::Cuda(device) => {
-                #[cfg(feature = "cuda")]
-                {
-                    use uniserve_tensor::backend::BackendDevice;
-                    return Ok(device.synchronize()?);
-                }
-                #[cfg(not(feature = "cuda"))]
-                panic!("Cuda device without cuda feature enabled: {device:?}")
-            }
-            Device::Metal(device) => {
-                #[cfg(feature = "metal")]
-                return device.wait_until_completed();
-                #[cfg(not(feature = "metal"))]
-                panic!("Metal device without metal feature enabled: {device:?}")
-            }
-        }
-    }
-
-    fn bench_name<S: Into<String>>(&self, name: S) -> String {
-        match self {
-            Device::Cpu => {
-                let cpu_type = if cfg!(feature = "accelerate") {
-                    "accelerate"
-                } else if cfg!(feature = "mkl") {
-                    "mkl"
-                } else {
-                    "cpu"
-                };
-                format!("{}_{}", cpu_type, name.into())
-            }
-            Device::Cuda(_) => format!("cuda_{}", name.into()),
-            Device::Metal(_) => format!("metal_{}", name.into()),
-        }
+/// The name of a benchmark group: the device kind, then the benchmark.
+pub(crate) fn bench_name<S: Into<String>>(device: &Device, name: S) -> String {
+    match device.location() {
+        DeviceLocation::Cpu => format!("cpu_{}", name.into()),
+        DeviceLocation::Backend { kind, .. } => format!("{kind}_{}", name.into()),
     }
 }
 
-struct BenchDeviceHandler {
-    devices: Vec<Device>,
-}
+/// A tensor of `dtype` values spread over `[lo, up)`, the same on every run.
+pub(crate) fn uniform<S: Into<Shape>>(
+    lo: f64,
+    up: f64,
+    shape: S,
+    dtype: DType,
+    device: &Device,
+) -> Tensor {
+    let shape = shape.into();
 
-impl BenchDeviceHandler {
-    pub fn new() -> Result<Self> {
-        let mut devices = Vec::new();
-        if cfg!(feature = "metal") {
-            devices.push(Device::new_metal(0)?);
-        } else if cfg!(feature = "cuda") {
-            devices.push(Device::new_cuda(0)?);
-        } else {
-            devices.push(Device::Cpu);
-        }
-        Ok(Self { devices })
-    }
+    // A 64-bit linear congruential generator; its high bits are the well-distributed ones.
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let values = (0..shape.elem_count())
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let unit = (state >> 11) as f64 / (1u64 << 53) as f64;
+            lo + (up - lo) * unit
+        })
+        .collect::<Vec<_>>();
+
+    Tensor::from_vec(values, shape, device)
+        .unwrap()
+        .to_dtype(dtype)
+        .unwrap()
 }

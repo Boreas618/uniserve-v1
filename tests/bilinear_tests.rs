@@ -1,4 +1,7 @@
-use uniserve_tensor::{test_device, Device, IndexOp, Result, Tensor};
+#[macro_use]
+mod common;
+
+use uniserve_tensor::{Device, IndexOp, Result, Tensor};
 
 // ============================================================================
 // PyTorch Exact Comparison Tests
@@ -336,7 +339,7 @@ fn bilinear_pytorch_large_64x64_to_128x128(dev: &Device) -> Result<()> {
     // We'll just verify dimensions and that output is finite
     use uniserve_tensor::DType;
 
-    let input = Tensor::randn(0f32, 1f32, (1, 1, 64, 64), dev)?;
+    let input = common::sample(0, (1, 1, 64, 64), dev)?;
     let output = input.upsample_bilinear2d(128, 128, false)?;
 
     assert_eq!(output.dims(), &[1, 1, 128, 128]);
@@ -438,88 +441,28 @@ fn bilinear_align_corners_difference(dev: &Device) -> Result<()> {
 // ============================================================================
 
 // PyTorch exact comparison tests
-test_device!(
-    bilinear_pytorch_2x_upscale,
-    bilinear_pytorch_2x_upscale_cpu,
-    bilinear_pytorch_2x_upscale_gpu,
-    bilinear_pytorch_2x_upscale_metal
-);
+test_device!(bilinear_pytorch_2x_upscale);
 
-test_device!(
-    bilinear_pytorch_downscale,
-    bilinear_pytorch_downscale_cpu,
-    bilinear_pytorch_downscale_gpu,
-    bilinear_pytorch_downscale_metal
-);
+test_device!(bilinear_pytorch_downscale);
 
-test_device!(
-    bilinear_pytorch_multi_channel,
-    bilinear_pytorch_multi_channel_cpu,
-    bilinear_pytorch_multi_channel_gpu,
-    bilinear_pytorch_multi_channel_metal
-);
+test_device!(bilinear_pytorch_multi_channel);
 
-test_device!(
-    bilinear_pytorch_align_corners_true,
-    bilinear_pytorch_align_corners_true_cpu,
-    bilinear_pytorch_align_corners_true_gpu,
-    bilinear_pytorch_align_corners_true_metal
-);
+test_device!(bilinear_pytorch_align_corners_true);
 
-test_device!(
-    bilinear_pytorch_scale_factor,
-    bilinear_pytorch_scale_factor_cpu,
-    bilinear_pytorch_scale_factor_gpu,
-    bilinear_pytorch_scale_factor_metal
-);
+test_device!(bilinear_pytorch_scale_factor);
 
-test_device!(
-    bilinear_pytorch_non_square_exact,
-    bilinear_pytorch_non_square_exact_cpu,
-    bilinear_pytorch_non_square_exact_gpu,
-    bilinear_pytorch_non_square_exact_metal
-);
+test_device!(bilinear_pytorch_non_square_exact);
 
-test_device!(
-    bilinear_pytorch_tiny_1x1_to_3x3,
-    bilinear_pytorch_tiny_1x1_to_3x3_cpu,
-    bilinear_pytorch_tiny_1x1_to_3x3_gpu,
-    bilinear_pytorch_tiny_1x1_to_3x3_metal
-);
+test_device!(bilinear_pytorch_tiny_1x1_to_3x3);
 
-test_device!(
-    bilinear_pytorch_tiny_1x2_to_3x6,
-    bilinear_pytorch_tiny_1x2_to_3x6_cpu,
-    bilinear_pytorch_tiny_1x2_to_3x6_gpu,
-    bilinear_pytorch_tiny_1x2_to_3x6_metal
-);
+test_device!(bilinear_pytorch_tiny_1x2_to_3x6);
 
-test_device!(
-    bilinear_pytorch_large_64x64_to_128x128,
-    bilinear_pytorch_large_64x64_to_128x128_cpu,
-    bilinear_pytorch_large_64x64_to_128x128_gpu,
-    bilinear_pytorch_large_64x64_to_128x128_metal
-);
+test_device!(bilinear_pytorch_large_64x64_to_128x128);
 
 // Dimension tests (consolidated)
-test_device!(
-    bilinear_output_dimensions,
-    bilinear_output_dimensions_cpu,
-    bilinear_output_dimensions_gpu,
-    bilinear_output_dimensions_metal
-);
+test_device!(bilinear_output_dimensions);
 
 // Special behavior tests
-test_device!(
-    bilinear_identity,
-    bilinear_identity_cpu,
-    bilinear_identity_gpu,
-    bilinear_identity_metal
-);
+test_device!(bilinear_identity);
 
-test_device!(
-    bilinear_align_corners_difference,
-    bilinear_align_corners_difference_cpu,
-    bilinear_align_corners_difference_gpu,
-    bilinear_align_corners_difference_metal
-);
+test_device!(bilinear_align_corners_difference);

@@ -1,8 +1,8 @@
-use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
-use uniserve_tensor::{DType, Device, Tensor};
+use crate::benchmarks::bench_name;
 use criterion::{criterion_group, Criterion, Throughput};
 use std::hint::black_box;
 use std::time::Instant;
+use uniserve_tensor::{DType, Device, Tensor};
 
 fn run(
     x: &Tensor,
@@ -33,7 +33,7 @@ fn run_benchmark(c: &mut Criterion, device: &Device, dtype: DType, name: &str) {
 
     let flops = t.dims().iter().product::<usize>() * dtype.size_in_bytes();
 
-    let mut group = c.benchmark_group(device.bench_name(name));
+    let mut group = c.benchmark_group(bench_name(device, name));
     group.throughput(Throughput::Bytes(flops as u64));
     group.bench_function("iter", move |b| {
         b.iter_custom(|iters| {
@@ -41,7 +41,7 @@ fn run_benchmark(c: &mut Criterion, device: &Device, dtype: DType, name: &str) {
             for _i in 0..iters {
                 run(black_box(&t), black_box(&kernel), 1, 0, 1, 2);
             }
-            device.sync().unwrap();
+            device.synchronize().unwrap();
             start.elapsed()
         })
     });
@@ -49,12 +49,10 @@ fn run_benchmark(c: &mut Criterion, device: &Device, dtype: DType, name: &str) {
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
-    let handler = BenchDeviceHandler::new().unwrap();
-    for device in handler.devices {
-        run_benchmark(c, &device, DType::F32, "conv_transpose2d_f32");
-        run_benchmark(c, &device, DType::F16, "conv_transpose2d_f16");
-        run_benchmark(c, &device, DType::BF16, "conv_transpose2d_bf16");
-    }
+    let device = Device::Cpu;
+    run_benchmark(c, &device, DType::F32, "conv_transpose2d_f32");
+    run_benchmark(c, &device, DType::F16, "conv_transpose2d_f16");
+    run_benchmark(c, &device, DType::BF16, "conv_transpose2d_bf16");
 }
 
 criterion_group!(benches, criterion_benchmark);

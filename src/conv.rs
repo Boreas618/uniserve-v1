@@ -1,28 +1,27 @@
 //! 1D and 2D Convolutions
 //!
-use crate::{op::BackpropOp, op::Op, Error, Result, Tensor};
+use crate::{Error, Result, Tensor};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamsConv1D {
-    pub(crate) b_size: usize,
+    pub b_size: usize,
     // Maybe we should have a version without l_in as this bit depends on the input and not only on
     // the weights.
-    pub(crate) l_in: usize,
-    pub(crate) c_out: usize,
-    pub(crate) c_in: usize,
-    pub(crate) k_size: usize,
-    pub(crate) padding: usize,
-    pub(crate) stride: usize,
-    pub(crate) dilation: usize,
-    pub(crate) cudnn_fwd_algo: Option<CudnnFwdAlgo>,
+    pub l_in: usize,
+    pub c_out: usize,
+    pub c_in: usize,
+    pub k_size: usize,
+    pub padding: usize,
+    pub stride: usize,
+    pub dilation: usize,
 }
 
 impl ParamsConv1D {
-    pub(crate) fn l_out(&self) -> usize {
+    pub fn l_out(&self) -> usize {
         (self.l_in + 2 * self.padding - self.dilation * (self.k_size - 1) - 1) / self.stride + 1
     }
 
-    pub(crate) fn out_dims(&self) -> Vec<usize> {
+    pub fn out_dims(&self) -> Vec<usize> {
         let l_out = self.l_out();
         vec![self.b_size, self.c_out, l_out]
     }
@@ -30,100 +29,86 @@ impl ParamsConv1D {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamsConvTranspose1D {
-    pub(crate) b_size: usize,
-    pub(crate) l_in: usize,
-    pub(crate) c_out: usize,
-    pub(crate) c_in: usize,
-    pub(crate) k_size: usize,
-    pub(crate) padding: usize,
-    pub(crate) output_padding: usize,
-    pub(crate) stride: usize,
-    pub(crate) dilation: usize,
+    pub b_size: usize,
+    pub l_in: usize,
+    pub c_out: usize,
+    pub c_in: usize,
+    pub k_size: usize,
+    pub padding: usize,
+    pub output_padding: usize,
+    pub stride: usize,
+    pub dilation: usize,
 }
 
 impl ParamsConvTranspose1D {
-    pub(crate) fn l_out(&self) -> usize {
+    pub fn l_out(&self) -> usize {
         (self.l_in - 1) * self.stride - 2 * self.padding
             + self.dilation * (self.k_size - 1)
             + self.output_padding
             + 1
     }
 
-    pub(crate) fn out_dims(&self) -> Vec<usize> {
+    pub fn out_dims(&self) -> Vec<usize> {
         let l_out = self.l_out();
         vec![self.b_size, self.c_out, l_out]
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CudnnFwdAlgo {
-    ImplicitGemm,
-    ImplicitPrecompGemm,
-    Gemm,
-    Direct,
-    Fft,
-    FftTiling,
-    Winograd,
-    WinogradNonFused,
-    Count,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamsConv2D {
-    pub(crate) b_size: usize,
-    pub(crate) i_h: usize,
-    pub(crate) i_w: usize,
-    pub(crate) k_h: usize,
-    pub(crate) k_w: usize,
-    pub(crate) c_out: usize,
-    pub(crate) c_in: usize,
-    pub(crate) padding: usize,
-    pub(crate) stride: usize,
-    pub(crate) dilation: usize,
-    pub cudnn_fwd_algo: Option<CudnnFwdAlgo>,
+    pub b_size: usize,
+    pub i_h: usize,
+    pub i_w: usize,
+    pub k_h: usize,
+    pub k_w: usize,
+    pub c_out: usize,
+    pub c_in: usize,
+    pub padding: usize,
+    pub stride: usize,
+    pub dilation: usize,
 }
 
 impl ParamsConv2D {
-    pub(crate) fn out_h(&self) -> usize {
+    pub fn out_h(&self) -> usize {
         (self.i_h + 2 * self.padding - self.dilation * (self.k_h - 1) - 1) / self.stride + 1
     }
 
-    pub(crate) fn out_w(&self) -> usize {
+    pub fn out_w(&self) -> usize {
         (self.i_w + 2 * self.padding - self.dilation * (self.k_w - 1) - 1) / self.stride + 1
     }
 
-    pub(crate) fn out_dims(&self) -> Vec<usize> {
+    pub fn out_dims(&self) -> Vec<usize> {
         vec![self.b_size, self.c_out, self.out_h(), self.out_w()]
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamsConvTranspose2D {
-    pub(crate) b_size: usize,
-    pub(crate) i_h: usize,
-    pub(crate) i_w: usize,
-    pub(crate) k_h: usize,
-    pub(crate) k_w: usize,
-    pub(crate) c_out: usize,
-    pub(crate) c_in: usize,
-    pub(crate) padding: usize,
-    pub(crate) output_padding: usize,
-    pub(crate) stride: usize,
-    pub(crate) dilation: usize,
+    pub b_size: usize,
+    pub i_h: usize,
+    pub i_w: usize,
+    pub k_h: usize,
+    pub k_w: usize,
+    pub c_out: usize,
+    pub c_in: usize,
+    pub padding: usize,
+    pub output_padding: usize,
+    pub stride: usize,
+    pub dilation: usize,
 }
 
 impl ParamsConvTranspose2D {
-    pub(crate) fn out_h(&self) -> usize {
+    pub fn out_h(&self) -> usize {
         (self.i_h - 1) * self.stride + self.dilation * (self.k_h - 1) + self.output_padding + 1
             - 2 * self.padding
     }
 
-    pub(crate) fn out_w(&self) -> usize {
+    pub fn out_w(&self) -> usize {
         (self.i_w - 1) * self.stride + self.dilation * (self.k_w - 1) + self.output_padding + 1
             - 2 * self.padding
     }
 
-    pub(crate) fn out_dims(&self) -> Vec<usize> {
+    pub fn out_dims(&self) -> Vec<usize> {
         vec![self.b_size, self.c_out, self.out_h(), self.out_w()]
     }
 }
@@ -133,15 +118,8 @@ impl Tensor {
         let storage =
             self.storage()
                 .conv1d(self.layout(), &kernel.storage(), kernel.layout(), params)?;
-        let op = BackpropOp::new2(self, kernel, |arg, kernel| Op::Conv1D {
-            arg,
-            kernel,
-            padding: params.padding,
-            stride: params.stride,
-            dilation: params.dilation,
-        });
         let out_dims = params.out_dims();
-        Ok(crate::tensor::from_storage(storage, out_dims, op, false))
+        Ok(crate::tensor::from_storage(storage, out_dims))
     }
 
     /// Applies a 1D convolution over the input tensor.
@@ -152,19 +130,6 @@ impl Tensor {
         stride: usize,
         dilation: usize,
         groups: usize,
-    ) -> Result<Self> {
-        self.conv1d_with_algo(kernel, padding, stride, dilation, groups, None)
-    }
-
-    /// Applies a 1D convolution over the input tensor.
-    pub fn conv1d_with_algo(
-        &self,
-        kernel: &Self,
-        padding: usize,
-        stride: usize,
-        dilation: usize,
-        groups: usize,
-        cudnn_fwd_algo: Option<CudnnFwdAlgo>,
     ) -> Result<Self> {
         let (c_out, c_in_k, k_size) = kernel.dims3()?;
         let (b_size, c_in, l_in) = self.dims3()?;
@@ -188,7 +153,6 @@ impl Tensor {
             padding,
             stride,
             dilation,
-            cudnn_fwd_algo,
         };
         if groups == 1 {
             self.conv1d_single_group(kernel, &params)
@@ -215,16 +179,8 @@ impl Tensor {
             kernel.layout(),
             params,
         )?;
-        let op = BackpropOp::new2(self, kernel, |arg, kernel| Op::ConvTranspose1D {
-            arg,
-            kernel,
-            padding: params.padding,
-            output_padding: params.output_padding,
-            stride: params.stride,
-            dilation: params.dilation,
-        });
         let out_dims = params.out_dims();
-        Ok(crate::tensor::from_storage(storage, out_dims, op, false))
+        Ok(crate::tensor::from_storage(storage, out_dims))
     }
 
     /// Applies a 1D transposed convolution over the input tensor.
@@ -274,15 +230,8 @@ impl Tensor {
         let storage =
             self.storage()
                 .conv2d(self.layout(), &kernel.storage(), kernel.layout(), params)?;
-        let op = BackpropOp::new2(self, kernel, |arg, kernel| Op::Conv2D {
-            arg,
-            kernel,
-            padding: params.padding,
-            stride: params.stride,
-            dilation: params.dilation,
-        });
         let out_dims = params.out_dims();
-        Ok(crate::tensor::from_storage(storage, out_dims, op, false))
+        Ok(crate::tensor::from_storage(storage, out_dims))
     }
 
     /// Applies a 2D convolution over the input tensor.
@@ -293,18 +242,6 @@ impl Tensor {
         stride: usize,
         dilation: usize,
         groups: usize,
-    ) -> Result<Self> {
-        self.conv2d_with_algo(kernel, padding, stride, dilation, groups, None)
-    }
-
-    pub fn conv2d_with_algo(
-        &self,
-        kernel: &Self,
-        padding: usize,
-        stride: usize,
-        dilation: usize,
-        groups: usize,
-        cudnn_fwd_algo: Option<CudnnFwdAlgo>,
     ) -> Result<Self> {
         let (b_size, c_in, i_h, i_w) = self.dims4()?;
         let (c_out, c_in_k, k_h, k_w) = kernel.dims4()?;
@@ -324,7 +261,6 @@ impl Tensor {
             padding,
             stride,
             dilation,
-            cudnn_fwd_algo,
         };
         if groups == 1 {
             self.conv2d_single_group(kernel, &params)
@@ -373,15 +309,7 @@ impl Tensor {
             kernel.layout(),
             &params,
         )?;
-        let op = BackpropOp::new2(self, kernel, |arg, kernel| Op::ConvTranspose2D {
-            arg,
-            kernel,
-            padding: params.padding,
-            output_padding: params.output_padding,
-            stride: params.stride,
-            dilation: params.dilation,
-        });
         let out_dims = params.out_dims();
-        Ok(crate::tensor::from_storage(storage, out_dims, op, false))
+        Ok(crate::tensor::from_storage(storage, out_dims))
     }
 }
