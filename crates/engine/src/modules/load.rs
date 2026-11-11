@@ -18,10 +18,10 @@ use crate::modules::select::{
 /// The Build Server's selection of a generation's packages, on the module-load lane.
 ///
 /// Every operator the generation launches is asked once, with every descriptor key it launches and
-/// the backends the deployment names for it; the server answers the package of each key
-/// (`BuildServer::cover`), and the answer is the generation's slots and the keys each slot's
+/// the backends the deployment names for it; the server returns the package of each key
+/// (`BuildServer::cover`), and the response gives the generation's slots and the keys each slot's
 /// package builds. The call has no deadline of its own, so it runs where a build runs: on the lane,
-/// a store that never answers costs a build slot and not the control thread that answers the
+/// a store that never responds costs a build slot and not the control thread that serves the
 /// daemon, the requests and the watchdog.
 pub(crate) struct Select {
     pub(crate) packages: Arc<Mutex<Client>>,
@@ -32,7 +32,7 @@ pub(crate) struct Select {
     pub(crate) keys: BTreeMap<String, BTreeSet<String>>,
 }
 
-/// What a selection answered: the generation's packages by slot, and the keys of each slot.
+/// What a selection returns: the generation's packages by slot, and the keys of each slot.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Selection {
     pub(crate) packages: Packages,
@@ -56,7 +56,7 @@ impl HostAction for Select {
                 op: op.clone(),
                 targets: self.targets.clone(),
                 keys: keys.iter().cloned().collect(),
-                named: named_backends(op, &self.named),
+                preferred: named_backends(op, &self.named),
                 fixed: fixed_revisions(op, &self.named),
             };
             let coverage = client.cover(&request).map_err(|error| {
@@ -73,7 +73,7 @@ impl HostAction for Select {
                     revision = package.revision,
                     part = slot.part.as_deref().unwrap_or(""),
                     keys = routes.get(slot).map_or(0, Vec::len),
-                    named = !request.named.is_empty(),
+                    named = !request.preferred.is_empty(),
                     "the Build Server selected a package for this operator's keys"
                 );
             }
@@ -105,12 +105,12 @@ pub(crate) enum ModuleWork {
 }
 
 impl HostAction for ModuleWork {
-    type Output = ModuleAnswer;
+    type Output = ModuleOutput;
 
     fn run(&self) -> worker::Result<Self::Output> {
         match self {
-            Self::Select(select) => select.run().map(ModuleAnswer::Selected),
-            Self::Install(install) => install.run().map(ModuleAnswer::Installed),
+            Self::Select(select) => select.run().map(ModuleOutput::Selected),
+            Self::Install(install) => install.run().map(ModuleOutput::Installed),
         }
     }
 
@@ -129,8 +129,8 @@ impl HostAction for ModuleWork {
     }
 }
 
-/// What one piece of the module lane's work answered.
-pub(crate) enum ModuleAnswer {
+/// What one piece of the module-load work returns.
+pub(crate) enum ModuleOutput {
     /// The generation's packages, as the Build Server selected them.
     Selected(Selection),
     /// One device's kernels for the generation being prepared.
@@ -171,7 +171,7 @@ struct Resolved {
 ///
 /// `dlopen` takes a path, and the handle the Build Server sends has none of its own. The file is
 /// used where it still has a name - glibc keys a loaded object by the name it was opened with, so a
-/// name this process derives from a descriptor would answer for the next module to land on that
+/// name this process derives from a descriptor would stand for the next module to land on that
 /// number, and one library's handle would serve another. When the store's file has no name left, the
 /// bytes are copied to one this process owns and that copy goes when the module does: `dlopen` maps
 /// the file, so the mapping outlives the name.
@@ -206,7 +206,7 @@ impl Drop for NativeModule {
 /// The file a native module's library is, and the path it is loaded from.
 ///
 /// **Never by position.** A `paged_attention` module holds `module.so` beside `cubins/`, and `cubins`
-/// sorts before `module.so`, so taking the first file handed `dlopen` a cubin and the answer was
+/// sorts before `module.so`, so taking the first file handed `dlopen` a cubin and the result was
 /// `cannot open shared object file`. The library is the file that defines the entry the package
 /// declared, which is the property `dlopen` is for; a module whose files define it in more than one
 /// place, or in none, is refused by name with its files listed.
@@ -270,7 +270,7 @@ fn native_library(
     if siblings {
         // The question a reader of a failed load has: where does this object look for the files
         // beside it? A module that resolves them itself uses the path it was loaded from - `dladdr`
-        // of its own entry - so that directory is the answer, and `origin` says whether it also
+        // of its own entry - so that directory is where it looks, and `origin` says whether it also
         // states `$ORIGIN` in a run path, which is the other way a sibling can be found.
         let module = match std::fs::read_link(format!("/proc/self/fd/{}", as_raw_fd(&file))) {
             Ok(target) => target,
@@ -438,8 +438,8 @@ fn causes<E: std::error::Error + std::fmt::Debug>(error: &E) -> String {
 
 /// States what an object defines when the entry a package declared is not among its symbols.
 ///
-/// `dlsym` answers yes or no and nothing else, so a `NativeSymbol` failure names the entry that was
-/// looked for and leaves "what does this object have" unanswered - the fact that turns the failure
+/// `dlsym` says yes or no and nothing else, so a `NativeSymbol` failure names the entry that was
+/// looked for and leaves "what does this object have" open - the fact that turns the failure
 /// into a fix. The line never changes the failure: the install still returns exactly what it did.
 fn report_missing_entry(error: &ops::Error) {
     let ops::Error::Platform(platform::Error::NativeSymbol { path, symbol, .. }) = error else {
@@ -593,48 +593,42 @@ impl HostAction for Install {
 
         let mut entries = Vec::new();
         let mut copies = 0_usize;
-        for chosen in &prepared.packages {
-            let operator = proto::module::operator::named(&chosen.slot.op).ok_or_else(|| {
+        for (slot, package) in &prepared {
+            let operator = proto::module::operator::named(&slot.op).ok_or_else(|| {
                 worker::Error::Invalid(format!(
                     "operator {} has no implementation in this build",
-                    chosen.slot.op
+                    slot.op
                 ))
             })?;
             // A slot's package is resolved for the keys selected for that slot alone.
             let keys = request
                 .descriptors
                 .iter()
-                .filter(|descriptor| descriptor.slot == chosen.slot)
+                .filter(|descriptor| descriptor.slot == *slot)
                 .flat_map(|descriptor| descriptor.keys.iter());
             for key in keys {
                 let module = client
-                    .resolve(
-                        &chosen.slot.op,
-                        &chosen.package,
-                        &self.target,
-                        key,
-                        &mut |progress| {
-                            tracing::debug!(
-                                path = %progress.path,
-                                state = ?progress.state,
-                                "resolving a module of the new generation"
-                            );
-                        },
-                    )
+                    .resolve(&slot.op, package, &self.target, key, &mut |progress| {
+                        tracing::debug!(
+                            path = %progress.path,
+                            state = ?progress.state,
+                            "resolving a module of the new generation"
+                        );
+                    })
                     .map_err(|error| {
                         tracing::warn!(
-                            op = %chosen.slot.op,
+                            op = %slot.op,
                             key = %key,
                             error = ?error,
                             "resolving this generation's module failed"
                         );
                         worker::Error::Invalid(format!(
                             "resolving {} for {key}: {}",
-                            chosen.slot.op,
+                            slot.op,
                             causes(&error)
                         ))
                     })?;
-                interface_agrees(operator, &chosen.package, module.interface_version)
+                interface_agrees(operator, package, module.interface_version)
                     .map_err(worker::Error::Invalid)?;
                 let module = resolved(module)?;
                 if module.copied() {

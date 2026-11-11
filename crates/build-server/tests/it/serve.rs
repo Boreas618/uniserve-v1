@@ -1,6 +1,6 @@
-//! Serving on the Unix socket (design section 6.3): a server answers a client
+//! Serving on the Unix socket (design section 6.3): a server serves a client
 //! that installs a package and lists what is installed, a socket no process
-//! answers on is replaced, and a socket a server answers on is not taken from
+//! serves on is replaced, and a socket a server serves on is not taken from
 //! it.
 
 use std::path::Path;
@@ -38,7 +38,7 @@ architectures = ["sm_100a"]
 descriptors = { dimensions = { dtype = ["bf16"] } }
 "#;
 
-/// Writes a package into `directory` and answers it.
+/// Writes a package into `directory` and returns it.
 fn package(directory: &Path) -> std::path::PathBuf {
     std::fs::create_dir_all(directory.join("src")).unwrap();
     std::fs::write(directory.join("package.toml"), MANIFEST).unwrap();
@@ -92,10 +92,10 @@ fn connect(socket: &Path) -> Client {
 }
 
 #[test]
-fn a_server_answers_an_installation_and_a_listing_over_its_socket() {
+fn a_server_serves_an_installation_and_a_listing_over_its_socket() {
     let temporary = tempfile::tempdir().unwrap();
     let configuration = config(temporary.path());
-    // A socket file that no server answers on is what a server that ended
+    // A socket file that no server serves on is what a server that ended
     // leaves; it is replaced.
     std::fs::write(&configuration.socket, b"stale").unwrap();
 
@@ -109,16 +109,16 @@ fn a_server_answers_an_installation_and_a_listing_over_its_socket() {
 
     let directory = package(&temporary.path().join("package"));
     let installed = client.install(&directory).unwrap();
-    assert_eq!(installed.package.op, "rms_norm");
-    assert_eq!(installed.package.revision, 1);
+    assert_eq!(installed.op, "rms_norm");
+    assert_eq!(installed.revision, 1);
 
     let listing = client.list().unwrap();
-    assert_eq!(listing.packages.len(), 1);
-    assert_eq!(listing.packages[0].revision, 1);
+    assert_eq!(listing.len(), 1);
+    assert_eq!(listing[0].0.revision, 1);
 }
 
 #[test]
-fn a_server_does_not_take_a_socket_another_server_answers_on() {
+fn a_server_does_not_take_a_socket_another_server_serves_on() {
     let temporary = tempfile::tempdir().unwrap();
     let configuration = config(temporary.path());
     let server = Arc::new(BuildServer::open(&configuration).unwrap());
@@ -135,7 +135,7 @@ fn a_server_does_not_take_a_socket_another_server_answers_on() {
         Err(Error::Io(error)) => {
             assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
         }
-        other => panic!("the second server answered {other:?}"),
+        other => panic!("the second server returned {other:?}"),
     }
 }
 
@@ -169,7 +169,7 @@ fn request(backend: &str) -> build_server::protocol::PrepareRequest {
     }
 }
 
-/// Serves `configuration` on a thread until the flag it answers is raised.
+/// Serves `configuration` on a thread until the flag it returns is raised.
 fn serving(
     configuration: &ServerConfig,
 ) -> (
@@ -190,7 +190,7 @@ fn serving(
 }
 
 #[test]
-fn a_prepare_waits_through_a_server_restart_and_answers_from_the_new_one() {
+fn a_prepare_waits_through_a_server_restart_and_returns_from_the_new_one() {
     let temporary = tempfile::tempdir().unwrap();
     let configuration = config(temporary.path());
 
@@ -225,10 +225,10 @@ fn a_prepare_waits_through_a_server_restart_and_answers_from_the_new_one() {
     let prepared = client
         .prepare(&request("triton"), &mut |_| {})
         .expect("the prepare waits for the restarted server");
-    assert_eq!(prepared.packages.len(), 1);
+    assert_eq!(prepared.len(), 1);
     assert!(
         started.elapsed() >= Duration::from_millis(250),
-        "the call answered after {:?}, so it did not wait",
+        "the call returned after {:?}, so it did not wait",
         started.elapsed()
     );
 
@@ -246,7 +246,7 @@ fn a_refusal_is_not_retried_through_a_restart() {
     let directory = package(&temporary.path().join("package"));
     client.install(&directory).unwrap();
 
-    // The server answers that this backend is not installed: it decided, so the
+    // The server responds that this backend is not installed: it decided, so the
     // client returns the decision rather than waiting for a restart.
     let started = Instant::now();
     let refused = client

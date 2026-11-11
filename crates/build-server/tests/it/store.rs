@@ -32,7 +32,7 @@ fn path() -> ModulePath {
     .unwrap()
 }
 
-/// Writes a build's files into a fresh workspace directory and answers it.
+/// Writes a build's files into a fresh workspace directory and returns it.
 fn workspace(directory: &std::path::Path, files: &[(&str, &[u8])]) -> std::path::PathBuf {
     let workspace = directory.join("workspace");
     fs::create_dir_all(&workspace).unwrap();
@@ -68,9 +68,9 @@ fn a_published_module_is_found_with_its_files_and_the_mark_is_not_one_of_them() 
     let directory = store.find(&path()).expect("the module's directory");
     assert!(directory.join(COMMITTED).is_file());
     let files = store.files(&path()).unwrap().expect("the module's files");
-    let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
+    let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(names, ["metadata.json", "module.cubin"]);
-    assert_eq!(fs::read(&files[1].path).unwrap(), b"cubin bytes");
+    assert_eq!(fs::read(&files[1].1).unwrap(), b"cubin bytes");
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn a_module_of_a_shared_read_only_root_is_found_and_never_written() {
 
     assert!(store.contains(&path()));
     let files = store.files(&path()).unwrap().expect("the shared module");
-    assert_eq!(fs::read(&files[0].path).unwrap(), b"shared cubin");
+    assert_eq!(fs::read(&files[0].1).unwrap(), b"shared cubin");
 
     // Publishing goes to the writable root, and leaves the shared one alone.
     let workspace = workspace(temporary.path(), &[("module.cubin", b"built cubin")]);
@@ -150,7 +150,7 @@ fn a_module_records_the_interface_version_it_was_built_for() {
         .unwrap();
     assert_eq!(store.interface_version(&path()), Some(2));
     let files = store.files(&path()).unwrap().unwrap();
-    assert_eq!(fs::read(&files[0].path).unwrap(), b"recorded");
+    assert_eq!(fs::read(&files[0].1).unwrap(), b"recorded");
 }
 
 #[test]
@@ -166,7 +166,7 @@ fn a_committed_module_is_never_replaced() {
     let replaced = store.publish(&path(), &workspace, &["module.cubin".to_owned()], 1);
     assert!(replaced.is_err());
     let files = store.files(&path()).unwrap().unwrap();
-    assert_eq!(fs::read(&files[0].path).unwrap(), b"first");
+    assert_eq!(fs::read(&files[0].1).unwrap(), b"first");
 }
 
 #[test]
@@ -182,7 +182,7 @@ fn a_publish_that_died_before_the_mark_is_retried_over() {
         .publish(&path(), &workspace, &["module.cubin".to_owned()], 1)
         .unwrap();
     let files = store.files(&path()).unwrap().unwrap();
-    assert_eq!(fs::read(&files[0].path).unwrap(), b"whole");
+    assert_eq!(fs::read(&files[0].1).unwrap(), b"whole");
 }
 
 #[test]
@@ -240,7 +240,7 @@ fn a_build_may_not_publish_a_file_outside_the_module_directory() {
         .publish(&path(), &tuning, &["tuning/tactics.json".to_owned()], 1)
         .unwrap();
     let files = store.files(&path()).unwrap().unwrap();
-    assert_eq!(files[0].name, "tuning/tactics.json");
+    assert_eq!(files[0].0, "tuning/tactics.json");
 }
 
 #[test]

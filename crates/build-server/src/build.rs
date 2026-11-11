@@ -334,7 +334,7 @@ fn build_package(
     // are then reported unbuilt rather than built again one by one by
     // `resolve`.
     let revision = match server.prepare(&request, &mut |_| {}) {
-        Ok(prepared) => prepared.packages[0].package.clone(),
+        Ok(prepared) => prepared[0].1.clone(),
         Err(error) => {
             failures.push(format!("{op} {backend}: prepare: {error}"));
             return Vec::new();
@@ -401,7 +401,7 @@ fn install_package(server: &BuildServer, directory: &Path) -> Result<(String, Ma
         package: directory.to_path_buf(),
         source: Box::new(source),
     })?;
-    Ok((installed.package.backend, manifest))
+    Ok((installed.backend, manifest))
 }
 
 #[cfg(test)]

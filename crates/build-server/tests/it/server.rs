@@ -1,6 +1,6 @@
 //! The server's operations (design section 6.3): what an installation
 //! numbers and where it lands, what a server that is not the upstream
-//! answers, and the errors a request gets before any build starts.
+//! returns, and the errors a request gets before any build starts.
 
 use std::path::{Path, PathBuf};
 
@@ -42,7 +42,7 @@ descriptors = { dimensions = { dtype = ["bf16"] } }
 tile = 1024
 "#;
 
-/// Writes a package into `directory` and answers it.
+/// Writes a package into `directory` and returns it.
 fn package(directory: &Path) -> PathBuf {
     std::fs::create_dir_all(directory.join("src")).unwrap();
     std::fs::write(directory.join("package.toml"), MANIFEST).unwrap();
@@ -89,7 +89,7 @@ fn installed(package_root: &Path, revision: u32) {
 }
 
 /// Records the build inputs of the revision laid out in `directory`, as its
-/// installation would have, and answers their digest.
+/// installation would have, and returns their digest.
 fn record(directory: &Path) -> String {
     // The digest of the revision's own tree: what the installation of a package that is its
     // directory records. A policy's is its crate's snapshot, which these revisions do not hold,
@@ -110,10 +110,10 @@ fn the_server_opens_over_the_packages_installed_before_it_started() {
 
     let server = BuildServer::open(&configuration).unwrap();
     let listing = server.list().unwrap();
-    assert_eq!(listing.packages.len(), 1);
-    assert_eq!(listing.packages[0].op, "rms_norm");
-    assert_eq!(listing.packages[0].revision, 3);
-    assert!(listing.packages[0].modules.is_empty());
+    assert_eq!(listing.len(), 1);
+    assert_eq!(listing[0].0.op, "rms_norm");
+    assert_eq!(listing[0].0.revision, 3);
+    assert!(listing[0].1.is_empty());
 }
 
 #[test]
@@ -124,9 +124,9 @@ fn an_installation_numbers_the_next_revision_of_its_operator_and_backend() {
     let first = package(&temporary.path().join("first"));
 
     let installed = server.install(&first).unwrap();
-    assert_eq!(installed.package.revision, 1);
+    assert_eq!(installed.revision, 1);
     let again = server.install(&first).unwrap();
-    assert_eq!(again.package.revision, 2);
+    assert_eq!(again.revision, 2);
 
     // Each revision keeps the package it was installed from, under the
     // package root.
@@ -139,7 +139,7 @@ fn an_installation_numbers_the_next_revision_of_its_operator_and_backend() {
         assert!(directory.join("package.toml").is_file());
         assert!(directory.join("src/rms.py").is_file());
     }
-    assert_eq!(server.list().unwrap().packages.len(), 2);
+    assert_eq!(server.list().unwrap().len(), 2);
 }
 
 /// A revision whose installation recorded no build inputs is not served, because modules found
@@ -152,12 +152,12 @@ fn a_revision_without_a_record_of_its_inputs_is_not_served_and_keeps_its_number(
     package(&configuration.package_root.join("rms_norm/triton/1"));
 
     let server = BuildServer::open(&configuration).unwrap();
-    assert!(server.list().unwrap().packages.is_empty());
+    assert!(server.list().unwrap().is_empty());
     let installed = server
         .install(&package(&temporary.path().join("again")))
         .unwrap();
-    assert_eq!(installed.package.revision, 2);
-    assert_eq!(server.list().unwrap().packages.len(), 1);
+    assert_eq!(installed.revision, 2);
+    assert_eq!(server.list().unwrap().len(), 1);
 }
 
 /// A source the tree shares between packages through a symbolic link is installed as the bytes it
@@ -202,7 +202,7 @@ fn a_server_that_is_not_the_upstream_refuses_an_installation_and_names_it() {
             Some(upstream.to_str().unwrap()),
             "the refusal names where the upstream is"
         ),
-        other => panic!("unexpected answer {other:?}"),
+        other => panic!("unexpected response {other:?}"),
     }
 }
 
@@ -221,7 +221,7 @@ fn a_package_the_manifest_refuses_is_not_installed() {
         server.install(&directory),
         Err(Error::Manifest { .. })
     ));
-    assert!(server.list().unwrap().packages.is_empty());
+    assert!(server.list().unwrap().is_empty());
 }
 
 #[test]
@@ -282,16 +282,13 @@ fn a_policy_module_is_listed_as_the_wasm_module_it_is() {
 
     let server = BuildServer::open(&configuration).unwrap();
     let listing = server.list().unwrap();
-    assert_eq!(listing.packages.len(), 1);
-    let package = &listing.packages[0];
+    assert_eq!(listing.len(), 1);
+    let (package, modules) = &listing[0];
     assert_eq!(package.op, "scheduling");
-    assert_eq!(package.modules.len(), 1);
-    assert_eq!(package.modules[0].target.as_str(), "wasm32");
-    assert_eq!(package.modules[0].descriptor, "default");
-    assert_eq!(
-        package.modules[0].form,
-        build_server::manifest::ModuleForm::Wasm
-    );
+    assert_eq!(modules.len(), 1);
+    assert_eq!(modules[0].target.as_str(), "wasm32");
+    assert_eq!(modules[0].descriptor, "default");
+    assert_eq!(modules[0].form, build_server::manifest::ModuleForm::Wasm);
 }
 
 #[test]
@@ -336,7 +333,7 @@ fn prepare_builds_a_scheduling_policy_once_for_wasm32() {
         .prepare(&request, &mut |step| progress.push(step))
         .unwrap();
 
-    assert_eq!(prepared.packages.len(), 1);
+    assert_eq!(prepared.len(), 1);
     assert_eq!(progress.len(), 1);
     assert_eq!(
         progress[0].path,
@@ -454,7 +451,7 @@ fn prepare_refuses_a_revision_that_is_not_installed() {
 
     match server.prepare(&request, &mut |_| {}) {
         Err(Error::UnknownRevision { revision, .. }) => assert_eq!(revision, 9),
-        other => panic!("unexpected answer {other:?}"),
+        other => panic!("unexpected response {other:?}"),
     }
 }
 
@@ -491,7 +488,7 @@ fn prepare_selects_the_latest_revision_of_a_backend() {
             assert_eq!(revision, 2, "the latest revision was chosen");
             assert_eq!(descriptor, "dtype_fp32");
         }
-        other => panic!("unexpected answer {other:?}"),
+        other => panic!("unexpected response {other:?}"),
     }
 }
 
@@ -542,7 +539,7 @@ fn resolve_refuses_a_target_the_package_does_not_build_for() {
         &mut |_| {},
     ) {
         Err(Error::Build { target, .. }) => assert_eq!(target, "sm_90a"),
-        other => panic!("unexpected answer {other:?}"),
+        other => panic!("unexpected response {other:?}"),
     }
 }
 
@@ -640,7 +637,7 @@ fn a_module_set_resolves_from_a_shipped_store_with_no_toolchain() {
                 op: op.to_owned(),
                 targets: Vec::new(),
                 keys: Vec::new(),
-                named: Vec::new(),
+                preferred: Vec::new(),
                 fixed: Vec::new(),
             })
             .unwrap()
@@ -694,7 +691,7 @@ fn a_module_set_resolves_from_a_shipped_store_with_no_toolchain() {
     // package root.
     let source = package(&temporary.path().join("source"));
     let installed = server.install(&source).unwrap();
-    assert_eq!(installed.package.revision, 2);
+    assert_eq!(installed.revision, 2);
     assert!(
         configuration
             .package_root

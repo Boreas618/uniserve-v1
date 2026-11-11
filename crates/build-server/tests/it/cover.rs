@@ -1,6 +1,6 @@
 //! `cover` (design section 6.3): which installed package is selected for each
 //! of an operator's descriptor keys. Every fixture package declares its own
-//! descriptors in `[kernel.descriptors]`, so the answer is read from the
+//! descriptors in `[kernel.descriptors]`, so the response is read from the
 //! manifests alone and nothing is compiled.
 
 use std::path::{Path, PathBuf};
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use build_server::builder::Limits;
 use build_server::inputs::Inputs;
-use build_server::protocol::{Client, CoverRequest, Covered, Named, Package};
+use build_server::protocol::{Client, CoverRequest, Package, Preference};
 use build_server::server::{BuildServer, ServerConfig};
 use build_server::store::Root;
 use build_server::target::{Device, Target};
@@ -121,30 +121,30 @@ fn request(keys: &[&str]) -> CoverRequest {
         op: OP.to_owned(),
         targets: vec![Target::new("sm_100a")],
         keys: keys.iter().map(|key| (*key).to_owned()).collect(),
-        named: Vec::new(),
+        preferred: Vec::new(),
         fixed: Vec::new(),
     }
 }
 
 /// `backend` named for `phase`, at its latest revision.
-fn named(phase: Option<PhaseKind>, backend: &str) -> Named {
-    Named {
+fn named(phase: Option<PhaseKind>, backend: &str) -> Preference {
+    Preference {
         phase,
         backend: backend.to_owned(),
         revision: None,
     }
 }
 
-/// The entry of an answer naming `backend`'s `revision` with `keys`.
-fn covered(backend: &str, revision: u32, keys: &[&str]) -> Covered {
-    Covered {
-        package: Package {
+/// The entry of a `cover` response that selects `backend`'s `revision` for `keys`.
+fn covered(backend: &str, revision: u32, keys: &[&str]) -> (Package, Vec<String>) {
+    (
+        Package {
             op: OP.to_owned(),
             backend: backend.to_owned(),
             revision,
         },
-        keys: keys.iter().map(|key| (*key).to_owned()).collect(),
-    }
+        keys.iter().map(|key| (*key).to_owned()).collect(),
+    )
 }
 
 /// Connects to a socket being served, waiting for it to listen.
@@ -165,7 +165,7 @@ fn connect(socket: &Path) -> Client {
 }
 
 /// Two packages declaring disjoint descriptors each get their own keys, and a
-/// key neither declares is named as uncovered: the answer a client reads over
+/// key neither declares is named as uncovered: the response a client reads over
 /// the socket after installing both.
 #[test]
 fn each_key_goes_to_the_package_that_declares_it_over_the_socket() {
@@ -254,7 +254,7 @@ fn a_named_backend_takes_the_keys_it_covers() {
     let server = BuildServer::open(&configuration).unwrap();
 
     let mut asked = request(&[BF16, F32]);
-    asked.named = vec![named(None, "beta")];
+    asked.preferred = vec![named(None, "beta")];
     let coverage = server.cover(&asked).unwrap();
     assert_eq!(
         coverage.covered,
@@ -280,7 +280,7 @@ fn a_backend_named_for_a_phase_takes_that_phase() {
     let prefill = "phase_prefill_dtype_bf16_head_dim_128";
     let decode = "phase_decode_dtype_bf16_head_dim_128";
     let mut asked = request(&[prefill, decode]);
-    asked.named = vec![named(Some(PhaseKind::Decode), "beta")];
+    asked.preferred = vec![named(Some(PhaseKind::Decode), "beta")];
     let coverage = server.cover(&asked).unwrap();
     assert_eq!(
         coverage.covered,
@@ -291,7 +291,7 @@ fn a_backend_named_for_a_phase_takes_that_phase() {
     );
 }
 
-/// Only a backend's latest revision answers, as `prepare` selects it: a key
+/// Only a backend's latest revision is a candidate, as `prepare` selects it: a key
 /// an earlier revision declared and the latest does not is uncovered.
 #[test]
 fn only_the_latest_revision_of_a_backend_covers() {
@@ -316,7 +316,7 @@ fn only_the_latest_revision_of_a_backend_covers() {
     assert_eq!(coverage.uncovered, vec![F16.to_owned()]);
 }
 
-/// The answer lists every candidate in selection order, which is what a module set fixes; and a
+/// The response lists every candidate in selection order, which is what a module set fixes; and a
 /// request that states a module set's revisions selects among exactly those: a revision or a
 /// package installed since is no candidate, and a fixed revision the server lacks is refused.
 #[test]

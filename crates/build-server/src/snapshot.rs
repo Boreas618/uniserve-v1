@@ -39,8 +39,8 @@ const WORKSPACE_MANIFEST: &str = "workspace/Cargo.toml";
 /// a manifest's `[source] kind` spells them.
 const CARGO_KINDS: [&str; 2] = ["cargo", "wasm"];
 
-/// Files of a snapshot: each by its name inside the installed revision and
-/// where it is now.
+/// Named files: each by its name inside what holds it (an installed revision,
+/// a module's directory) and where it is now.
 pub type Files = Vec<(String, PathBuf)>;
 
 /// What an installation of the package in `directory` holds: each file as its

@@ -36,17 +36,14 @@ use crate::builder::{Build, BuildState, Builder, Limits, Urgency};
 use crate::inputs::Inputs;
 use crate::manifest::Manifest;
 use crate::protocol::{
-    self, Chosen, Connection, Descriptors, Module, ModuleFile, PrepareRequest, Progress, Selector,
-    wire,
+    self, Connection, Descriptors, Module, ModuleFile, PrepareRequest, Progress, Selector, wire,
 };
 use crate::source::Source;
 use crate::store::{ModulePath, Root, Store};
 use crate::target::{self, Device, Target};
 use crate::toolchain::{ToolchainConfig, Toolchains};
 use crate::{Error, Result};
-use proto::module::PackageRevision;
-
-pub use crate::protocol::{Installed, Listing};
+use proto::module::{ModuleSlot, PackageRevision};
 
 /// How long the queue's driver waits before it looks at the host's memory
 /// again while builds it cannot start are queued.
@@ -83,7 +80,7 @@ impl Package {
 /// How to serve: what `uniserve build-server serve` takes.
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
-    /// The socket to response on.
+    /// The socket to serve on.
     pub socket: PathBuf,
     /// The package root. It is writable on the upstream Build Server, which
     /// accepts `install`, and a read-only mount of the upstream's root on
@@ -287,33 +284,34 @@ impl BuildServer {
                 let installed = self.install(Path::new(&install.package))?;
                 connection.send(
                     &wire::ServerMessage {
-                        message: Some(wire::server_message::Message::Installed(wire::Installed {
-                            package: Some(wire::Package {
-                                op: installed.package.op.clone(),
-                                backend: installed.package.backend.clone(),
-                                revision: installed.package.revision,
-                            }),
-                        })),
+                        message: Some(wire::server_message::Message::Installed(
+                            wire::InstallResponse {
+                                package: Some(wire::Package {
+                                    op: installed.op,
+                                    backend: installed.backend,
+                                    revision: installed.revision,
+                                }),
+                            },
+                        )),
                     },
                     &[],
                 )
             }
             wire::request::Request::Prepare(prepare) => {
                 let request = prepare_request(prepare)?;
-                let mut replies = Replies::new(connection);
+                let mut sender = ProgressSender::new(connection);
                 let prepared = self.prepare(&request, &mut |progress| {
-                    replies.progress(progress);
+                    sender.progress(progress);
                 })?;
-                replies.check()?;
-                let prepared = wire::Prepared {
+                sender.check()?;
+                let prepared = wire::PrepareResponse {
                     packages: prepared
-                        .packages
                         .into_iter()
-                        .map(|chosen| wire::Chosen {
-                            op: chosen.slot.op.clone(),
-                            phase: protocol::phase_to_wire(chosen.slot.phase),
-                            package: Some((&chosen.package).into()),
-                            part: chosen.slot.part.clone().unwrap_or_default(),
+                        .map(|(slot, package)| wire::SlotPackage {
+                            op: slot.op,
+                            phase: protocol::phase_to_wire(slot.phase),
+                            package: Some((&package).into()),
+                            part: slot.part.unwrap_or_default(),
                         })
                         .collect(),
                 };
@@ -331,15 +329,15 @@ impl BuildServer {
                         .ok_or_else(|| Error::Protocol("a resolve names no package".into()))?,
                 )?;
                 let target = Target::new(resolve.target);
-                let mut replies = Replies::new(connection);
+                let mut sender = ProgressSender::new(connection);
                 let module = self.resolve(
                     &resolve.op,
                     &revision,
                     &target,
                     &resolve.descriptor,
-                    &mut |progress| replies.progress(progress),
+                    &mut |progress| sender.progress(progress),
                 )?;
-                replies.check()?;
+                sender.check()?;
                 let mut files = Vec::with_capacity(module.files.len());
                 let mut descriptors = Vec::with_capacity(module.files.len());
                 for file in &module.files {
@@ -354,23 +352,25 @@ impl BuildServer {
                 }
                 connection.send(
                     &wire::ServerMessage {
-                        message: Some(wire::server_message::Message::Resolved(wire::Resolved {
-                            form: wire::ModuleForm::from(module.form) as i32,
-                            files,
-                            // Field 3 is superseded by `entries` and left empty.
-                            entry: String::new(),
-                            entries: module.entries.into_iter().collect(),
-                            metadata: module.metadata.unwrap_or_default(),
-                            interface_version: module.interface_version,
-                        })),
+                        message: Some(wire::server_message::Message::Resolved(
+                            wire::ResolveResponse {
+                                form: wire::ModuleForm::from(module.form) as i32,
+                                files,
+                                // Field 3 is superseded by `entries` and left empty.
+                                entry: String::new(),
+                                entries: module.entries.into_iter().collect(),
+                                metadata: module.metadata.unwrap_or_default(),
+                                interface_version: module.interface_version,
+                            },
+                        )),
                     },
                     &descriptors,
                 )
             }
             wire::request::Request::Cover(cover) => {
-                let mut named = Vec::with_capacity(cover.named.len());
-                for entry in cover.named {
-                    named.push(protocol::Named {
+                let mut preferred = Vec::with_capacity(cover.preferred.len());
+                for entry in cover.preferred {
+                    preferred.push(protocol::Preference {
                         phase: wire::Phase::try_from(entry.phase)
                             .map_err(|_| Error::Protocol("unknown package phase".into()))?
                             .try_into()?,
@@ -382,7 +382,7 @@ impl BuildServer {
                     op: cover.op,
                     targets: cover.targets.into_iter().map(Target::new).collect(),
                     keys: cover.keys,
-                    named,
+                    preferred,
                     fixed: cover
                         .fixed
                         .into_iter()
@@ -393,13 +393,13 @@ impl BuildServer {
                     covered: coverage
                         .covered
                         .into_iter()
-                        .map(|covered| wire::Covered {
+                        .map(|(package, keys)| wire::PackageKeys {
                             package: Some(wire::Package {
-                                op: covered.package.op,
-                                backend: covered.package.backend,
-                                revision: covered.package.revision,
+                                op: package.op,
+                                backend: package.backend,
+                                revision: package.revision,
                             }),
-                            keys: covered.keys,
+                            keys,
                         })
                         .collect(),
                     uncovered: coverage.uncovered,
@@ -421,19 +421,17 @@ impl BuildServer {
                 )
             }
             wire::request::Request::List(_) => {
-                let listing = self.list()?;
-                let listing = wire::Listing {
-                    packages: listing
-                        .packages
+                let listing = wire::ListResponse {
+                    packages: self
+                        .list()?
                         .into_iter()
-                        .map(|package| wire::ListedPackage {
+                        .map(|(package, modules)| wire::PackageEntry {
                             op: package.op,
                             backend: package.backend,
                             revision: package.revision,
-                            modules: package
-                                .modules
+                            modules: modules
                                 .into_iter()
-                                .map(|module| wire::ListedModule {
+                                .map(|module| wire::ModuleEntry {
                                     target: module.target.to_string(),
                                     descriptor: module.descriptor,
                                     form: wire::ModuleForm::from(module.form) as i32,
@@ -467,7 +465,7 @@ impl BuildServer {
     /// package's files and this host's identity of the toolchain that builds
     /// them. A host without that toolchain records why it has none, and no host
     /// builds the revision until it is installed where the toolchain is.
-    pub fn install(&self, directory: &Path) -> Result<protocol::Installed> {
+    pub fn install(&self, directory: &Path) -> Result<protocol::Package> {
         if let Some(upstream) = &self.upstream {
             return Err(Error::Refused {
                 reason: format!(
@@ -549,12 +547,10 @@ impl BuildServer {
             package.manifest.backend.clone(),
         );
         packages.insert((op.clone(), backend.clone(), revision), package);
-        Ok(protocol::Installed {
-            package: protocol::Package {
-                op,
-                backend,
-                revision,
-            },
+        Ok(protocol::Package {
+            op,
+            backend,
+            revision,
         })
     }
 
@@ -574,7 +570,7 @@ impl BuildServer {
     ///
     /// Fails when the directory holds no valid manifest or either tree cannot
     /// be read.
-    pub fn installed(&self, directory: &Path) -> Result<Option<protocol::Installed>> {
+    pub fn installed(&self, directory: &Path) -> Result<Option<protocol::Package>> {
         let manifest = Manifest::load(directory).map_err(|source| Error::Manifest {
             package: directory.to_path_buf(),
             source: Box::new(source),
@@ -599,12 +595,10 @@ impl BuildServer {
         if Inputs::of(directory, toolchain)? != package.inputs {
             return Ok(None);
         }
-        Ok(Some(protocol::Installed {
-            package: protocol::Package {
-                op: manifest.op,
-                backend: manifest.backend,
-                revision,
-            },
+        Ok(Some(protocol::Package {
+            op: manifest.op,
+            backend: manifest.backend,
+            revision,
         }))
     }
 
@@ -612,27 +606,25 @@ impl BuildServer {
     /// their descriptors need that the store misses (design section 6.3).
     ///
     /// Each build is reported through `progress` as it is queued and as it
-    /// ends; the call returns the selected package revisions once every module is
-    /// committed, and fails with the first build that failed.
+    /// ends; the call returns each requested slot with the package revision
+    /// selected for it once every module is committed, and fails with the
+    /// first build that failed.
     pub fn prepare(
         &self,
         request: &PrepareRequest,
         progress: &mut dyn FnMut(Progress),
-    ) -> Result<protocol::Prepared> {
+    ) -> Result<Vec<(ModuleSlot, PackageRevision)>> {
         let mut chosen = Vec::with_capacity(request.packages.len());
         for entry in &request.packages {
             let revision = self.select(&entry.slot.op, &entry.selector)?;
-            chosen.push(Chosen {
-                slot: entry.slot.clone(),
-                package: revision,
-            });
+            chosen.push((entry.slot.clone(), revision));
         }
 
         // Asking for the descriptors of a slot no package revision fills would
         // silently leave the epoch without its modules; it is the request's
         // inconsistency, not a missing build.
         for descriptors in &request.descriptors {
-            if !chosen.iter().any(|chosen| chosen.slot == descriptors.slot) {
+            if !chosen.iter().any(|(slot, _)| *slot == descriptors.slot) {
                 return Err(Error::Protocol(format!(
                     "prepare asks for the descriptors of {:?} and no package fills that slot",
                     descriptors.slot
@@ -642,8 +634,8 @@ impl BuildServer {
 
         let mut builds: Vec<(ModulePath, Receiver<BuildState>)> = Vec::new();
         let mut failures: Vec<Error> = Vec::new();
-        for chosen in &chosen {
-            let package = self.package(&chosen.slot.op, &chosen.package)?;
+        for (slot, revision) in &chosen {
+            let package = self.package(&slot.op, revision)?;
             // A slot's package revision builds the keys named for that slot alone: two
             // slots of one operator, one per phase or per part, hold disjoint
             // keys, and a package is never asked for another slot's.
@@ -651,7 +643,7 @@ impl BuildServer {
             for descriptors in request
                 .descriptors
                 .iter()
-                .filter(|descriptors| descriptors.slot == chosen.slot)
+                .filter(|descriptors| descriptors.slot == *slot)
             {
                 for key in &descriptors.keys {
                     if !keys.contains(key) {
@@ -662,17 +654,17 @@ impl BuildServer {
             for key in keys {
                 if !package.manifest.covers(&key) {
                     return Err(Error::UnsupportedDescriptor {
-                        op: chosen.slot.op.clone(),
-                        backend: chosen.package.backend.clone(),
-                        revision: chosen.package.revision,
+                        op: slot.op.clone(),
+                        backend: revision.backend.clone(),
+                        revision: revision.revision,
                         descriptor: key,
                     });
                 }
                 for target in self.targets(&package, &request.targets)? {
                     let path = ModulePath::new(
-                        chosen.slot.op.clone(),
-                        chosen.package.backend.clone(),
-                        chosen.package.revision,
+                        slot.op.clone(),
+                        revision.backend.clone(),
+                        revision.revision,
                         package.inputs.digest(),
                         target.to_string(),
                         key.clone(),
@@ -738,7 +730,7 @@ impl BuildServer {
         if let Some(failure) = failures.into_iter().next() {
             return Err(failure);
         }
-        Ok(protocol::Prepared { packages: chosen })
+        Ok(chosen)
     }
 
     /// Resolves one module, building it first when the store misses it
@@ -834,14 +826,14 @@ impl BuildServer {
             message: "the module is not in the store after its build was committed".into(),
         })?;
         let mut module_files = Vec::with_capacity(files.len());
-        for file in files {
-            let handle = fs::File::open(&file.path)?;
+        for (name, path) in files {
+            let handle = fs::File::open(&path)?;
             let size = handle.metadata()?.len();
             module_files.push(ModuleFile {
-                name: file.name,
+                name,
                 size,
                 file: handle,
-                path: file.path,
+                path,
             });
         }
         let entries = entries_of(&package, &self.store.directory(&path))?;
@@ -859,25 +851,15 @@ impl BuildServer {
         })
     }
 
-    /// Lists the installed packages, their revisions and their modules.
-    pub fn list(&self) -> Result<protocol::Listing> {
+    /// Lists every installed package revision with its modules.
+    pub fn list(&self) -> Result<Vec<(protocol::Package, Vec<protocol::ModuleEntry>)>> {
         let packages = self
             .packages
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut listed: BTreeMap<(String, String, u32), protocol::ListedPackage> = packages
-            .iter()
-            .map(|((op, backend, revision), _package)| {
-                (
-                    (op.clone(), backend.clone(), *revision),
-                    protocol::ListedPackage {
-                        op: op.clone(),
-                        backend: backend.clone(),
-                        revision: *revision,
-                        modules: Vec::new(),
-                    },
-                )
-            })
+        let mut listed: BTreeMap<(String, String, u32), Vec<protocol::ModuleEntry>> = packages
+            .keys()
+            .map(|key| (key.clone(), Vec::new()))
             .collect();
         for path in self.store.list()? {
             let key = (path.op.clone(), path.backend.clone(), path.revision);
@@ -890,23 +872,33 @@ impl BuildServer {
                 continue;
             };
             let form = package.manifest.module.form;
-            let Some(entry) = listed.get_mut(&key) else {
+            let Some(modules) = listed.get_mut(&key) else {
                 continue;
             };
             let interface_version = self
                 .store
                 .interface_version(&path)
                 .unwrap_or(package.manifest.interface_version);
-            entry.modules.push(protocol::ListedModule {
+            modules.push(protocol::ModuleEntry {
                 target: Target::new(path.target),
                 descriptor: path.descriptor,
                 form,
                 interface_version,
             });
         }
-        Ok(protocol::Listing {
-            packages: listed.into_values().collect(),
-        })
+        Ok(listed
+            .into_iter()
+            .map(|((op, backend, revision), modules)| {
+                (
+                    protocol::Package {
+                        op,
+                        backend,
+                        revision,
+                    },
+                    modules,
+                )
+            })
+            .collect())
     }
 
     /// Selects the installed package of each of an operator's descriptor keys:
@@ -946,10 +938,10 @@ impl BuildServer {
             }
             let stated = if request.fixed.is_empty() {
                 request
-                    .named
+                    .preferred
                     .iter()
-                    .find(|named| named.backend == *backend)
-                    .and_then(|named| named.revision)
+                    .find(|preference| preference.backend == *backend)
+                    .and_then(|preference| preference.revision)
             } else {
                 // A package the set does not hold is no candidate at all.
                 match request.fixed.iter().find(|(fixed, _)| fixed == backend) {
@@ -968,10 +960,10 @@ impl BuildServer {
             }
         }
         let stated = request
-            .named
+            .preferred
             .iter()
             .filter(|_| request.fixed.is_empty())
-            .filter_map(|named| Some((&named.backend, named.revision?)))
+            .filter_map(|preference| Some((&preference.backend, preference.revision?)))
             .chain(
                 request
                     .fixed
@@ -1015,14 +1007,15 @@ impl BuildServer {
                 continue;
             }
             let phase = proto::module::PhaseKind::of_key(key);
-            let named = |backend: &str| {
-                request.named.iter().any(|named| {
-                    named.backend == backend && (named.phase.is_none() || named.phase == phase)
+            let preferred = |backend: &str| {
+                request.preferred.iter().any(|preference| {
+                    preference.backend == backend
+                        && (preference.phase.is_none() || preference.phase == phase)
                 })
             };
             let covering = |index: &usize| candidates[*index].2.manifest.covers(key);
             let selected = (0..candidates.len())
-                .filter(|index| named(candidates[*index].0))
+                .filter(|index| preferred(candidates[*index].0))
                 .find(covering)
                 .or_else(|| (0..candidates.len()).find(covering));
             match selected {
@@ -1043,13 +1036,15 @@ impl BuildServer {
             .iter()
             .zip(chosen)
             .filter(|(_, keys)| !keys.is_empty())
-            .map(|((backend, revision, _), keys)| protocol::Covered {
-                package: protocol::Package {
-                    op: request.op.clone(),
-                    backend: (*backend).to_owned(),
-                    revision: *revision,
-                },
-                keys,
+            .map(|((backend, revision, _), keys)| {
+                (
+                    protocol::Package {
+                        op: request.op.clone(),
+                        backend: (*backend).to_owned(),
+                        revision: *revision,
+                    },
+                    keys,
+                )
             })
             .collect();
         Ok(protocol::Coverage {
@@ -1226,18 +1221,13 @@ struct Queue {
 
 struct QueueState {
     builder: Builder,
-    /// The build of each path that is queued or running: what to compile.
-    jobs: HashMap<ModulePath, Arc<BuildJob>>,
+    /// The package of each path whose build is queued or running: what
+    /// compiles it.
+    packages: HashMap<ModulePath, Arc<Package>>,
     /// One sender per waiting request, by the waiter's identity.
     waiters: HashMap<u64, mpsc::Sender<BuildState>>,
     next_waiter: u64,
     stopping: bool,
-}
-
-/// One queued build: the package it builds and the module path.
-struct BuildJob {
-    package: Arc<Package>,
-    path: ModulePath,
 }
 
 impl Queue {
@@ -1247,7 +1237,7 @@ impl Queue {
             toolchains,
             state: Mutex::new(QueueState {
                 builder: Builder::new(limits),
-                jobs: HashMap::new(),
+                packages: HashMap::new(),
                 waiters: HashMap::new(),
                 next_waiter: 0,
                 stopping: false,
@@ -1276,12 +1266,7 @@ impl Queue {
         state.next_waiter += 1;
         state.builder.submit(path, urgency, waiter);
         state.waiters.insert(waiter, sender);
-        state.jobs.entry(path.clone()).or_insert_with(|| {
-            Arc::new(BuildJob {
-                package,
-                path: path.clone(),
-            })
-        });
+        state.packages.entry(path.clone()).or_insert(package);
         drop(state);
         self.wake.notify_all();
         receiver
@@ -1307,10 +1292,13 @@ impl Queue {
             // Without `MemAvailable` the host cannot be gated on memory; the
             // job limit still applies.
             let framed = available_host_memory().unwrap_or(u64::MAX);
-            let QueueState { builder, jobs, .. } = &mut *state;
+            let QueueState {
+                builder, packages, ..
+            } = &mut *state;
             let started = builder.start(framed, |build| {
-                jobs.get(&build.path)
-                    .map_or(0, |job| peak(&self.toolchains, job))
+                packages
+                    .get(&build.path)
+                    .map_or(0, |package| peak(&self.toolchains, package, &build.path))
             });
             if started.is_empty() {
                 let timeout = if builder.pending() == 0 {
@@ -1327,14 +1315,14 @@ impl Queue {
             }
             let mut spawned = Vec::with_capacity(started.len());
             for path in started {
-                if let Some(job) = jobs.get(&path).cloned() {
-                    spawned.push(job);
+                if let Some(package) = packages.get(&path).cloned() {
+                    spawned.push((package, path));
                 }
             }
             drop(state);
-            for job in spawned {
+            for (package, path) in spawned {
                 let queue = Arc::clone(&self);
-                std::thread::spawn(move || queue.build(job));
+                std::thread::spawn(move || queue.build(&package, &path));
             }
         }
     }
@@ -1343,27 +1331,28 @@ impl Queue {
     ///
     /// A build that panics fails like one that returned an error: the
     /// failure is the build's log, and the queue keeps its slot.
-    fn build(self: Arc<Self>, job: Arc<BuildJob>) {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.compile(&job)))
-            .unwrap_or_else(|panic| {
-                let message = panic
-                    .downcast_ref::<&str>()
-                    .map(|message| (*message).to_owned())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "the build panicked".to_owned());
-                Err(Error::Build {
-                    op: job.path.op.clone(),
-                    backend: job.path.backend.clone(),
-                    revision: job.path.revision,
-                    target: job.path.target.clone(),
-                    descriptor: job.path.descriptor.clone(),
-                    message: format!("the build panicked: {message}"),
+    fn build(self: Arc<Self>, package: &Package, path: &ModulePath) {
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.compile(package, path)))
+                .unwrap_or_else(|panic| {
+                    let message = panic
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_owned())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "the build panicked".to_owned());
+                    Err(Error::Build {
+                        op: path.op.clone(),
+                        backend: path.backend.clone(),
+                        revision: path.revision,
+                        target: path.target.clone(),
+                        descriptor: path.descriptor.clone(),
+                        message: format!("the build panicked: {message}"),
+                    })
                 })
-            })
-            .map_err(|error| error.to_string());
+                .map_err(|error| error.to_string());
         let mut state = self.lock();
-        let ended: Option<Build> = state.builder.finish(&job.path, result);
-        state.jobs.remove(&job.path);
+        let ended: Option<Build> = state.builder.finish(path, result);
+        state.packages.remove(path);
         if let Some(build) = ended {
             for waiter in &build.waiters {
                 if let Some(sender) = state.waiters.remove(waiter) {
@@ -1382,11 +1371,10 @@ impl Queue {
     }
 
     /// Compiles one module into the store.
-    fn compile(&self, job: &BuildJob) -> Result<()> {
-        let package = &job.package;
+    fn compile(&self, package: &Package, path: &ModulePath) -> Result<()> {
         let kind = package.toolchain();
         let workspace = crate::source::Workspace::new()?;
-        let target = Target::new(job.path.target.clone());
+        let target = Target::new(path.target.clone());
         let toolchain = self.toolchains.get(kind)?;
         // A module is stored under the inputs its revision recorded, so
         // only the toolchain and compile driver the revision was
@@ -1400,7 +1388,7 @@ impl Queue {
                      builds with {identity}: install the package again",
                     package.manifest.op,
                     package.manifest.backend,
-                    job.path.revision,
+                    path.revision,
                     package.inputs.toolchain,
                 ),
             });
@@ -1420,7 +1408,7 @@ impl Queue {
                      has {}",
                     package.manifest.op,
                     package.manifest.backend,
-                    job.path.revision,
+                    path.revision,
                     package.manifest.toolchain.version,
                     toolchain.version()
                 ),
@@ -1431,25 +1419,22 @@ impl Queue {
             &package.manifest.backend,
             &package.manifest.toolchain,
         )?;
-        let built = package.source.build(
-            &job.path.op,
-            &job.path.descriptor,
-            &target,
-            toolchain,
-            &workspace,
-        )?;
+        let built =
+            package
+                .source
+                .build(&path.op, &path.descriptor, &target, toolchain, &workspace)?;
         if built.is_empty() {
             return Err(Error::Build {
-                op: job.path.op.clone(),
-                backend: job.path.backend.clone(),
-                revision: job.path.revision,
-                target: job.path.target.clone(),
-                descriptor: job.path.descriptor.clone(),
+                op: path.op.clone(),
+                backend: path.backend.clone(),
+                revision: path.revision,
+                target: path.target.clone(),
+                descriptor: path.descriptor.clone(),
                 message: "the build wrote no file".into(),
             });
         }
         self.store.publish(
-            &job.path,
+            path,
             workspace.path(),
             &built,
             package.manifest.interface_version,
@@ -1465,21 +1450,25 @@ impl Queue {
 }
 
 /// The peak host memory one build reserves, as its toolchain reports it.
-fn peak(toolchains: &Toolchains, job: &BuildJob) -> u64 {
-    let kind = job.package.toolchain();
+fn peak(toolchains: &Toolchains, package: &Package, path: &ModulePath) -> u64 {
+    let kind = package.toolchain();
     toolchains
         .get(kind)
-        .map(|toolchain| toolchain.peak_host_bytes(&job.path.op, &job.path.descriptor))
+        .map(|toolchain| toolchain.peak_host_bytes(&path.op, &path.descriptor))
         .unwrap_or(0)
 }
 
-/// The responses a request sends on its connection while it runs.
-struct Replies<'a> {
+/// Sends the progress of a request on its connection while it runs.
+///
+/// A send that fails is kept and ends the sending: the builds go on, nothing
+/// more is written to a connection that is gone, and [`Self::check`] returns
+/// the failure once the request's work has ended.
+struct ProgressSender<'a> {
     connection: &'a mut Connection,
     failure: Option<Error>,
 }
 
-impl<'a> Replies<'a> {
+impl<'a> ProgressSender<'a> {
     fn new(connection: &'a mut Connection) -> Self {
         Self {
             connection,
@@ -1517,13 +1506,13 @@ impl<'a> Replies<'a> {
 }
 
 /// The error a client is told about a failed request.
-fn refusal(error: &Error) -> wire::Refused {
+fn refusal(error: &Error) -> wire::Refusal {
     match error {
-        Error::Refused { reason, upstream } => wire::Refused {
+        Error::Refused { reason, upstream } => wire::Refusal {
             reason: reason.clone(),
             upstream: upstream.clone().unwrap_or_default(),
         },
-        other => wire::Refused {
+        other => wire::Refusal {
             reason: other.to_string(),
             upstream: String::new(),
         },

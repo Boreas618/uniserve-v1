@@ -1167,12 +1167,13 @@ pub fn with_store_modules(
     Ok(complete)
 }
 
-/// The candidates the Build Server selects among for `op`, with `named` preferred: every
-/// installed package of the interface, each at its latest revision or the one `named` states.
+/// The candidates the Build Server selects among for `op`, given what the deployment prefers:
+/// every installed package of the interface, each at its latest revision or the one `preferred`
+/// states.
 fn candidates(
     client: &mut build_server::Client,
     op: &str,
-    named: &[build_server::Named],
+    preferred: &[build_server::Preference],
 ) -> anyhow::Result<Vec<build_server::protocol::Package>> {
     let coverage = client
         .cover(&build_server::CoverRequest {
@@ -1181,7 +1182,7 @@ fn candidates(
             // main process selects among them for its own devices.
             targets: Vec::new(),
             keys: Vec::new(),
-            named: named.to_vec(),
+            preferred: preferred.to_vec(),
             fixed: Vec::new(),
         })
         .with_context(|| format!("asking the Build Server for the packages of {op}"))?;
@@ -1195,12 +1196,12 @@ fn fix_revision(
     op: &str,
     package: &mut proto::module::PackageRevision,
 ) -> anyhow::Result<()> {
-    let named = build_server::Named {
+    let stated = build_server::Preference {
         phase: None,
         backend: package.backend.clone(),
         revision: (package.revision != 0).then_some(package.revision),
     };
-    let selected = candidates(client, op, &[named])?
+    let selected = candidates(client, op, &[stated])?
         .into_iter()
         .find(|candidate| candidate.backend == package.backend)
         .with_context(|| format!("no {op} package {} is installed", package.backend))?;
@@ -1310,19 +1311,19 @@ fn prepare_at(
     steps.at(&server.host, "reading the modules a Build Server selected");
     tracing::info!(
         host = %server.host,
-        prepared = prepared.packages.len(),
+        prepared = prepared.len(),
         "a Build Server answered"
     );
     let mut kernels = BTreeMap::new();
     let mut policy = None;
     let mut engine = None;
-    for chosen in prepared.packages {
-        if chosen.slot == policy_slot {
-            policy = Some(chosen.package);
-        } else if chosen.slot == engine_slot {
-            engine = Some(chosen.package);
+    for (slot, package) in prepared {
+        if slot == policy_slot {
+            policy = Some(package);
+        } else if slot == engine_slot {
+            engine = Some(package);
         } else {
-            kernels.insert(chosen.slot, chosen.package);
+            kernels.insert(slot, package);
         }
     }
     let policy = policy.context("the Build Server selected no scheduling policy package")?;
@@ -1390,10 +1391,9 @@ pub fn select_engine(
         })
         .with_context(|| format!("selecting the engine package {}", engine.backend))?;
     prepared
-        .packages
         .into_iter()
         .next()
-        .map(|chosen| chosen.package)
+        .map(|(_, package)| package)
         .context("the Build Server selected no engine package")
 }
 

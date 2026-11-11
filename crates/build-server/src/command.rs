@@ -394,19 +394,18 @@ pub fn run(args: Args, host: HostTargets<'_>) -> Result<()> {
             let installed = client.install(&absolute(package))?;
             println!(
                 "{} {} revision {}",
-                installed.package.op, installed.package.backend, installed.package.revision
+                installed.op, installed.backend, installed.revision
             );
             Ok(())
         }
         Command::List { socket } => {
             let mut client = Client::connect(&socket_or_default(socket))?;
-            let listing = client.list()?;
-            for package in listing.packages {
+            for (package, modules) in client.list()? {
                 println!(
                     "{} {} revision {}",
                     package.op, package.backend, package.revision
                 );
-                for module in package.modules {
+                for module in modules {
                     println!(
                         "    {} {} {:?}",
                         module.target, module.descriptor, module.form

@@ -64,7 +64,7 @@ impl Bench {
         let target = Target::arch(DEVICE.compute_capability()?);
         let mut client = Client::connect(Path::new(&socket))?;
         let mut backends: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for package in client.list()?.packages {
+        for (package, _) in client.list()? {
             let known = backends.entry(package.op).or_default();
             if !known.contains(&package.backend) {
                 known.push(package.backend);
@@ -257,17 +257,13 @@ impl Bench {
                 .collect(),
         };
         let prepared = self.client.prepare(&request, &mut |_| {})?;
-        for chosen in prepared.packages {
-            let operator = proto::module::operator::named(&chosen.slot.op)
-                .ok_or_else(|| format!("{} is no operator of this build", chosen.slot.op))?;
+        for (slot, package) in prepared {
+            let operator = proto::module::operator::named(&slot.op)
+                .ok_or_else(|| format!("{} is no operator of this build", slot.op))?;
             for key in missing.get(operator).into_iter().flatten() {
-                let module = self.client.resolve(
-                    operator,
-                    &chosen.package,
-                    &self.target,
-                    key,
-                    &mut |_| {},
-                )?;
+                let module =
+                    self.client
+                        .resolve(operator, &package, &self.target, key, &mut |_| {})?;
                 let entry = load(&self.device, operator, key, module)?;
                 self.kernels.insert((operator, key.clone()), entry);
             }

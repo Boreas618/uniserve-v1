@@ -34,6 +34,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::snapshot::Files;
 use crate::{Error, Result};
 
 /// The mark that makes a module directory a committed module, and the
@@ -208,16 +209,17 @@ impl Store {
             .find_map(|root| recorded_version(&root.path.join(&relative)))
     }
 
-    /// The files of a committed module, in name order, from the first root
-    /// that has one. A file's name is its path inside the module's directory,
-    /// so tuning data in a subdirectory keeps its place.
-    pub fn files(&self, path: &ModulePath) -> Result<Option<Vec<StoreFile>>> {
+    /// The files of a committed module, from the first root that has one:
+    /// each file's name and where it is, in name order. A file's name is its
+    /// path inside the module's directory, such as `module.cubin` or
+    /// `tuning/tactics.json`, so tuning data in a subdirectory keeps its place.
+    pub fn files(&self, path: &ModulePath) -> Result<Option<Files>> {
         let Some(directory) = self.find(path) else {
             return Ok(None);
         };
-        let mut files = Vec::new();
+        let mut files = Files::new();
         collect(&directory, Path::new(""), &mut files)?;
-        files.sort_by(|left, right| left.name.cmp(&right.name));
+        files.sort();
         Ok(Some(files))
     }
 
@@ -357,16 +359,6 @@ impl Store {
     }
 }
 
-/// One file of a module: its name inside the module's directory, and where it
-/// is.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StoreFile {
-    /// The file's path inside the module's directory, such as `module.cubin`
-    /// or `tuning/tactics.json`.
-    pub name: String,
-    pub path: PathBuf,
-}
-
 /// The interface version the mark of the module directory `directory` records,
 /// or `None` when the directory is no committed module: it has no mark, or a
 /// mark that states no version.
@@ -389,7 +381,7 @@ fn is_name(name: &str) -> bool {
 }
 
 /// Adds every file below a module's directory, with its name relative to it.
-fn collect(directory: &Path, prefix: &Path, files: &mut Vec<StoreFile>) -> Result<()> {
+fn collect(directory: &Path, prefix: &Path, files: &mut Files) -> Result<()> {
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -402,10 +394,7 @@ fn collect(directory: &Path, prefix: &Path, files: &mut Vec<StoreFile>) -> Resul
             collect(&path, &relative, files)?;
             continue;
         }
-        files.push(StoreFile {
-            name: relative.to_string_lossy().into_owned(),
-            path,
-        });
+        files.push((relative.to_string_lossy().into_owned(), path));
     }
     Ok(())
 }

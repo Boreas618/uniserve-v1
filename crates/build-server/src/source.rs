@@ -28,10 +28,11 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::manifest::{Manifest, ModuleForm, SourceKind, ToolchainKind};
 use crate::target::Target;
-use crate::toolchain::{ToolJob, Toolchain};
+use crate::toolchain::Toolchain;
 use crate::{Error, Result};
 
 /// The name `ops` loads a cubin module by (design section 4.2).
@@ -467,12 +468,14 @@ impl Source for CudaSource {
                     kind: ToolchainKind::Nvcc,
                     message: "no nvcc named: pass --nvcc <path> or set CUDA_HOME".into(),
                 })?;
-                let job = ToolJob::new(interpreter, &package.root, &log)
-                    .argument(&script)
-                    .environment(package.environment(key, target, dir))
-                    .environment([("UNISERVE_NVCC".into(), nvcc.as_os_str().to_owned())]);
+                let mut command = Command::new(interpreter);
+                command
+                    .current_dir(&package.root)
+                    .arg(&script)
+                    .envs(package.environment(key, target, dir))
+                    .env("UNISERVE_NVCC", nvcc);
                 toolchain
-                    .run(job)
+                    .run(command, &log)
                     .map_err(|error| package.failure_with_log(key, target, error, &log))?;
             }
             None => run_nvcc(package, key, target, toolchain, dir, &log)?,
@@ -507,41 +510,41 @@ fn run_nvcc(
         message: "no nvcc named: pass --nvcc <path> or set CUDA_HOME".into(),
     })?;
     let parameters = &package.manifest.parameters;
-    let mut job = ToolJob::new(nvcc, &package.root, log).argument(format!("-arch={target}"));
+    let mut command = Command::new(nvcc);
+    command
+        .current_dir(&package.root)
+        .arg(format!("-arch={target}"));
     if let Some(standard) = parameter(parameters, "standard") {
-        job = job.argument(format!("-std={standard}"));
+        command.arg(format!("-std={standard}"));
     }
     if let Some(optimization) = parameter(parameters, "optimization") {
         for flag in optimization.split_whitespace() {
-            job = job.argument(flag);
+            command.arg(flag);
         }
     }
     if let Some(defines) = list(parameters, "defines") {
         for define in defines {
-            job = job.argument(format!("-D{define}"));
+            command.arg(format!("-D{define}"));
         }
     }
-    job = job.argument("-I").argument(package.root.join("src"));
+    command.arg("-I").arg(package.root.join("src"));
     if let Some(includes) = list(parameters, "include") {
         for include in includes {
-            job = job.argument("-I").argument(package.root.join(include));
+            command.arg("-I").arg(package.root.join(include));
         }
     }
     let output = match package.manifest.module.form {
         ModuleForm::Native => {
-            job = job
-                .argument("--shared")
-                .argument("-Xcompiler")
-                .argument("-fPIC");
+            command.arg("--shared").arg("-Xcompiler").arg("-fPIC");
             if let Some(libraries) = list(parameters, "libraries") {
                 for library in libraries {
-                    job = job.argument(library);
+                    command.arg(library);
                 }
             }
             dir.path().join(MODULE_SO)
         }
         ModuleForm::Cubin => {
-            job = job.argument("--cubin");
+            command.arg("--cubin");
             dir.path().join(MODULE_CUBIN)
         }
         other => {
@@ -565,15 +568,15 @@ fn run_nvcc(
                 format!("the package carries no {relative} for this descriptor"),
             ));
         }
-        job = job.argument(source);
+        command.arg(source);
         sources += 1;
     }
     if sources == 0 {
         return Err(package.failure(key, target, "the package names no .cu file to compile"));
     }
-    job = job.argument("-o").argument(&output);
+    command.arg("-o").arg(&output);
     toolchain
-        .run(job)
+        .run(command, log)
         .map_err(|error| package.failure_with_log(key, target, error, log))?;
     if package.manifest.module.form == ModuleForm::Cubin {
         write_cuda_metadata(package, key, target, dir)?;
@@ -708,11 +711,13 @@ impl Source for TritonSource {
                     script.display()
                 ),
             })?;
-        let job = ToolJob::new(interpreter, &package.root, &log)
-            .argument(&script)
-            .environment(package.environment(key, target, dir));
+        let mut command = Command::new(interpreter);
+        command
+            .current_dir(&package.root)
+            .arg(&script)
+            .envs(package.environment(key, target, dir));
         toolchain
-            .run(job)
+            .run(command, &log)
             .map_err(|error| package.failure_with_log(key, target, error, &log))?;
 
         // A cubin module is the cubin and the metadata JSON that says how to
@@ -785,11 +790,13 @@ impl Source for CuteDslSource {
                     script.display()
                 ),
             })?;
-        let job = ToolJob::new(interpreter, &package.root, &log)
-            .argument(&script)
-            .environment(package.environment(key, target, dir));
+        let mut command = Command::new(interpreter);
+        command
+            .current_dir(&package.root)
+            .arg(&script)
+            .envs(package.environment(key, target, dir));
         toolchain
-            .run(job)
+            .run(command, &log)
             .map_err(|error| package.failure_with_log(key, target, error, &log))?;
         package.check_module(key, target, dir, &log)?;
         copy_tuning(package, key, target, dir)?;
@@ -927,19 +934,21 @@ impl Source for WasmSource {
             .map_err(|error| package.failure(key, target, error.to_string()))?;
 
         // The raw module: the snapshot's crate, built for wasm32.
-        let job = ToolJob::new(cargo, &workspace, &log)
-            .argument("build")
-            .argument("--release")
-            .argument("--locked")
-            .argument("--offline")
-            .argument("--target")
-            .argument(WASM_TRIPLE)
-            .argument("--jobs")
-            .argument(toolchain.max_jobs().to_string())
-            .argument("--target-dir")
-            .argument(target_directory);
+        let mut command = Command::new(cargo);
+        command
+            .current_dir(&workspace)
+            .arg("build")
+            .arg("--release")
+            .arg("--locked")
+            .arg("--offline")
+            .arg("--target")
+            .arg(WASM_TRIPLE)
+            .arg("--jobs")
+            .arg(toolchain.max_jobs().to_string())
+            .arg("--target-dir")
+            .arg(target_directory);
         toolchain
-            .run(job)
+            .run(command, &log)
             .map_err(|error| package.failure_with_log(key, target, error, &log))?;
         let raw = target_directory
             .join(WASM_TRIPLE)
@@ -966,13 +975,15 @@ impl Source for WasmSource {
                 .into(),
         })?;
         let output = dir.path().join(MODULE_WASM);
-        let job = ToolJob::new(precompiler, &workspace, &log)
-            .argument("--wasm")
-            .argument(&raw)
-            .argument("--out")
-            .argument(&output);
+        let mut command = Command::new(precompiler);
+        command
+            .current_dir(&workspace)
+            .arg("--wasm")
+            .arg(&raw)
+            .arg("--out")
+            .arg(&output);
         toolchain
-            .run(job)
+            .run(command, &log)
             .map_err(|error| package.failure_with_log(key, target, error, &log))?;
         if !output.is_file() {
             return Err(package.failure(
@@ -1130,19 +1141,21 @@ impl Source for CargoSource {
             package.failure(key, target, "the package names no [source] binary to build")
         })?;
 
-        let job = ToolJob::new(cargo, &package.root.join(crate::snapshot::WORKSPACE), &log)
-            .argument("build")
-            .argument("--release")
-            .argument("--locked")
-            .argument("--offline")
-            .argument("--bin")
-            .argument(binary)
-            .argument("--jobs")
-            .argument(toolchain.max_jobs().to_string())
-            .argument("--target-dir")
-            .argument(target_directory);
+        let mut command = Command::new(cargo);
+        command
+            .current_dir(package.root.join(crate::snapshot::WORKSPACE))
+            .arg("build")
+            .arg("--release")
+            .arg("--locked")
+            .arg("--offline")
+            .arg("--bin")
+            .arg(binary)
+            .arg("--jobs")
+            .arg(toolchain.max_jobs().to_string())
+            .arg("--target-dir")
+            .arg(target_directory);
         toolchain
-            .run(job)
+            .run(command, &log)
             .map_err(|error| package.failure_with_log(key, target, error, &log))?;
 
         let built = target_directory.join("release").join(binary);
@@ -1182,16 +1195,14 @@ pub fn lock_snapshot(cargo: &dyn Toolchain, staged: &Path) -> Result<()> {
         message: "no cargo on this host: pass --cargo <path>".into(),
     })?;
     let log = tempfile::NamedTempFile::new()?;
-    let job = ToolJob::new(
-        executable,
-        &staged.join(crate::snapshot::WORKSPACE),
-        log.path(),
-    )
-    .argument("metadata")
-    .argument("--offline")
-    .argument("--format-version")
-    .argument("1");
-    cargo.run(job)
+    let mut command = Command::new(executable);
+    command
+        .current_dir(staged.join(crate::snapshot::WORKSPACE))
+        .arg("metadata")
+        .arg("--offline")
+        .arg("--format-version")
+        .arg("1");
+    cargo.run(command, log.path())
 }
 
 #[cfg(test)]

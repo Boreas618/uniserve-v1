@@ -89,8 +89,8 @@ fn main() -> ExitCode {
         ),
     ];
     let mut failed = false;
-    for (name, outcome) in checks {
-        match outcome {
+    for (name, result) in checks {
+        match result {
             Ok(()) => println!("passed  {name}"),
             Err(message) => {
                 failed = true;

@@ -51,12 +51,6 @@ pub struct Package {
     pub revision: u32,
 }
 
-/// The response to `install`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Installed {
-    pub package: Package,
-}
-
 /// The descriptors one slot's package revision must cover: `prepare` hands the package revision
 /// that fills `slot` exactly these keys, and no slot another's.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,19 +87,6 @@ pub struct PrepareRequest {
     pub targets: Vec<Target>,
     pub packages: Vec<PackageRequest>,
     pub descriptors: Vec<Descriptors>,
-}
-
-/// A package revision `prepare` selected.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Chosen {
-    pub slot: ModuleSlot,
-    pub package: PackageRevision,
-}
-
-/// The response to `prepare`: the selected package revisions, with their revisions.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Prepared {
-    pub packages: Vec<Chosen>,
 }
 
 /// One module's build, as it progresses.
@@ -155,29 +136,14 @@ pub struct Module {
     pub interface_version: u32,
 }
 
-/// One module a listing names.
+/// One module of an installed package, as `list` names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ListedModule {
+pub struct ModuleEntry {
     pub target: Target,
     pub descriptor: String,
     pub form: ModuleForm,
     /// The interface version the module was built for.
     pub interface_version: u32,
-}
-
-/// One installed package a listing names.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ListedPackage {
-    pub op: String,
-    pub backend: String,
-    pub revision: u32,
-    pub modules: Vec<ListedModule>,
-}
-
-/// The response to `list`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Listing {
-    pub packages: Vec<ListedPackage>,
 }
 
 /// What `cover` asks: which installed package the Build Server selects for
@@ -192,7 +158,7 @@ pub struct CoverRequest {
     /// The backends the deployment names for the operator, preferred for the
     /// keys of their phase; empty leaves every key to the manifests'
     /// priorities.
-    pub named: Vec<Named>,
+    pub preferred: Vec<Preference>,
     /// The revisions a module set fixed for the operator's packages, each a
     /// backend and its revision. When any is stated, the candidates are
     /// exactly these: a package or a revision installed since is none. Empty
@@ -204,26 +170,21 @@ pub struct CoverRequest {
 /// A backend a deployment names for an operator: preferred over every other
 /// package for the keys of `phase` (every key when `None`) that it covers.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Named {
+pub struct Preference {
     pub phase: Option<PhaseKind>,
     pub backend: String,
     /// The revision to use; `None` is the backend's latest installed one.
     pub revision: Option<u32>,
 }
 
-/// The keys of a `cover` one package was chosen for.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Covered {
-    pub package: Package,
-    pub keys: Vec<String>,
-}
-
 /// The response to `cover`: each requested key once, either under the package
-/// selected for it or in `uncovered`. `covered` is in the server's selection
-/// order, and each package's keys in the order the request named them.
+/// selected for it or in `uncovered`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Coverage {
-    pub covered: Vec<Covered>,
+    /// Each selected package with the keys it was selected for: the packages
+    /// in the server's selection order, and each one's keys in the order the
+    /// request named them.
+    pub covered: Vec<(Package, Vec<String>)>,
     /// The keys no installed package of the operator covers for the targets.
     pub uncovered: Vec<String>,
     /// Every candidate the selection chose among, in its selection order.
@@ -546,7 +507,7 @@ impl Client {
     ///
     /// Only the upstream Build Server installs; another one refuses and
     /// names the upstream, which the error carries.
-    pub fn install(&mut self, package: &Path) -> Result<Installed> {
+    pub fn install(&mut self, package: &Path) -> Result<Package> {
         let package = package
             .to_str()
             .ok_or_else(|| {
@@ -563,16 +524,14 @@ impl Client {
             &[],
         )?;
         match self.response()? {
-            wire::server_message::Message::Installed(installed) => Ok(Installed {
-                package: installed
-                    .package
-                    .map(|package| Package {
-                        op: package.op,
-                        backend: package.backend,
-                        revision: package.revision,
-                    })
-                    .ok_or_else(|| Error::Protocol("installed without a package".into()))?,
-            }),
+            wire::server_message::Message::Installed(installed) => installed
+                .package
+                .map(|package| Package {
+                    op: package.op,
+                    backend: package.backend,
+                    revision: package.revision,
+                })
+                .ok_or_else(|| Error::Protocol("installed without a package".into())),
             wire::server_message::Message::Refused(refused) => Err(refused_error(refused)),
             other => Err(unexpected(Some(other))),
         }
@@ -580,6 +539,7 @@ impl Client {
 
     /// Selects an epoch's package revisions and has every module of their descriptors
     /// built, reporting each build through `progress` (design section 6.3).
+    /// Returns each requested slot with the package revision selected for it.
     ///
     /// This waits until every missing module is committed; a module that
     /// cannot be built fails the call with the build's log.
@@ -587,7 +547,7 @@ impl Client {
         &mut self,
         request: &PrepareRequest,
         progress: &mut dyn FnMut(Progress),
-    ) -> Result<Prepared> {
+    ) -> Result<Vec<(ModuleSlot, PackageRevision)>> {
         self.call(|connection| Self::prepare_on(connection, request, &mut *progress))
     }
 
@@ -596,7 +556,7 @@ impl Client {
         connection: &mut Connection,
         request: &PrepareRequest,
         progress: &mut dyn FnMut(Progress),
-    ) -> Result<Prepared> {
+    ) -> Result<Vec<(ModuleSlot, PackageRevision)>> {
         connection.send(
             &wire::Request {
                 request: Some(wire::request::Request::Prepare(prepare_message(request)?)),
@@ -613,12 +573,9 @@ impl Client {
                         let revision = revision.package.ok_or_else(|| {
                             Error::Protocol("a chosen package carries no package".into())
                         })?;
-                        chosen.push(Chosen {
-                            slot,
-                            package: revision.try_into()?,
-                        });
+                        chosen.push((slot, revision.try_into()?));
                     }
-                    return Ok(Prepared { packages: chosen });
+                    return Ok(chosen);
                 }
                 wire::server_message::Message::Refused(refused) => {
                     return Err(refused_error(refused));
@@ -707,8 +664,8 @@ impl Client {
         }
     }
 
-    /// Lists the installed packages, their revisions and their modules.
-    pub fn list(&mut self) -> Result<Listing> {
+    /// Lists every installed package revision with its modules.
+    pub fn list(&mut self) -> Result<Vec<(Package, Vec<ModuleEntry>)>> {
         self.connection.send(
             &wire::Request {
                 request: Some(wire::request::Request::List(wire::List {})),
@@ -729,21 +686,23 @@ impl Client {
                                 ))
                             })?
                             .try_into()?;
-                        modules.push(ListedModule {
+                        modules.push(ModuleEntry {
                             target: Target::new(module.target),
                             descriptor: module.descriptor,
                             form,
                             interface_version: module.interface_version,
                         });
                     }
-                    packages.push(ListedPackage {
-                        op: package.op,
-                        backend: package.backend,
-                        revision: package.revision,
+                    packages.push((
+                        Package {
+                            op: package.op,
+                            backend: package.backend,
+                            revision: package.revision,
+                        },
                         modules,
-                    });
+                    ));
                 }
-                Ok(Listing { packages })
+                Ok(packages)
             }
             wire::server_message::Message::Refused(refused) => Err(refused_error(refused)),
             other => Err(unexpected(Some(other))),
@@ -759,13 +718,13 @@ impl Client {
                     op: request.op.clone(),
                     targets: request.targets.iter().map(Target::to_string).collect(),
                     keys: request.keys.clone(),
-                    named: request
-                        .named
+                    preferred: request
+                        .preferred
                         .iter()
-                        .map(|named| wire::Named {
-                            phase: phase_to_wire(named.phase),
-                            backend: named.backend.clone(),
-                            revision: named.revision.unwrap_or(0),
+                        .map(|preference| wire::Preference {
+                            phase: phase_to_wire(preference.phase),
+                            backend: preference.backend.clone(),
+                            revision: preference.revision.unwrap_or(0),
                         })
                         .collect(),
                     fixed: request
@@ -787,14 +746,14 @@ impl Client {
                     let package = entry.package.ok_or_else(|| {
                         Error::Protocol("a covering entry names no package".into())
                     })?;
-                    covered.push(Covered {
-                        package: Package {
+                    covered.push((
+                        Package {
                             op: package.op,
                             backend: package.backend,
                             revision: package.revision,
                         },
-                        keys: entry.keys,
-                    });
+                        entry.keys,
+                    ));
                 }
                 Ok(Coverage {
                     covered,
@@ -898,7 +857,7 @@ impl Connection {
     }
 }
 
-fn refused_error(refused: wire::Refused) -> Error {
+fn refused_error(refused: wire::Refusal) -> Error {
     Error::Refused {
         reason: refused.reason,
         upstream: (!refused.upstream.is_empty()).then_some(refused.upstream),

@@ -99,7 +99,7 @@ message Descriptors {
 // Ask the server to select the package revisions of a set of operators and to build
 // every module of their descriptors that is not in the store yet (design
 // section 6.3). The server reports each build as a `Progress` frame and ends
-// with `Prepared` once every module is committed, or with `Refused`.
+// with a `PrepareResponse` once every module is committed, or with a `Refusal`.
 message Prepare {
   // The targets to build for: architectures such as `sm_100a`, or GPU models
   // for a package that compiles the GPU's SM count into its binary.
@@ -108,8 +108,8 @@ message Prepare {
   repeated Descriptors descriptors = 3;
 }
 
-// A package revision the server selected.
-message Chosen {
+// A slot and the package revision the server selected for it.
+message SlotPackage {
   string op = 1;
   Phase phase = 2;
   PackageRevision package = 3;
@@ -142,9 +142,9 @@ message Cover {
   repeated string targets = 2;
   // Descriptor keys, in the canonical form the operator's `Display` gives.
   repeated string keys = 3;
-  // The backends the deployment names for the operator; none leaves the
+  // The backends the deployment prefers for the operator; none leaves the
   // selection to the manifests' priorities.
-  repeated Named named = 4;
+  repeated Preference preferred = 4;
   // The revisions a module set fixed for the operator's packages. When any is
   // stated, the candidates are exactly these packages at these revisions: a
   // package or a revision installed since is none.
@@ -158,8 +158,8 @@ message FixedRevision {
 }
 
 // A backend a deployment names for an operator, in every phase (`ALL`) or in
-// one: it is preferred for the keys of that phase whenever it covers them.
-message Named {
+// one: it is selected for the keys of that phase whenever it covers them.
+message Preference {
   Phase phase = 1;
   string backend = 2;
   // The revision to use; zero names the backend's latest installed revision.
@@ -217,15 +217,15 @@ message ModuleFile {
   string path = 3;
 }
 
-message Installed {
+message InstallResponse {
   Package package = 1;
 }
 
-message Prepared {
-  repeated Chosen packages = 1;
+message PrepareResponse {
+  repeated SlotPackage packages = 1;
 }
 
-message Resolved {
+message ResolveResponse {
   ModuleForm form = 1;
   repeated ModuleFile files = 2;
   // Superseded by `entries`; no longer sent. Kept so the schema stays
@@ -244,7 +244,7 @@ message Resolved {
   uint32 interface_version = 6;
 }
 
-message ListedModule {
+message ModuleEntry {
   string target = 1;
   string descriptor = 2;
   ModuleForm form = 3;
@@ -252,19 +252,19 @@ message ListedModule {
   uint32 interface_version = 4;
 }
 
-message ListedPackage {
+message PackageEntry {
   string op = 1;
   string backend = 2;
   uint32 revision = 3;
-  repeated ListedModule modules = 4;
+  repeated ModuleEntry modules = 4;
 }
 
-message Listing {
-  repeated ListedPackage packages = 1;
+message ListResponse {
+  repeated PackageEntry packages = 1;
 }
 
-// The keys of a `Cover` one package was chosen for.
-message Covered {
+// One package a `Cover` selected, and the keys it was selected for.
+message PackageKeys {
   Package package = 1;
   repeated string keys = 2;
 }
@@ -273,7 +273,7 @@ message Covered {
 // the package chosen for it or in `uncovered`. Packages are listed in the
 // server's selection order.
 message Coverage {
-  repeated Covered covered = 1;
+  repeated PackageKeys covered = 1;
   // The keys no installed package of the operator covers for the targets.
   repeated string uncovered = 2;
   // Every candidate the selection chose among, in its selection order: what
@@ -281,9 +281,9 @@ message Coverage {
   repeated Package candidates = 3;
 }
 
-// The server does not response the request. `upstream` is set when the request
+// The server refuses the request. `upstream` is set when the request
 // needed the upstream Build Server this one is not.
-message Refused {
+message Refusal {
   string reason = 1;
   string upstream = 2;
 }
@@ -292,11 +292,11 @@ message Refused {
 message ServerMessage {
   oneof message {
     Progress progress = 1;
-    Installed installed = 2;
-    Prepared prepared = 3;
-    Resolved resolved = 4;
-    Listing listing = 5;
-    Refused refused = 6;
+    InstallResponse installed = 2;
+    PrepareResponse prepared = 3;
+    ResolveResponse resolved = 4;
+    ListResponse listing = 5;
+    Refusal refused = 6;
     Coverage coverage = 7;
   }
 }

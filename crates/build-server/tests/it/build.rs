@@ -25,7 +25,7 @@ use build_server::target::{Device, Target};
 use build_server::toolchain::ToolchainConfig;
 use proto::module::ModuleSlot;
 
-/// Starts a server on its socket and answers it with its stop flag.
+/// Starts a server on its socket and returns it with its stop flag.
 fn start(
     configuration: &ServerConfig,
 ) -> (
@@ -79,7 +79,7 @@ fn configuration(temporary: &Path, toolchains: ToolchainConfig) -> ServerConfig 
     }
 }
 
-/// What one witness observed: the module `resolve` answered, the listing, and
+/// What one witness observed: the module `resolve` returned, the listing, and
 /// the things the test shuts down at its end.
 struct Witness {
     _temporary: tempfile::TempDir,
@@ -104,9 +104,9 @@ fn witness(
     let mut client = Client::connect(&configuration.socket).unwrap();
 
     let installed = client.install(package).unwrap();
-    assert_eq!(installed.package.revision, 1);
-    assert_eq!(installed.package.op, op);
-    assert_eq!(installed.package.backend, backend);
+    assert_eq!(installed.revision, 1);
+    assert_eq!(installed.op, op);
+    assert_eq!(installed.backend, backend);
 
     let target = Target::new("sm_100a");
     let request = PrepareRequest {
@@ -127,10 +127,10 @@ fn witness(
     let prepared = client
         .prepare(&request, &mut |step| progress.push(step))
         .unwrap();
-    assert_eq!(prepared.packages.len(), 1);
-    assert_eq!(prepared.packages[0].package.revision, 1);
+    assert_eq!(prepared.len(), 1);
+    assert_eq!(prepared[0].1.revision, 1);
 
-    let revision = prepared.packages[0].package.clone();
+    let revision = prepared[0].1.clone();
     let resolved = client
         .resolve(op, &revision, &target, key, &mut |_| {})
         .unwrap();
@@ -231,7 +231,7 @@ fn a_vendor_cubin_is_installed_stored_and_resolved_as_it_is() {
     let mut client = Client::connect(&configuration.socket).unwrap();
 
     let installed = client.install(&package).unwrap();
-    assert_eq!(installed.package.revision, 1);
+    assert_eq!(installed.revision, 1);
 
     let target = Target::new("sm_100a");
     let request = PrepareRequest {
@@ -252,7 +252,7 @@ fn a_vendor_cubin_is_installed_stored_and_resolved_as_it_is() {
     let prepared = client
         .prepare(&request, &mut |step| progress.push(step))
         .unwrap();
-    assert_eq!(prepared.packages.len(), 1);
+    assert_eq!(prepared.len(), 1);
     assert_eq!(progress.len(), 1);
     assert_eq!(progress[0].state, BuildState::Committed);
 
@@ -280,7 +280,7 @@ fn a_vendor_cubin_is_installed_stored_and_resolved_as_it_is() {
         );
     }
 
-    let revision = prepared.packages[0].package.clone();
+    let revision = prepared[0].1.clone();
     let resolved = client
         .resolve("paged_attention", &revision, &target, key, &mut |_| {})
         .unwrap();
@@ -288,7 +288,7 @@ fn a_vendor_cubin_is_installed_stored_and_resolved_as_it_is() {
     assert_eq!(
         resolved.metadata.as_deref(),
         Some(format!("metadata_{key}.json").as_str()),
-        "the resolve answer names the metadata the module holds"
+        "the resolve response names the metadata the module holds"
     );
     assert_eq!(file_of(&resolved, "module.cubin"), cubin);
 
@@ -448,7 +448,7 @@ fn a_policy_is_built_from_its_installed_snapshot() {
     let module = client
         .resolve(
             "scheduling",
-            &prepared.packages[0].package,
+            &prepared[0].1,
             &target,
             build_server::manifest::SINGLE_KEY,
             &mut |_| {},
@@ -664,7 +664,7 @@ fn a_build_into_an_existing_store_keeps_the_revision_of_an_unchanged_package() {
 }
 
 /// A store's modules are found by what built them, not by a revision number alone: a package root
-/// installed again from other files numbers its revision 1 again, and the store answers the
+/// installed again from other files numbers its revision 1 again, and the store returns the
 /// module of those files rather than the one the earlier revision 1 committed.
 #[test]
 fn a_revision_numbered_again_never_serves_the_module_of_other_files() {

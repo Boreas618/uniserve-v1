@@ -24,7 +24,6 @@
 //! host without a CUDA toolkit able to serve the packages it already has.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -65,50 +64,6 @@ const CARGO_JOB_PEAK_HOST_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// links while the compiler processes before it have ended.
 const CARGO_LINK_PEAK_HOST_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
-/// One compiler process a source runs.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ToolJob {
-    /// The executable to run: the interpreter, nvcc or the wasm precompiler.
-    pub executable: PathBuf,
-    pub arguments: Vec<OsString>,
-    /// The directory the executable runs in.
-    pub directory: PathBuf,
-    /// Variables added to the toolchain's environment.
-    pub environment: Vec<(OsString, OsString)>,
-    /// The file the executable's standard output and error are written to; a
-    /// failed build carries it as its log.
-    pub log: PathBuf,
-}
-
-impl ToolJob {
-    /// A job of a executable in `directory`, with its output going to `log`.
-    pub fn new(executable: &Path, directory: &Path, log: &Path) -> Self {
-        Self {
-            executable: executable.to_path_buf(),
-            arguments: Vec::new(),
-            directory: directory.to_path_buf(),
-            environment: Vec::new(),
-            log: log.to_path_buf(),
-        }
-    }
-
-    /// Adds one argument.
-    pub fn argument(mut self, argument: impl Into<OsString>) -> Self {
-        self.arguments.push(argument.into());
-        self
-    }
-
-    /// Adds the variables a source passes to its compiler, such as the
-    /// package root and the descriptor key.
-    pub fn environment(
-        mut self,
-        environment: impl IntoIterator<Item = (OsString, OsString)>,
-    ) -> Self {
-        self.environment.extend(environment);
-        self
-    }
-}
-
 /// What compiles a package.
 pub trait Toolchain: Send + Sync {
     /// The compiler's version, such as nvcc's `13.0.48`, Triton's `3.7.1` or
@@ -123,9 +78,12 @@ pub trait Toolchain: Send + Sync {
     /// `limits.host_reserve` (design section 6.2).
     fn peak_host_bytes(&self, op: &str, key: &str) -> u64;
 
-    /// Runs one compiler process, capping the compilers it may start itself
-    /// with `MAX_JOBS`.
-    fn run(&self, job: ToolJob) -> Result<()>;
+    /// Runs one compiler process to its end, capping the compilers it may
+    /// start itself with `MAX_JOBS`. `command` states the executable, its
+    /// arguments, the directory it runs in and the variables a source adds to
+    /// the server's environment; the process's standard output and error are
+    /// written to `log`, which a failed build carries as its log.
+    fn run(&self, command: Command, log: &Path) -> Result<()>;
 
     /// The number of compilers a toolchain process may start, which is the
     /// queue's `limits.max_jobs`.
@@ -424,8 +382,8 @@ impl Toolchain for Nvcc {
         NVCC_PEAK_HOST_BYTES
     }
 
-    fn run(&self, job: ToolJob) -> Result<()> {
-        execute(&job, self.max_jobs)
+    fn run(&self, command: Command, log: &Path) -> Result<()> {
+        execute(command, log, self.max_jobs)
     }
 
     fn max_jobs(&self) -> usize {
@@ -470,8 +428,8 @@ impl Toolchain for Triton {
         TRITON_PEAK_HOST_BYTES
     }
 
-    fn run(&self, job: ToolJob) -> Result<()> {
-        execute(&job, self.max_jobs)
+    fn run(&self, command: Command, log: &Path) -> Result<()> {
+        execute(command, log, self.max_jobs)
     }
 
     fn max_jobs(&self) -> usize {
@@ -512,8 +470,8 @@ impl Toolchain for CuteDsl {
         CUTE_DSL_PEAK_HOST_BYTES
     }
 
-    fn run(&self, job: ToolJob) -> Result<()> {
-        execute(&job, self.max_jobs)
+    fn run(&self, command: Command, log: &Path) -> Result<()> {
+        execute(command, log, self.max_jobs)
     }
 
     fn max_jobs(&self) -> usize {
@@ -564,8 +522,8 @@ impl Toolchain for Wasm {
         WASM_PEAK_HOST_BYTES
     }
 
-    fn run(&self, job: ToolJob) -> Result<()> {
-        execute(&job, self.max_jobs())
+    fn run(&self, command: Command, log: &Path) -> Result<()> {
+        execute(command, log, self.max_jobs())
     }
 
     fn max_jobs(&self) -> usize {
@@ -658,8 +616,8 @@ impl Toolchain for Cargo {
         (self.jobs as u64 * CARGO_JOB_PEAK_HOST_BYTES).max(CARGO_LINK_PEAK_HOST_BYTES)
     }
 
-    fn run(&self, job: ToolJob) -> Result<()> {
-        execute(&job, self.jobs)
+    fn run(&self, command: Command, log: &Path) -> Result<()> {
+        execute(command, log, self.jobs)
     }
 
     fn max_jobs(&self) -> usize {
@@ -705,7 +663,7 @@ impl Toolchain for Nothing {
         0
     }
 
-    fn run(&self, job: ToolJob) -> Result<()> {
+    fn run(&self, command: Command, _log: &Path) -> Result<()> {
         Err(Error::Build {
             op: String::new(),
             backend: String::new(),
@@ -714,7 +672,7 @@ impl Toolchain for Nothing {
             descriptor: String::new(),
             message: format!(
                 "nothing to run: this source compiles nothing ({} was asked)",
-                job.executable.display()
+                Path::new(command.get_program()).display()
             ),
         })
     }
@@ -921,25 +879,21 @@ fn resolve_in(configured: &Path, current: &Path) -> PathBuf {
     }
 }
 
-/// The environment a compiler process runs with: the toolchain's own, with
-/// `MAX_JOBS` set and the job's variables added.
-pub fn environment(job: &ToolJob, max_jobs: usize) -> Vec<(OsString, OsString)> {
-    let mut environment: Vec<(OsString, OsString)> =
-        vec![("MAX_JOBS".into(), OsString::from(max_jobs.to_string()))];
-    environment.extend(job.environment.iter().cloned());
-    environment
-}
+/// Runs a compiler process to its end, writing its output to `log`.
+///
+/// The process runs with the server's environment, `MAX_JOBS` set to
+/// `max_jobs` unless the command states its own, and the command's variables.
+pub fn execute(mut command: Command, log: &Path, max_jobs: usize) -> Result<()> {
+    if !command.get_envs().any(|(name, _)| name == "MAX_JOBS") {
+        command.env("MAX_JOBS", max_jobs.to_string());
+    }
 
-/// Runs a compiler process, writing its output to the job's log.
-pub fn execute(job: &ToolJob, max_jobs: usize) -> Result<()> {
-    let log = std::fs::File::create(&job.log)?;
-    let error_log = log.try_clone()?;
-    let status = Command::new(&job.executable)
-        .args(&job.arguments)
-        .current_dir(&job.directory)
-        .envs(environment(job, max_jobs))
-        .stdout(log)
-        .stderr(error_log)
+    let output = std::fs::File::create(log)?;
+    let error_output = output.try_clone()?;
+    let executable = command.get_program().to_owned();
+    let status = command
+        .stdout(output)
+        .stderr(error_output)
         .status()
         .map_err(|error| Error::Build {
             op: String::new(),
@@ -952,26 +906,33 @@ pub fn execute(job: &ToolJob, max_jobs: usize) -> Result<()> {
             // and the log is empty because the process never ran.
             message: format!(
                 "could not run {} {} in {}: {error}",
-                job.executable.display(),
-                job.arguments
-                    .iter()
+                Path::new(&executable).display(),
+                command
+                    .get_args()
                     .map(|argument| argument.to_string_lossy().into_owned())
                     .collect::<Vec<_>>()
                     .join(" "),
-                job.directory.display()
+                command
+                    .get_current_dir()
+                    .unwrap_or(Path::new("."))
+                    .display()
             ),
         })?;
+
     if status.success() {
         Ok(())
     } else {
-        let text = std::fs::read_to_string(&job.log).unwrap_or_default();
+        let text = std::fs::read_to_string(log).unwrap_or_default();
         Err(Error::Build {
             op: String::new(),
             backend: String::new(),
             revision: 0,
             target: String::new(),
             descriptor: String::new(),
-            message: format!("{} failed: {status}: {text}", job.executable.display()),
+            message: format!(
+                "{} failed: {status}: {text}",
+                Path::new(&executable).display()
+            ),
         })
     }
 }
@@ -979,8 +940,8 @@ pub fn execute(job: &ToolJob, max_jobs: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ToolJob, ToolchainConfig, Toolchains, disagreements, execute, normalized,
-        parse_nvcc_version, resolve_in,
+        ToolchainConfig, Toolchains, disagreements, execute, normalized, parse_nvcc_version,
+        resolve_in,
     };
     use crate::manifest::{PythonPackage, ToolchainKind};
     use std::collections::BTreeMap;
@@ -1074,14 +1035,14 @@ mod tests {
     /// log is empty, because the process never started: that combination is what made
     /// a relative toolchain path cost an hour to diagnose.
     #[test]
-    fn a_build_that_cannot_find_its_revision_names_the_revision_and_where_it_ran() {
+    fn a_build_that_cannot_find_its_compiler_names_the_executable_and_where_it_ran() {
         let temporary =
             std::env::temp_dir().join(format!("uniserve-tooljob-{}", std::process::id()));
         std::fs::create_dir_all(&temporary).unwrap();
         let log = temporary.join("build.log");
-        let job = ToolJob::new(Path::new("/no-such-toolchain/python"), &temporary, &log)
-            .argument("--version");
-        let error = execute(&job, 2).expect_err("a missing executable cannot run");
+        let mut command = std::process::Command::new("/no-such-toolchain/python");
+        command.current_dir(&temporary).arg("--version");
+        let error = execute(command, &log, 2).expect_err("a missing executable cannot run");
         let text = error.to_string();
         assert!(text.contains("/no-such-toolchain/python"), "{text}");
         assert!(text.contains("--version"), "{text}");
@@ -1093,7 +1054,7 @@ mod tests {
     /// build runs with its working directory set to the store's copy of a package, so a path that
     /// stayed relative would name that copy instead of the executable the caller named.
     #[test]
-    fn a_relative_toolchain_path_is_answered_absolute() {
+    fn a_relative_toolchain_path_is_resolved_absolute() {
         let root = Path::new("/srv/host");
         assert_eq!(
             resolve_in(Path::new("bin/nvcc"), root),

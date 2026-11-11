@@ -24,7 +24,7 @@ fn revision() -> PackageRevision {
     }
 }
 
-/// Runs `serve` on one end of a socket pair and answers the client of the
+/// Runs `serve` on one end of a socket pair and returns the client of the
 /// other.
 fn server_on(serve: impl FnOnce(&mut Connection) + Send + 'static) -> Client {
     let (client, server) = UnixStream::pair().unwrap();
@@ -71,19 +71,21 @@ fn a_request_crosses_the_connection_with_the_descriptor_of_its_frame() {
 }
 
 #[test]
-fn install_answers_the_revision_the_upstream_gave_the_package() {
+fn install_returns_the_revision_the_upstream_gave_the_package() {
     let mut client = server_on(|connection| {
         let _ = connection.receive::<wire::Request>().unwrap();
         connection
             .send(
                 &wire::ServerMessage {
-                    message: Some(wire::server_message::Message::Installed(wire::Installed {
-                        package: Some(wire::Package {
-                            op: "rms_norm".into(),
-                            backend: "triton".into(),
-                            revision: 4,
-                        }),
-                    })),
+                    message: Some(wire::server_message::Message::Installed(
+                        wire::InstallResponse {
+                            package: Some(wire::Package {
+                                op: "rms_norm".into(),
+                                backend: "triton".into(),
+                                revision: 4,
+                            }),
+                        },
+                    )),
                 },
                 &[],
             )
@@ -93,7 +95,7 @@ fn install_answers_the_revision_the_upstream_gave_the_package() {
     let installed = client
         .install(std::path::Path::new("/packages/rms_norm/triton"))
         .unwrap();
-    assert_eq!(installed.package.revision, 4);
+    assert_eq!(installed.revision, 4);
 }
 
 #[test]
@@ -103,7 +105,7 @@ fn an_install_another_server_refuses_names_the_upstream() {
         connection
             .send(
                 &wire::ServerMessage {
-                    message: Some(wire::server_message::Message::Refused(wire::Refused {
+                    message: Some(wire::server_message::Message::Refused(wire::Refusal {
                         reason: "only the upstream Build Server installs packages".into(),
                         upstream: "unix:/run/uniserve/leader-build-server.sock".into(),
                     })),
@@ -119,12 +121,12 @@ fn an_install_another_server_refuses_names_the_upstream() {
             upstream.as_deref(),
             Some("unix:/run/uniserve/leader-build-server.sock")
         ),
-        other => panic!("unexpected answer {other:?}"),
+        other => panic!("unexpected response {other:?}"),
     }
 }
 
 #[test]
-fn prepare_reports_each_build_and_answers_the_selected_packages() {
+fn prepare_reports_each_build_and_returns_the_selected_packages() {
     let mut client = server_on(|connection| {
         let _ = connection.receive::<wire::Request>().unwrap();
         let progress = |state: wire::BuildState, detail: &str| wire::ServerMessage {
@@ -147,18 +149,20 @@ fn prepare_reports_each_build_and_answers_the_selected_packages() {
         connection
             .send(
                 &wire::ServerMessage {
-                    message: Some(wire::server_message::Message::Prepared(wire::Prepared {
-                        packages: vec![wire::Chosen {
-                            op: "rms_norm".into(),
-                            phase: wire::Phase::All as i32,
-                            package: Some(wire::PackageRevision {
-                                backend: "triton".into(),
-                                revision: 2,
-                                arguments: "".into(),
-                            }),
-                            part: String::new(),
-                        }],
-                    })),
+                    message: Some(wire::server_message::Message::Prepared(
+                        wire::PrepareResponse {
+                            packages: vec![wire::SlotPackage {
+                                op: "rms_norm".into(),
+                                phase: wire::Phase::All as i32,
+                                package: Some(wire::PackageRevision {
+                                    backend: "triton".into(),
+                                    revision: 2,
+                                    arguments: "".into(),
+                                }),
+                                part: String::new(),
+                            }],
+                        },
+                    )),
                 },
                 &[],
             )
@@ -197,9 +201,9 @@ fn prepare_reports_each_build_and_answers_the_selected_packages() {
         )
         .unwrap()
     );
-    assert_eq!(prepared.packages.len(), 1);
-    assert_eq!(prepared.packages[0].slot, ModuleSlot::all("rms_norm"));
-    assert_eq!(prepared.packages[0].package.revision, 2);
+    assert_eq!(prepared.len(), 1);
+    assert_eq!(prepared[0].0, ModuleSlot::all("rms_norm"));
+    assert_eq!(prepared[0].1.revision, 2);
 }
 
 #[test]
@@ -211,18 +215,20 @@ fn a_module_comes_back_with_its_files_over_their_descriptors() {
         connection
             .send(
                 &wire::ServerMessage {
-                    message: Some(wire::server_message::Message::Resolved(wire::Resolved {
-                        form: wire::ModuleForm::Cubin as i32,
-                        files: vec![wire::ModuleFile {
-                            name: "module.cubin".into(),
-                            size: "the cubin bytes".len() as u64,
-                            path: "/store/module.cubin".into(),
-                        }],
-                        entry: String::new(),
-                        entries: std::collections::HashMap::new(),
-                        metadata: "metadata.json".into(),
-                        interface_version: 1,
-                    })),
+                    message: Some(wire::server_message::Message::Resolved(
+                        wire::ResolveResponse {
+                            form: wire::ModuleForm::Cubin as i32,
+                            files: vec![wire::ModuleFile {
+                                name: "module.cubin".into(),
+                                size: "the cubin bytes".len() as u64,
+                                path: "/store/module.cubin".into(),
+                            }],
+                            entry: String::new(),
+                            entries: std::collections::HashMap::new(),
+                            metadata: "metadata.json".into(),
+                            interface_version: 1,
+                        },
+                    )),
                 },
                 &[OwnedFd::from(file)],
             )
@@ -259,12 +265,12 @@ fn a_listing_names_the_packages_revisions_and_modules() {
         connection
             .send(
                 &wire::ServerMessage {
-                    message: Some(wire::server_message::Message::Listing(wire::Listing {
-                        packages: vec![wire::ListedPackage {
+                    message: Some(wire::server_message::Message::Listing(wire::ListResponse {
+                        packages: vec![wire::PackageEntry {
                             op: "rms_norm".into(),
                             backend: "triton".into(),
                             revision: 2,
-                            modules: vec![wire::ListedModule {
+                            modules: vec![wire::ModuleEntry {
                                 target: "sm_100a".into(),
                                 descriptor: "dtype_bf16".into(),
                                 form: wire::ModuleForm::Cubin as i32,
@@ -279,12 +285,12 @@ fn a_listing_names_the_packages_revisions_and_modules() {
     });
 
     let listing = client.list().unwrap();
-    assert_eq!(listing.packages.len(), 1);
-    let package = &listing.packages[0];
+    assert_eq!(listing.len(), 1);
+    let (package, modules) = &listing[0];
     assert_eq!(package.revision, 2);
-    assert_eq!(package.modules.len(), 1);
-    assert_eq!(package.modules[0].descriptor, "dtype_bf16");
-    assert_eq!(package.modules[0].form, ModuleForm::Cubin);
+    assert_eq!(modules.len(), 1);
+    assert_eq!(modules[0].descriptor, "dtype_bf16");
+    assert_eq!(modules[0].form, ModuleForm::Cubin);
 }
 
 #[test]
@@ -298,22 +304,24 @@ fn the_four_phases_of_a_revision_slot_travel_whole() {
         connection
             .send(
                 &wire::ServerMessage {
-                    message: Some(wire::server_message::Message::Prepared(wire::Prepared {
-                        packages: prepare
-                            .packages
-                            .iter()
-                            .map(|revision| wire::Chosen {
-                                op: revision.op.clone(),
-                                phase: revision.phase,
-                                package: Some(wire::PackageRevision {
-                                    backend: "triton".into(),
-                                    revision: 1,
-                                    arguments: String::new(),
-                                }),
-                                part: revision.part.clone(),
-                            })
-                            .collect(),
-                    })),
+                    message: Some(wire::server_message::Message::Prepared(
+                        wire::PrepareResponse {
+                            packages: prepare
+                                .packages
+                                .iter()
+                                .map(|revision| wire::SlotPackage {
+                                    op: revision.op.clone(),
+                                    phase: revision.phase,
+                                    package: Some(wire::PackageRevision {
+                                        backend: "triton".into(),
+                                        revision: 1,
+                                        arguments: String::new(),
+                                    }),
+                                    part: revision.part.clone(),
+                                })
+                                .collect(),
+                        },
+                    )),
                 },
                 &[],
             )
@@ -350,9 +358,8 @@ fn the_four_phases_of_a_revision_slot_travel_whole() {
     let prepared = client.prepare(&request, &mut |_| {}).unwrap();
     assert_eq!(
         prepared
-            .packages
             .iter()
-            .map(|chosen| chosen.slot.phase)
+            .map(|(slot, _)| slot.phase)
             .collect::<Vec<_>>(),
         phases.map(Some)
     );
@@ -367,23 +374,25 @@ fn a_native_module_comes_back_with_its_entries_by_role() {
         connection
             .send(
                 &wire::ServerMessage {
-                    message: Some(wire::server_message::Message::Resolved(wire::Resolved {
-                        form: wire::ModuleForm::Native as i32,
-                        files: vec![wire::ModuleFile {
-                            name: "module.so".into(),
-                            size: "the shared object".len() as u64,
-                            path: "/store/module.so".into(),
-                        }],
-                        entry: String::new(),
-                        entries: [
-                            ("launch".to_owned(), "uniserve_launch".to_owned()),
-                            ("restore".to_owned(), "uniserve_restore".to_owned()),
-                        ]
-                        .into_iter()
-                        .collect(),
-                        metadata: String::new(),
-                        interface_version: 1,
-                    })),
+                    message: Some(wire::server_message::Message::Resolved(
+                        wire::ResolveResponse {
+                            form: wire::ModuleForm::Native as i32,
+                            files: vec![wire::ModuleFile {
+                                name: "module.so".into(),
+                                size: "the shared object".len() as u64,
+                                path: "/store/module.so".into(),
+                            }],
+                            entry: String::new(),
+                            entries: [
+                                ("launch".to_owned(), "uniserve_launch".to_owned()),
+                                ("restore".to_owned(), "uniserve_restore".to_owned()),
+                            ]
+                            .into_iter()
+                            .collect(),
+                            metadata: String::new(),
+                            interface_version: 1,
+                        },
+                    )),
                 },
                 &[OwnedFd::from(file)],
             )
@@ -415,12 +424,12 @@ fn a_listing_names_a_policy_module_as_a_wasm_module() {
         connection
             .send(
                 &wire::ServerMessage {
-                    message: Some(wire::server_message::Message::Listing(wire::Listing {
-                        packages: vec![wire::ListedPackage {
+                    message: Some(wire::server_message::Message::Listing(wire::ListResponse {
+                        packages: vec![wire::PackageEntry {
                             op: "scheduling".into(),
                             backend: "fcfs".into(),
                             revision: 1,
-                            modules: vec![wire::ListedModule {
+                            modules: vec![wire::ModuleEntry {
                                 target: "wasm32".into(),
                                 descriptor: "default".into(),
                                 form: wire::ModuleForm::Wasm as i32,
@@ -435,7 +444,7 @@ fn a_listing_names_a_policy_module_as_a_wasm_module() {
     });
 
     let listing = client.list().unwrap();
-    assert_eq!(listing.packages[0].modules[0].form, ModuleForm::Wasm);
+    assert_eq!(listing[0].1[0].form, ModuleForm::Wasm);
 }
 
 #[test]
@@ -445,12 +454,12 @@ fn a_listed_module_of_an_unknown_form_is_refused_rather_than_guessed() {
         connection
             .send(
                 &wire::ServerMessage {
-                    message: Some(wire::server_message::Message::Listing(wire::Listing {
-                        packages: vec![wire::ListedPackage {
+                    message: Some(wire::server_message::Message::Listing(wire::ListResponse {
+                        packages: vec![wire::PackageEntry {
                             op: "rms_norm".into(),
                             backend: "triton".into(),
                             revision: 1,
-                            modules: vec![wire::ListedModule {
+                            modules: vec![wire::ModuleEntry {
                                 target: "sm_100a".into(),
                                 descriptor: "dtype_bf16".into(),
                                 form: 99,

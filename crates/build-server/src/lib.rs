@@ -58,10 +58,10 @@ pub mod toolchain;
 pub use builder::{BuildState, Limits, Urgency};
 pub use manifest::{Manifest, ManifestError, ModuleForm, SourceKind, TargetKind, ToolchainKind};
 pub use protocol::{
-    Client, CoverRequest, Coverage, Covered, Descriptors, Module, ModuleFile, Named,
-    PackageRequest, PrepareRequest, Prepared, Progress, Selector,
+    Client, CoverRequest, Coverage, Descriptors, Module, ModuleEntry, ModuleFile, PackageRequest,
+    Preference, PrepareRequest, Progress, Selector,
 };
-pub use server::{BuildServer, Installed, Listing, ServerConfig};
+pub use server::{BuildServer, ServerConfig};
 pub use store::{ModulePath, Root, Store};
 pub use target::{Device, Target};
 
@@ -71,7 +71,7 @@ pub use target::{Device, Target};
 pub fn default_socket() -> std::path::PathBuf {
     service::runtime_directory().join("build-server.sock")
 }
-pub use toolchain::{ToolJob, Toolchain, Toolchains};
+pub use toolchain::{Toolchain, Toolchains};
 
 use std::path::PathBuf;
 
@@ -103,7 +103,7 @@ pub enum Error {
     /// responding, so preparation is told a restart outlasted it.
     #[error("the build server at {socket} was away for the whole {waited:?} wait")]
     Restarted {
-        /// The socket that stayed unanswered.
+        /// The socket no server served.
         socket: String,
         /// How long the client waited before it gave up.
         waited: std::time::Duration,

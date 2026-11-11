@@ -33,24 +33,24 @@ use proto::module::ModuleSlot;
 
 /// A check's result: `Err` names what failed, and `main` reports it beside the check's name. An
 /// assertion that fails panics instead, and `main` reports that panic the same way.
-type Outcome<T = ()> = Result<T, String>;
+type CheckResult<T = ()> = Result<T, String>;
 
 /// One check of the example, over the caller's directories and toolchains.
-type Check = fn(&Args) -> Outcome;
+type Check = fn(&Args) -> CheckResult;
 
 /// A step's failure, stated as what the check needed and the error that denied it.
 trait Context<T> {
-    fn context(self, what: &str) -> Outcome<T>;
+    fn context(self, what: &str) -> CheckResult<T>;
 }
 
 impl<T, E: Display> Context<T> for Result<T, E> {
-    fn context(self, what: &str) -> Outcome<T> {
+    fn context(self, what: &str) -> CheckResult<T> {
         self.map_err(|error| format!("{what}: {error}"))
     }
 }
 
 impl<T> Context<T> for Option<T> {
-    fn context(self, what: &str) -> Outcome<T> {
+    fn context(self, what: &str) -> CheckResult<T> {
         self.ok_or_else(|| what.to_owned())
     }
 }
@@ -355,7 +355,7 @@ fn at_host_version(
     source: &Path,
     temporary: &Path,
     toolchains: &ToolchainConfig,
-) -> Outcome<Option<PathBuf>> {
+) -> CheckResult<Option<PathBuf>> {
     let Ok(manifest) = build_server::manifest::Manifest::load(source) else {
         return Ok(None);
     };
@@ -387,7 +387,7 @@ fn at_host_version(
 }
 
 /// Every file and directory of `source`, under `destination`.
-fn copy_tree(source: &Path, destination: &Path) -> Outcome {
+fn copy_tree(source: &Path, destination: &Path) -> CheckResult {
     std::fs::create_dir_all(destination).context("the copied package's directory")?;
     for entry in std::fs::read_dir(source).context("the package's files")? {
         let entry = entry.context("a package file")?;
@@ -426,8 +426,8 @@ type Serving = (
     std::thread::JoinHandle<()>,
 );
 
-/// Starts a server on its socket and answers it with its stop flag.
-fn start(configuration: &ServerConfig) -> Outcome<Serving> {
+/// Starts a server on its socket and returns it with its stop flag.
+fn start(configuration: &ServerConfig) -> CheckResult<Serving> {
     let server = Arc::new(BuildServer::open(configuration).context("the server opens")?);
     let stop = Arc::new(AtomicBool::new(false));
     let running = Arc::clone(&server);
@@ -450,7 +450,7 @@ fn start(configuration: &ServerConfig) -> Outcome<Serving> {
 }
 
 /// Stops a server `start` started and waits for its thread to end.
-fn stop_server(stop: &AtomicBool, thread: std::thread::JoinHandle<()>) -> Outcome {
+fn stop_server(stop: &AtomicBool, thread: std::thread::JoinHandle<()>) -> CheckResult {
     stop.store(true, Ordering::SeqCst);
     thread
         .join()
@@ -459,7 +459,7 @@ fn stop_server(stop: &AtomicBool, thread: std::thread::JoinHandle<()>) -> Outcom
 
 /// A server over a fresh package root and module store, with the compilers
 /// `toolchains` names.
-fn configuration(temporary: &Path, toolchains: ToolchainConfig) -> Outcome<ServerConfig> {
+fn configuration(temporary: &Path, toolchains: ToolchainConfig) -> CheckResult<ServerConfig> {
     let package_root = temporary.join("packages");
     std::fs::create_dir_all(&package_root).context("the package root")?;
     let store = temporary.join("store");
@@ -482,7 +482,7 @@ fn configuration(temporary: &Path, toolchains: ToolchainConfig) -> Outcome<Serve
     })
 }
 
-/// What one witness observed: the module `resolve` answered, the listing, and
+/// What one witness observed: the module `resolve` returned, the listing, and
 /// the things the test shuts down at its end.
 struct Witness {
     _temporary: tempfile::TempDir,
@@ -503,16 +503,16 @@ fn witness(
     backend: &str,
     key: &str,
     toolchains: ToolchainConfig,
-) -> Outcome<Witness> {
+) -> CheckResult<Witness> {
     let temporary = tempfile::tempdir().context("a temporary directory")?;
     let configuration = configuration(temporary.path(), toolchains)?;
     let (_server, stop, thread) = start(&configuration)?;
     let mut client = Client::connect(&configuration.socket).context("a client connects")?;
 
     let installed = client.install(package).context("the package installs")?;
-    assert_eq!(installed.package.revision, 1);
-    assert_eq!(installed.package.op, op);
-    assert_eq!(installed.package.backend, backend);
+    assert_eq!(installed.revision, 1);
+    assert_eq!(installed.op, op);
+    assert_eq!(installed.backend, backend);
 
     let target = Target::new("sm_100a");
     let request = PrepareRequest {
@@ -533,10 +533,10 @@ fn witness(
     let prepared = client
         .prepare(&request, &mut |step| progress.push(step))
         .context("the descriptor prepares")?;
-    assert_eq!(prepared.packages.len(), 1);
-    assert_eq!(prepared.packages[0].package.revision, 1);
+    assert_eq!(prepared.len(), 1);
+    assert_eq!(prepared[0].1.revision, 1);
 
-    let revision = prepared.packages[0].package.clone();
+    let revision = prepared[0].1.clone();
     let resolved = client
         .resolve(op, &revision, &target, key, &mut |_| {})
         .context("the committed module resolves")?;
@@ -551,7 +551,7 @@ fn witness(
 }
 
 /// Reads a file of a resolved module, by its name.
-fn file_of(module: &Module, name: &str) -> Outcome<Vec<u8>> {
+fn file_of(module: &Module, name: &str) -> CheckResult<Vec<u8>> {
     let mut bytes = Vec::new();
     module
         .files
@@ -575,21 +575,21 @@ fn file_of(module: &Module, name: &str) -> Outcome<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Installs and prepares one package, answering the failure's message when it
+/// Installs and prepares one package, returning the failure's message when it
 /// fails. The outer `Err` is a failure of the server the check runs, not of
 /// the package.
-fn prepare_outcome(
+fn prepare_result(
     package: &Path,
     op: &str,
     backend: &str,
     key: &str,
     toolchains: ToolchainConfig,
-) -> Outcome<std::result::Result<(), String>> {
+) -> CheckResult<std::result::Result<(), String>> {
     let temporary = tempfile::tempdir().context("a temporary directory")?;
     let configuration = configuration(temporary.path(), toolchains)?;
     let (_server, stop, thread) = start(&configuration)?;
     let mut client = Client::connect(&configuration.socket).context("a client connects")?;
-    let outcome = client
+    let result = client
         .install(package)
         .map_err(|error| error.to_string())
         .and_then(|_| {
@@ -613,10 +613,10 @@ fn prepare_outcome(
                 .map_err(|error| error.to_string())
         });
     stop_server(&stop, thread)?;
-    Ok(outcome)
+    Ok(result)
 }
 
-fn a_triton_package_builds_a_cubin_module_and_resolves_it(args: &Args) -> Outcome {
+fn a_triton_package_builds_a_cubin_module_and_resolves_it(args: &Args) -> CheckResult {
     let python = args.python.clone();
     let Some(package) = tree_package(args, "triton") else {
         eprintln!("SKIPPED: the tree holds no Triton package");
@@ -718,7 +718,7 @@ fn a_triton_package_builds_a_cubin_module_and_resolves_it(args: &Args) -> Outcom
     stop_server(&witness.stop, witness.thread)
 }
 
-fn a_cuda_package_builds_the_module_its_manifest_declares(args: &Args) -> Outcome {
+fn a_cuda_package_builds_the_module_its_manifest_declares(args: &Args) -> CheckResult {
     let Some(package) = tree_package(args, "cuda") else {
         eprintln!("SKIPPED: the tree holds no CUDA package");
         return Ok(());
@@ -804,7 +804,7 @@ fn a_cuda_package_builds_the_module_its_manifest_declares(args: &Args) -> Outcom
     stop_server(&witness.stop, witness.thread)
 }
 
-fn a_cute_dsl_package_builds_a_native_module_with_its_entries(args: &Args) -> Outcome {
+fn a_cute_dsl_package_builds_a_native_module_with_its_entries(args: &Args) -> CheckResult {
     let python = args.python.clone();
     let Some(package) = tree_package(args, "cute_dsl") else {
         eprintln!("SKIPPED: the tree holds no CuTe DSL package");
@@ -849,7 +849,7 @@ fn a_cute_dsl_package_builds_a_native_module_with_its_entries(args: &Args) -> Ou
 /// depend on the patch release declares it empty so that it builds on whichever
 /// host the caller's test uses (design section 5.2). The same package with a
 /// version no host has proves the comparison is still made.
-fn a_package_that_declares_no_toolchain_version_builds_on_any_host(args: &Args) -> Outcome {
+fn a_package_that_declares_no_toolchain_version_builds_on_any_host(args: &Args) -> CheckResult {
     let toolchains = toolchains(args);
     let source = args.kernels.join("moe_sort/trtllm");
     let manifest =
@@ -873,13 +873,13 @@ fn a_package_that_declares_no_toolchain_version_builds_on_any_host(args: &Args) 
         packages.push(directory);
     }
 
-    let built = prepare_outcome(&packages[0], "moe_sort", "trtllm", &key, toolchains.clone())?;
+    let built = prepare_result(&packages[0], "moe_sort", "trtllm", &key, toolchains.clone())?;
     assert!(
         built.is_ok(),
         "a package declaring no version was not built: {built:?}"
     );
 
-    let refused = prepare_outcome(&packages[1], "moe_sort", "trtllm", &key, toolchains)?;
+    let refused = prepare_result(&packages[1], "moe_sort", "trtllm", &key, toolchains)?;
     let Err(message) = refused else {
         return Err("a package declaring another version was built".to_owned());
     };
@@ -898,7 +898,7 @@ fn a_package_that_declares_no_toolchain_version_builds_on_any_host(args: &Args) 
 /// installs a package from a checkout it may later lose, and a downstream server's
 /// package root is a read-only mount of the upstream's; neither has the tree, so
 /// what compiles must be what was installed.
-fn a_package_compiles_from_the_copy_its_install_kept(args: &Args) -> Outcome {
+fn a_package_compiles_from_the_copy_its_install_kept(args: &Args) -> CheckResult {
     let toolchains = toolchains(args);
     let source = args.kernels.join("moe_sort/trtllm");
     let Ok(manifest) = std::fs::read_to_string(source.join("package.toml")) else {
@@ -965,7 +965,7 @@ fn a_package_compiles_from_the_copy_its_install_kept(args: &Args) -> Outcome {
 /// built. The package itself carries neither a wasm binary nor the policy's
 /// source — the build asks cargo for sched's own crate — which is why the install
 /// is the step that must have the tree.
-fn the_policy_fixture_installs_and_serves_without_a_compiler(args: &Args) -> Outcome {
+fn the_policy_fixture_installs_and_serves_without_a_compiler(args: &Args) -> CheckResult {
     let precompiler = args.precompile.clone();
     let package = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scheduling/policies/fixture");
 
@@ -1001,9 +1001,9 @@ fn the_policy_fixture_installs_and_serves_without_a_compiler(args: &Args) -> Out
     let installed = client
         .install(&package)
         .context("the policy fixture installs")?;
-    assert_eq!(installed.package.op, "scheduling");
-    assert_eq!(installed.package.backend, "fcfs");
-    assert_eq!(installed.package.revision, 1);
+    assert_eq!(installed.op, "scheduling");
+    assert_eq!(installed.backend, "fcfs");
+    assert_eq!(installed.revision, 1);
     stop_server(&stop, thread)?;
 
     // The precompiled module is beside the installed manifest, and it is wasmtime's

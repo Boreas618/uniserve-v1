@@ -3,13 +3,13 @@
 //! selection replaces or changes against what serves.
 //!
 //! The engine chooses nothing here. The Build Server owns coverage and selection
-//! (`BuildServer::cover`): for every key it answers the one package that builds it, the backend
+//! (`BuildServer::cover`): for every key it returns the one package that builds it, the backend
 //! the deployment names first and the manifests' priorities after. This module only turns that
-//! answer into the slots a generation records.
+//! response into the slots a generation records.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use build_server::Named;
+use build_server::Preference;
 use proto::module::{ModuleSlot, PackageRevision, Packages, PhaseKind};
 
 /// The descriptor keys of each slot a selection filled, by slot: the keys its package was selected
@@ -19,11 +19,11 @@ pub(crate) type Routes = BTreeMap<ModuleSlot, Vec<String>>;
 /// The backends a deployment names for `op`, as the Build Server's selection takes them: each
 /// slot's backend, its phase, and its revision when the daemon pinned one. A slot with a part is
 /// a candidate of the module set, not a preference, so it is none of these.
-pub(crate) fn named_backends(op: &str, named: &Packages) -> Vec<Named> {
+pub(crate) fn named_backends(op: &str, named: &Packages) -> Vec<Preference> {
     named
         .iter()
         .filter(|(slot, _)| slot.op == op && slot.part.is_none())
-        .map(|(slot, package)| Named {
+        .map(|(slot, package)| Preference {
             phase: slot.phase,
             backend: package.backend.clone(),
             revision: (package.revision != 0).then_some(package.revision),
@@ -70,8 +70,8 @@ pub(crate) fn selected_slots(
     let divided = coverage.covered.len() > 1;
     let mut slots = Vec::with_capacity(coverage.covered.len());
     let mut routes = Routes::new();
-    for covered in &coverage.covered {
-        let backend = &covered.package.backend;
+    for (covering, keys) in &coverage.covered {
+        let backend = &covering.backend;
         let slot = ModuleSlot {
             op: op.to_owned(),
             phase: None,
@@ -86,11 +86,11 @@ pub(crate) fn selected_slots(
             slot.clone(),
             PackageRevision {
                 backend: backend.clone(),
-                revision: covered.package.revision,
+                revision: covering.revision,
                 arguments,
             },
         ));
-        routes.insert(slot, covered.keys.clone());
+        routes.insert(slot, keys.clone());
     }
     Ok((slots, routes))
 }
@@ -253,19 +253,21 @@ mod tests {
         assert!(replaced_operators(&prepared, &prepared).is_empty());
     }
 
-    /// A `cover` answer naming `entries` - each a package's backend and the keys it was selected
+    /// A `cover` response naming `entries` - each a package's backend and the keys it was selected
     /// for, all at revision 1 - and the keys no package covers.
     fn coverage(entries: &[(&str, &[&str])], uncovered: &[&str]) -> build_server::Coverage {
         build_server::Coverage {
             covered: entries
                 .iter()
-                .map(|(backend, keys)| build_server::Covered {
-                    package: build_server::protocol::Package {
-                        op: "dense_attention".to_owned(),
-                        backend: (*backend).to_owned(),
-                        revision: 1,
-                    },
-                    keys: keys.iter().map(|key| (*key).to_owned()).collect(),
+                .map(|(backend, keys)| {
+                    (
+                        build_server::protocol::Package {
+                            op: "dense_attention".to_owned(),
+                            backend: (*backend).to_owned(),
+                            revision: 1,
+                        },
+                        keys.iter().map(|key| (*key).to_owned()).collect(),
+                    )
                 })
                 .collect(),
             uncovered: uncovered.iter().map(|key| (*key).to_owned()).collect(),
@@ -279,9 +281,9 @@ mod tests {
     fn keys_two_packages_are_selected_for_fill_a_part_slot_each() {
         let bf16 = "dtype_bf16_head_dim_128";
         let f32 = "dtype_f32_head_dim_64";
-        let answer = coverage(&[("f32", &[f32]), ("fa4", &[bf16])], &[]);
+        let covering = coverage(&[("f32", &[f32]), ("fa4", &[bf16])], &[]);
 
-        let (slots, routes) = selected_slots("dense_attention", &answer, &Packages::new())
+        let (slots, routes) = selected_slots("dense_attention", &covering, &Packages::new())
             .expect("every key is covered");
         let part = |backend: &str| ModuleSlot {
             op: "dense_attention".to_owned(),
@@ -308,14 +310,14 @@ mod tests {
     #[test]
     fn keys_one_package_is_selected_for_fill_one_slot() {
         let keys = ["dtype_bf16_head_dim_128", "dtype_bf16_head_dim_64"];
-        let answer = coverage(&[("fa4", &keys)], &[]);
+        let covering = coverage(&[("fa4", &keys)], &[]);
         let mut named = Packages::new();
         let mut stated = package("fa4", 1);
         stated.arguments.insert("tile".to_owned(), 64.into());
         named.insert(ModuleSlot::all("dense_attention"), stated.clone());
 
         let (slots, routes) =
-            selected_slots("dense_attention", &answer, &named).expect("every key is covered");
+            selected_slots("dense_attention", &covering, &named).expect("every key is covered");
         let slot = ModuleSlot::all("dense_attention");
         assert_eq!(slots, vec![(slot.clone(), stated)]);
         assert_eq!(routes[&slot], keys.map(str::to_owned).to_vec());
@@ -326,9 +328,9 @@ mod tests {
     #[test]
     fn a_key_no_package_covers_refuses_the_operator() {
         let uncovered = "dtype_f16_head_dim_96";
-        let answer = coverage(&[("fa4", &["dtype_bf16_head_dim_128"])], &[uncovered]);
+        let covering = coverage(&[("fa4", &["dtype_bf16_head_dim_128"])], &[uncovered]);
 
-        let error = selected_slots("dense_attention", &answer, &Packages::new())
+        let error = selected_slots("dense_attention", &covering, &Packages::new())
             .expect_err("a key is uncovered");
         assert!(error.contains("dense_attention"), "{error}");
         assert!(error.contains(uncovered), "{error}");
@@ -370,7 +372,7 @@ mod tests {
         );
         assert_eq!(
             named_backends("paged_attention", &set),
-            vec![Named {
+            vec![Preference {
                 phase: None,
                 backend: "trtllm".to_owned(),
                 revision: Some(4),
@@ -400,12 +402,12 @@ mod tests {
         assert_eq!(
             named_backends("paged_attention", &named),
             vec![
-                Named {
+                Preference {
                     phase: Some(PhaseKind::Prefill),
                     backend: "trtllm".to_owned(),
                     revision: Some(4),
                 },
-                Named {
+                Preference {
                     phase: Some(PhaseKind::Decode),
                     backend: "triton".to_owned(),
                     revision: None,

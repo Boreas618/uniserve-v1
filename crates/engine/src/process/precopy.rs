@@ -19,7 +19,7 @@ use worker::host::HostTask;
 use super::MainProcess;
 use super::device_command;
 use super::policy::{TOKEN_LIMIT, limit_refusal};
-use crate::modules::load::{ModuleAnswer, ModuleWork};
+use crate::modules::load::{ModuleOutput, ModuleWork};
 use crate::modules::select::{Routes, changed_operators, replaced_operators};
 
 /// The operator and descriptor key a failed walk named, when that is what failed.
@@ -427,10 +427,10 @@ impl MainProcess {
                 return Ok(());
             }
             Some(Outcome::Success(answer)) => match &*answer {
-                ModuleAnswer::Selected(selection) => selection.clone(),
+                ModuleOutput::Selected(selection) => selection.clone(),
                 // This stage holds the selection alone; an install here is a fault in this
                 // process, and it is refused by name rather than read as a selection.
-                ModuleAnswer::Installed(_) => {
+                ModuleOutput::Installed(_) => {
                     let failure = refuse(
                         "the module lane answered the selection with a kernel load".to_owned(),
                     );
@@ -508,9 +508,9 @@ impl MainProcess {
                     return Ok(());
                 }
                 Some(Outcome::Success(answer)) => match &*answer {
-                    ModuleAnswer::Installed(entries) => loaded.push(entries.clone()),
+                    ModuleOutput::Installed(entries) => loaded.push(entries.clone()),
                     // This stage holds installs; the selection has its own stage.
-                    ModuleAnswer::Selected(_) => {
+                    ModuleOutput::Selected(_) => {
                         return self.abandon_precopy(
                             generation,
                             UpdateFailure::Precopy {

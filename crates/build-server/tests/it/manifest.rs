@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use build_server::manifest::{Manifest, ModuleForm, SourceKind, ToolchainKind};
 
-/// Writes a package into a fresh directory and answers its root.
+/// Writes a package into a fresh directory and returns its root.
 fn package(text: &str, files: &[&str]) -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("package.toml"), text).unwrap();
