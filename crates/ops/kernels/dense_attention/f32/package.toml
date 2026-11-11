@@ -36,6 +36,7 @@
 
 op = "dense_attention"
 backend = "f32"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

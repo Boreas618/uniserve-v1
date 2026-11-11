@@ -61,7 +61,7 @@ impl Deployment {
 #[test]
 fn the_leader_routes_each_node_s_requests_to_its_daemon() {
     let deployment = Deployment::start();
-    let (mut engine, welcome) = Engine::hello(&deployment.address, proto::PROTOCOL_MAJOR);
+    let (mut engine, welcome) = Engine::hello(&deployment.address, proto::ENGINE_INTERFACE_VERSION);
     assert_eq!(welcome.refusal, "");
     let nodes: Vec<(u32, &str)> = welcome
         .nodes
@@ -151,7 +151,7 @@ fn a_node_joins_a_running_deployment_and_the_next_engine_runs_processes_there() 
     // A leader of one node that names its address serves at once.
     let leader = Daemon::start(options(1, 0, "leader")).unwrap();
     let address = leader.address().unwrap().to_owned();
-    let (mut serving, welcome) = Engine::hello(&address, proto::PROTOCOL_MAJOR);
+    let (mut serving, welcome) = Engine::hello(&address, proto::ENGINE_INTERFACE_VERSION);
     assert_eq!(welcome.nodes.len(), 1);
 
     // A node joins while an engine is served; a second node of the same
@@ -181,7 +181,7 @@ fn a_node_joins_a_running_deployment_and_the_next_engine_runs_processes_there() 
 
     // The next engine learns the node and runs a process there, whose exit
     // comes back through the leader.
-    let (mut engine, welcome) = Engine::hello(&address, proto::PROTOCOL_MAJOR);
+    let (mut engine, welcome) = Engine::hello(&address, proto::ENGINE_INTERFACE_VERSION);
     let nodes: Vec<(u32, &str)> = welcome
         .nodes
         .iter()

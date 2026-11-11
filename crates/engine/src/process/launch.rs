@@ -79,7 +79,7 @@ impl ProcessInterface {
             format!("connecting to the daemon's process interface at {address}")
         })?;
         connection.send(&proto::process::Hello {
-            major: proto::PROTOCOL_MAJOR,
+            major: proto::ENGINE_INTERFACE_VERSION,
             build: proto::BUILD.to_owned(),
             peer: Some(proto::process::hello::Peer::Engine(
                 proto::process::Engine {
@@ -262,7 +262,7 @@ pub(super) fn handshake(control: &mut Control, launch: &EngineArgs) -> Result<Ep
     control.daemon_mut().send(&proto::request::wire::Hello {
         engine: launch.engine,
         build: proto::BUILD.to_owned(),
-        major: proto::PROTOCOL_MAJOR,
+        major: proto::ENGINE_INTERFACE_VERSION,
         // The request link: requests, their events and the epoch's metrics. The process link
         // states `PROCESS` on its own socket, and both name the same engine number.
         interface: proto::process::Interface::Requests as i32,

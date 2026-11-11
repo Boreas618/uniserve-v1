@@ -18,6 +18,7 @@ use proto::module::{ModuleSlot, PackageRevision};
 const MANIFEST: &str = r#"
 op = "rms_norm"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"
@@ -238,6 +239,7 @@ fn a_package_root_with_an_invalid_package_is_refused_when_the_server_opens() {
 const POLICY: &str = r#"
 op = "scheduling"
 backend = "fcfs"
+interface_version = 1
 
 [toolchain]
 kind = "wasm"
@@ -269,7 +271,7 @@ fn a_policy_module_is_listed_as_the_wasm_module_it_is() {
         .join(format!("scheduling/fcfs/1/{inputs}/wasm32/default"));
     std::fs::create_dir_all(&module).unwrap();
     std::fs::write(module.join("module.wasm"), b"a precompiled module").unwrap();
-    std::fs::write(module.join(".committed"), b"").unwrap();
+    std::fs::write(module.join(".committed"), b"interface_version = 1\n").unwrap();
 
     let server = BuildServer::open(&configuration).unwrap();
     let listing = server.list().unwrap();
@@ -303,7 +305,7 @@ fn prepare_builds_a_scheduling_policy_once_for_wasm32() {
         .join(format!("scheduling/fcfs/1/{inputs}/wasm32/default"));
     std::fs::create_dir_all(&module).unwrap();
     std::fs::write(module.join("module.wasm"), b"a precompiled module").unwrap();
-    std::fs::write(module.join(".committed"), b"").unwrap();
+    std::fs::write(module.join(".committed"), b"interface_version = 1\n").unwrap();
 
     let server = BuildServer::open(&configuration).unwrap();
     let request = PrepareRequest {
@@ -354,7 +356,7 @@ fn a_policy_module_resolves_for_wasm32_only() {
         .join(format!("scheduling/fcfs/1/{inputs}/wasm32/default"));
     std::fs::create_dir_all(&module).unwrap();
     std::fs::write(module.join("module.wasm"), b"a precompiled module").unwrap();
-    std::fs::write(module.join(".committed"), b"").unwrap();
+    std::fs::write(module.join(".committed"), b"interface_version = 1\n").unwrap();
 
     let server = BuildServer::open(&configuration).unwrap();
     let revision = PackageRevision {

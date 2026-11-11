@@ -224,7 +224,10 @@ fn an_engine_of_another_major_version_is_refused() {
     let directory = tempfile::tempdir().unwrap();
     let daemon = start(&directory, "node");
 
-    let (_, welcome) = Engine::hello(daemon.address().unwrap(), proto::PROTOCOL_MAJOR + 1);
+    let (_, welcome) = Engine::hello(
+        daemon.address().unwrap(),
+        proto::ENGINE_INTERFACE_VERSION + 1,
+    );
     assert!(
         welcome.refusal.contains("major version"),
         "the refusal says why: {welcome:?}"

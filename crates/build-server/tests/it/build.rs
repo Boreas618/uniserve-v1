@@ -172,6 +172,7 @@ fn file_of(module: &Module, name: &str) -> Vec<u8> {
 const CUBIN_MANIFEST: &str = r#"
 op = "paged_attention"
 backend = "trtllm"
+interface_version = 1
 
 [toolchain]
 kind = "none"
@@ -294,11 +295,12 @@ fn a_vendor_cubin_is_installed_stored_and_resolved_as_it_is() {
     thread.join().unwrap();
 }
 
-/// An executable package: a package revision the main process runs as its own
-/// process, stored as it is (design section 5.1).
+/// An executable package: an executable run as its own process, stored as it
+/// is. It implements version 3 of its interface.
 const EXECUTABLE_MANIFEST: &str = r#"
 op = "sampler"
 backend = "process"
+interface_version = 3
 
 [toolchain]
 kind = "none"
@@ -322,10 +324,10 @@ fn an_executable_revision_is_installed_stored_and_resolved_as_it_is() {
     let package = temporary.path().join("sampler-process");
     std::fs::create_dir_all(package.join("bin")).unwrap();
     std::fs::write(package.join("package.toml"), EXECUTABLE_MANIFEST).unwrap();
-    // A package revision is what its bytes say it is; this one only has to survive the
+    // An executable is what its bytes say it is; this one only has to survive the
     // round trip, so the test does not run it.
-    let revision = b"#!/bin/sh\nexit 0\n".to_vec();
-    std::fs::write(package.join("bin/sampler"), &revision).unwrap();
+    let executable = b"#!/bin/sh\nexit 0\n".to_vec();
+    std::fs::write(package.join("bin/sampler"), &executable).unwrap();
 
     let witness = witness(
         &package,
@@ -346,8 +348,12 @@ fn an_executable_revision_is_installed_stored_and_resolved_as_it_is() {
     assert!(witness.resolved.entries.is_empty());
     assert_eq!(
         file_of(&witness.resolved, "bin/sampler"),
-        revision,
-        "the module is the package's package, byte for byte"
+        executable,
+        "the module is the package's executable, byte for byte"
+    );
+    assert_eq!(
+        witness.resolved.interface_version, 3,
+        "the module carries the interface version its package's manifest states"
     );
 
     witness.stop.store(true, Ordering::SeqCst);
@@ -393,6 +399,7 @@ fn a_policy_is_built_when_it_is_installed_and_needs_no_compiler_after() {
         r#"# A synthetic policy: the generation layer's wasm path, nothing else.
 op = "scheduling"
 backend = "fixture"
+interface_version = 1
 
 [toolchain]
 kind = "wasm"

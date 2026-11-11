@@ -11,6 +11,7 @@
 
 op = "sparse_attention"
 backend = "sm100"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

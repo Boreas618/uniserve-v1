@@ -260,7 +260,7 @@ impl Control {
         })?;
         reader
             .send(&proto::request::wire::Hello {
-                major: proto::PROTOCOL_MAJOR,
+                major: proto::ENGINE_INTERFACE_VERSION,
                 build: proto::BUILD.to_owned(),
                 engine: self.engine,
                 // A request link of a process of the deployment: the successor
@@ -414,7 +414,7 @@ mod tests {
                 .expect("the engine said hello");
             connection
                 .send(&proto::request::wire::Welcome {
-                    major: proto::PROTOCOL_MAJOR,
+                    major: proto::ENGINE_INTERFACE_VERSION,
                     build: proto::BUILD.to_owned(),
                     refusal,
                 })

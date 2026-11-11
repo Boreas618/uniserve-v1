@@ -12,6 +12,7 @@
 
 op = "layer_norm"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

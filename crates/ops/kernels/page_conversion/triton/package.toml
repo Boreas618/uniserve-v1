@@ -12,6 +12,7 @@
 
 op = "page_conversion"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

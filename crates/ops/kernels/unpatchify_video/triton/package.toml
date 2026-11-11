@@ -10,6 +10,7 @@
 
 op = "unpatchify_video"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

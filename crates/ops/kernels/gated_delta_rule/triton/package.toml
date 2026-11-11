@@ -13,6 +13,7 @@
 
 op = "gated_delta_rule"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

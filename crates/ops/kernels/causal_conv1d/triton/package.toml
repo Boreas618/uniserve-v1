@@ -12,6 +12,7 @@
 
 op = "causal_conv1d"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

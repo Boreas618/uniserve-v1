@@ -10,6 +10,7 @@
 
 op = "snake"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

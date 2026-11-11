@@ -60,6 +60,7 @@ fn a_published_module_is_found_with_its_files_and_the_mark_is_not_one_of_them() 
             &path(),
             &workspace,
             &["module.cubin".to_owned(), "metadata.json".to_owned()],
+            1,
         )
         .unwrap();
 
@@ -105,7 +106,7 @@ fn a_module_of_a_shared_read_only_root_is_found_and_never_written() {
     let elsewhere = shared.join(path().relative());
     fs::create_dir_all(&elsewhere).unwrap();
     fs::write(elsewhere.join("module.cubin"), b"shared cubin").unwrap();
-    fs::write(elsewhere.join(COMMITTED), b"").unwrap();
+    fs::write(elsewhere.join(COMMITTED), b"interface_version = 1\n").unwrap();
 
     assert!(store.contains(&path()));
     let files = store.files(&path()).unwrap().expect("the shared module");
@@ -114,7 +115,7 @@ fn a_module_of_a_shared_read_only_root_is_found_and_never_written() {
     // Publishing goes to the writable root, and leaves the shared one alone.
     let workspace = workspace(temporary.path(), &[("module.cubin", b"built cubin")]);
     store
-        .publish(&path(), &workspace, &["module.cubin".to_owned()])
+        .publish(&path(), &workspace, &["module.cubin".to_owned()], 1)
         .unwrap();
     assert_eq!(
         fs::read(elsewhere.join("module.cubin")).unwrap(),
@@ -127,17 +128,42 @@ fn a_module_of_a_shared_read_only_root_is_found_and_never_written() {
     );
 }
 
+/// A module's record states the interface version it was published for, and a directory whose
+/// mark states none is no module: nothing finds it, and a publish replaces it.
+#[test]
+fn a_module_records_the_interface_version_it_was_built_for() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = store(temporary.path());
+    assert_eq!(store.interface_version(&path()), None);
+
+    // A directory with an empty mark: what a store written without the record holds.
+    let directory = store.directory(&path());
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("module.cubin"), b"unrecorded").unwrap();
+    fs::write(directory.join(COMMITTED), b"").unwrap();
+    assert!(!store.contains(&path()));
+    assert_eq!(store.interface_version(&path()), None);
+
+    let workspace = workspace(temporary.path(), &[("module.cubin", b"recorded")]);
+    store
+        .publish(&path(), &workspace, &["module.cubin".to_owned()], 2)
+        .unwrap();
+    assert_eq!(store.interface_version(&path()), Some(2));
+    let files = store.files(&path()).unwrap().unwrap();
+    assert_eq!(fs::read(&files[0].path).unwrap(), b"recorded");
+}
+
 #[test]
 fn a_committed_module_is_never_replaced() {
     let temporary = tempfile::tempdir().unwrap();
     let store = store(temporary.path());
     let first = workspace(temporary.path(), &[("module.cubin", b"first")]);
     store
-        .publish(&path(), &first, &["module.cubin".to_owned()])
+        .publish(&path(), &first, &["module.cubin".to_owned()], 1)
         .unwrap();
 
     let workspace = workspace(temporary.path(), &[("module.cubin", b"second")]);
-    let replaced = store.publish(&path(), &workspace, &["module.cubin".to_owned()]);
+    let replaced = store.publish(&path(), &workspace, &["module.cubin".to_owned()], 1);
     assert!(replaced.is_err());
     let files = store.files(&path()).unwrap().unwrap();
     assert_eq!(fs::read(&files[0].path).unwrap(), b"first");
@@ -153,7 +179,7 @@ fn a_publish_that_died_before_the_mark_is_retried_over() {
 
     let workspace = workspace(temporary.path(), &[("module.cubin", b"whole")]);
     store
-        .publish(&path(), &workspace, &["module.cubin".to_owned()])
+        .publish(&path(), &workspace, &["module.cubin".to_owned()], 1)
         .unwrap();
     let files = store.files(&path()).unwrap().unwrap();
     assert_eq!(fs::read(&files[0].path).unwrap(), b"whole");
@@ -176,7 +202,7 @@ fn list_names_every_committed_module_of_every_root_once() {
     .unwrap();
     for path in [&first, &second] {
         store
-            .publish(path, &workspace, &["module.cubin".to_owned()])
+            .publish(path, &workspace, &["module.cubin".to_owned()], 1)
             .unwrap();
     }
 
@@ -204,14 +230,14 @@ fn a_build_may_not_publish_a_file_outside_the_module_directory() {
     let cubin = workspace(temporary.path(), &[("module.cubin", b"bytes")]);
 
     for name in ["/etc/passwd", "../escape", "tuning/../../escape"] {
-        let refused = store.publish(&path(), &cubin, &[name.to_owned()]);
+        let refused = store.publish(&path(), &cubin, &[name.to_owned()], 1);
         assert!(refused.is_err(), "{name:?} escapes the module directory");
         assert!(!store.contains(&path()));
     }
     // A file in a subdirectory of the module is a name, not an escape.
     let tuning = workspace(temporary.path(), &[("tuning/tactics.json", b"{}")]);
     store
-        .publish(&path(), &tuning, &["tuning/tactics.json".to_owned()])
+        .publish(&path(), &tuning, &["tuning/tactics.json".to_owned()], 1)
         .unwrap();
     let files = store.files(&path()).unwrap().unwrap();
     assert_eq!(files[0].name, "tuning/tactics.json");

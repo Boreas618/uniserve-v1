@@ -9,6 +9,7 @@
 
 op = "nvfp4_quantize"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

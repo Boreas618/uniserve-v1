@@ -12,6 +12,7 @@
 
 op = "vsa_compose_gated_rows"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

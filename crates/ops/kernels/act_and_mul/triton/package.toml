@@ -18,6 +18,7 @@
 
 op = "act_and_mul"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

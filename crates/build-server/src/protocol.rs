@@ -144,6 +144,10 @@ pub struct Module {
     /// (design section 4.2): [`LAUNCH_ENTRY`](crate::manifest::LAUNCH_ENTRY)
     /// and any lifecycle entries around it.
     pub entries: std::collections::BTreeMap<String, String>,
+    /// The version of the interface the module's package implements, as the
+    /// store recorded it when the module was built. Its loader compares it
+    /// with the version it was built for and refuses another.
+    pub interface_version: u32,
 }
 
 /// One module a listing names.
@@ -152,6 +156,8 @@ pub struct ListedModule {
     pub target: Target,
     pub descriptor: String,
     pub form: ModuleForm,
+    /// The interface version the module was built for.
+    pub interface_version: u32,
 }
 
 /// One installed package a listing names.
@@ -676,6 +682,7 @@ impl Client {
                         files,
                         metadata: (!resolved.metadata.is_empty()).then_some(resolved.metadata),
                         entries: resolved.entries.into_iter().collect(),
+                        interface_version: resolved.interface_version,
                     });
                 }
                 wire::server_message::Message::Refused(refused) => {
@@ -712,6 +719,7 @@ impl Client {
                             target: Target::new(module.target),
                             descriptor: module.descriptor,
                             form,
+                            interface_version: module.interface_version,
                         });
                     }
                     packages.push(ListedPackage {

@@ -22,6 +22,7 @@
 
 op = "cache_copy_region"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

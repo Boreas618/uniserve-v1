@@ -8,6 +8,7 @@
 
 op = "moe_unpermute"
 backend = "trtllm"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

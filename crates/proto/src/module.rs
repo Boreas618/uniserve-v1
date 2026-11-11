@@ -320,6 +320,25 @@ pub mod operator {
     pub fn named(name: &str) -> Option<&'static str> {
         ALL.iter().copied().find(|candidate| *candidate == name)
     }
+
+    /// The operators whose interface is past its first version, each with the version this build
+    /// launches.
+    ///
+    /// An operator's interface is its descriptor and its argument layout. A change of either that
+    /// is not an addition raises the operator's version here, and a package of the operator states
+    /// the version it implements in its manifest (`interface_version`).
+    const VERSIONS: &[(&str, u32)] = &[];
+
+    /// The version of `operator`'s interface in this build: 1 unless [`VERSIONS`] states another.
+    ///
+    /// The main process compares it with the version a module was built for when it loads the
+    /// module, and refuses another.
+    pub fn version(operator: &str) -> u32 {
+        VERSIONS
+            .iter()
+            .find(|(name, _)| *name == operator)
+            .map_or(1, |(_, version)| *version)
+    }
 }
 
 /// The commit table a batch's producer writes and the `slot_commit` operator reads: one row of

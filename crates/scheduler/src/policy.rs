@@ -373,6 +373,20 @@ impl PolicySource for ModuleSource {
             files = module.files.len(),
             "the policy package resolved"
         );
+        // A module built for another version of the policy interface would be asked decisions
+        // through calls whose messages mean something else to it.
+        if module.interface_version != scheduling::guest::INTERFACE_VERSION {
+            return Err(PolicyError::Load {
+                message: format!(
+                    "the {}/{} policy implements version {} of the scheduling policy interface \
+                     and this engine instantiates version {}",
+                    package.backend,
+                    package.revision,
+                    module.interface_version,
+                    scheduling::guest::INTERFACE_VERSION
+                ),
+            });
+        }
         let mut file = module
             .files
             .into_iter()

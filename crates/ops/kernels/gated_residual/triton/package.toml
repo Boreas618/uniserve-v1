@@ -15,6 +15,7 @@
 
 op = "gated_residual"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

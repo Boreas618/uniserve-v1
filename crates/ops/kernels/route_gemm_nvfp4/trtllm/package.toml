@@ -13,6 +13,7 @@
 
 op = "route_gemm_nvfp4"
 backend = "trtllm"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

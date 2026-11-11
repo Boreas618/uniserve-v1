@@ -11,7 +11,7 @@ use proto::module::Packages;
 use worker::completion::Outcome;
 use worker::host::HostAction;
 
-use crate::modules::select::{Routes, named_backends, selected_slots};
+use crate::modules::select::{Routes, interface_agrees, named_backends, selected_slots};
 
 /// The Build Server's selection of a generation's packages, on the module-load lane.
 ///
@@ -631,6 +631,8 @@ impl HostAction for Install {
                             causes(&error)
                         ))
                     })?;
+                interface_agrees(operator, &chosen.package, module.interface_version)
+                    .map_err(worker::Error::Invalid)?;
                 let module = resolved(module)?;
                 if module.copied() {
                     copies += 1;

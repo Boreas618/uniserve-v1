@@ -1193,6 +1193,7 @@ mod tests {
                 r#"
 op = "vendor"
 backend = "cubin"
+interface_version = 1
 
 [toolchain]
 kind = "none"
@@ -1279,6 +1280,7 @@ dimensions = {{ dtype = ["bf16"] }}
             r#"
 op = "rms_norm"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

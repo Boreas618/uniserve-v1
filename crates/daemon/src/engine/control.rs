@@ -358,11 +358,11 @@ impl EngineControl {
         control: &mut Connection,
     ) -> anyhow::Result<(Connection, Connection)> {
         let (reader, mut writer, hello) = self.accept(engine, Some(control))?;
-        let refusal = if hello.major != proto::PROTOCOL_MAJOR {
+        let refusal = if hello.major != proto::ENGINE_INTERFACE_VERSION {
             format!(
                 "the engine speaks major version {} and this daemon {}",
                 hello.major,
-                proto::PROTOCOL_MAJOR
+                proto::ENGINE_INTERFACE_VERSION
             )
         } else if hello.engine != engine {
             format!("engine {} connected for engine {engine}", hello.engine)
@@ -370,7 +370,7 @@ impl EngineControl {
             String::new()
         };
         writer.send(&wire::Welcome {
-            major: proto::PROTOCOL_MAJOR,
+            major: proto::ENGINE_INTERFACE_VERSION,
             build: proto::BUILD.to_owned(),
             refusal: refusal.clone(),
         })?;
@@ -410,17 +410,17 @@ impl EngineControl {
         stats: StatsSink,
     ) -> anyhow::Result<EngineClient> {
         let (mut reader, mut writer, hello) = self.accept(engine, None)?;
-        let refusal = if hello.major != proto::PROTOCOL_MAJOR {
+        let refusal = if hello.major != proto::ENGINE_INTERFACE_VERSION {
             format!(
                 "the engine speaks major version {} and this daemon {}",
                 hello.major,
-                proto::PROTOCOL_MAJOR
+                proto::ENGINE_INTERFACE_VERSION
             )
         } else {
             String::new()
         };
         writer.send(&wire::Welcome {
-            major: proto::PROTOCOL_MAJOR,
+            major: proto::ENGINE_INTERFACE_VERSION,
             build: proto::BUILD.to_owned(),
             refusal: refusal.clone(),
         })?;
@@ -476,11 +476,11 @@ impl EngineControl {
     ) -> anyhow::Result<EngineClient> {
         self.next_engine.fetch_max(next_engine, Ordering::Relaxed);
         let (mut reader, mut writer, hello) = self.accept(engine, control.as_mut())?;
-        let refusal = if hello.major != proto::PROTOCOL_MAJOR {
+        let refusal = if hello.major != proto::ENGINE_INTERFACE_VERSION {
             format!(
                 "the engine speaks major version {} and this daemon {}",
                 hello.major,
-                proto::PROTOCOL_MAJOR
+                proto::ENGINE_INTERFACE_VERSION
             )
         } else if hello.engine != engine {
             format!(
@@ -491,7 +491,7 @@ impl EngineControl {
             String::new()
         };
         writer.send(&wire::Welcome {
-            major: proto::PROTOCOL_MAJOR,
+            major: proto::ENGINE_INTERFACE_VERSION,
             build: proto::BUILD.to_owned(),
             refusal: refusal.clone(),
         })?;
@@ -531,7 +531,7 @@ impl EngineControl {
         let mut control = Connection::connect(&self.processes)
             .with_context(|| format!("connecting to the daemon at {}", self.processes))?;
         control.send(&process::Hello {
-            major: proto::PROTOCOL_MAJOR,
+            major: proto::ENGINE_INTERFACE_VERSION,
             build: proto::BUILD.to_owned(),
             peer: Some(hello::Peer::Engine(process::Engine {
                 deployment: self.deployment.clone(),

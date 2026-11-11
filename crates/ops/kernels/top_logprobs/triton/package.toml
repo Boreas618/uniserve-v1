@@ -11,6 +11,7 @@
 
 op = "top_logprobs"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

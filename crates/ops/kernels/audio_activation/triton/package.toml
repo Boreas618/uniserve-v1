@@ -10,6 +10,7 @@
 
 op = "audio_activation"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

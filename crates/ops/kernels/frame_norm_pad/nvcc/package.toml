@@ -11,6 +11,7 @@
 
 op = "frame_norm_pad"
 backend = "nvcc"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

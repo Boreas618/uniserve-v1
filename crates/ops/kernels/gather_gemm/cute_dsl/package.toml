@@ -10,6 +10,7 @@
 
 op = "gather_gemm"
 backend = "cute_dsl"
+interface_version = 1
 
 [toolchain]
 kind = "cute_dsl"

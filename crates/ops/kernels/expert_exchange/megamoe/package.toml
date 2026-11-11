@@ -15,6 +15,7 @@
 
 op = "expert_exchange"
 backend = "megamoe"
+interface_version = 1
 
 [toolchain]
 kind = "cute_dsl"

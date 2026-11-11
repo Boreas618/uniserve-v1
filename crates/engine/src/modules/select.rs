@@ -79,6 +79,29 @@ pub(crate) fn selected_slots(
     Ok((slots, routes))
 }
 
+/// Refuses a module built for another version of `operator`'s interface than this build
+/// launches (`proto::module::operator::version`).
+///
+/// `built_for` is the version the Build Server recorded with the module, which its package's
+/// manifest states. A module of another version would be launched through a descriptor or an
+/// argument layout it was not written for, so the generation that names it is not installed and
+/// what serves is untouched.
+pub(crate) fn interface_agrees(
+    operator: &str,
+    package: &PackageRevision,
+    built_for: u32,
+) -> std::result::Result<(), String> {
+    let launched = proto::module::operator::version(operator);
+    if built_for == launched {
+        return Ok(());
+    }
+    Err(format!(
+        "the {operator} package {} revision {} implements version {built_for} of the operator's \
+         interface and this engine launches version {launched}",
+        package.backend, package.revision
+    ))
+}
+
 /// One operator's packages as a comparison reads them: each slot's phase and part with its
 /// package, in a stated order. Arguments are left out - the two sides state a package's defaults in
 /// different words - so a package is its backend and revision.
@@ -292,6 +315,21 @@ mod tests {
             .expect_err("a key is uncovered");
         assert!(error.contains("dense_attention"), "{error}");
         assert!(error.contains(uncovered), "{error}");
+    }
+
+    /// A module built for the version of its operator's interface this build launches is
+    /// accepted, and one built for another version is refused by name.
+    #[test]
+    fn a_module_of_another_interface_version_is_refused() {
+        let package = package("triton", 4);
+        let launched = proto::module::operator::version("rms_norm");
+
+        interface_agrees("rms_norm", &package, launched).expect("the versions agree");
+        let refusal = interface_agrees("rms_norm", &package, launched + 1)
+            .expect_err("another version is refused");
+        assert!(refusal.contains("rms_norm"), "{refusal}");
+        assert!(refusal.contains("triton"), "{refusal}");
+        assert!(refusal.contains(&(launched + 1).to_string()), "{refusal}");
     }
 
     /// The named backends of an operator carry their phase, and a revision only once the daemon

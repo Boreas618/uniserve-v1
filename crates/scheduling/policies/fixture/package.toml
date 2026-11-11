@@ -3,6 +3,7 @@
 # §4.4, §5.2, §5.3). It fills the scheduling policy with the arrival-order body.
 op = "scheduling"
 backend = "fcfs"
+interface_version = 1
 
 [toolchain]
 kind = "wasm"

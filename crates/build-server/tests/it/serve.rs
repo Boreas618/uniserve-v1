@@ -18,6 +18,7 @@ use build_server::toolchain::ToolchainConfig;
 const MANIFEST: &str = r#"
 op = "rms_norm"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

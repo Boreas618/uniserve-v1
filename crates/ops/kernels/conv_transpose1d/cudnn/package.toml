@@ -30,6 +30,7 @@
 
 op = "conv_transpose1d"
 backend = "cudnn"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

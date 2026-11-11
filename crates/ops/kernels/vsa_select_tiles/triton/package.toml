@@ -12,6 +12,7 @@
 
 op = "vsa_select_tiles"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

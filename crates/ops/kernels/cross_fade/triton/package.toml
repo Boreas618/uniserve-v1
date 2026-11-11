@@ -12,6 +12,7 @@
 
 op = "cross_fade"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

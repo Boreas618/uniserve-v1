@@ -8,6 +8,7 @@
 
 op = "logits_gather"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

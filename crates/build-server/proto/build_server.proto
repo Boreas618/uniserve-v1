@@ -224,12 +224,18 @@ message Resolved {
   // The name of the metadata JSON among the files, for a cubin module: the
   // launch metadata the main process reads (design section 5.3).
   string metadata = 4;
+  // The version of the interface the module's package implements, as the
+  // store recorded it when the module was built. The loader refuses a module
+  // built for another version than its own.
+  uint32 interface_version = 6;
 }
 
 message ListedModule {
   string target = 1;
   string descriptor = 2;
   ModuleForm form = 3;
+  // The interface version the module was built for.
+  uint32 interface_version = 4;
 }
 
 message ListedPackage {

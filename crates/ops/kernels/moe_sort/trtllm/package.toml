@@ -15,6 +15,7 @@
 
 op = "moe_sort"
 backend = "trtllm"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

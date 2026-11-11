@@ -27,6 +27,7 @@
 
 op = "conv3d"
 backend = "cudnn"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

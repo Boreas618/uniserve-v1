@@ -15,6 +15,7 @@
 
 op = "pcm_interleave"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

@@ -329,6 +329,7 @@ impl BuildServer {
                             entry: String::new(),
                             entries: module.entries.into_iter().collect(),
                             metadata: module.metadata.unwrap_or_default(),
+                            interface_version: module.interface_version,
                         })),
                     },
                     &descriptors,
@@ -390,6 +391,7 @@ impl BuildServer {
                                     target: module.target.to_string(),
                                     descriptor: module.descriptor,
                                     form: wire::ModuleForm::from(module.form) as i32,
+                                    interface_version: module.interface_version,
                                 })
                                 .collect(),
                         })
@@ -856,6 +858,12 @@ impl BuildServer {
             files: module_files,
             metadata: package.manifest.module.metadata_name(&path.descriptor),
             entries,
+            // The record written with the module when it was built; the
+            // revision's manifest fixed it.
+            interface_version: self
+                .store
+                .interface_version(&path)
+                .unwrap_or(package.manifest.interface_version),
         })
     }
 
@@ -893,10 +901,15 @@ impl BuildServer {
             let Some(entry) = listed.get_mut(&key) else {
                 continue;
             };
+            let interface_version = self
+                .store
+                .interface_version(&path)
+                .unwrap_or(package.manifest.interface_version);
             entry.modules.push(protocol::ListedModule {
                 target: Target::new(path.target),
                 descriptor: path.descriptor,
                 form,
+                interface_version,
             });
         }
         Ok(protocol::Listing {
@@ -1443,8 +1456,12 @@ impl Queue {
                 message: "the build wrote no file".into(),
             });
         }
-        self.store
-            .publish(&job.path, workspace.path(), &built.files)?;
+        self.store.publish(
+            &job.path,
+            workspace.path(),
+            &built.files,
+            package.manifest.interface_version,
+        )?;
         Ok(())
     }
 

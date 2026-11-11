@@ -19,6 +19,7 @@
 
 op = "expert_exchange"
 backend = "alltoall"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

@@ -13,6 +13,7 @@
 
 op = "gemm"
 backend = "cublas_lt"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

@@ -25,6 +25,7 @@ fn package(text: &str, files: &[&str]) -> tempfile::TempDir {
 const REASONABLE: &str = r#"
 op = "rms_norm"
 backend = "triton"
+interface_version = 1
 tuning = ["tuning/tactics.json"]
 
 [toolchain]
@@ -73,6 +74,27 @@ fn a_manifest_says_what_the_package_is_and_how_it_is_built() {
     );
 }
 
+/// A manifest states the version of the interface its package implements: one that states
+/// none, or states zero, is refused, because a loader could not tell what it would be loading.
+#[test]
+fn a_manifest_states_the_interface_version_it_implements() {
+    let files = ["src/rms.py", "src/compile.py", "tuning/tactics.json"];
+    let stated = Manifest::load(package(REASONABLE, &files).path()).unwrap();
+    assert_eq!(stated.interface_version, 1);
+
+    let later = REASONABLE.replace("interface_version = 1", "interface_version = 4");
+    let later = Manifest::load(package(&later, &files).path()).unwrap();
+    assert_eq!(later.interface_version, 4);
+
+    let unstated = REASONABLE.replace("interface_version = 1\n", "");
+    let error = Manifest::load(package(&unstated, &files).path()).unwrap_err();
+    assert!(error.to_string().contains("interface_version"), "{error}");
+
+    let zero = REASONABLE.replace("interface_version = 1", "interface_version = 0");
+    let error = Manifest::load(package(&zero, &files).path()).unwrap_err();
+    assert!(error.to_string().contains("start at 1"), "{error}");
+}
+
 #[test]
 fn a_package_covers_a_descriptor_by_its_enumerated_values() {
     let root = package(
@@ -99,6 +121,7 @@ fn generic(descriptors: &str) -> String {
         r#"
 op = "cache_block_scatter"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"
@@ -188,6 +211,7 @@ fn a_native_module_names_a_launch_entry_and_any_lifecycle_entries() {
     let text = r#"
 op = "expert_exchange"
 backend = "deepep"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"
@@ -225,6 +249,7 @@ descriptors = { dimensions = { dtype = ["bf16"] } }
 const ENTRIES_FILE: &str = r#"
 op = "expert_exchange"
 backend = "deepep"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"
@@ -325,6 +350,7 @@ fn a_native_module_without_a_c_entry_is_refused() {
     let text = r#"
 op = "gather_gemm"
 backend = "cute"
+interface_version = 1
 
 [toolchain]
 kind = "triton"
@@ -350,6 +376,7 @@ fn a_manifest_without_architectures_is_refused() {
     let text = r#"
 op = "rms_norm"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"
@@ -385,6 +412,7 @@ fn a_package_may_carry_one_file_per_descriptor() {
     let text = r#"
 op = "paged_attention"
 backend = "trtllm-gen"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"
@@ -425,6 +453,7 @@ fn a_scheduling_policy_is_a_wasm_package_without_metadata_or_entry() {
     let text = r#"
 op = "scheduling"
 backend = "fcfs"
+interface_version = 1
 tuning = ["tuning/weights.json"]
 
 [toolchain]
@@ -465,6 +494,7 @@ fn a_wasm_package_that_names_a_kernel_revision_is_refused() {
     let text = r#"
 op = "scheduling"
 backend = "fcfs"
+interface_version = 1
 
 [toolchain]
 kind = "wasm"
@@ -490,6 +520,7 @@ fn a_wasm_module_with_a_c_entry_is_refused() {
     let text = r#"
 op = "scheduling"
 backend = "fcfs"
+interface_version = 1
 
 [toolchain]
 kind = "wasm"
@@ -512,6 +543,7 @@ files = ["src/lib.rs"]
 const EXECUTABLE: &str = r#"
 op = "sampler"
 backend = "process"
+interface_version = 1
 
 [toolchain]
 kind = "none"
@@ -568,6 +600,7 @@ fn a_package_may_declare_one_descriptor_table_per_key_shape() {
         package.join("package.toml"),
         r#"op = "qk_norm_rope"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"
@@ -626,6 +659,7 @@ fn a_package_may_declare_one_descriptor_table() {
         package.join("package.toml"),
         r#"op = "channel_affine"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

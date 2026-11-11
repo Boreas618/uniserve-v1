@@ -13,6 +13,7 @@
 
 op = "expert_exchange"
 backend = "deepep"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

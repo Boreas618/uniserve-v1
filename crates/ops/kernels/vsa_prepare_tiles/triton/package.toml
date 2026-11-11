@@ -18,6 +18,7 @@
 
 op = "vsa_prepare_tiles"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

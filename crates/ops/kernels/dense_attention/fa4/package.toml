@@ -13,6 +13,7 @@
 
 op = "dense_attention"
 backend = "fa4"
+interface_version = 1
 
 # The CuTe DSL this package is written for, as the toolchain reports it (`cutlass.__version__`);
 # the Build Server refuses a package whose version no host here has, so this must name the

@@ -26,14 +26,23 @@
 //! with the mark is a module; a reader that sees a half-written directory
 //! without one ignores it, and a build interrupted before the rename leaves
 //! nothing a reader can find.
+//!
+//! The mark is the module's record: it states the version of the interface
+//! the module's package implements, which `resolve` hands to the loader with
+//! the files so that a loader built for another version refuses the module.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::{Error, Result};
 
-/// The mark that makes a module directory a committed module.
+/// The mark that makes a module directory a committed module, and the
+/// module's record: a TOML file stating [`INTERFACE_VERSION`].
 pub const COMMITTED: &str = ".committed";
+
+/// The key of the record that states the interface version a module was built
+/// for.
+pub const INTERFACE_VERSION: &str = "interface_version";
 
 /// Numbers the staging directories one process makes, so two publishes beside
 /// each other never share one.
@@ -186,8 +195,17 @@ impl Store {
         let relative = path.relative();
         self.roots.iter().find_map(|root| {
             let directory = root.path.join(&relative);
-            directory.join(COMMITTED).is_file().then_some(directory)
+            recorded_version(&directory).map(|_| directory)
         })
+    }
+
+    /// The interface version the committed module at `path` was built for, as
+    /// its record states it, from the first root that has the module.
+    pub fn interface_version(&self, path: &ModulePath) -> Option<u32> {
+        let relative = path.relative();
+        self.roots
+            .iter()
+            .find_map(|root| recorded_version(&root.path.join(&relative)))
     }
 
     /// The files of a committed module, in name order, from the first root
@@ -203,14 +221,21 @@ impl Store {
         Ok(Some(files))
     }
 
-    /// Publishes the files a build wrote as the module at `path`.
+    /// Publishes the files a build wrote as the module at `path`, built for
+    /// `interface_version` of its package's interface.
     ///
     /// `workspace` is the build's directory; `files` names the files in it
     /// that belong to the module, in the order they are stored. Every file is
     /// fsynced, the directory is renamed into place atomically, and the
-    /// `.committed` mark is written last, so a reader never finds a module
-    /// that is partly written.
-    pub fn publish(&self, path: &ModulePath, workspace: &Path, files: &[String]) -> Result<()> {
+    /// `.committed` mark, which records the interface version, is written
+    /// last, so a reader never finds a module that is partly written.
+    pub fn publish(
+        &self,
+        path: &ModulePath,
+        workspace: &Path,
+        files: &[String],
+        interface_version: u32,
+    ) -> Result<()> {
         for name in files {
             if !is_relative_name(name) {
                 return Err(Error::Io(io::Error::new(
@@ -256,7 +281,7 @@ impl Store {
         }
         sync_directory(&staged)?;
         if destination.exists() {
-            if destination.join(COMMITTED).is_file() {
+            if recorded_version(&destination).is_some() {
                 // A path fixes a module's content, so a committed module
                 // is never replaced (design section 5.3).
                 std::fs::remove_dir_all(&staged)?;
@@ -265,9 +290,10 @@ impl Store {
                     format!("{path} is already committed"),
                 )));
             }
-            // A build that died between the rename and the mark left a
-            // directory no reader treats as a module; this publish replaces
-            // it.
+            // A build that died between the rename and the mark, or a store
+            // written before modules recorded their interface version, left
+            // a directory no reader treats as a module; this publish
+            // replaces it.
             std::fs::remove_dir_all(&destination)?;
         }
         std::fs::rename(&staged, &destination)?;
@@ -275,7 +301,12 @@ impl Store {
         // The mark makes the directory a module. It is written after the
         // rename and fsynced with its directory, so a reader that finds it
         // finds every file.
-        std::fs::File::create(destination.join(COMMITTED))?.sync_all()?;
+        let mark = destination.join(COMMITTED);
+        std::fs::write(
+            &mark,
+            format!("{INTERFACE_VERSION} = {interface_version}\n"),
+        )?;
+        std::fs::File::open(&mark)?.sync_all()?;
         sync_directory(&destination)?;
         sync_directory(parent)?;
         Ok(())
@@ -299,7 +330,7 @@ impl Store {
                         for inputs in directories(&revision_path(revision, &backend))? {
                             for target in directories(&inputs)? {
                                 for descriptor in directories(&target)? {
-                                    if !descriptor.join(COMMITTED).is_file() {
+                                    if recorded_version(&descriptor).is_none() {
                                         continue;
                                     }
                                     modules.push(ModulePath {
@@ -334,6 +365,15 @@ pub struct StoreFile {
     /// or `tuning/tactics.json`.
     pub name: String,
     pub path: PathBuf,
+}
+
+/// The interface version the mark of the module directory `directory` records,
+/// or `None` when the directory is no committed module: it has no mark, or a
+/// mark that states no version.
+fn recorded_version(directory: &Path) -> Option<u32> {
+    let record = std::fs::read_to_string(directory.join(COMMITTED)).ok()?;
+    let record: toml::Table = toml::from_str(&record).ok()?;
+    u32::try_from(record.get(INTERFACE_VERSION)?.as_integer()?).ok()
 }
 
 /// Whether a build's file name is a path inside the module directory:

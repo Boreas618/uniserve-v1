@@ -42,7 +42,7 @@ pub(crate) struct Engine {
 impl Engine {
     /// Connects to the leader at `address` as an engine of this build.
     pub(crate) fn connect(address: &str) -> Self {
-        let (engine, welcome) = Self::hello(address, proto::PROTOCOL_MAJOR);
+        let (engine, welcome) = Self::hello(address, proto::ENGINE_INTERFACE_VERSION);
         assert_eq!(welcome.refusal, "", "the leader refused this engine");
         engine
     }

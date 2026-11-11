@@ -12,6 +12,7 @@
 
 op = "sparse_attention"
 backend = "sm90"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

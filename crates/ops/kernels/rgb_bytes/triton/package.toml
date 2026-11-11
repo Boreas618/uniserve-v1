@@ -20,6 +20,7 @@
 
 op = "rgb_bytes"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

@@ -12,6 +12,7 @@
 
 op = "frame_moments"
 backend = "nvcc"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

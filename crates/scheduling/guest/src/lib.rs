@@ -30,6 +30,16 @@
 //! A policy implements [`policy::Policy`]; the `export_policy!` macro (in the
 //! guest helpers) generates the exports for it.
 
+/// The version of the scheduling policy interface: the calls of [`wire`] and
+/// what their messages mean.
+///
+/// A policy package's manifest states the version it implements
+/// (`interface_version`), and the mechanism refuses to instantiate a module
+/// built for another. An addition a reader tolerates, as described above,
+/// leaves the version; a change of what an existing call or field means
+/// raises it.
+pub const INTERFACE_VERSION: u32 = 1;
+
 pub mod abi;
 pub mod arrival;
 pub mod budget;

@@ -32,6 +32,7 @@ fn manifest(backend: &str, dtypes: &[&str], architecture: &str) -> String {
         r#"
 op = "{OP}"
 backend = "{backend}"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

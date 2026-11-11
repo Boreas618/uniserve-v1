@@ -12,6 +12,7 @@
 
 op = "fp8_gemm"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

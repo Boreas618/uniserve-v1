@@ -9,6 +9,7 @@
 
 op = "logits_shape"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

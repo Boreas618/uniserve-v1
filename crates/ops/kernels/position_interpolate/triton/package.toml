@@ -10,6 +10,7 @@
 
 op = "position_interpolate"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

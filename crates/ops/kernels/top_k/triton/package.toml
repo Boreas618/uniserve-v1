@@ -10,6 +10,7 @@
 
 op = "top_k"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

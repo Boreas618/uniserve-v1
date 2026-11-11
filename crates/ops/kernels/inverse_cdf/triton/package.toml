@@ -8,6 +8,7 @@
 
 op = "inverse_cdf"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

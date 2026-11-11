@@ -9,6 +9,7 @@
 
 op = "cache_block_scatter"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

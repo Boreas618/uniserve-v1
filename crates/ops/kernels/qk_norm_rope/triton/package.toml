@@ -10,6 +10,7 @@
 
 op = "qk_norm_rope"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

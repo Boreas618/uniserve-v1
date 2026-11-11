@@ -11,6 +11,7 @@
 
 op = "vsa_zero_padding"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

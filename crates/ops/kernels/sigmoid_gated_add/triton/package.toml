@@ -10,6 +10,7 @@
 
 op = "sigmoid_gated_add"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

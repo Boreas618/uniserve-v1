@@ -12,6 +12,7 @@
 
 op = "sparse_attention"
 backend = "sm120"
+interface_version = 1
 
 [toolchain]
 kind = "cute_dsl"

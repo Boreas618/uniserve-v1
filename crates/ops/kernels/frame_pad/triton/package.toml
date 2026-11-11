@@ -17,6 +17,7 @@
 
 op = "frame_pad"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

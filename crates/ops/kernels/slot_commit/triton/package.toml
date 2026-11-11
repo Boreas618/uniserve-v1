@@ -8,6 +8,7 @@
 
 op = "slot_commit"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

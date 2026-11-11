@@ -18,6 +18,7 @@
 
 op = "value_first_swiglu"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

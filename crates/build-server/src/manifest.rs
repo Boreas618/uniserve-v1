@@ -576,6 +576,13 @@ pub struct Manifest {
     pub op: String,
     /// The backend's name, which the configuration field selects.
     pub backend: String,
+    /// The version of the interface the package implements: its operator's
+    /// descriptor and argument layout, the scheduling policy's decisions, or
+    /// the engine's messages. Versions start at 1 and an interface raises its
+    /// own with any change that is not an addition. The Build Server records
+    /// it with every module the package builds, and a loader built for
+    /// another version refuses the module.
+    pub interface_version: u32,
     /// The package's place among its operator's backends: of the packages
     /// that cover a descriptor key, the Build Server selects the one with
     /// the highest priority, after the backend a deployment names (design
@@ -624,6 +631,13 @@ impl Manifest {
         if self.op.is_empty() || self.backend.is_empty() {
             return Err(ManifestError::Invalid(
                 "the operator and backend names must not be empty".into(),
+            ));
+        }
+        if self.interface_version == 0 {
+            return Err(ManifestError::Invalid(
+                "interface versions start at 1: state the version of the interface the package \
+                 implements in `interface_version`"
+                    .into(),
             ));
         }
         match (&self.kernel, self.module.form) {

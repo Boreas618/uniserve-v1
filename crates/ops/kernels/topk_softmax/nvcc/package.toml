@@ -12,6 +12,7 @@
 
 op = "topk_softmax"
 backend = "nvcc"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"
