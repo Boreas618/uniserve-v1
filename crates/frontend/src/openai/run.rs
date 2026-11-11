@@ -26,10 +26,11 @@ use anyhow::Context as _;
 use bytes::Bytes;
 use futures::FutureExt as _;
 use proto::handoff;
+use proto::handoff::stream::Application;
 use thiserror_ext::AsReport as _;
 use tracing::{error, trace};
 
-use crate::body::{Application, Session, Step};
+use crate::body::{Session, Step};
 use crate::events::{Events, Next as EventStep, Stats};
 use crate::openai::chat_completions::{ChatCollector, ChatStreamEmitter, chat_response};
 use crate::openai::error::ApiError;
@@ -550,7 +551,7 @@ mod tests {
 
     /// Drives a body to its end as its connection does and answers what it
     /// wrote, with the failure a held head states.
-    async fn answered(run: &mut impl Session) -> (Vec<u8>, Option<ApiError>) {
+    async fn responded(run: &mut impl Session) -> (Vec<u8>, Option<ApiError>) {
         let mut bytes = Vec::new();
         loop {
             match std::future::poll_fn(|cx| run.poll_step(cx)).await {
@@ -622,7 +623,7 @@ mod tests {
     ) -> Result<Value, ApiError> {
         let sink = ChatBodySink::new(&response(logprobs));
         let mut body = run(parser, decode, logprobs, events, sink);
-        match answered(&mut body).await {
+        match responded(&mut body).await {
             (bytes, None) => Ok(serde_json::from_slice(&bytes).unwrap()),
             (_, Some(error)) => Err(error),
         }
@@ -746,7 +747,7 @@ mod tests {
                 engine_events([text_token(b'a'), failure]),
                 sink,
             );
-            let (bytes, failed) = answered(&mut body).await;
+            let (bytes, failed) = responded(&mut body).await;
             assert!(failed.is_none());
             let text = String::from_utf8(bytes).unwrap();
             assert!(
@@ -851,7 +852,7 @@ mod tests {
     async fn a_stream_carries_tool_calls_as_openai_deltas() {
         let sink = ChatStreamEmitter::new(&response(false));
         let mut body = run(lookup_parser(), decode(), false, generated(TWO_CALLS), sink);
-        let (bytes, failed) = answered(&mut body).await;
+        let (bytes, failed) = responded(&mut body).await;
         assert!(failed.is_none());
 
         let text = String::from_utf8(bytes).unwrap();

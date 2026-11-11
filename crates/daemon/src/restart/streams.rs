@@ -372,12 +372,12 @@ fn take_over(
                     .as_ref()
                     .map_or(0, |lowering| lowering.started_unix_us),
             );
-            let outcome = leader.request_outcome(&state.request_id, chat.engine_replica, started);
+            let stats = leader.stat_logger(&state.request_id, chat.engine_replica, started);
             let run = frontend::openai::run::GenerationRun::resume_stream(
                 &chat,
                 leader.tokenizer(),
                 Box::new(events),
-                Box::new(outcome),
+                Box::new(stats),
             )?;
             // Server-sent events: the body keeps its connection alive while
             // it waits for the engine.
@@ -394,12 +394,12 @@ fn take_over(
                     .as_ref()
                     .map_or(0, |lowering| lowering.started_unix_us),
             );
-            let outcome = leader.request_outcome(&state.request_id, chat.engine_replica, started);
+            let stats = leader.stat_logger(&state.request_id, chat.engine_replica, started);
             let run = frontend::openai::run::GenerationRun::resume_collection(
                 &chat,
                 leader.tokenizer(),
                 Box::new(events),
-                Box::new(outcome),
+                Box::new(stats),
             )?;
             // One JSON body: no server-sent events, so no keep-alive comment.
             ResponseStream::start(Box::new(run), false)

@@ -672,7 +672,7 @@ async fn receive(
 /// Fails when the handoff fails or the deployment's serving fails.
 pub async fn take_over(
     descriptor: i32,
-    catalogue: processing::Catalogue,
+    families: processing::Registry,
     devices: crate::supervision::DeviceProbe,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
@@ -685,7 +685,7 @@ pub async fn take_over(
         (Message::Prepare(prepare), _) => prepare,
         (other, _) => anyhow::bail!("the daemon sent {other:?} first"),
     };
-    match prepared_successor(&mut channel, *prepare, &catalogue, devices, shutdown).await {
+    match prepared_successor(&mut channel, *prepare, &families, devices, shutdown).await {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = send(
@@ -704,14 +704,14 @@ pub async fn take_over(
 async fn prepared_successor(
     channel: &mut Channel,
     prepare: Prepare,
-    catalogue: &processing::Catalogue,
+    families: &processing::Registry,
     devices: crate::supervision::DeviceProbe,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let (mut config, _) = crate::options::resolve_text(&prepare.config, &[])?;
     config.server_config.api_key = prepare.api_key;
     let stated = Stated::from_paths(prepare.stated);
-    let prepared = Leader::prepare(catalogue, &config, &stated).await?;
+    let prepared = Leader::prepare(families, &config, &stated).await?;
     // Another listening address is bound before the handover, so that a
     // refused bind leaves the previous daemon serving; the listener it hands
     // over then closes once the previous daemon stops accepting.
@@ -902,7 +902,7 @@ async fn prepared_successor(
     first.start_standby();
     for (index, (handed, options, served, observer, client)) in adopted.enumerate() {
         let replica = crate::leader::Replica::new(
-            leader.catalogue.clone(),
+            leader.families.clone(),
             &options,
             Arc::new(client),
             observer,

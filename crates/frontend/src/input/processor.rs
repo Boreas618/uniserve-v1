@@ -1,7 +1,7 @@
 //! Load-time model resolution and the lowering of requests into engine requests.
 //!
 //! `ModelConfig::load` resolves checkpoint facts, the tokenizer, and what renders requests
-//! at startup, by the family of the executable's catalogue the checkpoint declares: a diffusers
+//! at startup, by the family of the executable's registry the checkpoint declares: a diffusers
 //! pipeline index selects a video family, whose processor reads the pipeline files the family
 //! names, and otherwise the root `config.json` selects a chat family with its chat template.
 //! [`Processor::new`] then binds the generation limits the started workers report and the request
@@ -20,7 +20,7 @@ use std::sync::Arc;
 use crate::model::ModelConfig;
 use crate::model::assets::{PipelineCheckpoint, ResolvedModelFiles};
 use crate::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
-use processing::Catalogue;
+use processing::Registry;
 use processing::{
     ImageFamily, ImageProcessor, ReasoningFormat, Serving, ToolCallFormat, VideoFamily,
 };
@@ -143,7 +143,7 @@ pub enum RequestRenderer {
     Video(VideoService),
 }
 
-/// Loads a diffusers pipeline's `tokenizer` component as the pipeline's own
+/// Loads a diffusers pipeline's `tokenizer` stage as the pipeline's own
 /// `transformers` tokenizer loads it: `tokenizer.json` with the special
 /// tokens its `tokenizer_config.json`, when published, declares.
 ///
@@ -153,11 +153,9 @@ pub enum RequestRenderer {
 pub async fn pipeline_tokenizer(
     pipeline: &PipelineCheckpoint,
 ) -> std::result::Result<HuggingFaceTokenizer, ModelResolutionError> {
-    let path = pipeline
-        .component_file("tokenizer", "tokenizer.json")
-        .await?;
+    let path = pipeline.stage_file("tokenizer", "tokenizer.json").await?;
     let config = match pipeline
-        .component_file("tokenizer", "tokenizer_config.json")
+        .stage_file("tokenizer", "tokenizer_config.json")
         .await
     {
         Ok(config) => Some(config),
@@ -171,10 +169,10 @@ pub async fn pipeline_tokenizer(
 impl ModelConfig {
     /// Loads the checkpoint `model` names: its facts and the tokenizer and
     /// template resources request processing needs, with the family of
-    /// `catalogue` that claims it.
+    /// `registry` that claims it.
     ///
     /// A diffusers pipeline has no chat template and carries its conditioner's
-    /// vision processor geometry instead. The returned `max_model_len` is the
+    /// vision processor configuration instead. The returned `max_model_len` is the
     /// configured `max_model_len`, else, for a root configuration, its
     /// `max_position_embeddings` or `ModelConfig::DEFAULT_MAX_MODEL_LEN`; a
     /// pipeline's deployment must state it. `chat` configures a chat
@@ -183,30 +181,30 @@ impl ModelConfig {
     /// # Errors
     ///
     /// Fails when the checkpoint's files cannot be resolved or read, or no
-    /// family of `catalogue` serves it.
+    /// family of `registry` serves it.
     pub async fn load(
         model: &str,
         max_model_len: Option<std::num::NonZeroU32>,
         chat: &proto::config::ChatConfig,
-        catalogue: &Catalogue,
+        registry: &Registry,
     ) -> std::result::Result<LoadedModel, ModelResolutionError> {
         let max_model_len = max_model_len.map(std::num::NonZeroU32::get);
-        // A diffusers pipeline declares its class and component folders in a
+        // A diffusers pipeline declares its class and stage folders in a
         // root index rather than a root `config.json`, so the index selects the
-        // family and locates the tokenizer component before any other asset
-        // is resolved. A component export reads the components its pinned
+        // family and locates the tokenizer stage before any other asset
+        // is resolved. A stage export reads the stages its pinned
         // base supplies from the Hub cache at the pinned revision, as its
         // workers do. A family that a root `config.json` describes is
         // selected by that file alone, even when the checkpoint publishes an
         // index beside it.
         if let Some(pipeline) = PipelineCheckpoint::resolve(model).await?
-            && let Some(family) = catalogue.by_class(pipeline.class_name())
+            && let Some(family) = registry.by_class(pipeline.class_name())
             && let Serving::Video(video) = family.serving
         {
             let tokenizer: DynTokenizer = Arc::new(pipeline_tokenizer(&pipeline).await?);
             let mut files = Vec::with_capacity(video.processor_files().len());
-            for (component, name) in video.processor_files() {
-                let path = pipeline.component_file(component, name).await?;
+            for (stage, name) in video.processor_files() {
+                let path = pipeline.stage_file(stage, name).await?;
                 let text = std::fs::read_to_string(&path).map_err(|source| {
                     ModelResolutionError::ProcessorFile {
                         path: path.clone(),
@@ -230,7 +228,7 @@ impl ModelConfig {
             &files.tokenizer_path,
             files.tokenizer_config_path.as_deref(),
         )?);
-        let config = Self::from_files(catalogue, &files, max_model_len, tokenizer.as_ref()).await?;
+        let config = Self::from_files(registry, &files, max_model_len, tokenizer.as_ref()).await?;
         // A family that takes images binds its processor to the checkpoint's processor files; a
         // template that reads content parts writes its own image markup, and one that reads
         // flattened content is given the family's.
@@ -347,7 +345,7 @@ impl Processor {
         }
     }
 
-    /// The served video contract, as `GET /v1/capabilities` reports it;
+    /// What the deployment serves of video, as `GET /v1/capabilities` reports it;
     /// `Value::Null` for a model that serves no video. See
     /// `VideoService::capabilities`.
     pub fn video_capabilities(&self) -> serde_json::Value {
@@ -904,12 +902,12 @@ mod tests {
         )
         .unwrap();
 
-        let catalogue = processing::Catalogue::new([crate::test_support::CHAT]).unwrap();
+        let registry = processing::Registry::new([crate::test_support::CHAT]).unwrap();
         let loaded = ModelConfig::load(
             directory.path().to_str().unwrap(),
             None,
             &proto::config::ChatConfig::default(),
-            &catalogue,
+            &registry,
         )
         .await
         .unwrap();

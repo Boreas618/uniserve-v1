@@ -74,7 +74,7 @@ pub trait Server: Send + Sync + 'static {
         adapter: Option<AdapterSelection>,
     ) -> BoxFuture<'_, Result<(Box<dyn Events>, OutputProcessor)>>;
 
-    /// Fetches, probes and plans a video request, submits it, and streams its
+    /// Fetches, probes and processes a video request, submits it, and streams its
     /// output; also returns what the request generates.
     ///
     /// # Errors

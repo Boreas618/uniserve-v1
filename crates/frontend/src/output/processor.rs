@@ -202,7 +202,7 @@ impl OutputProcessor {
             .map_err(|source| failed(source.into()))?;
 
         let mut outputs = Vec::new();
-        for event in decoded.events {
+        for event in decoded {
             match event {
                 DecodedTextEvent::Start {
                     prompt,
@@ -233,7 +233,12 @@ impl OutputProcessor {
                         });
                     }
                 }
-                DecodedTextEvent::Done(finished) => {
+                DecodedTextEvent::Done {
+                    reason,
+                    stop_reason,
+                    prompt_tokens,
+                    output_tokens,
+                } => {
                     // Release the text the parsers hold back and close the open block
                     // before the terminal output.
                     for event in self.parsers.finish().map_err(failed)? {
@@ -244,11 +249,11 @@ impl OutputProcessor {
 
                     let saturate = |count: usize| u32::try_from(count).unwrap_or(u32::MAX);
                     outputs.push(RequestOutput::Finished {
-                        reason: finished.reason,
-                        stop_reason: finished.stop_reason,
+                        reason,
+                        stop_reason,
                         usage: RequestUsage {
-                            prompt_tokens: saturate(finished.prompt_tokens),
-                            output_tokens: saturate(finished.output_tokens),
+                            prompt_tokens: saturate(prompt_tokens),
+                            output_tokens: saturate(output_tokens),
                             timings: self.clock.timings(),
                         },
                     });

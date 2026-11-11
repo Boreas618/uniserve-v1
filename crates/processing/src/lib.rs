@@ -16,7 +16,7 @@
 //!   and processes it into the engine's input ([`VideoInput`]).
 //!
 //! The executable registers the families it serves once; request processing reads them as one
-//! [`Catalogue`], and nothing in the daemon or the frontend names a model.
+//! [`Registry`], and nothing in the daemon or the frontend names a model.
 //!
 //! The family-neutral rules a video request is processed with are stated here once, each
 //! parameterized by values the family states: the frame rule ([`FrameClips`]), the canvas rule
@@ -42,7 +42,7 @@ mod video;
 mod vocabulary;
 
 pub use canvas::{CanvasError, CanvasRule, CoverCrop, cover_crop};
-pub use family::{Catalogue, ClaimError, Family};
+pub use family::{Family, Registry, RegistryError};
 pub use frames::{ClipSpan, FrameClips, requested_frames};
 pub use image::{ImageBlock, ImageFamily, ImageProcessor};
 pub use media::{

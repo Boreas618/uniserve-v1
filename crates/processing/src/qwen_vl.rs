@@ -1,7 +1,7 @@
 //! The Qwen-VL image and video processor rules: how an image or a video is sized to the vision
 //! tower's patch grid, how a clip is sampled, and the context block an image takes.
 //!
-//! - [`ProcessorConfig`] is the checkpoint's image and video processor geometry, with the
+//! - [`ProcessorConfig`] is the checkpoint's image and video processor configuration, with the
 //!   `smart_resize` of each ([`ProcessorConfig::image_grid`], [`ProcessorConfig::video_grid`]) and
 //!   the tokens one temporal block of a grid presents ([`ProcessorConfig::block_tokens`]);
 //! - [`sample_frames`] samples a clip at the video processor's 2 fps and labels its blocks;
@@ -60,7 +60,7 @@ pub enum VisionError {
     },
 }
 
-/// The patch geometry and pixel budgets a Qwen-VL processor sizes media by: the checkpoint's
+/// The patch sizes and pixel budgets a Qwen-VL processor sizes media by: the checkpoint's
 /// `preprocessor_config.json` and `video_preprocessor_config.json` ([`ProcessorConfig::FILES`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessorConfig {
@@ -118,7 +118,7 @@ impl ProcessorConfig {
         };
         let (patch_size, temporal_patch_size, merge_size) = patching(image_file, image)?;
         if patching(video_file, video)? != (patch_size, temporal_patch_size, merge_size) {
-            return Err("the image and video processors disagree on the patch geometry".to_owned());
+            return Err("the image and video processors disagree on the patch sizes".to_owned());
         }
         let (image_min_pixels, image_max_pixels) = budget(image_file, image)?;
         let (video_min_pixels, video_max_pixels) = budget(video_file, video)?;
@@ -255,7 +255,7 @@ pub const fn position_span(grid: VisionGrid, merge: u32) -> u32 {
 /// Every `frame_rate / 2`-th frame is sampled (every twelfth at 24 fps), the index rounded half to
 /// even as Python's `round` does. The tower merges the samples in groups of `temporal_patch`,
 /// repeating the last one to fill a group, and a group is labelled with the mean of its first and
-/// last timestamps. Answers the sampled frame indices and the block timestamps in seconds.
+/// last timestamps. Returns the sampled frame indices and the block timestamps in seconds.
 ///
 /// # Errors
 ///
@@ -363,7 +363,7 @@ mod tests {
                 "size": {"shortest_edge": 1, "longest_edge": 2}}"#,
         )
         .expect_err("two patch sizes");
-        assert!(error.contains("patch geometry"), "{error}");
+        assert!(error.contains("patch sizes"), "{error}");
 
         let missing = ProcessorConfig::parse(r#"{"patch_size": 16}"#, "{}").unwrap_err();
         assert!(missing.contains("temporal_patch_size"), "{missing}");

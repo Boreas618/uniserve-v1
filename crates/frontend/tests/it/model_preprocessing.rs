@@ -11,8 +11,8 @@ use frontend::model::ModelConfig;
 use frontend::model::assets::ResolvedModelFiles;
 use frontend::openai::ApiError;
 use frontend::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
-use processing::{Catalogue, Family};
 use processing::{ChatProfile, ReasoningFormat, Serving, ToolCallFormat};
+use processing::{Family, Registry};
 use proto::config::ChatTemplateContentFormat;
 use proto::handoff::Lowering;
 use proto::request::{GenerationLimits, GenerationRequest};
@@ -158,7 +158,7 @@ fn try_resolved_model(
         .build()
         .unwrap()
         .block_on(ModelConfig::from_files(
-            &Catalogue::new([CHAT, PLAIN, processing::qwen::QWEN4_EXP]).unwrap(),
+            &Registry::new([CHAT, PLAIN, processing::qwen::QWEN4_EXP]).unwrap(),
             &files,
             Some(4096),
             tokenizer.as_ref(),

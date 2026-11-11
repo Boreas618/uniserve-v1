@@ -35,7 +35,7 @@ pub enum Error {
         #[source]
         error: BoxedError,
     },
-    /// Incremental tool-call events violate the assembler state contract:
+    /// Incremental tool-call events violate the assembler's order:
     /// arguments arrive with no open tool call, or for a tool index other than
     /// the open one.
     #[error("tool call stream state is inconsistent: {message}")]

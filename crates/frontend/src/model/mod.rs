@@ -23,15 +23,15 @@ pub mod generation;
 // discovery share it immutably.
 //
 // The checkpoint's files are resolved and read here ([`assets`]); which family
-// a checkpoint is, and what that family serves, is the executable's catalogue
-// of families (`processing::Catalogue`), whose request processing reads the
+// a checkpoint is, and what that family serves, is the executable's registry
+// of families (`processing::Registry`), whose request processing reads the
 // checkpoint's tokenizer (`crate::tokenizer`) through `processing::Vocabulary`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-use processing::{Catalogue, Family};
 use processing::{ChatProfile, Serving, VideoFamily};
+use processing::{Family, Registry};
 
 use crate::model::assets::{
     GenerationConfig, HfTokenizerConfig, ResolvedModelFiles, load_generation_config,
@@ -86,7 +86,7 @@ impl ModelConfig {
     pub const DEFAULT_MAX_MODEL_LEN: u32 = 8192;
     /// Resolves vocabulary, checkpoint defaults, and the family once.
     ///
-    /// The family is the one of `catalogue` that claims the `model_type` of
+    /// The family is the one of `registry` that claims the `model_type` of
     /// `files.config_path`, and it must serve chat. A configured
     /// `max_model_len` takes precedence over the checkpoint's
     /// `max_position_embeddings`, and [`ModelConfig::DEFAULT_MAX_MODEL_LEN`]
@@ -95,9 +95,9 @@ impl ModelConfig {
     /// # Errors
     ///
     /// Fails when a present metadata file cannot be read or parsed, or when
-    /// `model_type` is missing or names no chat family of `catalogue`.
+    /// `model_type` is missing or names no chat family of `registry`.
     pub async fn from_files(
-        catalogue: &Catalogue,
+        registry: &Registry,
         files: &ResolvedModelFiles,
         max_model_len: Option<u32>,
         tokenizer: &HuggingFaceTokenizer,
@@ -108,7 +108,7 @@ impl ModelConfig {
             .ok_or(assets::Error::MissingField {
                 field: "model_type",
             })?;
-        let family = catalogue
+        let family = registry
             .by_model_type(actual_model_type)
             .filter(|family| matches!(family.serving, Serving::Chat(_)))
             .ok_or_else(|| assets::Error::UnsupportedModelType {
@@ -229,11 +229,11 @@ mod tests {
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
-    use processing::{Catalogue, Family};
     use processing::{
         ChatProfile, ReasoningFormat, Serving, ToolCallFormat, VideoBinding, VideoFamily,
         VideoProcessor,
     };
+    use processing::{Family, Registry};
 
     use super::ModelConfig;
     use crate::model::assets::ResolvedModelFiles;
@@ -320,8 +320,8 @@ mod tests {
             files.tokenizer_config_path.as_deref(),
         )
         .unwrap();
-        let catalogue = Catalogue::new([CHAT, VIDEO]).unwrap();
-        let config = ModelConfig::from_files(&catalogue, &files, None, &tokenizer).await;
+        let registry = Registry::new([CHAT, VIDEO]).unwrap();
+        let config = ModelConfig::from_files(&registry, &files, None, &tokenizer).await;
         (directory, tokenizer, config)
     }
 

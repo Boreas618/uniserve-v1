@@ -5,7 +5,7 @@
 //! token-ID candidates into decoded strings.
 
 pub use decoded::DecodeStream;
-pub use decoded::{DecodedTextEvent, Finished};
+pub use decoded::DecodedTextEvent;
 pub use error::{Error, Result};
 
 mod decoded;

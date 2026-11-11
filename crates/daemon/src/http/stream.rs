@@ -43,7 +43,8 @@ use axum::response::Response;
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
-pub(crate) use frontend::body::{Application, Session, Step};
+pub(crate) use frontend::body::{Session, Step};
+pub(crate) use proto::handoff::stream::Application;
 
 use crate::http::handoff::Registration;
 

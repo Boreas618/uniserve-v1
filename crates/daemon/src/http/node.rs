@@ -64,7 +64,7 @@ struct Node {
     /// at.
     program_config: program_server::command::Settings,
     /// The model families the executable serves.
-    catalogue: processing::Catalogue,
+    families: processing::Registry,
     /// Reads this host's idle devices, for each deployment's daemon.
     devices: crate::supervision::DeviceProbe,
 }
@@ -84,7 +84,7 @@ pub async fn node(
     admin: AdminConfig,
     server: ServerConfig,
     program_config: program_server::command::Settings,
-    catalogue: processing::Catalogue,
+    families: processing::Registry,
     devices: crate::supervision::DeviceProbe,
     shutdown: CancellationToken,
 ) -> Result<()> {
@@ -98,7 +98,7 @@ pub async fn node(
         current: Mutex::new(None),
         server: server.clone(),
         program_config,
-        catalogue,
+        families,
         devices,
     });
     let mut app = Router::new()
@@ -296,7 +296,7 @@ async fn serve_deployment(
         // first program switch commands through.
         let commands = daemon.commands();
         let engine = tokio::select! {
-            engine = Leader::start(&node.catalogue, config, stated, address, commands.as_ref(), updates) => {
+            engine = Leader::start(&node.families, config, stated, address, commands.as_ref(), updates) => {
                 Arc::new(engine?)
             }
             () = token.cancelled() => return Ok(()),

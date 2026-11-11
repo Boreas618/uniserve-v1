@@ -24,23 +24,6 @@ use crate::output::text::error::Error;
 use crate::tokenizer::{DynTokenizer, IncrementalDecoder};
 use proto::handoff::DecodedLogprobs;
 
-/// How a decoded request finished, with its token counts.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Finished {
-    /// Why the request finished.
-    pub reason: FinishReason,
-    /// The stop token or string that matched, when one did.
-    pub stop_reason: Option<StopReason>,
-    /// Prompt tokens submitted to the engine.
-    pub prompt_tokens: usize,
-    /// Generated tokens.
-    ///
-    /// The engine's `completion_tokens` when the engine finishes the request,
-    /// which counts the tokens of internal sections it never published as
-    /// text; the decoder's own count when a stop string ends the stream.
-    pub output_tokens: usize,
-}
-
 /// Decoded output of one generation request.
 ///
 /// A stream yields one `Start`, then `TextDelta` events in engine
@@ -76,7 +59,19 @@ pub enum DecodedTextEvent {
         logprobs: Option<DecodedLogprobs>,
     },
     /// The request finished.
-    Done(Finished),
+    Done {
+        /// Why the request finished.
+        reason: FinishReason,
+        /// The stop token or string that matched, when one did.
+        stop_reason: Option<StopReason>,
+        /// Prompt tokens submitted to the engine.
+        prompt_tokens: usize,
+        /// Generated tokens: the engine's `completion_tokens` when the engine
+        /// finishes the request, which counts the tokens of internal sections
+        /// it never published as text; the decoder's own count when a stop
+        /// string ends the stream.
+        output_tokens: usize,
+    },
     /// The engine refused the request before executing it.
     Rejected {
         /// Whether the request is unservable or the engine is full.
@@ -89,15 +84,6 @@ pub enum DecodedTextEvent {
         /// Engine-supplied failure detail.
         message: String,
     },
-}
-
-/// Result of decoding one generated token.
-struct ArDecode {
-    /// Newly visible text; empty when a stop string matched.
-    delta: String,
-    /// Matched stop string and the byte offset of its start in
-    /// `IncrementalDecoder::output`.
-    stop: Option<(String, usize)>,
 }
 
 /// One generation stream's decoding state, advanced one engine event at a
@@ -127,18 +113,6 @@ pub struct DecodeStream {
     pending_token: Option<u32>,
     /// Generated text tokens consumed by the decoder.
     output_tokens: usize,
-}
-
-/// The decoded events one engine event produced.
-pub struct Decoded {
-    /// The events, in order; a terminal event is the last.
-    pub events: Vec<DecodedTextEvent>,
-}
-
-impl Decoded {
-    fn new(events: Vec<DecodedTextEvent>) -> Self {
-        Self { events }
-    }
 }
 
 impl DecodeStream {
@@ -236,7 +210,11 @@ impl DecodeStream {
     /// Fails with [`Error::MalformedOutput`] when engine events violate the
     /// protocol of [`DecodedTextEvent`], and with a tokenizer error when
     /// decoding fails.
-    pub fn push(&mut self, event: Event, raw_stream: &mut dyn Events) -> Result<Decoded, Error> {
+    pub fn push(
+        &mut self,
+        event: Event,
+        raw_stream: &mut dyn Events,
+    ) -> Result<Vec<DecodedTextEvent>, Error> {
         let prompt_token_ids = self.prompt_token_ids.clone();
         let prompt_tokens = prompt_token_ids.len();
         let mut events = Vec::new();
@@ -286,7 +264,7 @@ impl DecodeStream {
                     raw_stream,
                     &mut events,
                 )? {
-                    return Ok(Decoded::new(events));
+                    return Ok(events);
                 }
             }
             // Tokens committed together, such as a block-diffusion canvas,
@@ -310,7 +288,7 @@ impl DecodeStream {
                     raw_stream,
                     &mut events,
                 )? {
-                    return Ok(Decoded::new(events));
+                    return Ok(events);
                 }
             }
             Event::TokenLogprobs { id, candidates } => {
@@ -338,7 +316,7 @@ impl DecodeStream {
                     raw_stream,
                     &mut events,
                 )? {
-                    return Ok(Decoded::new(events));
+                    return Ok(events);
                 }
             }
             // A terminal event flushes decoder holdback only after every pending
@@ -357,7 +335,7 @@ impl DecodeStream {
                     events.push(DecodedTextEvent::Failed {
                         message: "engine execution failed".to_owned(),
                     });
-                    return Ok(Decoded::new(events));
+                    return Ok(events);
                 }
 
                 // Release the decoder's holdback untruncated: a stop-string
@@ -377,21 +355,21 @@ impl DecodeStream {
                     token_ids: Vec::new(),
                     logprobs: None,
                 });
-                events.push(DecodedTextEvent::Done(Finished {
+                events.push(DecodedTextEvent::Done {
                     reason,
                     stop_reason,
                     prompt_tokens,
                     output_tokens: completion_tokens,
-                }));
-                return Ok(Decoded::new(events));
+                });
+                return Ok(events);
             }
             Event::Rejected { kind, message } => {
                 events.push(DecodedTextEvent::Rejected { kind, message });
-                return Ok(Decoded::new(events));
+                return Ok(events);
             }
             Event::Error { message } | Event::ArtifactUnavailable { message } => {
                 events.push(DecodedTextEvent::Failed { message });
-                return Ok(Decoded::new(events));
+                return Ok(events);
             }
             // A request's events migrate with it (`crate::migration`), which
             // carries a migratable end over to the next engine.
@@ -410,7 +388,7 @@ impl DecodeStream {
                 });
             }
         }
-        Ok(Decoded::new(events))
+        Ok(events)
     }
 
     /// Fails unless `Start` is emitted (by `start_event` or earlier) and no
@@ -458,15 +436,15 @@ impl DecodeStream {
 
         let mut delta = String::new();
         for (index, &token_id) in token_ids.iter().enumerate() {
-            let decoded = decode_one_token(
+            let (visible, stop) = decode_one_token(
                 &mut self.decoder,
                 token_id,
                 self.output_tokens,
                 &mut self.options,
             )?;
             self.output_tokens = self.output_tokens.saturating_add(1);
-            delta.push_str(&decoded.delta);
-            let Some((stop_string, offset)) = decoded.stop else {
+            delta.push_str(&visible);
+            let Some((stop_string, offset)) = stop else {
                 continue;
             };
 
@@ -486,12 +464,12 @@ impl DecodeStream {
                 token_ids: token_ids[..=index].to_vec(),
                 logprobs: decoded_logprobs,
             });
-            events.push(DecodedTextEvent::Done(Finished {
+            events.push(DecodedTextEvent::Done {
                 reason: FinishReason::Stop,
                 stop_reason: Some(StopReason::String(stop_string)),
                 prompt_tokens: prompt_token_ids.len(),
                 output_tokens: self.output_tokens,
-            }));
+            });
             return Ok(true);
         }
         raw_stream.acknowledge_consumed_prefix();
@@ -593,7 +571,11 @@ impl DecodeStream {
     }
 }
 
-/// Advances incremental decoding and returns only bytes newly made visible by this token.
+/// Advances incremental decoding by one generated token.
+///
+/// Returns the text this token newly made visible, empty when a stop string
+/// matched, and the matched stop string with the byte offset of its start in
+/// `IncrementalDecoder::output`.
 ///
 /// Stop strings are checked only from token number `min_tokens + 1` onward
 /// (`output_tokens` counts the tokens before this one). A matched stop
@@ -603,7 +585,7 @@ fn decode_one_token(
     token_id: u32,
     output_tokens: usize,
     options: &mut TextDecode,
-) -> Result<ArDecode, Error> {
+) -> Result<(String, Option<(String, usize)>), Error> {
     let new_bytes = decoder.push_token(token_id)?;
     let stop = if output_tokens + 1 > options.min_tokens as usize {
         matches_stop_string(&options.stop_strings, decoder.output(), new_bytes)
@@ -616,7 +598,7 @@ fn decode_one_token(
     } else {
         String::new()
     };
-    Ok(ArDecode { delta, stop })
+    Ok((delta, stop))
 }
 
 /// Returns the suffix byte count retained to detect cross-chunk stop strings.

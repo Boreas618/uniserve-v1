@@ -89,7 +89,7 @@ const SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25 * 
 pub struct Leader {
     /// The model families the executable serves, which every preparation of an epoch resolves
     /// its checkpoint with.
-    pub(crate) catalogue: processing::Catalogue,
+    pub(crate) families: processing::Registry,
     /// The single model name the API serves.
     served_model_name: String,
     /// The model the request and scheduler metrics are labelled with.
@@ -237,7 +237,7 @@ pub(crate) fn replica_configs(
 
 /// What a leader prepares before it has an engine (`Leader::prepare`).
 pub(crate) struct Prepared {
-    catalogue: processing::Catalogue,
+    families: processing::Registry,
     model_config: ModelConfig,
     tokenizer: frontend::tokenizer::DynTokenizer,
     renderer: LoadedRenderer,
@@ -572,14 +572,14 @@ impl Leader {
     /// start, or when the model cannot be bound to the capabilities its
     /// workers report.
     pub(crate) async fn start(
-        catalogue: &processing::Catalogue,
+        families: &processing::Registry,
         config: &ServerArgs,
         stated: &Stated,
         daemon: String,
         commands: Option<&crate::supervision::ProcessCommands>,
         updates: Arc<crate::updates::driver::Driver>,
     ) -> anyhow::Result<Self> {
-        let prepared = Self::prepare(catalogue, config, stated).await?;
+        let prepared = Self::prepare(families, config, stated).await?;
         info!(parallel = ?prepared.engine.parallel, "starting the engine process");
         let control = Arc::new(EngineControl::new(
             &config.request_socket(),
@@ -629,7 +629,7 @@ impl Leader {
         )?;
         for (index, (client, served, observer)) in clients.enumerate() {
             let replica = Replica::new(
-                leader.catalogue.clone(),
+                leader.families.clone(),
                 config,
                 Arc::new(client),
                 observer,
@@ -874,7 +874,7 @@ impl Leader {
     ///
     /// As [`Leader::start`], before the engine starts.
     pub(crate) async fn prepare(
-        catalogue: &processing::Catalogue,
+        families: &processing::Registry,
         config: &ServerArgs,
         stated: &Stated,
     ) -> anyhow::Result<Prepared> {
@@ -886,7 +886,7 @@ impl Leader {
             config.model(),
             config.max_model_len,
             &config.chat_config,
-            catalogue,
+            families,
         )
         .await
         .with_context(|| format!("failed to resolve model assets for `{}`", config.model()))?;
@@ -919,7 +919,7 @@ impl Leader {
         }
 
         Ok(Prepared {
-            catalogue: catalogue.clone(),
+            families: families.clone(),
             model_config,
             tokenizer,
             renderer,
@@ -944,7 +944,7 @@ impl Leader {
         updates: Arc<crate::updates::driver::Driver>,
     ) -> anyhow::Result<Self> {
         let Prepared {
-            catalogue,
+            families,
             model_config,
             tokenizer,
             renderer,
@@ -1007,7 +1007,7 @@ impl Leader {
         let images = MediaConnector::from_image_options(&config.image_fetch_config)
             .context("failed to initialize the image URL fetcher")?;
         let engine = Self::observed(
-            catalogue,
+            families,
             config.served_model_name().to_owned(),
             model_name,
             vec![Arc::new(client)],
@@ -1039,7 +1039,7 @@ impl Leader {
         updates: Arc<crate::updates::driver::Driver>,
     ) -> Self {
         Self::observed(
-            processing::Catalogue::default(),
+            processing::Registry::default(),
             served_model_name,
             model_name,
             clients,
@@ -1058,7 +1058,7 @@ impl Leader {
         reason = "a leader's model, engine and options, and its statistics' observer"
     )]
     fn observed(
-        catalogue: processing::Catalogue,
+        families: processing::Registry,
         served_model_name: String,
         model_name: String,
         clients: Vec<Arc<EngineClient>>,
@@ -1090,7 +1090,7 @@ impl Leader {
                     .enumerate()
                     .map(|(index, client)| {
                         Replica::new(
-                            catalogue.clone(),
+                            families.clone(),
                             &replica_options,
                             client,
                             Arc::clone(&observer),
@@ -1110,7 +1110,7 @@ impl Leader {
             replica.monitor();
         }
         Self {
-            catalogue,
+            families,
             served_model_name,
             model_name,
             processor: Arc::new(processor),
@@ -1224,7 +1224,7 @@ impl Leader {
             engine: core,
         };
         let log = self.log_requests.then_some(request_id);
-        let stats = crate::metrics::stats::RequestOutcome::new(labels, started, log);
+        let stats = crate::metrics::stats::StatLogger::new(labels, started, log);
         // Dropping the events on a failure cancels the request in its engine.
         let output = frontend::output::OutputProcessor::new(
             self.processor.tokenizer(),
@@ -1243,18 +1243,18 @@ impl Leader {
 
     /// The statistics recorder of a request this process takes over, under
     /// the replica that serves it and the instant it entered the deployment.
-    pub(crate) fn request_outcome(
+    pub(crate) fn stat_logger(
         &self,
         request_id: &str,
         replica: u32,
         started: std::time::Instant,
-    ) -> crate::metrics::stats::RequestOutcome {
+    ) -> crate::metrics::stats::StatLogger {
         let labels = EngineLabels {
             model_name: self.model_name.clone(),
             engine: replica,
         };
         let log = self.log_requests.then(|| request_id.to_owned());
-        crate::metrics::stats::RequestOutcome::new(labels, started, log)
+        crate::metrics::stats::StatLogger::new(labels, started, log)
     }
 
     /// Takes one request's engine event stream over from the process that
@@ -2071,7 +2071,7 @@ pub(crate) fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_
 pub(crate) struct Replica {
     /// The model families the executable serves, which an update of this replica resolves its
     /// target checkpoint with.
-    pub(crate) catalogue: processing::Catalogue,
+    pub(crate) families: processing::Registry,
     pub(crate) registry: std::sync::Weak<Replicas>,
     pub(crate) ordinal: usize,
     served_model_name: String,
@@ -2135,7 +2135,7 @@ pub(crate) struct Replica {
 
 impl Replica {
     pub(crate) fn new(
-        catalogue: processing::Catalogue,
+        families: processing::Registry,
         options: &ServerArgs,
         client: Arc<EngineClient>,
         observer: Arc<crate::observe::Observer>,
@@ -2145,7 +2145,7 @@ impl Replica {
     ) -> Arc<Self> {
         let hold = Arc::new(RequestHold::new());
         let replica = Arc::new(Replica {
-            catalogue,
+            families,
             registry,
             ordinal,
             served_model_name: options.served_model_name().to_owned(),
@@ -3558,7 +3558,7 @@ impl Replica {
             config.model = Some(model_path.to_owned());
             config.load_config.weights = None;
             let prepared =
-                Leader::prepare(&self.catalogue, &config, &Stated::from_paths(Vec::new()))
+                Leader::prepare(&self.families, &config, &Stated::from_paths(Vec::new()))
                     .await
                     .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
             let served = locked(&self.served)

@@ -48,18 +48,18 @@ pub const QWEN4_EXP: Family = Family {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::family::Catalogue;
+    use crate::family::Registry;
 
     /// A Qwen3.8 Flash Next checkpoint resolves to its family by the `model_type` or the class
     /// its `config.json` declares, and the family's profile names the formats its output is
     /// parsed in.
     #[test]
     fn a_qwen4_exp_checkpoint_resolves_to_its_profile() {
-        let catalogue = Catalogue::new([QWEN4_EXP]).unwrap();
+        let registry = Registry::new([QWEN4_EXP]).unwrap();
 
-        assert_eq!(catalogue.by_model_type("qwen4_exp"), Some(QWEN4_EXP));
+        assert_eq!(registry.by_model_type("qwen4_exp"), Some(QWEN4_EXP));
         assert_eq!(
-            catalogue.by_class("Qwen4ExpForConditionalGeneration"),
+            registry.by_class("Qwen4ExpForConditionalGeneration"),
             Some(QWEN4_EXP)
         );
         let Serving::Chat(profile) = QWEN4_EXP.serving else {

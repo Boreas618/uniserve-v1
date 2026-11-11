@@ -417,13 +417,13 @@ pub(crate) static OUTCOMES: Outcomes = Outcomes {
 /// recorded. The token metrics count only a request that finished.
 pub(crate) struct RequestStats {
     inner: RequestOutputStream,
-    outcome: RequestOutcome,
+    logger: StatLogger,
 }
 
 /// One request's statistics, folded from its output events by a body that is
 /// not a stream of them: the handoffable response body drives one engine
 /// event at a time (design §7.5.1) and reports each output here.
-pub(crate) struct RequestOutcome {
+pub(crate) struct StatLogger {
     labels: EngineLabels,
     started: Instant,
     /// The request whose summary line is logged when it ends, when request
@@ -446,12 +446,12 @@ impl RequestStats {
     ) -> Self {
         Self {
             inner,
-            outcome: RequestOutcome::new(labels, started, log),
+            logger: StatLogger::new(labels, started, log),
         }
     }
 }
 
-impl RequestOutcome {
+impl StatLogger {
     /// A recorder for a request accepted at `started`, recorded under
     /// `labels`.
     pub(crate) fn new(labels: EngineLabels, started: Instant, log: Option<String>) -> Self {
@@ -567,8 +567,8 @@ impl Stream for RequestStats {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let next = ready!(self.inner.poll_next_unpin(cx));
         match &next {
-            Some(Ok(event)) => self.outcome.observe(event),
-            Some(Err(_)) | None => self.outcome.record("error", None),
+            Some(Ok(event)) => self.logger.observe(event),
+            Some(Err(_)) | None => self.logger.record("error", None),
         }
         Poll::Ready(next)
     }
@@ -578,11 +578,11 @@ impl Drop for RequestStats {
     /// Records a request whose stream was dropped before its terminal event
     /// as aborted.
     fn drop(&mut self) {
-        self.outcome.abandoned();
+        self.logger.abandoned();
     }
 }
 
-impl Drop for RequestOutcome {
+impl Drop for StatLogger {
     /// Records a request whose body ended before its terminal event as
     /// aborted, so a handed-over or abandoned response is counted once.
     fn drop(&mut self) {
@@ -640,21 +640,21 @@ fn seconds(microseconds: u64) -> f64 {
     microseconds as f64 / 1_000_000.0
 }
 
-impl frontend::events::Stats for RequestOutcome {
+impl frontend::events::Stats for StatLogger {
     fn started(&self) -> Instant {
-        RequestOutcome::started(self)
+        StatLogger::started(self)
     }
 
     fn engine(&self) -> u32 {
-        RequestOutcome::engine(self)
+        StatLogger::engine(self)
     }
 
     fn observe(&mut self, output: &RequestOutput) {
-        RequestOutcome::observe(self, output);
+        StatLogger::observe(self, output);
     }
 
     fn abandoned(&mut self) {
-        RequestOutcome::abandoned(self);
+        StatLogger::abandoned(self);
     }
 }
 

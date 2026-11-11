@@ -2,7 +2,7 @@
 //!
 //! A model crate states one [`Family`] beside the numerical model execution loads
 //! (`nn::family::Family` holds it), and the executable registers each once: request processing
-//! reads the [`Catalogue`] of these values, execution the catalogue of numerical families built
+//! reads the [`Registry`] of these values, execution the registry of numerical families built
 //! from the same list. A checkpoint resolves by what its own files declare: the `model_type` of a
 //! root `config.json`, or its model class.
 
@@ -46,29 +46,29 @@ impl Eq for Family {}
 /// Two families claim one `model_type` or class: a checkpoint of it would resolve to either.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("two model families claim the class {0}")]
-pub struct ClaimError(pub &'static str);
+pub struct RegistryError(pub &'static str);
 
 /// The families an executable serves, each claiming the `model_type`s and classes its checkpoints
 /// declare.
 #[derive(Clone, Debug, Default)]
-pub struct Catalogue {
+pub struct Registry {
     families: Vec<Family>,
 }
 
-impl Catalogue {
-    /// A catalogue of `families`.
+impl Registry {
+    /// A registry of `families`.
     ///
     /// # Errors
     ///
     /// Fails, naming the class, when two families claim one `model_type` or class.
-    pub fn new(families: impl IntoIterator<Item = Family>) -> Result<Self, ClaimError> {
+    pub fn new(families: impl IntoIterator<Item = Family>) -> Result<Self, RegistryError> {
         let families: Vec<Family> = families.into_iter().collect();
         for (index, family) in families.iter().enumerate() {
             for class in family.model_types.iter().chain(family.classes) {
                 if families[..index].iter().any(|earlier| {
                     earlier.model_types.contains(class) || earlier.classes.contains(class)
                 }) {
-                    return Err(ClaimError(class));
+                    return Err(RegistryError(class));
                 }
             }
         }
@@ -118,11 +118,11 @@ mod tests {
     /// family claims resolves to none.
     #[test]
     fn a_family_is_found_by_what_its_checkpoints_declare() {
-        let catalogue = Catalogue::new([CHAT]).unwrap();
-        assert_eq!(catalogue.by_model_type("chat_model"), Some(CHAT));
-        assert_eq!(catalogue.by_class("ChatForCausalLM"), Some(CHAT));
-        assert_eq!(catalogue.by_model_type("other"), None);
-        assert_eq!(catalogue.by_class("chat_model"), None);
+        let registry = Registry::new([CHAT]).unwrap();
+        assert_eq!(registry.by_model_type("chat_model"), Some(CHAT));
+        assert_eq!(registry.by_class("ChatForCausalLM"), Some(CHAT));
+        assert_eq!(registry.by_model_type("other"), None);
+        assert_eq!(registry.by_class("chat_model"), None);
     }
 
     /// Two families that claim one `model_type` or class are refused: a checkpoint of it would
@@ -131,8 +131,8 @@ mod tests {
     fn two_families_may_not_claim_one_class() {
         let twin = Family { id: "twin", ..CHAT };
         assert_eq!(
-            Catalogue::new([CHAT, twin]).unwrap_err(),
-            ClaimError("chat_model")
+            Registry::new([CHAT, twin]).unwrap_err(),
+            RegistryError("chat_model")
         );
 
         let class = Family {
@@ -141,8 +141,8 @@ mod tests {
             ..CHAT
         };
         assert_eq!(
-            Catalogue::new([CHAT, class]).unwrap_err(),
-            ClaimError("ChatForCausalLM")
+            Registry::new([CHAT, class]).unwrap_err(),
+            RegistryError("ChatForCausalLM")
         );
     }
 }

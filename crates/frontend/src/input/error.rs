@@ -35,10 +35,10 @@ pub enum TokenizeError {
         /// What is wrong with it.
         message: String,
     },
-    /// Sampling controls violate the engine contract.
+    /// Sampling controls violate the engine's sampling rules.
     #[error(transparent)]
     Sampling(#[from] proto::request::SamplingParamsError),
-    /// The lowered request violates the canonical generation contract.
+    /// The lowered request violates the engine request's rules.
     #[error(transparent)]
     Generation(#[from] proto::request::GenerationRequestError),
     /// The profile cannot size the request's images.

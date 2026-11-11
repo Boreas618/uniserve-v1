@@ -178,12 +178,12 @@ impl CanvasRule {
             .windows(2)
             .map(|pair| f64::midpoint(pair[0], pair[1]))
             .collect();
-        let mut probes = cuts;
-        probes.extend(midpoints);
-        probes.sort_by(f64::total_cmp);
+        let mut ratios = cuts;
+        ratios.extend(midpoints);
+        ratios.sort_by(f64::total_cmp);
         let mut canvases = Vec::new();
-        // Every probe lies within the range, which the rule accepts.
-        for size in probes
+        // Every ratio lies within the range, which the rule accepts.
+        for size in ratios
             .into_iter()
             .filter_map(|ratio| self.canvas(ratio, 1.0).ok())
         {

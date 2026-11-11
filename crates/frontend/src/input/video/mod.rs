@@ -188,7 +188,7 @@ impl VideoService {
         self.processor.denoise_steps()
     }
 
-    /// Describes the served video contract for `GET /v1/capabilities`: the model's own part, the
+    /// Describes what the deployment serves of video for `GET /v1/capabilities`: the model's own part, the
     /// prompt capacity, the media sources and size caps, and the request fields.
     pub fn capabilities(&self, max_prompt_tokens: u32) -> Value {
         json!({
