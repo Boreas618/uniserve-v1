@@ -70,7 +70,7 @@ pub enum Scheme {
 
 /// The scheme a checkpoint's key/value cache scales follow.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum KvCache {
+pub enum KvCacheScheme {
     /// The cache is stored at the activations' own type; no scale is calibrated.
     Unquantized,
     /// FP8 E4M3 with calibrated per-layer key and value scales.
@@ -85,7 +85,7 @@ pub struct Declaration {
     /// The modules the calibration left in their source dtype, as `config.json` writes them.
     excluded: Vec<String>,
     /// The scheme the key/value cache scales follow.
-    kv_cache: KvCache,
+    kv_cache: KvCacheScheme,
     /// The weights whose shards store a block scale beside them, once [`Self::resolve`] has read
     /// the shards; `None` before, when the declaration alone decides.
     packed: Option<BTreeSet<String>>,
@@ -100,7 +100,7 @@ impl Declaration {
         Self {
             scheme: Scheme::Dense,
             excluded: Vec::new(),
-            kv_cache: KvCache::Unquantized,
+            kv_cache: KvCacheScheme::Unquantized,
             packed: None,
             layers: None,
         }
@@ -227,7 +227,7 @@ impl Declaration {
     }
 
     /// The scheme the key/value cache scales follow.
-    pub fn kv_cache(&self) -> KvCache {
+    pub fn kv_cache(&self) -> KvCacheScheme {
         self.kv_cache
     }
 }
@@ -392,12 +392,12 @@ fn stated(fields: &Fields<'_>, producer: Option<&str>) -> Result<(String, Result
 
     let kv_cache = match fields.optional_text("kv_cache_quant_algo")? {
         None => match fields.optional_object("kv_cache_scheme")? {
-            None => KvCache::Unquantized,
+            None => KvCacheScheme::Unquantized,
             Some(scheme) => match (
                 scheme.optional_index("num_bits")?,
                 scheme.optional_text("type")?,
             ) {
-                (Some(8), Some("float")) => KvCache::Fp8,
+                (Some(8), Some("float")) => KvCacheScheme::Fp8,
                 (bits, kind) => {
                     return Err(fields.refuse(
                         "kv_cache_scheme",
@@ -408,7 +408,7 @@ fn stated(fields: &Fields<'_>, producer: Option<&str>) -> Result<(String, Result
                 }
             },
         },
-        Some(algorithm) if algorithm.eq_ignore_ascii_case("FP8") => KvCache::Fp8,
+        Some(algorithm) if algorithm.eq_ignore_ascii_case("FP8") => KvCacheScheme::Fp8,
         Some(other) => {
             return Err(fields.refuse(
                 "kv_cache_quant_algo",
@@ -458,7 +458,7 @@ fn declaration(
     algorithm: &str,
     method: Option<&str>,
     excluded: Vec<String>,
-    kv_cache: KvCache,
+    kv_cache: KvCacheScheme,
     layers: Option<Vec<(String, Scheme)>>,
 ) -> Result<Declaration> {
     let scheme = match algorithm.to_ascii_uppercase().as_str() {

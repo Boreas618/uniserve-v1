@@ -66,8 +66,8 @@ pub fn encode_block(columns: u32, requested: u32) -> u32 {
 ///
 /// # Errors
 ///
-/// When the weight is not a matrix that contracts over `x`'s rows, the bias is another width,
-/// or the operator refuses its arguments.
+/// When the weight is not a matrix whose contraction axis is `x`'s row width, the bias is
+/// another width, or the operator refuses its arguments.
 pub fn linear(
     x: &Tensor,
     weight: &Tensor,
@@ -91,7 +91,7 @@ pub fn linear(
         return Err(Error::shape(
             OWNER,
             format!(
-                "a weight of {:?} in {order} order does not contract over rows of {k}",
+                "a weight of {:?} in {order} order has another contraction axis than rows of {k}",
                 weight.dims()
             ),
         ));

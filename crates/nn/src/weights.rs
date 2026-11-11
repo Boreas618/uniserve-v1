@@ -471,18 +471,13 @@ enum Retention<'a> {
     Meta(Rc<RefCell<HashMap<WeightKey, Tensor>>>),
 }
 
-/// One contiguous byte range of a checkpoint tensor that a weight's bytes are gathered from.
+/// One contiguous byte range of a checkpoint tensor that a weight's bytes are gathered from: the
+/// tensor, and the range within the tensor's own bytes.
 ///
 /// A load computes its spans from the shard headers alone, so every bound a device load checks
 /// is checked by a meta load too, without a payload byte read; a device load then copies the
 /// spans in order.
-pub(crate) struct Span<'c> {
-    pub(crate) location: &'c TensorLocation,
-    /// The first byte, within the tensor's own bytes.
-    pub(crate) from: usize,
-    /// One past the last byte, within the tensor's own bytes.
-    pub(crate) to: usize,
-}
+type Span<'c> = (&'c TensorLocation, std::ops::Range<usize>);
 
 /// How many bytes the shard's header states `location` holds.
 ///
@@ -747,7 +742,7 @@ impl<'a> WeightLoader<'a> {
         let spans = spans_in(source, &key, &|tensor| {
             logical.iter().find(|location| location.tensor == tensor)
         })?;
-        let read: u64 = spans.iter().map(|span| (span.to - span.from) as u64).sum();
+        let read: u64 = spans.iter().map(|(_, range)| range.len() as u64).sum();
         if read != numel(shape) * 2 {
             return Err(Error::weight(
                 name,
@@ -764,10 +759,10 @@ impl<'a> WeightLoader<'a> {
             let mut decoded: Vec<(String, Vec<u8>)> = Vec::new();
             let mut bytes = Vec::with_capacity(read as usize);
 
-            for span in &spans {
-                let tensor = &span.location.tensor;
+            for (location, range) in &spans {
+                let tensor = &location.tensor;
                 if !decoded.iter().any(|(decoded, _)| decoded == tensor) {
-                    let matrix = loader.decode_nvfp4(tensor, &span.location.shape)?;
+                    let matrix = loader.decode_nvfp4(tensor, &location.shape)?;
                     decoded.push((tensor.clone(), matrix));
                 }
 
@@ -775,7 +770,7 @@ impl<'a> WeightLoader<'a> {
                     .iter()
                     .find(|(decoded, _)| decoded == tensor)
                     .ok_or_else(|| Error::weight(tensor, "a decoded matrix went missing"))?;
-                bytes.extend_from_slice(&matrix[span.from..span.to]);
+                bytes.extend_from_slice(&matrix[range.clone()]);
             }
             Ok(Cow::Owned(bytes))
         })
@@ -904,7 +899,7 @@ impl<'a> WeightLoader<'a> {
             .ok_or_else(|| Error::weight(name, "the weight's bytes overflow"))?;
         let read = spans
             .iter()
-            .map(|span| (span.to - span.from) as u64)
+            .map(|(_, range)| range.len() as u64)
             .sum::<u64>();
 
         // A conversion keeps the element count and changes its width.
@@ -1350,19 +1345,19 @@ impl<'a> WeightLoader<'a> {
     /// Consecutive spans of one tensor are read in one [`Checkpoint::payload`] call, so a strided
     /// shard of an adapter-fused tensor, one span a row, reads the adapter's factors once.
     fn gather(&self, spans: &[Span<'_>]) -> Result<Vec<u8>> {
-        let total = spans.iter().map(|span| span.to - span.from).sum();
+        let total = spans.iter().map(|(_, range)| range.len()).sum();
         let mut gathered = Vec::with_capacity(total);
         let mut at = 0;
 
         while at < spans.len() {
-            let location = spans[at].location;
+            let location = spans[at].0;
             let run = spans[at..]
                 .iter()
-                .take_while(|span| std::ptr::eq(span.location, location))
+                .take_while(|(other, _)| std::ptr::eq(*other, location))
                 .count();
             let ranges = spans[at..at + run]
                 .iter()
-                .map(|span| (span.from, span.to))
+                .map(|(_, range)| (range.start, range.end))
                 .collect::<Vec<_>>();
 
             gathered.extend(self.checkpoint.payload(location, &ranges)?);
@@ -1511,11 +1506,7 @@ fn spans_in<'l>(
                 ));
             }
 
-            Ok(vec![Span {
-                location,
-                from: begin,
-                to: end,
-            }])
+            Ok(vec![(location, begin..end)])
         }
 
         WeightSource::Strided {
@@ -1561,7 +1552,7 @@ fn spans_in<'l>(
                         ),
                     ));
                 }
-                spans.push(Span { location, from, to });
+                spans.push((location, from..to));
             }
             Ok(spans)
         }
@@ -1619,11 +1610,7 @@ fn spans_in<'l>(
 
                 let to = usize::try_from(stored_bytes(location))
                     .map_err(|_| Error::weight(name, "a part is past usize::MAX"))?;
-                spans.push(Span {
-                    location,
-                    from: 0,
-                    to,
-                });
+                spans.push((location, 0..to));
             }
             fused(spans, key)
         }
@@ -1632,7 +1619,7 @@ fn spans_in<'l>(
 
 /// `spans`, the parts of a fused weight, refused when no part holds a byte.
 fn fused<'l>(spans: Vec<Span<'l>>, key: &WeightKey) -> Result<Vec<Span<'l>>> {
-    if spans.iter().all(|span| span.from == span.to) {
+    if spans.iter().all(|(_, range)| range.is_empty()) {
         return Err(Error::weight(
             &key.tensors.join("+"),
             "a fused weight has no part",
@@ -1682,7 +1669,7 @@ fn block_spans<'a>(
                 ),
             ));
         }
-        spans.push(Span { location, from, to });
+        spans.push((location, from..to));
     }
     Ok(spans)
 }
