@@ -193,6 +193,12 @@ pub struct CoverRequest {
     /// keys of their phase; empty leaves every key to the manifests'
     /// priorities.
     pub named: Vec<Named>,
+    /// The revisions a module set fixed for the operator's packages, each a
+    /// backend and its revision. When any is stated, the candidates are
+    /// exactly these: a package or a revision installed since is none. Empty
+    /// takes each backend's latest installed revision, which is what the
+    /// daemon asks when it fixes a module set.
+    pub fixed: Vec<(String, u32)>,
 }
 
 /// A backend a deployment names for an operator: preferred over every other
@@ -220,6 +226,8 @@ pub struct Coverage {
     pub covered: Vec<Covered>,
     /// The keys no installed package of the operator covers for the targets.
     pub uncovered: Vec<String>,
+    /// Every candidate the selection chose among, in its selection order.
+    pub candidates: Vec<Package>,
 }
 
 impl From<&PackageRevision> for wire::PackageRevision {
@@ -760,6 +768,14 @@ impl Client {
                             revision: named.revision.unwrap_or(0),
                         })
                         .collect(),
+                    fixed: request
+                        .fixed
+                        .iter()
+                        .map(|(backend, revision)| wire::FixedRevision {
+                            backend: backend.clone(),
+                            revision: *revision,
+                        })
+                        .collect(),
                 })),
             },
             &[],
@@ -783,6 +799,15 @@ impl Client {
                 Ok(Coverage {
                     covered,
                     uncovered: coverage.uncovered,
+                    candidates: coverage
+                        .candidates
+                        .into_iter()
+                        .map(|package| Package {
+                            op: package.op,
+                            backend: package.backend,
+                            revision: package.revision,
+                        })
+                        .collect(),
                 })
             }
             wire::server_message::Message::Refused(refused) => Err(refused_error(refused)),

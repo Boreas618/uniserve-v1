@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use build_server::builder::Limits;
 use build_server::inputs::Inputs;
-use build_server::protocol::{Client, CoverRequest, Coverage, Covered, Named, Package};
+use build_server::protocol::{Client, CoverRequest, Covered, Named, Package};
 use build_server::server::{BuildServer, ServerConfig};
 use build_server::store::Root;
 use build_server::target::{Device, Target};
@@ -121,6 +121,7 @@ fn request(keys: &[&str]) -> CoverRequest {
         targets: vec![Target::new("sm_100a")],
         keys: keys.iter().map(|key| (*key).to_owned()).collect(),
         named: Vec::new(),
+        fixed: Vec::new(),
     }
 }
 
@@ -187,12 +188,10 @@ fn each_key_goes_to_the_package_that_declares_it_over_the_socket() {
     let coverage = client.cover(&request(&[BF16, F32, F16, BF16])).unwrap();
     // `f32` sorts before `fa4` at the same priority, so it is listed first.
     assert_eq!(
-        coverage,
-        Coverage {
-            covered: vec![covered("f32", 1, &[F32]), covered("fa4", 1, &[BF16])],
-            uncovered: vec![F16.to_owned()],
-        }
+        coverage.covered,
+        vec![covered("f32", 1, &[F32]), covered("fa4", 1, &[BF16])]
     );
+    assert_eq!(coverage.uncovered, vec![F16.to_owned()]);
 }
 
 /// A key several packages declare goes to the one of highest priority, and
@@ -224,15 +223,13 @@ fn a_key_several_packages_cover_goes_to_the_highest_priority() {
 
     let coverage = server.cover(&request(&[BF16, F16, F32])).unwrap();
     assert_eq!(
-        coverage,
-        Coverage {
-            covered: vec![
-                covered("beta", 1, &[BF16, F16]),
-                covered("alpha", 1, &[F32]),
-            ],
-            uncovered: Vec::new(),
-        }
+        coverage.covered,
+        vec![
+            covered("beta", 1, &[BF16, F16]),
+            covered("alpha", 1, &[F32]),
+        ]
     );
+    assert!(coverage.uncovered.is_empty());
 }
 
 /// A named backend takes every key it covers before any priority, and a key it
@@ -314,13 +311,65 @@ fn only_the_latest_revision_of_a_backend_covers() {
     let server = BuildServer::open(&configuration).unwrap();
 
     let coverage = server.cover(&request(&[BF16, F16])).unwrap();
-    assert_eq!(
-        coverage,
-        Coverage {
-            covered: vec![covered("fa4", 2, &[BF16])],
-            uncovered: vec![F16.to_owned()],
-        }
+    assert_eq!(coverage.covered, vec![covered("fa4", 2, &[BF16])]);
+    assert_eq!(coverage.uncovered, vec![F16.to_owned()]);
+}
+
+/// The answer lists every candidate in selection order, which is what a module set fixes; and a
+/// request that states a module set's revisions selects among exactly those: a revision or a
+/// package installed since is no candidate, and a fixed revision the server lacks is refused.
+#[test]
+fn a_module_sets_revisions_are_the_only_candidates() {
+    let temporary = tempfile::tempdir().unwrap();
+    let configuration = config(temporary.path());
+    installed(
+        &configuration,
+        "fa4",
+        1,
+        &manifest("fa4", &["bf16"], "sm_100a"),
     );
+    let server = BuildServer::open(&configuration).unwrap();
+    let package = |backend: &str, revision: u32| build_server::protocol::Package {
+        op: OP.to_owned(),
+        backend: backend.to_owned(),
+        revision,
+    };
+
+    // What the daemon asks when a configuration is applied: no key, every candidate.
+    let applied = server.cover(&request(&[])).unwrap();
+    assert_eq!(applied.candidates, vec![package("fa4", 1)]);
+
+    // Installed after the set was fixed: a later revision of `fa4`, and another package.
+    installed(
+        &configuration,
+        "fa4",
+        2,
+        &manifest("fa4", &["bf16", "f16"], "sm_100a"),
+    );
+    installed(
+        &configuration,
+        "f32",
+        1,
+        &manifest("f32", &["f32"], "sm_100a"),
+    );
+    let server = BuildServer::open(&configuration).unwrap();
+    let latest = server.cover(&request(&[BF16, F16, F32])).unwrap();
+    assert_eq!(
+        latest.candidates,
+        vec![package("f32", 1), package("fa4", 2)]
+    );
+    assert!(latest.uncovered.is_empty());
+
+    let mut fixed = request(&[BF16, F16, F32]);
+    fixed.fixed = vec![("fa4".to_owned(), 1)];
+    let coverage = server.cover(&fixed).unwrap();
+    assert_eq!(coverage.candidates, vec![package("fa4", 1)]);
+    assert_eq!(coverage.covered, vec![covered("fa4", 1, &[BF16])]);
+    assert_eq!(coverage.uncovered, vec![F16.to_owned(), F32.to_owned()]);
+
+    fixed.fixed = vec![("fa4".to_owned(), 3)];
+    let refused = server.cover(&fixed).unwrap_err();
+    assert!(refused.to_string().contains("revision 3"), "{refused}");
 }
 
 /// A package that does not build for the requested target covers nothing

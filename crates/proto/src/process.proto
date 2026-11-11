@@ -374,6 +374,10 @@ message KernelPackage {
   string op = 1;
   optional PhaseKind phase = 2;
   PackageRevision package = 3;
+  // The package itself, for a candidate the epoch's module set fixed for an
+  // operator without naming it for a phase: the main process selects among
+  // the operator's candidates for each descriptor key.
+  optional string part = 4;
 }
 
 // A command for the main process of one epoch, from the daemon that manages

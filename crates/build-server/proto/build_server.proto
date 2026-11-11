@@ -129,9 +129,10 @@ message Resolve {
 message List {}
 
 // Ask which installed package is selected for each of an operator's
-// descriptor keys (design section 6.3). The candidates are each backend's
-// latest installed revision that builds for every target, or the revision a
-// named backend states; a key goes to the first candidate whose manifest
+// descriptor keys (design section 6.3). The candidates are the packages a
+// module set fixed, when the request states them, and otherwise each backend's
+// latest installed revision, or the revision a named backend states; of
+// those, the ones that build for every target. A key goes to the first candidate whose manifest
 // covers it, in this order: the backend the deployment names for the key's
 // phase, then the manifest's `priority`, highest first, then the backend whose
 // name sorts first. The server answers with `Coverage`; nothing is built.
@@ -144,6 +145,16 @@ message Cover {
   // The backends the deployment names for the operator; none leaves the
   // selection to the manifests' priorities.
   repeated Named named = 4;
+  // The revisions a module set fixed for the operator's packages. When any is
+  // stated, the candidates are exactly these packages at these revisions: a
+  // package or a revision installed since is none.
+  repeated FixedRevision fixed = 5;
+}
+
+// One package of an operator at the revision a module set fixed.
+message FixedRevision {
+  string backend = 1;
+  uint32 revision = 2;
 }
 
 // A backend a deployment names for an operator, in every phase (`ALL`) or in
@@ -265,6 +276,9 @@ message Coverage {
   repeated Covered covered = 1;
   // The keys no installed package of the operator covers for the targets.
   repeated string uncovered = 2;
+  // Every candidate the selection chose among, in its selection order: what
+  // a module set fixes when a configuration is applied.
+  repeated Package candidates = 3;
 }
 
 // The server does not answer the request. `upstream` is set when the request

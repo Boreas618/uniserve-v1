@@ -131,6 +131,7 @@ impl GenerationCommand {
                         op: slot.op.clone(),
                         phase: slot.phase.map(phase_to_wire).map(i32::from),
                         package: Some(package_to_wire(package)),
+                        part: slot.part.clone(),
                     })
                     .collect(),
                 policy: Some(package_to_wire(policy)),
@@ -177,7 +178,7 @@ impl GenerationCommand {
                     let slot = proto::module::ModuleSlot {
                         op: kernel.op,
                         phase,
-                        part: None,
+                        part: kernel.part,
                     };
                     packages.insert(slot, package_from_wire(package)?);
                 }

@@ -1088,12 +1088,12 @@ pub fn prepare_epoch(
         policy = %filled.policy.backend,
         "resolving the epoch's modules at its Build Servers"
     );
-    let pinned = prepare_at(leader_server, Selector::Latest, filled, descriptors, steps)?;
+    let pinned = prepare_at(leader_server, filled, descriptors, steps)?;
     for server in servers {
         if server.host == leader {
             continue;
         }
-        let selected = prepare_at(server, Selector::Fixed, filled, descriptors, steps)?;
+        let selected = prepare_at(server, filled, descriptors, steps)?;
         anyhow::ensure!(
             selected == pinned,
             "the Build Server of {} selected other modules than the leader's",
@@ -1108,20 +1108,23 @@ pub fn prepare_epoch(
     Ok(pinned)
 }
 
-/// `filled` with the packages the leader's store holds for every operator the deployment names
-/// nothing for: the generation's full module set.
+/// `filled` as a fixed module set: every package it names at the revision the leader's Build
+/// Server selects for it, and every installed kernel package of every operator at its selected
+/// revision.
 ///
-/// A deployment names the operators its configuration selects a backend for; for every other
-/// operator the Build Server selects, for each descriptor key, among its packages (`cover`). So
-/// what such an operator runs is decided by the packages the store holds, and the epoch's record
-/// keeps them - each backend's latest installed revision, one slot per backend with that backend
-/// as its part - so a revision installed for one of them is a package change a configuration
-/// comparison sees. These slots are not named to a main process (`GenerationSwitch::precopy`): they
-/// are what the selection chooses among, not a choice.
+/// This is the one selection of an apply. The daemon asks `cover` for each interface the
+/// deployment uses: the engine, the scheduling policy and every kernel operator of this build.
+/// A package the deployment names takes the revision it states, else its latest installed one.
+/// Every candidate of an operator is recorded as well, one slot per package with the package as
+/// its part: for each descriptor key the main process later asks `cover` to select among exactly
+/// these revisions, so a package or a revision installed after this call is run by nobody until
+/// a configuration is applied again, and a later revision of one of them is a package change a
+/// configuration comparison sees.
 ///
 /// # Errors
 ///
-/// Fails when the leader's Build Server cannot be reached or answers no listing.
+/// Fails when the leader's Build Server cannot be reached, or holds no package, or not the
+/// revision, the deployment names for an interface.
 pub fn with_store_modules(
     servers: &[BuildServer],
     leader: &str,
@@ -1138,49 +1141,79 @@ pub fn with_store_modules(
             leader_server.socket.display()
         )
     })?;
-    let listing = client
-        .list()
-        .with_context(|| format!("reading the store of {}", leader_server.host))?;
+
     let mut complete = filled.clone();
-    for package in listing.packages {
-        if package.op == POLICY_SLOT
-            || proto::module::operator::named(&package.op).is_none()
-            || filled.kernels.keys().any(|slot| slot.op == package.op)
-        {
-            continue;
+    fix_revision(&mut client, proto::module::ENGINE, &mut complete.engine)?;
+    fix_revision(&mut client, POLICY_SLOT, &mut complete.policy)?;
+    for (slot, package) in &mut complete.kernels {
+        fix_revision(&mut client, &slot.op, package)?;
+    }
+    for operator in proto::module::operator::ALL {
+        for candidate in candidates(&mut client, operator, &[])? {
+            complete.kernels.insert(
+                proto::module::ModuleSlot {
+                    op: candidate.op,
+                    phase: None,
+                    part: Some(candidate.backend.clone()),
+                },
+                proto::module::PackageRevision {
+                    backend: candidate.backend,
+                    revision: candidate.revision,
+                    arguments: toml::Table::new(),
+                },
+            );
         }
-        // Each backend's latest revision: `prepare` selects the same one for the slot.
-        complete.kernels.insert(
-            proto::module::ModuleSlot {
-                op: package.op,
-                phase: None,
-                part: Some(package.backend.clone()),
-            },
-            proto::module::PackageRevision {
-                backend: package.backend,
-                revision: 0,
-                arguments: toml::Table::new(),
-            },
-        );
     }
     Ok(complete)
 }
 
-/// How one host's `prepare` names the package that fills an operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Selector {
-    /// The backend's latest installed revision.
-    Latest,
-    /// Exactly this package, revision and all.
-    Fixed,
+/// The candidates the Build Server selects among for `op`, with `named` preferred: every
+/// installed package of the interface, each at its latest revision or the one `named` states.
+fn candidates(
+    client: &mut build_server::Client,
+    op: &str,
+    named: &[build_server::Named],
+) -> anyhow::Result<Vec<build_server::protocol::Package>> {
+    let coverage = client
+        .cover(&build_server::CoverRequest {
+            op: op.to_owned(),
+            // No target: a module set fixes revisions for every host of the deployment, and each
+            // main process selects among them for its own devices.
+            targets: Vec::new(),
+            keys: Vec::new(),
+            named: named.to_vec(),
+            fixed: Vec::new(),
+        })
+        .with_context(|| format!("asking the Build Server for the packages of {op}"))?;
+    Ok(coverage.candidates)
 }
 
-/// Runs `prepare` at one host's Build Server, selecting each slot the way
-/// `selector` says, and answers the epoch's modules with the revisions and
-/// parameters it selected.
+/// Fixes the revision of the package `package` names for `op`: the one it states, checked, or
+/// its latest installed one.
+fn fix_revision(
+    client: &mut build_server::Client,
+    op: &str,
+    package: &mut proto::module::PackageRevision,
+) -> anyhow::Result<()> {
+    let named = build_server::Named {
+        phase: None,
+        backend: package.backend.clone(),
+        revision: (package.revision != 0).then_some(package.revision),
+    };
+    let selected = candidates(client, op, &[named])?
+        .into_iter()
+        .find(|candidate| candidate.backend == package.backend)
+        .with_context(|| format!("no {op} package {} is installed", package.backend))?;
+    package.revision = selected.revision;
+    Ok(())
+}
+
+/// Runs `prepare` at one host's Build Server for the module set `filled`,
+/// whose revisions are fixed, and answers it with the parameters each
+/// package runs with: its manifest's defaults under the deployment's
+/// arguments.
 fn prepare_at(
     server: &BuildServer,
-    selector: Selector,
     filled: &crate::epoch::ModuleSet,
     descriptors: &[build_server::Descriptors],
     steps: &PrepareSteps,
@@ -1191,16 +1224,16 @@ fn prepare_at(
     for (slot, package) in &filled.kernels {
         requests.push(build_server::PackageRequest {
             slot: slot.clone(),
-            selector: selected(selector, package),
+            selector: build_server::Selector::Fixed(package.clone()),
         });
     }
     requests.push(build_server::PackageRequest {
         slot: policy_slot.clone(),
-        selector: selected(selector, &filled.policy),
+        selector: build_server::Selector::Fixed(filled.policy.clone()),
     });
     requests.push(build_server::PackageRequest {
         slot: engine_slot.clone(),
-        selector: selected(selector, &filled.engine),
+        selector: build_server::Selector::Fixed(filled.engine.clone()),
     });
     // The engine's one module is built here, on every host, before any node
     // starts a main process from it: a host whose store misses it builds the
@@ -1315,22 +1348,6 @@ fn prepare_at(
 /// by this slot and the daemon takes it back out.
 const POLICY_SLOT: &str = "scheduling";
 
-/// The selector a `prepare` request uses for `package`.
-fn selected(
-    selector: Selector,
-    package: &proto::module::PackageRevision,
-) -> build_server::Selector {
-    match selector {
-        // A revision the module set already states is asked for exactly: the
-        // one a configuration pins, or the one an earlier selection fixed.
-        Selector::Latest if package.revision == 0 => build_server::Selector::Latest {
-            backend: package.backend.clone(),
-            arguments: package.arguments.clone(),
-        },
-        Selector::Latest | Selector::Fixed => build_server::Selector::Fixed(package.clone()),
-    }
-}
-
 /// Fixes the engine package `engine` names at the Build Server on `socket`: its latest installed
 /// revision, or the one it states, with its module built for this host.
 ///
@@ -1346,20 +1363,23 @@ pub fn select_engine(
     socket: &std::path::Path,
     engine: &proto::module::PackageRevision,
 ) -> anyhow::Result<proto::module::PackageRevision> {
+    let mut client = build_server::Client::connect(socket)
+        .with_context(|| format!("connecting to the Build Server at {}", socket.display()))?;
+    let mut engine = engine.clone();
+    fix_revision(&mut client, proto::module::ENGINE, &mut engine)?;
+
     let slot = proto::module::ModuleSlot::all(proto::module::ENGINE);
     let request = build_server::PrepareRequest {
         targets: Vec::new(),
         packages: vec![build_server::PackageRequest {
             slot: slot.clone(),
-            selector: selected(Selector::Latest, engine),
+            selector: build_server::Selector::Fixed(engine.clone()),
         }],
         descriptors: vec![build_server::Descriptors {
             slot,
             keys: vec![proto::module::SINGLE_KEY.to_owned()],
         }],
     };
-    let mut client = build_server::Client::connect(socket)
-        .with_context(|| format!("connecting to the Build Server at {}", socket.display()))?;
     let prepared = client
         .prepare(&request, &mut |step| {
             tracing::info!(
@@ -1499,14 +1519,13 @@ impl<'a> GenerationSwitch<'a> {
         modules: &BTreeMap<crate::epoch::KernelKey, crate::epoch::PackageRevision>,
         policy: &crate::epoch::PackageRevision,
     ) -> Result<(), crate::epoch::Failure> {
-        // A slot with a part is a package the store holds for an operator the deployment names
-        // nothing for (`with_store_modules`): the record keeps it, and the main process's
-        // selection chooses among such packages itself, so it is not named.
+        // The whole fixed set is stated: a slot with a part is a candidate the main process's
+        // selection chooses among for each key (`with_store_modules`), at the revision the
+        // set fixed for it.
         let command = process::Command {
             kind: Some(command::Kind::Precopy(process::Precopy {
                 kernels: modules
                     .iter()
-                    .filter(|(slot, _)| slot.part.is_none())
                     .map(|(slot, package)| crate::epoch::kernel_to_wire(slot, package))
                     .collect(),
                 policy: Some(crate::epoch::package_to_wire(policy)),

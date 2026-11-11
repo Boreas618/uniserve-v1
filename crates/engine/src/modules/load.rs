@@ -11,7 +11,9 @@ use proto::module::Packages;
 use worker::completion::Outcome;
 use worker::host::HostAction;
 
-use crate::modules::select::{Routes, interface_agrees, named_backends, selected_slots};
+use crate::modules::select::{
+    Routes, fixed_revisions, interface_agrees, named_backends, selected_slots,
+};
 
 /// The Build Server's selection of a generation's packages, on the module-load lane.
 ///
@@ -55,6 +57,7 @@ impl HostAction for Select {
                 targets: self.targets.clone(),
                 keys: keys.iter().cloned().collect(),
                 named: named_backends(op, &self.named),
+                fixed: fixed_revisions(op, &self.named),
             };
             let coverage = client.cover(&request).map_err(|error| {
                 worker::Error::Invalid(format!(

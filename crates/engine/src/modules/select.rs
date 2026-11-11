@@ -17,17 +17,33 @@ use proto::module::{ModuleSlot, PackageRevision, Packages, PhaseKind};
 pub(crate) type Routes = BTreeMap<ModuleSlot, Vec<String>>;
 
 /// The backends a deployment names for `op`, as the Build Server's selection takes them: each
-/// slot's backend, its phase, and its revision when the daemon pinned one.
+/// slot's backend, its phase, and its revision when the daemon pinned one. A slot with a part is
+/// a candidate of the module set, not a preference, so it is none of these.
 pub(crate) fn named_backends(op: &str, named: &Packages) -> Vec<Named> {
     named
         .iter()
-        .filter(|(slot, _)| slot.op == op)
+        .filter(|(slot, _)| slot.op == op && slot.part.is_none())
         .map(|(slot, package)| Named {
             phase: slot.phase,
             backend: package.backend.clone(),
             revision: (package.revision != 0).then_some(package.revision),
         })
         .collect()
+}
+
+/// The revisions the epoch's module set fixed for `op`'s packages, each a backend and its
+/// revision: every slot of the operator whose revision the daemon fixed. The Build Server
+/// selects among exactly these, so a package or a revision installed after the set was fixed is
+/// not run. Empty when the set states none, which leaves the selection to what is installed.
+pub(crate) fn fixed_revisions(op: &str, named: &Packages) -> Vec<(String, u32)> {
+    let mut fixed: Vec<(String, u32)> = named
+        .iter()
+        .filter(|(slot, package)| slot.op == op && package.revision != 0)
+        .map(|(_, package)| (package.backend.clone(), package.revision))
+        .collect();
+    fixed.sort();
+    fixed.dedup();
+    fixed
 }
 
 /// The slots one operator's keys fill, from the Build Server's selection of them.
@@ -253,6 +269,7 @@ mod tests {
                 })
                 .collect(),
             uncovered: uncovered.iter().map(|key| (*key).to_owned()).collect(),
+            candidates: Vec::new(),
         }
     }
 
@@ -330,6 +347,39 @@ mod tests {
         assert!(refusal.contains("rms_norm"), "{refusal}");
         assert!(refusal.contains("triton"), "{refusal}");
         assert!(refusal.contains(&(launched + 1).to_string()), "{refusal}");
+    }
+
+    /// The revisions a module set fixed for an operator are its named packages' and its
+    /// candidates', each once; a candidate is no preference.
+    #[test]
+    fn a_module_sets_candidates_are_fixed_and_not_preferred() {
+        let candidate = |backend: &str| ModuleSlot {
+            op: "paged_attention".to_owned(),
+            phase: None,
+            part: Some(backend.to_owned()),
+        };
+        let mut set = Packages::new();
+        set.insert(ModuleSlot::all("paged_attention"), package("trtllm", 4));
+        set.insert(candidate("trtllm"), package("trtllm", 4));
+        set.insert(candidate("triton"), package("triton", 2));
+        set.insert(ModuleSlot::all("gemm"), package("cublas", 0));
+
+        assert_eq!(
+            fixed_revisions("paged_attention", &set),
+            vec![("triton".to_owned(), 2), ("trtllm".to_owned(), 4)]
+        );
+        assert_eq!(
+            named_backends("paged_attention", &set),
+            vec![Named {
+                phase: None,
+                backend: "trtllm".to_owned(),
+                revision: Some(4),
+            }]
+        );
+        assert!(
+            fixed_revisions("gemm", &set).is_empty(),
+            "a revision the daemon has not fixed is not stated"
+        );
     }
 
     /// The named backends of an operator carry their phase, and a revision only once the daemon

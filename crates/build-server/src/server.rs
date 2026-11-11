@@ -352,6 +352,11 @@ impl BuildServer {
                     targets: cover.targets.into_iter().map(Target::new).collect(),
                     keys: cover.keys,
                     named,
+                    fixed: cover
+                        .fixed
+                        .into_iter()
+                        .map(|fixed| (fixed.backend, fixed.revision))
+                        .collect(),
                 })?;
                 let coverage = wire::Coverage {
                     covered: coverage
@@ -367,6 +372,15 @@ impl BuildServer {
                         })
                         .collect(),
                     uncovered: coverage.uncovered,
+                    candidates: coverage
+                        .candidates
+                        .into_iter()
+                        .map(|package| wire::Package {
+                            op: package.op,
+                            backend: package.backend,
+                            revision: package.revision,
+                        })
+                        .collect(),
                 };
                 connection.send(
                     &wire::ServerMessage {
@@ -867,9 +881,11 @@ impl BuildServer {
     /// Selects the installed package of each of an operator's descriptor keys:
     /// the one rule by which a key's package revision is chosen (design section 6.3).
     ///
-    /// The candidates are each backend's latest installed revision of the
-    /// operator - or the revision a named backend states - that builds for
-    /// every requested target. A key goes to the first candidate whose manifest
+    /// The candidates are the packages a module set fixed for the operator,
+    /// when the request states them, and otherwise each backend's latest
+    /// installed revision - or the revision a named backend states; of those,
+    /// the ones that build for every requested target. The answer lists them
+    /// in selection order, which is what the daemon fixes a module set from. A key goes to the first candidate whose manifest
     /// covers it, in the selection order: a backend the request names for the
     /// key's phase ([`proto::module::PhaseKind::of_key`]) first, then the manifest's
     /// `priority`, highest first, then the backend whose name sorts first. A
@@ -881,32 +897,35 @@ impl BuildServer {
     ///
     /// # Errors
     ///
-    /// Fails when the request names no target, or names a revision of a backend
-    /// that is not installed.
+    /// Fails when the request names or fixes a revision of a backend that is
+    /// not installed.
     pub fn cover(&self, request: &protocol::CoverRequest) -> Result<protocol::Coverage> {
-        if request.targets.is_empty() {
-            return Err(Error::Protocol(format!(
-                "a cover of {} names no target to build for",
-                request.op
-            )));
-        }
         let packages = self
             .packages
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        // Each backend's revision: the one a named backend states, else the
-        // latest installed.
+        // Each backend's revision: the one a module set fixed, when the
+        // request states them, and otherwise the one a named backend states,
+        // else the latest installed.
         let mut revisions: BTreeMap<&str, (u32, &Arc<Package>)> = BTreeMap::new();
         for ((op, backend, revision), package) in packages.iter() {
             if *op != request.op {
                 continue;
             }
-            let stated = request
-                .named
-                .iter()
-                .find(|named| named.backend == *backend)
-                .and_then(|named| named.revision);
+            let stated = if request.fixed.is_empty() {
+                request
+                    .named
+                    .iter()
+                    .find(|named| named.backend == *backend)
+                    .and_then(|named| named.revision)
+            } else {
+                // A package the set does not hold is no candidate at all.
+                match request.fixed.iter().find(|(fixed, _)| fixed == backend) {
+                    Some((_, fixed)) => Some(*fixed),
+                    None => continue,
+                }
+            };
             if stated.is_some_and(|stated| stated != *revision) {
                 continue;
             }
@@ -917,13 +936,22 @@ impl BuildServer {
                 *held = (*revision, package);
             }
         }
-        for named in &request.named {
-            if let Some(revision) = named.revision
-                && !revisions.contains_key(named.backend.as_str())
-            {
+        let stated = request
+            .named
+            .iter()
+            .filter(|_| request.fixed.is_empty())
+            .filter_map(|named| Some((&named.backend, named.revision?)))
+            .chain(
+                request
+                    .fixed
+                    .iter()
+                    .map(|(backend, revision)| (backend, *revision)),
+            );
+        for (backend, revision) in stated {
+            if !revisions.contains_key(backend.as_str()) {
                 return Err(Error::UnknownRevision {
                     op: request.op.clone(),
-                    backend: named.backend.clone(),
+                    backend: backend.clone(),
                     revision,
                 });
             }
@@ -972,6 +1000,14 @@ impl BuildServer {
             }
         }
 
+        let selected = candidates
+            .iter()
+            .map(|(backend, revision, _)| protocol::Package {
+                op: request.op.clone(),
+                backend: (*backend).to_owned(),
+                revision: *revision,
+            })
+            .collect();
         let covered = candidates
             .iter()
             .zip(chosen)
@@ -985,7 +1021,11 @@ impl BuildServer {
                 keys,
             })
             .collect();
-        Ok(protocol::Coverage { covered, uncovered })
+        Ok(protocol::Coverage {
+            covered,
+            uncovered,
+            candidates: selected,
+        })
     }
 
     /// The package revision a `prepare` names for an operator, with the package's

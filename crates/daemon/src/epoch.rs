@@ -73,6 +73,7 @@ pub fn kernel_to_wire(
             phase as i32
         }),
         package: Some(package_to_wire(package)),
+        part: slot.part.clone(),
     }
 }
 
